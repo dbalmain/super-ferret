@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cox regexp course</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="../index.html">← Super Ferret survey</a>
+  <strong>Parts</strong>
+  <a href="part1.html">1. NFA / DFA</a>
+  <a href="part2.html">2. VM + submatch</a>
+  <a href="part3.html">3. In the wild</a>
+  <a href="part4.html">4. Trigram index</a>
+  <strong>This page</strong>
+  <a href="#how">How to take this</a>
+  <a href="#syntax">Regexp syntax</a>
+  <a href="#cli">The interface</a>
+  <a href="#run">Running tests</a>
+  <a href="#stages">What each stage tests</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">docs/grok/cox-trigrams</div>
+  <h1>Implementing regular expressions, then indexing them</h1>
+  <p class="lede">All four of Russ Cox’s articles, as a course. You write a matcher, then a virtual machine with captures, then a production-shaped engine, then a trigram index that feeds the matcher back its own candidates. The tests never see your source — only an executable and its JSON, so the language is yours.</p>
+  <p class="meta"><a href="https://swtch.com/~rsc/regexp/">swtch.com/~rsc/regexp</a> · 2007–2012 · tests in <code>harness/</code></p>
+</header>
+
+<div class="cards">
+  <a class="card" href="part1.html" style="text-decoration:none;color:inherit">
+    <h3>Part 1 — Simple and fast</h3>
+    <p>Backtracking is exponential. Thompson NFA is linear. Optional lazy DFA on top. Tests: <code>nfa</code>, <code>dfa</code>, <code>syntax</code>.</p>
+  </a>
+  <a class="card" href="part2.html" style="text-decoration:none;color:inherit">
+    <h3>Part 2 — The VM</h3>
+    <p>Regexps as bytecode. <code>save</code> tracks captures. Pike VM = Thompson in lock-step plus per-thread saved pointers. Tests: <code>vm</code>, <code>submatch</code>.</p>
+  </a>
+  <a class="card" href="part3.html" style="text-decoration:none;color:inherit">
+    <h3>Part 3 — In the wild</h3>
+    <p>What RE2 actually adds: <code>.</code>, classes, unanchored search, a bounded DFA cache. Tests: <code>search</code>, plus the earlier match suite still has to pass.</p>
+  </a>
+  <a class="card" href="part4.html" style="text-decoration:none;color:inherit">
+    <h3>Part 4 — Trigram index</h3>
+    <p>Compile a regexp to a boolean of trigrams, intersect posting lists, recheck with your matcher. Tests: <code>index</code>.</p>
+  </a>
+</div>
+
+<h2 id="how">How to take this</h2>
+<ul>
+  <li>Pick Python, Ruby, JavaScript, Go, or Rust. One program that grows. Stdlib only.</li>
+  <li>Read Cox when the lesson says to. Pencil before code.</li>
+  <li>Performance of the index does not matter. Performance of the matcher <em>does</em> in one place: the pathological case in part 1 must finish in a second, which backtracking will not.</li>
+  <li>The test harness is language-agnostic: it shells out to your binary and reads JSON on stdout. Debug prints go to stderr.</li>
+</ul>
+
+<h2 id="syntax">Regexp syntax (all four parts)</h2>
+<p>A tiny egrep subset. Same language in every part so the tests stay stable.</p>
+<table>
+  <thead><tr><th>Form</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>juxtaposition</td><td>concatenation</td></tr>
+    <tr><td><code>|</code></td><td>alternation (lowest precedence)</td></tr>
+    <tr><td><code>*</code> <code>+</code> <code>?</code></td><td>greedy repetition (highest)</td></tr>
+    <tr><td><code>(e)</code></td><td>grouping; also a capture for part 2</td></tr>
+    <tr><td><code>.</code></td><td>any single character — <strong>not</strong> concatenation. Cox’s C compiler uses <code>.</code> as concat only in an internal postfix form you never write.</td></tr>
+    <tr><td><code>[abc]</code> <code>[a-z]</code></td><td>character class (required from part 3; earlier parts’ tests do not use them)</td></tr>
+    <tr><td><code>\</code></td><td>escapes the next character (optional; fixtures avoid needing it)</td></tr>
+  </tbody>
+</table>
+<p>No backreferences, lookaround, <code>{n,m}</code>, non-greedy <code>*?</code>, or anchors. <code>match</code> is implicitly anchored at both ends. <code>search</code> is unanchored.</p>
+<p>Precedence, from tightest to loosest: repetition, concatenation, alternation. Thus <code>ab|c</code> means <code>(ab)|c</code>. Reject malformed patterns — an unbalanced <code>(</code>, a <code>*</code> with nothing to its left — with exit 2 rather than silently interpreting them; the <code>syntax</code> stage checks this.</p>
+
+<h2 id="cli">The interface</h2>
+<p>Your program is an executable. Commands take arguments, print <strong>one JSON object</strong> to stdout, and exit 0. The <code>match</code> value must be a JSON boolean, not <code>0</code>, <code>1</code>, or a string; <code>groups</code> must be <code>null</code> on a non-match. Copy <a href="harness/example_stub.py"><code>harness/example_stub.py</code></a> or <a href="harness/example_stub.av"><code>harness/example_stub.av</code></a> if you want the argv parsing done.</p>
+<table>
+  <thead><tr><th>Exit</th><th>Means</th><th>Stdout</th></tr></thead>
+  <tbody>
+    <tr><td><code>0</code></td><td>answered the question</td><td>one JSON object</td></tr>
+    <tr><td><code>2</code></td><td>the pattern is not a legal regexp</td><td>nothing (message on stderr)</td></tr>
+    <tr><td><code>1</code></td><td>bad usage, or you crashed</td><td>nothing</td></tr>
+  </tbody>
+</table>
+<p>Exit 2 is not decoration: the <code>syntax</code> stage feeds you malformed patterns and fails you for accepting any of them. A parser that treats a stray <code>(</code> as a literal passes every other stage in the suite.</p>
+
+<h3><code>match PATTERN TEXT</code> — parts 1 and 2</h3>
+<p>True iff the regexp matches the <em>entire</em> text (Cox’s <code>nfa.c</code>).</p>
+<div class="fig">{"match": true}</div>
+
+<h3><code>search PATTERN TEXT</code> — part 3 onward</h3>
+<p>True iff some substring matches (grep / Code Search). Implement as compiling <code>.*? PATTERN</code> and running the same engine, or by starting a new thread at every input position — both are linear if the engine is Thompson/Pike.</p>
+<div class="fig">{"match": true}</div>
+
+<h3><code>submatch PATTERN TEXT</code> — part 2</h3>
+<p>Whole-string match plus captures. Group 0 is the whole match. Then each <code>(</code> in left-to-right order. Unmatched optional group: <code>null</code>. Offsets are byte or character indices, but fixtures are ASCII so they coincide. Half-open <code>[start, end)</code>. Greedy: <code>split</code> prefers its first arm (Perl / Pike, not POSIX).</p>
+<div class="fig">{"match": true, "groups": [[0, 6], [0, 3], [3, 6]]}
+{"match": false, "groups": null}</div>
+
+<h3><code>index-search --corpus DIR PATTERN</code> — part 4</h3>
+<p>Build an in-memory trigram index of every file in <code>DIR</code>. Recursion is optional — the fixture corpus is flat. Search <code>PATTERN</code> as a <em>substring</em> regexp. Print two arrays of <strong>basenames</strong>, in any order and without duplicates (the harness sorts).</p>
+<ul>
+  <li><code>candidates</code> — what the trigram query selected, <em>before</em> recheck. Must be a superset of the true hits; dropping one is a failed test. Several fixtures also pin it exactly, so you cannot pass by reporting the survivors instead.</li>
+  <li><code>hits</code> — files that actually matched after recheck. Must equal the fixture list.</li>
+</ul>
+<div class="fig">{"candidates": ["a.txt", "c.txt", "d.txt"], "hits": ["a.txt", "c.txt"]}</div>
+
+<h2 id="run">Running tests</h2>
+<p>Harness needs Python 3. You do not write Python unless you want to.</p>
+<div class="fig">python3 harness/run_tests.py --bin ./yourprog nfa
+python3 harness/run_tests.py --bin ./yourprog nfa dfa vm
+python3 harness/run_tests.py --bin ./yourprog submatch
+python3 harness/run_tests.py --bin ./yourprog syntax
+python3 harness/run_tests.py --bin ./yourprog search
+python3 harness/run_tests.py --bin ./yourprog index
+python3 harness/run_tests.py --bin ./yourprog all</div>
+<p>Each case is one process. Default timeout 2s; the pathological NFA case is 1s. Debug on stderr. A failing case prints the pattern, the text, and what the harness got.</p>
+<p>The stub always returns no-match, so you can see the protocol work:</p>
+<div class="fig">python3 harness/run_tests.py --bin harness/example_stub.py nfa
+python3 harness/run_tests.py --bin harness/example_stub.av nfa
+# FAIL  nfa  22 passed, 29 failed   (the 22 are the true negatives)</div>
+<p><code>--bin</code> must be executable (shebang is enough for the stub). For a compiled language, point at the binary. For interpreted languages without a shebang, write a one-line wrapper that execs the interpreter.</p>
+
+<h2 id="stages">What each stage tests</h2>
+<table>
+  <thead><tr><th>Stage</th><th>Command</th><th>Fixtures</th><th>When you can run it</th></tr></thead>
+  <tbody>
+    <tr><td><code>nfa</code></td><td><code>match</code></td><td><code>match.json</code> + <code>pathological.json</code></td><td>After Thompson simulation. Pathological: <code>a?^20 a^20</code> vs <code>a^20</code> — backtracking will time out.</td></tr>
+    <tr><td><code>dfa</code></td><td><code>match</code></td><td>same as nfa</td><td>After you cache NFA state-sets as DFA states. Same answers, usually faster on repeats.</td></tr>
+    <tr><td><code>vm</code></td><td><code>match</code></td><td>same as nfa</td><td>After the lock-step VM (Thompson-as-bytecode). Same answers as nfa.</td></tr>
+    <tr><td><code>submatch</code></td><td><code>submatch</code></td><td><code>submatch.json</code></td><td>After <code>save</code> + Pike VM. Greedy captures.</td></tr>
+    <tr><td><code>search</code></td><td><code>search</code></td><td><code>search.json</code></td><td>After unanchored search, <code>.</code>, and <code>[ ]</code>.</td></tr>
+    <tr><td><code>syntax</code></td><td><code>match</code></td><td><code>syntax.json</code></td><td>As soon as the parser exists. Malformed patterns must exit 2. Independent of the engine.</td></tr>
+    <tr><td><code>index</code></td><td><code>index-search</code></td><td><code>index.json</code> + <code>corpus/</code></td><td>After trigram index + recheck. Recheck with <em>your</em> <code>search</code>, not the language’s regex.</td></tr>
+  </tbody>
+</table>
+<p>Pencil lessons have no harness. If a lesson has a command in the table above, it has tests.</p>
+<div class="callout warn">
+  <div class="label">What the harness cannot see</div>
+  <p><code>nfa</code>, <code>dfa</code> and <code>vm</code> run the same command against the same fixtures. They differ only in what you have built by the time you run them, and nothing outside your process can tell a state-set cache or a bytecode VM from the plain simulation. Those two stages are self-certified: they catch you breaking something, not you skipping something.</p>
+  <p>The DFA cache cap in part 3 is likewise untested, and the part-4 index is tested for soundness — never dropping a hit — but never for speed. Nothing here stops you writing a slow, correct engine. That is deliberate; correctness is the part a fixture can hold you to.</p>
+</div>
+
+<p>Start at <a href="part1.html">Part 1</a>.</p>
+<footer class="page">Cox 2007–2012 · tests do not import your code</footer>
+</main>
+</div>
+</body>
+</html>

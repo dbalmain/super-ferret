@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Part 4 — Trigram index</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="index.html">← Course home</a>
+  <a href="part3.html">← Part 3</a>
+  <strong>This part</strong>
+  <a href="#read">Read</a>
+  <a href="#l1">Why words fail</a>
+  <a href="#l2">Posting lists</a>
+  <a href="#l3">n = 3</a>
+  <a href="#l4">Index</a>
+  <a href="#l5">Literals</a>
+  <a href="#l6">Five facts</a>
+  <a href="#l7">Examples</a>
+  <a href="#l8">analyze</a>
+  <a href="#l9">Simplify</a>
+  <a href="#l10">Hook it up</a>
+  <a href="#tests">Tests</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">Part 4 of 4</div>
+  <h1>Matching with a trigram index</h1>
+  <p class="lede">The matcher you built still opens every file. Index overlapping 3-character slices, compile the regexp into a boolean of trigrams that every match must contain, intersect posting lists, recheck survivors with <code>search</code>.</p>
+</header>
+
+<h2 id="read">Read</h2>
+<p><a href="https://swtch.com/~rsc/regexp/regexp4.html">Regular Expression Matching with a Trigram Index</a> (Cox, 2012). First half before you implement; the transformation rules when you reach lesson 6. Production: <a href="https://github.com/google/codesearch">google/codesearch</a> <code>index/regexp.go</code> after your toy works.</p>
+<p>Recheck with <em>your</em> part-3 <code>search</code>, not the language’s regex. That is the point of having done the first three parts.</p>
+
+<h2 id="l1">Why a word index is not enough</h2>
+<p><strong>Pencil, no code.</strong> 40,000 files, query <code>hello world</code>: why is running even a linear matcher on every file unattractive? Why can a <em>word</em> inverted index not answer <code>/foo.*bar/</code>, <code>/handleRequest/</code> (if you split camelCase), or a twelve-character hexadecimal identifier? (The course syntax deliberately omits counted repetition.)</p>
+<p>Matches do not sit on word boundaries. The index of n-grams names substrings that <em>must</em> appear. Files that lack them cannot match. Files that have them still might not. <strong>Necessary condition, then recheck.</strong> Over-accept; never drop a hit.</p>
+<p>No tests yet.</p>
+
+<h2 id="l2">Posting lists</h2>
+<div class="fig">(1) Google Code Search
+(2) Google Code Project Hosting
+(3) Google Web Search
+
+Code {1,2}  Google {1,2,3}  Hosting {2}  Project {2}  Search {1,3}  Web {3}</div>
+<p>AND = intersection of sorted id lists. OR = union. Pencil: <code>Code AND Search</code> = {1}; <code>Code OR Search</code> = {1,2,3}; <code>Google AND NOT Web</code> = {1,2}.</p>
+<p>We store presence, not positions. Recheck handles phrases. No tests.</p>
+
+<h2 id="l3">Why n = 3</h2>
+<p>Read Cox through the first trigram example. 2-grams: too few keys, lists become “all files.” 4-grams: too many keys, index ≈ corpus. 3 is the stable point (Cox: Linux 3.1.3 sources, 420 MB → a 77 MB index, 18%).</p>
+<p><strong>Pencil.</strong> Document <code>banana</code>: trigrams <code>ban ana nan</code> (ana twice, posting list still {1}). Query <code>Goo oog Sea ear arc rch</code> on the three docs: {1,3}.</p>
+<p>No tests.</p>
+
+<h2 id="l4">Index a directory</h2>
+<p>Map trigram → set of file ids. For each file, overlapping windows of 3 characters. Treat a NUL in the first 8 KB as a binary-file signal and skip that file. Skip files shorter than 3 characters. ASCII is enough; pick characters or bytes and stick to one.</p>
+<p>The fixture corpus is <code>harness/corpus/</code>. Index those six files in your head: <code>a.txt</code> / <code>c.txt</code> contain <code>Search</code>; <code>d.txt</code> is <code>Seaearch</code>, which has every trigram of <code>Search</code> and not the substring — your first false positive.</p>
+<p>No harness yet: you cannot search.</p>
+
+<h2 id="l5">Literal search</h2>
+<p>Literal <code>s</code> of length ≥ 3: overlapping trigrams, intersect lists, <code>search</code> each survivor. Missing gram ⇒ empty. Implement <code>intersect</code> with two pointers.</p>
+<p>Still no full <code>index-search</code> until analyze exists; you can hard-code a literal path and print candidates vs hits for <code>Search</code> on the corpus: candidates <code>a.txt, c.txt, d.txt</code>, hits <code>a.txt, c.txt</code>.</p>
+
+<h2 id="l6">Five facts</h2>
+<p>Read Cox from “Indexed Regular Expression Search” through the transformation rules. A regexp is not “pull out the literals.” For every subexpression compute:</p>
+<table>
+  <thead><tr><th>Fact</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>emptyable</td><td>matches the empty string?</td></tr>
+    <tr><td>exact</td><td>the finite set of matching strings, or unknown</td></tr>
+    <tr><td>prefix / suffix</td><td>if exact unknown: possible match prefixes/suffixes</td></tr>
+    <tr><td>match</td><td>boolean query over trigrams: ALL, NONE, AND, OR. Necessary, not sufficient.</td></tr>
+  </tbody>
+</table>
+<p><code>trigrams(s)</code> = ALL if len&lt;3, else AND of overlapping 3-grams. <code>trigrams(set)</code> = OR of those. A short string in the set poisons it to ALL.</p>
+<p>Rules (copy onto paper):</p>
+<ul>
+  <li><code>''</code>: emptyable, exact {''}, match ALL</li>
+  <li><code>c</code>: exact {c}, match ALL</li>
+  <li><code>.</code> / unknown char: prefix {''}, suffix {''}, match ALL</li>
+  <li><code>e?</code>: exactly <code>e|''</code>. Run the alternation rule against the empty-string node — exact becomes exact(e) ∪ {''}, and match is ALL because the empty string is in there. Do <em>not</em> shortcut this to “emptyable, so throw the subtree away”: that is the <code>*</code> rule, and applying it here costs you the whole index. <code>ab?cdef</code> under the alternation rule yields <code>("acd" AND "cde" AND "def") OR ("abc" AND "bcd" AND "cde" AND "def")</code>; under the shortcut it yields ALL.</li>
+  <li><code>e*</code>: emptyable, exact unknown, prefix and suffix {''}, match ALL — genuinely throw everything away, because <code>e</code> need never appear</li>
+  <li><code>e+</code>: emptyable(e); match of e; exact unknown, and if exact(e) was known it becomes both prefix and suffix</li>
+  <li><code>e1|e2</code>: union; match = OR</li>
+  <li><code>e1e2</code>: cartesian exact if both known; match = AND; if not exact, also AND trigrams(suffix(e1)×prefix(e2)) when those strings are long enough to span the boundary</li>
+</ul>
+<p>Dump <code>trigrams(exact)</code> into match at the root when you finish. Saving into match <em>before</em> shrinking sets is lesson 9.</p>
+
+<h2 id="l7">Worked examples</h2>
+<p>Do these on paper, then as unit prints.</p>
+<ul>
+  <li><code>Sea</code> → query <code>"Sea"</code></li>
+  <li><code>Google.*Search</code> → AND of grams of Google and of Search. <code>.*</code> adds nothing.</li>
+  <li><code>ab[cd]e</code> → <code>("abc" AND "bce") OR ("abd" AND "bde")</code>. Weaker <code>("abc" OR "abd") AND ("bce" OR "bde")</code> is valid, less precise.</li>
+  <li><code>a*</code> → ALL. Every file is a candidate. Recheck is grep. Honest.</li>
+  <li><code>(foo|bar)baz</code> → OR of the two 6-letter paths’ grams (you may factor <code>"baz"</code>).</li>
+  <li><code>ab*</code> → ALL. <code>a</code> alone matches, and one character cannot name a trigram.</li>
+  <li><code>ab?cdef</code> → <code>("acd" AND "cde" AND "def") OR ("abc" AND "bcd" AND "cde" AND "def")</code>. Two exact strings, not a discarded subtree. If you get ALL here, you applied the <code>*</code> rule to <code>?</code>.</li>
+</ul>
+
+<h2 id="l8">Implement analyze</h2>
+<p>AST: Empty, Char, Dot, Class, Concat, Alt, Quest, Star, Plus. Build it from the parser you already have. Query: ALL / NONE / And / Or of trigrams and subqueries.</p>
+<p><strong>Invariant:</strong> if <code>search(pattern, file)</code> is true, that file’s id is in the candidate set. Test this yourself on the corpus before the harness. If it fails, a rule is wrong.</p>
+
+<h2 id="l9">Simplification</h2>
+<p>Sets explode (<code>[Aa][Bb][Cc]</code> is 8 exact strings). Cox’s Go code, in order:</p>
+<ol>
+  <li>AND trigrams(set) into match <em>before</em> shrinking. Information-saving transformations first, information-discarding second; do it the other way round and you throw away grams you could have kept.</li>
+  <li>Exact too big — Cox’s <code>maxExact</code> is 7, and he also dumps when the shortest string is ≥ 4 — then: extract its trigrams into match, replace each string by its first two and last two characters (strings shorter than 3 go into prefix and suffix whole), and clear exact.</li>
+  <li>Prefix or suffix too big — <code>maxSet</code> is 20 — then chop the last (prefix) or first (suffix) character off the longest strings until the set is small, and drop any string that already has a shorter one as its prefix or suffix.</li>
+  <li>Boolean: ALL AND q = q, NONE OR q = q, ALL OR q = ALL, NONE AND q = NONE.</li>
+</ol>
+<p>The constants are engineering, not theory; every step here trades precision for a bounded set, and every one stays sound. <code>[a-z][a-z][a-z]</code> should degrade toward ALL, not enumerate 17,576 exact strings.</p>
+
+<h2 id="l10">Hook it up</h2>
+<p><code>index-search --corpus DIR PATTERN</code>:</p>
+<ol>
+  <li>Index every file in DIR (basenames in the output).</li>
+  <li><code>q = analyze(pattern).match</code></li>
+  <li>Evaluate q on the posting lists: ALL = every id, NONE = empty, AND = intersect, OR = union, trigram = list or empty.</li>
+  <li>Recheck each candidate with <code>search</code>.</li>
+  <li>Print JSON <code>candidates</code> and <code>hits</code>.</li>
+</ol>
+
+<h2 id="tests">Tests</h2>
+<p>First tests in this part:</p>
+<div class="fig">python3 harness/run_tests.py --bin ./yourprog index</div>
+<p>Fixture <code>index.json</code> plus <code>harness/corpus/</code>:</p>
+<p>Where a pattern admits only one sound candidate set, the fixture asserts it exactly, so you cannot recheck everything and call it an index. Where a weaker but still sound analysis would legitimately return more, only the superset rule is enforced.</p>
+<table>
+  <thead><tr><th>Pattern</th><th>Hits</th><th>Candidates</th><th>What it catches</th></tr></thead>
+  <tbody>
+    <tr><td><code>Search</code></td><td>a, c</td><td>asserted: a, c, <strong>d</strong></td><td><code>d.txt</code> is <code>Seaearch</code> — every trigram of <code>Search</code>, not the substring. The false positive is mandatory.</td></tr>
+    <tr><td><code>Hosting</code></td><td>b</td><td>asserted: b</td><td>a plain intersection that selects one file</td></tr>
+    <tr><td><code>DATAKIT</code></td><td>e</td><td>asserted: e</td><td>the same, on text that is not English</td></tr>
+    <tr><td><code>banana</code></td><td>none</td><td>asserted: none</td><td>a missing gram must empty the intersection. Returning every file here means you are not pruning.</td></tr>
+    <tr><td><code>Se</code></td><td>a, c, d</td><td>asserted: all six</td><td>shorter than a trigram, so the query is ALL and recheck is grep. The honest degenerate case, and the one where pruning would be <em>wrong</em>.</td></tr>
+    <tr><td><code>Google.*Search</code></td><td>a, c</td><td>superset only</td><td><code>.*</code> contributes nothing; both sides must still be ANDed</td></tr>
+    <tr><td><code>ab[cd]e</code></td><td>f</td><td>superset only</td><td>a class becomes an OR of two exact strings — or, if you treat classes as unknown characters, ALL. Both are sound, so this one is not pinned.</td></tr>
+    <tr><td><code>ab?ce</code></td><td>f</td><td>asserted: f</td><td>the <code>?</code> rule, pinned. Exact is {<code>ace</code>, <code>abce</code>}, so the query is <code>"ace" OR ("abc" AND "bce")</code>. Answering ALL here is sound but is the mistake lesson 6 warns about, and this is the only case that catches it.</td></tr>
+  </tbody>
+</table>
+<p>Read a failure by which field is wrong.</p>
+<ul>
+  <li><strong>Hits wrong.</strong> Your <code>search</code> or your parser is wrong, not your index. Go back to part 3.</li>
+  <li><strong>A true hit missing from candidates.</strong> analyze dropped a necessary trigram. The invariant in lesson 8 has failed, and this is the only kind of wrong that is not merely slow — it silently loses results.</li>
+  <li><strong>Candidates for <code>Search</code> missing <code>d.txt</code>.</strong> You are reporting the survivors of the recheck, not the output of the trigram query. Print the query’s result before you recheck it.</li>
+  <li><strong>Candidates for <code>banana</code> not empty.</strong> Your query degenerated to ALL somewhere, or you never intersected. No file holds <code>ban</code>, so the intersection is empty before recheck ever runs — this is the case that proves the index prunes at all.</li>
+</ul>
+<p>After it passes, read <code>index/regexp.go</code>. You have earned it.</p>
+<footer class="page"><a href="index.html">Course home</a> · <a href="part3.html">Part 3</a></footer>
+</main>
+</div>
+</body>
+</html>

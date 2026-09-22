@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Part 2 — Virtual machine</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="index.html">← Course home</a>
+  <a href="part1.html">← Part 1</a>
+  <a href="part3.html">Part 3 →</a>
+  <strong>This part</strong>
+  <a href="#read">Read</a>
+  <a href="#l1">Bytecode</a>
+  <a href="#l2">Lock-step VM</a>
+  <a href="#l3">Save</a>
+  <a href="#l4">Pike</a>
+  <a href="#tests">Tests</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">Part 2 of 4</div>
+  <h1>The virtual machine approach</h1>
+  <p class="lede">The NFA graph is a program. Threads run it. A new instruction, <code>save</code>, records capture offsets without going exponential — if you run the threads in lock step.</p>
+</header>
+
+<h2 id="read">Read</h2>
+<p><a href="https://swtch.com/~rsc/regexp/regexp2.html">Regular Expression Matching: the Virtual Machine Approach</a> (Cox, 2009), through “Pike’s Implementation.” Skip the POSIX digression. Companion: <a href="https://github.com/rsc/re1">rsc/re1</a>.</p>
+
+<h2 id="l1">Lesson — bytecode is the NFA</h2>
+<p>Instructions:</p>
+<table>
+  <thead><tr><th>Op</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>char c</code></td><td>if <code>*SP != c</code>, kill thread; else SP++, PC++</td></tr>
+    <tr><td><code>match</code></td><td>this thread succeeded</td></tr>
+    <tr><td><code>jmp x</code></td><td>PC = x</td></tr>
+    <tr><td><code>split x, y</code></td><td>fork: one thread at x, one at y. First arm is preferred (greedy).</td></tr>
+    <tr><td><code>save i</code></td><td>saved[i] = SP; PC++  (part 2 only)</td></tr>
+  </tbody>
+</table>
+<p>Compile, from Cox’s tables:</p>
+<div class="fig">a          char a
+e1 e2      codes(e1) then codes(e2)
+e1|e2      split L1, L2; L1: e1; jmp L3; L2: e2; L3:
+e?         split L1, L2; L1: e; L2:
+e*         L1: split L2, L3; L2: e; jmp L1; L3:
+e+         L1: e; split L1, L3; L3:
+(e)        save 2k; e; save 2k+1     for the k-th '(' (1-based k)
+             plus save 0 at the start and save 1 before match, for group 0</div>
+<p><strong>Pencil.</strong> Write the program for <code>a+b+</code> and for <code>(a+)(b+)</code>. Check against the article.</p>
+<p>The obvious interpreter of this bytecode — recurse on both arms of every <code>split</code> — is, in Cox’s words, the essence of Henry Spencer’s original library and of the backtracking engines in Java, Perl, PCRE, Python, and the original <code>ed</code>, <code>sed</code> and <code>grep</code>. Write it only to watch part 1’s exponential blow-up reappear in new clothes. The <code>vm</code> stage expects the lock-step version.</p>
+
+<h2 id="l2">Lesson — Thompson as a VM</h2>
+<p>All threads share one SP (they walk the text together). Thread state is just PC. At most one thread per PC (identical PC ⇒ identical future). Process every current thread on the current character, producing the next list. Jmp/split/save happen in ε-closure when you <em>add</em> a thread, not when you consume a character — same as following Split nodes in part 1.</p>
+<p>If this passes <code>nfa</code> fixtures via the <code>match</code> command, you have a correct lock-step VM. Stage name: <code>vm</code>.</p>
+
+<h2 id="l3">Lesson — <code>save</code></h2>
+<p>Each thread carries an array of saved pointers. <code>save i</code> writes SP into slot i on <em>that thread’s copy</em>. Failed threads die with their copies. The winning thread’s array is the answer.</p>
+<p>Slot 0,1 = group 0 start/end. Slot 2k, 2k+1 = k-th capture. Report groups as <code>[start, end)</code> pairs built from those slots. Unmatched optional: the slot was never written — report <code>null</code> for that group. Initialize slots to a sentinel so you can tell.</p>
+<p><strong>Pencil.</strong> <code>(a+)(a+)</code> on <code>aaa</code>. Greedy first <code>+</code> takes as much as it can while leaving the second <code>+</code> at least one <code>a</code>. Groups: whole <code>[0,3)</code>, first <code>[0,2)</code>, second <code>[2,3)</code>.</p>
+
+<h2 id="l4">Lesson — Pike VM</h2>
+<p>Thompson VM + saved arrays = Pike VM, first used by Rob Pike in the text editor <em>sam</em> around 1985. Still one thread per PC: two threads at the same PC execute identically however their saved pointers differ, because those pointers record the past and never steer the future. So a later arrival at a PC can be dropped outright — and if you enqueue in preference order, the one already there is the one you wanted.</p>
+<p>To respect greedy preference: add ε-targets recursively when enqueueing, highest priority first. When a Match is seen, record it but continue higher-priority threads on this character so a longer greedy match can win; discard lower-priority ones.</p>
+<p>For this course, getting the <code>submatch.json</code> fixtures right is the definition of “respects greedy.” If a case fails, you added threads in the wrong order or overwrote a higher-priority save.</p>
+
+<h2 id="tests">Tests</h2>
+<div class="fig">python3 harness/run_tests.py --bin ./yourprog vm
+python3 harness/run_tests.py --bin ./yourprog submatch</div>
+<p><code>vm</code> reuses <code>match.json</code> and <code>pathological.json</code>, yes/no only — the same fixtures as <code>nfa</code>, so passing it proves your VM agrees with your part-1 machine, not that you wrote a VM at all. <code>submatch</code> is <code>submatch.json</code>. Captures are ASCII offsets, and the harness insists on the documented shape: <code>groups</code> is <code>null</code> on a non-match, and otherwise an array of <code>[start, end]</code> integer pairs with <code>null</code> for a group that never matched. No POSIX leftmost-longest: the fixtures encode Pike/Perl greedy throughout.</p>
+<p><a href="part3.html">Part 3 →</a></p>
+<footer class="page"><a href="index.html">Course home</a></footer>
+</main>
+</div>
+</body>
+</html>

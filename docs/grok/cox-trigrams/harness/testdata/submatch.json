@@ -1,0 +1,17 @@
+{
+  "command": "submatch",
+  "note": "Whole-string match. groups[0] is the whole match [start,end). Then each '(' in order. Unmatched optional group is null. Greedy * + ? (Pike/Perl: split prefers first arm).",
+  "cases": [
+    {"pattern": "a", "text": "a", "match": true, "groups": [[0, 1]]},
+    {"pattern": "a", "text": "b", "match": false, "groups": null},
+    {"pattern": "(a+)(b+)", "text": "aaabbb", "match": true, "groups": [[0, 6], [0, 3], [3, 6]]},
+    {"pattern": "(a+)(a+)", "text": "aaa", "match": true, "groups": [[0, 3], [0, 2], [2, 3]]},
+    {"pattern": "(ab)+", "text": "ababab", "match": true, "groups": [[0, 6], [4, 6]]},
+    {"pattern": "(a|b)*", "text": "ab", "match": true, "groups": [[0, 2], [1, 2]]},
+    {"pattern": "(a*)(a*)", "text": "aa", "match": true, "groups": [[0, 2], [0, 2], [2, 2]]},
+    {"pattern": "(a+)?b", "text": "b", "match": true, "groups": [[0, 1], null]},
+    {"pattern": "(a+)?b", "text": "aab", "match": true, "groups": [[0, 3], [0, 2]]},
+    {"pattern": "a(b|c)d", "text": "abd", "match": true, "groups": [[0, 3], [1, 2]]},
+    {"pattern": "a(b|c)d", "text": "acd", "match": true, "groups": [[0, 3], [1, 2]]}
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "command": "index-search",
+  "note": "Paths are basenames under harness/corpus, sorted. hits must equal brute-force substring matches. candidates must always be a superset of hits. Where 'candidates' is given, it is the only sound answer for that pattern and is checked exactly; it is omitted where a weaker but still sound analysis would give a larger set.",
+  "cases": [
+    {
+      "pattern": "Search",
+      "hits": ["a.txt", "c.txt"],
+      "candidates": ["a.txt", "c.txt", "d.txt"]
+    },
+    {
+      "pattern": "Hosting",
+      "hits": ["b.txt"],
+      "candidates": ["b.txt"]
+    },
+    {
+      "pattern": "DATAKIT",
+      "hits": ["e.txt"],
+      "candidates": ["e.txt"]
+    },
+    {
+      "pattern": "banana",
+      "hits": [],
+      "candidates": []
+    },
+    {
+      "pattern": "Se",
+      "hits": ["a.txt", "c.txt", "d.txt"],
+      "candidates": ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt"]
+    },
+    {
+      "pattern": "Google.*Search",
+      "hits": ["a.txt", "c.txt"]
+    },
+    {
+      "pattern": "ab[cd]e",
+      "hits": ["f.txt"]
+    },
+    {
+      "pattern": "ab?ce",
+      "hits": ["f.txt"],
+      "candidates": ["f.txt"]
+    }
+  ]
+}

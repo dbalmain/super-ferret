@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Landscape — Super Ferret survey</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="index.html">← Super Ferret survey</a>
+  <strong>Linux</strong>
+  <a href="#map">Map of the field</a>
+  <a href="#recoll">Recoll</a>
+  <a href="#localsearch">LocalSearch</a>
+  <a href="#baloo">Baloo</a>
+  <a href="#fsearch">FSearch / ANGRY</a>
+  <a href="#docfetcher">DocFetcher</a>
+  <a href="#locate">plocate</a>
+  <a href="#rga">rga / Clapgrep</a>
+  <a href="#others">Pinot, Catfish, dead</a>
+  <strong>Other OS</strong>
+  <a href="#windows">Windows</a>
+  <a href="#macos">macOS</a>
+  <strong>Engines</strong>
+  <a href="#engines">Embeddable engines</a>
+  <a href="#code">Code search</a>
+  <strong>Matrices</strong>
+  <a href="#formats">Formats</a>
+  <a href="#structures">Index structures</a>
+  <a href="#steal">Steal vs beat</a>
+  <a href="#sources">Sources</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">Report 1 of 2</div>
+  <h1>Landscape</h1>
+  <p class="lede">What you can install today, what files they actually read, and what sits on disk when they claim to have an index. Linux in full; Windows and macOS as the bars; engines as competitor intel you will reimplement, not link.</p>
+  <p class="meta">Primary sources: Recoll 1.44.1 manual and features page, Xapian Glass comments, SQLite FTS5 docs, Baloo source/bugs, voidtools FAQ, Apple/Microsoft docs, VictoriaLogs source. Reverse-engineering is labeled.</p>
+</header>
+
+<h2 id="map">Map of the field</h2>
+<table>
+  <thead><tr><th>Lineage</th><th>Indexes</th><th>Store</th><th>Linux face</th></tr></thead>
+  <tbody>
+    <tr><td>Full-text IR</td><td>name + body + nested containers</td><td>inverted index with positions</td><td>Recoll, DocFetcher, Pinot</td></tr>
+    <tr><td>Desktop RDF / metadata</td><td>name + properties + some body</td><td>SQLite FTS5 or LMDB postings</td><td>LocalSearch, Baloo</td></tr>
+    <tr><td>Filename Everything-clones</td><td>path / size / mtime</td><td>RAM arrays or SQLite FTS on paths</td><td>FSearch, ANGRYsearch, plocate</td></tr>
+    <tr><td>Scan at query</td><td>whatever an adapter can emit now</td><td>none, or a text cache</td><td>Catfish, rga, Clapgrep</td></tr>
+  </tbody>
+</table>
+<p>Beagle, Strigi, Glimpse, Namazu, Hyper Estraier, Swish-e and mg taught the inverted-index + extractor-plugin shape. Recoll is the only Linux app that still fully inhabits it.</p>
+
+<div class="callout">
+  <div class="label">Score against your brief</div>
+  <p>Lightning-fast names: FSearch / plocate / Everything, not Recoll. Body + boolean + phrase + nested docs: Recoll, not FSearch. Regex over contents: rga, not Recoll (wildcards and filename regex only). Small index: plocate and VictoriaLogs-class designs, not Recoll on HTML (73% of a Wikipedia dump). Near-real-time with a polite queue: nobody does this well; Pinot nices itself and pauses on battery; Recoll’s inotify daemon is known to be heavy on large trees.</p>
+</div>
+
+<h2 id="recoll">Recoll — the feature ceiling</h2>
+<p><span class="chip gpl">GPL-2.0-or-later</span> <span class="chip">C++ / Python</span> <span class="chip">Xapian Glass</span> <span class="chip">active · 1.44.1 · 2026-07</span></p>
+<p>Homepage <a href="https://www.recoll.org">recoll.org</a>. Recoll is the footwork (MIME, filters, query language, GUI); Xapian is the IR engine. That split matters: you can steal Recoll’s <em>product</em> ideas and must not steal the engine.</p>
+
+<h3>Formats</h3>
+<p>Native, no extra helper: plain text, HTML, maildir/mh/mbox, OpenDocument and OOXML via libxml2/libxslt, AbiWord, FB2, SVG, zip, classic Excel/PPT via Python stdlib. External helpers (subprocess): <code>pdftotext</code> (poppler, not xpdf), antiword / soffice / wvWare for <code>.doc</code>, unrtf, chmlib, mutagen, exiftool, libpff for PST, djvutxt, py7zr, unrar, ghostscript for PS. Nested containers to arbitrary depth — “DOCX attached to a message in a mailbox in a zip.” OCR and speech-to-text exist as optional Recoll config, default off because they are slow. Full list: <a href="https://www.recoll.org/pages/features.html">features.html</a>.</p>
+
+<h3>Queries</h3>
+<p>Xesam-descended language. Implicit AND; capital <code>OR</code> binds tighter; <code>-term</code>; <code>"phrase"</code>; <code>"pride prejudice"o1</code> ordered proximity, <code>"pride prejudice"p</code> unordered; fields <code>author:</code> <code>title:</code> <code>filename:</code> <code>ext:</code> <code>dir:</code> <code>mime:</code> <code>date:</code> <code>size&gt;100k</code>; wildcards <code>*</code> <code>?</code>. Stemming at <em>query</em> time (capitalise a word to suppress). No body regex. Left-anchored regex exists in the term explorer / filename mode.</p>
+
+<h3>Index data structures</h3>
+<p>Xapian Glass (default in 1.4 and still the production backend): B-trees of 8 KB blocks, one file per table under <code>~/.recoll/xapiandb/</code>.</p>
+<table>
+  <thead><tr><th>Table</th><th>File</th><th>Contents</th></tr></thead>
+  <tbody>
+    <tr><td>postlist</td><td><code>postlist.glass</code></td><td>term → chunked postings (docid + wdf); also value streams</td></tr>
+    <tr><td>termlist</td><td><code>termlist.glass</code></td><td>docid → terms in that document</td></tr>
+    <tr><td>position</td><td><code>position.glass</code></td><td>(term, docid) → positions, interpolative-coded</td></tr>
+    <tr><td>docdata</td><td><code>docdata.glass</code></td><td>opaque blob. Recoll 1.24+ stores <strong>document text</strong> here for snippets</td></tr>
+    <tr><td>spelling / synonym</td><td>lazy tables</td><td>aspell / synonyms</td></tr>
+  </tbody>
+</table>
+<p>Posting format, from <code>glass_postlist.cc</code>: lists split into ~2 KB chunks. First-chunk key = length-prefixed term; later chunks keyed by term + first docid of the chunk (so skip is a B-tree seek). A chunk is: last-chunk flag, last−first docid, first wdf, then repeated (docid increment, wdf) packed with Xapian’s continuation-bit integers. <strong>Not</strong> PFor, roaring, or Elias-Fano. Positions use Moffat–Stuiver interpolative coding. Recoll stopped reconstructing snippets from positions because newer Xapian formats made that “unacceptably slow”; it stores UTF-8 text instead (+10–20% index size).</p>
+<p>Stemming is not applied at index time. Surface forms go in; a stem dictionary is built after indexing and used to expand queries.</p>
+
+<h3>Size, live updates, cost</h3>
+<table>
+  <thead><tr><th>Corpus (Dockes, recoll.org/pages/perfs.html)</th><th>Data</th><th>Index</th><th>Ratio</th></tr></thead>
+  <tbody>
+    <tr><td>18k mixed PDFs</td><td>30 GB</td><td>1.2 GB</td><td>~4% of files (PDFs are mostly images)</td></tr>
+    <tr><td>French Wikipedia HTML</td><td>41 GB / 2.9M files</td><td>~30 GB</td><td>~73%</td></tr>
+    <tr><td>IETF mbox (old)</td><td>211 MB</td><td>350 MB</td><td>&gt;100% (tiny pure-text docs)</td></tr>
+    <tr><td>User report 2025</td><td>11M+ docs</td><td>250–550 GB</td><td>—</td></tr>
+  </tbody>
+</table>
+<p>Manual rule of thumb: index size is the same order of magnitude as uncompressed extracted text. Images barely count. Incremental: mtime/size, optional MD5 for dup collapsing. Real-time: <code>recollindex -m</code> via inotify. Periodic cron is the common setup. Multithreaded extraction; Xapian writes are single-threaded. A 2016 PDF bench peaked around 1.2 GB RSS. Recoll can throttle via cgroups (documented); default nice/ionice is not a first-class story.</p>
+<p><strong>Steal:</strong> query-time stemming; nested <code>ipath</code> containers; stored text for snippets; filter ABI as external processes; <code>dir:</code> / date / size sugar. <strong>Beat:</strong> license; index fatness on text; no body regex; inotify daemon cost; single-threaded writer.</p>
+
+<h2 id="localsearch">GNOME LocalSearch / TinySPARQL</h2>
+<p><span class="chip gpl">GPL miners · LGPL library</span> <span class="chip">SQLite FTS5</span> <span class="chip">renamed 2024</span></p>
+<p>Tracker SPARQL is now <a href="https://tinysparql.gnome.org">TinySPARQL</a>; Tracker Miners is <a href="https://gitlab.gnome.org/GNOME/localsearch">LocalSearch</a>. This is what GNOME Files searches. Not a product UI.</p>
+<p><strong>Formats:</strong> extract-modules for PDF (poppler-glib), OOXML, ODF, EPUB, HTML, AbiWord, PS, XPS, ISO, images, audio/video via FFmpeg/libav (GStreamer dropped in GNOME 48). Text extractor is only <code>text/plain</code> and <code>text/markdown</code> unless a more specific rule fires. No mail, no archive members, no CHM. PDF extractor is killed after ~5–10 s — large papers go missing.</p>
+<p><strong>Queries:</strong> SPARQL + <code>fts:match</code>, which is SQLite FTS5 (AND/OR/NOT, phrase, prefix <code>*</code>, NEAR). End users never see this. No Recoll-style <code>dir:</code> sugar. Regex is SPARQL <code>FILTER(REGEX)</code>, not the FTS path.</p>
+<p><strong>Index:</strong> ontology classes → SQL tables; FTS properties gathered into a contentless FTS5 table so tokens live once. FTS5 postings are varint doclists inside SQLite B-trees (segments + automerge), with positions for phrase. Graphs (<code>tracker:FileSystem</code>, <code>tracker:Documents</code>, …) are separate attached DBs. No first-party size-vs-corpus number found.</p>
+<p><strong>Live / sandbox:</strong> always-on user systemd units, GIO/inotify. Extractor is a separate process with <strong>seccomp default-deny and Landlock</strong> (tightened after CVE-2023-43641). This jail is the one to copy. Recoll does not have it.</p>
+<p><strong>Steal:</strong> contentless FTS5 pattern; extractor jail; filename vs content graphs. <strong>Beat:</strong> body coverage, archives, mail, regex, standalone UI, SPARQL as the only language.</p>
+
+<h2 id="baloo">KDE Baloo</h2>
+<p><span class="chip">LGPL (KDE)</span> <span class="chip">LMDB, 12 named DBs</span> <span class="chip">KFileMetaData extractors</span></p>
+<p>Plasma’s indexer. The wiki page that still says “sqlite and xapian” is outdated. Current Baloo is one LMDB environment at <code>~/.local/share/baloo/index</code>, <code>MDB_NOSUBDIR</code>, historically a 256 GB mapsize.</p>
+<table>
+  <thead><tr><th>DBI</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>postingdb</code></td><td>term → encoded list of docIds</td></tr>
+    <tr><td><code>positiondb</code></td><td>term → concatenated <code>[docId : n : positions…]</code></td></tr>
+    <tr><td><code>docterms</code> / <code>docfilenameterms</code></td><td>forward index, filename terms split out</td></tr>
+    <tr><td><code>idtree</code> / <code>idfilename</code></td><td>directory tree, names</td></tr>
+    <tr><td><code>documenttimedb</code> / <code>mtimedb</code></td><td>mtime both ways</td></tr>
+    <tr><td><code>documentdatadb</code>, <code>indexingleveldb</code>, <code>failediddb</code></td><td>metadata, basic vs content, failures</td></tr>
+  </tbody>
+</table>
+<p>DocID is 64-bit (fs id + inode). PostingCodec is custom; a 2018 rewrite to <code>MDB_DUPSORT</code> was prototyped and <strong>not landed</strong>. Integer coding (delta/varint/PFor) is <em>unverified</em>. PositionDB dominates space: T9805, ~11k text-ish docs, 554 MB file, PositionDB 51%, PostingDB 32%. Prefix-only word match: <code>tutorial</code> hits <code>my_great_tutorial.txt</code>, <code>utorial</code> does not. No regex. Text files over 10 MB skipped. <strong>ODF ZIP content is not indexed</strong> (wiki limitation). Classic Office goes through <code>catdoc</code> / <code>xls2csv</code> / <code>catppt</code>.</p>
+<p>Always-on <code>baloo_file</code> + extractor helper, inotify. LMDB single-writer + deleted lock files have caused real corruption (bug 389848). Small RSS is a design goal; on-disk is not small if positions are on.</p>
+<p><strong>Steal:</strong> split filename vs content term spaces; stable file ids so rename is cheap; <code>balooctl indexSize</code> introspection; LMDB as a <em>forward</em> map (path↔id), not as the posting codec. <strong>Beat:</strong> ODF hole, 10 MB cap, prefix-only tokens, corruption story, no regex, no nested archives.</p>
+
+<h2 id="fsearch">FSearch and ANGRYsearch — names only</h2>
+<p><strong>FSearch</strong> (<a href="https://github.com/cboxdoerfer/fsearch">cboxdoerfer/fsearch</a>, GPL-2, C/GTK3, 4.3k stars) is Everything for Linux and does not pretend otherwise. In-memory <code>DynamicArray</code> of files and folders: name offset, size, mtime, parent index. Several arrays kept sorted by different keys so sort is pointer swaps. Persist <code>~/.local/share/fsearch/fsearch.db</code> — custom dump, not an IR index. Third-party: 2.3M entries → 104 MB disk. Query: AND/OR/NOT, <code>*</code> <code>?</code>, PCRE2, modifiers <code>file:</code> <code>folder:</code> <code>case:</code> <code>dm:</code> size. Since 0.3: fanotify preferred, inotify fallback. No content.</p>
+<p><strong>ANGRYsearch</strong> (GPL-2, Python/Qt, last release 2022) stores paths in SQLite with FTS4/5. Fast mode cannot substring (<code>Pirate</code> not <code>rate</code>); slow mode is LIKE; F8 is regex on names. Author: ~1M files → ~200 MB, ~2 min. Cron recrawl, no inotify. Object lesson: FTS on paths is enough for filename UX; FSearch is the better clone.</p>
+<p>At your scale (&lt;5M files) the entire name table fits in RAM. That is the Everything lesson, and FSearch already proved it on Linux.</p>
+
+<h2 id="docfetcher">DocFetcher</h2>
+<p><span class="chip ok">EPL</span> <span class="chip">Java / SWT / Lucene</span> <span class="chip">FOSS frozen; Pro 2025</span></p>
+<p>Portable Lucene index per chosen folder. Boolean / phrase / fuzzy <code>term~</code> / proximity <code>"a b"~3</code>. Formats: PDF, Office, ODT, RTF, EPUB, HTML, Outlook in Pro. Claimed ~200 files/min — slow next to Recoll’s PDF numbers. Optional folder watcher applies on next GUI start. Closest <em>license-shaped</em> cousin (EPL/Apache, not GPL), wrong runtime. If you wanted a library, Tantivy is the Lucene analogue in Rust; you do not want a library.</p>
+
+<h2 id="locate">plocate — the only modern filename posting codec on Linux</h2>
+<p>GNU locate: sorted names, front-compression, sequential scan. mlocate: per-directory mtime so <code>updatedb</code> skips unchanged dirs; still a name list. <strong>plocate</strong> (Steinar Gunderson, default on Debian/Fedora) is a trigram inverted index over filenames:</p>
+<ul>
+  <li>ZSTD dictionary trained on sampled names; filename blocks of ~32 names.</li>
+  <li>Robin Hood hash table of trigrams.</li>
+  <li><strong>TurboPFor-encoded</strong> docid lists per trigram.</li>
+  <li>Query “foo” → trigrams → intersect → decompress candidate name blocks → match. Short needles and regex fall back to a scan. io_uring.</li>
+</ul>
+<p>Daily <code>updatedb</code>, not live. GPL. Reimplement the idea (trigrams + PFor + compressed name store). Do not link it. This is the filename half of Cox’s paper, already in production on every Debian box.</p>
+
+<h2 id="rga">rga and Clapgrep — refuse to index</h2>
+<p><strong>rga</strong> (ripgrep-all, AGPL-3, Rust, v0.10.10 Nov 2025): ripgrep plus adapters — pandoc (epub/odt/docx/html), <code>pdftotext</code>, ffmpeg tags/subs, zip/tar/decompress, sqlite dump. Optional mail. Recurse archives depth 5. Cache of extracted text in SQLite+ZSTD since 0.10.6, max blob 2 MB. Still a linear search over (cached) text. Best “I will not maintain an index” tool. Do not vendor (AGPL); copy the adapter ABI.</p>
+<p><strong>Clapgrep</strong> (GPL-3, Rust/GTK4, v26.02): rga-class engine with a modern GNOME UI, PDF highlight, Nautilus extension, result cap. 2024–2026 newcomer. Still no inverted index; will not win on a 100 GB interactive corpus.</p>
+
+<h2 id="others">Pinot, Catfish, launchers, the dead</h2>
+<p><strong>Pinot</strong> (GPL, Xapian + SQLite crawl history, gtkmm, 2005–2026): Recoll’s neglected cousin. inotify, nice 15, pause on battery. Format set is a subset. Steal the battery gate and crawl-history SQLite.</p>
+<p><strong>Catfish</strong> (Xfce): GUI over locate / find / optional Zeitgeist. Fulltext is <code>readline</code> substring. No index of its own.</p>
+<p><strong>Albert / Ulauncher / rofi:</strong> launchers. Filename or <code>fd</code>, not body search. Interoperate (KRunner / GNOME search provider), do not compete.</p>
+<p><strong>Beagle</strong> (2004–2009, C#/Lucene.Net): live inotify, 60+ formats, mail and IM as first-class. Died of Mono politics, not of Lucene. <strong>Strigi</strong> (KDE4, CLucene, SHA-1 dups, Xesam): replaced by Baloo. <strong>Tracker 1/2</strong> was a global RDF store; Tracker 3 killed the central store; 2024 renamed. <strong>Glimpse</strong> (Manber &amp; Wu 1993): block-addressed inverted file, index 2–30% of corpus, then agrep inside candidate blocks — the two-level idea Super Ferret still wants. <strong>mg</strong> / <em>Managing Gigabytes</em>: d-gap + Golomb/Elias, the textbook every posting codec is answering. <strong>Namazu / Hyper Estraier:</strong> Japanese morphology vs n-grams; Recoll’s CJK n-gram mode exists because segmenters are an extra dependency.</p>
+
+<h2 id="windows">Windows — top three</h2>
+
+<h3>1. Everything (voidtools) — steal the filename layer</h3>
+<p>Freeware, closed source. Does not walk the directory tree on NTFS. Reads the MFT sequentially, keeps names + parent FRNs in RAM, catches up from the USN Change Journal. Process can die; journal ID + next USN is the bookmark. FAT/network volumes are a slower folder-index path.</p>
+<p>On-disk <code>Everything.db</code> is a BZIP cache of that MFT snapshot plus USN bookmarks, written on exit. Sorted folders/files with a small name codec (length 0 = same name as previous). Official RAM: ~35 MB for 250k files, ~100 MB for 1M. Build: ~5 s / ~1 min.</p>
+<p>Query language is excellent on names: AND, <code>|</code>, <code>!</code>, phrase, wildcards, full regex, <code>size:</code> <code>dm:</code> <code>ext:</code> <code>path:</code>, hundreds of properties in 1.5.</p>
+<p><strong>1.5 content indexing is not an inverted index.</strong> Developer, 2021: extracted text is stored in RAM; designed for &lt;1 GB of text; default types doc/docx/pdf/txt/xls/xlsx; IFilter for the rest. Do not copy this. <code>si:</code> can query Windows Search instead.</p>
+<p>Linux mapping: there is no USN. Sequential metadata read per FS (ext4 inode table, btrfs tree, xfs AG btree) + fanotify/inotify with overflow → subtree rescan. Persist a compact name+parent snapshot so restart is seconds, not a walk.</p>
+
+<h3>2. Windows Search — steal the extractor isolation, not the store</h3>
+<p>Gatherer queues URLs; protocol handler in <code>SearchProtocolHost.exe</code>; IFilter + property handler in <code>SearchFilterHost.exe</code> (low integrity, ~100 MB cap, recycled). NTFS uses USN after the first crawl. Officially two indices: value indices for whole properties, inverted indices for words in text.</p>
+<p>Vista–10: <code>Windows.edb</code> (ESE / JET Blue) plus, historically, CiFiles (<code>*.ci</code> / <code>*.dir</code>) for word postings. Win11: SQLite <code>Windows.db</code> + <code>Windows-gather.db</code>. Whether Win11 word postings still live as CiFiles is <em>unverified</em> in public forensics literature, which mostly parses the property store. Query: AQS (no regex) and Windows Search SQL <code>CONTAINS</code>/<code>FREETEXT</code>. Scope is not the whole disk unless Enhanced indexing is on. The property store balloons (Outlook on Win11 is a known inflator).</p>
+<p>Steal: split value index vs inverted index; crashy parsers in a recycled worker; IFilter-style plugin ABI. Do not steal AQS, the gatherer URL queue, or “first N bytes of content in the property store.”</p>
+
+<h3>3. FileLocator Pro, with dtSearch as the dense-index cousin</h3>
+<p><strong>FileLocator Pro</strong> (Mythicsoft, commercial) is the Windows regex-in-documents tool. Default is multi-threaded scan with IFilters / built-in Office converters. Optional cache of extracted text; optional user-built indexes since v8, not NRT. Agent Ransack is the same engine with indexing compiled out. Query: Boost regex, boolean, NEAR, phrase. This is what people pay for when Spotlight/AQS refuse regex.</p>
+<p><strong>dtSearch</strong> is the dense positional inverted index: official 1/8 to 1/3 of original documents, boolean/phrase/proximity/regex/fuzzy, scheduled updates, noise-word list, huge format list with built-in parsers. Closest commercial analogue of “Recoll, but they wrote the engine.” Not NRT. Leading wildcards are slow (prefix dictionary).</p>
+<p>Honorable: Listary (MFT+USN, filename UX), Recoll-for-Windows, DocFetcher, Copernic, PowerToys Run (wraps Windows Search).</p>
+
+<h2 id="macos">macOS — top three</h2>
+
+<h3>1. Spotlight — steal the importer ABI</h3>
+<p><code>mds</code> reads <code>/dev/fsevents</code>; <code>mdworker</code> runs a <code>.mdimporter</code> keyed by UTI; <code>mds_stores</code> writes <code>/.Spotlight-V100/Store-V2/&lt;UUID&gt;/</code>. Importers fill <code>kMDItem*</code> including <code>kMDItemTextContent</code>, which is searchable and <strong>not readable back</strong> via <code>mdls</code> (Apple privacy constraint). Super Ferret should be able to snippet.</p>
+<p>On-disk (Oakley + Khatri, reverse-engineering): <code>store.db</code> / <code>.store.db</code> proprietary metadata (CNID + parent CNID); <code>0.indexHead</code>, <code>0.indexIds</code>, <code>0.indexPostings</code>; journals / live files. Patents describe hot/cold term tables and delta merge — do not treat patents as the shipping format. Heavily used 500 GB volume: often 5–15 GB of Spotlight data (Oakley, not official).</p>
+<p>Query: implicit AND, phrase, <code>kind:</code>; <code>mdfind</code> predicates with <code>c/d/w</code> modifiers. <strong>No regex.</strong> FSEvents can drop events; then <code>mdutil -E</code>. That unreliability is why EasyFind still exists. Mail moved to Core Spotlight; HoudahSpot lost Mail on Sonoma.</p>
+
+<h3>2. Alfred / Raycast — mostly not an index</h3>
+<p>Alfred uses Spotlight’s metadata index; a small local DB is ranking (usage), not content. Disable Spotlight and Alfred cannot find files. Raycast builds its <em>own filename index</em> of <code>$HOME</code> (respects <code>.gitignore</code> / <code>.rayignore</code>) and uses Spotlight/Windows Search for <em>content</em>. Steal ignore-file semantics. Do not wrap the OS content index.</p>
+
+<h3>3. FoxTrot Professional Search — own content index, scheduled</h3>
+<p>Commercial (CTM). Independent of Spotlight’s store. Reuses <strong>Spotlight importers</strong> for text and Quick Look for preview (importers feed only the first 10 MB unless overridden). Boolean, phrase, metadata, regex (Pro), facets. Update on demand or timer, not FSEvents-NRT. On-disk format unpublished. Sharp design: OS extractor ABI, your postings. Linux version: Recoll-style filters, your index.</p>
+<p>HoudahSpot is the best query UI on Spotlight and will never find what Spotlight missed. EasyFind / Find Any File walk the filesystem, no index. DEVONthink is a document manager with its own index inside its databases, not a disk search.</p>
+
+<h2 id="engines">Embeddable engines (competitor intel)</h2>
+<p>You will not link these. The encodings and layouts are the harvest.</p>
+<table>
+  <thead><tr><th>Engine</th><th>License</th><th>On disk</th><th>Postings</th><th>Regex</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>Xapian Glass/Honey</td><td class="no">GPL-2+</td><td>B-tree per table / Honey SSTable</td><td>chunked varint d-gaps; interpolative positions</td><td>no body regex</td><td>Recoll’s engine. Steal interpolative positions and (term, first-did) chunk keys.</td></tr>
+    <tr><td>Lucene 9/10</td><td class="yes">Apache-2</td><td>immutable segments</td><td>FOR/PackedInts blocks of 128; skip + block-max; FST/block-tree terms; roaring liveDocs; BKD numerics</td><td>term-dict regex, not Cox</td><td>The industry default. ES/OS/Solr add cluster, not a better codec.</td></tr>
+    <tr><td>Tantivy</td><td class="yes">MIT</td><td>Lucene-shaped, mmap</td><td>SIMD-BP128 blocks of 128; separate skip; fast fields = doc values</td><td>term-dict regex</td><td>Cleanest modern Lucene, in Rust. Textbook, not a dependency.</td></tr>
+    <tr><td>SQLite FTS5</td><td class="yes">public domain</td><td>shadow tables, LSM of segment b-trees</td><td>varint doclists + poslists; <code>detail=full|column|none</code></td><td>trigram tokenizer → substring</td><td>LocalSearch’s engine. <code>content=''</code> / external content. densest cheap MVP.</td></tr>
+    <tr><td>PISA</td><td class="yes">MIT</td><td>static <code>.docs/.freqs</code></td><td>PEF, BIC, SIMD-BP128, OptPFor, …</td><td>no</td><td>Research IR. Steal PEF + docid reordering. Not incremental.</td></tr>
+    <tr><td>Meilisearch milli</td><td class="yes">MIT</td><td>LMDB, ~20 roaring maps + FSTs</td><td>presence bitmaps, not BM25 postings</td><td>no</td><td>Search-as-you-type. Fat. Roaring for filters, not scored postings.</td></tr>
+    <tr><td>Typesense</td><td class="no">GPL-3 server</td><td>ART in RAM, RocksDB docs</td><td>uncompressed, RAM ≈ 2–3× fields</td><td>no</td><td>Wrong at hundreds of GB.</td></tr>
+    <tr><td>Sonic</td><td class="yes">MPL-2</td><td>RocksDB + FST</td><td>raw u32 IID lists, hashed terms</td><td>no</td><td>Identifier index. Hashing terms is a cautionary tale.</td></tr>
+    <tr><td>Bleve scorch</td><td class="yes">Apache-2</td><td>Go Lucene-like</td><td>roaring presence + chunked freq/pos</td><td>term-dict</td><td>Same split as Lucene filters vs postings.</td></tr>
+    <tr><td>Ferret (yours)</td><td class="yes">MIT</td><td>Lucene 1.4–2.x files (<code>.tis .frq .prx .cfs</code>)</td><td>VInt d-gaps, skip every N, prefix-compressed terms</td><td>term wildcard</td><td>Keep segments/skips/field flags. Replace every encoding. Add Cox. External content.</td></tr>
+  </tbody>
+</table>
+<p>FTS5 <code>detail=none|column|full</code> on 1636 MiB of email: <strong>134 / 340 / 743 MiB</strong> index. That knob — presence vs column vs positions — should be per-field in Super Ferret.</p>
+
+<h2 id="code">Code search, because regex is a hard requirement</h2>
+<p>Word inverted indexes cannot answer <code>/foo.*bar/</code> or <code>handleRequest</code> or <code>[0-9a-f]{12}</code>. Families:</p>
+<table>
+  <thead><tr><th>Family</th><th>Stores</th><th>Size vs corpus</th><th>Update</th></tr></thead>
+  <tbody>
+    <tr><td>Trigram presence (Cox / csearch / Hound)</td><td>each 3-gram → file ids; recheck with RE2</td><td>~0.2× (Linux 3.1: 420 MB → 77 MB)</td><td>merge postings</td></tr>
+    <tr><td>Positional trigrams (Zoekt)</td><td>3-gram → offsets; content in shard</td><td>~3.5×</td><td>shard rebuild</td></tr>
+    <tr><td>Suffix array (livegrep)</td><td>SA over concatenated corpus</td><td>~3–5× RAM</td><td>essentially static</td></tr>
+    <tr><td>Sparse n-grams (GitHub Blackbird)</td><td>variable grams at high-weight boundaries</td><td>~1× unique + index at GitHub scale</td><td>sharded, closed</td></tr>
+    <tr><td>ripgrep / ugrep</td><td>nothing, or ugrep’s per-dir sidecar</td><td>0</td><td>N/A</td></tr>
+  </tbody>
+</table>
+<p>Cox’s algorithm (extract obligatory trigrams from the regexp, AND/OR posting lists, always recheck) is the only one that stays small and still prunes. Zoekt’s 3.5× is the wrong density trade. Suffix arrays are the wrong update model. Blackbird’s sparse grams are SOTA at 15 billion documents; at 5 million Cox + a dense posting codec is enough. Patterns with no 3-character literal become ANY → scan. Pair with a per-chunk Bloom (qgrep) so ANY is not “read 200 GB.”</p>
+<p>If Super Ferret’s regex path is not faster than warm <code>rg</code> on typical code queries, the index is overhead. Unindexed files (too new, binary, generated) should fall back to mmap-grep, which is how Sourcegraph splits Zoekt vs searcher daemons.</p>
+
+<h2 id="formats">Format coverage</h2>
+<p>Quality: good = searchable body; ok = partial; poor = tags/filename. “Native” means a permissive-licensed implementation you could write or vendor. GPL helpers are subprocesses.</p>
+<table>
+  <thead>
+    <tr><th>Format</th><th>Recoll</th><th>LocalSearch</th><th>Baloo</th><th>rga</th><th>Permissive path</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>txt / md / code</td><td class="yes">native</td><td>plain+md only</td><td>≤10 MB text</td><td class="yes">rg</td><td>encoding_rs + NUL scan</td></tr>
+    <tr><td>HTML</td><td class="yes">native</td><td class="yes">libxml2</td><td class="yes">yes*</td><td>pandoc</td><td>html5ever</td></tr>
+    <tr><td>PDF digital</td><td>pdftotext</td><td>poppler-glib (5–10s kill)</td><td>Poppler Qt</td><td>pdftotext</td><td>pdfium BSD in a jail, or spawn poppler</td></tr>
+    <tr><td>PDF scanned</td><td>optional OCR, default off</td><td>no</td><td>no</td><td>opt-in tesseract</td><td>tesseract Apache-2 plugin</td></tr>
+    <tr><td>ODT/ODS/ODP</td><td class="yes">libxslt</td><td class="yes">oasis</td><td class="no">content not indexed</td><td>pandoc</td><td>zip + content.xml</td></tr>
+    <tr><td>DOCX/XLSX/PPTX</td><td class="yes">libxslt</td><td class="yes">msoffice-xml</td><td class="yes">office2007</td><td>docx via pandoc; xlsx not default</td><td>zip+xml; calamine for xlsx</td></tr>
+    <tr><td>.doc</td><td>antiword → soffice</td><td>libgsf</td><td>catdoc</td><td>no</td><td>spawn antiword</td></tr>
+    <tr><td>RTF</td><td>unrtf</td><td>unverified</td><td>unverified</td><td>no</td><td>spawn unrtf or a lossy stripper</td></tr>
+    <tr><td>EPUB</td><td>bundled</td><td class="yes">yes</td><td>libepub</td><td>pandoc</td><td>zip + XHTML</td></tr>
+    <tr><td>email</td><td class="yes">mbox/maildir/PST</td><td class="no">no</td><td class="no">no</td><td>opt-in mbox</td><td>plugin; mailparse crates</td></tr>
+    <tr><td>EXIF / ID3</td><td>exiftool / mutagen</td><td class="yes">yes</td><td class="yes">Exiv2 / TagLib</td><td>ffmpeg tags</td><td>Exiv2 BSD-3 / lofty</td></tr>
+    <tr><td>zip/tar as containers</td><td class="yes">child docs; tar off by default</td><td class="no">no</td><td class="no">no</td><td class="yes">depth 5</td><td>zip/tar crates, caps</td></tr>
+  </tbody>
+</table>
+<p>Ingest CPU is extractor-bound: PDF and fat XLSX dominate; txt/code/EXIF are milliseconds; <code>soffice --headless</code> and Tika JVM warmup are seconds. Reasonable default: 2 s soft / 15 s hard per file; OCR/STT/LibreOffice on a colder pool. Binary heuristic: NUL in the first 8 KiB (ripgrep), not tree-sitter.</p>
+<p>Tika (Apache-2, “thousand types”) is overkill as the primary extractor and the right long-tail plugin behind tika-server. Do not parse untrusted PDFs in-process. LocalSearch’s seccomp+Landlock jail is the threat model; Recoll’s rlimits-only helpers are not.</p>
+
+<h2 id="structures">Index data structures, one table</h2>
+<table>
+  <thead><tr><th>Product</th><th>Store</th><th>Postings</th><th>Positions</th><th>Compression</th><th>Incremental</th></tr></thead>
+  <tbody>
+    <tr><td>Recoll</td><td>Xapian Glass B-trees</td><td>chunked docid-delta + wdf</td><td>interpolative, separate table</td><td>7-bit continuation; not PFor</td><td>mtime + optional inotify</td></tr>
+    <tr><td>LocalSearch</td><td>SQLite + contentless FTS5</td><td>FTS5 varint doclists</td><td>yes</td><td>FTS varint in B-trees</td><td>always-on miner</td></tr>
+    <tr><td>Baloo</td><td>LMDB 12 DBIs</td><td>custom list of docids</td><td>concatenated lists, 51% of a sample index</td><td>unverified</td><td>always-on inotify</td></tr>
+    <tr><td>DocFetcher</td><td>Lucene segments</td><td>Lucene codec (version unverified)</td><td><code>.pos</code></td><td>FOR/PFor family</td><td>folder watcher</td></tr>
+    <tr><td>FSearch</td><td>RAM arrays + dump</td><td>none</td><td>none</td><td>none</td><td>fanotify</td></tr>
+    <tr><td>plocate</td><td>custom file</td><td>trigram → TurboPFor</td><td>no</td><td>TurboPFor + ZSTD names</td><td>daily updatedb</td></tr>
+    <tr><td>rga</td><td>SQLite blob cache</td><td>none</td><td>none</td><td>ZSTD blobs</td><td>cache on search</td></tr>
+    <tr><td>Everything</td><td>RAM MFT cache</td><td>none (names); 1.5 content = RAM text</td><td>n/a</td><td>name codec + BZIP db</td><td>USN journal</td></tr>
+    <tr><td>Windows Search</td><td>ESE then SQLite + inverted</td><td>word index (CiFiles historically)</td><td>yes, linguistic</td><td>ESE pages / SQLite</td><td>USN + gatherer</td></tr>
+    <tr><td>Spotlight</td><td>proprietary store + posting files</td><td><code>indexPostings</code> (RE)</td><td>tokenized text</td><td>unpublished</td><td>FSEvents</td></tr>
+    <tr><td>VictoriaLogs</td><td>columnar LSM parts</td><td>streams only, not terms</td><td>no</td><td>ZSTD + dict/int + 2 B/token blooms</td><td>in-memory parts, 5 s flush</td></tr>
+    <tr><td>Glimpse (hist.)</td><td>block-addressed inverted</td><td>block ids</td><td>no</td><td>tiny 2–4%</td><td>rebuild</td></tr>
+  </tbody>
+</table>
+
+<h2 id="steal">Steal vs beat</h2>
+<h3>Steal (license-clean ideas)</h3>
+<ol>
+  <li>plocate / Cox: trigrams → PFor postings → compressed names or files, then verify.</li>
+  <li>Everything: parent-offset records, journal bookmark, rebuild-is-cheap, names in RAM at 5M files.</li>
+  <li>FTS5 <code>detail=</code> and external content: the index is not the corpus.</li>
+  <li>Recoll: query-time stemming, stored extracted text for snippets, nested containers, Xesam-ish query surface.</li>
+  <li>LocalSearch: seccomp+Landlock extractor; contentless FTS so text is stored once.</li>
+  <li>Spotlight / IFilter: plugin ABI keyed by type; recycled, resource-capped worker.</li>
+  <li>Pinot / Recoll AC script: battery, idle, ionice. Your stated product requirement; almost nobody does it well.</li>
+  <li>FSearch query sugar on the name half: <code>file:</code> <code>dm:</code> size ranges, type-as-you-go.</li>
+  <li>FileLocator / dtSearch: regex as a first-class operator, not an afterthought.</li>
+  <li>Strigi/Recoll: content-hash dup detection. Cheap, loved on <code>node_modules</code>.</li>
+  <li>Raycast: <code>.gitignore</code> as index exclude.</li>
+  <li>VictoriaLogs: do not invert high-frequency body tokens; group similar files; bloom then scan compressed columns. See <a href="indexing.html">indexing options</a>.</li>
+</ol>
+<h3>Must beat</h3>
+<table>
+  <thead><tr><th>Competitor</th><th>Where they win</th><th>What beating them means</th></tr></thead>
+  <tbody>
+    <tr><td>Recoll</td><td>formats, query language, nesting, maturity</td><td>90% of filters without GPL in-process; smaller text-corpus index; a queue that does not melt the machine; body regex</td></tr>
+    <tr><td>LocalSearch / Baloo</td><td>already there, always on</td><td>better bodies, archives, mail-as-plugin, regex, a UI that is the product</td></tr>
+    <tr><td>FSearch</td><td>instant names</td><td>that UX plus content</td></tr>
+    <tr><td>rga / Clapgrep</td><td>regex, zero admin, Rust</td><td>first query over 100 GB must not be a cold pdftotext storm; after indexing, interactive tens of ms</td></tr>
+    <tr><td>Everything</td><td>filename gold standard</td><td>Linux cannot copy MFT/USN literally; must match the feel with fanotify + a compact name snapshot</td></tr>
+    <tr><td>Old Ferret</td><td>you already know it</td><td>denser codecs, Cox regex, external content, NRT segments</td></tr>
+  </tbody>
+</table>
+
+<h2 id="sources">Sources</h2>
+<p class="small">Every structural claim above is from one of these, or is marked unverified in place.</p>
+<ul class="refs">
+  <li>Recoll: <a href="https://www.recoll.org/pages/features.html">features</a>, <a href="https://www.recoll.org/usermanual/usermanual.html">manual 1.44.1</a>, <a href="https://www.recoll.org/pages/perfs.html">perfs</a>, <a href="https://www.recoll.org/pages/release-1.25.html">1.25 stored text</a></li>
+  <li>Xapian: <a href="https://getting-started-with-xapian.readthedocs.io/en/latest/advanced/admin_notes.html">admin notes</a>, GlassPostList format comment in <code>glass_postlist.cc</code></li>
+  <li>GNOME: <a href="https://blogs.gnome.org/carlosg/2024/07/14/goodbye-tracker-hello-tinysparql-and-localsearch/">rename</a>, <a href="https://tinysparql.gnome.org">TinySPARQL</a>, <a href="https://www.sqlite.org/fts5.html">FTS5</a></li>
+  <li>Baloo: <a href="https://community.kde.org/Baloo">wiki</a>, Phabricator T9805, bugs 389848 / 434926</li>
+  <li>FSearch: <a href="https://github.com/cboxdoerfer/fsearch">repo</a>, wiki search syntax / database-update</li>
+  <li>plocate: <code>plocate(1)</code>, <code>db.h</code> layout; mlocate.db(5); locatedb(5)</li>
+  <li>rga: <a href="https://github.com/phiresky/ripgrep-all">README</a>; Clapgrep: <a href="https://github.com/luleyleo/clapgrep">repo</a></li>
+  <li>Everything: <a href="https://www.voidtools.com/en-us/faq/">FAQ</a>, <a href="https://www.voidtools.com/support/everything/db/">DB layout</a>, <a href="https://www.voidtools.com/forum/viewtopic.php?t=9793">1.5 content</a></li>
+  <li>Windows Search: <a href="https://learn.microsoft.com/en-us/windows/win32/search/-search-indexing-process-overview">indexing process</a>; Stroz Friedberg / SIDR on <code>Windows.edb</code></li>
+  <li>Spotlight: Oakley <a href="https://eclecticlight.co/2025/07/30/a-deeper-dive-into-spotlight-indexes/">2025</a>; Khatri <a href="https://github.com/ydkhatri/spotlight_parser">spotlight_parser</a>; Apple <code>kMDItemTextContent</code></li>
+  <li>Cox: <a href="https://swtch.com/~rsc/regexp/regexp4.html">Regular Expression Matching with a Trigram Index</a></li>
+  <li>Zoekt: <a href="https://github.com/sourcegraph/zoekt/blob/main/doc/design.md">design.md</a></li>
+  <li>Tantivy: <a href="https://github.com/quickwit-oss/tantivy/blob/main/ARCHITECTURE.md">ARCHITECTURE.md</a>; Lucene90PostingsFormat javadoc</li>
+  <li>VictoriaLogs: <a href="https://docs.victoriametrics.com/victorialogs/faq/">FAQ</a>, <a href="https://victoriametrics.com/blog/victorialogs-internals-columnar-storage-on-disk/">columnar internals</a>, <code>lib/logstorage/bloomfilter.go</code></li>
+  <li>Ferret: <a href="https://github.com/dbalmain/ferret">github.com/dbalmain/ferret</a>, <code>c/FileFormat.txt</code></li>
+  <li>FoxTrot: <a href="https://foxtrot-search.com/foxtrot-professional.html">product</a>, <a href="https://help.foxtrot-search.com/">FAQ</a>; HoudahSpot help; Raycast <a href="https://manual.raycast.com/file-search">file search manual</a></li>
+  <li>dtSearch FAQ dts0142; FileLocator Pro v9 help PDF; Mythicsoft feature matrix</li>
+</ul>
+<p class="small">Unverified on purpose: Baloo PostingCodec integer coding; LocalSearch index/corpus ratio; FSearch on-disk dump layout; DocFetcher’s exact Lucene version; Win11 inverted-index files; FoxTrot and FileLocator Pro posting formats; Everything’s unpublished in-RAM matchers.</p>
+
+<footer class="page"><a href="index.html">Hub</a> · <a href="indexing.html">Indexing options</a> · <a href="decisions.html">Decisions</a></footer>
+</main>
+</div>
+</body>
+</html>

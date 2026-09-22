@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Part 3 — In the wild</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="index.html">← Course home</a>
+  <a href="part2.html">← Part 2</a>
+  <a href="part4.html">Part 4 →</a>
+  <strong>This part</strong>
+  <a href="#read">Read</a>
+  <a href="#l1">What RE2 adds</a>
+  <a href="#l2">Dot and classes</a>
+  <a href="#l3">Unanchored</a>
+  <a href="#l4">Bounded cache</a>
+  <a href="#tests">Tests</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">Part 3 of 4</div>
+  <h1>Regular expression matching in the wild</h1>
+  <p class="lede">RE2 is not a new algorithm. It is Thompson/Pike plus the operators grep actually needs, UTF-8 as bytes, and a DFA cache that does not eat RAM. You will add three of those; you will not clone RE2.</p>
+</header>
+
+<h2 id="read">Read</h2>
+<p><a href="https://swtch.com/~rsc/regexp/regexp3.html">Regular Expression Matching in the Wild</a> (Cox, 2010). Skim the UTF-8 compiler and the reverse-DFA submatch discussion. Notice the split-priority picture: greedy vs non-greedy is which arm of Split comes first. You already did greedy.</p>
+
+<h2 id="l1">Lesson — what “production” means here</h2>
+<p>Article 3 is a tour, not a spec. The implementable slice for this course:</p>
+<ol>
+  <li><code>.</code> and <code>[abc]</code> / <code>[a-z]</code> as instructions, not giant alternations.</li>
+  <li>Unanchored search in linear time.</li>
+  <li>The DFA cache from part 1, with a size cap. Optional, and untested — but it is the one item on this list that article 3 is really about.</li>
+</ol>
+<p>You will not implement Unicode tables, POSIX classes, reverse matching, or RE2’s actual compiler. Part 4 needs (1) and (2) so the recheck can be <em>your</em> engine on real substrings.</p>
+
+<h2 id="l2">Lesson — <code>.</code> and classes</h2>
+<p>New ops (names are yours):</p>
+<ul>
+  <li><code>any</code> — consume one character, whatever it is. (Fixtures have no newlines; you may treat newline as a character.)</li>
+  <li><code>class(set)</code> — consume one character if it is in the set. Build the set from <code>[abc]</code> and ranges <code>[a-z]</code>. No negation <code>[^]</code> in the fixtures.</li>
+</ul>
+<p>In the NFA picture these are labeled edges whose label is a set, not a char. In the VM, one instruction. Expanding <code>[a-z]</code> into 26-way Split works and is a fine first version; a class instruction is what Cox says production engines do.</p>
+<p>Parser: <code>.</code> is any-char, never concat. Concat is juxtaposition, as in part 1.</p>
+
+<h2 id="l3">Lesson — unanchored search</h2>
+<p>Trying the pattern at position 0, then 1, then 2, and running to end each time is quadratic. Cox’s fix: prefix the compiled program with the compiled form of <code>.*?</code> (non-greedy any-char star) so the VM itself walks the string once.</p>
+<p><code>.*?</code> here is an internal construction, not new source syntax: emit an any-char loop whose Split prefers the pattern-start arm over the loop arm.</p>
+<p>Non-greedy star is greedy star with Split arms reversed: prefer leaving the loop. For this course you may also start a fresh thread at every input position in the lock-step machine (add the start state to the next list every character). That is the same idea: the engine, not a for-loop in your host language, tries every start.</p>
+<p>Add that fresh thread at <em>lowest</em> priority, so an earlier start always outranks a later one. It makes no difference to the <code>search</code> command, which reports only a boolean — but the moment you want to report <em>where</em> the match was, leftmost-first depends on it, and the bug will not show up in any fixture here.</p>
+<p>The <code>search</code> command is this unanchored matcher. <code>match</code> stays whole-string. Keep both.</p>
+
+<h2 id="l4">Lesson — bounded DFA cache</h2>
+<p>Article 1 already built the cache. Article 3’s operational note: throw it away when it gets large so a giant class × unicode alphabet cannot OOM you. Cap at 32 or 256 states; correctness is unchanged. No extra tests — if <code>nfa</code> and <code>search</code> pass with the cap on, you are done.</p>
+<p>Reverse-DFA submatch (RE2 finds match bounds with a forward DFA then a reverse DFA) is the part you are allowed to only read about. Pike VM already gives you captures.</p>
+
+<h2 id="tests">Tests</h2>
+<div class="fig">python3 harness/run_tests.py --bin ./yourprog nfa search</div>
+<p><code>search.json</code> uses <code>.</code>, <code>[cd]</code>, <code>[a-z]</code>, and substring patterns like <code>Google.*Search</code>. Whole-string <code>match</code> must still pass — <code>search</code> is an addition, never a replacement, and part 4 needs both. There is no separate “part 3 only” stage name beyond <code>search</code>.</p>
+<p>Two cases are worth predicting before you run them: <code>a*</code> against <code>zzz</code> is <em>true</em>, because the empty match at position 0 is a substring match, and <code>[a-z]+</code> against <code>Hello</code> is also true, on <code>ello</code>. If either surprises you, your unanchored wrapper is anchored somewhere.</p>
+<p><a href="part4.html">Part 4 →</a></p>
+<footer class="page"><a href="index.html">Course home</a></footer>
+</main>
+</div>
+</body>
+</html>

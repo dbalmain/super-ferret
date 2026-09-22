@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Decisions — Super Ferret survey</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="index.html">← Super Ferret survey</a>
+  <strong>This page</strong>
+  <a href="#q1">1. Purpose</a>
+  <a href="#q2">2. Scale</a>
+  <a href="#q3">3. Content classes</a>
+  <a href="#q4">4. Freshness</a>
+  <a href="#q5">5. Survey scope</a>
+  <a href="#q6">6. License</a>
+  <a href="#open">Still open</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">docs/grok</div>
+  <h1>Decision record</h1>
+  <p class="lede">Answers that scoped this survey, plus the one architectural question the research actually opened.</p>
+  <p class="meta">Locked 2026-09-04. Update this page in place as later decisions land.</p>
+</header>
+
+<p>This page is the durable record of choices that would otherwise live only in chat. Answered items stay here with the tradeoff that produced them.</p>
+
+<div class="decision" id="q1">
+  <div class="answered">Answered · option 1</div>
+  <h3>1. What should this survey primarily inform?</h3>
+  <p><span class="option"><span class="name">1. Build Super Ferret.</span></span> Existing apps are competitive intel. Reports go deep on engines, index structures, and options nobody ships.</p>
+  <p><span class="option"><span class="name">2. Pick an existing Linux app.</span></span> A buyer’s guide.</p>
+  <p><span class="option"><span class="name">3. Both equally.</span></span></p>
+  <p><span class="rec">Answer:</span> 1. Nothing on Linux does exactly what you want; you expect to build. Recoll is the feature ceiling, not a candidate to install and stop.</p>
+</div>
+
+<div class="decision" id="q2">
+  <div class="answered">Answered · option 1</div>
+  <h3>2. Rough corpus size?</h3>
+  <p><span class="option"><span class="name">1. Personal workstation.</span></span> Tens to a few hundred GB, under ~5 million files.</p>
+  <p><span class="option"><span class="name">2. Power user / multi-disk.</span></span> 1–10 TB.</p>
+  <p><span class="option"><span class="name">3. Archive / NAS.</span></span> 10+ TB.</p>
+  <p><span class="rec">Answer:</span> 1. NAS-scale search, if it happens, gets its own design around those files. Super Ferret stays general and does not have to survive 100 million files.</p>
+</div>
+
+<div class="decision" id="q3">
+  <div class="answered">Answered · 1, 2, 5 first; 3 and 4 as plugins</div>
+  <h3>3. Which content classes are first-class?</h3>
+  <ol>
+    <li>Office / PDF / plain text — always on.</li>
+    <li>Source code — regex as a real query type over <code>~/src</code>.</li>
+    <li>Email (maildir / mbox / PST) — plugin later.</li>
+    <li>Scanned PDFs / OCR — plugin later.</li>
+    <li>Media metadata (EXIF, ID3, duration) — first wave, cheap.</li>
+  </ol>
+  <p><span class="rec">Answer:</span> Ship 1, 2, 5. Leave hooks so 3, 4, reverse-image, and speech-to-text can arrive as plugins without rewriting the index. Reverse-image and STT are vector/ASR sidecars, not extra posting lists.</p>
+</div>
+
+<div class="decision" id="q4">
+  <div class="answered">Answered · option 1, with a queue</div>
+  <h3>4. How fresh does the index need to be?</h3>
+  <p><span class="option"><span class="name">1. Near-real-time.</span></span> inotify / fanotify; updates in seconds.</p>
+  <p><span class="option"><span class="name">2. Periodic.</span></span></p>
+  <p><span class="option"><span class="name">3. Hybrid watch + batch archives.</span></span></p>
+  <p><span class="rec">Answer:</span> 1, with coalescing. Burst creates queue; the indexer is a niced, low-priority process and should not spoil interactivity. Save-storms become one reindex of the final inode.</p>
+</div>
+
+<div class="decision" id="q5">
+  <div class="answered">Answered · option 1</div>
+  <h3>5. Linux survey scope — apps, engines, or both?</h3>
+  <p><span class="rec">Answer:</span> Both. Recoll / Baloo / FSearch as products; Xapian / Lucene / Tantivy / FTS5 / PISA / VictoriaLogs as architecture intel. Ferret (<a href="https://github.com/dbalmain/ferret">dbalmain/ferret</a>) is prior art you wrote: a Lucene-shaped inverted index, MIT, C + Ruby. Super Ferret is not a port of that format. You would enjoy rewriting it in Rust for stability, but it is the wrong density trade for this job. VictoriaLogs is the density reference that did impress you.</p>
+</div>
+
+<div class="decision" id="q6">
+  <div class="answered">Answered · option 1</div>
+  <h3>6. License constraint if Super Ferret is built?</h3>
+  <p><span class="rec">Answer:</span> Permissive. You will not link a search library. The point of the survey is to learn the algorithms well enough to implement them. GPL tools (poppler <code>pdftotext</code>, antiword) are fine as <em>subprocesses</em>. Xapian, Recoll, FSearch, plocate, rga are competitors, not dependencies.</p>
+</div>
+
+<h2 id="open">Still open — opened by the research</h2>
+
+<div class="decision">
+  <h3>Should body-text search be inverted postings, VictoriaLogs-style bloom + scan, or a hybrid?</h3>
+  <p>This is the only question the overnight pass actually changed. Filename search wants Everything-class RAM structures. Regex wants Russ Cox trigrams. Body text is where density and query shape fight.</p>
+
+  <div class="option">
+    <p><span class="name">A. Classic inverted index</span> (PEF or block-FOR postings, optional positions). Recoll / Lucene / old Ferret. Phrase is exact. Common terms are still O(df). Index of extracted text is typically 0.3–1× that text, plus more if you store snippets.</p>
+    <p>Buys: phrase, BM25, the mental model you already have. Costs: the thing VictoriaLogs exists to avoid — a posting for every occurrence. Forecloses: “the index is barely larger than compressed extracted text.”</p>
+  </div>
+  <div class="option">
+    <p><span class="name">B. Bloom + scan of compressed columns</span> (VictoriaLogs). Tokenize each block, keep a ~2 byte/unique-token bloom, ZSTD the text, skip blocks that cannot match, scan the rest. No term postings of the body.</p>
+    <p>Buys: the density you liked in VictoriaLogs (vendor claims up to 15× less disk than Elasticsearch on logs; a worked part was ~11×). Costs: <code>TODO</code> / <code>error</code> / <code>fn</code> will not skip; phrase is a scan; regex still needs a separate n-gram index. Forecloses: O(df) lookup of a rare term is still fast, but common-term queries become sequential decompress of the matching type-group.</p>
+  </div>
+  <div class="option">
+    <p><span class="name">C. Hybrid (recommended)</span>. RAM filenames + Cox trigrams for regex. Columnar metadata (path, ext, mtime, size) with dict encoding. Body stored as type-grouped compressed text with per-block token blooms. A <em>sparse</em> inverted index only for rare terms (or only for filenames / code identifiers), not for every English word.</p>
+    <p>Buys: density where VL is right (repetitive extracted text), inverted lookup where VL is wrong (needles, identifiers). Costs: two query paths to implement and test. Forecloses: a single-codec textbook engine.</p>
+  </div>
+  <p><span class="rec">Recommendation:</span> C. The fact that would change it: if you decide phrase-over-body must be as fast as Recoll on <code>"to be or not to be"</code> without scanning, take A and spend the space. If you decide you will never invert body terms at all, take B and accept that <code>TODO</code> across 20 GB of Rust is a sequential decompress of the <code>*.rs</code> column — which is still fine on NVMe if that column is a few hundred MB compressed.</p>
+  <p>Worked out with numbers in <a href="indexing.html#density">Indexing options → The density question</a>.</p>
+</div>
+
+<footer class="page">Super Ferret survey · 2026-09-04</footer>
+</main>
+</div>
+</body>
+</html>

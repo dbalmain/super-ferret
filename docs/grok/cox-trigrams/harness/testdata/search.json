@@ -1,0 +1,31 @@
+{
+  "command": "search",
+  "note": "Substring match. '.' is any character. [abc] and [a-z] allowed.",
+  "cases": [
+    {"pattern": "Search", "text": "Google Code Search", "match": true},
+    {"pattern": "Search", "text": "Google Web Search", "match": true},
+    {"pattern": "Search", "text": "Seaearch", "match": false},
+    {"pattern": "Google.*Search", "text": "Google Code Search", "match": true},
+    {"pattern": "Google.*Search", "text": "Google Web Search", "match": true},
+    {"pattern": "Google.*Search", "text": "Google Code Project Hosting", "match": false},
+    {"pattern": "ab[cd]e", "text": "xxabceyy", "match": true},
+    {"pattern": "ab[cd]e", "text": "xxabdeyy", "match": true},
+    {"pattern": "ab[cd]e", "text": "xxabee", "match": false},
+    {"pattern": "a.c", "text": "abc", "match": true},
+    {"pattern": "a.c", "text": "a-c", "match": true},
+    {"pattern": "a.c", "text": "ac", "match": false},
+    {"pattern": "a.c", "text": "xxa-cyy", "match": true},
+    {"pattern": "[a-z]+", "text": "Hello", "match": true},
+    {"pattern": "[a-z]+", "text": "HELLO", "match": false},
+    {"pattern": "[a-c]+", "text": "xxcabyy", "match": true},
+    {"pattern": "[a-c]+", "text": "xxdefyy", "match": false},
+    {"pattern": "(foo|bar)baz", "text": "xfoobaz", "match": true},
+    {"pattern": "(foo|bar)baz", "text": "barbaz", "match": true},
+    {"pattern": "(foo|bar)baz", "text": "foobarbaz", "match": true},
+    {"pattern": "(foo|bar)baz", "text": "baz", "match": false},
+    {"pattern": "DATAKIT", "text": "#define AF_DATAKIT 9", "match": true},
+    {"pattern": "a*", "text": "zzz", "match": true},
+    {"pattern": "a*", "text": "", "match": true},
+    {"pattern": "abc", "text": "", "match": false}
+  ]
+}

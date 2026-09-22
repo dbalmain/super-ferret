@@ -1,0 +1,727 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Super Ferret Research</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,380;8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+/* ============================================================
+   Super Ferret research reports — shared design system
+   Type:   Archivo (display) / Source Serif 4 (body) / IBM Plex Mono (data)
+   Colour: cool slate ink on cool paper, teal accent, semantic
+           provenance hues that encode how a number was sourced.
+   ============================================================ */
+
+:root {
+  /* --- paper & ink (light) --- */
+  --paper:      #f4f6f8;
+  --surface:    #ffffff;
+  --surface-2:  #eceff3;
+  --sunk:       #e3e7ec;
+  --ink:        #12161d;
+  --ink-2:      #3d4653;
+  --ink-3:      #626d7d;
+  --rule:       #d3d9e1;
+  --rule-soft:  #e5e9ef;
+
+  /* --- accent --- */
+  --accent:     #0d7d8a;
+  --accent-2:   #0a5f6a;
+  --accent-ink: #063d45;
+  --accent-wash:#ddf0f2;
+
+  /* --- provenance semantics --- */
+  --pv-measured:  #0d7d8a;  --pv-measured-bg:  #dcf0f2;
+  --pv-doc:       #3f5aa6;  --pv-doc-bg:       #e2e7f7;
+  --pv-paper:     #5b4b9c;  --pv-paper-bg:     #e9e5f7;
+  --pv-bench:     #2f7a4a;  --pv-bench-bg:     #dff0e5;
+  --pv-vendor:    #9a6410;  --pv-vendor-bg:    #f7ecd8;
+  --pv-community: #8a5a6b;  --pv-community-bg: #f6e6ea;
+  --pv-est:       #7a6a55;  --pv-est-bg:       #efeae1;
+  --pv-none:      #8b3a3a;  --pv-none-bg:      #f7e2e2;
+
+  /* --- status --- */
+  --good: #2f7a4a; --warn: #9a6410; --bad: #a83232;
+
+  /* --- metrics --- */
+  --measure: 68ch;
+  --radius: 3px;
+  --shadow: 0 1px 2px rgba(18,22,29,.06), 0 6px 18px rgba(18,22,29,.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper:      #101318;
+    --surface:    #171b22;
+    --surface-2:  #1d222b;
+    --sunk:       #0b0e12;
+    --ink:        #e6eaf0;
+    --ink-2:      #b3bcc9;
+    --ink-3:      #838e9d;
+    --rule:       #2c333e;
+    --rule-soft:  #232932;
+
+    --accent:     #4fc7d4;
+    --accent-2:   #7adbe5;
+    --accent-ink: #a8e8ef;
+    --accent-wash:#0f3238;
+
+    --pv-measured:  #4fc7d4;  --pv-measured-bg:  #0f3238;
+    --pv-doc:       #8fa6ee;  --pv-doc-bg:       #1a2242;
+    --pv-paper:     #b2a3f0;  --pv-paper-bg:     #221d3d;
+    --pv-bench:     #6bc98d;  --pv-bench-bg:     #102b1c;
+    --pv-vendor:    #dfa94a;  --pv-vendor-bg:    #33260e;
+    --pv-community: #dfa0b3;  --pv-community-bg: #331d24;
+    --pv-est:       #c4b49a;  --pv-est-bg:       #2a2418;
+    --pv-none:      #e88a8a;  --pv-none-bg:      #3a1c1c;
+
+    --good: #6bc98d; --warn: #dfa94a; --bad: #e88a8a;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.3);
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper:      #101318;
+  --surface:    #171b22;
+  --surface-2:  #1d222b;
+  --sunk:       #0b0e12;
+  --ink:        #e6eaf0;
+  --ink-2:      #b3bcc9;
+  --ink-3:      #838e9d;
+  --rule:       #2c333e;
+  --rule-soft:  #232932;
+
+  --accent:     #4fc7d4;
+  --accent-2:   #7adbe5;
+  --accent-ink: #a8e8ef;
+  --accent-wash:#0f3238;
+
+  --pv-measured:  #4fc7d4;  --pv-measured-bg:  #0f3238;
+  --pv-doc:       #8fa6ee;  --pv-doc-bg:       #1a2242;
+  --pv-paper:     #b2a3f0;  --pv-paper-bg:     #221d3d;
+  --pv-bench:     #6bc98d;  --pv-bench-bg:     #102b1c;
+  --pv-vendor:    #dfa94a;  --pv-vendor-bg:    #33260e;
+  --pv-community: #dfa0b3;  --pv-community-bg: #331d24;
+  --pv-est:       #c4b49a;  --pv-est-bg:       #2a2418;
+  --pv-none:      #e88a8a;  --pv-none-bg:      #3a1c1c;
+
+  --good: #6bc98d; --warn: #dfa94a; --bad: #e88a8a;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.3);
+}
+
+/* ---------- base ---------- */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 5rem; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Source Serif 4", "Iowan Old Style", Charter, Georgia, serif;
+  font-size: 17px;
+  line-height: 1.62;
+  font-variant-numeric: oldstyle-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- top bar ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: .7rem clamp(1rem, 4vw, 2.5rem);
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule);
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+}
+.topbar .mark {
+  font-weight: 700; font-size: .82rem; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink);
+  white-space: nowrap;
+}
+.topbar .mark span { color: var(--accent); }
+.topbar nav { display: flex; gap: .25rem; flex-wrap: wrap; margin-left: auto; }
+.topbar nav a {
+  font-size: .78rem; font-weight: 500; letter-spacing: .02em;
+  color: var(--ink-3); text-decoration: none;
+  padding: .3rem .6rem; border-radius: var(--radius);
+}
+.topbar nav a:hover { color: var(--ink); background: var(--surface-2); }
+.topbar nav a[aria-current="page"] { color: var(--accent); background: var(--accent-wash); }
+.topbar nav a:focus-visible,
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* ---------- page shell ---------- */
+.shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 0 clamp(1rem, 4vw, 2.5rem) 6rem;
+}
+@media (min-width: 1080px) {
+  .shell { grid-template-columns: 250px minmax(0, 1fr); gap: clamp(2rem, 4vw, 4rem); }
+}
+
+/* ---------- sidebar TOC ---------- */
+.toc { display: none; }
+@media (min-width: 1080px) {
+  .toc {
+    display: block;
+    position: sticky; top: 4.2rem;
+    align-self: start;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    padding: 2.5rem 0 2rem;
+    font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+    font-size: .8rem;
+    line-height: 1.45;
+    border-right: 1px solid var(--rule-soft);
+    margin-right: -1px;
+  }
+}
+.toc h2 {
+  font-size: .68rem; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 600; margin: 0 0 .9rem;
+}
+.toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .12rem; }
+.toc ol ol { margin: .12rem 0 .4rem .85rem; }
+.toc a {
+  display: block; padding: .22rem .5rem .22rem .55rem;
+  color: var(--ink-2); text-decoration: none;
+  border-left: 2px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
+}
+.toc a:hover { color: var(--ink); background: var(--surface-2); }
+.toc a.on { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+.toc .sub a { color: var(--ink-3); font-size: .76rem; }
+
+/* ---------- main ---------- */
+main { min-width: 0; padding-top: 2.5rem; }
+main > * { max-width: var(--measure); }
+main > .wide, main > .tw, main > figure, main > .grid, main > .cards { max-width: none; }
+
+/* ---------- masthead ---------- */
+.masthead { max-width: none; margin-bottom: 3.5rem; }
+.eyebrow {
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: .7rem; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--accent); font-weight: 600; margin: 0 0 .9rem;
+}
+h1 {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-weight: 700; font-size: clamp(2.1rem, 5vw, 3.3rem);
+  line-height: 1.04; letter-spacing: -.022em;
+  margin: 0 0 1rem; text-wrap: balance; color: var(--ink);
+}
+.standfirst {
+  font-size: 1.17rem; line-height: 1.55; color: var(--ink-2);
+  max-width: 60ch; margin: 0 0 1.6rem;
+}
+.meta {
+  display: flex; flex-wrap: wrap; gap: .4rem 1.4rem;
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: .72rem; color: var(--ink-3);
+  padding-top: 1rem; border-top: 1px solid var(--rule);
+  font-variant-numeric: tabular-nums;
+}
+.meta b { color: var(--ink-2); font-weight: 500; }
+
+/* ---------- headings ---------- */
+h2, h3, h4, h5 {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  color: var(--ink); text-wrap: balance; letter-spacing: -.012em;
+}
+h2 {
+  font-size: 1.72rem; font-weight: 700; line-height: 1.15;
+  margin: 4rem 0 1.1rem; padding-top: 1.1rem;
+  border-top: 2px solid var(--ink); max-width: none;
+}
+h3 { font-size: 1.2rem; font-weight: 600; margin: 2.6rem 0 .7rem; }
+h4 {
+  font-size: .82rem; font-weight: 600; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-2); margin: 2rem 0 .5rem;
+}
+h5 { font-size: .95rem; font-weight: 600; margin: 1.4rem 0 .4rem; color: var(--ink-2); }
+
+/* section numbering: the reports ARE a numbered reference, so the
+   numbers carry real structure rather than decoration. */
+.numbered { counter-reset: h2; }
+.numbered h2:not(.nonum) { counter-increment: h2; counter-reset: h3; }
+.numbered h2:not(.nonum)::before {
+  content: counter(h2) "  ";
+  font-family: "IBM Plex Mono", monospace; font-size: .72em;
+  color: var(--accent); font-weight: 500;
+}
+.numbered h3:not(.nonum) { counter-increment: h3; }
+.numbered h3:not(.nonum)::before {
+  content: counter(h2) "." counter(h3) "  ";
+  font-family: "IBM Plex Mono", monospace; font-size: .78em;
+  color: var(--ink-3); font-weight: 500;
+}
+
+p { margin: 0 0 1.05rem; }
+a { color: var(--accent-2); text-underline-offset: .18em; text-decoration-thickness: .06em; }
+a:hover { color: var(--accent); }
+strong { font-weight: 600; color: var(--ink); }
+em { font-style: italic; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 3rem 0; }
+
+ul, ol { margin: 0 0 1.05rem; padding-left: 1.3rem; }
+li { margin-bottom: .38rem; }
+li > ul, li > ol { margin-top: .38rem; }
+
+dl { margin: 0 0 1.2rem; }
+dt { font-family: Archivo, sans-serif; font-weight: 600; font-size: .95rem; margin-top: .9rem; }
+dd { margin: .15rem 0 0; color: var(--ink-2); }
+
+blockquote {
+  margin: 1.4rem 0; padding: .2rem 0 .2rem 1.2rem;
+  border-left: 3px solid var(--accent); color: var(--ink-2); font-style: italic;
+}
+blockquote p:last-child { margin-bottom: 0; }
+
+/* ---------- code ---------- */
+code, kbd, samp {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .86em; font-variant-numeric: tabular-nums;
+}
+:not(pre) > code {
+  background: var(--surface-2); border: 1px solid var(--rule-soft);
+  padding: .08em .35em; border-radius: var(--radius);
+  color: var(--ink); white-space: nowrap;
+}
+pre {
+  margin: 1.4rem 0; padding: 1rem 1.15rem;
+  background: var(--sunk); border: 1px solid var(--rule);
+  border-radius: var(--radius); overflow-x: auto;
+  font-size: .82rem; line-height: 1.55; max-width: none;
+}
+pre code { background: none; border: 0; padding: 0; white-space: pre; color: var(--ink); }
+pre .cm { color: var(--ink-3); font-style: italic; }
+pre .kw { color: var(--accent); font-weight: 500; }
+figure.code { margin: 1.4rem 0; max-width: none; }
+figure.code figcaption {
+  font-family: Archivo, sans-serif; font-size: .74rem; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3);
+  margin-bottom: .45rem;
+}
+
+/* ---------- tables ---------- */
+.tw { overflow-x: auto; margin: 1.5rem 0; max-width: none;
+      border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
+table {
+  border-collapse: collapse; width: 100%;
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-size: .82rem; line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--surface-2); color: var(--ink);
+  font-weight: 600; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase;
+  text-align: left; padding: .6rem .7rem; border-bottom: 1.5px solid var(--rule);
+  white-space: nowrap;
+}
+tbody td, tbody th {
+  padding: .55rem .7rem; border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top; text-align: left; color: var(--ink-2);
+}
+tbody th { font-weight: 600; color: var(--ink); white-space: nowrap; }
+tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
+tbody tr:hover td, tbody tr:hover th { background: var(--surface-2); }
+td.num, th.num { text-align: right; font-family: "IBM Plex Mono", monospace; white-space: nowrap; }
+td.mono, th.mono { font-family: "IBM Plex Mono", monospace; font-size: .78rem; }
+caption {
+  caption-side: bottom; text-align: left; padding: .6rem .7rem;
+  font-family: "Source Serif 4", serif; font-size: .82rem; color: var(--ink-3);
+  border-top: 1px solid var(--rule-soft);
+}
+
+/* ---------- provenance chips: every number says how it was sourced ---------- */
+.p {
+  display: inline-block; vertical-align: baseline;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: .63rem; font-weight: 500; letter-spacing: .05em;
+  text-transform: uppercase; white-space: nowrap;
+  padding: .08em .38em; border-radius: 2px;
+  border: 1px solid currentColor;
+  margin-left: .3em; position: relative; top: -.08em;
+}
+.p-measured  { color: var(--pv-measured);  background: var(--pv-measured-bg); }
+.p-doc       { color: var(--pv-doc);       background: var(--pv-doc-bg); }
+.p-paper     { color: var(--pv-paper);     background: var(--pv-paper-bg); }
+.p-bench     { color: var(--pv-bench);     background: var(--pv-bench-bg); }
+.p-vendor    { color: var(--pv-vendor);    background: var(--pv-vendor-bg); }
+.p-community { color: var(--pv-community); background: var(--pv-community-bg); }
+.p-est       { color: var(--pv-est);       background: var(--pv-est-bg); }
+.p-none      { color: var(--pv-none);      background: var(--pv-none-bg); }
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: .45rem .7rem;
+  padding: .9rem 1rem; margin: 1.4rem 0; max-width: none;
+  background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius);
+  font-family: Archivo, sans-serif; font-size: .74rem; color: var(--ink-3);
+  align-items: center;
+}
+.legend > span { display: inline-flex; align-items: center; gap: .3rem; }
+.legend b {
+  font-family: Archivo, sans-serif; font-size: .68rem; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ink-2); margin-right: .3rem;
+}
+
+/* ---------- density bar: encodes index-size ratio visually ---------- */
+.bar { display: flex; align-items: center; gap: .5rem; min-width: 130px; }
+.bar .track {
+  flex: 1; height: 7px; background: var(--sunk);
+  border-radius: 4px; overflow: hidden; min-width: 56px;
+  border: 1px solid var(--rule-soft);
+}
+.bar .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.bar .fill.hi { background: var(--warn); }
+.bar .fill.vhi { background: var(--bad); }
+.bar .val {
+  font-family: "IBM Plex Mono", monospace; font-size: .72rem;
+  color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+
+/* ---------- callouts ---------- */
+.box {
+  margin: 1.6rem 0; padding: 1.05rem 1.2rem; max-width: none;
+  background: var(--surface); border: 1px solid var(--rule);
+  border-left: 3px solid var(--ink-3); border-radius: var(--radius);
+  font-size: .95rem;
+}
+.box > :first-child { margin-top: 0; }
+.box > :last-child { margin-bottom: 0; }
+.box .label {
+  display: block; font-family: Archivo, sans-serif;
+  font-size: .68rem; font-weight: 700; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: .5rem;
+}
+.box.key      { border-left-color: var(--accent); background: var(--accent-wash); }
+.box.key .label { color: var(--accent-2); }
+.box.warn     { border-left-color: var(--warn); }
+.box.warn .label { color: var(--warn); }
+.box.gap      { border-left-color: var(--bad); }
+.box.gap .label { color: var(--bad); }
+.box.verdict  { border-left-color: var(--ink); border-width: 1px 1px 1px 4px; background: var(--surface-2); }
+.box.verdict .label { color: var(--ink); }
+
+/* ---------- cards / grids ---------- */
+.grid { display: grid; gap: 1rem; margin: 1.6rem 0; max-width: none;
+        grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); }
+.card {
+  padding: 1.1rem 1.2rem; background: var(--surface);
+  border: 1px solid var(--rule); border-radius: var(--radius);
+  box-shadow: var(--shadow); font-size: .92rem;
+}
+.card h4 { margin-top: 0; }
+.card > :last-child { margin-bottom: 0; }
+.card .stat {
+  font-family: Archivo, sans-serif; font-weight: 700;
+  font-size: 1.9rem; line-height: 1.1; color: var(--accent-2);
+  font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+}
+.card .stat small {
+  font-size: .5em; font-weight: 500; color: var(--ink-3);
+  letter-spacing: 0; margin-left: .25em;
+}
+.card .cap {
+  font-family: Archivo, sans-serif; font-size: .72rem; color: var(--ink-3);
+  letter-spacing: .04em; text-transform: uppercase; margin-top: .35rem;
+}
+
+/* ---------- verdict pills ---------- */
+.pill {
+  display: inline-block; font-family: Archivo, sans-serif;
+  font-size: .68rem; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; padding: .14em .5em; border-radius: 10px;
+  border: 1px solid currentColor; white-space: nowrap;
+}
+.pill.yes { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.pill.no  { color: var(--bad);  background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.pill.part{ color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.pill.dead{ color: var(--ink-3); background: var(--surface-2); }
+
+/* ---------- footnotes / sources ---------- */
+.sources { margin-top: 4rem; padding-top: 1.4rem; border-top: 2px solid var(--ink); max-width: none; }
+.sources h2 { border: 0; margin: 0 0 1rem; padding: 0; font-size: 1.1rem; }
+.sources ol { font-size: .8rem; color: var(--ink-3); columns: 2; column-gap: 2.5rem; padding-left: 1.4rem; }
+@media (max-width: 800px) { .sources ol { columns: 1; } }
+.sources li { margin-bottom: .45rem; break-inside: avoid; }
+.sources a { word-break: break-word; }
+
+footer.pagefoot {
+  margin-top: 3rem; padding-top: 1.2rem; border-top: 1px solid var(--rule);
+  font-family: "IBM Plex Mono", monospace; font-size: .72rem; color: var(--ink-3);
+  display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; justify-content: space-between;
+  max-width: none;
+}
+
+/* ---------- misc ---------- */
+figure { margin: 1.8rem 0; }
+figure figcaption {
+  font-size: .82rem; color: var(--ink-3); margin-top: .6rem; line-height: 1.45;
+}
+svg { max-width: 100%; height: auto; }
+img { max-width: 100%; height: auto; }
+.skip {
+  position: absolute; left: -9999px; top: 0; background: var(--accent); color: #fff;
+  padding: .5rem 1rem; z-index: 100;
+}
+.skip:focus { left: .5rem; top: .5rem; }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="mark">Super<span>&nbsp;Ferret</span></div>
+  <nav>
+    <a href="index.html" aria-current="page">Overview</a>
+    <a href="landscape.html">Landscape</a>
+    <a href="indexing.html">Index structures</a>
+    <a href="architecture.html">Architecture</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="toc">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#finding">The measured finding</a></li>
+      <li><a href="#reports">The three reports</a></li>
+      <li><a href="#brief">The brief</a></li>
+      <li><a href="#corpus">The research corpus</a></li>
+      <li><a href="#method">Method and its limits</a></li>
+    </ol>
+  </aside>
+
+  <main id="main">
+    <div class="masthead">
+      <p class="eyebrow">Desktop search &middot; research dossier</p>
+      <h1>What to build, and what the measurement says not to</h1>
+      <p class="standfirst">A survey of desktop search on Linux, macOS and Windows;
+      a catalogue of the index structures underneath them; and a design for a new
+      one &mdash; checked against a benchmark of the corpus it would actually run on.</p>
+      <div class="meta">
+        <span><b>Compiled</b> 2026-09-05</span>
+        <span><b>Research</b> 11 files, 8,383 lines</span>
+        <span><b>Tools surveyed</b> 41</span>
+        <span><b>Target</b> Rust, permissive, personal workstation</span>
+      </div>
+    </div>
+
+    <h2 id="finding" class="nonum">The measured finding</h2>
+
+    <p>The research began from a premise: a corpus of roughly a million files and
+    10&ndash;200&nbsp;GB needs an index, because scanning it per query is hopeless.
+    Before writing the recommendation, that premise was measured against the actual
+    corpus in <code>~/w</code>. It did not survive intact.</p>
+
+    <div class="grid">
+      <div class="card">
+        <div class="stat">578,200</div>
+        <div class="cap">files in ~/w</div>
+      </div>
+      <div class="card">
+        <div class="stat">153.2<small>GB</small></div>
+        <div class="cap">total bytes</div>
+      </div>
+      <div class="card">
+        <div class="stat">3.7<small>%</small></div>
+        <div class="cap">of bytes survive build-artefact exclusion</div>
+      </div>
+      <div class="card">
+        <div class="stat">50<small>ms</small></div>
+        <div class="cap">ripgrep, warm, hard regex, whole tree</div>
+      </div>
+    </div>
+
+    <p>Excluding <code>.git</code>, <code>node_modules</code>, <code>target</code>,
+    <code>.venv</code> and their kin leaves <strong>73,565 files and 5.73&nbsp;GB</strong>
+    <span class="p p-measured">measured</span> &mdash; 12.7% of the files and 3.7% of
+    the bytes. Eighty-seven percent of the file count is machine-generated build
+    output: 260,695 <code>.o</code> files, 8,045 <code>.rlib</code>, 14,864
+    <code>.bin</code>. One directory, <code>clex</code>, is 74&nbsp;GB of which
+    73.5&nbsp;GB is noise.</p>
+
+    <p>On what remains, <code>ripgrep</code> with <code>.gitignore</code> pruning
+    answers a literal query in <strong>0.05&nbsp;s</strong> and a regex with no
+    extractable literal &mdash; the exact shape a trigram index exists to accelerate
+    &mdash; in <strong>0.05&nbsp;s</strong> as well
+    <span class="p p-measured">measured</span>, at over 1000% CPU across 32 threads.</p>
+
+    <div class="box key">
+      <span class="label">What this changes</span>
+      <p>The hard problem at this scale is not index density, posting-list
+      compression or query planning. It is <strong>exclusion policy</strong>:
+      getting the 96% right is worth more than every codec in the survey combined,
+      and a wrong exclusion rule costs 25&times; the index.</p>
+      <p>What still justifies building: the document tier, where extraction is
+      expensive and cannot be redone per query; cold-cache behaviour, where the
+      full tree costs 234&nbsp;s at 0.65&nbsp;GB/s
+      <span class="p p-measured">measured</span>; ranking, which grep has none of;
+      metadata and filename search, which is free; and corpora that are not 96%
+      build output &mdash; a mail spool, a document archive, a photo library.</p>
+    </div>
+
+    <p>The architecture report opens with this rather than around it, and marks
+    which requirements the measurement demoted.</p>
+
+    <h2 id="reports" class="nonum">The three reports</h2>
+
+    <div class="grid">
+      <div class="card">
+        <h4>Landscape</h4>
+        <p>Sixty-odd tools across Linux, macOS and Windows, plus the engines
+        underneath them. What each one chose as its index structure, and what that
+        choice cost in bytes and in latency.</p>
+        <p><a href="landscape.html">Read the landscape survey &rarr;</a></p>
+      </div>
+      <div class="card">
+        <h4>Index structures</h4>
+        <p>The options catalogue. Postings codecs, term dictionaries, n-gram and
+        regex planning, suffix and FM-indexes, approximate filters, columnar
+        skip-indexes, vector and learned-sparse &mdash; each with its bytes-per-byte
+        cost, query classes, and update story.</p>
+        <p><a href="indexing.html">Read the structures catalogue &rarr;</a></p>
+      </div>
+      <div class="card">
+        <h4>Architecture</h4>
+        <p>The recommendation, argued rather than surveyed: tiered index design,
+        query routing, the extractor plugin interface, change detection, the
+        politeness budget, and a staged build plan &mdash; with the open decisions
+        left explicitly open.</p>
+        <p><a href="architecture.html">Read the design &rarr;</a></p>
+      </div>
+    </div>
+
+    <h2 id="brief" class="nonum">The brief this was written against</h2>
+
+    <div class="tw">
+    <table>
+      <caption>Constraints fixed before the research began.</caption>
+      <thead><tr><th>Constraint</th><th>Decision</th><th>Consequence for the report</th></tr></thead>
+      <tbody>
+        <tr><th>Purpose</th><td>Build, not adopt</td><td>Existing tools are intelligence; the question on every row is what a choice cost</td></tr>
+        <tr><th>Scale</th><td>Personal workstation &mdash; under ~5M files, tens to a few hundred GB</td><td>NAS and web-scale techniques dismissed in a line</td></tr>
+        <tr><th>Tradeoff</th><td>Density over speed</td><td>Every comparison leads with bytes, latency second</td></tr>
+        <tr><th>Content, built in</th><td>Source + text/config, PDF/Office, media metadata</td><td>Extraction pipeline is tier-1 design, not polish</td></tr>
+        <tr><th>Content, plugin</th><td>Email/chat, OCR, later reverse-image and speech-to-text</td><td>Plugin interface is a first-class concern</td></tr>
+        <tr><th>Queries</th><td>Boolean, phrase, <strong>true regex over content</strong></td><td>Rules out most inverted-index designs, which only offer regex over the term dictionary</td></tr>
+        <tr><th>Freshness</th><td>Near-real-time, queue under burst, near-invisible at idle</td><td>Politeness gets its own section; it is what killed the prior art</td></tr>
+        <tr><th>Licence</th><td>Permissive (MIT/Apache/BSD)</td><td>GPL work is readable, not vendorable &mdash; pushes copyleft extractors behind a subprocess boundary</td></tr>
+        <tr><th>Implementation</th><td>Rust, index written from scratch, deliberately</td><td>Pseudocode is a deliverable; &ldquo;just use Tantivy&rdquo; is not an answer</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h2 id="corpus" class="nonum">The research corpus</h2>
+
+    <p>Eleven files in <code>docs/claude/research/</code>, 8,383 lines. The
+    HTML reports are syntheses of these; the raw files carry the full citation
+    trails and the done-notes, which record what each agent could not verify.</p>
+
+    <div class="tw">
+    <table>
+      <thead><tr><th>File</th><th>Subject</th><th class="num">Lines</th><th>Headline finding</th></tr></thead>
+      <tbody>
+        <tr><th class="mono">M1</th><td>Measured baseline</td><td class="num">128</td><td>The only data at target scale on target hardware; undercuts the premise</td></tr>
+        <tr><th class="mono">R1</th><td>Linux full-text apps</td><td class="num">519</td><td>Daemon resource use, not features, is what kills these projects</td></tr>
+        <tr><th class="mono">R2</th><td>Filename and code search</td><td class="num">820</td><td>Full Cox regex&rarr;trigram compilation with degenerate cases worked through</td></tr>
+        <tr><th class="mono">R3</th><td>macOS / Spotlight</td><td class="num">539</td><td>Store format is public only via forensics; no regex, no phrase operators</td></tr>
+        <tr><th class="mono">R4</th><td>Windows</td><td class="num">666</td><td>Everything's MFT+USN design; Linux has no equivalent, and why</td></tr>
+        <tr><th class="mono">R5</th><td>Embeddable engines</td><td class="num">659</td><td>Term-dictionary regex is not content regex &mdash; the field blurs these</td></tr>
+        <tr><th class="mono">R6</th><td>Inverted index internals</td><td class="num">1,129</td><td>Dropping positions and re-scanning for phrases is the biggest density lever</td></tr>
+        <tr><th class="mono">R7</th><td>Substring and regex structures</td><td class="num">983</td><td>move-r / r-index underrated for repetitive corpora; suffix arrays disqualified on size</td></tr>
+        <tr><th class="mono">R8</th><td>Extraction and change detection</td><td class="num">1,034</td><td>ionice is often inert on modern I/O schedulers; cgroup v2 is the mechanism that works</td></tr>
+        <tr><th class="mono">R9</th><td>Semantic at scale</td><td class="num">762</td><td>Vectors cost 6&ndash;18&times; the entire lexical index; SPLADE is not free either</td></tr>
+        <tr><th class="mono">R10</th><td>Dense index designs</td><td class="num">675</td><td>ClickHouse shipped a real inverted index in 2025&ndash;26, cutting against the bloom-only thesis</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h2 id="method" class="nonum">Method, and what it cannot tell you</h2>
+
+    <p>Every figure in these reports carries a chip saying how it was sourced.
+    This is the report set's one structural rule, and it exists because the survey
+    turned up more unverifiable numbers than verifiable ones.</p>
+
+    <div class="legend">
+      <b>Provenance</b>
+      <span><span class="p p-doc">upstream</span> project docs or source</span>
+      <span><span class="p p-paper">paper</span> peer-reviewed</span>
+      <span><span class="p p-bench">benchmark</span> independent</span>
+      <span><span class="p p-vendor">vendor</span> vendor-claimed</span>
+      <span><span class="p p-measured">measured</span> measured for this report</span>
+      <span><span class="p p-community">anecdote</span> community-reported</span>
+      <span><span class="p p-est">estimate</span> derived arithmetic</span>
+      <span><span class="p p-none">unknown</span> no figure exists</span>
+    </div>
+
+    <div class="box gap">
+      <span class="label">Three holes in the public record</span>
+      <p><strong>No independent benchmark exists at this scale.</strong> Two
+      research passes looked specifically for a controlled comparison of desktop
+      search tools at ~1M files and 10&ndash;200&nbsp;GB and found none anywhere.
+      That absence is why the measurement in <code>M1</code> was run at all, and
+      it is an opening: a reproducible harness would be a real contribution.</p>
+      <p><strong>Every VictoriaLogs density number traces to vendor or
+      vendor-adjacent sources.</strong> No fully independent confirmation was
+      found. Since that system is the stated performance reference for this
+      project, its figures should be treated as unverified until measured.</p>
+      <p><strong>Codec decode speeds are a decade old.</strong> The
+      nanoseconds-per-integer figures everyone cites come from 2015 work. The
+      rankings are probably still right; the absolute numbers are not evidence
+      about current hardware.</p>
+    </div>
+
+    <p>Two smaller cautions. A 4&times; discrepancy was found between two
+    third-party sources reporting the same ripgrep benchmark, and is shown rather
+    than averaged away. And the measured corpus is one machine's, heavily weighted
+    toward Rust and JavaScript development &mdash; a corpus with a large document
+    archive or mail spool would shift the balance toward extraction, and the
+    measurement should be repeated there before generalising.</p>
+
+    <footer class="pagefoot">
+      <span>Super Ferret research &middot; overview</span>
+      <span>Compiled 2026-09-05</span>
+    </footer>
+  </main>
+</div>
+
+<script>
+(function () {
+  var links = [].slice.call(document.querySelectorAll('.toc a[href^="#"]'));
+  if (!links.length) return;
+  var map = {};
+  links.forEach(function (a) {
+    var el = document.getElementById(a.getAttribute('href').slice(1));
+    if (el) map[el.id] = a;
+  });
+  var obs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        links.forEach(function (l) { l.classList.remove('on'); });
+        if (map[e.target.id]) map[e.target.id].classList.add('on');
+      }
+    });
+  }, { rootMargin: '-72px 0px -70% 0px', threshold: 0 });
+  Object.keys(map).forEach(function (id) {
+    var el = document.getElementById(id); if (el) obs.observe(el);
+  });
+})();
+</script>
+</body>
+</html>

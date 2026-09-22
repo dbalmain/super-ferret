@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Part 1 — Thompson NFA</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="index.html">← Course home</a>
+  <a href="part2.html">Part 2 →</a>
+  <strong>This part</strong>
+  <a href="#read">Read</a>
+  <a href="#l1">Backtracking</a>
+  <a href="#l2">Thompson fragments</a>
+  <a href="#l3">Simulate</a>
+  <a href="#l4">DFA cache</a>
+  <a href="#tests">Tests</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">Part 1 of 4</div>
+  <h1>Matching can be simple and fast</h1>
+  <p class="lede">A recursive matcher is easy and can take exponential time. Thompson’s NFA reads the text once, keeping a set of states. Same answers, linear in the text.</p>
+</header>
+
+<h2 id="read">Read</h2>
+<p><a href="https://swtch.com/~rsc/regexp/regexp1.html">Regular Expression Matching Can Be Simple And Fast</a> (Cox, 2007), through “Implementation: Simulating the NFA.” The C is <a href="https://swtch.com/~rsc/regexp/nfa.c.txt">nfa.c</a>. You will reimplement the algorithm, not the C.</p>
+<p>Cox compiles infix to postfix with <code>.</code> as an explicit concat operator, then a stack of NFA fragments. You may parse to an AST and build the graph recursively instead — same fragments, no postfix. The tests never see postfix.</p>
+
+<h2 id="l1">Lesson — feel backtracking die</h2>
+<p>On paper, match <code>a?a?a?aaa</code> against <code>aaa</code> by “try one, then zero” for each <code>?</code>. How many complete choices exist? Only the all-zero choice matches, and a backtracker reaches it last, having tried the other seven. That is 2<sup>n</sup> attempts for n optional <code>a</code>s — and note that the work is spent on a pattern that <em>does</em> match. Against <code>aaaaaaa</code>, which cannot match at all, it tries every one of the eight and fails.</p>
+<p>Optional: write a recursive matcher anyway. Do not run the harness against it. The pathological case (<code>a?</code> twenty times, then twenty <code>a</code>s, text twenty <code>a</code>s) is in <code>pathological.json</code> and will kill this approach.</p>
+
+<h2 id="l2">Lesson — Thompson fragments</h2>
+<p>Each subexpression becomes a fragment: a start state and a list of dangling outgoing arrows. Operators glue fragments:</p>
+<ul>
+  <li>literal <code>c</code> — one state, labeled arrow out</li>
+  <li>concat — patch e1’s outs onto e2’s start</li>
+  <li><code>|</code> — new Split, both ways, outs = e1.outs + e2.outs</li>
+  <li><code>?</code> — Split to e or skip</li>
+  <li><code>*</code> — Split to e or skip; e’s outs loop to the Split</li>
+  <li><code>+</code> — like star but start at e, not the Split</li>
+</ul>
+<p>States: <code>Char(c)</code>, <code>Split</code> (ε to two targets), <code>Match</code> (accept). One state per character or operator except parens. Draw <code>a(bb)+a</code> before you code it. Cox’s figures in the article are the spec.</p>
+<p><strong>Pencil.</strong> How many states does <code>(a|b)*</code> need under this construction?</p>
+
+<h2 id="l3">Lesson — simulate all states at once</h2>
+<p>Two lists: current set, next set. To step on character <code>c</code>: for every Char state in current whose label is <code>c</code>, add its target to next, following Splits (ε-closure) as you add. Never put a state on a list twice in the same step (generation number / visited flag).</p>
+<p>At end of input, accept if Match is in the current set. This is a <strong>whole-string</strong> match: that is the <code>match</code> command.</p>
+<p>Work per character is O(number of states). States ≈ length of the pattern. Text of length n ⇒ O(n · m). The pathological pattern has m ≈ 40, n = 20. Instant.</p>
+<p>Implement <code>match PATTERN TEXT</code> as in <a href="index.html#cli">the interface</a>.</p>
+
+<h2 id="l4">Lesson — cache lists as DFA states (optional, same tests)</h2>
+<p>Each NFA state-set is a DFA state. Cache <code>set × character → next set</code>. Next time you see the same set, skip the NFA step. Throw the whole cache away when it grows past some bound — awk uses a fixed limit of 32 states, which is why its curve in Cox’s graph kinks at n=28. Cox’s version is <a href="https://swtch.com/~rsc/regexp/dfa1.c.txt">dfa1.c</a>; the uncached DFA is <a href="https://swtch.com/~rsc/regexp/dfa0.c.txt">dfa0.c</a>.</p>
+<p>Same <code>match</code> command, and the same fixtures: run the harness as stage <code>dfa</code>. Nothing outside your program can tell a cached run from an uncached one, so this stage is on your honour — see <a href="index.html#stages">what each stage tests</a>.</p>
+
+<h2 id="tests">Tests</h2>
+<p>No tests until <code>match</code> exists. Then:</p>
+<div class="fig">python3 harness/run_tests.py --bin ./yourprog nfa
+# later:
+python3 harness/run_tests.py --bin ./yourprog dfa</div>
+<p><code>match.json</code> is ordinary cases. <code>pathological.json</code> is the exponential trap; timeout 1s. If <code>nfa</code> fails the trap, you are still backtracking, even if you think you are not.</p>
+<p>The <code>syntax</code> stage runs off the same <code>match</code> command and can be attempted as soon as your parser exists. It feeds you unbalanced parentheses and repetition operators with nothing to repeat, and every one must leave with exit 2. Nothing else in the suite notices a parser that quietly treats <code>(</code> as a literal.</p>
+<div class="fig">python3 harness/run_tests.py --bin ./yourprog syntax</div>
+<p>Part 1 does not test <code>.</code>, classes, substring search, or captures.</p>
+<p><a href="part2.html">Part 2 →</a></p>
+<footer class="page"><a href="index.html">Course home</a></footer>
+</main>
+</div>
+</body>
+</html>

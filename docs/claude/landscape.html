@@ -1,0 +1,2621 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Desktop Search Landscape</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,380;8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+/* ============================================================
+   Super Ferret research reports — shared design system
+   Type:   Archivo (display) / Source Serif 4 (body) / IBM Plex Mono (data)
+   Colour: cool slate ink on cool paper, teal accent, semantic
+           provenance hues that encode how a number was sourced.
+   ============================================================ */
+
+:root {
+  /* --- paper & ink (light) --- */
+  --paper:      #f4f6f8;
+  --surface:    #ffffff;
+  --surface-2:  #eceff3;
+  --sunk:       #e3e7ec;
+  --ink:        #12161d;
+  --ink-2:      #3d4653;
+  --ink-3:      #626d7d;
+  --rule:       #d3d9e1;
+  --rule-soft:  #e5e9ef;
+
+  /* --- accent --- */
+  --accent:     #0d7d8a;
+  --accent-2:   #0a5f6a;
+  --accent-ink: #063d45;
+  --accent-wash:#ddf0f2;
+
+  /* --- provenance semantics --- */
+  --pv-measured:  #0d7d8a;  --pv-measured-bg:  #dcf0f2;
+  --pv-doc:       #3f5aa6;  --pv-doc-bg:       #e2e7f7;
+  --pv-paper:     #5b4b9c;  --pv-paper-bg:     #e9e5f7;
+  --pv-bench:     #2f7a4a;  --pv-bench-bg:     #dff0e5;
+  --pv-vendor:    #9a6410;  --pv-vendor-bg:    #f7ecd8;
+  --pv-community: #8a5a6b;  --pv-community-bg: #f6e6ea;
+  --pv-est:       #7a6a55;  --pv-est-bg:       #efeae1;
+  --pv-none:      #8b3a3a;  --pv-none-bg:      #f7e2e2;
+
+  /* --- status --- */
+  --good: #2f7a4a; --warn: #9a6410; --bad: #a83232;
+
+  /* --- metrics --- */
+  --measure: 68ch;
+  --radius: 3px;
+  --shadow: 0 1px 2px rgba(18,22,29,.06), 0 6px 18px rgba(18,22,29,.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper:      #101318;
+    --surface:    #171b22;
+    --surface-2:  #1d222b;
+    --sunk:       #0b0e12;
+    --ink:        #e6eaf0;
+    --ink-2:      #b3bcc9;
+    --ink-3:      #838e9d;
+    --rule:       #2c333e;
+    --rule-soft:  #232932;
+
+    --accent:     #4fc7d4;
+    --accent-2:   #7adbe5;
+    --accent-ink: #a8e8ef;
+    --accent-wash:#0f3238;
+
+    --pv-measured:  #4fc7d4;  --pv-measured-bg:  #0f3238;
+    --pv-doc:       #8fa6ee;  --pv-doc-bg:       #1a2242;
+    --pv-paper:     #b2a3f0;  --pv-paper-bg:     #221d3d;
+    --pv-bench:     #6bc98d;  --pv-bench-bg:     #102b1c;
+    --pv-vendor:    #dfa94a;  --pv-vendor-bg:    #33260e;
+    --pv-community: #dfa0b3;  --pv-community-bg: #331d24;
+    --pv-est:       #c4b49a;  --pv-est-bg:       #2a2418;
+    --pv-none:      #e88a8a;  --pv-none-bg:      #3a1c1c;
+
+    --good: #6bc98d; --warn: #dfa94a; --bad: #e88a8a;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.3);
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper:      #101318;
+  --surface:    #171b22;
+  --surface-2:  #1d222b;
+  --sunk:       #0b0e12;
+  --ink:        #e6eaf0;
+  --ink-2:      #b3bcc9;
+  --ink-3:      #838e9d;
+  --rule:       #2c333e;
+  --rule-soft:  #232932;
+
+  --accent:     #4fc7d4;
+  --accent-2:   #7adbe5;
+  --accent-ink: #a8e8ef;
+  --accent-wash:#0f3238;
+
+  --pv-measured:  #4fc7d4;  --pv-measured-bg:  #0f3238;
+  --pv-doc:       #8fa6ee;  --pv-doc-bg:       #1a2242;
+  --pv-paper:     #b2a3f0;  --pv-paper-bg:     #221d3d;
+  --pv-bench:     #6bc98d;  --pv-bench-bg:     #102b1c;
+  --pv-vendor:    #dfa94a;  --pv-vendor-bg:    #33260e;
+  --pv-community: #dfa0b3;  --pv-community-bg: #331d24;
+  --pv-est:       #c4b49a;  --pv-est-bg:       #2a2418;
+  --pv-none:      #e88a8a;  --pv-none-bg:      #3a1c1c;
+
+  --good: #6bc98d; --warn: #dfa94a; --bad: #e88a8a;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.3);
+}
+
+/* ---------- base ---------- */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 5rem; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Source Serif 4", "Iowan Old Style", Charter, Georgia, serif;
+  font-size: 17px;
+  line-height: 1.62;
+  font-variant-numeric: oldstyle-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- top bar ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: .7rem clamp(1rem, 4vw, 2.5rem);
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule);
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+}
+.topbar .mark {
+  font-weight: 700; font-size: .82rem; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink);
+  white-space: nowrap;
+}
+.topbar .mark span { color: var(--accent); }
+.topbar nav { display: flex; gap: .25rem; flex-wrap: wrap; margin-left: auto; }
+.topbar nav a {
+  font-size: .78rem; font-weight: 500; letter-spacing: .02em;
+  color: var(--ink-3); text-decoration: none;
+  padding: .3rem .6rem; border-radius: var(--radius);
+}
+.topbar nav a:hover { color: var(--ink); background: var(--surface-2); }
+.topbar nav a[aria-current="page"] { color: var(--accent); background: var(--accent-wash); }
+.topbar nav a:focus-visible,
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* ---------- page shell ---------- */
+.shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 0 clamp(1rem, 4vw, 2.5rem) 6rem;
+}
+@media (min-width: 1080px) {
+  .shell { grid-template-columns: 250px minmax(0, 1fr); gap: clamp(2rem, 4vw, 4rem); }
+}
+
+/* ---------- sidebar TOC ---------- */
+.toc { display: none; }
+@media (min-width: 1080px) {
+  .toc {
+    display: block;
+    position: sticky; top: 4.2rem;
+    align-self: start;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    padding: 2.5rem 0 2rem;
+    font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+    font-size: .8rem;
+    line-height: 1.45;
+    border-right: 1px solid var(--rule-soft);
+    margin-right: -1px;
+  }
+}
+.toc h2 {
+  font-size: .68rem; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 600; margin: 0 0 .9rem;
+}
+.toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .12rem; }
+.toc ol ol { margin: .12rem 0 .4rem .85rem; }
+.toc a {
+  display: block; padding: .22rem .5rem .22rem .55rem;
+  color: var(--ink-2); text-decoration: none;
+  border-left: 2px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
+}
+.toc a:hover { color: var(--ink); background: var(--surface-2); }
+.toc a.on { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+.toc .sub a { color: var(--ink-3); font-size: .76rem; }
+
+/* ---------- main ---------- */
+main { min-width: 0; padding-top: 2.5rem; }
+main > * { max-width: var(--measure); }
+main > .wide, main > .tw, main > figure, main > .grid, main > .cards { max-width: none; }
+
+/* ---------- masthead ---------- */
+.masthead { max-width: none; margin-bottom: 3.5rem; }
+.eyebrow {
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: .7rem; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--accent); font-weight: 600; margin: 0 0 .9rem;
+}
+h1 {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-weight: 700; font-size: clamp(2.1rem, 5vw, 3.3rem);
+  line-height: 1.04; letter-spacing: -.022em;
+  margin: 0 0 1rem; text-wrap: balance; color: var(--ink);
+}
+.standfirst {
+  font-size: 1.17rem; line-height: 1.55; color: var(--ink-2);
+  max-width: 60ch; margin: 0 0 1.6rem;
+}
+.meta {
+  display: flex; flex-wrap: wrap; gap: .4rem 1.4rem;
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: .72rem; color: var(--ink-3);
+  padding-top: 1rem; border-top: 1px solid var(--rule);
+  font-variant-numeric: tabular-nums;
+}
+.meta b { color: var(--ink-2); font-weight: 500; }
+
+/* ---------- headings ---------- */
+h2, h3, h4, h5 {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  color: var(--ink); text-wrap: balance; letter-spacing: -.012em;
+}
+h2 {
+  font-size: 1.72rem; font-weight: 700; line-height: 1.15;
+  margin: 4rem 0 1.1rem; padding-top: 1.1rem;
+  border-top: 2px solid var(--ink); max-width: none;
+}
+h3 { font-size: 1.2rem; font-weight: 600; margin: 2.6rem 0 .7rem; }
+h4 {
+  font-size: .82rem; font-weight: 600; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-2); margin: 2rem 0 .5rem;
+}
+h5 { font-size: .95rem; font-weight: 600; margin: 1.4rem 0 .4rem; color: var(--ink-2); }
+
+/* section numbering: the reports ARE a numbered reference, so the
+   numbers carry real structure rather than decoration. */
+.numbered { counter-reset: h2; }
+.numbered h2:not(.nonum) { counter-increment: h2; counter-reset: h3; }
+.numbered h2:not(.nonum)::before {
+  content: counter(h2) "  ";
+  font-family: "IBM Plex Mono", monospace; font-size: .72em;
+  color: var(--accent); font-weight: 500;
+}
+.numbered h3:not(.nonum) { counter-increment: h3; }
+.numbered h3:not(.nonum)::before {
+  content: counter(h2) "." counter(h3) "  ";
+  font-family: "IBM Plex Mono", monospace; font-size: .78em;
+  color: var(--ink-3); font-weight: 500;
+}
+
+p { margin: 0 0 1.05rem; }
+a { color: var(--accent-2); text-underline-offset: .18em; text-decoration-thickness: .06em; }
+a:hover { color: var(--accent); }
+strong { font-weight: 600; color: var(--ink); }
+em { font-style: italic; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 3rem 0; }
+
+ul, ol { margin: 0 0 1.05rem; padding-left: 1.3rem; }
+li { margin-bottom: .38rem; }
+li > ul, li > ol { margin-top: .38rem; }
+
+dl { margin: 0 0 1.2rem; }
+dt { font-family: Archivo, sans-serif; font-weight: 600; font-size: .95rem; margin-top: .9rem; }
+dd { margin: .15rem 0 0; color: var(--ink-2); }
+
+blockquote {
+  margin: 1.4rem 0; padding: .2rem 0 .2rem 1.2rem;
+  border-left: 3px solid var(--accent); color: var(--ink-2); font-style: italic;
+}
+blockquote p:last-child { margin-bottom: 0; }
+
+/* ---------- code ---------- */
+code, kbd, samp {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .86em; font-variant-numeric: tabular-nums;
+}
+:not(pre) > code {
+  background: var(--surface-2); border: 1px solid var(--rule-soft);
+  padding: .08em .35em; border-radius: var(--radius);
+  color: var(--ink); white-space: nowrap;
+}
+pre {
+  margin: 1.4rem 0; padding: 1rem 1.15rem;
+  background: var(--sunk); border: 1px solid var(--rule);
+  border-radius: var(--radius); overflow-x: auto;
+  font-size: .82rem; line-height: 1.55; max-width: none;
+}
+pre code { background: none; border: 0; padding: 0; white-space: pre; color: var(--ink); }
+pre .cm { color: var(--ink-3); font-style: italic; }
+pre .kw { color: var(--accent); font-weight: 500; }
+figure.code { margin: 1.4rem 0; max-width: none; }
+figure.code figcaption {
+  font-family: Archivo, sans-serif; font-size: .74rem; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3);
+  margin-bottom: .45rem;
+}
+
+/* ---------- tables ---------- */
+.tw { overflow-x: auto; margin: 1.5rem 0; max-width: none;
+      border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
+table {
+  border-collapse: collapse; width: 100%;
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-size: .82rem; line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--surface-2); color: var(--ink);
+  font-weight: 600; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase;
+  text-align: left; padding: .6rem .7rem; border-bottom: 1.5px solid var(--rule);
+  white-space: nowrap;
+}
+tbody td, tbody th {
+  padding: .55rem .7rem; border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top; text-align: left; color: var(--ink-2);
+}
+tbody th { font-weight: 600; color: var(--ink); white-space: nowrap; }
+tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
+tbody tr:hover td, tbody tr:hover th { background: var(--surface-2); }
+td.num, th.num { text-align: right; font-family: "IBM Plex Mono", monospace; white-space: nowrap; }
+td.mono, th.mono { font-family: "IBM Plex Mono", monospace; font-size: .78rem; }
+caption {
+  caption-side: bottom; text-align: left; padding: .6rem .7rem;
+  font-family: "Source Serif 4", serif; font-size: .82rem; color: var(--ink-3);
+  border-top: 1px solid var(--rule-soft);
+}
+
+/* ---------- provenance chips: every number says how it was sourced ---------- */
+.p {
+  display: inline-block; vertical-align: baseline;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: .63rem; font-weight: 500; letter-spacing: .05em;
+  text-transform: uppercase; white-space: nowrap;
+  padding: .08em .38em; border-radius: 2px;
+  border: 1px solid currentColor;
+  margin-left: .3em; position: relative; top: -.08em;
+}
+.p-measured  { color: var(--pv-measured);  background: var(--pv-measured-bg); }
+.p-doc       { color: var(--pv-doc);       background: var(--pv-doc-bg); }
+.p-paper     { color: var(--pv-paper);     background: var(--pv-paper-bg); }
+.p-bench     { color: var(--pv-bench);     background: var(--pv-bench-bg); }
+.p-vendor    { color: var(--pv-vendor);    background: var(--pv-vendor-bg); }
+.p-community { color: var(--pv-community); background: var(--pv-community-bg); }
+.p-est       { color: var(--pv-est);       background: var(--pv-est-bg); }
+.p-none      { color: var(--pv-none);      background: var(--pv-none-bg); }
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: .45rem .7rem;
+  padding: .9rem 1rem; margin: 1.4rem 0; max-width: none;
+  background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius);
+  font-family: Archivo, sans-serif; font-size: .74rem; color: var(--ink-3);
+  align-items: center;
+}
+.legend > span { display: inline-flex; align-items: center; gap: .3rem; }
+.legend b {
+  font-family: Archivo, sans-serif; font-size: .68rem; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ink-2); margin-right: .3rem;
+}
+
+/* ---------- density bar: encodes index-size ratio visually ---------- */
+.bar { display: flex; align-items: center; gap: .5rem; min-width: 130px; }
+.bar .track {
+  flex: 1; height: 7px; background: var(--sunk);
+  border-radius: 4px; overflow: hidden; min-width: 56px;
+  border: 1px solid var(--rule-soft);
+}
+.bar .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.bar .fill.hi { background: var(--warn); }
+.bar .fill.vhi { background: var(--bad); }
+.bar .val {
+  font-family: "IBM Plex Mono", monospace; font-size: .72rem;
+  color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+
+/* ---------- callouts ---------- */
+.box {
+  margin: 1.6rem 0; padding: 1.05rem 1.2rem; max-width: none;
+  background: var(--surface); border: 1px solid var(--rule);
+  border-left: 3px solid var(--ink-3); border-radius: var(--radius);
+  font-size: .95rem;
+}
+.box > :first-child { margin-top: 0; }
+.box > :last-child { margin-bottom: 0; }
+.box .label {
+  display: block; font-family: Archivo, sans-serif;
+  font-size: .68rem; font-weight: 700; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: .5rem;
+}
+.box.key      { border-left-color: var(--accent); background: var(--accent-wash); }
+.box.key .label { color: var(--accent-2); }
+.box.warn     { border-left-color: var(--warn); }
+.box.warn .label { color: var(--warn); }
+.box.gap      { border-left-color: var(--bad); }
+.box.gap .label { color: var(--bad); }
+.box.verdict  { border-left-color: var(--ink); border-width: 1px 1px 1px 4px; background: var(--surface-2); }
+.box.verdict .label { color: var(--ink); }
+
+/* ---------- cards / grids ---------- */
+.grid { display: grid; gap: 1rem; margin: 1.6rem 0; max-width: none;
+        grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); }
+.card {
+  padding: 1.1rem 1.2rem; background: var(--surface);
+  border: 1px solid var(--rule); border-radius: var(--radius);
+  box-shadow: var(--shadow); font-size: .92rem;
+}
+.card h4 { margin-top: 0; }
+.card > :last-child { margin-bottom: 0; }
+.card .stat {
+  font-family: Archivo, sans-serif; font-weight: 700;
+  font-size: 1.9rem; line-height: 1.1; color: var(--accent-2);
+  font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+}
+.card .stat small {
+  font-size: .5em; font-weight: 500; color: var(--ink-3);
+  letter-spacing: 0; margin-left: .25em;
+}
+.card .cap {
+  font-family: Archivo, sans-serif; font-size: .72rem; color: var(--ink-3);
+  letter-spacing: .04em; text-transform: uppercase; margin-top: .35rem;
+}
+
+/* ---------- verdict pills ---------- */
+.pill {
+  display: inline-block; font-family: Archivo, sans-serif;
+  font-size: .68rem; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; padding: .14em .5em; border-radius: 10px;
+  border: 1px solid currentColor; white-space: nowrap;
+}
+.pill.yes { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.pill.no  { color: var(--bad);  background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.pill.part{ color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.pill.dead{ color: var(--ink-3); background: var(--surface-2); }
+
+/* ---------- footnotes / sources ---------- */
+.sources { margin-top: 4rem; padding-top: 1.4rem; border-top: 2px solid var(--ink); max-width: none; }
+.sources h2 { border: 0; margin: 0 0 1rem; padding: 0; font-size: 1.1rem; }
+.sources ol { font-size: .8rem; color: var(--ink-3); columns: 2; column-gap: 2.5rem; padding-left: 1.4rem; }
+@media (max-width: 800px) { .sources ol { columns: 1; } }
+.sources li { margin-bottom: .45rem; break-inside: avoid; }
+.sources a { word-break: break-word; }
+
+footer.pagefoot {
+  margin-top: 3rem; padding-top: 1.2rem; border-top: 1px solid var(--rule);
+  font-family: "IBM Plex Mono", monospace; font-size: .72rem; color: var(--ink-3);
+  display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; justify-content: space-between;
+  max-width: none;
+}
+
+/* ---------- misc ---------- */
+figure { margin: 1.8rem 0; }
+figure figcaption {
+  font-size: .82rem; color: var(--ink-3); margin-top: .6rem; line-height: 1.45;
+}
+svg { max-width: 100%; height: auto; }
+img { max-width: 100%; height: auto; }
+.skip {
+  position: absolute; left: -9999px; top: 0; background: var(--accent); color: #fff;
+  padding: .5rem 1rem; z-index: 100;
+}
+.skip:focus { left: .5rem; top: .5rem; }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="mark">Super<span>&nbsp;Ferret</span></div>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="landscape.html" aria-current="page">Landscape</a>
+    <a href="indexing.html">Index structures</a>
+    <a href="architecture.html">Architecture</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="toc">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#s1">What the survey found</a>
+        <ol class="sub"><li><a href="#s1a">The seven findings</a></li></ol>
+      </li>
+      <li><a href="#s2">The master table</a></li>
+      <li><a href="#s3">Linux</a>
+        <ol class="sub">
+          <li><a href="#s3a">Full-text desktop search</a></li>
+          <li><a href="#s3b">Filename and code search</a></li>
+        </ol>
+      </li>
+      <li><a href="#s4">macOS</a>
+        <ol class="sub">
+          <li><a href="#s4a">FSEvents</a></li>
+          <li><a href="#s4b">The query grammar</a></li>
+          <li><a href="#s4c">What goes wrong</a></li>
+        </ol>
+      </li>
+      <li><a href="#s5">Windows</a>
+        <ol class="sub">
+          <li><a href="#s5a">Everything: MFT + USN</a></li>
+          <li><a href="#s5b">Windows.edb</a></li>
+          <li><a href="#s5c">dtSearch and the rest</a></li>
+        </ol>
+      </li>
+      <li><a href="#s6">Engines and formats</a>
+        <ol class="sub"><li><a href="#s6a">Density ranking</a></li></ol>
+      </li>
+      <li><a href="#s7">The dense-index dissent</a>
+        <ol class="sub">
+          <li><a href="#s7a">Bloom vs posting list</a></li>
+          <li><a href="#s7b">What transfers</a></li>
+        </ol>
+      </li>
+      <li><a href="#s8">Cross-cutting findings</a>
+        <ol class="sub">
+          <li><a href="#s8a">Resource failure mode</a></li>
+          <li><a href="#s8b">Content regex is absent</a></li>
+          <li><a href="#s8c">No benchmark exists</a></li>
+          <li><a href="#s8d">Dictionary vs content regex</a></li>
+          <li><a href="#s8e">Filename vs content</a></li>
+          <li><a href="#s8f">Two engine families</a></li>
+        </ol>
+      </li>
+      <li><a href="#sources">Sources</a></li>
+    </ol>
+  </aside>
+
+  <main id="main" class="numbered">
+    <div class="masthead">
+      <p class="eyebrow">Super Ferret &middot; Research</p>
+      <h1>The Desktop Search Landscape</h1>
+      <p class="standfirst">Every desktop search tool worth knowing about on Linux, macOS and Windows, plus the embeddable engines and the log stores that dissent from them &mdash; read as intelligence, not as a shortlist. The recurring question is not &ldquo;is it good&rdquo; but &ldquo;what did it choose, and what did that choice cost in bytes and in latency&rdquo;.</p>
+      <div class="meta">
+        <span><b>Compiled</b> 2026-09-05</span>
+        <span><b>Scope</b> 40+ tools, 3 platforms, 5 engines</span>
+        <span><b>Sources</b> 64 cited</span>
+      </div>
+    </div>
+
+    <div class="legend">
+      <b>Provenance</b>
+      <span><span class="p p-doc">upstream</span> project docs or source</span>
+      <span><span class="p p-paper">paper</span> peer-reviewed</span>
+      <span><span class="p p-bench">benchmark</span> independent</span>
+      <span><span class="p p-vendor">vendor</span> vendor-claimed</span>
+      <span><span class="p p-measured">measured</span> measured for this report</span>
+      <span><span class="p p-community">anecdote</span> community-reported</span>
+      <span><span class="p p-est">estimate</span> derived arithmetic</span>
+      <span><span class="p p-none">unknown</span> no figure exists</span>
+    </div>
+
+    <h2 id="s1">What the survey found</h2>
+
+    <p>Forty-odd tools were examined across three platforms, plus five embeddable
+    engines and six log/analytics stores that solve an adjacent problem with
+    opposite priorities. Read as a group, they answer a narrower question than
+    &ldquo;which one is best&rdquo;: <b>what structure did each one commit to, and
+    what did that commitment cost in bytes and in query latency?</b> The answers
+    cluster far more tightly than the marketing does.</p>
+
+    <div class="box key">
+      <span class="label">The framing shock</span>
+      <p>Before any of the survey matters, one measurement on the target corpus
+      changes what the survey is for. On <span class="mono">/home/dave/w</span> &mdash;
+      <b>578,200 files, 153.2 GB</b> <span class="p p-measured">measured</span> &mdash;
+      <b>87% of the files and 96% of the bytes are machine-generated build
+      output</b> <span class="p p-measured">measured</span>. After excluding
+      <span class="mono">.git</span>, <span class="mono">node_modules</span>,
+      <span class="mono">target</span>, <span class="mono">.venv</span> and their
+      relatives, what is left is <b>73,565 files and 5.73 GB</b>
+      <span class="p p-measured">measured</span>.<sup><a href="#r1">1</a></sup></p>
+      <p>On that pruned corpus, ripgrep 15.1.0 answers a regex with <em>no
+      extractable literal</em> &mdash;
+      <span class="mono">[A-Za-z_]+_(index|posting)s?\b</span>, precisely the query
+      shape a trigram index exists to accelerate &mdash; in <b>0.05 s</b> at 1020%
+      CPU <span class="p p-measured">measured</span>. A plain literal costs the
+      same 0.05 s. <b>The single strongest argument for a content trigram index
+      evaporates at this corpus size</b>, because no index can be consulted faster
+      than 50 ms of already-parallel scanning. A full metadata crawl of all 578k
+      files costs <b>1.24 s</b> warm <span class="p p-measured">measured</span>;
+      metadata indexing is free.</p>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="stat">96<small>%</small></div>
+        <div class="cap">of target-corpus bytes are build output <span class="p p-measured">measured</span></div>
+      </div>
+      <div class="card">
+        <div class="stat">50<small>ms</small></div>
+        <div class="cap">literal <em>and</em> literal-free regex, pruned corpus, warm <span class="p p-measured">measured</span></div>
+      </div>
+      <div class="card">
+        <div class="stat">0.04<small>&times;</small></div>
+        <div class="cap">densest indexed design found &mdash; Recoll/Xapian over 30 GB of PDFs <span class="p p-doc">upstream</span><sup><a href="#r2">2</a></sup></div>
+      </div>
+      <div class="card">
+        <div class="stat">3.5<small>&times;</small></div>
+        <div class="cap">sparsest &mdash; zoekt positional trigrams vs source <span class="p p-doc">upstream</span></div>
+      </div>
+    </div>
+
+    <h3 id="s1a">The seven findings that survive the whole survey</h3>
+
+    <ol>
+      <li><b>Every long-lived Linux desktop content indexer is Xapian- or
+      Lucene-family, and nothing in the survey uses an LSM tree.</b> Xapian Glass
+      is a copy-on-write B+-tree; Lucene is segment-and-merge; Baloo is LMDB, also
+      a copy-on-write B+-tree.<sup><a href="#r4">4</a></sup><sup><a href="#r5">5</a></sup>
+      The one genuinely different structure in the whole field &mdash; livegrep's
+      suffix array &mdash; is the one that does not scale.</li>
+
+      <li><b>Daemon resource consumption, not query features, is what kills these
+      tools.</b> It killed Beagle (2006&ndash;2009), it has dogged Baloo for a
+      decade, and it is the longest-running complaint about Spotlight's
+      <span class="mono">mds</span>. &sect;3.1 works through why Baloo's
+      unusually complete throttling machinery does not fix it.</li>
+
+      <li><b>Content regex is nearly absent across the entire field.</b> Of the
+      Linux full-text apps, only Elasticsearch-backed tools (sist2, Nextcloud FTS)
+      and Obsidian's <span class="mono">/pattern/</span> offer it. Spotlight has
+      none, and neither does anything riding on it. Xapian, Lucene/DocFetcher,
+      Tracker/SPARQL and Baloo all lack it.<sup><a href="#r33">33</a></sup>
+      The exception on macOS is FoxTrot, which builds its own index rather than
+      querying Spotlight's &mdash; and it is an instructive exception, because it
+      exposes regex only as a <b>secondary criterion</b>, explicitly for
+      performance<sup><a href="#r66">66</a></sup>. That is not a licensing or
+      effort limitation. An index of terms cannot generate candidates for an
+      arbitrary pattern, so regex can only filter a set that something else
+      narrowed first. Every product here that offers regex over content without
+      an n-gram index has made that same concession somewhere, whether or not the
+      documentation says so.</li>
+
+      <li><b>Several tools that claim regex mean regex over the term dictionary,
+      not over content.</b> Baloo's <span class="mono">PostingDB::regexpIter()</span>
+      and Lucene's <span class="mono">RegexpQuery</span> (as used by OpenGrok) both
+      enumerate matching <em>terms</em> &mdash; grep against a vocabulary list, not
+      grep against bytes.<sup><a href="#r5">5</a></sup><sup><a href="#r28">28</a></sup>
+      This distinction is blurred constantly and is treated as a first-class
+      column in the master table.</li>
+
+      <li><b>Index-size ratios span nearly two orders of magnitude</b>, from 0.04&times;
+      (Recoll over a PDF corpus, where almost nothing is extractable text) to
+      3.5&times; (zoekt, which stores the corpus <em>and</em> positional postings).
+      Most of that spread is a decision about <em>what to store</em>, not about how
+      well it was compressed.</li>
+
+      <li><b>No independent benchmark exists at this scale.</b> R1 and R2 both
+      searched and found nothing: there is no controlled comparison of Recoll vs
+      Tracker vs Baloo vs a Tantivy build at 1M files, and no rigorous
+      fd/fzf-at-1M-files number <span class="p p-none">unknown</span>. Almost every
+      headline figure in this page is the author's own demo. That absence is the
+      reason M1 exists.</li>
+
+      <li><b>The filename problem and the content problem have never been solved in
+      one on-disk format.</b> plocate indexes filenames with trigrams; zoekt and
+      csearch index content with trigrams; nothing in the survey does both
+      coherently in one store.<sup><a href="#r19">19</a></sup><sup><a href="#r24">24</a></sup></li>
+    </ol>
+
+    <div class="box gap">
+      <span class="label">A note on what the numbers are worth</span>
+      <p>The provenance legend above is not decoration. plocate's headline
+      466 MB-vs-1.1 GB and 8 ms-vs-20 s figures are the author's own demo with the
+      test corpus unstated;<sup><a href="#r19">19</a></sup> zoekt's 3.5&times; came
+      from a single fetch of a living design document;<sup><a href="#r24">24</a></sup>
+      every VictoriaLogs density claim traces to the vendor or to vendor-adjacent
+      writing (&sect;7); and two third-party ripgrep benchmarks disagree by 4&times;
+      on the same corpus (&sect;3.2). The only figures in this report gathered on
+      the target hardware at the target scale are M1's, and they say the index is
+      less necessary than the field assumes.</p>
+    </div>
+    <h2 id="s2">The master table</h2>
+
+    <p>Every desktop tool in the survey, on one axis. Three conventions matter for
+    reading it. <b>Density bars show the upper bound of a stated range</b>, so a
+    row reading &ldquo;0.13&ndash;0.33&times;&rdquo; draws at 0.33; a bar is drawn
+    only where a real ratio against corpus size exists, and the caption says whose
+    ratio it is. <b>The regex column separates content regex from term-dictionary
+    regex</b> &mdash; a distinction several of these tools blur and the single most
+    common way a capability table gets this field wrong. And <b>every figure
+    carries its provenance</b>; a row with <span class="p p-none">unknown</span> is
+    a tool whose vendor or upstream has never published the number, which for a
+    survey this size turns out to be most of them.</p>
+
+    <div class="tw">
+    <table>
+      <caption>Desktop search tools, all platforms. Size ratio is index bytes vs
+      indexed-corpus bytes unless the cell says otherwise.</caption>
+      <thead>
+        <tr>
+          <th scope="col">Tool</th>
+          <th scope="col">Plat.</th>
+          <th scope="col">Index model / data structure</th>
+          <th scope="col">Index size ratio</th>
+          <th scope="col">Regex</th>
+          <th scope="col">Formats</th>
+          <th scope="col">Licence</th>
+          <th scope="col">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+
+        <tr>
+          <th scope="row">Recoll</th>
+          <td>Linux</td>
+          <td>Xapian Glass: copy-on-write B+-tree, postlist + termlist tables, 8 KB blocks. 1.24+ stores document text inside the index<sup><a href="#r3">3</a></sup></td>
+          <td><div class="bar"><span class="track"><span class="fill" style="width:4%"></span></span><span class="val">0.04&times;</span></div><span class="p p-doc">upstream</span> 1.2 GB over 18k PDFs / 30 GB<sup><a href="#r2">2</a></sup></td>
+          <td><span class="pill no">none</span></td>
+          <td>~200, via external helper processes (pdftotext, antiword, catdoc)</td>
+          <td class="mono">GPLv2</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Tracker / TinySPARQL + LocalSearch</th>
+          <td>Linux</td>
+          <td>RDF triple store on SQLite; FTS via SQLite's FTS extension. Text is one predicate among many<sup><a href="#r9">9</a></sup></td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">SPARQL only</span></td>
+          <td>GNOME stack in-process: poppler, GStreamer, exempi</td>
+          <td class="mono">LGPL-2.1+ / GPLv2+</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Baloo</th>
+          <td>Linux</td>
+          <td>LMDB, ~10 named sub-databases: PostingDB, PositionDB, 3&times; DocumentDB, DocumentTimeDB, MTimeDB, IdTreeDB, IdFilenameDB. No segments, no merge<sup><a href="#r5">5</a></sup><sup><a href="#r6">6</a></sup></td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill part">term dict</span></td>
+          <td>KFileMetaData in-process: poppler, taglib, exiv2</td>
+          <td class="mono">LGPL-2.1+</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">DocFetcher</th>
+          <td>Linux / Win</td>
+          <td>Apache Lucene, classic segment format; portable index folders</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">Lucene syntax</span></td>
+          <td>POI, PDFBox, html/rtf/odf/chm + archive recursion</td>
+          <td class="mono">EPL 1.0</td>
+          <td><span class="pill part">maintenance</span> 1.1.27, Jan 2026<sup><a href="#r13">13</a></sup></td>
+        </tr>
+
+        <tr>
+          <th scope="row">sist2</th>
+          <td>Linux</td>
+          <td>Crawler + extractor only; portable <span class="mono">.sist2</span> archive, search delegated to Elasticsearch (Lucene segments)<sup><a href="#r14">14</a></sup></td>
+          <td><span class="p p-none">unknown</span> &mdash; inherits ES</td>
+          <td><span class="pill yes">content (via ES)</span></td>
+          <td>Broad, bundled extraction + Tesseract OCR + archive recursion</td>
+          <td class="mono">GPLv3</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Beagle</th>
+          <td>Linux</td>
+          <td>Custom index over Lucene.NET, on Mono</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">boolean</span></td>
+          <td>Broad via helper backends: files, mail, IM logs, browser history</td>
+          <td class="mono">(L)GPL mix</td>
+          <td><span class="pill dead">dead</span> 0.3.9, Jan 2009<sup><a href="#r15">15</a></sup></td>
+        </tr>
+
+        <tr>
+          <th scope="row">regain</th>
+          <td>Linux</td>
+          <td>Apache Lucene; file-server and IMAP crawlers</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">Lucene syntax</span></td>
+          <td>Files, mail, web crawl</td>
+          <td class="mono">Apache-2.0</td>
+          <td><span class="pill dead">dead</span> last activity 2013-06-09<sup><a href="#r16">16</a></sup></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Paperless-ngx</th>
+          <td>Linux</td>
+          <td>Whoosh &rarr; <b>Tantivy</b> migration through 2025, with a regex query-rewrite shim to preserve Whoosh syntax<sup><a href="#r17">17</a></sup></td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">query lang</span></td>
+          <td>OCRmyPDF pipeline &mdash; throughput is OCR-bound, not index-bound</td>
+          <td class="mono">GPLv3</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Nextcloud Full Text Search</th>
+          <td>Linux (server)</td>
+          <td>Framework only; delegates to Elasticsearch or Solr, or an SQL fallback platform. Defines no on-disk format of its own</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill yes">content (via ES)</span></td>
+          <td>Provider apps per content type; size-capped by config</td>
+          <td class="mono">AGPLv3</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Zotero</th>
+          <td>cross</td>
+          <td>SQLite FTS over <span class="mono">fulltextContent</span> / <span class="mono">fulltextWords</span>; pdf.js text extraction</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">none</span></td>
+          <td>PDF, HTML, EPUB &mdash; library scale, thousands not millions</td>
+          <td class="mono">AGPLv3</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Obsidian (core search)</th>
+          <td>cross</td>
+          <td>In-memory inverted index rebuilt on load; <b>not persisted</b>. Omnisearch plugin adds a MiniSearch-backed persisted index<sup><a href="#r18">18</a></sup></td>
+          <td>n/a &mdash; no on-disk index</td>
+          <td><span class="pill yes">content <span class="mono">/re/</span></span></td>
+          <td>Markdown vault only</td>
+          <td class="mono">proprietary</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Logseq</th>
+          <td>cross</td>
+          <td>Datascript (in-memory Datalog) + client-side FlexSearch full-text index</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">none</span></td>
+          <td>Markdown / org</td>
+          <td class="mono">AGPLv3</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Catfish</th>
+          <td>Linux</td>
+          <td><b>No index.</b> Shells to <span class="mono">locate</span>, <span class="mono">find</span>, <span class="mono">grep</span>, or Tracker if present</td>
+          <td>0&times; by construction</td>
+          <td><span class="pill yes">content (it is grep)</span></td>
+          <td>Whatever the backend gives</td>
+          <td class="mono">GPLv2+</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Albert / Ulauncher / KRunner / GNOME Shell</th>
+          <td>Linux</td>
+          <td><b>No independent content index.</b> Albert indexes filenames into a SQLite cache; KRunner fronts Baloo; GNOME Shell fronts Tracker; Ulauncher wraps Recoll/Tracker/DocFetcher/locate by extension</td>
+          <td>n/a</td>
+          <td><span class="pill no">delegated</span></td>
+          <td>Delegated</td>
+          <td class="mono">GPLv3 / LGPL mix</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">plocate</th>
+          <td>Linux</td>
+          <td>Trigram inverted index over <b>filenames</b>; filenames grouped into compressed blocks before indexing, so postings point at blocks not files. <span class="mono">io_uring</span> async posting fetch<sup><a href="#r19">19</a></sup></td>
+          <td>466 MB vs mlocate's 1.1 GB on the same tree &mdash; <b>0.42&times; of mlocate's DB</b>, not of corpus <span class="p p-doc">upstream</span> (author's own demo, corpus unstated)</td>
+          <td><span class="pill no">glob</span></td>
+          <td>Filenames only</td>
+          <td class="mono">GPLv2</td>
+          <td><span class="pill yes">active</span> Debian default</td>
+        </tr>
+
+        <tr>
+          <th scope="row">mlocate</th>
+          <td>Linux</td>
+          <td>Flat sorted path list, per-directory front compression, <b>linear scan</b> per query. Per-directory mtime cache makes <em>updates</em> incremental; the defect is the search path</td>
+          <td>smaller DB, scan-bound queries</td>
+          <td><span class="pill part">paths only</span></td>
+          <td>Filenames only</td>
+          <td class="mono">GPLv2</td>
+          <td><span class="pill part">superseded</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">GNU findutils <span class="mono">locate</span></th>
+          <td>Linux</td>
+          <td>Front-coded ASCII sorted list (common-prefix count + suffix); whole-DB scan</td>
+          <td>compact but scan-bound</td>
+          <td><span class="pill part">paths only (BRE)</span></td>
+          <td>Filenames only</td>
+          <td class="mono">GPLv3</td>
+          <td><span class="pill yes">active</span> (legacy design)</td>
+        </tr>
+
+        <tr>
+          <th scope="row">fsearch</th>
+          <td>Linux</td>
+          <td>Whole path database held <b>in RAM</b>; on-disk cache between runs. Modelled on Everything, but with a tree walk instead of an MFT read<sup><a href="#r20">20</a></sup></td>
+          <td><span class="p p-none">unknown</span> &mdash; no published RAM/file or load-time figure</td>
+          <td><span class="pill yes">paths (GLib regex)</span></td>
+          <td>Filenames only &mdash; corpus <em>bytes</em> are irrelevant to it</td>
+          <td class="mono">GPLv2</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">ANGRYsearch</th>
+          <td>Linux</td>
+          <td>Loads the mlocate DB into a Python list / SQLite. No index of its own</td>
+          <td>n/a</td>
+          <td><span class="pill no">none</span></td>
+          <td>Filenames only</td>
+          <td class="mono">GPL</td>
+          <td><span class="pill part">dormant</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">fd + fzf, broot</th>
+          <td>Linux</td>
+          <td><b>No index.</b> Parallel walk per invocation; fzf holds candidates in memory for fuzzy scoring</td>
+          <td>0&times;</td>
+          <td><span class="pill yes">paths (Rust <span class="mono">regex</span>)</span></td>
+          <td>Filenames only</td>
+          <td class="mono">MIT / Apache-2.0</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">ripgrep</th>
+          <td>cross</td>
+          <td><b>No index.</b> Rust <span class="mono">regex</span> crate (linear-time, no backtracking), <span class="mono">-P</span> opts into PCRE2</td>
+          <td>0&times;</td>
+          <td><span class="pill yes">content</span></td>
+          <td>Text; skips binary, honours <span class="mono">.gitignore</span></td>
+          <td class="mono">MIT / Unlicense</td>
+          <td><span class="pill yes">very active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">ugrep + ugrep-indexer</th>
+          <td>cross</td>
+          <td>Own DFA regex engine. Optional sidecar index is a <b>per-file Bloom filter</b> over content-derived hashes &mdash; N&sup2; hash functions rather than the textbook N, plus a zero-false-positive byte-histogram pre-check<sup><a href="#r29">29</a></sup></td>
+          <td><span class="p p-none">unknown</span> &mdash; ratio not published; structurally a fixed bitset per file, independent of file length</td>
+          <td><span class="pill yes">content</span></td>
+          <td>Text + archives</td>
+          <td class="mono">BSD-3</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">ag (Silver Searcher) / ack</th>
+          <td>cross</td>
+          <td><b>No index.</b> PCRE / Perl regex</td>
+          <td>0&times;</td>
+          <td><span class="pill yes">content</span></td>
+          <td>Text</td>
+          <td class="mono">Apache-2.0 / Artistic</td>
+          <td><span class="pill part">ag unmaintained</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">csearch / codesearch (Russ Cox)</th>
+          <td>Linux</td>
+          <td>Trigram inverted index, file-granular posting lists, gob-encoded on disk. The reference implementation of regex&rarr;trigram-query compilation<sup><a href="#r21">21</a></sup></td>
+          <td><div class="bar"><span class="track"><span class="fill" style="width:20%"></span></span><span class="val">0.20&times;</span></div><span class="p p-doc">upstream</span> 77 MB over Linux 3.1.3, 420 MB</td>
+          <td><span class="pill yes">content (RE2)</span></td>
+          <td>Source text</td>
+          <td class="mono">BSD-3</td>
+          <td><span class="pill dead">archived</span> ~2015</td>
+        </tr>
+
+        <tr>
+          <th scope="row">zoekt</th>
+          <td>Linux</td>
+          <td><b>Positional</b> trigrams: postings carry in-file offsets, so a long literal is verified by checking two trigrams are the right distance apart before any regex runs. Memory-mapped shards capped near 4 GB (<span class="mono">uint32</span> offsets)<sup><a href="#r24">24</a></sup></td>
+          <td><div class="bar"><span class="track"><span class="fill vhi" style="width:100%"></span></span><span class="val">3.5&times;</span></div><span class="p p-doc">upstream</span> &mdash; single fetch of a living design doc; re-verify</td>
+          <td><span class="pill yes">content (RE2)</span></td>
+          <td>Source text; git-commit-anchored</td>
+          <td class="mono">Apache-2.0</td>
+          <td><span class="pill yes">active</span> (Sourcegraph)</td>
+        </tr>
+
+        <tr>
+          <th scope="row">livegrep</th>
+          <td>Linux</td>
+          <td><b>Suffix array</b> over one concatenated corpus buffer (divsufsort). No inverted index at all; literal anchors resolve exactly with zero false positives<sup><a href="#r23">23</a></sup></td>
+          <td><div class="bar"><span class="track"><span class="fill vhi" style="width:100%"></span></span><span class="val">~1&times;+</span></div><span class="p p-est">estimate</span> 4 or 8 bytes of SA per <em>source byte</em>, plus the buffer</td>
+          <td><span class="pill yes">content (RE2)</span></td>
+          <td>Source text, single bounded corpus</td>
+          <td class="mono">Apache-2.0</td>
+          <td><span class="pill part">dormant</span> ~2016&ndash;19</td>
+        </tr>
+
+        <tr>
+          <th scope="row">hound</th>
+          <td>Linux</td>
+          <td>Wraps <span class="mono">google/codesearch</span>'s trigram library directly &mdash; same format, same ratio</td>
+          <td><div class="bar"><span class="track"><span class="fill" style="width:20%"></span></span><span class="val">0.20&times;</span></div><span class="p p-doc">upstream</span> inherited</td>
+          <td><span class="pill yes">content (RE2)</span></td>
+          <td>Source text, multi-repo</td>
+          <td class="mono">MIT</td>
+          <td><span class="pill part">dormant</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">OpenGrok</th>
+          <td>Linux</td>
+          <td>Apache Lucene <b>tokenized</b> index (source-aware analyzer) plus a ctags symbol database &mdash; structurally unlike every other tool in this block</td>
+          <td><div class="bar"><span class="track"><span class="fill hi" style="width:100%"></span></span><span class="val">0.5&ndash;2&times;</span></div><span class="p p-community">anecdote</span> generic Lucene, not OpenGrok-measured</td>
+          <td><span class="pill part">term dict</span> Lucene <span class="mono">RegexpQuery</span></td>
+          <td>Source text + symbols</td>
+          <td class="mono">CDDL</td>
+          <td><span class="pill part">slow cadence</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">cscope / GNU Global / universal-ctags</th>
+          <td>Linux</td>
+          <td><b>Symbol indexes</b>, not text indexes: cross-reference DB, GTAGS/GRTAGS/GPATH, or a flat sorted tags file</td>
+          <td>small &mdash; one row per tag</td>
+          <td><span class="pill no">symbol lookup</span></td>
+          <td>Source symbols only</td>
+          <td class="mono">BSD-ish / GPLv3 / GPLv2</td>
+          <td><span class="pill part">maintenance</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Spotlight (<span class="mono">mds</span>/<span class="mono">mdworker</span>)</th>
+          <td>macOS</td>
+          <td>Undocumented per-volume and per-user store (<span class="mono">store.db</span>) with <span class="mono">live.N.M</span> journal files. Characterized as an inverted index by consensus; <b>no public source documents the posting encoding</b><sup><a href="#r32">32</a></sup>. FSEvents-driven updates<sup><a href="#r34">34</a></sup></td>
+          <td><span class="p p-none">unknown</span> &mdash; Apple publishes nothing</td>
+          <td><span class="pill no">none</span><sup><a href="#r33">33</a></sup></td>
+          <td>Dozens via <span class="mono">mdimporter</span> bundles; any app can add one</td>
+          <td class="mono">proprietary</td>
+          <td><span class="pill yes">shipped</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">HoudahSpot</th>
+          <td>macOS</td>
+          <td><b>No index.</b> Query builder and result-column UI over <span class="mono">mdfind</span></td>
+          <td>n/a</td>
+          <td><span class="pill no">inherits Spotlight</span></td>
+          <td>Same as Spotlight</td>
+          <td class="mono">commercial ~$34</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Alfred / Raycast</th>
+          <td>macOS</td>
+          <td>Alfred: no index, queries Spotlight. Raycast: <b>own</b> filename/metadata index (structure unpublished), content search falls back to Spotlight and is off wherever Spotlight is not covering</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">none documented</span></td>
+          <td>Same as Spotlight for content</td>
+          <td class="mono">commercial</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">DEVONthink</th>
+          <td>macOS</td>
+          <td>Own per-database document store + full-text index + a statistical layer: concordance, Classify, See Also. <b>Algorithm never published</b><sup><a href="#r36">36</a></sup></td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">boolean + operators</span></td>
+          <td>PDF, HTML, RTF, mail, Markdown, OCR &mdash; imported into its own store</td>
+          <td class="mono">commercial ~$99+</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Foxtrot Professional Search</th>
+          <td>macOS</td>
+          <td>Independent full-text index files, partitionable <b>per project</b> rather than per volume; format unpublished<sup><a href="#r35">35</a></sup></td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill yes">content</span> + slider-based proximity</td>
+          <td>PDF, HTML, Apple Mail, office formats, own importers</td>
+          <td class="mono">commercial</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">FoxTrot Professional Search</th>
+          <td>macOS</td>
+          <td><b>Own content index</b>, independent of the Spotlight store &mdash; multiple named indexes, structure unpublished. Text extraction <em>reuses Spotlight's metadata importers</em>, with an Xpdf path selectable for PDFs where the Apple importer extracts badly<sup><a href="#r65">65</a></sup></td>
+          <td>unpublished <span class="p p-none">unknown</span></td>
+          <td><span class="pill part">regex as a <em>secondary</em> criterion only<sup><a href="#r66">66</a></sup></span></td>
+          <td>Whatever Spotlight importers cover, plus its own PDF path</td>
+          <td class="mono">commercial</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Find Any File / EasyFind</th>
+          <td>macOS</td>
+          <td><b>No index.</b> Live filesystem scan per query; EasyFind reads file content at scan time and looks inside <span class="mono">.app</span> bundles Spotlight treats as opaque</td>
+          <td>0&times;</td>
+          <td><span class="pill yes">names; content by scan</span></td>
+          <td>Text content + metadata</td>
+          <td class="mono">commercial / free</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Everything (voidtools)</th>
+          <td>Windows</td>
+          <td>Reads the raw <b>NTFS MFT</b> in one sequential pass, then applies deltas from the <b>USN change journal</b> about once a second. In-memory name structure &mdash; <b>voidtools has never published what it is</b><sup><a href="#r38">38</a></sup>. Optional on-disk content index in 1.5</td>
+          <td>~45 MB on disk and ~100 MB RAM per 1M <em>files</em> <span class="p p-community">anecdote</span> (thread range 75&ndash;200 MB) &mdash; a per-file cost, not a corpus ratio<sup><a href="#r39">39</a></sup></td>
+          <td><span class="pill yes">names; content in 1.5</span> engine unpublished</td>
+          <td>Filenames always; content format-agnostic in 1.5</td>
+          <td class="mono">closed, free</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">Windows Search</th>
+          <td>Windows</td>
+          <td><b>ESE / JET Blue</b> B-tree ISAM database, <span class="mono">Windows.edb</span>. Forensic literature describes the property store as holding both properties and extracted content (<span class="mono">System_Search_AutoSummary</span>), with the word-level index inside ESE's own structures rather than a named table<sup><a href="#r42">42</a></sup></td>
+          <td><div class="bar"><span class="track"><span class="fill" style="width:35%"></span></span><span class="val">0.20&ndash;0.35&times;</span></div><span class="p p-community">anecdote</span> 107 GiB on 278 GiB, 92 GB on 500 GB; Microsoft's own KB acknowledges &gt;50 GB cases<sup><a href="#r40">40</a></sup></td>
+          <td><span class="pill no">AQS, no regex</span><sup><a href="#r43">43</a></sup></td>
+          <td>~50+ via IFilter and property handlers, sandboxed in <span class="mono">SearchFilterHost.exe</span></td>
+          <td class="mono">proprietary</td>
+          <td><span class="pill yes">shipped</span> core largely unchanged since Vista</td>
+        </tr>
+
+        <tr>
+          <th scope="row">dtSearch</th>
+          <td>Windows</td>
+          <td>Proprietary compressed inverted index, own format. The only vendor in the survey publishing a defensible ratio</td>
+          <td><div class="bar"><span class="track"><span class="fill" style="width:33%"></span></span><span class="val">0.13&ndash;0.33&times;</span></div><span class="p p-vendor">vendor</span> &ldquo;1/8 to 1/3&rdquo;, trending to <b>~15%</b> on large collections<sup><a href="#r44">44</a></sup></td>
+          <td><span class="pill yes">content</span> <span class="mono">##</span> prefix, combinable with fuzzy/proximity/stemming<sup><a href="#r45">45</a></sup></td>
+          <td>25+ filters: Office, PDF, PST/OST/MBOX, archives</td>
+          <td class="mono">commercial SDK</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">FileLocator Pro / Agent Ransack</th>
+          <td>Windows</td>
+          <td>Two explicit modes: Lite scans live with <b>no index</b>; Pro maintains one with real-time update</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill yes">content <em>and</em> filename, independently</span></td>
+          <td>Broad text/Office; OCR in Pro</td>
+          <td class="mono">freeware / commercial</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+        <tr>
+          <th scope="row">X1 Search / Copernic / Lookeen</th>
+          <td>Windows</td>
+          <td>Proprietary indexes; differentiator is breadth of connected sources (Outlook/Exchange/PST federation), not query power</td>
+          <td><span class="p p-none">unknown</span></td>
+          <td><span class="pill no">boolean/proximity</span></td>
+          <td>Email-centric; Copernic claims 170+ types <span class="p p-vendor">vendor</span></td>
+          <td class="mono">commercial</td>
+          <td><span class="pill yes">active</span></td>
+        </tr>
+
+      </tbody>
+    </table>
+    </div>
+
+    <div class="box warn">
+      <span class="label">Three cells that look comparable and are not</span>
+      <p><b>plocate's 0.42&times; is index-vs-index.</b> It is 466 MB against
+      mlocate's 1.1 GB for the same tree, not against corpus bytes &mdash; and
+      plocate is storing strictly <em>more</em> information (a real inverted index
+      versus a flat sorted list) in 42% of the space. Do not read it as a
+      density figure against content.<sup><a href="#r19">19</a></sup></p>
+      <p><b>Everything's ~45 MB / 1M files is per-file, not per-byte.</b> Corpus
+      size in GB is irrelevant to it: it indexes only the namespace. At the 5M-file
+      end of the target that is ~500 MB resident for filenames alone, before any
+      content index. Its efficiency story is &ldquo;small enough to hold entirely
+      in RAM&rdquo;, not &ldquo;compact on disk&rdquo;.</p>
+      <p><b>Recoll's 0.04&times; is a corpus artefact, not a codec win.</b> The test
+      corpus is 18,000 PDFs totalling 30 GB &mdash; overwhelmingly page images and
+      font tables, with very little extractable text per megabyte. Recoll's own
+      docs warn the ratio inverts on mbox archives, where the index can end up
+      <em>larger</em> than the source.<sup><a href="#r2">2</a></sup></p>
+    </div>
+    <h2 id="s3">Linux</h2>
+
+    <p>Linux is the only platform in the survey where the full-text lineage and the
+    filename/code lineage are entirely separate populations of tools with no
+    overlap. Nothing indexes both well. The full-text side has converged on two
+    engine families and one recurring failure mode; the filename/code side has
+    converged on one algorithm and one dominant implementation per problem.</p>
+
+    <h3 id="s3a">Full-text desktop search</h3>
+
+    <p><b>Recoll / Xapian</b> is the density winner in the whole survey, and the
+    caveat matters more than the number. Xapian's Glass backend is a copy-on-write
+    B+-tree with a postlist table and a termlist table &mdash; the termlist exists
+    so deleting or reindexing one document can find every posting list it must
+    touch without a scan.<sup><a href="#r4">4</a></sup> Recoll 1.24/1.25 changed the
+    format again to speed phrase search by storing document text <em>inside</em>
+    the index, a deliberate growth-for-speed trade
+    <span class="p p-doc">upstream</span>.<sup><a href="#r3">3</a></sup> The term
+    dictionary is a sorted B-tree, not an FST, which is precisely why the query
+    language offers prefix wildcards and no general regex: a B-tree gives cheap
+    prefix range scans and no efficient automaton intersection.</p>
+
+    <p>Its architectural distinction is negative and underrated: <b>Recoll does not
+    require a daemon</b>. Indexing is a batch or cron job, with inotify monitoring
+    optional (<span class="mono">recollindex -m</span>, subject to
+    <span class="mono">fs.inotify.max_user_watches</span>). Every recommendation of
+    Recoll as &ldquo;the one that doesn't hurt&rdquo; may be about that fact rather
+    than about its throttling code &mdash; R1 flags that it did not cleanly
+    separate the two.</p>
+
+    <p><b>Tracker / TinySPARQL and LocalSearch</b> is architecturally the outlier
+    on this list: an RDF triple store implemented on SQLite, where filesystem
+    metadata, EXIF, ID3 tags and extracted document text are all triples, and
+    full-text is the <span class="mono">fts:match</span> predicate &mdash; one
+    predicate among many rather than the primary interface. The 2024 GNOME rename
+    was a rebrand, not a rewrite: <b>the binary and package names changed, the
+    engine and file formats did not.</b><sup><a href="#r9">9</a></sup></p>
+
+    <h4>Baloo's LMDB schema &mdash; the one genuinely different structure here</h4>
+
+    <p>Baloo does not use segments and does not merge. Every database class under
+    <span class="mono">src/engine/</span> includes <span class="mono">lmdb.h</span>
+    and operates on <span class="mono">MDB_dbi</span>/<span class="mono">MDB_txn</span>
+    handles: a single memory-mapped, copy-on-write B+-tree environment holding about
+    ten named sub-databases, updated transactionally in place per write
+    batch.<sup><a href="#r5">5</a></sup><sup><a href="#r6">6</a></sup></p>
+
+    <figure class="code">
+      <figcaption>Baloo's LMDB sub-databases, from <span class="mono">src/engine/</span> headers and Phabricator T9805</figcaption>
+<pre><code>PostingDB        &lt;term&gt;  -&gt; &lt;id1&gt; &lt;id2&gt; &lt;id3&gt; ...   <span class="cm">// the term-to-document postings</span>
+PositionDB       &lt;term&gt;  -&gt; &lt;docID&gt;:&lt;n&gt;:[positions] <span class="cm">// phrase / proximity</span>
+DocumentDB  x3   &lt;docID&gt; -&gt; &lt;list of terms&gt;         <span class="cm">// content / filename / xattr terms;</span>
+                                                   <span class="cm">// the reverse map, so a delete or</span>
+                                                   <span class="cm">// reindex needs no scan</span>
+DocumentTimeDB, MTimeDB     <span class="cm">// mtimes, for incremental change detection</span>
+DocumentIdDB, IdTreeDB, IdFilenameDB
+                            <span class="cm">// docID &lt;-&gt; inode/path, and directory structure</span>
+
+<span class="cm">// docID = low 32 bits of st_dev  ..  low 32 bits of st_ino</span>
+<span class="cm">// -- filesystem identity IS the document identity.</span></code></pre>
+    </figure>
+
+    <p>Two consequences follow directly from that schema and are worth stating as
+    design intelligence rather than criticism. First, LMDB buys ACID
+    crash-consistency and gives up the append-then-merge write pattern that lets
+    Lucene and Tantivy batch a large indexing run cheaply &mdash; a real tradeoff,
+    not a mistake. Second, <b>building document IDs out of
+    <span class="mono">st_dev</span> and <span class="mono">st_ino</span> ties the
+    index to the local filesystem's device and inode numbering</b>, which is a
+    hard constraint for bind mounts, network filesystems and filesystem migration.
+    KDE's own wiki calls Baloo &ldquo;decentralized, no central database&rdquo;;
+    that is a claim about its three cooperating <em>processes</em>, and the storage
+    layer is considerably more conventional than the framing suggests.</p>
+
+    <p>Baloo's <span class="mono">PostingDB::regexpIter(const QRegularExpression &amp;,
+    const QByteArray &amp;prefix)</span> walks the term dictionary under a prefix
+    and validates each term against the pattern. That is real regex &mdash; over
+    <em>indexed terms</em>, equivalent to grep against a vocabulary list. It cannot
+    match inside a word the tokenizer split differently and cannot cross term
+    boundaries.<sup><a href="#r5">5</a></sup></p>
+
+    <div class="box key">
+      <span class="label">Key finding &mdash; throttling is not the answer</span>
+      <p>All three Linux indexers converge on the identical baseline:
+      <b><span class="mono">nice(19)</span> + <span class="mono">ioprio</span> idle
+      class + <span class="mono">SCHED_IDLE</span></b>, read from primary source in
+      each case.<sup><a href="#r7">7</a></sup><sup><a href="#r10">10</a></sup><sup><a href="#r12">12</a></sup>
+      This triad is table stakes, not a differentiator. <b>Baloo goes furthest</b>
+      &mdash; it is the only one that also ships default cgroup limits
+      (<span class="mono">Slice=background.slice</span>,
+      <span class="mono">CPUWeight=1</span>, <span class="mono">IOWeight=1</span>,
+      <span class="mono">MemoryHigh=25%</span>) and the only one with a confirmed
+      unconditional stop-content-indexing-on-battery gate &mdash; and it has the
+      worst and longest-running reputation for exactly the failure mode all of that
+      machinery targets, with reports as recent as August
+      2024.<sup><a href="#r8">8</a></sup></p>
+      <p>The mechanical reason is that <b>none of the triad is a ceiling</b>:
+      <span class="mono">nice</span>, <span class="mono">ioprio</span>,
+      <span class="mono">SCHED_IDLE</span> and cgroup <span class="mono">CPUWeight</span>
+      are all relative-to-contention. On an otherwise idle desktop a
+      <span class="mono">SCHED_IDLE</span> extractor still gets 100% of a free core
+      for free. And <span class="mono">MemoryHigh</span> throttles allocation rather
+      than capping it, while the complaints are frequently about RSS.
+      Recoll's own FAQ says so outright and tells administrators to layer
+      <span class="mono">systemd-run --property=CPUQuota=</span> on
+      top.<sup><a href="#r11">11</a></sup></p>
+      <p>R1 could not distinguish two remaining explanations, and neither can this
+      page: (a) total work volume &mdash; a million files of content extraction is
+      simply that many CPU-seconds regardless of scheduling class; or (b) extractor
+      correctness &mdash; one file that hangs inside poppler or exiv2 burns its
+      low-priority slice indefinitely. That is the most important open question the
+      Linux slice surfaced and did not answer.</p>
+    </div>
+
+    <p>Recoll holds one mechanism nobody else in the survey uses: if
+    <span class="mono">choom</span> is present it shells out to
+    <span class="mono">choom -n 300 -p &lt;pid&gt;</span>, making the indexer a
+    <em>preferred</em> OOM-killer victim.<sup><a href="#r12">12</a></sup> That targets
+    a different failure mode entirely &mdash; dying cleanly under memory pressure
+    rather than taking something else down with you &mdash; and for a design that
+    prefers a dense index (meaning more RAM pressure at merge, not less) it belongs
+    in the requirements, not bolted on after complaints the way Recoll's own issue
+    history suggests it was.</p>
+
+    <p><b>Nothing in any of the three implements queue-on-user-activity.</b> None of
+    the source trees contain input-idle detection &mdash; X11/Wayland idle time,
+    foreground-CPU watching &mdash; that pauses indexing on <em>interactive</em>
+    activity as opposed to battery state or raw priority. &ldquo;Don't index while
+    the user is compiling&rdquo; has no prior art here.</p>
+
+    <h4>The Beagle post-mortem</h4>
+
+    <p>Beagle's last release was 0.3.9 in January 2009.<sup><a href="#r15">15</a></sup>
+    Four causes, in ascending order of transferability:</p>
+    <ol>
+      <li><b>Mono was a distribution tax, not just a runtime cost.</b> Distros
+      without a mature Mono stack simply did not ship it, capping the addressable
+      install base independent of quality.</li>
+      <li><b>Resource use was never solved, and the team knew they were blind.</b>
+      The GUADEC 2006 material admits &ldquo;the tools to profile and debug them
+      were largely non-existent&rdquo; &mdash; flying blind on precisely the class
+      of problem that later sank Baloo's reputation.</li>
+      <li><b>Scope creep inherited from Dashboard</b>: chat logs, IM, web history,
+      contacts, all beyond &ldquo;index my files&rdquo;.</li>
+      <li><b>Loss of institutional backing.</b> GNOME chose Tracker. Once the
+      desktop environment does not depend on your indexer, nothing forces it to
+      keep going.</li>
+    </ol>
+    <p>The load-bearing pattern: <b>every daemon-based content indexer on Linux has
+    hit the same background-extractor-eats-a-core failure mode.</b> The survivors
+    survived by being installed by default with a desktop environment, not by
+    solving it. Baloo still has not.</p>
+
+    <p>Two other entries deserve a line each. <b>sist2</b> is a crawler and
+    extractor that writes a portable archive and delegates search to a separate
+    Elasticsearch instance &mdash; so it gets regex, wildcard and fuzzy queries for
+    free and pays Elasticsearch's JVM heap and index size for them, which is the
+    real cost of that stack at desktop scale. <b>Paperless-ngx migrated Whoosh to
+    Tantivy through 2025</b> explicitly for Whoosh's performance ceiling, and had to
+    build a regex-based query-rewrite shim to keep old syntax working &mdash; a shim
+    that PR&nbsp;#13010 shows reaching its limits.<sup><a href="#r17">17</a></sup>
+    That is a directly relevant data point on what a clean backend swap under a
+    stable query surface actually costs.</p>
+
+    <div class="box gap">
+      <span class="label">The ecosystem's own vote</span>
+      <p>Ulauncher's content-search extensions wrap <b>Recoll, Tracker, DocFetcher
+      or <span class="mono">locate</span></b>. Nobody wraps Baloo, despite it
+      shipping on every KDE desktop. Read that as an implicit reputation and
+      API-friction signal sitting on top of the explicit CPU/RAM complaints.</p>
+      <p>The 2024&ndash;2026 newcomers are all Rust and all Tantivy:
+      Universal-Local-AI-Indexer (Tantivy + SQLite, Windows), ultrasearch (NTFS MFT
+      for names, Tantivy for content, split-process), ygrep (Tantivy, framed as code
+      search for AI coding assistants). <b>No credible new Go-based Linux content
+      indexer was found at all.</b> Tantivy is the emerging default for new
+      entrants; none of them is yet a production-maturity general desktop indexer.</p>
+    </div>
+
+    <h3 id="s3b">Filename and code search</h3>
+
+    <p><b>plocate</b> is the densest design in the survey and its density comes from
+    one deliberate coarsening. Filenames are concatenated into compressed blocks
+    <em>before</em> the trigram index is built, so posting lists point at blocks,
+    not filenames. The upstream documentation states the tradeoff outright: bigger
+    compression context and fewer posting-list elements, at the price of less
+    precise postings and more false positives to weed out after
+    intersection.<sup><a href="#r19">19</a></sup> Queries trigram the pattern,
+    intersect fewest-postings-first (the same ordering csearch and zoekt use),
+    decompress the surviving blocks and substring-check. I/O is issued through
+    <span class="mono">io_uring</span> where available &mdash; which matters far
+    more on spinning disks than on NVMe.</p>
+
+    <p><b>This is exactly the trade a density-preferring design wants</b>, applied
+    to filenames: spend a little latency, save a lot of bytes. Its sibling is
+    <b>ugrep-indexer</b>, which is not a trigram index at all &mdash; it is a
+    per-file Bloom filter over content-derived hashes, using N&sup2; hash functions
+    instead of the textbook N because the author found standard parameterisation
+    has too high a false-positive rate for the short substrings typical of code
+    search, plus a cheaper zero-false-positive pre-check that rejects a file if any
+    byte of the pattern's first 8 bytes never occurs in
+    it.<sup><a href="#r29">29</a></sup> Fixed cost per file regardless of file
+    length; all imprecision pushed to query time. <b>These two are the designs most
+    worth studying for a dense build</b>, and they sit at the opposite end of the
+    spectrum from zoekt and livegrep.</p>
+
+    <div class="tw">
+    <table>
+      <caption>Where each indexed design sits on the density-vs-latency axis, cheapest index first</caption>
+      <thead>
+        <tr><th scope="col">Design</th><th scope="col">Index vs corpus</th><th scope="col">What the bytes buy</th><th scope="col">Where the latency goes</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">ugrep-indexer (Bloom, per file)</th>
+          <td><span class="p p-none">unknown</span> &mdash; fixed bitset per file, independent of length</td>
+          <td>Near-zero index overhead per file</td>
+          <td>Every false positive costs a full grep of that file. Minimal bytes, willing to eat re-scan.</td>
+        </tr>
+        <tr>
+          <th scope="row">plocate (filenames, block-coarsened)</th>
+          <td>0.42&times; <em>of mlocate's DB</em> <span class="p p-doc">upstream</span></td>
+          <td>Densest filename design surveyed; block grouping is a stated, deliberate size/precision trade</td>
+          <td>Block-level postings mean more false positives per hit, so more decompress-and-recheck per query</td>
+        </tr>
+        <tr>
+          <th scope="row">Cox trigram (csearch, hound)</th>
+          <td>0.20&times; <span class="p p-doc">upstream</span></td>
+          <td>Cheapest of the classical indexed designs; file-level postings, no offsets</td>
+          <td>Every surviving candidate needs a full-file regex re-scan &mdash; no offset info to shortcut long literals</td>
+        </tr>
+        <tr>
+          <th scope="row">OpenGrok (Lucene tokenized)</th>
+          <td>0.5&ndash;2&times; <span class="p p-community">anecdote</span></td>
+          <td>Positions, frequencies, stored fields; ranked and phrase queries a trigram index cannot give</td>
+          <td>Regex is bolted onto the term dictionary, not raw bytes &mdash; a different cost model, not a clean comparison</td>
+        </tr>
+        <tr>
+          <th scope="row">zoekt (positional trigram)</th>
+          <td>3.5&times; <span class="p p-doc">upstream</span></td>
+          <td>Offset-level verification: a long literal is confirmed correct-distance-apart from two trigram hits without running a regex over the file</td>
+          <td>None &mdash; this is the design that spends 3.5&times; corpus specifically to shave query latency. An upper bound to avoid, not a target.</td>
+        </tr>
+        <tr>
+          <th scope="row">livegrep (raw suffix array)</th>
+          <td>~1&times;+ per source <em>byte</em> <span class="p p-est">estimate</span></td>
+          <td>Exact literal answers with zero false positives; the best query latency in the survey</td>
+          <td>None, and that is the problem &mdash; a naive SA over 200 GB at 4 bytes/char is 800 GB of index before the buffer</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+
+    <p>The scaling law is the real distinction, not the ratio. Trigram index size
+    scales with the corpus's <em>trigram vocabulary</em>; a suffix array scales with
+    corpus <em>bytes</em> &mdash; one 4- or 8-byte integer per byte of source. That
+    is why livegrep was built for one large but bounded corpus (Linux kernel HEAD)
+    and why it does not survive contact with 200 GB without compressed-suffix-array
+    or FM-index machinery the reference implementation does not
+    have.<sup><a href="#r23">23</a></sup></p>
+
+    <p>zoekt's other constraints are worth recording: shards are memory-mapped
+    single files capped near 4 GB because offsets are
+    <span class="mono">uint32</span> (~1 GB of source content each once overhead is
+    counted); case-insensitive queries expand each literal into its case-variant
+    OR-set rather than folding case in the index, which is the same selectivity loss
+    Cox describes; and updates are <b>whole-repo reindex per shard on HEAD
+    movement</b>, not file-level incremental &mdash; a clean fit for Sourcegraph's
+    git-anchored model and a structural mismatch for a live desktop filesystem where
+    files change outside any commit boundary.<sup><a href="#r24">24</a></sup></p>
+
+    <p>Cox's numbers remain the reference: on the DATAKIT query the trigram index
+    cut candidates from 2,739 files to 3 before the verify pass; case-sensitive
+    searches ran roughly 100&times; faster than brute force and case-insensitive
+    roughly 10&ndash;15&times;, because OR-ing case variants is strictly less
+    selective than a single AND chain.<sup><a href="#r21">21</a></sup></p>
+
+    <div class="box warn">
+      <span class="label">A 4&times; contradiction in the unindexed baseline</span>
+      <p>The number an index has to beat is disputed by a factor of four, in
+      third-party sources, on what is described as the same corpus.</p>
+      <p>ripgrep.dev's own benchmark page (i9-12900K, 64 GB, NVMe, Ubuntu 22.04,
+      hyperfine, median of 10, warm cache) reports <b>6.73 s</b> for
+      &ldquo;Sherlock Holmes&rdquo; over a 13.5 GB concatenated Project Gutenberg
+      file &mdash; about <b>2.0 GB/s</b>
+      <span class="p p-bench">benchmark</span>.<sup><a href="#r27">27</a></sup> A
+      separately-surfaced DEV Community article claims <b>1.664 s</b> for what it
+      describes as the same scenario <span class="p p-bench">benchmark</span>.
+      R2 could not reconcile them and neither can this page. <b>Do not average
+      them and do not silently prefer one.</b> A 4&times; uncertainty on the exact
+      baseline an index is supposed to beat is not a rounding error.</p>
+      <p>M1 sidesteps the dispute by measuring the corpus that actually matters:
+      <span class="mono">rg -uuu</span> over the full 153.2 GB ran at
+      <b>0.65&ndash;0.71 GB/s</b> at 99&ndash;106% CPU &mdash; I/O-bound on one
+      core's worth of work, reading bytes nobody wants indexed
+      <span class="p p-measured">measured</span>.<sup><a href="#r1">1</a></sup></p>
+    </div>
+
+    <p>The rest of the same table: on the Linux 6.6 source tree (~75k files,
+    ~900 MB) matching <span class="mono">[A-Z]+_SUSPEND</span>, ripgrep took 0.082 s
+    against ugrep 0.301 s (3.7&times;), git grep 0.273 s (3.3&times;), GNU grep
+    0.671 s (8.2&times;), ag 0.443 s (5.4&times;) and ack 3.231 s (39.4&times;)
+    <span class="p p-bench">benchmark</span>.<sup><a href="#r27">27</a></sup> Every
+    actively-maintained tool here that supports real regex uses RE2 or an
+    RE2-equivalent linear-time engine &mdash; csearch, zoekt, livegrep &mdash;
+    specifically to avoid backtracking blowup in the verify pass. The Rust
+    <span class="mono">regex</span> crate is the same guarantee, so that choice is
+    validated prior art rather than a convenience default.</p>
+
+    <div class="box gap">
+      <span class="label">Two holes in the record, and one absence that is a finding</span>
+      <p><b>plocate publishes no build time or build throughput</b> &mdash; not in
+      the man pages, not on the project page <span class="p p-none">unknown</span>.
+      Build time on a 1M-file corpus is a first-order design constraint and the
+      number does not exist publicly.</p>
+      <p><b>No rigorous fd/fzf-at-1M-files benchmark exists</b>
+      <span class="p p-none">unknown</span>. The unindexed walk-time tools publish
+      nothing because their pitch is that a warm-cache walk on NVMe is fast enough
+      not to need an index &mdash; which is exactly the claim an index exists to
+      falsify. M1 measured it directly: <span class="mono">find</span> over 578k
+      files, warm, is <b>1.24 s</b> <span class="p p-measured">measured</span>. The
+      claim holds.</p>
+      <p><b>No new plocate- or zoekt-class Rust project exists.</b> The
+      trigram-index-for-code-search space has had one dominant living
+      implementation (zoekt) for years and the filename-index space has one
+      (plocate). Either the problem is hard to get right, or it is an opening.</p>
+    </div>
+    <h2 id="s4">macOS</h2>
+
+    <p>macOS is the platform where the most is known about the <em>architecture</em>
+    and the least about the <em>format</em>. Spotlight is a pipeline, not a daemon:
+    <span class="mono">mds</span> owns the store and schedules work,
+    <span class="mono">mdworker</span> processes do per-file extraction in parallel
+    and sandboxed (so a hung importer on one file type does not block the pipeline),
+    and <span class="mono">mdimporter</span> bundles &mdash; under
+    <span class="mono">/System/Library/Spotlight/</span>,
+    <span class="mono">/Library/Spotlight/</span>, or inside any app bundle at
+    <span class="mono">Contents/Library/Spotlight/</span> &mdash; parse one or more
+    UTIs and return a dictionary of <span class="mono">kMDItem*</span> attributes
+    plus extracted text.<sup><a href="#r31">31</a></sup></p>
+
+    <p><b>Metadata and content are one attribute space.</b> An importer returns a
+    single dictionary mixing filesystem attributes (owner, size, kind) with
+    content-derived fields (document text, EXIF, ID3), and Spotlight indexes all of
+    it through the same pipeline. That is why an
+    <span class="mono">mdfind</span>/<span class="mono">NSMetadataQuery</span>
+    predicate can mix <span class="mono">kMDItemKind == 'PDF'</span> with
+    <span class="mono">kMDItemTextContent == '*foo*'</span> in one expression. It
+    is the single most copyable idea in the platform, and its inverse &mdash;
+    building a metadata database and a full-text index that cannot be joined in one
+    query &mdash; is the mistake it avoids.</p>
+
+    <h3 id="s4a">FSEvents: the durable change log</h3>
+
+    <p>Spotlight does not poll. <span class="mono">fseventsd</span> consumes the
+    kernel's <span class="mono">/dev/fsevents</span> and persists a rolling
+    per-volume log &mdash; <span class="mono">/System/Volumes/Data/.fseventsd/</span>
+    since Big Sur, <span class="mono">/.fseventsd</span> before it &mdash; in a
+    proprietary gzip-compressed binary format Apple has never
+    published.<sup><a href="#r34">34</a></sup> Two properties separate it from
+    anything Linux offers:</p>
+    <ul>
+      <li><b>Directory granularity, not file granularity.</b> An event says
+      &ldquo;something changed under this directory&rdquo; with flags and a
+      monotonically increasing global event ID; the consumer must
+      <span class="mono">stat</span>/<span class="mono">readdir</span> to find out
+      what. inotify and fanotify report the specific path inline. FSEvents trades
+      precision for coalescing &mdash; a burst of writes to one file collapses to
+      one notification.</li>
+      <li><b>It is durable and replayable.</b> A consumer that was not running can
+      resume from its last known event ID. <b>inotify cannot do this at all</b>: it
+      has no persistent log, and a watcher that is not running misses events
+      entirely. fanotify has no built-in durable log either.</li>
+    </ul>
+    <p>A Linux indexer that wants &ldquo;catch up from where I left off, even after
+    a crash, without a full rescan&rdquo; has to build something FSEvents-shaped
+    itself. That is real work the platform will not do for you.</p>
+
+    <div class="box gap">
+      <span class="label">What is genuinely not public about the store</span>
+      <p><b>Apple has never published Spotlight's on-disk format.</b> Everything
+      known comes from digital-forensics reverse engineering, principally Yogesh
+      Khatri's <span class="mono">spotlight_parser</span>, with derivative tooling
+      in <span class="mono">mac_apt</span> and plaso.<sup><a href="#r32">32</a></sup>
+      What that establishes: locations
+      (<span class="mono">/.Spotlight-V100/Store-V2/&lt;UUID&gt;/</span> per volume;
+      <span class="mono">~/Library/Metadata/CoreSpotlight/index.spotlightV3/</span>
+      per user since High Sierra, when Apple consolidated Safari history, Notes,
+      Mail metadata and Maps into it), record framing, category and property
+      enumeration, per-value type tags, and forensically interesting attributes
+      &mdash; last-opened timestamps and open counts that exist in no other
+      artefact.</p>
+      <p>What it does <b>not</b> establish, and what this page will therefore not
+      claim: <b>the posting-list encoding, the term dictionary structure, or any
+      compression scheme</b> <span class="p p-none">unknown</span>. The
+      <span class="mono">live.N.M</span> files in the store directory look like
+      write-ahead journals and their commit semantics are inferred from filenames
+      and DFIR chatter, not from a spec <span class="p p-none">unknown</span>.
+      Khatri's blog promised a follow-up format post that R3 could not find. The
+      closest thing to a public specification is
+      <span class="mono">spotlight_parser.py</span> itself.</p>
+      <p>Sources routinely call the store &ldquo;an inverted index&rdquo; as settled
+      fact; the only primary-ish evidence documents records, categories and
+      properties without ever confirming that term. Treat it as the consensus
+      description, not a structural fact.</p>
+    </div>
+
+    <h3 id="s4b">The query grammar, and the industry it created</h3>
+
+    <p>Apple's own predicate-comparison reference is the best primary source on
+    what the language cannot do.<sup><a href="#r33">33</a></sup> Comparisons must be
+    <span class="mono">KEY operator VALUE</span> and never reversed; substring match
+    is written <span class="mono">myAttribute == '*foo*'</span> (glob wildcards, not
+    LIKE or regex); case and diacritic sensitivity are trailing modifier letters on
+    the literal (<span class="mono">'foo'cd</span>). And then:
+    <b>no regex, and no phrase or proximity operator</b>, twenty-plus years in
+    <span class="p p-doc">upstream</span>. Multi-word literals are matched as a
+    substring pattern, not as an adjacent-phrase query.</p>
+
+    <p>That gap is the entire business model of the third-party market:</p>
+    <ul>
+      <li><b>HoudahSpot</b> maintains no index at all. It is a query builder,
+      saved-search templates, and hundreds of result columns drawn from the
+      <span class="mono">kMDItem*</span> space that the stock UI never exposes. It
+      inherits every Spotlight limit verbatim &mdash; a paid product that is proof
+      a well-specified, attribute-rich query capability is valuable independent of
+      any UI, and equally proof a good front-end cannot fix a thin engine.</li>
+      <li><b>Alfred</b> queries Spotlight directly. <b>Raycast</b> is the hybrid:
+      its own local filename/metadata index (structure unpublished
+      <span class="p p-none">unknown</span>), but its own manual states content
+      search falls back to the OS index and is disabled wherever Spotlight is not
+      covering a folder.</li>
+      <li><b>DEVONthink</b> is the most architecturally distinct: it does not search
+      the live filesystem in normal use, it <em>imports</em> documents into its own
+      store. Its differentiators are IR concepts surfaced in the UI &mdash;
+      Concordance (a browsable word-frequency view over a document or the whole
+      database), Classify (find the statistical pattern distinguishing a group from
+      its siblings, then place new documents), and See Also (similarity retrieval
+      over the whole database rather than a typed query). <b>The algorithm has never
+      been published</b> <span class="p p-none">unknown</span> &mdash; TF-IDF vector
+      similarity, Bayesian, something else, unknown. Community threads exist
+      precisely because power users are reverse-engineering it from the
+      outside.<sup><a href="#r36">36</a></sup></li>
+      <li><b>Foxtrot Professional Search</b> is the existence proof that matters:
+      an independent full-text index built by a small team, with <b>Boolean,
+      wildcards, term exclusion, a drag-adjustable word-distance proximity slider,
+      and real regex</b>, covering local disks, externals and network volumes
+      Spotlight covers badly, and partitioned <b>per project</b> rather than per
+      volume.<sup><a href="#r35">35</a></sup> Its index format is not published
+      <span class="p p-none">unknown</span>. It settles the question of whether
+      Spotlight's grammar is a platform ceiling: it is not, it is a decision.</li>
+      <li><b>Find Any File</b> and <b>EasyFind</b> take the opposite bet entirely:
+      no index, scan on every query. Find Any File's selling point is a
+      <em>guarantee</em> of completeness &mdash; it cannot miss a file to stale
+      index state, corruption, or an excluded location. EasyFind adds regex on names,
+      live content search, and looks inside <span class="mono">.app</span> bundles
+      Spotlight treats as opaque. Their sustained popularity is direct evidence that
+      a meaningful fraction of Mac power users <b>do not trust the built-in index to
+      be complete</b>.</li>
+    </ul>
+
+    <h3 id="s4c">What goes wrong, and what it argues for</h3>
+
+    <p>Spotlight's failure list rhymes exactly with Baloo's and Beagle's.
+    <span class="mono">mds</span>/<span class="mono">mds_stores</span>/<span class="mono">mdworker</span>
+    runaway CPU is a decades-long recurring complaint, usually triggered by a bad
+    importer, a large untracked change set, or index corruption. There is <b>no
+    proactive corruption detection and no &ldquo;your index is stale&rdquo;
+    signal</b>: users notice symptoms, then run
+    <span class="mono">mdutil -i off</span>, delete
+    <span class="mono">.Spotlight-V100</span>, <span class="mono">mdutil -i on</span>,
+    <span class="mono">mdutil -E</span> &mdash; an all-or-nothing rebuild with no
+    incremental-repair path exposed. Sonoma-era regressions sustained threads on
+    Apple's own developer forums, and Eclectic Light was still publishing systematic
+    &ldquo;quirks of Spotlight&rdquo; investigations in September
+    2025.<sup><a href="#r31">31</a></sup></p>
+
+    <p>The importer plugin model has the security cost that goes with ambient trust:
+    <span class="mono">mdimporter</span> bundles auto-load from app bundles and run
+    against attacker-controlled bytes, which has made them a documented macOS
+    persistence technique and, in 2025, the vector for the &ldquo;Sploitlight&rdquo;
+    TCC bypass. <b>A stable public extractor plugin API is the right idea and
+    ambient trust for its plugins is the wrong implementation</b> &mdash; treat
+    &ldquo;parses attacker-controlled bytes&rdquo; as the threat model for every
+    format plugin from day one.</p>
+
+    <p>Three further constraints transfer as negatives worth designing against.
+    <b>Index scope is coupled to volume boundaries</b> &mdash; indexing is
+    essentially per-volume on/off, which is precisely why Foxtrot's per-project
+    partitioning is a feature users pay for; design indices as user-scoped
+    collections of paths, not as a property of which disk a file is on.
+    <b>Network volume coverage is inconsistent</b> and often disabled by default,
+    which is the gap the direct-scan tools fill. And <b>index health is hidden</b>
+    &mdash; expose freshness as a first-class checkable state and support
+    incremental repair rather than nuke-and-rebuild.</p>
+    <h2 id="s5">Windows</h2>
+
+    <p>Windows holds both the best engineering in the survey and its worst
+    cautionary tale, and they are the same problem solved at opposite ends.</p>
+
+    <h3 id="s5a">Everything: MFT plus USN</h3>
+
+    <p>Everything's entire speed advantage is a refusal to use
+    <span class="mono">FindFirstFile</span>/<span class="mono">FindNextFile</span>
+    at all.<sup><a href="#r38">38</a></sup></p>
+
+    <ol>
+      <li><b>Initial build:</b> open the raw volume
+      (<span class="mono">\\.\C:</span>) and read the <b>Master File Table</b> in
+      one sequential pass. The MFT is the record NTFS already maintains &mdash; one
+      entry per file or directory, with name, parent reference, size, timestamps
+      &mdash; so first-index time is proportional to MFT size rather than to the
+      number of <span class="mono">FindNextFile</span> round-trips a crawl needs.</li>
+      <li><b>Ongoing:</b> stop reading the MFT and poll the <b>USN change
+      journal</b> &mdash; NTFS's append-only log of every create, delete, rename and
+      attribute change &mdash; roughly once a second, applying deltas to the
+      in-memory index. The journal is a capped circular log; if the service has been
+      off long enough that it has wrapped past the last read position, the fallback
+      is a fresh MFT re-read for that volume (inferred from how USN journals behave,
+      not documented by voidtools <span class="p p-none">unknown</span>).</li>
+      <li><b>Privilege:</b> both raw volume handles and USN reads need elevation.
+      voidtools' answer is the Everything Service &mdash; installed once, it holds
+      the elevated handle persistently, and the ordinary non-admin client talks to
+      the service. <b>Privilege separation as a product feature</b>, and directly
+      transferable.</li>
+      <li><b>Non-NTFS</b> volumes &mdash; FAT, exFAT, network shares, optical
+      &mdash; have no MFT and no journal, so Everything falls back to conventional
+      folder indexing: an ordinary recursive scan that cannot track changes made
+      while it was not watching. voidtools' own docs separate &ldquo;NTFS
+      index&rdquo;, &ldquo;ReFS index&rdquo;, &ldquo;Folder index&rdquo; and
+      &ldquo;File List&rdquo; as distinct types
+      <span class="p p-doc">upstream</span>. ReFS is first-class at the
+      &ldquo;it works&rdquo; level; the mechanism is not published.</li>
+    </ol>
+
+    <div class="box key">
+      <span class="label">The honest verdict on matching it</span>
+      <p><b>The mechanism cannot be matched on Linux; the outcome at the target
+      scale probably can.</b> There is no cross-filesystem MFT. ext4, XFS, Btrfs and
+      ZFS each keep inode metadata in incompatible on-disk formats and none exposes
+      a supported bulk &ldquo;give me every inode&rsquo;s metadata in one read&rdquo;
+      interface. Reading them directly means <b>one bespoke, format-version-sensitive
+      reader per filesystem</b> instead of one MFT reader that covers essentially
+      every Windows disk &mdash; which is almost certainly why nothing plays this
+      trick on Linux. Btrfs's <span class="mono">subvolume find-new</span> and
+      generation numbers are the nearest analogue and are neither general nor
+      always-on.</p>
+      <p>For the change-tracking half, <b>fanotify with
+      <span class="mono">FAN_MARK_FILESYSTEM</span></b> watches a whole mounted
+      filesystem without one watch descriptor per directory (inotify's classic
+      scaling wall). It differs from USN in two ways that matter: it is a live
+      stream with <b>no persistent backing log</b> &mdash; if the daemon is not
+      running, or an event is dropped under buffer pressure, that change is gone
+      &mdash; and the filesystem-wide mark needs
+      <span class="mono">CAP_SYS_ADMIN</span>.</p>
+      <p>And the scale argument settles it. At ~1M files even a walk that is one to
+      two orders of magnitude slower per entry than an MFT read is seconds of
+      wall-clock, not minutes; the two designs only diverge sharply at NTFS's home
+      scale of tens of millions of files. <b>M1 measured the Linux side directly:
+      578,200 files enumerated in 1.24 s warm</b>
+      <span class="p p-measured">measured</span>.<sup><a href="#r1">1</a></sup>
+      Everything's cold-start is not the bar; the actual corpus size is.</p>
+    </div>
+
+    <p>Two things about Everything are <b>not</b> known and should not be asserted.
+    Its in-memory name structure is closed-source, no credible reverse-engineering
+    writeup exists, and any claim of a trie, suffix array or sorted string table is
+    speculation <span class="p p-none">unknown</span>. And <b>which regex engine
+    backs its <span class="mono">regex:</span> function is unpublished</b>
+    <span class="p p-none">unknown</span> &mdash; the syntax surface discussed on
+    its forums (named groups, lookaheads, <span class="mono">(?m)</span>, a
+    <span class="mono">multiline:</span> modifier) is consistent with a PCRE-family
+    engine, which is an inference, not a fact.<sup><a href="#r39">39</a></sup></p>
+
+    <p>What <em>is</em> worth reverse-specifying is the query micro-language:
+    <span class="mono">size:</span> with ranges and a
+    <span class="mono">metric:</span> variant, <span class="mono">dm:</span> and
+    sibling date functions (<span class="mono">dm:today</span>,
+    <span class="mono">dm:april</span>), <span class="mono">content:</span>
+    combinable with <span class="mono">regex:</span>,
+    <span class="mono">ext:</span> <span class="mono">type:</span>
+    <span class="mono">folder:</span> <span class="mono">file:</span>
+    <span class="mono">empty:</span> <span class="mono">dupe:</span>
+    <span class="mono">attrib:</span> <span class="mono">parent:</span>
+    <span class="mono">child:</span> <span class="mono">sizerank:</span>, booleans
+    with parenthesised grouping, and glob wildcards distinct from and combinable
+    with regex &mdash; all evaluated live as the user types.<sup><a href="#r64">64</a></sup>
+    None of those primitives require anything NTFS-specific.</p>
+
+    <div class="box warn">
+      <span class="label">The anti-pattern inside the best design</span>
+      <p>Everything's index efficiency story is &ldquo;small enough to hold entirely
+      in RAM&rdquo;, not &ldquo;compact on disk&rdquo;: no compression, no B-tree
+      overhead, because the structure is one process's heap. ~100 MB RAM per 1M
+      files <span class="p p-community">anecdote</span> (independent threads span
+      75&ndash;200 MB, higher during active indexing, and <b>no vendor number
+      exists</b> <span class="p p-none">unknown</span>), with ~45 MB per million
+      persisted <span class="p p-community">anecdote</span>. At 5M files that is
+      ~500 MB resident for filenames alone. <b>It never had to solve the on-disk
+      density problem because it never put the index on disk in a compact form.</b>
+      Study the update mechanism; do not copy the index model.</p>
+    </div>
+
+    <h3 id="s5b">Windows Search and <span class="mono">Windows.edb</span></h3>
+
+    <p>Windows Search decomposes into <span class="mono">SearchIndexer.exe</span>
+    (owns the ESE database and the queue, exposes the OLE DB provider,
+    <span class="mono">ISearchQueryHelper</span> and the
+    <span class="mono">search-ms:</span> protocol),
+    <span class="mono">SearchProtocolHost.exe</span> (hosts protocol handlers that
+    enumerate a namespace), and <span class="mono">SearchFilterHost.exe</span>
+    &mdash; which runs IFilters and property handlers <b>as a separate,
+    low-integrity, sandboxed process specifically because parsing arbitrary
+    untrusted file formats is the highest-risk code in the
+    pipeline</b>.<sup><a href="#r41">41</a></sup> That isolation decision is the one
+    unambiguously right call in the design and maps directly onto Linux, where
+    poppler and LibreOffice's filters are exactly the code you do not want inside a
+    privileged daemon.</p>
+
+    <p>An IFilter emits chunks of extracted text <em>with position information</em>
+    (so phrase and proximity queries are possible) plus chunks of property values;
+    the indexer word-breaks and normalizes before insertion. Property handlers cover
+    structured metadata independently. The gathering tables
+    (<span class="mono">SystemIndex_Gthr</span>,
+    <span class="mono">SystemIndex_GthrPth</span>) hold the work queue, which is how
+    a bulk copy or a resumed-after-sleep indexer catches up incrementally.</p>
+
+    <p>On disk it is a single <b>ESE (JET Blue)</b> file &mdash; a B-tree ISAM
+    engine, the same one behind <span class="mono">NTDS.dit</span> and historically
+    Exchange &mdash; at
+    <span class="mono">C:\ProgramData\Microsoft\Search\Data\Applications\Windows\Windows.edb</span>.
+    Microsoft does not document the internal table layout as a stable contract, so
+    the best available source is forensic literature parsing the file directly. What
+    that literature describes is structurally interesting: rather than a separate
+    inverted-index table distinct from a documents table,
+    <span class="mono">SystemIndex_PropertyStore</span> carries <b>both structured
+    properties and extracted content</b> &mdash; including
+    <span class="mono">System_Search_AutoSummary</span>, a text snippet of the file
+    &mdash; with the word-level index encoded inside ESE's own structures rather
+    than any obviously named table.<sup><a href="#r42">42</a></sup></p>
+
+    <p>And that is the whole size problem. Microsoft's own KB is titled
+    &ldquo;The Windows.edb file grows very large&rdquo; and describes cases
+    exceeding <b>50 GB</b> <span class="p p-doc">upstream</span>; community reports
+    include <b>107 GiB on a 278 GiB drive</b> and <b>92 GB on a 500 GB drive</b>
+    <span class="p p-community">anecdote</span>, roughly 20&ndash;35% of source
+    volume.<sup><a href="#r40">40</a></sup> <b>Microsoft publishes no expected
+    ratio</b> <span class="p p-none">unknown</span>; the guidance is &ldquo;exclude
+    the offending locations and rebuild&rdquo;. The cited root causes are unbounded
+    per-item content snippets and <b>whole-file reindexing of continuously appended
+    logs</b>, so the property store accumulates re-extracted text over a file's
+    lifetime rather than a bounded per-file cost. This is accidental bloat, not a
+    chosen tradeoff &mdash; it is larger than dtSearch's worst published ratio for a
+    system with no reputation for being fast either.</p>
+
+    <p>AQS supports property-scoped queries, uppercase-only boolean operators (the
+    one case-sensitive part of an otherwise case-insensitive grammar), quoted exact
+    phrases, and stem-based prefix behaviour rather than true globs. <b>No native
+    regex</b> <span class="p p-doc">upstream</span>, and no proximity operator found
+    in first-party documentation &mdash; R4 records that as
+    &ldquo;not found&rdquo; rather than &ldquo;does not exist&rdquo;
+    <span class="p p-none">unknown</span>.<sup><a href="#r43">43</a></sup> Its
+    fourth failure mode is worth naming because it is a design choice, not a bug:
+    a file outside an indexed location, or one whose IFilter is not registered,
+    <b>simply does not appear in results, with no slow-scan fallback</b> of the kind
+    Everything or grep would give.</p>
+
+    <h3 id="s5c">dtSearch and the rest</h3>
+
+    <p><b>dtSearch is the only vendor in the entire survey publishing a defensible
+    index-size ratio</b>: &ldquo;generally about 1/8 to 1/3 the size of the original
+    documents&rdquo;, trending toward <b>~15%</b> on large collections
+    <span class="p p-vendor">vendor</span>.<sup><a href="#r44">44</a></sup> It is a
+    licensable engine, not just an app &mdash; it sits inside legal and eDiscovery
+    platforms such as Relativity &mdash; with native regex behind a
+    <span class="mono">##</span> prefix, combinable with fuzzy, stemming and
+    <span class="mono">w/n</span> proximity in the same
+    query.<sup><a href="#r45">45</a></sup> No independent latency numbers were found
+    <span class="p p-none">unknown</span>, but 15% at multi-GB-to-TB scale, in a
+    market that would notice if queries were slow, is the single best external
+    figure to check a density claim against.</p>
+
+    <p><b>FileLocator Pro / Agent Ransack</b> contributes one structural idea worth
+    more than its market share: two explicit modes, Lite scanning live with zero
+    index, Pro maintaining one with real-time update &mdash; and regex offered
+    <b>independently on the filename box and the content box</b> in the same query,
+    which almost nothing else does.<sup><a href="#r46">46</a></sup> X1, Copernic and
+    Lookeen differentiate on breadth of connected sources (Outlook, Exchange, PST
+    federation) rather than query power and publish no index figures
+    <span class="p p-none">unknown</span>.</p>
+    <h2 id="s6">Engines and formats</h2>
+
+    <p>Every long-lived tool above is a client of one of five formats. This section
+    is the ledger of what each format chose and what the choice cost, ranked on
+    bytes rather than QPS. The consistent finding across all of them is stated
+    first because it determines how the whole table reads.</p>
+
+    <div class="box key">
+      <span class="label">The distinction the field blurs</span>
+      <p><b>Regex over the term dictionary</b> walks the vocabulary &mdash; the
+      sorted or FST-encoded list of distinct terms &mdash; with a compiled
+      automaton and turns matching terms into an OR of exact-term postings lookups.
+      It is fast, proportional to vocabulary size rather than corpus size, and it
+      is what Tantivy's <span class="mono">RegexQuery</span>, Lucene's
+      <span class="mono">RegexpQuery</span>, Bleve's, Elasticsearch's
+      <span class="mono">regexp</span>, and Baloo's
+      <span class="mono">regexpIter</span> all do. It <b>only ever matches whole
+      tokens as the tokenizer produced them</b>: no cross-token spans, no matching
+      inside a word the analyzer split differently, nothing the analyzer stripped.</p>
+      <p><b>Regex over document content</b> inspects the original byte stream, as
+      grep does. <b>None of the classic inverted-index engines do this natively.</b>
+      The one format-level answer in the entire survey is the trigram-shortlist
+      pattern &mdash; index every overlapping 3-gram, intersect trigram postings to
+      shortlist candidate documents, then run a real regex engine over the
+      survivors. SQLite FTS5's <span class="mono">trigram</span> tokenizer is the
+      only mainstream engine that ships the shortlist half; csearch, zoekt and
+      livegrep are the tools that built the whole thing.</p>
+      <p>A tool advertising &ldquo;regex search&rdquo; that means only the first
+      kind will silently fail on patterns spanning tokenizer boundaries, case
+      folding, or stemmed forms. <b>True content regex is not a term-dictionary
+      feature at all</b> &mdash; it is a separate n-gram shortlist stage in front of
+      a real regex engine, and every mainstream engine treats it as an afterthought
+      or omits it.</p>
+    </div>
+
+    <div class="tw">
+    <table>
+      <caption>The five formats that matter, plus the ones commonly mistaken for them</caption>
+      <thead>
+        <tr>
+          <th scope="col">Engine</th>
+          <th scope="col">Licence</th>
+          <th scope="col">Term dictionary</th>
+          <th scope="col">Postings codec</th>
+          <th scope="col">Regex kind</th>
+          <th scope="col">Published size figure</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Apache Lucene</th>
+          <td class="mono">Apache-2.0</td>
+          <td><b>Block tree</b>: per-field FST in <span class="mono">.tip</span> maps term prefixes to blocks of 25&ndash;48 terms in <span class="mono">.tim</span>, scanned linearly. The FST only disambiguates to block granularity, not to individual terms &mdash; a deliberate density-for-lookup-work trade</td>
+          <td><span class="mono">.doc</span>/<span class="mono">.pos</span>/<span class="mono">.pay</span>: 128-integer FOR-style packed blocks, per-block bit width, VInt tail. Skip entries every 128 docs carry <b>competitive impact deltas</b> for block-max WAND<sup><a href="#r28">28</a></sup></td>
+          <td>dictionary</td>
+          <td>0.5&ndash;2&times; generic <span class="p p-community">anecdote</span>; 0.3&ndash;1&times;+ with positions and stored source in the ES framing <span class="p p-vendor">vendor</span></td>
+        </tr>
+        <tr>
+          <th scope="row">Tantivy</th>
+          <td class="mono">MIT</td>
+          <td><b>FST as the primary dictionary</b> (<span class="mono">tantivy-fst</span>): term &rarr; TermOrdinal, then a term-info store to file pointers. Same family as Lucene, different commitment &mdash; FST all the way to the term<sup><a href="#r47">47</a></sup></td>
+          <td>128-doc blocks, delta-encoded then bitpacked doc IDs at uniform per-block width; bitpacked freqs; positions stored separately. Fast fields are the columnar side-store (Lucene's DocValues)</td>
+          <td>dictionary, via <span class="mono">regex-automata</span> over the FST</td>
+          <td><span class="p p-none">unknown</span> &mdash; no upstream ratio published; community reports ~1.1&ndash;1.4&times; of Lucene's <span class="p p-community">anecdote</span></td>
+        </tr>
+        <tr>
+          <th scope="row">Xapian (Glass)</th>
+          <td class="mono">GPLv2+</td>
+          <td><b>Sorted B-tree, not an FST.</b> Lookups are B-tree seeks. This is exactly why the query language has prefix wildcards and no general regex &mdash; a B-tree gives cheap prefix range scans, not efficient automaton intersection<sup><a href="#r49">49</a></sup></td>
+          <td>Compressed posting lists inside the postlist B-tree, fixed 8 KB blocks, own varint-ish scheme. No spec as legible as Lucene's javadocs; the source is the truth</td>
+          <td>none (wildcard only)</td>
+          <td>Recoll's 0.04&times; on a PDF corpus <span class="p p-doc">upstream</span>; nothing central published <span class="p p-none">unknown</span></td>
+        </tr>
+        <tr>
+          <th scope="row">SQLite FTS5</th>
+          <td class="mono">public domain</td>
+          <td>LSM-style segment B-trees inside ordinary SQLite tables: <span class="mono">%_data</span> holds per-segment pages, <span class="mono">%_idx</span> holds (segment, term-prefix, page) triples to seek without scanning<sup><a href="#r51">51</a></sup></td>
+          <td>Doclist = varint delta-encoded rowids, each followed at <span class="mono">detail=full</span> by a position list (column number + within-column offsets, varint delta)</td>
+          <td><b>content</b>, uniquely &mdash; via the <span class="mono">trigram</span> tokenizer plus LIKE/GLOB; dictionary otherwise</td>
+          <td><b>743 / 340 / 134 MiB</b> for <span class="mono">detail=</span> <span class="mono">full</span> / <span class="mono">column</span> / <span class="mono">none</span> on one email corpus <span class="p p-community">anecdote</span></td>
+        </tr>
+        <tr>
+          <th scope="row">PISA</th>
+          <td class="mono">Apache-2.0</td>
+          <td>Not a general term dictionary &mdash; batch-built, sorted doc IDs, no incremental update <em>at all</em></td>
+          <td><b>Partitioned Elias-Fano</b>: each list split into variable-length chunks, EF-encoded, with a second EF layer over the chunk endpoints. Plus recursive graph bisection to reorder doc IDs so vocabulary-sharing documents cluster<sup><a href="#r50">50</a></sup></td>
+          <td>none</td>
+          <td>See the warning below &mdash; the absolute numbers could not be retrieved</td>
+        </tr>
+        <tr>
+          <th scope="row"><span class="mono">fst</span> + <span class="mono">regex-automata</span></th>
+          <td class="mono">MIT / Unlicense</td>
+          <td>The FST itself &mdash; a minimal acyclic FST, memory-mappable, with automaton-constrained traversal in the iteration API<sup><a href="#r48">48</a></sup></td>
+          <td>none &mdash; this is the dictionary layer only</td>
+          <td>dictionary (and Levenshtein, behind a feature flag)</td>
+          <td>n/a</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+
+    <p>The <span class="mono">fst</span> row is the important one for a from-scratch
+    build. <span class="mono">regex-automata</span> implements
+    <span class="mono">fst::Automaton</span> behind its
+    <span class="mono">transducer</span> feature, which is precisely the mechanism
+    Tantivy's <span class="mono">RegexQuery</span> and
+    <span class="mono">FuzzyTermQuery</span> are built on. <b>Dictionary regex and
+    Levenshtein fuzzy come free, as MIT-licensed pure Rust, even in a
+    written-from-scratch index</b> &mdash; which narrows the real build gap to
+    postings codec, segment management and query planning.</p>
+
+    <h3 id="s6a">Density ranking &mdash; bytes per indexed token</h3>
+
+    <p>Ranked by how small a phrase-capable index gets. <b>Do not average across
+    rows: the provenance classes differ.</b></p>
+
+    <div class="tw">
+    <table>
+      <caption>Every documented density knob in the survey, and its price</caption>
+      <thead>
+        <tr><th scope="col">Knob</th><th scope="col">What it drops</th><th scope="col">What it costs</th><th scope="col">Provenance</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">FTS5 <span class="mono">detail=none</span></th>
+          <td>Positions <em>and</em> column info; doclist is a rowid list</td>
+          <td><b>134 MiB vs 743 MiB &mdash; ~5.5&times; smaller</b>, and phrase, NEAR and column filters are gone entirely</td>
+          <td><span class="p p-community">anecdote</span> one corpus</td>
+        </tr>
+        <tr>
+          <th scope="row">FTS5 <span class="mono">detail=column</span></th>
+          <td>Offsets; keeps column</td>
+          <td><b>340 MiB &mdash; ~2.2&times; smaller than full</b>; loses phrase and NEAR, same-column existence only</td>
+          <td><span class="p p-community">anecdote</span></td>
+        </tr>
+        <tr>
+          <th scope="row">FTS5 <span class="mono">detail=full</span></th>
+          <td>nothing</td>
+          <td>743 MiB baseline &mdash; the tier phrase search actually requires</td>
+          <td><span class="p p-community">anecdote</span></td>
+        </tr>
+        <tr>
+          <th scope="row">Lucene / Tantivy positions off</th>
+          <td><span class="mono">DOCS_AND_FREQS</span> instead of <span class="mono">..._AND_POSITIONS</span>; Tantivy's per-field <span class="mono">IndexRecordOption</span></td>
+          <td>Same shape of tradeoff as FTS5's knob. <b>Nobody published the bytes-per-token delta</b> the way SQLite's docs incidentally did</td>
+          <td><span class="p p-none">unknown</span></td>
+        </tr>
+        <tr>
+          <th scope="row">Lucene <span class="mono">match_only_text</span></th>
+          <td>Term frequency, positions and norms &mdash; only term-per-doc occurrence survives</td>
+          <td><b>~10% disk on logging datasets</b> <span class="p p-vendor">vendor</span>. Term queries unchanged; phrase queries fall back to loading <span class="mono">_source</span> (or synthetic source) and re-verifying by re-scanning the text</td>
+          <td><span class="p p-vendor">vendor</span></td>
+        </tr>
+        <tr>
+          <th scope="row">Doc-values / fast fields</th>
+          <td>The field's postings list entirely &mdash; it moves to a dense columnar array keyed by internal doc ID</td>
+          <td>Not a ratio, a <em>removal</em>. No term-level search on that field, only exact and range lookup. Directly applicable to path, mtime, size, extension</td>
+          <td>architectural</td>
+        </tr>
+        <tr>
+          <th scope="row">Partitioned Elias-Fano (PISA)</th>
+          <td>Nothing functional &mdash; a better codec at the same capability</td>
+          <td>Clustered EF is <b>24% smaller than OptPFD on Gov2, 14.5% on ClueWeb09</b>, and up to <b>11% / 6.25% smaller than plain partitioned EF</b> on the same collections</td>
+          <td><span class="p p-paper">paper</span> &mdash; via a follow-on paper's abstract, not the primary table</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+
+    <p><b>Read together, every format in this survey that documents a density knob
+    documents the same knob: drop positions, keep doc membership, and give up
+    phrase.</b> Which makes the useful question not &ldquo;positions or not&rdquo;
+    globally but <em>which fields need positions</em> &mdash; body text does, path
+    and metadata do not. Lucene and Tantivy allow that per field; <b>FTS5's
+    <span class="mono">detail=</span> is one setting for a whole virtual table</b>,
+    not per column, which is the clearest thing in the survey to do differently.</p>
+
+    <p>The second transferable codec observation, from PISA: global compression
+    parameters leave real bytes on the table versus schemes that vary parameters
+    <em>within</em> a single postings list. Lucene and Tantivy already do this at
+    the FOR level with per-128-doc-block bit widths; Partitioned Elias-Fano is the
+    same idea taken further, varying the chunk size itself rather than only the
+    width within a fixed chunk. And Lucene's impact/competitive-score skip data is
+    the one item here that is <b>not on the tradeoff curve at all</b> &mdash; a few
+    extra bytes per skip entry, negligible against the postings, in exchange for
+    skipping whole blocks that provably cannot enter the top-k. Worth keeping even
+    in a design that prefers density.</p>
+
+    <div class="box gap">
+      <span class="label">Three engine figures that do not exist</span>
+      <p><b>Tantivy publishes no index-size ratio</b>
+      <span class="p p-none">unknown</span>. Every figure R5 found was anecdotal or
+      absent. Its indexing throughput is similarly community-sourced: ~300 GB/hour
+      on English Wikipedia (5M docs / 8 GB) with 4 threads on &ldquo;an outdated
+      desktop&rdquo; <span class="p p-community">anecdote</span>, and a maintainer
+      claim of ~40% throughput improvement in 0.22 on a GitHub-issues dataset
+      <span class="p p-vendor">vendor</span>. Directional, not a spec.</p>
+      <p><b>PISA's absolute bits-per-posting numbers could not be retrieved.</b> The
+      SIGIR'14 PDF fetch failed on an SSL error and only relative percentages from a
+      secondary paper's abstract came back. R5 calls this the most important
+      unfilled gap in its own file. Everything quoted above is a <em>ratio between
+      codecs</em>, never an absolute density.</p>
+      <p><b>Xapian publishes no central size or throughput figures</b>
+      <span class="p p-none">unknown</span> beyond Recoll's corpus-specific 4%.</p>
+    </div>
+
+    <p>One licence note, because it decides whether a design is readable intel or
+    vendorable code. <b>Permissive and vendorable:</b> Tantivy,
+    <span class="mono">fst</span>, Lucene, PISA, SQLite/FTS5, Bleve, Pagefind.
+    <b>LGPL, linkable with obligations:</b> Groonga &mdash; a genuine dark horse
+    with an n-gram lexicon mode that reaches toward content matching, but the same
+    FFI concern as Xapian. <b>Design-only, not vendorable:</b> Xapian (GPLv2+),
+    Quickwit / Lnx / Nucliadb (AGPL), Manticore and Typesense (GPLv3), SurrealDB
+    (BUSL), Elasticsearch (SSPL / Elastic). The pattern is clean and worth stating
+    plainly: <b>the two designs every long-lived tool converges on split down the
+    licence axis</b> &mdash; Lucene and its Rust successor Tantivy are Apache-2.0
+    and MIT, freely referenceable at the code level; Xapian and Recoll on top of it
+    are GPL, freely readable as design and off-limits as code.</p>
+
+    <p>Finally, the shapes that look like candidates and are not. Quickwit, Lnx,
+    Toshi and Nucliadb are all Tantivy wrapped in server machinery and change none
+    of the codec facts. Meilisearch is Rust and still wrong: it is architecturally a
+    standalone LMDB-backed process with its own HTTP API and lifecycle, tuned for
+    typo-tolerant UX search rather than boolean and regex power. Typesense wants the
+    whole index resident. Whoosh has been unmaintained since roughly 2016 (Woosh is
+    the 2023+ community fork) and is a trap chosen for &ldquo;it's pure Python&rdquo;
+    reasons. Sonic is an autocomplete store with no BM25 and no phrase queries.
+    DuckDB's FTS is SQL macros over columnar tables, a convenience layer rather than
+    a tuned engine.</p>
+    <h2 id="s7">The dense-index dissent</h2>
+
+    <p>One family of systems looked at the inverted index and declined it. Their
+    reasoning is worth taking seriously on its own terms, because they are the only
+    working systems in the survey that deliberately bought a <em>small</em> index
+    rather than a <em>fast</em> one &mdash; and because two of them are converging
+    back the other way.</p>
+
+    <div class="tw">
+    <table>
+      <caption>Log and columnar stores, ranked by index size against raw data</caption>
+      <thead>
+        <tr>
+          <th scope="col">System</th>
+          <th scope="col">Index model</th>
+          <th scope="col">Index vs raw</th>
+          <th scope="col">Latency</th>
+          <th scope="col">Content regex</th>
+          <th scope="col">Licence</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">Grafana Loki</th>
+          <td>Labels only. TSDB index of label sets &rarr; chunk refs; <b>the log body is not indexed at all</b>. Chunks are gzip/zstd/snappy blobs. Per-chunk bloom filters added 2024+, still experimental<sup><a href="#r56">56</a></sup></td>
+          <td><div class="bar"><span class="track"><span class="fill" style="width:2%"></span></span><span class="val">0.01&ndash;0.02&times;</span></div><span class="p p-vendor">vendor</span></td>
+          <td>seconds &mdash; brute-force decompress-and-grep of every chunk surviving label selection</td>
+          <td>Yes, <span class="mono">|~</span> RE2, entirely brute force</td>
+          <td class="mono">AGPLv3</td>
+        </tr>
+        <tr>
+          <th scope="row">VictoriaLogs</th>
+          <td>Columnar per-field blocks, ~2 MiB uncompressed (4 MiB after merge), plus one bloom filter per block per column over that block's <b>unique tokens</b>. <b>No posting lists anywhere</b><sup><a href="#r52">52</a></sup></td>
+          <td><div class="bar"><span class="track"><span class="fill" style="width:10%"></span></span><span class="val">0.03&ndash;0.10&times;</span></div><span class="p p-vendor">vendor</span> &mdash; the compressed store <em>is</em> the index</td>
+          <td>ms to low hundreds of ms, entirely dependent on block-skip rate</td>
+          <td>Yes, <span class="mono">re()</span> &mdash; <b>gets zero benefit from the bloom filter</b></td>
+          <td class="mono">Apache-2.0</td>
+        </tr>
+        <tr>
+          <th scope="row">ClickHouse</th>
+          <td>Sparse primary index, <b>one mark per 8192-row granule</b>, plus opt-in skip indexes: <span class="mono">minmax</span>, <span class="mono">set</span>, <span class="mono">ngrambf_v1</span>, <span class="mono">tokenbf_v1</span>. <b>Plus a real native inverted text index since 2026</b><sup><a href="#r57">57</a></sup><sup><a href="#r58">58</a></sup></td>
+          <td>Sparse PK &lt;&lt;1%; the new text index is comparable order to Lucene's <span class="p p-doc">upstream</span></td>
+          <td>ms vectorized scan, sub-ms on a skip-index hit</td>
+          <td><span class="mono">match()</span> works but is a per-granule linear scan after pruning, not indexed</td>
+          <td class="mono">Apache-2.0</td>
+        </tr>
+        <tr>
+          <th scope="row">Splunk</th>
+          <td><b>Hybrid.</b> Per-bucket tsidx (a lexicon plus posting-like value arrays &mdash; much closer to a classical inverted index) with a bloom filter used purely to skip <em>whole buckets</em> without touching their tsidx<sup><a href="#r59">59</a></sup></td>
+          <td>Not published precisely; <b>tsidx is commonly as large as or larger than the raw data</b> <span class="p p-vendor">vendor</span></td>
+          <td>ms warm/hot, seconds+ cold</td>
+          <td><span class="mono">| regex</span> runs against already-matched events post-search, not the index</td>
+          <td class="mono">proprietary</td>
+        </tr>
+        <tr>
+          <th scope="row">Parquet</th>
+          <td>Row groups, column chunks, per-page min/max statistics, and optionally a split-block Bloom filter per column chunk (256-bit blocks of eight 32-bit words &mdash; the only representation the spec defines)<sup><a href="#r61">61</a></sup></td>
+          <td>Bloom overhead only &mdash; <b>no inverted index at all</b></td>
+          <td>scan-dominated, ms to seconds by row-group pruning</td>
+          <td>None native; entirely a query-engine concern after column decode</td>
+          <td class="mono">Apache-2.0</td>
+        </tr>
+        <tr>
+          <th scope="row">Quickwit</th>
+          <td>Full Tantivy index per immutable &ldquo;split&rdquo;, plus a tiny always-fetched <b>hotcache</b> (&lt;0.1% of split size, ~10 MB) that lets a searcher open a split from object storage by fetching only needed byte ranges &mdash; under 60 ms<sup><a href="#r63">63</a></sup></td>
+          <td>Full Tantivy size &mdash; <b>included for contrast, not as a dense design</b></td>
+          <td>tens to hundreds of ms including object-store fetch</td>
+          <td>Tantivy's dictionary regex</td>
+          <td class="mono">Apache-2.0 / AGPL</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h3 id="s7a">The arithmetic: bloom filter versus posting list</h3>
+
+    <p>VictoriaLogs sizes its bloom filters at <b>~2 bytes per unique token per
+    block-column</b> <span class="p p-doc">upstream</span> &mdash; 1,000 unique words
+    costs ~2 KB, 20,000 costs ~40 KB. That is deliberately <em>not</em> tuned to a
+    target false-positive rate; it is a flat, predictable budget, accepting a higher
+    FPR than a textbook Bloom filter at that bit budget in exchange for
+    simplicity.<sup><a href="#r52">52</a></sup> For comparison, the standard results:
+    a classical Bloom filter needs ~9.6 bits/element at 1% FPR and ~14.4 at 0.1%;
+    Xor8 is ~10 bits/key at 0.39% FPR <span class="p p-doc">upstream</span>; Binary
+    Fuse8 is ~9 bits/key at 0.39% and Binary Fuse16 ~18 bits/key at 0.0015%
+    <span class="p p-paper">paper</span> &mdash; and binary fuse filters remain
+    zstd-compressible after construction, which classical Bloom filters do
+    not.<sup><a href="#r62">62</a></sup></p>
+
+    <p>The structural difference is the whole argument, and it is not about
+    compression at all. <b>A bloom-style block filter is a membership-per-block
+    structure costing O(blocks) &times; a constant, essentially independent of how
+    often the term occurs inside a block.</b> A term appearing once in a block costs
+    the same bits as a term appearing a thousand times. A posting list costs
+    O(occurrences) &times; bytes-per-posting, strictly linear. So:</p>
+    <ul>
+      <li><b>Low-frequency terms scattered across many blocks:</b> the two converge,
+      but the bloom filter never writes exact positions and wins on bytes.</li>
+      <li><b>High-frequency terms concentrated in few blocks:</b> the posting list
+      for that block is one entry plus in-block positions, while the bloom filter
+      pays its flat per-block budget regardless. Bloom filters are indifferent to
+      intra-block frequency &mdash; which is exactly why they are cheap, and exactly
+      why <b>once inside a flagged block you get zero help finding the matching
+      rows</b>.</li>
+      <li><b>At VictoriaLogs' own numbers:</b> a 2 MiB block with 20,000 unique
+      tokens costs 40 KB of bloom regardless of total occurrences, which could
+      easily be 200,000+. A positional inverted index over that same block exceeds
+      40 KB the moment average term frequency passes about 1 &mdash; i.e. always.
+      <b>The order-of-magnitude saving comes from throwing away all intra-block
+      addressing, not just positions.</b></li>
+    </ul>
+
+    <p>Execution follows from the structure. LogsQL prunes by tenant and time
+    partition (free &mdash; directory layout), prunes blocks by stream and min/max
+    timestamp from the in-RAM <span class="mono">metaindex.bin</span> and
+    <span class="mono">index.bin</span> (headers only, no decompression), tests each
+    surviving block-column's bloom filter, and decompresses and linearly scans only
+    the survivors. It is filter-pushdown-with-prefilter, the same family as
+    ClickHouse skip indexes and Parquet row-group pruning. <b>The consequence: a
+    rare term over a wide unfiltered range still touches every non-skipped block's
+    filter &mdash; O(blocks in range) &mdash; where a real inverted index jumps
+    straight to the posting list in O(log terms).</b> VictoriaLogs wins when blocks
+    are prunable and loses on needle-in-haystack with no time or stream narrowing.</p>
+
+    <div class="box warn">
+      <span class="label">Every VictoriaLogs number traces to the vendor</span>
+      <p>&ldquo;usually compresses logs by 10x or more&rdquo;
+      <span class="p p-vendor">vendor</span>; &ldquo;15&ndash;30x for typical log
+      data, up to 100x&rdquo; <span class="p p-vendor">vendor</span>, restated by a
+      third party without independent measurement; &ldquo;up to 30x less RAM, up to
+      15x less disk space&rdquo; than Elasticsearch
+      <span class="p p-vendor">vendor</span>; &ldquo;up to 1000x faster than
+      Grafana Loki&rdquo; <span class="p p-vendor">vendor</span>. The one
+      third-party benchmark R10 found &mdash; 3&times; ingestion, 72% less CPU, 87%
+      less memory, 12&times; faster search &mdash; is from a partner consultancy
+      <span class="p p-bench">benchmark</span> with methodology and independence
+      unverified.<sup><a href="#r55">55</a></sup></p>
+      <p><b>R10 found no benchmark run by a party with no commercial stake, with
+      disclosed raw data and a repeatable methodology</b>
+      <span class="p p-none">unknown</span>. Worse, the &ldquo;at least 8 bytes per
+      token&rdquo; figure attributed to Elasticsearch-style inverted indexes &mdash;
+      the denominator in VictoriaMetrics' own 4&times;-smaller claim, and therefore
+      the load-bearing number in the whole thesis &mdash; is <b>vendor-stated
+      without a cited derivation</b>.<sup><a href="#r54">54</a></sup></p>
+      <p>The 1000x-vs-Loki figure is mechanically <em>plausible</em>, which is not
+      the same as verified: Loki genuinely does zero indexing of log bodies, so any
+      query not satisfied by label selection is a full decompress-and-grep. Read it
+      as an upper bound for a rare term over a low-selectivity range, not a typical
+      case.</p>
+    </div>
+
+    <div class="box warn">
+      <span class="label">The contradiction: ClickHouse went the other way</span>
+      <p>VictoriaMetrics' materials frame &ldquo;not an inverted index&rdquo; as
+      categorically superior. ClickHouse &mdash; a comparable columnar system that
+      shipped exactly the bloom-filter-over-granules design in
+      <span class="mono">tokenbf_v1</span> and
+      <span class="mono">ngrambf_v1</span> &mdash; found that approach wanting,
+      <b>re-implemented a real native inverted text index from scratch starting
+      February 2025, reached beta in December 2025 and General Availability around
+      March 2026</b>, reporting <b>10&ndash;50&times; better query latency than the
+      bloom-filter approach and 7&ndash;10&times; faster cold queries</b>
+      <span class="p p-vendor">vendor</span>.<sup><a href="#r58">58</a></sup></p>
+      <p>Two things about it are worth noting precisely. It is a real token-based
+      inverted index, not a bloom filter. And it is <b>explicitly not a relevance
+      engine</b> &mdash; no BM25, no TF-IDF, purpose-built for filter-and-aggregate
+      over billions of rows rather than ranked retrieval. So the direction of travel
+      is not &ldquo;columnar plus bloom is always sufficient&rdquo; and it is not a
+      return to Lucene either: it is <b>&ldquo;just enough inverted index, no
+      ranking&rdquo;</b>. The observability world is bifurcating, not converging on
+      VictoriaLogs' end of the spectrum, and it is bifurcating for exactly the query
+      patterns bloom filters serve worst.</p>
+    </div>
+
+    <h3 id="s7b">What transfers, and what does not</h3>
+
+    <p>The log lineage optimises for a data shape a desktop corpus does not have:
+    <b>append-mostly, recency-skewed, discarded after a retention window, ingested
+    continuously at high volume, and queried rarely per byte stored.</b> Daily
+    partitions, hot/cold tiering, &ldquo;do not index what will probably never be
+    queried&rdquo;, accepting 100ms-plus because operators run ad hoc
+    investigations &mdash; all of it follows from that shape. A desktop corpus is
+    the mirror image: largely static, read-mostly, queried interactively and
+    <em>repeatedly against the same working set</em>, and two to four orders of
+    magnitude smaller than what these systems target.</p>
+
+    <p>Three consequences, stated bluntly rather than in deference to a design
+    worth admiring:</p>
+    <ol>
+      <li><b>The central saving has no analog.</b> The log lineage skips
+      per-occurrence structure because most of the data will age out unqueried.
+      Files do not age out, and &ldquo;search all my files&rdquo; is the common case
+      and it recurs. That removes the strongest argument for bloom-over-blocks.</li>
+      <li><b>The central cost is a worse fit here than there.</b> Block-granularity
+      results with no intra-block addressing are fine for logs, where a line is
+      already the natural unit of a hit. A 50,000-line source file is not: you want
+      line and offset results, which pushes back toward wanting <em>some</em>
+      per-occurrence structure even if it is only a block-relative offset table
+      &mdash; much smaller than full positions, but not free.</li>
+      <li><b>Regex is precisely what none of them accelerate.</b> VictoriaLogs'
+      <span class="mono">re()</span>, Loki's <span class="mono">|~</span>,
+      ClickHouse's <span class="mono">match()</span> all fall through to linear scan
+      once past coarse pruning &mdash; a regex has no fixed token set to hash, so
+      the bloom filter cannot help by construction. This is documented behaviour,
+      not a hidden gap, and it is the sharpest edge of the design for a
+      regex-oriented workload.</li>
+    </ol>
+
+    <p>What does transfer, cleanly and cheaply: <b>columnar per-field storage with
+    dictionary encoding then zstd</b> for metadata (path, extension, mtime, size,
+    mime type) &mdash; pure win, no argument for anything heavier;
+    <b>zone maps and time partitioning</b>, where the partition boundary <em>is</em>
+    the zone map and the pruning is done by directory naming before any index opens
+    &mdash; free for mtime-range and path-prefix queries, worthless for content; and
+    Quickwit's <b>hotcache</b> idea, which needs no object storage to be useful: a
+    tiny always-resident &ldquo;which byte ranges do I need&rdquo; summary in front
+    of a heavy on-disk structure is cheap regardless of whether the heavy structure
+    is dense or sparse. Pagefind's partition-by-first-letters-and-lazy-fetch is the
+    same instinct from the static-site world.</p>
+
+    <div class="box verdict">
+      <span class="label">The layering pattern is Splunk's, not VictoriaLogs'</span>
+      <p>The technique R10 concluded is most worth building in is <b>not</b>
+      bloom-filter-as-primary-index. It is Splunk's layering: <b>a cheap, flat-cost
+      bloom filter at coarse file or block granularity purely to skip whole files
+      before touching anything more expensive, sitting in front of a real
+      &mdash; but non-positional or sparsely-positional &mdash; per-file structure
+      that does the actual matching.</b> Bloom as a prefilter, not a substitute.
+      Combine it with VictoriaLogs' columnar-dictionary-then-zstd encoding for the
+      metadata columns and you get most of the density win and none of the regex or
+      addressing regressions the pure log designs carry.</p>
+      <p>And the scan-first arithmetic keeps the whole question honest. zstd level 1
+      decompresses at ~1.3&ndash;1.4 GB/s single-core, and <b>zstd decompression
+      speed is roughly independent of the compression level used to write the
+      frame</b> <span class="p p-bench">benchmark</span> &mdash; which is why
+      VictoriaLogs and ClickHouse can compress hard at write time without paying at
+      query time. LZ4 runs ~4&ndash;5 GB/s <span class="p p-bench">benchmark</span>.
+      At 1.3 GB/s, a fully decompressed 10 GB hot set costs ~7.7 s single-threaded
+      and trivially parallelises. <b>M1 already demonstrated the endpoint of that
+      argument on real data: 5.73 GB of signal, and 50 ms to regex all of it</b>
+      <span class="p p-measured">measured</span>.<sup><a href="#r1">1</a></sup></p>
+    </div>
+    <h2 id="s8">Cross-cutting findings</h2>
+
+    <p>Six things are visible only when the whole field is laid out at once. None of
+    them appears in any single tool's documentation.</p>
+
+    <h3 id="s8a">1. The resource failure mode is universal, and throttling does not fix it</h3>
+
+    <p>Beagle 2006&ndash;2009. Baloo, continuously, to at least August 2024.
+    Spotlight's <span class="mono">mds_stores</span>, for two decades. Windows
+    Search's <span class="mono">SearchIndexer.exe</span> contending for CPU and I/O
+    after any large file operation. <b>Every daemon-based content indexer in this
+    survey, on every platform, has the same failure mode: the background extractor
+    eats a core, or grows unbounded RSS, and the user turns it off.</b></p>
+
+    <p>The evidence that this is not solvable with scheduling primitives is Baloo,
+    which has the most complete set in the survey &mdash; nice 19, ioprio idle
+    class, <span class="mono">SCHED_IDLE</span>, an unconditional battery gate, and
+    the only default cgroup limits &mdash; and the worst
+    reputation.<sup><a href="#r7">7</a></sup><sup><a href="#r8">8</a></sup> The
+    mechanical reason is that <b>every one of those primitives is
+    relative-to-contention</b>; on an idle desktop a
+    <span class="mono">SCHED_IDLE</span> process gets a full core for free, and
+    <span class="mono">MemoryHigh</span> throttles rather than caps. Recoll's own
+    documentation concedes the point and tells administrators to layer
+    <span class="mono">CPUQuota=</span> on top.<sup><a href="#r11">11</a></sup>
+    Recoll's <span class="mono">choom -n 300</span> is the only mechanism found
+    anywhere in the survey that targets the memory failure mode directly, by making
+    the indexer the preferred OOM victim.</p>
+
+    <p>The correct reading is that the design decision that matters is not how to
+    throttle the work but <b>how much work to do at all</b> &mdash; and that is
+    where M1 lands hardest. On the target corpus, <b>96% of the bytes are build
+    output</b> <span class="p p-measured">measured</span>. A wrong exclusion rule
+    costs 25&times; the index. Getting exclusion right is worth more than every
+    codec in this document combined.</p>
+
+    <h3 id="s8b">2. Content regex is nearly absent across the entire field</h3>
+
+    <div class="tw">
+    <table>
+      <caption>Who actually offers regex over bytes, across all three platforms</caption>
+      <thead>
+        <tr><th scope="col">Kind</th><th scope="col">Tools</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row"><b>Content regex, indexed</b></th>
+          <td>csearch, hound, zoekt, livegrep &mdash; all research or code-search tools, all Cox lineage, three of the four dormant or archived. dtSearch (commercial, closed). Everything 1.5 (closed, engine unpublished). Foxtrot (closed). FileLocator Pro (closed). sist2 and Nextcloud FTS, only by delegating to Elasticsearch.</td>
+        </tr>
+        <tr>
+          <th scope="row"><b>Content regex, unindexed</b></th>
+          <td>ripgrep, ugrep, ag, ack, Catfish (which is literally grep), EasyFind, Agent Ransack Lite, Obsidian's <span class="mono">/pattern/</span> over an in-memory index.</td>
+        </tr>
+        <tr>
+          <th scope="row"><b>Term-dictionary regex, frequently mislabelled as content regex</b></th>
+          <td>Baloo (<span class="mono">PostingDB::regexpIter</span>), Lucene <span class="mono">RegexpQuery</span> and therefore OpenGrok and Elasticsearch's <span class="mono">regexp</span>, Tantivy <span class="mono">RegexQuery</span>, Bleve, Manticore.</td>
+        </tr>
+        <tr>
+          <th scope="row"><b>None at all</b></th>
+          <td>Recoll and Xapian, Tracker and SPARQL, DocFetcher, Spotlight and everything riding on it (HoudahSpot, Alfred, Raycast), Windows Search / AQS, plocate, DEVONthink, Zotero, Logseq, X1, Copernic, Lookeen.</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+
+    <p><b>There is no maintained, embedded, open-source prior art for indexed
+    content regex on a desktop.</b> The Cox lineage is the algorithmic answer and
+    its implementations are archived (csearch, 2015), dormant (hound, livegrep) or
+    structurally mismatched (zoekt reindexes a whole shard when git HEAD moves; a
+    desktop filesystem has no commit boundaries). SQLite FTS5's
+    <span class="mono">trigram</span> tokenizer gets you the shortlist mechanism and
+    not the regex. This is a genuine gap in the field, not an oversight in the
+    research.</p>
+
+    <h3 id="s8c">3. No independent benchmark exists at this scale, for anything</h3>
+
+    <p>This is the most consistent finding across the whole research set, and it is
+    worth enumerating because a reader will otherwise assume the numbers exist
+    somewhere.</p>
+
+    <div class="tw">
+    <table>
+      <caption>Figures that do not exist in the public record</caption>
+      <thead><tr><th scope="col">Missing</th><th scope="col">Status</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">Recoll vs Tracker vs Baloo vs a Tantivy build, controlled, at 1M files</th><td><span class="p p-none">unknown</span> &mdash; R1 searched and found nothing anywhere</td></tr>
+        <tr><th scope="row">plocate build time or build throughput</th><td><span class="p p-none">unknown</span> &mdash; absent from man pages and project site</td></tr>
+        <tr><th scope="row">Rigorous fd/fzf at 1M files</th><td><span class="p p-none">unknown</span></td></tr>
+        <tr><th scope="row">Tantivy's index-size ratio against raw text</th><td><span class="p p-none">unknown</span> &mdash; no upstream figure</td></tr>
+        <tr><th scope="row">fsearch RAM per file or load time per file</th><td><span class="p p-none">unknown</span> &mdash; one forum anecdote (~420k entries in a few seconds)</td></tr>
+        <tr><th scope="row">Everything's cold index-build time, controlled</th><td><span class="p p-none">unknown</span> &mdash; only &ldquo;seconds&rdquo;, qualitatively, on forums</td></tr>
+        <tr><th scope="row">Everything's RAM per million files, vendor-published</th><td><span class="p p-none">unknown</span> &mdash; ~100 MB is a converged community figure spanning 75&ndash;200 MB</td></tr>
+        <tr><th scope="row">Windows Search's expected index-to-corpus ratio</th><td><span class="p p-none">unknown</span> &mdash; Microsoft publishes none</td></tr>
+        <tr><th scope="row">Spotlight's posting encoding, term dictionary, compression</th><td><span class="p p-none">unknown</span> &mdash; Apple has published nothing in twenty years</td></tr>
+        <tr><th scope="row">PISA's absolute bits-per-posting on Gov2 / ClueWeb09</th><td><span class="p p-none">unknown</span> to this survey &mdash; PDF fetch failed; only inter-codec percentages recovered</td></tr>
+        <tr><th scope="row">VictoriaLogs measured by anyone without a commercial stake</th><td><span class="p p-none">unknown</span></td></tr>
+        <tr><th scope="row">ugrep-indexer's index-size ratio</th><td><span class="p p-none">unknown</span> &mdash; only a &ldquo;&gt;10&times; speedup&rdquo; claim</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <p>Of the figures that <em>do</em> exist, most are the author's own demo:
+    plocate's 466 MB and 8 ms, Recoll's 4%, zoekt's 3.5&times; from a living design
+    document, Cox's 20% from one kernel tree. <b>The only two defensible external
+    numbers in the survey are dtSearch's vendor-published ~15% and the ripgrep.dev
+    benchmark table &mdash; and the latter is contradicted by 4&times; by another
+    third-party source on what is described as the same corpus.</b> That is the
+    state of the public record, and it is the reason M1 was worth the afternoon.</p>
+
+    <h3 id="s8d">4. Term-dictionary regex is sold as content regex</h3>
+
+    <p>Stated once more as a standalone finding, because it recurs across every
+    layer of the survey and changes what several rows of the master table mean.
+    Dictionary regex compiles the pattern to an automaton and intersects it with the
+    FST or B-tree, producing an OR of exact-term lookups: fast, proportional to
+    vocabulary rather than corpus, and <b>structurally incapable of matching across
+    token boundaries or inside tokens the analyzer transformed</b>. Content regex
+    inspects bytes. Baloo, Lucene, Tantivy, Bleve, OpenGrok and Elasticsearch all
+    advertise the first; several third-party comparison tables record it as the
+    second. A specification for a new tool should name which one it means in the
+    first sentence of the feature.</p>
+
+    <h3 id="s8e">5. Nobody has unified filename and content in one format</h3>
+
+    <p>plocate solves filenames with block-coarsened trigrams and knows nothing
+    about content. zoekt and csearch solve content with trigrams and treat filenames
+    as a separate posting list bolted alongside. Everything indexes the namespace
+    with extreme efficiency and added content only in 1.5, as an optional and
+    separate index. Recoll, Tracker and Baloo index content and treat filenames as
+    another term field with no special structure. <b>Every tool in the survey solves
+    exactly one of the two problems.</b> The one architecture that explicitly splits
+    them &mdash; ultrasearch's separate fast-filename process and Tantivy content
+    process &mdash; is a Windows-only 2025 project, and the split-process shape,
+    not the implementation, is the interesting part.</p>
+
+    <h3 id="s8f">6. Everyone converged on the same two engine families, and no LSM</h3>
+
+    <p>Xapian Glass is a copy-on-write B+-tree. Lucene is segment-and-merge. Baloo
+    is LMDB, another copy-on-write B+-tree. Windows Search is ESE, a B-tree ISAM.
+    SQLite FTS5 is the closest thing to an LSM here, and it is an LSM implemented
+    <em>inside</em> SQLite's own B-tree machinery. <b>Every long-lived desktop
+    search tool in this survey is Xapian-family or Lucene-family, and nothing uses a
+    genuine LSM tree.</b> The one structurally different design &mdash; livegrep's
+    suffix array &mdash; is the one that does not scale past a bounded corpus.
+    That is a strong prior, and it is worth stating plainly rather than implying:
+    the design space here has been explored, and it converged.</p>
+
+    <div class="box verdict">
+      <span class="label">What the survey says to a builder</span>
+      <p><b>The intelligence is mostly about what not to spend effort on.</b>
+      Density and codec choice are the field's most-discussed axis and, at the
+      measured corpus size, its least consequential: exclusion policy dominates, and
+      50 ms of parallel scanning already beats any index that could be built. The
+      axis the field has genuinely failed on, repeatedly and across every platform,
+      is <b>bounding background resource use deterministically</b> &mdash; and the
+      survey's own evidence says the standard primitives cannot do it. The
+      capability the field has genuinely failed to ship is <b>indexed content
+      regex in a maintained, embeddable, open form</b>. The structure nobody has
+      built is <b>one on-disk format serving filenames and content coherently</b>.
+      Those three, not posting-list compression, are where the open ground is.</p>
+    </div>
+    <div class="sources">
+      <h2 class="nonum" id="sources">Sources</h2>
+      <ol>
+        <li id="r1"><b>M1 &mdash; Measured baseline</b>, <span class="mono">/home/dave/w</span>, AMD Ryzen 9 9955HX / 60 GB / NVMe, 2026-09-04. This report. The only data in the set gathered at target scale on target hardware.</li>
+        <li id="r2"><a href="https://www.recoll.org/pages/perfs.html">Recoll &mdash; performance page</a> (18,000 PDFs / 30 GB &rarr; 1.2 GB index)</li>
+        <li id="r3"><a href="https://www.recoll.org/usermanual/webhelp/docs/RCL.INDEXING.STORAGE.FORMAT.html">Recoll &mdash; Xapian index formats</a>, user manual</li>
+        <li id="r4"><a href="https://xapian.org/docs/admin_notes.html">Xapian &mdash; administrative notes</a>; <a href="https://getting-started-with-xapian.readthedocs.io/en/latest/concepts/indexing/databases.html">Getting Started with Xapian &mdash; Databases</a></li>
+        <li id="r5"><a href="https://github.com/KDE/baloo/tree/master/src/engine">KDE/baloo &mdash; <span class="mono">src/engine/</span></a> (<span class="mono">postingdb.h</span>, <span class="mono">positiondb.h</span>, <span class="mono">documentdb.h</span>, <span class="mono">postingdb.cpp</span>)</li>
+        <li id="r6"><a href="https://phabricator.kde.org/T9805">KDE Phabricator T9805 &mdash; Overhaul Baloo database scheme</a></li>
+        <li id="r7"><a href="https://github.com/KDE/baloo/blob/master/src/file/priority.cpp">KDE/baloo &mdash; <span class="mono">src/file/priority.cpp</span></a> and <span class="mono">src/file/kde-baloo.service.in</span></li>
+        <li id="r8"><a href="https://github.com/chimera-linux/cports/issues/2677">chimera-linux/cports#2677</a> &mdash; <span class="mono">baloo_file_extractor</span> CPU/RAM, Aug 2024; <a href="https://forum.manjaro.org/t/baloo-indexing-high-cpu-and-memory-usage-when-idle/96726">Manjaro forum thread</a></li>
+        <li id="r9"><a href="https://blogs.gnome.org/carlosg/2024/07/14/goodbye-tracker-hello-tinysparql-and-localsearch/">Carlos Garnacho &mdash; &ldquo;Goodbye Tracker, hello TinySPARQL and LocalSearch&rdquo;</a>, 2024</li>
+        <li id="r10"><a href="https://gitlab.gnome.org/GNOME/localsearch/-/blob/main/src/indexer/tracker-main.c">GNOME/localsearch &mdash; <span class="mono">src/indexer/tracker-main.c</span></a> and <span class="mono">tracker-miner-fs.service.in</span></li>
+        <li id="r11"><a href="https://www.recoll.org/faqsandhowtos/cgroups_instructions.html">Recoll &mdash; Using Linux cgroups to limit indexing CPU usage</a></li>
+        <li id="r12"><a href="https://fossies.org/linux/recoll/index/recollindex.cpp">Recoll &mdash; <span class="mono">index/recollindex.cpp</span></a> (Fossies cross-reference): <span class="mono">setMyPriority</span>, <span class="mono">rclIxIonice</span>, <span class="mono">choom -n 300</span></li>
+        <li id="r13"><a href="https://github.com/docfetcher/DocFetcher/releases">DocFetcher &mdash; GitHub releases</a> and <a href="https://sourceforge.net/p/docfetcher/wiki/ChangeLog/">SourceForge ChangeLog</a> (1.1.27, 2026-01-19)</li>
+        <li id="r14"><a href="https://github.com/sist2app/sist2">sist2app/sist2</a> (note: <span class="mono">simon987/Simple-Incremental-Search-Tool</span> is a different, dead project)</li>
+        <li id="r15"><a href="https://en.wikipedia.org/wiki/Beagle_(software)">Beagle (software) &mdash; Wikipedia</a>; <a href="https://www.joeshaw.org/talks/Beagle-GUADEC2006.pdf">Joe Shaw, GUADEC 2006 slides</a>; <a href="https://github.com/joeshaw/beagle">source archive</a></li>
+        <li id="r16"><a href="https://sourceforge.net/projects/regain/">regain &mdash; SourceForge project page</a> (last news post 2013-06-09; page metadata 2014-07-30)</li>
+        <li id="r17"><a href="https://github.com/paperless-ngx/paperless-ngx/discussions/11352">paperless-ngx &mdash; discussion #11352</a>, <a href="https://github.com/paperless-ngx/paperless-ngx/pull/12471">PR #12471</a> (Whoosh &rarr; Tantivy), <a href="https://github.com/paperless-ngx/paperless-ngx/pull/13010">PR #13010</a> (query-rewrite shim limits)</li>
+        <li id="r18"><a href="https://forum.obsidian.md/t/how-exactly-does-obsidians-search-work/90905">Obsidian forum &mdash; &ldquo;How exactly does Obsidian's search work?&rdquo;</a></li>
+        <li id="r19"><a href="https://plocate.sesse.net/">plocate</a> (Steinar H. Gunderson) and <span class="mono">plocate-build(8)</span>; source at <a href="https://git.sesse.net/?p=plocate">git.sesse.net</a></li>
+        <li id="r20"><a href="https://github.com/cboxdoerfer/fsearch">fsearch</a></li>
+        <li id="r21"><a href="https://swtch.com/~rsc/regexp/regexp4.html">Russ Cox &mdash; &ldquo;Regular Expression Matching with a Trigram Index&rdquo;</a></li>
+        <li id="r22"><a href="https://github.com/google/codesearch">google/codesearch</a> (<span class="mono">cindex</span> / <span class="mono">csearch</span>, Go, BSD-3, archived)</li>
+        <li id="r23"><a href="https://blog.nelhage.com/2015/02/regular-expression-search-with-suffix-arrays/">Nelson Elhage &mdash; &ldquo;Regular Expression Search with Suffix Arrays&rdquo;</a>; <a href="https://github.com/livegrep/livegrep">livegrep</a></li>
+        <li id="r24"><a href="https://github.com/sourcegraph/zoekt/blob/master/doc/design.md">zoekt &mdash; <span class="mono">doc/design.md</span></a> (Sourcegraph). The 3.5&times; figure came from a single fetch of a living document; re-verify before relying on it.</li>
+        <li id="r25"><a href="https://github.com/hound-search/hound">hound</a> (Etsy; wraps google/codesearch)</li>
+        <li id="r26"><a href="https://github.com/oracle/opengrok">OpenGrok</a></li>
+        <li id="r27"><a href="https://ripgrep.dev/benchmarks/">ripgrep.dev &mdash; benchmarks</a> (i9-12900K, 64 GB, NVMe, Ubuntu 22.04, hyperfine, median of 10, warm). Contradicted ~4&times; by a DEV Community article on the 13.5 GB case; see &sect;3.2.</li>
+        <li id="r28"><a href="https://lucene.apache.org/core/9_0_0/core/org/apache/lucene/codecs/lucene90/blocktree/Lucene90BlockTreeTermsWriter.html">Lucene &mdash; <span class="mono">Lucene90BlockTreeTermsWriter</span></a> and <a href="https://lucene.apache.org/core/9_11_0/core/org/apache/lucene/codecs/lucene99/Lucene99PostingsFormat.html"><span class="mono">Lucene99PostingsFormat</span></a> javadocs</li>
+        <li id="r29"><a href="https://github.com/Genivia/ugrep-indexer">Genivia/ugrep-indexer</a> (merged into ugrep &ge; 6.0)</li>
+        <li id="r30"><a href="https://cursor.com/blog/fast-regex-search">Cursor &mdash; &ldquo;Fast regex search: indexing text for agent tools&rdquo;</a>. Flagged by R2 as relevant and <b>unread</b> &mdash; not cited for any claim here.</li>
+        <li id="r31"><a href="https://eclecticlight.co/2021/01/28/spotlight-on-search-how-spotlight-works/">Eclectic Light Co &mdash; &ldquo;Spotlight on search: how Spotlight works&rdquo;</a>; <a href="https://eclecticlight.co/2025/09/04/quirks-of-spotlight-local-search/">&ldquo;Quirks of Spotlight local search&rdquo;</a>, 2025; <a href="https://eclecticlight.co/2024/11/19/when-and-how-to-rebuild-spotlight-indexes/">rebuild guidance</a></li>
+        <li id="r32"><a href="https://www.swiftforensics.com/2018/08/parsing-spotlight-database.html">Yogesh Khatri &mdash; &ldquo;Parsing the Spotlight database&rdquo;</a>; <a href="http://www.swiftforensics.com/2018/10/the-user-spotlight-database.html">&ldquo;The user Spotlight database&rdquo;</a>; <a href="https://github.com/ydkhatri/spotlight_parser/blob/master/spotlight_parser.py"><span class="mono">spotlight_parser.py</span></a> &mdash; the closest thing to a public specification</li>
+        <li id="r33"><a href="https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Predicates/Articles/pSpotlightComparison.html">Apple &mdash; NSPredicate / Spotlight query comparison</a></li>
+        <li id="r34"><a href="https://github.com/Houwenda/FSEventsParser-rs">FSEventsParser-rs</a>; <a href="https://www.hexordia.com/blog/mac-forensics-analysis">Hexordia &mdash; Mac forensics analysis</a> (FSEvents log format and location)</li>
+        <li id="r35"><a href="http://foxtrot-search.com/foxtrot-professional.html">Foxtrot Professional Search</a>; <a href="https://www.macdrifter.com/2015/01/searching-without-spotlight.html">MacDrifter &mdash; searching without Spotlight</a></li>
+        <li id="r36"><a href="https://discourse.devontechnologies.com/t/see-also-classify-what-do-they-look-at/55816">DEVONtechnologies discourse &mdash; &ldquo;See Also / Classify: what do they look at?&rdquo;</a>; DEVONthink help, Concordance inspector</li>
+        <li id="r37"><a href="https://danielbahl.com/tech/easyfind-on-macos-when-spotlight-fails-and-terminal-is-too-much">EasyFind and Find Any File</a> &mdash; the no-index alternative on macOS</li>
+        <li id="r38"><a href="https://www.voidtools.com/support/everything/indexes/">voidtools &mdash; Everything indexes</a> (NTFS index, ReFS index, Folder index, File List)</li>
+        <li id="r39">voidtools forums &mdash; MFT/USN mechanism (<a href="https://voidtools.com/forum/viewtopic.php?t=12779">t=12779</a>; the author's own <span class="mono">t=5433</span> returned HTTP 403), RAM per million files (<a href="https://www.voidtools.com/forum/viewtopic.php?t=8318">t=8318</a>, <a href="https://www.voidtools.com/forum/viewtopic.php?t=11234">t=11234</a>), <span class="mono">regex:</span> syntax (<a href="https://www.voidtools.com/forum/viewtopic.php?t=12803">t=12803</a>)</li>
+        <li id="r40"><a href="https://support.microsoft.com/en-us/topic/the-windows-edb-file-grows-very-large-in-windows-8-or-windows-server-2012-ab43f14c-7e22-34c5-e704-e4ad1e39871c">Microsoft &mdash; &ldquo;The Windows.edb file grows very large&rdquo;</a></li>
+        <li id="r41"><a href="https://learn.microsoft.com/en-us/windows/win32/search/-search-ifilter-about">Microsoft Learn &mdash; About IFilters</a> (SearchIndexer / SearchProtocolHost / SearchFilterHost)</li>
+        <li id="r42"><a href="https://www.levelblue.com/blogs/spiderlabs-blog/windows-search-index-the-forensic-artifact-youve-been-searching-for/">LevelBlue SpiderLabs &mdash; &ldquo;Windows Search Index: the forensic artifact you've been searching for&rdquo;</a>; <a href="https://forensafe.com/blogs/winsearchindex.html">Forensafe &mdash; Windows Search index</a></li>
+        <li id="r43"><a href="https://learn.microsoft.com/en-us/windows/win32/search/-search-3x-advancedquerysyntax">Microsoft Learn &mdash; Advanced Query Syntax</a></li>
+        <li id="r44"><a href="https://support.dtsearch.com/faq/dts0142.htm">dtSearch FAQ dts0142 &mdash; index size</a> (&ldquo;1/8 to 1/3&rdquo;, ~15% at large scale)</li>
+        <li id="r45"><a href="https://help.relativity.com/10.3/Content/Relativity/Regular_expressions/Using_regular_expressions_with_dtSearch.htm">Relativity &mdash; using regular expressions with dtSearch</a></li>
+        <li id="r46"><a href="https://www.mythicsoft.com/filelocatorpro/information/">Mythicsoft &mdash; FileLocator Pro</a> and <a href="https://www.mythicsoft.com/agentransack/information/">Agent Ransack</a></li>
+        <li id="r47"><a href="https://github.com/quickwit-oss/tantivy/blob/main/ARCHITECTURE.md">Tantivy &mdash; ARCHITECTURE.md</a>; <a href="https://fulmicoton.com/posts/behold-tantivy/">Paul Masurel &mdash; &ldquo;Of tantivy, a search engine in Rust&rdquo;</a>; <a href="https://docs.rs/tantivy/latest/tantivy/query/struct.RegexQuery.html">docs.rs &mdash; RegexQuery</a></li>
+        <li id="r48"><a href="https://github.com/BurntSushi/fst">BurntSushi/fst</a> and <a href="https://docs.rs/regex-automata">regex-automata</a> (<span class="mono">transducer</span> feature; <span class="mono">Levenshtein</span>)</li>
+        <li id="r49"><a href="https://xapian.org/docs/sourcedoc/html/classGlassDatabase.html">Xapian &mdash; GlassDatabase source docs</a>; <a href="https://xapian.org/docs/xapian-core-1.4.27/NEWS">NEWS, 1.4.27, 2024-12-06</a></li>
+        <li id="r50"><a href="https://pisa.readthedocs.io/">PISA documentation</a>; Ottaviano &amp; Venturini, <a href="http://groups.di.unipi.it/~ottavian/files/elias_fano_sigir14.pdf">&ldquo;Partitioned Elias-Fano Indexes&rdquo;</a>, SIGIR 2014 &mdash; <b>PDF fetch failed; absolute figures not retrieved</b></li>
+        <li id="r51"><a href="https://sqlite.org/fts5.html">SQLite &mdash; FTS5</a> (&sect;4 The FTS Index, &sect;5 Key/Doclist Format, <span class="mono">detail=</span>, <span class="mono">trigram</span> tokenizer, <span class="mono">bm25()</span>)</li>
+        <li id="r52"><a href="https://victoriametrics.com/blog/victorialogs-internals-columnar-storage-on-disk/">VictoriaLogs internals &mdash; columnar storage on disk</a></li>
+        <li id="r53"><a href="https://docs.victoriametrics.com/victorialogs/faq/">VictoriaLogs FAQ</a> (30&times; RAM, 15&times; disk, 1000&times; vs Loki &mdash; all vendor-claimed)</li>
+        <li id="r54"><a href="https://itnext.io/how-do-open-source-solutions-for-logs-work-elasticsearch-loki-and-victorialogs-9f7097ecbc2f">ITNEXT &mdash; how open-source log solutions work</a> (the &ldquo;8 bytes per token&rdquo; inverted-index figure, vendor-stated without derivation)</li>
+        <li id="r55"><a href="https://www.truefoundry.com/blog/victorialogs-vs-loki">TrueFoundry &mdash; VictoriaLogs vs Loki</a> (partner/consultancy; methodology and independence unverified)</li>
+        <li id="r56"><a href="https://grafana.com/docs/loki/latest/get-started/components/">Grafana Loki &mdash; components</a> and <a href="https://grafana.com/docs/loki/latest/configure/">configuration</a> (<span class="mono">bloom_build</span> / <span class="mono">bloom_gateway</span>, experimental)</li>
+        <li id="r57"><a href="https://clickhouse.com/docs/guides/best-practices/sparse-primary-indexes">ClickHouse &mdash; sparse primary indexes</a>; <a href="https://altinity.com/blog/clickhouse-black-magic-skipping-indices">Altinity &mdash; skipping indices</a></li>
+        <li id="r58"><a href="https://clickhouse.com/blog/full-text-search-ga-release">ClickHouse &mdash; full-text search GA release</a> and <a href="https://clickhouse.com/blog/clickhouse-full-text-search">&ldquo;Inside ClickHouse full-text search&rdquo;</a></li>
+        <li id="r59"><a href="https://docs.splunk.com/Documentation/Splunk/9.3.2/Indexer/Reducetsidxdiskusage">Splunk &mdash; reduce tsidx disk usage</a>; <a href="https://docs.splunk.com/Splexicon:Bloomfilter">Splexicon &mdash; bloomfilter</a></li>
+        <li id="r60"><a href="https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/match-only-text">Elasticsearch &mdash; <span class="mono">match_only_text</span></a>; <a href="https://www.elastic.co/blog/save-10-percent-disk-space-on-your-logging-datasets-with-match-only-text">&ldquo;Save 10% disk space&hellip;&rdquo;</a>; <a href="https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/doc-values">doc_values</a></li>
+        <li id="r61"><a href="https://parquet.apache.org/docs/file-format/bloomfilter/">Apache Parquet &mdash; Bloom filter spec</a>; <a href="https://duckdb.org/2025/03/07/parquet-bloom-filters-in-duckdb/">DuckDB &mdash; Parquet bloom filters</a></li>
+        <li id="r62"><a href="https://github.com/FastFilter/xorfilter/blob/master/README.md">FastFilter &mdash; xorfilter README</a>; <a href="https://arxiv.org/pdf/2201.01174.pdf">Graf &amp; Lemire, &ldquo;Binary Fuse Filters&rdquo;</a>, arXiv 2201.01174</li>
+        <li id="r63"><a href="https://quickwit.io/blog/quickwit-101">Quickwit 101</a>; <a href="https://quickwit.io/docs/operating/data-directory">Quickwit &mdash; data directory</a> (hotcache)</li>
+        <li id="r65"><a href="https://help.foxtrot-search.com/650-third-party-file-formats">Third party file formats &mdash; FoxTrot Search help</a></li>
+<li id="r66"><a href="https://groups.google.com/g/foxtrot-search/c/fXducn2sgMY">Evaluating FoxTrot Personal Search &mdash; foxtrot-search group (vendor participation)</a></li>
+<li id="r64"><a href="https://ftp.voidtools.com/support/everything/advanced_search_functions/">voidtools &mdash; Everything advanced search functions</a></li>
+      </ol>
+    </div>
+    <footer class="pagefoot">
+      <span>Super Ferret research &middot; page 2 of 4</span>
+      <span>Compiled 2026-09-05</span>
+    </footer>
+  </main>
+</div>
+
+<script>
+// TOC scroll-spy. Copy verbatim.
+(function () {
+  var links = [].slice.call(document.querySelectorAll('.toc a[href^="#"]'));
+  if (!links.length) return;
+  var map = {};
+  links.forEach(function (a) {
+    var el = document.getElementById(a.getAttribute('href').slice(1));
+    if (el) map[el.id] = a;
+  });
+  var obs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        links.forEach(function (l) { l.classList.remove('on'); });
+        if (map[e.target.id]) map[e.target.id].classList.add('on');
+      }
+    });
+  }, { rootMargin: '-72px 0px -70% 0px', threshold: 0 });
+  Object.keys(map).forEach(function (id) {
+    var el = document.getElementById(id); if (el) obs.observe(el);
+  });
+})();
+</script>
+</body>
+</html>

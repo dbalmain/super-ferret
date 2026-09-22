@@ -1,0 +1,17 @@
+{
+  "command": "match",
+  "note": "Malformed patterns. The program must exit 2 and print nothing on stdout. Every case here is illegal in all four parts: unbalanced parentheses, and a repetition operator with nothing to repeat. Character-class errors are deliberately absent because parts 1 and 2 have no '['.",
+  "cases": [
+    {"pattern": "("},
+    {"pattern": ")"},
+    {"pattern": "a(b"},
+    {"pattern": "a)b"},
+    {"pattern": "(a"},
+    {"pattern": "a(b(c)"},
+    {"pattern": "*"},
+    {"pattern": "*a"},
+    {"pattern": "+a"},
+    {"pattern": "?a"},
+    {"pattern": "(*)"}
+  ]
+}

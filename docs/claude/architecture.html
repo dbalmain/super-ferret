@@ -1,0 +1,2423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building Super Ferret</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,380;8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+/* ============================================================
+   Super Ferret research reports — shared design system
+   Type:   Archivo (display) / Source Serif 4 (body) / IBM Plex Mono (data)
+   Colour: cool slate ink on cool paper, teal accent, semantic
+           provenance hues that encode how a number was sourced.
+   ============================================================ */
+
+:root {
+  /* --- paper & ink (light) --- */
+  --paper:      #f4f6f8;
+  --surface:    #ffffff;
+  --surface-2:  #eceff3;
+  --sunk:       #e3e7ec;
+  --ink:        #12161d;
+  --ink-2:      #3d4653;
+  --ink-3:      #626d7d;
+  --rule:       #d3d9e1;
+  --rule-soft:  #e5e9ef;
+
+  /* --- accent --- */
+  --accent:     #0d7d8a;
+  --accent-2:   #0a5f6a;
+  --accent-ink: #063d45;
+  --accent-wash:#ddf0f2;
+
+  /* --- provenance semantics --- */
+  --pv-measured:  #0d7d8a;  --pv-measured-bg:  #dcf0f2;
+  --pv-doc:       #3f5aa6;  --pv-doc-bg:       #e2e7f7;
+  --pv-paper:     #5b4b9c;  --pv-paper-bg:     #e9e5f7;
+  --pv-bench:     #2f7a4a;  --pv-bench-bg:     #dff0e5;
+  --pv-vendor:    #9a6410;  --pv-vendor-bg:    #f7ecd8;
+  --pv-community: #8a5a6b;  --pv-community-bg: #f6e6ea;
+  --pv-est:       #7a6a55;  --pv-est-bg:       #efeae1;
+  --pv-none:      #8b3a3a;  --pv-none-bg:      #f7e2e2;
+
+  /* --- status --- */
+  --good: #2f7a4a; --warn: #9a6410; --bad: #a83232;
+
+  /* --- metrics --- */
+  --measure: 68ch;
+  --radius: 3px;
+  --shadow: 0 1px 2px rgba(18,22,29,.06), 0 6px 18px rgba(18,22,29,.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper:      #101318;
+    --surface:    #171b22;
+    --surface-2:  #1d222b;
+    --sunk:       #0b0e12;
+    --ink:        #e6eaf0;
+    --ink-2:      #b3bcc9;
+    --ink-3:      #838e9d;
+    --rule:       #2c333e;
+    --rule-soft:  #232932;
+
+    --accent:     #4fc7d4;
+    --accent-2:   #7adbe5;
+    --accent-ink: #a8e8ef;
+    --accent-wash:#0f3238;
+
+    --pv-measured:  #4fc7d4;  --pv-measured-bg:  #0f3238;
+    --pv-doc:       #8fa6ee;  --pv-doc-bg:       #1a2242;
+    --pv-paper:     #b2a3f0;  --pv-paper-bg:     #221d3d;
+    --pv-bench:     #6bc98d;  --pv-bench-bg:     #102b1c;
+    --pv-vendor:    #dfa94a;  --pv-vendor-bg:    #33260e;
+    --pv-community: #dfa0b3;  --pv-community-bg: #331d24;
+    --pv-est:       #c4b49a;  --pv-est-bg:       #2a2418;
+    --pv-none:      #e88a8a;  --pv-none-bg:      #3a1c1c;
+
+    --good: #6bc98d; --warn: #dfa94a; --bad: #e88a8a;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.3);
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper:      #101318;
+  --surface:    #171b22;
+  --surface-2:  #1d222b;
+  --sunk:       #0b0e12;
+  --ink:        #e6eaf0;
+  --ink-2:      #b3bcc9;
+  --ink-3:      #838e9d;
+  --rule:       #2c333e;
+  --rule-soft:  #232932;
+
+  --accent:     #4fc7d4;
+  --accent-2:   #7adbe5;
+  --accent-ink: #a8e8ef;
+  --accent-wash:#0f3238;
+
+  --pv-measured:  #4fc7d4;  --pv-measured-bg:  #0f3238;
+  --pv-doc:       #8fa6ee;  --pv-doc-bg:       #1a2242;
+  --pv-paper:     #b2a3f0;  --pv-paper-bg:     #221d3d;
+  --pv-bench:     #6bc98d;  --pv-bench-bg:     #102b1c;
+  --pv-vendor:    #dfa94a;  --pv-vendor-bg:    #33260e;
+  --pv-community: #dfa0b3;  --pv-community-bg: #331d24;
+  --pv-est:       #c4b49a;  --pv-est-bg:       #2a2418;
+  --pv-none:      #e88a8a;  --pv-none-bg:      #3a1c1c;
+
+  --good: #6bc98d; --warn: #dfa94a; --bad: #e88a8a;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.3);
+}
+
+/* ---------- base ---------- */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 5rem; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Source Serif 4", "Iowan Old Style", Charter, Georgia, serif;
+  font-size: 17px;
+  line-height: 1.62;
+  font-variant-numeric: oldstyle-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- top bar ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: .7rem clamp(1rem, 4vw, 2.5rem);
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule);
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+}
+.topbar .mark {
+  font-weight: 700; font-size: .82rem; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink);
+  white-space: nowrap;
+}
+.topbar .mark span { color: var(--accent); }
+.topbar nav { display: flex; gap: .25rem; flex-wrap: wrap; margin-left: auto; }
+.topbar nav a {
+  font-size: .78rem; font-weight: 500; letter-spacing: .02em;
+  color: var(--ink-3); text-decoration: none;
+  padding: .3rem .6rem; border-radius: var(--radius);
+}
+.topbar nav a:hover { color: var(--ink); background: var(--surface-2); }
+.topbar nav a[aria-current="page"] { color: var(--accent); background: var(--accent-wash); }
+.topbar nav a:focus-visible,
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* ---------- page shell ---------- */
+.shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 0 clamp(1rem, 4vw, 2.5rem) 6rem;
+}
+@media (min-width: 1080px) {
+  .shell { grid-template-columns: 250px minmax(0, 1fr); gap: clamp(2rem, 4vw, 4rem); }
+}
+
+/* ---------- sidebar TOC ---------- */
+.toc { display: none; }
+@media (min-width: 1080px) {
+  .toc {
+    display: block;
+    position: sticky; top: 4.2rem;
+    align-self: start;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    padding: 2.5rem 0 2rem;
+    font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+    font-size: .8rem;
+    line-height: 1.45;
+    border-right: 1px solid var(--rule-soft);
+    margin-right: -1px;
+  }
+}
+.toc h2 {
+  font-size: .68rem; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 600; margin: 0 0 .9rem;
+}
+.toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .12rem; }
+.toc ol ol { margin: .12rem 0 .4rem .85rem; }
+.toc a {
+  display: block; padding: .22rem .5rem .22rem .55rem;
+  color: var(--ink-2); text-decoration: none;
+  border-left: 2px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
+}
+.toc a:hover { color: var(--ink); background: var(--surface-2); }
+.toc a.on { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+.toc .sub a { color: var(--ink-3); font-size: .76rem; }
+
+/* ---------- main ---------- */
+main { min-width: 0; padding-top: 2.5rem; }
+main > * { max-width: var(--measure); }
+main > .wide, main > .tw, main > figure, main > .grid, main > .cards { max-width: none; }
+
+/* ---------- masthead ---------- */
+.masthead { max-width: none; margin-bottom: 3.5rem; }
+.eyebrow {
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: .7rem; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--accent); font-weight: 600; margin: 0 0 .9rem;
+}
+h1 {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-weight: 700; font-size: clamp(2.1rem, 5vw, 3.3rem);
+  line-height: 1.04; letter-spacing: -.022em;
+  margin: 0 0 1rem; text-wrap: balance; color: var(--ink);
+}
+.standfirst {
+  font-size: 1.17rem; line-height: 1.55; color: var(--ink-2);
+  max-width: 60ch; margin: 0 0 1.6rem;
+}
+.meta {
+  display: flex; flex-wrap: wrap; gap: .4rem 1.4rem;
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: .72rem; color: var(--ink-3);
+  padding-top: 1rem; border-top: 1px solid var(--rule);
+  font-variant-numeric: tabular-nums;
+}
+.meta b { color: var(--ink-2); font-weight: 500; }
+
+/* ---------- headings ---------- */
+h2, h3, h4, h5 {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  color: var(--ink); text-wrap: balance; letter-spacing: -.012em;
+}
+h2 {
+  font-size: 1.72rem; font-weight: 700; line-height: 1.15;
+  margin: 4rem 0 1.1rem; padding-top: 1.1rem;
+  border-top: 2px solid var(--ink); max-width: none;
+}
+h3 { font-size: 1.2rem; font-weight: 600; margin: 2.6rem 0 .7rem; }
+h4 {
+  font-size: .82rem; font-weight: 600; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-2); margin: 2rem 0 .5rem;
+}
+h5 { font-size: .95rem; font-weight: 600; margin: 1.4rem 0 .4rem; color: var(--ink-2); }
+
+/* section numbering: the reports ARE a numbered reference, so the
+   numbers carry real structure rather than decoration. */
+.numbered { counter-reset: h2; }
+.numbered h2:not(.nonum) { counter-increment: h2; counter-reset: h3; }
+.numbered h2:not(.nonum)::before {
+  content: counter(h2) "  ";
+  font-family: "IBM Plex Mono", monospace; font-size: .72em;
+  color: var(--accent); font-weight: 500;
+}
+.numbered h3:not(.nonum) { counter-increment: h3; }
+.numbered h3:not(.nonum)::before {
+  content: counter(h2) "." counter(h3) "  ";
+  font-family: "IBM Plex Mono", monospace; font-size: .78em;
+  color: var(--ink-3); font-weight: 500;
+}
+
+p { margin: 0 0 1.05rem; }
+a { color: var(--accent-2); text-underline-offset: .18em; text-decoration-thickness: .06em; }
+a:hover { color: var(--accent); }
+strong { font-weight: 600; color: var(--ink); }
+em { font-style: italic; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 3rem 0; }
+
+ul, ol { margin: 0 0 1.05rem; padding-left: 1.3rem; }
+li { margin-bottom: .38rem; }
+li > ul, li > ol { margin-top: .38rem; }
+
+dl { margin: 0 0 1.2rem; }
+dt { font-family: Archivo, sans-serif; font-weight: 600; font-size: .95rem; margin-top: .9rem; }
+dd { margin: .15rem 0 0; color: var(--ink-2); }
+
+blockquote {
+  margin: 1.4rem 0; padding: .2rem 0 .2rem 1.2rem;
+  border-left: 3px solid var(--accent); color: var(--ink-2); font-style: italic;
+}
+blockquote p:last-child { margin-bottom: 0; }
+
+/* ---------- code ---------- */
+code, kbd, samp {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .86em; font-variant-numeric: tabular-nums;
+}
+:not(pre) > code {
+  background: var(--surface-2); border: 1px solid var(--rule-soft);
+  padding: .08em .35em; border-radius: var(--radius);
+  color: var(--ink); white-space: nowrap;
+}
+pre {
+  margin: 1.4rem 0; padding: 1rem 1.15rem;
+  background: var(--sunk); border: 1px solid var(--rule);
+  border-radius: var(--radius); overflow-x: auto;
+  font-size: .82rem; line-height: 1.55; max-width: none;
+}
+pre code { background: none; border: 0; padding: 0; white-space: pre; color: var(--ink); }
+pre .cm { color: var(--ink-3); font-style: italic; }
+pre .kw { color: var(--accent); font-weight: 500; }
+figure.code { margin: 1.4rem 0; max-width: none; }
+figure.code figcaption {
+  font-family: Archivo, sans-serif; font-size: .74rem; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3);
+  margin-bottom: .45rem;
+}
+
+/* ---------- tables ---------- */
+.tw { overflow-x: auto; margin: 1.5rem 0; max-width: none;
+      border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
+table {
+  border-collapse: collapse; width: 100%;
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-size: .82rem; line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--surface-2); color: var(--ink);
+  font-weight: 600; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase;
+  text-align: left; padding: .6rem .7rem; border-bottom: 1.5px solid var(--rule);
+  white-space: nowrap;
+}
+tbody td, tbody th {
+  padding: .55rem .7rem; border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top; text-align: left; color: var(--ink-2);
+}
+tbody th { font-weight: 600; color: var(--ink); white-space: nowrap; }
+tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
+tbody tr:hover td, tbody tr:hover th { background: var(--surface-2); }
+td.num, th.num { text-align: right; font-family: "IBM Plex Mono", monospace; white-space: nowrap; }
+td.mono, th.mono { font-family: "IBM Plex Mono", monospace; font-size: .78rem; }
+caption {
+  caption-side: bottom; text-align: left; padding: .6rem .7rem;
+  font-family: "Source Serif 4", serif; font-size: .82rem; color: var(--ink-3);
+  border-top: 1px solid var(--rule-soft);
+}
+
+/* ---------- provenance chips: every number says how it was sourced ---------- */
+.p {
+  display: inline-block; vertical-align: baseline;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: .63rem; font-weight: 500; letter-spacing: .05em;
+  text-transform: uppercase; white-space: nowrap;
+  padding: .08em .38em; border-radius: 2px;
+  border: 1px solid currentColor;
+  margin-left: .3em; position: relative; top: -.08em;
+}
+.p-measured  { color: var(--pv-measured);  background: var(--pv-measured-bg); }
+.p-doc       { color: var(--pv-doc);       background: var(--pv-doc-bg); }
+.p-paper     { color: var(--pv-paper);     background: var(--pv-paper-bg); }
+.p-bench     { color: var(--pv-bench);     background: var(--pv-bench-bg); }
+.p-vendor    { color: var(--pv-vendor);    background: var(--pv-vendor-bg); }
+.p-community { color: var(--pv-community); background: var(--pv-community-bg); }
+.p-est       { color: var(--pv-est);       background: var(--pv-est-bg); }
+.p-none      { color: var(--pv-none);      background: var(--pv-none-bg); }
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: .45rem .7rem;
+  padding: .9rem 1rem; margin: 1.4rem 0; max-width: none;
+  background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius);
+  font-family: Archivo, sans-serif; font-size: .74rem; color: var(--ink-3);
+  align-items: center;
+}
+.legend > span { display: inline-flex; align-items: center; gap: .3rem; }
+.legend b {
+  font-family: Archivo, sans-serif; font-size: .68rem; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ink-2); margin-right: .3rem;
+}
+
+/* ---------- density bar: encodes index-size ratio visually ---------- */
+.bar { display: flex; align-items: center; gap: .5rem; min-width: 130px; }
+.bar .track {
+  flex: 1; height: 7px; background: var(--sunk);
+  border-radius: 4px; overflow: hidden; min-width: 56px;
+  border: 1px solid var(--rule-soft);
+}
+.bar .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.bar .fill.hi { background: var(--warn); }
+.bar .fill.vhi { background: var(--bad); }
+.bar .val {
+  font-family: "IBM Plex Mono", monospace; font-size: .72rem;
+  color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+
+/* ---------- callouts ---------- */
+.box {
+  margin: 1.6rem 0; padding: 1.05rem 1.2rem; max-width: none;
+  background: var(--surface); border: 1px solid var(--rule);
+  border-left: 3px solid var(--ink-3); border-radius: var(--radius);
+  font-size: .95rem;
+}
+.box > :first-child { margin-top: 0; }
+.box > :last-child { margin-bottom: 0; }
+.box .label {
+  display: block; font-family: Archivo, sans-serif;
+  font-size: .68rem; font-weight: 700; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: .5rem;
+}
+.box.key      { border-left-color: var(--accent); background: var(--accent-wash); }
+.box.key .label { color: var(--accent-2); }
+.box.warn     { border-left-color: var(--warn); }
+.box.warn .label { color: var(--warn); }
+.box.gap      { border-left-color: var(--bad); }
+.box.gap .label { color: var(--bad); }
+.box.verdict  { border-left-color: var(--ink); border-width: 1px 1px 1px 4px; background: var(--surface-2); }
+.box.verdict .label { color: var(--ink); }
+
+/* ---------- cards / grids ---------- */
+.grid { display: grid; gap: 1rem; margin: 1.6rem 0; max-width: none;
+        grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); }
+.card {
+  padding: 1.1rem 1.2rem; background: var(--surface);
+  border: 1px solid var(--rule); border-radius: var(--radius);
+  box-shadow: var(--shadow); font-size: .92rem;
+}
+.card h4 { margin-top: 0; }
+.card > :last-child { margin-bottom: 0; }
+.card .stat {
+  font-family: Archivo, sans-serif; font-weight: 700;
+  font-size: 1.9rem; line-height: 1.1; color: var(--accent-2);
+  font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+}
+.card .stat small {
+  font-size: .5em; font-weight: 500; color: var(--ink-3);
+  letter-spacing: 0; margin-left: .25em;
+}
+.card .cap {
+  font-family: Archivo, sans-serif; font-size: .72rem; color: var(--ink-3);
+  letter-spacing: .04em; text-transform: uppercase; margin-top: .35rem;
+}
+
+/* ---------- verdict pills ---------- */
+.pill {
+  display: inline-block; font-family: Archivo, sans-serif;
+  font-size: .68rem; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; padding: .14em .5em; border-radius: 10px;
+  border: 1px solid currentColor; white-space: nowrap;
+}
+.pill.yes { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.pill.no  { color: var(--bad);  background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.pill.part{ color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.pill.dead{ color: var(--ink-3); background: var(--surface-2); }
+
+/* ---------- footnotes / sources ---------- */
+.sources { margin-top: 4rem; padding-top: 1.4rem; border-top: 2px solid var(--ink); max-width: none; }
+.sources h2 { border: 0; margin: 0 0 1rem; padding: 0; font-size: 1.1rem; }
+.sources ol { font-size: .8rem; color: var(--ink-3); columns: 2; column-gap: 2.5rem; padding-left: 1.4rem; }
+@media (max-width: 800px) { .sources ol { columns: 1; } }
+.sources li { margin-bottom: .45rem; break-inside: avoid; }
+.sources a { word-break: break-word; }
+
+footer.pagefoot {
+  margin-top: 3rem; padding-top: 1.2rem; border-top: 1px solid var(--rule);
+  font-family: "IBM Plex Mono", monospace; font-size: .72rem; color: var(--ink-3);
+  display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; justify-content: space-between;
+  max-width: none;
+}
+
+/* ---------- misc ---------- */
+figure { margin: 1.8rem 0; }
+figure figcaption {
+  font-size: .82rem; color: var(--ink-3); margin-top: .6rem; line-height: 1.45;
+}
+svg { max-width: 100%; height: auto; }
+img { max-width: 100%; height: auto; }
+.skip {
+  position: absolute; left: -9999px; top: 0; background: var(--accent); color: #fff;
+  padding: .5rem 1rem; z-index: 100;
+}
+.skip:focus { left: .5rem; top: .5rem; }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="mark">Super<span>&nbsp;Ferret</span></div>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="landscape.html">Landscape</a>
+    <a href="indexing.html">Index structures</a>
+    <a href="architecture.html" aria-current="page">Architecture</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="toc">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#s1">The measurement that reframes the project</a></li>
+      <li><a href="#s2">Requirements, restated as a spec</a></li>
+      <li><a href="#s3">The recommended architecture</a></li>
+      <li><a href="#s4">Tiered index design</a>
+        <ol class="sub"><li><a href="#s4a">Second exclusion axis</a></li><li><a href="#s4b">The four tiers</a></li><li><a href="#s4c">The size budget</a></li><li><a href="#s4d">What was rejected</a></li></ol>
+      </li>
+      <li><a href="#s5">Query planning and execution</a>
+        <ol class="sub"><li><a href="#s5a">The five routes</a></li><li><a href="#s5b">The planner</a></li><li><a href="#s5c">Scan rates</a></li><li><a href="#s5d">Regex derivation</a></li><li><a href="#s5e">Two correctness rules</a></li><li><a href="#s5f">Execution</a></li></ol>
+      </li>
+      <li><a href="#s6">Extraction and the plugin interface</a></li>
+      <li><a href="#s7">Change detection and the politeness budget</a>
+        <ol class="sub"><li><a href="#s7a">fanotify vs inotify</a></li><li><a href="#s7b">Queue overflow</a></li><li><a href="#s7c">Save-storm debouncing</a></li><li><a href="#s7d">The politeness budget</a></li><li><a href="#s7e">Activity-based backoff</a></li></ol>
+      </li>
+      <li><a href="#s8">Crash safety, atomic swap, NRT</a></li>
+      <li><a href="#s9">Semantic search</a></li>
+      <li><a href="#s95">Ferret and Super Ferret</a></li>
+      <li><a href="#s10">A staged build plan</a></li>
+      <li><a href="#s11">Open questions</a></li>
+      <li><a href="#sources">Sources</a></li>
+    </ol>
+  </aside>
+
+  <main id="main" class="numbered">
+    <div class="masthead">
+      <p class="eyebrow">Super Ferret &middot; Research</p>
+      <h1>Building Super Ferret</h1>
+      <p class="standfirst">The recommended architecture, argued from a measured
+      baseline that undercuts part of the original premise. What to build, in
+      what order, and which parts of the idea did not survive contact with the
+      corpus.</p>
+      <div class="meta">
+        <span><b>Compiled</b> 2026-09-05</span>
+        <span><b>Scope</b> design recommendation</span>
+        <span><b>Basis</b> M1 measurement plus R1&ndash;R10</span>
+      </div>
+    </div>
+
+    <div class="legend">
+      <b>Provenance</b>
+      <span><span class="p p-doc">upstream</span> project docs or source</span>
+      <span><span class="p p-paper">paper</span> peer-reviewed</span>
+      <span><span class="p p-bench">benchmark</span> independent</span>
+      <span><span class="p p-vendor">vendor</span> vendor-claimed</span>
+      <span><span class="p p-measured">measured</span> measured for this report</span>
+      <span><span class="p p-community">anecdote</span> community-reported</span>
+      <span><span class="p p-est">estimate</span> derived arithmetic</span>
+      <span><span class="p p-none">unknown</span> no figure exists</span>
+    </div>
+<section>
+<h2 id="s1">The measurement that reframes the project</h2>
+
+<p>Before any of the design below, the number that has to be
+absorbed: on the corpus this tool is being built for, <b>ripgrep already answers
+the hardest query shape in 50 milliseconds</b>. Not a literal &mdash; a regex
+with no extractable literal, the exact query a trigram index exists to
+accelerate. A content index cannot beat that. Everything downstream of this page
+is an argument about what remains worth building once you accept it.</p>
+
+<div class="grid">
+  <div class="card">
+    <div class="stat">578,200</div>
+    <div class="cap">files under <span class="mono">/home/dave/w</span> <span class="p p-measured">measured</span></div>
+  </div>
+  <div class="card">
+    <div class="stat">3.7<small>%</small></div>
+    <div class="cap">of bytes surviving build-artefact exclusion <span class="p p-measured">measured</span></div>
+  </div>
+  <div class="card">
+    <div class="stat">50<small>ms</small></div>
+    <div class="cap">warm <span class="mono">rg</span> for a literal <i>and</i> for a hard regex <span class="p p-measured">measured</span></div>
+  </div>
+  <div class="card">
+    <div class="stat">1.24<small>s</small></div>
+    <div class="cap">full metadata crawl of 578k files, warm <span class="p p-measured">measured</span></div>
+  </div>
+</div>
+
+<h3 id="s1a">What M1 actually found<sup><a href="#r1">1</a></sup></h3>
+
+<p>The corpus is 153.2&nbsp;GB across 578,200 files <span class="p p-measured">measured</span>.
+Excluding any path containing a <span class="mono">.git</span>,
+<span class="mono">node_modules</span>, <span class="mono">target</span>,
+<span class="mono">.venv</span>, <span class="mono">__pycache__</span>,
+<span class="mono">.cache</span>, <span class="mono">dist</span>,
+<span class="mono">build</span>, <span class="mono">.next</span>,
+<span class="mono">vendor</span>, <span class="mono">.direnv</span> or
+<span class="mono">result</span> component leaves <b>73,565 files and
+5.73&nbsp;GB</b> <span class="p p-measured">measured</span>. That is 12.7% of the
+files and 3.7% of the bytes. Put the other way: <b>87% of files and 96% of bytes
+are machine-generated build output</b> that no search engine should ever
+touch.</p>
+
+<div class="tw">
+<table>
+<caption>Where the 153.2&nbsp;GB lives. Every row <span class="p p-measured">measured</span>.</caption>
+<thead><tr><th>Extension</th><th class="num">Bytes</th><th class="num">Files</th><th>Character</th></tr></thead>
+<tbody>
+<tr><th class="mono">.bin</th><td class="num">43.46 GB</td><td class="num">14,864</td><td>build output</td></tr>
+<tr><th>(none)</th><td class="num">35.25 GB</td><td class="num">53,104</td><td>mostly build output</td></tr>
+<tr><th class="mono">.o</th><td class="num">30.84 GB</td><td class="num">260,695</td><td>object files</td></tr>
+<tr><th class="mono">.rlib</th><td class="num">23.47 GB</td><td class="num">8,045</td><td>Rust libraries</td></tr>
+<tr><th class="mono">.rmeta</th><td class="num">9.83 GB</td><td class="num">14,588</td><td>Rust metadata</td></tr>
+<tr><th class="mono">.csv</th><td class="num">3.00 GB</td><td class="num">48</td><td><b>real data</b></td></tr>
+<tr><th class="mono">.so</th><td class="num">2.71 GB</td><td class="num">764</td><td>build output</td></tr>
+<tr><th class="mono">.db</th><td class="num">1.14 GB</td><td class="num">7</td><td><b>real data</b></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The four largest source-text extensions total well under 200&nbsp;MB:
+<span class="mono">.json</span> 265&nbsp;MB / 14,609 files,
+<span class="mono">.md</span> 87&nbsp;MB / 9,274 files,
+<span class="mono">.rs</span> 33&nbsp;MB / 2,327 files,
+<span class="mono">.py</span> 25&nbsp;MB / 4,324 files,
+<span class="mono">.txt</span> 16&nbsp;MB / 16,127 files
+<span class="p p-measured">measured</span>. The entire hand-written text corpus
+this project set out to index is roughly the size of a single Rust
+<span class="mono">.rlib</span>.</p>
+
+<div class="tw">
+<table>
+<caption>Scan timings, ripgrep 15.1.0, Ryzen 9 9955HX / 32 threads / NVMe. All <span class="p p-measured">measured</span>.</caption>
+<thead><tr><th>Case</th><th class="num">Time</th><th class="num">CPU</th><th>Rate</th></tr></thead>
+<tbody>
+<tr><th>A. Literal <span class="mono">fn parse_query</span>, default <span class="mono">rg</span>, warm</th><td class="num">0.05 s</td><td class="num">963%</td><td>&mdash;</td></tr>
+<tr><th>B. Regex <span class="mono">[A-Za-z_]+_(index|posting)s?\b</span>, no usable literal, warm</th><td class="num">0.05 s</td><td class="num">1020%</td><td>&mdash;</td></tr>
+<tr><th>C. <span class="mono">rg -uuu</span> over the full 153.2 GB, cold-ish</th><td class="num">234.07 s</td><td class="num">99%</td><td>0.65 GB/s</td></tr>
+<tr><th>D. Same, second run</th><td class="num">217.10 s</td><td class="num">106%</td><td>0.71 GB/s</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+<span class="label">The premise that does not survive</span>
+<p><b>"Build a trigram or n-gram content index so that regex search over my code
+is fast."</b> Case B kills it. The query shape with no extractable literal &mdash;
+the one case where a literal-based scanner is supposed to degrade to a full
+scan &mdash; costs 50&nbsp;ms, identical to the literal case, because
+<span class="mono">.gitignore</span> pruning has already reduced the input to
+5.73&nbsp;GB and 32 threads eat that at multiple GB/s. An index lookup, posting
+intersection, candidate-set materialisation and per-candidate verification pass
+cannot be made to happen in materially less than 50&nbsp;ms on cold structures,
+and it will be <i>slower</i> the first time after boot. There is no latency win
+here, at this corpus size, ever.</p>
+<p>Two second-order claims fall with it. <b>"The index will save I/O"</b> &mdash;
+case C shows the full-corpus scan is I/O-bound at one core's worth of CPU,
+reading bytes nobody wants indexed anyway; exclusion, not indexing, is what
+saves that I/O. And <b>"153 GB is a big corpus"</b> &mdash; it is 5.73 GB of
+corpus wearing a 147 GB costume.</p>
+</div>
+
+<h3 id="s1b">What survives, and why it is still worth building</h3>
+
+<p>A weaker version of the project does not survive. A different and better
+version does. Five things the 50&nbsp;ms measurement does <i>not</i> touch:</p>
+
+<div class="tw">
+<table>
+<caption>The surviving value propositions, each with the reason M1 does not refute it.</caption>
+<thead><tr><th>Capability</th><th>Survives?</th><th>Why</th></tr></thead>
+<tbody>
+<tr><th>Extraction-backed document search (PDF, Office, email)</th><td><span class="pill yes">yes</span></td><td>Extraction costs tens to hundreds of ms per document <span class="p p-est">estimate</span>. It cannot be redone per query. This is the one tier where the index is unambiguously buying something a scanner cannot.</td></tr>
+<tr><th>Metadata and filename search</th><td><span class="pill yes">yes</span></td><td>A full metadata crawl is 1.24 s warm <span class="p p-measured">measured</span>; the resulting structure is small enough to hold resident and answers in microseconds. Free capability, no downside.</td></tr>
+<tr><th>Cold-cache content search</th><td><span class="pill part">partly</span></td><td>The 50 ms figure is warm. The cold full-corpus scan ran at 0.65 GB/s <span class="p p-measured">measured</span>; a cold 5.73 GB tier is therefore roughly 8.8 s <span class="p p-est">estimate</span>. An index that fits in a few hundred MB is cheap to fault in by comparison. But see the honesty note below.</td></tr>
+<tr><th>Ranking</th><td><span class="pill yes">yes</span></td><td>ripgrep returns matches in traversal order. "The 20 most relevant files" is a capability grep does not have and cannot acquire, and it is orthogonal to latency.</td></tr>
+<tr><th>Corpora that are not 96% build output</th><td><span class="pill yes">yes</span></td><td>M1 itself caveats this: a large <span class="mono">~/Documents</span>, a mail spool or a photo library shifts the balance toward extraction. The measurement is one corpus, heavily Rust/JS development.</td></tr>
+<tr><th>Sub-50 ms regex over source code</th><td><span class="pill no">no</span></td><td>Already solved by the tool he has installed.</td></tr>
+<tr><th>Index density as the central engineering problem</th><td><span class="pill no">no</span></td><td>Demoted. See below.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">The honest cold-cache caveat</span>
+<p>The cold-cache argument is the weakest of the five and should not be leaned
+on. The cold number available is 0.65&nbsp;GB/s over the full 153.2&nbsp;GB
+<span class="p p-measured">measured</span> &mdash; a mostly-sequential read of
+large binaries. A cold read of 73,565 small files is a different access pattern
+and no measurement of it exists <span class="p p-none">unknown</span>. On NVMe
+with high queue depth it may be far better than 8.8&nbsp;s; on a fragmented tree
+it may be worse. <b>This is the first experiment to run</b> (see
+&sect;<a href="#s10">10</a>, stage 0): drop caches, scan the 5.73&nbsp;GB tier,
+and get the number. If cold scan is under ~1&nbsp;s the cold-cache argument dies
+too and the project narrows to documents, metadata and ranking.</p>
+</div>
+
+<h3 id="s1c">What this does to the engineering priorities</h3>
+
+<p>M1's own conclusion, and I agree with it without reservation: at this scale
+the design problem is <b>not</b> posting-list compression, and it is not query
+planning either. Ranked by how much a wrong answer costs:</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Concern</th><th>Cost of getting it wrong</th><th>Was it the plan?</th></tr></thead>
+<tbody>
+<tr><th>Exclusion policy</th><td><b>25&times; the index</b>. 153.2 GB vs 5.73 GB <span class="p p-measured">measured</span>. One wrong rule and every codec decision in <a href="indexing.html">the index-structures page</a> is noise by comparison.</td><td>Barely mentioned</td></tr>
+<tr><th>Extraction correctness and robustness</th><td>Silent staleness; a poison PDF looping forever; wrong text indexed under a right filename.</td><td>Secondary</td></tr>
+<tr><th>Politeness under load</th><td>Uninstallation. This is what killed Beagle and what still dogs Baloo &mdash; see <a href="landscape.html">the landscape page</a>.</td><td>Stated as a requirement</td></tr>
+<tr><th>Posting-list codec choice</th><td>Tens of MB on a corpus where the whole content tier is 5.73 GB.</td><td><b>The centrepiece</b></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>That inversion is the finding. It does not mean the index is not worth
+writing &mdash; he is writing it to learn the algorithms, and that is a
+legitimate and sufficient reason on its own. It means <b>the index must not be
+the thing the product's usefulness rests on</b>, because on this corpus it
+demonstrably is not. Build the index because it is interesting and because the
+document tier genuinely needs it. Build the exclusion engine, the extractor
+pipeline and the politeness budget because <i>those</i> are what determine
+whether the tool is used.</p>
+
+<div class="box verdict">
+<span class="label">Verdict</span>
+<p>Build <b>Super Ferret as a document-and-metadata search engine with a
+first-class scan fallback</b>, not as a grep replacement. The inverted index
+earns its keep over extracted text (PDF, Office, email, OCR) and over metadata;
+over source code it is a convenience layer in front of a scanner that is already
+fast enough, and the query planner should be honest enough to route to the
+scanner when the scanner wins. That routing decision &mdash; &sect;<a href="#s5">5</a>
+&mdash; is the most novel part of this design, and it exists only because the
+measurement was taken.</p>
+</div>
+</section>
+<section>
+<h2 id="s2">Requirements, restated as a spec</h2>
+
+<p>The original requirements list, rewritten as things a implementation can be
+tested against, with the ones M1 demoted marked. <b>Demoted does not mean
+dropped</b> &mdash; it means the requirement is no longer allowed to drive an
+architectural decision on its own.</p>
+
+<div class="tw">
+<table>
+<caption>Functional requirements. Priority reflects the measured baseline, not the original enthusiasm.</caption>
+<thead><tr><th>#</th><th>Requirement</th><th>Testable form</th><th>Priority</th></tr></thead>
+<tbody>
+<tr><th class="mono">F1</th><td>Filename and path search</td><td>Substring and glob over 578k paths, p99 under 10 ms, no crawl needed at query time</td><td><span class="pill yes">core</span></td></tr>
+<tr><th class="mono">F2</th><td>Metadata search and filtering</td><td>size, mtime, extension, mime, owner, dimensions, duration; composable with every other predicate</td><td><span class="pill yes">core</span></td></tr>
+<tr><th class="mono">F3</th><td>Extracted-content search over documents</td><td>PDF/Office/email text indexed once, searchable without re-opening the source; snippets served from cache</td><td><span class="pill yes">core</span></td></tr>
+<tr><th class="mono">F4</th><td>Boolean queries</td><td>AND/OR/NOT over term postings with correct short-circuiting</td><td><span class="pill yes">core</span></td></tr>
+<tr><th class="mono">F5</th><td>Phrase queries</td><td>Positional postings; exact adjacency and slop</td><td><span class="pill yes">core</span></td></tr>
+<tr><th class="mono">F6</th><td>Ranking</td><td>BM25 over the document tier; a defensible ordering for code (recency, path depth, symbol-vs-comment)</td><td><span class="pill yes">core</span></td></tr>
+<tr><th class="mono">F7</th><td><b>True regex over content</b></td><td>Byte-accurate matches against original file bytes, with ripgrep-equivalent semantics</td><td><span class="pill yes">core</span> &mdash; but see D1</td></tr>
+<tr><th class="mono">F8</th><td>Near-real-time freshness</td><td>A saved file is queryable within a bounded delay; the bound is a config value and is observable</td><td><span class="pill yes">core</span></td></tr>
+<tr><th class="mono">F9</th><td>Plugin content tiers</td><td>email/chat, OCR; later reverse-image and speech-to-text. Interface frozen before the first plugin ships</td><td><span class="pill yes">core</span></td></tr>
+<tr><th class="mono">F10</th><td>Semantic / embedding search</td><td>Opt-in over a chosen subtree, never over the corpus</td><td><span class="pill part">plugin</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tw">
+<table>
+<caption>Non-functional requirements, with the demotions marked.</caption>
+<thead><tr><th>#</th><th>Requirement</th><th>Target</th><th>Status after M1</th></tr></thead>
+<tbody>
+<tr><th class="mono">N1</th><td>Correct exclusion</td><td>Index 5.73 GB, not 153.2 GB, with zero manual per-project configuration <span class="p p-measured">measured</span></td><td><b>Promoted to first</b>. Worth 25&times; the index.</td></tr>
+<tr><th class="mono">N2</th><td>Politeness</td><td>Indexing a full corpus must not be perceptible: no foreground stall, no page-cache eviction of the working set</td><td><b>Promoted.</b> This is what kills these tools.</td></tr>
+<tr><th class="mono">N3</th><td>Index density</td><td>Slightly slower search for a denser index, in his words</td><td><span class="pill part">demoted</span> The whole content tier is 5.73 GB; a 2&times; codec difference is tens of MB.</td></tr>
+<tr><th class="mono">N4</th><td>Content-search latency</td><td>Originally: beat grep</td><td><span class="pill no">demoted hard</span> Unreachable at 50 ms warm. Restated as N4&prime;.</td></tr>
+<tr><th class="mono">N4&prime;</th><td>Content-search latency, restated</td><td>Never <i>lose</i> to <span class="mono">rg</span> by more than ~2&times; on any query the planner accepts, and never be slower cold</td><td>Achievable, and it is the honest bar.</td></tr>
+<tr><th class="mono">N5</th><td>Crash safety</td><td>Kill -9 at any instant leaves a queryable index; no fsck pass on start</td><td>Unchanged</td></tr>
+<tr><th class="mono">N6</th><td>Observable staleness</td><td>The tool can answer "is my index behind, and by how much" for a user</td><td><b>New.</b> R8's biggest identified risk.</td></tr>
+<tr><th class="mono">N7</th><td>Licence hygiene</td><td>MIT/Apache/BSD in the link graph. GPL code only across a process boundary.</td><td>Unchanged; drives &sect;<a href="#s6">6</a>.</td></tr>
+<tr><th class="mono">N8</th><td>Rust posture</td><td>Edition 2024, <span class="mono">unsafe_code = "forbid"</span>, clippy <span class="mono">all = deny</span> at workspace level</td><td>Unchanged; see the exceptions note.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s2a">Where the no-unsafe posture bites</h3>
+
+<p>Four techniques in this design would force an exception. Each is avoidable,
+and I recommend avoiding all four in the core.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Technique</th><th>Why it needs unsafe</th><th>Recommendation</th></tr></thead>
+<tbody>
+<tr><th><span class="mono">mmap</span> of index segments</th><td>A memory-mapped file is not a sound <span class="mono">&amp;[u8]</span> in Rust's model: another process can truncate or rewrite it under you, which is UB. Every mmap crate exposes this as <span class="mono">unsafe</span>.</td><td><b>Confine it.</b> One small leaf crate with <span class="mono">unsafe_code = "allow"</span>, wrapping <span class="mono">memmap2</span>, with the soundness argument written down (index files are append-only and never truncated in place; a segment is unlinked only after every reader has dropped it). Everything else in the workspace stays <span class="mono">forbid</span>. This is the one exception I would actually take.</td></tr>
+<tr><th>Raw syscalls: <span class="mono">statx</span>, <span class="mono">fanotify</span>, <span class="mono">posix_fadvise</span>, <span class="mono">SCM_RIGHTS</span></th><td>FFI into libc is unsafe by definition.</td><td><b>Avoid the exception.</b> <span class="mono">rustix</span> provides safe wrappers over all four, and on Linux it can use raw syscalls with no libc at all. Take the dependency; do not write the FFI.</td></tr>
+<tr><th>Zero-copy posting decode via transmute / <span class="mono">bytemuck::cast_slice</span></th><td>Alignment and validity invariants.</td><td><b>Avoid.</b> <span class="mono">zerocopy</span> proves the invariants at compile time with derives and no unsafe at the call site. Where alignment cannot be guaranteed, read unaligned via <span class="mono">u32::from_le_bytes</span> on a 4-byte slice &mdash; LLVM compiles that to the same load.</td></tr>
+<tr><th>SIMD-accelerated decode (bitpacking, SIMD-BP128)</th><td>Intrinsics are unsafe; runtime feature detection doubly so.</td><td><b>Do not do this in v1.</b> It is a density-neutral speed optimisation on a tier where speed is already demoted (N3, N4). If it ever matters, <span class="mono">std::simd</span> or a vendored leaf crate, same confinement pattern as mmap.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">Posture recommendation</span>
+<p>Workspace lints stay <span class="mono">unsafe_code = "forbid"</span>. Exactly
+<b>one</b> crate &mdash; call it <span class="mono">ferret-mmap</span> &mdash;
+downgrades to <span class="mono">deny</span> with a per-item
+<span class="mono">#[allow]</span> and a doc comment stating the invariant it
+relies on. If a second crate ever needs the exception, that is a design smell
+worth a day of thought first.</p>
+</div>
+</section>
+<section>
+<h2 id="s3">The recommended architecture</h2>
+
+<p>Five layers, each with a hard boundary and an independently testable
+contract. The shape is conventional &mdash; segment-based index, immutable
+segments, manifest commit &mdash; because R1 found that <b>every long-lived
+Linux desktop search tool in the survey is Xapian- or Lucene-family</b>, and
+nothing in M1 argues for novelty in that layer. The novelty, such as it is,
+lives in three places: the exclusion engine sitting <i>ahead</i> of the crawler,
+the query planner that is willing to route around its own index, and the
+politeness controller nobody has built.</p>
+
+<figure class="code">
+<figcaption>Layer contracts. Each layer knows only the one below it.</figcaption>
+<pre><code><span class="cm">// L5  query      parse -&gt; plan -&gt; route -&gt; execute -&gt; rank -&gt; snippet</span>
+<span class="cm">// L4  index      segments, manifest, merge, tombstones           (immutable on disk)</span>
+<span class="cm">// L3  extract    path + bytes -&gt; {text, metadata, symbols}       (subprocess boundary)</span>
+<span class="cm">// L2  queue      durable, priority-ordered, survives kill -9     (append log + index)</span>
+<span class="cm">// L1  observe    crawl + inotify + reconcile -&gt; change events   (never blocks)</span>
+<span class="cm">// L0  policy     exclusion rules; the 25x layer                 (pure, testable)</span></code></pre>
+</figure>
+
+<h3 id="s3a">The pipeline, with the mechanism shown</h3>
+
+<figure>
+<svg viewBox="0 0 940 700" role="img" aria-labelledby="pipe-title pipe-desc" xmlns="http://www.w3.org/2000/svg">
+  <title id="pipe-title">Super Ferret indexing and query pipeline</title>
+  <desc id="pipe-desc">Change events from inotify and a reconciliation crawl are filtered by
+  the exclusion policy, debounced, written to a durable priority queue, dispatched to
+  in-process or subprocess extractors, written to immutable index segments committed by an
+  atomic manifest rename, and read by a query planner that can route to the index or to a
+  brute-force scanner.</desc>
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--ink-3)"/>
+    </marker>
+    <marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+  <style>
+    .bx  { fill: var(--surface); stroke: var(--rule); stroke-width: 1.2; }
+    .bxa { fill: var(--accent-wash); stroke: var(--accent); stroke-width: 1.4; }
+    .bxs { fill: var(--surface-2); stroke: var(--rule); stroke-width: 1.2; stroke-dasharray: 4 3; }
+    .t   { font: 600 13px Archivo, sans-serif; fill: var(--ink); }
+    .ts  { font: 400 11px "IBM Plex Mono", monospace; fill: var(--ink-3); }
+    .tl  { font: 600 10px Archivo, sans-serif; fill: var(--ink-3); letter-spacing: .1em; }
+    .ln  { stroke: var(--ink-3); stroke-width: 1.3; fill: none; marker-end: url(#ar); }
+    .lna { stroke: var(--accent); stroke-width: 1.6; fill: none; marker-end: url(#ara); }
+    .lnd { stroke: var(--ink-3); stroke-width: 1.3; fill: none; stroke-dasharray: 5 4; marker-end: url(#ar); }
+  </style>
+
+  <text class="tl" x="8" y="16">L1  OBSERVE</text>
+  <rect class="bx" x="8" y="26" width="180" height="62" rx="3"/>
+  <text class="t" x="20" y="48">inotify watches</text>
+  <text class="ts" x="20" y="65">one per directory</text>
+  <text class="ts" x="20" y="79">IN_Q_OVERFLOW -&gt; rescan</text>
+
+  <rect class="bx" x="8" y="102" width="180" height="62" rx="3"/>
+  <text class="t" x="20" y="124">reconcile crawl</text>
+  <text class="ts" x="20" y="141">getdents64 + statx</text>
+  <text class="ts" x="20" y="155">1.24 s / 578k files</text>
+
+  <rect class="bx" x="8" y="178" width="180" height="48" rx="3"/>
+  <text class="t" x="20" y="200">first-run crawl</text>
+  <text class="ts" x="20" y="216">ignore crate, parallel</text>
+
+  <text class="tl" x="234" y="16">L0  POLICY</text>
+  <rect class="bxa" x="234" y="26" width="164" height="200" rx="3"/>
+  <text class="t" x="246" y="50">exclusion engine</text>
+  <text class="ts" x="246" y="70">.gitignore + .ignore</text>
+  <text class="ts" x="246" y="86">+ builtin denylist</text>
+  <text class="ts" x="246" y="102">+ size / mime caps</text>
+  <text class="ts" x="246" y="118">+ (st_dev, st_ino) dedup</text>
+  <text class="ts" x="246" y="146">578,200 in</text>
+  <text class="ts" x="246" y="162">73,565 out</text>
+  <text class="ts" x="246" y="178">153.2 GB -&gt; 5.73 GB</text>
+  <text class="ts" x="246" y="202">pure fn; the 25x layer</text>
+
+  <text class="tl" x="444" y="16">L2  QUEUE</text>
+  <rect class="bx" x="444" y="26" width="176" height="86" rx="3"/>
+  <text class="t" x="456" y="48">debounce ring</text>
+  <text class="ts" x="456" y="65">per-path, 200 ms</text>
+  <text class="ts" x="456" y="79">coalesces save-storms</text>
+  <text class="ts" x="456" y="95">rename cookie pairing</text>
+
+  <rect class="bx" x="444" y="126" width="176" height="100" rx="3"/>
+  <text class="t" x="456" y="148">durable work queue</text>
+  <text class="ts" x="456" y="165">append log + redb/sled</text>
+  <text class="ts" x="456" y="179">prio 0 text  1 doc  2 plugin</text>
+  <text class="ts" x="456" y="193">survives kill -9</text>
+  <text class="ts" x="456" y="212">never blocks the watcher</text>
+
+  <text class="tl" x="666" y="16">L3  EXTRACT</text>
+  <rect class="bx" x="666" y="26" width="266" height="92" rx="3"/>
+  <text class="t" x="678" y="48">in-process (trusted, pure Rust)</text>
+  <text class="ts" x="678" y="66">text/code: read + encoding_rs + NFC</text>
+  <text class="ts" x="678" y="80">tree-sitter symbols; calamine; lofty</text>
+  <text class="ts" x="678" y="94">kamadak-exif; lol_html; pulldown-cmark</text>
+  <text class="ts" x="678" y="110">fadvise(DONTNEED) after every read</text>
+
+  <rect class="bxs" x="666" y="132" width="266" height="94" rx="3"/>
+  <text class="t" x="678" y="154">subprocess pool (untrusted / GPL)</text>
+  <text class="ts" x="678" y="172">protobuf frames on stdio, fd via SCM_RIGHTS</text>
+  <text class="ts" x="678" y="186">bwrap + seccomp; RLIMIT_AS; 60 s timeout</text>
+  <text class="ts" x="678" y="200">pdfium | pdftotext | libreoffice | tesseract</text>
+  <text class="ts" x="678" y="216">crash =&gt; one worker, poison-quarantine at N=3</text>
+
+  <text class="tl" x="8" y="266">L4  INDEX</text>
+  <rect class="bx" x="8" y="278" width="212" height="118" rx="3"/>
+  <text class="t" x="20" y="300">extracted-text cache</text>
+  <text class="ts" x="20" y="318">zstd, dictionary-trained</text>
+  <text class="ts" x="20" y="332">keyed by (dev, ino, mtime, size)</text>
+  <text class="ts" x="20" y="352">serves snippets without</text>
+  <text class="ts" x="20" y="366">re-extraction; makes a</text>
+  <text class="ts" x="20" y="380">tokenizer change cheap</text>
+
+  <rect class="bx" x="240" y="278" width="212" height="118" rx="3"/>
+  <text class="t" x="252" y="300">in-memory segment</text>
+  <text class="ts" x="252" y="318">BTreeMap&lt;Term, Postings&gt;</text>
+  <text class="ts" x="252" y="332">searchable before flush</text>
+  <text class="ts" x="252" y="352">flush at 4 MB or 1000 docs</text>
+  <text class="ts" x="252" y="372">= NRT visibility</text>
+
+  <rect class="bx" x="472" y="278" width="212" height="118" rx="3"/>
+  <text class="t" x="484" y="300">immutable segments</text>
+  <text class="ts" x="484" y="318">fst dict + EF postings</text>
+  <text class="ts" x="484" y="332">roaring filters + doc values</text>
+  <text class="ts" x="484" y="346">trigram index (content)</text>
+  <text class="ts" x="484" y="366">tombstone bitset per segment</text>
+  <text class="ts" x="484" y="386">write once, fsync, never mutate</text>
+
+  <rect class="bxa" x="704" y="278" width="228" height="118" rx="3"/>
+  <text class="t" x="716" y="300">manifest / commit point</text>
+  <text class="ts" x="716" y="318">write temp, fsync,</text>
+  <text class="ts" x="716" y="332">rename() over MANIFEST,</text>
+  <text class="ts" x="716" y="346">fsync the directory</text>
+  <text class="ts" x="716" y="368">the only mutable byte</text>
+  <text class="ts" x="716" y="382">in the whole index</text>
+
+  <text class="tl" x="8" y="436">L5  QUERY</text>
+  <rect class="bx" x="8" y="448" width="196" height="76" rx="3"/>
+  <text class="t" x="20" y="470">parse</text>
+  <text class="ts" x="20" y="488">boolean / phrase / path:</text>
+  <text class="ts" x="20" y="502">mtime: size: ext: /re/</text>
+  <text class="ts" x="20" y="516">regex-syntax HIR for /re/</text>
+
+  <rect class="bxa" x="224" y="448" width="212" height="130" rx="3"/>
+  <text class="t" x="236" y="470">planner</text>
+  <text class="ts" x="236" y="488">Cox lattice over the HIR</text>
+  <text class="ts" x="236" y="502">-&gt; trigram AND/OR tree</text>
+  <text class="ts" x="236" y="518">estimate selectivity from</text>
+  <text class="ts" x="236" y="532">df stats in the dictionary</text>
+  <text class="ts" x="236" y="552">if est. candidates &gt; 15%</text>
+  <text class="ts" x="236" y="566">of tier: do not use index</text>
+
+  <rect class="bx" x="456" y="448" width="212" height="60" rx="3"/>
+  <text class="t" x="468" y="470">index path</text>
+  <text class="ts" x="468" y="488">leapfrog AND, BM25,</text>
+  <text class="ts" x="468" y="502">block-max WAND top-k</text>
+
+  <rect class="bx" x="456" y="518" width="212" height="60" rx="3"/>
+  <text class="t" x="468" y="540">scan path</text>
+  <text class="ts" x="468" y="558">ignore + grep-searcher,</text>
+  <text class="ts" x="468" y="572">32 threads, 50 ms warm</text>
+
+  <rect class="bx" x="688" y="448" width="244" height="130" rx="3"/>
+  <text class="t" x="700" y="470">verify + render</text>
+  <text class="ts" x="700" y="488">re-run the real regex over</text>
+  <text class="ts" x="700" y="502">candidate bytes (regex crate)</text>
+  <text class="ts" x="700" y="522">phrase: re-scan candidate file,</text>
+  <text class="ts" x="700" y="536">gated on (ino, mtime) doc value</text>
+  <text class="ts" x="700" y="556">snippets from the text cache;</text>
+  <text class="ts" x="700" y="570">stale file =&gt; drop, never lie</text>
+
+  <rect class="bxs" x="8" y="606" width="924" height="80" rx="3"/>
+  <text class="tl" x="20" y="626">CROSS-CUTTING  POLITENESS CONTROLLER</text>
+  <text class="ts" x="20" y="646">cgroup v2: cpu.weight=10, io.weight=10, memory.high  |  SCHED_IDLE on extract+merge workers, SCHED_OTHER on the watcher</text>
+  <text class="ts" x="20" y="662">posix_fadvise(DONTNEED) after every content read  |  merge rate limiter, trailing 2 s window  |  activity backoff: foreground load =&gt; drain rate -&gt; 0</text>
+  <text class="ts" x="20" y="678">ionice set but assumed inert: NVMe scheduler is none/mq-deadline on this machine</text>
+
+  <path class="ln" d="M 188 57 L 230 57"/>
+  <path class="ln" d="M 188 133 L 230 133"/>
+  <path class="ln" d="M 188 202 L 230 175"/>
+  <path class="lna" d="M 398 90 L 440 78"/>
+  <path class="ln" d="M 532 112 L 532 122"/>
+  <path class="ln" d="M 620 176 L 662 100"/>
+  <path class="lna" d="M 620 190 L 662 178"/>
+  <path class="ln" d="M 862 226 L 862 258 L 114 258 L 114 274"/>
+  <path class="ln" d="M 220 337 L 236 337"/>
+  <path class="ln" d="M 452 337 L 468 337"/>
+  <path class="lna" d="M 684 337 L 700 337"/>
+  <path class="ln" d="M 204 486 L 220 486"/>
+  <path class="lna" d="M 436 490 L 452 478"/>
+  <path class="lna" d="M 436 546 L 452 546"/>
+  <path class="ln" d="M 668 478 L 684 490"/>
+  <path class="ln" d="M 668 548 L 684 536"/>
+  <path class="lnd" d="M 810 396 L 810 420 L 330 420 L 330 444"/>
+  <text class="ts" x="600" y="416">manifest generation read once per query</text>
+  <path class="lnd" d="M 114 396 L 114 440 L 690 440 L 800 444"/>
+</svg>
+<figcaption>The indexing and query pipeline. Solid arrows are the hot path; the
+accent path is the one that matters most (exclusion &rarr; queue &rarr;
+subprocess &rarr; commit, and planner &rarr; whichever executor wins). Dashed
+lines are reads, not writes.</figcaption>
+</figure>
+
+<h3 id="s3b">The five decisions embedded in that picture</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>Decision</th><th>Chosen</th><th>Rejected, and why</th></tr></thead>
+<tbody>
+<tr><th>Exclusion runs <i>before</i> the crawler, not as an index-time filter</th><td>A pure <span class="mono">fn should_index(&amp;Path, &amp;Metadata) -&gt; Decision</span> consulted by the walker, so an excluded subtree is never descended into. The <span class="mono">ignore</span> crate already implements gitignore semantics with subtree pruning &mdash; use it rather than reimplement.</td><td>Filtering after the walk. It would still cost the <span class="mono">getdents</span> traffic over 260,695 <span class="mono">.o</span> files <span class="p p-measured">measured</span>, and worse, it puts the 25&times; decision somewhere untestable. Making it a pure function means the exclusion policy gets a unit-test corpus and a golden file.</td></tr>
+<tr><th>The queue is durable and lives on disk</th><td>Append log plus a key-value index; the watcher's only job is to write a path into it and return. Priority tiers so a plugin's OCR backlog cannot delay a source file.</td><td>An in-memory <span class="mono">VecDeque</span>. R8 is explicit: you cannot outrun <span class="mono">IN_Q_OVERFLOW</span> by reading harder if extraction is the bottleneck. Decoupling "note that this changed" (must never block) from "extract it" (may queue for minutes) is the whole design.</td></tr>
+<tr><th>Extraction is split by trust, not by convenience</th><td>Pure-Rust, dependency-light parsers in-process; everything with a CVE history or a copyleft licence across a process boundary.</td><td>One uniform boundary either way. All in-process means a crafted PDF crashes the process holding the index. All subprocess means paying IPC for a 3 KB <span class="mono">.rs</span> file, which is the bulk of the corpus by file count.</td></tr>
+<tr><th>The planner may decline to use the index</th><td>A selectivity estimate gates the index path; below it, the scanner runs. See &sect;<a href="#s5">5</a>.</td><td>"Always use the index." M1 case B says that is a latency <i>regression</i> on this corpus. R7 says the same thing from theory: an index that narrows 200 GB to 150 GB is pure overhead on top of the scan it failed to avoid.</td></tr>
+<tr><th>One politeness controller, not per-subsystem niceness</th><td>A single component owning the cgroup writes, the scheduling class of each worker pool, the merge rate limiter and the activity backoff.</td><td>Scattering <span class="mono">nice()</span> calls at thread spawn, which is what all three surveyed tools do <span class="p p-doc">upstream</span> and which R1 concludes is demonstrably insufficient.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">Process topology</span>
+<p>Three processes, one systemd user slice.
+<b><span class="mono">ferretd</span></b> holds the watcher, the queue, the
+in-process extractors, the segment writer and the merge scheduler.
+<b><span class="mono">ferret-extract-*</span></b> are pooled, long-lived
+subprocess workers &mdash; spawned once per format family, not per file, because
+LibreOffice-headless startup is reported in the hundreds-of-ms-to-seconds range
+<span class="p p-est">estimate</span> and must be amortised.
+<b><span class="mono">ferret</span></b> is the CLI/query client, which opens the
+index read-only and does <i>not</i> talk to the daemon &mdash; so a query works
+while the daemon is stopped, crashed, or being upgraded. That last property is
+worth more than it sounds: it means the search tool is never down.</p>
+</div>
+</section>
+<section>
+<h2 id="s4">Tiered index design</h2>
+
+<p>Four tiers. Each is separately buildable, separately droppable, and answers a
+named set of queries. The point of the separation is that <b>tier 2 is the one
+whose existence is genuinely in doubt</b> after M1, and the design must let him
+build tiers 0 and 1, measure, and then decide &mdash; rather than discovering at
+the end that the trigram index is load-bearing for the whole thing.</p>
+
+<h3 id="s4a">A second exclusion axis the path rules miss</h3>
+
+<p>Before sizing anything: the 5.73&nbsp;GB post-exclusion figure is still not
+the text corpus. M1's exclusion was purely path-based. Look at what survives
+it:</p>
+
+<figure class="code">
+<figcaption>Deriving the actual text tier from M1's measured extension table.</figcaption>
+<pre><code>  5.73 GB   surviving path-based exclusion, 73,565 files   <span class="cm">[measured]</span>
+- 3.00 GB   .csv        48 files, mean 62.5 MB each        <span class="cm">[measured]</span>
+- 1.14 GB   .db          7 files                           <span class="cm">[measured]</span>
+-----------
+  1.59 GB   across ~73,510 files, mean 21.8 KB             <span class="cm">[estimate, from measured inputs]</span></code></pre>
+</figure>
+
+<p><b>55 files hold 72% of the post-exclusion bytes.</b> A per-file size cap and
+a mime check are therefore worth almost as much as the whole path denylist, and
+cost one <span class="mono">statx</span> field. Recommendation: cap full-text
+indexing at <b>8&nbsp;MB per file</b>; above it, index metadata plus the first
+8&nbsp;MB, flag the document as <span class="mono">TRUNCATED</span>, and let the
+scan path answer regex over the tail. A 62&nbsp;MB CSV is not a document; it is
+a table, and a search engine that pretends otherwise produces a term dictionary
+full of one-off numeric tokens that inflate every structure downstream.</p>
+
+<div class="box warn">
+<span class="label">Caveat on that cap</span>
+<p>This is a judgement, not a measurement: the 8&nbsp;MB threshold has no
+empirical basis and should be a config value with the default chosen after
+looking at the actual size histogram. M1's distribution table says 527k of 578k
+files (91%) are under 256&nbsp;KB <span class="p p-measured">measured</span>, so
+almost any cap in the low megabytes captures essentially every real document;
+the cap exists to catch the tail, not to tune recall.</p>
+</div>
+
+<h3 id="s4b">The four tiers</h3>
+
+<div class="tw">
+<table>
+<caption>Tier definitions. "Answers" means: this tier alone is sufficient for that query class.</caption>
+<thead><tr><th>Tier</th><th>Stores</th><th>Structure</th><th>Answers</th><th>Drop it and you lose</th></tr></thead>
+<tbody>
+<tr><th class="mono">T0 &mdash; metadata</th><td>path, (dev,ino), size, mtime, ext-id, mime-id, depth, flags; plus a filename trigram index</td><td>Column-oriented doc values, delta + bitpack + zstd. Roaring bitmaps for the categorical filters. Path strings front-coded in path-sorted docID order.</td><td>Filename substring, glob, <span class="mono">ext:</span>, <span class="mono">size:</span>, <span class="mono">mtime:</span>, <span class="mono">path:</span>, and every one of those composed with the other tiers</td><td>Everything. This tier is the product's floor.</td></tr>
+<tr><th class="mono">T1 &mdash; terms</th><td>docID + tf per term. <b>No positions.</b></td><td>Per-segment <span class="mono">fst</span> term dictionary; Elias-Fano docID postings in 128-doc blocks; SIMD-BP128/PFOR for the freq stream</td><td>Boolean, ranked (BM25F), and &mdash; via the FST&times;DFA product walk &mdash; wildcard and regex <i>over terms</i></td><td>Ranking, and boolean over the document tier where re-extraction is prohibitive</td></tr>
+<tr><th class="mono">T2 &mdash; trigrams</th><td>doc-level trigram postings over content, plus a per-file binary fuse filter</td><td>Same postings machinery as T1, different key space. <span class="mono">BinaryFuse8</span><sup><a href="#r14">14</a></sup> at ~9 bits/key <span class="p p-paper">paper</span> per file as the admission gate</td><td>Index-assisted regex and substring: narrows the candidate set before the verify scan</td><td>Regex falls through to full scan &mdash; which M1 measured at <b>50 ms</b> <span class="p p-measured">measured</span>. This is the tier under genuine doubt.</td></tr>
+<tr><th class="mono">T3 &mdash; extracted text</th><td>The normalised text of every document whose extraction cost more than a read</td><td>zstd with a trained dictionary, block-framed for seekable random access, keyed by (dev, ino, mtime, size)</td><td>Snippets without re-extraction; re-tokenisation without re-extraction; phrase verification</td><td>Every result render re-opens and re-parses a PDF. This is the tier the whole project rests on for documents.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s4c">The size budget, with the arithmetic shown</h3>
+
+<p>Every figure below is <span class="p p-est">estimate</span> unless chipped
+otherwise. Assumptions are stated as their own rows so he can substitute.</p>
+
+<figure class="code">
+<figcaption>Assumptions. Change these, not the totals.</figcaption>
+<pre><code>A1  files indexed                 73,565            <span class="cm">[measured]</span>
+A2  files in the full tree        578,200           <span class="cm">[measured]</span>
+A3  text tier bytes              1.59 GB            <span class="cm">[derived above from measured]</span>
+A4  mean path length               60 B             <span class="cm">[ASSUMPTION - not measured anywhere]</span>
+A5  front-coding gain on paths      3x              <span class="cm">[ASSUMPTION - path-sorted order]</span>
+A6  bytes per token incl. delim    6.5 B            <span class="cm">[ASSUMPTION - code-heavy text]</span>
+A7  distinct trigrams per file    3,000             <span class="cm">[ASSUMPTION - saturating; 22 KB mean file]</span>
+A8  mean bytes per EF posting      1.0 B            <span class="cm">[from EF bound 2+log2(u/n) bits, u=73,565]</span>
+A9  term postings / token occs      0.18            <span class="cm">[ASSUMPTION - distinct terms per doc]</span></code></pre>
+</figure>
+
+<figure class="code">
+<figcaption>T0 &mdash; metadata and filenames.</figcaption>
+<pre><code>doc values   73,565 x 24 B  (41 B raw, ~24 B after per-column delta+bitpack+zstd)
+             = 1.77 MB
+path store   73,565 x 60 B / 3        (A4, A5)
+             = 1.47 MB
+fname trigrams  73,565 files x ~50 distinct path trigrams x 1.0 B  (A8)
+             = 3.68 MB
+roaring filters (ext, mime, depth buckets, tombstones)
+             = ~1 MB
+                                              T0 subtotal   ~8 MB
+optional: filename-only index over all 578,200 files
+             578,200 x (20 B path + 50 x 1.0 B trigram)     +40 MB</code></pre>
+</figure>
+
+<figure class="code">
+<figcaption>T1 &mdash; term index, positions dropped.</figcaption>
+<pre><code>token occurrences  1.59e9 B / 6.5 B      (A3, A6)     = 245 M
+term postings      245 M x 0.18          (A9)         =  44 M
+postings bytes     44 M x 1.0 B          (A8)         =  44 MB
+freq stream        44 M x ~0.5 B (bitpacked, small tf) =  22 MB
+term dictionary    ~2 M distinct terms, FST            =  ~15 MB
+                                              T1 subtotal  ~81 MB
+cross-check: 81 MB / 1.59 GB = 5.1% of text.
+  R6 says positional indexes run 10-30% of text and positions are 2-4x the
+  freq-only index, so freq-only should land at 3-10%.  5.1% sits inside that.
+  Recoll measured 1.2 GB over a 30 GB PDF corpus = 4%.</code></pre>
+</figure>
+
+<figure class="code">
+<figcaption>T2 &mdash; trigram index. The expensive tier.</figcaption>
+<pre><code>trigram postings   73,510 x 3,000       (A1, A7)      = 221 M
+postings bytes     221 M x 1.0 B        (A8)          = 221 MB
+fuse filters       73,510 files x 3,000 keys x 9 bits (BinaryFuse8)
+                   = 248 Mbit                          =  31 MB
+                                              T2 subtotal ~252 MB
+                                     = 15.8% of the text tier
+                                     = 3.1x the entire term index</code></pre>
+</figure>
+
+<figure class="code">
+<figcaption>T3 &mdash; extracted-text cache, and the total.</figcaption>
+<pre><code>T3 on THIS corpus:  M1's extension census lists no PDF or Office tier at all.
+                    The document tier here is effectively empty.        ~0 MB
+                    General case: 5-20 KB of text per document, zstd'd.
+
+TOTAL, measured corpus, all tiers:      8 + 81 + 252 +  0  =  341 MB
+TOTAL, without T2 (no trigram index):   8 + 81 +   0 +  0  =   89 MB
+
+  341 MB / 5.73 GB post-exclusion  = 5.9%
+  341 MB / 1.59 GB text tier       = 21.4%
+   89 MB / 1.59 GB text tier       =  5.6%
+  341 MB / 153.2 GB raw tree       =  0.22%</code></pre>
+</figure>
+
+<div class="tw">
+<table>
+<caption>Index-to-text ratio against the alternatives. Track is 1&times; the text tier.</caption>
+<thead><tr><th>Design</th><th>Ratio to text</th><th class="num">On 1.59 GB</th></tr></thead>
+<tbody>
+<tr><th>T0+T1 only (this design, no trigrams)</th><td><div class="bar"><span class="track"><span class="fill" style="width:5.6%"></span></span><span class="val">0.056&times;</span></div></td><td class="num">89 MB <span class="p p-est">estimate</span></td></tr>
+<tr><th>T0+T1+T2 (this design, full)</th><td><div class="bar"><span class="track"><span class="fill" style="width:21.4%"></span></span><span class="val">0.21&times;</span></div></td><td class="num">341 MB <span class="p p-est">estimate</span></td></tr>
+<tr><th>Recoll, measured on a 30 GB PDF corpus</th><td><div class="bar"><span class="track"><span class="fill" style="width:4%"></span></span><span class="val">0.04&times;</span></div></td><td class="num">&mdash; <span class="p p-doc">upstream</span></td></tr>
+<tr><th>Lucene/Tantivy-class, with positions</th><td><div class="bar"><span class="track"><span class="fill" style="width:30%"></span></span><span class="val">0.1&ndash;0.3&times;</span></div></td><td class="num">160&ndash;480 MB <span class="p p-est">estimate</span></td></tr>
+<tr><th>zoekt, positional trigrams<sup><a href="#r10">10</a></sup></th><td><div class="bar"><span class="track"><span class="fill vhi" style="width:100%"></span></span><span class="val">3.5&times;</span></div></td><td class="num">5.6 GB <span class="p p-doc">upstream</span></td></tr>
+<tr><th>Plain suffix array + LCP</th><td><div class="bar"><span class="track"><span class="fill vhi" style="width:100%"></span></span><span class="val">4&ndash;5&times;</span></div></td><td class="num">6.4&ndash;8.0 GB <span class="p p-est">estimate</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">The number that should change his mind about T2</span>
+<p><b>The trigram index costs 3.1&times; the entire term index</b>
+<span class="p p-est">estimate</span> and buys acceleration for a query that
+already completes in 50&nbsp;ms <span class="p p-measured">measured</span>. It is
+the single largest line in the budget and the one with the weakest
+justification. Everything else in this design earns its bytes.</p>
+<p>I am not recommending he skip it &mdash; there is a real case, below &mdash;
+but the case has to be made on cold-cache behaviour and on the
+not-yet-measured corpora, not on warm regex latency, because warm regex latency
+is a lost argument.</p>
+</div>
+
+<h3 id="s4d">What was rejected, and why</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>Alternative</th><th>Verdict</th><th>Reasoning</th></tr></thead>
+<tbody>
+<tr><th>Positional postings</th><td><span class="pill no">rejected</span></td><td>R6's own top-ranked density lever. Positions run 2&ndash;4&times; the freq-only index <span class="p p-paper">paper</span> and 3&ndash;10&times; docs-only <span class="p p-bench">benchmark</span>. Elasticsearch's <span class="mono">match_only_text</span><sup><a href="#r13">13</a></sup> ships exactly this trade <span class="p p-doc">upstream</span>. Phrase queries re-scan the candidate file, gated on an (ino, mtime) doc value so a since-modified file fails the check rather than lying. On a candidate set of tens to low thousands at NVMe latency, that is single-digit ms per query, paid only on phrase queries, against a permanent corpus-wide saving. This is the most direct possible instantiation of his stated preference, and it is the item most likely to be carried past unexamined out of Ferret habit.</td></tr>
+<tr><th>Positional (zoekt-style) trigrams with successor lists</th><td><span class="pill no">rejected</span></td><td>~1.2&times; corpus in RAM per zoekt's own design doc <span class="p p-doc">upstream</span>, ~3.5&times; on disk <span class="p p-doc">upstream</span> (flagged for re-verification in R2's done-note). It buys offset-level verification &mdash; latency &mdash; at roughly 22&times; the cost of the doc-only tier. Wrong side of the density mandate by a wide margin.</td></tr>
+<tr><th>Plain suffix array (livegrep model)</th><td><span class="pill no">rejected</span></td><td>4&ndash;5 bytes of index per byte of text <span class="p p-est">estimate</span>, and non-local update: one changed file perturbs global sort order, so livegrep rebuilds per repository. Disqualified twice over &mdash; density and NRT.</td></tr>
+<tr><th>Suffix tree / CDAWG</th><td><span class="pill no">rejected</span></td><td>10&ndash;20+ bytes per character <span class="p p-est">estimate</span>. R7: no production text-search system ships one, for exactly this reason.</td></tr>
+<tr><th>FM-index / r-index / move-r<sup><a href="#r15">15</a></sup> as cold segments</th><td><span class="pill part">deferred, and genuinely interesting</span></td><td>move-r reports 2&ndash;35&times; faster locate at 0.8&ndash;2.5&times; the size of prior r-indexes <span class="p p-paper">paper</span>, at or below compressed-text size, and would give <b>exact regex with no verify pass at all</b>. It fits a source tree's repetitiveness precisely. But: no maintained Rust implementation exists, the reference is GPL-3.0 C++ (readable intel, not vendorable), and every published variant is static &mdash; usable only as a cold-segment target behind a merge. R7 calls it the most underrated technique for this build and I agree, but it is a multi-week port and belongs after stage 4, not in it.</td></tr>
+<tr><th>Bloom-over-blocks as the primary structure (VictoriaLogs model)</th><td><span class="pill no">rejected</span></td><td>Three reasons from R10, in order: it accelerates no regex at all (VictoriaLogs' <span class="mono">re()</span>, Loki's <span class="mono">|~</span> and ClickHouse's <span class="mono">match()</span> all fall through to linear scan); it gives block-granularity hits with no intra-file addressing, which is right for a log line and wrong for a 50,000-line source file; and its core saving assumes data ages out unqueried, which is false for personal files. ClickHouse's own 2025&ndash;26 move <i>back</i> toward a native inverted index for a 10&ndash;50&times; latency win <span class="p p-vendor">vendor</span> is corroborating evidence. Borrow the per-file filter as a gate in front of a real structure &mdash; Splunk's layering, not VictoriaLogs' &mdash; and borrow the columnar-dictionary-then-zstd encoding for T0 wholesale, where there is no argument for anything heavier.</td></tr>
+<tr><th>Static index pruning</th><td><span class="pill no">rejected outright</span></td><td>Not on the density/latency axis at all: it trades size for lost recall. A desktop user's expectation is "did it search my whole disk". R6 says reject rather than file under tradeoffs, and that is right.</td></tr>
+<tr><th>Bigram / next-word indexes for phrases</th><td><span class="pill no">rejected</span></td><td>Vocabulary grows by an order of magnitude or more <span class="p p-est">estimate</span>, which is itself a density cost, and 3+-word phrases still chain or fall back. The re-scan fallback is already needed for the since-modified case, so bigrams add a second mechanism for a benefit the first already delivers.</td></tr>
+<tr><th>Recursive graph bisection for docID assignment</th><td><span class="pill part">deferred; path-sort now</span></td><td>Path-sort is nearly free and unusually strong on a filesystem corpus, because directory structure is a real topical signal in a way a web crawl's URL order is not. BP is the state of the art <span class="p p-paper">paper</span>, cross-validated by an independent reproducibility study <span class="p p-paper">paper</span>, but has no Rust implementation and is a build-time batch step. Do it only if profiling after path-sort still shows index size mattering &mdash; which, at 341 MB, it will not.</td></tr>
+<tr><th>SIMD-BP128 hand-vectorised decode</th><td><span class="pill no">rejected for v1</span></td><td>Density-neutral. Costs the <span class="mono">unsafe</span> exception. The <span class="mono">bitpacking</span> crate exists (MIT, actively maintained <span class="p p-doc">upstream</span>) if it ever matters.</td></tr>
+<tr><th>Binary interpolative coding</th><td><span class="pill no">rejected</span></td><td>Best known size on clustered lists, ~1&ndash;2 bits/posting better than the PFOR family <span class="p p-paper">paper</span>, but slow, recursive and non-vectorisable. On a 44 M-posting index that saves roughly 10 MB. Not worth a decode path that cannot skip.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box verdict">
+<span class="label">Tier verdict</span>
+<p><b>Elias-Fano for docID postings</b> (it is near-optimal in bits/element and
+hands you <span class="mono">nextGEQ</span>, which both leapfrog intersection and
+block-max WAND need), <b>PFOR/bitpacked frequencies</b>, <b><span class="mono">fst</span>
+term dictionaries</b> (the FST&times;DFA product walk is the load-bearing reason
+to prefer a trie over a hash map &mdash; it is what makes wildcard, regex-over-terms
+and Levenshtein fuzzy matching possible at all), <b>Roaring for filter and
+tombstone bitsets</b>, <b>no positions</b>, <b>path-sorted docIDs</b>. That
+combination is ~89&nbsp;MB on his corpus and every piece of it is justified
+independently of whether the trigram tier ever gets built.</p>
+</div>
+</section>
+<section>
+<h2 id="s5">Query planning and execution</h2>
+
+<p>This is the heart of the design and the part that is actually novel, because
+it exists only as a consequence of the measurement. Every other indexed search
+tool assumes its index is worth consulting. On this corpus that assumption is
+false often enough that the planner must be able to <b>decline its own
+index</b>, and must do so from a cost model rather than a heuristic bolted on
+later.</p>
+
+<h3 id="s5a">The five routes</h3>
+
+<div class="tw">
+<table>
+<caption>Query routes, in the order the planner considers them.</caption>
+<thead><tr><th>Route</th><th>Trigger</th><th>Touches</th><th>Expected cost</th></tr></thead>
+<tbody>
+<tr><th class="mono">R1 METADATA</th><td>No content predicate at all &mdash; <span class="mono">ext:</span>, <span class="mono">size:</span>, <span class="mono">mtime:</span>, <span class="mono">path:</span> only</td><td>T0 doc values + Roaring filters</td><td>Microseconds. The whole tier is ~8 MB <span class="p p-est">estimate</span> and stays resident.</td></tr>
+<tr><th class="mono">R2 FILENAME</th><td>A name/path pattern, with or without metadata predicates</td><td>T0 filename trigrams, then the path store</td><td>Sub-millisecond. plocate answers an equivalent query in 0.008 s over a whole filesystem <span class="p p-doc">upstream</span>.</td></tr>
+<tr><th class="mono">R3 INDEXED CONTENT</th><td>Term, phrase, or boolean over content; or any query whose scope includes extracted documents</td><td>T1 dictionary + postings; T3 for snippets; source file re-scan for phrase</td><td>Low single-digit ms. Ranked, which is the capability grep does not have.</td></tr>
+<tr><th class="mono">R4 INDEX-ASSISTED REGEX</th><td>A regex whose Cox derivation yields a trigram query with estimated selectivity below the threshold</td><td>T2 fuse filters &rarr; T2 postings &rarr; verify with the <span class="mono">regex</span> crate over surviving bytes</td><td>Index lookup plus verify over the survivors. Wins only when it eliminates most of the scope.</td></tr>
+<tr><th class="mono">R5 SCAN</th><td>Everything else, and everything the estimator says would be cheaper this way</td><td>T0 to bound the scope, then <span class="mono">ignore</span> + <span class="mono">grep-searcher</span> over the surviving files</td><td>50 ms warm for the whole text tier <span class="p p-measured">measured</span>; ~8.8 s cold at 0.65 GB/s <span class="p p-est">estimate</span>.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">R5 is not a failure mode</span>
+<p>R7<sup><a href="#r5">5</a></sup> argues this and M1 proves it. A regex that degenerates to "match all"
+&mdash; a leading <span class="mono">.*</span>, a short alternation, a
+<span class="mono">\b</span>-only pattern &mdash; is not an apology. It is the
+case where the honest answer is a scan, and on this corpus the scan takes
+50&nbsp;ms. R5 gets the same engineering attention as R4: memory-mapped,
+work-stealing across files, SIMD-prefiltered, and it reuses <span class="mono">ripgrep</span>'s
+own crates (<span class="mono">ignore</span>, <span class="mono">grep-searcher</span>,
+<span class="mono">grep-regex</span>) rather than reimplementing them. Those
+crates are MIT/Unlicense, so the licence posture holds.</p>
+</div>
+
+<h3 id="s5b">The planner, concretely</h3>
+
+<figure class="code">
+<figcaption>Query planning. This is implementable as written.</figcaption>
+<pre><code><span class="kw">enum</span> Route { Metadata, Filename, IndexedContent, IndexRegex, Scan }
+
+<span class="kw">fn</span> plan(q: &amp;Query, idx: &amp;IndexView, ctx: &amp;Ctx) -&gt; Plan {
+    <span class="cm">// 1. Split predicates. Metadata and filename predicates are always</span>
+    <span class="cm">//    evaluated first: they are cheap and they shrink the scope for</span>
+    <span class="cm">//    everything after them.</span>
+    <span class="kw">let</span> scope = idx.t0.evaluate(&amp;q.metadata_preds, &amp;q.path_preds);
+    <span class="cm">//    scope: { docs: RoaringBitmap, n_files: u32, n_bytes: u64 }</span>
+
+    <span class="kw">if</span> q.content.is_none() {
+        <span class="kw">return</span> Plan::new(Route::Metadata, scope);
+    }
+    <span class="kw">if</span> q.content.is_filename_only() {
+        <span class="kw">return</span> Plan::new(Route::Filename, scope);
+    }
+
+    <span class="cm">// 2. Documents whose text was extracted have no original bytes to</span>
+    <span class="cm">//    scan. The index is the ONLY way to reach them, at any cost.</span>
+    <span class="kw">let</span> (extracted, raw) = scope.split_by(DocFlag::Extracted);
+    <span class="kw">if</span> !extracted.is_empty() {
+        plan.force_index_for(extracted);   <span class="cm">// R3, unconditionally</span>
+    }
+
+    <span class="cm">// 3. Route the raw-byte part on cost, not on query shape.</span>
+    <span class="kw">match</span> &amp;q.content {
+        Content::Terms(t)  =&gt; Route::IndexedContent,   <span class="cm">// T1 always wins: ranking</span>
+        Content::Regex(hir) =&gt; {
+            <span class="kw">let</span> tq = cox::derive(hir);            <span class="cm">// AND/OR tree over trigrams</span>
+            <span class="kw">if</span> tq.is_match_all() { <span class="kw">return</span> Route::Scan; }
+
+            <span class="cm">// Selectivity from document frequencies already in the</span>
+            <span class="cm">// dictionary. No extra structure needed.</span>
+            <span class="kw">let</span> sel = idx.t2.estimate_selectivity(&amp;tq);   <span class="cm">// in [0,1]</span>
+            <span class="kw">let</span> cand_bytes = (raw.n_bytes <span class="kw">as</span> f64 * sel) <span class="kw">as</span> u64;
+
+            <span class="kw">let</span> scan_rate  = ctx.scan_rate(raw);         <span class="cm">// warm vs cold, below</span>
+            <span class="kw">let</span> c_scan  = raw.n_bytes <span class="kw">as</span> f64 / scan_rate;
+            <span class="kw">let</span> c_index = idx.t2.lookup_cost(&amp;tq)        <span class="cm">// postings decode</span>
+                        + cand_bytes <span class="kw">as</span> f64 / scan_rate  <span class="cm">// verify pass</span>
+                        + raw.n_files <span class="kw">as</span> f64 * sel * ctx.per_file_open;
+
+            <span class="cm">// Hysteresis: the index must win by a clear margin, not a</span>
+            <span class="cm">// coin flip, because a wrong index route also costs the</span>
+            <span class="cm">// page-cache churn of faulting in postings.</span>
+            <span class="kw">if</span> c_index &lt; c_scan * 0.7 { Route::IndexRegex } <span class="kw">else</span> { Route::Scan }
+        }
+    }
+}</code></pre>
+</figure>
+
+<h3 id="s5c">The two rates the estimator needs</h3>
+
+<p>The cost model is only as good as <span class="mono">scan_rate</span>. Two
+regimes, both anchored to M1:</p>
+
+<figure class="code">
+<figcaption>Deriving the scan rates. Both derived from measured inputs.</figcaption>
+<pre><code>WARM.  M1 case A/B: 5.73 GB text tier answered in 0.05 s at ~1000% CPU.
+       5.73 GB / 0.05 s = ~115 GB/s aggregate effective        <span class="cm">[estimate]</span>
+       This is NOT per-byte examination - it is memchr/Teddy skipping most
+       of the buffer.  A pattern with no usable literal (M1 case B) hit the
+       same 0.05 s, so use one rate for both; do not model them apart.
+
+COLD.  M1 case C/D: 153.2 GB in 234.07 s / 217.10 s at 99-106% CPU.
+       = 0.65-0.71 GB/s, I/O-bound at one core's worth of CPU  <span class="cm">[measured]</span>
+       Caveat: that is a mostly-sequential read of ~7,000 large binaries.
+       A cold read of 73,565 small files is a DIFFERENT access pattern and
+       no measurement of it exists.                            <span class="cm">[unknown]</span>
+
+Therefore:  scan_rate = if page_cache_resident(scope) { 115 GB/s } else { 0.65 GB/s }
+Estimate residency from the last-scan timestamp per subtree, or ask the kernel
+with mincore() over a sample of the scope.  Prefer measuring: keep an EWMA of
+observed bytes/sec per route and let the planner learn its own constants.</code></pre>
+</figure>
+
+<div class="box warn">
+<span class="label">The 177&times; gap is the whole game</span>
+<p>Warm and cold differ by roughly <b>177&times;</b>
+<span class="p p-est">estimate</span>. Every argument for the trigram index
+lives in the cold regime and every argument against it lives in the warm one.
+That is why the planner must estimate residency rather than assume it, and why
+<b>stage 0 of the build plan is a cold-cache measurement</b>: without it, the
+constant that decides whether T2 was worth building is a guess.</p>
+</div>
+
+<h3 id="s5d">Regex derivation: what the planner does with the HIR</h3>
+
+<p>Do not write a regex parser. Walk <span class="mono">regex_syntax::hir::Hir</span>
+and implement Cox's<sup><a href="#r9">9</a></sup> <span class="mono">match</span>/<span class="mono">exact</span>/<span class="mono">prefix</span>/<span class="mono">suffix</span>
+lattice as a fold over it. The crate is MIT/Apache, Unicode-correct, and gives
+you a clean recursive tree with <span class="mono">Literal</span>,
+<span class="mono">Class</span>, <span class="mono">Repetition</span>,
+<span class="mono">Concat</span>, <span class="mono">Alternation</span> and
+<span class="mono">Look</span> nodes. The genuinely novel work is the lattice and
+the boolean-query simplification, not the parsing.</p>
+
+<div class="tw">
+<table>
+<caption>HIR node handling. The right column is the implementation rule.</caption>
+<thead><tr><th>Node</th><th>Lattice effect</th><th>Rule</th></tr></thead>
+<tbody>
+<tr><th class="mono">Concat(A, B)</th><td>Cross-product of exact sets, capped</td><td>Cap the exact set at a small constant (8 is a reasonable start); beyond it degrade to prefix/suffix. <b>Emit the cross term</b> combining <span class="mono">suffix(A)</span> with <span class="mono">prefix(B)</span> &mdash; a trigram can straddle the boundary and neither child owns it. This is the subtle bit and the one most likely to be got wrong.</td></tr>
+<tr><th class="mono">Alternation(A, B)</th><td>Union if both exact and small; else <span class="mono">OR</span></td><td>The single biggest source of degradation. If <i>any</i> branch is under 3 characters it contributes no trigram, so the OR is "match all" and the whole node poisons upward. Detect this early and bail to R5 rather than building a large useless tree.</td></tr>
+<tr><th class="mono">Repetition</th><td>Destroys exact; usually destroys prefix/suffix</td><td>Keep only the fixed literal parts. <span class="mono">.*</span> between two required literals still forces the cross term to fall back to disjoint subqueries.</td></tr>
+<tr><th class="mono">Class</th><td>Enumerate if small; else match-all at that position</td><td>Enumerate up to ~4 members. Beyond that the position is poisoned and so is every trigram straddling it.</td></tr>
+<tr><th class="mono">Look</th> <td>No constraint</td><td><span class="mono">\b</span>, <span class="mono">^</span>, <span class="mono">$</span>, lookaround: zero-width assertions about <i>context</i>, not properties of the matched text. Drop from the index query entirely and leave to the verify pass. They cannot be encoded in a trigram existence query at all.</td></tr>
+<tr><th><span class="mono">(?i)</span> anywhere</th><td>Multiplies query size by up to 2<sup>3</sup> per trigram</td><td>Cap total derived-query size. Past the cap, bail to R5. Do not fold case in the index &mdash; folding collapses the alphabet, lengthens every posting list, and breaks exact-case matching.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s5e">Two correctness rules that are easy to get wrong</h3>
+
+<div class="box key">
+<span class="label">Rule 1 &mdash; regex matches original bytes, and the UI must say when it cannot</span>
+<p>R8 calls this the real design trap and it is. Normalisation &mdash;
+encoding conversion, NFC, dehyphenation, whitespace collapse &mdash; is
+mandatory for usable full-text search and every step of it moves byte offsets.
+A user typing a regex expects it to match the bytes in the file.</p>
+<p><b>The decision, made explicitly rather than by default:</b> T1 is built over
+<i>normalised</i> text; T2 and every verify pass operate on <i>original</i>
+bytes. Two streams, deliberately. Regex results always carry a real byte offset
+into a real file, and are always re-verified against those bytes. Recoll and
+most FTS tools quietly reach the same place by degrading regex to "grep the
+original file at query time" &mdash; that is honest, and it is what R5 already
+is.</p>
+<p>The exception has to be surfaced, not hidden: for an <b>extracted</b>
+document there are no original bytes. A regex over a PDF matches the extracted
+text, which is a normalised, dehyphenated, reading-order-approximate proxy of
+the document. Label those results in the output (a marker on the hit, not a
+footnote in the man page), because a user who opens the PDF and cannot find the
+bytes we reported will conclude the tool is broken, and will be right to.</p>
+</div>
+
+<div class="box key">
+<span class="label">Rule 2 &mdash; filters are only valid where the necessary condition holds</span>
+<p>A trigram or fuse filter answers "can this file possibly match". That is a
+<i>necessary</i> condition for a positive match and for nothing else.
+<span class="mono">ugrep-indexer</span> documents exactly this limitation<sup><a href="#r19">19</a></sup>: its
+indexed path is incompatible with <span class="mono">-v</span>/invert-match,
+<span class="mono">--filter</span>, PCRE mode and fuzzy matching
+<span class="p p-doc">upstream</span>. Make "can this query be filter-accelerated
+at all" an explicit predicate on the query, checked before the planner reaches
+the cost model &mdash; not an assumption. Invert-match and fuzzy go straight to
+R5.</p>
+</div>
+
+<h3 id="s5f">Execution</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>Operation</th><th>Mechanism</th><th>Source</th></tr></thead>
+<tbody>
+<tr><th>Boolean AND / OR / NOT</th><td>Leapfrog / galloping intersection over <span class="mono">nextGEQ</span>-capable iterators. Elias-Fano gives <span class="mono">nextGEQ</span> in ~O(1) amortised via select-on-zeros over the high-bit vector, with a cursor so sequential calls do not re-run select.</td><td>R6 &sect;2.5, &sect;4.1</td></tr>
+<tr><th>Top-k ranked</th><td>Block-Max WAND over per-block score upper bounds. Only for ranked retrieval &mdash; pure boolean needs every match, so early termination does not apply and leapfrog speed is what matters.</td><td>R6 &sect;4.4, &sect;4.6</td></tr>
+<tr><th>Phrase</th><td>docID intersection on T1, then re-scan the candidate file, gated on the (dev, ino, mtime, size) doc value. Mismatch &rArr; drop the candidate, never serve a guess.</td><td>R6 &sect;4.2</td></tr>
+<tr><th>Wildcard / fuzzy over terms</th><td>FST &times; DFA product walk. A dead DFA state prunes the whole subtree without visiting it, so cost is proportional to matching paths, not vocabulary size. Levenshtein automata for fuzzy come free from the same mechanism.</td><td>R6 &sect;3.1</td></tr>
+<tr><th>Regex verify</th><td>The <span class="mono">regex</span> crate, with its own Teddy/memchr prefilter active. Linear-time guaranteed &mdash; no catastrophic backtracking, which matters because a verify stage runs over attacker-shaped-if-not-attacker-controlled bytes. Every actively maintained indexed code-search tool since 2006 uses RE2 or an RE2-equivalent for exactly this reason.</td><td>R7 &sect;2.4, R2</td></tr>
+<tr><th>Lookaround / backreferences</th><td>PCRE2 behind an explicit flag, with a step budget. It is a backtracking engine and retains worst-case exponential blowup; without a budget one unlucky file stalls the query.</td><td>R7 &sect;2.4</td></tr>
+<tr><th>Scoring</th><td>BM25F over three fields (filename, path components, body) with the filename field weighted up, then post-multipliers from doc values: mtime recency decay, path-depth penalty, per-extension prior. All of these are score-combination-layer additions &mdash; none of them touch the postings format.</td><td>R6 &sect;4.7</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>One thing deliberately not adopted: <b>Hyperscan/Vectorscan</b>. Its
+multi-pattern-simultaneous design is genuinely superior when verifying many
+saved queries against one candidate set, and Hyperflex reaches 8.89 Gbit/s
+<span class="p p-paper">paper</span>. But it is a C FFI dependency with real
+build complexity, and a desktop tool runs one query at a time. Revisit only if
+saved/continuous searches become a feature.</p>
+</section>
+<section>
+<h2 id="s6">Extraction and the plugin interface</h2>
+
+<p>The plugin interface has to be settled before the first plugin is written or
+every plugin becomes a one-off integration. It is also, simultaneously, the
+sandboxing boundary and the licence boundary &mdash; which is the reason the
+answer is as clear as it is.</p>
+
+<h3 id="s6a">The licence ledger forces the shape</h3>
+
+<p>R8's survey<sup><a href="#r6">6</a></sup> is blunt: <b>the best-in-class PDF and legacy-Office parsers are
+all copyleft or worse.</b> poppler is GPLv2, MuPDF is AGPL-or-commercial,
+LibreOffice is MPL-2.0, calibre and notmuch are GPLv3, readpst/libpff is GPLv2.
+The permissive alternatives trade away either build complexity (pdfium: BSD-3 /
+Apache-2.0, but vendoring Google's prebuilt shared library is not a small
+dependency) or extraction fidelity (pure-Rust <span class="mono">lopdf</span> /
+<span class="mono">pdf-extract</span> lag noticeably on ligatures and CID
+fonts).</p>
+
+<p>Static-linking GPL code into an MIT/Apache binary is the mistake to avoid.
+Invoking a GPL binary at arm's length as a subprocess &mdash; the way a shell
+script would &mdash; does not propagate the licence; this is the standard,
+widely-relied-on reading of the FSF's own distinction between linking and mere aggregation <span class="p p-doc">upstream</span><sup><a href="#r21">21</a></sup>. So the subprocess boundary
+does triple duty: crash isolation, sandbox, and licence firewall. That is an
+unusually clean alignment of three separate concerns onto one mechanism, and it
+is why option 2 wins on its own merits rather than by elimination.</p>
+
+<h3 id="s6b">Four candidate ABIs, and the choice</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>Shape</th><th>Verdict</th><th>Reasoning</th></tr></thead>
+<tbody>
+<tr><th>Dynamic library behind a stable C ABI (<span class="mono">dlopen</span>)</th><td><span class="pill no">ruled out</span></td><td>A segfault in a <span class="mono">dlopen</span>ed plugin <i>is</i> a segfault in the process holding the index. Zero isolation, maximum blast radius, and Rust's ABI is unstable across compiler versions without a hand-frozen C API. Right only for a plugin trusted as much as core &mdash; which, in this threat model, is nothing outside core.</td></tr>
+<tr><th><b>Subprocess, protobuf frames on stdio</b></th><td><span class="pill yes">chosen</span></td><td>Total memory and crash isolation for free. Any implementation language. Protobuf schema evolution is a solved problem. Composes naturally with <span class="mono">bubblewrap</span>/seccomp &mdash; the subprocess boundary <i>is</i> the sandbox boundary, no extra abstraction. Works with the parsers as they actually exist today. Recoll has shipped this shape for twenty years at this exact scale.</td></tr>
+<tr><th>WASM / WASI components</th><td><span class="pill part">later, behind the same contract</span></td><td>Strictly stronger isolation (capability-based, no ambient filesystem, no root or Landlock needed) and a typed cross-language interface. General WASM runs ~1.3&times; slower than native on compute-bound code <span class="p p-bench">benchmark</span>, which is fine for parsing. The trap is I/O: one WASI file-I/O benchmark found a write-heavy workload <b>10&times; slower</b> in Wasmtime <span class="p p-bench">benchmark</span>, traced to routing synchronous writes through an async engine. Avoidable by passing file content as one in-memory buffer rather than letting the guest syscall per read. The real blocker is ecosystem: essentially none of poppler, MuPDF, LibreOffice or Tesseract has a production <span class="mono">wasm32-wasi</span> build, so WASI is realistic today only for pure-Rust extractors &mdash; the tier that least needs sandboxing.</td></tr>
+<tr><th>Declarative "shell out to this command" (Recoll's <span class="mono">mimeview</span>)</th><td><span class="pill part">as a user escape hatch</span></td><td>Zero interface code, trivially extended by the user with one config line, twenty years proven. But: no structured output beyond text on stdout, no error codes richer than exit status, and nowhere to put the timeout/memory-cap machinery. Ship it <i>as well</i>, for the long tail, but not as the ABI.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box verdict">
+<span class="label">Plugin ABI</span>
+<p><b>Subprocess with length-prefixed protobuf on stdio now; the host-side
+contract written so that a pure-Rust plugin can be migrated to a WASI component
+later without the contract changing.</b> That is a phasing decision, not a fork
+in the road &mdash; "send a request, get back {text, metadata, error}" is
+identical whether a process or a component is behind it. Revisit WASI when
+either the pure-Rust extractor tier matures enough to drop poppler entirely, or
+upstream poppler/Tesseract gain first-class WASI builds. Neither is true today,
+and committing to WASI now would mean shipping without real PDF support or
+falling back to subprocess anyway &mdash; defeating the point of picking one
+ABI.</p>
+</div>
+
+<h3 id="s6c">The interface</h3>
+
+<figure class="code">
+<figcaption>ferret-plugin.proto &mdash; the frozen contract. Length-prefixed (varint) frames on stdin/stdout.</figcaption>
+<pre><code><span class="kw">syntax</span> = <span class="cm">"proto3"</span>;
+<span class="kw">package</span> ferret.plugin.v1;
+
+<span class="cm">// --- handshake: host writes Hello, plugin replies Capabilities, once ---</span>
+
+<span class="kw">message</span> Hello {
+  uint32 protocol_version = 1;     <span class="cm">// host's max; plugin picks min(its own, this)</span>
+  string host_version     = 2;
+  bool   fd_passing       = 3;     <span class="cm">// host can pass SCM_RIGHTS fds</span>
+  uint64 memory_high      = 4;     <span class="cm">// bytes; advisory, also enforced by cgroup</span>
+}
+
+<span class="kw">message</span> Capabilities {
+  uint32 protocol_version   = 1;
+  string plugin_name        = 2;   <span class="cm">// stable id, e.g. "ocr-tesseract"</span>
+  string plugin_version     = 3;
+  <span class="kw">repeated</span> string mime_types = 4;   <span class="cm">// what it claims; host arbitrates conflicts</span>
+  <span class="kw">repeated</span> string extensions = 5;   <span class="cm">// hint only, never the routing decision</span>
+  Tier   tier               = 6;   <span class="cm">// determines queue priority</span>
+  uint32 max_concurrency    = 7;   <span class="cm">// host will not exceed this</span>
+  bool   stateless          = 8;   <span class="cm">// if false, host restarts between batches</span>
+  uint64 typical_us_per_mb  = 9;   <span class="cm">// self-declared; host replaces with observed</span>
+}
+
+<span class="kw">enum</span> Tier { TIER_TEXT = 0; TIER_DOCUMENT = 1; TIER_MEDIA = 2; TIER_OPTIONAL = 3; }
+
+<span class="cm">// --- the work loop: many Request/Response pairs, pipelined, correlated by id ---</span>
+
+<span class="kw">message</span> Request {
+  uint64 id            = 1;
+  <span class="kw">oneof</span> source {
+    string path        = 2;        <span class="cm">// plugin opens it (needs a bwrap bind)</span>
+    uint32 fd_index    = 3;        <span class="cm">// nth fd passed via SCM_RIGHTS - preferred</span>
+    bytes  inline      = 4;        <span class="cm">// small files, &lt; 256 KB, saves a syscall</span>
+  }
+  string sniffed_mime  = 5;        <span class="cm">// host's content-sniff result</span>
+  uint64 size          = 6;
+  uint32 deadline_ms   = 7;        <span class="cm">// plugin SHOULD self-abort; host WILL SIGKILL</span>
+  uint32 max_output    = 8;        <span class="cm">// bytes of text; truncate, set truncated=true</span>
+  uint32 recursion_depth = 9;      <span class="cm">// archives: host refuses above 4</span>
+}
+
+<span class="kw">message</span> Response {
+  uint64 id                   = 1;
+  <span class="kw">oneof</span> result {
+    Extracted extracted       = 2;
+    Failure   failure         = 3;
+  }
+}
+
+<span class="kw">message</span> Extracted {
+  bytes  text                 = 1;  <span class="cm">// UTF-8, NFC; host does not re-normalise</span>
+  bool   truncated            = 2;
+  <span class="kw">map</span>&lt;string, string&gt; metadata = 3;  <span class="cm">// author, title, duration, dimensions...</span>
+  <span class="kw">repeated</span> Symbol symbols    = 4;  <span class="cm">// optional: name + kind + byte range</span>
+  <span class="kw">repeated</span> Child   children   = 5;  <span class="cm">// archive members, mail attachments</span>
+  string confidence_note      = 6;  <span class="cm">// e.g. "no ToUnicode CMap; text may be glyph ids"</span>
+  uint32 pages                = 7;
+}
+
+<span class="kw">message</span> Child {                        <span class="cm">// re-enters the queue as its own document,</span>
+  string virtual_path         = 1;    <span class="cm">// path "a.zip!/b/c.txt"; parent doc id kept</span>
+  bytes  inline               = 2;
+  string sniffed_mime         = 3;
+}
+
+<span class="kw">message</span> Failure {
+  <span class="kw">enum</span> Kind {
+    UNSUPPORTED = 0;   <span class="cm">// not mine; host may try another plugin</span>
+    MALFORMED   = 1;   <span class="cm">// parsed, is garbage - do not retry, quarantine</span>
+    ENCRYPTED   = 2;   <span class="cm">// index metadata only, flag the file</span>
+    TOO_LARGE   = 3;   <span class="cm">// exceeded a budget the plugin enforces itself</span>
+    TRANSIENT   = 4;   <span class="cm">// retry later; only Kind that is ever retried</span>
+    INTERNAL    = 5;
+  }
+  Kind   kind    = 1;
+  string detail  = 2;
+}</code></pre>
+</figure>
+
+<div class="tw">
+<table>
+<caption>Host obligations. These are the parts a plugin author must be able to rely on.</caption>
+<thead><tr><th>Obligation</th><th>Specification</th></tr></thead>
+<tbody>
+<tr><th>Lifetime</th><td>Spawn once per format family, <b>not per file</b>. LibreOffice-headless startup is reported in the hundreds-of-ms-to-multi-second range <span class="p p-est">estimate</span>; JVM cold start is several hundred ms to over a second <span class="p p-est">estimate</span>. Per-file spawn makes those the dominant cost. Long-lived pools, recycled every N requests or on memory growth.</td></tr>
+<tr><th>Timeout</th><td>Wall-clock per file. 60 s default for tiers 0&ndash;2, configurable and much longer for the OCR tier. On expiry: SIGTERM, then SIGKILL, then quarantine.</td></tr>
+<tr><th>Memory</th><td><span class="mono">RLIMIT_AS</span> plus a per-pool cgroup <span class="mono">memory.max</span>. An OOM in an extractor must never reach <span class="mono">ferretd</span>.</td></tr>
+<tr><th>Sandbox</th><td><span class="mono">bubblewrap</span>: new mount/PID/net namespace, read-only bind of exactly the file being processed (or just the passed fd and nothing else), no network, seccomp filter. <b>R8's finding is that none of Recoll, Tracker or sist2 does this</b> &mdash; they all stop at process isolation plus resource limits <span class="p p-doc">upstream</span>. That is a real gap a new project can close, and bwrap-wrapping is not exotic engineering.</td></tr>
+<tr><th>Poison quarantine</th><td>Crash or timeout N times (N=3) &rarr; record the failure signature in a known-bad table, stop retrying on every re-index cycle, surface in index health. Without this one malformed file becomes a permanent Sisyphean loop. Tracker does this <span class="p p-doc">upstream</span>; copy it.</td></tr>
+<tr><th>Archive budgets</th><td>Decompressed-byte budget per top-level file (cap at 10&ndash;20&times; compressed size or an absolute 2 GB), a compression-ratio pre-check from the central directory before decompressing at all, and a recursion depth cap of 4 enforced independently. <span class="mono">42.zip</span> expands 42 KB to 4.5 PB <span class="p p-doc">upstream</span>; these are not optional.</td></tr>
+<tr><th>Format routing</th><td>Extension is a <i>hint</i> that orders which detector runs first &mdash; a performance optimisation, never the routing decision. Content sniffing (<span class="mono">infer</span> or <span class="mono">tree_magic_mini</span>) decides, with an explicit peek inside the zip for the OOXML/ODF family, since every OOXML format shares zip magic bytes.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s6d">Which extractor goes where</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>Content</th><th>Placement</th><th>Tool</th><th>Licence</th></tr></thead>
+<tbody>
+<tr><th>Source code, text, config, markdown</th><td>In-process</td><td><span class="mono">encoding_rs</span> (WHATWG standard; none of <span class="mono">chardet</span>'s false-positive problems on short text) + NFC + <span class="mono">pulldown-cmark</span></td><td>MIT/Apache</td></tr>
+<tr><th>Symbols</th><td>In-process, second pass</td><td><span class="mono">tree-sitter</span>. Single-digit ms per source file <span class="p p-est">estimate</span>, so it does not change the cost model. Names and kinds only &mdash; type resolution is an LSP's job, not a search engine's.</td><td>MIT</td></tr>
+<tr><th>Spreadsheets, audio tags, EXIF, HTML</th><td>In-process</td><td><span class="mono">calamine</span>, <span class="mono">lofty</span>, <span class="mono">kamadak-exif</span>, <span class="mono">lol_html</span></td><td>MIT/Apache/BSD-3</td></tr>
+<tr><th>OOXML / ODF text</th><td>In-process</td><td>Direct zip + XML walk. These are documented zip-of-XML; no LibreOffice, no JVM, no subprocess. Note R8 found no mature pure-Rust pptx text extractor &mdash; budget hand-rolled XML walking there.</td><td>&mdash;</td></tr>
+<tr><th>PDF</th><td><b>Subprocess</b></td><td><span class="mono">pdfium</span> as the default (what Chrome renders PDFs with; continuously fuzzed by Google), <span class="mono">pdftotext</span> as the fidelity fallback. MuPDF avoided entirely on AGPL.</td><td>BSD-3/Apache; poppler GPLv2 at arm's length</td></tr>
+<tr><th>Legacy binary Office (.doc/.xls/.ppt)</th><td><b>Subprocess pool</b></td><td>LibreOffice headless, long-lived workers. The worst-documented format family here and the only broad-fidelity option.</td><td>MPL-2.0, never linked</td></tr>
+<tr><th>Email / chat</th><td><b>Plugin</b></td><td><span class="mono">mail-parser</span> for MIME. Prefer the plain-text part when non-trivial, else HTML-to-text; sniff the charset because declared charsets are frequently wrong. PST via <span class="mono">readpst</span> (GPLv2, subprocess).</td><td>MIT core, GPL at arm's length</td></tr>
+<tr><th>OCR</th><td><b>Plugin, opt-in, size-bounded</b></td><td>Tesseract at ~3 pages/sec parallel on a 16-core machine <span class="p p-bench">benchmark</span>. 10k pages ~56 min; 100k pages ~9 h; 1M pages ~93 h <span class="p p-est">estimate</span>. The rate is fine; the input count is unknowable and dominates. Gate behind the text-layer sanity check, and show the user an up-front estimate before the job is queued.</td><td>Apache-2.0</td></tr>
+<tr><th>Speech-to-text</th><td><b>Plugin, GPU-gated or not offered</b></td><td>whisper.cpp (no Python/PyTorch dependency, which is why it fits). ~8&times; real-time on an RTX 4070 <span class="p p-bench">benchmark</span>; <b>no verified Linux x86 CPU-only figure exists</b> <span class="p p-none">unknown</span>. R8's own arithmetic: 1,667 hours of audio is ~8.7 days on GPU and weeks-to-months on CPU <span class="p p-est">estimate</span>. Either require a GPU and set expectations, sharply limit scope, or use a much smaller model.</td><td>MIT</td></tr>
+<tr><th>The long tail</th><td>Declarative config, or Tika</td><td>Recoll-style <span class="mono">mime &rarr; command</span> lines for anything a user wants. Apache Tika (1000+ formats) as a genuinely last-resort tier &mdash; as a long-lived <span class="mono">tika-server</span>, never per-file.</td><td>Apache-2.0</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s6e">The extracted-text cache is not optional</h3>
+
+<p>Two reasons beyond avoiding re-extraction, and the second is the one that
+matters over the life of the project. <b>Snippets</b>: rendering a result needs
+the actual text, and without a cache every rendered PDF result re-opens and
+re-parses the source &mdash; exactly the expensive path the index existed to
+avoid. <b>Re-indexing after a tokenizer or schema change</b>, which is a
+near-certainty: with a cache it is a text-processing pass over cached text;
+without one it is a full re-extraction, which for the OCR tier is the
+multi-day figure above. Extracted text is far smaller than its source (a 500 KB
+PDF might yield 5&ndash;20 KB of text <span class="p p-est">estimate</span>), so
+zstd'd this is bounded and cheap. Invalidate it on exactly the same
+(dev, ino, mtime, size) key that governs re-indexing &mdash; one staleness
+check, two consumers.</p>
+</section>
+<section>
+<h2 id="s7">Change detection and the politeness budget</h2>
+
+<p>R1's verdict<sup><a href="#r2">2</a></sup> on this subsystem is the harshest finding in the whole research
+set, and it is the reason this section is long: <b>the
+daemon-resource-consumption failure mode is the single most repeated cause of
+user abandonment across the entire Linux desktop search landscape.</b> It killed
+Beagle and it still dogs Baloo. Recoll and Catfish get recommended as "the ones
+that don't hurt" specifically because one has no forced daemon and the other has
+no index at all. Bounding background resource use deterministically is a bigger
+determinant of whether this tool survives than any indexing decision on this
+page.</p>
+
+<h3 id="s7a">fanotify versus inotify</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>inotify</th><th>fanotify (<span class="mono">FAN_MARK_FILESYSTEM</span>)</th></tr></thead>
+<tbody>
+<tr><th>Watch granularity</th><td>One watch per <b>directory</b>, non-recursive</td><td>One mark for an entire mounted filesystem &mdash; present and future</td></tr>
+<tr><th>Privilege</th><td>None</td><td><b><span class="mono">CAP_SYS_ADMIN</span></b> &mdash; the hard blocker</td></tr>
+<tr><th>Scaling cost</th><td>~1 KB unswappable kernel memory per watch <span class="p p-community">anecdote</span> (estimates in the wild span 160 B to ~1.76 KB &mdash; a 10&times; band, so treat any single figure as approximate). At 50k&ndash;200k directories that is 50&ndash;200 MB <span class="p p-est">estimate</span>.</td><td>One mark. The scaling problem simply does not exist.</td></tr>
+<tr><th>Limits on this machine</th><td><span class="mono">max_user_watches</span> 524288, <span class="mono">max_user_instances</span> 524288, <span class="mono">max_queued_events</span> 16384 <span class="p p-measured">measured</span> &mdash; unusually generous; many distros default instances to 128.</td><td>&mdash;</td></tr>
+<tr><th>New-directory race</th><td><b>Real and frequently hit.</b> A directory can be created and populated between the <span class="mono">IN_CREATE</span> event and your <span class="mono">inotify_add_watch</span> on it, silently losing every event in that new subtree.</td><td>None &mdash; nothing to add a watch to.</td></tr>
+<tr><th>Path reconstruction</th><td>Direct</td><td>Needs <span class="mono">FAN_REPORT_FID</span> (Linux 5.1) to get a file handle instead of an open fd, plus <span class="mono">FAN_REPORT_DFID_NAME</span> (5.9, refined ~5.17 with <span class="mono">FAN_REPORT_TARGET_FID</span> for renames) to reconstruct a <i>path</i> rather than "some inode changed". Pre-5.1 fanotify is unusable for this at all.</td></tr>
+<tr><th>Non-privileged fanotify</th><td colspan="2">Exists (per-directory or per-mount marks with <span class="mono">FAN_REPORT_FID</span>, no <span class="mono">CAP_SYS_ADMIN</span>) but does <b>not</b> give the single-mark scaling win. It solves a different, smaller problem: stable file-handle identity for rename-robust tracking. Do not mistake it for the answer to watch-count scaling.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box verdict">
+<span class="label">Recommendation</span>
+<p><b>inotify as the default, with a fanotify path behind an optional
+system-service install.</b> Kernel 6.18.43 on this machine
+<span class="p p-measured">measured</span> is far past every fanotify feature
+gate, so the capability is purely a deployment question, not a technical one.
+Ship the unprivileged tool that "just works as your own user"; offer
+<span class="mono">ferret install-system-service</span> for anyone who wants
+whole-filesystem coverage and will accept a unit with
+<span class="mono">AmbientCapabilities=CAP_SYS_ADMIN</span>. This is a product
+decision, not a technical one, and R8 is right that it should be surfaced rather
+than silently defaulted &mdash; see &sect;<a href="#s11">11</a>.</p>
+</div>
+
+<h3 id="s7b">Queue overflow, and the reconciliation backstop</h3>
+
+<p>When the per-instance queue (16,384 events here
+<span class="p p-measured">measured</span>) fills faster than userspace drains it
+&mdash; a <span class="mono">git checkout</span> across branches, a large
+<span class="mono">rsync</span>, a cargo build touching 260,695 object files
+<span class="p p-measured">measured</span> &mdash; the kernel drops events and
+delivers one <span class="mono">IN_Q_OVERFLOW</span><sup><a href="#r16">16</a></sup> pseudo-event with watch
+descriptor &minus;1. <b>You cannot know which files were affected.</b> The only
+correct response is to re-crawl and diff, scoped to the affected subtree if you
+can bound it and to the whole tree if you cannot. An indexer that logs a warning
+and continues will silently drift out of sync forever.</p>
+
+<p>Two structural facts make this worse than it sounds. First, <b>Linux has no
+USN journal.</b> NTFS maintains a persistent, queryable, append-only log of
+every metadata change, so Windows Search can catch up after being offline by
+reading the backlog. inotify and fanotify are purely event-<i>streaming</i>:
+anything that happens while the daemon is not running is gone. This is not a
+fixable-with-better-code gap; it is an absent primitive on ext4 and xfs.
+btrfs <span class="mono">send --no-data</span> and <span class="mono">zfs diff</span>
+are the closest Linux analogues and are available only on those filesystems.
+Second, no notification mechanism works at all on NFS, SMB, or most FUSE mounts
+&mdash; those need a periodic crawl, full stop.</p>
+
+<div class="box key">
+<span class="label">Design consequence: reconciliation is always on</span>
+<p>Because of both facts, a periodic metadata-only reconciliation crawl is not a
+fallback &mdash; it is a permanent, always-running backstop, and it is cheap
+enough to be one: <b>1.24 s for 578,200 files warm</b>
+<span class="p p-measured">measured</span>. Run it on daemon start
+unconditionally, then on a low-frequency timer, comparing
+(dev, ino, mtime, size) against doc values. Every wrong answer the watcher can
+give &mdash; the create race, the overflow, the network mount, the unclean
+shutdown &mdash; is caught by this one mechanism, and it costs a rounding error.</p>
+<p>And then <b>surface it</b>. R8 identifies the compound risk as the biggest in
+the whole subsystem: change detection can silently miss events and extraction
+can silently produce garbage, neither crashes anything, neither logs anything
+anyone reads, and the result is an index quietly diverging from the filesystem
+for months in a way indistinguishable from working correctly &mdash; until a
+user searches for something they know exists, gets nothing, and files a bug with
+no reproduction. The mitigation is not a better watcher. It is
+<span class="mono">ferret status</span> reporting <i>N files failed extraction,
+M pending, last full reconciliation T ago, K quarantined</i> as a first-class
+user-visible answer.</p>
+</div>
+
+<h3 id="s7c">Save-storm debouncing</h3>
+
+<p>Atomic-save-via-rename &mdash; write temp, rename over the original, which vim
+and most IDEs do &mdash; produces several inotify events per logical save: an
+<span class="mono">IN_CREATE</span> for the temp file, an
+<span class="mono">IN_MOVED_FROM</span>/<span class="mono">IN_MOVED_TO</span>
+pair, sometimes an intervening <span class="mono">IN_CLOSE_WRITE</span>. Naively
+re-extracting per raw event wastes work and can race: indexing the temp file's
+transient content under the final filename.</p>
+
+<figure class="code">
+<figcaption>Debounce and rename correlation.</figcaption>
+<pre><code>on_event(ev):
+    <span class="cm">// Rename pairing first: MOVED_FROM and MOVED_TO share a 32-bit cookie,</span>
+    <span class="cm">// but ONLY within one inotify instance and only when both ends are</span>
+    <span class="cm">// watched.  An unpaired MOVED_FROM is a delete; an unpaired</span>
+    <span class="cm">// MOVED_TO is a create.  Hold each for one debounce window before</span>
+    <span class="cm">// deciding, then decide.</span>
+    <span class="kw">if</span> ev.cookie != 0:
+        <span class="kw">match</span> pending_cookies.take(ev.cookie):
+            Some(other) =&gt; emit(Rename { from: other.path, to: ev.path })
+            None        =&gt; pending_cookies.insert(ev.cookie, ev, deadline: now + W)
+
+    <span class="cm">// Debounce keyed on the RESOLVED path, after rename correlation.</span>
+    <span class="cm">// W = 200 ms: long enough to coalesce an editor's save sequence,</span>
+    <span class="cm">// short enough to still read as near-real-time.</span>
+    debounce.upsert(resolved_path, deadline: now + W)
+
+on_debounce_expiry(path):
+    <span class="cm">// This is the ONLY place that writes to the durable queue, and it</span>
+    <span class="cm">// must never block: the kernel's own 16384-deep queue is behind us.</span>
+    queue.push(Job { path, prio: tier_of(path), enqueued: now })</code></pre>
+</figure>
+
+<p>The other special cases that must be handled at this layer, all from R8:
+<b>hardlinks and bind mounts</b> need <span class="mono">(st_dev, st_ino)</span>
+dedup or the same content is indexed twice under two paths, polluting ranking
+with duplicate hits &mdash; index once, list both paths as aliases.
+<b>Symlinks</b> are not followed by default, matching <span class="mono">fd</span>
+and <span class="mono">find</span>; if followed, track the target's
+<span class="mono">(dev, ino)</span> against cycles. <b>Huge single files</b> are
+no different at the watch layer but must not trigger full re-extraction on every
+touch &mdash; that is the size cap from &sect;<a href="#s4">4</a>, and it belongs
+in the indexing layer, not here. The change-detection layer's only job is to
+report "this inode changed" correctly.</p>
+
+<h3 id="s7d">The politeness budget</h3>
+
+<p>R1 found all three surveyed tools converge on the identical triad:
+<span class="mono">nice(19)</span> + <span class="mono">ioprio</span> idle class
++ <span class="mono">SCHED_IDLE</span> <span class="p p-doc">upstream</span>.
+That is table stakes, not a differentiator &mdash; and all three ecosystems know
+it is insufficient; Recoll's own FAQ says so outright and points users at cgroups <span class="p p-doc">upstream</span><sup><a href="#r18">18</a></sup>. Baloo is the decisive data point:
+it has the most complete mechanism set in the survey, including the <b>only</b>
+default cgroup limits and the only confirmed battery-based pause, and it still
+has the worst and longest-running reputation for exactly the failure mode all of
+that machinery targets.</p>
+
+<div class="tw">
+<table>
+<caption>Mechanisms, ranked by whether they actually bound anything.</caption>
+<thead><tr><th>Mechanism</th><th>Works?</th><th>What it actually does</th></tr></thead>
+<tbody>
+<tr><th><span class="mono">nice(19)</span></th><td><span class="pill part">relative only</span></td><td>Tilts CFS fairness. Only matters under contention; a nice-19 process alone on an idle machine gets a full core at full speed. Cheap, correct, necessary, not sufficient.</td></tr>
+<tr><th><span class="mono">ionice</span> IDLE</th><td><span class="pill no">likely inert here</span></td><td><b>The commonly repeated claim that this just works is stale.</b> Only BFQ (and obsolete CFQ) convert ionice classes into proportional bandwidth. <span class="mono">mq-deadline</span> gives coarse ordering only. <span class="mono">none</span> &mdash; the default on NVMe in modern kernels, precisely because NVMe's own queue depth makes software reordering redundant &mdash; <b>ignores ionice entirely</b> <span class="p p-doc">upstream</span><sup><a href="#r17">17</a></sup>. On this NVMe desktop it is probably doing nothing. Check <span class="mono">/sys/block/nvme0n1/queue/scheduler</span> rather than assuming. Set it anyway; it is free and helps the HDD/BFQ minority.</td></tr>
+<tr><th><span class="mono">SCHED_IDLE</span></th><td><span class="pill yes">yes, where correct</span></td><td>Stronger than nice: the process runs <i>only</i> when nothing else wants the CPU. Right for the bulk-extraction and merge worker pools, which are latency-insensitive by nature. <b>Wrong for the watcher</b> &mdash; an idle-scheduled watcher risks queue overflow under load, trading a performance problem for a correctness one. Watcher stays <span class="mono">SCHED_OTHER</span>.</td></tr>
+<tr><th>cgroup v2 <span class="mono">cpu.weight</span>, <span class="mono">io.weight</span>, <span class="mono">memory.high</span></th><td><span class="pill yes">the real mechanism</span></td><td>Operates at the block-cgroup layer <i>beneath</i> the I/O scheduler, so <span class="mono">io.weight</span> throttles disk share even under <span class="mono">none</span>/<span class="mono">mq-deadline</span> where ionice is inert. <span class="mono">memory.high</span> is a soft cap &mdash; throttle and reclaim, not OOM-kill. Set via a systemd <span class="mono">--user</span> unit: <span class="mono">IOWeight=</span>, <span class="mono">CPUWeight=</span>, <span class="mono">MemoryHigh=</span>. <b>Strictly more portable and more effective than the nice/ionice pair, and it should be primary.</b></td></tr>
+<tr><th><span class="mono">posix_fadvise(DONTNEED)</span></th><td><span class="pill yes">yes &mdash; and skipping it is a bug</span></td><td>An extraction pass that reads every file populates the page cache with all of it. Reading the 5.73 GB tier evicts a comparable slice of his working set &mdash; his editor's mmaps, his browser's cache &mdash; purely as a side effect. One syscall per file, same wall-clock cost to the indexer, entirely different experienced cost to the user. Pair with <span class="mono">POSIX_FADV_SEQUENTIAL</span> before the read. This is the difference between "the index took an hour and I didn't notice" and "the index took an hour and now my browser is swapping".</td></tr>
+<tr><th>Merge rate limiter</th><td><span class="pill yes">yes</span></td><td>Track bytes-merged per wall-second over a trailing 2 s window and sleep proportionally when over budget. Lucene's <span class="mono">MergeRateLimiter</span>, a few dozen lines <span class="p p-doc">upstream</span>. Needed because <span class="mono">ionice -c3</span> does nothing to bound how much of your own merge work queues up when the disk saturates.</td></tr>
+<tr><th>OOM score adjustment</th><td><span class="pill yes">yes</span></td><td>Recoll's <span class="mono">choom -n 300</span> is the one mechanism in R1's survey nobody else uses <span class="p p-doc">upstream</span>, and it targets a distinct failure mode: getting OOM-killed unpredictably, or worse, causing something <i>else</i> to be. For a design that accepts more RAM pressure during merges, treat it as a requirement rather than a post-complaint patch.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s7e">The activity-based backoff nobody has built</h3>
+
+<div class="box gap">
+<span class="label">Genuine gap in the prior art</span>
+<p>R1 read the source trees of Baloo, Tracker/LocalSearch and Recoll and found
+that <b>none of the three implements input-idle detection or foreground-activity
+detection</b> &mdash; no X11/Wayland idle time, no watching for foreground CPU
+spikes &mdash; that pauses or resumes indexing based on <i>interactive</i>
+activity, as opposed to battery state (Baloo only) or raw scheduling priority
+(all three) <span class="p p-doc">upstream</span>. "Don't index while I'm
+compiling" is not a pattern to copy from anywhere. It is new design work.</p>
+<p>R1 also names the uncomfortable possibility this has to answer: Baloo's
+complaints may not be a scheduling failure at all, but a <b>total work volume</b>
+problem &mdash; extracting a million files' content is simply a lot of CPU-seconds
+regardless of scheduling class &mdash; or an <b>extractor correctness</b> problem,
+where one file hanging inside a poppler call burns its low-priority slice forever.
+R1 could not distinguish those two explanations and calls it the most important
+open question it surfaced. Note that this design attacks both directly:
+exclusion cuts total work volume by 25&times;, and the poison-file quarantine
+plus per-file timeout bounds the hang. That is a claim worth testing, not
+asserting.</p>
+</div>
+
+<figure class="code">
+<figcaption>The backoff controller. Deliberately simple; complexity here is a liability.</figcaption>
+<pre><code><span class="cm">// Inputs, all cheap, all polled at 1 Hz from the controller thread.</span>
+<span class="cm">//   idle_ms   : seconds since last input, from the compositor's idle</span>
+<span class="cm">//               protocol (ext-idle-notify-v1 on Wayland, XScreenSaver on</span>
+<span class="cm">//               X11).  Absent on a headless box - then treat as idle.</span>
+<span class="cm">//   load1     : /proc/loadavg, first field</span>
+<span class="cm">//   pressure  : /proc/pressure/{cpu,io} some avg10 - PSI, the best signal</span>
+<span class="cm">//   on_battery: /sys/class/power_supply/*/status</span>
+
+<span class="kw">fn</span> target_concurrency(s: &amp;Signals, ncpu: usize) -&gt; usize {
+    <span class="kw">if</span> s.on_battery &amp;&amp; cfg.pause_on_battery { <span class="kw">return</span> 0; }
+    <span class="cm">// PSI is the honest signal: it measures stall time actually</span>
+    <span class="cm">// experienced, not a proxy for it.  io.some avg10 &gt; 10% means</span>
+    <span class="cm">// something is already waiting on the disk - and it may well be us.</span>
+    <span class="kw">if</span> s.io_pressure_avg10 &gt; 10.0 { <span class="kw">return</span> 0; }
+    <span class="kw">if</span> s.cpu_pressure_avg10 &gt; 20.0 { <span class="kw">return</span> 1; }
+
+    <span class="kw">match</span> s.idle_ms {
+        0..=30_000       =&gt; 1,            <span class="cm">// user is right there: one worker</span>
+        30_001..=300_000 =&gt; ncpu / 4,     <span class="cm">// stepped away</span>
+        _                =&gt; ncpu / 2,     <span class="cm">// idle: half, never all</span>
+    }
+}
+
+<span class="cm">// Ratchet, do not jump.  Raise by one worker per 10 s of sustained calm;</span>
+<span class="cm">// drop to the target immediately on any pressure signal.  Asymmetric</span>
+<span class="cm">// because being slow to back off is the failure users notice, and being</span>
+<span class="cm">// slow to ramp up is the failure nobody notices.</span></code></pre>
+</figure>
+
+<p>Two deliberate choices in that sketch. It never uses all cores, even fully
+idle &mdash; an indexer that pins 32 threads the moment you walk away is exactly
+the behaviour that gets a tool uninstalled, and the marginal wall-clock gain over
+half the cores is small next to the cost of being wrong about idleness. And it
+uses <b>PSI</b> (<span class="mono">/proc/pressure/io</span>) rather than load
+average or raw utilisation, because PSI measures stall time actually experienced
+rather than a proxy for it &mdash; it is the one signal that directly answers
+"is anything waiting on the disk right now", which is the question the
+controller is really asking.</p>
+</section>
+<section>
+<h2 id="s8">Crash safety, atomic swap, and near-real-time flush</h2>
+
+<p>This part is solved. Copy Lucene's commit protocol<sup><a href="#r12">12</a></sup> close to verbatim rather
+than re-deriving it &mdash; R6 says so and it is right. What is <i>not</i>
+solved, and what this section actually has to work out, is how the merge
+scheduler behaves when it is deliberately throttled to lose every contention it
+enters.</p>
+
+<h3 id="s8a">The commit protocol</h3>
+
+<figure class="code">
+<figcaption>The only mutable state in the whole index is one small file.</figcaption>
+<pre><code>index/
+  MANIFEST                  <span class="cm">// generation N: list of live segment ids + tombstone gen</span>
+  MANIFEST.tmp              <span class="cm">// transient, during commit only</span>
+  seg-0001a.dict            <span class="cm">// fst</span>
+  seg-0001a.post            <span class="cm">// elias-fano docids + bitpacked freqs</span>
+  seg-0001a.tri             <span class="cm">// trigram postings + per-file fuse filters</span>
+  seg-0001a.dv              <span class="cm">// doc values, column-oriented</span>
+  seg-0001a.del             <span class="cm">// tombstone bitset, rewritten wholesale on change</span>
+  cache/                    <span class="cm">// extracted text, zstd, addressed by content hash</span>
+  queue/                    <span class="cm">// durable work queue, independent lifecycle</span>
+
+commit(new_segments, dropped):
+    <span class="kw">for</span> s <span class="kw">in</span> new_segments: write(s); fsync(s)      <span class="cm">// 1. data first, always</span>
+    write(MANIFEST.tmp); fsync(MANIFEST.tmp)      <span class="cm">// 2. then the pointer</span>
+    rename(MANIFEST.tmp, MANIFEST)                <span class="cm">// 3. atomic, same directory</span>
+    fsync(dirfd(index/))                          <span class="cm">// 4. THE STEP EVERYONE FORGETS</span>
+    <span class="cm">// Only now may dropped segments be unlinked, and only after every</span>
+    <span class="cm">// reader holding the previous generation has released it.</span></code></pre>
+</figure>
+
+<p>Step 4 is what makes the rename itself durable across a power loss on Linux;
+omitting it is the classic bug in this protocol and it is invisible in testing
+because it only manifests on an unclean shutdown. Recovery is then trivial: read
+the manifest, open exactly the segments it names, and garbage-collect every
+segment file no manifest generation references &mdash; those are either
+half-written or superseded-by-merge leftovers, and the two cases need not be
+distinguished.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Property</th><th>How it falls out</th></tr></thead>
+<tbody>
+<tr><th>Kill -9 at any instant</th><td>The manifest either points at generation N or N+1, never at a torn state. Worst case is losing the in-memory segment &mdash; recovered from the durable queue, which is why the queue is durable.</td></tr>
+<tr><th>Query while the daemon is down</th><td>The CLI opens the manifest read-only. Segments are immutable, so no lock is needed and no daemon need be running. The search tool is never down.</td></tr>
+<tr><th>Concurrent readers during a commit</th><td>A reader resolves the manifest once at query start and holds its segments open for the duration. Unlink after rename is safe on POSIX &mdash; the inode survives until the last fd closes.</td></tr>
+<tr><th>Upgrade with a format change</th><td>Manifest carries a format version. A newer daemon reads an older manifest, or refuses and rebuilds from the extracted-text cache &mdash; which is the second reason that cache exists.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 id="s8b">mmap, and why it is not the automatic answer</h3>
+
+<p>The default: <b>mmap for read-only, already-fsynced segments; buffered reads
+for anything still being written or on storage that might vanish.</b> The
+page-cache-sharing benefit is real when most segments are read rarely and the OS
+manages eviction for free. But mmap has two costs worth naming explicitly rather
+than accepting because Lucene does it. Page faults are synchronous and opaque:
+a query thread blocks on disk inside what looks like a memory read, with no
+timeout, no retry, no accounting &mdash; the core of the widely-cited 2022 argument for buffer-pool-managed I/O<sup><a href="#r20">20</a></sup> <span class="p p-paper">paper</span>. And
+the failure mode that actually matters for a <i>desktop</i> tool: a USB drive
+yanked or a network mount dropped mid-mmap raises <b>SIGBUS</b> on the next page
+fault, which kills the process, where a <span class="mono">read()</span>-based
+design gets a catchable <span class="mono">EIO</span>. Wrap mmap access with
+SIGBUS handling, or simply do not mmap anything not proven to be on stable local
+storage. Use <span class="mono">MADV_RANDOM</span> on dictionary and term-index
+files (defeating readahead that would otherwise pull in irrelevant neighbours)
+and <span class="mono">MADV_SEQUENTIAL</span> during merges.</p>
+
+<p>This is also the one place the <span class="mono">unsafe</span> exception is
+taken (&sect;<a href="#s2">2</a>): a single leaf crate wrapping
+<span class="mono">memmap2</span>, with the soundness argument written down
+&mdash; segment files are append-only, never truncated in place, and unlinked
+only after every reader has dropped them.</p>
+
+<h3 id="s8c">NRT under a throttle</h3>
+
+<p>The standard Lucene NRT model applies unchanged on the write path: a change
+event re-tokenizes one file, appends to the in-memory buffer, and the buffer is
+exposed as a searchable segment <i>before</i> it is flushed. That gives
+sub-second visibility of an edit without a commit. What changes here is the
+merge side, and it changes in one specific way: <b>merge I/O now competes with
+the user's foreground disk activity, on purpose throttled to lose that
+contention</b> &mdash; so merges must be <i>rate-limited</i>, not merely
+deferred.</p>
+
+<div class="tw">
+<table>
+<caption>Starting parameters. These are Lucene defaults transplanted as a starting point <span class="p p-est">estimate</span>, not measurements of this build &mdash; tune against observed background CPU/IO share on real hardware.</caption>
+<thead><tr><th>Parameter</th><th>Start at</th><th>Reasoning</th></tr></thead>
+<tbody>
+<tr><th>Flush trigger</th><td>4 MB buffered or 1,000 docs, whichever first</td><td>Bias small. At this scale single-file re-index events dominate after the first build, so cheap frequent flushes buy visibility at almost no cost.</td></tr>
+<tr><th>Merge trigger</th><td>~10 segments in a size tier</td><td>Conservative &mdash; do not merge on every flush. Merge is the expensive throttled operation, and update cost is dominated by merge write amplification, not by the update.</td></tr>
+<tr><th>Merge fan-in</th><td>10</td><td>Each document is rewritten O(log<sub>M</sub>(N/flush_size)) times over its lifetime. At 73,565 files with a few thousand changes a day, that is cheap.</td></tr>
+<tr><th>Merge threads</th><td>1</td><td>Deliberate. A single throttled merge thread is invisible; two are not, and the wall-clock difference does not matter for work nobody is waiting on.</td></tr>
+<tr><th>Merge rate cap</th><td>Trailing 2 s window, sleep proportionally when over</td><td>The belt to cgroup <span class="mono">io.weight</span>'s suspenders. Lucene's <span class="mono">MergeRateLimiter</span>, a few dozen lines <span class="p p-doc">upstream</span>.</td></tr>
+<tr><th>Tombstone-triggered merge</th><td>&gt;20% reclaimable</td><td>Bounds the dead space a query walks. Lucene's tiered-merge scoring uses the same threshold <span class="p p-doc">upstream</span>.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">The interaction that needs testing, not assuming</span>
+<p>The merge scheduler and the backoff controller (&sect;<a href="#s7">7</a>) can
+deadlock each other in a soft but real way: the controller drops merge
+concurrency to zero whenever there is I/O pressure, and on a machine that is
+busy most of the day, segments accumulate without bound. Segment count degrades
+every query linearly. The fix is a <b>floor</b>, not a smarter controller: below
+some segment count &mdash; say 40 &mdash; merges are genuinely optional and the
+controller may starve them freely; above it, one merge thread runs at a hard-capped
+rate regardless of pressure, because an unmerged index eventually hurts the user
+more than a throttled merge does. Pick the floor by measuring query latency
+against segment count, which is a half-day experiment.</p>
+</div>
+</section>
+<section>
+<h2 id="s9">Semantic search</h2>
+
+<p>R9's verdict<sup><a href="#r7">7</a></sup> is unambiguous and I adopt it without modification: <b>a plugin
+over a chosen subdirectory, not a mode over the corpus.</b> The reason is a
+single ratio.</p>
+
+<div class="grid">
+  <div class="card">
+    <div class="stat">6&ndash;18<small>&times;</small></div>
+    <div class="cap">what a 768-dim fp32 vector store costs versus the entire lexical index, same corpus <span class="p p-est">estimate</span></div>
+  </div>
+  <div class="card">
+    <div class="stat">13&ndash;40<small>d</small></div>
+    <div class="cap">CPU-only first embed of a 200 GB corpus at bge-small <span class="p p-est">estimate</span></div>
+  </div>
+  <div class="card">
+    <div class="stat">2.6<small>d</small></div>
+    <div class="cap">the same job on GPU <span class="p p-est">estimate</span></div>
+  </div>
+  <div class="card">
+    <div class="stat">20&ndash;50<small>GB</small></div>
+    <div class="cap">where "run it overnight" becomes "run it for weeks" <span class="p p-est">estimate</span></div>
+  </div>
+</div>
+
+<p>For 100 GB of extracted text a Lucene-class lexical index runs 10&ndash;30 GB
+<span class="p p-est">estimate</span>; the 768-dim fp32 vector store for the same
+corpus is 176 GB <span class="p p-est">estimate</span>. <b>Above 768-fp32 the
+vector index is not an addition to the search engine &mdash; it is the dominant
+storage cost of the whole system, several times over.</b> Only <b>binary
+quantization at 384 dimensions</b> (2.7 GB, ratio ~0.014 GB/GB
+<span class="p p-est">estimate</span>) undercuts the lexical index, and it is
+therefore the only configuration in R9's whole table that actually satisfies
+"slightly slower search for a denser index" rather than fighting it. RaBitQ-style
+quantization is what closed the recall gap that made naive binary quantization
+unattractive before 2024.</p>
+
+<div class="box verdict">
+<span class="label">Verdict</span>
+<p><b>Do not build this into the core, at any tier, in any form.</b> Ship it as
+<span class="mono">ferret semantic-index &lt;path&gt;</span> &mdash; an
+explicitly opted-into subsystem scoped to a path or a content-type filter,
+entirely separate from the always-on lexical index. Default it to documents
+only: PDF, Office, email, notes. <b>Never</b> <span class="mono">.rs</span>,
+<span class="mono">.c</span>, <span class="mono">.py</span> by default, because
+semantic code search is a different and harder problem, and on code the lexical
+and structural paths are both cheaper and more precise.</p>
+<p>At a curated 1&ndash;10 GB slice the entire feasibility picture inverts:
+first-embed drops from days to hours, the vector store drops to low single-digit
+GB even at fp32, and HNSW's RAM residency stops being a consideration at all.
+The lexical and semantic query paths meet only at a result-merging step
+(reciprocal rank fusion); neither has to be architecturally aware of the
+other.</p>
+</div>
+
+<p>Two supporting facts worth carrying. <b>Incremental cost is not the problem</b>
+&mdash; a normal day's file changes re-embed in seconds to minutes even CPU-only;
+it is exclusively the first full index, plus any wholesale re-embed forced by a
+model upgrade, which on a large corpus is effectively running the whole job
+again. And <b>the desktop-embeddable vector stores that exist today are
+independently documented to struggle well below this scale</b>: sqlite-vec above
+~1M vectors, DuckDB VSS near-OOM at 500K <span class="p p-community">anecdote</span>
+&mdash; the direct opposite of the "billions of vectors on a laptop" marketing
+framing. LanceDB and usearch are the more plausible candidates on architectural
+grounds, but R9 found no independent at-scale verification of either
+<span class="p p-none">unknown</span>.</p>
+
+<p>The one thing genuinely worth revisiting later: <b>learned sparse retrieval</b>
+(SPLADE, not BM42) reuses the inverted index this design already has instead of
+standing up a separate ANN subsystem, at the cost of a transformer pass per
+document comparable to dense embedding. That is the cheapest possible on-ramp to
+semantic behaviour for a project that has already built T1 &mdash; but its recall
+claims need verification against his own corpus before being trusted. ColBERT-style
+late interaction is a reranker over a small candidate set and never a primary
+index; its storage scales with token count and would run into terabytes here.</p>
+</section>
+<section>
+<h2 id="s95">Ferret and Super Ferret: what carries over</h2>
+
+<p>He wrote Ferret &mdash; the Ruby port of Lucene 2 &mdash; and has said he would
+enjoy building it again in Rust while doubting it is the right engine for this
+job. That instinct is correct, and it is worth being precise about <em>which</em>
+part of it is correct, because the answer is not "throw it away." Ferret's file
+formats are all of the 2005 answer and none of them survive. Ferret's
+<em>write model</em> survives almost intact.</p>
+
+<div class="tw">
+<table>
+<caption>Ferret (Lucene-2 lineage, 2005&ndash;2010) against this design</caption>
+<thead>
+<tr><th>Concern</th><th>Ferret</th><th>Super Ferret</th><th></th></tr>
+</thead>
+<tbody>
+<tr><th>Postings</th><td>VByte d-gaps</td><td>FOR / SIMD-BP128 blocks; PEF if disk pressure demands it</td><td><span class="pill no">replace</span></td></tr>
+<tr><th>Skipping</th><td>skip list every N postings</td><td>block skip on last-docid-per-block; the skip <em>interval</em> stays a first-class tunable</td><td><span class="pill part">evolve</span></td></tr>
+<tr><th>Positions</th><td>VByte d-gaps, always on</td><td>omitted from body text entirely; re-scan on phrase (&sect;4)</td><td><span class="pill no">replace</span></td></tr>
+<tr><th>Term dictionary</th><td>prefix-compressed <span class="mono">.tis</span> + <span class="mono">.tii</span> skip index</td><td>front-coded blocks under an FST, so the dictionary itself walks an automaton for regex</td><td><span class="pill part">evolve</span></td></tr>
+<tr><th>Stored content</th><td>document bodies stored in the index (<span class="mono">.fdt</span>)</td><td>files stay on disk; extracted text cached only for formats that cannot be re-read (T3)</td><td><span class="pill no">replace</span></td></tr>
+<tr><th>Deletions</th><td>deleted-docs bitvector</td><td>roaring live-docs, reclaimed at merge</td><td><span class="pill part">evolve</span></td></tr>
+<tr><th>Regex</th><td>term-dictionary wildcards only</td><td>Cox compilation over content n-grams, then verify (&sect;7)</td><td><span class="pill no">new</span></td></tr>
+<tr><th>Filenames</th><td>just another field</td><td>a first-class tier with its own resident structure (T0)</td><td><span class="pill no">new</span></td></tr>
+<tr><th>Sort/facet fields</th><td>none; field cache built at search time</td><td>columnar doc values written at index time</td><td><span class="pill no">new</span></td></tr>
+<tr><th>Segments and merge</th><td>immutable segments, compound files, merge policy</td><td><b>unchanged in shape</b></td><td><span class="pill yes">keep</span></td></tr>
+<tr><th>Field bitflags</th><td>per-field indexed/stored/positions flags</td><td><b>unchanged in shape</b> &mdash; and now the load-bearing knob, because the whole density argument is which flag is off</td><td><span class="pill yes">keep</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">The distinction that matters</span>
+<p>Every row marked <span class="pill no">replace</span> is an <em>encoding</em>.
+Every row marked <span class="pill yes">keep</span> is a <em>write model</em>.
+Rewriting Ferret in Rust would produce a better Ferret and not this product,
+because it would carry the encodings forward and those are exactly the parts
+that have moved on twenty years. The reverse is also true and less obvious: the
+segment-and-merge mental model he already has is not a legacy constraint to
+escape, it is the thing that lets this design do near-real-time updates without
+a mutable posting format. Build the new encodings inside the old write model.</p>
+<p>The enjoyable part &mdash; implementing codecs, skip structures, segment
+merge &mdash; is entirely preserved. It is the file format that changes.</p>
+</div>
+</section>
+<section>
+<h2 id="s10">A staged build plan</h2>
+
+<p>The ordering principle: <b>each stage ships something usable, and each stage
+tests the assumption that would invalidate the next one.</b> That is not
+generic agile advice here &mdash; it is a direct consequence of M1. The riskiest
+assumption in this whole project is "a content index is worth building", and the
+plan is arranged so that assumption gets tested by stages 0 and 1, before a
+single posting list is written.</p>
+
+<div class="tw">
+<table>
+<caption>Effort figures are <span class="p p-est">estimate</span> and are calendar-shaped, not hours.</caption>
+<thead><tr><th>Stage</th><th>Build</th><th>Proves</th><th>Decision at the end</th></tr></thead>
+<tbody>
+<tr>
+<th class="mono">0 &mdash; measure<br><span class="mono">~1 day</span></th>
+<td>Not code. Three measurements: (a) drop caches, scan the 5.73 GB text tier with <span class="mono">rg</span>, cold &mdash; the number that does not exist; (b) the same after applying a size cap, i.e. over the ~1.59 GB tier; (c) a mean path length and directory count for the tree, which A4 and the inotify watch budget both need.</td>
+<td>Whether the cold-cache argument &mdash; the strongest surviving argument for a content index &mdash; is real.</td>
+<td><b>If cold scan of the text tier is under ~1 s, T2 is dead</b> and stage 5 is cancelled before it is scheduled. If it is 5&ndash;10 s, T2 has a case. Either answer is worth a day.</td>
+</tr>
+<tr>
+<th class="mono">1 &mdash; useful with no index<br><span class="mono">2&ndash;3 wk</span></th>
+<td>The exclusion engine as a pure function with a golden-file test corpus; the parallel crawler; T0 (doc values, path store, filename trigrams, Roaring filters); the query parser; routes R1, R2 and R5. No daemon, no content index, no extraction. <b>Plus: a query log.</b></td>
+<td>That the 25&times; layer is correct on his real tree, that T0 is ~8 MB and instant, and &mdash; via R5 &mdash; that content search at 50 ms warm is genuinely sufficient. Also establishes what queries he actually issues.</td>
+<td><b>This is a shippable tool.</b> Use it for a month. The query log then answers the question no amount of research can: what fraction of real queries are regex with no extractable literal, versus term queries wanting ranking, versus metadata queries. R10 names this as the measurement that would flip its own recommendation<sup><a href="#r8">8</a></sup>.</td>
+</tr>
+<tr>
+<th class="mono">2 &mdash; invisible daemon<br><span class="mono">2&ndash;3 wk</span></th>
+<td>inotify watcher with rename correlation and debounce; the durable priority queue; the always-on reconciliation crawl; <span class="mono">ferret status</span>; the whole politeness controller &mdash; cgroup unit, <span class="mono">SCHED_IDLE</span> pools, <span class="mono">fadvise(DONTNEED)</span>, PSI-driven backoff.</td>
+<td>The thing that kills these tools. Nothing here needs a content index, which is exactly why it comes before one: build the hard part while the easy part is still absent.</td>
+<td>Run a full crawl while compiling something large and see whether it is perceptible. If it is, the backoff controller is wrong, and finding that out now costs days rather than reputation. R1's unanswered question &mdash; is Baloo's problem scheduling or total work volume &mdash; gets an answer here, because exclusion has already removed 96% of the volume.</td>
+</tr>
+<tr>
+<th class="mono">3 &mdash; the index<br><span class="mono">4&ndash;6 wk</span></th>
+<td>Segments, manifest commit, tombstones, tiered merge with a rate limiter, NRT flush. <span class="mono">fst</span> dictionary, Elias-Fano postings with <span class="mono">nextGEQ</span>, bitpacked freqs, path-sorted docIDs, leapfrog intersection, BM25F with the desktop priors, block-max WAND. Route R3.</td>
+<td>The learning payload, and the crash-safety and NRT properties. Elias-Fano's select structure is the piece most likely to be skipped by someone defaulting to VByte+PFOR from habit, and it is the one that pays.</td>
+<td>Measure T1's actual size against the 81 MB estimate. Measure phrase-query latency with the re-scan strategy against the assumption that candidate sets stay small. If they do not, positions come back &mdash; but the doc-value gate means that change is local.</td>
+</tr>
+<tr>
+<th class="mono">4 &mdash; documents<br><span class="mono">3&ndash;4 wk</span></th>
+<td>The plugin ABI frozen; the subprocess pool with bwrap, timeouts, memory caps and poison quarantine; the pdfium extractor; OOXML/ODF direct parse; tree-sitter symbols; media metadata; the zstd extracted-text cache.</td>
+<td><b>The value proposition that survives M1 intact.</b> Extraction cannot be redone per query, so this is the one tier where the index is unambiguously buying something a scanner cannot.</td>
+<td>Point it at whatever document corpus actually exists &mdash; <span class="mono">~/Documents</span>, a mail spool &mdash; and measure. M1 measured a tree with no PDFs in its top extensions <span class="p p-measured">measured</span>, so the size of this tier is currently unknown <span class="p p-none">unknown</span>, and it determines how much of the rest was worth it.</td>
+</tr>
+<tr>
+<th class="mono">5 &mdash; trigrams<br><span class="mono">4&ndash;6 wk</span></th>
+<td>The Cox lattice over <span class="mono">regex-syntax</span>'s HIR; boolean-query simplification; T2 postings; per-file binary fuse filters; the selectivity estimator and the cost model; route R4.</td>
+<td>Index-assisted regex &mdash; if stages 0 and 1 said it was worth it.</td>
+<td><b>Gated, not scheduled.</b> Build this only if the cold number from stage 0 and the query log from stage 1 both support it. It is the largest single line in the size budget (252 MB, 3.1&times; T1 <span class="p p-est">estimate</span>) and the weakest justified.</td>
+</tr>
+<tr>
+<th class="mono">6 &mdash; plugins<br><span class="mono">open</span></th>
+<td>Email/chat and OCR as the first two external plugins &mdash; which is the real test of whether the ABI in &sect;<a href="#s6">6</a> was designed right, since a plugin interface that has only ever hosted its own author's plugins has not been tested.</td>
+<td>The ABI.</td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<th class="mono">Later &mdash; optional</th>
+<td>Semantic as a scoped plugin (&sect;<a href="#s9">9</a>). A move-r cold-segment tier ported from the papers (&sect;<a href="#s4">4</a>). Recursive graph bisection. WASI plugins when the ecosystem catches up.</td>
+<td>&mdash;</td>
+<td>All four are genuinely interesting and none is on the critical path for a tool that works.</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">Why stage 1 is the smallest genuinely useful thing</span>
+<p>Because it is a complete search tool. Filename and metadata search is
+instant and free at this scale &mdash; a full crawl is 1.24 s
+<span class="p p-measured">measured</span> &mdash; and content search routed to
+a well-optimised scanner answers in 50 ms warm
+<span class="p p-measured">measured</span>. Neither <span class="mono">plocate</span>
+nor <span class="mono">updatedb</span> is installed on this machine
+<span class="p p-measured">measured</span>, so stage 1 fills a real gap on day
+one rather than duplicating something. And it makes the strongest possible test
+of the project's premise: <b>if a month of using stage 1 does not produce a
+concrete query he wished had been indexed, stages 3 and 5 are being built for
+the pleasure of building them</b> &mdash; which is a fine reason, and worth
+knowing is the reason.</p>
+</div>
+
+<div class="box warn">
+<span class="label">Commit discipline</span>
+<p>Stages 3 and 5 are each long enough that their first green boundary is weeks
+away. Write the design notes and the size measurements into the repository as
+they are produced, not at the end &mdash; the analysis is the expensive half and
+the least recoverable. A design can be re-derived only from scratch; code can be
+rewritten from a design.</p>
+</div>
+</section>
+<section>
+<h2 id="s11">Open questions</h2>
+
+<p>Seven decisions this research does not settle. Each is genuinely his: the
+evidence constrains the answer but does not determine it. For each: the
+question, the named options, the tradeoff with numbers where numbers exist, my
+recommendation, and the one fact that would change it.</p>
+
+<div class="box verdict">
+<span class="label">Q1 &mdash; Build the trigram tier at all?</span>
+<p><b>The question:</b> Should Super Ferret build a content trigram index (T2)
+for index-assisted regex, or route every regex to the scanner permanently?</p>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Costs</th><th>Buys</th><th>Forecloses</th></tr></thead>
+<tbody>
+<tr><th>A. Build it in stage 5</th><td>252 MB on the measured corpus, 3.1&times; the entire term index <span class="p p-est">estimate</span>. 4&ndash;6 weeks. A whole selectivity estimator and cost model that must be kept honest.</td><td>Cold-cache regex, and the per-file fuse filter avoids <i>opening</i> most files &mdash; which is the layer that saves I/O, and is exactly the framing <span class="mono">ugrep-indexer</span> uses <span class="p p-doc">upstream</span><sup><a href="#r19">19</a></sup>.</td><td>Nothing. It is additive.</td></tr>
+<tr><th>B. Never build it; R5 forever</th><td>Regex is 50 ms warm <span class="p p-measured">measured</span> and an unmeasured cold figure. Loses the "index the whole disk" story for regex.</td><td>163 MB back. Six weeks back. A much simpler planner &mdash; no selectivity estimator, no cost model, no threshold to get wrong.</td><td>The FM-index/move-r cold-segment path later, which would need a comparable planner anyway.</td></tr>
+<tr><th>C. Build only the fuse filters, not the postings</th><td>31 MB <span class="p p-est">estimate</span>. Maybe a week.</td><td>Skips whole files before opening them &mdash; the cold-cache win &mdash; without any posting-list machinery. Degrades to a scan over survivors, which is R5 with a smaller input.</td><td>Offset-level candidate narrowing, which this design was never going to have anyway (positional trigrams rejected in &sect;<a href="#s4">4</a>).</td></tr>
+</tbody></table></div>
+<p><b>Recommendation: C, then decide about A.</b> The fuse filters capture the
+part of T2's value that M1 does <i>not</i> refute &mdash; avoiding cold reads
+&mdash; at 12% of its cost, and they are a fraction of the work. Full postings
+buy candidate narrowing within surviving files, which matters much less when the
+survivor set is already small.</p>
+<p><b>The one fact that would change it:</b> the stage-0 cold measurement. If a
+cold scan of the 1.59 GB text tier takes 8&ndash;10 s, option A becomes
+defensible on its own merits. If it takes under 1 s &mdash; entirely possible on
+NVMe with 32 threads at high queue depth &mdash; then even option C is
+unnecessary and the answer is B.</p>
+</div>
+
+<div class="box verdict">
+<span class="label">Q2 &mdash; Which corpus is this tool actually for?</span>
+<p><b>The question:</b> Is the target <span class="mono">/home/dave/w</span>, all
+of <span class="mono">$HOME</span>, or a set of explicitly configured roots?</p>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Costs</th><th>Buys</th></tr></thead>
+<tbody>
+<tr><th>A. <span class="mono">~/w</span> and similar dev trees</th><td>M1 has already measured this and the answer is uncomfortable: 96% build output, 1.59 GB of real text, and grep already wins.</td><td>Certainty. Every number on this page applies.</td></tr>
+<tr><th>B. All of <span class="mono">$HOME</span></th><td>Unmeasured. R8's warm <span class="mono">find</span> over <span class="mono">$HOME</span> counted ~1.55M directory entries <span class="p p-measured">measured</span> &mdash; roughly 2.7&times; the <span class="mono">~/w</span> file count &mdash; but says nothing about content mix.</td><td>Potentially the document tier: <span class="mono">~/Documents</span>, mail, a photo library. M1 explicitly caveats that such a corpus "would shift the balance toward extraction and toward the document tier".</td></tr>
+<tr><th>C. Configured roots, defaulting to B minus obvious noise</th><td>One config file the user has to think about.</td><td>Lets the tool be right on both.</td></tr>
+</tbody></table></div>
+<p><b>Recommendation: C, but run M1's census over <span class="mono">$HOME</span>
+before committing to any of the sizing on this page.</b> This is the cheapest
+high-value measurement remaining &mdash; it is the same script, pointed
+elsewhere &mdash; and it determines whether tier T3 has anything in it. Right
+now the document tier's size is genuinely unknown
+<span class="p p-none">unknown</span>, and T3 is the tier whose value M1 does not
+undercut.</p>
+<p><b>The one fact that would change it:</b> if <span class="mono">$HOME</span>
+turns out to hold, say, 20 GB of PDFs and a mail spool, the whole emphasis of
+this document shifts from "the index is hard to justify" to "the index is
+obviously justified and extraction is the bottleneck" &mdash; and stage 4 moves
+ahead of stage 3.</p>
+</div>
+
+<div class="box verdict">
+<span class="label">Q3 &mdash; Write the index, or borrow one for the first two stages?</span>
+<p><b>The question:</b> Stage 3 is 4&ndash;6 weeks of index engineering before
+the document tier exists. Should Tantivy sit behind a trait in the interim?</p>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Costs</th><th>Buys</th><th>Forecloses</th></tr></thead>
+<tbody>
+<tr><th>A. Write everything, in order</th><td>The document tier (stage 4) &mdash; the value M1 leaves standing &mdash; arrives 4&ndash;6 weeks later than it needs to.</td><td>The stated purpose. Elias-Fano's select structure, the FST&times;DFA walk, the merge policy: these are the things worth having built.</td><td>Nothing.</td></tr>
+<tr><th>B. Tantivy behind <span class="mono">trait IndexBackend</span> for stages 3&ndash;4, own implementation in stage 5</th><td>The trait is real work and will leak &mdash; Tantivy's segment model is close enough to this design that the leak is small, but "close enough" is doing work in that sentence. MIT licence, so no posture problem.</td><td>Stage 4 ships in week 6 instead of week 12. The document tier gets exercised against real documents while the index is still swappable, which is when finding out its shape is wrong is cheapest.</td><td>Some of the learning, if the swap never happens. That is the actual risk, and it is a discipline risk rather than a technical one.</td></tr>
+<tr><th>C. Tantivy permanently</th><td>Abandons the stated purpose of the project.</td><td>Weeks.</td><td>Everything this project is for.</td></tr>
+</tbody></table></div>
+<p><b>Recommendation: A.</b> This is the one place I would set the engineering
+argument aside. He is building this to learn the algorithms; B's saving is real
+but it buys calendar time on a project with no deadline, and it trades away
+exactly the part that motivated the project. The honest engineering advice is B
+and I am telling him so plainly &mdash; but A is the right call given why the
+project exists, and the ordering already puts stages 1 and 2 (both genuinely
+useful, neither requiring an index) first, which recovers most of B's real
+benefit.</p>
+<p><b>The one fact that would change it:</b> if Q2 resolves toward a large
+document corpus, the document tier becomes the product and B's argument gets
+much stronger &mdash; ship the thing that is useful, then rebuild its engine.</p>
+</div>
+
+<div class="box verdict">
+<span class="label">Q4 &mdash; inotify only, or a privileged fanotify helper?</span>
+<p><b>The question:</b> Does Super Ferret ship a system service holding
+<span class="mono">CAP_SYS_ADMIN</span> so that fanotify's
+<span class="mono">FAN_MARK_FILESYSTEM</span> can replace per-directory
+watches?</p>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Costs</th><th>Buys</th></tr></thead>
+<tbody>
+<tr><th>A. inotify only</th><td>~1 KB kernel memory per watched directory <span class="p p-community">anecdote</span> &mdash; 50&ndash;200 MB at 50k&ndash;200k directories <span class="p p-est">estimate</span>. The create-then-watch race, which is a real correctness bug, not a theoretical one. Nothing outside the watched set is seen.</td><td>Installs and runs as the user. No privilege story at all. This is what Tracker and Baloo both do <span class="p p-doc">upstream</span>.</td></tr>
+<tr><th>B. Optional <span class="mono">ferret install-system-service</span></th><td>A setuid binary or a systemd unit with <span class="mono">AmbientCapabilities=CAP_SYS_ADMIN</span> &mdash; a materially worse install experience, and a security surface to defend.</td><td>One mark covers a whole filesystem. The watch-count problem and the create race both cease to exist. Kernel 6.18.43 here <span class="p p-measured">measured</span> is well past every feature gate.</td></tr>
+<tr><th>C. Require the helper</th><td>Everything in B, mandatory.</td><td>One code path instead of two.</td></tr>
+</tbody></table></div>
+<p><b>Recommendation: A now, B later, never C.</b> The reconciliation crawl
+(1.24 s warm <span class="p p-measured">measured</span>) already covers every
+gap inotify leaves &mdash; the race, the overflow, the offline window &mdash; so
+fanotify's marginal correctness value is smaller than it looks, while its
+install-friction cost is immediate and certain.</p>
+<p><b>The one fact that would change it:</b> a measured directory count over the
+chosen roots. If it is 20k, watch memory is ~20 MB and A is obviously right. If
+it is 400k, watch memory approaches half a gigabyte of unswappable kernel
+memory and B stops being optional.</p>
+</div>
+
+<div class="box verdict">
+<span class="label">Q5 &mdash; Regex semantics over extracted documents</span>
+<p><b>The question:</b> A regex query reaches a PDF. There are no original bytes
+to match &mdash; only extracted, normalised, dehyphenated,
+reading-order-approximate text. What does the tool do?</p>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Costs</th><th>Buys</th></tr></thead>
+<tbody>
+<tr><th>A. Match the extracted text; label the result</th><td>The reported offset is into the extracted text, not the file. A user who opens the PDF cannot find the bytes.</td><td>Regex works everywhere. One flag on the hit and one line in the docs.</td></tr>
+<tr><th>B. Maintain an offset map back to original byte positions</th><td>Expensive to build and to keep correct through every normalisation step &mdash; and for a PDF the "original position" is a glyph in a content stream, which is not a thing a user can look at anyway. R8 flags this as expensive; for PDFs specifically I think it is close to meaningless.</td><td>Byte-accurate reporting, and the ability to re-verify against the raw slice.</td></tr>
+<tr><th>C. Refuse regex over extracted documents</th><td>Loses regex over the one tier the index genuinely earns.</td><td>No lying, ever.</td></tr>
+</tbody></table></div>
+<p><b>Recommendation: A, with the label as a visible marker on the result and
+not a footnote.</b> B is right in principle for formats where original bytes are
+meaningful text &mdash; and for those (HTML, Markdown, source) the answer is
+simpler still: keep the raw file and re-verify against it, which is what R5
+already does. For PDF and Office there is no useful original byte offset to
+report, so B's cost buys nothing a user can act on.</p>
+<p><b>The one fact that would change it:</b> if the extracted-text cache proves
+cheap to keep byte-aligned for the <i>text-shaped</i> formats (HTML, mail
+bodies), extend B to exactly those and keep A only for PDF and Office.</p>
+</div>
+
+<div class="box verdict">
+<span class="label">Q6 &mdash; Drop positions, really?</span>
+<p><b>The question:</b> Store no positional postings and resolve phrase,
+proximity and highlighting by re-scanning the candidate file?</p>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Costs</th><th>Buys</th></tr></thead>
+<tbody>
+<tr><th>A. No positions, re-scan (recommended)</th><td>One <span class="mono">open()</span> + <span class="mono">pread()</span> per surviving candidate on phrase queries only. Single-digit ms per candidate file at NVMe latency <span class="p p-est">estimate</span>. Requires an (ino, mtime) doc-value gate so a since-modified file fails safely.</td><td>Positions run 2&ndash;4&times; the freq-only index <span class="p p-paper">paper</span> and 3&ndash;10&times; docs-only <span class="p p-bench">benchmark</span>. On the 81 MB T1 estimate that is 160&ndash;240 MB saved &mdash; comparable to the entire trigram tier, for free.</td></tr>
+<tr><th>B. Positions on the body field only</th><td>The full multiplier, on the only field where it matters.</td><td>Phrase queries never touch the disk. Highlighting comes from the index.</td></tr>
+<tr><th>C. Positions only for extracted documents</th><td>A per-field split, which Lucene's <span class="mono">IndexOptions</span> model makes natural <span class="p p-doc">upstream</span>.</td><td>Extracted documents are the tier where re-scanning means re-extracting &mdash; unless the T3 cache serves the re-scan, which it does.</td></tr>
+</tbody></table></div>
+<p><b>Recommendation: A.</b> This is R6's own top-ranked density lever<sup><a href="#r4">4</a></sup> and the
+single most direct instantiation of his stated preference. Note that C dissolves
+on inspection: the T3 cache already holds the extracted text, so re-scanning an
+extracted document costs a zstd block decode, not a re-extraction. That
+observation is what makes A safe across every tier.</p>
+<p><b>The one fact that would change it:</b> if the stage-1 query log shows
+phrase queries dominating <i>and</i> stage 3 shows post-intersection candidate
+sets in the tens of thousands rather than the hundreds. Both would have to be
+true; either alone is survivable.</p>
+</div>
+
+<div class="box verdict">
+<span class="label">Q7 &mdash; What backs the durable work queue?</span>
+<p><b>The question:</b> The queue must accept a path faster than inotify
+delivers, survive <span class="mono">kill -9</span>, and support priority
+ordering.</p>
+<div class="tw"><table>
+<thead><tr><th>Option</th><th>Tradeoff</th></tr></thead>
+<tbody>
+<tr><th>A. <span class="mono">redb</span></th><td>Pure Rust, MIT/Apache, no unsafe in the API surface, ordered keys give priority ordering for free. Actively maintained. The conservative choice.</td></tr>
+<tr><th>B. Hand-rolled append log + in-memory index, rebuilt on start</th><td>Fewer dependencies and a shape he fully controls; the recovery path is a replay, which is easy to test. But it is a small database, and small databases become large databases.</td></tr>
+<tr><th>C. <span class="mono">sled</span></th><td>Long-standing beta status and a history of format churn. Not for something whose whole job is durability.</td></tr>
+</tbody></table></div>
+<p><b>Recommendation: A.</b> The queue is infrastructure, not the interesting
+part, and the interesting part is elsewhere on this page. <b>The one fact that
+would change it:</b> if the same store also has to back doc values or the
+tombstone bitsets, then it stops being infrastructure and B's control becomes
+worth the work &mdash; but this design keeps those in the segment files
+precisely so that does not happen.</p>
+</div>
+</section>
+    <div class="sources">
+      <h2 class="nonum" id="sources">Sources</h2>
+      <p>Research files in this set are cited by their identifier; external
+      sources are those the research files established provenance for and that
+      a claim on this page rests on directly.</p>
+      <ol>
+        <li id="r1"><b>M1</b> &mdash; Measured baseline on the target machine and corpus, 2026-09-04. Every <span class="p p-measured">measured</span> chip on this page traces here.</li>
+        <li id="r2"><b>R1</b> &mdash; Linux full-text-search applications: Recoll, Tracker/LocalSearch, Baloo, Beagle, DocFetcher. Politeness mechanisms, the abandonment failure mode, the cgroup finding.</li>
+        <li id="r3"><b>R2</b> &mdash; Linux filename and code search: plocate, zoekt, livegrep, ripgrep, ugrep. Index-size ratios and the regex prior art.</li>
+        <li id="r4"><b>R6</b> &mdash; Inverted index internals: postings codecs, Elias-Fano, term dictionaries, top-k, segments, merge policy, NRT.</li>
+        <li id="r5"><b>R7</b> &mdash; Substring, n-gram, suffix and filter structures; Cox's regex-to-trigram derivation; the brute-force baseline.</li>
+        <li id="r6"><b>R8</b> &mdash; Content extraction pipeline and filesystem change detection; the plugin ABI analysis; indexer politeness.</li>
+        <li id="r7"><b>R9</b> &mdash; Semantic search at scale: vector-store sizing, embedding throughput, the plugin verdict.</li>
+        <li id="r8"><b>R10</b> &mdash; Density-first designs: VictoriaLogs, Loki, ClickHouse, Splunk, Parquet; the filter-vs-postings arithmetic.</li>
+        <li id="r9"><a href="https://swtch.com/~rsc/regexp/regexp4.html">Russ Cox &mdash; Regular Expression Matching with a Trigram Index (2012)</a>. The primary source for &sect;5's derivation.</li>
+        <li id="r10"><a href="https://github.com/sourcegraph/zoekt/blob/main/doc/design.md">zoekt design document &mdash; Sourcegraph</a>. Positional trigrams at ~1.2&times; corpus in RAM.</li>
+        <li id="r11"><a href="https://burntsushi.net/regex-internals/">Andrew Gallant &mdash; Regex engine internals as a library</a>, and <a href="https://github.com/rust-lang/regex">rust-lang/regex</a>. The HIR walked by the planner and the verify engine.</li>
+        <li id="r12"><a href="https://lucene.apache.org/core/9_11_0/core/org/apache/lucene/index/SegmentInfos.html">Lucene <span class="mono">SegmentInfos</span></a> and <a href="https://lucene.apache.org/core/9_11_0/core/org/apache/lucene/index/ConcurrentMergeScheduler.html"><span class="mono">ConcurrentMergeScheduler</span></a>. The commit protocol and the merge rate limiter.</li>
+        <li id="r13"><a href="https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/match-only-text">Elasticsearch <span class="mono">match_only_text</span></a>. Prior art for dropping positions and re-scanning.</li>
+        <li id="r14"><a href="https://arxiv.org/pdf/2201.01174">Graf &amp; Lemire &mdash; Binary Fuse Filters: Fast and Smaller Than Xor Filters (2022)</a>, and the <a href="https://docs.rs/xorf/">xorf</a> crate.</li>
+        <li id="r15"><a href="https://arxiv.org/abs/1705.10382">Gagie, Navarro, Prezza &mdash; Optimal-Time Text Indexing in BWT-runs Bounded Space</a>, and <a href="https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.SEA.2024.1">Bertram et al. &mdash; move-r (SEA 2024)</a>.</li>
+        <li id="r16"><a href="https://man7.org/linux/man-pages/man7/inotify.7.html">inotify(7)</a>, <a href="https://man7.org/linux/man-pages/man7/fanotify.7.html">fanotify(7)</a>, <a href="https://man7.org/linux/man-pages/man2/fanotify_init.2.html">fanotify_init(2)</a>, <a href="https://man7.org/linux/man-pages/man2/statx.2.html">statx(2)</a>.</li>
+        <li id="r17"><a href="https://docs.kernel.org/block/ioprio.html">Linux block I/O priority documentation</a>. The scheduler-dependence that makes ionice inert on NVMe.</li>
+        <li id="r18"><a href="https://www.recoll.org/faqsandhowtos/cgroups_instructions.html">Recoll &mdash; using Linux cgroups to limit indexing CPU usage</a>. Upstream conceding that nice/ionice/SCHED_IDLE is not a ceiling.</li>
+        <li id="r19"><a href="https://github.com/Genivia/ugrep-indexer">ugrep-indexer</a>. Per-file n-gram pre-index, and the documented query classes a filter cannot serve.</li>
+        <li id="r20"><a href="https://db.cs.cmu.edu/mmap-cidr2022/">Crotty, Leis, Pavlo &mdash; Are You Sure You Want to Use MMAP in Your DBMS? (CIDR 2022)</a>.</li>
+        <li id="r21"><a href="https://www.gnu.org/licenses/gpl-faq.html">GNU GPL FAQ</a> &mdash; the linking versus process-invocation distinction the plugin boundary relies on.</li>
+        <li id="r22"><a href="https://ocrmypdf.readthedocs.io/">OCRmyPDF documentation</a> and <a href="https://tesseract-ocr.github.io/tessdoc/Benchmarks.html">Tesseract benchmarks</a>.</li>
+        <li id="r23"><a href="https://github.com/pisa-engine/pisa">PISA</a> and <a href="https://pisa.readthedocs.io/">its documentation</a> &mdash; the best "read the source" target for postings compression, block-max pruning and document reordering.</li>
+      </ol>
+    </div>
+    <footer class="pagefoot">
+      <span>Super Ferret research &middot; page 4 of 4</span>
+      <span>Compiled 2026-09-05</span>
+    </footer>
+  </main>
+</div>
+<script>
+// TOC scroll-spy. Copy verbatim.
+(function () {
+  var links = [].slice.call(document.querySelectorAll('.toc a[href^="#"]'));
+  if (!links.length) return;
+  var map = {};
+  links.forEach(function (a) {
+    var el = document.getElementById(a.getAttribute('href').slice(1));
+    if (el) map[el.id] = a;
+  });
+  var obs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        links.forEach(function (l) { l.classList.remove('on'); });
+        if (map[e.target.id]) map[e.target.id].classList.add('on');
+      }
+    });
+  }, { rootMargin: '-72px 0px -70% 0px', threshold: 0 });
+  Object.keys(map).forEach(function (id) {
+    var el = document.getElementById(id); if (el) obs.observe(el);
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,2817 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Index Structures for Local Search</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,380;8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+/* ============================================================
+   Super Ferret research reports — shared design system
+   Type:   Archivo (display) / Source Serif 4 (body) / IBM Plex Mono (data)
+   Colour: cool slate ink on cool paper, teal accent, semantic
+           provenance hues that encode how a number was sourced.
+   ============================================================ */
+
+:root {
+  /* --- paper & ink (light) --- */
+  --paper:      #f4f6f8;
+  --surface:    #ffffff;
+  --surface-2:  #eceff3;
+  --sunk:       #e3e7ec;
+  --ink:        #12161d;
+  --ink-2:      #3d4653;
+  --ink-3:      #626d7d;
+  --rule:       #d3d9e1;
+  --rule-soft:  #e5e9ef;
+
+  /* --- accent --- */
+  --accent:     #0d7d8a;
+  --accent-2:   #0a5f6a;
+  --accent-ink: #063d45;
+  --accent-wash:#ddf0f2;
+
+  /* --- provenance semantics --- */
+  --pv-measured:  #0d7d8a;  --pv-measured-bg:  #dcf0f2;
+  --pv-doc:       #3f5aa6;  --pv-doc-bg:       #e2e7f7;
+  --pv-paper:     #5b4b9c;  --pv-paper-bg:     #e9e5f7;
+  --pv-bench:     #2f7a4a;  --pv-bench-bg:     #dff0e5;
+  --pv-vendor:    #9a6410;  --pv-vendor-bg:    #f7ecd8;
+  --pv-community: #8a5a6b;  --pv-community-bg: #f6e6ea;
+  --pv-est:       #7a6a55;  --pv-est-bg:       #efeae1;
+  --pv-none:      #8b3a3a;  --pv-none-bg:      #f7e2e2;
+
+  /* --- status --- */
+  --good: #2f7a4a; --warn: #9a6410; --bad: #a83232;
+
+  /* --- metrics --- */
+  --measure: 68ch;
+  --radius: 3px;
+  --shadow: 0 1px 2px rgba(18,22,29,.06), 0 6px 18px rgba(18,22,29,.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper:      #101318;
+    --surface:    #171b22;
+    --surface-2:  #1d222b;
+    --sunk:       #0b0e12;
+    --ink:        #e6eaf0;
+    --ink-2:      #b3bcc9;
+    --ink-3:      #838e9d;
+    --rule:       #2c333e;
+    --rule-soft:  #232932;
+
+    --accent:     #4fc7d4;
+    --accent-2:   #7adbe5;
+    --accent-ink: #a8e8ef;
+    --accent-wash:#0f3238;
+
+    --pv-measured:  #4fc7d4;  --pv-measured-bg:  #0f3238;
+    --pv-doc:       #8fa6ee;  --pv-doc-bg:       #1a2242;
+    --pv-paper:     #b2a3f0;  --pv-paper-bg:     #221d3d;
+    --pv-bench:     #6bc98d;  --pv-bench-bg:     #102b1c;
+    --pv-vendor:    #dfa94a;  --pv-vendor-bg:    #33260e;
+    --pv-community: #dfa0b3;  --pv-community-bg: #331d24;
+    --pv-est:       #c4b49a;  --pv-est-bg:       #2a2418;
+    --pv-none:      #e88a8a;  --pv-none-bg:      #3a1c1c;
+
+    --good: #6bc98d; --warn: #dfa94a; --bad: #e88a8a;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.3);
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper:      #101318;
+  --surface:    #171b22;
+  --surface-2:  #1d222b;
+  --sunk:       #0b0e12;
+  --ink:        #e6eaf0;
+  --ink-2:      #b3bcc9;
+  --ink-3:      #838e9d;
+  --rule:       #2c333e;
+  --rule-soft:  #232932;
+
+  --accent:     #4fc7d4;
+  --accent-2:   #7adbe5;
+  --accent-ink: #a8e8ef;
+  --accent-wash:#0f3238;
+
+  --pv-measured:  #4fc7d4;  --pv-measured-bg:  #0f3238;
+  --pv-doc:       #8fa6ee;  --pv-doc-bg:       #1a2242;
+  --pv-paper:     #b2a3f0;  --pv-paper-bg:     #221d3d;
+  --pv-bench:     #6bc98d;  --pv-bench-bg:     #102b1c;
+  --pv-vendor:    #dfa94a;  --pv-vendor-bg:    #33260e;
+  --pv-community: #dfa0b3;  --pv-community-bg: #331d24;
+  --pv-est:       #c4b49a;  --pv-est-bg:       #2a2418;
+  --pv-none:      #e88a8a;  --pv-none-bg:      #3a1c1c;
+
+  --good: #6bc98d; --warn: #dfa94a; --bad: #e88a8a;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 20px rgba(0,0,0,.3);
+}
+
+/* ---------- base ---------- */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 5rem; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Source Serif 4", "Iowan Old Style", Charter, Georgia, serif;
+  font-size: 17px;
+  line-height: 1.62;
+  font-variant-numeric: oldstyle-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- top bar ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: 1.5rem;
+  padding: .7rem clamp(1rem, 4vw, 2.5rem);
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule);
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+}
+.topbar .mark {
+  font-weight: 700; font-size: .82rem; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink);
+  white-space: nowrap;
+}
+.topbar .mark span { color: var(--accent); }
+.topbar nav { display: flex; gap: .25rem; flex-wrap: wrap; margin-left: auto; }
+.topbar nav a {
+  font-size: .78rem; font-weight: 500; letter-spacing: .02em;
+  color: var(--ink-3); text-decoration: none;
+  padding: .3rem .6rem; border-radius: var(--radius);
+}
+.topbar nav a:hover { color: var(--ink); background: var(--surface-2); }
+.topbar nav a[aria-current="page"] { color: var(--accent); background: var(--accent-wash); }
+.topbar nav a:focus-visible,
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* ---------- page shell ---------- */
+.shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  max-width: 1500px;
+  margin: 0 auto;
+  padding: 0 clamp(1rem, 4vw, 2.5rem) 6rem;
+}
+@media (min-width: 1080px) {
+  .shell { grid-template-columns: 250px minmax(0, 1fr); gap: clamp(2rem, 4vw, 4rem); }
+}
+
+/* ---------- sidebar TOC ---------- */
+.toc { display: none; }
+@media (min-width: 1080px) {
+  .toc {
+    display: block;
+    position: sticky; top: 4.2rem;
+    align-self: start;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    padding: 2.5rem 0 2rem;
+    font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+    font-size: .8rem;
+    line-height: 1.45;
+    border-right: 1px solid var(--rule-soft);
+    margin-right: -1px;
+  }
+}
+.toc h2 {
+  font-size: .68rem; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 600; margin: 0 0 .9rem;
+}
+.toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .12rem; }
+.toc ol ol { margin: .12rem 0 .4rem .85rem; }
+.toc a {
+  display: block; padding: .22rem .5rem .22rem .55rem;
+  color: var(--ink-2); text-decoration: none;
+  border-left: 2px solid transparent; border-radius: 0 var(--radius) var(--radius) 0;
+}
+.toc a:hover { color: var(--ink); background: var(--surface-2); }
+.toc a.on { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+.toc .sub a { color: var(--ink-3); font-size: .76rem; }
+
+/* ---------- main ---------- */
+main { min-width: 0; padding-top: 2.5rem; }
+main > * { max-width: var(--measure); }
+main > .wide, main > .tw, main > figure, main > .grid, main > .cards { max-width: none; }
+
+/* ---------- masthead ---------- */
+.masthead { max-width: none; margin-bottom: 3.5rem; }
+.eyebrow {
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: .7rem; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--accent); font-weight: 600; margin: 0 0 .9rem;
+}
+h1 {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-weight: 700; font-size: clamp(2.1rem, 5vw, 3.3rem);
+  line-height: 1.04; letter-spacing: -.022em;
+  margin: 0 0 1rem; text-wrap: balance; color: var(--ink);
+}
+.standfirst {
+  font-size: 1.17rem; line-height: 1.55; color: var(--ink-2);
+  max-width: 60ch; margin: 0 0 1.6rem;
+}
+.meta {
+  display: flex; flex-wrap: wrap; gap: .4rem 1.4rem;
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: .72rem; color: var(--ink-3);
+  padding-top: 1rem; border-top: 1px solid var(--rule);
+  font-variant-numeric: tabular-nums;
+}
+.meta b { color: var(--ink-2); font-weight: 500; }
+
+/* ---------- headings ---------- */
+h2, h3, h4, h5 {
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  color: var(--ink); text-wrap: balance; letter-spacing: -.012em;
+}
+h2 {
+  font-size: 1.72rem; font-weight: 700; line-height: 1.15;
+  margin: 4rem 0 1.1rem; padding-top: 1.1rem;
+  border-top: 2px solid var(--ink); max-width: none;
+}
+h3 { font-size: 1.2rem; font-weight: 600; margin: 2.6rem 0 .7rem; }
+h4 {
+  font-size: .82rem; font-weight: 600; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-2); margin: 2rem 0 .5rem;
+}
+h5 { font-size: .95rem; font-weight: 600; margin: 1.4rem 0 .4rem; color: var(--ink-2); }
+
+/* section numbering: the reports ARE a numbered reference, so the
+   numbers carry real structure rather than decoration. */
+.numbered { counter-reset: h2; }
+.numbered h2:not(.nonum) { counter-increment: h2; counter-reset: h3; }
+.numbered h2:not(.nonum)::before {
+  content: counter(h2) "  ";
+  font-family: "IBM Plex Mono", monospace; font-size: .72em;
+  color: var(--accent); font-weight: 500;
+}
+.numbered h3:not(.nonum) { counter-increment: h3; }
+.numbered h3:not(.nonum)::before {
+  content: counter(h2) "." counter(h3) "  ";
+  font-family: "IBM Plex Mono", monospace; font-size: .78em;
+  color: var(--ink-3); font-weight: 500;
+}
+
+p { margin: 0 0 1.05rem; }
+a { color: var(--accent-2); text-underline-offset: .18em; text-decoration-thickness: .06em; }
+a:hover { color: var(--accent); }
+strong { font-weight: 600; color: var(--ink); }
+em { font-style: italic; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 3rem 0; }
+
+ul, ol { margin: 0 0 1.05rem; padding-left: 1.3rem; }
+li { margin-bottom: .38rem; }
+li > ul, li > ol { margin-top: .38rem; }
+
+dl { margin: 0 0 1.2rem; }
+dt { font-family: Archivo, sans-serif; font-weight: 600; font-size: .95rem; margin-top: .9rem; }
+dd { margin: .15rem 0 0; color: var(--ink-2); }
+
+blockquote {
+  margin: 1.4rem 0; padding: .2rem 0 .2rem 1.2rem;
+  border-left: 3px solid var(--accent); color: var(--ink-2); font-style: italic;
+}
+blockquote p:last-child { margin-bottom: 0; }
+
+/* ---------- code ---------- */
+code, kbd, samp {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .86em; font-variant-numeric: tabular-nums;
+}
+:not(pre) > code {
+  background: var(--surface-2); border: 1px solid var(--rule-soft);
+  padding: .08em .35em; border-radius: var(--radius);
+  color: var(--ink); white-space: nowrap;
+}
+pre {
+  margin: 1.4rem 0; padding: 1rem 1.15rem;
+  background: var(--sunk); border: 1px solid var(--rule);
+  border-radius: var(--radius); overflow-x: auto;
+  font-size: .82rem; line-height: 1.55; max-width: none;
+}
+pre code { background: none; border: 0; padding: 0; white-space: pre; color: var(--ink); }
+pre .cm { color: var(--ink-3); font-style: italic; }
+pre .kw { color: var(--accent); font-weight: 500; }
+figure.code { margin: 1.4rem 0; max-width: none; }
+figure.code figcaption {
+  font-family: Archivo, sans-serif; font-size: .74rem; font-weight: 600;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3);
+  margin-bottom: .45rem;
+}
+
+/* ---------- tables ---------- */
+.tw { overflow-x: auto; margin: 1.5rem 0; max-width: none;
+      border: 1px solid var(--rule); border-radius: var(--radius); background: var(--surface); }
+table {
+  border-collapse: collapse; width: 100%;
+  font-family: Archivo, "Helvetica Neue", Arial, sans-serif;
+  font-size: .82rem; line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--surface-2); color: var(--ink);
+  font-weight: 600; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase;
+  text-align: left; padding: .6rem .7rem; border-bottom: 1.5px solid var(--rule);
+  white-space: nowrap;
+}
+tbody td, tbody th {
+  padding: .55rem .7rem; border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top; text-align: left; color: var(--ink-2);
+}
+tbody th { font-weight: 600; color: var(--ink); white-space: nowrap; }
+tbody tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
+tbody tr:hover td, tbody tr:hover th { background: var(--surface-2); }
+td.num, th.num { text-align: right; font-family: "IBM Plex Mono", monospace; white-space: nowrap; }
+td.mono, th.mono { font-family: "IBM Plex Mono", monospace; font-size: .78rem; }
+caption {
+  caption-side: bottom; text-align: left; padding: .6rem .7rem;
+  font-family: "Source Serif 4", serif; font-size: .82rem; color: var(--ink-3);
+  border-top: 1px solid var(--rule-soft);
+}
+
+/* ---------- provenance chips: every number says how it was sourced ---------- */
+.p {
+  display: inline-block; vertical-align: baseline;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: .63rem; font-weight: 500; letter-spacing: .05em;
+  text-transform: uppercase; white-space: nowrap;
+  padding: .08em .38em; border-radius: 2px;
+  border: 1px solid currentColor;
+  margin-left: .3em; position: relative; top: -.08em;
+}
+.p-measured  { color: var(--pv-measured);  background: var(--pv-measured-bg); }
+.p-doc       { color: var(--pv-doc);       background: var(--pv-doc-bg); }
+.p-paper     { color: var(--pv-paper);     background: var(--pv-paper-bg); }
+.p-bench     { color: var(--pv-bench);     background: var(--pv-bench-bg); }
+.p-vendor    { color: var(--pv-vendor);    background: var(--pv-vendor-bg); }
+.p-community { color: var(--pv-community); background: var(--pv-community-bg); }
+.p-est       { color: var(--pv-est);       background: var(--pv-est-bg); }
+.p-none      { color: var(--pv-none);      background: var(--pv-none-bg); }
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: .45rem .7rem;
+  padding: .9rem 1rem; margin: 1.4rem 0; max-width: none;
+  background: var(--surface); border: 1px solid var(--rule); border-radius: var(--radius);
+  font-family: Archivo, sans-serif; font-size: .74rem; color: var(--ink-3);
+  align-items: center;
+}
+.legend > span { display: inline-flex; align-items: center; gap: .3rem; }
+.legend b {
+  font-family: Archivo, sans-serif; font-size: .68rem; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--ink-2); margin-right: .3rem;
+}
+
+/* ---------- density bar: encodes index-size ratio visually ---------- */
+.bar { display: flex; align-items: center; gap: .5rem; min-width: 130px; }
+.bar .track {
+  flex: 1; height: 7px; background: var(--sunk);
+  border-radius: 4px; overflow: hidden; min-width: 56px;
+  border: 1px solid var(--rule-soft);
+}
+.bar .fill { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.bar .fill.hi { background: var(--warn); }
+.bar .fill.vhi { background: var(--bad); }
+.bar .val {
+  font-family: "IBM Plex Mono", monospace; font-size: .72rem;
+  color: var(--ink-2); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+
+/* ---------- callouts ---------- */
+.box {
+  margin: 1.6rem 0; padding: 1.05rem 1.2rem; max-width: none;
+  background: var(--surface); border: 1px solid var(--rule);
+  border-left: 3px solid var(--ink-3); border-radius: var(--radius);
+  font-size: .95rem;
+}
+.box > :first-child { margin-top: 0; }
+.box > :last-child { margin-bottom: 0; }
+.box .label {
+  display: block; font-family: Archivo, sans-serif;
+  font-size: .68rem; font-weight: 700; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: .5rem;
+}
+.box.key      { border-left-color: var(--accent); background: var(--accent-wash); }
+.box.key .label { color: var(--accent-2); }
+.box.warn     { border-left-color: var(--warn); }
+.box.warn .label { color: var(--warn); }
+.box.gap      { border-left-color: var(--bad); }
+.box.gap .label { color: var(--bad); }
+.box.verdict  { border-left-color: var(--ink); border-width: 1px 1px 1px 4px; background: var(--surface-2); }
+.box.verdict .label { color: var(--ink); }
+
+/* ---------- cards / grids ---------- */
+.grid { display: grid; gap: 1rem; margin: 1.6rem 0; max-width: none;
+        grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); }
+.card {
+  padding: 1.1rem 1.2rem; background: var(--surface);
+  border: 1px solid var(--rule); border-radius: var(--radius);
+  box-shadow: var(--shadow); font-size: .92rem;
+}
+.card h4 { margin-top: 0; }
+.card > :last-child { margin-bottom: 0; }
+.card .stat {
+  font-family: Archivo, sans-serif; font-weight: 700;
+  font-size: 1.9rem; line-height: 1.1; color: var(--accent-2);
+  font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+}
+.card .stat small {
+  font-size: .5em; font-weight: 500; color: var(--ink-3);
+  letter-spacing: 0; margin-left: .25em;
+}
+.card .cap {
+  font-family: Archivo, sans-serif; font-size: .72rem; color: var(--ink-3);
+  letter-spacing: .04em; text-transform: uppercase; margin-top: .35rem;
+}
+
+/* ---------- verdict pills ---------- */
+.pill {
+  display: inline-block; font-family: Archivo, sans-serif;
+  font-size: .68rem; font-weight: 600; letter-spacing: .06em;
+  text-transform: uppercase; padding: .14em .5em; border-radius: 10px;
+  border: 1px solid currentColor; white-space: nowrap;
+}
+.pill.yes { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.pill.no  { color: var(--bad);  background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.pill.part{ color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.pill.dead{ color: var(--ink-3); background: var(--surface-2); }
+
+/* ---------- footnotes / sources ---------- */
+.sources { margin-top: 4rem; padding-top: 1.4rem; border-top: 2px solid var(--ink); max-width: none; }
+.sources h2 { border: 0; margin: 0 0 1rem; padding: 0; font-size: 1.1rem; }
+.sources ol { font-size: .8rem; color: var(--ink-3); columns: 2; column-gap: 2.5rem; padding-left: 1.4rem; }
+@media (max-width: 800px) { .sources ol { columns: 1; } }
+.sources li { margin-bottom: .45rem; break-inside: avoid; }
+.sources a { word-break: break-word; }
+
+footer.pagefoot {
+  margin-top: 3rem; padding-top: 1.2rem; border-top: 1px solid var(--rule);
+  font-family: "IBM Plex Mono", monospace; font-size: .72rem; color: var(--ink-3);
+  display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; justify-content: space-between;
+  max-width: none;
+}
+
+/* ---------- misc ---------- */
+figure { margin: 1.8rem 0; }
+figure figcaption {
+  font-size: .82rem; color: var(--ink-3); margin-top: .6rem; line-height: 1.45;
+}
+svg { max-width: 100%; height: auto; }
+img { max-width: 100%; height: auto; }
+.skip {
+  position: absolute; left: -9999px; top: 0; background: var(--accent); color: #fff;
+  padding: .5rem 1rem; z-index: 100;
+}
+.skip:focus { left: .5rem; top: .5rem; }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <div class="mark">Super<span>&nbsp;Ferret</span></div>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="landscape.html">Landscape</a>
+    <a href="indexing.html" aria-current="page">Index structures</a>
+    <a href="architecture.html">Architecture</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <aside class="toc">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#axes">The four axes</a></li>
+      <li><a href="#provenance">Provenance</a></li>
+      <li><a href="#master">The master table</a></li>
+      <li><a href="#inverted">Inverted indexes</a>
+        <ol class="sub">
+          <li><a href="#codecs">Postings codecs</a></li>
+          <li><a href="#ef">Elias-Fano</a></li>
+        </ol>
+      </li>
+      <li><a href="#dict">Term dictionaries</a></li>
+      <li><a href="#eval">Query evaluation</a>
+        <ol class="sub">
+          <li><a href="#phrase">Phrase: positions vs re-scan</a></li>
+          <li><a href="#bmw">Block-max WAND</a></li>
+        </ol>
+      </li>
+      <li><a href="#substring">Substring and regex</a>
+        <ol class="sub">
+          <li><a href="#glimpse">Glimpse, 1993</a></li>
+          <li><a href="#cox">Cox&rsquo;s compilation</a></li>
+          <li><a href="#fm">FM-index and BWT</a></li>
+          <li><a href="#rindex">r-index and move-r</a></li>
+        </ol>
+      </li>
+      <li><a href="#filters">Approximate filters</a></li>
+      <li><a href="#columnar">Dense and columnar</a></li>
+      <li><a href="#vector">Vector and learned-sparse</a></li>
+      <li><a href="#matrix">The selection matrix</a></li>
+      <li><a href="#sources">Sources</a></li>
+    </ol>
+  </aside>
+
+  <main id="main" class="numbered">
+    <div class="masthead">
+      <p class="eyebrow">Super Ferret &middot; Research</p>
+      <h1>Index Structures for Local Search</h1>
+      <p class="standfirst">An options catalogue for a desktop search engine: every
+      structure that could carry the load, priced in bytes of index per byte of text
+      first and in query latency second. This page does not recommend; it lays out the
+      ground so that the recommendation on the architecture page can be checked
+      against it.</p>
+      <div class="meta">
+        <span><b>Compiled</b> 2026-09-05</span>
+        <span><b>Scope</b> postings, dictionaries, suffix structures, filters, vectors</span>
+        <span><b>Sources</b> 28 cited</span>
+        <span><b>Basis</b> M1, R5, R6, R7, R9, R10</span>
+      </div>
+    </div>
+<section>
+<h2 id="axes">The four axes, and why most comparisons only show two</h2>
+
+<p>Every structure below is a point in a four-dimensional space, and the
+published comparisons for almost all of them project onto two dimensions and
+drop the other two silently. The four:</p>
+
+<div class="tw">
+<table>
+<caption>The axes this page prices every structure against</caption>
+<thead>
+<tr><th>Axis</th><th>Unit</th><th>Who publishes it</th><th>Who omits it</th></tr>
+</thead>
+<tbody>
+<tr><th>Density</th><td>bytes of index per byte of indexed text</td>
+<td>zoekt, suffix-array literature, r-index/move-r papers</td>
+<td>most IR codec papers, which report bits/posting and never the whole-index ratio</td></tr>
+<tr><th>Query latency</th><td>ns/posting decoded, or ms end-to-end</td>
+<td>every codec paper, every ANN benchmark</td>
+<td>the succinct-structure literature, which reports asymptotics</td></tr>
+<tr><th>Update cost</th><td>work per changed file; whether the structure is mutable at all</td>
+<td>almost nobody</td>
+<td>every suffix/BWT/FM/r-index paper — all published work is build-once</td></tr>
+<tr><th>Expressiveness</th><td>which query classes the structure answers exactly, without a verify pass</td>
+<td>the regex-index literature (Cox, zoekt)</td>
+<td>the codec literature, which assumes the query class is fixed</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The reason to state this up front is that the two axes normally omitted are
+the two that eliminate the most candidates here. A plain suffix array is
+disqualified on density (4&ndash;5&times; the text <span class="p p-est">estimate</span>).
+An r-index is disqualified as the <em>live</em> structure on update cost, not on
+density, where it is the best option on the page. Neither of those verdicts is
+visible in the comparison tables those structures are usually presented with.</p>
+
+<figure>
+<svg viewBox="0 0 720 300" width="100%" role="img" aria-label="Diagram: index density on the horizontal axis against query expressiveness, with structures placed by their measured or reported size multiplier.">
+  <defs>
+    <marker id="ar" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g style="color:var(--ink-3)" fill="none" stroke="currentColor" stroke-width="1">
+    <line x1="60" y1="250" x2="690" y2="250" marker-end="url(#ar)"/>
+    <line x1="60" y1="250" x2="60" y2="24" marker-end="url(#ar)"/>
+  </g>
+  <g style="color:var(--ink-3)" fill="currentColor" font-family="IBM Plex Mono, monospace" font-size="11">
+    <text x="60" y="272">0&times;</text>
+    <text x="185" y="272">0.3&times;</text>
+    <text x="330" y="272">1&times;</text>
+    <text x="470" y="272">2&times;</text>
+    <text x="610" y="272">5&times;</text>
+    <text x="300" y="290" font-size="12">index bytes per byte of text &rarr;</text>
+    <text x="14" y="140" font-size="12" transform="rotate(-90 14 140)">expressiveness &rarr;</text>
+  </g>
+  <g style="color:var(--accent)">
+    <rect x="60" y="24" width="130" height="226" fill="currentColor" opacity="0.07"/>
+  </g>
+  <g font-family="IBM Plex Mono, monospace" font-size="11" style="color:var(--ink)" fill="currentColor">
+    <circle cx="95"  cy="220" r="5" fill="var(--accent)"/><text x="106" y="224">binary fuse filter</text>
+    <circle cx="120" cy="188" r="5" fill="var(--accent)"/><text x="131" y="192">doc-only trigrams</text>
+    <circle cx="150" cy="120" r="5" fill="var(--accent)"/><text x="161" y="124">move-r / r-index</text>
+    <circle cx="175" cy="150" r="5" fill="var(--accent)"/><text x="186" y="154">FM-index (BWT)</text>
+    <circle cx="230" cy="205" r="5" fill="var(--accent)"/><text x="241" y="209">docs+freq postings</text>
+    <circle cx="360" cy="196" r="5" fill="var(--accent)"/><text x="371" y="200">positional trigrams (zoekt 1.2&times;)</text>
+    <circle cx="430" cy="176" r="5" fill="var(--accent)"/><text x="441" y="180">positional postings</text>
+    <circle cx="610" cy="104" r="5" fill="var(--warn)"/><text x="500" y="86">suffix array + LCP</text>
+  </g>
+  <g style="color:var(--ink-3)" fill="currentColor" font-family="IBM Plex Mono, monospace" font-size="10">
+    <text x="66" y="40">density budget for a personal workstation</text>
+  </g>
+</svg>
+<figcaption>Positions on the horizontal axis are the size multipliers cited in
+the sections below; the vertical axis is ordinal, not measured. The shaded band
+is the sub-0.3&times; region that a density-first mandate actually lives in.
+Note that the two structures highest on expressiveness sit at opposite extremes
+of density.</figcaption>
+</figure>
+
+<div class="box key">
+<span class="label">Key finding</span>
+<p>The measured baseline changes what these axes are worth. On the target
+corpus, a hard regex with no extractable literal over the gitignore-pruned tree
+completes in <b>0.05&nbsp;s</b> <span class="p p-measured">measured</span>
+&mdash; the exact query shape a trigram index exists to accelerate. At this
+scale the index's job is not to beat the CPU at matching; it is to
+<em>avoid reading bytes</em> on a cold cache. Read every latency column below
+against that: the density column is the one that still means something.</p>
+</div>
+
+<p>One consequence worth stating before the catalogue starts: the exclusion
+policy dominates every structure choice on this page. 87% of files and 96% of
+bytes in the measured corpus are build output
+<span class="p p-measured">measured</span>; a wrong exclusion rule costs
+roughly 25&times; the index, which is more than the entire spread between the
+best and worst codec here.</p>
+</section>
+<section>
+<h2 id="provenance">Provenance</h2>
+
+<div class="legend">
+  <b>Provenance</b>
+  <span><span class="p p-doc">upstream</span> project docs or source</span>
+  <span><span class="p p-paper">paper</span> peer-reviewed</span>
+  <span><span class="p p-bench">benchmark</span> independent</span>
+  <span><span class="p p-vendor">vendor</span> vendor-claimed</span>
+  <span><span class="p p-measured">measured</span> measured for this report</span>
+  <span><span class="p p-community">anecdote</span> community-reported</span>
+  <span><span class="p p-est">estimate</span> derived arithmetic</span>
+  <span><span class="p p-none">unknown</span> no figure exists</span>
+</div>
+
+<p>Two whole classes of figure on this page are weak, and it is better to say so
+once here than to hedge in every cell.</p>
+
+<div class="box warn">
+<span class="label">All codec decode speeds here are 2015-vintage</span>
+<p>Every ns/int and M-ints/s figure in the postings-codec table traces to
+Lemire &amp; Boytsov, <em>Decoding billions of integers per second through
+vectorization</em> (2015) or to Ottaviano &amp; Venturini (2014). That is
+2015-era x86 with SSE. The research pass found <b>no canonical 2023&ndash;2026
+re-benchmark</b> of the full codec family on AVX-512 or ARM NEON
+<span class="p p-none">unknown</span>. Treat the <em>ranking</em>
+(SIMD-BP128 &ge; Masked-VByte &gt; VByte; EF-family competitive on both size
+and skip) as durable, corroborated across PISA's docs, Lemire's own benchmarks
+and several follow-up papers. Do not carry the absolute nanoseconds forward:
+re-benchmark on the 9955HX before making a final codec choice.</p>
+<p><b>One later source is worth going to for space rather than speed.</b> Pibiri
+&amp; Venturini's survey <em>Techniques for Inverted Index Compression</em>
+(ACM Computing Surveys 53(6), 2021; arXiv 2019)
+<sup><a href="#r30">30</a></sup> re-measures the whole codec family on Gov2 and
+ClueWeb09 under one harness, and ships that harness as
+<span class="mono">jermp/2i_bench</span> so the numbers can be reproduced rather
+than cited. It is the right place to get current bits-per-integer figures.
+<b>This page does not quote its numbers</b> &mdash; two attempts to pull the
+results tables out of the arXiv and ACM copies failed, and a figure nobody here
+has read is not a figure worth stamping
+<span class="p p-none">unverified</span>. The reproducible harness is the
+reason to prefer it over re-citing 2015: run it, then replace the table.</p>
+</div>
+
+<div class="box warn">
+<span class="label">Vendor-sourced figures in the columnar section</span>
+<p>Every VictoriaLogs number in the dense/columnar section traces to vendor
+sources &mdash; the project's own blog posts and docs, not an independent
+benchmark <span class="p p-vendor">vendor</span>. The design lessons
+(bloom-over-blocks, per-field column files, scan-first) are structural and
+survive the doubt; the compression ratios do not.</p>
+</div>
+
+<div class="box gap">
+<span class="label">Missing implementations</span>
+<p>Two structures on this page have <b>no maintained Rust crate</b>
+<span class="p p-none">unknown</span>: <b>partitioned Elias-Fano</b> and
+<b>recursive graph bisection</b>. Both would need porting from the reference
+C++ (ds2i, <span class="mono">mpetri/recursive_graph_bisection</span>). The
+same is true of <b>r-index</b> and <b>move-r</b>, whose reference
+implementations are GPL-3.0 research code &mdash; port the algorithm from the
+paper, do not vendor the code. That is build-cost information, and it is
+carried in the master table's difficulty column rather than buried here.</p>
+</div>
+</section>
+<section>
+<h2 id="master">The master structure table</h2>
+
+<p>Every structure in the survey, sorted by index-size multiplier. The
+multiplier column is bytes of index per byte of <em>indexed text</em>, not per
+byte of raw disk &mdash; on the measured corpus those differ by 27&times;. Read
+the multiplier and the update column together: several of the densest rows are
+build-once structures that cannot be the live tier at any price.</p>
+
+<div class="tw">
+<table>
+<caption>Index-size multiplier, query classes, update cost, build cost and Rust availability. Sorted densest first.</caption>
+<thead>
+<tr><th>Structure</th><th class="num">Index / text</th><th></th><th>Answers</th><th>Update</th><th>Difficulty</th><th>Rust &amp; licence</th></tr>
+</thead>
+<tbody>
+
+<tr><th>Zone map / min-max</th>
+<td class="num">2 values per block <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:0.5%"></span></span><span class="val">&asymp;0</span></div></td>
+<td>Range predicates only, and only on a sorted or clustered column</td>
+<td><span class="pill yes">trivial</span> per block</td>
+<td>Trivial</td>
+<td>hand-rolled</td></tr>
+
+<tr><th>Sparse primary index</th>
+<td class="num">&lt;&lt;1% (1 mark / 8192 rows) <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:1%"></span></span><span class="val">&lt;0.01&times;</span></div></td>
+<td>Range/prefix predicates correlated with the sort order</td>
+<td><span class="pill yes">cheap</span> rebuild per block</td>
+<td>Trivial</td>
+<td>hand-rolled</td></tr>
+
+<tr><th>Binary fuse filter (per file)</th>
+<td class="num">~9 bits/element; well under 0.1&times; text <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:3%"></span></span><span class="val">&lt;0.1&times;</span></div></td>
+<td>Membership only &mdash; "can this file possibly contain these n-grams". <b>Not</b> invert-match or fuzzy</td>
+<td><span class="pill part">immutable</span> rebuild the one file's filter</td>
+<td>Low</td>
+<td class="mono">xorf <span class="pill yes">MIT/Apache</span></td></tr>
+
+<tr><th>Blocked Bloom (per block)</th>
+<td class="num">slightly above 9.6 bits/element <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:4%"></span></span><span class="val">&lt;0.1&times;</span></div></td>
+<td>Membership only</td>
+<td><span class="pill part">counting variant needed for deletes</span></td>
+<td>Low</td>
+<td class="mono">fastbloom <span class="pill yes">permissive</span></td></tr>
+
+<tr><th>Vector store, 384-dim binary</th>
+<td class="num">~0.014 GB/GB corpus <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:1.4%"></span></span><span class="val">0.014&times;</span></div></td>
+<td>Semantic similarity (with an fp32 rerank on candidates)</td>
+<td><span class="pill part">HNSW inserts; deletes are tombstone-only</span></td>
+<td>Moderate + a model and an embedding budget</td>
+<td><span class="mono">hnsw_rs</span>, <span class="mono">usearch</span> <span class="pill yes">permissive</span></td></tr>
+
+<tr><th>r-index / move-r (RLBWT)</th>
+<td class="num">O(r), at or below compressed-text size <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:8%"></span></span><span class="val">&le;compressed</span></div></td>
+<td><b>Exact substring and regex, no verify pass</b>, no false positives</td>
+<td><span class="pill dead">none published</span> build-once; a local edit can split runs globally</td>
+<td>Very high &mdash; multi-week port</td>
+<td><span class="pill no">none</span> C++ refs are <b>GPL-3.0</b></td></tr>
+
+<tr><th>FM-index / BWT</th>
+<td class="num">&asymp; compressed text + single-digit-% to ~25% for locate <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:12%"></span></span><span class="val">&asymp;gzip</span></div></td>
+<td>Exact substring; regex via automaton over backward search</td>
+<td><span class="pill no">static</span> per-segment rebuild only</td>
+<td>High</td>
+<td><span class="mono">fm-index</span>, <span class="mono">sucds</span> <span class="pill part">small projects</span></td></tr>
+
+<tr><th>Doc-only trigram index</th>
+<td class="num">well under 1&times; source <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:25%"></span></span><span class="val">&lt;1&times;</span></div></td>
+<td>Substring and regex candidate sets (Cox derivation), then verify</td>
+<td><span class="pill yes">cheap</span> append postings, tombstone and compact</td>
+<td>Moderate</td>
+<td>hand-rolled over <span class="mono">fst</span>/<span class="mono">roaring</span></td></tr>
+
+<tr><th>Postings: docs-only</th>
+<td class="num">baseline; 6&ndash;14 bits/posting with EF/PEF at TREC scale <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:12%"></span></span><span class="val">1&times; base</span></div></td>
+<td>Boolean filters, existence, facets</td>
+<td><span class="pill yes">segmented</span> O(log<sub>M</sub> N) rewrites per doc</td>
+<td>Moderate</td>
+<td class="mono">sucds <span class="pill yes">MIT/Apache</span></td></tr>
+
+<tr><th>Postings: docs+freq</th>
+<td class="num">~1.15&ndash;1.4&times; docs-only <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:16%"></span></span><span class="val">1.3&times;</span></div></td>
+<td>+ BM25/BM25F ranking</td>
+<td><span class="pill yes">segmented</span></td>
+<td>Moderate</td>
+<td class="mono">bitpacking <span class="pill yes">MIT</span></td></tr>
+
+<tr><th>Vector store, 384-dim int8</th>
+<td class="num">~0.11 GB/GB corpus <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:11%"></span></span><span class="val">0.11&times;</span></div></td>
+<td>Semantic similarity</td>
+<td><span class="pill part">as above</span></td>
+<td>Moderate</td>
+<td>as above</td></tr>
+
+<tr><th>Positional trigram index (zoekt-style)</th>
+<td class="num"><b>~1.2&times; corpus, in RAM</b> <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:40%"></span></span><span class="val">1.2&times;</span></div></td>
+<td>Substring, regex, phrase-by-adjacency; verify seeds from offsets</td>
+<td><span class="pill yes">cheap</span> same as doc-only</td>
+<td>Moderate&ndash;high (successor lists, rune/byte tables)</td>
+<td>hand-rolled</td></tr>
+
+<tr><th>Postings: +positions</th>
+<td class="num">3&ndash;10&times; docs-only <span class="p p-bench">benchmark</span>; 2&ndash;4&times; whole-index <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:65%"></span></span><span class="val">3&ndash;10&times;</span></div></td>
+<td>+ phrase, proximity, highlighting without re-reading the file</td>
+<td><span class="pill yes">segmented</span></td>
+<td>Moderate</td>
+<td class="mono">bitpacking <span class="pill yes">MIT</span></td></tr>
+
+<tr><th>Vector store, 768-dim fp32 + HNSW</th>
+<td class="num">~0.88 GB/GB, +20&ndash;40% graph <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:88%"></span></span><span class="val">0.88&times;</span></div></td>
+<td>Semantic similarity</td>
+<td><span class="pill part">RAM-resident graph is the binding constraint</span></td>
+<td>Moderate</td>
+<td class="mono">hnsw_rs <span class="pill yes">permissive</span></td></tr>
+
+<tr><th>SPLADE sparse layer</th>
+<td class="num">~53 GB on a 200 GB corpus, plausibly 50&ndash;500 GB <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill vhi" style="width:100%"></span></span><span class="val">0.25&ndash;2.5&times;</span></div></td>
+<td>Paraphrase-tolerant retrieval <b>inside the existing posting lists</b> &mdash; no new structure</td>
+<td><span class="pill yes">segmented</span>, but needs a transformer pass per document</td>
+<td>High (model + retuning the FLOPS budget)</td>
+<td>Checkpoint licences are <span class="pill part">research-use</span> &mdash; verify per checkpoint</td></tr>
+
+<tr><th>Suffix array + LCP</th>
+<td class="num"><b>4&ndash;5&times;</b> the text <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill vhi" style="width:100%"></span></span><span class="val">4&ndash;5&times;</span></div></td>
+<td>Exact substring, every occurrence as a contiguous SA range</td>
+<td><span class="pill no">global sort order</span> one edit perturbs it non-locally</td>
+<td>Moderate (SA-IS / DivSufSort)</td>
+<td><span class="mono">divsufsort</span> FFI <span class="pill yes">MIT</span></td></tr>
+
+<tr><th>Suffix tree / CDAWG</th>
+<td class="num">10&ndash;20+ bytes/char, 2&ndash;5&times; worse than an SA <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill vhi" style="width:100%"></span></span><span class="val">10&ndash;20&times;</span></div></td>
+<td>Same query power as an SA, at O(m) instead of O(m log n)</td>
+<td><span class="pill no">static</span></td>
+<td>High</td>
+<td><span class="pill dead">nobody ships these at corpus scale</span></td></tr>
+
+<tr><th colspan="7" style="text-align:left"><b>Supporting structures &mdash; not on the same axis</b></th></tr>
+
+<tr><th>FST term dictionary</th>
+<td class="num">very compact; no universal ratio published <span class="p p-none">unknown</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:5%"></span></span><span class="val">small</span></div></td>
+<td>Exact term, prefix, <b>wildcard/regex/fuzzy over terms via automaton intersection</b></td>
+<td><span class="pill part">batch-built per segment</span></td>
+<td>Low (use the crate)</td>
+<td class="mono">fst 0.4.7 <span class="pill yes">Unlicense/MIT</span>, last release 2021</td></tr>
+
+<tr><th>Roaring bitmap (filter fields)</th>
+<td class="num">worse than EF on sparse lists; near-optimal on dense sets <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:8%"></span></span><span class="val">adaptive</span></div></td>
+<td>Fast AND/OR/NOT over filter sets, tombstones, facets</td>
+<td><span class="pill yes">mutable</span></td>
+<td>Low</td>
+<td class="mono">roaring 0.11.5 <span class="pill yes">MIT/Apache</span></td></tr>
+
+<tr><th>Doc values / fast fields (columnar)</th>
+<td class="num">a removal, not a ratio <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:6%"></span></span><span class="val">&mdash;</span></div></td>
+<td>Range, sort, facet, and the mtime/inode check that makes phrase-by-re-scan safe. <b>No term search</b></td>
+<td><span class="pill yes">segmented</span></td>
+<td>Low&ndash;moderate</td>
+<td>hand-rolled; crib <span class="mono">tantivy</span>'s columnar crate</td></tr>
+
+<tr><th>Block-max scores (BMW)</th>
+<td class="num">one quantised float per 128-doc block per term &mdash; negligible <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:2%"></span></span><span class="val">negligible</span></div></td>
+<td>Top-k early termination for ranked retrieval</td>
+<td><span class="pill yes">computed at build</span></td>
+<td>Moderate</td>
+<td>hand-rolled</td></tr>
+
+<tr><th>Recursive graph bisection</th>
+<td class="num"><b>negative</b> &mdash; shrinks everything downstream <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:0%"></span></span><span class="val">saves</span></div></td>
+<td>Nothing directly; improves every posting list's compressibility and BMW pruning</td>
+<td><span class="pill part">batch, once per full re-merge</span></td>
+<td>High &mdash; graph partitioning over ~1M docs</td>
+<td><span class="pill no">none</span> port from C++</td></tr>
+
+<tr><th>Path-sorted docIDs</th>
+<td class="num"><b>negative</b>, and unusually strong on a filesystem corpus <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:0%"></span></span><span class="val">saves</span></div></td>
+<td>Same as above, at the cost of one sort</td>
+<td><span class="pill part">assign at build</span></td>
+<td><b>Trivial</b></td>
+<td>hand-rolled</td></tr>
+
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">Reading the table for a shortlist</span>
+<p>Three rows are unconditional: <b>path-sorted docIDs</b> (negative cost),
+<b>doc values</b> for metadata (a removal, not a ratio) and a <b>per-file binary
+fuse filter</b> (under 0.1&times;, and the only layer that stops a cold file
+being opened). Three rows are disqualified outright: <b>suffix array</b> and
+<b>suffix tree</b> on density, <b>static pruning</b> because it trades recall
+rather than latency. Everything else is a real choice, and the update column is
+what separates the live tier from the cold tier.</p>
+</div>
+</section>
+<section>
+<h2 id="inverted">Inverted indexes: the storage ladder, then the codecs</h2>
+
+<h3>The ladder is worth more than the codec</h3>
+
+<p>Before any codec choice, the decision that moves the most bytes is what goes
+into a posting at all. The four rungs, with the multipliers the literature
+actually supports:</p>
+
+<div class="tw">
+<table>
+<caption>Postings storage levels, docs-only as the baseline</caption>
+<thead>
+<tr><th>Level</th><th>Contents</th><th>Size vs docs-only</th><th></th><th>Buys</th></tr>
+</thead>
+<tbody>
+<tr><th>Docs-only</th><td class="mono">docID</td>
+<td class="num">1&times; <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:10%"></span></span><span class="val">1.0&times;</span></div></td>
+<td>Boolean filters, existence, tag/facet fields</td></tr>
+<tr><th>Doc+freq</th><td class="mono">docID, tf</td>
+<td class="num">~1.15&ndash;1.4&times; <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:14%"></span></span><span class="val">1.3&times;</span></div></td>
+<td>BM25/tf-idf ranking, no phrases</td></tr>
+<tr><th>Doc+freq+positions</th><td class="mono">docID, tf, position list</td>
+<td class="num">3&ndash;10&times; <span class="p p-bench">benchmark</span><br>(2&ndash;4&times; whole-index <span class="p p-paper">paper</span>)</td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:65%"></span></span><span class="val">3&ndash;10&times;</span></div></td>
+<td>Phrase, proximity, highlighting</td></tr>
+<tr><th>+ byte offsets</th><td class="mono">+ start/end offset per occurrence</td>
+<td class="num">+20&ndash;40% over positions <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill vhi" style="width:85%"></span></span><span class="val">4&ndash;13&times;</span></div></td>
+<td>Snippets without re-reading the file</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>R6 flags a soft tension between its own two sources here, and it is worth
+carrying rather than flattening. Manning/Raghavan/Sch&uuml;tze &sect;5.2 gives
+the textbook rule that a positional index is <b>2&ndash;4&times;</b> a
+frequency-only index for English text <span class="p p-paper">paper</span>;
+PISA/ds2i-family papers instead report positions as a separate, additively
+large cost. Both are directionally right and they measure different things
+&mdash; whole-index-with-positions versus positions-list-alone. Neither has
+been merged into a false-precision single number.</p>
+
+<p>Lucene's per-field <span class="mono">IndexOptions</span> model exists
+precisely to let you pick a different rung per field
+<span class="p p-doc">upstream</span><sup><a href="#r1">1</a></sup>. Steal it
+rather than redesigning it: positions on the body-text field only if at all,
+doc-existence with no freq for structural filter fields (extension, directory
+depth, mtime bucket).</p>
+
+<p>For orientation on the absolute floor: PISA and ds2i-family systems report
+<b>6&ndash;14 bits/posting</b> for docID+freq combined on TREC GOV2/ClueWeb-scale
+collections with Elias-Fano/PEF-family codecs
+<span class="p p-paper">paper</span>, <em>before</em> positions.</p>
+
+<h3 id="codecs">Postings codecs, led by bits per posting</h3>
+
+<div class="tw">
+<table>
+<caption>Postings codecs. Bits/posting first; decode speed is the secondary column and is 2015-vintage throughout.</caption>
+<thead>
+<tr><th>Scheme</th><th class="num">Bits/posting</th><th></th><th>Decode speed</th><th>Difficulty</th><th>Rust</th></tr>
+</thead>
+<tbody>
+<tr><th>Elias-Fano</th>
+<td class="num">&asymp;2 + log&#8322;(u/n) <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:22%"></span></span><span class="val">best principled</span></div></td>
+<td>fast sequential; O(1)-ish <span class="mono">nextGEQ</span></td>
+<td>Moderate&ndash;high (select structure)</td>
+<td class="mono">sucds <span class="pill yes">MIT/Apache</span></td></tr>
+<tr><th>Partitioned EF</th>
+<td class="num">matches or beats PFOR-family <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:18%"></span></span><span class="val">best measured</span></div></td>
+<td>similar sequential, much faster skip than plain EF</td>
+<td>High (chunk DP + nested EF)</td>
+<td><span class="pill no">none</span> port from ds2i</td></tr>
+<tr><th>Binary interpolative (BIC)</th>
+<td class="num">1&ndash;2 bits/posting better than PFOR on clustered lists <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:15%"></span></span><span class="val">smallest</span></div></td>
+<td>slow, recursive, <b>no SIMD</b>, no random access</td>
+<td>High</td>
+<td><span class="pill no">none</span> ~dozens of lines</td></tr>
+<tr><th>PForDelta / NewPFD / OptPFor</th>
+<td class="num">~3&ndash;6 bits/int <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:30%"></span></span><span class="val">3&ndash;6 b</span></div></td>
+<td>~1000&ndash;2500 M ints/s (2015 hw)</td>
+<td>Moderate&ndash;high (exceptions)</td>
+<td>via <span class="mono">bitpacking</span></td></tr>
+<tr><th>SIMD-BP128</th>
+<td class="num">close to OptPFD, slight overhead <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:33%"></span></span><span class="val">~OptPFD</span></div></td>
+<td>fastest in Lemire &amp; Boytsov 2015</td>
+<td>Moderate (SIMD kernels)</td>
+<td class="mono">bitpacking 0.9.3 <span class="pill yes">MIT</span></td></tr>
+<tr><th>Simple9 / Simple16 / Simple8b</th>
+<td class="num">similar to PFOR, slightly worse <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:38%"></span></span><span class="val">&gt;PFOR</span></div></td>
+<td>behind BP128/OptPFD</td>
+<td>Moderate</td>
+<td><span class="pill dead">superseded</span></td></tr>
+<tr><th>StreamVByte</th>
+<td class="num">~VByte + small control overhead <span class="p p-bench">benchmark</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:62%"></span></span><span class="val">~8&ndash;16 b</span></div></td>
+<td>~3&ndash;4&times; scalar VByte</td>
+<td>Moderate</td>
+<td class="mono">streamvbyte64 <span class="pill yes">MIT/Apache</span>; <span class="mono">stream-vbyte</span> <span class="pill part">licence unclear</span></td></tr>
+<tr><th>Masked-VByte</th>
+<td class="num">identical to VByte <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:62%"></span></span><span class="val">~8&ndash;16 b</span></div></td>
+<td>2&ndash;4&times; scalar VByte, same size</td>
+<td>Low&ndash;moderate (SIMD shuffle table)</td>
+<td><span class="pill no">none</span> port from C</td></tr>
+<tr><th>VByte</th>
+<td class="num">~8&ndash;16 <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:62%"></span></span><span class="val">8&ndash;16 b</span></div></td>
+<td>~1&ndash;2 ns/int scalar, branch-heavy</td>
+<td>Trivial</td>
+<td>trivial to write</td></tr>
+<tr><th>QMX / Varint-G8IU</th>
+<td class="num">competitive with Masked-VByte <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:60%"></span></span><span class="val">&mdash;</span></div></td>
+<td>QMX beats SIMD-BP128 on some collections in Trotman's paper</td>
+<td>High</td>
+<td><span class="pill no">none</span>, thin ecosystem</td></tr>
+<tr><th>Roaring bitmap</th>
+<td class="num">worse than EF/PFOR on sparse lists; near-optimal on dense sets <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:25%"></span></span><span class="val">density-adaptive</span></div></td>
+<td>very fast set ops (AND/OR/NOT)</td>
+<td>Low (use the crate)</td>
+<td class="mono">roaring 0.11.5 <span class="pill yes">MIT/Apache</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Two rows carry an asymmetry that the bits/posting column alone hides.
+<b>Binary interpolative coding</b> is the smallest practical scheme known on
+clustered postings and is disqualified from the hot path anyway: decode is
+inherently sequential and recursive, with no known practical vectorisation and
+no random access without decoding a whole subtree. That makes it a
+<em>cold-tier</em> codec &mdash; an archival segment tier where you never
+<span class="mono">nextGEQ</span> &mdash; not a top-k codec.
+<b>Roaring</b> is the opposite: not competitive on the size of a sparse rare
+term's list, near-optimal on dense filter sets, and unbeatable on set
+operations. R6's split is explicit: compressed document-ordered postings
+(FOR/PFOR/EF) for ranked term postings, Roaring for boolean filter fields
+&mdash; tombstones, extension buckets, directory-scope filters.</p>
+
+<h3 id="ef">Elias-Fano, in enough detail to implement</h3>
+
+<p>Given a monotonically non-decreasing sequence of <span class="mono">n</span>
+values from universe <span class="mono">[0, u)</span>, split each value's binary
+representation. The <b>low</b> <span class="mono">l = &lceil;log&#8322;(u/n)&rceil;</span>
+bits go into a contiguous fixed-width array &mdash; O(1) random access. The
+<b>high</b> bits go into a single bitvector of length
+<span class="mono">n + 2^(&lceil;log&#8322;u&rceil;&minus;l)</span>, written
+unary-differentially: for element <span class="mono">i</span> with high part
+<span class="mono">h_i</span>, set <span class="mono">B[h_i + i] = 1</span>.
+Because the input is sorted, <span class="mono">h_i</span> is non-decreasing,
+the bitvector has exactly <span class="mono">n</span> ones, and counting
+zeros-before-each-one recovers every high part.</p>
+
+<p>Total space is <span class="mono">n&middot;l + n + o(n)</span> bits, which
+Elias and Fano proved is at most <b>2 bits/element above the
+information-theoretic optimum</b> <span class="p p-paper">paper</span> &mdash;
+about <span class="mono">2 + log&#8322;(u/n)</span> bits per element. For a term
+in <span class="mono">m</span> of <span class="mono">N</span> documents this is
+exactly the right asymptotic: it gets <em>better</em> as the term gets commoner,
+degrading gracefully where naive delta+VByte blows up.</p>
+
+<figure class="code">
+<figcaption>Elias-Fano encode (R6 &sect;2.5, reproduced)</figcaption>
+<pre><code><span class="cm">// Elias-Fano encode (sketch)</span>
+<span class="kw">fn</span> ef_encode(values: &amp;[u64], universe: u64) -&gt; (BitVec <span class="cm">/*low*/</span>, BitVec <span class="cm">/*high*/</span>) {
+    <span class="kw">let</span> n = values.len() <span class="kw">as</span> u64;
+    <span class="kw">let</span> l = <span class="kw">if</span> n == 0 { 0 } <span class="kw">else</span> { (universe / n).max(1).ilog2() <span class="kw">as</span> u64 };
+    <span class="kw">let mut</span> low = BitVec::with_capacity(n * l);
+    <span class="kw">let mut</span> high = BitVec::zeros(n + (universe &gt;&gt; l) + 1);
+    <span class="kw">for</span> (i, &amp;v) <span class="kw">in</span> values.iter().enumerate() {
+        low.push_bits(v &amp; ((1 &lt;&lt; l) - 1), l);
+        <span class="kw">let</span> h = v &gt;&gt; l;
+        high.set(h + i <span class="kw">as</span> u64, <span class="kw">true</span>); <span class="cm">// monotone =&gt; strictly increasing set positions</span>
+    }
+    (low, high)
+}
+</code></pre>
+</figure>
+
+<p><span class="mono">nextGEQ(x)</span> is Elias-Fano's killer feature for query
+processing, and the reason it pairs with both leapfrog intersection and
+block-max WAND. Compute <span class="mono">h = x &gt;&gt; l</span>; use a
+select-on-zeros structure over the high bitvector to jump straight to the
+<span class="mono">h</span>-th group of ones, skipping every zero-run before it;
+then scan forward through the ones, comparing low bits. The select structure
+costs <span class="mono">o(n)</span> extra bits. Because intersections walk with
+steadily increasing targets, sequential calls from a retained cursor amortise to
+O(1) in practice &mdash; you only fall back to a global select when the jump is
+large.</p>
+
+<figure class="code">
+<figcaption>nextGEQ via select-on-high-bitvector plus a cursor (R6 &sect;2.5, reproduced)</figcaption>
+<pre><code><span class="cm">// nextGEQ via select-on-high-bitvector + cursor (sketch)</span>
+<span class="kw">fn</span> next_geq(ef: &amp;EliasFano, cursor: &amp;<span class="kw">mut</span> EfCursor, x: u64) -&gt; Option&lt;u64&gt; {
+    <span class="kw">let</span> l = ef.low_bits;
+    <span class="kw">let</span> target_high = x &gt;&gt; l;
+    <span class="cm">// jump the high-bitvector position to the first '1' whose *rank among 1s'</span>
+    <span class="cm">// corresponds to target_high zeros having been consumed; select1 gives</span>
+    <span class="cm">// position of the k-th 1, but we need "first 1 with h &gt;= target_high",</span>
+    <span class="cm">// which is: position = select0(target_high) + target_high, then scan 1s from there.</span>
+    cursor.seek_high(target_high);
+    <span class="kw">while let</span> Some((pos_in_seq, v)) = cursor.next_candidate() {
+        <span class="kw">if</span> v &gt;= x { <span class="kw">return</span> Some(v); }
+    }
+    None
+}
+</code></pre>
+</figure>
+
+<p><b>Partitioned Elias-Fano</b> (Ottaviano &amp; Venturini, SIGIR 2014
+<sup><a href="#r2">2</a></sup>) exists because plain EF's bound is tight only
+when the sequence is <em>uniformly</em> distributed over the universe, and real
+postings lists are bursty. PEF splits a list into variable-length chunks, each
+re-based to its own local universe, EF-encodes each independently, and stores a
+top-level EF-encoded array of chunk endpoints; boundaries are chosen by dynamic
+programming to minimise total encoded size. <span class="mono">nextGEQ</span>
+becomes: EF-search the endpoint index for the chunk, then
+<span class="mono">nextGEQ</span> within it. The paper reports PEF matching or
+beating the previously best schemes in space while being nearly as fast
+sequentially and <em>much</em> faster for skipping
+<span class="p p-paper">paper</span>.</p>
+
+<div class="box gap">
+<span class="label">Hole in the ecosystem</span>
+<p>There is no widely-adopted, actively-maintained standalone <b>partitioned</b>
+Elias-Fano crate <span class="p p-none">unknown</span>. Implementing PEF as a
+thin layer over <span class="mono">sucds::EliasFano</span> per chunk is the
+realistic path. Note also that neither tantivy nor Quickwit use EF as their
+primary postings codec &mdash; tantivy defaults to block VInt/bitpacking via the
+<span class="mono">bitpacking</span> crate, and EF-like techniques appear in
+<span class="mono">tantivy</span>'s columnar crate for sparse fast-fields
+instead. That columnar crate is the best working Rust EF reference to crib
+layout decisions from.</p>
+</div>
+
+<h3>Block layout, and why 128 is the number</h3>
+
+<p>Lucene groups postings into <b>blocks of 128 docs</b>
+(<span class="mono">Lucene99PostingsFormat</span>, back through the ForUtil
+codecs to 4.1) <span class="p p-doc">upstream</span>. Each full block is
+bit-packed with a single bits-per-value chosen for the block's max delta &mdash;
+FOR/PFOR-style, so decode is a tight SIMD-able unpack loop; a final partial
+block falls back to vInt. Skip data records, at
+<span class="mono">skipInterval^level</span>, the
+<span class="mono">(docID, freq-ptr, pos-ptr, payload-ptr)</span> tuple needed to
+jump into the corresponding streams. 128 is the number to copy if you want a
+codec that is SIMD-bitpackable and well-trodden &mdash; and it is the same
+granularity block-max scores must be stored at, which couples this choice to the
+pruning algorithm below.</p>
+
+<h3>Segments, tombstones, and what an update actually costs</h3>
+
+<p>Any index supporting incremental update without full rebuild is built as
+immutable, independently-searchable segments &mdash; an LSM tree by another
+name. Deletes and updates are a per-segment tombstone bitset
+(Lucene's <span class="mono">liveDocs</span>
+<span class="p p-doc">upstream</span>); an update is logically delete-old plus
+insert-new. The cost model that matters:</p>
+
+<div class="tw">
+<table>
+<caption>Update cost in a segmented index</caption>
+<thead><tr><th>Operation</th><th>Cost</th><th>Note</th></tr></thead>
+<tbody>
+<tr><th>Append to in-memory buffer</th><td>O(1) amortised</td><td>The visible cost; misleadingly small</td></tr>
+<tr><th>Lifetime rewrites per document</th><td class="num">O(log<sub>M</sub>(N / flush_size))</td><td>M = merge fan-in. Same write-amplification argument as a levelled LSM</td></tr>
+<tr><th>Tombstone-triggered force-merge</th><td>~20% reclaimable-deletes weight <span class="p p-doc">upstream</span></td><td>Lucene's tiered-merge default, bounds dead space walked per query</td></tr>
+<tr><th>Starting parameters</th><td>flush at ~a few MB or ~1000 docs; merge trigger at ~10 segments per tier; fan-in ~10 <span class="p p-est">estimate</span></td><td>Lucene defaults transplanted, <em>not</em> a measurement of this build</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Update cost is dominated by merge write amplification, not by the update
+itself. At the measured corpus &mdash; 73,565 files of real signal, a few
+thousand changes a day &mdash; this is cheap. It only bites if you index
+something with build-directory churn, which the exclusion policy should already
+have removed.</p>
+
+<div class="box key">
+<span class="label">The thing to act on</span>
+<p>Choose the storage rung before the codec. Dropping positions is a
+3&ndash;10&times; cut on the postings tier; the entire spread from VByte to
+partitioned Elias-Fano is roughly 2&ndash;4&times; on a stream that is already
+the smaller one. If you implement exactly one codec, implement Elias-Fano over
+<span class="mono">sucds</span>, because it also hands you the
+<span class="mono">nextGEQ</span> that leapfrog AND and block-max WAND both
+need.</p>
+</div>
+</section>
+<section>
+<h2 id="dict">Term dictionaries, and which of them walk an automaton</h2>
+
+<p>The dictionary is a small fraction of the index by bytes, so the axis that
+selects one here is not density but <b>expressiveness</b>: whether the structure
+can be intersected with a query automaton. That single property decides whether
+wildcard, regex-over-terms and fuzzy search are cheap or impossible.</p>
+
+<div class="tw">
+<table>
+<caption>Term dictionary structures</caption>
+<thead>
+<tr><th>Structure</th><th>Size per term</th><th>Lookup</th><th>Automaton traversal</th><th>Update model</th></tr>
+</thead>
+<tbody>
+<tr><th>Sorted blocks + front coding</th>
+<td>Compact; needs a block scan after binary search on block heads</td>
+<td class="mono">O(log #blocks + block scan)</td>
+<td><span class="pill no">no</span> whole block must be decoded to compare</td>
+<td>Batch, per segment</td></tr>
+<tr><th>FST / MA-FSA (Lucene <span class="mono">.tim</span>/<span class="mono">.tip</span>)</th>
+<td>Very compact for large shared-prefix vocabularies; no single universal number published <span class="p p-none">unknown</span></td>
+<td class="mono">O(term length)</td>
+<td><span class="pill yes">yes</span> the standout property</td>
+<td>Batch, per segment</td></tr>
+<tr><th>MARISA trie</th>
+<td>Compact, LOUDS-based, bit-parallel and cache-friendly</td>
+<td class="mono">O(term length)</td>
+<td><span class="pill yes">yes</span> as FST, less common in IR</td>
+<td>Batch only</td></tr>
+<tr><th>Succinct trie / LOUDS</th>
+<td>Near the information-theoretic minimum for the tree shape</td>
+<td class="mono">O(term length)</td>
+<td><span class="pill yes">yes</span> plus rank/select overhead</td>
+<td>Batch only</td></tr>
+<tr><th>Adaptive Radix Tree (ART)</th>
+<td>Compact on skewed key distributions; fixed node sizes 4/16/48/256</td>
+<td class="mono">O(key len / node fanout)</td>
+<td><span class="pill part">in principle</span> ordered radix, rarely used for term dicts</td>
+<td>Mutable in place</td></tr>
+<tr><th>Hash table (term &rarr; term-id)</th>
+<td>Larger &mdash; needs stored keys or collision handling</td>
+<td class="mono">O(1) average</td>
+<td><span class="pill no">no</span> hashing destroys order entirely</td>
+<td>Mutable in place</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Lucene's <span class="mono">.tim</span>/<span class="mono">.tip</span> build
+the dictionary as a minimal acyclic finite-state <em>transducer</em>: input is
+term bytes, output is a file pointer or term-id. Because it is a transducer and
+not merely an FSA, shared <em>suffixes</em> merge the same way shared prefixes
+do <span class="p p-doc">upstream</span>. The Rust equivalent is BurntSushi's
+<span class="mono">fst</span> crate, which implements exactly this &mdash; an
+ordered set/map FST with automaton-based search.</p>
+
+<h3>Why an FST and not a hash map</h3>
+
+<p>An FST is a DFA over the term-byte alphabet. Enumerating every term matching
+a query automaton Q &mdash; a wildcard compiled to a DFA, a regex compiled to a
+DFA, or a Levenshtein automaton for fuzzy &mdash; is a product-automaton walk:
+step both machines on the same byte, continue only where both have a live
+state, report only where the FST is final <em>and</em> Q is accepting.</p>
+
+<figure class="code">
+<figcaption>FST &cap; DFA term enumeration (R6 &sect;3.1, reproduced; matches <span class="mono">fst::Automaton</span>)</figcaption>
+<pre><code><span class="cm">// FST &#8745; DFA term enumeration (sketch, matches `fst::Automaton` design)</span>
+<span class="kw">fn</span> enumerate(fst: &amp;Fst, dfa: &amp;Dfa, out: &amp;<span class="kw">mut</span> Vec&lt;(String, Output)&gt;) {
+    <span class="kw">fn</span> go(fst_node: FstNode, dfa_state: DfaState, prefix: &amp;<span class="kw">mut</span> Vec&lt;u8&gt;,
+          fst: &amp;Fst, dfa: &amp;Dfa, out: &amp;<span class="kw">mut</span> Vec&lt;(String, Output)&gt;) {
+        <span class="kw">if</span> fst_node.is_final() &amp;&amp; dfa.is_accepting(dfa_state) {
+            out.push((String::from_utf8(prefix.clone()).unwrap(), fst_node.output()));
+        }
+        <span class="kw">for</span> (byte, next_fst_node) <span class="kw">in</span> fst_node.transitions() {
+            <span class="kw">if let</span> Some(next_dfa_state) = dfa.step(dfa_state, byte) {
+                prefix.push(byte);
+                go(next_fst_node, next_dfa_state, prefix, fst, dfa, out);
+                prefix.pop();
+            }
+            <span class="cm">// if dfa.step returns None (dead state), this whole subtree is</span>
+            <span class="cm">// pruned WITHOUT visiting it -- this is the entire point: cost is</span>
+            <span class="cm">// proportional to the number of *matching* FST paths explored,</span>
+            <span class="cm">// not to the vocabulary size.</span>
+        }
+    }
+    go(fst.root(), dfa.start(), &amp;<span class="kw">mut</span> Vec::new(), fst, dfa, out);
+}
+</code></pre>
+</figure>
+
+<p>The comment in the middle is the load-bearing part. A dead DFA state prunes a
+whole subtree unvisited, so cost is proportional to matching paths, not to
+vocabulary size. A hash-table dictionary cannot do this at all. This is the
+concrete reason to prefer an FST over a hash map even though the hash map wins
+on pure exact-term lookup, and it is the same mechanism
+<span class="mono">fst</span>'s <span class="mono">Levenshtein</span> type uses
+for fuzzy search today.</p>
+
+<p>MARISA tries are conceptually interchangeable with FSTs for this use,
+generally slightly better on very large, highly prefix-shared vocabularies at
+some cost in update-friendliness. Both are batch-built, which is not a
+limitation in a segment architecture &mdash; you rebuild the dictionary once per
+new immutable segment and never mutate one in place, exactly as Lucene does.</p>
+
+<div class="box warn">
+<span class="label">Maintenance signal on <span class="mono">fst</span></span>
+<p><span class="mono">fst</span> 0.4.7 was last released <b>2021-06-06</b>
+<span class="p p-doc">upstream</span> &mdash; no releases in about five years,
+though it is stable, feature-complete, and depended on by ripgrep's ecosystem,
+so bit-rot risk is low. Licence is Unlicense OR MIT. Plan to be ready to patch
+it yourself rather than expecting upstream responsiveness; its scope (ordered
+set/map FST) is narrow and stable enough that this is a low risk.</p>
+</div>
+
+<p>At the scale in question &mdash; vocabularies in the low millions of terms at
+most &mdash; FST traversal will not be the bottleneck. Use
+<span class="mono">fst</span> for per-segment dictionaries, keep a small term-id
+to postings-offset side table if you want term-ids decoupled from FST outputs,
+and reach for ART or a hash map only if a profiler says otherwise.</p>
+</section>
+<section>
+<h2 id="eval">Query evaluation: intersection, phrases, pruning, reordering</h2>
+
+<h3>Leapfrog and galloping intersection</h3>
+
+<p>The general primitive for intersecting k sorted iterators each exposing
+<span class="mono">nextGEQ</span>:</p>
+
+<figure class="code">
+<figcaption>Leapfrog AND (R6 &sect;4.1, reproduced)</figcaption>
+<pre><code><span class="kw">fn</span> leapfrog_and(iters: &amp;<span class="kw">mut</span> [PostingIter]) -&gt; Option&lt;DocId&gt; {
+    <span class="kw">let mut</span> i = 0;
+    <span class="kw">let mut</span> candidate = iters[0].current()?;
+    <span class="kw">loop</span> {
+        <span class="kw">let mut</span> advanced = <span class="kw">false</span>;
+        <span class="kw">for</span> _ <span class="kw">in</span> 0..iters.len() {
+            <span class="kw">let</span> v = iters[i].next_geq(candidate)?;
+            <span class="kw">if</span> v != candidate {
+                candidate = v;
+                advanced = <span class="kw">true</span>;
+            }
+            i = (i + 1) % iters.len();
+            <span class="kw">if</span> advanced { <span class="kw">break</span>; } <span class="cm">// restart the round from the iter that moved</span>
+        }
+        <span class="kw">if</span> !advanced {
+            <span class="kw">return</span> Some(candidate); <span class="cm">// all iterators agree on `candidate`</span>
+        }
+    }
+}
+</code></pre>
+</figure>
+
+<p>Inside <span class="mono">nextGEQ</span> on a plain sorted array, galloping
+(probe at offsets 1, 2, 4, 8&hellip;, then binary-search the bracket) beats a
+linear scan whenever the lists have very different lengths &mdash; a rare term
+ANDed with a common one. That is precisely what skip lists and Elias-Fano's
+<span class="mono">nextGEQ</span> are built to make cheap. For AND-NOT, wrap an
+iterator to skip ids in the excluded set; cheapest when that set is a Roaring
+bitmap.</p>
+
+<h3 id="phrase">Phrases: positions versus re-scan &mdash; the biggest density lever on this page</h3>
+
+<p>R6 ranks this above every codec choice, and the reasoning is arithmetic
+rather than taste. Positions cost 3&ndash;10&times; the docs-only postings tier
+(2&ndash;4&times; whole-index by the textbook rule). Eliminating them removes
+that multiplier rather than compressing it better, which no codec can do.</p>
+
+<div class="tw">
+<table>
+<caption>Three ways to answer a phrase query</caption>
+<thead>
+<tr><th>Approach</th><th>Index cost</th><th>Query cost</th><th>Verdict</th></tr>
+</thead>
+<tbody>
+<tr><th>Positional postings</th>
+<td class="num">2&ndash;4&times; freq-only index <span class="p p-paper">paper</span></td>
+<td>Leapfrog AND, then walk both position lists on survivors</td>
+<td>Correct and fast; the one thing that costs real bytes</td></tr>
+<tr><th>Re-scan the source file<br>(<span class="mono">match_only_text</span>)</th>
+<td class="num">0 &mdash; docs+freq only <span class="p p-doc">upstream</span></td>
+<td>One <span class="mono">open()</span> + <span class="mono">pread()</span> per surviving candidate; single-digit ms per file on NVMe <span class="p p-est">estimate</span></td>
+<td><b>Density-optimal.</b> Exactly the trade Dave asked for</td></tr>
+<tr><th>Next-word / bigram index</th>
+<td class="num">Vocabulary grows ~an order of magnitude or more <span class="p p-est">estimate</span></td>
+<td>Bigram list intersection; 3+-word phrases still chain or fall back</td>
+<td><span class="pill no">skip</span> a second mechanism for a benefit re-scan already gets</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Elasticsearch's <span class="mono">match_only_text</span> field type is the
+production precedent: it stores no positions and falls back to the stored
+source for phrase and highlighting needs
+<span class="p p-doc">upstream</span><sup><a href="#r3">3</a></sup>. The cost
+model is concrete &mdash; each surviving candidate costs one file read instead
+of an in-index position-list decode, and after AND-intersection candidate sets
+at this scale are tens to low thousands, not millions.</p>
+
+<div class="box key">
+<span class="label">The one condition attached</span>
+<p>Re-scan reads the file's <em>current</em> content, which may have changed
+since indexing. Keep the file's inode, mtime and a generation counter in doc
+values so a since-modified file fails the phrase check safely rather than
+returning a match against stale content. That is one doc-value field, and it is
+what makes the whole trade legitimate rather than merely cheap.</p>
+</div>
+
+<p>Proximity and NEAR use the same machinery generalised: after docID
+intersection, sweep both sorted position lists in O(p&#8321; + p&#8322;) rather
+than O(p&#8321; &times; p&#8322;) to find the minimum distance. Under the
+re-scan design, that sweep happens over the re-tokenised candidate file instead
+of over stored positions.</p>
+
+<h3 id="bmw">Dynamic pruning: WAND, block-max WAND, MaxScore</h3>
+
+<p>All four are the same idea &mdash; skip documents that provably cannot enter
+the current top-k, using precomputed upper bounds. WAND (Broder et al., CIKM
+2003) keeps one global max-score per term and finds a <b>pivot</b>: the first
+term in docID order whose cumulative max-score prefix exceeds the current
+threshold &theta;. Block-Max WAND (Ding &amp; Suel, SIGIR 2011
+<sup><a href="#r4">4</a></sup>) is the refinement that matters: store a max
+score <em>per block</em>, aligned with the postings' physical block layout, so
+the pivot check uses a locally accurate bound.</p>
+
+<p>This is why codec choice and pruning algorithm are coupled. Block-max scores
+must be computed at index build time at the same granularity the codec already
+uses &mdash; if the block size is 128, that is one quantised max-score per
+128-doc block per term.</p>
+
+<figure class="code">
+<figcaption>Block-Max WAND main loop (R6 &sect;4.4, reproduced)</figcaption>
+<pre><code><span class="kw">fn</span> bmw_topk(<span class="kw">mut</span> cursors: Vec&lt;TermCursor&gt;, k: usize) -&gt; TopK {
+    <span class="kw">let mut</span> heap = MinHeap::with_capacity(k);
+    <span class="kw">let mut</span> theta = f32::MIN; <span class="cm">// current k-th best score, -inf until heap full</span>
+    <span class="kw">loop</span> {
+        cursors.sort_by_key(|c| c.doc_id()); <span class="cm">// reorder by current position</span>
+        <span class="cm">// find pivot: smallest prefix whose cumulative UPPER bound &gt; theta</span>
+        <span class="kw">let mut</span> acc = 0.0;
+        <span class="kw">let mut</span> pivot_idx = None;
+        <span class="kw">for</span> (i, c) <span class="kw">in</span> cursors.iter().enumerate() {
+            acc += c.term_max_score();
+            <span class="kw">if</span> acc &gt; theta { pivot_idx = Some(i); <span class="kw">break</span>; }
+        }
+        <span class="kw">let</span> Some(pi) = pivot_idx <span class="kw">else</span> { <span class="kw">break</span> }; <span class="cm">// no prefix can beat theta -&gt; done</span>
+        <span class="kw">let</span> pivot_doc = cursors[pi].doc_id();
+        <span class="kw">if</span> pivot_doc == SENTINEL_END { <span class="kw">break</span>; }
+
+        <span class="kw">if</span> cursors[0].doc_id() == pivot_doc {
+            <span class="cm">// all cursors before pivot already at pivot_doc: must fully score,</span>
+            <span class="cm">// but first check the BLOCK-MAX bound for a cheap reject</span>
+            <span class="kw">let</span> block_bound: f32 = cursors[..=pi].iter()
+                .map(|c| c.block_max_score_for(pivot_doc)).sum();
+            <span class="kw">if</span> block_bound &lt;= theta {
+                <span class="cm">// skip the whole block for every term whose block ends before</span>
+                <span class="cm">// the next block boundary, without decoding any postings</span>
+                <span class="kw">for</span> c <span class="kw">in</span> cursors[..=pi].iter_mut() { c.skip_to_next_block_or(pivot_doc + 1); }
+                <span class="kw">continue</span>;
+            }
+            <span class="kw">let</span> score = full_score(&amp;cursors[..=pi], pivot_doc);
+            <span class="kw">if</span> heap.len() &lt; k || score &gt; theta {
+                heap.push(pivot_doc, score);
+                <span class="kw">if</span> heap.len() &gt; k { heap.pop_min(); }
+                theta = heap.min_score();
+            }
+            <span class="kw">for</span> c <span class="kw">in</span> cursors[..=pi].iter_mut() { c.next(); }
+        } <span class="kw">else</span> {
+            <span class="cm">// advance the cursor furthest before the pivot up TO the pivot doc</span>
+            cursors[0].next_geq(pivot_doc);
+        }
+    }
+    heap.into_sorted_topk()
+}
+</code></pre>
+</figure>
+
+<p><b>MaxScore</b> (Turtle &amp; Flood, IPM 1995 &mdash; older than WAND)
+partitions differently: essential terms that cannot be skipped, non-essential
+terms looked up opportunistically only for docs the essential ones already
+produced. Often competitive, sometimes faster when few terms dominate the score
+budget. <b>Block-Max MaxScore</b> applies the block-max augmentation to it.
+Recent work on superblock and adaptive-block pruning reports further reductions
+in scored postings <span class="p p-paper">paper</span> &mdash; but scoped to
+<em>learned-sparse</em> scoring, not classical BM25, so it is not a drop-in
+number here. For BM25 on a desktop corpus, fixed-block BMW is the proven,
+simplest choice.</p>
+
+<div class="box warn">
+<span class="label">Static pruning runs backwards for this build</span>
+<p>Dropping postings below a score threshold at build time trades size for
+<em>lost recall</em>, not size for latency. A desktop tool's users expect
+exhaustive recall &mdash; "did I definitely search my whole disk". It is not on
+the speed/density axis at all; reject it outright rather than filing it under
+the tradeoff. <b>Tiering</b> (a small high-quality tier 0 queried first, full
+postings as fallback) preserves exhaustive recall at the cost of maintaining two
+postings copies per term, which is a density cost, not a saving.</p>
+</div>
+
+<h3>Document identifier reassignment</h3>
+
+<p>DocID assignment is free at query time and shrinks every downstream posting
+list, because d-gaps get smaller when co-occurring documents get adjacent ids.
+Two techniques:</p>
+
+<div class="tw">
+<table>
+<caption>DocID reordering</caption>
+<thead><tr><th>Technique</th><th>Cost to build</th><th>Effect</th><th>Rust</th></tr></thead>
+<tbody>
+<tr><th>Path-sort</th>
+<td>A sort at index-build time &mdash; effectively free</td>
+<td>Large gains: files under one directory share vocabulary. <b>Unusually strong on a filesystem corpus</b>, where directory structure is a real topical signal, compared with a web crawl</td>
+<td>trivial</td></tr>
+<tr><th>Recursive graph bisection (BP)</th>
+<td>Build a document-similarity graph over up to ~1M docs and recursively bisect it minimising a log-gap objective. Build-time only, once per full re-merge</td>
+<td>State of the art. Shrinks the index <em>and</em> speeds intersection and BMW pruning, because shorter gaps mean tighter block-max clustering. Confirmed by an independent ECIR 2019 reproducibility study <span class="p p-paper">paper</span></td>
+<td><span class="pill no">none</span> port from <span class="mono">mpetri/recursive_graph_bisection</span> (C++)</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>PISA documents BP-based reordering as a first-class pipeline step
+<span class="p p-doc">upstream</span><sup><a href="#r5">5</a></sup>. Since it is
+a build-time batch step, running the C++ as a subprocess is as reasonable as a
+from-scratch Rust port &mdash; but it is the first thing to defer if the
+schedule is tight, because path-sort already captures much of the easy win here.</p>
+
+<div class="box key">
+<span class="label">The thing to act on</span>
+<p>Path-sort docIDs on the first build; it costs a sort and shrinks everything
+downstream. Then implement leapfrog AND over Elias-Fano
+<span class="mono">nextGEQ</span>, and only add block-max scores once ranked
+retrieval over large result sets is actually the bottleneck &mdash; on the
+measured corpus, exhaustive Boolean intersection over 73k documents rarely is.</p>
+</div>
+</section>
+<section>
+<h2 id="substring">Substring and regex: trigrams, suffix structures, and the run-length family</h2>
+
+<h3 id="glimpse">Prior art: Glimpse got here in 1993</h3>
+
+<p>Candidate-generation-then-verify is not a Google Code Search invention; it is
+the organising idea of Manber and Wu's <b>Glimpse</b>, written up as Arizona TR
+93-34 in October 1993 and presented at the 1994 Winter USENIX
+<sup><a href="#r29">29</a></sup>. Every recommendation on this page that trades
+precision for size is a descendant of it, and the paper states the density
+argument in the terms this project uses.</p>
+
+<div class="box key">
+<span class="label">The 1993 numbers, from the paper itself</span>
+<p>Glimpse's index is <b>2&ndash;4% of the size of the text</b> in most cases
+<span class="p p-paper">paper</span>, against a full inverted index which the
+paper puts at <b>50&ndash;300% of the text</b> (citing Faloutsos 1985)
+<span class="p p-paper">paper</span> and signature files at 10&ndash;30%. That is
+a 12&times; to 100&times; gap, argued in 1993, and it is the same gap this page
+measures between a positional inverted index and a filter-plus-scan design.</p>
+</div>
+
+<p>The mechanism is worth stating precisely, because two details of it are
+better than what most modern descriptions of &ldquo;n-gram index then verify&rdquo;
+carry:</p>
+
+<ul>
+<li><b>Block addressing, capped at 256 blocks.</b> The corpus is divided into
+roughly equal blocks and the index maps a word to the <em>blocks</em> that
+contain it, not the files and not the offsets. The cap is chosen so that a block
+address is exactly one byte <span class="p p-paper">paper</span>. That single
+decision is where the 2&ndash;4% comes from: the posting is a byte, and there is
+no positional data anywhere in the structure.</li>
+<li><b>The index is searched with the same engine as the text.</b> The words in
+the index are stored as ASCII specifically so that <span class="mono">agrep</span>
+can run over them; a pattern is first matched against the index's word list, and
+then <span class="mono">agrep</span> runs again over the candidate blocks
+<span class="p p-paper">paper</span>. This is the distinction drawn in
+&sect;7.2 below &mdash; regex over the term dictionary versus regex over content
+&mdash; implemented as literally the same tool called twice, thirty years before
+anyone framed it that way.</li>
+</ul>
+
+<p>What Glimpse does not give is what the rest of this section is about: a word
+index cannot answer <span class="mono">/foo.*bar/</span> where the match crosses
+a token boundary, and block granularity means the verify stage rescans a whole
+block rather than a file. Cox's contribution is not the two-stage shape but
+compiling an arbitrary regex into a <em>sound</em> boolean query over n-grams.
+The lineage is worth keeping in view: plocate is Glimpse's idea applied to
+filenames with a modern codec, and the tiered design recommended on the
+architecture page is Glimpse's idea applied to a corpus that also contains
+PDFs.</p>
+
+<h3>n-gram indexes</h3>
+
+<p>A trigram index keys postings by every contiguous 3-byte or 3-character
+substring. A literal of length &ge;3 is looked up by ANDing its constituent
+trigrams' lists; a regex is compiled into a boolean expression over trigram
+existence and evaluated the same way. Every candidate is then <b>verified</b>
+with a real regex engine, because the trigram query is a necessary but not
+sufficient condition. This is Russ Cox's Google Code Search design
+<sup><a href="#r6">6</a></sup>.</p>
+
+<div class="tw">
+<table>
+<caption>Doc-only versus position-carrying trigrams</caption>
+<thead>
+<tr><th></th><th>Doc-only trigrams</th><th>Position-carrying trigrams</th></tr>
+</thead>
+<tbody>
+<tr><th>Index size</th>
+<td class="num">well under 1&times; source <span class="p p-est">estimate</span><div class="bar"><span class="track"><span class="fill" style="width:25%"></span></span><span class="val">&lt;1&times;</span></div></td>
+<td class="num">~1.2&times; corpus, in RAM (zoekt) <span class="p p-doc">upstream</span><div class="bar"><span class="track"><span class="fill hi" style="width:40%"></span></span><span class="val">1.2&times;</span></div></td></tr>
+<tr><th>False positives</th>
+<td>Any doc containing all required trigrams, even scattered in unrelated contexts</td>
+<td>Adjacency check at query time removes most before the verify stage</td></tr>
+<tr><th>Verify cost / candidate</th>
+<td>Full-document regex scan</td>
+<td>Seeds from candidate offsets, often near-O(1) per candidate</td></tr>
+<tr><th>Best for</th>
+<td>Many-small-file corpora, index-size-constrained</td>
+<td>Single large repo, latency-constrained, jump-to-match UX</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>zoekt's 1.2&times; already reflects a compact run-length/delta-coded posting
+representation; a naive list of <span class="mono">(docid, offset)</span> pairs
+would be several times larger, because a 32-bit offset per trigram occurrence
+dominates a corpus stored at one byte per position. The commonly quoted
+<span class="mono">pg_trgm</span> figure of 2&ndash;4&times; the indexed text is
+Postgres-community folklore rather than a controlled benchmark
+<span class="p p-community">anecdote</span> &mdash; R7 flags it explicitly and
+declines to rely on it. Cox's article gives <b>no</b> index/corpus ratio for the
+Google Code Search index <span class="p p-none">unknown</span>; do not cite one.</p>
+
+<h4>The common-trigram pathology</h4>
+
+<p>Trigram frequency in code and prose is savagely skewed &mdash;
+<span class="mono">" th"</span>, <span class="mono">"ing"</span>,
+<span class="mono">" = "</span>, <span class="mono">"()."</span> occur in nearly
+every document and contribute no selectivity. Two mitigations, both used in
+practice: <b>cap or elide</b> postings lists above a document-frequency
+threshold (a dropped trigram is treated as "matches everything" for planning, so
+correctness is unaffected), and <b>plan on the rarest trigrams</b> rather than
+ANDing all of them &mdash; dropping a redundant AND term can only enlarge the
+candidate set, never lose a true positive.</p>
+
+<p>Case folding controls the same pathology from the other side, and it is a
+genuine two-way trade: folding collapses roughly 96 useful ASCII characters to
+about 63, halving distinct trigrams (a smaller index) while lengthening every
+posting list and losing case-sensitive matching. Production tools keep a
+case-sensitive index and handle <span class="mono">(?i)</span> by trying case
+variants of each query trigram &mdash; which multiplies the boolean query by up
+to 2&sup3; variants per trigram, worse for non-ASCII.</p>
+
+<h4>zoekt's successor lists</h4>
+
+<p>zoekt does not store a flat trigram-to-doclist map. Because it already keeps
+per-occurrence offsets, a literal of length L decomposes into L&minus;2
+overlapping trigrams whose positions must be <em>consecutive</em>. The executor
+picks the rarest trigram's posting list as the driver and, for each candidate
+position, checks the neighbouring trigrams directly at
+<span class="mono">offset&plusmn;1</span> without a second index lookup
+<span class="p p-doc">upstream</span>. Verification cost becomes O(occurrences
+of the rarest trigram) rather than O(file size) per candidate document. That is
+the whole reason positional trigrams beat doc-only for longer literals.</p>
+
+<p>On encoding: byte-level trigrams are simplest and are correct for
+ASCII-dominated text, but shred multi-byte codepoints into meaningless
+fragments. zoekt n-grams over runes and keeps a <b>rune-to-byte offset table
+sampled every 100 runes</b> <span class="p p-doc">upstream</span> to translate
+between n-gramming space and file-slicing space. For CJK, prefer bigrams &mdash;
+this is why <span class="mono">pg_bigm</span> exists alongside
+<span class="mono">pg_trgm</span>. Going to 4-grams roughly quarters posting-list
+length at the cost of proportionally more distinct keys and worse recall for
+3-character search terms.</p>
+
+<h3 id="cox">Cox<h3>Cox's regex-to-trigram compilation</h3>rsquo;s regex-to-trigram compilation</h3>
+
+<p>The algorithm computes four sets bottom-up over the regex parse tree:</p>
+
+<div class="tw">
+<table>
+<caption>Cox's lattice, per parse-tree node</caption>
+<thead><tr><th>Set</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><th class="mono">match</th><td>The (possibly infinite) set of strings the subexpression can match. Symbolic, never enumerated</td></tr>
+<tr><th class="mono">exact</th><td>A <em>finite</em> set with <span class="mono">match == exact</span>, when the language is small and enumerable (<span class="mono">"foo"</span>, <span class="mono">(cat|dog)</span>); absent otherwise</td></tr>
+<tr><th class="mono">prefix</th><td>Strings each of which is a required prefix of every match, used when <span class="mono">exact</span> is unavailable</td></tr>
+<tr><th class="mono">suffix</th><td>Dually, required suffixes of every match</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>From whichever set survives, the algorithm derives a boolean AND/OR tree over
+"trigram T must appear". The composition rules, and the subtle one is
+concatenation:</p>
+
+<div class="tw">
+<table>
+<caption>Composition rules</caption>
+<thead><tr><th>Node</th><th>Rule</th></tr></thead>
+<tbody>
+<tr><th>Concatenation <span class="mono">AB</span></th>
+<td>If both children are exact, the parent's <span class="mono">exact</span> is the cross product, <b>capped at a small constant</b>, beyond which it degrades to prefix/suffix tracking only &mdash; this bounds blow-up from things like <span class="mono">(a|b|c|d)(a|b|c|d)(a|b|c|d)&hellip;</span>. If not exact: <span class="mono">query(A) AND query(B)</span>, <em>plus a cross term combining <span class="mono">suffix(A)</span> with <span class="mono">prefix(B)</span></em> to catch trigrams straddling the boundary. A trigram index only cares that a literal 3-byte run occurs contiguously, and that run can span a concatenation boundary neither child alone owns</td></tr>
+<tr><th>Alternation <span class="mono">A|B</span></th>
+<td>Union of exact sets if both are exact and small; otherwise <span class="mono">query(A) OR query(B)</span>. <b>The single biggest source of query degradation</b> &mdash; ORing two uncertain subqueries is rarely more selective than match-all</td></tr>
+<tr><th>Repetition <span class="mono">A*</span>, <span class="mono">A+</span>, <span class="mono">A{n,}</span></th>
+<td>Unbounded repetition destroys <span class="mono">exact</span> (infinite language) and generally destroys usable prefix/suffix beyond one iteration of A</td></tr>
+<tr><th>Classes <span class="mono">[abc]</span>, <span class="mono">.</span></th>
+<td>Small class: enumerate. <span class="mono">.</span> or a large class: degrades immediately to match-all for that position, poisoning any surrounding trigram containing it</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The raw derived query can be arbitrarily large from combinatorial cross
+products, so Cox's implementation simplifies &mdash; folding duplicate leaves,
+distributing AND over OR to detect always-true subtrees, capping exact-set sizes
+&mdash; to a bounded-size boolean query before it reaches the posting-list
+executor.</p>
+
+<h4>The degenerate cases, worked</h4>
+
+<div class="tw">
+<table>
+<caption>What makes a regex unindexable (R7 &sect;2.2)</caption>
+<thead><tr><th>Pattern feature</th><th>Why it degrades</th><th>Result</th></tr></thead>
+<tbody>
+<tr><th class="mono">.*foo</th>
+<td>No required prefix; <span class="mono">.*</span> matches from any position</td>
+<td>Degenerates toward <span class="mono">query(foo)</span> alone &mdash; <b>actually fine</b>, since <span class="mono">.*</span> only means "foo can occur anywhere". But <span class="mono">.*</span> <em>between</em> two required literals forces the suffix/prefix cross term to fall back to disjoint queries</td></tr>
+<tr><th class="mono">.*</th>
+<td><span class="mono">match</span> = everything</td>
+<td>Query = match-all. Full corpus scan required</td></tr>
+<tr><th class="mono">(a|b|c|&hellip;|z)</th>
+<td>Each branch under 3 characters has no derivable trigram at all</td>
+<td>OR of match-alls, so it degrades to match-all as soon as <em>any</em> branch is under 3 characters</td></tr>
+<tr><th>Classes spanning a required position</th>
+<td>Enumerable set too large to keep as <span class="mono">exact</span></td>
+<td>Falls back, poisoning any trigram straddling that position</td></tr>
+<tr><th class="mono">a{2,}</th>
+<td>Variable-length match; prefix/suffix do not compose across iterations</td>
+<td>Only the fixed literal parts survive as constraints</td></tr>
+<tr><th class="mono">(?i)</th>
+<td>Every literal becomes an alternation over case variants per character</td>
+<td>Multiplies derived query size, up to intractable for long literals. Must cap and fall back</td></tr>
+<tr><th><span class="mono">\b</span>, lookaround, backreferences</th>
+<td>Not a property of the matched <em>text</em> &mdash; zero-width assertions about context, or (backreferences) not regular at all</td>
+<td><b>Cannot be encoded in a trigram existence query.</b> Drop from derivation entirely; leave to the verify pass</td></tr>
+<tr><th>Anchors <span class="mono">^</span> / <span class="mono">$</span></th>
+<td>A position constraint, not a substring constraint</td>
+<td>Same &mdash; drop from the index query, verify only</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">The fallback is a first-class path, not an edge case</span>
+<p>Derive the query; if it degenerates to match-all, or if simplification yields
+something whose estimated selectivity from the trigram-frequency statistics is
+worse than a threshold, <b>skip the index entirely</b> and brute-force scan.
+Leading <span class="mono">.*</span>, <span class="mono">\b</span>-only patterns
+and short alternations are all common in real queries, so budget this as a
+frequent expected branch. The measured baseline makes it painless: a regex with
+no extractable literal over the pruned tree finishes in <b>0.05&nbsp;s</b>
+<span class="p p-measured">measured</span>.</p>
+</div>
+
+<p>Do not write a regex parser for this. Walk
+<span class="mono">regex_syntax::hir::Hir</span> &mdash; it already gives a clean
+recursive tree of <span class="mono">Literal</span>,
+<span class="mono">Class</span>, <span class="mono">Repetition</span>,
+<span class="mono">Concat</span>, <span class="mono">Alternation</span> and
+<span class="mono">Look</span> nodes with Unicode handled &mdash; and implement
+the lattice as a fold over it, mapping <span class="mono">Hir::Look</span>
+straight to "no constraint, drop". The only genuinely novel work in this whole
+area is the trigram-specific lattice computation and the postings engineering
+around it, not a new regex engine.</p>
+
+<h4>Verify-pass engines</h4>
+
+<div class="tw">
+<table>
+<caption>Engines for the verify pass</caption>
+<thead><tr><th>Engine</th><th>Model</th><th>Multi-pattern</th><th>Linear-time safe</th><th>Note</th></tr></thead>
+<tbody>
+<tr><th>Rust <span class="mono">regex</span> / <span class="mono">regex-automata</span></th>
+<td>Literal prefilter (memchr / memmem / Teddy) + lazy DFA, PikeVM fallback</td>
+<td><span class="pill part">membership only</span> via <span class="mono">RegexSet</span></td>
+<td><span class="pill yes">yes</span></td>
+<td><b>The default.</b> In-process, SIMD-prefiltered, and the same engine ripgrep uses, so its throughput <em>is</em> the brute-force baseline</td></tr>
+<tr><th>RE2</th><td>Automaton-based, backtracking-free</td><td><span class="pill no">no</span></td><td><span class="pill yes">yes</span></td><td>Same design lineage; comparable order of magnitude</td></tr>
+<tr><th>Hyperscan / Vectorscan</th>
+<td>Compiles a <em>database</em> of many patterns into hybrid DFA/NFA/SIMD literal matching</td>
+<td><span class="pill yes">yes</span> its core value proposition</td>
+<td><span class="pill yes">yes</span></td>
+<td>Hyperflex DFA model reaches <b>8.89 Gbit/s</b>, up to <b>2.27&times;</b> Hyperscan's default McClellan model on the benchmarked workload <span class="p p-paper">paper</span>. Native streaming across block boundaries. C FFI; pays for itself only with many concurrent saved queries</td></tr>
+<tr><th>PCRE2 + JIT</th><td>Backtracking, JIT-compiled per pattern</td><td><span class="pill no">no</span></td><td><span class="pill no">no</span> worst-case exponential</td><td>Only for backreferences/lookaround the linear engine cannot express, and only behind an explicit step budget</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Suffix arrays, and why they are disqualified</h3>
+
+<p>A suffix array plus LCP answers substring lookup in
+<span class="mono">O(m log n)</span> and enumerates every occurrence as a
+contiguous SA range. It costs one 4-byte integer per input byte, plus LCP: the
+standard rule of thumb is <b>4&ndash;5n bytes</b>
+<span class="p p-est">estimate</span> &mdash; the textbook figure from the
+suffix-array literature, not a single benchmark.</p>
+
+<div class="grid">
+  <div class="card"><div class="stat">4&ndash;5<small>&times;</small></div><div class="cap">SA+LCP per byte of text <span class="p p-est">estimate</span></div></div>
+  <div class="card"><div class="stat">400&ndash;500<small>GB</small></div><div class="cap">SA+LCP over a 100 GB corpus</div></div>
+  <div class="card"><div class="stat">10&ndash;20<small>B/char</small></div><div class="cap">naive suffix tree, 2&ndash;5&times; worse again <span class="p p-est">estimate</span></div></div>
+</div>
+
+<p>That is larger than the corpus itself and well outside any density budget for
+a personal workstation. Its update cost is equally disqualifying: an SA is a
+global sort order, so one file's change perturbs it non-locally. livegrep's
+answer is to rebuild per repository and hold everything resident in RAM, sharded
+across machines &mdash; a reasonable architecture at repo scale, a poor fit for
+an always-on personal index that should reflect edits within seconds. Treat the
+plain suffix array as a <b>build-time stepping stone to the FM-index</b>, whose
+construction goes through one anyway. Suffix trees and CDAWGs are worse still
+and nobody ships them at corpus scale for exactly this reason.</p>
+
+<h3 id="fm">FM-index and BWT</h3>
+
+<p>The BWT of the text is the sequence of characters preceding each suffix in
+suffix-sorted order, computable from the SA as
+<span class="mono">BWT[i] = text[SA[i]-1]</span> and invertible. The FM-index
+adds three things on top of the BWT string L: a rank/select structure
+(typically a wavelet tree, or per-character bitvectors for small alphabets); the
+<b>C-array</b>, counting characters lexicographically smaller than each
+character; and a <b>sampled suffix array</b>, every k-th SA value, to recover
+text offsets.</p>
+
+<figure class="code">
+<figcaption>Backward search over an FM-index (R7 &sect;3.3, reproduced)</figcaption>
+<pre><code><span class="cm"># Backward search for pattern P[0..m) over FM-index (C array, rank support over BWT L)</span>
+lo, hi = 0, n
+<span class="kw">for</span> i <span class="kw">in</span> reversed(range(m)):
+    c = P[i]
+    lo = C[c] + rank(L, c, lo)
+    hi = C[c] + rank(L, c, hi)
+    <span class="kw">if</span> lo &gt;= hi:
+        <span class="kw">return</span> NO_MATCH
+<span class="kw">return</span> (lo, hi)   <span class="cm"># [lo, hi) is the SA range of all suffixes starting with P; hi-lo = occurrence count</span>
+</code></pre>
+</figure>
+
+<p><span class="mono">count(P)</span> falls straight out as
+<span class="mono">hi - lo</span> in O(m) rank operations, with no locate needed.
+<span class="mono">locate(P)</span> additionally walks each position back to a
+sampled entry via the LF-mapping
+(<span class="mono">LF(i) = C[L[i]] + rank(L, L[i], i)</span>), costing up to
+<span class="mono">O(sample_interval)</span> extra steps per occurrence. That is
+the classic tradeoff: <b>count is cheap, locate is proportional to sampling
+density</b>, and sampling density is exactly the index-size knob.</p>
+
+<div class="tw">
+<table>
+<caption>FM-index space, with every figure's scope stated</caption>
+<thead><tr><th>Figure</th><th>Value</th><th>Scope &mdash; read this before reusing the number</th></tr></thead>
+<tbody>
+<tr><th>QuadRank (SEA 2026)</th>
+<td class="num">14.4% space overhead at <b>2.29 bits/base-pair</b> <span class="p p-paper">paper</span></td>
+<td><b>DNA, 4-symbol alphabet.</b> Do not transplant to source-code text without re-measuring &mdash; the wavelet-tree layer's cost is alphabet-size-sensitive</td></tr>
+<tr><th>SDSL <span class="mono">rank_support_v5</span></th>
+<td class="num">6.25% overhead <span class="p p-doc">upstream</span></td>
+<td>Overhead of <em>one rank layer</em> over the bitvector it augments &mdash; not the whole FM-index</td></tr>
+<tr><th>Byte-alphabet floor</th>
+<td class="num">~8 bits/char <span class="p p-est">estimate</span></td>
+<td>Roughly <span class="mono">log&#8322;(&sigma;)</span> as a floor before compression tricks, plus rank overhead, plus SA sampling</td></tr>
+<tr><th>General rule of thumb</th>
+<td class="num">&asymp; the compressed text, plus single-digit-% to ~25% for locate structures <span class="p p-est">estimate</span></td>
+<td>Order-of-magnitude claim only. <b>No single number applies universally</b> &mdash; benchmark against the actual corpus with sdsl-lite's harness before committing to a budget</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The first-order objection is update cost. A classical FM-index is effectively
+<b>static</b>: changing bytes anywhere perturbs the suffix order of everything
+lexicographically nearby, so in general the BWT, its wavelet tree and its SA
+samples must be recomputed over the whole affected partition. The mitigation is
+the one the segment architecture already provides &mdash; build one FM-index per
+cold segment, keep recently-changed files in a small cheaply-mutable structure,
+and merge-and-rebuild in the background. A changed file costs an update to a
+small live segment rather than a global BWT rebuild, at the price of querying N
+segments instead of one.</p>
+
+<h3 id="rindex">r-index, RLBWT, move-r</h3>
+
+<p>This is the section most relevant to a source-code corpus, because such a
+corpus is <em>repetitive</em> in the technical sense: vendored dependencies,
+near-duplicate generated files, multiple versions of similar files. The number
+of BWT runs <span class="mono">r</span> can be orders of magnitude smaller than
+the text length <span class="mono">n</span>.</p>
+
+<div class="tw">
+<table>
+<caption>The run-length compressed family</caption>
+<thead><tr><th>Structure</th><th>Space</th><th>Query</th><th>Reported figures</th></tr></thead>
+<tbody>
+<tr><th>r-index<br>(Gagie, Navarro, Prezza, SODA 2018 / JACM 2020)</th>
+<td class="num"><b>O(r)</b>, not O(n) <span class="p p-paper">paper</span></td>
+<td><span class="mono">count</span> near-optimal; <span class="mono">locate</span> in <span class="mono">O(log(n/r))</span> per occurrence</td>
+<td>The key technical contribution is an SA sampling of size <b>2r</b>, versus the <span class="mono">O(n/r)</span>-per-occurrence cost naive FM-index sampling would give at the same size. Reported to locate <b>orders of magnitude faster than RLCSA</b> at matched index size <span class="p p-paper">paper</span></td></tr>
+<tr><th>move-r<br>(Bertram et al., SEA 2024)</th>
+<td class="num">0.8&ndash;2.5&times; other r-indexes, typically ~2&times; <span class="p p-paper">paper</span></td>
+<td>O(r) space <em>and</em> O(1)-time LF-steps via the move structure, which the classical r-index sampling does not achieve</td>
+<td><b>2&ndash;35&times; faster</b> count/locate than other locate-supporting r-indexes, typically ~15&times;. Constructed 0.9&ndash;2&times; as fast, typically ~2&times;, using 1/3&ndash;1&times; the construction memory, typically 1/2 <span class="p p-paper">paper</span></td></tr>
+<tr><th>b-move and successors (2024&ndash;2026)</th>
+<td class="num">no consolidated figures <span class="p p-none">unknown</span></td>
+<td>Adds fast <b>bidirectional</b> extension &mdash; directly relevant to automaton-driven regex search below</td>
+<td>Active area: 2026 SEA/arXiv work on bounding average move-structure query cost and optimal-time construction. <b>Do not assume the 2024 move-r numbers are the ceiling</b></td></tr>
+<tr><th>Grammar-compressed indexes</th>
+<td class="num">no comparable figures gathered <span class="p p-none">unknown</span></td>
+<td>Exploits <em>structural</em> repetition (exact-duplicate large blocks) rather than local BWT-run structure</td>
+<td>More attractive for versioned document collections and vendored trees; no implementation as mature or portable as move-r's C++ reference. Monitor, do not build against</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+<span class="label">Update cost is the disqualifier, not density</span>
+<p>r-index and move-r are <b>no better than a plain FM-index for updates, and
+arguably worse</b>. Their entire value comes from exploiting <em>global</em>
+run-structure &mdash; <span class="mono">r</span> is a property of the whole text
+&mdash; so a local edit can split existing runs and increase
+<span class="mono">r</span> in ways not confined to the edited region. Every
+published r-index and move-r result targets static, build-once collections
+(pangenomes, versioned reference corpora); <b>none of the papers reviewed
+describe an incremental or dynamic construction algorithm</b>
+<span class="p p-none">unknown</span>. These are cold-segment-only structures:
+the background indexer folds files below a "hasn't changed in N days" watermark
+into an r-index segment while recently-touched files stay in a cheaply-mutable
+trigram segment until they age into the next merge.</p>
+</div>
+
+<h4>True regex over an FM-index</h4>
+
+<p>Yes, via automaton search: generalise backward search from one fixed pattern
+to the current SA range for every active DFA state.</p>
+
+<figure class="code">
+<figcaption>Regex over FM-index via bidirectional backward search (R7 &sect;3.5, reproduced)</figcaption>
+<pre><code><span class="cm"># Regex-over-FM-index via bidirectional backward search (conceptual)</span>
+<span class="cm"># dfa: regex compiled to a DFA (or NFA with subset-construction on the fly)</span>
+<span class="cm"># state: set of (dfa_state, [lo,hi) SA-range) pairs, extended one char at a time</span>
+frontier = { (dfa.start_state, full_range) }
+<span class="kw">for</span> position <span class="kw">in</span> corpus_positions_to_try:   <span class="cm"># or, extend both directions from a seed</span>
+    next_frontier = {}
+    <span class="kw">for</span> (dfa_state, [lo,hi)) <span class="kw">in</span> frontier:
+        <span class="kw">for</span> c <span class="kw">in</span> alphabet:
+            new_dfa_state = dfa.transition(dfa_state, c)
+            <span class="kw">if</span> new_dfa_state <span class="kw">is</span> dead: <span class="kw">continue</span>
+            new_lo, new_hi = extend_range([lo,hi), c)   <span class="cm"># LF-mapping / rank step</span>
+            <span class="kw">if</span> new_lo &lt; new_hi:
+                merge_into(next_frontier, (new_dfa_state, [new_lo,new_hi)))
+    frontier = next_frontier
+    <span class="kw">if</span> any(dfa.is_accepting(s) <span class="kw">for</span> (s, _) <span class="kw">in</span> frontier): record_matches(...)
+</code></pre>
+</figure>
+
+<p>Cost is bounded by DFA states &times; active SA-range splits, which is why it
+pays off only for patterns whose DFA stays small. Note the symmetry: a regex
+that degrades badly under Cox's derivation tends to degrade badly here too,
+because both are bottlenecked by how much the pattern actually constrains the
+search space. The selling point is that <b>there is no verify pass at all</b>
+&mdash; the match is exact by construction, no false positives. The cost is
+interactive automaton simulation over compressed rank structures instead of a
+handful of cheap posting-list ANDs, and a substantially heavier engineering
+lift.</p>
+
+<div class="box gap">
+<span class="label">No Rust path exists</span>
+<p>There is no maintained, production-grade Rust-native r-index or move-r
+<span class="p p-none">unknown</span>. The reference implementations
+(<span class="mono">nicolaprezza/r-index</span>, move-r) are <b>GPL-3.0 research
+code</b> &mdash; port the algorithm from the paper, do not vendor the code into a
+permissively-licensed build. The same licence flag applies to
+<span class="mono">sdsl-lite</span>, which is a read-only reference for
+algorithms and benchmark methodology, not a dependency candidate. Budget a
+<b>port</b>, not a <span class="mono">cargo add</span>: R7 calls it a multi-week
+undertaking and a distinct later milestone.</p>
+</div>
+
+<h3>The honest baseline</h3>
+
+<p>An index cannot beat disk bandwidth on a genuinely cold read of the whole
+corpus. It can only help by <em>reading less of it</em>. R7's single-threaded
+warm-cache ripgrep figures on a synthetic 1.6 GB file
+<span class="p p-measured">measured</span>: ~7.3 GB/s for a literal that never
+matches (memmem fast path skips most of the buffer), ~1.3 GB/s for a literal
+present on every line, ~0.95 GB/s for a small char-class regex present on every
+line. The match-everywhere cases pay for materialising 20 million match records
+&mdash; a realistic worst case, not typical sparse-match search.</p>
+
+<p>M1's figures on the real corpus are stronger still and supersede the
+extrapolations: <b>0.05 s</b> for both a literal and a hard regex over the
+gitignore-pruned tree at ~1000% CPU, and <b>217&ndash;234 s at 0.65&ndash;0.71
+GB/s</b> for <span class="mono">rg -uuu</span> over the full unpruned 153.2 GB
+<span class="p p-measured">measured</span> &mdash; I/O-bound at one core's worth
+of CPU, meaning the bottleneck is reading bytes nobody wants indexed anyway.</p>
+
+<p>The index's job, restated: not to make regex matching faster, but to avoid
+touching most of the corpus's bytes at all on a cold cache. That is what the
+filter cascade in the next section is for.</p>
+
+<div class="box key">
+<span class="label">The thing to act on</span>
+<p>Build the Cox derivation over a doc-only trigram index and make brute-force
+scanning a first-class, well-optimised fallback rather than an apology. Then, if
+the density mandate still bites after exclusion policy has done its work, fold
+cold segments into move-r &mdash; R7 names it the most underrated option here,
+precisely because it is invisible to anyone reading only the 2010s
+suffix-array/FM-index literature.</p>
+</div>
+</section>
+<section>
+<h2 id="filters">Approximate filters</h2>
+
+<p>Filters are the cheapest structure on this page by a wide margin, and the
+only one whose job is explicitly to <em>avoid I/O</em> rather than to answer a
+query. Led by bits per element:</p>
+
+<div class="tw">
+<table>
+<caption>Approximate membership filters, at roughly 1% false-positive rate unless noted</caption>
+<thead>
+<tr><th>Filter</th><th class="num">Bits/element</th><th></th><th>Query cost</th><th>Deletes</th><th>Note</th></tr>
+</thead>
+<tbody>
+<tr><th>XOR filter (<span class="mono">Xor8</span>)</th>
+<td class="num">~8 bits at ~0.4% FPR <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:40%"></span></span><span class="val">8 b</span></div></td>
+<td>3 fixed probes, no loop, no branching</td>
+<td><span class="pill no">no</span> immutable</td>
+<td>Smaller and faster than Cuckoo/Bloom at matched FPR for static sets; must be fully rebuilt on any change</td></tr>
+<tr><th>Cuckoo filter</th>
+<td class="num">~8 bits at ~3% FPR <span class="p p-paper">paper</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:40%"></span></span><span class="val">8 b</span></div></td>
+<td>2 bucket lookups + linear probe within</td>
+<td><span class="pill yes">yes</span> its main advantage</td>
+<td>Insertion uses a randomised kick-out process that can rarely fail at high load factors</td></tr>
+<tr><th><b>Binary fuse</b> (<span class="mono">BinaryFuse8</span>)</th>
+<td class="num"><b>~9 bits</b> at &asymp;2<sup>&minus;8</sup> FPR (&lt;0.4%) <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:45%"></span></span><span class="val">9 b</span></div></td>
+<td>3 fixed probes, as XOR</td>
+<td><span class="pill no">no</span> immutable</td>
+<td><b>Current best-in-class for static sets:</b> smaller and faster to construct than XOR at equal FPR, with higher construction success probability</td></tr>
+<tr><th>Bloom (standard)</th>
+<td class="num">~9.6 bits at 1% FPR <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:48%"></span></span><span class="val">9.6 b</span></div></td>
+<td>k &asymp; 7 hashes and probes, scattered across a large bit array &mdash; cache-unfriendly</td>
+<td><span class="pill part">counting variant</span></td>
+<td>Simplest to implement. The 9.6 figure is <span class="mono">-log&#8322;(0.01)/ln2</span>, the standard formula, not a benchmark</td></tr>
+<tr><th>Blocked Bloom</th>
+<td class="num">slightly above standard Bloom at equal FPR <span class="p p-est">estimate</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:52%"></span></span><span class="val">&gt;9.6 b</span></div></td>
+<td>1 cache-line fetch + k probes within it</td>
+<td><span class="pill no">no</span></td>
+<td>The standard practical fix for Bloom's cache-unfriendliness; the shape RocksDB's full filter and Apache-ecosystem filters use</td></tr>
+<tr><th><span class="mono">BinaryFuse16</span></th>
+<td class="num">~18 bits at ~0.0015% FPR <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:90%"></span></span><span class="val">18 b</span></div></td>
+<td>3 fixed probes</td>
+<td><span class="pill no">no</span></td>
+<td>Buy this only when a false positive costs a whole file read you badly want to avoid</td></tr>
+</tbody>
+</table>
+</div>
+
+<figure class="code">
+<figcaption>BinaryFuse8 membership probe (R7 &sect;4.2, reproduced)</figcaption>
+<pre><code><span class="cm"># BinaryFuse8 membership probe (conceptual; xorf crate does the real construction/hashing)</span>
+<span class="kw">fn</span> contains(filter, key) -&gt; bool:
+    h = hash(key)                       <span class="cm"># one strong hash of the key</span>
+    f = fingerprint8(h)                 <span class="cm"># 8-bit fingerprint derived from h</span>
+    (h0, h1, h2) = filter.three_positions(h)   <span class="cm"># three array positions, xorf's "binary-partitioned" segments</span>
+    <span class="kw">return</span> filter.fingerprints[h0] ^ filter.fingerprints[h1] ^ filter.fingerprints[h2] == f
+</code></pre>
+</figure>
+
+<p>Construction requires the full key set up front &mdash; it solves a peelable
+hypergraph problem across three hash-derived positions per key, which is exactly
+why it is immutable. That is fine for a per-file or per-segment structure
+rebuilt when the file changes, and not fine for a live single-document insert
+path, where a mutable Bloom (<span class="mono">fastbloom</span>) covers the gap.
+The crate to reach for is <span class="mono">xorf</span>
+(<span class="pill yes">MIT/Apache</span>), which implements
+<span class="mono">Xor8</span>/<span class="mono">Xor16</span> and
+<span class="mono">BinaryFuse8</span>/<span class="mono">BinaryFuse16</span>; it
+is Lemire-lineage-adjacent and this is one place to depend rather than
+reimplement.</p>
+
+<h3>ugrep-indexer: the production instance of this idea</h3>
+
+<p><span class="mono">ugrep-indexer</span>, now folded into
+<span class="mono">ugrep</span> &ge; 6.0 as <span class="mono">ug --index</span>,
+builds a Bloom-like structure per indexed file over that file's n-grams &mdash;
+bigrams and trigrams in a shared hash table, but with <b>separate bit tiers per
+n-gram length so 2-grams and 3-grams never share bits</b> and cannot
+cross-contaminate each other's false-positive rate
+<span class="p p-doc">upstream</span>. Its stated goal is a <b>&gt;10&times;
+search speedup</b> <span class="p p-doc">upstream</span>, and its framing is the
+right one: the win matters most on <em>large, cold, not-page-cache-warm</em>
+filesystems &mdash; the target is avoiding a disk read at all, not avoiding a
+CPU-bound scan.</p>
+
+<p>One correctness-relevant design choice worth copying: it uses
+<b>N&sup2; hash functions rather than N</b>, because short patterns have too few
+distinct n-grams to get a low false-positive rate from a standard
+single-hash-per-position scheme <span class="p p-doc">upstream</span>.</p>
+
+<div class="box warn">
+<span class="label">Filters do not apply to every query class</span>
+<p>ugrep's indexed search is documented as incompatible with
+<span class="mono">-v</span>/<span class="mono">--invert-match</span>,
+<span class="mono">--filter</span>,
+<span class="mono">-P</span>/<span class="mono">--perl-regexp</span> and
+<span class="mono">-Z</span>/<span class="mono">--fuzzy</span>
+<span class="p p-doc">upstream</span>. The general lesson: a pre-index filter
+only helps where "do the pattern's n-grams occur in this file" is a valid
+<em>necessary</em> condition. Inverted and fuzzy matches do not have that
+property &mdash; a fuzzy match can occur with no exact n-gram from the pattern
+present. Treat "can this query even be filter-accelerated" as a first-class
+check on the query, not an assumption.</p>
+</div>
+
+<h3>The cascade</h3>
+
+<p>The composition pattern across every structure on this page, each layer
+strictly cheaper per candidate than the one below it:</p>
+
+<div class="tw">
+<table>
+<caption>Coarse filter to exact verify</caption>
+<thead><tr><th>Layer</th><th>Eliminates</th><th>Cost per candidate</th></tr></thead>
+<tbody>
+<tr><th>1. Shard-level filter</th><td>Whole shards, one fuse filter over all trigrams in the shard</td><td>3 memory probes</td></tr>
+<tr><th>2. Per-file filter</th><td>Whole files, <b>before the file's bytes are read off disk</b> &mdash; this is the layer that actually saves I/O</td><td>3 memory probes</td></tr>
+<tr><th>3. Trigram posting AND/OR</th><td>Narrows to a candidate file set, or with positional trigrams a candidate offset set</td><td>Posting-list decode and intersection</td></tr>
+<tr><th>4. Regex verify</th><td>Nothing &mdash; produces the answer</td><td>A full scan of exactly the surviving bytes. The only exact step, and the only one that can produce a false negative if skipped</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Putting the verify before the cheap filters, or skipping straight to
+corpus-wide posting-list ANDs without a per-shard filter, throws away most of
+the benefit. The ordering <em>is</em> the design.</p>
+
+<p>The selectivity condition that decides whether the index is worth consulting
+at all:</p>
+
+<figure class="code">
+<figcaption>When the index earns its lookup cost (R7 &sect;5.4)</figcaption>
+<pre><code>index_is_worth_it  &hArr;  (candidate_bytes_after_filtering / total_corpus_bytes)
+                        + (index_lookup_cost / total_scan_cost_if_brute_forced)
+                        &lt; 1
+</code></pre>
+</figure>
+
+<p>An index that narrows 200 GB to 2 GB of candidates is an easy win. One that
+degrades to match-all, or narrows only to 150 GB, is pure overhead on top of the
+brute-force scan it did not avoid &mdash; which is why the fallback threshold in
+the regex planner is load-bearing rather than a nicety.</p>
+
+<div class="box key">
+<span class="label">The thing to act on</span>
+<p>Build the per-file binary fuse filter first, before any posting list. At ~9
+bits per element it is far under 0.1&times; the text for realistic trigram
+cardinalities, it is the only layer that stops a cold file being opened, and
+<span class="mono">xorf</span> means it is a dependency rather than a project.</p>
+</div>
+</section>
+<section>
+<h2 id="columnar">Dense and columnar alternatives: the scan-first position</h2>
+
+<p>A whole lineage of systems &mdash; the observability and columnar world &mdash;
+deliberately made the trade Dave stated, and went further than he asked. They
+throw away the posting list entirely and keep only a skip structure over
+compressed blocks. Worth cataloguing honestly, including where it does not fit.</p>
+
+<div class="box warn">
+<span class="label">Provenance on this whole section</span>
+<p>Every VictoriaLogs performance and compression figure below traces to
+VictoriaMetrics itself or to a vendor-adjacent blog restating it. R10 found
+<b>no benchmark run by a party with no commercial relationship</b> to either
+product, with disclosed raw data and repeatable methodology
+<span class="p p-none">unknown</span>. The figures follow mechanically from the
+architecture and are directionally plausible; the magnitudes are unconfirmed.
+The "8 bytes per token" figure attributed to Lucene-style indexes &mdash; the
+denominator of the whole 4&times; thesis &mdash; is likewise vendor-stated
+without a cited derivation.</p>
+</div>
+
+<div class="tw">
+<table>
+<caption>Dense-index systems, index size versus raw data</caption>
+<thead>
+<tr><th>System</th><th>Model</th><th class="num">Index vs raw</th><th></th><th>Regex over content</th></tr>
+</thead>
+<tbody>
+<tr><th>Grafana Loki</th>
+<td>Labels only. Log body <b>not indexed at all</b>; chunks are gzip/zstd blobs. Optional per-chunk bloom filters (2024+, still experimental)</td>
+<td class="num">~1&ndash;2% <span class="p p-vendor">vendor</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:2%"></span></span><span class="val">0.02&times;</span></div></td>
+<td>Brute-force RE2 over decompressed chunks. No acceleration</td></tr>
+<tr><th>VictoriaLogs</th>
+<td>Columnar per-field blocks, per-block-column bloom over tokens. <b>No posting lists at all</b></td>
+<td class="num">~3&ndash;10% <span class="p p-vendor">vendor</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:7%"></span></span><span class="val">0.07&times;</span></div></td>
+<td><span class="mono">re()</span> gets <b>no block-skip benefit</b> &mdash; a regex has no fixed token set to hash. Full row scan of every surviving block</td></tr>
+<tr><th>ClickHouse (sparse PK + skip indexes)</th>
+<td>One mark per 8192-row granule, plus opt-in <span class="mono">minmax</span>, <span class="mono">set</span>, <span class="mono">ngrambf_v1</span>, <span class="mono">tokenbf_v1</span></td>
+<td class="num">&lt;&lt;1% for the sparse PK <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:1%"></span></span><span class="val">&lt;0.01&times;</span></div></td>
+<td><span class="mono">match()</span> is a granule-level linear scan after skip-index pruning</td></tr>
+<tr><th>Parquet + bloom</th>
+<td>Row groups, page min/max stats, optional split-block bloom (256-bit blocks of eight 32-bit words) per column chunk</td>
+<td class="num">bloom overhead only, bits/key chosen by the writer <span class="p p-doc">upstream</span></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:3%"></span></span><span class="val">&asymp;0</span></div></td>
+<td><span class="pill no">none native</span> query-engine layer only, after column decode</td></tr>
+<tr><th>Splunk (tsidx + bucket bloom)</th>
+<td><b>Real inverted index per bucket</b>, bloom filter only at the coarse bucket-skip layer</td>
+<td class="num">tsidx often &asymp; raw data size or larger <span class="p p-vendor">vendor</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:100%"></span></span><span class="val">&ge;1&times;</span></div></td>
+<td><span class="mono">| regex</span> runs against already-matched events, not the index</td></tr>
+<tr><th>Elasticsearch <span class="mono">match_only_text</span></th>
+<td>Same tokenisation and dictionary as <span class="mono">text</span>, positions and norms dropped</td>
+<td class="num">~10% smaller than full <span class="mono">text</span> on logging datasets <span class="p p-vendor">vendor</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:45%"></span></span><span class="val">0.9&times; of text</span></div></td>
+<td><span class="pill no">n/a</span> not a regex field type</td></tr>
+<tr><th>Elasticsearch <span class="mono">text</span></th>
+<td>Full Lucene inverted index with positions</td>
+<td class="num">30&ndash;100%+ of source <span class="p p-vendor">vendor</span></td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:65%"></span></span><span class="val">0.3&ndash;1&times;</span></div></td>
+<td><span class="mono">regexp</span>/<span class="mono">wildcard</span> over the term dictionary &mdash; indexed, but expensive for leading wildcards</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>The techniques, extracted</h3>
+
+<div class="tw">
+<table>
+<caption>Reusable pieces, independent of the systems that popularised them</caption>
+<thead><tr><th>Technique</th><th>Cost</th><th>When it helps</th></tr></thead>
+<tbody>
+<tr><th>Sparse primary index</th>
+<td>row count / N entries, <em>independent of block contents</em>. ClickHouse N = 8192 rows <span class="p p-doc">upstream</span>; VictoriaLogs' analogue is a ~2 MiB block <span class="p p-doc">upstream</span></td>
+<td>Only when the predicate correlates with the sort order. Free for path-prefix, mtime-range and size-range queries; near-useless for full-text, which is not range-shaped</td></tr>
+<tr><th>Zone maps / min-max</th>
+<td>Two values per block</td>
+<td>Range predicates only, and <b>only if the data is sorted or locally clustered</b> by that column &mdash; an unsorted min-max index degenerates to global min and max and prunes nothing</td></tr>
+<tr><th>Time / mtime partitioning</th>
+<td>Free &mdash; directory naming does the pruning before any index is opened</td>
+<td>The special case where the partition boundary <em>is</em> the zone map. Free for "modified in the last week"; zero value for content queries</td></tr>
+<tr><th>Per-block bloom over tokens</th>
+<td>VictoriaLogs: <b>~2 bytes = 16 bits per unique token per block</b> <span class="p p-doc">upstream</span>. 20,000 unique tokens in a block costs ~40 KB</td>
+<td>Coarse block-skip. Note this is <em>not</em> tuned to a target FPR &mdash; it is a flat budget accepted as good enough, trading a higher FPR for predictability</td></tr>
+<tr><th>Columnar + zstd with a trained dictionary</th>
+<td>LZ4 decompresses at ~4&ndash;5 GB/s, zstd level 1 at ~1.3&ndash;1.4 GB/s single-core <span class="p p-bench">benchmark</span></td>
+<td>When the column clusters similar values and the win comes from cross-row redundancy. zstd decompression speed is roughly <b>independent of the compression level</b> used to produce the frame &mdash; which is why these systems compress aggressively at write time for free at query time</td></tr>
+<tr><th>A tiny always-resident summary</th>
+<td>Quickwit's hotcache: <b>under 0.1% of split size</b>, ~10 MB, opens a split from S3 in under 60 ms <span class="p p-vendor">vendor</span></td>
+<td>A "which byte ranges do I need" blueprint in front of a heavy on-disk structure is a cheap win regardless of whether that structure is dense or sparse</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>The arithmetic: where a bloom filter beats a real posting list</h3>
+
+<p>This is the central question of R10's slice, and it has a clean answer.
+Setup: a corpus of D documents or blocks, a term t appearing in n of them.</p>
+
+<div class="tw">
+<table>
+<caption>Bloom-over-blocks versus a compressed posting list</caption>
+<thead><tr><th></th><th>Posting list</th><th>Bloom-style block filter</th></tr></thead>
+<tbody>
+<tr><th>Cost</th>
+<td class="num">O(n) &times; bytes/posting &mdash; <b>strictly linear in occurrence count</b>. ~1&ndash;2 bytes/posting for delta+VByte/PFOR at typical gap sizes <span class="p p-est">estimate</span></td>
+<td class="num">O(B) &times; const, where B = number of blocks &mdash; <b>essentially independent of intra-block frequency</b>. ~9&ndash;18 bits/key tuned, or VictoriaLogs' flat 16 bits/token</td></tr>
+<tr><th>Low-frequency, well-distributed term</th>
+<td>n &asymp; blocks hit, so the two converge</td>
+<td><b>Wins hugely.</b> Pays per block, not per occurrence, and never writes exact positions</td></tr>
+<tr><th>High-frequency term in few blocks</th>
+<td>One entry (or a handful) for that block</td>
+<td>Costs the same flat per-block budget it always does &mdash; and once inside a flagged block you get <b>zero help</b> finding the matching rows</td></tr>
+<tr><th>Worked case</th>
+<td>A positional index over a 2 MiB text block with 200,000+ occurrences costs meaningfully more than 40 KB the moment average term frequency exceeds ~1, i.e. almost always</td>
+<td>A block with 20,000 unique tokens costs 40 KB <em>regardless of occurrence count</em> <span class="p p-doc">upstream</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">Where the crossover actually lands</span>
+<p>The bloom trade is a clean win when the unit of "found it" is <b>coarse</b>
+&mdash; a whole log line, a whole block, a whole file &mdash; and a bad one when
+you need to <em>locate</em> the match cheaply. VictoriaLogs' index is an order
+of magnitude smaller than Lucene's because it throws away <em>all</em>
+intra-block addressing, not merely positions. A tool answering "which files
+contain X" can tolerate block-then-scan. A tool expected to jump to line N
+inside a 50,000-line file cannot, without at least an in-block offset table
+&mdash; much smaller than full positions, but not free.</p>
+</div>
+
+<h3>The scan-first argument, and where it breaks</h3>
+
+<p>At ~1.3 GB/s single-core zstd decompression, scanning a fully decompressed
+10 GB hot set costs <b>~7.7 s single-threaded</b>
+<span class="p p-est">estimate</span>, trivially parallel to sub-second on a
+modern desktop. If the selective working set after cheap block and zone-map
+pruning is single-digit GB, brute-force decompress-and-scan is competitive with
+maintaining a term index, and categorically simpler. On the measured corpus the
+figure is stronger again: 5.73 GB of real signal after exclusions
+<span class="p p-measured">measured</span>, and 50 ms for a hard regex over it.</p>
+
+<p>Three reasons the log lineage's architecture does not transfer wholesale:</p>
+
+<div class="tw">
+<table>
+<caption>Where the log-search assumptions fail on a desktop corpus</caption>
+<thead><tr><th>Log-lineage assumption</th><th>Desktop reality</th></tr></thead>
+<tbody>
+<tr><th>Data ages out; most of it is never queried before retention expires, so per-occurrence structure is wasted</th>
+<td>Files do not age out. "Search all my files" is the common case and it <em>recurs</em> &mdash; you re-search your own codebase dozens of times a day. This removes the strongest argument for bloom-over-blocks</td></tr>
+<tr><th>A log line is already the natural unit of a hit, so block granularity is fine</th>
+<td>A 50,000-line source file is not. You want line and offset level results, which pushes back toward wanting <em>some</em> per-occurrence structure</td></tr>
+<tr><th>Regex is a rare ad-hoc investigation, latency-tolerant</th>
+<td>Regex-over-content is a stated hard requirement here &mdash; and it is precisely the query type <b>none</b> of these systems accelerate</td></tr>
+<tr><th>Recency skew justifies hot/cold tiering</th>
+<td>A five-year-old PDF is queried as often, in expectation, as yesterday's. This technique transfers weakly</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn">
+<span class="label">A contradiction inside this lineage</span>
+<p>VictoriaMetrics positions "not an inverted index" as categorically superior.
+But ClickHouse's 2025&ndash;2026 trajectory runs the other way: it dropped its
+bloom-filter-only <span class="mono">tokenbf_v1</span>/<span class="mono">ngrambf_v1</span>
+approach in favour of a real native inverted index, re-implemented from scratch
+from Feb 2025, beta Dec 2025, GA around March 2026, reporting a
+<b>10&ndash;50&times; query-latency win</b> over the bloom approach and
+7&ndash;10&times; on cold queries <span class="p p-vendor">vendor</span>. That
+is direct evidence from a comparable system that bloom-over-columnar-blocks has
+a real ceiling once latency is prioritised. Notably ClickHouse's new index is
+explicitly <b>not a relevance engine</b> &mdash; no BM25, no TF-IDF, built for
+filter-and-aggregate. The field is bifurcating, not converging.</p>
+</div>
+
+<div class="box key">
+<span class="label">The thing to act on</span>
+<p>Borrow the layering, not the philosophy. R10's own conclusion is that the
+transferable pattern is <b>Splunk's</b>, not VictoriaLogs': a cheap flat-cost
+bloom at file or block granularity purely to skip whole files, sitting
+<em>in front of</em> a real (non-positional) per-file structure &mdash; not as a
+substitute for it. Add VictoriaLogs' columnar-dictionary-then-zstd encoding for
+every metadata column (path, size, mtime, extension, mime type), where there is
+no argument for anything heavier.</p>
+</div>
+</section>
+<section>
+<h2 id="vector">Vector and learned-sparse structures</h2>
+
+<p>R9 frames this whole area as a ratio rather than an absolute, and that is the
+only framing that survives contact with the density mandate: <b>GB of index per
+GB of corpus</b>. The lexical index for this corpus is roughly
+<b>0.1&ndash;0.3 GB/GB</b> <span class="p p-est">estimate</span>. Every vector
+configuration below is priced against that line.</p>
+
+<h3>The storage table, which decides everything downstream</h3>
+
+<div class="tw">
+<table>
+<caption>Raw vector bytes, before graph overhead. Chunk counts: ~3M for a 10 GB corpus, ~57M for 200 GB <span class="p p-est">estimate</span></caption>
+<thead>
+<tr><th>Dim / precision</th><th class="num">10 GB corpus</th><th class="num">200 GB corpus</th><th class="num">GB per GB</th><th></th></tr>
+</thead>
+<tbody>
+<tr><th>384-binary</th><td class="num">0.14 GB</td><td class="num">2.7 GB</td><td class="num"><b>~0.014</b></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:1.4%"></span></span><span class="val">0.014&times;</span></div></td></tr>
+<tr><th>768-binary</th><td class="num">0.29 GB</td><td class="num">5.5 GB</td><td class="num">~0.027</td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:3%"></span></span><span class="val">0.027&times;</span></div></td></tr>
+<tr><th>1024-binary</th><td class="num">0.38 GB</td><td class="num">7.3 GB</td><td class="num">~0.037</td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:4%"></span></span><span class="val">0.037&times;</span></div></td></tr>
+<tr><th>384-int8</th><td class="num">1.2 GB</td><td class="num">22 GB</td><td class="num">~0.11</td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:11%"></span></span><span class="val">0.11&times;</span></div></td></tr>
+<tr><th>768-int8</th><td class="num">2.3 GB</td><td class="num">44 GB</td><td class="num">~0.22</td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:22%"></span></span><span class="val">0.22&times;</span></div></td></tr>
+<tr><th>1024-int8</th><td class="num">3.1 GB</td><td class="num">58 GB</td><td class="num">~0.29</td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:29%"></span></span><span class="val">0.29&times;</span></div></td></tr>
+<tr><th>384-fp32</th><td class="num">4.6 GB</td><td class="num">88 GB</td><td class="num">~0.44</td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:44%"></span></span><span class="val">0.44&times;</span></div></td></tr>
+<tr><th>768-fp32</th><td class="num">9.2 GB</td><td class="num">176 GB</td><td class="num">~0.88</td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:88%"></span></span><span class="val">0.88&times;</span></div></td></tr>
+<tr><th>1024-fp32</th><td class="num">12.3 GB</td><td class="num">234 GB</td><td class="num">~1.17</td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:100%"></span></span><span class="val">1.17&times;</span></div></td></tr>
+<tr><th>1536-fp32</th><td class="num">18.4 GB</td><td class="num">350 GB</td><td class="num">~1.75</td>
+<td><div class="bar"><span class="track"><span class="fill vhi" style="width:100%"></span></span><span class="val">1.75&times;</span></div></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Every figure here is <span class="p p-est">estimate</span> &mdash; pure
+chunk-count &times; byte-width arithmetic, no vendor claim. HNSW's graph edges
+add another 20&ndash;40% on top. The line to read against is the lexical index's
+0.1&ndash;0.3: at 768-fp32 the vector store is 176 GB against a 10&ndash;30 GB
+lexical index. At 768-int8 it is comparable. <b>Only binary quantisation at
+384 dimensions undercuts the lexical index outright</b>, at ~0.014 GB/GB
+&mdash; roughly an order of magnitude denser than the lexical index itself, and
+the one configuration compatible with the stated preference.</p>
+
+<h3>ANN index structures</h3>
+
+<div class="tw">
+<table>
+<caption>Approximate nearest-neighbour structures</caption>
+<thead>
+<tr><th>Structure</th><th>Mechanism</th><th>Query-time memory</th><th>Update / delete</th><th>Rust</th></tr>
+</thead>
+<tbody>
+<tr><th>HNSW</th>
+<td>Multi-layer proximity graph, greedy descent from the top layer</td>
+<td><b>Fully RAM-resident in nearly all implementations</b> &mdash; the defining constraint. Build is O(n log n) and slow past 50M</td>
+<td>Insert supported; delete is tombstone-only, real compaction rare and expensive</td>
+<td><span class="mono">hnsw_rs</span>, <span class="mono">instant-distance</span>, <span class="mono">usearch</span> bindings <span class="pill yes">mature</span></td></tr>
+<tr><th>IVF / IVF-PQ / IVF-SQ</th>
+<td>k-means coarse quantiser partitions space; search probes nearest cells; PQ/SQ compress residuals</td>
+<td>Much lower than HNSW at the same recall &mdash; codes are small. Needs a training pass first</td>
+<td>Better than HNSW (cell-based), still not free</td>
+<td>Faiss is C++/Python; Rust bindings thinner than the HNSW family</td></tr>
+<tr><th>DiskANN / Vamana</th>
+<td>Single-layer graph built to be disk-friendly; hot vertices cached in RAM, rest read from SSD</td>
+<td><b>Small RAM by design</b>, but build is CPU/RAM-heavy anyway. Documented weakness: high query latency from limited DRAM and parallelism relative to SPANN <span class="p p-bench">benchmark</span></td>
+<td>Largely build-once; SPFresh targets incremental in-place update as an open problem DiskANN did not solve</td>
+<td><span class="mono">diskann</span> crate far less mature; expect to build against the C++ or reimplement</td></tr>
+<tr><th>SPANN</th>
+<td>Inverted-index-style &mdash; only centroids in RAM, large posting lists on disk. The closest analogue to a lexical posting list</td>
+<td><b>Very low</b> &mdash; centroids only</td>
+<td>SPFresh is explicitly the incremental follow-on, implying vanilla SPANN's update story was weak too</td>
+<td><span class="pill no">no mainstream crate</span> Microsoft C++ reference</td></tr>
+<tr><th>ScaNN</th>
+<td>Anisotropic quantisation tuned to the actual inner-product objective, not generic reconstruction error</td>
+<td>Compact</td>
+<td>Largely static/batch</td>
+<td><span class="pill no">none</span> would need FFI</td></tr>
+<tr><th>NGT</th><td>Graph-based (ANNG/ONNG), same family as HNSW</td><td>RAM-resident</td><td>Delete support historically stronger than raw HNSW</td><td><span class="pill no">no mainstream binding</span></td></tr>
+<tr><th>Annoy</th><td>Random-projection forest</td><td>RAM or mmap-able, read-only</td><td><span class="pill dead">no update or delete at all</span></td><td>Not relevant to a live index, for exactly that reason</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>SPANN's reported figure, worth carrying: it "significantly outperforms
+DiskANN in both recall@1 and recall@10 especially in the low query latency
+budget (&lt;4ms), and is more than two times faster than DiskANN to reach 95%
+recall" <span class="p p-paper">paper</span>. The structural point is that SPANN
+is the ANN design that most resembles a posting list, which makes it the
+conceptually cheapest to bolt onto an existing inverted-index engine &mdash; and
+it has no Rust path.</p>
+
+<h3>Quantisation: the lever that makes the storage table survivable</h3>
+
+<div class="tw">
+<table>
+<caption>Compression of the vector store</caption>
+<thead><tr><th>Technique</th><th>Effect</th><th>Recall</th></tr></thead>
+<tbody>
+<tr><th>Binary quantisation + Hamming rescoring</th>
+<td class="num"><b>32&times;</b> reduction &mdash; 88 GB fp32 to 2.7 GB binary at 384-dim for the 200 GB case <span class="p p-est">estimate</span>, matching the fp32-to-binary byte-width ratio exactly</td>
+<td>Historically its weak point: a lossy hack that worked only for easy queries</td></tr>
+<tr><th><b>RaBitQ</b> (SIGMOD 2024)</th>
+<td>Randomised quantisation via a Johnson-Lindenstrauss rotation to D-bit strings <b>with a theoretical error bound</b> rather than the heuristic error of naive binary quantisation. An extended version (SIGMOD 2025) improves further</td>
+<td><b>Over 95% recall typically achievable with 100 or fewer reranking candidates</b> on datasets over 1M vectors <span class="p p-paper">paper</span> &mdash; this is what closes the gap</td></tr>
+<tr><th>Matryoshka embeddings</th>
+<td>Truncatable dimensions: a prefix of the vector is itself a valid lower-quality embedding, so one stored artefact serves both a coarse first pass and the rerank</td>
+<td>Avoids needing two trained models or two stores</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box key">
+<span class="label">The one configuration that fits a density mandate</span>
+<p>RaBitQ-style binary quantisation plus rerank-on-candidates. It is the
+difference between choosing 88 GB of fp32 and being stuck with it, and a 2.7 GB
+store that undercuts the lexical index by an order of magnitude with a bounded
+recall guarantee that older ad-hoc binary methods did not have. Any other row in
+the storage table costs more than the entire lexical index it is meant to
+complement.</p>
+</div>
+
+<h3>Learned sparse: SPLADE and the "reuse your inverted index" promise</h3>
+
+<p>The architectural appeal is real and it is the most actionable idea in R9 for
+a from-scratch Ferret-shaped index: SPLADE produces a sparse weighted term
+vector that lives in <em>the posting lists you already have</em> &mdash; no
+separate ANN structure, no GB of dense floats. But it is not free density, and
+R9 quantifies the bloat rather than waving at it.</p>
+
+<div class="tw">
+<table>
+<caption>SPLADE index bloat, worked</caption>
+<thead><tr><th>Quantity</th><th>Value</th><th>Scope</th></tr></thead>
+<tbody>
+<tr><th>Non-zero terms per document</th>
+<td class="num">~127 average <span class="p p-bench">benchmark</span></td>
+<td>splade-cocondenser-ensembledistil on MS MARCO</td></tr>
+<tr><th>Sparse index for 100K documents</th>
+<td class="num">93 MB &asymp; <b>930 bytes/document</b> <span class="p p-bench">benchmark</span></td>
+<td>Same measurement</td></tr>
+<tr><th>Expansion multiplier vs plain lexical</th>
+<td class="num">roughly <b>2&ndash;4&times;</b> the postings entries per document <span class="p p-est">estimate</span></td>
+<td>Against a 100&ndash;300 distinct-term baseline for natural English &mdash; a rule of thumb, not measured. Treat as directional</td></tr>
+<tr><th>Scaled to the 200 GB case</th>
+<td class="num">930 B &times; ~57M chunks &asymp; <b>~53 GB</b> of additional postings <span class="p p-est">estimate</span></td>
+<td><b>Very likely an undercount.</b> MS MARCO passages are ~55&ndash;60 tokens; these chunks are 256&ndash;1024. Real cost could land anywhere from ~50 GB to <b>~500 GB</b> depending on chunk length and FLOPS-regularisation tuning</td></tr>
+<tr><th>Against the plain lexical index (10&ndash;30 GB)</th>
+<td class="num">a naively-tuned SPLADE layer could <b>double to quintuple total index size</b> <span class="p p-est">estimate</span></td>
+<td>The "reuses what you already have" framing is architecturally true but not size-free</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The mechanism is term expansion: SPLADE assigns weight to related vocabulary
+the document never contains &mdash; that <em>is</em> the paraphrase tolerance
+&mdash; and each synthetic term becomes a posting. The paper's own L1-style
+FLOPS regularisation exists to cap this, because unconstrained sparsity both
+bloats the index and lengthens posting-list traversal.</p>
+
+<div class="box warn">
+<span class="label">Two cautions R9 states explicitly</span>
+<p><b>Do not adopt BM42</b> on the strength of its launch post &mdash; Qdrant's
+own SPLADE-adjacent claim was contested within months. SPLADE itself has real,
+less-contested evidence. And check the <b>licence per checkpoint</b>: NAVER's
+original SPLADE releases have historically been closer to research /
+non-commercial than a clean Apache or MIT grant. Verify the specific checkpoint's
+licence file before any redistribution rather than assuming.</p>
+</div>
+
+<div class="box gap">
+<span class="label">Embeddable stores, and a hard ceiling</span>
+<p><span class="mono">sqlite-vec</span> is <b>brute-force, with no ANN index</b>
+as of its v0.1.0 stable release, and is documented as struggling above ~1M
+high-dimensional vectors <span class="p p-bench">benchmark</span> &mdash; which
+caps it out of contention for the tens-of-millions-of-chunks end of this corpus
+unless paired with a pre-filter. DuckDB VSS was reported to "nearly OOM a
+development machine" at 500K vectors &times; 512d
+<span class="p p-bench">benchmark</span>; DuckDB is built to consume all
+available RAM, a bad fit for a background daemon. <b>LanceDB</b> (Rust core,
+IVF-PQ) and <b>Qdrant</b> (Rust, HNSW, embedded mode) are the credible
+candidates, but R9 found <b>no independently-verified demonstration</b> of
+either at this scale on a desktop <span class="p p-none">unknown</span>.</p>
+</div>
+
+<div class="box verdict">
+<span class="label">Where R9 lands</span>
+<p>Semantic search over the full corpus is possible but not an "index it
+overnight" feature: CPU-only first-embed of a 200 GB mixed corpus is
+<b>13&ndash;40 days</b> <span class="p p-est">estimate</span>, and the boundary
+between "runs overnight" and "runs for weeks" sits somewhere in the
+<b>20&ndash;50 GB band</b>, not at 200 GB. The answer R9 lands on is
+<b>opt-in, per-collection, over a curated 1&ndash;10 GB slice</b> &mdash; a
+project's docs, a PDF archive, a mail folder &mdash; where the vector store
+drops to low single-digit GB even at fp32 and HNSW's RAM residency stops
+mattering at all.</p>
+</div>
+
+<div class="box key">
+<span class="label">The thing to act on</span>
+<p>If you build a vector tier, build it as a per-collection opt-in with 384-dim
+binary quantisation and an fp32 rerank &mdash; that is the only cell in the
+storage table that is denser than the lexical index it complements. Treat SPLADE
+as the more interesting long-run option precisely because it needs no new
+structure, but measure its expansion on the real corpus before believing the
+"barely bigger than lexical" framing.</p>
+</div>
+</section>
+<section>
+<h2 id="matrix">The selection matrix: query shape by density budget</h2>
+
+<p>R7's matrix, extended with the term-postings, filter, columnar and vector
+material from the other files. Budget tiers are defined in bytes of index per
+byte of <em>text</em>, not in abstract labels, and every row states its
+incremental-update cost as a first-order property. <b>A structure that is small
+but rebuild-only is disqualified from being the live tier</b> in a near-real-time
+indexer, however good its resting place as a cold segment.</p>
+
+<div class="tw">
+<table>
+<caption>Density tiers</caption>
+<thead><tr><th>Tier</th><th class="num">Budget</th><th>Occupants</th></tr></thead>
+<tbody>
+<tr><th>Dense</th><td class="num">&lesssim;0.1&ndash;0.3&times; text</td>
+<td>Binary fuse and blocked-Bloom filters; FM-index, r-index, move-r; docs-only and docs+freq postings; 384-dim binary vectors; sparse indexes and zone maps</td></tr>
+<tr><th>Moderate</th><td class="num">~1&ndash;1.5&times; text</td>
+<td>Positional trigram index (zoekt ~1.2&times;); doc-only trigrams sit under 1&times; but pair naturally with this tier; int8 vectors</td></tr>
+<tr><th>Heavy</th><td class="num">&ge;2&ndash;5&times; text</td>
+<td>Positional postings at the top of their range; suffix array + LCP (<b>disqualified</b> except as a build-time intermediate); suffix tree / CDAWG (<b>never</b>); fp32 vectors; an unregularised SPLADE layer</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tw">
+<table>
+<caption>Query shape &times; density budget. The right-hand column is the property that most often decides the row.</caption>
+<thead>
+<tr><th>Query shape</th><th>Dense (&lesssim;0.3&times;)</th><th>Moderate (~1&ndash;1.5&times;)</th><th>Heavy (&ge;2&times;)</th><th>Incremental update</th></tr>
+</thead>
+<tbody>
+
+<tr><th>Filename substring</th>
+<td>Trigram index over filenames only. The whole filename corpus is a rounding error at 1M&ndash;5M files &mdash; effectively free at any tier. <b>Always build this</b></td>
+<td>Same. No reason to spend more</td>
+<td><span class="pill no">never justified</span></td>
+<td><span class="pill yes">cheap</span> a rename touches a handful of postings. Keep it fully mutable in place; no segment merge needed at this scale</td></tr>
+
+<tr><th>Metadata: extension, mtime, size, path depth</th>
+<td>Doc values / fast fields, plus zone maps and mtime partitioning &mdash; a removal from the postings machinery, not an addition. Roaring bitmaps for the boolean filter sets</td>
+<td>Same</td>
+<td><span class="pill no">never</span> a term index over metadata is pure waste</td>
+<td><span class="pill yes">cheap</span> columnar rewrite per segment. Metadata crawl of the whole target corpus costs <b>1.24 s warm</b> <span class="p p-measured">measured</span> &mdash; free</td></tr>
+
+<tr><th>Content literal</th>
+<td>Per-file binary fuse filter as the admission gate, backed by a doc-only trigram index for files that pass; brute-force verify the survivors</td>
+<td>Positional trigrams &mdash; verify jumps straight to candidate offsets. Note this is the <em>reverse</em> of the stated trade: positional trigrams cost more than doc-only, so spend here only if literal-search latency on large files matters</td>
+<td><span class="pill no">never</span> an SA's 4&ndash;5&times; buys locate time a trigram+verify pipeline already gets close enough to</td>
+<td>Trigram postings are cheaply mutable &mdash; this is the live segment. Fuse filters are immutable but per-file, so a change rebuilds one file's filter, not the corpus's</td></tr>
+
+<tr><th>Content phrase</th>
+<td>Docs+freq postings only, phrase resolved by <b>re-scanning the candidate file</b>, gated on an mtime/inode doc-value check. This is the biggest single density win available</td>
+<td>Positional postings, or positional trigrams with the adjacency check. Costs 3&ndash;10&times; the postings tier for latency you probably do not need</td>
+<td><span class="pill no">never</span></td>
+<td><span class="pill yes">segmented</span>. The re-scan design adds one doc-value field and removes a whole stream</td></tr>
+
+<tr><th>Ranked retrieval (BM25/BM25F)</th>
+<td>Docs+freq postings, Elias-Fano coded, path-sorted docIDs. Add mtime, path-affinity and file-type priors as post-BM25 score multipliers &mdash; none of them touch the index format</td>
+<td>+ block-max scores per 128-doc block for BMW pruning. Negligible density cost, real latency win &mdash; <b>this row is not on the size/speed curve</b></td>
+<td>Impact-ordered postings: a web-scale technique that breaks exact Boolean filtering, which a desktop tool always needs</td>
+<td><span class="pill yes">segmented</span>. Block-max scores are recomputed at merge, not per update</td></tr>
+
+<tr><th>Content regex <span class="p p-doc">hard requirement</span></th>
+<td>Cox trigram derivation over a doc-only index behind a fuse-filter gate, brute-force fallback for the unindexable fraction. <b>The cheapest structure that still makes the common case fast</b></td>
+<td>Same derivation over positional trigrams if verify latency on large files becomes the real bottleneck. Still needs the fallback for degenerate patterns</td>
+<td>An SA is not the answer even here. If you want exact, false-positive-free regex, the answer is r-index/move-r, not a plain SA</td>
+<td><b>Live:</b> trigram postings, cheaply mutable. <b>Cold:</b> fold files below a "unchanged for N days" watermark into an r-index/move-r segment for exact automaton search at or below compressed-text size. Budget that as a genuine second-phase deliverable, not exotica</td></tr>
+
+<tr><th>Fuzzy / typo-tolerant over terms</th>
+<td>Levenshtein automaton intersected with the FST dictionary &mdash; free, the dictionary is already there</td>
+<td>Same</td>
+<td><span class="pill no">never</span></td>
+<td><span class="pill part">batch</span> the FST rebuilds per segment</td></tr>
+
+<tr><th>Fuzzy over content</th>
+<td><b>Not filter-accelerable at all.</b> ugrep explicitly excludes fuzzy from its indexed path &mdash; a fuzzy match can occur with no exact n-gram from the pattern present. Brute-force with an approximate scanner is the only honest option regardless of tier</td>
+<td>A q-gram-relaxed candidate generator ("at least k of n query trigrams") over the same index narrows candidates before an approximate verify, trading recall for speed</td>
+<td>Not worth the space at any tier</td>
+<td>Shares the trigram structure; the approximate verify has no index of its own</td></tr>
+
+<tr><th>Semantic similarity</th>
+<td>384-dim binary quantisation with an fp32 rerank, RaBitQ-style, at ~0.014 GB/GB &mdash; the only vector configuration denser than the lexical index it complements</td>
+<td>int8 at 0.11&ndash;0.29 GB/GB, comparable to the whole lexical index</td>
+<td>fp32 at 0.88&ndash;1.75 GB/GB. An unregularised SPLADE layer, which could double to quintuple total index size</td>
+<td><span class="pill part">HNSW inserts, tombstone deletes.</span> The real cost is the embedding pass: <b>13&ndash;40 days CPU-only</b> for a 200 GB corpus <span class="p p-est">estimate</span>. Scope it per-collection over a curated 1&ndash;10 GB slice</td></tr>
+
+<tr><th>The degenerate tail<br>(<span class="mono">.*</span>, short alternations, <span class="mono">\b</span>-only)</th>
+<td colspan="3">Brute-force scan. <b>Not a failure mode</b> &mdash; on the measured corpus a hard regex over the gitignore-pruned tree costs <b>0.05 s</b> at ~1000% CPU <span class="p p-measured">measured</span>, and a full unpruned scan of 153.2 GB costs 217&ndash;234 s at 0.65&ndash;0.71 GB/s, I/O-bound <span class="p p-measured">measured</span></td>
+<td>No index to update. Make this a first-class, memory-mapped, multi-threaded, SIMD-prefiltered code path &mdash; reuse ripgrep's crates rather than writing one</td></tr>
+
+</tbody>
+</table>
+</div>
+
+<h3>One measured ladder worth having in front of you</h3>
+
+<p>The clearest published instance of the positions trade, from SQLite FTS5's
+<span class="mono">detail=</span> knob on one reference corpus
+<span class="p p-community">anecdote</span> &mdash; one corpus, community
+reported, needs re-measurement, but it is the only place a mainstream engine
+incidentally published the number at all:</p>
+
+<div class="tw">
+<table>
+<caption>FTS5 <span class="mono">detail=</span> on one reference corpus</caption>
+<thead><tr><th>Setting</th><th class="num">Index size</th><th></th><th>What it loses</th></tr></thead>
+<tbody>
+<tr><th><span class="mono">detail=full</span></th><td class="num">743 MiB</td>
+<td><div class="bar"><span class="track"><span class="fill hi" style="width:100%"></span></span><span class="val">1.0&times;</span></div></td>
+<td>Baseline &mdash; the tier phrase search actually requires</td></tr>
+<tr><th><span class="mono">detail=column</span></th><td class="num">340 MiB &mdash; <b>2.2&times; smaller</b></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:46%"></span></span><span class="val">0.46&times;</span></div></td>
+<td>Phrase and NEAR; keeps same-column existence</td></tr>
+<tr><th><span class="mono">detail=none</span></th><td class="num">134 MiB &mdash; <b>5.5&times; smaller</b></td>
+<td><div class="bar"><span class="track"><span class="fill" style="width:18%"></span></span><span class="val">0.18&times;</span></div></td>
+<td>Phrase, NEAR and column filters entirely &mdash; doclist becomes a rowid list</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>R5's reading of this across every format it surveyed: <em>every</em> engine
+that documents a density knob does it the same way &mdash; drop positions, keep
+doc-membership or freq &mdash; and the price is always phrase support. FTS5's
+mistake is making it a table-wide setting. Lucene and Tantivy make it per-field,
+and a from-scratch design should too: positions (or the re-scan substitute) for
+body text, existence-only for structural fields, doc values for anything needing
+range or sort rather than term match.</p>
+
+<div class="box verdict">
+<span class="label">What the matrix says as one sentence</span>
+<p>Filters first, then a doc-only trigram index with the Cox derivation and an
+honest brute-force fallback, then docs+freq postings under Elias-Fano with
+phrase resolved by re-scan; positional structures only if measurement shows
+verify latency is the real bottleneck; move-r as a cold-segment second phase for
+the repetitive fraction; and vectors as a per-collection opt-in at 384-dim
+binary. Every one of those choices leads with bytes, and each has a named point
+at which measurement would overturn it.</p>
+</div>
+</section>
+<div class="sources">
+<h2 class="nonum" id="sources">Sources</h2>
+<ol>
+<li id="r1"><a href="https://lucene.apache.org/core/9_11_0/core/org/apache/lucene/index/IndexOptions.html">Lucene <span class="mono">IndexOptions</span> javadoc &mdash; Apache Lucene</a></li>
+<li id="r2"><a href="https://www.di.unipi.it/~ottavian/files/elias_fano_sigir14.pdf">Ottaviano &amp; Venturini, Partitioned Elias-Fano Indexes &mdash; SIGIR 2014</a></li>
+<li id="r3"><a href="https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/match-only-text">The <span class="mono">match_only_text</span> field type &mdash; Elastic</a></li>
+<li id="r4"><a href="https://dl.acm.org/doi/10.1145/2009916.2010048">Ding &amp; Suel, Faster Top-k Document Retrieval Using Block-Max Indexes &mdash; SIGIR 2011</a></li>
+<li id="r5"><a href="https://pisa.readthedocs.io/en/latest/document_reordering.html">Document reordering &mdash; PISA documentation</a></li>
+<li id="r6"><a href="https://swtch.com/~rsc/regexp/regexp4.html">Russ Cox, Regular Expression Matching with a Trigram Index &mdash; swtch.com</a></li>
+<li id="r7"><a href="https://github.com/sourcegraph/zoekt/blob/main/doc/design.md">zoekt design document &mdash; Sourcegraph</a></li>
+<li id="r8"><a href="https://arxiv.org/abs/1209.2137">Lemire &amp; Boytsov, Decoding billions of integers per second through vectorization &mdash; SPE 2015</a></li>
+<li id="r9"><a href="https://arxiv.org/abs/1402.6407">Chambi, Lemire, Kaser, Godin, Better bitmap performance with Roaring bitmaps &mdash; SPE 2016</a></li>
+<li id="r10"><a href="https://arxiv.org/abs/1705.10382">Gagie, Navarro, Prezza, Optimal-Time Text Indexing in BWT-runs Bounded Space &mdash; SODA 2018 / JACM 2020</a></li>
+<li id="r11"><a href="https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.SEA.2024.1">Bertram et al., move-r &mdash; SEA 2024</a></li>
+<li id="r12"><a href="https://arxiv.org/pdf/2201.01174">Graf &amp; Lemire, Binary Fuse Filters: Fast and Smaller Than Xor Filters &mdash; 2022</a></li>
+<li id="r13"><a href="https://github.com/Genivia/ugrep-indexer">ugrep-indexer &mdash; Genivia</a></li>
+<li id="r14"><a href="https://arxiv.org/pdf/1602.08820">Dhulipala et al., Compressing Graphs and Indexes with Recursive Graph Bisection &mdash; KDD 2016</a></li>
+<li id="r15"><a href="https://docs.rs/fst/latest/fst/trait.Automaton.html">The <span class="mono">fst::Automaton</span> trait &mdash; docs.rs</a></li>
+<li id="r16"><a href="https://victoriametrics.com/blog/victorialogs-internals-columnar-storage-on-disk/">VictoriaLogs internals: columnar storage on disk &mdash; VictoriaMetrics</a></li>
+<li id="r17"><a href="https://clickhouse.com/docs/guides/best-practices/sparse-primary-indexes">Sparse primary indexes &mdash; ClickHouse documentation</a></li>
+<li id="r18"><a href="https://clickhouse.com/blog/clickhouse-full-text-search">Inside ClickHouse full-text search &mdash; ClickHouse</a></li>
+<li id="r19"><a href="https://parquet.apache.org/docs/file-format/bloomfilter/">Bloom filter specification &mdash; Apache Parquet</a></li>
+<li id="r20"><a href="https://dl.acm.org/doi/pdf/10.1145/3654970">Gao &amp; Long, RaBitQ &mdash; SIGMOD 2024</a></li>
+<li id="r21"><a href="https://arxiv.org/pdf/2111.08566">Chen et al., SPANN: Highly-efficient Billion-scale Approximate Nearest Neighbor Search &mdash; NeurIPS 2021</a></li>
+<li id="r22"><a href="https://europe.naverlabs.com/blog/splade-a-sparse-bi-encoder-bert-based-model-achieves-effective-and-efficient-first-stage-ranking/">SPLADE: a sparse bi-encoder BERT-based model &mdash; NAVER Labs Europe</a></li>
+<li id="r23"><a href="https://github.com/kampersanda/sucds">sucds &mdash; succinct data structures in Rust</a></li>
+<li id="r24"><a href="https://github.com/pisa-engine/pisa">PISA &mdash; Performant Indexes and Search for Academia</a></li>
+<li id="r25"><a href="https://db.cs.cmu.edu/mmap-cidr2022/">Crotty, Leis, Pavlo, Are You Sure You Want to Use MMAP in Your Database Management System? &mdash; CIDR 2022</a></li>
+<li id="r26"><a href="https://github.com/simongog/sdsl-lite">sdsl-lite &mdash; the succinct data structure library (GPL-3.0, reference only)</a></li>
+<li id="r27"><a href="https://burntsushi.net/regex-internals/">Andrew Gallant, Regex engine internals as a library &mdash; burntsushi.net</a></li>
+<li id="r29"><a href="https://www.usenix.org/conference/usenix-winter-1994-technical-conference/glimpse-tool-search-through-entire-file-systems">Manber &amp; Wu, GLIMPSE: A Tool to Search Through Entire File Systems &mdash; Arizona TR 93-34, Winter USENIX 1994</a></li>
+<li id="r30"><a href="https://arxiv.org/abs/1908.10598">Pibiri &amp; Venturini, Techniques for Inverted Index Compression &mdash; ACM Computing Surveys 53(6), 2021</a></li>
+<li id="r28"><a href="https://nlp.stanford.edu/IR-book/pdf/04const.pdf">Manning, Raghavan, Sch&uuml;tze, Introduction to Information Retrieval &mdash; index construction</a></li>
+</ol>
+</div>
+    <footer class="pagefoot">
+      <span>Super Ferret research &middot; page 3 of 4</span>
+      <span>Compiled 2026-09-05</span>
+    </footer>
+  </main>
+</div>
+
+<script>
+// TOC scroll-spy. Copy verbatim.
+(function () {
+  var links = [].slice.call(document.querySelectorAll('.toc a[href^="#"]'));
+  if (!links.length) return;
+  var map = {};
+  links.forEach(function (a) {
+    var el = document.getElementById(a.getAttribute('href').slice(1));
+    if (el) map[el.id] = a;
+  });
+  var obs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        links.forEach(function (l) { l.classList.remove('on'); });
+        if (map[e.target.id]) map[e.target.id].classList.add('on');
+      }
+    });
+  }, { rootMargin: '-72px 0px -70% 0px', threshold: 0 });
+  Object.keys(map).forEach(function (id) {
+    var el = document.getElementById(id); if (el) obs.observe(el);
+  });
+})();
+</script>
+</body>
+</html>

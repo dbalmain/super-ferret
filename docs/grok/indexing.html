@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Indexing options — Super Ferret survey</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="index.html">← Super Ferret survey</a>
+  <strong>This report</strong>
+  <a href="#density">The density question</a>
+  <a href="#vl">What VictoriaLogs actually does</a>
+  <a href="#layers">Layers</a>
+  <a href="#names">Filenames</a>
+  <a href="#order">Posting order</a>
+  <a href="#enc">Integer encodings</a>
+  <a href="#bitmaps">Bitmaps</a>
+  <a href="#dict">Term dictionaries</a>
+  <a href="#pos">Positions and snippets</a>
+  <a href="#regex">Regex / trigrams</a>
+  <a href="#col">Columnar and ranges</a>
+  <a href="#write">LSM vs B-tree vs WAL</a>
+  <a href="#ingest">Ingest</a>
+  <a href="#plugins">Plugin hooks</a>
+  <a href="#recipe">Recommended composition</a>
+  <a href="#ferret">Old Ferret vs this</a>
+  <a href="#papers">Papers</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">Report 2 of 2</div>
+  <h1>Indexing options</h1>
+  <p class="lede">Algorithms and data structures you could implement, including ones no desktop search app ships. Density preferred over raw QPS. Personal scale: under five million files, hundreds of GB. Boolean, phrase, and regex are all first-class. You will write the codecs; this page is the menu.</p>
+  <p class="meta">Measured bits/int are from Pibiri &amp; Venturini CSUR 2020 (Gov2 / ClueWeb / CCNews) unless noted. Personal-scale file search with path-clustered IDs compresses better than ClueWeb and closer to Gov2.</p>
+</header>
+
+<div class="callout">
+  <div class="label">How to use this</div>
+  <p>The landscape report is what others built. This one is what Super Ferret can build. Several options are not in Recoll, Lucene, or old Ferret — VictoriaLogs-style blooms, Cox trigrams, partitioned Elias-Fano, RAM name tables. The load-bearing choice is whether body text is inverted at all. That is opened as a real question, with numbers.</p>
+</div>
+
+<h2 id="density">The density question</h2>
+<p>You asked for a denser index even if queries are slightly slower, and named VictoriaLogs. VL is not a Lucene with better compression. It <strong>does not build term postings of the message</strong>. “Automatically indexes all fields” means: tokenize each block, put unique tokens in a bloom (~2 bytes/token), ZSTD the column, skip blocks the bloom rejects, scan the rest. The only inverted index is of low-cardinality <em>streams</em> (host, app, container).</p>
+<p>Desktop files are not nginx logs. Grouping by <code>(extension, directory prefix)</code> recovers some of that repetition. Common queries (<code>TODO</code>, <code>error</code>, <code>fn</code>) will not skip. Needles will. Phrase becomes a scan of surviving blocks. Regex still needs n-grams — VL blooms are tokens, not trigrams, and cannot skip <code>foo.*bar</code>.</p>
+
+<div class="decision">
+  <h3>Invert the body, bloom-and-scan it, or both?</h3>
+  <div class="option">
+    <p><span class="name">A. Classic inverted postings</span> (PEF or SIMD-BP128 blocks of 128, optional interpolative positions). Recoll / Lucene / Ferret lineage.</p>
+    <p>Space, extracted English: roughly 3–9 bits per posting (docIDs only) plus 2–4× if you store positions (IR-book folklore, confirmed by every positions-on/off toggle). FTS5’s own knob on 1636 MiB of email: 134 / 340 / 743 MiB for presence / column / full positions. Phrase is exact. <code>rare_symbol</code> is O(df). <code>the</code> is a fat list.</p>
+    <p>Buys the mental model you already shipped in Ferret. Costs the thing VL exists to avoid. Forecloses “index ≈ compressed extracted text.”</p>
+  </div>
+  <div class="option">
+    <p><span class="name">B. Bloom + scan, no body postings</span>. Type-grouped 2 MiB blocks of extracted UTF-8, per-block token bloom, ZSTD. Stream-analogue = <code>(ext, dir-prefix)</code>, not per-file.</p>
+    <p>Space: compressed text (often 3–10× on prose, worse on already-compressed code) + ~2 bytes per unique token per block. Valialkin’s back-of-envelope vs Elasticsearch: 2 B/unique-token vs ≥8 B/occurrence. A worked VL part: 5.6 GiB uncompressed-equivalent → 513 MiB (~11×). Vendor disk-vs-ES “up to 15×” is marketing; TrueFoundry’s 500 GB/7d logs: Loki 501 GB vs VL 318 GB (−37%).</p>
+    <p>Buys VL density. Costs: common tokens scan the type-column; phrase is adjacency-on-scan; you still need Cox for regex. Forecloses Recoll-class <code>"to be or not to be"</code> without reading those blocks.</p>
+  </div>
+  <div class="option">
+    <p><span class="name">C. Hybrid (recommended)</span></p>
+    <ul>
+      <li>RAM filenames + name trigrams (Everything / plocate).</li>
+      <li>Columnar metadata, dict/int encoded (VL columns).</li>
+      <li>Body stored compressed, type-grouped, with per-block token blooms (VL datadb).</li>
+      <li>Sparse inverted index for <em>rare</em> terms and for code identifiers — not for English function words.</li>
+      <li>Cox trigram index, budget ≤0.3× corpus, for regex and substring.</li>
+      <li>Positions only where phrase is a product requirement (filenames, maybe code tokens); not on body English.</li>
+    </ul>
+    <p>Buys density where VL is right and O(df) where VL is wrong. Costs two query paths. Forecloses a single-codec textbook engine — which is fine, you are not shipping a library.</p>
+  </div>
+  <p><span class="rec">Recommendation: C.</span> Change it if phrase-over-body must match Recoll on stopword-heavy quotes (take A) or if you refuse to invert body terms at all (take B). On NVMe, scanning a few hundred MB of compressed <code>*.rs</code> for <code>TODO</code> is acceptable; scanning 40 GB of mixed extracted PDF text for <code>invoice</code> is not, which is why grouping by type is mandatory in B and C.</p>
+</div>
+
+<h2 id="vl">What VictoriaLogs actually does</h2>
+<p>Primary: <a href="https://docs.victoriametrics.com/victorialogs/faq/">FAQ</a>, <a href="https://victoriametrics.com/blog/victorialogs-internals-columnar-storage-on-disk/">columnar internals</a>, <code>lib/logstorage/{indexdb,bloomfilter,tokenizer,datadb}.go</code>.</p>
+<p>A log line is a flat <code>map[string]string</code> plus a timestamp. Low-cardinality labels are <em>stream fields</em>; everything else is a regular column. One UTC day = one partition. Parts are an LSM: in-memory → small disk → big disk, merge up to 15 similarly sized parts, ≥1.7× size multiplier or skip (write-amp control).</p>
+<div class="fig">part/
+  metadata.json          min/max ts, rows, bloom shard count
+  metaindex.bin          in RAM: stream range, time range → index.bin
+  index.bin              block headers (stream, rows, pointers)
+  timestamps.bin         delta/varint then ZSTD
+  values.binN            columnar values, typed
+  bloom.binN             per (block, column) token bloom
+  message_values.bin     _msg
+  message_bloom.bin
+  columns_header*.bin    type, min/max, offsets</div>
+<p>Value types, tried in order: dict if ≤8 distinct and ≤256 B total; packed uint/int/float; IPv4 as 4 bytes; ISO8601 as int64 ns; else string. Const columns live in the header. Blooms: 6 hashes, 16 bits/unique token, xxhash64, tokens = <code>[A-Za-z0-9_]+</code> (a whole CJK sentence becomes one token — wrong for desktop). Query: time → partition, stream filter → indexdb (true inverted index of streams), metaindex skip, bloom, decompress surviving columns, per-row bitmap.</p>
+<p>What maps: grouping similar objects, columnar metadata, bloom-as-negative-index, LSM parts, type-specialized encoding, projection so the UI does not touch content columns. What does not: daily time partitions of file <em>content</em>; per-file streams (path cardinality is millions); CJK tokenizer; assuming needle queries dominate.</p>
+
+<h2 id="layers">Layers of a desktop index</h2>
+<p>Three different jobs get mashed together in every disappointing Linux search app:</p>
+<ol>
+  <li><strong>Names.</strong> Millions of short strings, prefix and substring, updated live. RAM is the right medium at 5M files (~400–750 MB with paths). Everything already measured this.</li>
+  <li><strong>Metadata.</strong> mtime, size, extension, mime. Columnar + a small inverted or BKD for ranges. Not postings of English.</li>
+  <li><strong>Bodies.</strong> Huge vocabulary, selective terms, phrase, regex. This is where A/B/C above lives.</li>
+</ol>
+<p>Web-search literature (billions of docs, RAM-resident postings, thousands of QPS) is the right source of <em>algorithms</em>. Several of its axioms invert here: space beats decode speed once the list is in page cache; boolean/phrase dominate ranking; regex is not a plugin; ingest is extractor-bound, not encoder-bound; updates are file-granular save-storms. DocIDs fit in 24 bits (5M &lt; 2²³). That fact leaks into every codec.</p>
+
+<h2 id="names">Filenames</h2>
+<h3>RAM table, Everything-style</h3>
+<p>Record: name blob + parent id + optional 8-byte size/mtime. Sorted names share prefixes. Official Everything: 250k files → 35 MB RAM / 14 MB disk; 1M → ~100 MB / 45 MB. Community: 8M with size+mtime → ~700 MB. Build from a sequential metadata read, not <code>find</code>. Persist a snapshot; journal/fanotify for live updates; overflow → subtree walk. Linux has no USN; overflow handling is the whole game.</p>
+<p>FSearch already did this with <code>DynamicArray</code> + parent_idx. At your scale, do not mmap a PEF of names and congratulate yourself. As-you-type wants RAM.</p>
+<h3>Name trigrams (plocate / Cox on paths)</h3>
+<p>Substring <code>*Invoice*</code> and regex on names: overlapping 3-grams → TurboPFor/PEF docids → verify. Short needles scan. This is small (names are tiny) and should exist even if body search is bloom-only.</p>
+<h3>Tries</h3>
+<p>ART (Leis et al., ICDE 2013), HAT-trie, crit-bit: good in-RAM prefix maps. A front-coded sorted path column is enough for <code>~/src/foo/**</code> if paths are sorted. Substring still needs trigrams. A suffix array on 5M × 40-byte names is ~800 MB to answer a query a 20 MB trigram index answers.</p>
+
+<h2 id="order">Posting-list order</h2>
+<table>
+  <thead><tr><th>Order</th><th>Fast</th><th>Slow</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>Document-ordered</td><td>AND/OR, nextGEQ, skips, merges</td><td>top-k by score without WAND</td><td>Always the primary, if you invert at all</td></tr>
+    <tr><td>Frequency-ordered</td><td>TAAT ranked</td><td>boolean, phrase</td><td>No. tf is a payload, not the sort key</td></tr>
+    <tr><td>Impact-ordered (JASS)</td><td>anytime top-k, stable latency</td><td>boolean, phrase, changing BM25</td><td>Not primary. Optional later view</td></tr>
+  </tbody>
+</table>
+<p>Intersection is galloping <code>nextGEQ</code> on the longer list, driven by the shorter. An encoding that cannot <code>nextGEQ</code> without decoding the whole list is a non-starter for boolean search, no matter how small. That single fact knocks out “just gzip the docid array.”</p>
+<p>Assign docIDs path-sorted (or graph-bisection later, PISA-style). Clustered IDs make every delta codec denser. RecGraph / recursive graph bisection is 20–40% smaller postings after a rebuild — highest-leverage density trick once the first index works.</p>
+
+<h2 id="enc">Integer encodings</h2>
+<p>All of these assume a monotone sequence, almost always stored as d-gaps. Bits/int are <strong>measured</strong> on web docIDs (CSUR 2020) unless noted.</p>
+<table>
+  <thead><tr><th>Codec</th><th>Gov2 bits/int</th><th>nextGEQ</th><th>Decode</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td>VByte / LEB128 / StreamVByte</td><td>~8.8–9.3</td><td>scan</td><td>fast (StreamVByte SIMD)</td><td>short lists, leftovers, metadata</td></tr>
+    <tr><td>Simple8b / Simple16</td><td>~4.2–6.4</td><td>walk words + skips</td><td>fast sequential</td><td>50-line encoder, no SIMD</td></tr>
+    <tr><td>FOR / SIMD-BP128 (128-int blocks)</td><td>~5–6.5</td><td>block skip by max docid</td><td>fastest scan (Lemire ~0.7 cyc/int)</td><td>pragmatic default</td></tr>
+    <tr><td>PFor / OptPFor / FastPFor</td><td>OptPFor 3.63</td><td>block skip</td><td>patching can lose (Catena et al.: plain FOR won query time)</td><td>density knob, not obviously worth it</td></tr>
+    <tr><td>Interpolative (BIC)</td><td>2.94 — densest</td><td>poor without extra skips</td><td>5–7 ns/int, 5–10× slower</td><td>Xapian positions; optional cold lists</td></tr>
+    <tr><td>Elias-Fano</td><td>~n(2+log(u/n))</td><td>almost O(1) via select</td><td>fast</td><td>uniform lists; no clustering</td></tr>
+    <tr><td>Partitioned EF (PEF)</td><td>3.12; Gov2 index 4.65 GB vs 7.66 EF</td><td>two-level NextGEQ</td><td>~0.76 ns/int</td><td><strong>best space/skip trade</strong> if you invert</td></tr>
+    <tr><td>Roaring as postings</td><td>6.63 — worse than PEF</td><td>excellent set ops</td><td>fastest “decode”</td><td>filters and liveDocs, not scored postings</td></tr>
+  </tbody>
+</table>
+<p><strong>VByte:</strong> 7 data bits + continuation. Floor of 8 bits/int. Lucene still uses it for short lists and skip metadata. StreamVByte separates control bytes so SIMD can shuffle payloads (Lemire, Kurz, Rupp 2018).</p>
+<p><strong>Simple family:</strong> selector + packed payload in a 32/64-bit word. One large gap poisons the word. Fine if you want no SIMD and density close to PFor.</p>
+<p><strong>FOR / PFor:</strong> block of 128, bit-width from the max. PFor patches exceptions. Lucene 4.1 shipped packed-int blocks (FOR, not interpolative); later codecs added PFor-like flavors. Tantivy: d-gap + SIMD bitpack of 128, remainder varint, skip of last-docid-per-block. Interpolative was never Lucene’s default; Xapian is the interpolative shop, and only on positions.</p>
+<p><strong>BIC:</strong> recursively encode the midpoint given known bounds (Moffat &amp; Stuiver 2000). Clustered runs cost almost nothing. Sequential decode is a recursive bit-reader. At personal scale the space win over PEF is ~0.2 bits/int on Gov2 — maybe 10–20 MB on a 5M-doc index. Probably not worth the tax on docIDs. Still defensible for position lists, which is why Glass does that.</p>
+<p><strong>Elias-Fano / PEF:</strong> split high/low bits; high bits as a unary-gap bitvector with select. Quasi-succinct, no clustering assumption. PEF (Ottaviano &amp; Venturini SIGIR 2014) partitions into chunks, encodes each over its local universe, dense chunks become bitmaps, endpoints another EF. Linear-time (1+ε)-optimal partition. This is PISA’s <code>opt</code> index. If Super Ferret inverts medium/long lists, PEF is the dense adult option; SIMD-BP128+skips is the simple adult option.</p>
+<p>Old Ferret is VInt d-gaps + skip every N. That is the 2005 answer. Replace it. Keep the skip interval as a first-class parameter.</p>
+
+<h2 id="bitmaps">Bitmaps</h2>
+<p>A posting list is also a bitvector of length N with n ones. At 5M docs that is 625 KB uncompressed <em>per term</em> — insane for rare terms, excellent above ~10% df.</p>
+<p><strong>Roaring</strong> (Chambi, Lemire et al.): 2¹⁶-sized chunks; array if ≤4096 values (16 bits each), bitmap if denser (8 KB), run containers for consecutive ranges. 4096 × 2 B = 8 KB is the exact threshold. 64-bit roaring is for offsets/hashes, not 5M docIDs. Lucene uses roaring for liveDocs and filter caches, <em>not</em> for scored postings. Meilisearch uses roaring for everything and pays for it in size. Wang et al. SIGMOD 2017: use roaring for bitmaps; do not use WAH/EWAH/Concise in a new system.</p>
+<p><strong>When:</strong> deletion bitmaps; dense filters (extension, mime, year); in-memory AND of several filters. Not the only posting format.</p>
+
+<h2 id="dict">Term dictionaries</h2>
+<table>
+  <thead><tr><th>Structure</th><th>Point</th><th>Prefix</th><th>Mutable</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td>FST / Lucene BlockTree</td><td>O(|term|)</td><td>walk</td><td>rebuild per segment</td><td>on-disk default for immutable segments</td></tr>
+    <tr><td>B-tree (Xapian Glass, LMDB)</td><td>log</td><td>walk</td><td>yes</td><td>if you choose mutable postings</td></tr>
+    <tr><td>Hash</td><td>fastest exact</td><td>no</td><td>RAM</td><td>intern table during ingest</td></tr>
+    <tr><td>Front-coded blocks</td><td>jump + linear</td><td>yes</td><td>rebuild</td><td>always, as the leaf under an FST/B-tree</td></tr>
+    <tr><td>LOUDS / SuRF</td><td>rank/select</td><td>yes</td><td>static</td><td>optimization, not required at 5M docs</td></tr>
+    <tr><td>ART</td><td>RAM</td><td>yes</td><td>yes</td><td>in-memory filename prefix</td></tr>
+  </tbody>
+</table>
+<p>Lucene BlockTree: FST of prefixes → on-disk block of 25–48 front-coded terms. Better than a giant FST of all terms. Lucene 10.3 moved the in-block structure toward a trie. Pulse/inline lists with df &lt; 8 into the dictionary (saves a seek). That is Lucene 2 “pulsing,” and old Ferret could grow it.</p>
+
+<h2 id="pos">Positions, phrases, snippets</h2>
+<p>Positions: per (term, doc), monotone token indexes, encoded like a posting list. IR-book: a positional index is 2–4× a docID-only index. First thing to drop if the index does not fit. Needed for phrase and proximity. Common-term phrases (<code>to be</code>) are the expensive ones — doc-intersection is huge and you actually walk positions.</p>
+<p>Next-word indexes (Bahle, Williams, Zobel SIGIR 2002): +10–26% space for faster two-word phrases. A 1999–2004 answer; SSD + block skips mostly defanged it. Spend that space on trigrams instead.</p>
+<p>Three snippet strategies:</p>
+<ol>
+  <li>Store compressed extracted text (zstd). Recoll 1.24+ did this because Glass positions were too slow for snippets. +10–20%.</li>
+  <li>Re-read the file. Free for UTF-8 source; wrong for PDF (extracted text is not the file).</li>
+  <li>Re-extract at query time. Slow; extractor bugs become snippet bugs.</li>
+</ol>
+<p>Recommendation: store zstd’d extracted text for PDF/Office/email; re-read code and plain text. Token positions for fields where phrase is required; skip char offsets in v1. Recoll’s pre-1.25 “walk positions” path is the cautionary tale.</p>
+
+<h2 id="regex">Regex and substring</h2>
+<p>Russ Cox, 2012, <a href="https://swtch.com/~rsc/regexp/regexp4.html">Regular Expression Matching with a Trigram Index</a>. Mandatory. Implementation: <code>github.com/google/codesearch</code>.</p>
+<p>Why 3: too few 2-grams (postings huge), too many 4-grams (key explosion). Index overlapping 3-grams → sorted file ids. Reject invalid UTF-8, very long lines, too many distinct trigrams. ~20% of corpus.</p>
+<p>From each regexp compute emptyable / exact / prefix / suffix / match. Concatenation and alternation have exact rules; information-saving moves about-to-be-discarded prefix/suffix/exact grams into the match query; information-discarding keeps sets bounded. Always recheck with a linear-time engine (RE2 / Rust <code>regex</code>). <code>/Google.*Search/</code> becomes AND of <code>Goo oog ogl gle Sea ear arc rch</code>. <code>ab[cd]e</code> becomes <code>(abc AND bce) OR (abd AND bde)</code>. No 3-char literal → ANY → scan.</p>
+<p>Zoekt stores <em>offsets</em> per trigram (~3.5× corpus) and picks the two rarest grams. Wrong density trade for you; steal “pick rare grams, not all of them.” livegrep’s suffix array is 3–5× RAM and static. GitHub Blackbird’s sparse grams are for 15 billion documents. qgrep’s 4-gram Bloom per compressed chunk makes the ANY fallback a fast scan, not a 200 GB read. Use that.</p>
+<p>CJK trap: a UTF-8 CJK character is 3 bytes, so a byte trigram is a unigram. For CJK content, use character bigrams (Japanese IR tradition) plus UTF-8-aware character trigrams for regex. Recoll’s default CJK n-grams exist because morphological segmenters are an extra dependency. Do not copy VL’s “whole CJK sentence = one token.”</p>
+
+<h2 id="col">Columnar fields, BKD, stored docs</h2>
+<p>Two access patterns: given docID, get field (sort, UI columns) → columnar / Lucene DocValues / Tantivy fast fields. Given a range, get docIDs (mtime between, size &gt; 1 MB) → BKD or a roaring per bucket.</p>
+<p>Numerics pack to ceil(log max) bits. Low-cardinality strings (ext, mime): dictionary + ordinals. Unique paths: you are almost storing the original column — front-code and/or FSST (Boncz, Neumann, Leis: 1-byte codes, random access per string, ~2× on short strings). zstd is the wrong codec for millions of short paths because of its block nature.</p>
+<p>BKD (Lucene 2015): k-d tree of packed points, 512/leaf, one copy of each point. 1D mtime/size ranges prune by min/max. Combined with index-sort-by-mtime, last-7-days is one region of docIDs. Do not use BKD for extension — a roaring per value ANDs faster. Keep both: BKD for the range query, doc values for retrieve/sort.</p>
+<p>Lucene stored fields: chunk-compressed documents. Elastic has been moving those chunks toward zstd. This is the original-document store if you have one. Do not put mtime here; you will regret every sort.</p>
+
+<h2 id="write">LSM vs B-tree vs “just LMDB”</h2>
+<table>
+  <thead><tr><th></th><th>Lucene-style segments</th><th>Xapian Glass B-tree</th><th>LMDB of blobs</th></tr></thead>
+  <tbody>
+    <tr><td>Update</td><td>delete+add; coalesce by path in RAM</td><td>point update of a compressed value</td><td>copy the value on write</td></tr>
+    <tr><td>Crash</td><td>fsync segment files, then a commit that names the live set</td><td>COW blocks + revision</td><td>COW pages, single writer</td></tr>
+    <tr><td>Encode</td><td>append-only, optimal compression on merge</td><td>must tolerate rewrite of a tag</td><td>you reinvent Glass</td></tr>
+    <tr><td>Search fanout</td><td>union of live segments until merge</td><td>one tree</td><td>one tree</td></tr>
+    <tr><td>When</td><td><strong>default</strong> for postings</td><td>tiny edits all day — not this workload</td><td>path↔docID, hash dedup, watcher cursor</td></tr>
+  </tbody>
+</table>
+<p>DocIDs should be segment-local 0..maxDoc-1. Never let a user-facing id be the posting docID. Path and content hash live in columns. Deletes are a roaring liveDocs per segment; reclaim at merge. A WAL of (path, reason) is enough to not miss events across crash — content is still on the filesystem. Do not WAL extracted text. FTS5 automerge=8, crisismerge=16, segments of 50k–200k docs is enough at this scale. Hundreds of GB of <em>files</em> is not hundreds of GB of <em>postings</em> if content is external and positions are opt-in.</p>
+<p>VL’s mergeset is the same LSM idea with empirically tuned 1.7× merge multiplier. Steal that write-amp control.</p>
+
+<h2 id="ingest">Ingest, watchers, extractors</h2>
+<p>Linux: fanotify on the mount if you can; inotify per directory otherwise (<code>max_user_watches</code>). Debounce 200–500 ms by path; editors write <code>file.tmp</code> + rename. A save-storm becomes one reindex of the final inode. <code>IN_Q_OVERFLOW</code> means you missed events: subtree walk, do not pretend. NFS: inotify is unreliable; periodic walk.</p>
+<p>Three threads, not one:</p>
+<ol>
+  <li>Watcher: enqueue paths only.</li>
+  <li>Extractor pool: bounded, niced, one file at a time, hard timeouts, memory caps, cache by content hash. PDF bombs are a real file.</li>
+  <li>Indexer: tokenize, write. Never block on extraction.</li>
+</ol>
+<p>Every native parser (especially PDF, OLE, image codecs) runs in a helper: seccomp default-deny, Landlock read of the target file + lib dirs, no network, <code>RLIMIT_AS</code> + <code>RLIMIT_CPU</code>, parent watchdog. Spawn <code>pdftotext</code> / antiword inside that jail; do not link poppler. LocalSearch is the model; Recoll’s rlimits-only helpers are not. 2 s soft / 15 s hard per file; OCR/STT/LibreOffice on a colder pool. ionice class 3, nice, maybe a cgroup. Pinot pauses on battery; Recoll has an AC-only script. Do both.</p>
+<p>A Python/PDF extract of a 50-page PDF is 100–1000× the cost of encoding its postings. The write path should be simple and crash-safe, not the fastest encoder on the planet.</p>
+
+<h2 id="plugins">Plugin hooks</h2>
+<p>Core model: a document is a bag of named fields; each field has an analyzer and an index option (docs / docs+freqs / docs+pos / trigrams / columnar / BKD / bloom+scan / none). Plugins add fields and extractors, not storage engines.</p>
+<ul>
+  <li><strong>Email:</strong> one document per message. Fields from/to/subject/body/msgid/date. Attachments as children with <code>parent=msgid</code>. Dedup by msgid. Never index a 20 GB mbox as one doc.</li>
+  <li><strong>OCR:</strong> extra field <code>body_ocr</code>, not an overwrite of <code>body</code>, so a query can exclude noisy text. Cache by image hash forever. Default off. Explodes index size and wrecks trigram selectivity.</li>
+  <li><strong>Reverse image:</strong> do not put vectors in the inverted index. HNSW sidecar keyed by docID (Malkov &amp; Yashunin). Fine for 10⁵–10⁶ images. DiskANN when it no longer fits in RAM. Not in the NRT loop; rebuild offline. Query: ANN → candidate ids → liveDocs ∩ boolean.</li>
+  <li><strong>Speech-to-text:</strong> extra field <code>body_asr</code>, same economics as OCR.</li>
+</ul>
+
+<h2 id="recipe">Recommended composition</h2>
+<p>Pending the density question, the composition that matches the brief:</p>
+<table>
+  <thead><tr><th>Layer</th><th>Structure</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Names in RAM</td><td>parent-id records, ART or sorted front-coded, name trigrams</td><td>Everything-class UX at 5M files</td></tr>
+    <tr><td>Path ↔ doc, hash ↔ doc</td><td>LMDB / redb</td><td>mutable, crash-safe, not postings</td></tr>
+    <tr><td>Metadata</td><td>columnar dict/int + 1D BKD or skippers</td><td>mtime/size/ext range and sort</td></tr>
+    <tr><td>Body text store</td><td>type-grouped zstd blocks + per-block token bloom</td><td>VL density; grouping is mandatory</td></tr>
+    <tr><td>Rare terms / identifiers</td><td>PEF or SIMD-BP128 postings, 128-doc skips</td><td>needles stay O(df)</td></tr>
+    <tr><td>Tiny lists</td><td>inlined VByte in the terms dict</td><td>avoid a seek</td></tr>
+    <tr><td>Dense filters / liveDocs</td><td>roaring</td><td>AND is free</td></tr>
+    <tr><td>Terms dict</td><td>front-coded blocks + FST/trie</td><td>prefix, compact</td></tr>
+    <tr><td>Regex</td><td>byte trigrams, no positions, regex recheck; 4-gram Bloom per chunk for ANY</td><td>Cox + qgrep, budget ≤0.3×</td></tr>
+    <tr><td>CJK</td><td>character bigrams as a field</td><td>not UTF-8 byte trigrams</td></tr>
+    <tr><td>Snippets</td><td>stored zstd for extracted-only formats; re-read code/plain</td><td>Recoll 1.24 lesson</td></tr>
+    <tr><td>Dedup</td><td>content hash; document = contents, paths = multi-valued column</td><td>extractor CPU on node_modules</td></tr>
+    <tr><td>Writes</td><td>immutable segments, delete bitmap, coalesced watcher, niced merge</td><td>NRT without mutable PEF</td></tr>
+    <tr><td>Vectors later</td><td>HNSW sidecar</td><td>not postings</td></tr>
+  </tbody>
+</table>
+<p><strong>Do not build in v1:</strong> impact-ordered primary index, WAH, corpus suffix array, Glass-style mutable PEF, stemming by default, stopwords by default, char offsets, next-word index, 64-bit roaring for docIDs, linking Tantivy/Xapian/poppler.</p>
+<p><strong>Build later if a profile says so:</strong> PEF as default instead of FOR (when disk &lt; RAM), interpolative on remaining position lists, WAND (when 5-term prose is slow), FSST on paths, CJK tokenizer, sparse n-grams.</p>
+<p>Ranking, short: boolean + recency + path-depth is a complete function for “find that file.” Filename hit ≫ body hit. Exact basename ≫ path substring. BM25 on a body field is fine when the query is several uncommon tokens (k1≈1.2, b≈0.75). DFR is why people think Xapian is smart; it is not why you would pick it. No LTR, no PageRank.</p>
+
+<h2 id="ferret">Old Ferret vs Super Ferret</h2>
+<table>
+  <thead><tr><th></th><th>Ferret (2005–2010 Lucene)</th><th>Super Ferret (this brief)</th></tr></thead>
+  <tbody>
+    <tr><td>Term dict</td><td><code>.tis</code> prefix-compressed + <code>.tii</code> skip</td><td>block-tree or FST+blocks</td></tr>
+    <tr><td>Postings</td><td>VInt d-gaps</td><td>PEF and/or SIMD-BP128; sparse for rare terms</td></tr>
+    <tr><td>Skip</td><td>every N postings</td><td>block skip; PEF NextGEQ</td></tr>
+    <tr><td>Positions</td><td>VInt d-gaps</td><td>interpolative, and only where phrase is required</td></tr>
+    <tr><td>Doc values</td><td>none (field cache at search)</td><td>columnar bitpack / interpolating</td></tr>
+    <tr><td>Deletes</td><td>deleted-docs bitvector</td><td>roaring alive bitset</td></tr>
+    <tr><td>Regex</td><td>term wildcard</td><td>Cox trigrams + linear recheck</td></tr>
+    <tr><td>Content</td><td>stored fields in <code>.fdt</code></td><td>external files + stored extracted text for PDF/Office</td></tr>
+    <tr><td>Names</td><td>just another field</td><td>RAM table, first-class</td></tr>
+    <tr><td>Body density</td><td>occurrence postings</td><td>bloom+scan of grouped columns, optional sparse invert</td></tr>
+    <tr><td>Language</td><td>C + Ruby</td><td>Rust</td></tr>
+    <tr><td>Keep</td><td colspan="2">segment/merge/compound mental model, field bitflags, skip interval as a parameter</td></tr>
+  </tbody>
+</table>
+<p>Rewriting Ferret in Rust would make a better Ferret. It would not make this product. The enjoyable part — implementing codecs, skip lists, segment merge — still happens. The format is not <code>.tis/.frq/.prx</code>.</p>
+
+<h2 id="papers">Papers and implementations to read, not to copy</h2>
+<ul class="refs">
+  <li>Pibiri &amp; Venturini, “Techniques for Inverted Index Compression”, CSUR 2020. <a href="https://arxiv.org/abs/1908.10598">arXiv:1908.10598</a> — the encoding table.</li>
+  <li>Zobel &amp; Moffat, “Inverted Files for Text Search Engines”, CSUR 2006; Manning/Raghavan/Schütze IR-book ch. 1–2.</li>
+  <li>Moffat &amp; Stuiver, interpolative, IR 2000. Zukowski et al., PFor, ICDE 2006. Yan/Ding/Suel, OptPFor, WWW 2009. Anh &amp; Moffat, Simple8b, SPE 2010. Dean, Group Varint, WSDM 2009.</li>
+  <li>Lemire &amp; Boytsov, SIMD-BP128, SPE 2015. <a href="https://arxiv.org/abs/1209.2137">arXiv:1209.2137</a>. StreamVByte: <a href="https://arxiv.org/abs/1709.08990">arXiv:1709.08990</a>.</li>
+  <li>Vigna, “Quasi-succinct indices”, WSDM 2013. <a href="https://arxiv.org/abs/1206.4300">arXiv:1206.4300</a>. Ottaviano &amp; Venturini, PEF, SIGIR 2014. PISA: <a href="https://pisa.readthedocs.io/en/latest/compress_index.html">compress_index</a>.</li>
+  <li>Chambi et al., Roaring, SPE 2016. <a href="https://arxiv.org/abs/1402.6407">arXiv:1402.6407</a>. CRoaring. Wang et al., bitmaps vs inverted, SIGMOD 2017.</li>
+  <li>Turtle &amp; Flood, MaxScore 1995; Broder et al., WAND 2003; Ding &amp; Suel, BMW 2011.</li>
+  <li>Cox, trigram codesearch. <a href="https://swtch.com/~rsc/regexp/regexp4.html">swtch.com/~rsc/regexp/regexp4.html</a>. GitHub code search 2023. zeux, qgrep internals.</li>
+  <li>Ferragina &amp; Manzini, FM-index. Leis et al., ART, ICDE 2013. Boncz/Neumann/Leis, FSST, VLDB 2020. Graf &amp; Lemire, xor filters.</li>
+  <li>Malkov &amp; Yashunin, HNSW. Subramanya et al., DiskANN, NeurIPS 2019.</li>
+  <li>Systems: Lucene <code>Lucene90/104PostingsFormat</code>; Xapian <code>glass_postlist.cc</code> / interpolative positions; Tantivy <code>ARCHITECTURE.md</code>; SQLite <a href="https://www.sqlite.org/fts5.html">FTS5</a>; Everything DB doc; VL <code>lib/logstorage</code>; old Ferret <code>c/FileFormat.txt</code>.</li>
+</ul>
+
+<footer class="page"><a href="index.html">Hub</a> · <a href="landscape.html">Landscape</a> · <a href="decisions.html">Decisions</a></footer>
+</main>
+</div>
+</body>
+</html>

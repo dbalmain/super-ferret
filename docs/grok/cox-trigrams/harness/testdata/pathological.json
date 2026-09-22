@@ -1,0 +1,12 @@
+{
+  "command": "match",
+  "note": "Same CLI as match.json. The runner adds this file to the nfa/dfa/vm stages. a?^n a^n vs a^n is O(n^2) for Thompson, O(2^n) for backtracking. n=20 is enough to hang naive backtracking and still instant for NFA.",
+  "cases": [
+    {
+      "pattern": "a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?a?aaaaaaaaaaaaaaaaaaaa",
+      "text": "aaaaaaaaaaaaaaaaaaaa",
+      "match": true,
+      "timeout_s": 1.0
+    }
+  ]
+}

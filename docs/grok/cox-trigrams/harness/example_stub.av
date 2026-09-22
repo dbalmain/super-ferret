@@ -1,0 +1,76 @@
+#!/usr/bin/env -S aven run --
+# CLI skeleton. Replace the function bodies. Speaks the course protocol so
+# the harness can run against you from the first compiling binary.
+#
+#   ./example_stub.av match a a
+#   ./example_stub.av index-search --corpus DIR PATTERN
+
+cli = import("std/cli")
+
+cmdMatch = (pattern: Text, text: Text): Bool =>
+  # Whole-string match. Return true/false.
+  _ = (pattern, text)
+  false
+
+cmdSearch = (pattern: Text, text: Text): Bool =>
+  # Substring match.
+  _ = (pattern, text)
+  false
+
+cmdSubmatch = (
+  pattern: Text,
+  text: Text
+): { match: Bool, groups: Array(Array(Int)?)? } =>
+  # groups[0] is [start, end) of the whole match; then each '('.
+  # Unmatched optional group: null. Non-match: groups is null.
+  _ = (pattern, text)
+  { match: false, groups: null }
+
+cmdIndexSearch = (
+  corpus: Text,
+  pattern: Text
+): { candidates: Array(Text), hits: Array(Text) } =>
+  # Return { candidates, hits }, each a list of basenames.
+  _ = (corpus, pattern)
+  { candidates: [], hits: [] }
+
+printJson = (value): Int =>
+  writeLine(value.encode(Json)?!)
+  0
+
+fail = (message: Text): Int =>
+  _ = stderr.writeLine(message)
+  1
+
+pairSpec = (name: Text) =>
+  cli.define({
+    pattern: cli.positional(cli.text, { help: "Regexp", valueName: "PATTERN" })
+    text: cli.positional(cli.text, { help: "Input text", valueName: "TEXT" })
+  }, { name, examples: ["${name} PATTERN TEXT"] })
+
+index = cli.define({
+  corpus: cli.required(cli.text, { help: "Corpus directory", valueName: "DIR" })
+  pattern: cli.positional(cli.text, { help: "Regexp", valueName: "PATTERN" })
+}, { name: "index-search", examples: ["index-search --corpus DIR PATTERN"] })
+
+match = pairSpec("match")
+search = pairSpec("search")
+submatch = pairSpec("submatch")
+
+tool = cli.app({
+  match: cli.command(match, (a) => @Match(a), { help: "Whole-string match" })
+  search: cli.command(search, (a) => @Search(a), { help: "Substring match" })
+  submatch: cli.command(submatch, (a) => @Submatch(a), { help: "Captures" })
+  "index-search": cli.command(index, (a) => @IndexSearch(a), { help: "Index" })
+}, { name: programName, description: "Cox regexp course protocol" })
+
+run = (cmd): Int =>
+  cmd ?>
+    @Match(a) => printJson({ match: cmdMatch(a.pattern, a.text) })
+    @Search(a) => printJson({ match: cmdSearch(a.pattern, a.text) })
+    @Submatch(a) => printJson(cmdSubmatch(a.pattern, a.text))
+    @IndexSearch(a) => printJson(cmdIndexSearch(a.corpus, a.pattern))
+
+cli.parse(tool, args) ?>
+  @Ok(cmd) => run(cmd)
+  @Err(message) => fail(message)

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Super Ferret — desktop search survey</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <strong>Reports</strong>
+  <a href="landscape.html">Landscape</a>
+  <a href="indexing.html">Indexing options</a>
+  <a href="decisions.html">Decisions</a>
+  <strong>On this page</strong>
+  <a href="#verdict">Verdict in one screen</a>
+  <a href="#gap">The hole</a>
+  <a href="#stack">Implied stack</a>
+  <a href="#read">How to read</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">Super Ferret · competitive + architecture brief</div>
+  <h1>Desktop search, surveyed for a from-scratch build</h1>
+  <p class="lede">Linux is the product. macOS and Windows are the bars to beat on filename speed and extractor plugins. The index is yours to write — denser than Recoll, more capable than FSearch, not a port of old Ferret.</p>
+  <p class="meta">Research date 2026-09-04 · personal workstation scale · permissive · near-real-time with a niced queue</p>
+</header>
+
+<div class="cards">
+  <a class="card" href="landscape.html" style="text-decoration:none;color:inherit">
+    <h3>Landscape</h3>
+    <p>Every serious Linux option, with formats and the actual index data structures. Top 1–3 on Windows and macOS. Engines as competitor intel, not dependencies.</p>
+  </a>
+  <a class="card" href="indexing.html" style="text-decoration:none;color:inherit">
+    <h3>Indexing options</h3>
+    <p>Algorithms you could implement: encodings, trigrams, blooms, LSM vs B-tree, VictoriaLogs’ density trick, and a recommended composition. Independent of any product.</p>
+  </a>
+  <a class="card" href="decisions.html" style="text-decoration:none;color:inherit">
+    <h3>Decisions</h3>
+    <p>The six scoping answers, plus the one architectural question the research opened: invert the body, bloom-and-scan it, or both.</p>
+  </a>
+  <a class="card" href="cox-trigrams/index.html" style="text-decoration:none;color:inherit">
+    <h3>Cox regexp course</h3>
+    <p>All four Cox articles: Thompson NFA, VM captures, RE2-shaped extras, trigram index. Language-agnostic tests.</p>
+  </a>
+</div>
+
+<h2 id="verdict">Verdict in one screen</h2>
+<p>Nothing on Linux is Everything-fast on names <em>and</em> Recoll-deep on documents <em>and</em> rga-honest on regex, in one process, with a small index. That combination is the product.</p>
+
+<table>
+  <thead>
+    <tr><th>Job</th><th>Best today</th><th>Why it is not Super Ferret</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Filename, instant</td><td>Everything (Windows); FSearch / plocate on Linux</td><td>No content. FSearch is GPL. plocate is daily, not live.</td></tr>
+    <tr><td>Document body + nested containers</td><td>Recoll (Xapian Glass)</td><td>GPL + Xapian GPL. Index ≈ extracted text. Real-time daemon is heavy. No body regex.</td></tr>
+    <tr><td>Distro default</td><td>GNOME LocalSearch (SQLite FTS5); KDE Baloo (LMDB)</td><td>Metadata-first. Baloo skips ODF zip content. LocalSearch has no mail/archives. Query language is not yours.</td></tr>
+    <tr><td>Regex over files</td><td>ripgrep / rga / Clapgrep</td><td>No persistent inverted index. First PDF search pays <code>pdftotext</code> every cold run (rga caches text, not postings).</td></tr>
+    <tr><td>Dense “index all fields”</td><td>VictoriaLogs</td><td>Logs, not files. Full-text is bloom + scan, <em>not</em> term postings. The density lesson still applies.</td></tr>
+    <tr><td>Your previous engine</td><td>Ferret (Lucene 2-era, MIT, C)</td><td>VInt d-gaps, no FOR/PEF, no Cox regex path, stores bodies. Fast for 2008, fat for this brief.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <div class="label">Windows and macOS, compressed</div>
+  <p><strong>Windows:</strong> Everything for names (MFT + USN, ~100 bytes/file in RAM). Windows Search for OS content (IFilter + inverted index in ESE, SQLite on Win11). FileLocator Pro / dtSearch for regex-over-documents. Everything 1.5 “content index” is extracted text in RAM with a 1 GB-of-text cap — do not copy that.</p>
+  <p><strong>macOS:</strong> Spotlight is the OS (FSEvents + <code>.mdimporter</code> + proprietary store with postings). Alfred wraps it. Raycast builds its own <em>filename</em> index and still uses Spotlight for content. FoxTrot is the only mainstream Mac app with its own content index and regex; it reuses Spotlight importers and is scheduled, not NRT.</p>
+</div>
+
+<h2 id="gap">The hole</h2>
+<p>Four lineages grew up on Linux and never merged:</p>
+<ol>
+  <li><strong>IR desktop search</strong> — Recoll, Pinot, DocFetcher. Inverted index, extractors, boolean/phrase. Slow to start, fat on text, GPL or Java.</li>
+  <li><strong>DE metadata miners</strong> — LocalSearch, Baloo. Always on, small RSS, weak body quality, no regex, integration instead of a product UI.</li>
+  <li><strong>Everything clones</strong> — FSearch, ANGRYsearch. Instant names, no body.</li>
+  <li><strong>Scan-at-query</strong> — Catfish, rga, Clapgrep. Honest regex, no index to maintain.</li>
+</ol>
+<p>Glimpse (1993) already knew the missing move: a cheap first stage (block ids / trigrams) plus verification. plocate is that idea applied to filenames with TurboPFor. Super Ferret is that idea applied to a personal corpus that also contains PDFs and code.</p>
+
+<h2 id="stack">Implied stack</h2>
+<p>Not a spec — a picture of what the two reports jointly recommend, pending the <a href="decisions.html#open">density question</a>.</p>
+<div class="fig">watcher (fanotify/inotify, overflow → subtree walk)
+  → coalesce queue (debounce path, nice/ionice, idle/AC gates)
+  → jailed extractors (seccomp+Landlock; spawn pdftotext, never link poppler)
+  → four stores:
+       RAM names + parent ids          (Everything / FSearch)
+       columnar metadata               (mtime, size, ext — VL-style dict/int)
+       body: bloom+scan and/or PEF     (the open question)
+       Cox trigrams for regex          (≈0.2× corpus, then recheck)
+  → snippets from stored extracted text for PDF/Office; re-read files for code
+  → later: mail/OCR as extra fields; HNSW sidecar for images; ASR field for audio</div>
+
+<p>Do not link Xapian, Tantivy, Lucene, or poppler. Do spawn GPL helpers. Do reimplement PEF / SIMD-BP128 / Cox / roaring — those are algorithms, not products. Old Ferret’s segment + skip-interval mental model is still the right <em>write</em> model; every encoding in it should be replaced.</p>
+
+<h2 id="read">How to read</h2>
+<ul>
+  <li><a href="landscape.html">Landscape</a> is “what exists, what it indexes, what the files on disk actually are.” Read it to know who you are competing with and which extractor/query ideas to steal.</li>
+  <li><a href="indexing.html">Indexing options</a> is “what you could build.” Encodings have measured bits/int. VictoriaLogs is unpacked because you named it. The recommended composition is at the end.</li>
+  <li>Claims that are reverse-engineered or vendor-only are marked. Primary sources are linked from each report.</li>
+</ul>
+
+<footer class="page">Built for a from-scratch Rust indexer · not a library shopping list</footer>
+</main>
+</div>
+</body>
+</html>
