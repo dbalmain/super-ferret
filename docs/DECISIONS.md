@@ -12,20 +12,23 @@ Predecessors, carried forward where still open:
 
 ## Status
 
-| Id  | Question                                             | Status | Answer |
-| --- | ---------------------------------------------------- | ------ | ------ |
-| D1  | Repository shape                                     | open   |        |
-| D2  | Format of the living documents                       | open   |        |
-| D3  | Build order: index first, or the no-index tool first | open   |        |
-| D4  | What identifies a document                           | open   |        |
-| D5  | Where the mutable state (paths, inodes) lives        | open   |        |
-| D6  | Postings versus filters, and how that gets decided   | open   |        |
-| D7  | Positions                                            | open   |        |
-| D8  | Regex at first ship                                  | open   |        |
-| D9  | What a term is                                       | open   |        |
-| D10 | Which roots                                          | open   |        |
-| D11 | `unsafe` posture and the intpack dependency          | open   |        |
-| D12 | Licence                                              | open   |        |
+| Id  | Question                                             | Status             | Answer                                                                               |
+| --- | ---------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------ |
+| D1  | Repository shape                                     | answered           | A: one repo, workspace under `crates/`; crate boundaries get the most design thought |
+| D2  | Format of the living documents                       | open               | no comment yet                                                                       |
+| D3  | Build order: index first, or the no-index tool first | answered           | B: usable tool first, to start collecting data                                       |
+| D4  | What identifies a document                           | restated — confirm | ordinal doc ids in add order; doc → hash → inodes → names                            |
+| D5  | Where the mutable state (paths, inodes) lives        | answered           | A: own catalog; memory budget configurable, set by experiment                        |
+| D6  | What the index holds: postings, filters, positions   | answered           | every structure is a candidate filter, verified by scan; trade-offs by experiment    |
+| D7  | Positions                                            | merged into D6     |                                                                                      |
+| D8  | Regex at first ship                                  | answered           | not a bare scan: trigram filters (B) or postings (C), by experiment                  |
+| D9  | What a term is                                       | answered           | B: identifier splitting, filenames especially                                        |
+| D10 | Which roots                                          | answered           | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides    |
+| D11 | `unsafe` posture and the intpack dependency          | answered           | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored           |
+| D12 | Licence                                              | answered           | A: `MIT OR Apache-2.0`                                                               |
+| D13 | Ignore rules: precedence, and whose matcher          | open               |                                                                                      |
+| D14 | Filename search: scan the names, or index them       | open               |                                                                                      |
+| D15 | Result unit: per path or per document                | open               |                                                                                      |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -53,6 +56,16 @@ and how do extractable components graduate?
 practice: it was built as its own crate with its own bench, and nothing here
 depends on where it lives. The fact that would change it: if a second person is
 expected to work on one crate without the rest — not the case.
+
+> Dave: Let's go with A. Splitting into crates will be important though. See
+> /review-craft for what I care about in terms of structure. The orthogonality I
+> try to achieve will be challenging here because the query planner for example
+> will need to know about how the index is structured. That is where I think
+> we'll need to put the most thought.
+
+**Answer (2026-09-23): A.** The planner/index coupling is the hardest boundary;
+the proposed seam is in D6's answer — the planner sees the index only as
+candidate sources with an exactness flag and a cost estimate, never as a format.
 
 ## D2 — Format of the living documents
 
@@ -89,16 +102,26 @@ stage; what it drops is the month of usage, and the fact that would change the
 answer is whether you intend to use the tool daily while it is being built. If
 yes, B's ordering pays for itself; if this is a build-then-use project, C.
 
+> Dave: Let's go with B - I want to use it ASAP so we can start collecting data.
+> On this topic, we should respect .gitignore files but have .ferretignore files
+> which can override .gitignore by force including or force ignoring.
+
+**Answer (2026-09-23): B.** First usable slice: exclusion rules, crawler,
+catalog, filename and metadata search, and a local query log — used daily while
+the index is built behind it. Ignore rules moved to D13. Because D8 rules out a
+bare scan over `$HOME`, content search arrives with the first index slice rather
+than as a stop-gap scanner.
+
 ## D4 — What identifies a document
 
 **Question:** In `document → hash → inode(s) → name → dir inode → … → root`,
 what is the primary key of a document, and what follows from it?
 
-| Option                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                   | Buys                                                                                                                                                                                                                                                                                                                              |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Option                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                  | Buys                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A. Content-addressed: doc id ← (content hash, extractor version, tokenizer version). `(dev, ino) → doc`. `(parent ino, name) → child ino`. Paths resolved by walking parents. | Every indexed file is hashed in full (it is being read in full to tokenize, so the marginal cost is the hash). A result is a (doc, path) pair, not a path: a doc with three names is three results. Metadata predicates (`ext:`, `path:`, `mtime:`) live on the inode/name, not the doc, so composing them with term postings needs a doc↔inode mapping at query time. | Rename or move of a file or a whole directory is one row update; a cross-filesystem move (copy + delete) reuses the doc. Duplicate content is indexed once. A changed tokenizer is a reindex keyed by version, not a migration. Inode reuse (a new file landing on a recycled number) is detected by hash mismatch, not by trust. |
-| B. Inode-addressed: doc id ← `(dev, ino)`; hash kept only to skip re-tokenizing unchanged content                                                                             | A duplicate file is indexed twice. Cross-filesystem moves reindex. Inode reuse after delete is a correctness hazard: `(dev, ino)` alone is not an identity on Linux — it needs `ctime` or a generation number alongside.                                                                                                                                                | Simpler results: one doc, one path. Simpler query-time composition.                                                                                                                                                                                                                                                               |
-| C. Path-addressed                                                                                                                                                             | Every rename is a reindex — the thing the chain exists to avoid.                                                                                                                                                                                                                                                                                                        | Nothing.                                                                                                                                                                                                                                                                                                                          |
+| B. Inode-addressed: doc id ← `(dev, ino)`; hash kept only to skip re-tokenizing unchanged content                                                                             | A duplicate file is indexed twice. Cross-filesystem moves reindex. Inode reuse after delete is a correctness hazard: `(dev, ino)` alone is not an identity on Linux — it needs `ctime` or a generation number alongside.                                                                                                                                               | Simpler results: one doc, one path. Simpler query-time composition.                                                                                                                                                                                                                                                               |
+| C. Path-addressed                                                                                                                                                             | Every rename is a reindex — the thing the chain exists to avoid.                                                                                                                                                                                                                                                                                                       | Nothing.                                                                                                                                                                                                                                                                                                                          |
 
 **Recommendation:** A, with two things stated now because they shape the index:
 (1) the query engine's unit of result is `(doc, name)`, and metadata filters are
@@ -114,6 +137,44 @@ xxh3-128 is a few hundred lines.
 **Expand on:** whether you expect results per path or per document, and whether
 hard links and bind mounts on your machines make the many-names case common or a
 corner.
+
+> Dave: the documents are indexed from 0 as they're added. This will help
+> optimise postings lists. I think we might need to discuss this one as I
+> thought that was clear from my explanation. When I add
+> /home/dave/sandbox/file.txt, and it is the 3rd document I've added, it gets a
+> document id of 2. 2 maps to the hash of the file which maps to all inodes that
+> match that hash. If I later add another file with the same hash, it gets added
+> here. If I update the file, the hash will change so index 0 will no longer
+> point at that hash (which may need to be grave-posted) and the new hash will
+> be updated to point at the new inode (or if the hash already exists, 2 will
+> point at the existing hash and the inode will be added to that hash).
+
+**Restated (2026-09-23) — please confirm.** Option A's wording, "doc id ← hash",
+read as the hash _being_ the id; it meant keyed by, and your model is the right
+statement of it:
+
+- **Doc ids are ordinals**, assigned densely in the order content is first
+  added, which is what the postings codecs want. A first crawl runs in directory
+  order, so the first build is close to path-sorted for free.
+- **`doc → hash` is 1:1 and never changes**, because a doc's postings describe
+  one content. `hash → {inode}` and `(parent inode, name) → inode` are the only
+  edges that move.
+- **Rename or move** (file or directory) edits one name edge. No postings touch.
+- **Duplicate content** adds an inode to an existing hash. No postings touch.
+- **Edit in place**: the inode leaves hash H and joins H′. If H′ is new it gets
+  the next doc id and is indexed; if H′ already exists the inode just joins its
+  set. If H is left with no inodes, its doc id is tombstoned (your
+  "grave-posted") and reclaimed at merge. (Your text says "2 will point at the
+  existing hash" — I read that as _the inode_ pointing at it, since doc 2's
+  postings describe the old content.)
+- **Tokenizer or extractor change**: a reindex assigning new ordinals; versions
+  are recorded per segment, not folded into the hash.
+
+Consequence: two id spaces. Content postings are over doc ids; filename terms
+and metadata (`ext:`, `mtime:`, `path:`) are over names/inodes in the catalog. A
+query mixing them joins across `doc → hash → inodes → names`, so the catalog
+needs a fast doc → inodes lookup, and D15 asks which side a result lives on.
+Hash: BLAKE3 unless you want zero dependencies there.
 
 ## D5 — Where the mutable state lives
 
@@ -137,7 +198,14 @@ below).
 **Expand on:** the daemon RSS you will tolerate at idle and during a crawl.
 "Nice to CPU" is in the goals; the memory number is not.
 
-## D6 — Postings versus filters, and how that gets decided
+> Dave: Agree strongly with A here. We need to really own this storage
+> mechanism. We need to experiment to know what memory numbers are tolerable and
+> make it configurable.
+
+**Answer (2026-09-23): A.** The memory budget is a config value; its default
+comes from an experiment row (catalog RSS and query latency against budget).
+
+## D6 — What the index holds: postings, filters, positions
 
 **Question:** For the term → candidate-documents structure over tier-1 text,
 what is compared, where, and when?
@@ -167,6 +235,30 @@ class), B is not built at all.
 **Expand on:** "postings only" — no positions (D7), no stored fields, no doc
 values in the segment? Or only "no positions"?
 
+> Dave: positions are usually used for phrase search and other types of queries.
+> They take up a lot of space though. My hypothesis is that the index should
+> filter the candidates and then we do a ripgrep type search over the
+> candidates. I suppose it would be nice to decide you want to sacrifice space
+> for faster search. We should experiment to find out the actual trade-offs.
+> I'll value having all of the tools available for other search projects in the
+> future, like a rust-based embeddable VictoriaLogs alternative.
+
+**Answer (2026-09-23).** The index is a **candidate filter**; a verifier (a
+ripgrep-style scan of the candidate's bytes) makes every answer exact. Postings,
+per-document filters, block filters and positions are then one family — each
+trades bytes for a narrower candidate set — measured, not assumed. Structures
+that are not clearly better ship with the opt-in side-by-side experiment. Two
+design consequences:
+
+1. **The planner/index seam.** A structure exposes
+   `candidates(atom) → doc-id iterator`, an `exact` flag and a cost estimate —
+   nothing about its format. The planner composes candidate sources and decides
+   whether to verify; it never knows whether it holds postings or a filter. This
+   is the boundary D1 flagged.
+2. **Structure crates know nothing about files.** They index doc ids and byte
+   strings, so they are reusable for the embeddable VictoriaLogs-style store.
+   Everything filesystem-shaped stays in the catalog and crawler crates.
+
 ## D7 — Positions
 
 **Question:** Store positional postings, or resolve phrase, proximity and
@@ -181,6 +273,12 @@ highlighting by re-reading the candidate file?
 most direct instantiation of "density over speed". The fact that would change
 it: post-intersection candidate sets in the tens of thousands on phrase queries,
 which the bench in D6 can measure.
+
+> Dave: Ok, A is what I just said above. I'm not quite sure I understand the
+> reason for splitting D6 and D7 and the distinction.
+
+**Merged into D6 (2026-09-23).** No real distinction: positions are one more
+candidate-narrowing structure in the same experiment.
 
 ## D8 — Regex at first ship
 
@@ -197,20 +295,41 @@ answered by a scan, by a trigram tier, or by per-file filters (architecture Q1)?
 stage-0 cold measurement. The fact that would change it: a cold scan of the 1.6
 GB text tier above ~5 s makes B a slice-1 item; under ~1 s, B is dropped too.
 
+> Dave: I'm pretty sure A is not possible. Running ripgrep on my home directory
+> takes more than a few minutes to run. I didn't wait for it to complete. Are
+> you suggesting we could run it in seconds by restricting to text files
+> perhaps? I'm pretty sure we want B or C.
+
+**Answer (2026-09-23): B or C, by experiment.** You are right, and the brief
+over-read M1: the 50 ms was `~/w` _warm_, _after_ `.gitignore` pruning cut it to
+5.73 GB; the same research measured the whole tree cold at 234 s. The scan
+survives only as the verifier over candidates. B (per-file trigram filters)
+versus C (trigram postings) is a D6 experiment row; the Cox regex → trigram
+derivation is common to both.
+
 ## D9 — What a term is
 
 **Question:** For tier-1 text (code, config, prose), what does the tokenizer
 emit?
 
-| Option                                                      | Costs                                                                 | Buys                                                                            |
-| ----------------------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| A. Maximal runs of `char::is_alphanumeric()                 |                                                                       | '\_'`, lowercased; no stemming, no splitting; ASCII-only fast path. `std` only. | `fooBar` and `foo_bar` are one term each; `TODO` and `todo` are one term. Prose stemming absent (`index` ≠ `indexes`). | Zero dependencies; deterministic; the term dictionary stays small on code, where the identifier is the query. |
-| B. A plus identifier splitting: emit `fooBar`, `foo`, `bar` | Roughly 1.5–2× the postings on code (estimate — a bench row).         | Sub-word search on identifiers.                                                 |
-| C. Language-aware (tree-sitter)                             | A large dependency with per-language grammars; a plugin-tier concern. | Symbols versus comments versus strings.                                         |
+| Option                                                                                                       | Costs                                                                                                              | Buys                                                                                                          |
+| ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| A. Maximal runs of alphanumerics and `_`, lowercased; no stemming, no splitting; ASCII fast path; `std` only | `fooBar` and `foo_bar` are one term each; `TODO` and `todo` are one term. No prose stemming (`index` ≠ `indexes`). | Zero dependencies; deterministic; the term dictionary stays small on code, where the identifier is the query. |
+| B. A plus identifier splitting: emit `fooBar`, `foo`, `bar`                                                  | Roughly 1.5–2× the postings on code (estimate — a bench row).                                                      | Sub-word search on identifiers.                                                                               |
+| C. Language-aware (tree-sitter)                                                                              | A large dependency with per-language grammars; a plugin-tier concern.                                              | Symbols versus comments versus strings.                                                                       |
 
 **Recommendation:** A, with the tokenizer version in the doc identity (D4) so B
 is a reindex of tier 1, not a format change. The fact that would change it: the
 query log, once it exists — if sub-identifier queries are common, B.
+
+> Dave: I'm pretty sure we want B here, particularly for filenames. It's _very_
+> common for me to name files with camelCase or TitleCase and I'd want to be
+> able to search those by individual words.
+
+**Answer (2026-09-23): B**, for filenames and content alike: emit the whole
+token and its camelCase / TitleCase / snake / digit-boundary parts
+(`parseHTTPRequest2` → `parsehttprequest2`, `parse`, `http`, `request`, `2`).
+The postings cost is a bench row.
 
 ## D10 — Which roots
 
@@ -224,6 +343,14 @@ query log, once it exists — if sub-identifier queries are common, B.
 **Recommendation:** A, and run M1's census over `$HOME` in the stage-0 day
 (D3/C). The fact that would change it: nothing — but the census decides whether
 the extracted-document tier is empty or the product.
+
+> Dave: yes, configurable roots, and as mentioned above, we want our own
+> .ferretignore file to override .gitignore, but generally we should respect
+> .gitignore. We should have global overrides too. e.g. node_modules, which
+> won't be .gitignored when not in a git repository but still needs to be
+> ignored.
+
+**Answer (2026-09-23): A.** Precedence and implementation are D13.
 
 ## D11 — `unsafe` posture and the intpack dependency
 
@@ -242,6 +369,15 @@ toolchain ledger for them. What is the posture?
 change it: if intpack turns out to be the only consumer-facing codec crate and
 never changes again, C immediately.
 
+> Dave: I want to remain flexible on this one. It's quite possible that we'll
+> want to vendor in intpack, and I want to use SIMD wherever it makes sense,
+> espcially if it's not already being done by regex scanning for example.
+
+**Answer (2026-09-23): stay flexible.** No workspace-wide `forbid`; `unsafe` and
+SIMD are allowed where a measurement justifies them, each recorded in a
+toolchain ledger in the intpack style. intpack starts as a git dependency and
+may be vendored.
+
 ## D12 — Licence
 
 **Question:** "As open a licence as possible" — which?
@@ -253,6 +389,74 @@ never changes again, C immediately.
 
 **Recommendation:** A, for consistency with intpack and intpack-bench. The fact
 that would change it: a stated wish for public-domain-equivalent terms.
+
+> Dave: Let's go with A.
+
+**Answer (2026-09-23): A.**
+
+## D13 — Ignore rules: precedence, and whose matcher
+
+**Question:** `.gitignore` is respected, `.ferretignore` can force-include or
+force-ignore over it, and global rules (e.g. `node_modules` outside any repo)
+apply everywhere. What is the precedence, and do we write the matcher?
+
+Proposed precedence, most specific wins (git's own model, with ferret's file one
+level above git's at each directory):
+
+1. `.ferretignore` in the directory or nearest ancestor (`!pat` force-includes)
+2. `.gitignore`, `.git/info/exclude` — only inside a git work tree
+3. user global rules, `~/.config/ferret/ignore`
+4. built-in defaults (`node_modules/`, `target/`, `.venv/`, `__pycache__/` …, a
+   size cap, binary detection)
+
+So `!node_modules/` in a `.ferretignore` beats the built-in default, and a
+repo's `.gitignore` beats the global rules inside that repo. One gitignore
+limitation to decide: git cannot re-include a file under an excluded directory.
+Proposed: `.ferretignore` can, since force-include is its point — the walker
+descends an excluded directory only when a force-include pattern could match
+beneath it.
+
+| Option                                                                                                                                    | Costs                                                                                                                                                  | Buys                                                                |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| A. `ignore` crate (BurntSushi, MIT/Unlicense): custom ignore filenames with precedence over `.gitignore` built in, plus a parallel walker | A dependency with transitive `globset` et al. (`regex` is needed anyway). Re-inclusion under an excluded directory is unsupported and needs a wrapper. | ripgrep's matcher and the semantics users already expect, in a day. |
+| B. Own matcher over `globset`                                                                                                             | Gitignore's edge cases (anchoring, `**`, trailing `/`, negation order) are a known bug farm.                                                           | Exactly the semantics above, re-inclusion included.                 |
+| C. Own matcher and glob engine                                                                                                            | B plus a glob compiler.                                                                                                                                | Zero dependencies.                                                  |
+
+**Recommendation:** A for the first slice, behind one
+`should_index(path, meta) -> Decision` function with a golden-file test corpus,
+so B can replace it with no caller noticing. The fact that would change it: if
+re-inclusion under excluded directories is common in your trees, go straight to
+B.
+
+## D14 — Filename search: scan the names, or index them
+
+**Question:** Is "much faster find" answered by scanning the catalog's names or
+by an index over them?
+
+| Option                                                                                                                        | Costs                                                                                                                                  | Buys                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| A. Scan: names stored contiguously in the catalog; substring/glob/regex is one SIMD pass over ~1M names (~20–30 MB, estimate) | Every query touches every name: single-digit ms warm, more cold (estimate — a bench row). Word matching means splitting at query time. | No index at all; any pattern shape, including regex. The Everything/FSearch approach. |
+| B. Term postings over name tokens (D9 splitting)                                                                              | A second postings set, over names.                                                                                                     | Word search (`request` finds `parseHTTPRequest.rs`) at postings speed, and ranking.   |
+| C. A for substring/glob/regex, B for words                                                                                    | Both.                                                                                                                                  | Each query shape on the structure that suits it.                                      |
+
+**Recommendation:** C, with A first — it is the first slice's whole filename
+search — and B once the postings machinery exists. The fact that would change
+it: if A answers word queries fast enough by splitting at query time, B is never
+built.
+
+## D15 — Result unit: per path or per document
+
+**Question:** When one content (a doc) has three names, is that one result or
+three?
+
+| Option                                                 | Costs                                                                             | Buys                                                             |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| A. Per path: three results                             | Duplicate content crowds the list (vendored copies, backups).                     | Matches `find` and `rg`; every result is something you can open. |
+| B. Per doc, names grouped under it                     | A result is not a path; the JSON output and the agent skill must model the group. | Duplicates collapse — the point of the chain.                    |
+| C. Per path by default, `--group` collapses to per doc | A flag.                                                                           | A for scripts and agents, B on request.                          |
+
+**Recommendation:** C. The fact that would change it: if your trees hold many
+duplicates, B as the default.
 
 ---
 
