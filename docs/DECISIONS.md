@@ -441,6 +441,14 @@ B.
 ancestor `.ferretignore` and any `.gitignore`, including re-inclusion beneath an
 excluded directory.
 
+> Dave: A .ferretignore that appears in a .gitignore excluded directory would
+> never get found. That's fine. It would need to be overridden at the same level
+> or higher.
+
+**Clarified (2026-09-23):** an excluded directory is never read, so a
+`.ferretignore` inside it has no effect. Re-including it takes a `!` pattern in
+a `.ferretignore` at the excluded directory's level or above.
+
 ## D14 — Filename search: scan the names, or index them
 
 **Question:** Is "much faster find" answered by scanning the catalog's names or

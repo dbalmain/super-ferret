@@ -137,7 +137,9 @@ defaults (`node_modules/`, `target/`, `.venv/`, …, a size cap, a binary check)
 `!pat` in a `.ferretignore` overrides an ancestor `.ferretignore` or any
 `.gitignore`, and can re-include below an excluded directory; the walker
 descends an excluded directory only when some `!` pattern could match inside it.
-The first implementation wraps the `ignore` crate; the re-inclusion case is the
+A `.ferretignore` inside an excluded directory is never read; overriding an
+exclusion takes a `!` pattern at that directory's level or above (D13). The
+first implementation wraps the `ignore` crate; the re-inclusion case is the
 wrapper's job.
 
 Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
