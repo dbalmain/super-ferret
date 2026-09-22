@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>intpack decisions</title>
+<style>
+:root{--bg:#fbfaf7;--fg:#1d1d1b;--mut:#6b6a66;--line:#e2dfd8;--acc:#0b5bd3;--ok:#2a7a3b;--open:#b8560b;--card:#fff}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#15161a;--fg:#e8e6e1;--mut:#9a9891;--line:#2c2e35;--acc:#7cb1ff;--ok:#6fcf86;--open:#f0a05a;--card:#1c1e24}}
+:root[data-theme="dark"]{--bg:#15161a;--fg:#e8e6e1;--mut:#9a9891;--line:#2c2e35;--acc:#7cb1ff;--ok:#6fcf86;--open:#f0a05a;--card:#1c1e24}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 16px 64px}
+h1{font-size:1.6rem;margin:0 0 4px}.meta{color:var(--mut);font-size:.9rem;margin-bottom:28px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:18px 0}
+h2{font-size:1.15rem;margin:0 0 6px}.tag{font-size:.75rem;font-weight:600;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;border-radius:999px;border:1px solid}
+.open{color:var(--open);border-color:var(--open)}.done{color:var(--ok);border-color:var(--ok)}
+table{border-collapse:collapse;width:100%;font-size:.92rem;margin:10px 0}th,td{text-align:left;vertical-align:top;padding:6px 8px;border-top:1px solid var(--line)}th{color:var(--mut);font-weight:600}
+td:first-child{white-space:nowrap;font-weight:600}
+.rec{border-left:3px solid var(--acc);padding:6px 12px;margin-top:10px;background:color-mix(in srgb,var(--acc) 6%,transparent)}
+code{font:.9em ui-monospace,monospace}p{margin:8px 0}.ans{border-left:3px solid var(--ok);padding:6px 12px;margin-top:10px}
+@media (max-width:600px){table,thead,tbody,tr,th,td{display:block}th{display:none}td{border:0;padding:3px 0}td:first-child{margin-top:10px}tr{border-top:1px solid var(--line);padding:6px 0}}
+</style></head><body><main>
+<h1>intpack decisions</h1>
+<div class="meta">Goal: <em>match or beat the Lucene numbers while keeping complexity low.</em> Numbers from <code>results/msa2</code> at intpack-bench <code>9d574f3</code>, intpack <code>6423815</code> (one binary, fresh inode, same run). Results page: <a href="https://claude.ai/artifact/HodeP1XJ9mtrVNDm9NTnu6">intpack results</a>. Updated 2026-09-22.</div>
+
+<section><span class="tag done">answered by measurement</span><h2>Q5 · The last 1.7 ns/e at ∩ 1:10</h2>
+<p>The one thing not yet tried on the residue was the precise perf method (cycles, dwarf stacks, <code>--only ix10</code>) applied to <i>both</i> codecs side by side; the "levers spent" verdict rested on an rdtsc split whose sub-phases were skid. Brief: produce the like-for-like leaf table, fix only if the cost is one cursor-only place under ~60 lines, otherwise stop with the table.</p>
+<table><thead><tr><th>ns/e at 1:10</th><th>words ip / lucene</th><th>trigrams ip / lucene</th></tr></thead><tbody>
+<tr><td>decode</td><td>3.4 / 6.8</td><td>2.5 / 3.7</td></tr>
+<tr><td>in-block scan</td><td><b>9.4 / 4.6</b></td><td><b>5.1 / 2.2</b></td></tr>
+<tr><td>bitset</td><td>2.5 / 1.0</td><td>2.0 / 1.9</td></tr>
+<tr><td>dispatch + skip + next</td><td>8.2 / 9.0</td><td>8.5 / 8.6</td></tr>
+<tr><td>harness frame</td><td>4.7 / 5.8</td><td>1.2 / 1.4</td></tr>
+</tbody></table>
+<div class="ans"><b>One place: the in-block scan.</b> A 1:10 hop is ~10 ids, so the scan pays per compare-and-branch round; the 4-lane SSE2 loop ran twice the rounds of Lucene's scalar scan and the cheaper decode had been hiding it. Fix (intpack <code>8bd715d</code> + <code>d0cf41b</code>, +64 lines, cursor only): a sixteen-lane <code>scan_geq</code> under <code>target_feature = "avx512f"</code>, SSE2 kept as the other arm; and a 12-line empty-<code>asm!</code> <code>pin(target)</code> because LLVM then hoisted the plain cursor's needle broadcast out of its loop and spilled the zmm across every <code>enter_block</code> (plain ∩ 1:1 8.5 → 6.8). Published run (intpack-bench <code>ba7138d</code>): words ∩ 1:10 <b>23.9 vs 26.1</b>, trigrams <b>17.7 vs 17.1</b> (inside the run band; the ip-only remainder is the harness's <code>Adapt</code> tail-call thunk), trigrams ∩ 1:1 6.9 vs 11.8, seek −6%, nothing regressed.
+<p><b>Dave (2026-09-22): keep the <code>asm!</code>, but document it so a Rust upgrade triggers a recheck; and the AVX-512-only arm "needs to be well documented".</b> Done as intpack <code>6423815</code>: <code>src/toolchain.rs</code> is a ledger of every compiler-steering item — the <code>asm!</code> pin and the five inlining attributes in the cursors — each with the bench row and the number that justified it; its test compares the compiling rustc (recorded by a 6-line <code>build.rs</code>) against the version they were measured with (1.95.0 / LLVM 21.1.8) and fails with the recheck recipe when the toolchain moves. The SIMD scan arms are no longer on that list: both now compile for tests on any x86_64 and <code>scan_agrees_on_random_blocks</code> runs every arm the host can execute under runtime detection, so a baseline <code>cargo test</code> covers the sixteen-lane arm with no flags. Gates green at baseline and under <code>target-cpu=native</code>; 101 tests.</p></div>
+</section>
+
+<section><span class="tag done">answered by measurement</span><h2>Q4 · The ∩ 1:10 residue: words −11%, trigrams −24%. Stop, or one more slice?</h2>
+<p>The question: is the ∩ 1:10 gap worth another cursor slice, given that the bitset kind halved it on words and widened it on trigrams?</p>
+<p>What the trigrams regression says: a 1:10 walk lands in most blocks of the long list. On a packed block the cost is one unpack plus SSE scan set-up for ~13 hits (≈6 ns/e amortised plus set-up); on a bitset block each landing walks words from the previous hit with a popcount per word (<code>next_set(from, i)</code>), and a 32-word body with hits ~10 bits apart means ~2 words per landing — cheap, but the entry into a bitset from a table search starts at word 0 and pops every word up to the target, and trigrams has 44 k bitset blocks against words' 15 k. That is a guess from the shape of the code; it has not been profiled.</p>
+<table><thead><tr><th>option</th><th>gain</th><th>cost</th><th>forecloses</th></tr></thead><tbody>
+<tr><td>1 · Accept</td><td>0. Ship: density leads everywhere, 1:1 / 1:100 / 1:1000 at or ahead, hot decode 1.9×, seek 2×</td><td>nothing</td><td>nothing</td></tr>
+<tr><td>2 · Cheaper bitset entry</td><td>trigrams 1:10 back to ≈19 if the guess is right (recovers the regression, not the original gap). Keep a running popcount so a fresh landing does not re-pop from word 0; make <code>next()</code> on a bitset hold its current word instead of re-deriving it (fixes uniform-d0.5 too)</td><td>~40 lines in the skip cursor, one profile run first to confirm the guess (≈1 h)</td><td>—</td></tr>
+<tr><td>3 · Profile the packed-block landing</td><td>the remaining words gap (3 ns/e) is on packed-block landings, which the lean-cursor slice already failed to move twice</td><td>another profile round with no lever identified; the two cheap levers were spent in <code>DONE-lean.md</code></td><td>—</td></tr>
+</tbody></table>
+<div class="ans"><b>Taken on the recommendation (2026-09-22), since the deciding fact was cheap to get.</b> Three fresh inodes of one binary agreed at 21.0 / 20.8 / 21.1 vs Lucene 17.5 / 17.2 / 17.0 — real, not placement. The subagent's perf phase split (same session, pre- and post-bitset binaries alternating, new bench <code>--only &lt;phase&gt;</code>) found the guess above was wrong in an instructive way: the bitset work itself got <i>cheaper</i> on the packed side (−2.2 ns/e) and the cost was call overhead — the <code>Loaded::Bits</code> arm pushed <code>SortedCursor::enter</code> past LLVM's inlining threshold, so every <code>next()</code> and fast-path miss paid a call whose body was 55% early-return epilogue (+0.9), and <code>next()</code> on a bitset called the general <code>next_set</code> out of line (+1.1). Fix: check inline, dispatch in <code>#[inline(never)] load</code>; a one-word <code>successor</code> for <code>next()</code>. intpack <code>84481df</code>, +22 lines, cursor only. Published run (one binary, fresh inode): trigrams ∩ 1:10 <b>19.2 vs 17.4</b> (−10%, back to pre-bitset), words <b>28.0 vs 26.3</b> (−6%), uniform-d0.5 ∩ 1:1 20.7 vs 17.8; nothing else moved. The remaining 1:10 residue turned out to be one place after all — see Q5.</div>
+</section>
+
+<section><span class="tag done">done · measured</span><h2>Q3 · The ∩ 1:10 gap: accept it, or add a bitset block?</h2>
+<p>Where the goal stands (after the lean-cursor slice): density ahead on every dataset (words.docs 9.33 vs 9.41, freqs 4.33 vs 4.54, posdeltas 10.16 vs 10.23, trigrams 5.57 vs 5.72); hot decode 1.7×, fresh seek 2.1×, encode 1.1× Lucene; ∩ 1:1 ahead (5.3 vs 5.6 words, 9.1 vs 11.4 trigrams); ∩ 1:1000 words tie (53.5 vs 53.9). Behind at <b>∩ 1:10: words 33.3 vs 25.9 (−29%), trigrams 19.2 vs 16.8 (−14%)</b>, and by 5–11% at 1:100 and trigrams 1:1000 (62.5 vs 56.2; Lucene's 1:1000 swings ±4 run to run).</p>
+<p>What the 1:10 profile says (<code>.ai/DONE-ix10.md</code>): the pairs are median 90 × 900 ints in a 334 k universe — not stopword lists. The whole 7.4 ns/e gap is inside our <code>next_geq</code> body (20.8 vs 14.0 ns/e); block decode is identical for both (≈6 ns/e); the leapfrog frame is the same. Inside <code>next_geq</code>: prologue/skip-search 4.7, enter 2.0, scan setup 4.8, scan loop 2.9, hit commit 6.3. Lucene spends its 14 in a scalar <code>inc/cmp</code> scan (~5) and not much else. Only half the landings are blocks Lucene stores as bitsets, and its <code>next_set_bit</code> path is invisible in the samples.</p>
+<table><thead><tr><th>option</th><th>gain at 1:10</th><th>cost</th><th>forecloses</th></tr></thead><tbody>
+<tr><td>1 · Accept</td><td>0. Ship as is: every density number and 1:100/1:1000 met; 1:10 behind 8 ns/e per short element</td><td>nothing</td><td>nothing — the format is unchanged either way</td></tr>
+<tr><td>2 · Lean cursor <span class="tag done">tried</span></td><td><b>0 at 1:10</b> (34.1 → 34.0 in the paired run). The same-block fast path is kept for its 1:1 win (6.6 → 5.3); the prologue/enter work the profile blamed turned out to be sample skid. Unaligned scanning gained 1.5 ns at 1:10 and cost 20% on whole-block scans; realigning after the first group cost 3.5 ns at 1:10. Both reverted (<code>.ai/DONE-lean.md</code>)</td><td>spent: intpack 98133e8, +115 lines net, most of it the boundary test</td><td>—</td></tr>
+<tr><td>3 · Bitset block kind <span class="tag done">landed</span></td><td>3–4 of the 7.4 (the bitset landings are already the cheap scans); 5–8 at 1:1000 where we already lead; ~0 at 1:1</td><td>Format change, ~200 lines, a second block kind the cursor dispatches on. <b>Density improves</b>: chosen per block only when smaller than the patched block, it saves 0.07 bits/int on words.docs (14 k of 95 k blocks) and 0.17 on trigrams (40 k of 139 k) — the earlier text on this page had the sign wrong</td><td>"every loaded block is 128 ints"; the token byte is full, so <code>0xfe</code> becomes the second escape</td></tr>
+</tbody></table>
+<div class="ans"><b>Dave (2026-09-22): "I think it's worth running the experiment."</b> Landed as intpack <code>33dacc5</code> (+645 lines, mostly tests; token <code>0xfe</code>, chosen per block only when strictly smaller). One binary, fresh inode, all datasets in one run (intpack-bench <code>a8574d0</code>):
+<table><thead><tr><th>ip-pfor128-skip</th><th>before</th><th>after</th><th>lucene-docs</th></tr></thead><tbody>
+<tr><td>words bits/int</td><td>9.69</td><td><b>9.61</b></td><td>10.36</td></tr>
+<tr><td>words ∩ 1:1 / 1:10 / 1:100 / 1:1000</td><td>5.3 / 33.3 / 45.6 / 53.5</td><td>5.8 / <b>28.6</b> / 42.3 / <b>40.7</b></td><td>5.6 / 25.7 / 44.0 / 54.8</td></tr>
+<tr><td>trigrams bits/int</td><td>6.05</td><td><b>5.85</b></td><td>6.42</td></tr>
+<tr><td>trigrams ∩ 1:1 / 1:10 / 1:100 / 1:1000</td><td>9.1 / 19.2 / 31.4 / 62.5</td><td>9.4 / <b>21.1</b> / 29.6 / <b>49.8</b></td><td>11.5 / 17.0 / 29.5 / 56.7</td></tr>
+<tr><td>hot decode words / trigrams Mi/s</td><td>1788 / 1824</td><td>1943 / 1952</td><td>1054 / 994</td></tr>
+<tr><td>seek words / trigrams ns</td><td>239 / 211</td><td>244 / 218</td><td>498 / 475</td></tr>
+</tbody></table>
+Density and 1:1000 improved as forecast; words 1:10 recovered half the gap (now −11%); <b>trigrams 1:10 got worse, 19.2 → 21.1 (−24%)</b>, and this is one binary for both codecs so it is not the inode effect. Fully-dense synthetic lists (uniform-d0.5) walk element by element at 23.4 vs 18.2. Everything else at or ahead. Kept: the density gain alone justifies it. The trigrams 1:10 regression is resolved under Q4.</div>
+</section>
+
+<section><span class="tag done">answered by measurement</span><h2>Q2 · Trigrams ∩ 1:1000 was 4 ns/e behind — chase it?</h2>
+<p>Options were: accept; find the "alignment-sensitive loop"; bitset block. Two investigations resolved it without a decision: the one-pass patched-decode kernel moved intersection by nothing (parked on <code>wt/pfor-fused</code>), and the 54.8 / 62.0 build-to-build spread turned out to be one binary's inode (6× L1I misses, all L2 fills, gone on <code>cp</code>), not code. On a fresh inode trigrams is 63.1 vs 61.5 (−3%) and words is ahead.</p>
+<div class="ans">Superseded by Q3: the 1:10 gap is larger and structural; 1:1000 is within noise.</div>
+</section>
+
+<section><span class="tag done">answered</span><h2>Q1 · Close the 0.06 bits/int on words.freqs?</h2>
+<p>Options were: frame-of-reference minimum on unsorted blocks (recommended); Lucene's all-equal shortcut; leave it. Taken on the recommendation since the goal stood and the slice was cheap and reversible.</p>
+<div class="ans">Option 1 landed (intpack 886584e + 54a229c): freqs <b>4.33 vs 4.54</b>, posdeltas <b>10.16 vs 10.23</b>; unsorted encode −10%, decode flat (the add rides inside the unpack kernel), sorted path byte-identical. An all-equal block is now <code>[token 0][vbyte min]</code>, which is Lucene's shortcut for free.</div>
+</section>
+
+<section><span class="tag open">open · yours</span><h2>Housekeeping</h2>
+<p><b>Push</b>: intpack-bench main is 9 commits ahead of origin (dc81357 … 4d09cdc). You asked for a push earlier in the stretch; say the word and it goes. <b>intpack on GitHub</b>: creating the public repo was blocked for me — <code>cd ~/w/intpack; gh repo create dbalmain/intpack --public --source=. --remote=origin --push</code>. <b>Branches to keep or drop</b>: <code>wt/pfor-fused</code> (negative result, kept for the record), bench <code>wt/intpack-pfor</code> carries the 1.5 k-line <code>ix-profile</code> driver, feature-gated and off the default build — not merged to main.</p>
+</section>
+</main></body></html>

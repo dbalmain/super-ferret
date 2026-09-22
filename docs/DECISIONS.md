@@ -7,28 +7,30 @@ their answer, so the record survives the conversation that produced it.
 
 Predecessors, carried forward where still open:
 
-- `claude/architecture.html` § Open questions (Q1–Q7, 2026-09-05)
-- `grok/decisions.html` (survey scoping, 2026-09-04)
+- [`research/claude/architecture.html`](research/claude/architecture.html) §
+  Open questions (Q1–Q7, 2026-09-05)
+- [`research/grok/decisions.html`](research/grok/decisions.html) (survey
+  scoping, 2026-09-04)
 
 ## Status
 
-| Id  | Question                                             | Status             | Answer                                                                               |
-| --- | ---------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------ |
-| D1  | Repository shape                                     | answered           | A: one repo, workspace under `crates/`; crate boundaries get the most design thought |
-| D2  | Format of the living documents                       | open               | no comment yet                                                                       |
-| D3  | Build order: index first, or the no-index tool first | answered           | B: usable tool first, to start collecting data                                       |
-| D4  | What identifies a document                           | restated — confirm | ordinal doc ids in add order; doc → hash → inodes → names                            |
-| D5  | Where the mutable state (paths, inodes) lives        | answered           | A: own catalog; memory budget configurable, set by experiment                        |
-| D6  | What the index holds: postings, filters, positions   | answered           | every structure is a candidate filter, verified by scan; trade-offs by experiment    |
-| D7  | Positions                                            | merged into D6     |                                                                                      |
-| D8  | Regex at first ship                                  | answered           | not a bare scan: trigram filters (B) or postings (C), by experiment                  |
-| D9  | What a term is                                       | answered           | B: identifier splitting, filenames especially                                        |
-| D10 | Which roots                                          | answered           | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides    |
-| D11 | `unsafe` posture and the intpack dependency          | answered           | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored           |
-| D12 | Licence                                              | answered           | A: `MIT OR Apache-2.0`                                                               |
-| D13 | Ignore rules: precedence, and whose matcher          | open               |                                                                                      |
-| D14 | Filename search: scan the names, or index them       | open               |                                                                                      |
-| D15 | Result unit: per path or per document                | open               |                                                                                      |
+| Id  | Question                                             | Status         | Answer                                                                                                     |
+| --- | ---------------------------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------- |
+| D1  | Repository shape                                     | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                       |
+| D2  | Format of the living documents                       | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`     |
+| D3  | Build order: index first, or the no-index tool first | answered       | B: usable tool first, to start collecting data                                                             |
+| D4  | What identifies a document                           | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                          |
+| D5  | Where the mutable state (paths, inodes) lives        | answered       | A: own catalog; memory budget configurable, set by experiment                                              |
+| D6  | What the index holds: postings, filters, positions   | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                          |
+| D7  | Positions                                            | merged into D6 |                                                                                                            |
+| D8  | Regex at first ship                                  | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                        |
+| D9  | What a term is                                       | answered       | B: identifier splitting, filenames especially                                                              |
+| D10 | Which roots                                          | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                          |
+| D11 | `unsafe` posture and the intpack dependency          | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                 |
+| D12 | Licence                                              | answered       | A: `MIT OR Apache-2.0`                                                                                     |
+| D13 | Ignore rules: precedence, and whose matcher          | answered       | A: `ignore` crate behind `should_index`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore` |
+| D14 | Filename search: scan the names, or index them       | answered       | C, scan first; an optional resident daemon keeps names warm                                                |
+| D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                           |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -83,6 +85,9 @@ a hosted artifact. Enable GitHub Pages over `docs/` only if it turns out to be
 wanted. The fact that would change it: if the design itself needs the density
 bars and provenance chips — it will need tables and numbers, and Markdown
 carries those.
+
+**Answer (2026-09-23): A.** Research moved to `docs/research/{claude,grok}/`;
+intpack's results and decisions pages copied to `docs/intpack/`.
 
 ## D3 — Build order
 
@@ -149,9 +154,9 @@ corner.
 > be updated to point at the new inode (or if the hash already exists, 2 will
 > point at the existing hash and the inode will be added to that hash).
 
-**Restated (2026-09-23) — please confirm.** Option A's wording, "doc id ← hash",
-read as the hash _being_ the id; it meant keyed by, and your model is the right
-statement of it:
+**Restated (2026-09-23), confirmed by Dave the same day.** Option A's wording,
+"doc id ← hash", read as the hash _being_ the id; it meant keyed by, and your
+model is the right statement of it:
 
 - **Doc ids are ordinals**, assigned densely in the order content is first
   added, which is what the postings codecs want. A first crawl runs in directory
@@ -214,9 +219,10 @@ The candidates: (i) term → doc-id postings (intpack `pfor128skip` or Elias-Fan
 both in intpack); (ii) a per-document filter over its terms (bloom or binary
 fuse, ~9 bits/key) with a scan of the survivors; (iii) per-block filters over
 the concatenated compressed text, VictoriaLogs-style. The research's
-`grok/decisions.html` last question and `claude/architecture.html` § What was
-rejected both argued (i) with a filter gate in front — Splunk's layering — but
-argued it from vendor figures; you want it measured.
+`research/grok/decisions.html` last question and
+`research/claude/architecture.html` § What was rejected both argued (i) with a
+filter gate in front — Splunk's layering — but argued it from vendor figures;
+you want it measured.
 
 | Option                                                                                                                                                                                                   | Costs                                                                                                                              | Buys                                                                      |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
@@ -285,11 +291,11 @@ candidate-narrowing structure in the same experiment.
 **Question:** Regex over content is a hard requirement. At first ship, is it
 answered by a scan, by a trigram tier, or by per-file filters (architecture Q1)?
 
-| Option                                                                                                                                                                           | Costs                                                                                                                         | Buys                                                                                                          |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| A. Scan path: walk the catalog (already exclusion-filtered, no directory traversal), run the regex over file bytes in parallel; ripgrep-class, 50 ms warm on the measured corpus | Cold cache is unmeasured. No index-side narrowing.                                                                            | The requirement is met in slice 1 with no new structure. The verifier is needed by every other option anyway. |
-| B. Per-file binary fuse filter over trigrams as a gate in front of A                                                                                                             | ~31 MB on the measured corpus; the Cox regex→trigram derivation has to be written (the `grok/cox-trigrams` course covers it). | Skips most files without opening them — the cold-cache win at 12% of the trigram tier's cost.                 |
-| C. Full trigram postings (T2)                                                                                                                                                    | ~252 MB estimate, 3.1× the entire term index; a selectivity estimator and cost model.                                         | Candidate narrowing inside surviving files.                                                                   |
+| Option                                                                                                                                                                           | Costs                                                                                                                                  | Buys                                                                                                          |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| A. Scan path: walk the catalog (already exclusion-filtered, no directory traversal), run the regex over file bytes in parallel; ripgrep-class, 50 ms warm on the measured corpus | Cold cache is unmeasured. No index-side narrowing.                                                                                     | The requirement is met in slice 1 with no new structure. The verifier is needed by every other option anyway. |
+| B. Per-file binary fuse filter over trigrams as a gate in front of A                                                                                                             | ~31 MB on the measured corpus; the Cox regex→trigram derivation has to be written (the `research/grok/cox-trigrams` course covers it). | Skips most files without opening them — the cold-cache win at 12% of the trigram tier's cost.                 |
+| C. Full trigram postings (T2)                                                                                                                                                    | ~252 MB estimate, 3.1× the entire term index; a selectivity estimator and cost model.                                                  | Candidate narrowing inside surviving files.                                                                   |
 
 **Recommendation:** A in slice 1, with B as the first experiment row after the
 stage-0 cold measurement. The fact that would change it: a cold scan of the 1.6
@@ -428,6 +434,13 @@ so B can replace it with no caller noticing. The fact that would change it: if
 re-inclusion under excluded directories is common in your trees, go straight to
 B.
 
+> Dave: Agree. Use the bang syntax to unignore something that was ignored by an
+> upper .ferretignore or to override a .gitignore.
+
+**Answer (2026-09-23): A**, with `!pat` in a `.ferretignore` overriding both an
+ancestor `.ferretignore` and any `.gitignore`, including re-inclusion beneath an
+excluded directory.
+
 ## D14 — Filename search: scan the names, or index them
 
 **Question:** Is "much faster find" answered by scanning the catalog's names or
@@ -444,6 +457,13 @@ search — and B once the postings machinery exists. The fact that would change
 it: if A answers word queries fast enough by splitting at query time, B is never
 built.
 
+> Dave: Agree. Also, we can avoid the cold cache by running a permanent ferret
+> daemon which I think we should do at least optionally.
+
+**Answer (2026-09-23): C, scan first.** An optional resident daemon holds the
+catalog (and hot index files) in memory so name search never starts cold; the
+CLI works with or without it.
+
 ## D15 — Result unit: per path or per document
 
 **Question:** When one content (a doc) has three names, is that one result or
@@ -459,6 +479,13 @@ three?
 duplicates, B as the default.
 
 ---
+
+> Dave: Per path. Depending on the view we might change this though. I could
+> imagine doing image search later and wanting an image to come up once even if
+> there are duplicates.
+
+**Answer (2026-09-23): per path** in the CLI. Grouping by document is a property
+of a view, not of the index, so the index keeps both available.
 
 ## Settled without a brief (object if wrong)
 
