@@ -21,7 +21,8 @@ when content changes.
 ## Crates
 
 One cargo workspace (D1). Each line lists a crate's dependencies; there are no
-cycles.
+cycles. This block is enforced: `crates/ferret/tests/layering.rs` fails when a
+crate's `Cargo.toml` disagrees with it.
 
 ```text
 ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify
@@ -79,9 +80,12 @@ pub trait DocCursor {
 }
 ```
 
-The trait is the first thing written in the index slice and the thing most worth
-reviewing; its exact shape (boxed cursors versus an enum of known cursors, cost
-units) is settled there, against intpack's cursor.
+The interface is the first thing written in the index slice and the thing most
+worth reviewing. The style guide prefers a plain `enum` + `match` over trait
+objects until a second caller needs them, so the likely shape is an enum of the
+known structures with one arm each — "adding a structure" is then a variant plus
+its arms, still without reading the planner. Settled there, against intpack's
+cursor, along with the cost units.
 
 ## The catalog (D4, D5)
 

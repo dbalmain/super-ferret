@@ -1,0 +1,22 @@
+[package]
+name = "ferret"
+description = "The ferret command-line tool."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ferret"
+path = "src/main.rs"
+
+[dependencies]
+ferret-catalog.workspace = true
+ferret-crawl.workspace = true
+ferret-index.workspace = true
+ferret-query.workspace = true
+ferret-verify.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dbalmain/super-ferret"
+publish = false
+
+[workspace.dependencies]
+ferret-catalog = { path = "crates/ferret-catalog" }
+ferret-crawl = { path = "crates/ferret-crawl" }
+ferret-index = { path = "crates/ferret-index" }
+ferret-policy = { path = "crates/ferret-policy" }
+ferret-query = { path = "crates/ferret-query" }
+ferret-text = { path = "crates/ferret-text" }
+ferret-verify = { path = "crates/ferret-verify" }
+
+# `unsafe` is allowed where a measurement justifies it (D11), but never by
+# default: a crate that needs it allows it on the item, with a comment, and
+# records it in that crate's toolchain ledger (see CLAUDE.md).
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "thin"

@@ -19,14 +19,17 @@ the skill; extraction plugins, TUI and GUI much later.
   [github.com/dbalmain/intpack-bench](https://github.com/dbalmain/intpack-bench),
   results and decisions in [docs/intpack/](intpack/).
 
-## S0 — Skeleton
+## S0 — Skeleton (done 2026-09-23)
 
 Workspace, licence (`MIT OR Apache-2.0`), lints, gates (fmt, clippy
 `-D warnings`, test), crate stubs with their boundaries documented, and the
 toolchain-ledger pattern from intpack ready for the first compiler-steering
 item.
 
-**Done when:** the gates run green on an empty workspace.
+**Done when:** the gates run green on an empty workspace. Landed with a test
+that holds every crate's dependencies to the graph in DESIGN.md, and a working
+guide for agents in [CLAUDE.md](../CLAUDE.md). The toolchain ledger is a rule in
+that guide, created by the first item that needs it rather than empty now.
 
 ## S1 — Find, faster (first usable)
 

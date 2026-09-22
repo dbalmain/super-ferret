@@ -1,0 +1,13 @@
+[package]
+name = "ferret-policy"
+description = "Exclusion policy: decides whether a path is catalogued and whether its content is indexed."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

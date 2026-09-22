@@ -1,0 +1,14 @@
+[package]
+name = "ferret-index"
+description = "Index structures over document ids, each a source of candidate documents."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ferret-text.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "ferret-verify"
+description = "Re-reads candidate files and checks a query atom against their bytes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

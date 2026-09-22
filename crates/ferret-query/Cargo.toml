@@ -1,0 +1,17 @@
+[package]
+name = "ferret-query"
+description = "Query parsing, planning over candidate sources, execution and result rows."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ferret-catalog.workspace = true
+ferret-index.workspace = true
+ferret-text.workspace = true
+ferret-verify.workspace = true
+
+[lints]
+workspace = true
