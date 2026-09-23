@@ -550,6 +550,8 @@ gap, C is the stopping point.
 3. **Blind tests**: an agent that has not seen ignore's test suite writes our
    own tests from that list.
 4. Bench against `ignore::gitignore` before `ignore` leaves the tree.
+5. **Reviews** by codex `gpt-6-astra` (effort medium): one after step 1, one
+   over the finished branch before it merges.
 
 ## Settled without a brief (object if wrong)
 
