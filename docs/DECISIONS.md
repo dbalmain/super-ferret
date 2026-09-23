@@ -14,23 +14,23 @@ Predecessors, carried forward where still open:
 
 ## Status
 
-| Id  | Question                                             | Status         | Answer                                                                                                     |
-| --- | ---------------------------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------- |
-| D1  | Repository shape                                     | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                       |
-| D2  | Format of the living documents                       | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`     |
-| D3  | Build order: index first, or the no-index tool first | answered       | B: usable tool first, to start collecting data                                                             |
-| D4  | What identifies a document                           | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                          |
-| D5  | Where the mutable state (paths, inodes) lives        | answered       | A: own catalog; memory budget configurable, set by experiment                                              |
-| D6  | What the index holds: postings, filters, positions   | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                          |
-| D7  | Positions                                            | merged into D6 |                                                                                                            |
-| D8  | Regex at first ship                                  | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                        |
-| D9  | What a term is                                       | answered       | B: identifier splitting, filenames especially                                                              |
-| D10 | Which roots                                          | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                          |
-| D11 | `unsafe` posture and the intpack dependency          | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                 |
-| D12 | Licence                                              | answered       | A: `MIT OR Apache-2.0`                                                                                     |
-| D13 | Ignore rules: precedence, and whose matcher          | answered       | A: `ignore` crate behind `should_index`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore` |
-| D14 | Filename search: scan the names, or index them       | answered       | C, scan first; an optional resident daemon keeps names warm                                                |
-| D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                           |
+| Id  | Question                                             | Status         | Answer                                                                                                         |
+| --- | ---------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------- |
+| D1  | Repository shape                                     | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                           |
+| D2  | Format of the living documents                       | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`         |
+| D3  | Build order: index first, or the no-index tool first | answered       | B: usable tool first, to start collecting data                                                                 |
+| D4  | What identifies a document                           | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                              |
+| D5  | Where the mutable state (paths, inodes) lives        | answered       | A: own catalog; memory budget configurable, set by experiment                                                  |
+| D6  | What the index holds: postings, filters, positions   | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                              |
+| D7  | Positions                                            | merged into D6 |                                                                                                                |
+| D8  | Regex at first ship                                  | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                            |
+| D9  | What a term is                                       | answered       | B: identifier splitting, filenames especially                                                                  |
+| D10 | Which roots                                          | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                              |
+| D11 | `unsafe` posture and the intpack dependency          | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                     |
+| D12 | Licence                                              | answered       | A: `MIT OR Apache-2.0`                                                                                         |
+| D13 | Ignore rules: precedence, and whose matcher          | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore` |
+| D14 | Filename search: scan the names, or index them       | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
+| D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                               |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -448,6 +448,19 @@ excluded directory.
 **Clarified (2026-09-23):** an excluded directory is never read, so a
 `.ferretignore` inside it has no effect. Re-including it takes a `!` pattern in
 a `.ferretignore` at the excluded directory's level or above.
+
+**Landed (2026-09-23, `76725e8`).** The API is a per-directory `DirRules`
+(`root`, `enter`, `traverse`, `decide`) rather than one `should_index` function,
+so the crawler carries rules down the walk and the policy stays pure. An
+excluded directory is walked in a re-include-only mode (`traverse`: not
+catalogued, its ignore files unread) only when an **anchored** `.ferretignore`
+`!` pattern could match something beneath it, checked one path component at a
+time with gitignore glob rules. So `!/target/doc/**` and
+`!/target/*/report.html` reach into `target/`, while `!*.pdf` and `!**/x` never
+cause an excluded directory to be walked. Inside a traversed directory only
+`.ferretignore` `!` patterns re-include; `.gitignore` and the global file
+cannot, as in git. A bad pattern line is dropped and reported, and the rest of
+its file still applies.
 
 ## D14 — Filename search: scan the names, or index them
 
