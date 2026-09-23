@@ -31,6 +31,7 @@ Predecessors, carried forward where still open:
 | D13 | Ignore rules: precedence, and whose matcher          | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore` |
 | D14 | Filename search: scan the names, or index them       | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
 | D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                               |
+| D16 | Replace `ignore` with our own gitignore matcher      | experimenting  | A: timeboxed experiment; keep `ignore` unless ours matches it on correctness and speed                         |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -122,11 +123,11 @@ than as a stop-gap scanner.
 **Question:** In `document → hash → inode(s) → name → dir inode → … → root`,
 what is the primary key of a document, and what follows from it?
 
-| Option                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                  | Buys                                                                                                                                                                                                                                                                                                                              |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Option                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                   | Buys                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A. Content-addressed: doc id ← (content hash, extractor version, tokenizer version). `(dev, ino) → doc`. `(parent ino, name) → child ino`. Paths resolved by walking parents. | Every indexed file is hashed in full (it is being read in full to tokenize, so the marginal cost is the hash). A result is a (doc, path) pair, not a path: a doc with three names is three results. Metadata predicates (`ext:`, `path:`, `mtime:`) live on the inode/name, not the doc, so composing them with term postings needs a doc↔inode mapping at query time. | Rename or move of a file or a whole directory is one row update; a cross-filesystem move (copy + delete) reuses the doc. Duplicate content is indexed once. A changed tokenizer is a reindex keyed by version, not a migration. Inode reuse (a new file landing on a recycled number) is detected by hash mismatch, not by trust. |
-| B. Inode-addressed: doc id ← `(dev, ino)`; hash kept only to skip re-tokenizing unchanged content                                                                             | A duplicate file is indexed twice. Cross-filesystem moves reindex. Inode reuse after delete is a correctness hazard: `(dev, ino)` alone is not an identity on Linux — it needs `ctime` or a generation number alongside.                                                                                                                                               | Simpler results: one doc, one path. Simpler query-time composition.                                                                                                                                                                                                                                                               |
-| C. Path-addressed                                                                                                                                                             | Every rename is a reindex — the thing the chain exists to avoid.                                                                                                                                                                                                                                                                                                       | Nothing.                                                                                                                                                                                                                                                                                                                          |
+| B. Inode-addressed: doc id ← `(dev, ino)`; hash kept only to skip re-tokenizing unchanged content                                                                             | A duplicate file is indexed twice. Cross-filesystem moves reindex. Inode reuse after delete is a correctness hazard: `(dev, ino)` alone is not an identity on Linux — it needs `ctime` or a generation number alongside.                                                                                                                                                | Simpler results: one doc, one path. Simpler query-time composition.                                                                                                                                                                                                                                                               |
+| C. Path-addressed                                                                                                                                                             | Every rename is a reindex — the thing the chain exists to avoid.                                                                                                                                                                                                                                                                                                        | Nothing.                                                                                                                                                                                                                                                                                                                          |
 
 **Recommendation:** A, with two things stated now because they shape the index:
 (1) the query engine's unit of result is `(doc, name)`, and metadata filters are
@@ -507,6 +508,48 @@ duplicates, B as the default.
 
 **Answer (2026-09-23): per path** in the CLI. Grouping by document is a property
 of a view, not of the index, so the index keeps both available.
+
+## D16 — Replace `ignore` with our own gitignore matcher
+
+**Question:** `ignore` (D13) brings 11 crates into `ferret-policy`. Do we write
+our own gitignore matcher and drop it?
+
+What the tree actually is (`cargo tree -p ferret-policy`, 2026-09-24): we use
+only `ignore::gitignore::{Gitignore, GitignoreBuilder}` and `Match` — build from
+lines, then `matched(path, is_dir)`. `crossbeam-deque`/`-epoch`/`-utils`,
+`walkdir` and `same-file` exist for ignore's parallel walker, which we do not
+call; they are not Windows support (that is `winapi-util`, `cfg(windows)`, never
+built here). `globset` compiles each glob to a regex and matches the set through
+`regex-automata`, with fast paths for literal basenames, extensions, prefixes
+and suffixes; that brings `aho-corasick`, `bstr`, `memchr`, `regex-syntax` and
+`log`. The part we would replace is `gitignore.rs` (885 lines with tests) plus a
+glob matcher. Git's own matcher is a backtracking wildmatch with no regex
+engine, so this is independent of whether we build our own regex (D8).
+
+| Option                                                                                                                                                              | Costs                                           | Buys                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------ |
+| A. Timeboxed experiment: own gitignore module on a wildmatch-style glob matcher, checked against the golden corpus and `git check-ignore`, benched against `ignore` | ~600–900 lines; about half a day of agent time. | 11 fewer crates; the semantics are ours; the regex question stays independent.       |
+| B. Keep `ignore`                                                                                                                                                    | Nothing now.                                    | A mature matcher, ripgrep's semantics.                                               |
+| C. Own gitignore rules over `globset` directly, drop `ignore`                                                                                                       | Small: only the gitignore layer is rewritten.   | Drops the walker's crates (crossbeam ×3, walkdir, same-file); the regex crates stay. |
+
+**Recommendation:** A. It forecloses nothing — if it loses, `ignore` stays. The
+fact that would change it: if the bench shows ours well behind globset at ~1M
+paths with realistic rule sets, and only a regex-style set matcher closes the
+gap, C is the stopping point.
+
+**Answer (2026-09-24): A**, run as:
+
+1. **First implementation** (codex `gpt-5.6-sol`, effort high), tests first,
+   written from `gitignore(5)` and `git check-ignore` as a black-box oracle.
+   Git's `wildmatch.c` is GPL-2 and is **not** ported or read (D12). ignore's
+   and globset's sources are not read either, so the first test suite is
+   independent of theirs.
+2. **Conformance pass** (codex `gpt-5.6-luna`, effort high): ignore's own tests
+   are copied in **temporarily** to find divergences, fixed, then removed. The
+   output is a list of behaviours that need testing, not tests.
+3. **Blind tests**: an agent that has not seen ignore's test suite writes our
+   own tests from that list.
+4. Bench against `ignore::gitignore` before `ignore` leaves the tree.
 
 ## Settled without a brief (object if wrong)
 
