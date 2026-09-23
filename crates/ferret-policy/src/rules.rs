@@ -172,9 +172,6 @@ impl DirRules {
     /// over the size cap, a symlink is catalogued. An excluded directory is
     /// traversed if an anchored `.ferretignore` `!` pattern reaches below it.
     pub fn decide(&self, name: &OsStr, entry: Entry) -> Decision {
-        if entry == Entry::Other {
-            return Decision::Skip;
-        }
         let path = self.path.join(name);
         let is_dir = entry == Entry::Dir;
         let included = match self.first_match(&path, is_dir) {

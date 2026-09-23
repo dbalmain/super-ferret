@@ -33,6 +33,10 @@
 //! from the fixture even though the walk never enters `.git/`, as the crawler
 //! reads it directly.
 
+// Test-only helpers outside `#[test]` fns: clippy's allow-unwrap-in-tests
+// does not reach them, and a panic naming the fixture is the right failure.
+#![allow(clippy::unwrap_used)]
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;

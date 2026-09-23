@@ -32,23 +32,19 @@ pub(crate) struct Reinclude {
 
 impl Reinclude {
     /// Parses one `.ferretignore` line. `None` when the line is not a `!`
-    /// pattern, is not anchored, can reach nothing below its first component
-    /// (`!/target/` names the directory itself, which plain matching handles),
-    /// or does not compile (the caller has already reported the bad line).
+    /// pattern, is not anchored beneath a directory, or does not compile (the
+    /// caller has already reported the bad line).
     pub(crate) fn parse(line: &str) -> Option<Self> {
         let pattern = line.strip_prefix('!')?.trim_end();
-        let body = pattern.strip_suffix('/').unwrap_or(pattern);
-        let anchored = body.contains('/');
-        let body = body.strip_prefix('/').unwrap_or(body);
-        let parts: Vec<&str> = body.split('/').filter(|p| !p.is_empty()).collect();
-        if !anchored || parts.first().is_none_or(|p| *p == "**") {
+        let parts: Vec<&str> = pattern.split('/').filter(|p| !p.is_empty()).collect();
+        // One component is either unanchored (`!*.pdf`) or names the
+        // directory itself (`!/target/`); a leading `**` is unanchored too.
+        // Neither reaches below an excluded directory.
+        if parts.len() < 2 || parts[0] == "**" {
             return None;
         }
         let open_at = parts.iter().position(|p| *p == "**");
         let depth = open_at.unwrap_or(parts.len() - 1);
-        if depth == 0 {
-            return None;
-        }
         let prefixes = (1..=depth)
             .map(|d| {
                 let mut builder = GitignoreBuilder::new(".");
