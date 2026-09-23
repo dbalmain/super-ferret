@@ -1,0 +1,59 @@
+# Excluded directories, and re-including beneath them (D13).
+
+== case 5: !/target/doc/** traverses target/, indexes target/doc/x.html, skips target/debug/
+.git/                   skip
+.gitignore              index
+  | !*.md
+.ferretignore           index
+  | !/target/doc/**
+README.md               index
+target/                 traverse
+target/README.md        skip
+target/CACHEDIR.TAG     skip
+target/.ferretignore    skip
+  | !debug/
+  | !*
+target/doc/             traverse
+target/doc/x.html       index
+target/doc/sub/         descend
+target/doc/sub/y.html   index
+target/debug/           skip
+target/debug/a.o        unvisited
+
+== an anchored pattern with a wildcard component reaches through it
+.ferretignore           index
+  | !/target/*/report.html
+target/                 traverse
+target/debug/           traverse
+target/debug/report.html index
+target/debug/a.o        skip
+target/debug/deps/      skip
+
+== case 6: !*.pdf does not descend node_modules/ even when it holds a PDF
+.git/                   skip
+.gitignore              index
+  | *.pdf
+.ferretignore           index
+  | !*.pdf
+paper.pdf               index
+node_modules/           skip
+node_modules/doc.pdf    unvisited
+
+== case 7: a .ferretignore inside an excluded directory is never consulted
+.git/                   skip
+.gitignore              index
+  | out/
+out/                    skip
+out/.ferretignore       unvisited
+  | !*
+  | !/x.txt
+out/x.txt               unvisited
+
+== a .gitignore ! pattern cannot re-include beneath an excluded directory
+.git/                   skip
+.gitignore              index
+  | build/
+  | !/build/keep/**
+build/                  skip
+build/keep/             unvisited
+build/keep/a.txt        unvisited

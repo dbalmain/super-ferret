@@ -1,0 +1,25 @@
+# Entry kinds, directory-only patterns and the size cap.
+
+== case 8: a directory-only pattern does not match a file of that name
+.ferretignore           index
+  | foo/
+foo                     index
+sub/                    descend
+sub/foo/                skip
+sub/foo/x               unvisited
+
+== case 9: size cap — at the cap is indexed, one byte over is catalogued
+cap 100
+at-cap.txt      100     index
+over-cap.txt    101     too-large
+.ferretignore           index
+  | *.log
+  | !big.log
+big.log         5000    too-large
+
+== symlinks are catalogued unless excluded; special files are always skipped
+.ferretignore           index
+  | !fifo
+link@                   symlink
+result@                 skip
+fifo=                   skip

@@ -1,0 +1,52 @@
+# .gitignore and .git/info/exclude apply only inside a git work tree.
+
+== case 2: a deeper .gitignore !keep.log beats a parent .gitignore *.log
+.git/                   skip
+.gitignore              index
+  | *.log
+a.log                   skip
+logs/                   descend
+logs/.gitignore         index
+  | !keep.log
+logs/keep.log           index
+logs/other.log          skip
+
+== case 3: .gitignore outside any work tree has no effect
+.gitignore              index
+  | *.txt
+  | out/
+notes.txt               index
+out/                    descend
+out/x.txt               index
+repo/                   descend
+repo/.git/              skip
+repo/.gitignore         index
+  | *.o
+repo/a.o                skip
+repo/b.txt              index
+
+== .git/info/exclude applies inside its work tree, below every .gitignore
+repo/                   descend
+repo/.git/              skip
+repo/.git/info/         unvisited
+repo/.git/info/exclude  unvisited
+  | *.tmp
+  | *.swp
+repo/.gitignore         index
+  | !a.tmp
+repo/a.tmp              index
+repo/b.tmp              skip
+repo/sub/               descend
+repo/sub/c.swp          skip
+other.tmp               index
+
+== a nested work tree drops the enclosing repository's .gitignore
+.git/                   skip
+.gitignore              index
+  | *.gen
+a.gen                   skip
+inner/                  descend
+inner/.git/             skip
+inner/b.gen             index
+plain/                  descend
+plain/c.gen             skip

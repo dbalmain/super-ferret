@@ -1,0 +1,57 @@
+# Precedence between the four bands: .ferretignore, git, global, defaults.
+
+== case 1: root .ferretignore !secret.txt beats secret.txt in a deeper .gitignore
+.git/                   skip
+.ferretignore           index
+  | !secret.txt
+sub/                    descend
+sub/.gitignore          index
+  | secret.txt
+  | *.bak
+sub/secret.txt          index
+sub/old.bak             skip
+
+== a closer .ferretignore beats an ancestor .ferretignore, both ways
+.ferretignore           index
+  | *.draft
+  | !keep.me
+a/                      descend
+a/.ferretignore         index
+  | !final.draft
+  | keep.me
+a/final.draft           index
+a/wip.draft             skip
+a/keep.me               skip
+keep.me                 index
+
+== case 4: !node_modules/ in a .ferretignore beats the built-in default
+.ferretignore           index
+  | !node_modules/
+node_modules/           descend
+node_modules/pkg.js     index
+target/                 skip
+target/debug/           unvisited
+
+== global rules apply everywhere, below .ferretignore and inside-repo .gitignore
+global
+  | *.tmp
+  | scratch/
+.ferretignore           index
+  | !pinned.tmp
+a.tmp                   skip
+pinned.tmp              index
+scratch/                skip
+scratch/x.txt           unvisited
+repo/                   descend
+repo/.git/              skip
+repo/.gitignore         index
+  | !kept.tmp
+repo/kept.tmp           index
+repo/b.tmp              skip
+
+== defaults off: built-in names are ordinary directories
+defaults off
+node_modules/           descend
+node_modules/a.js       index
+.git/                   descend
+.git/HEAD               index
