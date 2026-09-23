@@ -17,6 +17,7 @@
 //! Pattern syntax and matching are the `ignore` crate's (D13 option A), kept
 //! behind this API so an own matcher can replace it without callers noticing.
 
+mod gitignore;
 mod reinclude;
 mod rules;
 
