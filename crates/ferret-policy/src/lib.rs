@@ -14,8 +14,8 @@
 //!
 //! Seams: `rules` holds the precedence chain, `reinclude` the one extension
 //! over gitignore semantics (re-including beneath an excluded directory).
-//! Pattern syntax and matching are the `ignore` crate's (D13 option A), kept
-//! behind this API so an own matcher can replace it without callers noticing.
+//! Pattern syntax and matching are implemented in this crate (D16), behind
+//! this API so callers do not depend on matcher details.
 
 mod gitignore;
 mod reinclude;

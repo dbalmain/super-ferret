@@ -13,22 +13,20 @@
 //! Within one file the last matching line wins, as in gitignore. Each layer
 //! matches paths relative to the directory holding its file.
 //!
-//! Seams: the `ignore` crate compiles and matches each file's patterns;
-//! `reinclude` decides whether an excluded directory must be traversed.
+//! Seams: `gitignore` compiles and matches each file's patterns; `reinclude`
+//! decides whether an excluded directory must be traversed.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ignore::Match;
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
-
+use crate::gitignore::{Gitignore, Match};
 use crate::reinclude::Reinclude;
 use crate::{Config, Decision, Entry, IgnoreFile, IgnoreFiles, PatternError, Reason};
 
 /// The M1 list, measured on Dave's tree (research M1). `result` has no slash:
 /// Nix's `result` is a symlink.
-const DEFAULTS: &str = "\
+pub(crate) const DEFAULTS: &str = "\
 .git/
 node_modules/
 target/
@@ -280,26 +278,13 @@ impl Layer {
         parent: Chain,
         errors: &mut Vec<PatternError>,
     ) -> Self {
-        // Root "." disables the matcher's own prefix stripping; `matched`
-        // hands it paths already relative to `base`.
-        let mut builder = GitignoreBuilder::new(".");
-        for (index, line) in text.lines().enumerate() {
-            if let Err(err) = builder.add_line(None, line) {
-                errors.push(PatternError::Line {
-                    file: file.clone(),
-                    line: index + 1,
-                    pattern: line.to_owned(),
-                    detail: err.to_string(),
-                });
-            }
-        }
-        let matcher = builder.build().unwrap_or_else(|err| {
-            errors.push(PatternError::File {
-                file,
-                detail: err.to_string(),
-            });
-            Gitignore::empty()
-        });
+        let (matcher, line_errors) = Gitignore::compile(text);
+        errors.extend(line_errors.into_iter().map(|error| PatternError::Line {
+            file: file.clone(),
+            line: error.line,
+            pattern: error.pattern,
+            detail: error.detail,
+        }));
         Self {
             base,
             matcher,
@@ -314,8 +299,8 @@ impl Layer {
         let rel = path.strip_prefix(&self.base).ok()?;
         match self.matcher.matched(rel, is_dir) {
             Match::None => None,
-            Match::Ignore(_) => Some(false),
-            Match::Whitelist(_) => Some(true),
+            Match::Ignore => Some(false),
+            Match::Whitelist => Some(true),
         }
     }
 }
@@ -342,7 +327,7 @@ mod tests {
     #[test]
     fn a_bad_line_is_reported_and_the_rest_of_its_file_applies() {
         let files = IgnoreFiles {
-            ferretignore: Some("*.log\na{b\n"),
+            ferretignore: Some("*.log\nbad\\\n"),
             ..IgnoreFiles::default()
         };
         let (rules, errors) = root(None, files);
@@ -350,7 +335,7 @@ mod tests {
             matches!(
                 errors.as_slice(),
                 [PatternError::Line { file: IgnoreFile::Ferret(path), line: 2, pattern, .. }]
-                    if path == Path::new("/r/.ferretignore") && pattern == "a{b"
+                    if path == Path::new("/r/.ferretignore") && pattern == "bad\\"
             ),
             "{errors:?}"
         );
@@ -360,7 +345,7 @@ mod tests {
 
     #[test]
     fn global_file_errors_name_the_global_file() {
-        let (_, errors) = root(Some("a{b"), IgnoreFiles::default());
+        let (_, errors) = root(Some("bad\\"), IgnoreFiles::default());
         assert!(
             matches!(
                 errors.as_slice(),

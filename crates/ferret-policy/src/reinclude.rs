@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use crate::gitignore::{Gitignore, Match};
 
 /// One anchored `!` pattern, split into per-depth directory prefixes.
 #[derive(Clone, Debug)]
@@ -47,12 +47,10 @@ impl Reinclude {
         let depth = open_at.unwrap_or(parts.len() - 1);
         let prefixes = (1..=depth)
             .map(|d| {
-                let mut builder = GitignoreBuilder::new(".");
-                builder.add_line(None, &format!("/{}", parts[..d].join("/")))?;
-                builder.build()
+                let (matcher, errors) = Gitignore::compile(&format!("/{}", parts[..d].join("/")));
+                errors.is_empty().then_some(matcher)
             })
-            .collect::<Result<_, _>>()
-            .ok()?;
+            .collect::<Option<_>>()?;
         Some(Self {
             prefixes,
             open_at,
@@ -73,7 +71,7 @@ impl Reinclude {
             && self
                 .prefixes
                 .get(at - 1)
-                .is_some_and(|p| p.matched(&probe, true).is_ignore())
+                .is_some_and(|p| p.matched(&probe, true) == Match::Ignore)
     }
 }
 

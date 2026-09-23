@@ -31,7 +31,7 @@ ferret-crawl   → ferret-policy, ferret-catalog
 ferret-index   → ferret-text, intpack (git dependency, may be vendored — D11)
 ferret-catalog → (std only)
 ferret-verify  → regex
-ferret-policy  → ignore
+ferret-policy  → (std only)
 ferret-text    → (std only)
 ferret-bench   → anything; nothing depends on it
 ferret-daemon  → later
@@ -146,8 +146,9 @@ traverses an excluded directory (uncatalogued, its ignore files unread) only
 when an anchored `.ferretignore` `!` pattern could match inside it — never for
 an unanchored one such as `!*.pdf`. A `.ferretignore` inside an excluded
 directory is never read; overriding an exclusion takes a `!` pattern at that
-directory's level or above (D13). The first implementation wraps the `ignore`
-crate; the re-inclusion case is the wrapper's job.
+directory's level or above (D13). D16 replaces the first implementation's
+`ignore` crate edge with an in-crate matcher while retaining the same policy API
+and re-inclusion behavior.
 
 Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
 and **content-indexed** (also hashed and tokenized). Binary files and files over
