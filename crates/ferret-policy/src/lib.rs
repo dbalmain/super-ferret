@@ -167,13 +167,6 @@ pub enum PatternError {
         /// The matcher's reason.
         detail: String,
     },
-    /// The file's patterns could not be compiled together; none of it applies.
-    File {
-        /// Where it came from.
-        file: IgnoreFile,
-        /// The matcher's reason.
-        detail: String,
-    },
 }
 
 impl fmt::Display for IgnoreFile {
@@ -197,7 +190,6 @@ impl fmt::Display for PatternError {
                 pattern,
                 detail,
             } => write!(f, "{file}:{line}: `{pattern}`: {detail}"),
-            Self::File { file, detail } => write!(f, "{file}: {detail}"),
         }
     }
 }

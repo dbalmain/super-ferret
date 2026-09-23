@@ -29,7 +29,9 @@ pub(crate) struct LineError {
 pub(crate) struct Gitignore {
     literals: HashMap<Vec<u8>, Vec<FastMatch>>,
     extensions: HashMap<Vec<u8>, Vec<FastMatch>>,
-    general: Vec<Pattern>,
+    basename_general: Vec<Pattern>,
+    anchored_any: Vec<Pattern>,
+    anchored_by_first: HashMap<u8, Vec<Pattern>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +47,7 @@ struct Pattern {
     result: Match,
     directory_only: bool,
     basename_only: bool,
+    literal: bool,
     tokens: Vec<Token>,
 }
 
@@ -108,7 +111,25 @@ impl Gitignore {
             best = Some(candidate);
         }
 
-        for pattern in self.general.iter().rev() {
+        let prefixed = bytes
+            .first()
+            .and_then(|first| self.anchored_by_first.get(first))
+            .map_or(&[][..], Vec::as_slice);
+        let groups = [
+            self.basename_general.as_slice(),
+            self.anchored_any.as_slice(),
+            prefixed,
+        ];
+        let mut positions = groups.map(<[Pattern]>::len);
+        while let Some(group) = positions
+            .iter()
+            .enumerate()
+            .filter(|(_, position)| **position != 0)
+            .max_by_key(|(group, position)| groups[*group][**position - 1].index)
+            .map(|(group, _)| group)
+        {
+            positions[group] -= 1;
+            let pattern = &groups[group][positions[group]];
             if best.is_some_and(|candidate| pattern.index < candidate.index) {
                 break;
             }
@@ -137,7 +158,16 @@ impl Gitignore {
             self.extensions.entry(extension).or_default().push(fast);
             return;
         }
-        self.general.push(pattern);
+        if pattern.basename_only {
+            self.basename_general.push(pattern);
+        } else if let Some(Token::Literal(first)) = pattern.tokens.first() {
+            self.anchored_by_first
+                .entry(*first)
+                .or_default()
+                .push(pattern);
+        } else {
+            self.anchored_any.push(pattern);
+        }
     }
 }
 
@@ -170,11 +200,15 @@ impl Pattern {
 
         let basename_only = !leading_slash && !body.as_bytes().contains(&b'/');
         let tokens = compile_tokens(body.as_bytes())?;
+        let literal = tokens
+            .iter()
+            .all(|token| matches!(token, Token::Literal(_)));
         Ok(Some(Self {
             index,
             result,
             directory_only,
             basename_only,
+            literal,
             tokens,
         }))
     }
@@ -184,7 +218,16 @@ impl Pattern {
             return false;
         }
         let candidate = if self.basename_only { basename } else { path };
-        matches_tokens(&self.tokens, candidate)
+        if self.literal {
+            self.tokens.len() == candidate.len()
+                && self
+                    .tokens
+                    .iter()
+                    .zip(candidate)
+                    .all(|(token, byte)| matches!(token, Token::Literal(want) if want == byte))
+        } else {
+            matches_tokens(&self.tokens, candidate)
+        }
     }
 }
 
@@ -696,31 +739,34 @@ mod tests {
     #[test]
     fn agrees_with_git_check_ignore_on_seeded_patterns_and_paths() {
         let mut random = XorShift::new(0xd16_f3e2_7a91_4c05);
-        let patterns = random_patterns(&mut random, 240);
-        let paths = random_paths(&mut random, 3_000);
-        let repository = TempRepository::new(&patterns, &paths);
-        let queries: Vec<&str> = paths.keys().map(String::as_str).collect();
-        let oracle = repository.check_ignore(&queries);
-        let (matcher, _) = Gitignore::compile(&patterns);
+        let mut total = 0;
+        for _ in 0..6 {
+            let patterns = random_patterns(&mut random, 40);
+            let paths = random_paths(&mut random, 500);
+            let repository = TempRepository::new(&patterns, &paths);
+            let queries: Vec<&str> = paths.keys().map(String::as_str).collect();
+            let oracle = repository.check_ignore(&queries);
+            let (matcher, _) = Gitignore::compile(&patterns);
 
-        let by_path: BTreeMap<&str, Match> = queries.iter().copied().zip(oracle).collect();
-        let mut compared = 0;
-        for (path, is_dir) in &paths {
-            // check-ignore folds an ignored parent into its answer. `matched`
-            // is intentionally direct because the walker already queried each
-            // parent, so only compare paths with no ignored parent.
-            if parents(path).any(|parent| by_path.get(parent) == Some(&Match::Ignore)) {
-                continue;
+            let by_path: BTreeMap<&str, Match> = queries.iter().copied().zip(oracle).collect();
+            for (path, is_dir) in &paths {
+                // check-ignore folds an ignored parent into its answer.
+                // `matched` is intentionally direct because the walker
+                // already queried each parent, so compare only when none is
+                // ignored.
+                if parents(path).any(|parent| by_path.get(parent) == Some(&Match::Ignore)) {
+                    continue;
+                }
+                let want = by_path[path.as_str()];
+                let got = matcher.matched(Path::new(path), *is_dir);
+                assert_eq!(
+                    got, want,
+                    "Git differential mismatch for path {path:?}, is_dir={is_dir}\npatterns:\n{patterns}"
+                );
+                total += 1;
             }
-            let want = by_path[path.as_str()];
-            let got = matcher.matched(Path::new(path), *is_dir);
-            assert_eq!(
-                got, want,
-                "Git differential mismatch for path {path:?}, is_dir={is_dir}\npatterns:\n{patterns}"
-            );
-            compared += 1;
         }
-        assert!(compared >= 1_000, "only {compared} direct paths compared");
+        assert!(total >= 2_000, "only {total} direct paths compared");
     }
 
     #[test]
