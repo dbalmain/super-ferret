@@ -31,7 +31,7 @@ Predecessors, carried forward where still open:
 | D13 | Ignore rules: precedence, and whose matcher          | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore` |
 | D14 | Filename search: scan the names, or index them       | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
 | D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                               |
-| D16 | Replace `ignore` with our own gitignore matcher      | experimenting  | A: timeboxed experiment; keep `ignore` unless ours matches it on correctness and speed                         |
+| D16 | Replace `ignore` with our own gitignore matcher      | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
 | D17 | Whose regex engine, and when                         | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
@@ -540,24 +540,39 @@ gap, C is the stopping point.
 
 **Answer (2026-09-24): A**, run as:
 
-1. **First implementation** (codex `gpt-5.6-sol`, effort high), tests first,
-   written from `gitignore(5)` and `git check-ignore` as a black-box oracle.
-   Git's `wildmatch.c` is GPL-2 and is **not** ported or read (D12). ignore's
-   and globset's sources are not read either, so the first test suite is
-   independent of theirs.
-2. **Conformance pass** (codex `gpt-5.6-luna`, effort high): ignore's own tests
-   are copied in **temporarily** to find divergences, fixed, then removed. The
-   output is a list of behaviours that need testing, not tests.
-3. **Blind tests**: an agent that has not seen ignore's test suite writes our
-   own tests from that list.
-4. Bench against `ignore::gitignore` before `ignore` leaves the tree. The core
-   rewrite after the first review (linear-time glob automaton, globstar and
-   class parsing, a parser shared with `reinclude.rs`, fast paths, a
-   correctly-based bench; target: at or below `ignore` on every rule set) went
-   to a second `gpt-5.6-sol` run (2026-09-24).
+1. **First implementation** (codex Sol), tests first, written from
+   `gitignore(5)` with `git check-ignore` as a black-box oracle. Git's
+   `wildmatch.c` is GPL-2 and was **not** ported or read (D12); ignore's and
+   globset's sources were not read either.
+2. **Review** (codex Astra): exponential backtracking (6.9 s on one 40-byte
+   name), globstar and class divergences, a benchmark fed paths on the wrong
+   base. A **core rewrite** (codex Sol) followed: bounded component matching, a
+   parser shared with `reinclude.rs`, measured fast paths.
+3. **Conformance pass** (codex Luna): ignore's and globset's tests (181 cases)
+   copied in temporarily; 24 failures, every one a case where `ignore` disagrees
+   with git and we follow git. The ported tests were deleted; the output was a
+   list of behaviours, not tests.
+4. **Blind tests** (Claude): written from that list without seeing upstream
+   tests; every table row is checked against git by a permanent test; 28
+   deliberate mutations of the matcher, all caught.
+5. **Final review** (codex Astra): five more git-verified divergences
+   (re-inclusion skipped file normalisation, escaped separators, CR/NUL order,
+   bracket corner cases, an oracle pipe deadlock), fixed by codex Luna.
 
-5. **Reviews** by codex `gpt-6-astra` (effort medium): one after step 1, one
-   over the finished branch before it merges.
+**Adopted (2026-09-25).** `ferret-policy` has no dependencies. Matching is
+O(pattern bytes × path bytes) with no recursion; a step-count test guards it at
+sizes up to 1,024. Warm matching, 500k real paths from `~/w`, each ignore file
+against paths relative to its own directory, ns/path:
+
+| Rule set                         | Ours | `ignore` |
+| -------------------------------- | ---: | -------: |
+| built-in defaults                |   63 |       76 |
+| aic-edit `.gitignore` (48 lines) |   89 |      420 |
+| CPython `.gitignore` (171 lines) |  238 |      252 |
+
+Build of the largest set: 131 µs against 705 µs. This is a matching
+micro-benchmark, not an end-to-end crawl measurement. The comparison bench lives
+on branch `bench/gitignore-vs-ignore`, not on `main`.
 
 ## D17 — Whose regex engine, and when
 
