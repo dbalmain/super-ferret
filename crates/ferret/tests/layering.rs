@@ -19,7 +19,8 @@ fn root() -> &'static Path {
 }
 
 /// Lines of the form `crate → dep, dep (note), …` inside DESIGN.md's first
-/// `text` block. `(std only)`, `anything` and `later` list no dependencies.
+/// `text` block. `(std only)` and `later` list no dependencies; `anything`
+/// stays in the set and exempts that crate from the check.
 fn designed() -> Graph {
     let doc = fs::read_to_string(root().join("docs/DESIGN.md")).unwrap();
     let block = doc
@@ -89,6 +90,9 @@ fn crate_graph_matches_design() {
         let Some(allowed) = designed.get(name) else {
             panic!("crate `{name}` is missing from docs/DESIGN.md § Crates");
         };
+        if allowed.contains("anything") {
+            continue;
+        }
         let internal = |set: &BTreeSet<String>| -> BTreeSet<String> {
             set.iter()
                 .filter(|d| actual.contains_key(*d))
