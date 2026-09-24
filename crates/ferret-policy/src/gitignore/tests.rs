@@ -1,4 +1,4 @@
-//! Git 2.54 oracle facts found during the round-one review.
+//! Manual-derived cases and Git 2.54 oracle facts from the round-two review.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -221,6 +221,30 @@ fn pattern_format_from_gitignore_manual() {
         let (matcher, errors) = Gitignore::compile(patterns);
         assert!(errors.is_empty(), "{rule}: {errors:?}");
         assert_eq!(matcher.matched(Path::new(path), is_dir), want, "{rule}");
+    }
+}
+
+#[test]
+fn last_match_wins_across_fast_and_general_buckets() {
+    let cases = [
+        ("foo*\n!foobar\n", "foobar", Match::Whitelist),
+        ("!foobar\nfoo*\n", "foobar", Match::Ignore),
+        ("*.gc??\n!*.gcda\n", "x.gcda", Match::Whitelist),
+        ("!*.gcda\n*.gc??\n", "x.gcda", Match::Ignore),
+        ("Doc/*/x\n!Doc/a/x\n", "Doc/a/x", Match::Whitelist),
+        ("!Doc/a/x\nDoc/*/x\n", "Doc/a/x", Match::Ignore),
+        ("*mid*\n!amidb\n", "amidb", Match::Whitelist),
+        ("!amidb\n*mid*\n", "amidb", Match::Ignore),
+    ];
+
+    for (patterns, path, want) in cases {
+        let (matcher, errors) = Gitignore::compile(patterns);
+        assert!(errors.is_empty(), "{patterns:?}: {errors:?}");
+        assert_eq!(
+            matcher.matched(Path::new(path), false),
+            want,
+            "{patterns:?}"
+        );
     }
 }
 
