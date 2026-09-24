@@ -7,8 +7,5 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[dev-dependencies]
-ignore.workspace = true
-
 [lints]
 workspace = true
