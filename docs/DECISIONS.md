@@ -32,7 +32,7 @@ Predecessors, carried forward where still open:
 | D14 | Filename search: scan the names, or index them       | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
 | D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                               |
 | D16 | Replace `ignore` with our own gitignore matcher      | experimenting  | A: timeboxed experiment; keep `ignore` unless ours matches it on correctness and speed                         |
-| D17 | Whose regex engine, and when                         | open           |                                                                                                                |
+| D17 | Whose regex engine, and when                         | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -550,7 +550,12 @@ gap, C is the stopping point.
    output is a list of behaviours that need testing, not tests.
 3. **Blind tests**: an agent that has not seen ignore's test suite writes our
    own tests from that list.
-4. Bench against `ignore::gitignore` before `ignore` leaves the tree.
+4. Bench against `ignore::gitignore` before `ignore` leaves the tree. The core
+   rewrite after the first review (linear-time glob automaton, globstar and
+   class parsing, a parser shared with `reinclude.rs`, fast paths, a
+   correctly-based bench; target: at or below `ignore` on every rule set) went
+   to a second `gpt-5.6-sol` run (2026-09-24).
+
 5. **Reviews** by codex `gpt-6-astra` (effort medium): one after step 1, one
    over the finished branch before it merges.
 
@@ -591,6 +596,10 @@ for it delays the data. The fact that would change it: if you want the regex
 engine itself as a learning goal, like the index structures (build, not adopt),
 choose C deliberately and schedule it as its own stage after S1, not as a
 dependency of D16.
+
+**Answer (2026-09-24): A.** `regex` executes, behind a narrow verifier trait;
+revisit at S3 with the verification-share measurement. D16's matcher proceeds
+without a regex engine.
 
 ## Settled without a brief (object if wrong)
 
