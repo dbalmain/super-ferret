@@ -32,6 +32,7 @@ Predecessors, carried forward where still open:
 | D14 | Filename search: scan the names, or index them       | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
 | D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                               |
 | D16 | Replace `ignore` with our own gitignore matcher      | experimenting  | A: timeboxed experiment; keep `ignore` unless ours matches it on correctness and speed                         |
+| D17 | Whose regex engine, and when                         | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -552,6 +553,44 @@ gap, C is the stopping point.
 4. Bench against `ignore::gitignore` before `ignore` leaves the tree.
 5. **Reviews** by codex `gpt-6-astra` (effort medium): one after step 1, one
    over the finished branch before it merges.
+
+## D17 — Whose regex engine, and when
+
+**Question:** Does Super Ferret run regex on the `regex` crate, or on its own
+engine — and does that work start now, so D16's gitignore matcher can share it?
+
+Where regex runs: content search (S3) derives a trigram query from the regex
+(Cox), takes candidate files from a trigram structure, then **verifies** each
+candidate by running the real regex over its bytes (`ferret-verify`). Name
+search (D14) runs glob and regex over the name heap. The trigram derivation
+needs a parsed regex (a syntax tree), whichever engine executes it; the verifier
+and name search need an executor. DESIGN today says `ferret-verify → regex`.
+
+What the gitignore matcher needs is not a regex engine. `ignore` is fast where
+globset avoids its regex set: literal names, extensions, prefixes and suffixes
+by hashing and byte comparison. D16's gap (~710 vs ~600 ns/path on real files,
+measured against the wrong base path) comes from general patterns taking a
+recursive backtracker; the fixes are more of those fast paths and a small
+linear-time glob automaton. Globs are a strict subset of regex with
+path-component rules, so they can lower onto a shared automaton later if one
+exists.
+
+| Option                                                                                                                                                          | Costs                                                                                                                                                                                                                       | Buys                                                                                                                                                              |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. `regex` / `regex-automata` executes; `regex-syntax`'s parse tree feeds our Cox derivation; the verifier sits behind a narrow trait                           | The same ~8 regex crates D16 is removing from `ferret-policy` come back in `ferret-verify`. The engine is not ours to learn from.                                                                                           | ripgrep-class verification on day one. S3's effort goes into the index, which is where the density goal lives. The trait leaves the executor replaceable.         |
+| B. Own parser and syntax tree (Cox derivation, name search and the error messages are ours); `regex-automata` executes, fed by translating our tree             | A parser (~2–3k lines) and a translation layer; still the regex dependency.                                                                                                                                                 | The part that touches the index is ours; the hard performance work (lazy DFA, SIMD literal prefilters) stays borrowed; C remains possible one executor at a time. |
+| C. Own engine end to end: parser, Thompson NFA, a linear-time simulation (Pike VM), then a lazy DFA and literal prefilters; globs and gitignore compile onto it | Large and open-ended. A correct linear-time engine is weeks; matching `regex-automata` on hard patterns is the years of work that crate represents. Delays S1, which D3 put first so you can use the tool and collect data. | Zero regex dependencies anywhere; one automaton core for globs, names and content; the deepest learning payload.                                                  |
+
+**Recommendation:** A now, choosing between A, B and C at S3 with a measurement.
+The deciding number is **verification's share of end-to-end regex latency** on
+`$HOME`: with a selective trigram filter, the verifier touches few files and its
+speed barely matters, and an own engine loses little; if verification dominates,
+only a highly optimised engine competes. Don't start an engine now for D16's
+sake: the gitignore matcher doesn't need one to match `ignore`, and pausing S1
+for it delays the data. The fact that would change it: if you want the regex
+engine itself as a learning goal, like the index structures (build, not adopt),
+choose C deliberately and schedule it as its own stage after S1, not as a
+dependency of D16.
 
 ## Settled without a brief (object if wrong)
 
