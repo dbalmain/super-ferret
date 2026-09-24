@@ -33,9 +33,15 @@ pub(crate) struct LineError {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Gitignore {
     literals: HashMap<Vec<u8>, Vec<FastMatch>>,
+    paths: HashMap<Vec<u8>, Vec<FastMatch>>,
     extensions: HashMap<Vec<u8>, Vec<FastMatch>>,
+    prefixes: Vec<ByteFastMatch>,
+    suffixes: Vec<ByteFastMatch>,
+    contains: Vec<ByteFastMatch>,
+    fixed_suffixes: Vec<Pattern>,
     basename_general: Vec<Pattern>,
     anchored_any: Vec<Pattern>,
+    anchored_by_prefix2: HashMap<u16, Vec<Pattern>>,
     anchored_by_first: HashMap<u8, Vec<Pattern>>,
 }
 
@@ -44,6 +50,12 @@ struct FastMatch {
     index: usize,
     result: Match,
     directory_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ByteFastMatch {
+    bytes: Vec<u8>,
+    action: FastMatch,
 }
 
 impl Gitignore {
@@ -79,6 +91,14 @@ impl Gitignore {
             .literals
             .get(basename)
             .and_then(|entries| latest_fast(entries, is_dir));
+        if let Some(candidate) = self
+            .paths
+            .get(bytes)
+            .and_then(|entries| latest_fast(entries, is_dir))
+            && best.is_none_or(|current| candidate.index > current.index)
+        {
+            best = Some(candidate);
+        }
         if let Some(dot) = basename.iter().rposition(|byte| *byte == b'.')
             && let Some(candidate) = self
                 .extensions
@@ -88,33 +108,41 @@ impl Gitignore {
         {
             best = Some(candidate);
         }
-
+        scan_byte_fast(
+            &self.prefixes,
+            basename,
+            is_dir,
+            &mut best,
+            |name, bytes| name.starts_with(bytes),
+        );
+        scan_byte_fast(
+            &self.suffixes,
+            basename,
+            is_dir,
+            &mut best,
+            |name, bytes| name.ends_with(bytes),
+        );
+        scan_byte_fast(
+            &self.contains,
+            basename,
+            is_dir,
+            &mut best,
+            |name, bytes| name.windows(bytes.len()).any(|window| window == bytes),
+        );
+        scan_fixed_suffixes(&self.fixed_suffixes, basename, is_dir, &mut best);
         let prefixed = bytes
             .first()
             .and_then(|first| self.anchored_by_first.get(first))
             .map_or(&[][..], Vec::as_slice);
-        let groups = [
-            self.basename_general.as_slice(),
-            self.anchored_any.as_slice(),
-            prefixed,
-        ];
-        let mut positions = groups.map(<[Pattern]>::len);
-        while let Some(group) = positions
-            .iter()
-            .enumerate()
-            .filter(|(_, position)| **position != 0)
-            .max_by_key(|(group, position)| groups[*group][**position - 1].index)
-            .map(|(group, _)| group)
-        {
-            positions[group] -= 1;
-            let pattern = &groups[group][positions[group]];
-            if best.is_some_and(|candidate| pattern.index < candidate.index) {
-                break;
-            }
-            if pattern.matches(bytes, basename, is_dir) {
-                return pattern.result;
-            }
-        }
+        let prefix2 = bytes
+            .get(..2)
+            .map(|prefix| u16::from_ne_bytes([prefix[0], prefix[1]]))
+            .and_then(|prefix| self.anchored_by_prefix2.get(&prefix))
+            .map_or(&[][..], Vec::as_slice);
+        scan_patterns(&self.basename_general, bytes, basename, is_dir, &mut best);
+        scan_patterns(&self.anchored_any, bytes, basename, is_dir, &mut best);
+        scan_patterns(prefixed, bytes, basename, is_dir, &mut best);
+        scan_patterns(prefix2, bytes, basename, is_dir, &mut best);
         best.map_or(Match::None, |candidate| candidate.result)
     }
 
@@ -126,10 +154,34 @@ impl Gitignore {
         };
         if let Some(literal) = pattern.literal_basename() {
             self.literals.entry(literal).or_default().push(fast);
+        } else if let Some(path) = pattern.literal_path() {
+            self.paths.entry(path).or_default().push(fast);
         } else if let Some(extension) = pattern.simple_extension() {
             self.extensions.entry(extension).or_default().push(fast);
+        } else if let Some(prefix) = pattern.basename_prefix() {
+            self.prefixes.push(ByteFastMatch {
+                bytes: prefix,
+                action: fast,
+            });
+        } else if let Some(suffix) = pattern.basename_suffix() {
+            self.suffixes.push(ByteFastMatch {
+                bytes: suffix,
+                action: fast,
+            });
+        } else if let Some(needle) = pattern.basename_contains() {
+            self.contains.push(ByteFastMatch {
+                bytes: needle,
+                action: fast,
+            });
+        } else if pattern.has_fixed_basename_suffix() {
+            self.fixed_suffixes.push(pattern);
         } else if pattern.basename_only {
             self.basename_general.push(pattern);
+        } else if let Some(prefix) = pattern.first_literal_prefix2() {
+            self.anchored_by_prefix2
+                .entry(prefix)
+                .or_default()
+                .push(pattern);
         } else if let Some(first) = pattern.first_literal_byte() {
             self.anchored_by_first
                 .entry(first)
@@ -137,6 +189,67 @@ impl Gitignore {
                 .push(pattern);
         } else {
             self.anchored_any.push(pattern);
+        }
+    }
+}
+
+fn scan_fixed_suffixes(
+    patterns: &[Pattern],
+    basename: &[u8],
+    is_dir: bool,
+    best: &mut Option<FastMatch>,
+) {
+    for pattern in patterns.iter().rev() {
+        if best.is_some_and(|candidate| pattern.index < candidate.index) {
+            break;
+        }
+        if pattern.matches_fixed_basename_suffix(basename, is_dir) {
+            *best = Some(FastMatch {
+                index: pattern.index,
+                result: pattern.result,
+                directory_only: pattern.directory_only,
+            });
+            break;
+        }
+    }
+}
+
+fn scan_byte_fast(
+    patterns: &[ByteFastMatch],
+    basename: &[u8],
+    is_dir: bool,
+    best: &mut Option<FastMatch>,
+    matches: impl Fn(&[u8], &[u8]) -> bool,
+) {
+    for pattern in patterns.iter().rev() {
+        if best.is_some_and(|candidate| pattern.action.index < candidate.index) {
+            break;
+        }
+        if (!pattern.action.directory_only || is_dir) && matches(basename, &pattern.bytes) {
+            *best = Some(pattern.action);
+            break;
+        }
+    }
+}
+
+fn scan_patterns(
+    patterns: &[Pattern],
+    path: &[u8],
+    basename: &[u8],
+    is_dir: bool,
+    best: &mut Option<FastMatch>,
+) {
+    for pattern in patterns.iter().rev() {
+        if best.is_some_and(|candidate| pattern.index < candidate.index) {
+            break;
+        }
+        if pattern.matches(path, basename, is_dir) {
+            *best = Some(FastMatch {
+                index: pattern.index,
+                result: pattern.result,
+                directory_only: pattern.directory_only,
+            });
+            break;
         }
     }
 }

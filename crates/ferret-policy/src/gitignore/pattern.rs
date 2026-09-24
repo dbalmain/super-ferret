@@ -16,6 +16,7 @@ pub(crate) struct Pattern {
     pub(super) directory_only: bool,
     pub(super) basename_only: bool,
     components: Box<[Component]>,
+    flat: Option<ComponentGlob>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -98,17 +99,19 @@ impl Pattern {
 
         let basename_only = !parsed.leading_separator && parsed.parts.len() == 1;
         let anchored = !basename_only;
-        let components = parsed
+        let components: Box<[Component]> = parsed
             .parts
             .into_iter()
             .map(|part| compile_component(&part, anchored))
             .collect();
+        let flat = flatten_components(&components);
         Ok(Some(Self {
             index,
             result,
             directory_only: parsed.trailing_separator,
             basename_only,
             components,
+            flat,
         }))
     }
 
@@ -119,23 +122,37 @@ impl Pattern {
         if self.basename_only {
             return self.components[0].matches(basename);
         }
+        if let Some(prefix) = self.components.first().and_then(Component::literal_slice)
+            && (!path.starts_with(prefix) || !matches!(path.get(prefix.len()), None | Some(b'/')))
+        {
+            return false;
+        }
+        if let Some(flat) = &self.flat {
+            return flat.matches_path(path);
+        }
         matches_components(&self.components, path)
     }
 
     pub(super) fn literal_basename(&self) -> Option<Vec<u8>> {
-        if !self.basename_only {
+        self.basename_glob()?.literal_bytes()
+    }
+
+    pub(super) fn literal_path(&self) -> Option<Vec<u8>> {
+        if self.basename_only {
             return None;
         }
-        self.components[0].literal_bytes()
+        let mut path = Vec::new();
+        for component in &self.components {
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend(component.literal_bytes()?);
+        }
+        Some(path)
     }
 
     pub(super) fn simple_extension(&self) -> Option<Vec<u8>> {
-        if !self.basename_only {
-            return None;
-        }
-        let Component::Glob(glob) = &self.components[0] else {
-            return None;
-        };
+        let glob = self.basename_glob()?;
         let [Atom::Star, Atom::Literal(suffix)] = glob.atoms.as_ref() else {
             return None;
         };
@@ -143,6 +160,66 @@ impl Pattern {
             return None;
         }
         Some(suffix.to_vec())
+    }
+
+    pub(super) fn basename_prefix(&self) -> Option<Vec<u8>> {
+        let glob = self.basename_glob()?;
+        let [Atom::Literal(prefix), Atom::Star] = glob.atoms.as_ref() else {
+            return None;
+        };
+        Some(prefix.to_vec())
+    }
+
+    pub(super) fn basename_suffix(&self) -> Option<Vec<u8>> {
+        let glob = self.basename_glob()?;
+        let [Atom::Star, Atom::Literal(suffix)] = glob.atoms.as_ref() else {
+            return None;
+        };
+        Some(suffix.to_vec())
+    }
+
+    pub(super) fn basename_contains(&self) -> Option<Vec<u8>> {
+        let glob = self.basename_glob()?;
+        let [Atom::Star, Atom::Literal(needle), Atom::Star] = glob.atoms.as_ref() else {
+            return None;
+        };
+        Some(needle.to_vec())
+    }
+
+    pub(super) fn has_fixed_basename_suffix(&self) -> bool {
+        let Some(glob) = self.basename_glob() else {
+            return false;
+        };
+        matches!(glob.atoms.first(), Some(Atom::Star))
+            && glob.atoms[1..]
+                .iter()
+                .all(|atom| !matches!(atom, Atom::Star))
+    }
+
+    pub(super) fn matches_fixed_basename_suffix(&self, basename: &[u8], is_dir: bool) -> bool {
+        if self.directory_only && !is_dir {
+            return false;
+        }
+        let Some(glob) = self.basename_glob() else {
+            return false;
+        };
+        let width = glob.atoms[1..]
+            .iter()
+            .map(Atom::fixed_width)
+            .sum::<Option<usize>>();
+        let Some(suffix) =
+            width.and_then(|width| basename.get(basename.len().checked_sub(width)?..))
+        else {
+            return false;
+        };
+        let mut at = 0;
+        for atom in &glob.atoms[1..] {
+            let Some(consumed) = atom.consumes(&suffix[at..], false) else {
+                return false;
+            };
+            at += consumed;
+        }
+        at == suffix.len()
     }
 
     pub(super) fn first_literal_byte(&self) -> Option<u8> {
@@ -156,6 +233,32 @@ impl Pattern {
             return None;
         };
         run.first().copied()
+    }
+
+    pub(super) fn first_literal_prefix2(&self) -> Option<u16> {
+        if self.basename_only {
+            return None;
+        }
+        let Component::Glob(glob) = self.components.first()? else {
+            return None;
+        };
+        let Atom::Literal(run) = glob.atoms.first()? else {
+            return None;
+        };
+        let prefix = run.get(..2)?;
+        Some(u16::from_ne_bytes([prefix[0], prefix[1]]))
+    }
+
+    fn basename_glob(&self) -> Option<&ComponentGlob> {
+        let component = match self.components.as_ref() {
+            [Component::Glob(glob)] if self.basename_only => return Some(glob),
+            [Component::Globstar, component] => component,
+            _ => return None,
+        };
+        let Component::Glob(glob) = component else {
+            return None;
+        };
+        Some(glob)
     }
 
     pub(crate) fn is_anchored_reinclude(&self) -> bool {
@@ -196,7 +299,7 @@ impl Pattern {
             return (false, 0);
         };
         let mut steps = 0;
-        let matched = glob.matches_observed(text, || steps += 1);
+        let matched = glob.matches_observed(text, false, || steps += 1);
         (matched, steps)
     }
 }
@@ -214,14 +317,17 @@ impl Component {
         let Self::Glob(glob) = self else {
             return None;
         };
-        let mut literal = Vec::new();
-        for atom in &glob.atoms {
-            let Atom::Literal(run) = atom else {
-                return None;
-            };
-            literal.extend_from_slice(run);
-        }
-        Some(literal)
+        glob.literal_bytes()
+    }
+
+    fn literal_slice(&self) -> Option<&[u8]> {
+        let Self::Glob(glob) = self else {
+            return None;
+        };
+        let [Atom::Literal(run)] = glob.atoms.as_ref() else {
+            return None;
+        };
+        Some(run)
     }
 
     fn has_witness(&self) -> bool {
@@ -233,6 +339,19 @@ impl Component {
     }
 }
 
+impl ComponentGlob {
+    fn literal_bytes(&self) -> Option<Vec<u8>> {
+        let mut literal = Vec::new();
+        for atom in &self.atoms {
+            let Atom::Literal(run) = atom else {
+                return None;
+            };
+            literal.extend_from_slice(run);
+        }
+        Some(literal)
+    }
+}
+
 impl Atom {
     fn has_witness(&self) -> bool {
         match self {
@@ -240,14 +359,26 @@ impl Atom {
             _ => true,
         }
     }
+
+    fn fixed_width(&self) -> Option<usize> {
+        match self {
+            Self::Literal(run) => Some(run.len()),
+            Self::Any | Self::Class(_) => Some(1),
+            Self::Star => None,
+        }
+    }
 }
 
 impl ComponentGlob {
     fn matches(&self, text: &[u8]) -> bool {
-        self.matches_observed(text, || {})
+        self.matches_observed(text, false, || {})
     }
 
-    fn matches_observed(&self, text: &[u8], mut step: impl FnMut()) -> bool {
+    fn matches_path(&self, text: &[u8]) -> bool {
+        self.matches_observed(text, true, || {})
+    }
+
+    fn matches_observed(&self, text: &[u8], path_mode: bool, mut step: impl FnMut()) -> bool {
         let mut atom_at = 0;
         let mut text_at = 0;
         let mut star: Option<(usize, usize)> = None;
@@ -262,7 +393,7 @@ impl ComponentGlob {
             if let Some(consumed) = self
                 .atoms
                 .get(atom_at)
-                .and_then(|atom| atom.consumes(&text[text_at..]))
+                .and_then(|atom| atom.consumes(&text[text_at..], path_mode))
             {
                 atom_at += 1;
                 text_at += consumed;
@@ -272,6 +403,9 @@ impl ComponentGlob {
                 return false;
             };
             if *retry_at == text.len() {
+                return false;
+            }
+            if path_mode && text[*retry_at] == b'/' {
                 return false;
             }
             *retry_at += 1;
@@ -287,14 +421,17 @@ impl ComponentGlob {
 }
 
 impl Atom {
-    fn consumes(&self, text: &[u8]) -> Option<usize> {
+    fn consumes(&self, text: &[u8], path_mode: bool) -> Option<usize> {
         match self {
             Self::Literal(run) => text.starts_with(run).then_some(run.len()),
-            Self::Any => (!text.is_empty()).then_some(1),
+            Self::Any => text
+                .first()
+                .is_some_and(|byte| !path_mode || *byte != b'/')
+                .then_some(1),
             Self::Star => None,
             Self::Class(class) => text
                 .first()
-                .is_some_and(|byte| class.matches(*byte))
+                .is_some_and(|byte| (!path_mode || *byte != b'/') && class.matches(*byte))
                 .then_some(1),
         }
     }
@@ -463,6 +600,22 @@ fn compile_component(part: &[PatternByte], anchored: bool) -> Component {
     }
     flush_literal(&mut atoms, &mut literal);
     Component::Glob(ComponentGlob {
+        atoms: atoms.into_boxed_slice(),
+    })
+}
+
+fn flatten_components(components: &[Component]) -> Option<ComponentGlob> {
+    let mut atoms = Vec::new();
+    for (component_at, component) in components.iter().enumerate() {
+        if component_at != 0 {
+            atoms.push(Atom::Literal(Box::from(&b"/"[..])));
+        }
+        let Component::Glob(glob) = component else {
+            return None;
+        };
+        atoms.extend(glob.atoms.iter().cloned());
+    }
+    Some(ComponentGlob {
         atoms: atoms.into_boxed_slice(),
     })
 }
