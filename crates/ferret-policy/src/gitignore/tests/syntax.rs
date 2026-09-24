@@ -270,6 +270,48 @@ pub(super) const ROWS: &[Row] = &[
         File,
         Ignore,
     ),
+    (
+        "escaped leading slash is not an anchor",
+        "\\/probe\n",
+        "probe",
+        File,
+        Unmatched,
+    ),
+    (
+        "escaped trailing slash is not directory-only",
+        "crates\\/\n",
+        "crates",
+        Dir,
+        Unmatched,
+    ),
+    (
+        "escaped separator after globstar needs a directory",
+        "**\\/probe\n",
+        "probe",
+        File,
+        Unmatched,
+    ),
+    (
+        "escaped separator after globstar matches one directory",
+        "**\\/probe\n",
+        "x/probe",
+        File,
+        Ignore,
+    ),
+    (
+        "escaped separator after globstar matches many directories",
+        "**\\/probe\n",
+        "x/y/probe",
+        File,
+        Ignore,
+    ),
+    (
+        "escaped separator after middle globstar needs a directory",
+        "a/**\\/b\n",
+        "a/b",
+        File,
+        Unmatched,
+    ),
     // Case sensitivity.
     (
         "matching is case-sensitive",
@@ -286,35 +328,6 @@ pub(super) const ROWS: &[Row] = &[
         "x",
         Dir,
         Unmatched,
-    ),
-    // Earlier spellings of the cases above, kept verbatim.
-    (
-        "comment, earlier spelling",
-        "# generated\n",
-        "# generated",
-        File,
-        Unmatched,
-    ),
-    (
-        "escaped hash, earlier spelling",
-        "\\#notes\n",
-        "#notes",
-        File,
-        Ignore,
-    ),
-    (
-        "escaped bang, earlier spelling",
-        "\\!keep\n",
-        "!keep",
-        File,
-        Ignore,
-    ),
-    (
-        "trailing spaces, earlier spelling",
-        "plain   \n",
-        "plain",
-        File,
-        Ignore,
     ),
     ("quoted space", "quoted\\ \n", "quoted ", File, Ignore),
     (
@@ -417,17 +430,32 @@ fn invalid_line_is_reported_with_its_number_and_text() {
 
 #[test]
 fn pathological_stars_have_bounded_work() {
-    const TEXT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let (matcher, errors) = Gitignore::compile("*a*a*a*a*a*a*a*a*a*b\n");
-    assert!(errors.is_empty());
-    assert_eq!(matcher.matched(Path::new(TEXT), false), Unmatched);
-    let pattern = match Pattern::compile(0, "*a*a*a*a*a*a*a*a*a*b") {
-        Ok(Some(pattern)) => pattern,
-        other => panic!("pathological pattern did not compile: {other:?}"),
-    };
-    let (matched, steps) = pattern.basename_match_steps(TEXT.as_bytes());
-    assert!(!matched);
-    // A backtracking matcher takes millions of steps here; the last-star
-    // retry loop takes pattern x text at most.
-    assert!(steps <= 1_000, "iterative matcher used {steps} steps");
+    for n in [64, 256, 1024] {
+        let text = "a".repeat(n);
+        let stars = format!("{}b", "*a".repeat(n / 8));
+        let literals = format!("{}b", "a".repeat(n));
+        let classes = format!("{}b", "[a]".repeat(n / 8));
+        for (label, source, path) in [
+            ("star runs", stars, text.clone()),
+            ("long literal", literals, format!("{text}c")),
+            ("classes", classes, format!("{text}c")),
+        ] {
+            let pattern = Pattern::compile(0, &source).unwrap().unwrap();
+            let (matched, steps) = pattern.basename_match_steps(path.as_bytes());
+            assert!(!matched, "{label} unexpectedly matched at n={n}");
+            // Counts matcher loop/retry iterations. Literal byte comparisons,
+            // class-term scans, and fast-bucket probes are not included; each
+            // is bounded by the compiled pattern width per matcher iteration.
+            let bound = 8 * source.len() * path.len();
+            assert!(steps <= bound, "{label} n={n}: {steps} > {bound}");
+        }
+
+        let source = "**/a*/b";
+        let path = format!("{}{}/c", "x/".repeat(n / 2), "a".repeat(n));
+        let pattern = Pattern::compile(0, source).unwrap().unwrap();
+        let (matched, steps) = pattern.path_match_steps(path.as_bytes());
+        assert!(!matched);
+        let bound = 8 * source.len() * path.len();
+        assert!(steps <= bound, "globstar retries n={n}: {steps} > {bound}");
+    }
 }

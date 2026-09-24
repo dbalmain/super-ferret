@@ -132,6 +132,34 @@ pub(super) const ROWS: &[Row] = &[
         Ignore,
     ),
     // POSIX classes.
+    (
+        "escaped byte in POSIX name is not syntax",
+        "[[:digi\\t:]]\n",
+        "5",
+        File,
+        Unmatched,
+    ),
+    (
+        "range hyphen before POSIX syntax does not absorb digits",
+        "[a-[:digit:]]\n",
+        "5",
+        File,
+        Unmatched,
+    ),
+    (
+        "raw class close leaves trailing bracket literal",
+        "[a-[:digit:]]\n",
+        "a]",
+        File,
+        Ignore,
+    ),
+    (
+        "POSIX space excludes form feed",
+        "[[:space:]]\n",
+        "\u{000c}",
+        File,
+        Unmatched,
+    ),
     ("POSIX digit", "[[:digit:]]\n", "7", File, Ignore),
     (
         "POSIX digit excludes",
@@ -227,13 +255,6 @@ pub(super) const ROWS: &[Row] = &[
         "brace is no alternation",
         "{red,blue}\n",
         "red",
-        File,
-        Unmatched,
-    ),
-    (
-        "slash in a class, earlier spelling",
-        "a[/]b\n",
-        "a/b",
         File,
         Unmatched,
     ),

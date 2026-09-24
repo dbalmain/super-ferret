@@ -301,34 +301,6 @@ pub(super) const ROWS: &[Row] = &[
         File,
         Unmatched,
     ),
-    (
-        "middle globstar zero, earlier spelling",
-        "a/**/b\n",
-        "a/b",
-        File,
-        Ignore,
-    ),
-    (
-        "middle globstar many, earlier spelling",
-        "a/**/b\n",
-        "a/x/y/b",
-        File,
-        Ignore,
-    ),
-    (
-        "adjacent globstars, earlier spelling",
-        "a/**/**/b\n",
-        "a/b",
-        File,
-        Ignore,
-    ),
-    (
-        "double star beside a literal, earlier spelling",
-        "a**/b\n",
-        "ax/y/b",
-        File,
-        Unmatched,
-    ),
 ];
 
 #[test]

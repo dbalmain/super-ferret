@@ -25,10 +25,15 @@ pub(crate) struct Reinclude {
 }
 
 impl Reinclude {
+    pub(crate) fn from_pattern(pattern: Pattern) -> Option<Self> {
+        pattern.is_anchored_reinclude().then_some(Self { pattern })
+    }
+
     /// Parses one `.ferretignore` line. `None` when the line is not a `!`
     /// pattern, is not anchored beneath a directory, or does not compile (the
     /// caller has already reported the bad line).
-    pub(crate) fn parse(line: &str) -> Option<Self> {
+    #[cfg(test)]
+    fn parse(line: &str) -> Option<Self> {
         let pattern = Pattern::compile(0, line).ok()??;
         pattern.is_anchored_reinclude().then_some(Self { pattern })
     }

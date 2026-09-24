@@ -232,20 +232,6 @@ pub(super) const ROWS: &[Row] = &[
         File,
         Ignore,
     ),
-    (
-        "negation, earlier spelling",
-        "*.log\n!important.log\n",
-        "important.log",
-        File,
-        Whitelist,
-    ),
-    (
-        "last match, earlier spelling",
-        "!important.log\n*.log\n",
-        "important.log",
-        File,
-        Ignore,
-    ),
 ];
 
 #[test]

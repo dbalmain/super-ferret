@@ -32,6 +32,8 @@ pub(crate) struct LineError {
 /// patterns jointly implement last-match-wins.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Gitignore {
+    // Each bucket is appended in source order. Matching scans it backwards and
+    // compares its newest result with the best index found in other buckets.
     literals: HashMap<Vec<u8>, Vec<FastMatch>>,
     paths: BTreeMap<u16, BTreeMap<Vec<u8>, Vec<FastMatch>>>,
     extensions: HashMap<Vec<u8>, Vec<FastMatch>>,
@@ -68,14 +70,31 @@ impl Gitignore {
     /// Compiles all valid lines and returns invalid ones separately. A bad line
     /// never prevents another line in the same file from applying.
     pub(crate) fn compile(text: &str) -> (Self, Vec<LineError>) {
+        let (matcher, errors, _) = Self::compile_inner(text, false);
+        (matcher, errors)
+    }
+
+    /// Compiles each normalized source line once. The returned patterns let
+    /// policy derive traversal reincludes from the same parse as matching.
+    pub(crate) fn compile_patterns(text: &str) -> (Self, Vec<LineError>, Vec<Pattern>) {
+        Self::compile_inner(text, true)
+    }
+
+    fn compile_inner(text: &str, retain_patterns: bool) -> (Self, Vec<LineError>, Vec<Pattern>) {
         let mut matcher = Self::default();
         let mut errors = Vec::new();
+        let mut patterns = Vec::new();
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        for (index, line) in text.lines().enumerate() {
-            let original = line.split('\0').next().unwrap_or(line);
-            let original = original.strip_suffix('\r').unwrap_or(original);
+        for (index, line) in text.split('\n').enumerate() {
+            let original = line.strip_suffix('\r').unwrap_or(line);
+            let original = original.split('\0').next().unwrap_or(original);
             match Pattern::compile(index, original) {
-                Ok(Some(pattern)) => matcher.push(pattern),
+                Ok(Some(pattern)) => {
+                    if retain_patterns {
+                        patterns.push(pattern.clone());
+                    }
+                    matcher.push(pattern);
+                }
                 Ok(None) => {}
                 Err(detail) => errors.push(LineError {
                     line: index + 1,
@@ -84,7 +103,7 @@ impl Gitignore {
                 }),
             }
         }
-        (matcher, errors)
+        (matcher, errors, patterns)
     }
 
     /// Returns the last matching line's action for `path` itself. Exclusion by

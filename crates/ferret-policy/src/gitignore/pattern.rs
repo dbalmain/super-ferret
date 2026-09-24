@@ -27,7 +27,7 @@ struct PatternByte {
 
 #[derive(Clone, Debug)]
 enum Component {
-    Globstar,
+    Globstar { allow_zero: bool },
     Glob(ComponentGlob),
     Never,
 }
@@ -99,11 +99,21 @@ impl Pattern {
 
         let basename_only = !parsed.leading_separator && parsed.parts.len() == 1;
         let anchored = !basename_only;
-        let components: Box<[Component]> = parsed
+        let mut components: Vec<Component> = parsed
             .parts
             .into_iter()
             .map(|part| compile_component(&part, anchored))
             .collect();
+        if parsed.escaped_edge && let Some(first) = components.first_mut() {
+            *first = Component::Never;
+        }
+        for (at, component) in components.iter_mut().enumerate() {
+            if matches!(component, Component::Globstar { .. }) {
+                let allow_zero = parsed.separators.get(at).copied().unwrap_or(true);
+                *component = Component::Globstar { allow_zero };
+            }
+        }
+        let components: Box<[Component]> = components.into_boxed_slice();
         let flat = flatten_components(&components);
         Ok(Some(Self {
             index,
@@ -130,7 +140,7 @@ impl Pattern {
         if let Some(flat) = &self.flat {
             return flat.matches_path(path);
         }
-        matches_components(&self.components, path)
+        matches_components_observed(&self.components, path, || {})
     }
 
     pub(super) fn literal_basename(&self) -> Option<Vec<u8>> {
@@ -251,7 +261,7 @@ impl Pattern {
     fn basename_glob(&self) -> Option<&ComponentGlob> {
         let component = match self.components.as_ref() {
             [Component::Glob(glob)] if self.basename_only => return Some(glob),
-            [Component::Globstar, component] => component,
+            [Component::Globstar { allow_zero: true }, component] => component,
             _ => return None,
         };
         let Component::Glob(glob) = component else {
@@ -264,14 +274,14 @@ impl Pattern {
         self.result == Match::Whitelist
             && !self.basename_only
             && self.components.len() >= 2
-            && !matches!(self.components.first(), Some(Component::Globstar))
+            && !matches!(self.components.first(), Some(Component::Globstar { .. }))
             && self.components.iter().all(Component::has_witness)
     }
 
     pub(crate) fn reaches_below(&self, dir: &Path) -> bool {
         let mut path_at = 0;
         for (component_at, component) in self.components.iter().enumerate() {
-            if matches!(component, Component::Globstar) {
+            if matches!(component, Component::Globstar { .. }) {
                 return component_at != 0
                     && self.components[component_at + 1..]
                         .iter()
@@ -301,12 +311,19 @@ impl Pattern {
         let matched = glob.matches_observed(text, false, || steps += 1);
         (matched, steps)
     }
+
+    #[cfg(test)]
+    pub(super) fn path_match_steps(&self, path: &[u8]) -> (bool, usize) {
+        let mut steps = 0;
+        let matched = matches_components_observed(&self.components, path, || steps += 1);
+        (matched, steps)
+    }
 }
 
 impl Component {
     fn matches(&self, text: &[u8]) -> bool {
         match self {
-            Self::Globstar => true,
+            Self::Globstar { .. } => true,
             Self::Glob(glob) => glob.matches(text),
             Self::Never => false,
         }
@@ -331,7 +348,7 @@ impl Component {
 
     fn has_witness(&self) -> bool {
         match self {
-            Self::Globstar => true,
+            Self::Globstar { .. } => true,
             Self::Glob(glob) => glob.atoms.iter().all(Atom::has_witness),
             Self::Never => false,
         }
@@ -483,7 +500,9 @@ impl PosixClass {
             Self::Lower => byte.is_ascii_lowercase(),
             Self::Print => byte.is_ascii_graphic() || byte == b' ',
             Self::Punct => byte.is_ascii_punctuation(),
-            Self::Space => byte.is_ascii_whitespace(),
+            // Git's ASCII class omits form feed (unlike Rust's whitespace
+            // predicate); these bytes were checked against git 2.54.
+            Self::Space => matches!(byte, b' ' | b'\t' | b'\n' | b'\r'),
             Self::Upper => byte.is_ascii_uppercase(),
             Self::Xdigit => byte.is_ascii_hexdigit(),
         }
@@ -494,10 +513,13 @@ struct SplitPattern {
     leading_separator: bool,
     trailing_separator: bool,
     parts: Vec<Vec<PatternByte>>,
+    separators: Vec<bool>,
+    escaped_edge: bool,
 }
 
 fn split_components(pattern: &[u8]) -> Result<SplitPattern, String> {
     let mut parts = vec![Vec::new()];
+    let mut separators = Vec::new();
     let mut at = 0;
     while at < pattern.len() {
         match pattern[at] {
@@ -506,6 +528,7 @@ fn split_components(pattern: &[u8]) -> Result<SplitPattern, String> {
                     return Err("trailing backslash".to_owned());
                 };
                 if escaped == b'/' {
+                    separators.push(false);
                     parts.push(Vec::new());
                 } else {
                     let Some(current) = parts.last_mut() else {
@@ -519,6 +542,7 @@ fn split_components(pattern: &[u8]) -> Result<SplitPattern, String> {
                 at += 2;
             }
             b'/' => {
+                separators.push(true);
                 parts.push(Vec::new());
                 at += 1;
             }
@@ -535,24 +559,33 @@ fn split_components(pattern: &[u8]) -> Result<SplitPattern, String> {
         }
     }
 
-    let leading_separator = parts.first().is_some_and(Vec::is_empty) && parts.len() > 1;
+    let leading_separator = parts.first().is_some_and(Vec::is_empty)
+        && parts.len() > 1
+        && separators.first().copied().unwrap_or(false);
+    let escaped_edge = pattern.starts_with(b"\\/") || pattern.ends_with(b"\\/");
     if leading_separator {
         parts.remove(0);
+        separators.remove(0);
     }
-    let trailing_separator = parts.last().is_some_and(Vec::is_empty) && parts.len() > 1;
+    let trailing_separator = parts.last().is_some_and(Vec::is_empty)
+        && parts.len() > 1
+        && separators.last().copied().unwrap_or(false);
     if trailing_separator {
         parts.pop();
+        separators.pop();
     }
     Ok(SplitPattern {
         leading_separator,
         trailing_separator,
         parts,
+        separators,
+        escaped_edge,
     })
 }
 
 fn compile_component(part: &[PatternByte], anchored: bool) -> Component {
     if anchored && part.len() >= 2 && part.iter().all(|byte| !byte.escaped && byte.value == b'*') {
-        return Component::Globstar;
+        return Component::Globstar { allow_zero: true };
     }
     if part.is_empty() {
         return Component::Never;
@@ -665,6 +698,39 @@ fn compile_class(part: &[PatternByte], start: usize) -> Option<(CharacterClass, 
                 name_end += 1;
                 part.get(name_end)?;
             }
+            if part[name_start..name_end].iter().any(|item| item.escaped) {
+                return None;
+            }
+            if members.last().is_some_and(|member| {
+                matches!(
+                    member,
+                    ClassMember::Byte(PatternByte {
+                        value: b'-',
+                        escaped: false
+                    })
+                )
+            }) {
+                // In Git, a POSIX-looking token after a range hyphen is raw
+                // bracket syntax. The first close bracket ends the class;
+                // the final close bracket is then an ordinary pattern byte.
+                members.pop();
+                let prior = members.pop()?;
+                members.push(prior);
+                let class_end = name_end + 2;
+                let mut terms = Vec::new();
+                for member in members {
+                    if let ClassMember::Byte(byte) = member {
+                        terms.push(ClassTerm::Byte(byte.value));
+                    }
+                }
+                return Some((
+                    CharacterClass {
+                        negated,
+                        terms: terms.into_boxed_slice(),
+                    },
+                    class_end,
+                ));
+            }
             let name: Vec<u8> = part[name_start..name_end]
                 .iter()
                 .map(|item| item.value)
@@ -718,18 +784,25 @@ fn compile_class(part: &[PatternByte], start: usize) -> Option<(CharacterClass, 
     ))
 }
 
-fn matches_components(pattern: &[Component], path: &[u8]) -> bool {
+fn matches_components_observed(pattern: &[Component], path: &[u8], mut step: impl FnMut()) -> bool {
     let mut pattern_at = 0;
     let mut path_at = 0;
     let mut globstar: Option<(usize, usize)> = None;
 
     while let Some((path_component, next_path)) = next_component(path, path_at) {
-        if let Some(Component::Globstar) = pattern.get(pattern_at) {
+        step();
+        if let Some(Component::Globstar { allow_zero }) = pattern.get(pattern_at) {
             if pattern_at + 1 == pattern.len() {
                 return true;
             }
             globstar = Some((pattern_at + 1, path_at));
             pattern_at += 1;
+            if !allow_zero {
+                let Some((_, next_path)) = next_component(path, path_at) else {
+                    return false;
+                };
+                path_at = next_path;
+            }
             continue;
         }
         if pattern
@@ -751,7 +824,7 @@ fn matches_components(pattern: &[Component], path: &[u8]) -> bool {
         path_at = next_retry;
     }
 
-    while matches!(pattern.get(pattern_at), Some(Component::Globstar)) {
+    while matches!(pattern.get(pattern_at), Some(Component::Globstar { .. })) {
         if pattern_at + 1 == pattern.len() {
             return false;
         }
@@ -786,4 +859,76 @@ fn trim_trailing_spaces(mut line: &str) -> &str {
         line = &line[..line.len() - 1];
     }
     line
+}
+
+#[cfg(test)]
+mod posix_class_tests {
+    use super::PosixClass;
+
+    // Membership observed with git 2.54 for every filesystem-representable
+    // single-byte name except slash, dot, and dot-dot, which Unix resolves as
+    // path syntax; NUL cannot occur in a path. Hex pairs are the matched bytes.
+    const GIT_MEMBERSHIP: &[(&str, &str)] = &[
+        (
+            "alnum",
+            "303132333435363738394142434445464748494a4b4c4d4e4f505152535455565758595a6162636465666768696a6b6c6d6e6f707172737475767778797a",
+        ),
+        (
+            "alpha",
+            "4142434445464748494a4b4c4d4e4f505152535455565758595a6162636465666768696a6b6c6d6e6f707172737475767778797a",
+        ),
+        ("blank", "0920"),
+        (
+            "cntrl",
+            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f7f",
+        ),
+        ("digit", "30313233343536373839"),
+        (
+            "graph",
+            "2122232425262728292a2b2c2d303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e",
+        ),
+        (
+            "lower",
+            "6162636465666768696a6b6c6d6e6f707172737475767778797a",
+        ),
+        (
+            "print",
+            "202122232425262728292a2b2c2d303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e",
+        ),
+        (
+            "punct",
+            "2122232425262728292a2b2c2d3a3b3c3d3e3f405b5c5d5e5f607b7c7d7e",
+        ),
+        ("space", "090a0d20"),
+        (
+            "upper",
+            "4142434445464748494a4b4c4d4e4f505152535455565758595a",
+        ),
+        ("xdigit", "30313233343536373839414243444546616263646566"),
+    ];
+
+    #[test]
+    fn classes_match_the_git_254_byte_tables() {
+        for (name, hex) in GIT_MEMBERSHIP {
+            let class = PosixClass::parse(name.as_bytes()).unwrap();
+            let observed: Vec<u8> = hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            for byte in 1..=u8::MAX {
+                if byte == b'/' || byte == b'.' {
+                    continue;
+                }
+                assert_eq!(
+                    class.matches(byte),
+                    observed.contains(&byte),
+                    "{name} {byte:#04x}"
+                );
+            }
+            assert_eq!(class.matches(0), *name == "cntrl", "{name} NUL");
+            assert!(!class.matches(b'/'), "{name} slash");
+            assert_eq!(class.matches(b'.'), observed.contains(&b'.'), "{name} dot");
+        }
+    }
 }

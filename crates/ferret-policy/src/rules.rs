@@ -113,7 +113,14 @@ impl DirRules {
     ) -> (Self, Vec<PatternError>) {
         let mut errors = Vec::new();
         let global = global.map(|text| {
-            Layer::compile(PathBuf::new(), IgnoreFile::Global, text, None, &mut errors)
+            Layer::compile(
+                PathBuf::new(),
+                IgnoreFile::Global,
+                text,
+                None,
+                &mut errors,
+                false,
+            )
         });
         let defaults = config.defaults.then(|| {
             Layer::compile(
@@ -122,6 +129,7 @@ impl DirRules {
                 DEFAULTS,
                 None,
                 &mut errors,
+                false,
             )
         });
         let bare = Self {
@@ -231,10 +239,14 @@ impl DirRules {
         let ferret = match files.ferretignore {
             Some(text) => {
                 let file = IgnoreFile::Ferret(dir.join(".ferretignore"));
-                let mut layer =
-                    Layer::compile(path.clone(), file, text, self.ferret.clone(), errors);
-                layer.reincludes = text.lines().filter_map(Reinclude::parse).collect();
-                Some(Arc::new(layer))
+                Some(Arc::new(Layer::compile(
+                    path.clone(),
+                    file,
+                    text,
+                    self.ferret.clone(),
+                    errors,
+                    true,
+                )))
             }
             None => self.ferret.clone(),
         };
@@ -243,7 +255,14 @@ impl DirRules {
                 ignores: None,
                 exclude: files.git_exclude.map(|text| {
                     let file = IgnoreFile::GitExclude(dir.join(".git/info/exclude"));
-                    Arc::new(Layer::compile(path.clone(), file, text, None, errors))
+                    Arc::new(Layer::compile(
+                        path.clone(),
+                        file,
+                        text,
+                        None,
+                        errors,
+                        false,
+                    ))
                 }),
             })
         } else {
@@ -252,7 +271,8 @@ impl DirRules {
         let git = enclosing.map(|mut tree| {
             if let Some(text) = files.gitignore {
                 let file = IgnoreFile::Git(dir.join(".gitignore"));
-                let layer = Layer::compile(path.clone(), file, text, tree.ignores.take(), errors);
+                let layer =
+                    Layer::compile(path.clone(), file, text, tree.ignores.take(), errors, false);
                 tree.ignores = Some(Arc::new(layer));
             }
             tree
@@ -277,8 +297,14 @@ impl Layer {
         text: &str,
         parent: Chain,
         errors: &mut Vec<PatternError>,
+        collect_reincludes: bool,
     ) -> Self {
-        let (matcher, line_errors) = Gitignore::compile(text);
+        let (matcher, line_errors, patterns) = if collect_reincludes {
+            Gitignore::compile_patterns(text)
+        } else {
+            let (matcher, errors) = Gitignore::compile(text);
+            (matcher, errors, Vec::new())
+        };
         errors.extend(line_errors.into_iter().map(|error| PatternError::Line {
             file: file.clone(),
             line: error.line,
@@ -288,7 +314,14 @@ impl Layer {
         Self {
             base,
             matcher,
-            reincludes: Vec::new(),
+            reincludes: if collect_reincludes {
+                patterns
+                    .into_iter()
+                    .filter_map(Reinclude::from_pattern)
+                    .collect()
+            } else {
+                Vec::new()
+            },
             parent,
         }
     }
@@ -369,5 +402,33 @@ mod tests {
             rules.decide(OsStr::new("node_modules"), Entry::Dir),
             Decision::Descend
         );
+    }
+
+    #[test]
+    fn normalized_reincludes_drive_traversal_and_decisions() {
+        for content in ["\u{feff}!/target/doc/**\n", "!/target/doc\0ignored\n"] {
+            let files = IgnoreFiles {
+                ferretignore: Some(content),
+                ..IgnoreFiles::default()
+            };
+            let (rules, errors) = root(None, files);
+            assert!(errors.is_empty());
+            assert_eq!(
+                rules.decide(OsStr::new("target"), Entry::Dir),
+                Decision::Traverse
+            );
+            let traversed = rules.traverse(OsStr::new("target"));
+            let decision = traversed.decide(OsStr::new("doc"), Entry::Dir);
+            if decision == Decision::Traverse {
+                let doc = traversed.traverse(OsStr::new("doc"));
+                assert_eq!(
+                    doc.decide(OsStr::new("README.md"), Entry::File { size: 0 }),
+                    Decision::Index,
+                    "{content:?}"
+                );
+            } else {
+                assert_eq!(decision, Decision::Descend, "{content:?}");
+            }
+        }
     }
 }

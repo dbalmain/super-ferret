@@ -107,10 +107,12 @@ fn every_table_row_agrees_with_git() {
 /// Asks git about each relative path in `repository`, in order.
 pub(super) fn check_ignore(repository: &Path, paths: &[Vec<u8>]) -> Vec<Match> {
     let mut child = must(
-        Command::new("git")
+        isolated_git()
             .args([
                 "-c",
                 "core.excludesFile=/dev/null",
+                "-c",
+                "core.ignoreCase=false",
                 "check-ignore",
                 "--no-index",
                 "--verbose",
@@ -124,17 +126,25 @@ pub(super) fn check_ignore(repository: &Path, paths: &[Vec<u8>]) -> Vec<Match> {
             .stderr(Stdio::piped())
             .spawn(),
     );
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .unwrap_or_else(|| panic!("piped git stdin was unavailable"));
-        for path in paths {
-            must(stdin.write_all(path));
-            must(stdin.write_all(&[0]));
-        }
-    }
-    let output = must(child.wait_with_output());
+    let mut stdin = child
+        .stdin
+        .take()
+        .unwrap_or_else(|| panic!("piped git stdin was unavailable"));
+    let output = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            for path in paths {
+                stdin.write_all(path)?;
+                stdin.write_all(&[0])?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let output = must(child.wait_with_output());
+        writer
+            .join()
+            .unwrap_or_else(|_| panic!("git query writer panicked"))
+            .unwrap_or_else(|error| panic!("writing git queries failed: {error}"));
+        output
+    });
     assert!(
         output.status.success() || output.status.code() == Some(1),
         "git check-ignore failed: {}",
@@ -174,7 +184,9 @@ impl Scratch {
         let _ = fs::remove_dir_all(&path);
         must(fs::create_dir(&path));
         let init = must(
-            Command::new("git")
+            isolated_git()
+                .arg("-c")
+                .arg("init.templateDir=")
                 .arg("init")
                 .arg("-q")
                 .arg(&path)
@@ -187,6 +199,14 @@ impl Scratch {
         );
         Self { path }
     }
+}
+
+fn isolated_git() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command
 }
 
 impl Drop for Scratch {

@@ -39,6 +39,20 @@ pub(super) const ROWS: &[Row] = &[
         Ignore,
     ),
     ("CRLF drops the CR", "f\r\n", "f", File, Ignore),
+    (
+        "one of two CR bytes before LF is line ending",
+        "foo\r\r\n",
+        "foo\r",
+        File,
+        Ignore,
+    ),
+    (
+        "CR immediately before NUL remains pattern data",
+        "foo\r\0bar\n",
+        "foo\r",
+        File,
+        Ignore,
+    ),
     ("CRLF on every line", "one\r\ntwo\r\n", "two", File, Ignore),
     ("inner CR is data", "a\rb\n", "a\rb", File, Ignore),
     (
@@ -77,22 +91,6 @@ pub(super) const ROWS: &[Row] = &[
         File,
         Unmatched,
     ),
-    (
-        "BOM, earlier spelling",
-        "\u{feff}foo\n",
-        "foo",
-        File,
-        Ignore,
-    ),
-    ("NUL, earlier spelling", "foo\0bar\n", "foo", File, Ignore),
-    (
-        "literal tab, earlier spelling",
-        "f\t\n",
-        "f\t",
-        File,
-        Ignore,
-    ),
-    ("final CR, earlier spelling", "f\r", "f", File, Ignore),
 ];
 
 #[test]
