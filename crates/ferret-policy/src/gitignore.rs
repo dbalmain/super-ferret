@@ -442,6 +442,10 @@ fn match_tokens_from(tokens: &[Token], token_at: usize, path: &[u8], path_at: us
 }
 
 #[cfg(test)]
+#[path = "gitignore/tests.rs"]
+mod oracle_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Debug;
