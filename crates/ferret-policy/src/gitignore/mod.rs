@@ -70,7 +70,10 @@ impl Gitignore {
     pub(crate) fn compile(text: &str) -> (Self, Vec<LineError>) {
         let mut matcher = Self::default();
         let mut errors = Vec::new();
-        for (index, original) in text.lines().enumerate() {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        for (index, line) in text.lines().enumerate() {
+            let original = line.split('\0').next().unwrap_or(line);
+            let original = original.strip_suffix('\r').unwrap_or(original);
             match Pattern::compile(index, original) {
                 Ok(Some(pattern)) => matcher.push(pattern),
                 Ok(None) => {}

@@ -453,10 +453,8 @@ fn pathological_stars_have_bounded_work() {
 }
 
 #[test]
-fn byte_normalization_oracle_cases_are_explicitly_deferred() {
-    // Round 2 excludes ignore-file byte normalization. Keep the exact Git
-    // facts visible so a later pass cannot accidentally omit them.
-    let deferred = [
+fn byte_normalization_matches_git_oracle() {
+    let cases = [
         (
             "UTF-8 BOM is stripped",
             "\u{feff}foo\n",
@@ -466,12 +464,11 @@ fn byte_normalization_oracle_cases_are_explicitly_deferred() {
         ("final CR is stripped", "f\r", "f", Match::Ignore),
         ("NUL truncates a line", "foo\0bar\n", "foo", Match::Ignore),
     ];
-    assert_eq!(deferred.len(), 3);
-    assert!(
-        deferred
-            .iter()
-            .all(|(_, _, _, want)| *want == Match::Ignore)
-    );
+    for (label, patterns, path, want) in cases {
+        let (matcher, errors) = Gitignore::compile(patterns);
+        assert!(errors.is_empty(), "{label}: {errors:?}");
+        assert_eq!(matcher.matched(Path::new(path), false), want, "{label}");
+    }
 }
 
 #[derive(Default)]
