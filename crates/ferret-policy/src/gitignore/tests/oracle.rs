@@ -94,6 +94,10 @@ fn every_table_row_agrees_with_git() {
     // Each answer must be well represented, or the tables have drifted into
     // testing only one outcome.
     let [unmatched, ignored, whitelisted] = counts;
+    eprintln!(
+        "git oracle: {} rows, None={unmatched}, Ignore={ignored}, Whitelist={whitelisted}",
+        cases.len()
+    );
     assert!(
         unmatched >= 100 && ignored >= 100 && whitelisted >= 50,
         "outcome coverage: None={unmatched}, Ignore={ignored}, Whitelist={whitelisted}"

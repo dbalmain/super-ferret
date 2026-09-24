@@ -92,6 +92,7 @@ pub(super) const ROWS: &[Row] = &[
         File,
         Ignore,
     ),
+    ("final CR, earlier spelling", "f\r", "f", File, Ignore),
 ];
 
 #[test]
