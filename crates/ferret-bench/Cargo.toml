@@ -1,0 +1,21 @@
+[package]
+name = "ferret-bench"
+description = "Experiments: compares implementations of one role on this machine's data."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ferret-policy.workspace = true
+ignore.workspace = true
+
+# The binary compiles ferret-policy's matcher in place; its unit tests already
+# run in ferret-policy.
+[[bin]]
+name = "gitignore_vs_ignore"
+test = false
+
+[lints]
+workspace = true

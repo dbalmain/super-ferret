@@ -17,6 +17,7 @@ ferret-policy = { path = "crates/ferret-policy" }
 ferret-query = { path = "crates/ferret-query" }
 ferret-text = { path = "crates/ferret-text" }
 ferret-verify = { path = "crates/ferret-verify" }
+ignore = "0.4"
 
 # `unsafe` is allowed where a measurement justifies it (D11), but never by
 # default: a crate that needs it allows it on the item, with a comment, and
