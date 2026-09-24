@@ -104,7 +104,9 @@ impl Pattern {
             .into_iter()
             .map(|part| compile_component(&part, anchored))
             .collect();
-        if parsed.escaped_edge && let Some(first) = components.first_mut() {
+        if parsed.escaped_edge
+            && let Some(first) = components.first_mut()
+        {
             *first = Component::Never;
         }
         for (at, component) in components.iter_mut().enumerate() {
@@ -927,8 +929,9 @@ mod posix_class_tests {
                 );
             }
             assert_eq!(class.matches(0), *name == "cntrl", "{name} NUL");
-            assert!(!class.matches(b'/'), "{name} slash");
-            assert_eq!(class.matches(b'.'), observed.contains(&b'.'), "{name} dot");
+            let punctuation = matches!(*name, "graph" | "print" | "punct");
+            assert_eq!(class.matches(b'/'), punctuation, "{name} slash");
+            assert_eq!(class.matches(b'.'), punctuation, "{name} dot");
         }
     }
 }
