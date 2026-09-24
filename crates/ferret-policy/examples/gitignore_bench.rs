@@ -19,6 +19,7 @@ const ROOT: &str = "/home/dave/w";
 const TYPICAL: &str = "/home/dave/w/aic-edit/.gitignore";
 const LARGEST: &str = "/home/dave/w/intpack-bench/data/corpus-src/cpython/.gitignore";
 const GLOBAL: &str = "*.tmp\n*.bak\n.cache/\n";
+const MIN_TIMED_PATHS: usize = 500_000;
 const DEFAULTS: &str = "\
 .git/
 node_modules/
@@ -45,8 +46,10 @@ fn main() {
         let (ours, our_errors) = Gitignore::compile(&input.patterns);
         let (theirs, ignore_errors) = compile_ignore(&input.patterns);
         assert_matchers_agree(input, &ours, &theirs);
-        let our_time = best_of_three(|| time_ours(&ours, &input.paths));
-        let ignore_time = best_of_three(|| time_ignore(&theirs, &input.paths));
+        let repetitions = MIN_TIMED_PATHS.div_ceil(input.paths.len());
+        let visits = repetitions * input.paths.len();
+        let our_time = best_of_three(|| time_ours(&ours, &input.paths, repetitions));
+        let ignore_time = best_of_three(|| time_ignore(&theirs, &input.paths, repetitions));
         println!(
             "match\t{}\tpaths={}\tlines={}\terrors={}/{}\tours={:.2} ns/path\tignore={:.2} ns/path",
             input.label,
@@ -54,8 +57,8 @@ fn main() {
             input.patterns.lines().count(),
             our_errors.len(),
             ignore_errors,
-            nanos_per_path(our_time, input.paths.len()),
-            nanos_per_path(ignore_time, input.paths.len())
+            nanos_per_path(our_time, visits),
+            nanos_per_path(ignore_time, visits)
         );
     }
 
@@ -87,11 +90,12 @@ fn main() {
         Config::default(),
     );
     assert!(errors.is_empty(), "policy chain errors: {errors:?}");
-    let chain_time = best_of_three(|| time_policy(&chain, &typical.paths));
+    let repetitions = MIN_TIMED_PATHS.div_ceil(typical.paths.len());
+    let chain_time = best_of_three(|| time_policy(&chain, &typical.paths, repetitions));
     println!(
         "policy\tbuilt-ins + global + aic-edit\tpaths={}\tours={:.2} ns/path",
         typical.paths.len(),
-        nanos_per_path(chain_time, typical.paths.len())
+        nanos_per_path(chain_time, repetitions * typical.paths.len())
     );
 }
 
@@ -147,36 +151,46 @@ fn assert_matchers_agree(input: &RuleSet, ours: &Gitignore, theirs: &ignore::git
     }
 }
 
-fn time_ours(matcher: &Gitignore, paths: &[(PathBuf, bool)]) -> Duration {
+fn time_ours(matcher: &Gitignore, paths: &[(PathBuf, bool)], repetitions: usize) -> Duration {
     let start = Instant::now();
     let mut matches = 0;
-    for (path, is_dir) in paths {
-        matches += usize::from(matcher.matched(path, *is_dir) != Match::None);
+    for _ in 0..repetitions {
+        for (path, is_dir) in paths {
+            matches += usize::from(matcher.matched(path, *is_dir) != Match::None);
+        }
     }
     std::hint::black_box(matches);
     start.elapsed()
 }
 
-fn time_ignore(matcher: &ignore::gitignore::Gitignore, paths: &[(PathBuf, bool)]) -> Duration {
+fn time_ignore(
+    matcher: &ignore::gitignore::Gitignore,
+    paths: &[(PathBuf, bool)],
+    repetitions: usize,
+) -> Duration {
     let start = Instant::now();
     let mut matches = 0;
-    for (path, is_dir) in paths {
-        matches += usize::from(!matcher.matched(path, *is_dir).is_none());
+    for _ in 0..repetitions {
+        for (path, is_dir) in paths {
+            matches += usize::from(!matcher.matched(path, *is_dir).is_none());
+        }
     }
     std::hint::black_box(matches);
     start.elapsed()
 }
 
-fn time_policy(rules: &DirRules, paths: &[(PathBuf, bool)]) -> Duration {
+fn time_policy(rules: &DirRules, paths: &[(PathBuf, bool)], repetitions: usize) -> Duration {
     let start = Instant::now();
     let mut skipped = 0;
-    for (path, is_dir) in paths {
-        let entry = if *is_dir {
-            Entry::Dir
-        } else {
-            Entry::File { size: 0 }
-        };
-        skipped += usize::from(rules.decide(path.as_os_str(), entry) == Decision::Skip);
+    for _ in 0..repetitions {
+        for (path, is_dir) in paths {
+            let entry = if *is_dir {
+                Entry::Dir
+            } else {
+                Entry::File { size: 0 }
+            };
+            skipped += usize::from(rules.decide(path.as_os_str(), entry) == Decision::Skip);
+        }
     }
     std::hint::black_box(skipped);
     start.elapsed()

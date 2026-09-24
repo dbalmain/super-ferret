@@ -186,29 +186,28 @@ impl Pattern {
         Some(needle.to_vec())
     }
 
-    pub(super) fn has_fixed_basename_suffix(&self) -> bool {
-        let Some(glob) = self.basename_glob() else {
-            return false;
-        };
-        matches!(glob.atoms.first(), Some(Atom::Star))
-            && glob.atoms[1..]
-                .iter()
-                .all(|atom| !matches!(atom, Atom::Star))
+    pub(super) fn fixed_basename_suffix_width(&self) -> Option<usize> {
+        let glob = self.basename_glob()?;
+        matches!(glob.atoms.first(), Some(Atom::Star)).then_some(())?;
+        glob.atoms[1..].iter().map(Atom::fixed_width).sum()
     }
 
-    pub(super) fn matches_fixed_basename_suffix(&self, basename: &[u8], is_dir: bool) -> bool {
+    pub(super) fn matches_fixed_basename_suffix(
+        &self,
+        basename: &[u8],
+        is_dir: bool,
+        width: usize,
+    ) -> bool {
         if self.directory_only && !is_dir {
             return false;
         }
         let Some(glob) = self.basename_glob() else {
             return false;
         };
-        let width = glob.atoms[1..]
-            .iter()
-            .map(Atom::fixed_width)
-            .sum::<Option<usize>>();
-        let Some(suffix) =
-            width.and_then(|width| basename.get(basename.len().checked_sub(width)?..))
+        let Some(suffix) = basename
+            .len()
+            .checked_sub(width)
+            .and_then(|start| basename.get(start..))
         else {
             return false;
         };

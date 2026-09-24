@@ -7,7 +7,7 @@
 
 mod pattern;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub(crate) use pattern::Pattern;
@@ -33,12 +33,12 @@ pub(crate) struct LineError {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Gitignore {
     literals: HashMap<Vec<u8>, Vec<FastMatch>>,
-    paths: HashMap<Vec<u8>, Vec<FastMatch>>,
+    paths: BTreeMap<u16, BTreeMap<Vec<u8>, Vec<FastMatch>>>,
     extensions: HashMap<Vec<u8>, Vec<FastMatch>>,
     prefixes: Vec<ByteFastMatch>,
     suffixes: Vec<ByteFastMatch>,
     contains: Vec<ByteFastMatch>,
-    fixed_suffixes: Vec<Pattern>,
+    fixed_suffixes: Vec<FixedSuffixMatch>,
     basename_general: Vec<Pattern>,
     anchored_any: Vec<Pattern>,
     anchored_by_prefix2: HashMap<u16, Vec<Pattern>>,
@@ -56,6 +56,12 @@ struct FastMatch {
 struct ByteFastMatch {
     bytes: Vec<u8>,
     action: FastMatch,
+}
+
+#[derive(Clone, Debug)]
+struct FixedSuffixMatch {
+    pattern: Pattern,
+    width: usize,
 }
 
 impl Gitignore {
@@ -91,9 +97,11 @@ impl Gitignore {
             .literals
             .get(basename)
             .and_then(|entries| latest_fast(entries, is_dir));
-        if let Some(candidate) = self
-            .paths
-            .get(bytes)
+        if let Some(candidate) = bytes
+            .first()
+            .map(|first| u16::from_ne_bytes([*first, bytes.get(1).copied().unwrap_or(0)]))
+            .and_then(|prefix| self.paths.get(&prefix))
+            .and_then(|paths| paths.get(bytes))
             .and_then(|entries| latest_fast(entries, is_dir))
             && best.is_none_or(|current| candidate.index > current.index)
         {
@@ -155,7 +163,13 @@ impl Gitignore {
         if let Some(literal) = pattern.literal_basename() {
             self.literals.entry(literal).or_default().push(fast);
         } else if let Some(path) = pattern.literal_path() {
-            self.paths.entry(path).or_default().push(fast);
+            let prefix = u16::from_ne_bytes([path[0], path.get(1).copied().unwrap_or(0)]);
+            self.paths
+                .entry(prefix)
+                .or_default()
+                .entry(path)
+                .or_default()
+                .push(fast);
         } else if let Some(extension) = pattern.simple_extension() {
             self.extensions.entry(extension).or_default().push(fast);
         } else if let Some(prefix) = pattern.basename_prefix() {
@@ -173,8 +187,9 @@ impl Gitignore {
                 bytes: needle,
                 action: fast,
             });
-        } else if pattern.has_fixed_basename_suffix() {
-            self.fixed_suffixes.push(pattern);
+        } else if let Some(width) = pattern.fixed_basename_suffix_width() {
+            self.fixed_suffixes
+                .push(FixedSuffixMatch { pattern, width });
         } else if pattern.basename_only {
             self.basename_general.push(pattern);
         } else if let Some(prefix) = pattern.first_literal_prefix2() {
@@ -194,16 +209,17 @@ impl Gitignore {
 }
 
 fn scan_fixed_suffixes(
-    patterns: &[Pattern],
+    patterns: &[FixedSuffixMatch],
     basename: &[u8],
     is_dir: bool,
     best: &mut Option<FastMatch>,
 ) {
-    for pattern in patterns.iter().rev() {
+    for fixed in patterns.iter().rev() {
+        let pattern = &fixed.pattern;
         if best.is_some_and(|candidate| pattern.index < candidate.index) {
             break;
         }
-        if pattern.matches_fixed_basename_suffix(basename, is_dir) {
+        if pattern.matches_fixed_basename_suffix(basename, is_dir, fixed.width) {
             *best = Some(FastMatch {
                 index: pattern.index,
                 result: pattern.result,
