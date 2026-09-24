@@ -571,8 +571,10 @@ against paths relative to its own directory, ns/path:
 | CPython `.gitignore` (171 lines) |  238 |      252 |
 
 Build of the largest set: 131 µs against 705 µs. This is a matching
-micro-benchmark, not an end-to-end crawl measurement. The comparison bench lives
-on branch `bench/gitignore-vs-ignore`, not on `main`.
+micro-benchmark, not an end-to-end crawl measurement. It is the `ferret-bench`
+binary `gitignore_vs_ignore`, on branch `bench/gitignore-vs-ignore`: an
+experiment that needs a dependency `main` has dropped lives on its own branch,
+so `main` does not carry `ignore`.
 
 ## D17 — Whose regex engine, and when
 
