@@ -19,6 +19,11 @@ flake pins it, and the build stays on stable. Plain `cargo fmt` with stable
 rustfmt warns about the unstable options and leaves comments unwrapped. Add
 `-- --check` to verify without writing.
 
+Comment wrapping reflows any paragraph with an over-long line, joining its
+lines. Put a diagram, table or other hand-laid-out text in a comment inside a
+` ```text ` fence, which rustfmt leaves alone; indented lines are also left
+alone. Review formatting diffs to comments like any other change.
+
 Style: `~/style-guide/rust.md` and `~/style-guide/common.md`
 (github.com/dbalmain/style-guide).
 
