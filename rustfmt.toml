@@ -1,4 +1,5 @@
 # Unstable: nightly rustfmt wraps comments to comment_width (80).
-# Stable rustfmt warns and leaves comment text alone.
+# Stable rustfmt warns and leaves comment text alone; `nix run .#fmt` runs
+# the nightly that flake.lock pins.
 unstable_features = true
 wrap_comments = true

@@ -9,10 +9,15 @@ with their reasons, are in [docs/DECISIONS.md](docs/DECISIONS.md).
 All green with zero warnings before a change is done:
 
 ```sh
-cargo fmt --all
+nix run .#fmt        # cargo fmt --all with the pinned nightly rustfmt
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
+
+Formatting needs nightly rustfmt because `rustfmt.toml` wraps comments; the
+flake pins it, and the build stays on stable. Plain `cargo fmt` with stable
+rustfmt warns about the unstable options and leaves comments unwrapped. Add
+`-- --check` to verify without writing.
 
 Style: `~/style-guide/rust.md` and `~/style-guide/common.md`
 (github.com/dbalmain/style-guide).

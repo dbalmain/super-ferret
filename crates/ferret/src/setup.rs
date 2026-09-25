@@ -26,7 +26,8 @@ pub enum Written {
 /// file that a retry would mistake for that opt-out.
 pub fn write_ignore_file(path: &Path) -> io::Result<Written> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    // XDG: a base directory setup creates is 0700; one that exists keeps its mode.
+    // XDG: a base directory setup creates is 0700; one that exists keeps its
+    // mode.
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
