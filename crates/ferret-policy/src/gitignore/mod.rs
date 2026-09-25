@@ -2,8 +2,8 @@
 //!
 //! `pattern` owns parsing and matching one pattern. This module keeps pattern
 //! positions while partitioning common shapes into fast lookup buckets. Tests
-//! use Git 2.54 only as a black-box oracle; no Git or third-party matcher source
-//! or tests are used.
+//! use Git 2.54 only as a black-box oracle; no Git or third-party matcher
+//! source or tests are used.
 
 mod pattern;
 

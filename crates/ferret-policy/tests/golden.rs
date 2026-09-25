@@ -23,10 +23,10 @@
 //!
 //! `cap` sets `Config::size_cap`. The global ignore file starts as
 //! `DEFAULT_IGNORE`, as setup writes it; `defaults off` starts it empty, and
-//! `global` appends lines after the defaults, as a user editing it would. An entry line is a path, an
-//! optional size in bytes (default 1) and the expectation. A trailing `/`
-//! marks a directory, `@` a symlink, `=` a special file. `| ` lines are the
-//! contents of the file (or `global`) above them.
+//! `global` appends lines after the defaults, as a user editing it would. An
+//! entry line is a path, an optional size in bytes (default 1) and the
+//! expectation. A trailing `/` marks a directory, `@` a symlink, `=` a special
+//! file. `| ` lines are the contents of the file (or `global`) above them.
 //!
 //! Expectations: `skip`, `descend`, `traverse`, `index`, `too-large`,
 //! `symlink`, `unvisited`. Every path's parent directory must be listed. A
