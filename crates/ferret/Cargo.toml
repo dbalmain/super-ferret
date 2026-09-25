@@ -15,6 +15,7 @@ path = "src/main.rs"
 ferret-catalog.workspace = true
 ferret-crawl.workspace = true
 ferret-index.workspace = true
+ferret-policy.workspace = true
 ferret-query.workspace = true
 ferret-verify.workspace = true
 

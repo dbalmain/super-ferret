@@ -21,8 +21,9 @@
 //!   | *.log
 //! ```
 //!
-//! `cap` sets `Config::size_cap`, `defaults off` clears `Config::defaults`,
-//! and `global` starts the global ignore file. An entry line is a path, an
+//! `cap` sets `Config::size_cap`. The global ignore file starts as
+//! `DEFAULT_IGNORE`, as setup writes it; `defaults off` starts it empty, and
+//! `global` appends lines after the defaults, as a user editing it would. An entry line is a path, an
 //! optional size in bytes (default 1) and the expectation. A trailing `/`
 //! marks a directory, `@` a symlink, `=` a special file. `| ` lines are the
 //! contents of the file (or `global`) above them.
@@ -42,12 +43,12 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, Reason};
+use ferret_policy::{Config, DEFAULT_IGNORE, Decision, DirRules, Entry, IgnoreFiles, Reason};
 
 struct Case {
     title: String,
     config: Config,
-    global: Option<String>,
+    global: String,
     nodes: BTreeMap<PathBuf, Node>,
 }
 
@@ -70,7 +71,7 @@ fn parse(source: &str, file: &Path) -> Vec<Case> {
             cases.push(Case {
                 title: title.to_owned(),
                 config: Config::default(),
-                global: None,
+                global: DEFAULT_IGNORE.to_owned(),
                 nodes: BTreeMap::new(),
             });
             target = None;
@@ -88,7 +89,7 @@ fn parse(source: &str, file: &Path) -> Vec<Case> {
                 .as_ref()
                 .unwrap_or_else(|| panic!("{}: stray `|`", at()))
             {
-                None => case.global.get_or_insert_with(String::new),
+                None => &mut case.global,
                 Some(path) => &mut case.nodes.get_mut(path).unwrap().content,
             };
             buffer.push_str(text);
@@ -98,7 +99,7 @@ fn parse(source: &str, file: &Path) -> Vec<Case> {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
             ["cap", bytes] => case.config.size_cap = bytes.parse().unwrap(),
-            ["defaults", "off"] => case.config.defaults = false,
+            ["defaults", "off"] => case.global.clear(),
             ["global"] => target = Some(None),
             [spec, rest @ ..] if !rest.is_empty() && rest.len() <= 2 => {
                 let (path, entry) = parse_spec(spec, rest, &at());
@@ -201,7 +202,7 @@ impl Case {
         let root = Path::new("");
         let (rules, errors) = DirRules::root(
             Path::new("/golden"),
-            self.global.as_deref(),
+            Some(&self.global),
             self.ignore_files(root),
             self.config,
         );

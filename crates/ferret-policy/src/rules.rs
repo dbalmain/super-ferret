@@ -7,8 +7,8 @@
 //! 1. `.ferretignore` files, closest directory first;
 //! 2. inside a git work tree only, `.gitignore` files closest first, then
 //!    `.git/info/exclude`;
-//! 3. the user's global ignore file;
-//! 4. the built-in defaults.
+//! 3. the user's global ignore file, which setup seeds with
+//!    [`DEFAULT_IGNORE`](crate::DEFAULT_IGNORE).
 //!
 //! Within one file the last matching line wins, as in gitignore. Each layer
 //! matches paths relative to the directory holding its file.
@@ -23,23 +23,6 @@ use std::sync::Arc;
 use crate::gitignore::{Gitignore, Match};
 use crate::reinclude::Reinclude;
 use crate::{Config, Decision, Entry, IgnoreFile, IgnoreFiles, PatternError, Reason};
-
-/// The M1 list, measured on Dave's tree (research M1). `result` has no slash:
-/// Nix's `result` is a symlink.
-pub(crate) const DEFAULTS: &str = "\
-.git/
-node_modules/
-target/
-.venv/
-__pycache__/
-.cache/
-dist/
-build/
-.next/
-vendor/
-.direnv/
-result
-";
 
 /// Rules in force for one directory: its ancestors' rules plus whatever
 /// ignore files it holds.
@@ -75,7 +58,6 @@ struct WorkTree {
 #[derive(Debug)]
 struct Shared {
     global: Option<Layer>,
-    defaults: Option<Layer>,
     config: Config,
 }
 
@@ -98,8 +80,9 @@ enum Band {
 }
 
 impl DirRules {
-    /// Rules at a configured root: its own ignore files, the global ignore
-    /// file's contents (if any) and, when `config.defaults`, the built-ins.
+    /// Rules at a configured root: its own ignore files and the global ignore
+    /// file's contents, if any. With no global file nothing is excluded by
+    /// default.
     ///
     /// Returns every pattern that could not be used alongside the rules,
     /// which apply without them. `root` is only used to name files in those
@@ -122,26 +105,12 @@ impl DirRules {
                 false,
             )
         });
-        let defaults = config.defaults.then(|| {
-            Layer::compile(
-                PathBuf::new(),
-                IgnoreFile::Builtin,
-                DEFAULTS,
-                None,
-                &mut errors,
-                false,
-            )
-        });
         let bare = Self {
             path: PathBuf::new(),
             root: Arc::from(root),
             ferret: None,
             git: None,
-            shared: Arc::new(Shared {
-                global,
-                defaults,
-                config,
-            }),
+            shared: Arc::new(Shared { global, config }),
             traversing: false,
         };
         let rules = bare.with_files(PathBuf::new(), files, &mut errors);
@@ -211,10 +180,7 @@ impl DirRules {
                 .chain(tree.exclude.as_deref())
                 .map(|layer| (Band::Other, layer))
         });
-        let base = [&self.shared.global, &self.shared.defaults]
-            .into_iter()
-            .flatten()
-            .map(|layer| (Band::Other, layer));
+        let base = self.shared.global.iter().map(|layer| (Band::Other, layer));
         ferret
             .chain(git)
             .chain(base)
@@ -352,8 +318,8 @@ mod tests {
     }
 
     #[test]
-    fn builtin_defaults_compile_cleanly() {
-        let (_, errors) = root(None, IgnoreFiles::default());
+    fn default_ignore_compiles_cleanly() {
+        let (_, errors) = root(Some(crate::DEFAULT_IGNORE), IgnoreFiles::default());
         assert_eq!(errors, []);
     }
 
@@ -392,12 +358,8 @@ mod tests {
     }
 
     #[test]
-    fn defaults_off_leaves_default_names_alone() {
-        let config = Config {
-            defaults: false,
-            ..Config::default()
-        };
-        let (rules, _) = DirRules::root(Path::new("/r"), None, IgnoreFiles::default(), config);
+    fn without_a_global_file_default_names_are_ordinary() {
+        let (rules, _) = root(None, IgnoreFiles::default());
         assert_eq!(
             rules.decide(OsStr::new("node_modules"), Entry::Dir),
             Decision::Descend
@@ -411,7 +373,7 @@ mod tests {
                 ferretignore: Some(content),
                 ..IgnoreFiles::default()
             };
-            let (rules, errors) = root(None, files);
+            let (rules, errors) = root(Some("target/\n"), files);
             assert!(errors.is_empty());
             assert_eq!(
                 rules.decide(OsStr::new("target"), Entry::Dir),

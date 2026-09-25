@@ -25,7 +25,7 @@ cycles. This block is enforced: `crates/ferret/tests/layering.rs` fails when a
 crate's `Cargo.toml` disagrees with it.
 
 ```text
-ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify
+ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify, ferret-policy
 ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text
 ferret-crawl   → ferret-policy, ferret-catalog
 ferret-index   → ferret-text, intpack (git dependency, may be vendored — D11)
@@ -37,16 +37,16 @@ ferret-bench   → anything; nothing depends on it
 ferret-daemon  → later
 ```
 
-| Crate            | Owns                                                                                                           | Knows nothing about            |
-| ---------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| `ferret-policy`  | `DirRules::decide(name, entry) -> Decision`, `sniff`; `.ferretignore` / `.gitignore` / global / built-in (D13) | the catalog, the index         |
-| `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing                                          | query, index formats           |
-| `ferret-catalog` | names, inodes, documents, the snapshot + log store, name scan (D14)                                            | tokens, postings               |
-| `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                         | files, ids                     |
-| `ferret-index`   | segments over doc ids; each structure implements `CandidateSource`                                             | files, paths, inodes           |
-| `ferret-verify`  | re-reading a file and matching a query atom against its bytes                                                  | how candidates were found      |
-| `ferret-query`   | query syntax, planning, execution, result rows                                                                 | any structure's on-disk format |
-| `ferret`         | the CLI, config, JSON lines output, the query log                                                              | —                              |
+| Crate            | Owns                                                                                                                           | Knows nothing about            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
+| `ferret-policy`  | `DirRules::decide(name, entry) -> Decision`, `sniff`; `.ferretignore` / `.gitignore` / global (D13); the defaults setup writes | the catalog, the index         |
+| `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing                                                          | query, index formats           |
+| `ferret-catalog` | names, inodes, documents, the snapshot + log store, name scan (D14)                                                            | tokens, postings               |
+| `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                                         | files, ids                     |
+| `ferret-index`   | segments over doc ids; each structure implements `CandidateSource`                                                             | files, paths, inodes           |
+| `ferret-verify`  | re-reading a file and matching a query atom against its bytes                                                                  | how candidates were found      |
+| `ferret-query`   | query syntax, planning, execution, result rows                                                                                 | any structure's on-disk format |
+| `ferret`         | the CLI, config, XDG directories, setup, JSON lines output, the query log                                                      | —                              |
 
 Two boundaries carry the design, and both are where D1 said the thought goes:
 
@@ -138,17 +138,18 @@ then `enter` with that directory's ignore-file contents, or `traverse`), asks it
 to `decide` each entry, and `sniff`s file heads; it is tested against a golden
 corpus of trees and expected decisions. Precedence, most specific first: a
 `.ferretignore` in the directory or an ancestor; `.gitignore` and
-`.git/info/exclude` inside a work tree; the user's global ignore file; built-in
-defaults (`node_modules/`, `target/`, `.venv/`, …, a size cap, a binary check).
-`!pat` in a `.ferretignore` overrides an ancestor `.ferretignore` or any
-`.gitignore`, and can re-include below an excluded directory; the walker
-traverses an excluded directory (uncatalogued, its ignore files unread) only
-when an anchored `.ferretignore` `!` pattern could match inside it — never for
-an unanchored one such as `!*.pdf`. A `.ferretignore` inside an excluded
-directory is never read; overriding an exclusion takes a `!` pattern at that
-directory's level or above (D13). D16 replaces the first implementation's
-`ignore` crate edge with an in-crate matcher while retaining the same policy API
-and re-inclusion behavior.
+`.git/info/exclude` inside a work tree; the user's global ignore file
+(`$XDG_CONFIG_HOME/ferret/ignore`), which setup seeds once with the defaults
+(`node_modules/`, `target/`, `.venv/`, …) and which is the user's to edit from
+then on. A size cap and a binary check sit beside the patterns. `!pat` in a
+`.ferretignore` overrides an ancestor `.ferretignore` or any `.gitignore`, and
+can re-include below an excluded directory; the walker traverses an excluded
+directory (uncatalogued, its ignore files unread) only when an anchored
+`.ferretignore` `!` pattern could match inside it — never for an unanchored one
+such as `!*.pdf`. A `.ferretignore` inside an excluded directory is never read;
+overriding an exclusion takes a `!` pattern at that directory's level or above
+(D13). D16 replaces the first implementation's `ignore` crate edge with an
+in-crate matcher while retaining the same policy API and re-inclusion behavior.
 
 Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
 and **content-indexed** (also hashed and tokenized). Binary files and files over

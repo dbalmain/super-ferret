@@ -464,6 +464,18 @@ cause an excluded directory to be walked. Inside a traversed directory only
 cannot, as in git. A bad pattern line is dropped and reported, and the rest of
 its file still applies.
 
+**Revised (2026-09-25): the defaults are a file, not a layer.** Setup writes
+`DEFAULT_IGNORE` to `$XDG_CONFIG_HOME/ferret/ignore` (default
+`~/.config/ferret/ignore`) once, in commented sections, and never overwrites it.
+From then on it is an ordinary global ignore file: deleting a line or adding
+`!pat` below it re-includes, by gitignore's last-match rule. The built-in layer
+and `Config::defaults` are gone, since a second copy would keep matching after
+the user edited the file. Precedence is unchanged, because the defaults already
+sat directly below the global file. Two things follow. Defaults added in later
+versions do not reach an existing file, as with git's own global ignore. And
+with no global file nothing is excluded, so the CLI must not crawl before setup
+has run.
+
 ## D14 — Filename search: scan the names, or index them
 
 **Question:** Is "much faster find" answered by scanning the catalog's names or

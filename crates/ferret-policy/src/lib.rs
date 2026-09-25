@@ -1,9 +1,10 @@
 //! Exclusion policy: which entries of a directory walk are skipped,
 //! catalogued, or content-indexed.
 //!
-//! Owns the precedence of `.ferretignore`, `.gitignore`, the user's global
-//! ignore file and the built-in defaults (DECISIONS.md D13), plus the size cap
-//! and binary check that separate *catalogued* from *content-indexed*.
+//! Owns the precedence of `.ferretignore`, `.gitignore` and the user's global
+//! ignore file (DECISIONS.md D13), the default contents setup writes to that
+//! file ([`DEFAULT_IGNORE`]), and the size cap and binary check that separate
+//! *catalogued* from *content-indexed*.
 //!
 //! Pure: no file-system I/O. The crawler (`ferret-crawl`) walks the tree,
 //! reads ignore files and each file's head, and asks this crate what to do:
@@ -26,6 +27,37 @@ use std::path::PathBuf;
 
 pub use rules::DirRules;
 
+/// What setup writes to a new global ignore file: the M1 list, measured on
+/// Dave's tree (research M1), in sections a user can comment out. After that
+/// the file is the user's; nothing here applies these patterns by itself.
+/// `result` has no slash: Nix's `result` is a symlink.
+pub const DEFAULT_IGNORE: &str = "\
+# ferret's global ignore file: gitignore syntax, applied under every root,
+# below any .ferretignore or .gitignore. Delete a line, or add `!pattern`
+# after it, to index what it excludes.
+
+# Version control
+.git/
+
+# Dependencies
+node_modules/
+vendor/
+.venv/
+
+# Build output
+target/
+dist/
+build/
+.next/
+# Nix build output: a symlink, so no trailing slash.
+result
+
+# Caches and environments
+.cache/
+__pycache__/
+.direnv/
+";
+
 /// How many leading bytes of a file the crawler reads for [`sniff`].
 pub const SNIFF_LEN: usize = 8192;
 
@@ -38,17 +70,12 @@ pub struct Config {
     /// Files larger than this many bytes are catalogued, not content-indexed.
     /// A file of exactly this size is indexed.
     pub size_cap: u64,
-    /// Whether the built-in default exclusions (`node_modules/`, `target/`, …)
-    /// apply. They sit below every ignore file, so `!pat` anywhere overrides
-    /// them either way.
-    pub defaults: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             size_cap: DEFAULT_SIZE_CAP,
-            defaults: true,
         }
     }
 }
@@ -148,8 +175,6 @@ pub enum IgnoreFile {
     GitExclude(PathBuf),
     /// The user's global ignore file.
     Global,
-    /// The built-in defaults. An error here is a bug in this crate.
-    Builtin,
 }
 
 /// An ignore file the policy could not fully use. Non-fatal: as in git, a bad
@@ -176,7 +201,6 @@ impl fmt::Display for IgnoreFile {
                 write!(f, "{}", path.display())
             }
             Self::Global => f.write_str("global ignore file"),
-            Self::Builtin => f.write_str("built-in defaults"),
         }
     }
 }

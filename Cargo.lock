@@ -9,6 +9,7 @@ dependencies = [
  "ferret-catalog",
  "ferret-crawl",
  "ferret-index",
+ "ferret-policy",
  "ferret-query",
  "ferret-verify",
 ]

@@ -49,9 +49,16 @@ repo/.gitignore         index
 repo/kept.tmp           index
 repo/b.tmp              skip
 
-== defaults off: built-in names are ordinary directories
+== defaults off: default names are ordinary directories
 defaults off
 node_modules/           descend
 node_modules/a.js       index
 .git/                   descend
 .git/HEAD               index
+
+== a default is re-included by a later line in the global file
+global
+  | !node_modules/
+node_modules/           descend
+node_modules/a.js       index
+target/                 skip
