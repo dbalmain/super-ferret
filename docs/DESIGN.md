@@ -89,8 +89,9 @@ cursor, along with the cost units.
 
 ## The catalog (D4, D5)
 
-Five tables, all with dense `u32` ids assigned by the catalog. Raw inode numbers
-are data, never keys.
+Five tables. `names`, `inodes` and `docs` have dense `u32` ids assigned by the
+catalog; `roots` and `links` hang off an existing `InoId`. Raw inode numbers are
+data, never keys.
 
 | Table    | Id       | Row                                                                     |
 | -------- | -------- | ----------------------------------------------------------------------- |
