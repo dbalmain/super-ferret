@@ -33,6 +33,7 @@ Predecessors, carried forward where still open:
 | D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                               |
 | D16 | Replace `ignore` with our own gitignore matcher      | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
 | D17 | Whose regex engine, and when                         | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
+| D18 | Symlinks: catalogue as links, and what they match    | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -629,6 +630,59 @@ dependency of D16.
 **Answer (2026-09-24): A.** `regex` executes, behind a narrow verifier trait;
 revisit at S3 with the verification-share measurement. D16's matcher proceeds
 without a regex engine.
+
+## D18 — Symlinks: catalogue as links, and what they match
+
+**Question:** How does the catalog represent a symlink, and when does one appear
+in results?
+
+The crawler never follows a link: `Decision::Catalog(Reason::Symlink)`
+catalogues it and reads nothing through it. That stays. What was open is what
+the link means afterwards.
+
+**Direction (Dave, 2026-09-26, in conversation):** symlinks are represented as
+symlinks in the catalog, with a reverse mapping. They appear in results in two
+cases: (1) the search matches the link's own name; (2) the search matches the
+content of the file it links to. Directory links appear only in case 1. Pulling
+files outside every root into the index through a link is a later enhancement;
+for now a file not under a root is not indexed.
+
+**Answer (2026-09-26): deferred, with the structure prepared now.** The target
+model, for when it lands:
+
+- A link is a catalog entry holding the text `readlink` returned. Its **next
+  hop** is that text resolved against the link's directory, and never the final
+  canonical path: a canonical pointer goes stale, unnoticed, when an
+  intermediate link is retargeted.
+- A **reverse map** from target path to the links naming it, keyed by path
+  rather than by entry, so a dangling link binds when its target appears.
+- Case 2 lookup: doc → inodes → paths → the links naming each path, repeated
+  through chains, with a visited set against cycles and a hop limit (40, as
+  Linux).
+- A case-2 row is the link's path, shown with `→ target` so the user sees why it
+  matched (D15: one row per path).
+- Change detection needs nothing extra: a link's content comes from its target
+  at query time, and retargeting a link replaces its inode, which `lstat`
+  already shows.
+
+**Known gap:** a file link whose target path goes _through_ a directory link
+(`notes/r → ../proj/report.md` with `proj → ~/w/proj`) is not reached from a hit
+on `~/w/proj/report.md`. Handling it means recording the hop as (directory link,
+remaining suffix) and checking directory links against each hit's path prefixes;
+left out until it is seen to matter.
+
+**Later, and separate — links that pull content in.** Following a link out of
+every root would need: the target catalogued once at its real path, which makes
+the catalog the visited set, so cycles cost nothing extra; membership by
+**reachability** from a root, via a simple mark-and-sweep, because reference
+counts leak on two external trees linking to each other; and a target directory
+ruled as its own root: its own ignore files plus the global file (agreed as
+option A). No generational collector; the work is in when it runs and over what.
+
+**What changes now:** the catalog stores each link's target text (the `links`
+table in DESIGN.md § The catalog), captured by one `readlink` per link during
+the crawl. That keeps D18 an addition over data already on disk, with no
+re-crawl and no format change.
 
 ## Settled without a brief (object if wrong)
 

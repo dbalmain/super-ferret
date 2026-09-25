@@ -89,7 +89,7 @@ cursor, along with the cost units.
 
 ## The catalog (D4, D5)
 
-Four tables, all with dense `u32` ids assigned by the catalog. Raw inode numbers
+Five tables, all with dense `u32` ids assigned by the catalog. Raw inode numbers
 are data, never keys.
 
 | Table    | Id       | Row                                                                     |
@@ -98,10 +98,16 @@ are data, never keys.
 | `inodes` | `InoId`  | `(dev, ino)`, kind, size, mtime, ctime, mode, uid, gid, `DocId` or none |
 | `docs`   | `DocId`  | content hash (BLAKE3, 128 bits kept), live flag                         |
 | `roots`  | —        | configured root paths and the `InoId` of each                           |
+| `links`  | —        | a symlink's `InoId`, its target as `readlink` returned it (in the heap) |
 
 Derived at load: `hash → DocId`, `DocId → [InoId]`, `InoId → [NameId]`
 (directories have exactly one name). A path is the walk from a name through its
 parent's name to a root.
+
+A symlink is catalogued as itself — an `inodes` row of kind symlink, named like
+any file — and never followed. Its target text is stored now so that D18's
+reverse map (target path → links) and content matches through links can be
+derived at load later, without a re-crawl.
 
 What each change costs:
 

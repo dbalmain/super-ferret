@@ -98,4 +98,5 @@ comparison logs and the query log. Transport and privacy design at that point.
 
 Extraction: PDFs, image and video metadata out of the box, then a plugin
 interface for other formats. TUI (ratatui) and GUI (Tauri, or not — undecided on
-purpose). Semantic search as a scoped plugin.
+purpose). Semantic search as a scoped plugin. Symlinks matched through their
+targets' content, then links that pull content in from outside the roots (D18).
