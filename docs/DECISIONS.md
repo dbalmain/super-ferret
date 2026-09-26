@@ -34,7 +34,7 @@ Predecessors, carried forward where still open:
 | D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
 | D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
-| D19 | Ignore matching: whole paths, or per-directory rule sets | open           | B-flat-indexed 2x faster decide than A, regex faster still at 6x memory; adopt indexed?                        |
+| D19 | Ignore matching: whole paths, or per-directory rule sets | answered       | B-flat-indexed: one shared, indexed rule list per directory; last match wins                                   |
 | D20 | Walk across mount points, or stay on the root's device   | answered       | A: cross mount points below a root, as now                                                                     |
 | D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
 | D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
@@ -1013,6 +1013,11 @@ and one engine is worth the tie on a cold walk. Sharing by rule text should also
 cut its `enter`. What would change it: if our own regex engine ends up with
 cheap multi-pattern compilation, then 3, as a matcher swap behind the same
 shared lists.
+
+> Dave: Agree. Let's go with 1.
+
+**Answer (2026-09-27): 1.** B-flat-indexed replaces whole-path matching for both
+the walker and the daemon, with lists shared by rule text.
 
 ## D20 — Walk across mount points, or stay on the root's device
 
