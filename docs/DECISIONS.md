@@ -777,6 +777,26 @@ and the replay above did not include it, because it was collected before the
 fix. Where A's `decide` time goes is not yet profiled; probing every layer's
 buckets for each entry is the likely cost.
 
+**Profiled and fixed in A (2026-09-26, `02f24fa`).** Two thirds of the warm
+walk's user time was `decide`, and none of it was the model: std's
+`Path::strip_prefix` parsing components for every layer on every entry (about a
+fifth of user time), SipHash in the bucket maps, and the work trees'
+`**/.claude/<name>` excludes scanned against every entry from `anchored_any`. A
+new bucket keys anchored patterns by a literal last component (a path can only
+match one if its basename is that literal), the maps use a small multiplicative
+hasher, and layer bases are stripped as bytes. Warm walk of `~/w` 0.28 s → 0.205
+s, then 0.185 s with D21's handles; user time 0.14 s → 0.05 s. Decisions
+identical on all 86,243 entries, also with CPython's `.gitignore` added
+globally. On `$HOME` (430k entries) the walk is 1.07 s, of which user 0.31 s and
+policy about a fifth of that.
+
+That is the fact the recommendation named: the cost was a fixable bucket miss in
+A. Matching is now under a tenth of the walk; B would save a share of that
+tenth. **Revised recommendation: A; park B** (the prototype stays on
+`bench/policy-derive`). The fact that would change it: a real rule set whose
+anchored patterns have neither a literal first nor a literal last component, in
+numbers large enough to show in a profile.
+
 ## D20 — Walk across mount points, or stay on the root's device
 
 **Question:** When a configured root contains a mount point, does the walker
