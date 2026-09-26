@@ -460,9 +460,7 @@ fn pathological_stars_have_bounded_work() {
         let mut cursors = vec![(0, false)];
         for parent in parents.split('/') {
             let mut next = Vec::new();
-            for (pos, fed) in cursors {
-                pattern.advance(pos, fed, parent.as_bytes(), &mut next);
-            }
+            pattern.step(cursors, parent.as_bytes(), &mut next);
             assert!(
                 next.len() <= pattern.component_count(),
                 "globstar cursors n={n}: {next:?}"
@@ -471,5 +469,53 @@ fn pathological_stars_have_bounded_work() {
         }
         let (matcher, _) = OneFile::compile(source);
         assert_eq!(matched(&matcher, path.as_bytes(), false), Unmatched);
+    }
+}
+
+#[test]
+fn globstar_runs_have_bounded_work() {
+    let n = 10_000;
+    // A run of `**/` compiles to one globstar, so this is `**/hit`.
+    let plain = format!("{}hit", "**/".repeat(n));
+    // Globstars separated by literals do not collapse: 2n + 1 components,
+    // and a chain of `a` directories leaves a cursor on every globstar and
+    // literal it has reached.
+    let alternating = format!("{}hit", "**/a/".repeat(n));
+    let chain = "a/".repeat(200);
+    for (label, source, path, expected) in [
+        ("plain", &plain, "a/b/hit".to_owned(), Ignore),
+        ("plain", &plain, "a/b/x".to_owned(), Unmatched),
+        (
+            "alternating",
+            &alternating,
+            format!("{chain}hit"),
+            Unmatched,
+        ),
+        (
+            "alternating",
+            &alternating,
+            format!("{chain}b/hit"),
+            Unmatched,
+        ),
+    ] {
+        let (matcher, errors) = OneFile::compile(source);
+        assert!(errors.is_empty(), "{label}: {errors:?}");
+        let words = source.len().div_ceil(64);
+        crate::rules::take_step_work();
+        assert_eq!(
+            matched(&matcher, path.as_bytes(), false),
+            expected,
+            "{label} {path}"
+        );
+        let work = crate::rules::take_step_work();
+        // A step visits each live cursor's component and, from a globstar,
+        // the one after it: at most two visits per cursor. A directory adds
+        // at most two cursors, and the position bitsets add a word scan per
+        // step. The old recursion walked all n globstars of the plain form in
+        // one step, and deduplicated the alternating form's cursors by linear
+        // search, quadratic in the cursors per step.
+        let steps = path.split('/').count() - 1;
+        let bound = steps * (4 * (2 * steps + 1) + words + 4);
+        assert!(work <= bound, "{label} {path}: {work} > {bound}");
     }
 }

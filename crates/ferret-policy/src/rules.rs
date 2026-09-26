@@ -115,7 +115,7 @@ struct Anchored {
     reaches: bool,
 }
 
-/// A position in one anchored pattern; see [`Pattern::advance`].
+/// A position in one anchored pattern; see [`Pattern::step`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Cursor {
     slot: usize,
@@ -439,13 +439,36 @@ impl State {
                     return false;
                 }
                 step.clear();
-                anchored
+                let work = anchored
                     .pattern
-                    .advance(cursor.pos, cursor.fed, name, &mut step);
+                    .step([(cursor.pos, cursor.fed)], name, &mut step);
+                count_step_work(work);
                 !step.is_empty()
             })
         })
     }
+}
+
+/// Adds one step's work to the test counter; nothing outside tests.
+#[cfg(not(test))]
+fn count_step_work(_work: usize) {}
+
+#[cfg(test)]
+thread_local! {
+    /// Component visits by [`Pattern::step`] on this thread, for tests that
+    /// bound the work of a walk rather than its wall-clock time.
+    static STEP_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_step_work(work: usize) {
+    STEP_WORK.with(|total| total.set(total.get() + work));
+}
+
+/// Takes the step work counted on this thread since the last take.
+#[cfg(test)]
+pub(crate) fn take_step_work() -> usize {
+    STEP_WORK.with(|total| total.replace(0))
 }
 
 impl Layer {
@@ -476,7 +499,7 @@ impl Layer {
             if pattern.is_shared_basename() {
                 // One that cannot match anything (an escaped edge) projects
                 // to nothing.
-                if let Some(projected) = pattern.project_basename(0, false) {
+                if let Some(Some(projected)) = pattern.projections().into_iter().next() {
                     shared.push((pattern.line(), lists.rule(projected, ferret)));
                 }
                 continue;
@@ -486,12 +509,10 @@ impl Layer {
                 && !patterns[at + 1..]
                     .iter()
                     .any(|later| pattern.is_superseded_by(later));
-            let projections = (0..pattern.component_count())
-                .flat_map(|pos| [(pos, false), (pos, true)])
-                .map(|(pos, fed)| {
-                    let projected = pattern.project_basename(pos, fed)?;
-                    Some(lists.rule(projected, ferret))
-                })
+            let projections = pattern
+                .projections()
+                .into_iter()
+                .map(|projected| Some(lists.rule(projected?, ferret)))
                 .collect();
             anchored.push(Anchored {
                 pattern: pattern.clone(),
@@ -524,26 +545,18 @@ impl Layer {
         }
         let mut out: Vec<Cursor> = Vec::with_capacity(self.cursors.len());
         let mut step = Vec::new();
-        for cursor in self.cursors.iter() {
-            let anchored = &self.source.anchored[cursor.slot];
+        // Cursors are kept grouped by slot, each group in position order, so
+        // one pattern's cursors step together and come back canonical.
+        for group in self.cursors.chunk_by(|a, b| a.slot == b.slot) {
+            let slot = group[0].slot;
             step.clear();
-            anchored
-                .pattern
-                .advance(cursor.pos, cursor.fed, name, &mut step);
-            for (pos, fed) in step.drain(..) {
-                if let Some(existing) = out
-                    .iter_mut()
-                    .find(|item| item.slot == cursor.slot && item.pos == pos)
-                {
-                    existing.fed |= fed;
-                } else {
-                    out.push(Cursor {
-                        slot: cursor.slot,
-                        pos,
-                        fed,
-                    });
-                }
-            }
+            let work = self.source.anchored[slot].pattern.step(
+                group.iter().map(|cursor| (cursor.pos, cursor.fed)),
+                name,
+                &mut step,
+            );
+            count_step_work(work);
+            out.extend(step.iter().map(|&(pos, fed)| Cursor { slot, pos, fed }));
         }
         if *out == *self.cursors {
             return None;

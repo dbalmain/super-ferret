@@ -5,9 +5,9 @@
 //! component uses the standard last-star retry loop, O(pattern x name) work
 //! without recursion or allocation. An anchored pattern is never matched
 //! against a whole path: the walker steps cursors through it per directory
-//! ([`Pattern::advance`]) and projects each live cursor onto the entry names
-//! of one directory ([`Pattern::project_basename`]). A pattern of k
-//! components holds at most k cursors, so a step is O(k) component matches.
+//! ([`Pattern::step`]) and projects each live cursor onto the entry names of
+//! one directory ([`Pattern::projections`]). A pattern of k components holds
+//! at most k cursors, and a step is O(k) component matches.
 
 use super::Match;
 
@@ -116,6 +116,18 @@ impl Pattern {
                 *component = Component::Globstar { allow_zero };
             }
         }
+        // `**/**` matches exactly what `**` does, so a run of zero-allowing
+        // globstars is one. Collapsing keeps a line of a thousand `**/` from
+        // costing a thousand cursor positions.
+        components.dedup_by(|next, kept| {
+            matches!(
+                (next, kept),
+                (
+                    Component::Globstar { allow_zero: true },
+                    Component::Globstar { allow_zero: true }
+                )
+            )
+        });
         let components: Box<[Component]> = components.into_boxed_slice();
         Ok(Some(Self {
             index,
@@ -128,8 +140,8 @@ impl Pattern {
 
     /// Whether this basename pattern matches entry `name`, honouring
     /// `directory_only`. Only basename patterns reach a list's index; an
-    /// anchored pattern is stepped with [`advance`](Self::advance) and
-    /// projected with [`project_basename`](Self::project_basename) first.
+    /// anchored pattern is stepped with [`step`](Self::step) and projected
+    /// with [`projections`](Self::projections) first.
     pub(super) fn matches_name(&self, name: &[u8], is_dir: bool) -> bool {
         debug_assert!(self.basename_only);
         (!self.directory_only || is_dir) && self.components[0].matches(name)
@@ -147,6 +159,7 @@ impl Pattern {
 
     /// How many components an anchored pattern has; a cursor's position is
     /// below this.
+    #[cfg(test)]
     pub(crate) fn component_count(&self) -> usize {
         self.components.len()
     }
@@ -264,87 +277,110 @@ impl Pattern {
             )
     }
 
-    /// Cursors in the child directory after consuming `name`, appended to
-    /// `out` without duplicating a position.
+    /// Steps the cursors `(pos, fed)` of this anchored pattern into child
+    /// `name`, writing the child's cursors to `out` in position order, each
+    /// position once. Returns the work done, in component visits and
+    /// position marks, for tests to bound.
     ///
     /// `fed` means the cursor sits on a globstar that has already consumed
     /// the directory a `**\/` pattern requires, so that globstar may now
     /// match zero further components. A pattern of k components therefore
     /// holds at most k cursors in one directory.
-    pub(crate) fn advance(&self, pos: usize, fed: bool, name: &[u8], out: &mut Vec<(usize, bool)>) {
-        let Some(component) = self.components.get(pos) else {
-            return;
-        };
-        if let Component::Globstar { allow_zero } = *component {
-            // Consuming `name` leaves the globstar fed whether or not it was
-            // allowed to match zero components before this directory.
-            push_cursor(out, pos, true);
-            if allow_zero || fed {
-                self.advance(pos + 1, false, name, out);
+    ///
+    /// Iterative, with positions deduplicated in bitsets and each globstar's
+    /// zero-width continuation followed at most once per step, so a step is
+    /// O(cursors + k / 64) component visits and word operations, however
+    /// the globstars are arranged.
+    pub(crate) fn step(
+        &self,
+        cursors: impl IntoIterator<Item = (usize, bool)>,
+        name: &[u8],
+        out: &mut Vec<(usize, bool)>,
+    ) -> usize {
+        let count = self.components.len();
+        let mut marks = Marks::new(count);
+        let mut work = 0;
+        for (mut pos, mut fed) in cursors {
+            while let Some(component) = self.components.get(pos) {
+                work += 1;
+                match *component {
+                    Component::Globstar { allow_zero } => {
+                        // Consuming `name` leaves the globstar fed whether or
+                        // not it was allowed to match zero components before.
+                        marks.mark(pos, true);
+                        if !(allow_zero || fed) || !marks.expand(pos) {
+                            break;
+                        }
+                        pos += 1;
+                        fed = false;
+                    }
+                    Component::Glob(_) | Component::Never => {
+                        if pos + 1 < count && component.matches(name) {
+                            marks.mark(pos + 1, false);
+                        }
+                        break;
+                    }
+                }
             }
-            return;
         }
-        if component.matches(name) {
-            let next = pos + 1;
-            if next < self.components.len() {
-                push_cursor(out, next, false);
-            }
-        }
+        work + marks.drain(out)
     }
 
-    /// A basename pattern that matches the same entry names as the cursor
-    /// `(pos, fed)` does in its directory. `None` when nothing in this
-    /// directory can match: the cursor only constrains descendants.
+    /// The basename rule each cursor projects to, at index `2 * pos + fed`
+    /// for every position of this pattern: a basename pattern matching the
+    /// same entry names as the cursor does in its directory, or `None` when
+    /// nothing in this directory can match and the cursor only constrains
+    /// descendants. Computed from the end in one pass, so O(k) for k
+    /// components.
     ///
     /// A shared basename pattern projects at `(0, false)` to itself (a
     /// leading `**/` dropped). A lone `*` is rewritten to `?*` because the
     /// basename fast path reads a bare star as a zero-width suffix, which
     /// would match only an empty name.
-    pub(crate) fn project_basename(&self, pos: usize, fed: bool) -> Option<Self> {
-        let glob = match self.projection(pos, fed)? {
-            Projection::Any => any_glob(),
-            Projection::Glob(glob) => normalize_star(glob.clone()),
+    pub(crate) fn projections(&self) -> Vec<Option<Self>> {
+        let count = self.components.len();
+        // `tail[i]`: what a cursor at `i` that is not fed projects to, as the
+        // index of the glob it lands on, or `ANY` for a trailing globstar.
+        const ANY: usize = usize::MAX;
+        let mut tail: Vec<Option<usize>> = vec![None; count];
+        for at in (0..count).rev() {
+            let last = at + 1 == count;
+            tail[at] = match self.components[at] {
+                Component::Globstar { .. } if last => Some(ANY),
+                Component::Glob(_) if last => Some(at),
+                Component::Globstar { allow_zero: true } => tail[at + 1],
+                _ => None,
+            };
+        }
+        let project = |target: Option<usize>| {
+            let glob = match target? {
+                ANY => any_glob(),
+                at => match &self.components[at] {
+                    Component::Glob(glob) => normalize_star(glob.clone()),
+                    Component::Globstar { .. } | Component::Never => return None,
+                },
+            };
+            Some(self.as_basename(glob))
         };
-        Some(Self {
+        (0..count)
+            .flat_map(|pos| {
+                let fed = match self.components[pos] {
+                    Component::Globstar { .. } if pos + 1 == count => Some(ANY),
+                    Component::Globstar { .. } => tail[pos + 1],
+                    _ => None,
+                };
+                [project(tail[pos]), project(fed)]
+            })
+            .collect()
+    }
+
+    fn as_basename(&self, glob: ComponentGlob) -> Self {
+        Self {
             index: self.index,
             result: self.result,
             directory_only: self.directory_only,
             basename_only: true,
             components: Box::from([Component::Glob(glob)]),
-        })
-    }
-
-    fn projection(&self, pos: usize, fed: bool) -> Option<Projection<'_>> {
-        if self.basename_only {
-            return match (pos, &*self.components) {
-                (0, [Component::Glob(glob)]) => Some(Projection::Glob(glob)),
-                _ => None,
-            };
-        }
-        let rest = self.components.get(pos..)?;
-        if rest.is_empty() {
-            return None;
-        }
-        let mut at = 0;
-        if fed {
-            if !matches!(rest.first(), Some(Component::Globstar { .. })) {
-                return None;
-            }
-            if rest.len() == 1 {
-                return Some(Projection::Any);
-            }
-            at = 1;
-        }
-        while let Some(Component::Globstar { allow_zero: true }) = rest.get(at) {
-            if at + 1 == rest.len() {
-                break;
-            }
-            at += 1;
-        }
-        match rest.get(at)? {
-            Component::Globstar { .. } if at + 1 == rest.len() => Some(Projection::Any),
-            Component::Glob(glob) if at + 1 == rest.len() => Some(Projection::Glob(glob)),
-            _ => None,
         }
     }
 
@@ -390,18 +426,53 @@ pub(crate) struct RuleText {
     directory_only: bool,
 }
 
-/// What a cursor projects to in its directory.
-enum Projection<'a> {
-    Any,
-    Glob(&'a ComponentGlob),
+/// Positions reached in one step, and which of them are fed, one bit each;
+/// plus the globstars whose zero-width continuation has been followed.
+struct Marks {
+    reached: Vec<u64>,
+    fed: Vec<u64>,
+    expanded: Vec<u64>,
 }
 
-fn push_cursor(out: &mut Vec<(usize, bool)>, pos: usize, fed: bool) {
-    if let Some(existing) = out.iter_mut().find(|(at, _)| *at == pos) {
-        existing.1 |= fed;
-        return;
+impl Marks {
+    fn new(count: usize) -> Self {
+        let words = count.div_ceil(64);
+        Self {
+            reached: vec![0; words],
+            fed: vec![0; words],
+            expanded: vec![0; words],
+        }
     }
-    out.push((pos, fed));
+
+    fn mark(&mut self, pos: usize, fed: bool) {
+        let (word, bit) = (pos / 64, 1u64 << (pos % 64));
+        self.reached[word] |= bit;
+        if fed {
+            self.fed[word] |= bit;
+        }
+    }
+
+    /// Records that `pos`'s continuation is being followed; false if it
+    /// already was this step.
+    fn expand(&mut self, pos: usize) -> bool {
+        let (word, bit) = (pos / 64, 1u64 << (pos % 64));
+        let first = self.expanded[word] & bit == 0;
+        self.expanded[word] |= bit;
+        first
+    }
+
+    /// Appends the marked positions in order; returns the words scanned.
+    fn drain(&self, out: &mut Vec<(usize, bool)>) -> usize {
+        for (word, &bits) in self.reached.iter().enumerate() {
+            let mut rest = bits;
+            while rest != 0 {
+                let bit = rest.trailing_zeros() as usize;
+                rest &= rest - 1;
+                out.push((word * 64 + bit, self.fed[word] >> bit & 1 == 1));
+            }
+        }
+        self.reached.len()
+    }
 }
 
 /// `?*`: every non-empty name. A path component is never empty.

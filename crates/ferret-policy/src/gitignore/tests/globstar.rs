@@ -301,6 +301,62 @@ pub(super) const ROWS: &[Row] = &[
         File,
         Unmatched,
     ),
+    (
+        "a run of globstars is one, zero directories",
+        "**/**/**/hit\n",
+        "hit",
+        File,
+        Ignore,
+    ),
+    (
+        "a run of globstars is one, many directories",
+        "**/**/**/hit\n",
+        "a/b/hit",
+        File,
+        Ignore,
+    ),
+    (
+        "a run of globstars still needs the name",
+        "**/**/**/hit\n",
+        "a/b/x",
+        File,
+        Unmatched,
+    ),
+    (
+        "a globstar run after a literal matches zero directories",
+        "a/**/**/x\n",
+        "a/x",
+        File,
+        Ignore,
+    ),
+    (
+        "alternating globstars, adjacent literals",
+        "**/a/**/a/**/a/hit\n",
+        "a/a/a/hit",
+        File,
+        Ignore,
+    ),
+    (
+        "alternating globstars, spread literals",
+        "**/a/**/a/**/a/hit\n",
+        "x/a/y/z/a/a/hit",
+        File,
+        Ignore,
+    ),
+    (
+        "alternating globstars need every literal",
+        "**/a/**/a/**/a/hit\n",
+        "a/y/a/hit",
+        File,
+        Unmatched,
+    ),
+    (
+        "alternating globstars need the name after the last literal",
+        "**/a/**/a/**/a/hit\n",
+        "a/a/hit/a",
+        File,
+        Unmatched,
+    ),
 ];
 
 #[test]
