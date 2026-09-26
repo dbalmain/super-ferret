@@ -9,11 +9,42 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use ferret_policy::{Config, Decision};
 
 use super::gitfile::{git, git_ok, ignored, init};
-use super::{Scratch, decision, walked, write};
+use super::{Scratch, decision, mkfifo, walked, write};
+
+#[test]
+fn a_fifo_commondir_does_not_block_discovery_and_reports_a_fault() {
+    let scratch = Scratch::new("ancestor-fifo-commondir");
+    let repo = scratch.join("repo");
+    write(&repo.join(".git/HEAD"), "ref: refs/heads/main\n");
+    fs::create_dir_all(repo.join(".git/refs")).unwrap();
+    mkfifo(&repo.join(".git/commondir"));
+    write(&repo.join("sub/file.txt"), "x");
+
+    let (sender, receiver) = mpsc::channel();
+    let root = repo.join("sub");
+    std::thread::spawn(move || {
+        let result = walked(&root, None, Config::default());
+        let _ = sender.send(result);
+    });
+    let result = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("discovery blocked on the commondir FIFO");
+    assert_eq!(decision(&result, "file.txt"), Decision::Index);
+    assert!(
+        result
+            .io
+            .iter()
+            .any(|(_, kind)| *kind == std::io::ErrorKind::InvalidData),
+        "discovery fault was lost: {:?}",
+        result.io
+    );
+}
 
 fn assert_same(root: &Path, rel: &str) {
     let walked = walked(root, None, Config::default());

@@ -402,8 +402,6 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &Shared) -> V {
 
 impl<F: EventVisitor> Walker<F> {
     fn root_job(&mut self, root: &Path, global: Option<&str>, config: Config) -> Option<Job> {
-        let ancestors = self.discover(root);
-        let within = !ancestors.is_empty();
         let fd = match open_path(root, root_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {
@@ -419,6 +417,8 @@ impl<F: EventVisitor> Walker<F> {
             }
         };
         self.root_id = Some((root_stat.st_dev, root_stat.st_ino));
+        let ancestors = self.discover(root);
+        let within = !ancestors.is_empty();
         let mut dir = match Dir::new(fd) {
             Ok(dir) => dir,
             Err(error) => {
@@ -1010,13 +1010,20 @@ impl<F: EventVisitor> Walker<F> {
     fn discover(&mut self, root: &Path) -> Vec<Found> {
         let canon = match fs::canonicalize(root) {
             Ok(path) => path,
-            Err(_) => return Vec::new(),
+            Err(error) => {
+                self.fail_abs(root, error);
+                return Vec::new();
+            }
         };
-        if has_git(&canon) {
+        if self.discovered_git(&canon) {
             return Vec::new();
         }
-        let Some(root_dev) = device_of(&canon) else {
-            return Vec::new();
+        let root_dev = match device_of(&canon) {
+            Ok(dev) => dev,
+            Err(error) => {
+                self.fail_abs(&canon, error);
+                return Vec::new();
+            }
         };
         let mut above = match canon.file_name() {
             Some(name) => PathBuf::from(name),
@@ -1027,11 +1034,18 @@ impl<F: EventVisitor> Walker<F> {
             None => return Vec::new(),
         };
         let mut drafts = Vec::new();
-        while let Some(dev) = device_of(&current) {
+        loop {
+            let dev = match device_of(&current) {
+                Ok(dev) => dev,
+                Err(error) => {
+                    self.fail_abs(&current, error);
+                    break;
+                }
+            };
             if dev != root_dev {
                 break;
             }
-            let top = has_git(&current);
+            let top = self.discovered_git(&current);
             drafts.push(Draft {
                 directory: current.clone(),
                 above: above.clone(),
@@ -1057,6 +1071,16 @@ impl<F: EventVisitor> Walker<F> {
             .into_iter()
             .filter_map(|draft| self.read_ancestor(draft))
             .collect()
+    }
+
+    fn discovered_git(&mut self, directory: &Path) -> bool {
+        match has_git(directory) {
+            Ok(found) => found,
+            Err(error) => {
+                self.fail_abs(&directory.join(".git"), error);
+                false
+            }
+        }
     }
 
     /// `None` for a non-top directory with no `.gitignore`. The top is always
@@ -1455,22 +1479,20 @@ fn resolve_git_path(base: &Path, raw: &OsStr) -> PathBuf {
 /// `commondir` naming such a directory instead of `objects`; a `gitdir:`
 /// file pointing at one of those; a symlink to any of them. An empty
 /// directory named `.git` is not a repository.
-fn has_git(dir: &Path) -> bool {
+fn has_git(dir: &Path) -> io::Result<bool> {
     is_git_path(&dir.join(".git"), 0)
 }
 
-fn is_git_path(path: &Path, depth: u32) -> bool {
+fn is_git_path(path: &Path, depth: u32) -> io::Result<bool> {
     if depth > 8 {
-        return false;
+        return Ok(false);
     }
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return false;
+    let Some(meta) = discovery_metadata(path, false)? else {
+        return Ok(false);
     };
     let kind = meta.file_type();
     if kind.is_symlink() {
-        let Ok(target) = fs::read_link(path) else {
-            return false;
-        };
+        let target = fs::read_link(path)?;
         let base = path.parent().unwrap_or(path);
         return is_git_path(&resolve_git_path(base, target.as_os_str()), depth + 1);
     }
@@ -1479,46 +1501,89 @@ fn is_git_path(path: &Path, depth: u32) -> bool {
     }
     if kind.is_file() {
         let Some(parent) = path.parent() else {
-            return false;
+            return Ok(false);
         };
         return is_git_file(parent, path, depth);
     }
-    false
+    Ok(false)
 }
 
-fn is_git_dir(path: &Path, depth: u32) -> bool {
+fn is_git_dir(path: &Path, depth: u32) -> io::Result<bool> {
     if depth > 8 {
-        return false;
+        return Ok(false);
     }
-    let head = fs::metadata(path.join("HEAD")).is_ok_and(|meta| meta.is_file());
-    let refs = fs::metadata(path.join("refs")).is_ok_and(|meta| meta.is_dir());
+    let head = discovery_metadata(&path.join("HEAD"), true)?.is_some_and(|meta| meta.is_file());
+    let refs = discovery_metadata(&path.join("refs"), true)?.is_some_and(|meta| meta.is_dir());
     if !(head && refs) {
-        return false;
+        return Ok(false);
     }
-    if fs::metadata(path.join("objects")).is_ok_and(|meta| meta.is_dir()) {
-        return true;
+    if discovery_metadata(&path.join("objects"), true)?.is_some_and(|meta| meta.is_dir()) {
+        return Ok(true);
     }
-    let Ok(bytes) = fs::read(path.join("commondir")) else {
-        return false;
+    let commondir = path.join("commondir");
+    let bytes = match open_discovery_file(&commondir)? {
+        Opened::Bytes(bytes) => bytes,
+        Opened::Missing => return Ok(false),
+        Opened::NotRegular => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: not a regular file", commondir.display()),
+            ));
+        }
     };
     let Some(raw) = first_line(&bytes) else {
-        return false;
+        return Ok(false);
     };
     is_git_dir(&resolve_git_path(path, raw), depth + 1)
 }
 
-fn is_git_file(work_tree: &Path, file: &Path, depth: u32) -> bool {
-    let Ok(bytes) = fs::read(file) else {
-        return false;
+fn is_git_file(work_tree: &Path, file: &Path, depth: u32) -> io::Result<bool> {
+    let bytes = match open_discovery_file(file)? {
+        Opened::Bytes(bytes) => bytes,
+        Opened::Missing => return Ok(false),
+        Opened::NotRegular => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: not a regular file", file.display()),
+            ));
+        }
     };
     let Some(raw) = parse_gitdir(&bytes) else {
-        return false;
+        return Ok(false);
     };
     is_git_path(&resolve_git_path(work_tree, raw), depth + 1)
 }
 
-fn device_of(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|meta| meta.dev())
+fn discovery_metadata(path: &Path, follow: bool) -> io::Result<Option<fs::Metadata>> {
+    let result = if follow {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    match result {
+        Ok(meta) => Ok(Some(meta)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_discovery_file(path: &Path) -> io::Result<Opened> {
+    match open_path(path, ignore_flags(), Mode::empty()) {
+        Ok(fd) => read_opened(fd),
+        Err(Errno::NOENT | Errno::NOTDIR) => Ok(Opened::Missing),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+fn device_of(path: &Path) -> io::Result<u64> {
+    fs::metadata(path).map(|meta| meta.dev())
 }
 
 fn file_type(stat: &rustix::fs::Stat) -> FileType {
