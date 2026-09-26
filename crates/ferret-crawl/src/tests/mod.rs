@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+mod ancestor;
 mod gitfile;
 mod golden;
 mod race;

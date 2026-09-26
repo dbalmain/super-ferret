@@ -8,7 +8,8 @@
 //!
 //! Pure: no file-system I/O. The crawler (`ferret-crawl`) walks the tree,
 //! reads ignore files and each file's head, and asks this crate what to do:
-//! [`DirRules::root`] once per configured root, [`DirRules::enter`] or
+//! [`DirRules::root`] once per configured root (or [`DirRules::root_within`]
+//! when that root sits inside a work tree), [`DirRules::enter`] or
 //! [`DirRules::traverse`] per directory it walks into, [`DirRules::decide`]
 //! per entry, and [`sniff`] per file it would index. Knows nothing about the
 //! catalog or the index. Tested against the golden corpus in `tests/golden/`.
@@ -25,7 +26,7 @@ mod rules;
 use std::fmt;
 use std::path::PathBuf;
 
-pub use rules::DirRules;
+pub use rules::{AncestorGit, DirRules};
 
 /// What setup writes to a new global ignore file: the M1 list, measured on
 /// Dave's tree (research M1), in sections a user can comment out. After that

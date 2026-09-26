@@ -11,7 +11,9 @@
 //!    [`DEFAULT_IGNORE`](crate::DEFAULT_IGNORE).
 //!
 //! Within one file the last matching line wins, as in gitignore. Each layer
-//! matches paths relative to the directory holding its file.
+//! matches paths relative to the directory holding its file. A layer above
+//! the walk root (D22) prepends the path from that directory down to the root
+//! before matching, so the walk's paths stay root-relative.
 //!
 //! Seams: `gitignore` compiles and matches each file's patterns; `reinclude`
 //! decides whether an excluded directory must be traversed.
@@ -64,12 +66,38 @@ struct Shared {
 /// One compiled ignore file.
 #[derive(Debug)]
 struct Layer {
-    /// Directory holding the file, relative to the root.
+    /// Directory holding the file, relative to the root. Empty when the
+    /// file is at the root, and unused when [`above`](Self::above) is set.
     base: PathBuf,
+    /// Path from this file's directory down to the walk root, when the file
+    /// sits above the root (D22). Empty for a file at or below the root. A
+    /// root-relative path is matched as `above/path`, so the pattern stays
+    /// relative to the directory that holds it.
+    above: PathBuf,
     matcher: Gitignore,
     /// Anchored `!` patterns; only ever non-empty for a `.ferretignore`.
     reincludes: Vec<Reinclude>,
     parent: Chain,
+}
+
+/// One directory above the walk root, carrying that directory's git rules.
+///
+/// The crawler discovers these from the work tree's top down to the root's
+/// parent. [`DirRules`] does not look at the file system.
+#[derive(Clone, Copy, Debug)]
+pub struct AncestorGit<'a> {
+    /// Path from this directory to the walk root. `src` when this directory
+    /// is the parent of root `repo/src`.
+    pub above: &'a Path,
+    /// Absolute path of this directory, used only to name pattern errors.
+    pub directory: &'a Path,
+    /// `.gitignore` in this directory, if it had one.
+    pub gitignore: Option<&'a str>,
+    /// `.git/info/exclude` of the work tree. Set only when [`top`](Self::top)
+    /// is true.
+    pub git_exclude: Option<&'a str>,
+    /// This directory holds the work tree's `.git`.
+    pub top: bool,
 }
 
 /// Which precedence band a match came from.
@@ -86,35 +114,16 @@ impl DirRules {
     ///
     /// Returns every pattern that could not be used alongside the rules,
     /// which apply without them. `root` is only used to name files in those
-    /// errors. A work tree begins at `root` only if `files.git_root`; a root
-    /// inside a work tree whose `.git` is above it is treated as outside one.
+    /// errors. This does not look above `root`. A root inside a work tree is
+    /// built with [`root_within`](Self::root_within), which the crawler calls
+    /// after discovering that tree (D22).
     pub fn root(
         root: &Path,
         global: Option<&str>,
         files: IgnoreFiles<'_>,
         config: Config,
     ) -> (Self, Vec<PatternError>) {
-        let mut errors = Vec::new();
-        let global = global.map(|text| {
-            Layer::compile(
-                PathBuf::new(),
-                IgnoreFile::Global,
-                text,
-                None,
-                &mut errors,
-                false,
-            )
-        });
-        let bare = Self {
-            path: PathBuf::new(),
-            root: Arc::from(root),
-            ferret: None,
-            git: None,
-            shared: Arc::new(Shared { global, config }),
-            traversing: false,
-        };
-        let rules = bare.with_files(PathBuf::new(), files, &mut errors);
-        (rules, errors)
+        Self::root_within(root, global, files, &[], config)
     }
 
     /// Rules for child directory `name`, which [`decide`](Self::decide)
@@ -141,12 +150,99 @@ impl DirRules {
     /// Whether `.gitignore` rules are in force here.
     ///
     /// True when this directory or an ancestor started a work tree
-    /// (`git_root`). The crawler uses it to skip reading `.gitignore` where
-    /// those rules cannot apply. A configured root whose `.git` sits above
-    /// it is outside a work tree (D22): [`root`](Self::root) does not look
-    /// above `root`.
+    /// (`git_root`), including a work tree discovered above the root
+    /// ([`root_within`](Self::root_within)). The crawler uses it to skip
+    /// reading `.gitignore` where those rules cannot apply.
     pub fn in_work_tree(&self) -> bool {
         self.git.is_some()
+    }
+
+    /// Rules at a root that sits inside a work tree whose `.git` is above it.
+    ///
+    /// `ancestors` runs from the work tree's top down to the root's parent.
+    /// Each layer matches paths relative to its own directory: `above` is the
+    /// path from that directory to the root, prepended to the root-relative
+    /// path before matching. So for root `repo/src`, `repo`'s `/src/gen/`
+    /// skips `gen` and its `/gen/` does not. Only the top carries
+    /// `git_exclude`. No `.ferretignore` above the root is consulted; pass
+    /// those only in `files`, which are the root's own.
+    ///
+    /// An empty `ancestors` is [`root`](Self::root). A `.git` in `files`
+    /// (`git_root`) still starts a new work tree at the root and drops these
+    /// ancestors, as a nested repository does.
+    pub fn root_within(
+        root: &Path,
+        global: Option<&str>,
+        files: IgnoreFiles<'_>,
+        ancestors: &[AncestorGit<'_>],
+        config: Config,
+    ) -> (Self, Vec<PatternError>) {
+        let mut errors = Vec::new();
+        let global = global.map(|text| {
+            Layer::compile(
+                PathBuf::new(),
+                IgnoreFile::Global,
+                text,
+                None,
+                &mut errors,
+                false,
+            )
+        });
+        let mut rules = Self {
+            path: PathBuf::new(),
+            root: Arc::from(root),
+            ferret: None,
+            git: None,
+            shared: Arc::new(Shared { global, config }),
+            traversing: false,
+        };
+        for ancestor in ancestors {
+            rules = rules.with_ancestor(ancestor, &mut errors);
+        }
+        let rules = rules.with_files(PathBuf::new(), files, &mut errors);
+        (rules, errors)
+    }
+
+    /// Adds one ancestor's git rules. The top replaces any work tree already
+    /// in force; a closer directory keeps it and prepends its `.gitignore`.
+    fn with_ancestor(mut self, ancestor: &AncestorGit<'_>, errors: &mut Vec<PatternError>) -> Self {
+        let mut tree = if ancestor.top {
+            WorkTree {
+                ignores: None,
+                exclude: None,
+            }
+        } else if let Some(tree) = self.git.take() {
+            tree
+        } else {
+            WorkTree {
+                ignores: None,
+                exclude: None,
+            }
+        };
+        if ancestor.top
+            && let Some(text) = ancestor.git_exclude
+        {
+            let file = IgnoreFile::GitExclude(ancestor.directory.join(".git/info/exclude"));
+            tree.exclude = Some(Arc::new(
+                Layer::compile(PathBuf::new(), file, text, None, errors, false)
+                    .above(ancestor.above.to_path_buf()),
+            ));
+        }
+        if let Some(text) = ancestor.gitignore {
+            let file = IgnoreFile::Git(ancestor.directory.join(".gitignore"));
+            let layer = Layer::compile(
+                PathBuf::new(),
+                file,
+                text,
+                tree.ignores.take(),
+                errors,
+                false,
+            )
+            .above(ancestor.above.to_path_buf());
+            tree.ignores = Some(Arc::new(layer));
+        }
+        self.git = Some(tree);
+        self
     }
 
     /// Decides the entry at root-relative `path`, which must be a direct child
@@ -292,6 +388,7 @@ impl Layer {
         }));
         Self {
             base,
+            above: PathBuf::new(),
             matcher,
             reincludes: if collect_reincludes {
                 patterns
@@ -315,10 +412,30 @@ impl Layer {
         }
     }
 
+    /// This layer sits above the walk root. `above` is the path from the
+    /// file's directory down to that root.
+    fn above(mut self, above: PathBuf) -> Self {
+        self.above = above;
+        self
+    }
+
     /// `Some(whitelisted)` if a pattern in this file matches `path` (relative
     /// to the root), `None` if none does.
     fn matched(&self, path: &Path, is_dir: bool) -> Option<bool> {
-        let rel = path.strip_prefix(&self.base).ok()?;
+        if self.above.as_os_str().is_empty() {
+            let rel = path.strip_prefix(&self.base).ok()?;
+            self.outcome(rel, is_dir)
+        } else {
+            // `path` is already below this directory. Joining is the
+            // layer-relative path the matcher expects; ancestor layers are
+            // few, and a root that is not inside a work tree never takes
+            // this branch.
+            let rel = self.above.join(path);
+            self.outcome(&rel, is_dir)
+        }
+    }
+
+    fn outcome(&self, rel: &Path, is_dir: bool) -> Option<bool> {
         match self.matcher.matched(rel, is_dir) {
             Match::None => None,
             Match::Ignore => Some(false),
@@ -483,5 +600,115 @@ mod tests {
         let (deeper, _) = inside.enter(OsStr::new("sub"), IgnoreFiles::default());
         assert!(deeper.in_work_tree());
         assert!(inside.traverse(OsStr::new("sub")).in_work_tree());
+    }
+
+    #[test]
+    fn an_ancestor_layer_matches_relative_to_its_own_directory() {
+        let directory = Path::new("/repo");
+        let above = Path::new("src");
+        let positive = [AncestorGit {
+            above,
+            directory,
+            gitignore: Some("*.o\n/src/gen/\n"),
+            git_exclude: None,
+            top: true,
+        }];
+        let (rules, errors) = DirRules::root_within(
+            Path::new("/repo/src"),
+            None,
+            IgnoreFiles::default(),
+            &positive,
+            Config::default(),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(rules.in_work_tree());
+        assert_eq!(
+            rules.decide(Path::new("a.o"), Entry::File { size: 1 }),
+            Decision::Skip
+        );
+        assert_eq!(rules.decide(Path::new("gen"), Entry::Dir), Decision::Skip);
+        assert_eq!(
+            rules.decide(Path::new("keep.c"), Entry::File { size: 1 }),
+            Decision::Index
+        );
+
+        // `/gen/` anchored at `repo` does not name `repo/src/gen`. Anchoring
+        // it at the walk root would skip `gen`, which is the bug.
+        let anchored = [AncestorGit {
+            above,
+            directory,
+            gitignore: Some("/gen/\n"),
+            git_exclude: None,
+            top: true,
+        }];
+        let (rules, errors) = DirRules::root_within(
+            Path::new("/repo/src"),
+            None,
+            IgnoreFiles::default(),
+            &anchored,
+            Config::default(),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            rules.decide(Path::new("gen"), Entry::Dir),
+            Decision::Descend
+        );
+    }
+
+    #[test]
+    fn a_closer_gitignore_reincludes_over_an_ancestor() {
+        let ancestors = [AncestorGit {
+            above: Path::new("src"),
+            directory: Path::new("/repo"),
+            gitignore: Some("*.o\n"),
+            git_exclude: None,
+            top: true,
+        }];
+        let files = IgnoreFiles {
+            gitignore: Some("!keep.o\n"),
+            ..IgnoreFiles::default()
+        };
+        let (rules, errors) = DirRules::root_within(
+            Path::new("/repo/src"),
+            None,
+            files,
+            &ancestors,
+            Config::default(),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            rules.decide(Path::new("keep.o"), Entry::File { size: 1 }),
+            Decision::Index
+        );
+        assert_eq!(
+            rules.decide(Path::new("drop.o"), Entry::File { size: 1 }),
+            Decision::Skip
+        );
+    }
+
+    #[test]
+    fn the_root_git_file_drops_ancestor_rules() {
+        let ancestors = [AncestorGit {
+            above: Path::new("src"),
+            directory: Path::new("/repo"),
+            gitignore: Some("*.o\n"),
+            git_exclude: None,
+            top: true,
+        }];
+        let files = IgnoreFiles {
+            git_root: true,
+            ..IgnoreFiles::default()
+        };
+        let (rules, _) = DirRules::root_within(
+            Path::new("/repo/src"),
+            None,
+            files,
+            &ancestors,
+            Config::default(),
+        );
+        assert_eq!(
+            rules.decide(Path::new("a.o"), Entry::File { size: 1 }),
+            Decision::Index
+        );
     }
 }
