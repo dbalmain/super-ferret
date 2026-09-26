@@ -134,3 +134,42 @@ fn a_swapped_git_dir_does_not_apply_an_outside_exclude() {
     // The rename lands inside the root after the listing, so it is not a row.
     assert!(!out.rows.contains_key(Path::new(".git.real")));
 }
+
+/// `O_NOFOLLOW` does not catch a directory replaced by a different directory.
+/// The open must `fstat` and refuse a `(dev, ino)` other than the one `decide`
+/// was given.
+#[test]
+fn a_directory_replaced_by_another_directory_is_not_listed() {
+    let scratch = Scratch::new("swap-ino");
+    let root = scratch.join("root");
+    fs::create_dir_all(root.join("dir")).unwrap();
+    write(&root.join("dir/inside.txt"), "in");
+
+    let mut swapped = false;
+    let mut out = fresh();
+    walk(&root, None, Config::default(), |event| {
+        if let Event::Decided(decided) = &event
+            && decided.path == Path::new("dir")
+            && decided.decision == Decision::Descend
+        {
+            let victim = root.join("dir");
+            fs::rename(&victim, root.join("dir.was")).unwrap();
+            fs::create_dir(&victim).unwrap();
+            write(&victim.join("leaked.txt"), "out");
+            swapped = true;
+        }
+        record(&mut out, event);
+    });
+
+    assert!(swapped, "the descend hook did not run");
+    assert!(
+        !out.rows.contains_key(Path::new("dir/leaked.txt")),
+        "listed the replacement directory: {:?}",
+        out.rows.keys()
+    );
+    assert!(
+        out.io.iter().any(|(path, _)| path == Path::new("dir")),
+        "expected an Io event for dir, got {:?}",
+        out.io
+    );
+}

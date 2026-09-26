@@ -17,6 +17,9 @@ ferret-policy = { path = "crates/ferret-policy" }
 ferret-query = { path = "crates/ferret-query" }
 ferret-text = { path = "crates/ferret-text" }
 ferret-verify = { path = "crates/ferret-verify" }
+# Directory handles for the walker (D21). `fs` is the `*at` calls; `std`
+# is `std::io::Error` conversion. Nothing here needs `unsafe`.
+rustix = { version = "1.1.5", features = ["fs", "std"] }
 
 # `unsafe` is allowed where a measurement justifies it (D11), but never by
 # default: a crate that needs it allows it on the item, with a comment, and
