@@ -271,3 +271,34 @@ fn a_symlinked_exclude_applies_with_both_git_layouts() {
         assert_eq!(decision(&result, "secret.txt"), Decision::Skip);
     }
 }
+
+/// A `gitdir:` path is followed as git follows it, symlinks included: the
+/// gitdir's text can already name any directory, so refusing a symlink as
+/// its last component protects nothing and breaks a working layout.
+#[test]
+fn a_gitdir_reached_through_a_symlink_applies_its_exclude() {
+    let tree = Tree::new("symlinked-gitdir");
+    let main = tree.join("main");
+    init(&main);
+    write(&main.join("README"), "hi\n");
+    commit(&main);
+    let exclude = main.join(".git/info/exclude");
+    let mut text = fs::read_to_string(&exclude).unwrap();
+    text.push_str("secret.txt\n");
+    fs::write(&exclude, text).unwrap();
+
+    let linked = tree.join("linked");
+    let linked_arg = linked.to_string_lossy().into_owned();
+    git_ok(&main, &["worktree", "add", "-q", &linked_arg]);
+    symlink(main.join(".git/worktrees/linked"), tree.join("alias")).unwrap();
+    write(&linked.join("secret.txt"), "x");
+
+    let absolute = format!("gitdir: {}\n", tree.join("alias").display());
+    for gitfile in [absolute.as_str(), "gitdir: ../alias\n"] {
+        fs::write(linked.join(".git"), gitfile).unwrap();
+        assert!(ignored(&linked, "secret.txt"), "git: {gitfile}");
+        let result = walked(&linked, None, Config::default());
+        assert!(result.io.is_empty(), "{gitfile}: {:?}", result.io);
+        assert_eq!(decision(&result, "secret.txt"), Decision::Skip, "{gitfile}");
+    }
+}

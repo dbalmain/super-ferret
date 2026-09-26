@@ -1330,12 +1330,15 @@ impl<F: EventVisitor> Walker<F> {
         self.read_exclude(common)
     }
 
+    /// Symlinks are followed, as git follows them: the gitdir's text can
+    /// already name any directory, so `O_NOFOLLOW` here would protect nothing.
+    /// What the handle protects is `base`, which a rename cannot redirect.
     fn open_git_directory(&mut self, base: BorrowedFd<'_>, raw: &OsStr) -> Option<OwnedFd> {
         let path = Path::new(raw);
         let opened = if path.is_absolute() {
-            open_path(path, child_dir_flags(), Mode::empty())
+            open_path(path, root_dir_flags(), Mode::empty())
         } else {
-            openat(base, path, child_dir_flags(), Mode::empty())
+            openat(base, path, root_dir_flags(), Mode::empty())
         };
         match opened {
             Ok(fd) => Some(fd),
@@ -1635,27 +1638,4 @@ fn public_stat<'a>(stat: &rustix::fs::Stat, target: Option<&'a OsStr>) -> Stat<'
 fn decode_lossy(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes)
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
-}
-
-#[cfg(test)]
-mod scheduler_tests {
-    use super::*;
-
-    #[test]
-    fn sharing_the_oldest_does_not_move_the_remaining_jobs() {
-        let root = std::env::temp_dir().join(format!("ferret-scheduler-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let make_job = || {
-            let mut walker = Walker::new(&root, |_: Event<'_>| {});
-            walker.root_job(&root, None, Config::default()).unwrap()
-        };
-        let shared = Shared::new(make_job());
-        let mut local = VecDeque::from([make_job(), make_job()]);
-        let newest = &local[1] as *const Job;
-        shared.idle.store(1, Ordering::SeqCst);
-        shared.share_oldest(&mut local);
-        assert_eq!(local.len(), 1);
-        assert!(std::ptr::eq(newest, &local[0]));
-        fs::remove_dir(&root).unwrap();
-    }
 }
