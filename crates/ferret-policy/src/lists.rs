@@ -17,7 +17,9 @@
 //! outside the lock. Neither table evicts: the rule table holds at most the
 //! distinct lines (and anchored projections) of the ignore files read under
 //! the root, and the list table at most one list per directory entered, in
-//! practice 611 for the 76,771 directories under a home directory. Both are
+//! practice 611 for the 76,771 directories under a home directory. Total
+//! retained positions are the sum of the lengths of the distinct lists, which
+//! is quadratic in depth for a chain in which every level adds rules. Both are
 //! dropped with the last [`DirRules`](crate::DirRules) of the root.
 
 use std::sync::{Arc, Mutex, PoisonError};

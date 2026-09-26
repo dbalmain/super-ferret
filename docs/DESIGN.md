@@ -177,10 +177,12 @@ precedence above. Every rule in the list matches an entry's name alone. A
 pattern with no slash before its last character applies unchanged in every
 directory. An anchored one (`/build/`, `docs/**/*.tmp`) is followed by cursors,
 positions in the pattern stepped one component per directory entered, which put
-its last component into the list only where it can match. A layer above the root
-(D22) is stepped down to the root before the walk. The same cursors answer
-whether a `.ferretignore` `!` pattern reaches below an excluded directory. No
-whole path is ever matched.
+its last component into the list only where it can match. A run of `**/`
+compiles to one globstar, and a step marks positions in a bitset, so a pattern
+of k components costs O(k) per directory however its globstars fall. A layer
+above the root (D22) is stepped down to the root before the walk. The same
+cursors answer whether a `.ferretignore` `!` pattern reaches below an excluded
+directory. No whole path is ever matched.
 
 A list is identified by its rules' text and flags in order, band included: a
 `.ferretignore` line differs from the same `.gitignore` line. It is compiled
@@ -194,7 +196,9 @@ lists serve 6,071 directories, and 24 of 1,117 lock acquisitions wait, for under
 30 µs in total. Neither table evicts. The rule table is bounded by the distinct
 lines of the ignore files read under the root, and the list table by the
 directories entered; in practice far fewer (611 lists for 76,771 directories
-under `~`). Both are dropped with the root's last `DirRules`.
+under `~`). Total retained positions are the sum of the lengths of the distinct
+lists, which is quadratic in depth for a chain in which every level adds rules.
+Both are dropped with the root's last `DirRules`.
 
 The walk goes through directory handles (D21): the root is opened by path, and
 everything below it with `openat(O_NOFOLLOW)` plus a `(dev, ino)` check against
