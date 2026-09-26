@@ -226,15 +226,10 @@ impl Pattern {
     }
 
     fn basename_glob(&self) -> Option<&ComponentGlob> {
-        let component = match self.components.as_ref() {
-            [Component::Glob(glob)] if self.basename_only => return Some(glob),
-            [Component::Globstar { allow_zero: true }, component] => component,
-            _ => return None,
-        };
-        let Component::Glob(glob) = component else {
-            return None;
-        };
-        Some(glob)
+        match self.components.as_ref() {
+            [Component::Glob(glob)] if self.basename_only => Some(glob),
+            _ => None,
+        }
     }
 
     pub(crate) fn is_anchored_reinclude(&self) -> bool {

@@ -170,6 +170,32 @@ in-crate matcher. The crawler owns the candidate path so policy decisions do not
 allocate a joined path per entry. Re-inclusion pruning discards negations that a
 later exclusion provably supersedes; uncertain overlaps still permit traversal.
 
+Each directory's rules are one list (D19). Concatenating the files lowest
+precedence first — global, `info/exclude`, `.gitignore` root to here,
+`.ferretignore` root to here — and taking the last matching line gives the
+precedence above. Every rule in the list matches an entry's name alone. A
+pattern with no slash before its last character applies unchanged in every
+directory. An anchored one (`/build/`, `docs/**/*.tmp`) is followed by cursors,
+positions in the pattern stepped one component per directory entered, which put
+its last component into the list only where it can match. A layer above the root
+(D22) is stepped down to the root before the walk. The same cursors answer
+whether a `.ferretignore` `!` pattern reaches below an excluded directory. No
+whole path is ever matched.
+
+A list is identified by its rules' text and flags in order, band included: a
+`.ferretignore` line differs from the same `.gitignore` line. It is compiled
+once into a bucketed last-match index, shared through an `Arc` by every
+directory with that list, whichever files it came from. A directory holds its
+path, that handle and its cursors; a child whose cursors and files do not change
+shares its parent's. The rule and list tables live per root, behind one mutex
+each. A directory reaches the list table only when its list differs from its
+parent's, and a miss compiles outside the lock. On `~/w` with 16 workers, 88
+lists serve 6,071 directories, and 24 of 1,117 lock acquisitions wait, for under
+30 µs in total. Neither table evicts. The rule table is bounded by the distinct
+lines of the ignore files read under the root, and the list table by the
+directories entered; in practice far fewer (611 lists for 76,771 directories
+under `~`). Both are dropped with the root's last `DirRules`.
+
 The walk goes through directory handles (D21): the root is opened by path, and
 everything below it with `openat(O_NOFOLLOW)` plus a `(dev, ino)` check against
 the stat that `decide` saw. `walk_parallel` lists directories on N worker
