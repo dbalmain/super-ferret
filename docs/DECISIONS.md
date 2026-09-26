@@ -943,11 +943,10 @@ buys nothing, and A's per-layer indexes are already the cheap answer, so 3.
 
 ### Options 1 and 2 measured (2026-09-27)
 
-Both are built on `bench/policy-derive` at `fcafaff`, as `FlatIndexed` (option
-
-1. and `FlatRegex` (option 2), with a fully compiled DFA as a third row. All
-   three agree with A on every entry under both rule sets. The regex crate
-   (`regex-automata`) is a dependency of `ferret-bench` only.
+Both are built on `bench/policy-derive` at `fcafaff`, as `FlatIndexed` for
+option 1 and `FlatRegex` for option 2, with a fully compiled DFA as a third row.
+All three agree with A on every entry under both rule sets. The regex crate
+(`regex-automata`) is a dependency of `ferret-bench` only.
 
 Identical lists are shared. The 6,035 directories in `~/w` have 334 distinct
 lists, about 18 directories each. The key is where each rule came from; keyed by
