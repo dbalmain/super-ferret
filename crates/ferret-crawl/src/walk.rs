@@ -614,7 +614,11 @@ fn open_regular(path: &Path, nofollow: bool) -> io::Result<Option<Vec<u8>>> {
     if meta.len() > MAX_IGNORE_BYTES {
         return Err(ignore_too_large());
     }
+    // Size the buffer from the stat. An empty `Vec` makes `read_to_end` grow
+    // by small steps, one `read` each, on every ignore file.
     let mut bytes = Vec::new();
+    let len = usize::try_from(meta.len()).unwrap_or(0);
+    let _ = bytes.try_reserve_exact(len);
     file.take(MAX_IGNORE_BYTES + 1).read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_IGNORE_BYTES {
         return Err(ignore_too_large());
