@@ -516,6 +516,6 @@ fn globstar_runs_have_bounded_work() {
         // search, quadratic in the cursors per step.
         let steps = path.split('/').count() - 1;
         let bound = steps * (4 * (2 * steps + 1) + words + 4);
-        assert!(work <= bound, "{label} {path}: {work} > {bound}");
+        assert!(work <= bound, "{label}, {steps} steps: {work} > {bound}");
     }
 }

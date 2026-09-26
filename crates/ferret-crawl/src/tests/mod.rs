@@ -244,6 +244,44 @@ fn a_ferretignore_bang_reincludes_under_an_excluded_directory() {
 }
 
 #[test]
+// Git cannot re-include a file below an excluded directory: it never lists the
+// directory, so `!out/keep.txt` is dead. The walker must not traverse `out`
+// for it. The same two lines in a `.ferretignore` do re-include (D13), and
+// that is the one case in which an excluded directory is traversed.
+fn a_gitignore_bang_under_an_excluded_directory_is_not_traversed() {
+    let dir = Scratch::new("git-reinclude");
+    let repo = dir.join("repo");
+    gitfile::init(&repo);
+    write(&repo.join(".gitignore"), "out/\n!out/keep.txt\n");
+    write(&repo.join("out/keep.txt"), "k");
+    write(&repo.join("out/drop.txt"), "d");
+
+    let git_walk = walked(&repo, None, Config::default());
+    assert!(git_walk.io.is_empty(), "{:?}", git_walk.io);
+    assert!(gitfile::ignored(&repo, "out"));
+    assert_eq!(decision(&git_walk, "out"), Decision::Skip);
+    // Git's own view of what is visible: the untracked files it does not
+    // ignore. `keep.txt` is not among them.
+    let visible = gitfile::git(&repo, &["ls-files", "--others", "--exclude-standard"]);
+    assert!(visible.status.success());
+    assert_eq!(String::from_utf8_lossy(&visible.stdout), ".gitignore\n");
+    assert!(
+        !git_walk.rows.contains_key(Path::new("out/keep.txt")),
+        "a skipped directory is not listed"
+    );
+
+    let ferret = dir.join("ferret");
+    write(&ferret.join(".ferretignore"), "out/\n!out/keep.txt\n");
+    write(&ferret.join("out/keep.txt"), "k");
+    write(&ferret.join("out/drop.txt"), "d");
+    let ferret_walk = walked(&ferret, None, Config::default());
+    assert!(ferret_walk.io.is_empty(), "{:?}", ferret_walk.io);
+    assert_eq!(decision(&ferret_walk, "out"), Decision::Traverse);
+    assert_eq!(decision(&ferret_walk, "out/keep.txt"), Decision::Index);
+    assert_eq!(decision(&ferret_walk, "out/drop.txt"), Decision::Skip);
+}
+
+#[test]
 fn a_symlink_is_catalogued_and_not_followed() {
     let dir = Scratch::new("symlink");
     fs::create_dir(dir.join("real")).unwrap();
