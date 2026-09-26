@@ -1,7 +1,7 @@
 //! Files a new install starts with. Setup writes each once; after that the
 //! file is the user's, and setup never overwrites it.
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -24,20 +24,29 @@ pub enum Written {
 ///
 /// The bytes go to a temporary file first and are linked into place only once
 /// they are on disk, so a failed or interrupted setup never leaves an empty
-/// file that a retry would mistake for that opt-out.
+/// file that a retry would mistake for that opt-out. Each directory this
+/// creates is synced, and so is its parent: the new name lives in the parent.
+/// The file's own directory is synced again after the link and the temporary
+/// name is removed.
 pub fn write_ignore_file(path: &Path) -> io::Result<Written> {
     write_ignore_file_with_sequence(path, &NEXT_TEMP_ID)
 }
 
 fn write_ignore_file_with_sequence(path: &Path, sequence: &AtomicU64) -> io::Result<Written> {
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = parent_dir(path);
     if destination_exists(path)? {
         return kept(path);
     }
 
     // XDG: a base directory setup creates is 0700; one that exists keeps its
-    // mode.
+    // mode. The new directory's name is an entry in its parent, so that parent
+    // is synced too: mkdir's success is not durable until then.
+    let created = missing_dirs(dir);
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    for directory in &created {
+        sync_dir(directory)?;
+        sync_dir(parent_dir(directory))?;
+    }
 
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let (temp, mut file) = create_temp(dir, &name, sequence)?;
@@ -52,10 +61,51 @@ fn write_ignore_file_with_sequence(path: &Path, sequence: &AtomicU64) -> io::Res
     let linked = fs::hard_link(&temp, path);
     let removed = fs::remove_file(&temp);
     match linked {
-        Ok(()) => removed.map(|()| Written::Created),
+        Ok(()) => {
+            sync_dir(dir)?;
+            removed.map(|()| Written::Created)
+        }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => kept(path),
         Err(error) => Err(error),
     }
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// Directories under `dir` that do not exist yet, shallowest first. A path
+/// that exists, or that cannot be statted, is left for [`DirBuilder`] to
+/// report.
+fn missing_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = dir.to_path_buf();
+    loop {
+        if current.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = current.parent().map(Path::to_path_buf);
+                missing.push(current);
+                match parent {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    missing.reverse();
+    missing
 }
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -230,6 +280,30 @@ mod tests {
 
         assert_eq!(write_ignore_file(&path).unwrap(), Written::Kept);
         assert_eq!(fs::read_to_string(target).unwrap(), "user rules");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    // Power loss is not simulated. Syncing the created directories and the
+    // file's parent must still leave the ignore file in place.
+    fn a_created_file_still_lands_when_its_directories_are_synced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("sync");
+        let path = dir.join("ferret/config/ignore");
+        assert_eq!(write_ignore_file(&path).unwrap(), Written::Created);
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_IGNORE);
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["ignore"]);
+        for directory in ["ferret", "ferret/config"] {
+            let mode = fs::metadata(dir.join(directory))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "{directory}");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
