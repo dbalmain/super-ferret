@@ -2,22 +2,37 @@
 //!
 //! Seam: [`ferret_policy`] decides what to do with each entry. This module
 //! reads the tree and reports. It does not touch the catalog.
+//!
+//! The root is opened by the path the caller gave, following a symlink there
+//! (that path is the user's), with `O_DIRECTORY`. Every later open, stat,
+//! `readlink` and ignore-file read is relative to a directory descriptor.
+//! The walk is recursive and lists each directory in full before visiting
+//! its children, so the descriptor stack is one open directory per level
+//! still on the call stack. While that directory's ignore files are read,
+//! its `.git` directory descriptor is held as well, and `info` under it for
+//! the exclude read; both are closed before any child is visited. That is
+//! the bound: depth, plus two during the ignore read, and nothing cached.
+//! `EMFILE` opening a child is an [`Event::Io`] for that child and the walk
+//! continues with the next sibling. There is no path-based fallback.
+//!
+//! A catalogued symlink is one observation: `openat` with `O_PATH |
+//! O_NOFOLLOW`, then `fstat` and `readlinkat` on that descriptor (an empty
+//! path, which on Linux reads the link the descriptor refers to). The stat
+//! in the event and the stored target cannot disagree.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, FileType, Metadata, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError, Reason};
-
-/// `O_NONBLOCK` from Linux `<fcntl.h>` (`04000`). std does not export it.
-const O_NONBLOCK: i32 = 0o4000;
-
-/// `O_NOFOLLOW` from Linux `<fcntl.h>` (`0400000`). Opening `.git` with this
-/// set refuses a symlink instead of reading through it.
-const O_NOFOLLOW: i32 = 0o400000;
+use ferret_policy::{AncestorGit, Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
+use rustix::fs::{
+    AtFlags, Dir, FileType, Mode, OFlags, fstat, open as open_path, openat, readlinkat, statat,
+};
+use rustix::io::Errno;
 
 /// An ignore file larger than this is an [`Event::Io`] and counts as absent.
 /// One mebibyte is past any ignore file this tree has seen; the bound is what
@@ -91,8 +106,8 @@ pub enum Event<'a> {
     /// A directory listing, `lstat`, `readlink` or ignore-file read failed.
     ///
     /// `path` is root-relative. It is empty when the root itself cannot be
-    /// listed, and it is the directory being listed when `read_dir` yields an
-    /// error with no name. The walk continues with the next entry.
+    /// opened or listed, and it is the directory being listed when `getdents`
+    /// yields an error with no name. The walk continues with the next entry.
     Io {
         /// Root-relative path the operation was about.
         path: &'a Path,
@@ -121,8 +136,13 @@ pub enum Event<'a> {
 /// ([`Decision::Descend`]). A directory reached only so a `.ferretignore` `!`
 /// pattern can re-include beneath it ([`Decision::Traverse`]) is listed, and
 /// its ignore files are not read (D13). `.gitignore` is read only inside a
-/// work tree, where its rules can apply; the root counts as outside one unless
-/// it contains `.git` (D22). `.git/info/exclude` is read when `.git` is a real
+/// work tree, where its rules can apply. The root is inside a work tree when
+/// it contains `.git`, or when a parent does, up to a filesystem boundary
+/// (D22): those
+/// parents' `.gitignore` files and the top's `info/exclude` apply, and a
+/// `.ferretignore` above the root does not. The search canonicalises the
+/// root and does not cross onto another device. `.git/info/exclude` is read
+/// when `.git` is a real
 /// directory. When `.git` is a regular file whose first line is `gitdir:
 /// <path>` (relative to the directory that holds the file), exclude is read
 /// from that gitdir, or from the directory named by a `commondir` file there:
@@ -136,42 +156,110 @@ pub enum Event<'a> {
 /// absent and not a fault: a FIFO or directory of one of these names must not
 /// stall the walk. A name that cannot be opened at all (a socket, say) is a
 /// fault. A regular file that exists but cannot be read is a fault, and is
-/// then treated as absent. Bytes that are not UTF-8 are converted lossily.
+/// then treated as absent. Bytes that are not UTF-8 are converted lossily. A
+/// symlinked `.gitignore` is followed, as is a symlinked `exclude`; `info` is
+/// not, and neither is `.git`.
 ///
 /// The listing is a snapshot. An ignore file created after the directory was
 /// listed is not seen until the next crawl, so it does not apply to the
 /// siblings listed with it. A listed name that is gone by the time it is
 /// opened is absent.
 ///
-/// File types come from `read_dir` (`d_type`, or `lstat` when the filesystem
-/// leaves the type unknown). `d_type` does not follow symlinks. Once `lstat`
-/// has run, its type is the truth and the entry is classified again when the
-/// listing disagreed: the catalog stores that inode, so the decision should
-/// describe it. A name skipped from `d_type` alone is not statted. Regular
-/// files are `lstat`ed so `decide` can see the size. Anything that is not
-/// skipped is `lstat`ed for the catalog fields. A catalogued symlink gets one
-/// `readlink`; the link is never opened. If that `lstat` or `readlink` fails,
-/// the walk emits [`Event::Io`] and no [`Event::Decided`].
+/// File types come from the directory entry (`d_type`, or `statat` with
+/// `AT_SYMLINK_NOFOLLOW` when the filesystem leaves the type unknown).
+/// `d_type` does not follow symlinks. Once a stat has run, its type is the
+/// truth and the entry is classified again when the listing disagreed: the
+/// catalog stores that inode, so the decision should describe it. A name
+/// skipped from `d_type` alone is not statted. Regular files are statted so
+/// `decide` can see the size. Anything that is not skipped is statted for the
+/// catalog fields. A catalogued symlink is opened `O_PATH | O_NOFOLLOW` and
+/// both the stat and the target come from that descriptor. If the stat or
+/// `readlink` fails, the walk emits [`Event::Io`] and no [`Event::Decided`].
+///
+/// A directory that is descended or traversed is opened with `O_DIRECTORY |
+/// O_NOFOLLOW` after its `Decided` event and `fstat`ed. A different `(dev,
+/// ino)` from the stat `decide` was given, or a symlink where the directory
+/// was, is an [`Event::Io`] and the directory is not listed.
 ///
 /// Mount points are crossed: the walk does not compare `st_dev` with the
-/// root. The walk is single-threaded.
+/// root. The walk is single-threaded. See the module docs for how many
+/// descriptors the recursion holds.
 pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut(Event<'_>)) {
     let mut walker = Walker::new(root, visit);
-    let Some(children) = walker.list() else {
+    let ancestors = walker.discover(root);
+    let within = !ancestors.is_empty();
+    let fd = match open_path(root, root_dir_flags(), Mode::empty()) {
+        Ok(fd) => fd,
+        Err(error) => {
+            walker.fail(io::Error::from(error));
+            return;
+        }
+    };
+    let mut dir = match Dir::new(fd) {
+        Ok(dir) => dir,
+        Err(error) => {
+            walker.fail(io::Error::from(error));
+            return;
+        }
+    };
+    let Some(children) = walker.list(&mut dir) else {
         return;
     };
-    // The root is outside a work tree unless it contains `.git` (D22).
-    let loaded = walker.load_ignores(&children, false);
-    let (rules, errors) = DirRules::root(root, global, loaded.files(), config);
+    let loaded = match dir.fd() {
+        Ok(fd) => walker.load_ignores(fd, &children, within),
+        Err(error) => {
+            walker.fail(io::Error::from(error));
+            return;
+        }
+    };
+    let borrowed: Vec<AncestorGit<'_>> = ancestors
+        .iter()
+        .map(|found| AncestorGit {
+            above: found.above.as_path(),
+            directory: found.directory.as_path(),
+            gitignore: found.gitignore.as_deref(),
+            git_exclude: found.git_exclude.as_deref(),
+            top: found.top,
+        })
+        .collect();
+    let (rules, errors) = if within {
+        DirRules::root_within(root, global, loaded.files(), &borrowed, config)
+    } else {
+        DirRules::root(root, global, loaded.files(), config)
+    };
     walker.patterns(errors);
-    walker.walk_listed(&rules, children);
+    walker.walk_listed(&dir, &rules, children);
+}
+
+fn root_dir_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC
+}
+
+fn child_dir_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+fn nofollow_file_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+/// Ignore files follow a final symlink. `.gitignore` as a symlink is still
+/// read (known, left as it is).
+fn ignore_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC
+}
+
+fn link_flags() -> OFlags {
+    OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
 // ── walk state ──
 
 struct Walker<F> {
-    /// Absolute or caller-supplied path of the directory under consideration.
-    /// Kept in lockstep with [`Self::rel`]: every push and pop touches both.
+    /// Path of the directory under consideration, as the caller spelled the
+    /// root plus each child name. Used to resolve a `.git` file's `gitdir:`
+    /// path, which is relative to that directory and may leave the root.
+    /// Kept in lockstep with [`Self::rel`].
     abs: PathBuf,
     /// Root-relative path. Empty at the root. Reused for every entry.
     rel: PathBuf,
@@ -180,14 +268,40 @@ struct Walker<F> {
 
 struct Child {
     name: OsString,
-    kind: io::Result<FileType>,
+    kind: FileType,
 }
 
-struct Classified {
-    entry: Entry,
-    /// Already `lstat`ed for a regular file, so a kept file is not statted
-    /// twice.
-    meta: Option<Metadata>,
+/// What `.git` is. A symlink is [`GitProbe::Present`]: nothing is opened
+/// through it. A real directory keeps the descriptor from the probe so
+/// `info/exclude` cannot be redirected by a later swap of the name.
+enum GitProbe {
+    Missing,
+    Directory(OwnedFd),
+    /// Bytes of a regular `.git` file, already read from the opened inode.
+    File(Vec<u8>),
+    /// A symlink or other non-regular entry. Still starts a work tree
+    /// (so `.gitignore` applies) but contributes no exclude.
+    Present,
+}
+
+impl GitProbe {
+    fn is_root(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+}
+
+struct Draft {
+    directory: PathBuf,
+    above: PathBuf,
+    top: bool,
+}
+
+struct Found {
+    directory: PathBuf,
+    above: PathBuf,
+    gitignore: Option<String>,
+    git_exclude: Option<String>,
+    top: bool,
 }
 
 struct Ignores {
@@ -208,18 +322,10 @@ impl Ignores {
     }
 }
 
-/// What `.git` is, from `lstat`. A symlink is [`GitKind::Present`], not a
-/// directory and not a file, so nothing is opened through it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GitKind {
+enum Opened {
     Missing,
-    /// A real directory: `.git/info/exclude` may be read.
-    Directory,
-    /// A regular file. May hold `gitdir: <path>`; exclude comes from there.
-    File,
-    /// A symlink or other non-regular entry. Still starts a work tree
-    /// (so `.gitignore` applies) but contributes no exclude.
-    Present,
+    NotRegular,
+    Bytes(Vec<u8>),
 }
 
 impl<F> Walker<F>
@@ -259,20 +365,7 @@ where
         }
     }
 
-    fn emit(&mut self, decision: Decision, meta: Option<&Metadata>, target: Option<&OsStr>) {
-        let stat = meta.map(|meta| Stat {
-            size: meta.len(),
-            mtime_sec: meta.mtime(),
-            mtime_nsec: meta.mtime_nsec(),
-            ctime_sec: meta.ctime(),
-            ctime_nsec: meta.ctime_nsec(),
-            dev: meta.dev(),
-            ino: meta.ino(),
-            mode: meta.mode(),
-            uid: meta.uid(),
-            gid: meta.gid(),
-            link_target: target,
-        });
+    fn emit(&mut self, decision: Decision, stat: Option<Stat<'_>>) {
         (self.visit)(Event::Decided(Decided {
             path: &self.rel,
             decision,
@@ -280,168 +373,405 @@ where
         }));
     }
 
-    /// Lists the current directory, or reports one fault and returns `None`.
-    ///
-    /// Names are collected so the listing fd is closed before recursion
-    /// (otherwise a deep tree pins one fd per level) and so a directory that
-    /// cannot be listed is a single fault, before any ignore file is probed.
-    fn list(&mut self) -> Option<Vec<Child>> {
-        match self.read_children() {
-            Ok(children) => Some(children),
-            Err(error) => {
-                self.fail(error);
-                None
-            }
-        }
+    fn emit_skip(&mut self) {
+        self.emit(Decision::Skip, None);
     }
 
-    fn read_children(&mut self) -> io::Result<Vec<Child>> {
-        let iter = fs::read_dir(&self.abs)?;
+    fn emit_stat(&mut self, decision: Decision, stat: &rustix::fs::Stat, target: Option<&OsStr>) {
+        self.emit(decision, Some(public_stat(stat, target)));
+    }
+
+    /// Lists `dir`. An error from `getdents` with no entry yet is one fault
+    /// and `None`, so ignore files are not probed for a directory that could
+    /// not be listed. An error after some entries is reported and the entries
+    /// already read are kept.
+    fn list(&mut self, dir: &mut Dir) -> Option<Vec<Child>> {
         let mut children = Vec::new();
-        for item in iter {
+        let mut failed = false;
+        while let Some(item) = dir.read() {
             match item {
-                Ok(entry) => children.push(Child {
-                    name: entry.file_name(),
-                    kind: entry.file_type(),
-                }),
-                Err(error) => self.fail(error),
+                Ok(entry) => {
+                    let bytes = entry.file_name().to_bytes();
+                    if bytes == b"." || bytes == b".." {
+                        continue;
+                    }
+                    children.push(Child {
+                        name: OsStr::from_bytes(bytes).to_os_string(),
+                        kind: entry.file_type(),
+                    });
+                }
+                Err(error) => {
+                    self.fail(io::Error::from(error));
+                    failed = true;
+                }
             }
         }
-        Ok(children)
+        if failed && children.is_empty() {
+            None
+        } else {
+            Some(children)
+        }
     }
 
-    fn walk_listed(&mut self, rules: &DirRules, children: Vec<Child>) {
+    fn walk_listed(&mut self, dir: &Dir, rules: &DirRules, children: Vec<Child>) {
         for child in children {
             self.push(&child.name);
-            match child.kind {
-                Ok(kind) => self.consider(rules, &child.name, kind),
-                Err(error) => self.fail(error),
+            match dir.fd() {
+                Ok(fd) => self.consider(fd, rules, &child.name, child.kind),
+                Err(error) => self.fail(io::Error::from(error)),
             }
             self.pop();
         }
     }
 
-    fn consider(&mut self, rules: &DirRules, name: &OsStr, kind: FileType) {
-        let Some(classified) = self.classify(kind) else {
-            return;
-        };
-        // A regular file was lstat'd in classify. That stat's type wins over
-        // the listing's d_type before the first decision.
-        let entry = match &classified.meta {
-            Some(meta) => entry_from_meta(meta),
-            None => classified.entry,
-        };
-        let mut decision = rules.decide(&self.rel, entry);
-        if decision == Decision::Skip {
-            self.emit(decision, None, None);
-            return;
-        }
-        let Some(meta) = self.metadata_for(classified.meta) else {
-            return;
-        };
-        let observed = entry_from_meta(&meta);
-        if !same_type(entry, observed) {
-            decision = rules.decide(&self.rel, observed);
-            if decision == Decision::Skip {
-                self.emit(decision, None, None);
-                return;
+    fn consider(&mut self, dir: BorrowedFd<'_>, rules: &DirRules, name: &OsStr, kind: FileType) {
+        match kind {
+            FileType::RegularFile | FileType::Unknown => {
+                let Some(stat) = self.stat_child(dir, name) else {
+                    return;
+                };
+                self.decide_statted(dir, rules, name, stat);
             }
-        }
-        let target = match self.link_target(decision) {
-            Ok(target) => target,
-            Err(error) => {
-                self.fail(error);
-                return;
-            }
-        };
-        self.emit(
-            decision,
-            Some(&meta),
-            target.as_deref().map(Path::as_os_str),
-        );
-        self.follow(rules, name, decision);
-    }
-
-    /// Symlink first: `d_type` of a link is `DT_LNK`, including a link to a
-    /// directory, and `file_type` does not follow it. When the filesystem
-    /// reports `DT_UNKNOWN`, std fills the type in with `lstat`, which also
-    /// does not follow.
-    fn classify(&mut self, kind: FileType) -> Option<Classified> {
-        if kind.is_symlink() {
-            Some(Classified {
-                entry: Entry::Symlink,
-                meta: None,
-            })
-        } else if kind.is_dir() {
-            Some(Classified {
-                entry: Entry::Dir,
-                meta: None,
-            })
-        } else if kind.is_file() {
-            match fs::symlink_metadata(&self.abs) {
-                Ok(meta) => Some(Classified {
-                    entry: entry_from_meta(&meta),
-                    meta: Some(meta),
-                }),
-                Err(error) => {
-                    self.fail(error);
-                    None
+            FileType::Symlink => {
+                let decision = rules.decide(&self.rel, Entry::Symlink);
+                if decision == Decision::Skip {
+                    self.emit_skip();
+                    return;
                 }
+                self.finish_link(dir, rules, name, decision);
             }
-        } else {
-            Some(Classified {
-                entry: Entry::Other,
-                meta: None,
-            })
+            FileType::Directory => self.consider_dir(dir, rules, name),
+            _ => {
+                if rules.decide(&self.rel, Entry::Other) == Decision::Skip {
+                    self.emit_skip();
+                    return;
+                }
+                let Some(stat) = self.stat_child(dir, name) else {
+                    return;
+                };
+                self.decide_statted(dir, rules, name, stat);
+            }
         }
     }
 
-    fn metadata_for(&mut self, have: Option<Metadata>) -> Option<Metadata> {
-        if let Some(meta) = have {
-            return Some(meta);
+    fn consider_dir(&mut self, dir: BorrowedFd<'_>, rules: &DirRules, name: &OsStr) {
+        let mut decision = rules.decide(&self.rel, Entry::Dir);
+        if decision == Decision::Skip {
+            self.emit_skip();
+            return;
         }
-        match fs::symlink_metadata(&self.abs) {
-            Ok(meta) => Some(meta),
+        let Some(stat) = self.stat_child(dir, name) else {
+            return;
+        };
+        let seen = entry_from_stat(&stat);
+        if seen != Entry::Dir {
+            decision = rules.decide(&self.rel, seen);
+            if decision == Decision::Skip {
+                self.emit_skip();
+                return;
+            }
+            if seen == Entry::Symlink {
+                self.finish_link(dir, rules, name, decision);
+                return;
+            }
+        }
+        self.emit_stat(decision, &stat, None);
+        self.follow(dir, rules, name, decision, &stat);
+    }
+
+    /// `stat` came from `statat` (`d_type` was a file, unknown, or disagreed).
+    /// A symlink result is re-opened so the published stat and the target are
+    /// one observation.
+    fn decide_statted(
+        &mut self,
+        dir: BorrowedFd<'_>,
+        rules: &DirRules,
+        name: &OsStr,
+        stat: rustix::fs::Stat,
+    ) {
+        let entry = entry_from_stat(&stat);
+        let decision = rules.decide(&self.rel, entry);
+        if decision == Decision::Skip {
+            self.emit_skip();
+            return;
+        }
+        if entry == Entry::Symlink {
+            self.finish_link(dir, rules, name, decision);
+            return;
+        }
+        self.emit_stat(decision, &stat, None);
+        self.follow(dir, rules, name, decision, &stat);
+    }
+
+    /// Opens `name` with `O_PATH | O_NOFOLLOW`. The stat and, when it is a
+    /// symlink, the target come from that descriptor.
+    fn finish_link(
+        &mut self,
+        dir: BorrowedFd<'_>,
+        rules: &DirRules,
+        name: &OsStr,
+        decision: Decision,
+    ) {
+        let (stat, target) = match observe_link(dir, name) {
+            Ok(pair) => pair,
             Err(error) => {
                 self.fail(error);
+                return;
+            }
+        };
+        let seen = entry_from_stat(&stat);
+        if seen != Entry::Symlink {
+            let decision = rules.decide(&self.rel, seen);
+            if decision == Decision::Skip {
+                self.emit_skip();
+                return;
+            }
+            self.emit_stat(decision, &stat, None);
+            self.follow(dir, rules, name, decision, &stat);
+            return;
+        }
+        let Some(target) = target else {
+            self.fail(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "symlink has no target",
+            ));
+            return;
+        };
+        self.emit_stat(decision, &stat, Some(target.as_os_str()));
+    }
+
+    fn stat_child(&mut self, dir: BorrowedFd<'_>, name: &OsStr) -> Option<rustix::fs::Stat> {
+        match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Some(stat),
+            Err(error) => {
+                self.fail(io::Error::from(error));
                 None
             }
         }
     }
 
-    /// `Ok(None)` when `decision` is not a catalogued symlink. A `readlink`
-    /// error is returned to the caller, which emits it and no `Decided`.
-    fn link_target(&mut self, decision: Decision) -> io::Result<Option<PathBuf>> {
-        if decision != Decision::Catalog(Reason::Symlink) {
-            return Ok(None);
-        }
-        fs::read_link(&self.abs).map(Some)
-    }
-
-    fn follow(&mut self, rules: &DirRules, name: &OsStr, decision: Decision) {
+    fn follow(
+        &mut self,
+        parent: BorrowedFd<'_>,
+        rules: &DirRules,
+        name: &OsStr,
+        decision: Decision,
+        expected: &rustix::fs::Stat,
+    ) {
         match decision {
-            Decision::Descend => self.enter_and_list(rules, name),
-            Decision::Traverse => self.traverse_and_list(rules, name),
+            Decision::Descend => self.enter_and_list(parent, rules, name, expected),
+            Decision::Traverse => self.traverse_and_list(parent, rules, name, expected),
             Decision::Skip | Decision::Catalog(_) | Decision::Index => {}
         }
     }
 
-    fn enter_and_list(&mut self, parent: &DirRules, name: &OsStr) {
-        let Some(children) = self.list() else {
+    fn enter_and_list(
+        &mut self,
+        parent: BorrowedFd<'_>,
+        parent_rules: &DirRules,
+        name: &OsStr,
+        expected: &rustix::fs::Stat,
+    ) {
+        let Some(mut child) = self.open_child(parent, name, expected) else {
             return;
         };
-        let loaded = self.load_ignores(&children, parent.in_work_tree());
-        let (rules, errors) = parent.enter(name, loaded.files());
+        let Some(children) = self.list(&mut child) else {
+            return;
+        };
+        let loaded = match child.fd() {
+            Ok(fd) => self.load_ignores(fd, &children, parent_rules.in_work_tree()),
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                return;
+            }
+        };
+        let (rules, errors) = parent_rules.enter(name, loaded.files());
         self.patterns(errors);
-        self.walk_listed(&rules, children);
+        self.walk_listed(&child, &rules, children);
     }
 
-    fn traverse_and_list(&mut self, parent: &DirRules, name: &OsStr) {
-        let Some(children) = self.list() else {
+    fn traverse_and_list(
+        &mut self,
+        parent: BorrowedFd<'_>,
+        parent_rules: &DirRules,
+        name: &OsStr,
+        expected: &rustix::fs::Stat,
+    ) {
+        let Some(mut child) = self.open_child(parent, name, expected) else {
             return;
         };
-        let rules = parent.traverse(name);
-        self.walk_listed(&rules, children);
+        let Some(children) = self.list(&mut child) else {
+            return;
+        };
+        let rules = parent_rules.traverse(name);
+        self.walk_listed(&child, &rules, children);
+    }
+
+    /// `O_DIRECTORY | O_NOFOLLOW`, then `fstat`. A symlink is `ELOOP`. A
+    /// different inode than `expected` is a fault either way: the `Decided`
+    /// event already described the inode `decide` saw.
+    fn open_child(
+        &mut self,
+        parent: BorrowedFd<'_>,
+        name: &OsStr,
+        expected: &rustix::fs::Stat,
+    ) -> Option<Dir> {
+        let fd = match openat(parent, name, child_dir_flags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                return None;
+            }
+        };
+        match fstat(&fd) {
+            Ok(stat) if stat.st_dev == expected.st_dev && stat.st_ino == expected.st_ino => {}
+            Ok(_) => {
+                self.fail(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory changed between stat and open",
+                ));
+                return None;
+            }
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                return None;
+            }
+        }
+        match Dir::new(fd) {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                None
+            }
+        }
+    }
+
+    /// The work tree above `root`, top first. Empty when `root` itself holds
+    /// `.git`, or when no parent on the same device does.
+    ///
+    /// Git resolves the starting directory (`getcwd` / `git -C`) and refuses
+    /// to cross a filesystem boundary unless
+    /// `GIT_DISCOVERY_ACROSS_FILESYSTEM` is set. This follows that default:
+    /// [`fs::canonicalize`], then parents while `st_dev` matches the root's.
+    /// The ancestor directories are opened by that canonical path; `.gitignore`
+    /// and `info/exclude` are read relative to those descriptors.
+    fn discover(&mut self, root: &Path) -> Vec<Found> {
+        let canon = match fs::canonicalize(root) {
+            Ok(path) => path,
+            Err(_) => return Vec::new(),
+        };
+        if has_git(&canon) {
+            return Vec::new();
+        }
+        let Some(root_dev) = device_of(&canon) else {
+            return Vec::new();
+        };
+        let mut above = match canon.file_name() {
+            Some(name) => PathBuf::from(name),
+            None => return Vec::new(),
+        };
+        let mut current = match canon.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => return Vec::new(),
+        };
+        let mut drafts = Vec::new();
+        while let Some(dev) = device_of(&current) {
+            if dev != root_dev {
+                break;
+            }
+            let top = has_git(&current);
+            drafts.push(Draft {
+                directory: current.clone(),
+                above: above.clone(),
+                top,
+            });
+            if top {
+                break;
+            }
+            let Some(name) = current.file_name() else {
+                break;
+            };
+            above = Path::new(name).join(above);
+            let Some(parent) = current.parent() else {
+                break;
+            };
+            current = parent.to_path_buf();
+        }
+        if !drafts.iter().any(|draft| draft.top) {
+            return Vec::new();
+        }
+        drafts.reverse();
+        drafts
+            .into_iter()
+            .filter_map(|draft| self.read_ancestor(draft))
+            .collect()
+    }
+
+    /// `None` for a non-top directory with no `.gitignore`. The top is always
+    /// returned, so the root is inside the work tree even when the top has
+    /// no patterns of its own.
+    fn read_ancestor(&mut self, draft: Draft) -> Option<Found> {
+        let fd = match open_path(&draft.directory, root_dir_flags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.fail_abs(&draft.directory, io::Error::from(error));
+                return draft.top.then_some(Found {
+                    directory: draft.directory,
+                    above: draft.above,
+                    gitignore: None,
+                    git_exclude: None,
+                    top: true,
+                });
+            }
+        };
+        let gitignore_path = draft.directory.join(".gitignore");
+        let gitignore = self.read_ancestor_ignore(fd.as_fd(), ".gitignore", &gitignore_path);
+        let git_exclude = if draft.top {
+            self.ancestor_exclude(fd.as_fd(), &draft.directory)
+        } else {
+            None
+        };
+        if !draft.top && gitignore.is_none() {
+            return None;
+        }
+        Some(Found {
+            directory: draft.directory,
+            above: draft.above,
+            gitignore,
+            git_exclude,
+            top: draft.top,
+        })
+    }
+
+    fn read_ancestor_ignore(
+        &mut self,
+        dir: BorrowedFd<'_>,
+        name: &str,
+        full: &Path,
+    ) -> Option<String> {
+        match open_ignore(dir, name) {
+            Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
+            Ok(Opened::Missing | Opened::NotRegular) => None,
+            Err(error) => {
+                self.fail_abs(full, error);
+                None
+            }
+        }
+    }
+
+    fn ancestor_exclude(&mut self, dir: BorrowedFd<'_>, directory: &Path) -> Option<String> {
+        match self.probe_git(dir) {
+            GitProbe::Directory(fd) => self.read_exclude(fd.as_fd()),
+            GitProbe::File(bytes) => self.read_gitfile_exclude(directory, &bytes),
+            GitProbe::Missing | GitProbe::Present => None,
+        }
+    }
+
+    fn fail_abs(&mut self, path: &Path, error: io::Error) {
+        self.fail(io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        ));
     }
 
     // ── ignore files ──
@@ -450,103 +780,165 @@ where
     /// the usual case, costs no failed `open`s.
     ///
     /// `in_work_tree` is the parent directory. The root passes `false`.
-    fn load_ignores(&mut self, children: &[Child], in_work_tree: bool) -> Ignores {
+    /// `.git`, when it is a directory, is opened here and that descriptor is
+    /// what `info/exclude` is read from, including across the `.gitignore`
+    /// callback below.
+    fn load_ignores(
+        &mut self,
+        dir: BorrowedFd<'_>,
+        children: &[Child],
+        in_work_tree: bool,
+    ) -> Ignores {
         let listed = |name: &str| children.iter().any(|child| child.name == name);
         let ferretignore = listed(".ferretignore")
-            .then(|| self.read_named(".ferretignore"))
+            .then(|| self.read_named(dir, ".ferretignore"))
             .flatten();
         let git = if listed(".git") {
-            self.probe_git()
+            self.probe_git(dir)
         } else {
-            GitKind::Missing
+            GitProbe::Missing
         };
         // A `.gitignore` outside a work tree cannot affect decisions, so it is
         // not opened. A FIFO of that name must not stall a walk that is not in
         // a repository.
-        let gitignore = if (in_work_tree || git != GitKind::Missing) && listed(".gitignore") {
-            self.read_named(".gitignore")
+        let gitignore = if (in_work_tree || git.is_root()) && listed(".gitignore") {
+            self.read_named(dir, ".gitignore")
         } else {
             None
         };
-        let git_exclude = match git {
-            GitKind::Directory => self.read_exclude(),
-            GitKind::File => self.read_gitfile_exclude(),
-            GitKind::Missing | GitKind::Present => None,
+        let git_exclude = match &git {
+            GitProbe::Directory(fd) => self.read_exclude(fd.as_fd()),
+            GitProbe::File(bytes) => {
+                let base = self.abs.clone();
+                self.read_gitfile_exclude(&base, bytes)
+            }
+            GitProbe::Missing | GitProbe::Present => None,
         };
         Ignores {
             ferretignore,
             gitignore,
-            git_root: git != GitKind::Missing,
+            git_root: git.is_root(),
             git_exclude,
         }
     }
 
-    fn read_named(&mut self, name: &str) -> Option<String> {
+    fn read_named(&mut self, dir: BorrowedFd<'_>, name: &str) -> Option<String> {
         self.push(name);
-        let text = self.read_at_cursor();
-        self.pop();
-        text
-    }
-
-    fn read_exclude(&mut self) -> Option<String> {
-        self.push(".git");
-        self.push("info");
-        self.push("exclude");
-        let text = self.read_at_cursor();
-        self.pop();
-        self.pop();
-        self.pop();
-        text
-    }
-
-    /// Text of the file at the cursor, or `None` when it is absent or not a
-    /// regular file. Any other error is reported and the file is treated as
-    /// absent so the rest of the directory still walks.
-    fn read_at_cursor(&mut self) -> Option<String> {
-        match open_regular(&self.abs, false) {
-            Ok(Some(bytes)) => Some(decode_lossy(bytes)),
-            Ok(None) => None,
+        let text = match open_ignore(dir, name) {
+            Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
+            Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
                 self.fail(error);
                 None
             }
-        }
+        };
+        self.pop();
+        text
     }
 
-    fn probe_git(&mut self) -> GitKind {
+    /// `info` is opened `O_NOFOLLOW` relative to the `.git` descriptor held
+    /// since [`probe_git`](Self::probe_git). `exclude` itself is an ordinary
+    /// ignore file: a symlink of that name is followed.
+    fn read_exclude(&mut self, git: BorrowedFd<'_>) -> Option<String> {
         self.push(".git");
-        let kind = match fs::symlink_metadata(&self.abs) {
-            Ok(meta) if meta.is_dir() => GitKind::Directory,
-            Ok(meta) if meta.is_file() => GitKind::File,
-            Ok(_) => GitKind::Present,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => GitKind::Missing,
+        self.push("info");
+        let info = match openat(git, "info", child_dir_flags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => {
+                self.pop();
+                self.pop();
+                return None;
+            }
+            Err(error) => {
+                self.push("exclude");
+                self.fail(io::Error::from(error));
+                self.pop();
+                self.pop();
+                self.pop();
+                return None;
+            }
+        };
+        self.push("exclude");
+        let text = match open_ignore(info.as_fd(), "exclude") {
+            Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
+            Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
                 self.fail(error);
-                GitKind::Missing
+                None
             }
         };
         self.pop();
-        kind
+        self.pop();
+        self.pop();
+        text
+    }
+
+    fn probe_git(&mut self, dir: BorrowedFd<'_>) -> GitProbe {
+        match openat(dir, ".git", child_dir_flags(), Mode::empty()) {
+            Ok(fd) => GitProbe::Directory(fd),
+            Err(Errno::NOENT) => GitProbe::Missing,
+            Err(Errno::LOOP) => GitProbe::Present,
+            Err(Errno::NOTDIR) => self.probe_git_file(dir),
+            Err(error) => self.probe_git_failed(dir, error),
+        }
+    }
+
+    /// The directory open failed for a reason other than "not a directory"
+    /// or "a symlink". A directory we cannot search still starts a work
+    /// tree; a regular file is read below.
+    fn probe_git_failed(&mut self, dir: BorrowedFd<'_>, error: Errno) -> GitProbe {
+        match statat(dir, ".git", AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if file_type(&stat) == FileType::RegularFile => self.probe_git_file(dir),
+            Ok(stat) if file_type(&stat) == FileType::Directory => {
+                self.fail_at_git(io::Error::from(error));
+                GitProbe::Present
+            }
+            Ok(_) => GitProbe::Present,
+            Err(Errno::NOENT) => GitProbe::Missing,
+            Err(stat_err) => {
+                self.fail_at_git(io::Error::from(stat_err));
+                GitProbe::Missing
+            }
+        }
+    }
+
+    /// `.git` is not a directory. `O_NOFOLLOW` so a symlink that appeared
+    /// since the listing is not a gitdir file.
+    fn probe_git_file(&mut self, dir: BorrowedFd<'_>) -> GitProbe {
+        match openat(dir, ".git", nofollow_file_flags(), Mode::empty()) {
+            Ok(fd) => match read_regular(fd) {
+                Ok(Some(bytes)) => GitProbe::File(bytes),
+                Ok(None) => GitProbe::Present,
+                Err(error) => {
+                    self.fail_at_git(error);
+                    GitProbe::Present
+                }
+            },
+            Err(Errno::NOENT) => GitProbe::Missing,
+            Err(Errno::LOOP) => GitProbe::Present,
+            Err(error) => match statat(dir, ".git", AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) if file_type(&stat) == FileType::RegularFile => {
+                    self.fail_at_git(io::Error::from(error));
+                    GitProbe::Present
+                }
+                Ok(_) => GitProbe::Present,
+                Err(Errno::NOENT) => GitProbe::Missing,
+                Err(stat_err) => {
+                    self.fail_at_git(io::Error::from(stat_err));
+                    GitProbe::Missing
+                }
+            },
+        }
     }
 
     /// Exclude for a regular `.git` file: `gitdir:` then an optional
     /// `commondir`, then `<common>/info/exclude`. A fault is reported against
     /// the `.git` file. The gitdir may sit outside the walk root (a linked
-    /// work tree, a submodule's module directory).
-    fn read_gitfile_exclude(&mut self) -> Option<String> {
-        self.push(".git");
-        let bytes = match open_regular(&self.abs, true) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.fail(error);
-                self.pop();
-                return None;
-            }
-        };
-        self.pop();
-        let bytes = bytes?;
-        let raw = parse_gitdir(&bytes)?;
-        let gitdir = resolve_git_path(&self.abs, raw);
+    /// work tree, a submodule's module directory) and is opened by path, with
+    /// `O_NOFOLLOW` on the final component.
+    fn read_gitfile_exclude(&mut self, base: &Path, bytes: &[u8]) -> Option<String> {
+        let raw = parse_gitdir(bytes)?;
+        let gitdir = resolve_git_path(base, raw);
         let common = self.common_dir(&gitdir)?;
         self.read_external(&common.join("info").join("exclude"))
     }
@@ -558,18 +950,16 @@ where
     /// directory.
     fn common_dir(&mut self, gitdir: &Path) -> Option<PathBuf> {
         let commondir = gitdir.join("commondir");
-        match open_regular(&commondir, false) {
-            Ok(None) => match fs::symlink_metadata(&commondir) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(gitdir.to_path_buf()),
-                _ => {
-                    self.fail_at_git(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{}: not a regular file", commondir.display()),
-                    ));
-                    None
-                }
-            },
-            Ok(Some(bytes)) => {
+        match open_regular_path(&commondir) {
+            Ok(Opened::Missing) => Some(gitdir.to_path_buf()),
+            Ok(Opened::NotRegular) => {
+                self.fail_at_git(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: not a regular file", commondir.display()),
+                ));
+                None
+            }
+            Ok(Opened::Bytes(bytes)) => {
                 let raw = first_line(&bytes)?;
                 Some(resolve_git_path(gitdir, raw))
             }
@@ -581,9 +971,9 @@ where
     }
 
     fn read_external(&mut self, path: &Path) -> Option<String> {
-        match open_regular(path, false) {
-            Ok(Some(bytes)) => Some(decode_lossy(bytes)),
-            Ok(None) => None,
+        match open_regular_path(path) {
+            Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
+            Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
                 self.fail_at_git(io::Error::new(
                     error.kind(),
@@ -601,27 +991,56 @@ where
     }
 }
 
-/// Opens `path` for reading without blocking, and returns its bytes when the
-/// open file is a regular file of at most [`MAX_IGNORE_BYTES`].
-///
-/// `Ok(None)` is absence: nothing was there, or the opened inode is not a
-/// regular file (a FIFO, directory, or device of an ignore-file's name). The
-/// open uses `O_NONBLOCK` so a FIFO does not wait for a writer. `nofollow`
-/// adds `O_NOFOLLOW`, for the `.git` file only. The check is `fstat` on that
-/// file, not a prior `lstat`, so a name that changes between the listing and
-/// the open is classified from what was actually opened.
-fn open_regular(path: &Path, nofollow: bool) -> io::Result<Option<Vec<u8>>> {
-    let mut flags = O_NONBLOCK;
-    if nofollow {
-        flags |= O_NOFOLLOW;
+/// `O_PATH | O_NOFOLLOW`, then `fstat` and, for a symlink, `readlinkat` of
+/// that descriptor. `Ok`'s stat is the inode the descriptor refers to, which
+/// may no longer be a symlink; then the target is `None`.
+fn observe_link(
+    dir: BorrowedFd<'_>,
+    name: &OsStr,
+) -> io::Result<(rustix::fs::Stat, Option<OsString>)> {
+    let fd = openat(dir, name, link_flags(), Mode::empty())?;
+    let stat = fstat(&fd)?;
+    if file_type(&stat) != FileType::Symlink {
+        return Ok((stat, None));
     }
-    let file = match OpenOptions::new().read(true).custom_flags(flags).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
+    // An empty path reads the link the `O_PATH` descriptor already refers
+    // to (Linux 2.6.39), so the target cannot be a different inode from
+    // `stat`.
+    let raw = readlinkat(&fd, "", Vec::new())?;
+    Ok((stat, Some(OsString::from_vec(raw.into_bytes()))))
+}
+
+fn open_ignore(dir: BorrowedFd<'_>, name: &str) -> io::Result<Opened> {
+    match openat(dir, name, ignore_flags(), Mode::empty()) {
+        Ok(fd) => read_opened(fd),
+        Err(Errno::NOENT) => Ok(Opened::Missing),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+fn open_regular_path(path: &Path) -> io::Result<Opened> {
+    match open_path(path, nofollow_file_flags(), Mode::empty()) {
+        Ok(fd) => read_opened(fd),
+        Err(Errno::NOENT) => Ok(Opened::Missing),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+fn read_opened(fd: OwnedFd) -> io::Result<Opened> {
+    match read_regular(fd)? {
+        Some(bytes) => Ok(Opened::Bytes(bytes)),
+        None => Ok(Opened::NotRegular),
+    }
+}
+
+/// Bytes of `fd` when it is a regular file of at most [`MAX_IGNORE_BYTES`].
+///
+/// `Ok(None)` means the opened inode is not a regular file. The check is
+/// `fstat` on the descriptor that was opened, not a prior `lstat`.
+fn read_regular(fd: OwnedFd) -> io::Result<Option<Vec<u8>>> {
+    let file = File::from(fd);
     let meta = file.metadata()?;
-    if !meta.is_file() {
+    if !meta.file_type().is_file() {
         return Ok(None);
     }
     if meta.len() > MAX_IGNORE_BYTES {
@@ -678,27 +1097,107 @@ fn resolve_git_path(base: &Path, raw: &OsStr) -> PathBuf {
     }
 }
 
-fn entry_from_meta(meta: &Metadata) -> Entry {
+/// Whether `dir` is the top of a work tree, by the shapes `git rev-parse
+/// --is-inside-work-tree` accepts. Checked as a black box, not from git's
+/// source: a directory with `HEAD`, `refs` and `objects`; the same with
+/// `commondir` naming such a directory instead of `objects`; a `gitdir:`
+/// file pointing at one of those; a symlink to any of them. An empty
+/// directory named `.git` is not a repository.
+fn has_git(dir: &Path) -> bool {
+    is_git_path(&dir.join(".git"), 0)
+}
+
+fn is_git_path(path: &Path, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
     let kind = meta.file_type();
     if kind.is_symlink() {
-        Entry::Symlink
-    } else if kind.is_dir() {
-        Entry::Dir
-    } else if kind.is_file() {
-        Entry::File { size: meta.len() }
-    } else {
-        Entry::Other
+        let Ok(target) = fs::read_link(path) else {
+            return false;
+        };
+        let base = path.parent().unwrap_or(path);
+        return is_git_path(&resolve_git_path(base, target.as_os_str()), depth + 1);
+    }
+    if kind.is_dir() {
+        return is_git_dir(path, depth);
+    }
+    if kind.is_file() {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        return is_git_file(parent, path, depth);
+    }
+    false
+}
+
+fn is_git_dir(path: &Path, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let head = fs::metadata(path.join("HEAD")).is_ok_and(|meta| meta.is_file());
+    let refs = fs::metadata(path.join("refs")).is_ok_and(|meta| meta.is_dir());
+    if !(head && refs) {
+        return false;
+    }
+    if fs::metadata(path.join("objects")).is_ok_and(|meta| meta.is_dir()) {
+        return true;
+    }
+    let Ok(bytes) = fs::read(path.join("commondir")) else {
+        return false;
+    };
+    let Some(raw) = first_line(&bytes) else {
+        return false;
+    };
+    is_git_dir(&resolve_git_path(path, raw), depth + 1)
+}
+
+fn is_git_file(work_tree: &Path, file: &Path, depth: u32) -> bool {
+    let Ok(bytes) = fs::read(file) else {
+        return false;
+    };
+    let Some(raw) = parse_gitdir(&bytes) else {
+        return false;
+    };
+    is_git_path(&resolve_git_path(work_tree, raw), depth + 1)
+}
+
+fn device_of(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|meta| meta.dev())
+}
+
+fn file_type(stat: &rustix::fs::Stat) -> FileType {
+    FileType::from_raw_mode(stat.st_mode)
+}
+
+fn entry_from_stat(stat: &rustix::fs::Stat) -> Entry {
+    match file_type(stat) {
+        FileType::Symlink => Entry::Symlink,
+        FileType::Directory => Entry::Dir,
+        FileType::RegularFile => Entry::File {
+            size: u64::try_from(stat.st_size).unwrap_or(0),
+        },
+        _ => Entry::Other,
     }
 }
 
-fn same_type(left: Entry, right: Entry) -> bool {
-    matches!(
-        (left, right),
-        (Entry::Dir, Entry::Dir)
-            | (Entry::Symlink, Entry::Symlink)
-            | (Entry::Other, Entry::Other)
-            | (Entry::File { .. }, Entry::File { .. })
-    )
+fn public_stat<'a>(stat: &rustix::fs::Stat, target: Option<&'a OsStr>) -> Stat<'a> {
+    Stat {
+        size: u64::try_from(stat.st_size).unwrap_or(0),
+        mtime_sec: stat.st_mtime,
+        mtime_nsec: i64::try_from(stat.st_mtime_nsec).unwrap_or(0),
+        ctime_sec: stat.st_ctime,
+        ctime_nsec: i64::try_from(stat.st_ctime_nsec).unwrap_or(0),
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+        mode: stat.st_mode,
+        uid: stat.st_uid,
+        gid: stat.st_gid,
+        link_target: target,
+    }
 }
 
 fn decode_lossy(bytes: Vec<u8>) -> String {

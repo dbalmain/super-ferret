@@ -35,7 +35,7 @@ impl Drop for Tree {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+pub(super) fn git(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .args(args)
         .current_dir(dir)
@@ -49,7 +49,7 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-fn git_ok(dir: &Path, args: &[&str]) {
+pub(super) fn git_ok(dir: &Path, args: &[&str]) {
     let output = git(dir, args);
     assert!(
         output.status.success(),
@@ -61,7 +61,7 @@ fn git_ok(dir: &Path, args: &[&str]) {
 }
 
 /// `git check-ignore` exits 0 when the path is ignored and 1 when it is not.
-fn ignored(dir: &Path, rel: &str) -> bool {
+pub(super) fn ignored(dir: &Path, rel: &str) -> bool {
     let output = git(dir, &["check-ignore", "-q", "--", rel]);
     match output.status.code() {
         Some(0) => true,
@@ -74,7 +74,7 @@ fn ignored(dir: &Path, rel: &str) -> bool {
     }
 }
 
-fn init(dir: &Path) {
+pub(super) fn init(dir: &Path) {
     fs::create_dir_all(dir).unwrap();
     git_ok(dir, &["init", "-q", "-b", "main"]);
 }
