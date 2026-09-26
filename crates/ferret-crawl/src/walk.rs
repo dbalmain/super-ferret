@@ -26,6 +26,7 @@
 //! path, which on Linux reads the link the descriptor refers to). The stat
 //! in the event and the stored target cannot disagree.
 
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -324,7 +325,7 @@ impl Shared {
         }
     }
 
-    fn share_oldest(&self, local: &mut Vec<Job>) {
+    fn share_oldest(&self, local: &mut VecDeque<Job>) {
         if local.is_empty() || self.idle.load(Ordering::SeqCst) == 0 {
             return;
         }
@@ -333,7 +334,10 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Nearest the root is likely to expose the most independent work.
-        jobs.push(local.remove(0));
+        let Some(oldest) = local.pop_front() else {
+            return;
+        };
+        jobs.push(oldest);
         if self.idle.load(Ordering::SeqCst) != 0 {
             self.ready.notify_one();
         }
@@ -368,7 +372,7 @@ fn run_guarded<V: EventVisitor>(walker: Walker<V>, shared: &Shared) -> V {
 }
 
 fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &Shared) -> V {
-    let mut local = Vec::new();
+    let mut local = VecDeque::new();
     let Some(mut current) = shared.take() else {
         return walker.visit;
     };
@@ -381,7 +385,7 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &Shared) -> V {
                 if parent.next != parent.children.entries.len() {
                     shared.outstanding.fetch_add(1, Ordering::AcqRel);
                     shared.reserve_or_spill(&mut parent);
-                    local.push(parent);
+                    local.push_back(parent);
                     shared.share_oldest(&mut local);
                 }
                 current = child;
@@ -389,7 +393,7 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &Shared) -> V {
             None => {
                 shared.finish_one();
                 shared.share_oldest(&mut local);
-                if let Some(job) = local.pop() {
+                if let Some(job) = local.pop_back() {
                     shared.release_open(&job);
                     current = job;
                 } else if let Some(job) = shared.take() {
@@ -1631,4 +1635,27 @@ fn public_stat<'a>(stat: &rustix::fs::Stat, target: Option<&'a OsStr>) -> Stat<'
 fn decode_lossy(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes)
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn sharing_the_oldest_does_not_move_the_remaining_jobs() {
+        let root = std::env::temp_dir().join(format!("ferret-scheduler-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let make_job = || {
+            let mut walker = Walker::new(&root, |_: Event<'_>| {});
+            walker.root_job(&root, None, Config::default()).unwrap()
+        };
+        let shared = Shared::new(make_job());
+        let mut local = VecDeque::from([make_job(), make_job()]);
+        let newest = &local[1] as *const Job;
+        shared.idle.store(1, Ordering::SeqCst);
+        shared.share_oldest(&mut local);
+        assert_eq!(local.len(), 1);
+        assert!(std::ptr::eq(newest, &local[0]));
+        fs::remove_dir(&root).unwrap();
+    }
 }
