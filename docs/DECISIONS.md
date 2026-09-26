@@ -14,26 +14,27 @@ Predecessors, carried forward where still open:
 
 ## Status
 
-| Id  | Question                                             | Status         | Answer                                                                                                         |
-| --- | ---------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------- |
-| D1  | Repository shape                                     | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                           |
-| D2  | Format of the living documents                       | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`         |
-| D3  | Build order: index first, or the no-index tool first | answered       | B: usable tool first, to start collecting data                                                                 |
-| D4  | What identifies a document                           | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                              |
-| D5  | Where the mutable state (paths, inodes) lives        | answered       | A: own catalog; memory budget configurable, set by experiment                                                  |
-| D6  | What the index holds: postings, filters, positions   | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                              |
-| D7  | Positions                                            | merged into D6 |                                                                                                                |
-| D8  | Regex at first ship                                  | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                            |
-| D9  | What a term is                                       | answered       | B: identifier splitting, filenames especially                                                                  |
-| D10 | Which roots                                          | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                              |
-| D11 | `unsafe` posture and the intpack dependency          | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                     |
-| D12 | Licence                                              | answered       | A: `MIT OR Apache-2.0`                                                                                         |
-| D13 | Ignore rules: precedence, and whose matcher          | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore` |
-| D14 | Filename search: scan the names, or index them       | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
-| D15 | Result unit: per path or per document                | answered       | per path; a view may group (e.g. image search, once per content)                                               |
-| D16 | Replace `ignore` with our own gitignore matcher      | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
-| D17 | Whose regex engine, and when                         | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
-| D18 | Symlinks: catalogue as links, and what they match    | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
+| Id  | Question                                                 | Status         | Answer                                                                                                         |
+| --- | -------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------- |
+| D1  | Repository shape                                         | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                           |
+| D2  | Format of the living documents                           | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`         |
+| D3  | Build order: index first, or the no-index tool first     | answered       | B: usable tool first, to start collecting data                                                                 |
+| D4  | What identifies a document                               | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                              |
+| D5  | Where the mutable state (paths, inodes) lives            | answered       | A: own catalog; memory budget configurable, set by experiment                                                  |
+| D6  | What the index holds: postings, filters, positions       | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                              |
+| D7  | Positions                                                | merged into D6 |                                                                                                                |
+| D8  | Regex at first ship                                      | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                            |
+| D9  | What a term is                                           | answered       | B: identifier splitting, filenames especially                                                                  |
+| D10 | Which roots                                              | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                              |
+| D11 | `unsafe` posture and the intpack dependency              | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                     |
+| D12 | Licence                                                  | answered       | A: `MIT OR Apache-2.0`                                                                                         |
+| D13 | Ignore rules: precedence, and whose matcher              | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore` |
+| D14 | Filename search: scan the names, or index them           | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
+| D15 | Result unit: per path or per document                    | answered       | per path; a view may group (e.g. image search, once per content)                                               |
+| D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
+| D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
+| D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
+| D19 | Ignore matching: whole paths, or per-directory rule sets | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -683,6 +684,54 @@ option A). No generational collector; the work is in when it runs and over what.
 table in DESIGN.md § The catalog), captured by one `readlink` per link during
 the crawl. That keeps D18 an addition over data already on disk, with no
 re-crawl and no format change.
+
+## D19 — Ignore matching: whole paths, or per-directory rule sets
+
+**Question:** Should `DirRules` keep matching each entry's whole relative path
+against every layer, or carry a per-directory set of the patterns still live
+there, derived on `enter`?
+
+**Today** (`rules.rs`, `gitignore/mod.rs`): `enter` does no pattern work; it
+clones a few `Arc`s and adds a layer only when the directory holds an ignore
+file. `decide` asks each layer, closest first, to match the entry's path
+relative to that layer's directory. Inside a layer, patterns sit in buckets:
+basename patterns (`*.txt`, `db.sql`, `node_modules/`) are a hash lookup on the
+basename or extension, independent of depth and pattern count; anchored patterns
+(a `/` before the last character) are bucketed by the path's first one or two
+bytes and run through the component matcher over the whole path. Patterns with
+no literal prefix (`**/__log/log.txt`, `*/x`) land in `anchored_any` and are
+tried against every entry in the tree.
+
+**Proposed** (Dave, 2026-09-26): each directory carries the patterns that can
+still match beneath it. Entering `docs/` turns `docs/*.md` into `/*.md`,
+`**/docs/my-notes.md` into `/my-notes.md` (keeping the original too), and drops
+`logs/*.json`. Basename patterns are unchanged by entering, so they stay as
+today's shared buckets; only anchored patterns are derived. A pattern of k
+components can sit at no more than k positions, so `**` cannot blow up the set
+(an NFA over path components). Two rules the derivation must keep: a derived
+pattern stays anchored to its directory (`docs/*.md` must not match
+`docs/sub/x.md`), and it keeps its file, band and line number, so last match
+wins and closest file first still hold.
+
+What the rules look like here (every `.gitignore` under `~/w`, 2026-09-26, with
+a leading `**/` counted as basename): 866 basename patterns, 273 anchored (24%).
+
+| Option                                                    | Costs                                                                                                                                                                                                                 | Buys                                                                                                                                               |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Keep whole-path matching                               | Nothing now. Anchored patterns cost O(depth) per entry, and `anchored_any` ones are tried everywhere. `reinclude.rs` stays a second piece of logic (`reaches_below`, `is_superseded_by`).                             | One matcher, verified against git as a black box on whole paths. `enter` is free.                                                                  |
+| B. Derive anchored patterns per directory; buckets as now | Anchored matching is rewritten to match one component at a time; `enter` builds a small derived set wherever an anchored pattern's first component matches. The differential test against git must go through a walk. | Anchored patterns are only tried where they can match. `Traverse` becomes "a whitelist survives in the derived set", which deletes `reinclude.rs`. |
+
+**Recommendation:** A until measured, then B if the numbers favour it. B is the
+better model, but nothing has shown matching to matter: a walk of ~1M files is
+dominated by `getdents` and `lstat`, and D16's matcher is 63–238 ns/path warm.
+The fact that would change it: a real walk where `decide` is a noticeable share
+of walk time, or a prototype of B that is faster on real trees and agrees with A
+on every decision; either makes B the next change. A bug in `reaches_below`
+would too, since B removes it.
+
+**In progress (2026-09-26):** a prototype of B on the bench branch, checked
+against `DirRules` decision by decision on `~/w` and timed against it; and the
+S1 walker, which gives the walk-time share.
 
 ## Settled without a brief (object if wrong)
 
