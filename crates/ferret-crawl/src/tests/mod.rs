@@ -637,3 +637,100 @@ fn gitignore_outside_a_work_tree_is_not_read() {
     assert_eq!(decision(&walked, "repo/a.o"), Decision::Index);
     assert_eq!(decision(&walked, "repo/a.c"), Decision::Index);
 }
+
+/// Fires while ignore patterns are reported, which is after the directory is
+/// listed and before any child is classified. `bad\` is the pattern error that
+/// opens that window.
+fn on_pattern(dir: &Scratch, body: impl FnOnce(&Path)) -> Walked {
+    write(&dir.join(".ferretignore"), "bad\\\n");
+    let root = dir.path.clone();
+    let mut out = Walked {
+        rows: BTreeMap::new(),
+        io: Vec::new(),
+        patterns: Vec::new(),
+    };
+    let mut body = Some(body);
+    walk(&root, None, Config::default(), |event| match event {
+        Event::Pattern(error) => {
+            out.patterns.push(error);
+            let body = body.take().expect("one pattern error");
+            body(&root);
+        }
+        Event::Decided(Decided {
+            path,
+            decision,
+            stat,
+        }) => {
+            out.rows.insert(
+                path.to_path_buf(),
+                Row {
+                    decision,
+                    stat: stat.map(OwnedStat::from),
+                },
+            );
+        }
+        Event::Io { path, error } => out.io.push((path.to_path_buf(), error.kind())),
+    });
+    assert!(body.is_none(), "the pattern hook did not run");
+    out
+}
+
+#[test]
+fn a_listed_file_replaced_by_a_symlink_is_catalogued_as_the_link() {
+    let dir = Scratch::new("d-type-link");
+    write(&dir.join("victim"), "file");
+    let walked = on_pattern(&dir, |root| {
+        fs::remove_file(root.join("victim")).unwrap();
+        std::os::unix::fs::symlink("target", root.join("victim")).unwrap();
+    });
+    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    assert_eq!(
+        decision(&walked, "victim"),
+        Decision::Catalog(Reason::Symlink)
+    );
+    let stat = walked
+        .rows
+        .get(Path::new("victim"))
+        .unwrap()
+        .stat
+        .as_ref()
+        .unwrap();
+    assert_eq!(stat.target.as_deref(), Some(OsStr::new("target")));
+    assert_lstat(dir.path.as_path(), "victim", stat);
+}
+
+#[test]
+fn a_listed_symlink_replaced_by_a_file_is_indexed_as_the_file() {
+    let dir = Scratch::new("d-type-file");
+    std::os::unix::fs::symlink("old", dir.join("victim")).unwrap();
+    let walked = on_pattern(&dir, |root| {
+        fs::remove_file(root.join("victim")).unwrap();
+        fs::write(root.join("victim"), "hello").unwrap();
+    });
+    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    assert_eq!(decision(&walked, "victim"), Decision::Index);
+    let stat = walked
+        .rows
+        .get(Path::new("victim"))
+        .unwrap()
+        .stat
+        .as_ref()
+        .unwrap();
+    assert!(stat.target.is_none());
+    assert_eq!(stat.size, 5);
+    assert_lstat(dir.path.as_path(), "victim", stat);
+}
+
+#[test]
+fn a_symlink_removed_before_lstat_is_a_fault_and_not_decided() {
+    let dir = Scratch::new("d-type-gone");
+    std::os::unix::fs::symlink("old", dir.join("victim")).unwrap();
+    let walked = on_pattern(&dir, |root| {
+        fs::remove_file(root.join("victim")).unwrap();
+    });
+    assert!(!walked.rows.contains_key(Path::new("victim")));
+    assert_eq!(
+        walked.io,
+        vec![(PathBuf::from("victim"), io::ErrorKind::NotFound)]
+    );
+}

@@ -26,8 +26,10 @@ const MAX_IGNORE_BYTES: u64 = 1 << 20;
 /// `st_gid`: the catalog's inode row stores them, and they come from the same
 /// `lstat` as the rest.
 ///
-/// `link_target` is set only for a catalogued symlink. It is the raw
-/// `readlink` bytes, not resolved and not re-encoded (D18).
+/// `link_target` is the raw `readlink` bytes of a catalogued symlink, not
+/// resolved and not re-encoded (D18). It is `Some` exactly then. A catalogued
+/// symlink is not emitted until `readlink` succeeds; a failure is
+/// [`Event::Io`] and no [`Decided`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stat<'a> {
     /// `st_size`. For a symlink, the length of the target path.
@@ -58,16 +60,17 @@ pub struct Stat<'a> {
 ///
 /// `path` is relative to the walk's root and borrows the walker's path
 /// buffer. It is valid only for the callback that receives it. `stat` is
-/// absent for [`Decision::Skip`], and also when `lstat` failed after the
-/// decision (an [`Event::Io`] for the same path was emitted as well).
+/// absent for [`Decision::Skip`] and present for every other decision. If
+/// `lstat` fails, or `readlink` fails for a catalogued symlink, the walk
+/// emits [`Event::Io`] and does not emit `Decided`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Decided<'a> {
     /// Root-relative path of the entry.
     pub path: &'a Path,
     /// What the policy said to do with `path`.
     pub decision: Decision,
-    /// `lstat` of `path`, when the entry was not skipped and the stat
-    /// succeeded.
+    /// `lstat` of `path`. Present for every decision other than
+    /// [`Decision::Skip`].
     pub stat: Option<Stat<'a>>,
 }
 
@@ -126,10 +129,14 @@ pub enum Event<'a> {
 /// then treated as absent. Bytes that are not UTF-8 are converted lossily.
 ///
 /// File types come from `read_dir` (`d_type`, or `lstat` when the filesystem
-/// leaves the type unknown). `d_type` does not follow symlinks. Regular files
-/// are `lstat`ed so `decide` can see the size. Anything that is not skipped
-/// is `lstat`ed for the catalog fields. A catalogued symlink gets one
-/// `readlink`; the link is never opened.
+/// leaves the type unknown). `d_type` does not follow symlinks. Once `lstat`
+/// has run, its type is the truth and the entry is classified again when the
+/// listing disagreed: the catalog stores that inode, so the decision should
+/// describe it. A name skipped from `d_type` alone is not statted. Regular
+/// files are `lstat`ed so `decide` can see the size. Anything that is not
+/// skipped is `lstat`ed for the catalog fields. A catalogued symlink gets one
+/// `readlink`; the link is never opened. If that `lstat` or `readlink` fails,
+/// the walk emits [`Event::Io`] and no [`Event::Decided`].
 ///
 /// Mount points are crossed: the walk does not compare `st_dev` with the
 /// root. The walk is single-threaded.
@@ -301,17 +308,35 @@ where
         let Some(classified) = self.classify(kind) else {
             return;
         };
-        let decision = rules.decide(&self.rel, classified.entry);
+        // A regular file was lstat'd in classify. That stat's type wins over
+        // the listing's d_type before the first decision.
+        let entry = match &classified.meta {
+            Some(meta) => entry_from_meta(meta),
+            None => classified.entry,
+        };
+        let mut decision = rules.decide(&self.rel, entry);
         if decision == Decision::Skip {
             self.emit(decision, None, None);
             return;
         }
         let Some(meta) = self.metadata_for(classified.meta) else {
-            self.emit(decision, None, None);
-            self.follow(rules, name, decision);
             return;
         };
-        let target = self.link_target(decision);
+        let observed = entry_from_meta(&meta);
+        if !same_type(entry, observed) {
+            decision = rules.decide(&self.rel, observed);
+            if decision == Decision::Skip {
+                self.emit(decision, None, None);
+                return;
+            }
+        }
+        let target = match self.link_target(decision) {
+            Ok(target) => target,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
         self.emit(
             decision,
             Some(&meta),
@@ -338,7 +363,7 @@ where
         } else if kind.is_file() {
             match fs::symlink_metadata(&self.abs) {
                 Ok(meta) => Some(Classified {
-                    entry: Entry::File { size: meta.len() },
+                    entry: entry_from_meta(&meta),
                     meta: Some(meta),
                 }),
                 Err(error) => {
@@ -367,17 +392,13 @@ where
         }
     }
 
-    fn link_target(&mut self, decision: Decision) -> Option<PathBuf> {
+    /// `Ok(None)` when `decision` is not a catalogued symlink. A `readlink`
+    /// error is returned to the caller, which emits it and no `Decided`.
+    fn link_target(&mut self, decision: Decision) -> io::Result<Option<PathBuf>> {
         if decision != Decision::Catalog(Reason::Symlink) {
-            return None;
+            return Ok(None);
         }
-        match fs::read_link(&self.abs) {
-            Ok(target) => Some(target),
-            Err(error) => {
-                self.fail(error);
-                None
-            }
-        }
+        fs::read_link(&self.abs).map(Some)
     }
 
     fn follow(&mut self, rules: &DirRules, name: &OsStr, decision: Decision) {
@@ -528,6 +549,29 @@ fn ignore_too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::FileTooLarge,
         "ignore file is larger than 1 MiB",
+    )
+}
+
+fn entry_from_meta(meta: &Metadata) -> Entry {
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        Entry::Symlink
+    } else if kind.is_dir() {
+        Entry::Dir
+    } else if kind.is_file() {
+        Entry::File { size: meta.len() }
+    } else {
+        Entry::Other
+    }
+}
+
+fn same_type(left: Entry, right: Entry) -> bool {
+    matches!(
+        (left, right),
+        (Entry::Dir, Entry::Dir)
+            | (Entry::Symlink, Entry::Symlink)
+            | (Entry::Other, Entry::Other)
+            | (Entry::File { .. }, Entry::File { .. })
     )
 }
 
