@@ -761,8 +761,14 @@ The walk itself (`read_dir` plus `lstat`, same directories) is 1,763 ns/entry;
 the S1 walker's warm `~/w` walk is 0.219 s. So policy is about a fifth of a warm
 walk (A 31% of the bare walk, B 25%), and B saves about 110 ns/entry, 10 ms on
 `~/w`, about 5% of the walker. The saving is not from `anchored_any`: only 30
-such patterns were read. Where A's `decide` time goes is not yet profiled;
-probing every layer's buckets for each entry is the likely cost.
+such patterns were read. A second data point, from the walker (2026-09-26): once
+it read `info/exclude` through `.git` files, `~/w`'s 87 linked work trees
+contributed patterns such as `**/.claude/…`, which have no literal prefix, and
+the warm walk went from 0.219 s to 0.275 s with identical decisions; all of the
+difference is user time in matching. That is the pattern class B is built for,
+and the replay above did not include it, because it was collected before the
+fix. Where A's `decide` time goes is not yet profiled; probing every layer's
+buckets for each entry is the likely cost.
 
 ## D20 — Walk across mount points, or stay on the root's device
 
