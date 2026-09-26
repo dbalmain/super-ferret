@@ -481,6 +481,13 @@ versions do not reach an existing file, as with git's own global ignore. And
 with no global file nothing is excluded, so the CLI must not crawl before setup
 has run.
 
+**Later decisions that change this one.** How the matcher is built — whole-path
+matching against bucketed layers, or per-directory derived rule sets that would
+replace `reinclude.rs` and the re-include-only walk above — is **D19**, with
+measurements. Where a work tree starts is **D22**: a root inside a work tree
+applies the `.gitignore` files and `info/exclude` above it, but not a
+`.ferretignore` above the root.
+
 ## D14 — Filename search: scan the names, or index them
 
 **Question:** Is "much faster find" answered by scanning the catalog's names or
@@ -868,6 +875,37 @@ it.
 **Answer (2026-09-26): B.** Discover the enclosing work tree and apply its
 `.gitignore` files and `info/exclude` from the top down to the root; a
 `.ferretignore` above the root does not apply.
+
+## D23 — Recording work trees, so duplicate results can be hidden
+
+**Premise (Dave, 2026-09-26):** the catalog records that a file is in a git work
+tree, and which, so results can hide linked work trees. A project with a dozen
+work trees open would otherwise show every match a dozen times.
+
+**Question:** What does the catalog record, and where?
+
+The walker already tells the three kinds of `.git` apart: a `.git` directory
+starts a repository's main work tree; a `.git` file whose gitdir has a
+`commondir` is a **linked** work tree of that common directory; a `.git` file
+without one is a submodule, a separate repository and not a duplicate. The
+repository's identity is the common directory, which for a linked work tree
+usually sits outside the root (`~/w/super-ferret/.git` for every
+`super-ferret-wt/*`).
+
+| Option                                                                                                                                         | Costs                                                                                                                                                                                      | Buys                                                                                                                                                                           |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A. A sixth table, `worktrees`: the top directory's `InoId`, kind (main / linked / submodule), repository id (the common directory's path text) | One row per work tree (tens of bytes; ~100 under `~/w`). The walker reports the kind and common directory at each `.git`. Membership is derived at load by the parent chain, as paths are. | "Hide linked work trees" and "group a hit with the same repo-relative path in other work trees" are both expressible, for names and content alike. Nothing per file is stored. |
+| B. A work-tree id on every `inodes` row                                                                                                        | ~4 B per inode, 4 MB at 1M files, and redundant with the parent chain; moving a directory between work trees rewrites every row below it.                                                  | Filtering without an ancestry walk — which A gets anyway from a map derived at load.                                                                                           |
+| C. Record nothing; collapse results by `DocId` at query time                                                                                   | Nothing stored. Only identical content collapses; a file edited in one work tree still shows once per work tree for a name match, and nothing says which copy is the main one.             | Works for any duplicate, work tree or plain copy, from data the catalog already has (`DocId → [InoId]`).                                                                       |
+
+**Recommendation:** A, with C as the default presentation on top: a hit shows
+once with "+N identical in other work trees", and a copy that differs shows
+separately, since a divergent work tree is usually the one you want. Hiding
+linked work trees entirely is then a query flag. The walker change follows the
+current D21/D22 slice, since that rewrites the `.git` probe. The fact that would
+change it: if the name scan (D14) needs the work-tree filter inside its inner
+loop and the derived map is too slow there — then a per-directory bit, still not
+B.
 
 ## Settled without a brief (object if wrong)
 
