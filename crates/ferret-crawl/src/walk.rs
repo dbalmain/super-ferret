@@ -6,12 +6,14 @@
 //! The root is opened by the path the caller gave, following a symlink there
 //! (that path is the user's), with `O_DIRECTORY`. Every later open, stat,
 //! `readlink` and ignore-file read is relative to a directory descriptor.
-//! A queued job holds a listing cursor and usually its directory descriptor.
-//! After 128 queued descriptors, parent continuations close their descriptors
-//! and reopen by checked `openat` steps from the root when resumed. Each worker
-//! holds one active job and at most three extra descriptors while opening a
-//! child and reading `.git/info/exclude`. Thus a parallel walk with N workers
-//! holds at most 128 + 4N descriptors, independent of tree depth and width.
+//! Each worker keeps parent continuations in a local LIFO stack. When another
+//! worker is idle it shares the oldest continuation through a mutex and
+//! `Condvar`. Jobs in local stacks and the shared queue hold at most 128
+//! directory descriptors combined. Beyond that, a continuation closes its
+//! descriptor and reopens by checked `openat` steps from the root when resumed.
+//! Each worker holds one active job and at most three extra descriptors while
+//! opening a child and reading `.git/info/exclude`. Thus a parallel walk with N
+//! workers holds at most 128 + 4N descriptors, independent of depth and width.
 //! `EMFILE` opening a child is an [`Event::Io`] and the walk continues. There
 //! is no path-based fallback below the root.
 //!
@@ -27,6 +29,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 
@@ -191,16 +194,7 @@ pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut
     let Some(root_job) = walker.root_job(root, global, config) else {
         return;
     };
-    let queue = (
-        Mutex::new(Queue {
-            jobs: vec![root_job],
-            outstanding: 1,
-            cancelled: false,
-            open_jobs: 1,
-        }),
-        Condvar::new(),
-    );
-    run_worker(walker, &queue);
+    run_worker(walker, &Shared::new(root_job));
 }
 
 /// A worker-local visitor. The returned visitors retain their accumulated
@@ -232,26 +226,18 @@ pub fn walk_parallel<V: EventVisitor + Send>(
         return vec![first.visit];
     };
     let root_id = first.root_id;
-    let queue = (
-        Mutex::new(Queue {
-            jobs: vec![root_job],
-            outstanding: 1,
-            cancelled: false,
-            open_jobs: 1,
-        }),
-        Condvar::new(),
-    );
+    let shared = Shared::new(root_job);
     if count == 1 {
-        return vec![run_worker(first, &queue)];
+        return vec![run_worker(first, &shared)];
     }
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
-        handles.push(scope.spawn(|| run_guarded(first, &queue)));
+        handles.push(scope.spawn(|| run_guarded(first, &shared)));
         for _ in 1..count {
             let visitor = make_visitor();
             let mut walker = Walker::new(root, visitor);
             walker.root_id = root_id;
-            handles.push(scope.spawn(|| run_guarded(walker, &queue)));
+            handles.push(scope.spawn(|| run_guarded(walker, &shared)));
         }
         handles
             .into_iter()
@@ -265,89 +251,147 @@ pub fn walk_parallel<V: EventVisitor + Send>(
 
 const MAX_OPEN_JOBS: usize = 128;
 
-struct Queue {
-    jobs: Vec<Job>,
-    outstanding: usize,
-    cancelled: bool,
-    open_jobs: usize,
+struct Shared {
+    jobs: Mutex<Vec<Job>>,
+    ready: Condvar,
+    idle: AtomicUsize,
+    outstanding: AtomicUsize,
+    open_jobs: AtomicUsize,
+    cancelled: AtomicBool,
 }
 
-fn run_guarded<V: EventVisitor>(walker: Walker<V>, shared: &(Mutex<Queue>, Condvar)) -> V {
+impl Shared {
+    fn new(root: Job) -> Self {
+        Self {
+            jobs: Mutex::new(vec![root]),
+            ready: Condvar::new(),
+            idle: AtomicUsize::new(0),
+            outstanding: AtomicUsize::new(1),
+            open_jobs: AtomicUsize::new(1),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn take(&self) -> Option<Job> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(job) = jobs.pop() {
+                self.release_open(&job);
+                return Some(job);
+            }
+            if self.outstanding.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            // Mark idle while holding the queue lock, before wait releases it.
+            self.idle.fetch_add(1, Ordering::SeqCst);
+            while jobs.is_empty()
+                && !self.cancelled.load(Ordering::Acquire)
+                && self.outstanding.load(Ordering::Acquire) != 0
+            {
+                jobs = self
+                    .ready
+                    .wait(jobs)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            self.idle.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn reserve_or_spill(&self, parent: &mut Job) {
+        let reserved = self
+            .open_jobs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (open < MAX_OPEN_JOBS).then_some(open + 1)
+            });
+        if reserved.is_err() {
+            parent.dir.take();
+        }
+    }
+
+    fn release_open(&self, job: &Job) {
+        if job.dir.is_some() {
+            self.open_jobs.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn share_oldest(&self, local: &mut Vec<Job>) {
+        if local.is_empty() || self.idle.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let mut jobs = self
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Nearest the root is likely to expose the most independent work.
+        jobs.push(local.remove(0));
+        if self.idle.load(Ordering::SeqCst) != 0 {
+            self.ready.notify_one();
+        }
+    }
+
+    fn finish_one(&self) {
+        if self.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Synchronize with a worker about to wait, or it can miss this
+            // wake.
+            let _jobs = self
+                .jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.ready.notify_all();
+        }
+    }
+}
+
+fn run_guarded<V: EventVisitor>(walker: Walker<V>, shared: &Shared) -> V {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_worker(walker, shared))) {
         Ok(visitor) => visitor,
         Err(panic) => {
-            let mut queue = shared
-                .0
+            shared.cancelled.store(true, Ordering::Release);
+            let _jobs = shared
+                .jobs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            queue.cancelled = true;
-            shared.1.notify_all();
+            shared.ready.notify_all();
             std::panic::resume_unwind(panic);
         }
     }
 }
 
-fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &(Mutex<Queue>, Condvar)) -> V {
-    let (lock, ready) = shared;
+fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &Shared) -> V {
+    let mut local = Vec::new();
+    let Some(mut current) = shared.take() else {
+        return walker.visit;
+    };
     loop {
-        let job = {
-            let mut queue = lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            loop {
-                if queue.cancelled {
-                    return walker.visit;
+        if shared.cancelled.load(Ordering::Acquire) {
+            return walker.visit;
+        }
+        match walker.process(current) {
+            Some((mut parent, child)) => {
+                if parent.next != parent.children.len() {
+                    shared.outstanding.fetch_add(1, Ordering::AcqRel);
+                    shared.reserve_or_spill(&mut parent);
+                    local.push(parent);
+                    shared.share_oldest(&mut local);
                 }
-                if let Some(job) = queue.jobs.pop() {
-                    if job.dir.is_some() {
-                        queue.open_jobs -= 1;
-                    }
-                    break job;
-                }
-                if queue.outstanding == 0 {
-                    return walker.visit;
-                }
-                queue = ready
-                    .wait(queue)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                current = child;
             }
-        };
-        let mut current = job;
-        loop {
-            match walker.process(current) {
-                Some((mut parent, child)) => {
-                    if parent.next == parent.children.len() {
-                        current = child;
-                        continue;
-                    }
-                    let mut queue = lock
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if queue.cancelled {
-                        return walker.visit;
-                    }
-                    queue.outstanding += 1;
-                    if queue.open_jobs == MAX_OPEN_JOBS {
-                        parent.dir.take();
-                    } else {
-                        queue.open_jobs += 1;
-                    }
-                    queue.jobs.push(parent);
-                    ready.notify_one();
-                    current = child;
-                }
-                None => {
-                    let mut queue = lock
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if queue.cancelled {
-                        return walker.visit;
-                    }
-                    queue.outstanding -= 1;
-                    if queue.outstanding == 0 {
-                        ready.notify_all();
-                    }
-                    break;
+            None => {
+                shared.finish_one();
+                shared.share_oldest(&mut local);
+                if let Some(job) = local.pop() {
+                    shared.release_open(&job);
+                    current = job;
+                } else if let Some(job) = shared.take() {
+                    current = job;
+                } else {
+                    return walker.visit;
                 }
             }
         }
