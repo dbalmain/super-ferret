@@ -249,8 +249,8 @@ impl DirRules {
             lists: Lists::default(),
         });
         let mut state = State {
-            global: global.map(|text| {
-                Layer::compile(IgnoreFile::Global, text, false, &shared.lists, &mut errors)
+            global: global.and_then(|text| {
+                Layer::compile(IgnoreFile::Global, text, false, &shared.lists, &mut errors).live()
             }),
             ..State::default()
         };
@@ -344,13 +344,25 @@ impl State {
             }
             None => layer.clone(),
         };
+        // A layer whose last cursor died here, with no shared rules, is
+        // dropped; the work tree it belonged to stays in force.
         let next = Self {
-            global: self.global.as_ref().map(&mut step),
+            global: self.global.as_ref().map(&mut step).and_then(Layer::live),
             git: self.git.as_ref().map(|tree| WorkTree {
-                exclude: tree.exclude.as_ref().map(&mut step),
-                ignores: tree.ignores.iter().map(&mut step).collect(),
+                exclude: tree.exclude.as_ref().map(&mut step).and_then(Layer::live),
+                ignores: tree
+                    .ignores
+                    .iter()
+                    .map(&mut step)
+                    .filter_map(Layer::live)
+                    .collect(),
             }),
-            ferret: self.ferret.iter().map(&mut step).collect(),
+            ferret: self
+                .ferret
+                .iter()
+                .map(&mut step)
+                .filter_map(Layer::live)
+                .collect(),
         };
         changed.then_some(next)
     }
@@ -366,13 +378,13 @@ impl State {
         if let Some(text) = files.ferretignore {
             let file = IgnoreFile::Ferret(dir.join(".ferretignore"));
             self.ferret
-                .push(Layer::compile(file, text, true, lists, errors));
+                .extend(Layer::compile(file, text, true, lists, errors).live());
         }
         if files.git_root {
             self.git = Some(WorkTree {
-                exclude: files.git_exclude.map(|text| {
+                exclude: files.git_exclude.and_then(|text| {
                     let file = IgnoreFile::GitExclude(dir.join(".git/info/exclude"));
-                    Layer::compile(file, text, false, lists, errors)
+                    Layer::compile(file, text, false, lists, errors).live()
                 }),
                 ignores: Vec::new(),
             });
@@ -380,7 +392,7 @@ impl State {
         if let (Some(tree), Some(text)) = (&mut self.git, files.gitignore) {
             let file = IgnoreFile::Git(dir.join(".gitignore"));
             tree.ignores
-                .push(Layer::compile(file, text, false, lists, errors));
+                .extend(Layer::compile(file, text, false, lists, errors).live());
         }
     }
 
@@ -403,12 +415,13 @@ impl State {
         {
             let file = IgnoreFile::GitExclude(ancestor.directory.join(".git/info/exclude"));
             let layer = Layer::compile(file, text, false, lists, errors);
-            tree.exclude = Some(layer.stepped_through(ancestor.above));
+            tree.exclude = layer.stepped_through(ancestor.above).live();
         }
         if let Some(text) = ancestor.gitignore {
             let file = IgnoreFile::Git(ancestor.directory.join(".gitignore"));
             let layer = Layer::compile(file, text, false, lists, errors);
-            tree.ignores.push(layer.stepped_through(ancestor.above));
+            tree.ignores
+                .extend(layer.stepped_through(ancestor.above).live());
         }
         self.git = Some(tree);
     }
@@ -536,6 +549,15 @@ impl Layer {
             cursors,
         };
         (layer, errors)
+    }
+
+    /// This layer, unless it can no longer contribute anything: no rule
+    /// shared by every directory and no live cursor. An empty ignore file is
+    /// such a layer from the start. Keeping one would cost a slot in every
+    /// descendant's state, so a chain of d empty `.gitignore` files would
+    /// hold Θ(d²) slots between its directories.
+    fn live(self) -> Option<Self> {
+        (!self.source.shared.is_empty() || !self.cursors.is_empty()).then_some(self)
     }
 
     /// This layer in child `name`, or `None` when its cursors do not change.
@@ -956,6 +978,38 @@ mod tests {
         fn shares_list_with(&self, other: &Self) -> bool {
             Arc::ptr_eq(&self.0.list, &other.0.list)
         }
+
+        fn layer_count(&self) -> usize {
+            self.0.state.layers().count()
+        }
+    }
+
+    #[test]
+    fn empty_and_spent_ignore_files_hold_no_layer() {
+        let root = Dir::root(Some(""), git("*.log\n"));
+        assert_eq!(root.layer_count(), 1);
+        let mut dir = root.enter("a", gitignore(""));
+        for depth in 0..50 {
+            dir = dir.enter(&format!("d{depth}"), gitignore(""));
+            assert_eq!(dir.layer_count(), 1, "depth {depth}");
+            assert!(dir.shares_list_with(&root));
+        }
+        // Still in the work tree, whose rules still apply.
+        assert!(dir.0.in_work_tree());
+        assert_eq!(dir.decide("x.log", FILE), Decision::Skip);
+
+        // An empty file at the top of a work tree adds no layer either, and
+        // still makes the tree.
+        let bare = Dir::root(None, git(""));
+        assert_eq!(bare.layer_count(), 0);
+        assert!(bare.0.in_work_tree());
+
+        // An anchored-only file is dropped once no cursor survives.
+        let anchored = root.enter("b", gitignore("/c/d\n"));
+        assert_eq!(anchored.layer_count(), 2);
+        assert_eq!(anchored.empty("c").layer_count(), 2);
+        assert_eq!(anchored.empty("x").layer_count(), 1);
+        assert_eq!(anchored.empty("c").decide("d", FILE), Decision::Skip);
     }
 
     #[test]
