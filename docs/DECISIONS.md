@@ -823,6 +823,15 @@ the consequence is indexing a file outside a root, not writing anything. The
 fact that would change it: roots shared with other users (a writable shared
 directory), where the race is an attack rather than an accident; then B now.
 
+> Dave: let's switch to rustix now unless you think we can get away with never
+> using it.
+
+**Answer (2026-09-26): B, now.** There is no version of the walker that avoids
+it: std has no directory-relative calls, so only handles close the race; the
+`statx` fields DESIGN gives `ferret-crawl` (birth time, a cheaper mask) are not
+in std either; and a parallel walker wants a handle per directory anyway.
+`ferret-crawl → rustix` joins the crate graph.
+
 ## D22 — A root inside a git work tree
 
 **Question:** When a configured root sits inside a work tree whose `.git` is
@@ -853,6 +862,12 @@ where the user said ferret's view begins. A few file reads per root. The fact
 that would change it: if roots are always at or above work trees in practice
 (`$HOME`, `~/w`), A costs nothing real, and the extra constructor isn't worth
 it.
+
+> Dave: agree with your recommendation.
+
+**Answer (2026-09-26): B.** Discover the enclosing work tree and apply its
+`.gitignore` files and `info/exclude` from the top down to the root; a
+`.ferretignore` above the root does not apply.
 
 ## Settled without a brief (object if wrong)
 
