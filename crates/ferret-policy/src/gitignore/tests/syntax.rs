@@ -1,8 +1,9 @@
 //! Line syntax: blanks, comments, escapes, trailing spaces, `?` and `*`.
 
 use super::super::Pattern;
-use super::{Case, Dir, File, Gitignore, Ignore, Row, Unmatched, assert_cases, assert_rows};
-use std::path::Path;
+use super::{
+    Case, Dir, File, Ignore, OneFile, Row, Unmatched, assert_cases, assert_rows, matched,
+};
 
 pub(super) const ROWS: &[Row] = &[
     // Blank and comment lines.
@@ -418,14 +419,14 @@ fn invalid_lines_never_match() {
 
 #[test]
 fn invalid_line_is_reported_with_its_number_and_text() {
-    let (matcher, errors) = Gitignore::compile("ok\nbad\\\nalso\n");
+    let (matcher, errors) = OneFile::compile("ok\nbad\\\nalso\n");
     let reported: Vec<_> = errors
         .iter()
         .map(|error| (error.line, error.pattern.as_str()))
         .collect();
     assert_eq!(reported, [(2, "bad\\")]);
-    assert_eq!(matcher.matched(Path::new("ok"), false), Ignore);
-    assert_eq!(matcher.matched(Path::new("also"), false), Ignore);
+    assert_eq!(matched(&matcher, b"ok", false), Ignore);
+    assert_eq!(matched(&matcher, b"also", false), Ignore);
 }
 
 #[test]
@@ -450,12 +451,27 @@ fn pathological_stars_have_bounded_work() {
             assert!(steps <= bound, "{label} n={n}: {steps} > {bound}");
         }
 
+        // An anchored pattern is stepped a directory at a time. Its cursors
+        // are deduplicated by position, so however many components the path
+        // has, each step does at most one component match per pattern
+        // component, each bounded as above.
         let source = "**/a*/b";
         let path = format!("{}{}/c", "x/".repeat(n / 2), "a".repeat(n));
         let pattern = Pattern::compile(0, source).unwrap().unwrap();
-        let (matched, steps) = pattern.path_match_steps(path.as_bytes());
-        assert!(!matched);
-        let bound = 8 * source.len() * path.len();
-        assert!(steps <= bound, "globstar retries n={n}: {steps} > {bound}");
+        let (parents, _) = path.rsplit_once('/').unwrap();
+        let mut cursors = vec![(0, false)];
+        for parent in parents.split('/') {
+            let mut next = Vec::new();
+            for (pos, fed) in cursors {
+                pattern.advance(pos, fed, parent.as_bytes(), &mut next);
+            }
+            assert!(
+                next.len() <= pattern.component_count(),
+                "globstar cursors n={n}: {next:?}"
+            );
+            cursors = next;
+        }
+        let (matcher, _) = OneFile::compile(source);
+        assert_eq!(matched(&matcher, path.as_bytes(), false), Unmatched);
     }
 }

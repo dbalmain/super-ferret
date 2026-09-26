@@ -6,10 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
 
 use super::oracle::{Scratch, check_ignore, must};
-use super::{Gitignore, Match};
+use super::{Match, OneFile, matched};
 
 #[derive(Default)]
 struct Coverage {
@@ -38,13 +37,13 @@ fn agrees_with_git_on_seeded_random_and_structured_cases() {
         let patterns = random_patterns(&mut random, 40);
         let paths = random_paths(&mut random, 500);
         let (oracle, ignored_parents) = git_results(&patterns, &paths, batch);
-        let (matcher, _) = Gitignore::compile(&patterns);
+        let (matcher, _) = OneFile::compile(&patterns);
 
         for ((path, is_dir), want) in paths.iter().zip(oracle) {
             if parents(path).any(|parent| ignored_parents.contains(parent)) {
                 continue;
             }
-            let got = matcher.matched(Path::new(path), *is_dir);
+            let got = matched(&matcher, path.as_bytes(), *is_dir);
             assert_eq!(
                 got, want,
                 "Git differential mismatch for {path:?}, is_dir={is_dir}\npatterns:\n{patterns}"
@@ -56,10 +55,10 @@ fn agrees_with_git_on_seeded_random_and_structured_cases() {
 
     let (patterns, paths) = structured_cases(&mut random, 64);
     let (oracle, _) = git_results(&patterns, &paths, 99);
-    let (matcher, errors) = Gitignore::compile(&patterns);
+    let (matcher, errors) = OneFile::compile(&patterns);
     assert!(errors.is_empty(), "structured generator errors: {errors:?}");
     for ((path, is_dir), want) in paths.iter().zip(oracle) {
-        let got = matcher.matched(Path::new(path), *is_dir);
+        let got = matched(&matcher, path.as_bytes(), *is_dir);
         assert_eq!(got, want, "structured mismatch for {path:?}\n{patterns}");
         coverage.record(want);
         compared += 1;

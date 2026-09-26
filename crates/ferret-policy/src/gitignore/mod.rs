@@ -1,28 +1,26 @@
-//! Gitignore pattern-list compilation and last-match-wins dispatch.
+//! Gitignore line parsing and a last-match-wins index over basename patterns.
 //!
-//! `pattern` owns parsing and matching one pattern. This module keeps pattern
-//! positions while partitioning common shapes into fast lookup buckets. Tests
+//! `pattern` owns parsing one pattern, matching one component, and stepping
+//! an anchored pattern through directories. This module parses a file's lines
+//! and indexes one directory's basename rules, keeping their positions while
+//! partitioning common shapes into fast lookup buckets. Tests
 //! use Git 2.54 only as a black-box oracle; no Git or third-party matcher
 //! source or tests are used.
 
 mod fxhash;
 mod pattern;
 
-use std::path::Path;
+pub(crate) use fxhash::FxHashMap;
+pub(crate) use pattern::{Pattern, RuleText};
 
-use fxhash::FxHashMap;
-
-pub(crate) use pattern::Pattern;
-
-/// The result of matching one path against one ignore file.
+/// What the last matching rule says about an entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Match {
-    None,
     Ignore,
     Whitelist,
 }
 
-/// One invalid line, omitted from the compiled matcher.
+/// One invalid line, omitted from the rules.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LineError {
     pub(crate) line: usize,
@@ -30,28 +28,42 @@ pub(crate) struct LineError {
     pub(crate) detail: String,
 }
 
-/// A compiled ignore file. Pattern positions let fast buckets and general
-/// patterns jointly implement last-match-wins.
+/// Parses every line of one ignore file, in source order, and returns the
+/// invalid ones separately. A bad line never prevents another line in the
+/// same file from applying.
+pub(crate) fn parse(text: &str) -> (Vec<Pattern>, Vec<LineError>) {
+    let mut patterns = Vec::new();
+    let mut errors = Vec::new();
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    for (index, line) in text.split('\n').enumerate() {
+        let original = line.strip_suffix('\r').unwrap_or(line);
+        let original = original.split('\0').next().unwrap_or(original);
+        match Pattern::compile(index, original) {
+            Ok(Some(pattern)) => patterns.push(pattern),
+            Ok(None) => {}
+            Err(detail) => errors.push(LineError {
+                line: index + 1,
+                pattern: original.to_owned(),
+                detail,
+            }),
+        }
+    }
+    (patterns, errors)
+}
+
+/// Basename patterns indexed for last-match-wins. Pattern positions let fast
+/// buckets and general patterns jointly implement it: each bucket is appended
+/// in position order, scanned backwards, and cut off below the best position
+/// another bucket already found.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Gitignore {
-    // Each bucket is appended in source order. Matching scans it backwards and
-    // compares its newest result with the best index found in other buckets.
     literals: FxHashMap<Vec<u8>, Vec<FastMatch>>,
-    paths: FxHashMap<Vec<u8>, Vec<FastMatch>>,
     extensions: FxHashMap<Vec<u8>, Vec<FastMatch>>,
     prefixes: Vec<ByteFastMatch>,
     suffixes: Vec<ByteFastMatch>,
     contains: Vec<ByteFastMatch>,
     fixed_suffixes: Vec<FixedSuffixMatch>,
-    basename_general: Vec<Pattern>,
-    anchored_any: Vec<Pattern>,
-    /// Anchored patterns whose last component is literal, by that component:
-    /// a path can only match one if its basename is that literal. This is
-    /// where `**/.claude/worktrees/` lands, which would otherwise be tried
-    /// against every entry.
-    anchored_by_last: FxHashMap<Vec<u8>, Vec<Pattern>>,
-    anchored_by_prefix2: FxHashMap<u16, Vec<Pattern>>,
-    anchored_by_first: FxHashMap<u8, Vec<Pattern>>,
+    general: Vec<Pattern>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,119 +86,49 @@ struct FixedSuffixMatch {
 }
 
 impl Gitignore {
-    /// Compiles all valid lines and returns invalid ones separately. A bad line
-    /// never prevents another line in the same file from applying.
-    pub(crate) fn compile(text: &str) -> (Self, Vec<LineError>) {
-        let (matcher, errors, _) = Self::compile_inner(text, false);
-        (matcher, errors)
-    }
-
-    /// Compiles each normalized source line once. The returned patterns let
-    /// policy derive traversal reincludes from the same parse as matching.
-    pub(crate) fn compile_patterns(text: &str) -> (Self, Vec<LineError>, Vec<Pattern>) {
-        Self::compile_inner(text, true)
-    }
-
-    fn compile_inner(text: &str, retain_patterns: bool) -> (Self, Vec<LineError>, Vec<Pattern>) {
+    /// Indexes basename patterns. Last-match order is by each pattern's
+    /// index, so callers may pass them in any order.
+    pub(crate) fn from_patterns(patterns: impl IntoIterator<Item = Pattern>) -> Self {
+        let mut patterns: Vec<Pattern> = patterns.into_iter().collect();
+        patterns.sort_by_key(|pattern| pattern.index);
         let mut matcher = Self::default();
-        let mut errors = Vec::new();
-        let mut patterns = Vec::new();
-        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        for (index, line) in text.split('\n').enumerate() {
-            let original = line.strip_suffix('\r').unwrap_or(line);
-            let original = original.split('\0').next().unwrap_or(original);
-            match Pattern::compile(index, original) {
-                Ok(Some(pattern)) => {
-                    if retain_patterns {
-                        patterns.push(pattern.clone());
-                    }
-                    matcher.push(pattern);
-                }
-                Ok(None) => {}
-                Err(detail) => errors.push(LineError {
-                    line: index + 1,
-                    pattern: original.to_owned(),
-                    detail,
-                }),
-            }
+        for pattern in patterns {
+            matcher.push(pattern);
         }
-        (matcher, errors, patterns)
+        matcher
     }
 
-    /// Returns the last matching line's action for `path` itself. Exclusion by
-    /// a matching parent directory is deliberately the walker's responsibility.
-    pub(crate) fn matched(&self, path: &Path, is_dir: bool) -> Match {
-        let bytes = path.as_os_str().as_encoded_bytes();
-        let basename = bytes
-            .iter()
-            .rposition(|byte| *byte == b'/')
-            .map_or(bytes, |slash| &bytes[slash + 1..]);
-
+    /// The index and action of the last pattern that matches entry `name`.
+    pub(crate) fn best(&self, name: &[u8], is_dir: bool) -> Option<(usize, Match)> {
         let mut best = self
             .literals
-            .get(basename)
+            .get(name)
             .and_then(|entries| latest_fast(entries, is_dir));
-        if let Some(candidate) = self
-            .paths
-            .get(bytes)
-            .and_then(|entries| latest_fast(entries, is_dir))
-            && best.is_none_or(|current| candidate.index > current.index)
-        {
-            best = Some(candidate);
-        }
-        if let Some(dot) = basename.iter().rposition(|byte| *byte == b'.')
+        if let Some(dot) = name.iter().rposition(|byte| *byte == b'.')
             && let Some(candidate) = self
                 .extensions
-                .get(&basename[dot..])
+                .get(&name[dot..])
                 .and_then(|entries| latest_fast(entries, is_dir))
             && best.is_none_or(|current| candidate.index > current.index)
         {
             best = Some(candidate);
         }
-        scan_byte_fast(
-            &self.prefixes,
-            basename,
-            is_dir,
-            &mut best,
-            |name, bytes| name.starts_with(bytes),
-        );
-        scan_byte_fast(
-            &self.suffixes,
-            basename,
-            is_dir,
-            &mut best,
-            |name, bytes| name.ends_with(bytes),
-        );
-        scan_byte_fast(
-            &self.contains,
-            basename,
-            is_dir,
-            &mut best,
-            |name, bytes| name.windows(bytes.len()).any(|window| window == bytes),
-        );
-        scan_fixed_suffixes(&self.fixed_suffixes, basename, is_dir, &mut best);
-        let prefixed = bytes
-            .first()
-            .and_then(|first| self.anchored_by_first.get(first))
-            .map_or(&[][..], Vec::as_slice);
-        let prefix2 = bytes
-            .get(..2)
-            .map(|prefix| u16::from_ne_bytes([prefix[0], prefix[1]]))
-            .and_then(|prefix| self.anchored_by_prefix2.get(&prefix))
-            .map_or(&[][..], Vec::as_slice);
-        let by_last = self
-            .anchored_by_last
-            .get(basename)
-            .map_or(&[][..], Vec::as_slice);
-        scan_patterns(&self.basename_general, bytes, basename, is_dir, &mut best);
-        scan_patterns(by_last, bytes, basename, is_dir, &mut best);
-        scan_patterns(&self.anchored_any, bytes, basename, is_dir, &mut best);
-        scan_patterns(prefixed, bytes, basename, is_dir, &mut best);
-        scan_patterns(prefix2, bytes, basename, is_dir, &mut best);
-        best.map_or(Match::None, |candidate| candidate.result)
+        scan_byte_fast(&self.prefixes, name, is_dir, &mut best, |name, bytes| {
+            name.starts_with(bytes)
+        });
+        scan_byte_fast(&self.suffixes, name, is_dir, &mut best, |name, bytes| {
+            name.ends_with(bytes)
+        });
+        scan_byte_fast(&self.contains, name, is_dir, &mut best, |name, bytes| {
+            name.windows(bytes.len()).any(|window| window == bytes)
+        });
+        scan_fixed_suffixes(&self.fixed_suffixes, name, is_dir, &mut best);
+        scan_patterns(&self.general, name, is_dir, &mut best);
+        best.map(|candidate| (candidate.index, candidate.result))
     }
 
     fn push(&mut self, pattern: Pattern) {
+        debug_assert!(pattern.basename_only);
         let fast = FastMatch {
             index: pattern.index,
             result: pattern.result,
@@ -194,8 +136,6 @@ impl Gitignore {
         };
         if let Some(literal) = pattern.literal_basename() {
             self.literals.entry(literal).or_default().push(fast);
-        } else if let Some(path) = pattern.literal_path() {
-            self.paths.entry(path).or_default().push(fast);
         } else if let Some(extension) = pattern.simple_extension() {
             self.extensions.entry(extension).or_default().push(fast);
         } else if let Some(prefix) = pattern.basename_prefix() {
@@ -216,22 +156,8 @@ impl Gitignore {
         } else if let Some(width) = pattern.fixed_basename_suffix_width() {
             self.fixed_suffixes
                 .push(FixedSuffixMatch { pattern, width });
-        } else if pattern.basename_only {
-            self.basename_general.push(pattern);
-        } else if let Some(last) = pattern.last_literal() {
-            self.anchored_by_last.entry(last).or_default().push(pattern);
-        } else if let Some(prefix) = pattern.first_literal_prefix2() {
-            self.anchored_by_prefix2
-                .entry(prefix)
-                .or_default()
-                .push(pattern);
-        } else if let Some(first) = pattern.first_literal_byte() {
-            self.anchored_by_first
-                .entry(first)
-                .or_default()
-                .push(pattern);
         } else {
-            self.anchored_any.push(pattern);
+            self.general.push(pattern);
         }
     }
 }
@@ -276,18 +202,12 @@ fn scan_byte_fast(
     }
 }
 
-fn scan_patterns(
-    patterns: &[Pattern],
-    path: &[u8],
-    basename: &[u8],
-    is_dir: bool,
-    best: &mut Option<FastMatch>,
-) {
+fn scan_patterns(patterns: &[Pattern], name: &[u8], is_dir: bool, best: &mut Option<FastMatch>) {
     for pattern in patterns.iter().rev() {
         if best.is_some_and(|candidate| pattern.index < candidate.index) {
             break;
         }
-        if pattern.matches(path, basename, is_dir) {
+        if pattern.matches_name(name, is_dir) {
             *best = Some(FastMatch {
                 index: pattern.index,
                 result: pattern.result,

@@ -2,7 +2,8 @@
 //!
 //! Each area module holds a table of rows: the ignore-file text, one path, its
 //! kind, and git's answer. Every row is checked twice: its area test drives
-//! `Gitignore::compile` + `matched`, and `oracle` asks `git check-ignore` the
+//! [`OneFile`], the walk's own compile, cursor steps and list index over one
+//! file, and `oracle` asks `git check-ignore` the
 //! same question, so no expected value rests on a reading of the manual alone.
 //! `differential` keeps the seeded random comparison with git.
 //!
@@ -21,12 +22,27 @@ mod oracle;
 mod ordering;
 mod syntax;
 
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use crate::rules::OneFile;
 
-use super::Gitignore;
-use super::Match::{self, Ignore, None as Unmatched, Whitelist};
+/// What git says about one path: no line matched, or the last matching
+/// line ignores or re-includes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Match {
+    None,
+    Ignore,
+    Whitelist,
+}
+
+use Match::{Ignore, None as Unmatched, Whitelist};
+
+/// Asks `matcher` about `path` as git would be asked.
+fn matched(matcher: &OneFile, path: &[u8], is_dir: bool) -> Match {
+    match matcher.matched(path, is_dir) {
+        Some(true) => Whitelist,
+        Some(false) => Ignore,
+        None => Unmatched,
+    }
+}
 
 /// Whether the queried path is a file or a directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,8 +81,8 @@ impl From<&Row> for Case {
 
 impl Case {
     fn matched(&self) -> (Match, usize) {
-        let (matcher, errors) = Gitignore::compile(&self.patterns);
-        let got = matcher.matched(Path::new(OsStr::from_bytes(&self.path)), self.kind == Dir);
+        let (matcher, errors) = OneFile::compile(&self.patterns);
+        let got = matched(&matcher, &self.path, self.kind == Dir);
         (got, errors.len())
     }
 

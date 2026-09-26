@@ -9,11 +9,11 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
-pub(super) type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub(crate) type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 /// The rustc hasher's mixing step, eight bytes at a time.
 #[derive(Clone, Copy, Default)]
-pub(super) struct FxHasher {
+pub(crate) struct FxHasher {
     hash: u64,
 }
 

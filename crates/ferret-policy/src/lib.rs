@@ -14,13 +14,15 @@
 //! per entry, and [`sniff`] per file it would index. Knows nothing about the
 //! catalog or the index. Tested against the golden corpus in `tests/golden/`.
 //!
-//! Seams: `rules` holds the precedence chain, `reinclude` the one extension
-//! over gitignore semantics (re-including beneath an excluded directory).
-//! Pattern syntax and matching are implemented in this crate (D16), behind
-//! this API so callers do not depend on matcher details.
+//! Seams: `rules` holds the precedence order as one list of rules per
+//! directory (D19), including the one extension over gitignore semantics
+//! (re-including beneath an excluded directory); `lists` interns those lists
+//! so each distinct one is compiled once. Pattern syntax and matching are
+//! implemented in this crate (D16), behind this API so callers do not depend
+//! on matcher details.
 
 mod gitignore;
-mod reinclude;
+mod lists;
 mod rules;
 
 use std::fmt;

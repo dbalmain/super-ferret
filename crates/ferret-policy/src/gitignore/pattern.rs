@@ -1,11 +1,13 @@
-//! One parsed gitignore pattern and its bounded iterative matchers.
+//! One parsed gitignore pattern, its component matcher, and the cursor steps
+//! that apply an anchored pattern one directory at a time.
 //!
 //! Separators are recognized before component syntax, including `\/`. A
-//! slash-free component uses the standard last-star retry loop; path components
-//! use the same loop with globstar as their star. Both take O(pattern x path)
-//! work, without recursion or per-match allocation.
-
-use std::path::Path;
+//! component uses the standard last-star retry loop, O(pattern x name) work
+//! without recursion or allocation. An anchored pattern is never matched
+//! against a whole path: the walker steps cursors through it per directory
+//! ([`Pattern::advance`]) and projects each live cursor onto the entry names
+//! of one directory ([`Pattern::project_basename`]). A pattern of k
+//! components holds at most k cursors, so a step is O(k) component matches.
 
 use super::Match;
 
@@ -16,7 +18,6 @@ pub(crate) struct Pattern {
     pub(super) directory_only: bool,
     pub(super) basename_only: bool,
     components: Box<[Component]>,
-    flat: Option<ComponentGlob>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -32,12 +33,12 @@ enum Component {
     Never,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ComponentGlob {
     atoms: Box<[Atom]>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Atom {
     Literal(Box<[u8]>),
     Any,
@@ -45,13 +46,13 @@ enum Atom {
     Class(CharacterClass),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CharacterClass {
     negated: bool,
     terms: Box<[ClassTerm]>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ClassTerm {
     Byte(u8),
     Range(u8, u8),
@@ -64,7 +65,7 @@ enum ClassMember {
     Posix(PosixClass),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum PosixClass {
     Alnum,
     Alpha,
@@ -116,51 +117,42 @@ impl Pattern {
             }
         }
         let components: Box<[Component]> = components.into_boxed_slice();
-        let flat = flatten_components(&components);
         Ok(Some(Self {
             index,
             result,
             directory_only: parsed.trailing_separator,
             basename_only,
             components,
-            flat,
         }))
     }
 
-    pub(super) fn matches(&self, path: &[u8], basename: &[u8], is_dir: bool) -> bool {
-        if self.directory_only && !is_dir {
-            return false;
-        }
-        if self.basename_only {
-            return self.components[0].matches(basename);
-        }
-        if let Some(prefix) = self.components.first().and_then(Component::literal_slice)
-            && (!path.starts_with(prefix) || !matches!(path.get(prefix.len()), None | Some(b'/')))
-        {
-            return false;
-        }
-        if let Some(flat) = &self.flat {
-            return flat.matches_path(path);
-        }
-        matches_components_observed(&self.components, path, || {})
+    /// Whether this basename pattern matches entry `name`, honouring
+    /// `directory_only`. Only basename patterns reach a list's index; an
+    /// anchored pattern is stepped with [`advance`](Self::advance) and
+    /// projected with [`project_basename`](Self::project_basename) first.
+    pub(super) fn matches_name(&self, name: &[u8], is_dir: bool) -> bool {
+        debug_assert!(self.basename_only);
+        (!self.directory_only || is_dir) && self.components[0].matches(name)
+    }
+
+    /// Source line index, for last-match-wins order within one file.
+    pub(crate) fn line(&self) -> usize {
+        self.index
+    }
+
+    /// A `!` pattern.
+    pub(crate) fn is_whitelist(&self) -> bool {
+        self.result == Match::Whitelist
+    }
+
+    /// How many components an anchored pattern has; a cursor's position is
+    /// below this.
+    pub(crate) fn component_count(&self) -> usize {
+        self.components.len()
     }
 
     pub(super) fn literal_basename(&self) -> Option<Vec<u8>> {
         self.basename_glob()?.literal_bytes()
-    }
-
-    pub(super) fn literal_path(&self) -> Option<Vec<u8>> {
-        if self.basename_only {
-            return None;
-        }
-        let mut path = Vec::new();
-        for component in &self.components {
-            if !path.is_empty() {
-                path.push(b'/');
-            }
-            path.extend(component.literal_bytes()?);
-        }
-        Some(path)
     }
 
     pub(super) fn simple_extension(&self) -> Option<Vec<u8>> {
@@ -225,48 +217,12 @@ impl Pattern {
         };
         let mut at = 0;
         for atom in &glob.atoms[1..] {
-            let Some(consumed) = atom.consumes(&suffix[at..], false) else {
+            let Some(consumed) = atom.consumes(&suffix[at..]) else {
                 return false;
             };
             at += consumed;
         }
         at == suffix.len()
-    }
-
-    /// The last component, when it is a literal. Only for anchored patterns:
-    /// a basename pattern has its own buckets.
-    pub(super) fn last_literal(&self) -> Option<Vec<u8>> {
-        if self.basename_only {
-            return None;
-        }
-        self.components.last()?.literal_bytes()
-    }
-
-    pub(super) fn first_literal_byte(&self) -> Option<u8> {
-        if self.basename_only {
-            return None;
-        }
-        let Component::Glob(glob) = self.components.first()? else {
-            return None;
-        };
-        let Atom::Literal(run) = glob.atoms.first()? else {
-            return None;
-        };
-        run.first().copied()
-    }
-
-    pub(super) fn first_literal_prefix2(&self) -> Option<u16> {
-        if self.basename_only {
-            return None;
-        }
-        let Component::Glob(glob) = self.components.first()? else {
-            return None;
-        };
-        let Atom::Literal(run) = glob.atoms.first()? else {
-            return None;
-        };
-        let prefix = run.get(..2)?;
-        Some(u16::from_ne_bytes([prefix[0], prefix[1]]))
     }
 
     fn basename_glob(&self) -> Option<&ComponentGlob> {
@@ -301,28 +257,123 @@ impl Pattern {
             && (!later.directory_only || self.directory_only)
     }
 
-    pub(crate) fn reaches_below(&self, dir: &Path) -> bool {
-        let mut path_at = 0;
-        for (component_at, component) in self.components.iter().enumerate() {
-            if matches!(component, Component::Globstar { .. }) {
-                return component_at != 0
-                    && self.components[component_at + 1..]
-                        .iter()
-                        .all(Component::has_witness);
+    /// A basename rule is not stepped on enter. A leading `**/` plus one
+    /// component matches in every directory, so it is one too; `**\/x`
+    /// (`allow_zero: false`) is not, because it cannot match at its own
+    /// file's directory.
+    pub(crate) fn is_shared_basename(&self) -> bool {
+        self.basename_only
+            || matches!(
+                self.components.as_ref(),
+                [Component::Globstar { allow_zero: true }, _]
+            )
+    }
+
+    /// Cursors in the child directory after consuming `name`, appended to
+    /// `out` without duplicating a position.
+    ///
+    /// `fed` means the cursor sits on a globstar that has already consumed
+    /// the directory a `**\/` pattern requires, so that globstar may now
+    /// match zero further components. A pattern of k components therefore
+    /// holds at most k cursors in one directory.
+    pub(crate) fn advance(&self, pos: usize, fed: bool, name: &[u8], out: &mut Vec<(usize, bool)>) {
+        let Some(component) = self.components.get(pos) else {
+            return;
+        };
+        if let Component::Globstar { allow_zero } = *component {
+            // Consuming `name` leaves the globstar fed whether or not it was
+            // allowed to match zero components before this directory.
+            push_cursor(out, pos, true);
+            if allow_zero || fed {
+                self.advance(pos + 1, false, name, out);
             }
-            let Some((path_component, next)) =
-                next_component(dir.as_os_str().as_encoded_bytes(), path_at)
-            else {
-                return self.components[component_at..]
-                    .iter()
-                    .all(Component::has_witness);
-            };
-            if !component.matches(path_component) {
-                return false;
-            }
-            path_at = next;
+            return;
         }
-        false
+        if component.matches(name) {
+            let next = pos + 1;
+            if next < self.components.len() {
+                push_cursor(out, next, false);
+            }
+        }
+    }
+
+    /// A basename pattern that matches the same entry names as the cursor
+    /// `(pos, fed)` does in its directory. `None` when nothing in this
+    /// directory can match: the cursor only constrains descendants.
+    ///
+    /// A shared basename pattern projects at `(0, false)` to itself (a
+    /// leading `**/` dropped). A lone `*` is rewritten to `?*` because the
+    /// basename fast path reads a bare star as a zero-width suffix, which
+    /// would match only an empty name.
+    pub(crate) fn project_basename(&self, pos: usize, fed: bool) -> Option<Self> {
+        let glob = match self.projection(pos, fed)? {
+            Projection::Any => any_glob(),
+            Projection::Glob(glob) => normalize_star(glob.clone()),
+        };
+        Some(Self {
+            index: self.index,
+            result: self.result,
+            directory_only: self.directory_only,
+            basename_only: true,
+            components: Box::from([Component::Glob(glob)]),
+        })
+    }
+
+    fn projection(&self, pos: usize, fed: bool) -> Option<Projection<'_>> {
+        if self.basename_only {
+            return match (pos, &*self.components) {
+                (0, [Component::Glob(glob)]) => Some(Projection::Glob(glob)),
+                _ => None,
+            };
+        }
+        let rest = self.components.get(pos..)?;
+        if rest.is_empty() {
+            return None;
+        }
+        let mut at = 0;
+        if fed {
+            if !matches!(rest.first(), Some(Component::Globstar { .. })) {
+                return None;
+            }
+            if rest.len() == 1 {
+                return Some(Projection::Any);
+            }
+            at = 1;
+        }
+        while let Some(Component::Globstar { allow_zero: true }) = rest.get(at) {
+            if at + 1 == rest.len() {
+                break;
+            }
+            at += 1;
+        }
+        match rest.get(at)? {
+            Component::Globstar { .. } if at + 1 == rest.len() => Some(Projection::Any),
+            Component::Glob(glob) if at + 1 == rest.len() => Some(Projection::Glob(glob)),
+            _ => None,
+        }
+    }
+
+    /// This pattern with source index `index`: a list merged from several
+    /// files numbers its rules by list position instead of source line.
+    pub(crate) fn renumbered(&self, index: usize) -> Self {
+        Self {
+            index,
+            ..self.clone()
+        }
+    }
+
+    /// What decides a basename pattern's matches: its glob and flags, not
+    /// its line. Two rules with equal text are interchangeable in a list.
+    pub(crate) fn text(&self) -> RuleText {
+        debug_assert!(self.basename_only);
+        RuleText {
+            glob: match &self.components[0] {
+                Component::Glob(glob) => Some(glob.clone()),
+                Component::Globstar { .. } | Component::Never => None,
+            },
+            whitelist: self.is_whitelist(),
+            directory_only: self.directory_only,
+        }
     }
 
     #[cfg(test)]
@@ -331,15 +382,45 @@ impl Pattern {
             return (false, 0);
         };
         let mut steps = 0;
-        let matched = glob.matches_observed(text, false, || steps += 1);
+        let matched = glob.matches_observed(text, || steps += 1);
         (matched, steps)
     }
+}
 
-    #[cfg(test)]
-    pub(super) fn path_match_steps(&self, path: &[u8]) -> (bool, usize) {
-        let mut steps = 0;
-        let matched = matches_components_observed(&self.components, path, || steps += 1);
-        (matched, steps)
+/// The rendered text of a basename rule: see [`Pattern::text`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RuleText {
+    glob: Option<ComponentGlob>,
+    whitelist: bool,
+    directory_only: bool,
+}
+
+/// What a cursor projects to in its directory.
+enum Projection<'a> {
+    Any,
+    Glob(&'a ComponentGlob),
+}
+
+fn push_cursor(out: &mut Vec<(usize, bool)>, pos: usize, fed: bool) {
+    if let Some(existing) = out.iter_mut().find(|(at, _)| *at == pos) {
+        existing.1 |= fed;
+        return;
+    }
+    out.push((pos, fed));
+}
+
+/// `?*`: every non-empty name. A path component is never empty.
+fn any_glob() -> ComponentGlob {
+    ComponentGlob {
+        atoms: Box::from([Atom::Any, Atom::Star]),
+    }
+}
+
+fn normalize_star(glob: ComponentGlob) -> ComponentGlob {
+    if matches!(glob.atoms.as_ref(), [Atom::Star]) {
+        any_glob()
+    } else {
+        glob
     }
 }
 
@@ -350,23 +431,6 @@ impl Component {
             Self::Glob(glob) => glob.matches(text),
             Self::Never => false,
         }
-    }
-
-    fn literal_bytes(&self) -> Option<Vec<u8>> {
-        let Self::Glob(glob) = self else {
-            return None;
-        };
-        glob.literal_bytes()
-    }
-
-    fn literal_slice(&self) -> Option<&[u8]> {
-        let Self::Glob(glob) = self else {
-            return None;
-        };
-        let [Atom::Literal(run)] = glob.atoms.as_ref() else {
-            return None;
-        };
-        Some(run)
     }
 
     fn has_witness(&self) -> bool {
@@ -410,14 +474,10 @@ impl Atom {
 
 impl ComponentGlob {
     fn matches(&self, text: &[u8]) -> bool {
-        self.matches_observed(text, false, || {})
+        self.matches_observed(text, || {})
     }
 
-    fn matches_path(&self, text: &[u8]) -> bool {
-        self.matches_observed(text, true, || {})
-    }
-
-    fn matches_observed(&self, text: &[u8], path_mode: bool, mut step: impl FnMut()) -> bool {
+    fn matches_observed(&self, text: &[u8], mut step: impl FnMut()) -> bool {
         let mut atom_at = 0;
         let mut text_at = 0;
         let mut star: Option<(usize, usize)> = None;
@@ -432,7 +492,7 @@ impl ComponentGlob {
             if let Some(consumed) = self
                 .atoms
                 .get(atom_at)
-                .and_then(|atom| atom.consumes(&text[text_at..], path_mode))
+                .and_then(|atom| atom.consumes(&text[text_at..]))
             {
                 atom_at += 1;
                 text_at += consumed;
@@ -442,9 +502,6 @@ impl ComponentGlob {
                 return false;
             };
             if *retry_at == text.len() {
-                return false;
-            }
-            if path_mode && text[*retry_at] == b'/' {
                 return false;
             }
             *retry_at += 1;
@@ -460,17 +517,14 @@ impl ComponentGlob {
 }
 
 impl Atom {
-    fn consumes(&self, text: &[u8], path_mode: bool) -> Option<usize> {
+    fn consumes(&self, text: &[u8]) -> Option<usize> {
         match self {
             Self::Literal(run) => text.starts_with(run).then_some(run.len()),
-            Self::Any => text
-                .first()
-                .is_some_and(|byte| !path_mode || *byte != b'/')
-                .then_some(1),
+            Self::Any => (!text.is_empty()).then_some(1),
             Self::Star => None,
             Self::Class(class) => text
                 .first()
-                .is_some_and(|byte| (!path_mode || *byte != b'/') && class.matches(*byte))
+                .is_some_and(|byte| class.matches(*byte))
                 .then_some(1),
         }
     }
@@ -659,22 +713,6 @@ fn compile_component(part: &[PatternByte], anchored: bool) -> Component {
     })
 }
 
-fn flatten_components(components: &[Component]) -> Option<ComponentGlob> {
-    let mut atoms = Vec::new();
-    for (component_at, component) in components.iter().enumerate() {
-        if component_at != 0 {
-            atoms.push(Atom::Literal(Box::from(&b"/"[..])));
-        }
-        let Component::Glob(glob) = component else {
-            return None;
-        };
-        atoms.extend(glob.atoms.iter().cloned());
-    }
-    Some(ComponentGlob {
-        atoms: atoms.into_boxed_slice(),
-    })
-}
-
 fn flush_literal(atoms: &mut Vec<Atom>, literal: &mut Vec<u8>) {
     if !literal.is_empty() {
         atoms.push(Atom::Literal(std::mem::take(literal).into_boxed_slice()));
@@ -805,67 +843,6 @@ fn compile_class(part: &[PatternByte], start: usize) -> Option<(CharacterClass, 
         },
         end,
     ))
-}
-
-fn matches_components_observed(pattern: &[Component], path: &[u8], mut step: impl FnMut()) -> bool {
-    let mut pattern_at = 0;
-    let mut path_at = 0;
-    let mut globstar: Option<(usize, usize)> = None;
-
-    while let Some((path_component, next_path)) = next_component(path, path_at) {
-        step();
-        if let Some(Component::Globstar { allow_zero }) = pattern.get(pattern_at) {
-            if pattern_at + 1 == pattern.len() {
-                return true;
-            }
-            globstar = Some((pattern_at + 1, path_at));
-            pattern_at += 1;
-            if !allow_zero {
-                let Some((_, next_path)) = next_component(path, path_at) else {
-                    return false;
-                };
-                path_at = next_path;
-            }
-            continue;
-        }
-        if pattern
-            .get(pattern_at)
-            .is_some_and(|component| component.matches(path_component))
-        {
-            pattern_at += 1;
-            path_at = next_path;
-            continue;
-        }
-        let Some((after_globstar, retry_at)) = globstar.as_mut() else {
-            return false;
-        };
-        let Some((_, next_retry)) = next_component(path, *retry_at) else {
-            return false;
-        };
-        *retry_at = next_retry;
-        pattern_at = *after_globstar;
-        path_at = next_retry;
-    }
-
-    while matches!(pattern.get(pattern_at), Some(Component::Globstar { .. })) {
-        if pattern_at + 1 == pattern.len() {
-            return false;
-        }
-        pattern_at += 1;
-    }
-    pattern_at == pattern.len()
-}
-
-fn next_component(path: &[u8], at: usize) -> Option<(&[u8], usize)> {
-    if at >= path.len() {
-        return None;
-    }
-    let end = path[at..]
-        .iter()
-        .position(|byte| *byte == b'/')
-        .map_or(path.len(), |offset| at + offset);
-    let next = if end < path.len() { end + 1 } else { end };
-    Some((&path[at..end], next))
 }
 
 fn trim_trailing_spaces(mut line: &str) -> &str {
