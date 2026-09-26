@@ -89,26 +89,34 @@ cursor, along with the cost units.
 
 ## The catalog (D4, D5)
 
-Five tables. `names`, `inodes` and `docs` have dense `u32` ids assigned by the
-catalog; `roots` and `links` hang off an existing `InoId`. Raw inode numbers are
-data, never keys.
+Six tables. `names`, `inodes` and `docs` have dense `u32` ids assigned by the
+catalog; `roots`, `links` and `worktrees` hang off an existing `InoId`. Raw
+inode numbers are data, never keys.
 
-| Table    | Id       | Row                                                                     |
-| -------- | -------- | ----------------------------------------------------------------------- |
-| `names`  | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`  |
-| `inodes` | `InoId`  | `(dev, ino)`, kind, size, mtime, ctime, mode, uid, gid, `DocId` or none |
-| `docs`   | `DocId`  | content hash (BLAKE3, 128 bits kept), live flag                         |
-| `roots`  | —        | configured root paths and the `InoId` of each                           |
-| `links`  | —        | a symlink's `InoId`, its target as `readlink` returned it (in the heap) |
+| Table       | Id       | Row                                                                                                                             |
+| ----------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`                                                          |
+| `inodes`    | `InoId`  | `(dev, ino)`, kind, size, mtime, ctime, mode, uid, gid, `DocId` or none                                                         |
+| `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept), live flag                                                                                 |
+| `roots`     | —        | configured root paths and the `InoId` of each                                                                                   |
+| `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the heap)                                                         |
+| `worktrees` | —        | a work tree's top directory `InoId`, kind (main / linked / submodule), repository id (the common directory's path, in the heap) |
 
 Derived at load: `hash → DocId`, `DocId → [InoId]`, `InoId → [NameId]`
-(directories have exactly one name). A path is the walk from a name through its
+(directories have exactly one name), and each directory's work tree from the
+nearest `worktrees` row above it. A path is the walk from a name through its
 parent's name to a root.
 
 A symlink is catalogued as itself — an `inodes` row of kind symlink, named like
 any file — and never followed. Its target text is stored now so that D18's
 reverse map (target path → links) and content matches through links can be
 derived at load later, without a re-crawl.
+
+A work tree is recorded at its top directory so results can show a match once
+across a repository's linked work trees (D23): by default a hit shows once with
+a count of identical copies in other work trees, a copy that differs shows
+separately, and hiding linked work trees entirely is a query flag. A submodule
+is its own repository, not a duplicate.
 
 What each change costs:
 

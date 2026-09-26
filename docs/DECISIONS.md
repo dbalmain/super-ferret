@@ -907,6 +907,11 @@ change it: if the name scan (D14) needs the work-tree filter inside its inner
 loop and the derived map is too slow there — then a per-directory bit, still not
 B.
 
+> Dave: Agree with this recommendation
+
+**Answer (2026-09-26): A, with C as the default display.** DESIGN § The catalog
+gains the `worktrees` table.
+
 ## Settled without a brief (object if wrong)
 
 - The CLI emits JSON lines behind a flag from the first slice, with stable exit
