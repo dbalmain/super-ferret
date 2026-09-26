@@ -25,19 +25,19 @@ struct PatternByte {
     escaped: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Component {
     Globstar { allow_zero: bool },
     Glob(ComponentGlob),
     Never,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ComponentGlob {
     atoms: Box<[Atom]>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Atom {
     Literal(Box<[u8]>),
     Any,
@@ -45,13 +45,13 @@ enum Atom {
     Class(CharacterClass),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CharacterClass {
     negated: bool,
     terms: Box<[ClassTerm]>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClassTerm {
     Byte(u8),
     Range(u8, u8),
@@ -64,7 +64,7 @@ enum ClassMember {
     Posix(PosixClass),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PosixClass {
     Alnum,
     Alpha,
@@ -278,6 +278,18 @@ impl Pattern {
             && self.components.len() >= 2
             && !matches!(self.components.first(), Some(Component::Globstar { .. }))
             && self.components.iter().all(Component::has_witness)
+    }
+
+    /// Whether a later exclusion covers every path this re-include can match.
+    /// The comparison is deliberately conservative: parsed component
+    /// structure must be identical, and a directory-only exclusion cannot
+    /// cancel a re-include that also matches files.
+    pub(crate) fn is_superseded_by(&self, later: &Self) -> bool {
+        self.result == Match::Whitelist
+            && later.result == Match::Ignore
+            && self.basename_only == later.basename_only
+            && self.components == later.components
+            && (!later.directory_only || self.directory_only)
     }
 
     pub(crate) fn reaches_below(&self, dir: &Path) -> bool {

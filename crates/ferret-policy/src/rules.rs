@@ -138,7 +138,9 @@ impl DirRules {
         }
     }
 
-    /// Decides entry `name` of this directory.
+    /// Decides the entry at root-relative `path`, which must be a direct child
+    /// of this directory. The crawler can pass its existing candidate path so
+    /// decisions do not allocate a joined path for each entry.
     ///
     /// Special files are always skipped. Otherwise an entry is included when
     /// the first matching layer whitelists it or no layer matches; while
@@ -146,16 +148,15 @@ impl DirRules {
     /// includes. An included directory descends, a file indexes unless it is
     /// over the size cap, a symlink is catalogued. An excluded directory is
     /// traversed if an anchored `.ferretignore` `!` pattern reaches below it.
-    pub fn decide(&self, name: &OsStr, entry: Entry) -> Decision {
-        let path = self.path.join(name);
+    pub fn decide(&self, path: &Path, entry: Entry) -> Decision {
         let is_dir = entry == Entry::Dir;
-        let included = match self.first_match(&path, is_dir) {
+        let included = match self.first_match(path, is_dir) {
             Some((band, true)) => !self.traversing || band == Band::Ferret,
             Some((_, false)) => false,
             None => !self.traversing,
         };
         if !included {
-            return if is_dir && self.reinclude_below(&path) {
+            return if is_dir && self.reinclude_below(path) {
                 Decision::Traverse
             } else {
                 Decision::Skip
@@ -282,8 +283,18 @@ impl Layer {
             matcher,
             reincludes: if collect_reincludes {
                 patterns
-                    .into_iter()
-                    .filter_map(Reinclude::from_pattern)
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, pattern)| {
+                        if !pattern.is_anchored_reinclude()
+                            || patterns[index + 1..]
+                                .iter()
+                                .any(|later| pattern.is_superseded_by(later))
+                        {
+                            return None;
+                        }
+                        Reinclude::from_pattern(pattern.clone())
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -338,7 +349,7 @@ mod tests {
             ),
             "{errors:?}"
         );
-        let log = rules.decide(OsStr::new("x.log"), Entry::File { size: 1 });
+        let log = rules.decide(Path::new("x.log"), Entry::File { size: 1 });
         assert_eq!(log, Decision::Skip);
     }
 
@@ -361,7 +372,7 @@ mod tests {
     fn without_a_global_file_default_names_are_ordinary() {
         let (rules, _) = root(None, IgnoreFiles::default());
         assert_eq!(
-            rules.decide(OsStr::new("node_modules"), Entry::Dir),
+            rules.decide(Path::new("node_modules"), Entry::Dir),
             Decision::Descend
         );
     }
@@ -376,20 +387,68 @@ mod tests {
             let (rules, errors) = root(Some("target/\n"), files);
             assert!(errors.is_empty());
             assert_eq!(
-                rules.decide(OsStr::new("target"), Entry::Dir),
+                rules.decide(Path::new("target"), Entry::Dir),
                 Decision::Traverse
             );
             let traversed = rules.traverse(OsStr::new("target"));
-            let decision = traversed.decide(OsStr::new("doc"), Entry::Dir);
+            let decision = traversed.decide(Path::new("target/doc"), Entry::Dir);
             if decision == Decision::Traverse {
                 let doc = traversed.traverse(OsStr::new("doc"));
                 assert_eq!(
-                    doc.decide(OsStr::new("README.md"), Entry::File { size: 0 }),
+                    doc.decide(Path::new("target/doc/README.md"), Entry::File { size: 0 }),
                     Decision::Index,
                     "{content:?}"
                 );
             } else {
                 assert_eq!(decision, Decision::Descend, "{content:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_fully_superseded_reincludes_are_pruned() {
+        // This pins traversal after a negation is canceled, including the
+        // directory-only scope and last-match cases.
+        let cases = [
+            ("!/target/**\ntarget/**\n", Decision::Skip),
+            (
+                "!/target/**\ntarget/**\n!/target/doc/**\n",
+                Decision::Traverse,
+            ),
+            ("!/target/**\ntarget/**/\n", Decision::Traverse),
+            ("!/target/**/\ntarget/**\n", Decision::Skip),
+            ("!/target/**\ntarget/**\n!/target/**\n", Decision::Traverse),
+        ];
+        for (ferretignore, expected) in cases {
+            let files = IgnoreFiles {
+                ferretignore: Some(ferretignore),
+                ..IgnoreFiles::default()
+            };
+            let (rules, errors) = root(Some("target/\n"), files);
+            assert!(errors.is_empty(), "{ferretignore:?}: {errors:?}");
+            assert_eq!(
+                rules.decide(Path::new("target"), Entry::Dir),
+                expected,
+                "{ferretignore:?}"
+            );
+            if expected == Decision::Traverse {
+                let traversed = rules.traverse(OsStr::new("target"));
+                if ferretignore.ends_with("!/target/doc/**\n") {
+                    assert_eq!(
+                        traversed.decide(Path::new("target/doc"), Entry::Dir),
+                        Decision::Traverse
+                    );
+                    let doc = traversed.traverse(OsStr::new("doc"));
+                    assert_eq!(
+                        doc.decide(Path::new("target/doc/README.md"), Entry::File { size: 0 }),
+                        Decision::Index
+                    );
+                } else {
+                    assert_eq!(
+                        traversed.decide(Path::new("target/file"), Entry::File { size: 0 }),
+                        Decision::Index
+                    );
+                }
             }
         }
     }

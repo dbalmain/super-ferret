@@ -183,7 +183,7 @@ impl Case {
             .filter(|(path, _)| path.parent() == Some(dir));
         for (path, node) in children {
             let name = path.file_name().unwrap_or(OsStr::new(""));
-            let decision = rules.decide(name, node.entry);
+            let decision = rules.decide(path, node.entry);
             seen.insert(path.clone(), label(decision));
             match decision {
                 Decision::Descend => {
