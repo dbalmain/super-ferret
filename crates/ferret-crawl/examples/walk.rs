@@ -1,4 +1,5 @@
-//! `cargo run --release -p ferret-crawl --example walk -- <root> [global-file]`
+//! `cargo run --release -p ferret-crawl --example walk -- <root> [global-file]
+//! [workers]`
 //!
 //! Walks one root and prints decision counts, the error count, how many
 //! directories were entered, how many devices the walk touched, and the wall
@@ -17,7 +18,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ferret_crawl::{Event, walk};
+use ferret_crawl::{Event, EventVisitor, walk_parallel};
 use ferret_policy::{Config, DEFAULT_IGNORE, Decision, Reason};
 
 fn main() -> ExitCode {
@@ -35,6 +36,13 @@ fn main() -> ExitCode {
         },
         None => DEFAULT_IGNORE.to_owned(),
     };
+    let workers = match args.next() {
+        Some(value) => match value.to_string_lossy().parse::<usize>() {
+            Ok(workers) if workers > 0 => workers,
+            _ => return usage(),
+        },
+        None => 1,
+    };
     if args.next().is_some() {
         return usage();
     }
@@ -42,27 +50,23 @@ fn main() -> ExitCode {
     let mut counts = Counts::default();
     let mut devices = HashSet::new();
     let started = Instant::now();
-    walk(
+    let visitors = walk_parallel(
         Path::new(&root),
         Some(&global),
         Config::default(),
-        |event| match event {
-            Event::Decided(decided) => {
-                if let Some(stat) = decided.stat {
-                    devices.insert(stat.dev);
-                }
-                match decided.decision {
-                    Decision::Skip => counts.skip += 1,
-                    Decision::Descend => counts.descend += 1,
-                    Decision::Traverse => counts.traverse += 1,
-                    Decision::Index => counts.index += 1,
-                    Decision::Catalog(Reason::TooLarge) => counts.too_large += 1,
-                    Decision::Catalog(Reason::Symlink) => counts.symlink += 1,
-                }
-            }
-            Event::Io { .. } | Event::Pattern(_) => counts.errors += 1,
-        },
+        workers,
+        CountsVisitor::default,
     );
+    for visitor in visitors {
+        counts.skip += visitor.counts.skip;
+        counts.descend += visitor.counts.descend;
+        counts.traverse += visitor.counts.traverse;
+        counts.index += visitor.counts.index;
+        counts.too_large += visitor.counts.too_large;
+        counts.symlink += visitor.counts.symlink;
+        counts.errors += visitor.counts.errors;
+        devices.extend(visitor.devices);
+    }
     let wall = started.elapsed();
 
     println!("skip {}", counts.skip);
@@ -76,6 +80,33 @@ fn main() -> ExitCode {
     println!("devices {}", devices.len());
     println!("wall_s {:.3}", wall.as_secs_f64());
     ExitCode::SUCCESS
+}
+
+#[derive(Default)]
+struct CountsVisitor {
+    counts: Counts,
+    devices: HashSet<u64>,
+}
+
+impl EventVisitor for CountsVisitor {
+    fn visit(&mut self, event: Event<'_>) {
+        match event {
+            Event::Decided(decided) => {
+                if let Some(stat) = decided.stat {
+                    self.devices.insert(stat.dev);
+                }
+                match decided.decision {
+                    Decision::Skip => self.counts.skip += 1,
+                    Decision::Descend => self.counts.descend += 1,
+                    Decision::Traverse => self.counts.traverse += 1,
+                    Decision::Index => self.counts.index += 1,
+                    Decision::Catalog(Reason::TooLarge) => self.counts.too_large += 1,
+                    Decision::Catalog(Reason::Symlink) => self.counts.symlink += 1,
+                }
+            }
+            Event::Io { .. } | Event::Pattern(_) => self.counts.errors += 1,
+        }
+    }
 }
 
 #[derive(Default)]
