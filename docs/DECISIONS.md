@@ -801,14 +801,22 @@ Found by codex review (2026-09-26), reproduced: after `Descend` is emitted, the
 walker calls `read_dir` on the path. If `dir` is replaced by a symlink in
 between, the walk follows it and reports files outside the root as `Index`.
 Children are also `lstat`ed by path, so a swap after listing reaches outside
-too. std offers no directory-relative calls; closing the race needs `rustix` (or
-`libc` and `unsafe`, which D11 allows only when measured).
+too. Codex's round 2 found the same race on ignore files: `.git` is classified
+by `lstat`, then `.git/info/exclude` is opened by path, so a `.git` swapped for
+a symlink in between applies an exclude from outside the root. And a symlink's
+`lstat` and `readlink` are two observations of a name that can change between
+them. std offers no directory-relative calls; closing the race needs `rustix`
+(or `libc` and `unsafe`, which D11 allows only when measured).
 
-| Option                                                       | Costs                                                                                                                          | Buys                                                                                                                 |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| A. Path-based, with an identity check                        | The race narrows but stays: re-`lstat` the directory after listing and drop the listing if `(dev, ino)` or type changed.       | std only. Enough for a user's own tree, where the swap needs a process racing the crawler.                           |
-| B. Directory handles via `rustix`                            | One dependency (`rustix`, Apache-2.0/MIT, no `unsafe` in our code); DESIGN's crate graph gains an edge; the walk is rewritten. | The race is closed. No per-entry path resolution, which may be faster; it is also the shape a parallel walker wants. |
-| C. A now, B when the walker is parallelised or measured slow | A now; B later.                                                                                                                | Defers the dependency until something else needs it.                                                                 |
+| Option                                                                                                                        | Costs                                                                                                                          | Buys                                                                                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| A. Path-based, with an identity check                                                                                         | The race narrows but stays: re-`lstat` the directory after listing and drop the listing if `(dev, ino)` or type changed.       | std only. Enough for a user's own tree, where the swap needs a process racing the crawler.                           |
+| B. Directory handles via `rustix` for every operation (listing, child `lstat`, ignore reads, `readlink`, later content opens) | One dependency (`rustix`, Apache-2.0/MIT, no `unsafe` in our code); DESIGN's crate graph gains an edge; the walk is rewritten. | The race is closed. No per-entry path resolution, which may be faster; it is also the shape a parallel walker wants. |
+| C. A now, B when the walker is parallelised or measured slow                                                                  | A now; B later.                                                                                                                | Defers the dependency until something else needs it.                                                                 |
+
+Option A has **not** landed: the walker has no identity check yet, pending this
+decision. A narrows the race, it does not close it: a swap after the check still
+redirects child operations.
 
 **Recommendation:** C. The exposure is a race inside the user's own tree, and
 the consequence is indexing a file outside a root, not writing anything. The
@@ -832,10 +840,19 @@ tree, so either the code or D13 is wrong.
 | A. Keep it; narrow D13 to "a work tree that starts at or below a root" | A doc change. A root inside a repo indexes what git ignores there.                                                                                                                                                                                | Nothing to build; roots stay self-contained.                                                    |
 | B. Discover the enclosing work tree                                    | The walker looks up from the root for `.git`, then builds rules from the work tree's top down to the root: each ancestor's `.gitignore` and `info/exclude`, no `.ferretignore` above the root. A `DirRules` constructor for a chain of ancestors. | Git's semantics wherever the root is. Matches what a user expects from `ferret index repo/src`. |
 
-**Recommendation:** B, and cheap: one upward search per root and a few file
-reads. The fact that would change it: if roots are always at or above work trees
-in practice (`$HOME`, `~/w`), A costs nothing real, and the extra constructor
-isn't worth it.
+Two things B has to settle, from codex's round 2. Ancestor patterns match
+relative to their own directory while the walk's paths stay root-relative, so
+each ancestor layer needs its base expressed above the root; that is a
+`DirRules` change, not only an upward search. And for root `repo/src`,
+`repo/.ferretignore` is an ancestor in D13's wording: B as written leaves it
+out, which is a choice to make explicitly.
+
+**Recommendation:** B, with `.ferretignore` above the root left out: a
+`.ferretignore` is ferret configuration for the tree it sits in, and a root is
+where the user said ferret's view begins. A few file reads per root. The fact
+that would change it: if roots are always at or above work trees in practice
+(`$HOME`, `~/w`), A costs nothing real, and the extra constructor isn't worth
+it.
 
 ## Settled without a brief (object if wrong)
 
