@@ -170,6 +170,16 @@ in-crate matcher. The crawler owns the candidate path so policy decisions do not
 allocate a joined path per entry. Re-inclusion pruning discards negations that a
 later exclusion provably supersedes; uncertain overlaps still permit traversal.
 
+The walk goes through directory handles (D21): the root is opened by path, and
+everything below it with `openat(O_NOFOLLOW)` plus a `(dev, ino)` check against
+the stat that `decide` saw. `walk_parallel` lists directories on N worker
+threads. Each worker keeps its own stack of unfinished parent listings and hands
+the oldest one over only while another worker is idle. Each worker's visitor is
+built by a factory and returned at the end, so a consumer accumulates per thread
+with no lock. At most 128 waiting listings keep a descriptor. The rest reopen
+from the root one checked step at a time, which bounds the walker at 128 + 4N
+descriptors. `walk` is the same code with one worker. The default N is D24.
+
 Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
 and **content-indexed** (also hashed and tokenized). Binary files and files over
 the size cap are catalogued, not content-indexed.

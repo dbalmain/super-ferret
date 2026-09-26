@@ -942,3 +942,38 @@ gains the `worktrees` table.
 - One bench run at a time on msa2; measurement hygiene as in
   `intpack-bench/README.md`.
 - No `git push` and no `Cargo.toml` edits by offloaded agents.
+
+## D24 — How many walk workers by default
+
+**Question:** What worker count should `ferret index` pass to `walk_parallel`
+when the user sets none?
+
+Measured warm, best of five, on this machine (Ryzen 9 9955HX, 16 cores / 32
+threads, ext4 on NVMe), final walker `32bb2ed`; CPU is user + sys seconds for
+the whole walk:
+
+| Workers | `~/w` (86k) wall | CPU   | `$HOME` (436k) wall | CPU   |
+| ------: | ---------------: | ----- | ------------------: | ----- |
+|       1 |          0.176 s | 0.175 |             1.007 s | 1.002 |
+|       4 |          0.053 s | 0.198 |             0.275 s | 1.086 |
+|       8 |          0.029 s | 0.209 |             0.154 s | 1.198 |
+|      16 |          0.018 s | 0.234 |             0.097 s | 1.451 |
+|      32 |          0.024 s | 0.320 |             0.090 s | 2.013 |
+
+Wall stops improving past 16. CPU rises steeply past 8, and most of the rise is
+kernel time: sys goes from 0.87 s at 8 workers to 1.56 s at 32 on `$HOME`. Why
+the kernel costs more under concurrency is not profiled.
+
+| Option                               | Costs                                                         | Buys                                                                                                                  |
+| ------------------------------------ | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| A. `min(8, available_parallelism)`   | 57 ms more wall than 16 on a 436k-entry `$HOME`, warm.        | About 83% of the CPU that 16 uses, and the least disturbance to a laptop's other work. Scales down on small machines. |
+| B. `min(16, available_parallelism)`  | 0.25 s more CPU than A per full `$HOME` crawl.                | The fastest warm walk measured on `~/w`, and within 7 ms of 32 on `$HOME`.                                            |
+| C. `available_parallelism` (32 here) | 0.56 s more CPU than B for 7 ms, and slower than 16 on `~/w`. | Nothing measured; a larger queue depth might help cold reads (unmeasured).                                            |
+
+**Recommendation:** A, with a config key and a `--jobs` flag for the rest. A
+full crawl is rare once the daemon (D14) keeps the catalog current, and 0.15 s
+against 0.10 s is invisible to a person, while the CPU difference is paid on
+every crawl. The fact that would change it: a **cold-cache** crawl, which is the
+one a person waits for after boot, that is markedly faster at 16 or 32 because
+NVMe rewards queue depth. That needs a `drop_caches`, which needs root, so it
+has not been measured.
