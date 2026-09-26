@@ -1178,6 +1178,21 @@ mod tests {
         assert_eq!(root.0.shared.lists.list_count(), 3);
     }
 
+    #[test]
+    fn a_cursor_reached_both_fed_and_unfed_is_fed() {
+        // In `**/*/**\/b`, entering `y` below `x` reaches the second
+        // globstar twice: from `*` (unfed) and from itself (fed). Only the
+        // fed cursor may match zero more directories, so dropping `fed` when
+        // merging the two loses `x/y/b`. git 2.54 ignores `x/y/b` and
+        // `x/y/z/b`, and not `x/b`.
+        let root = Dir::root(None, git("**/*/**\\/b\n"));
+        let x = root.empty("x");
+        assert_eq!(x.decide("b", FILE), Decision::Index);
+        let y = x.empty("y");
+        assert_eq!(y.decide("b", FILE), Decision::Skip);
+        assert_eq!(y.empty("z").decide("b", FILE), Decision::Skip);
+    }
+
     fn reaches(line: &str, dir: &str) -> bool {
         let lists = Lists::default();
         let (layer, errors) = Layer::compile_text(line, true, &lists);
