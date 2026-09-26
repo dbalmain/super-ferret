@@ -1349,17 +1349,21 @@ namespace intact; only its content is unknown.
 | B. Mutate: diff the walk against the catalog, append a record per change, compact when the log grows                                                                                                                                                          | The log format, replay, torn-tail recovery, compaction, and a sweep for entries the walk did not visit, which needs the same faulted-directory rule as A. All written in S1 and exercised only by full re-crawls until S5.                                                                                                                                                      | One mechanism from the start. A re-run that changed little writes little.                                                                                                        |
 
 **Recommendation:** A′ for S1, moving to A once measured fault frequency
-justifies typed faults and subtree reconciliation. `io::Error::kind` already
-separates `NotFound`, so A′ needs no walker change to tell a deletion from a
-coverage fault. The log is the daemon's requirement, and designing it before the
-daemon means designing it without the workload that shapes it (small inotify
-bursts, not whole-tree diffs). A forecloses nothing: B's log is an addition over
-A's snapshot. A′ is the only variant that is correct with today's untyped
-faults; A's carry-forward needs each fault to say which operation failed on
-which entry. The facts that would change it: roots with permanent faults
-(anything under `/`), which make A′ never publish and so make A necessary; or a
-measured snapshot write that a person would notice on a re-run, over about a
-second at 1M entries, which favours B.
+justifies typed faults and subtree reconciliation. Telling a deletion from a
+coverage fault needs the walker's help: `NotFound` from an entry's `lstat` is a
+deletion, but the same error from reopening a saved directory (`reopen`) or from
+ancestor discovery loses a subtree or its rules. So `Event::Io` gains an
+operation tag, one of the D33 walker additions, and only `lstat` `NotFound` is
+exempt. Until the tag exists, every `Event::Io` blocks publication. The log is
+the daemon's requirement, and designing it before the daemon means designing it
+without the workload that shapes it (small inotify bursts, not whole-tree
+diffs). A forecloses nothing: B's log is an addition over A's snapshot. A′ is
+the only variant that is correct with today's untyped faults; A's carry-forward
+needs each fault to say which operation failed on which entry. The facts that
+would change it: roots with permanent faults (anything under `/`), which make A′
+never publish and so make A necessary; or a measured snapshot write that a
+person would notice on a re-run, over about a second at 1M entries, which
+favours B.
 
 ## D27 — `InoId` and `NameId`: stable, or renumbered each snapshot
 
@@ -1446,13 +1450,15 @@ The name scan's target is single-digit milliseconds warm (estimate), and every
 **Recommendation:** C for S1, plus one persisted array. A name-scan hit
 identifies its `NameId`, whose row gives the parent directory's `InoId`; but an
 inode row holds no `NameId`, so walking up needs a directory's own name. With
-D31 C every directory has exactly one, so a persisted directory-only
-`InoId → NameId` array (4 B per directory, 0.3 MB for `$HOME`) is the whole path
-structure, and a name-only `find` needs nothing else. `DocId → [InoId]` and the
-full inverse serve `stats` and, from S2, content results; they are built when
-first needed, and one is persisted when a measured query shows its build
-dominating. The fact that would change it: a measured S1 query whose latency is
-mostly that build, which moves that structure to B.
+D31 C every directory except a configured root (which has a `roots` row instead)
+has exactly one. Directory inode rows are numbered first, so their `InoId`s are
+the dense range `0..directories`, and a directory-only `InoId → NameId` array (4
+B per directory, 0.3 MB for `$HOME`) is the whole path structure, and a
+name-only `find` needs nothing else. `DocId → [InoId]` and the full inverse
+serve `stats` and, from S2, content results; they are built when first needed,
+and one is persisted when a measured query shows its build dominating. The fact
+that would change it: a measured S1 query whose latency is mostly that build,
+which moves that structure to B.
 
 ## D31 — One inode, several names
 
@@ -1479,13 +1485,15 @@ would change it: a census showing many aliased directories **and** a way to give
 each alias its own path context under one row; without the second, A cannot
 represent them.
 
-"Hashed once" cannot wait for the merge: two names of one file can reach `Index`
-on different workers at the same time. So `ferret-crawl` keeps one per-run
-cache, shared by the workers, from a validated `(dev, ino, size, mtime, ctime)`
-to its hash, with an in-flight mark so the second name waits for the first hash
-instead of reading the file again. The cost is one concurrent-map probe per
-hashed file; the fact that would change it is a census showing hard links rare
-enough that the duplicate reads cost less than the probes.
+Two names of one file can reach `Index` on different workers at the same time,
+so the merge, not the walk, guarantees one row and one `DocId`: each worker
+hashes what it sees, and the merge unifies rows by `(dev, ino)`. A hard-linked
+file may therefore be read more than once in a run. A shared in-flight cache
+would prevent that, at the cost of a key, a hash and a lock-protected state for
+every hashed inode held for the whole crawl, which the density goal argues
+against while hard-link prevalence is unmeasured. The fact that would add the
+cache: a census showing enough hard-linked bytes that the duplicate reads show
+in crawl time.
 
 ## D32 — A reader while `ferret index` runs
 
@@ -1532,16 +1540,19 @@ handle-relative opens.
 **Question:** After `ferret index /a /b`, does `ferret index /a` refresh `/a`
 and keep `/b`, or replace the catalog with `/a` alone?
 
-| Option                                                                                                                                           | Costs                                                                                                                                                                                                                       | Buys                                                                                                                  |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| A. The invocation's roots are the whole set: anything not named is dropped                                                                       | Forgetting a root on the command line deletes it from the catalog.                                                                                                                                                          | One rule, no ownership bookkeeping.                                                                                   |
-| B. Named roots are refreshed and others kept; removal is explicit (`ferret roots remove`); with no arguments, every configured root is refreshed | Each root owns its rows, and a rebuild copies the untouched roots' rows forward. An overlapping pair (`~` and `~/w/x`, where D25 lets the inner root expose what the outer one ignores) needs an owner for the shared rows. | Refreshing one tree is cheap and safe; the configured roots in `config` are the authority, not the last command line. |
+| Option                                                                                                                                           | Costs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Buys                                                                                                                  |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| A. The invocation's roots are the whole set: anything not named is dropped                                                                       | Forgetting a root on the command line deletes it from the catalog.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | One rule, no ownership bookkeeping.                                                                                   |
+| B. Named roots are refreshed and others kept; removal is explicit (`ferret roots remove`); with no arguments, every configured root is refreshed | Each root owns its directory rows and name edges, and a rebuild copies the untouched roots' forward. File inodes and docs cannot be owned by one root, since a hard link can join two disjoint roots (D31); they are global, live while any retained name references them, and a fresh observation in this run supersedes a carried one. An overlapping pair (`~` and `~/w/x`, where D25 lets the inner root expose what the outer one ignores) needs an owner for the shared subtree, and the walker a way to stop at it: `walk_parallel` has no root-boundary parameter today. | Refreshing one tree is cheap and safe; the configured roots in `config` are the authority, not the last command line. |
 
 **Recommendation:** B, with overlap resolved by the innermost configured root
-owning its subtree: the outer root's walk stops at the inner root's top and the
-inner root's rules and D25 behaviour apply there. The fact that would change it:
-roots never overlapping in practice, which would let B drop the ownership rule
-but not the explicit removal.
+owning its subtree: the outer root's walk is given the inner roots as boundaries
+and stops at each, and the inner root's rules and D25 behaviour apply there.
+Adding or removing a root that overlaps another changes which rules govern that
+subtree, so the affected region is re-walked before the new root set is
+published, never copied. The fact that would change it: roots never overlapping
+in practice, which would let B drop the ownership rule but not the explicit
+removal.
 
 ## D35 — Work-tree context for a root inside a repository
 
@@ -1560,7 +1571,8 @@ becoming searchable, which D18's later "links that pull content in" might bring.
 ## D36 — Dead documents before there is an index to merge
 
 **Question:** In S1 nothing reclaims a dead `DocId` (only an S2 merge may), so
-every edit adds a `docs` row forever. What bounds that?
+every previously unseen content adds a `docs` row forever; a revert reactivates
+an existing one. What bounds that?
 
 | Option                                                                                       | Costs                                                                                                                     | Buys                                                                                                         |
 | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -1569,9 +1581,11 @@ every edit adds a `docs` row forever. What bounds that?
 | C. Allow an explicit reset that renumbers everything                                         | Invalidates every `DocId`, which is harmless in S1 (no index) and expensive after S2.                                     | Bounded storage by command.                                                                                  |
 
 **Recommendation:** A, and record dead-doc count and bytes in `ferret stats` so
-the budget is measured rather than guessed. The fact that would change it:
-measured churn making the history a material share of the catalog before S2's
-merge lands, in which case B.
+the budget is measured rather than guessed. Reactivation holds only while the
+dead doc's postings exist: once an S2 merge reclaims them, reappearing content
+gets a new `DocId` and is indexed again. The fact that would change it: measured
+churn making the history a material share of the catalog before S2's merge
+lands, in which case B.
 
 ## D37 — Remembering why a file has no document
 
@@ -1579,10 +1593,10 @@ merge lands, in which case B.
 the size cap is raised, or the sniffer changes, which unchanged files are read
 again?
 
-| Option                                                                                                                           | Costs                                                                                          | Buys                                                                                                                                    |
-| -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| A. Re-sniff every row without a document on every run                                                                            | A head read of every binary file each run: every image, archive and object file, warm or cold. | No extra state.                                                                                                                         |
-| B. A content state per inode (not content-eligible / binary / hashed / fault), plus the sniffer's version in the snapshot header | 1 B per inode, which fits in the row's padding (estimate).                                     | An unchanged binary is not re-read; a new cap re-evaluates only rows whose state the cap affects; a new sniffer version re-sniffs once. |
+| Option                                                                                                                           | Costs                                                                                                                                                                                                                                                | Buys                                                                                                                                    |
+| -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Re-sniff every row without a document on every run                                                                            | A head read of every binary file each run: every image, archive and object file, warm or cold.                                                                                                                                                       | No extra state.                                                                                                                         |
+| B. A content state per inode (not content-eligible / binary / hashed / fault), plus the sniffer's version in the snapshot header | 2 bits per inode in a side array (0.25 MB at 1M), since the 64 B row has no spare byte. A sniffer-version change must refresh every root before the header advances, or D34's partial refresh would carry old classifications under the new version. | An unchanged binary is not re-read; a new cap re-evaluates only rows whose state the cap affects; a new sniffer version re-sniffs once. |
 
 **Recommendation:** B. Current policy decides eligibility each run; the stored
 state only says what the last observation found. The fact that would change it:
