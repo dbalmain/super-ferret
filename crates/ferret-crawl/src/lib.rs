@@ -1,7 +1,13 @@
-//! Walking roots, `statx`, change detection against the catalog, hashing.
+//! Walking configured roots.
 //!
-//! Descends only where `ferret-policy` allows; compares `(size, mtime, ctime)`
-//! with the catalog row and re-reads and re-hashes only what changed
-//! (DESIGN.md § The catalog).
-//!
-//! Knows nothing about queries or index formats.
+//! [`walk`] visits one root and reports each entry [`ferret_policy`] decides,
+//! with the `lstat` fields the catalog will store. Change detection against
+//! the catalog and content hashing are later slices (DESIGN.md § Policy and
+//! crawl); this crate still knows nothing about queries or index formats.
+
+mod walk;
+
+pub use walk::{Decided, Event, Stat, walk};
+
+#[cfg(test)]
+mod tests;
