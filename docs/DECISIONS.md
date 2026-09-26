@@ -34,7 +34,7 @@ Predecessors, carried forward where still open:
 | D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
 | D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
-| D19 | Ignore matching: whole paths, or per-directory rule sets | open           | Reopened: B-flat is 2x faster than A on real rules, 5x slower on stress; next step?                            |
+| D19 | Ignore matching: whole paths, or per-directory rule sets | open           | B-flat-indexed 2x faster decide than A, regex faster still at 6x memory; adopt indexed?                        |
 | D20 | Walk across mount points, or stay on the root's device   | answered       | A: cross mount points below a root, as now                                                                     |
 | D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
 | D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
@@ -938,6 +938,81 @@ directory's list. Which way should it go next?
 part of the same run. That count decides whether 2 is ever worth trying. The
 fact that would change it: if nearly every directory's list is distinct, sharing
 buys nothing, and A's per-layer indexes are already the cheap answer, so 3.
+
+> Dave: measure 1 vs 2
+
+### Options 1 and 2 measured (2026-09-27)
+
+Both are built on `bench/policy-derive` at `fcafaff`, as `FlatIndexed` (option
+
+1. and `FlatRegex` (option 2), with a fully compiled DFA as a third row. All
+   three agree with A on every entry under both rule sets. The regex crate
+   (`regex-automata`) is a dependency of `ferret-bench` only.
+
+Identical lists are shared. The 6,035 directories in `~/w` have 334 distinct
+lists, about 18 directories each. The key is where each rule came from; keyed by
+rule text, the same rule in two clones would count once, and there would be
+only 88. Median of three runs, ns per entry. Cached `enter` includes compiling
+each distinct list once:
+
+| Rules  | Engine         | Cached `decide` | Cached `enter` | Replay `decide` |
+| ------ | -------------- | --------------: | -------------: | --------------: |
+| real   | A              |             183 |             42 |             215 |
+| real   | B-flat         |              97 |            110 |             124 |
+| real   | B-flat-indexed |              81 |            142 |             117 |
+| real   | B-flat-regex   |              50 |            536 |             196 |
+| real   | B-flat-dense   |              58 |          4,601 |              97 |
+| stress | A              |             302 |             41 |             328 |
+| stress | B-flat         |           1,599 |            170 |           1,614 |
+| stress | B-flat-indexed |             149 |            257 |             183 |
+| stress | B-flat-regex   |              99 |          1,601 |             674 |
+| stress | B-flat-dense   |              88 |         95,638 |             154 |
+
+| Engine, rules   | Compile per list, mean | Heap for all lists |
+| --------------- | ---------------------: | -----------------: |
+| indexed, real   |                   7 µs |     878 KiB (est.) |
+| indexed, stress |                  23 µs |   2,919 KiB (est.) |
+| regex, real     |                 105 µs |          5,896 KiB |
+| regex, stress   |                 342 µs |         17,595 KiB |
+| dense, stress   |                  25 ms |         54,647 KiB |
+
+- **Indexed** halves A's `decide` under both rule sets. Its `enter` is about 3x
+  A's.
+- **Regex** has the fastest `decide` once its lazy DFA is warm: about 30–50 ns
+  better than indexed. It costs 15x indexed's compile time and 6x its memory.
+  Its replay `decide` is worse than indexed's, because the first searches
+  against each new list fill the lazy DFA.
+- **Dense** is dominated: seconds of compiling, and tens of MB, for about 10 ns
+  on stress.
+- On a 500-event prettier burst, indexed saves about 50 µs of `decide` over A,
+  and regex about 15 µs more.
+- The merged-list fix was real: `best_at` returns the source line number, which
+  is wrong once lists from several files are merged. Lists are now renumbered by
+  list position, and a test catches the old bug.
+
+### Question: adopt B-flat-indexed?
+
+1. **Adopt B-flat-indexed for both the walker and the daemon**, sharing lists by
+   rule text.
+   - Buys: `decide` about 2x faster than A. One engine for both uses. Shared
+     lists (88 in `~/w`) keep memory near 1 MB.
+   - Costs: rewriting `DirRules` onto the bench code, with the git-oracle and
+     golden tests as the gate. On a single cold walk it roughly ties with A:
+     `enter` plus `decide` is 223 against A's 225 on the real rules, and worse
+     on stress (406 against 343).
+2. **Adopt it for the daemon only, and keep A for the walker.**
+   - Buys: each use gets its fastest engine.
+   - Costs: two matchers to keep in agreement for ever.
+3. **Adopt B-flat-regex.**
+   - Buys: about 30–50 ns better warm `decide` than option 1.
+   - Costs: 6x the memory. The regex dependency stays forbidden, so it waits for
+     our own multi-pattern engine.
+
+**Recommendation: 1.** A daemon keeps its lists, so `decide` is what repeats,
+and one engine is worth the tie on a cold walk. Sharing by rule text should also
+cut its `enter`. What would change it: if our own regex engine ends up with
+cheap multi-pattern compilation, then 3, as a matcher swap behind the same
+shared lists.
 
 ## D20 — Walk across mount points, or stay on the root's device
 
