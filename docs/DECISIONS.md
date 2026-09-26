@@ -35,6 +35,7 @@ Predecessors, carried forward where still open:
 | D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
 | D19 | Ignore matching: whole paths, or per-directory rule sets | open           |                                                                                                                |
+| D20 | Walk across mount points, or stay on the root's device   | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -732,6 +733,27 @@ would too, since B removes it.
 **In progress (2026-09-26):** a prototype of B on the bench branch, checked
 against `DirRules` decision by decision on `~/w` and timed against it; and the
 S1 walker, which gives the walk-time share.
+
+## D20 — Walk across mount points, or stay on the root's device
+
+**Question:** When a configured root contains a mount point, does the walker
+cross into the other file system?
+
+Today it does (`ferret-crawl`, 2026-09-26): it never compares `st_dev` with the
+root's. `~/w` is one device, so the measurement so far shows no cost either way.
+DESIGN already lists "multiple devices and bind mounts under one root" as not
+yet designed.
+
+| Option                                   | Costs                                                                                                                                                | Buys                                                                                              |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| A. Cross mount points (current)          | A root of `$HOME` indexes any disk mounted beneath it, and bind mounts of other file systems.                                                        | A project bind-mounted under the root is indexed; no extra stat, no new rule. Forecloses nothing. |
+| B. Stay on the root's `st_dev` (`-xdev`) | Misses a deliberately mounted file system unless it is added as its own root. One `lstat` of the root, and a rule for a directory on another device. | A backup disk or network mount under the root is never indexed by accident.                       |
+| C. Configurable, default A               | A flag and a test matrix before any measurement says the default is wrong.                                                                           | Both behaviours.                                                                                  |
+
+**Recommendation:** A, until a real root crosses into a file system that should
+not be indexed. The fact that would change it: a crawl of the configured root
+(likely `$HOME`, D10) whose time or catalog is dominated by another mounted file
+system.
 
 ## Settled without a brief (object if wrong)
 
