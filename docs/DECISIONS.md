@@ -859,6 +859,19 @@ it: std has no directory-relative calls, so only handles close the race; the
 in std either; and a parallel walker wants a handle per directory anyway.
 `ferret-crawl → rustix` joins the crate graph.
 
+**What the handles guarantee, after review (2026-09-26).** An independent review
+of the parallel walker found the remaining path-based reads of a gitfile's
+exclude and fixed them to use handles. It also named the limit of the design.
+Past 128 open descriptors, a waiting directory listing closes its handle and
+later reopens from the root by checked `O_NOFOLLOW` steps, matching the saved
+`(dev, ino)`. An inode number can be recycled, so a directory deleted and
+recreated at the same path between the two could pass that check. The reopened
+directory is still at the same path inside the root. That is identity anchoring
+within the root, not a guarantee that the listing is the same directory object,
+and it indexes nothing an attacker in the tree could not have placed there
+anyway. Left as is. `statx` birth time would close it, where the file system
+reports one, if it ever matters.
+
 ## D22 — A root inside a git work tree
 
 **Question:** When a configured root sits inside a work tree whose `.git` is
