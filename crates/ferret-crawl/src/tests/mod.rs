@@ -2,6 +2,7 @@
 
 mod gitfile;
 mod golden;
+mod race;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
