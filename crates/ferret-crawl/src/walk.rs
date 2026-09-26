@@ -123,7 +123,7 @@ pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut
     let Some(children) = walker.list() else {
         return;
     };
-    let loaded = walker.load_ignores();
+    let loaded = walker.load_ignores(&children);
     let (rules, errors) = DirRules::root(root, global, loaded.files(), config);
     walker.patterns(errors);
     walker.walk_listed(&rules, children);
@@ -376,7 +376,7 @@ where
         let Some(children) = self.list() else {
             return;
         };
-        let loaded = self.load_ignores();
+        let loaded = self.load_ignores(&children);
         let (rules, errors) = parent.enter(name, loaded.files());
         self.patterns(errors);
         self.walk_listed(&rules, children);
@@ -392,10 +392,21 @@ where
 
     // ── ignore files ──
 
-    fn load_ignores(&mut self) -> Ignores {
-        let ferretignore = self.read_named(".ferretignore");
-        let gitignore = self.read_named(".gitignore");
-        let git = self.probe_git();
+    /// Only names in the listing are opened: a directory without ignore files,
+    /// the usual case, costs no failed `open`s.
+    fn load_ignores(&mut self, children: &[Child]) -> Ignores {
+        let listed = |name: &str| children.iter().any(|child| child.name == name);
+        let ferretignore = listed(".ferretignore")
+            .then(|| self.read_named(".ferretignore"))
+            .flatten();
+        let gitignore = listed(".gitignore")
+            .then(|| self.read_named(".gitignore"))
+            .flatten();
+        let git = if listed(".git") {
+            self.probe_git()
+        } else {
+            GitKind::Missing
+        };
         let git_exclude = if git == GitKind::Directory {
             self.read_exclude()
         } else {
