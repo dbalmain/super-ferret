@@ -135,6 +135,46 @@ fn a_swapped_git_dir_does_not_apply_an_outside_exclude() {
     assert!(!out.rows.contains_key(Path::new(".git.real")));
 }
 
+/// A gitfile's relative gitdir is resolved from the already-open work
+/// directory, even when that directory's pathname is replaced in a callback.
+#[test]
+fn a_swapped_gitfile_parent_does_not_apply_an_outside_exclude() {
+    let scratch = Scratch::new("swap-gitfile-parent");
+    let root = scratch.join("root");
+    let work = root.join("work");
+    let outside = scratch.join("outside");
+    write(&work.join(".git"), "gitdir: meta\n");
+    write(&work.join("meta/info/exclude"), "# in tree\n");
+    write(&outside.join("meta/info/exclude"), "secret.txt\n");
+    write(&work.join(".gitignore"), "*.o\n");
+    fs::set_permissions(work.join(".gitignore"), fs::Permissions::from_mode(0o000)).unwrap();
+    write(&work.join("secret.txt"), "x");
+
+    let mut swapped = false;
+    let mut out = fresh();
+    walk(&root, None, Config::default(), |event| {
+        if let Event::Io { path, error } = &event
+            && *path == Path::new("work/.gitignore")
+            && error.kind() == io::ErrorKind::PermissionDenied
+        {
+            fs::rename(&work, root.join("work.saved")).unwrap();
+            symlink(&outside, &work).unwrap();
+            swapped = true;
+        }
+        record(&mut out, event);
+    });
+
+    assert!(swapped, "the gitignore Io hook did not run");
+    assert_eq!(
+        out.rows
+            .get(Path::new("work/secret.txt"))
+            .map(|row| row.decision),
+        Some(Decision::Index),
+        "outside exclude applied: {:?}",
+        out.io
+    );
+}
+
 /// `O_NOFOLLOW` does not catch a directory replaced by a different directory.
 /// The open must `fstat` and refuse a `(dev, ino)` other than the one `decide`
 /// was given.

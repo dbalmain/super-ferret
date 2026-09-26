@@ -1103,7 +1103,7 @@ impl<F: EventVisitor> Walker<F> {
         let gitignore_path = draft.directory.join(".gitignore");
         let gitignore = self.read_ancestor_ignore(fd.as_fd(), ".gitignore", &gitignore_path);
         let git_exclude = if draft.top {
-            self.ancestor_exclude(fd.as_fd(), &draft.directory)
+            self.ancestor_exclude(fd.as_fd())
         } else {
             None
         };
@@ -1135,10 +1135,10 @@ impl<F: EventVisitor> Walker<F> {
         }
     }
 
-    fn ancestor_exclude(&mut self, dir: BorrowedFd<'_>, directory: &Path) -> Option<String> {
+    fn ancestor_exclude(&mut self, dir: BorrowedFd<'_>) -> Option<String> {
         match self.probe_git(dir) {
             GitProbe::Directory(fd) => self.read_exclude(fd.as_fd()),
-            GitProbe::File(bytes) => self.read_gitfile_exclude(directory, &bytes),
+            GitProbe::File(bytes) => self.read_gitfile_exclude(dir, &bytes),
             GitProbe::Missing | GitProbe::Present => None,
         }
     }
@@ -1184,10 +1184,7 @@ impl<F: EventVisitor> Walker<F> {
         };
         let git_exclude = match &git {
             GitProbe::Directory(fd) => self.read_exclude(fd.as_fd()),
-            GitProbe::File(bytes) => {
-                let base = self.root.join(bytes_path(&self.rel));
-                self.read_gitfile_exclude(&base, bytes)
-            }
+            GitProbe::File(bytes) => self.read_gitfile_exclude(dir, bytes),
             GitProbe::Missing | GitProbe::Present => None,
         };
         Ignores {
@@ -1307,16 +1304,31 @@ impl<F: EventVisitor> Walker<F> {
         }
     }
 
-    /// Exclude for a regular `.git` file: `gitdir:` then an optional
-    /// `commondir`, then `<common>/info/exclude`. A fault is reported against
-    /// the `.git` file. The gitdir may sit outside the walk root (a linked
-    /// work tree, a submodule's module directory) and is opened by path, with
-    /// `O_NOFOLLOW` on the final component.
-    fn read_gitfile_exclude(&mut self, base: &Path, bytes: &[u8]) -> Option<String> {
+    /// Follow git's `gitdir:` and optional `commondir` from held descriptors.
+    /// A relative path may include `..`, as git's format requires. An
+    /// absolute gitdir is opened by path because it is outside the tree.
+    fn read_gitfile_exclude(&mut self, work: BorrowedFd<'_>, bytes: &[u8]) -> Option<String> {
         let raw = parse_gitdir(bytes)?;
-        let gitdir = resolve_git_path(base, raw);
-        let common = self.common_dir(&gitdir)?;
-        self.read_external(&common.join("info").join("exclude"))
+        let gitdir = self.open_git_directory(work, raw)?;
+        let common = self.common_dir(gitdir)?;
+        self.read_gitfile_info_exclude(common.as_fd())
+    }
+
+    fn open_git_directory(&mut self, base: BorrowedFd<'_>, raw: &OsStr) -> Option<OwnedFd> {
+        let path = Path::new(raw);
+        let opened = if path.is_absolute() {
+            open_path(path, child_dir_flags(), Mode::empty())
+        } else {
+            openat(base, path, child_dir_flags(), Mode::empty())
+        };
+        match opened {
+            Ok(fd) => Some(fd),
+            Err(Errno::NOENT) => None,
+            Err(error) => {
+                self.fail_at_git(io::Error::from(error));
+                None
+            }
+        }
     }
 
     /// The gitdir itself when it has no `commondir` file. `None` when that
@@ -1324,20 +1336,29 @@ impl<F: EventVisitor> Walker<F> {
     /// work tree's own directory is not where exclude lives, so it is not a
     /// fallback. Only a missing `commondir` means the gitdir is the common
     /// directory.
-    fn common_dir(&mut self, gitdir: &Path) -> Option<PathBuf> {
-        let commondir = gitdir.join("commondir");
-        match open_regular_path(&commondir) {
-            Ok(Opened::Missing) => Some(gitdir.to_path_buf()),
+    fn common_dir(&mut self, gitdir: OwnedFd) -> Option<OwnedFd> {
+        let opened = match openat(
+            gitdir.as_fd(),
+            "commondir",
+            nofollow_file_flags(),
+            Mode::empty(),
+        ) {
+            Ok(fd) => read_opened(fd),
+            Err(Errno::NOENT) => Ok(Opened::Missing),
+            Err(error) => Err(io::Error::from(error)),
+        };
+        match opened {
+            Ok(Opened::Missing) => Some(gitdir),
             Ok(Opened::NotRegular) => {
                 self.fail_at_git(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("{}: not a regular file", commondir.display()),
+                    "commondir is not a regular file",
                 ));
                 None
             }
             Ok(Opened::Bytes(bytes)) => {
                 let raw = first_line(&bytes)?;
-                Some(resolve_git_path(gitdir, raw))
+                self.open_git_directory(gitdir.as_fd(), raw)
             }
             Err(error) => {
                 self.fail_at_git(error);
@@ -1346,15 +1367,30 @@ impl<F: EventVisitor> Walker<F> {
         }
     }
 
-    fn read_external(&mut self, path: &Path) -> Option<String> {
-        match open_regular_path(path) {
+    fn read_gitfile_info_exclude(&mut self, common: BorrowedFd<'_>) -> Option<String> {
+        let info = match openat(common, "info", child_dir_flags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return None,
+            Err(error) => {
+                self.fail_at_git(io::Error::from(error));
+                return None;
+            }
+        };
+        let opened = match openat(
+            info.as_fd(),
+            "exclude",
+            nofollow_file_flags(),
+            Mode::empty(),
+        ) {
+            Ok(fd) => read_opened(fd),
+            Err(Errno::NOENT) => Ok(Opened::Missing),
+            Err(error) => Err(io::Error::from(error)),
+        };
+        match opened {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
             Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
-                self.fail_at_git(io::Error::new(
-                    error.kind(),
-                    format!("{}: {error}", path.display()),
-                ));
+                self.fail_at_git(error);
                 None
             }
         }
@@ -1388,14 +1424,6 @@ fn observe_link(
 
 fn open_ignore(dir: BorrowedFd<'_>, name: &str) -> io::Result<Opened> {
     match openat(dir, name, ignore_flags(), Mode::empty()) {
-        Ok(fd) => read_opened(fd),
-        Err(Errno::NOENT) => Ok(Opened::Missing),
-        Err(error) => Err(io::Error::from(error)),
-    }
-}
-
-fn open_regular_path(path: &Path) -> io::Result<Opened> {
-    match open_path(path, nofollow_file_flags(), Mode::empty()) {
         Ok(fd) => read_opened(fd),
         Err(Errno::NOENT) => Ok(Opened::Missing),
         Err(error) => Err(io::Error::from(error)),
