@@ -34,8 +34,7 @@ impl Reinclude {
     /// caller has already reported the bad line).
     #[cfg(test)]
     fn parse(line: &str) -> Option<Self> {
-        let pattern = Pattern::compile(0, line).ok()??;
-        pattern.is_anchored_reinclude().then_some(Self { pattern })
+        Self::from_pattern(Pattern::compile(0, line).ok()??)
     }
 
     /// True when this pattern could match something strictly beneath `dir`,
