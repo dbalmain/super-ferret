@@ -620,7 +620,8 @@ impl OneFile {
         state.rules(&mut rules);
         let key: Vec<usize> = rules.iter().map(|rule| rule.id()).collect();
         let list = self.lists.list(&key, &rules);
-        list.last_match(name, is_dir).map(|(whitelist, _)| whitelist)
+        list.last_match(name, is_dir)
+            .map(|(whitelist, _)| whitelist)
     }
 }
 
@@ -927,7 +928,11 @@ mod tests {
         }
 
         fn traverse(&self, name: &str) -> Self {
-            assert_eq!(self.decide(name, DIR), Decision::Traverse, "traversing {name}");
+            assert_eq!(
+                self.decide(name, DIR),
+                Decision::Traverse,
+                "traversing {name}"
+            );
             Self(self.0.traverse(OsStr::new(name)))
         }
 
@@ -947,7 +952,10 @@ mod tests {
         assert_eq!(root.decide("keep.log", FILE), Decision::Skip);
         assert_eq!(sub.decide("keep.log", FILE), Decision::Index);
         assert_eq!(sub.decide("other.log", FILE), Decision::Skip);
-        assert_eq!(sub.empty("deeper").decide("keep.log", FILE), Decision::Index);
+        assert_eq!(
+            sub.empty("deeper").decide("keep.log", FILE),
+            Decision::Index
+        );
     }
 
     #[test]
@@ -1227,7 +1235,11 @@ mod tests {
         let lists = Lists::default();
         for (line, want) in cases {
             let (layer, _) = Layer::compile_text(line, true, &lists);
-            let qualifies = layer.source.anchored.iter().any(|anchored| anchored.reaches);
+            let qualifies = layer
+                .source
+                .anchored
+                .iter()
+                .any(|anchored| anchored.reaches);
             assert_eq!(qualifies, want, "{line}");
         }
     }

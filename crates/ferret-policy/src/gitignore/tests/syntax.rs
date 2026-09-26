@@ -1,9 +1,7 @@
 //! Line syntax: blanks, comments, escapes, trailing spaces, `?` and `*`.
 
 use super::super::Pattern;
-use super::{
-    Case, Dir, File, Ignore, OneFile, Row, Unmatched, assert_cases, assert_rows, matched,
-};
+use super::{Case, Dir, File, Ignore, OneFile, Row, Unmatched, assert_cases, assert_rows, matched};
 
 pub(super) const ROWS: &[Row] = &[
     // Blank and comment lines.

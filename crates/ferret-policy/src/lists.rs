@@ -8,8 +8,8 @@
 //!
 //! Two tables do this, both behind a [`Mutex`]:
 //!
-//! - rules, by [`RuleText`] plus band: each distinct rule gets an id when
-//!   an ignore file is compiled, so building a list's key hashes no globs;
+//! - rules, by [`RuleText`] plus band: each distinct rule gets an id when an
+//!   ignore file is compiled, so building a list's key hashes no globs;
 //! - lists, by the ids of their rules in order.
 //!
 //! A rule list lookup takes the lock only when a directory's list differs
