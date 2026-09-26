@@ -1,10 +1,10 @@
 //! Exercises the real work queue against the sequential event stream.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
-use ferret_policy::Config;
+use ferret_policy::{Config, Decision};
 
 use super::{Scratch, write};
 use crate::{Event, EventVisitor, walk, walk_parallel};
@@ -75,15 +75,62 @@ fn many_siblings_match_sequential() {
 #[test]
 fn deep_chain_matches_sequential_with_bounded_fds() {
     let tree = Scratch::new("parallel-deep");
+    for index in 0..160 {
+        let dir = tree.path.join(format!("sibling-{index:03}"));
+        fs::create_dir(&dir).unwrap();
+    }
     let mut current = tree.path.clone();
     for _ in 0..180 {
+        let parent = current.clone();
         current.push("d");
         fs::create_dir(&current).unwrap();
+        write(&parent.join("side"), "text");
         write(&current.join("file"), "text");
     }
+    let (single, single_fds) = compare(&tree.path, 1);
     let (events, max_fds) = compare(&tree.path, 8);
-    assert_eq!(events.len(), 360);
+    assert_eq!(single, events);
+    assert_eq!(events.len(), 700);
+    assert!(
+        single_fds < 160,
+        "observed {single_fds} open fds with one worker"
+    );
     assert!(max_fds < 256, "observed {max_fds} open fds");
+}
+
+/// A spilled parent reopened after an ancestor swap must fault, not follow it.
+#[test]
+fn a_spilled_parent_does_not_follow_a_swapped_ancestor() {
+    let tree = Scratch::new("parallel-spill-swap");
+    let root = tree.join("root");
+    let outside = tree.join("outside");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    write(&outside.join("leaked"), "outside");
+    let mut current = root.clone();
+    for _ in 0..140 {
+        let parent = current.clone();
+        current.push("d");
+        fs::create_dir(&current).unwrap();
+        write(&parent.join("side"), "inside");
+    }
+
+    let mut swapped = false;
+    let mut events = Vec::new();
+    walk(&root, None, Config::default(), |event| {
+        if let Event::Decided(decided) = &event
+            && decided.decision == Decision::Descend
+            && decided.path.components().count() == 140
+        {
+            fs::rename(root.join("d"), root.join("d.was")).unwrap();
+            symlink(&outside, root.join("d")).unwrap();
+            swapped = true;
+        }
+        events.push(line(event));
+    });
+    assert!(swapped);
+    assert!(events.iter().any(|event| event.contains(" io ")));
+    assert!(!events.iter().any(|event| event.contains("leaked")));
 }
 
 /// A failed directory must not terminate workers that have sibling jobs.
@@ -102,4 +149,23 @@ fn one_fault_does_not_stop_other_subtrees() {
     fs::set_permissions(&bad, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(events.iter().any(|line| line.starts_with("bad io ")));
     assert!(events.iter().any(|line| line.starts_with("good-63/file ")));
+}
+
+/// A visitor panic must wake idle workers so scoped-thread joining can unwind.
+#[test]
+fn a_panicking_visitor_does_not_strand_idle_workers() {
+    struct Panic;
+
+    impl EventVisitor for Panic {
+        fn visit(&mut self, _: Event<'_>) {
+            panic!("visitor panic");
+        }
+    }
+
+    let tree = Scratch::new("parallel-panic");
+    write(&tree.join("file"), "text");
+    let result = std::panic::catch_unwind(|| {
+        walk_parallel(&tree.path, None, Config::default(), 8, || Panic);
+    });
+    assert!(result.is_err());
 }

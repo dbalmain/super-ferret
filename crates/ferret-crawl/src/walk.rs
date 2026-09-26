@@ -6,13 +6,14 @@
 //! The root is opened by the path the caller gave, following a symlink there
 //! (that path is the user's), with `O_DIRECTORY`. Every later open, stat,
 //! `readlink` and ignore-file read is relative to a directory descriptor.
-//! A queued job owns one directory descriptor and a listing cursor. The queue
-//! holds at most 128 jobs; each worker holds one active job and at most two
-//! extra descriptors while opening a child or reading ignore files. Thus a
-//! parallel walk with N workers holds at most 128 + 3N descriptors, independent
-//! of tree depth and width. A single-worker walk uses the same jobs.
-//! `EMFILE` opening a child is an [`Event::Io`] for that child and the walk
-//! continues with the next sibling. There is no path-based fallback.
+//! A queued job holds a listing cursor and usually its directory descriptor.
+//! After 128 queued descriptors, parent continuations close their descriptors
+//! and reopen by checked `openat` steps from the root when resumed. Each worker
+//! holds one active job and at most three extra descriptors while opening a
+//! child and reading `.git/info/exclude`. Thus a parallel walk with N workers
+//! holds at most 128 + 4N descriptors, independent of tree depth and width.
+//! `EMFILE` opening a child is an [`Event::Io`] and the walk continues. There
+//! is no path-based fallback below the root.
 //!
 //! A catalogued symlink is one observation: `openat` with `O_PATH |
 //! O_NOFOLLOW`, then `fstat` and `readlinkat` on that descriptor (an empty
@@ -97,9 +98,10 @@ pub struct Decided<'a> {
 
 /// What the walk reports, in the order it happens.
 ///
-/// A directory is reported before its children. Siblings come out in
-/// directory order, which is not sorted. Paths borrow the walker's buffers
-/// and must be copied to be kept.
+/// A directory is reported before its children in [`walk`]. Its siblings come
+/// out in directory order, which is not sorted. [`walk_parallel`] gives no
+/// cross-worker event order. Paths borrow a worker's buffer and must be copied
+/// to be kept.
 #[derive(Debug)]
 pub enum Event<'a> {
     /// An entry `decide` classified.
@@ -193,6 +195,8 @@ pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut
         Mutex::new(Queue {
             jobs: vec![root_job],
             outstanding: 1,
+            cancelled: false,
+            open_jobs: 1,
         }),
         Condvar::new(),
     );
@@ -213,7 +217,8 @@ impl<F: FnMut(Event<'_>)> EventVisitor for F {
 }
 
 /// Walks with `workers` worker-local visitors and returns them for merging.
-/// Zero workers means one. Event order is unspecified across workers.
+/// Zero workers means one. Event order is unspecified across workers. When the
+/// root fails before threads start, only its fault visitor is returned.
 pub fn walk_parallel<V: EventVisitor + Send>(
     root: &Path,
     global: Option<&str>,
@@ -226,19 +231,27 @@ pub fn walk_parallel<V: EventVisitor + Send>(
     let Some(root_job) = first.root_job(root, global, config) else {
         return vec![first.visit];
     };
+    let root_id = first.root_id;
     let queue = (
         Mutex::new(Queue {
             jobs: vec![root_job],
             outstanding: 1,
+            cancelled: false,
+            open_jobs: 1,
         }),
         Condvar::new(),
     );
+    if count == 1 {
+        return vec![run_worker(first, &queue)];
+    }
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
-        handles.push(scope.spawn(|| run_worker(first, &queue)));
+        handles.push(scope.spawn(|| run_guarded(first, &queue)));
         for _ in 1..count {
             let visitor = make_visitor();
-            handles.push(scope.spawn(|| run_worker(Walker::new(root, visitor), &queue)));
+            let mut walker = Walker::new(root, visitor);
+            walker.root_id = root_id;
+            handles.push(scope.spawn(|| run_guarded(walker, &queue)));
         }
         handles
             .into_iter()
@@ -250,11 +263,28 @@ pub fn walk_parallel<V: EventVisitor + Send>(
     })
 }
 
-const MAX_QUEUED: usize = 128;
+const MAX_OPEN_JOBS: usize = 128;
 
 struct Queue {
     jobs: Vec<Job>,
     outstanding: usize,
+    cancelled: bool,
+    open_jobs: usize,
+}
+
+fn run_guarded<V: EventVisitor>(walker: Walker<V>, shared: &(Mutex<Queue>, Condvar)) -> V {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_worker(walker, shared))) {
+        Ok(visitor) => visitor,
+        Err(panic) => {
+            let mut queue = shared
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.cancelled = true;
+            shared.1.notify_all();
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
 
 fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &(Mutex<Queue>, Condvar)) -> V {
@@ -265,7 +295,13 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &(Mutex<Queue>, Co
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
+                if queue.cancelled {
+                    return walker.visit;
+                }
                 if let Some(job) = queue.jobs.pop() {
+                    if job.dir.is_some() {
+                        queue.open_jobs -= 1;
+                    }
                     break job;
                 }
                 if queue.outstanding == 0 {
@@ -279,17 +315,24 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &(Mutex<Queue>, Co
         let mut current = job;
         loop {
             match walker.process(current) {
-                Some((parent, child)) => {
+                Some((mut parent, child)) => {
+                    if parent.next == parent.children.len() {
+                        current = child;
+                        continue;
+                    }
                     let mut queue = lock
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    queue.outstanding += 1;
-                    queue.jobs.push(parent);
-                    if queue.jobs.len() < MAX_QUEUED {
-                        queue.jobs.push(child);
-                        ready.notify_all();
-                        break;
+                    if queue.cancelled {
+                        return walker.visit;
                     }
+                    queue.outstanding += 1;
+                    if queue.open_jobs == MAX_OPEN_JOBS {
+                        parent.dir.take();
+                    } else {
+                        queue.open_jobs += 1;
+                    }
+                    queue.jobs.push(parent);
                     ready.notify_one();
                     current = child;
                 }
@@ -297,6 +340,9 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &(Mutex<Queue>, Co
                     let mut queue = lock
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if queue.cancelled {
+                        return walker.visit;
+                    }
                     queue.outstanding -= 1;
                     if queue.outstanding == 0 {
                         ready.notify_all();
@@ -319,6 +365,14 @@ impl<F: EventVisitor> Walker<F> {
                 return None;
             }
         };
+        let root_stat = match fstat(&fd) {
+            Ok(stat) => stat,
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                return None;
+            }
+        };
+        self.root_id = Some((root_stat.st_dev, root_stat.st_ino));
         let mut dir = match Dir::new(fd) {
             Ok(dir) => dir,
             Err(error) => {
@@ -356,6 +410,7 @@ impl<F: EventVisitor> Walker<F> {
             children,
             self.abs.clone(),
             self.rel.clone(),
+            (root_stat.st_dev, root_stat.st_ino),
         ))
     }
 }
@@ -385,6 +440,8 @@ fn link_flags() -> OFlags {
 // ── walk state ──
 
 struct Walker<F> {
+    root: PathBuf,
+    root_id: Option<(u64, u64)>,
     /// Path of the directory under consideration, as the caller spelled the
     /// root plus each child name. Used to resolve a `.git` file's `gitdir:`
     /// path, which is relative to that directory and may leave the root.
@@ -401,23 +458,32 @@ struct Child {
 }
 
 struct Job {
-    dir: Dir,
+    dir: Option<Dir>,
     rules: DirRules,
     children: Vec<Child>,
     next: usize,
     abs: PathBuf,
     rel: PathBuf,
+    id: (u64, u64),
 }
 
 impl Job {
-    fn new(dir: Dir, rules: DirRules, children: Vec<Child>, abs: PathBuf, rel: PathBuf) -> Self {
+    fn new(
+        dir: Dir,
+        rules: DirRules,
+        children: Vec<Child>,
+        abs: PathBuf,
+        rel: PathBuf,
+        id: (u64, u64),
+    ) -> Self {
         Self {
-            dir,
+            dir: Some(dir),
             rules,
             children,
             next: 0,
             abs,
             rel,
+            id,
         }
     }
 }
@@ -485,7 +551,13 @@ impl<F: EventVisitor> Walker<F> {
         abs.reserve(256);
         let mut rel = PathBuf::new();
         rel.reserve(256);
-        Self { abs, rel, visit }
+        Self {
+            root: root.to_path_buf(),
+            root_id: None,
+            abs,
+            rel,
+            visit,
+        }
     }
 
     fn push(&mut self, name: impl AsRef<OsStr>) {
@@ -564,11 +636,15 @@ impl<F: EventVisitor> Walker<F> {
     fn process(&mut self, mut job: Job) -> Option<(Job, Job)> {
         self.abs.clone_from(&job.abs);
         self.rel.clone_from(&job.rel);
+        if job.dir.is_none() {
+            job.dir = self.reopen(&job.rel, job.id);
+        }
+        let dir = job.dir.as_ref()?;
         while job.next < job.children.len() {
             let child = &job.children[job.next];
             job.next += 1;
             self.push(&child.name);
-            let descended = match job.dir.fd() {
+            let descended = match dir.fd() {
                 Ok(fd) => self.consider(fd, &job.rules, &child.name, child.kind),
                 Err(error) => {
                     self.fail(io::Error::from(error));
@@ -581,6 +657,66 @@ impl<F: EventVisitor> Walker<F> {
             }
         }
         None
+    }
+
+    /// Reopen a spilled continuation one component at a time. Only the
+    /// configured root is opened by path; every component below it uses
+    /// `O_NOFOLLOW`. The root and final inode must match the first pass.
+    fn reopen(&mut self, rel: &Path, expected: (u64, u64)) -> Option<Dir> {
+        let root = match open_path(&self.root, root_dir_flags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                return None;
+            }
+        };
+        let Some(root_id) = self.root_id else {
+            self.fail(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing root identity",
+            ));
+            return None;
+        };
+        let mut fd = root;
+        if !self.same_dir(&fd, root_id) {
+            return None;
+        }
+        for name in rel.iter() {
+            fd = match openat(&fd, name, child_dir_flags(), Mode::empty()) {
+                Ok(next) => next,
+                Err(error) => {
+                    self.fail(io::Error::from(error));
+                    return None;
+                }
+            };
+        }
+        if !self.same_dir(&fd, expected) {
+            return None;
+        }
+        match Dir::new(fd) {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                None
+            }
+        }
+    }
+
+    fn same_dir(&mut self, fd: &OwnedFd, expected: (u64, u64)) -> bool {
+        match fstat(fd) {
+            Ok(stat) if (stat.st_dev, stat.st_ino) == expected => true,
+            Ok(_) => {
+                self.fail(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory changed before resume",
+                ));
+                false
+            }
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                false
+            }
+        }
     }
 
     fn consider(
@@ -746,6 +882,7 @@ impl<F: EventVisitor> Walker<F> {
             children,
             self.abs.clone(),
             self.rel.clone(),
+            (expected.st_dev, expected.st_ino),
         ))
     }
 
@@ -765,6 +902,7 @@ impl<F: EventVisitor> Walker<F> {
             children,
             self.abs.clone(),
             self.rel.clone(),
+            (expected.st_dev, expected.st_ino),
         ))
     }
 
