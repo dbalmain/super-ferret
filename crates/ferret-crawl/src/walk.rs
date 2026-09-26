@@ -14,6 +14,8 @@
 //! Each worker holds one active job and at most three extra descriptors while
 //! opening a child and reading `.git/info/exclude`. Thus a parallel walk with N
 //! workers holds at most 128 + 4N descriptors, independent of depth and width.
+//! The git directory closes as soon as `info` opens, and `info` closes as soon
+//! as `exclude` opens, so five worker descriptors never overlap.
 //! `EMFILE` opening a child is an [`Event::Io`] and the walk continues. There
 //! is no path-based fallback below the root.
 //! Listings store names in one byte buffer with offsets, and a worker reuses
@@ -1137,7 +1139,7 @@ impl<F: EventVisitor> Walker<F> {
 
     fn ancestor_exclude(&mut self, dir: BorrowedFd<'_>) -> Option<String> {
         match self.probe_git(dir) {
-            GitProbe::Directory(fd) => self.read_exclude(fd.as_fd()),
+            GitProbe::Directory(fd) => self.read_exclude(fd),
             GitProbe::File(bytes) => self.read_gitfile_exclude(dir, &bytes),
             GitProbe::Missing | GitProbe::Present => None,
         }
@@ -1182,15 +1184,16 @@ impl<F: EventVisitor> Walker<F> {
         } else {
             None
         };
-        let git_exclude = match &git {
-            GitProbe::Directory(fd) => self.read_exclude(fd.as_fd()),
-            GitProbe::File(bytes) => self.read_gitfile_exclude(dir, bytes),
+        let git_root = git.is_root();
+        let git_exclude = match git {
+            GitProbe::Directory(fd) => self.read_exclude(fd),
+            GitProbe::File(bytes) => self.read_gitfile_exclude(dir, &bytes),
             GitProbe::Missing | GitProbe::Present => None,
         };
         Ignores {
             ferretignore,
             gitignore,
-            git_root: git.is_root(),
+            git_root,
             git_exclude,
         }
     }
@@ -1212,10 +1215,10 @@ impl<F: EventVisitor> Walker<F> {
     /// `info` is opened `O_NOFOLLOW` relative to the held git directory (or
     /// common directory). `exclude` is an ordinary ignore file: a symlink of
     /// that name is followed.
-    fn read_exclude(&mut self, git: BorrowedFd<'_>) -> Option<String> {
+    fn read_exclude(&mut self, git: OwnedFd) -> Option<String> {
         let git_length = self.push(".git");
         let info_length = self.push("info");
-        let info = match openat(git, "info", child_dir_flags(), Mode::empty()) {
+        let info = match openat(git.as_fd(), "info", child_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => {
                 self.pop(info_length);
@@ -1231,8 +1234,17 @@ impl<F: EventVisitor> Walker<F> {
                 return None;
             }
         };
+        drop(git);
         let exclude_length = self.push("exclude");
-        let text = match open_ignore(info.as_fd(), "exclude") {
+        let opened = match openat(info.as_fd(), "exclude", ignore_flags(), Mode::empty()) {
+            Ok(fd) => {
+                drop(info);
+                read_opened(fd)
+            }
+            Err(Errno::NOENT) => Ok(Opened::Missing),
+            Err(error) => Err(io::Error::from(error)),
+        };
+        let text = match opened {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
             Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
@@ -1311,7 +1323,7 @@ impl<F: EventVisitor> Walker<F> {
         let raw = parse_gitdir(bytes)?;
         let gitdir = self.open_git_directory(work, raw)?;
         let common = self.common_dir(gitdir)?;
-        self.read_exclude(common.as_fd())
+        self.read_exclude(common)
     }
 
     fn open_git_directory(&mut self, base: BorrowedFd<'_>, raw: &OsStr) -> Option<OwnedFd> {

@@ -5,6 +5,7 @@ use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
+use std::process::Command;
 
 use ferret_policy::{Config, Decision};
 
@@ -71,6 +72,49 @@ fn many_siblings_match_sequential() {
     }
     let (events, _) = compare(&tree.path, 8);
     assert_eq!(events.len(), 384);
+}
+
+/// A parent, child, git directory and exclude file must fit in four worker
+/// descriptor slots while the exclude is read. Run in a child so the low
+/// soft limit cannot affect other tests in this process.
+#[test]
+fn exclude_read_fits_four_worker_descriptors() {
+    const ROOT: &str = "FERRET_FD_BOUND_ROOT";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let baseline = fs::read_dir("/proc/self/fd").unwrap().count() - 1;
+        let limit = baseline + 4;
+        let status = Command::new("prlimit")
+            .args([
+                "--pid".to_owned(),
+                std::process::id().to_string(),
+                format!("--nofile={limit}:{limit}"),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "prlimit failed: {status}");
+        let result = super::walked(Path::new(&root), None, Config::default());
+        assert!(result.io.is_empty(), "{:?}", result.io);
+        assert_eq!(super::decision(&result, "work/secret.txt"), Decision::Skip);
+        return;
+    }
+
+    let tree = Scratch::new("exclude-fd-bound");
+    write(&tree.join("work/.git/info/exclude"), "secret.txt\n");
+    write(&tree.join("work/secret.txt"), "x");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::parallel::exclude_read_fits_four_worker_descriptors",
+        ])
+        .env(ROOT, &tree.path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// The packed listing must preserve arbitrary filename bytes.
