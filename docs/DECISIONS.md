@@ -977,3 +977,30 @@ every crawl. The fact that would change it: a **cold-cache** crawl, which is the
 one a person waits for after boot, that is markedly faster at 16 or 32 because
 NVMe rewards queue depth. That needs a `drop_caches`, which needs root, so it
 has not been measured.
+
+## D25 — A configured root that git ignores
+
+**Question:** When the configured root, or a directory between it and the top of
+its work tree, is excluded by the work tree's rules, does Ferret index the root?
+
+Found by review of D22's implementation. With `repo/.gitignore` containing
+`/src/` and root `repo/src`, git ignores everything below `src`, including a
+file that `src/.gitignore` re-includes with `!keep.txt`: `git check-ignore`
+reports all three test files as ignored by `/src/`. The walker never asks
+`decide` about the root or its ancestors, so today it indexes all of `src`, and
+applies the closer `!keep.txt` as though `src` were live. The global ignore file
+behaves the same way: a root inside `node_modules/` is walked.
+
+| Option                                                                           | Costs                                                                                                                                                         | Buys                                                                                                                    |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| A. Follow git: an excluded root or ancestor excludes the whole root              | A root the user named explicitly yields an empty catalog, unless a `.ferretignore` `!` re-includes (D13). Needs decisions for each ancestor from top to root. | Exactly git's answer, which is the premise of D22.                                                                      |
+| B. A configured root is always walked; D22's rules apply only below it (current) | Differs from git for this one case. Closer negations inside the root apply although git would not reach them.                                                 | The user's explicit choice wins, consistent with how the global ignore treats a root. No code; document it and test it. |
+| C. Follow git, but report it: walk nothing and emit an event naming the rule     | The event plumbing for a new kind of report.                                                                                                                  | No silent surprise either way.                                                                                          |
+
+**Recommendation:** B. Naming a root is the most specific instruction Ferret
+gets, more specific than any ignore file, and it matches the global-ignore
+behaviour. D22's purpose was to make `ferret index repo/src` agree with git
+**inside** `src`, which B keeps. The fact that would change it: roots chosen by
+something other than a person, such as auto-discovering every repository under a
+directory. Then a root git ignores is more likely an accident than a request,
+and A or C is right.
