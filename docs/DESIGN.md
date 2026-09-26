@@ -178,7 +178,8 @@ the oldest one over only while another worker is idle. Each worker's visitor is
 built by a factory and returned at the end, so a consumer accumulates per thread
 with no lock. At most 128 waiting listings keep a descriptor. The rest reopen
 from the root one checked step at a time, which bounds the walker at 128 + 4N
-descriptors. `walk` is the same code with one worker. The default N is D24.
+descriptors. `walk` is the same code with one worker. By default N is the
+available parallelism capped at 16 (D24).
 
 A configured root is always walked, even when the enclosing work tree's rules
 exclude it or one of its ancestors: naming a root overrides `.gitignore` (D25),

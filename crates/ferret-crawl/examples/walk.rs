@@ -41,7 +41,7 @@ fn main() -> ExitCode {
             Ok(workers) if workers > 0 => workers,
             _ => return usage(),
         },
-        None => 1,
+        None => ferret_crawl::default_workers(),
     };
     if args.next().is_some() {
         return usage();
@@ -129,10 +129,11 @@ fn read_lossy(path: &Path) -> io::Result<String> {
 fn usage() -> ExitCode {
     let _ = writeln!(
         io::stderr(),
-        "usage: walk <root> [global-file]\n\
+        "usage: walk <root> [global-file] [workers]\n\
          \n\
          Walks <root> and prints decision counts and wall time. Without a\n\
-         global file, the built-in default ignore text is used."
+         global file, the built-in default ignore text is used. Without a\n\
+         worker count, the crate's default is used (D24)."
     );
     ExitCode::from(2)
 }

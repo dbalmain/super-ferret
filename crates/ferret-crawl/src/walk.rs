@@ -215,6 +215,18 @@ impl<F: FnMut(Event<'_>)> EventVisitor for F {
     }
 }
 
+/// Most workers [`default_workers`] picks. Warm on a 16-core machine, 16
+/// workers walked `$HOME` in 0.097 s against 0.154 s for 8 and 0.090 s for 32,
+/// and cold in 2.50 s against 3.08 s and 2.60 s; 32 cost 39% more CPU than 16
+/// for no gain (D24).
+const MAX_DEFAULT_WORKERS: usize = 16;
+
+/// The worker count to use when the user sets none: the machine's available
+/// parallelism, capped at 16 (D24).
+pub fn default_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |threads| threads.get().min(MAX_DEFAULT_WORKERS))
+}
+
 /// Walks with `workers` worker-local visitors and returns them for merging.
 /// Zero workers means one. Event order is unspecified across workers. When the
 /// root fails before threads start, only its fault visitor is returned.

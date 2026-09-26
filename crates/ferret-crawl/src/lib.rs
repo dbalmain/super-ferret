@@ -10,7 +10,7 @@
 
 mod walk;
 
-pub use walk::{Decided, Event, EventVisitor, Stat, walk, walk_parallel};
+pub use walk::{Decided, Event, EventVisitor, Stat, default_workers, walk, walk_parallel};
 
 #[cfg(test)]
 mod tests;

@@ -39,7 +39,7 @@ Predecessors, carried forward where still open:
 | D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
 | D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
 | D23 | Recording work trees, so duplicate results can be hidden | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                        |
-| D24 | How many walk workers by default                         | answered       | A: `min(8, cores)`; cold data favours 16, confirm                                                              |
+| D24 | How many walk workers by default                         | answered       | B: `min(16, cores)`, fastest cold (2.50 s vs 3.08 s at 8); `default_workers()`                                 |
 | D25 | A configured root that git ignores                       | answered       | B: a configured root is always walked; rules apply below it                                                    |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
@@ -1043,6 +1043,12 @@ more CPU per full crawl. So the question comes back once, briefly:
 full crawls are rare once the daemon runs. The fact that would change it: a
 repeat of the cold runs (these are one each) in which the 8 and 16 figures
 overlap.
+
+> Dave: Go with 16
+
+**Answer (2026-09-27): B, `min(16, available_parallelism)`.** It is
+`ferret_crawl::default_workers()`; the `walk` example uses it when no count is
+given. A config key and `--jobs` come with `ferret index`.
 
 ## D25 — A configured root that git ignores
 
