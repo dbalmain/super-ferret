@@ -144,22 +144,22 @@ delete carries a new ctime, so it is re-read and re-hashed like any change.
 then `enter` with that directory's ignore-file contents, or `traverse`), asks it
 to `decide` each entry using a borrowed root-relative path, and `sniff`s file
 heads; it is tested against a golden corpus of trees and expected decisions.
-Precedence, most specific first: a
-`.ferretignore` in the directory or an ancestor; `.gitignore` and
-`.git/info/exclude` inside a work tree; the user's global ignore file
-(`$XDG_CONFIG_HOME/ferret/ignore`), which setup seeds once with the defaults
-(`node_modules/`, `target/`, `.venv/`, …) and which is the user's to edit from
-then on. A size cap and a binary check sit beside the patterns. `!pat` in a
-`.ferretignore` overrides an ancestor `.ferretignore` or any `.gitignore`, and
-can re-include below an excluded directory; the walker traverses an excluded
-directory (uncatalogued, its ignore files unread) only when an anchored
-`.ferretignore` `!` pattern could match inside it — never for an unanchored one
-such as `!*.pdf`. A `.ferretignore` inside an excluded directory is never read;
-overriding an exclusion takes a `!` pattern at that directory's level or above
-(D13). D16 replaces the first implementation's `ignore` crate edge with an
-in-crate matcher. The crawler owns the candidate path so policy decisions do not
-allocate a joined path per entry. Re-inclusion pruning discards negations that a
-later exclusion provably supersedes; uncertain overlaps still permit traversal.
+Precedence, most specific first: a `.ferretignore` in the directory or an
+ancestor; `.gitignore` and `.git/info/exclude` inside a work tree; the user's
+global ignore file (`$XDG_CONFIG_HOME/ferret/ignore`), which setup seeds once
+with the defaults (`node_modules/`, `target/`, `.venv/`, …) and which is the
+user's to edit from then on. A size cap and a binary check sit beside the
+patterns. `!pat` in a `.ferretignore` overrides an ancestor `.ferretignore` or
+any `.gitignore`, and can re-include below an excluded directory; the walker
+traverses an excluded directory (uncatalogued, its ignore files unread) only
+when an anchored `.ferretignore` `!` pattern could match inside it — never for
+an unanchored one such as `!*.pdf`. A `.ferretignore` inside an excluded
+directory is never read; overriding an exclusion takes a `!` pattern at that
+directory's level or above (D13). D16 replaces the first implementation's
+`ignore` crate edge with an in-crate matcher. The crawler owns the candidate
+path so policy decisions do not allocate a joined path per entry. Re-inclusion
+pruning discards negations that a later exclusion provably supersedes; uncertain
+overlaps still permit traversal.
 
 Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
 and **content-indexed** (also hashed and tokenized). Binary files and files over

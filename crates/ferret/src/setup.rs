@@ -54,10 +54,7 @@ fn write_ignore_file_with_sequence(path: &Path, sequence: &AtomicU64) -> io::Res
     match linked {
         Ok(()) => removed.map(|()| Written::Created),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => kept(path),
-        Err(error) => {
-            let _ = removed;
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
