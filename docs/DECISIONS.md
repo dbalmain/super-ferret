@@ -49,6 +49,10 @@ Predecessors, carried forward where still open:
 | D31 | One inode, several names                                 | open           |                                                                                                                |
 | D32 | A reader while `ferret index` runs                       | open           |                                                                                                                |
 | D33 | What the walker must also hand the catalog               | open           |                                                                                                                |
+| D34 | Which roots a re-run replaces                            | open           |                                                                                                                |
+| D35 | Work-tree context for a root inside a repository         | open           |                                                                                                                |
+| D36 | Dead documents before there is an index to merge         | open           |                                                                                                                |
+| D37 | Remembering why a file has no document                   | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1289,12 +1293,14 @@ a test that a root excluded by an ancestor `.gitignore` is still indexed.
 
 DESIGN § The catalog fixes the tables, the ids and the hash. These questions
 stay open before code. Measured to size them: the default-ignore walk of `$HOME`
-on this machine catalogues **434,846 entries** (76,789 directories, 354,383
-content-indexable files, 3,674 catalogue-only), with **10.2 MB of name bytes,
+on this machine catalogues **434,846 entries** (76,789 directories; 354,383
+files the policy sends to the index, before the binary sniff moves some to
+catalogue-only; 3,674 already catalogue-only), with **10.2 MB of name bytes,
 23.4 B per name**, and no I/O faults and no traversed directories. Full relative
 paths would be 43 MB. Everything else below marked an estimate is one.
 
-Reviewed by Sol (gpt-6-sol) before reaching you; its findings are folded in.
+Reviewed by Sol (gpt-6-sol, three rounds) and Astra (gpt-6-astra) before
+reaching you; their findings are folded in.
 
 Settled without a brief (object if wrong):
 
@@ -1303,12 +1309,16 @@ Settled without a brief (object if wrong):
   `blake3` edge to DESIGN § Crates in the same commit. Only files the policy
   sends to the index are hashed; catalogue-only files (binary, over the size
   cap) have no `DocId`.
+- **Hashing and sniffing stay in `ferret-crawl`**, as DESIGN § Crates has it;
+  the catalog receives results, never file contents.
 - **`DocId` is never renumbered by the catalog.** Postings are keyed by it (D4);
   only an index merge may reclaim a dead doc, and that is S2's business.
-- **New `DocId`s are assigned in the order hashing finishes.** D4 expected the
-  first crawl to be close to path-sorted; `walk_parallel` gives no cross-worker
-  order, so it is not. Revisit if an S2 postings measurement shows the lost
-  locality costs bytes.
+- **New `DocId`s are assigned at the merge, in the order hashing finished.**
+  Assigning them in one place means two workers that hash equal content
+  concurrently still produce one `DocId`. D4 expected the first crawl to be
+  close to path-sorted; `walk_parallel` gives no cross-worker order, so it is
+  not. Revisit if an S2 postings measurement shows the lost locality costs
+  bytes.
 
 ## D26 — A re-run: rebuild the snapshot, or mutate it through a log
 
@@ -1327,22 +1337,29 @@ vanishes; and an unreadable ignore file changes the rules applied below it.
 `Event::Io` carries no operation tag, so the catalog cannot tell these apart to
 repair only the affected subtree.
 
-| Option                                                                                                                                                                                                                          | Costs                                                                                                                                                                                                                                                                                            | Buys                                                                                                                                                                             |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A. Rebuild and swap: the walk writes a new snapshot. A file's hash and `DocId` carry over when `(dev, ino, size, mtime, ctime)` match the old row. A directory whose listing faulted keeps its old children and their subtrees. | Writes the whole snapshot every run: at least 36 MB for `$HOME` and 83 MB at 1M entries (estimate, a floor: 48 B per inode plus 12 B per name row plus name bytes). Transient maps over the old snapshot for `(dev, ino)` and hash lookups, whose peak RSS must be measured against D5's budget. | No log format, no replay, no sweep. Deletion is absence, except under a faulted directory. The log arrives with the daemon, over a snapshot format already settled and measured. |
-| A′. As A, but a crawl with any I/O fault publishes nothing and keeps the old snapshot                                                                                                                                           | A root with one permanently unreadable directory (common under `/`, zero under `$HOME` today) never updates.                                                                                                                                                                                     | The simplest correct rule.                                                                                                                                                       |
-| B. Mutate: diff the walk against the catalog, append a record per change, compact when the log grows                                                                                                                            | The log format, replay, torn-tail recovery, compaction, and a sweep for entries the walk did not visit, which needs the same faulted-directory rule as A. All written in S1 and exercised only by full re-crawls until S5.                                                                       | One mechanism from the start. A re-run that changed little writes little.                                                                                                        |
+Not every fault is a coverage fault. An entry that vanished between listing and
+`lstat` (`NotFound`) is a deletion, which the new snapshot records correctly. A
+file that cannot be hashed, or changes while it is hashed (D33), leaves the
+namespace intact; only its content is unknown.
+
+| Option                                                                                                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                           | Buys                                                                                                                                                                             |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Rebuild and swap: the walk writes a new snapshot. A file's hash and `DocId` carry over when `(dev, ino, size, mtime, ctime)` match the old row. A directory whose listing faulted keeps its old children and their subtrees.                               | Writes the whole snapshot every run: about 50 MB for `$HOME` and 114 MB at 1M entries (estimate: 64 B inode rows as the walker's fields pack, 12 B name rows, 24.4 B of terminated name, and 128-bit hashes; 48 B rows need a compression scheme). Transient maps over the old snapshot for `(dev, ino)` and hash lookups, whose peak RSS must be measured against D5's budget. | No log format, no replay, no sweep. Deletion is absence, except under a faulted directory. The log arrives with the daemon, over a snapshot format already settled and measured. |
+| A′. As A, but a crawl with a coverage fault (a listing, open or ignore-file read that failed, or an `lstat`/`readlink` failure other than `NotFound`) publishes nothing and keeps the old snapshot. A content fault publishes, with that file marked unhashed | A root with one permanently unreadable directory (common under `/`, zero under `$HOME` today) never updates.                                                                                                                                                                                                                                                                    | The simplest correct rule.                                                                                                                                                       |
+| B. Mutate: diff the walk against the catalog, append a record per change, compact when the log grows                                                                                                                                                          | The log format, replay, torn-tail recovery, compaction, and a sweep for entries the walk did not visit, which needs the same faulted-directory rule as A. All written in S1 and exercised only by full re-crawls until S5.                                                                                                                                                      | One mechanism from the start. A re-run that changed little writes little.                                                                                                        |
 
 **Recommendation:** A′ for S1, moving to A once measured fault frequency
-justifies typed faults and subtree reconciliation. The log is the daemon's
-requirement, and designing it before the daemon means designing it without the
-workload that shapes it (small inotify bursts, not whole-tree diffs). A
-forecloses nothing: B's log is an addition over A's snapshot. A′ is the only
-variant that is correct with today's untyped faults; A's carry-forward needs
-each fault to say which operation failed on which entry. The facts that would
-change it: roots with permanent faults (anything under `/`), which make A′ never
-publish and so make A necessary; or a measured snapshot write that a person
-would notice on a re-run, over about a second at 1M entries, which favours B.
+justifies typed faults and subtree reconciliation. `io::Error::kind` already
+separates `NotFound`, so A′ needs no walker change to tell a deletion from a
+coverage fault. The log is the daemon's requirement, and designing it before the
+daemon means designing it without the workload that shapes it (small inotify
+bursts, not whole-tree diffs). A forecloses nothing: B's log is an addition over
+A's snapshot. A′ is the only variant that is correct with today's untyped
+faults; A's carry-forward needs each fault to say which operation failed on
+which entry. The facts that would change it: roots with permanent faults
+(anything under `/`), which make A′ never publish and so make A necessary; or a
+measured snapshot write that a person would notice on a re-run, over about a
+second at 1M entries, which favours B.
 
 ## D27 — `InoId` and `NameId`: stable, or renumbered each snapshot
 
@@ -1373,6 +1390,12 @@ one.
 | A. Raw bytes, NUL-terminated, one heap; `names` rows sorted by (parent, name) with a `u32` offset each, so a directory's children are one contiguous range | 23.4 B per name as measured, plus 1 B terminator and 4 B offset in the row: about 28 MB at 1M names for the heap and offsets (estimate).                                | A name cannot contain NUL, so a substring search over the whole heap cannot match across names, and a hit's offset finds its row by binary search. Children are a slice, binary-searchable by name. |
 | B. Front-coded per directory (shared prefix length + suffix)                                                                                               | Each name is decoded before matching, so a SIMD search over the heap no longer applies directly. Saving unmeasured; sibling names in source trees share short prefixes. | Fewer bytes, if siblings share enough prefix, as in `IMG_0001.jpg`-style directories.                                                                                                               |
 | C. Raw bytes in walk order, with a separate sorted child index                                                                                             | 4 B more per name for the index, and walk order is not reproducible across runs with parallel workers.                                                                  | Nothing A lacks.                                                                                                                                                                                    |
+
+The terminator settles literal substring search only. A glob or regex run over
+the whole heap could consume a terminator or anchor to the heap's ends, so those
+are evaluated per name slice, after a literal prefilter where the pattern has
+one. Names are bytes, never re-encoded: a name with a newline or invalid UTF-8
+is stored and matched as the kernel returned it, and only display escapes it.
 
 **Recommendation:** A, and measure B on `$HOME` before the format is frozen: net
 snapshot bytes and scan latency together, since density comes first in this
@@ -1414,19 +1437,22 @@ tree — rebuilt by every reader, or stored in the snapshot?
 The name scan's target is single-digit milliseconds warm (estimate), and every
 `ferret find` without the daemon pays whatever opening costs.
 
-| Option                                                                                                                                                                                                            | Costs                                                                                                                                                                                                                  | Buys                                                                                                                        |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| A. Rebuild all of them on open (DESIGN now)                                                                                                                                                                       | A hash map of up to 354k entries (one per distinct content; the file count is the upper bound) and three inverse arrays on every invocation: tens of milliseconds at 1M (estimate), which would dominate a name query. | The smallest file. Nothing to keep consistent.                                                                              |
-| B. Store the query-path structures as arrays in the snapshot (`DocId → [InoId]` and `InoId → [NameId]` as offset-plus-list arrays, the work tree per directory); build the `hash → DocId` map only in the indexer | About 8 B per entry more on disk (estimate), all sequential and mapped rather than read.                                                                                                                               | Opening is an `mmap`; a name-only query touches the heap and the rows it hits. The hash map is paid only by `ferret index`. |
-| C. Build each lazily, on the first query that needs it                                                                                                                                                            | The first content query pays A's cost for its structure.                                                                                                                                                               | A name-only query pays nothing, without growing the file.                                                                   |
+| Option                                                                                                                                                                                                            | Costs                                                                                                                                                                                            | Buys                                                                                                                        |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| A. Rebuild all of them on open (DESIGN now)                                                                                                                                                                       | A hash map with one entry per document ever assigned, live or dead (D36) and three inverse arrays on every invocation: tens of milliseconds at 1M (estimate), which would dominate a name query. | The smallest file. Nothing to keep consistent.                                                                              |
+| B. Store the query-path structures as arrays in the snapshot (`DocId → [InoId]` and `InoId → [NameId]` as offset-plus-list arrays, the work tree per directory); build the `hash → DocId` map only in the indexer | About 14–16 B per entry more on disk for the two inverses as offset-plus-list arrays (estimate), all sequential and mapped rather than read.                                                     | Opening is an `mmap`; a name-only query touches the heap and the rows it hits. The hash map is paid only by `ferret index`. |
+| C. Build each lazily, on the first query that needs it                                                                                                                                                            | The first content query pays A's cost for its structure.                                                                                                                                         | A name-only query pays nothing, without growing the file.                                                                   |
 
-**Recommendation:** C for S1. With D31 C, a name-scan hit already identifies its
-`NameId`, and its row gives the inode and the one parent chain, so a name-only
-`find` needs none of these structures. `DocId → [InoId]` and the full inverse
-serve `stats` and, from S2, content results; they are built when first needed,
-and one is persisted when a measured query shows its build dominating. The fact
-that would change it: a measured S1 query whose latency is mostly that build,
-which moves that structure to B.
+**Recommendation:** C for S1, plus one persisted array. A name-scan hit
+identifies its `NameId`, whose row gives the parent directory's `InoId`; but an
+inode row holds no `NameId`, so walking up needs a directory's own name. With
+D31 C every directory has exactly one, so a persisted directory-only
+`InoId → NameId` array (4 B per directory, 0.3 MB for `$HOME`) is the whole path
+structure, and a name-only `find` needs nothing else. `DocId → [InoId]` and the
+full inverse serve `stats` and, from S2, content results; they are built when
+first needed, and one is persisted when a measured query shows its build
+dominating. The fact that would change it: a measured S1 query whose latency is
+mostly that build, which moves that structure to B.
 
 ## D31 — One inode, several names
 
@@ -1452,6 +1478,14 @@ found by its path edge (parent row and name) plus its identity. The fact that
 would change it: a census showing many aliased directories **and** a way to give
 each alias its own path context under one row; without the second, A cannot
 represent them.
+
+"Hashed once" cannot wait for the merge: two names of one file can reach `Index`
+on different workers at the same time. So `ferret-crawl` keeps one per-run
+cache, shared by the workers, from a validated `(dev, ino, size, mtime, ctime)`
+to its hash, with an in-flight mark so the second name waits for the first hash
+instead of reading the file again. The cost is one concurrent-map probe per
+hashed file; the fact that would change it is a census showing hard links rare
+enough that the duplicate reads cost less than the probes.
 
 ## D32 — A reader while `ferret index` runs
 
@@ -1481,9 +1515,10 @@ by path?
 
 A handle check proves the name still names the inode; it does not prove the
 inode held still while it was read. So in A the hash is taken between two
-`fstat`s of the open file: a changed `(size, mtime, ctime)` retries once, then
-reports a fault and leaves the file unhashed for this run, rather than recording
-a hash that matches neither version.
+`fstat`s of the open file, and the first must also match the stat in the
+`Decided` event, since that is what the catalog row records. Any mismatch
+retries once, then is a content fault (D26): the file is published unhashed for
+this run, rather than with a hash that matches neither version.
 
 **Recommendation:** A, with the stat-bracketed hash. It keeps D21's guarantee
 end to end, and the walker's `.git` probe is the natural place to classify work
@@ -1491,3 +1526,64 @@ trees. The fact that would change it: hashing inside a walker callback
 measurably defeating crawl throughput, which would change how handles are passed
 (a queue of opened descriptors for hashing workers) while keeping
 handle-relative opens.
+
+## D34 — Which roots a re-run replaces
+
+**Question:** After `ferret index /a /b`, does `ferret index /a` refresh `/a`
+and keep `/b`, or replace the catalog with `/a` alone?
+
+| Option                                                                                                                                           | Costs                                                                                                                                                                                                                       | Buys                                                                                                                  |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| A. The invocation's roots are the whole set: anything not named is dropped                                                                       | Forgetting a root on the command line deletes it from the catalog.                                                                                                                                                          | One rule, no ownership bookkeeping.                                                                                   |
+| B. Named roots are refreshed and others kept; removal is explicit (`ferret roots remove`); with no arguments, every configured root is refreshed | Each root owns its rows, and a rebuild copies the untouched roots' rows forward. An overlapping pair (`~` and `~/w/x`, where D25 lets the inner root expose what the outer one ignores) needs an owner for the shared rows. | Refreshing one tree is cheap and safe; the configured roots in `config` are the authority, not the last command line. |
+
+**Recommendation:** B, with overlap resolved by the innermost configured root
+owning its subtree: the outer root's walk stops at the inner root's top and the
+inner root's rules and D25 behaviour apply there. The fact that would change it:
+roots never overlapping in practice, which would let B drop the ownership rule
+but not the explicit removal.
+
+## D35 — Work-tree context for a root inside a repository
+
+**Question:** For root `repo/src` (D22), the work tree's top directory is above
+the root and has no row, yet D23 keys `worktrees` by that row. Where does the
+context live?
+
+| Option                                                                                                                 | Costs                                                                                                                    | Buys                                                                                                                                            |
+| ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. The `roots` row carries inherited context: kind, repository id, and the root's path relative to the work tree's top | A special case in `roots`, a few tens of bytes per root.                                                                 | Grouping a hit across work trees compares repository-relative paths, which needs exactly that prefix; nothing outside a root becomes an entity. |
+| B. Synthesize rows for the ancestors up to the work tree's top                                                         | Rows for directories outside every root, which the name scan must then skip, and which D34's ownership must account for. | `worktrees` stays uniform.                                                                                                                      |
+
+**Recommendation:** A. The fact that would change it: ancestors outside roots
+becoming searchable, which D18's later "links that pull content in" might bring.
+
+## D36 — Dead documents before there is an index to merge
+
+**Question:** In S1 nothing reclaims a dead `DocId` (only an S2 merge may), so
+every edit adds a `docs` row forever. What bounds that?
+
+| Option                                                                                       | Costs                                                                                                                     | Buys                                                                                                         |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| A. Keep dead docs; content that reappears (a revert, a checkout) reactivates its old `DocId` | 16 B hash plus a live bit per historical content, growing with churn until S2's merge exists. Unmeasured on this machine. | Stable ids across a revert, which is what S2's postings want, and the S1 data shows how much churn there is. |
+| B. Keep only the ordinal high-water mark; drop dead rows at each rebuild                     | Content that reappears gets a new `DocId`; the id space has holes.                                                        | The table holds live content only.                                                                           |
+| C. Allow an explicit reset that renumbers everything                                         | Invalidates every `DocId`, which is harmless in S1 (no index) and expensive after S2.                                     | Bounded storage by command.                                                                                  |
+
+**Recommendation:** A, and record dead-doc count and bytes in `ferret stats` so
+the budget is measured rather than guessed. The fact that would change it:
+measured churn making the history a material share of the catalog before S2's
+merge lands, in which case B.
+
+## D37 — Remembering why a file has no document
+
+**Question:** `DocId = none` means too large, binary, or failed to hash. After
+the size cap is raised, or the sniffer changes, which unchanged files are read
+again?
+
+| Option                                                                                                                           | Costs                                                                                          | Buys                                                                                                                                    |
+| -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Re-sniff every row without a document on every run                                                                            | A head read of every binary file each run: every image, archive and object file, warm or cold. | No extra state.                                                                                                                         |
+| B. A content state per inode (not content-eligible / binary / hashed / fault), plus the sniffer's version in the snapshot header | 1 B per inode, which fits in the row's padding (estimate).                                     | An unchanged binary is not re-read; a new cap re-evaluates only rows whose state the cap affects; a new sniffer version re-sniffs once. |
+
+**Recommendation:** B. Current policy decides eligibility each run; the stored
+state only says what the last observation found. The fact that would change it:
+a measured re-sniff of `$HOME`'s binaries cheap enough to ignore.
