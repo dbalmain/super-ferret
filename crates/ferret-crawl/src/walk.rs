@@ -1,4 +1,4 @@
-//! One root, walked depth-first, with one [`DirRules`] per directory.
+//! One root, walked by directory handles, with one [`DirRules`] per directory.
 //!
 //! Seam: [`ferret_policy`] decides what to do with each entry. This module
 //! reads the tree and reports. It does not touch the catalog.
@@ -6,12 +6,11 @@
 //! The root is opened by the path the caller gave, following a symlink there
 //! (that path is the user's), with `O_DIRECTORY`. Every later open, stat,
 //! `readlink` and ignore-file read is relative to a directory descriptor.
-//! The walk is recursive and lists each directory in full before visiting
-//! its children, so the descriptor stack is one open directory per level
-//! still on the call stack. While that directory's ignore files are read,
-//! its `.git` directory descriptor is held as well, and `info` under it for
-//! the exclude read; both are closed before any child is visited. That is
-//! the bound: depth, plus two during the ignore read, and nothing cached.
+//! A queued job owns one directory descriptor and a listing cursor. The queue
+//! holds at most 128 jobs; each worker holds one active job and at most two
+//! extra descriptors while opening a child or reading ignore files. Thus a
+//! parallel walk with N workers holds at most 128 + 3N descriptors, independent
+//! of tree depth and width. A single-worker walk uses the same jobs.
 //! `EMFILE` opening a child is an [`Event::Io`] for that child and the walk
 //! continues with the next sibling. There is no path-based fallback.
 //!
@@ -27,6 +26,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
+use std::thread;
 
 use ferret_policy::{AncestorGit, Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
 use rustix::fs::{
@@ -182,53 +183,181 @@ pub enum Event<'a> {
 /// was, is an [`Event::Io`] and the directory is not listed.
 ///
 /// Mount points are crossed: the walk does not compare `st_dev` with the
-/// root. The walk is single-threaded. See the module docs for how many
-/// descriptors the recursion holds.
+/// root. See the module docs for the descriptor bound.
 pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut(Event<'_>)) {
     let mut walker = Walker::new(root, visit);
-    let ancestors = walker.discover(root);
-    let within = !ancestors.is_empty();
-    let fd = match open_path(root, root_dir_flags(), Mode::empty()) {
-        Ok(fd) => fd,
-        Err(error) => {
-            walker.fail(io::Error::from(error));
-            return;
-        }
-    };
-    let mut dir = match Dir::new(fd) {
-        Ok(dir) => dir,
-        Err(error) => {
-            walker.fail(io::Error::from(error));
-            return;
-        }
-    };
-    let Some(children) = walker.list(&mut dir) else {
+    let Some(root_job) = walker.root_job(root, global, config) else {
         return;
     };
-    let loaded = match dir.fd() {
-        Ok(fd) => walker.load_ignores(fd, &children, within),
-        Err(error) => {
-            walker.fail(io::Error::from(error));
-            return;
+    let queue = (
+        Mutex::new(Queue {
+            jobs: vec![root_job],
+            outstanding: 1,
+        }),
+        Condvar::new(),
+    );
+    run_worker(walker, &queue);
+}
+
+/// A worker-local visitor. The returned visitors retain their accumulated
+/// state, so callers can merge it after the walk without locking per entry.
+pub trait EventVisitor {
+    /// Receives one event; borrowed paths are valid only during this call.
+    fn visit(&mut self, event: Event<'_>);
+}
+
+impl<F: FnMut(Event<'_>)> EventVisitor for F {
+    fn visit(&mut self, event: Event<'_>) {
+        self(event);
+    }
+}
+
+/// Walks with `workers` worker-local visitors and returns them for merging.
+/// Zero workers means one. Event order is unspecified across workers.
+pub fn walk_parallel<V: EventVisitor + Send>(
+    root: &Path,
+    global: Option<&str>,
+    config: Config,
+    workers: usize,
+    make_visitor: impl Fn() -> V + Sync,
+) -> Vec<V> {
+    let count = workers.max(1);
+    let mut first = Walker::new(root, make_visitor());
+    let Some(root_job) = first.root_job(root, global, config) else {
+        return vec![first.visit];
+    };
+    let queue = (
+        Mutex::new(Queue {
+            jobs: vec![root_job],
+            outstanding: 1,
+        }),
+        Condvar::new(),
+    );
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(count);
+        handles.push(scope.spawn(|| run_worker(first, &queue)));
+        for _ in 1..count {
+            let visitor = make_visitor();
+            handles.push(scope.spawn(|| run_worker(Walker::new(root, visitor), &queue)));
         }
-    };
-    let borrowed: Vec<AncestorGit<'_>> = ancestors
-        .iter()
-        .map(|found| AncestorGit {
-            above: found.above.as_path(),
-            directory: found.directory.as_path(),
-            gitignore: found.gitignore.as_deref(),
-            git_exclude: found.git_exclude.as_deref(),
-            top: found.top,
-        })
-        .collect();
-    let (rules, errors) = if within {
-        DirRules::root_within(root, global, loaded.files(), &borrowed, config)
-    } else {
-        DirRules::root(root, global, loaded.files(), config)
-    };
-    walker.patterns(errors);
-    walker.walk_listed(&dir, &rules, children);
+        handles
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(visitor) => visitor,
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect()
+    })
+}
+
+const MAX_QUEUED: usize = 128;
+
+struct Queue {
+    jobs: Vec<Job>,
+    outstanding: usize,
+}
+
+fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &(Mutex<Queue>, Condvar)) -> V {
+    let (lock, ready) = shared;
+    loop {
+        let job = {
+            let mut queue = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if let Some(job) = queue.jobs.pop() {
+                    break job;
+                }
+                if queue.outstanding == 0 {
+                    return walker.visit;
+                }
+                queue = ready
+                    .wait(queue)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        let mut current = job;
+        loop {
+            match walker.process(current) {
+                Some((parent, child)) => {
+                    let mut queue = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    queue.outstanding += 1;
+                    queue.jobs.push(parent);
+                    if queue.jobs.len() < MAX_QUEUED {
+                        queue.jobs.push(child);
+                        ready.notify_all();
+                        break;
+                    }
+                    ready.notify_one();
+                    current = child;
+                }
+                None => {
+                    let mut queue = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    queue.outstanding -= 1;
+                    if queue.outstanding == 0 {
+                        ready.notify_all();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl<F: EventVisitor> Walker<F> {
+    fn root_job(&mut self, root: &Path, global: Option<&str>, config: Config) -> Option<Job> {
+        let ancestors = self.discover(root);
+        let within = !ancestors.is_empty();
+        let fd = match open_path(root, root_dir_flags(), Mode::empty()) {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                return None;
+            }
+        };
+        let mut dir = match Dir::new(fd) {
+            Ok(dir) => dir,
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                return None;
+            }
+        };
+        let children = self.list(&mut dir)?;
+        let loaded = match dir.fd() {
+            Ok(fd) => self.load_ignores(fd, &children, within),
+            Err(error) => {
+                self.fail(io::Error::from(error));
+                return None;
+            }
+        };
+        let borrowed: Vec<AncestorGit<'_>> = ancestors
+            .iter()
+            .map(|found| AncestorGit {
+                above: found.above.as_path(),
+                directory: found.directory.as_path(),
+                gitignore: found.gitignore.as_deref(),
+                git_exclude: found.git_exclude.as_deref(),
+                top: found.top,
+            })
+            .collect();
+        let (rules, errors) = if within {
+            DirRules::root_within(root, global, loaded.files(), &borrowed, config)
+        } else {
+            DirRules::root(root, global, loaded.files(), config)
+        };
+        self.patterns(errors);
+        Some(Job::new(
+            dir,
+            rules,
+            children,
+            self.abs.clone(),
+            self.rel.clone(),
+        ))
+    }
 }
 
 fn root_dir_flags() -> OFlags {
@@ -269,6 +398,28 @@ struct Walker<F> {
 struct Child {
     name: OsString,
     kind: FileType,
+}
+
+struct Job {
+    dir: Dir,
+    rules: DirRules,
+    children: Vec<Child>,
+    next: usize,
+    abs: PathBuf,
+    rel: PathBuf,
+}
+
+impl Job {
+    fn new(dir: Dir, rules: DirRules, children: Vec<Child>, abs: PathBuf, rel: PathBuf) -> Self {
+        Self {
+            dir,
+            rules,
+            children,
+            next: 0,
+            abs,
+            rel,
+        }
+    }
 }
 
 /// What `.git` is. A symlink is [`GitProbe::Present`]: nothing is opened
@@ -328,10 +479,7 @@ enum Opened {
     Bytes(Vec<u8>),
 }
 
-impl<F> Walker<F>
-where
-    F: FnMut(Event<'_>),
-{
+impl<F: EventVisitor> Walker<F> {
     fn new(root: &Path, visit: F) -> Self {
         let mut abs = PathBuf::from(root);
         abs.reserve(256);
@@ -353,7 +501,7 @@ where
     }
 
     fn fail(&mut self, error: io::Error) {
-        (self.visit)(Event::Io {
+        self.visit.visit(Event::Io {
             path: &self.rel,
             error,
         });
@@ -361,12 +509,12 @@ where
 
     fn patterns(&mut self, errors: Vec<PatternError>) {
         for error in errors {
-            (self.visit)(Event::Pattern(error));
+            self.visit.visit(Event::Pattern(error));
         }
     }
 
     fn emit(&mut self, decision: Decision, stat: Option<Stat<'_>>) {
-        (self.visit)(Event::Decided(Decided {
+        self.visit.visit(Event::Decided(Decided {
             path: &self.rel,
             decision,
             stat,
@@ -413,70 +561,80 @@ where
         }
     }
 
-    fn walk_listed(&mut self, dir: &Dir, rules: &DirRules, children: Vec<Child>) {
-        for child in children {
+    fn process(&mut self, mut job: Job) -> Option<(Job, Job)> {
+        self.abs.clone_from(&job.abs);
+        self.rel.clone_from(&job.rel);
+        while job.next < job.children.len() {
+            let child = &job.children[job.next];
+            job.next += 1;
             self.push(&child.name);
-            match dir.fd() {
-                Ok(fd) => self.consider(fd, rules, &child.name, child.kind),
-                Err(error) => self.fail(io::Error::from(error)),
-            }
+            let descended = match job.dir.fd() {
+                Ok(fd) => self.consider(fd, &job.rules, &child.name, child.kind),
+                Err(error) => {
+                    self.fail(io::Error::from(error));
+                    None
+                }
+            };
             self.pop();
+            if let Some(descended) = descended {
+                return Some((job, descended));
+            }
         }
+        None
     }
 
-    fn consider(&mut self, dir: BorrowedFd<'_>, rules: &DirRules, name: &OsStr, kind: FileType) {
+    fn consider(
+        &mut self,
+        dir: BorrowedFd<'_>,
+        rules: &DirRules,
+        name: &OsStr,
+        kind: FileType,
+    ) -> Option<Job> {
         match kind {
             FileType::RegularFile | FileType::Unknown => {
-                let Some(stat) = self.stat_child(dir, name) else {
-                    return;
-                };
-                self.decide_statted(dir, rules, name, stat);
+                let stat = self.stat_child(dir, name)?;
+                self.decide_statted(dir, rules, name, stat)
             }
             FileType::Symlink => {
                 let decision = rules.decide(&self.rel, Entry::Symlink);
                 if decision == Decision::Skip {
                     self.emit_skip();
-                    return;
+                    return None;
                 }
-                self.finish_link(dir, rules, name, decision);
+                self.finish_link(dir, rules, name, decision)
             }
             FileType::Directory => self.consider_dir(dir, rules, name),
             _ => {
                 if rules.decide(&self.rel, Entry::Other) == Decision::Skip {
                     self.emit_skip();
-                    return;
+                    return None;
                 }
-                let Some(stat) = self.stat_child(dir, name) else {
-                    return;
-                };
-                self.decide_statted(dir, rules, name, stat);
+                let stat = self.stat_child(dir, name)?;
+                self.decide_statted(dir, rules, name, stat)
             }
         }
     }
 
-    fn consider_dir(&mut self, dir: BorrowedFd<'_>, rules: &DirRules, name: &OsStr) {
+    fn consider_dir(&mut self, dir: BorrowedFd<'_>, rules: &DirRules, name: &OsStr) -> Option<Job> {
         let mut decision = rules.decide(&self.rel, Entry::Dir);
         if decision == Decision::Skip {
             self.emit_skip();
-            return;
+            return None;
         }
-        let Some(stat) = self.stat_child(dir, name) else {
-            return;
-        };
+        let stat = self.stat_child(dir, name)?;
         let seen = entry_from_stat(&stat);
         if seen != Entry::Dir {
             decision = rules.decide(&self.rel, seen);
             if decision == Decision::Skip {
                 self.emit_skip();
-                return;
+                return None;
             }
             if seen == Entry::Symlink {
-                self.finish_link(dir, rules, name, decision);
-                return;
+                return self.finish_link(dir, rules, name, decision);
             }
         }
         self.emit_stat(decision, &stat, None);
-        self.follow(dir, rules, name, decision, &stat);
+        self.follow(dir, rules, name, decision, &stat)
     }
 
     /// `stat` came from `statat` (`d_type` was a file, unknown, or disagreed).
@@ -488,19 +646,18 @@ where
         rules: &DirRules,
         name: &OsStr,
         stat: rustix::fs::Stat,
-    ) {
+    ) -> Option<Job> {
         let entry = entry_from_stat(&stat);
         let decision = rules.decide(&self.rel, entry);
         if decision == Decision::Skip {
             self.emit_skip();
-            return;
+            return None;
         }
         if entry == Entry::Symlink {
-            self.finish_link(dir, rules, name, decision);
-            return;
+            return self.finish_link(dir, rules, name, decision);
         }
         self.emit_stat(decision, &stat, None);
-        self.follow(dir, rules, name, decision, &stat);
+        self.follow(dir, rules, name, decision, &stat)
     }
 
     /// Opens `name` with `O_PATH | O_NOFOLLOW`. The stat and, when it is a
@@ -511,12 +668,12 @@ where
         rules: &DirRules,
         name: &OsStr,
         decision: Decision,
-    ) {
+    ) -> Option<Job> {
         let (stat, target) = match observe_link(dir, name) {
             Ok(pair) => pair,
             Err(error) => {
                 self.fail(error);
-                return;
+                return None;
             }
         };
         let seen = entry_from_stat(&stat);
@@ -524,20 +681,20 @@ where
             let decision = rules.decide(&self.rel, seen);
             if decision == Decision::Skip {
                 self.emit_skip();
-                return;
+                return None;
             }
             self.emit_stat(decision, &stat, None);
-            self.follow(dir, rules, name, decision, &stat);
-            return;
+            return self.follow(dir, rules, name, decision, &stat);
         }
         let Some(target) = target else {
             self.fail(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "symlink has no target",
             ));
-            return;
+            return None;
         };
         self.emit_stat(decision, &stat, Some(target.as_os_str()));
+        None
     }
 
     fn stat_child(&mut self, dir: BorrowedFd<'_>, name: &OsStr) -> Option<rustix::fs::Stat> {
@@ -557,11 +714,11 @@ where
         name: &OsStr,
         decision: Decision,
         expected: &rustix::fs::Stat,
-    ) {
+    ) -> Option<Job> {
         match decision {
             Decision::Descend => self.enter_and_list(parent, rules, name, expected),
             Decision::Traverse => self.traverse_and_list(parent, rules, name, expected),
-            Decision::Skip | Decision::Catalog(_) | Decision::Index => {}
+            Decision::Skip | Decision::Catalog(_) | Decision::Index => None,
         }
     }
 
@@ -571,23 +728,25 @@ where
         parent_rules: &DirRules,
         name: &OsStr,
         expected: &rustix::fs::Stat,
-    ) {
-        let Some(mut child) = self.open_child(parent, name, expected) else {
-            return;
-        };
-        let Some(children) = self.list(&mut child) else {
-            return;
-        };
+    ) -> Option<Job> {
+        let mut child = self.open_child(parent, name, expected)?;
+        let children = self.list(&mut child)?;
         let loaded = match child.fd() {
             Ok(fd) => self.load_ignores(fd, &children, parent_rules.in_work_tree()),
             Err(error) => {
                 self.fail(io::Error::from(error));
-                return;
+                return None;
             }
         };
         let (rules, errors) = parent_rules.enter(name, loaded.files());
         self.patterns(errors);
-        self.walk_listed(&child, &rules, children);
+        Some(Job::new(
+            child,
+            rules,
+            children,
+            self.abs.clone(),
+            self.rel.clone(),
+        ))
     }
 
     fn traverse_and_list(
@@ -596,15 +755,17 @@ where
         parent_rules: &DirRules,
         name: &OsStr,
         expected: &rustix::fs::Stat,
-    ) {
-        let Some(mut child) = self.open_child(parent, name, expected) else {
-            return;
-        };
-        let Some(children) = self.list(&mut child) else {
-            return;
-        };
+    ) -> Option<Job> {
+        let mut child = self.open_child(parent, name, expected)?;
+        let children = self.list(&mut child)?;
         let rules = parent_rules.traverse(name);
-        self.walk_listed(&child, &rules, children);
+        Some(Job::new(
+            child,
+            rules,
+            children,
+            self.abs.clone(),
+            self.rel.clone(),
+        ))
     }
 
     /// `O_DIRECTORY | O_NOFOLLOW`, then `fstat`. A symlink is `ELOOP`. A

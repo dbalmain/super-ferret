@@ -3,6 +3,7 @@
 mod ancestor;
 mod gitfile;
 mod golden;
+mod parallel;
 mod race;
 
 use std::collections::BTreeMap;

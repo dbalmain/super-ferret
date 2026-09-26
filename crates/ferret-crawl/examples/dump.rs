@@ -1,4 +1,5 @@
-//! `cargo run --release -p ferret-crawl --example dump -- <root> [global-file]`
+//! `cargo run --release -p ferret-crawl --example dump -- <root> [global-file]
+//! [workers]`
 //!
 //! Walks one root and prints one line per event, sorted by path: the decision
 //! (or `io` / `pattern`) and the root-relative path. Two builds that print the
@@ -10,7 +11,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use ferret_crawl::{Event, walk};
+use ferret_crawl::{Event, EventVisitor, walk_parallel};
 use ferret_policy::{Config, DEFAULT_IGNORE};
 
 fn main() -> ExitCode {
@@ -28,26 +29,27 @@ fn main() -> ExitCode {
         },
         None => DEFAULT_IGNORE.to_owned(),
     };
+    let workers = match args.next() {
+        Some(value) => match value.to_string_lossy().parse::<usize>() {
+            Ok(workers) if workers > 0 => workers,
+            _ => return usage(),
+        },
+        None => 1,
+    };
     if args.next().is_some() {
         return usage();
     }
 
-    let mut lines = Vec::new();
-    walk(
+    let mut lines: Vec<_> = walk_parallel(
         Path::new(&root),
         Some(&global),
         Config::default(),
-        |event| {
-            let line = match event {
-                Event::Decided(decided) => {
-                    format!("{}\t{:?}", decided.path.display(), decided.decision)
-                }
-                Event::Io { path, .. } => format!("{}\tio", path.display()),
-                Event::Pattern(error) => format!("-\tpattern {error:?}"),
-            };
-            lines.push(line);
-        },
-    );
+        workers,
+        Dump::default,
+    )
+    .into_iter()
+    .flat_map(|visitor| visitor.lines)
+    .collect();
     lines.sort_unstable();
     let mut out = io::BufWriter::new(io::stdout().lock());
     for line in lines {
@@ -59,6 +61,24 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: dump <root> [global-file]");
+    eprintln!("usage: dump <root> [global-file] [workers]");
     ExitCode::from(2)
+}
+
+#[derive(Default)]
+struct Dump {
+    lines: Vec<String>,
+}
+
+impl EventVisitor for Dump {
+    fn visit(&mut self, event: Event<'_>) {
+        let line = match event {
+            Event::Decided(decided) => {
+                format!("{}\t{:?}", decided.path.display(), decided.decision)
+            }
+            Event::Io { path, .. } => format!("{}\tio", path.display()),
+            Event::Pattern(error) => format!("-\tpattern {error:?}"),
+        };
+        self.lines.push(line);
+    }
 }
