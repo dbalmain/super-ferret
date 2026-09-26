@@ -6,6 +6,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, FileType, Metadata, OpenOptions};
 use std::io::{self, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,10 @@ use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError
 
 /// `O_NONBLOCK` from Linux `<fcntl.h>` (`04000`). std does not export it.
 const O_NONBLOCK: i32 = 0o4000;
+
+/// `O_NOFOLLOW` from Linux `<fcntl.h>` (`0400000`). Opening `.git` with this
+/// set refuses a symlink instead of reading through it.
+const O_NOFOLLOW: i32 = 0o400000;
 
 /// An ignore file larger than this is an [`Event::Io`] and counts as absent.
 /// One mebibyte is past any ignore file this tree has seen; the bound is what
@@ -118,7 +123,11 @@ pub enum Event<'a> {
 /// its ignore files are not read (D13). `.gitignore` is read only inside a
 /// work tree, where its rules can apply; the root counts as outside one unless
 /// it contains `.git` (D22). `.git/info/exclude` is read when `.git` is a real
-/// directory.
+/// directory. When `.git` is a regular file whose first line is `gitdir:
+/// <path>` (relative to the directory that holds the file), exclude is read
+/// from that gitdir, or from the directory named by a `commondir` file there:
+/// one line, relative to the gitdir, which is how a linked work tree points at
+/// the main repository. Nothing is opened through a symlinked `.git`.
 ///
 /// `.ferretignore`, `.gitignore` and `info/exclude` are opened without blocking
 /// (`O_NONBLOCK`) and read only when that open file is a regular file of at
@@ -194,14 +203,16 @@ impl Ignores {
 }
 
 /// What `.git` is, from `lstat`. A symlink is [`GitKind::Present`], not a
-/// directory, so exclude is never read through a link.
+/// directory and not a file, so nothing is opened through it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GitKind {
     Missing,
     /// A real directory: `.git/info/exclude` may be read.
     Directory,
-    /// A file or a symlink. Still starts a work tree (submodule, linked work
-    /// tree).
+    /// A regular file. May hold `gitdir: <path>`; exclude comes from there.
+    File,
+    /// A symlink or other non-regular entry. Still starts a work tree
+    /// (so `.gitignore` applies) but contributes no exclude.
     Present,
 }
 
@@ -451,10 +462,10 @@ where
         } else {
             None
         };
-        let git_exclude = if git == GitKind::Directory {
-            self.read_exclude()
-        } else {
-            None
+        let git_exclude = match git {
+            GitKind::Directory => self.read_exclude(),
+            GitKind::File => self.read_gitfile_exclude(),
+            GitKind::Missing | GitKind::Present => None,
         };
         Ignores {
             ferretignore,
@@ -486,7 +497,7 @@ where
     /// regular file. Any other error is reported and the file is treated as
     /// absent so the rest of the directory still walks.
     fn read_at_cursor(&mut self) -> Option<String> {
-        match open_regular(&self.abs) {
+        match open_regular(&self.abs, false) {
             Ok(Some(bytes)) => Some(decode_lossy(bytes)),
             Ok(None) => None,
             Err(error) => {
@@ -500,6 +511,7 @@ where
         self.push(".git");
         let kind = match fs::symlink_metadata(&self.abs) {
             Ok(meta) if meta.is_dir() => GitKind::Directory,
+            Ok(meta) if meta.is_file() => GitKind::File,
             Ok(_) => GitKind::Present,
             Err(error) if error.kind() == io::ErrorKind::NotFound => GitKind::Missing,
             Err(error) => {
@@ -510,6 +522,65 @@ where
         self.pop();
         kind
     }
+
+    /// Exclude for a regular `.git` file: `gitdir:` then an optional
+    /// `commondir`, then `<common>/info/exclude`. A fault is reported against
+    /// the `.git` file. The gitdir may sit outside the walk root (a linked
+    /// work tree, a submodule's module directory).
+    fn read_gitfile_exclude(&mut self) -> Option<String> {
+        self.push(".git");
+        let bytes = match open_regular(&self.abs, true) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.fail(error);
+                self.pop();
+                return None;
+            }
+        };
+        self.pop();
+        let bytes = bytes?;
+        let raw = parse_gitdir(&bytes)?;
+        let gitdir = resolve_git_path(&self.abs, raw);
+        let common = self.common_dir(&gitdir)?;
+        self.read_external(&common.join("info").join("exclude"))
+    }
+
+    /// The gitdir itself when it has no `commondir` file. `None` when that
+    /// file cannot be read or names nothing: a linked work tree's own
+    /// directory is not where exclude lives, so it is not a fallback.
+    fn common_dir(&mut self, gitdir: &Path) -> Option<PathBuf> {
+        match open_regular(&gitdir.join("commondir"), false) {
+            Ok(None) => Some(gitdir.to_path_buf()),
+            Ok(Some(bytes)) => {
+                let raw = first_line(&bytes)?;
+                Some(resolve_git_path(gitdir, raw))
+            }
+            Err(error) => {
+                self.fail_at_git(error);
+                None
+            }
+        }
+    }
+
+    fn read_external(&mut self, path: &Path) -> Option<String> {
+        match open_regular(path, false) {
+            Ok(Some(bytes)) => Some(decode_lossy(bytes)),
+            Ok(None) => None,
+            Err(error) => {
+                self.fail_at_git(io::Error::new(
+                    error.kind(),
+                    format!("{}: {error}", path.display()),
+                ));
+                None
+            }
+        }
+    }
+
+    fn fail_at_git(&mut self, error: io::Error) {
+        self.push(".git");
+        self.fail(error);
+        self.pop();
+    }
 }
 
 /// Opens `path` for reading without blocking, and returns its bytes when the
@@ -517,15 +588,16 @@ where
 ///
 /// `Ok(None)` is absence: nothing was there, or the opened inode is not a
 /// regular file (a FIFO, directory, or device of an ignore-file's name). The
-/// open uses `O_NONBLOCK` so a FIFO does not wait for a writer. The check is
-/// `fstat` on that file, not a prior `lstat`, so a name that changes between
-/// the listing and the open is classified from what was actually opened.
-fn open_regular(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NONBLOCK)
-        .open(path)
-    {
+/// open uses `O_NONBLOCK` so a FIFO does not wait for a writer. `nofollow`
+/// adds `O_NOFOLLOW`, for the `.git` file only. The check is `fstat` on that
+/// file, not a prior `lstat`, so a name that changes between the listing and
+/// the open is classified from what was actually opened.
+fn open_regular(path: &Path, nofollow: bool) -> io::Result<Option<Vec<u8>>> {
+    let mut flags = O_NONBLOCK;
+    if nofollow {
+        flags |= O_NOFOLLOW;
+    }
+    let file = match OpenOptions::new().read(true).custom_flags(flags).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -550,6 +622,38 @@ fn ignore_too_large() -> io::Error {
         io::ErrorKind::FileTooLarge,
         "ignore file is larger than 1 MiB",
     )
+}
+
+/// First line of a gitdir or commondir file, without its newline. Spaces are
+/// part of the path: git does not trim them.
+fn first_line(bytes: &[u8]) -> Option<&OsStr> {
+    let line = bytes.split(|byte| *byte == b'\n').next()?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() {
+        None
+    } else {
+        Some(OsStr::from_bytes(line))
+    }
+}
+
+/// `gitdir: <path>` from the first line. The path is relative to the directory
+/// that holds the `.git` file. Anything else is not a gitdir pointer.
+fn parse_gitdir(bytes: &[u8]) -> Option<&OsStr> {
+    let raw = first_line(bytes)?.as_bytes().strip_prefix(b"gitdir: ")?;
+    if raw.is_empty() {
+        None
+    } else {
+        Some(OsStr::from_bytes(raw))
+    }
+}
+
+fn resolve_git_path(base: &Path, raw: &OsStr) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 fn entry_from_meta(meta: &Metadata) -> Entry {

@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+mod gitfile;
 mod golden;
 
 use std::collections::BTreeMap;

@@ -1,0 +1,232 @@
+//! `.git` files against `git check-ignore`. Git is the oracle only: these
+//! tests never read its source.
+
+use std::fs;
+use std::os::unix::fs::symlink;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use ferret_policy::{Config, Decision, Reason};
+
+use super::{decision, walked};
+
+struct Tree {
+    path: PathBuf,
+}
+
+impl Tree {
+    fn new(name: &str) -> Self {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/ferret-git-oracle")
+            .join(format!("{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn join(&self, rel: &str) -> PathBuf {
+        self.path.join(rel)
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "ferret")
+        .env("GIT_AUTHOR_EMAIL", "ferret@example.com")
+        .env("GIT_COMMITTER_NAME", "ferret")
+        .env("GIT_COMMITTER_EMAIL", "ferret@example.com")
+        .output()
+        .unwrap()
+}
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let output = git(dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} in {}: {}\n{}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr),
+        output.status,
+    );
+}
+
+/// `git check-ignore` exits 0 when the path is ignored and 1 when it is not.
+fn ignored(dir: &Path, rel: &str) -> bool {
+    let output = git(dir, &["check-ignore", "-q", "--", rel]);
+    match output.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        code => panic!(
+            "git check-ignore {rel} in {}: {code:?}\n{}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr),
+        ),
+    }
+}
+
+fn init(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    git_ok(dir, &["init", "-q", "-b", "main"]);
+}
+
+fn commit(dir: &Path) {
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-q", "-m", "init"]);
+}
+
+fn write(path: &Path, bytes: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn a_gitfile_matches_check_ignore_for_a_worktree_and_a_submodule() {
+    let tree = Tree::new("layouts");
+
+    let main = tree.join("main");
+    init(&main);
+    write(&main.join("README"), "hi\n");
+    commit(&main);
+    let exclude = main.join(".git/info/exclude");
+    let mut text = fs::read_to_string(&exclude).unwrap();
+    text.push_str("secret.txt\n");
+    fs::write(&exclude, text).unwrap();
+
+    let linked = tree.join("linked");
+    let linked_arg = linked.to_string_lossy().into_owned();
+    git_ok(
+        &main,
+        &["worktree", "add", "-q", "-b", "linked", &linked_arg],
+    );
+    let gitfile = fs::read_to_string(linked.join(".git")).unwrap();
+    let gitdir = gitfile
+        .strip_prefix("gitdir: ")
+        .unwrap()
+        .trim_end_matches(['\n', '\r']);
+    assert!(
+        Path::new(gitdir).is_absolute(),
+        "worktree gitdir: {gitfile}"
+    );
+    assert!(fs::symlink_metadata(linked.join(".git")).unwrap().is_file());
+    let commondir = fs::read_to_string(Path::new(gitdir).join("commondir")).unwrap();
+    assert_eq!(commondir, "../..\n");
+
+    write(&linked.join("secret.txt"), "x\n");
+    write(&linked.join("kept.txt"), "x\n");
+    // A per-worktree exclude is not the common dir. Git ignores it.
+    let local = Path::new(gitdir).join("info/exclude");
+    write(&local, "decoy.txt\n");
+    write(&linked.join("decoy.txt"), "x\n");
+
+    let linked_walk = walked(linked.as_path(), None, Config::default());
+    assert!(linked_walk.io.is_empty(), "{:?}", linked_walk.io);
+    for rel in ["secret.txt", "kept.txt", "decoy.txt"] {
+        let skip = decision(&linked_walk, rel) == Decision::Skip;
+        assert_eq!(skip, ignored(&linked, rel), "{rel}");
+    }
+
+    let remote = tree.join("remote");
+    init(&remote);
+    write(&remote.join("lib.txt"), "lib\n");
+    commit(&remote);
+    let super_repo = tree.join("super");
+    init(&super_repo);
+    write(&super_repo.join("README"), "top\n");
+    commit(&super_repo);
+    let remote_arg = remote.to_string_lossy().into_owned();
+    git_ok(
+        &super_repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &remote_arg,
+            "sub",
+        ],
+    );
+    let sub_git = fs::read_to_string(super_repo.join("sub/.git")).unwrap();
+    let sub_rel = sub_git
+        .strip_prefix("gitdir: ")
+        .unwrap()
+        .trim_end_matches(['\n', '\r']);
+    assert!(
+        !Path::new(sub_rel).is_absolute(),
+        "submodule gitdir: {sub_git}"
+    );
+    assert!(!super_repo.join(".git/modules/sub/commondir").exists());
+
+    let module_exclude = super_repo.join(".git/modules/sub/info/exclude");
+    let mut text = fs::read_to_string(&module_exclude).unwrap();
+    text.push_str("mod-secret.txt\n");
+    fs::write(&module_exclude, text).unwrap();
+    let super_exclude = super_repo.join(".git/info/exclude");
+    let mut text = fs::read_to_string(&super_exclude).unwrap();
+    text.push_str("parent-secret.txt\n");
+    fs::write(&super_exclude, text).unwrap();
+
+    write(&super_repo.join("parent-secret.txt"), "x\n");
+    write(&super_repo.join("sub/mod-secret.txt"), "x\n");
+    write(&super_repo.join("sub/mod-kept.txt"), "x\n");
+    write(&super_repo.join("sub/parent-secret.txt"), "x\n");
+
+    let sub = super_repo.join("sub");
+    assert!(ignored(&super_repo, "parent-secret.txt"));
+    assert!(ignored(&sub, "mod-secret.txt"));
+    assert!(!ignored(&sub, "mod-kept.txt"));
+    assert!(!ignored(&sub, "parent-secret.txt"));
+
+    let super_walk = walked(super_repo.as_path(), None, Config::default());
+    assert!(super_walk.io.is_empty(), "{:?}", super_walk.io);
+    assert_eq!(decision(&super_walk, "parent-secret.txt"), Decision::Skip);
+    assert_eq!(decision(&super_walk, "sub/mod-secret.txt"), Decision::Skip);
+    assert_eq!(decision(&super_walk, "sub/mod-kept.txt"), Decision::Index);
+    assert_eq!(
+        decision(&super_walk, "sub/parent-secret.txt"),
+        Decision::Index
+    );
+}
+
+#[test]
+fn a_symlinked_dot_git_does_not_contribute_exclude() {
+    // Git follows the symlink and applies exclude. The walker must not open
+    // anything through it; `.gitignore` still applies because the entry exists.
+    let tree = Tree::new("symlink");
+    let repo = tree.join("repo");
+    init(&repo);
+    let exclude = repo.join(".git/info/exclude");
+    let mut text = fs::read_to_string(&exclude).unwrap();
+    text.push_str("secret.txt\n");
+    fs::write(&exclude, text).unwrap();
+    fs::rename(repo.join(".git"), repo.join(".gitreal")).unwrap();
+    symlink(".gitreal", repo.join(".git")).unwrap();
+    write(&repo.join(".gitignore"), "*.o\n");
+    write(&repo.join("secret.txt"), "x\n");
+    write(&repo.join("a.o"), "x\n");
+    write(&repo.join("a.c"), "y\n");
+
+    assert!(ignored(&repo, "secret.txt"));
+
+    let walked = walked(repo.as_path(), None, Config::default());
+    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    assert_eq!(decision(&walked, "secret.txt"), Decision::Index);
+    assert_eq!(decision(&walked, "a.o"), Decision::Skip);
+    assert_eq!(decision(&walked, "a.c"), Decision::Index);
+    assert_eq!(
+        decision(&walked, ".git"),
+        Decision::Catalog(Reason::Symlink)
+    );
+}
