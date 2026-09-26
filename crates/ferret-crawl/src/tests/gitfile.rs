@@ -250,3 +250,24 @@ fn a_commondir_that_is_not_a_file_is_a_fault_not_the_gitdir() {
         [(PathBuf::from(".git"), std::io::ErrorKind::InvalidData)]
     );
 }
+
+#[test]
+fn a_symlinked_exclude_applies_with_both_git_layouts() {
+    let tree = Tree::new("symlinked-exclude");
+    let directory = tree.join("directory");
+    write(&directory.join(".git/info/rules"), "secret.txt\n");
+    symlink("rules", directory.join(".git/info/exclude")).unwrap();
+    write(&directory.join("secret.txt"), "x");
+
+    let file = tree.join("file");
+    write(&file.join(".git"), "gitdir: ../gitdir\n");
+    write(&tree.join("gitdir/info/rules"), "secret.txt\n");
+    symlink("rules", tree.join("gitdir/info/exclude")).unwrap();
+    write(&file.join("secret.txt"), "x");
+
+    for root in [directory, file] {
+        let result = walked(&root, None, Config::default());
+        assert!(result.io.is_empty(), "{}: {:?}", root.display(), result.io);
+        assert_eq!(decision(&result, "secret.txt"), Decision::Skip);
+    }
+}

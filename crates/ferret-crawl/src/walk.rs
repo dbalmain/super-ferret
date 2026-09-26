@@ -1209,9 +1209,9 @@ impl<F: EventVisitor> Walker<F> {
         text
     }
 
-    /// `info` is opened `O_NOFOLLOW` relative to the `.git` descriptor held
-    /// since [`probe_git`](Self::probe_git). `exclude` itself is an ordinary
-    /// ignore file: a symlink of that name is followed.
+    /// `info` is opened `O_NOFOLLOW` relative to the held git directory (or
+    /// common directory). `exclude` is an ordinary ignore file: a symlink of
+    /// that name is followed.
     fn read_exclude(&mut self, git: BorrowedFd<'_>) -> Option<String> {
         let git_length = self.push(".git");
         let info_length = self.push("info");
@@ -1311,7 +1311,7 @@ impl<F: EventVisitor> Walker<F> {
         let raw = parse_gitdir(bytes)?;
         let gitdir = self.open_git_directory(work, raw)?;
         let common = self.common_dir(gitdir)?;
-        self.read_gitfile_info_exclude(common.as_fd())
+        self.read_exclude(common.as_fd())
     }
 
     fn open_git_directory(&mut self, base: BorrowedFd<'_>, raw: &OsStr) -> Option<OwnedFd> {
@@ -1360,35 +1360,6 @@ impl<F: EventVisitor> Walker<F> {
                 let raw = first_line(&bytes)?;
                 self.open_git_directory(gitdir.as_fd(), raw)
             }
-            Err(error) => {
-                self.fail_at_git(error);
-                None
-            }
-        }
-    }
-
-    fn read_gitfile_info_exclude(&mut self, common: BorrowedFd<'_>) -> Option<String> {
-        let info = match openat(common, "info", child_dir_flags(), Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => return None,
-            Err(error) => {
-                self.fail_at_git(io::Error::from(error));
-                return None;
-            }
-        };
-        let opened = match openat(
-            info.as_fd(),
-            "exclude",
-            nofollow_file_flags(),
-            Mode::empty(),
-        ) {
-            Ok(fd) => read_opened(fd),
-            Err(Errno::NOENT) => Ok(Opened::Missing),
-            Err(error) => Err(io::Error::from(error)),
-        };
-        match opened {
-            Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
-            Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
                 self.fail_at_git(error);
                 None
