@@ -34,7 +34,7 @@ Predecessors, carried forward where still open:
 | D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
 | D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
-| D19 | Ignore matching: whole paths, or per-directory rule sets | open           | Dave leans B for the daemon; pushback: B saves <65 µs per 500-file burst; settle by re-running the replay      |
+| D19 | Ignore matching: whole paths, or per-directory rule sets | answered       | A: re-measured, B is 30–41% slower at `decide` than current A; B parked                                        |
 | D20 | Walk across mount points, or stay on the root's device   | answered       | A: cross mount points below a root, as now                                                                     |
 | D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
 | D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
@@ -831,6 +831,40 @@ cheap way to settle it is to re-run the replay, A on current `main` against B on
 `bench/policy-derive`, which is about an hour of agent time. If B still saves
 more than about 10% of `decide` on the real rule set, I would build it for the
 daemon. Otherwise, keep A.
+
+> Dave: run the replay
+
+**Replay (2026-09-27, `bench/policy-derive` at `0d437dd`): B is now slower than
+A, so A stays.** The branch was merged with `main`, and A's code there is
+exactly `main`'s. The harness was fixed in two ways:
+
+- It now reads the linked work trees' excludes, as the walker does: 126 exclude
+  files, not 36.
+- It adds a "cached" timing, in which each directory's rules are built once, as
+  a daemon would keep them, and then `decide` runs in one loop.
+
+A and B agree on all 86,415 entries. Warm, five runs, median ns per entry on the
+real rule set:
+
+| Engine | Replay `decide` | Replay `enter` | Cached `decide` | Cached `enter` |
+| ------ | --------------: | -------------: | --------------: | -------------: |
+| A      |             217 |             35 |             182 |             44 |
+| B      |             282 |             73 |             257 |             99 |
+
+B is 30% slower on the replay's `decide` (21–43% across runs) and 41% slower
+with cached rules. It costs about 100 ns more per entry once its `enter` is
+counted, about 40 µs more over a 500-event burst. Two causes:
+
+- B probes two full matchers per layer, where A probes one. Most of B's old lead
+  was A's per-layer overhead (`strip_prefix`, SipHash), which `main` has
+  removed.
+- The work trees' `**/.claude/<name>` excludes keep a cursor alive in every
+  directory below them, which doubles B's `enter`. A handles that class with one
+  lookup on the last path component.
+
+**Answer (2026-09-27): A, by the agreed rule.** B stays parked on
+`bench/policy-derive` with the fair harness. The fact that would reopen it: a
+real rule set on which a re-run shows B ahead.
 
 ## D20 — Walk across mount points, or stay on the root's device
 
