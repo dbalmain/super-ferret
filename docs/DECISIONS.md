@@ -34,7 +34,7 @@ Predecessors, carried forward where still open:
 | D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
 | D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
-| D19 | Ignore matching: whole paths, or per-directory rule sets | answered       | A: re-measured, B is 30–41% slower at `decide` than current A; B parked                                        |
+| D19 | Ignore matching: whole paths, or per-directory rule sets | open           | Reopened: B-flat is 2x faster than A on real rules, 5x slower on stress; next step?                            |
 | D20 | Walk across mount points, or stay on the root's device   | answered       | A: cross mount points below a root, as now                                                                     |
 | D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
 | D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
@@ -865,6 +865,79 @@ counted, about 40 µs more over a 500-event burst. Two causes:
 **Answer (2026-09-27): A, by the agreed rule.** B stays parked on
 `bench/policy-derive` with the fair harness. The fact that would reopen it: a
 real rule set on which a re-run shows B ahead.
+
+### Reopened: B-flat, Dave's algorithm (2026-09-27)
+
+The B measured above was not the algorithm Dave meant. His version is
+**B-flat**: each directory keeps a single flat list of basename patterns, with
+every rule from every layer projected onto names in that directory. The list is
+ordered global, `info/exclude`, `.gitignore` root to here, then ferret root to
+here. `decide` scans the list from the end, and the last matching pattern
+decides. There is no chain and no path, only the name. The state needed to
+derive a child's list is kept beside the list and read only by `enter`.
+
+It is built as `FlatRules` on `bench/policy-derive` (`ea3cbdf`). It is a
+deliberately plain linear scan, with no hash buckets. It agrees with A on all
+86,416 entries under both global rule sets. Median of three runs, ns per entry:
+
+| Rules  | Engine  | Replay `decide` | Cached `decide` | Cached `enter` |
+| ------ | ------- | --------------: | --------------: | -------------: |
+| real   | A       |             218 |             182 |             46 |
+| real   | B-chain |             285 |             255 |            102 |
+| real   | B-flat  |             120 |              95 |             95 |
+| stress | A       |             329 |             295 |             41 |
+| stress | B-flat  |           1,554 |           1,542 |            139 |
+
+The stress global is the default rules plus cpython's `.gitignore`. Lists hold
+20 rules on average (max 54) with the real rules, and 63 (max 97) with the
+stress rules.
+
+- **Real rules:** B-flat's `decide` is half of A's. Most global rules are
+  directory-only literals, which a file rejects without running the glob, so
+  each rule costs about 5 ns.
+- **Stress rules:** B-flat is 5x slower than A. Only 0.8% of entries match any
+  rule, so almost every `decide` scans the whole list. Most of cpython's lines
+  are `*.ext` globs, each about 25 ns through the generic matcher, where A finds
+  them with one hash lookup on the extension.
+- **`enter`:** B-flat's is twice A's, because every directory rebuilds its list.
+  A daemon builds it once per watched directory, not once per event.
+
+For scale, 100 ns per entry is 50 µs over a 500-event prettier burst.
+
+The ferret band and the traversal re-include were tested by unit tests only,
+because `~/w` has no `.ferretignore`.
+
+### Question: what next for D19?
+
+B-flat's shape wins, but its cost grows with the number of glob rules in a
+directory's list. Which way should it go next?
+
+1. **B-flat with A's buckets.** Index each directory's merged list the way A
+   indexes a layer: literals and extensions in hash maps, and the remaining
+   globs scanned. Identical lists are shared, since most directories inherit the
+   same global rules plus their repository root's `.gitignore`.
+   - Buys: `decide` should fall below A on both rule sets, because it is one
+     indexed probe where A probes each layer.
+   - Costs: building hash maps is dearer than building a `Vec`, unless lists are
+     shared. About one agent run to measure.
+   - Also answers the space question, since shared lists are not copied.
+2. **B-flat as one automaton.** Compile each distinct list into a single
+   anchored alternation in reverse order, with leftmost-first matching, so the
+   winning pattern number is the last matching line. `decide` costs one pass
+   over the name, however many rules there are.
+   - Costs: compiling is far dearer than building a list or hash maps, so it
+     depends even more on sharing.
+   - Needs a benchmark-only regex dependency, since the project builds its own
+     engine.
+3. **Stop and keep A.** A is within 90 ns per entry of B-flat on the real rules,
+   and 5x better on the stress rules.
+   - Costs: nothing now.
+   - Forecloses the per-directory cache for inotify until something reopens it.
+
+**Recommendation: 1**, measuring how many distinct lists `~/w` actually has as
+part of the same run. That count decides whether 2 is ever worth trying. The
+fact that would change it: if nearly every directory's list is distinct, sharing
+buys nothing, and A's per-layer indexes are already the cheap answer, so 3.
 
 ## D20 — Walk across mount points, or stay on the root's device
 
