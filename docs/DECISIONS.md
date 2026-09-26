@@ -34,10 +34,13 @@ Predecessors, carried forward where still open:
 | D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
 | D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
-| D19 | Ignore matching: whole paths, or per-directory rule sets | open           |                                                                                                                |
+| D19 | Ignore matching: whole paths, or per-directory rule sets | open           | recommendation revised to A (profiled, fixed); B parked on `bench/policy-derive` — confirm                     |
 | D20 | Walk across mount points, or stay on the root's device   | open           |                                                                                                                |
-| D21 | Walk by path, or by directory handle                     | open           |                                                                                                                |
-| D22 | A root inside a git work tree                            | open           |                                                                                                                |
+| D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
+| D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
+| D23 | Recording work trees, so duplicate results can be hidden | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                        |
+| D24 | How many walk workers by default                         | open           |                                                                                                                |
+| D25 | A configured root that git ignores                       | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
