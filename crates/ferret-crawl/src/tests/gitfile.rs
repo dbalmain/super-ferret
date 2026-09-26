@@ -16,8 +16,8 @@ struct Tree {
 
 impl Tree {
     fn new(name: &str) -> Self {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/ferret-git-oracle")
+        let path = std::env::temp_dir()
+            .join("ferret-git-oracle")
             .join(format!("{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
@@ -228,5 +228,25 @@ fn a_symlinked_dot_git_does_not_contribute_exclude() {
     assert_eq!(
         decision(&walked, ".git"),
         Decision::Catalog(Reason::Symlink)
+    );
+}
+
+#[test]
+fn a_commondir_that_is_not_a_file_is_a_fault_not_the_gitdir() {
+    let tree = Tree::new("commondir-dir");
+    let gitdir = tree.join("gitdir");
+    write(&gitdir.join("info/exclude"), "excluded.txt\n");
+    fs::create_dir(gitdir.join("commondir")).unwrap();
+    let work = tree.join("work");
+    write(&work.join(".git"), "gitdir: ../gitdir\n");
+    write(&work.join("excluded.txt"), "x\n");
+
+    let walk = walked(work.as_path(), None, Config::default());
+    // The gitdir's own exclude is not the common dir's; git fails here
+    // rather than apply it.
+    assert_eq!(decision(&walk, "excluded.txt"), Decision::Index);
+    assert_eq!(
+        walk.io,
+        [(PathBuf::from(".git"), std::io::ErrorKind::InvalidData)]
     );
 }

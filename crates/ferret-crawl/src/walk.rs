@@ -132,9 +132,10 @@ pub enum Event<'a> {
 /// `.ferretignore`, `.gitignore` and `info/exclude` are opened without blocking
 /// (`O_NONBLOCK`) and read only when that open file is a regular file of at
 /// most 1 MiB. A larger file is an [`Event::Io`] and is then treated as
-/// absent. A missing file, or anything that is not a regular file, is absent
-/// and not a fault: a FIFO or directory of one of these names must not stall
-/// the walk. A regular file that exists but cannot be read is a fault, and is
+/// absent. A missing file, or an opened inode that is not a regular file, is
+/// absent and not a fault: a FIFO or directory of one of these names must not
+/// stall the walk. A name that cannot be opened at all (a socket, say) is a
+/// fault. A regular file that exists but cannot be read is a fault, and is
 /// then treated as absent. Bytes that are not UTF-8 are converted lossily.
 ///
 /// The listing is a snapshot. An ignore file created after the directory was
@@ -551,11 +552,23 @@ where
     }
 
     /// The gitdir itself when it has no `commondir` file. `None` when that
-    /// file cannot be read or names nothing: a linked work tree's own
-    /// directory is not where exclude lives, so it is not a fallback.
+    /// file cannot be read, is not a regular file, or names nothing: a linked
+    /// work tree's own directory is not where exclude lives, so it is not a
+    /// fallback. Only a missing `commondir` means the gitdir is the common
+    /// directory.
     fn common_dir(&mut self, gitdir: &Path) -> Option<PathBuf> {
-        match open_regular(&gitdir.join("commondir"), false) {
-            Ok(None) => Some(gitdir.to_path_buf()),
+        let commondir = gitdir.join("commondir");
+        match open_regular(&commondir, false) {
+            Ok(None) => match fs::symlink_metadata(&commondir) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(gitdir.to_path_buf()),
+                _ => {
+                    self.fail_at_git(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}: not a regular file", commondir.display()),
+                    ));
+                    None
+                }
+            },
             Ok(Some(bytes)) => {
                 let raw = first_line(&bytes)?;
                 Some(resolve_git_path(gitdir, raw))
