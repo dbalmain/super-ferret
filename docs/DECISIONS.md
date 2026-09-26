@@ -34,13 +34,13 @@ Predecessors, carried forward where still open:
 | D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
 | D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
-| D19 | Ignore matching: whole paths, or per-directory rule sets | open           | recommendation revised to A (profiled, fixed); B parked on `bench/policy-derive` — confirm                     |
+| D19 | Ignore matching: whole paths, or per-directory rule sets | open           | Dave leans B for the daemon; pushback: B saves <65 µs per 500-file burst; settle by re-running the replay      |
 | D20 | Walk across mount points, or stay on the root's device   | open           |                                                                                                                |
 | D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
 | D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
 | D23 | Recording work trees, so duplicate results can be hidden | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                        |
-| D24 | How many walk workers by default                         | open           |                                                                                                                |
-| D25 | A configured root that git ignores                       | open           |                                                                                                                |
+| D24 | How many walk workers by default                         | answered       | A: `min(8, cores)`; cold data favours 16, confirm                                                              |
+| D25 | A configured root that git ignores                       | answered       | B: a configured root is always walked; rules apply below it                                                    |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -800,6 +800,38 @@ tenth. **Revised recommendation: A; park B** (the prototype stays on
 anchored patterns have neither a literal first nor a literal last component, in
 numbers large enough to show in a profile.
 
+> Dave: I still think we should look at B. Once that per-directory check is
+> cached, inotify rules can be checked much more efficiently. It's not just the
+> speed I'm concerned about. If I run a process that touches hundreds of files,
+> e.g. prettier fix, then I want to use as few cycles as possible. Please push
+> back if you think it won't make a difference.
+
+**Pushback (2026-09-27): it won't make a measurable difference, for three
+reasons.**
+
+1. **Caching per directory is not B's alone.** A's `DirRules` is already a
+   per-directory object; the walker holds one per directory and a daemon would
+   cache one per watched directory the same way. An event then costs one
+   `decide` against the cached value under either option. What B adds is pruning
+   anchored patterns that can no longer match below the directory.
+2. **`decide` is already a small share of an event.** The single-worker warm
+   walk spends 0.045 s of user time on 86k entries, about 0.5 µs per entry for
+   everything in user space, `decide` included. One `stat` alone is about 2 µs
+   in the kernel (strace, same walk). A changed file that is re-indexed also
+   costs an open, a read, a hash and tokenizing: tens of microseconds to
+   milliseconds.
+3. **B's saving is a fraction of that share.** On the replay B saved about 130
+   ns per `decide`, measured against A **before** A's fixes, which cut the same
+   costs B was built to avoid. For a prettier run touching 500 files, that is at
+   most 65 µs in total, next to milliseconds for the stats and re-index.
+
+Where B would matter is a rule set with many anchored patterns that have neither
+a literal first nor a literal last component: the fact already named above. The
+cheap way to settle it is to re-run the replay, A on current `main` against B on
+`bench/policy-derive`, which is about an hour of agent time. If B still saves
+more than about 10% of `decide` on the real rule set, I would build it for the
+daemon. Otherwise, keep A.
+
 ## D20 — Walk across mount points, or stay on the root's device
 
 **Question:** When a configured root contains a mount point, does the walker
@@ -994,6 +1026,24 @@ one a person waits for after boot, that is markedly faster at 16 or 32 because
 NVMe rewards queue depth. That needs a `drop_caches`, which needs root, so it
 has not been measured.
 
+> Dave: Agree. Cold, one run each after `drop_caches`, `$HOME`: 8 workers 3.079
+> s, 16 workers 2.500 s, 32 workers 2.599 s.
+
+**Answer (2026-09-27): A, `min(8, available_parallelism)`.** The cold numbers
+arrived with the answer, and they are the fact named above: cold, 16 workers is
+0.58 s (19%) faster than 8, and 32 is no better than 16. Warm, 16 costs 0.25 s
+more CPU per full crawl. So the question comes back once, briefly:
+
+| Option               | Costs                                                | Buys                                      |
+| -------------------- | ---------------------------------------------------- | ----------------------------------------- |
+| Keep A (8, answered) | 0.58 s more waiting on the crawl after boot.         | 0.25 s less CPU on every warm full crawl. |
+| B (16)               | 0.25 s more CPU per warm full crawl, about 20% more. | The fastest measured, both cold and warm. |
+
+**Recommendation:** B, because the cold crawl is the one a person waits for, and
+full crawls are rare once the daemon runs. The fact that would change it: a
+repeat of the cold runs (these are one each) in which the 8 and 16 figures
+overlap.
+
 ## D25 — A configured root that git ignores
 
 **Question:** When the configured root, or a directory between it and the top of
@@ -1020,3 +1070,9 @@ behaviour. D22's purpose was to make `ferret index repo/src` agree with git
 something other than a person, such as auto-discovering every repository under a
 directory. Then a root git ignores is more likely an accident than a request,
 and A or C is right.
+
+> Dave: Yes, a specified root overrides .gitignore
+
+**Answer (2026-09-27): B.** A configured root is always walked, and the
+enclosing work tree's rules apply only below it. To do: say so in DESIGN and add
+a test that a root excluded by an ancestor `.gitignore` is still indexed.

@@ -180,6 +180,10 @@ with no lock. At most 128 waiting listings keep a descriptor. The rest reopen
 from the root one checked step at a time, which bounds the walker at 128 + 4N
 descriptors. `walk` is the same code with one worker. The default N is D24.
 
+A configured root is always walked, even when the enclosing work tree's rules
+exclude it or one of its ancestors: naming a root overrides `.gitignore` (D25),
+as it overrides the global ignore file. Those rules still apply below the root.
+
 Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
 and **content-indexed** (also hashed and tokenized). Binary files and files over
 the size cap are catalogued, not content-indexed.

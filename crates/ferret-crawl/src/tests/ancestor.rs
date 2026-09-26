@@ -317,3 +317,22 @@ fn xdev_child() {
     };
     fs::write(&marker, text).unwrap();
 }
+
+/// D25: a configured root is always walked, even when the enclosing work
+/// tree's rules exclude it, as they exclude everything below it for git. The
+/// same rules still apply below the root.
+#[test]
+fn a_root_that_git_ignores_is_still_walked() {
+    let scratch = Scratch::new("ancestor-ignored-root");
+    let repo = scratch.join("repo");
+    init(&repo);
+    write(&repo.join(".gitignore"), "/src/\n*.o\n");
+    write(&repo.join("src/file.txt"), "x");
+    write(&repo.join("src/a.o"), "y");
+    assert!(ignored(&repo, "src/file.txt"), "git no longer ignores it");
+
+    let walked = walked(&repo.join("src"), None, Config::default());
+    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    assert_eq!(decision(&walked, "file.txt"), Decision::Index);
+    assert_eq!(decision(&walked, "a.o"), Decision::Skip);
+}
