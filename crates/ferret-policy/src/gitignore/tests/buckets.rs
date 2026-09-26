@@ -24,9 +24,14 @@ const REPRESENTATIVES: &[(&str, &str)] = &[
     ("fixed-width suffix", "*.r?"),
     ("general basename", "f*.rs"),
     ("anchored, two-byte literal start", "src/*.rs"),
-    ("anchored, one-byte literal start", "s*/foo.rs"),
-    ("anchored, wildcard start", "*/foo.rs"),
+    ("anchored, one-byte literal start", "s*/f*.rs"),
+    ("anchored, wildcard start", "*/f*.rs"),
     ("anchored, globstar start", "**/src/f*"),
+    ("anchored, literal last component", "*/foo.rs"),
+    (
+        "anchored, globstar then literal last component",
+        "**/src/foo.rs",
+    ),
 ];
 
 pub(super) fn cases() -> Vec<Case> {

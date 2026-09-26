@@ -233,6 +233,15 @@ impl Pattern {
         at == suffix.len()
     }
 
+    /// The last component, when it is a literal. Only for anchored patterns:
+    /// a basename pattern has its own buckets.
+    pub(super) fn last_literal(&self) -> Option<Vec<u8>> {
+        if self.basename_only {
+            return None;
+        }
+        self.components.last()?.literal_bytes()
+    }
+
     pub(super) fn first_literal_byte(&self) -> Option<u8> {
         if self.basename_only {
             return None;

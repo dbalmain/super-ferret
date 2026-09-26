@@ -5,10 +5,12 @@
 //! use Git 2.54 only as a black-box oracle; no Git or third-party matcher
 //! source or tests are used.
 
+mod fxhash;
 mod pattern;
 
-use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+
+use fxhash::FxHashMap;
 
 pub(crate) use pattern::Pattern;
 
@@ -34,17 +36,22 @@ pub(crate) struct LineError {
 pub(crate) struct Gitignore {
     // Each bucket is appended in source order. Matching scans it backwards and
     // compares its newest result with the best index found in other buckets.
-    literals: HashMap<Vec<u8>, Vec<FastMatch>>,
-    paths: BTreeMap<u16, BTreeMap<Vec<u8>, Vec<FastMatch>>>,
-    extensions: HashMap<Vec<u8>, Vec<FastMatch>>,
+    literals: FxHashMap<Vec<u8>, Vec<FastMatch>>,
+    paths: FxHashMap<Vec<u8>, Vec<FastMatch>>,
+    extensions: FxHashMap<Vec<u8>, Vec<FastMatch>>,
     prefixes: Vec<ByteFastMatch>,
     suffixes: Vec<ByteFastMatch>,
     contains: Vec<ByteFastMatch>,
     fixed_suffixes: Vec<FixedSuffixMatch>,
     basename_general: Vec<Pattern>,
     anchored_any: Vec<Pattern>,
-    anchored_by_prefix2: HashMap<u16, Vec<Pattern>>,
-    anchored_by_first: HashMap<u8, Vec<Pattern>>,
+    /// Anchored patterns whose last component is literal, by that component:
+    /// a path can only match one if its basename is that literal. This is
+    /// where `**/.claude/worktrees/` lands, which would otherwise be tried
+    /// against every entry.
+    anchored_by_last: FxHashMap<Vec<u8>, Vec<Pattern>>,
+    anchored_by_prefix2: FxHashMap<u16, Vec<Pattern>>,
+    anchored_by_first: FxHashMap<u8, Vec<Pattern>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -119,11 +126,9 @@ impl Gitignore {
             .literals
             .get(basename)
             .and_then(|entries| latest_fast(entries, is_dir));
-        if let Some(candidate) = bytes
-            .first()
-            .map(|first| u16::from_ne_bytes([*first, bytes.get(1).copied().unwrap_or(0)]))
-            .and_then(|prefix| self.paths.get(&prefix))
-            .and_then(|paths| paths.get(bytes))
+        if let Some(candidate) = self
+            .paths
+            .get(bytes)
             .and_then(|entries| latest_fast(entries, is_dir))
             && best.is_none_or(|current| candidate.index > current.index)
         {
@@ -169,7 +174,12 @@ impl Gitignore {
             .map(|prefix| u16::from_ne_bytes([prefix[0], prefix[1]]))
             .and_then(|prefix| self.anchored_by_prefix2.get(&prefix))
             .map_or(&[][..], Vec::as_slice);
+        let by_last = self
+            .anchored_by_last
+            .get(basename)
+            .map_or(&[][..], Vec::as_slice);
         scan_patterns(&self.basename_general, bytes, basename, is_dir, &mut best);
+        scan_patterns(by_last, bytes, basename, is_dir, &mut best);
         scan_patterns(&self.anchored_any, bytes, basename, is_dir, &mut best);
         scan_patterns(prefixed, bytes, basename, is_dir, &mut best);
         scan_patterns(prefix2, bytes, basename, is_dir, &mut best);
@@ -185,13 +195,7 @@ impl Gitignore {
         if let Some(literal) = pattern.literal_basename() {
             self.literals.entry(literal).or_default().push(fast);
         } else if let Some(path) = pattern.literal_path() {
-            let prefix = u16::from_ne_bytes([path[0], path.get(1).copied().unwrap_or(0)]);
-            self.paths
-                .entry(prefix)
-                .or_default()
-                .entry(path)
-                .or_default()
-                .push(fast);
+            self.paths.entry(path).or_default().push(fast);
         } else if let Some(extension) = pattern.simple_extension() {
             self.extensions.entry(extension).or_default().push(fast);
         } else if let Some(prefix) = pattern.basename_prefix() {
@@ -214,6 +218,8 @@ impl Gitignore {
                 .push(FixedSuffixMatch { pattern, width });
         } else if pattern.basename_only {
             self.basename_general.push(pattern);
+        } else if let Some(last) = pattern.last_literal() {
+            self.anchored_by_last.entry(last).or_default().push(pattern);
         } else if let Some(prefix) = pattern.first_literal_prefix2() {
             self.anchored_by_prefix2
                 .entry(prefix)

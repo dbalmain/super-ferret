@@ -17,6 +17,7 @@
 //! decides whether an excluded directory must be traversed.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -202,8 +203,8 @@ impl DirRules {
 
     fn reinclude_below(&self, path: &Path) -> bool {
         layers(&self.ferret).any(|layer| {
-            path.strip_prefix(&layer.base)
-                .is_ok_and(|rel| layer.reincludes.iter().any(|r| r.reaches_below(rel)))
+            below(path, &layer.base)
+                .is_some_and(|rel| layer.reincludes.iter().any(|r| r.reaches_below(rel)))
         })
     }
 
@@ -318,13 +319,27 @@ impl Layer {
     /// `Some(whitelisted)` if a pattern in this file matches `path` (relative
     /// to the root), `None` if none does.
     fn matched(&self, path: &Path, is_dir: bool) -> Option<bool> {
-        let rel = path.strip_prefix(&self.base).ok()?;
+        let rel = below(path, &self.base)?;
         match self.matcher.matched(rel, is_dir) {
             Match::None => None,
             Match::Ignore => Some(false),
             Match::Whitelist => Some(true),
         }
     }
+}
+
+/// `path` relative to `base`, both root-relative and built by joining names,
+/// or `None` when `path` is not below `base`. A byte comparison: std's
+/// `strip_prefix` parses both paths into components on every call, which was
+/// a fifth of a walk's user time.
+fn below<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
+    let base = base.as_os_str().as_bytes();
+    if base.is_empty() {
+        return Some(path);
+    }
+    let rest = path.as_os_str().as_bytes().strip_prefix(base)?;
+    let rest = rest.strip_prefix(b"/")?;
+    Some(Path::new(OsStr::from_bytes(rest)))
 }
 
 /// The layers of a chain, closest directory first.
