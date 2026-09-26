@@ -732,9 +732,37 @@ of walk time, or a prototype of B that is faster on real trees and agrees with A
 on every decision; either makes B the next change. A bug in `reaches_below`
 would too, since B removes it.
 
-**In progress (2026-09-26):** a prototype of B on the bench branch, checked
-against `DirRules` decision by decision on `~/w` and timed against it; and the
-S1 walker, which gives the walk-time share.
+**Measured (2026-09-26).** A prototype of B, `DerivedRules`, is on branch
+`bench/policy-derive` (grok, commit `ac40047`), with the same `root` / `enter` /
+`traverse` / `decide` API. Basename patterns stay in shared buckets; anchored
+ones become per-directory cursors stepped by the existing component matcher, and
+a cursor that can match an entry here is projected to a basename pattern for
+this directory only. No second glob engine.
+
+Agreement: the golden corpus runs both engines through one driver; unit tests
+cover the discriminating cases (anchoring after derivation, `**` at zero and
+many levels, last-match-wins in both orders, a nested `.gitignore` beating a
+derived pattern, superseded re-includes); and on `~/w` B equals A at all 85,948
+entries (5,925 directories, 156 `.gitignore`, 36 `info/exclude`), also with the
+CPython `.gitignore` added to the global file. No `.ferretignore` exists under
+`~/w`, so live-tree `Traverse` is covered only by the corpus and unit tests.
+
+Timing, warm, release, best of three, in-memory replay of the same walk, ns per
+entry (load 1.20, no other build running):
+
+| Rule set                     | Engine | Whole replay | `decide` | `enter` |
+| ---------------------------- | ------ | -----------: | -------: | ------: |
+| real (defaults + files read) | A      |          545 |      393 |      27 |
+| real                         | B      |          434 |      264 |      41 |
+| stress (+ CPython globally)  | A      |          651 |      495 |      29 |
+| stress                       | B      |          535 |      353 |      46 |
+
+The walk itself (`read_dir` plus `lstat`, same directories) is 1,763 ns/entry;
+the S1 walker's warm `~/w` walk is 0.219 s. So policy is about a fifth of a warm
+walk (A 31% of the bare walk, B 25%), and B saves about 110 ns/entry, 10 ms on
+`~/w`, about 5% of the walker. The saving is not from `anchored_any`: only 30
+such patterns were read. Where A's `decide` time goes is not yet profiled;
+probing every layer's buckets for each entry is the likely cost.
 
 ## D20 — Walk across mount points, or stay on the root's device
 
