@@ -137,6 +137,11 @@ pub enum Event<'a> {
 /// the walk. A regular file that exists but cannot be read is a fault, and is
 /// then treated as absent. Bytes that are not UTF-8 are converted lossily.
 ///
+/// The listing is a snapshot. An ignore file created after the directory was
+/// listed is not seen until the next crawl, so it does not apply to the
+/// siblings listed with it. A listed name that is gone by the time it is
+/// opened is absent.
+///
 /// File types come from `read_dir` (`d_type`, or `lstat` when the filesystem
 /// leaves the type unknown). `d_type` does not follow symlinks. Once `lstat`
 /// has run, its type is the truth and the entry is classified again when the
