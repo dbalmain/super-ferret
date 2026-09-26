@@ -168,8 +168,9 @@ pub enum Event<'a> {
 /// stall the walk. A name that cannot be opened at all (a socket, say) is a
 /// fault. A regular file that exists but cannot be read is a fault, and is
 /// then treated as absent. Bytes that are not UTF-8 are converted lossily. A
-/// symlinked `.gitignore` is followed, as is a symlinked `exclude`; `info` is
-/// not, and neither is `.git`.
+/// symlinked `.gitignore` is absent, here and above the root, as git
+/// disregards it; a symlinked `.ferretignore` or `exclude` is followed; `info`
+/// is not, and neither is `.git`.
 ///
 /// The listing is a snapshot. An ignore file created after the directory was
 /// listed is not seen until the next crawl, so it does not apply to the
@@ -490,10 +491,17 @@ fn nofollow_file_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-/// Ignore files follow a final symlink. `.gitignore` as a symlink is still
-/// read (known, left as it is).
+/// `.ferretignore`, `info/exclude` and discovery files follow a final
+/// symlink, as git does for `exclude`.
 fn ignore_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC
+}
+
+/// Git disregards a `.gitignore` that is a symlink (it warns "unable to
+/// access"), in the walked directories and above the root alike, so it is
+/// opened `O_NOFOLLOW` and a symlink reads as absent.
+fn gitignore_flags() -> OFlags {
+    ignore_flags() | OFlags::NOFOLLOW
 }
 
 fn link_flags() -> OFlags {
@@ -1424,10 +1432,18 @@ fn observe_link(
     Ok((stat, Some(OsString::from_vec(raw.into_bytes()))))
 }
 
+/// Opens ignore file `name`: `.gitignore` without following a symlink, which
+/// then reads as absent; any other name through one.
 fn open_ignore(dir: BorrowedFd<'_>, name: &str) -> io::Result<Opened> {
-    match openat(dir, name, ignore_flags(), Mode::empty()) {
+    let flags = if name == ".gitignore" {
+        gitignore_flags()
+    } else {
+        ignore_flags()
+    };
+    match openat(dir, name, flags, Mode::empty()) {
         Ok(fd) => read_opened(fd),
         Err(Errno::NOENT) => Ok(Opened::Missing),
+        Err(Errno::LOOP) if flags.contains(OFlags::NOFOLLOW) => Ok(Opened::Missing),
         Err(error) => Err(io::Error::from(error)),
     }
 }

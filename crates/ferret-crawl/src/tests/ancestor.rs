@@ -336,3 +336,42 @@ fn a_root_that_git_ignores_is_still_walked() {
     assert_eq!(decision(&walked, "file.txt"), Decision::Index);
     assert_eq!(decision(&walked, "a.o"), Decision::Skip);
 }
+
+#[test]
+// Git disregards a `.gitignore` that is a symlink ("unable to access"), in a
+// walked directory and above the root alike. The regular-file tree beside it
+// is the control: the same rules as a file do skip `secret`.
+fn a_symlinked_gitignore_is_disregarded_as_git_does() {
+    let scratch = Scratch::new("ancestor-symlinked-gitignore");
+    let repo = scratch.join("repo");
+    init(&repo);
+    write(&repo.join("rules"), "secret\n");
+    symlink("rules", repo.join(".gitignore")).unwrap();
+    write(&repo.join("secret"), "s");
+    write(&repo.join("sub/secret"), "s");
+    symlink("../rules", repo.join("sub/.gitignore")).unwrap();
+    write(&repo.join("sub/root/secret"), "s");
+
+    let control = scratch.join("control");
+    init(&control);
+    write(&control.join(".gitignore"), "secret\n");
+    write(&control.join("sub/root/secret"), "s");
+
+    // Walked from the work tree top: the top's and `sub`'s `.gitignore`.
+    for rel in ["secret", "sub/secret", "sub/root/secret"] {
+        assert!(!ignored(&repo, rel), "git ignored {rel}");
+        assert_same(&repo, rel);
+    }
+    // Walked from below: both are ancestors of the root.
+    let root = repo.join("sub/root");
+    assert!(!ignored(&root, "secret"));
+    assert_same(&root, "secret");
+    assert_eq!(
+        decision(&walked(&root, None, Config::default()), "secret"),
+        Decision::Index
+    );
+
+    let control_root = control.join("sub/root");
+    assert!(ignored(&control_root, "secret"));
+    assert_same(&control_root, "secret");
+}
