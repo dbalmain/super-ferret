@@ -16,6 +16,8 @@
 //! workers holds at most 128 + 4N descriptors, independent of depth and width.
 //! `EMFILE` opening a child is an [`Event::Io`] and the walk continues. There
 //! is no path-based fallback below the root.
+//! Listings store names in one byte buffer with offsets, and a worker reuses
+//! one root-relative byte path, restoring its length after each entry.
 //!
 //! A catalogued symlink is one observation: `openat` with `O_PATH |
 //! O_NOFOLLOW`, then `fstat` and `readlinkat` on that descriptor (an empty
@@ -374,7 +376,7 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &Shared) -> V {
         }
         match walker.process(current) {
             Some((mut parent, child)) => {
-                if parent.next != parent.children.len() {
+                if parent.next != parent.children.entries.len() {
                     shared.outstanding.fetch_add(1, Ordering::AcqRel);
                     shared.reserve_or_spill(&mut parent);
                     local.push(parent);
@@ -452,7 +454,6 @@ impl<F: EventVisitor> Walker<F> {
             dir,
             rules,
             children,
-            self.abs.clone(),
             self.rel.clone(),
             (root_stat.st_dev, root_stat.st_ino),
         ))
@@ -481,51 +482,59 @@ fn link_flags() -> OFlags {
     OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
+fn bytes_path(bytes: &[u8]) -> &Path {
+    Path::new(OsStr::from_bytes(bytes))
+}
+
 // ── walk state ──
 
 struct Walker<F> {
     root: PathBuf,
     root_id: Option<(u64, u64)>,
-    /// Path of the directory under consideration, as the caller spelled the
-    /// root plus each child name. Used to resolve a `.git` file's `gitdir:`
-    /// path, which is relative to that directory and may leave the root.
-    /// Kept in lockstep with [`Self::rel`].
-    abs: PathBuf,
-    /// Root-relative path. Empty at the root. Reused for every entry.
-    rel: PathBuf,
+    /// Root-relative path bytes. Empty at the root. Reused for every entry.
+    rel: Vec<u8>,
     visit: F,
 }
 
 struct Child {
-    name: OsString,
+    start: usize,
+    end: usize,
     kind: FileType,
+}
+
+struct Children {
+    names: Vec<u8>,
+    entries: Vec<Child>,
+}
+
+impl Children {
+    fn name(&self, child: &Child) -> &OsStr {
+        OsStr::from_bytes(&self.names[child.start..child.end])
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|child| self.name(child).as_bytes() == name.as_bytes())
+    }
 }
 
 struct Job {
     dir: Option<Dir>,
     rules: DirRules,
-    children: Vec<Child>,
+    children: Children,
     next: usize,
-    abs: PathBuf,
-    rel: PathBuf,
+    rel: Vec<u8>,
     id: (u64, u64),
 }
 
 impl Job {
-    fn new(
-        dir: Dir,
-        rules: DirRules,
-        children: Vec<Child>,
-        abs: PathBuf,
-        rel: PathBuf,
-        id: (u64, u64),
-    ) -> Self {
+    fn new(dir: Dir, rules: DirRules, children: Children, rel: Vec<u8>, id: (u64, u64)) -> Self {
         Self {
             dir: Some(dir),
             rules,
             children,
             next: 0,
-            abs,
             rel,
             id,
         }
@@ -591,34 +600,30 @@ enum Opened {
 
 impl<F: EventVisitor> Walker<F> {
     fn new(root: &Path, visit: F) -> Self {
-        let mut abs = PathBuf::from(root);
-        abs.reserve(256);
-        let mut rel = PathBuf::new();
-        rel.reserve(256);
         Self {
             root: root.to_path_buf(),
             root_id: None,
-            abs,
-            rel,
+            rel: Vec::with_capacity(256),
             visit,
         }
     }
 
-    fn push(&mut self, name: impl AsRef<OsStr>) {
-        let name = name.as_ref();
-        self.rel.push(name);
-        self.abs.push(name);
+    fn push(&mut self, name: impl AsRef<OsStr>) -> usize {
+        let length = self.rel.len();
+        if length != 0 {
+            self.rel.push(b'/');
+        }
+        self.rel.extend_from_slice(name.as_ref().as_bytes());
+        length
     }
 
-    fn pop(&mut self) {
-        let rel = self.rel.pop();
-        let abs = self.abs.pop();
-        debug_assert!(rel && abs, "pop past the walk root");
+    fn pop(&mut self, length: usize) {
+        self.rel.truncate(length);
     }
 
     fn fail(&mut self, error: io::Error) {
         self.visit.visit(Event::Io {
-            path: &self.rel,
+            path: bytes_path(&self.rel),
             error,
         });
     }
@@ -631,7 +636,7 @@ impl<F: EventVisitor> Walker<F> {
 
     fn emit(&mut self, decision: Decision, stat: Option<Stat<'_>>) {
         self.visit.visit(Event::Decided(Decided {
-            path: &self.rel,
+            path: bytes_path(&self.rel),
             decision,
             stat,
         }));
@@ -649,8 +654,11 @@ impl<F: EventVisitor> Walker<F> {
     /// and `None`, so ignore files are not probed for a directory that could
     /// not be listed. An error after some entries is reported and the entries
     /// already read are kept.
-    fn list(&mut self, dir: &mut Dir) -> Option<Vec<Child>> {
-        let mut children = Vec::new();
+    fn list(&mut self, dir: &mut Dir) -> Option<Children> {
+        let mut children = Children {
+            names: Vec::new(),
+            entries: Vec::new(),
+        };
         let mut failed = false;
         while let Some(item) = dir.read() {
             match item {
@@ -659,8 +667,11 @@ impl<F: EventVisitor> Walker<F> {
                     if bytes == b"." || bytes == b".." {
                         continue;
                     }
-                    children.push(Child {
-                        name: OsStr::from_bytes(bytes).to_os_string(),
+                    let start = children.names.len();
+                    children.names.extend_from_slice(bytes);
+                    children.entries.push(Child {
+                        start,
+                        end: children.names.len(),
                         kind: entry.file_type(),
                     });
                 }
@@ -670,7 +681,7 @@ impl<F: EventVisitor> Walker<F> {
                 }
             }
         }
-        if failed && children.is_empty() {
+        if failed && children.entries.is_empty() {
             None
         } else {
             Some(children)
@@ -678,24 +689,24 @@ impl<F: EventVisitor> Walker<F> {
     }
 
     fn process(&mut self, mut job: Job) -> Option<(Job, Job)> {
-        self.abs.clone_from(&job.abs);
         self.rel.clone_from(&job.rel);
         if job.dir.is_none() {
-            job.dir = self.reopen(&job.rel, job.id);
+            job.dir = self.reopen(bytes_path(&job.rel), job.id);
         }
         let dir = job.dir.as_ref()?;
-        while job.next < job.children.len() {
-            let child = &job.children[job.next];
+        while job.next < job.children.entries.len() {
+            let child = &job.children.entries[job.next];
+            let name = job.children.name(child);
             job.next += 1;
-            self.push(&child.name);
+            let length = self.push(name);
             let descended = match dir.fd() {
-                Ok(fd) => self.consider(fd, &job.rules, &child.name, child.kind),
+                Ok(fd) => self.consider(fd, &job.rules, name, child.kind),
                 Err(error) => {
                     self.fail(io::Error::from(error));
                     None
                 }
             };
-            self.pop();
+            self.pop(length);
             if let Some(descended) = descended {
                 return Some((job, descended));
             }
@@ -776,7 +787,7 @@ impl<F: EventVisitor> Walker<F> {
                 self.decide_statted(dir, rules, name, stat)
             }
             FileType::Symlink => {
-                let decision = rules.decide(&self.rel, Entry::Symlink);
+                let decision = rules.decide(bytes_path(&self.rel), Entry::Symlink);
                 if decision == Decision::Skip {
                     self.emit_skip();
                     return None;
@@ -785,7 +796,7 @@ impl<F: EventVisitor> Walker<F> {
             }
             FileType::Directory => self.consider_dir(dir, rules, name),
             _ => {
-                if rules.decide(&self.rel, Entry::Other) == Decision::Skip {
+                if rules.decide(bytes_path(&self.rel), Entry::Other) == Decision::Skip {
                     self.emit_skip();
                     return None;
                 }
@@ -796,7 +807,7 @@ impl<F: EventVisitor> Walker<F> {
     }
 
     fn consider_dir(&mut self, dir: BorrowedFd<'_>, rules: &DirRules, name: &OsStr) -> Option<Job> {
-        let mut decision = rules.decide(&self.rel, Entry::Dir);
+        let mut decision = rules.decide(bytes_path(&self.rel), Entry::Dir);
         if decision == Decision::Skip {
             self.emit_skip();
             return None;
@@ -804,7 +815,7 @@ impl<F: EventVisitor> Walker<F> {
         let stat = self.stat_child(dir, name)?;
         let seen = entry_from_stat(&stat);
         if seen != Entry::Dir {
-            decision = rules.decide(&self.rel, seen);
+            decision = rules.decide(bytes_path(&self.rel), seen);
             if decision == Decision::Skip {
                 self.emit_skip();
                 return None;
@@ -828,7 +839,7 @@ impl<F: EventVisitor> Walker<F> {
         stat: rustix::fs::Stat,
     ) -> Option<Job> {
         let entry = entry_from_stat(&stat);
-        let decision = rules.decide(&self.rel, entry);
+        let decision = rules.decide(bytes_path(&self.rel), entry);
         if decision == Decision::Skip {
             self.emit_skip();
             return None;
@@ -858,7 +869,7 @@ impl<F: EventVisitor> Walker<F> {
         };
         let seen = entry_from_stat(&stat);
         if seen != Entry::Symlink {
-            let decision = rules.decide(&self.rel, seen);
+            let decision = rules.decide(bytes_path(&self.rel), seen);
             if decision == Decision::Skip {
                 self.emit_skip();
                 return None;
@@ -924,7 +935,6 @@ impl<F: EventVisitor> Walker<F> {
             child,
             rules,
             children,
-            self.abs.clone(),
             self.rel.clone(),
             (expected.st_dev, expected.st_ino),
         ))
@@ -944,7 +954,6 @@ impl<F: EventVisitor> Walker<F> {
             child,
             rules,
             children,
-            self.abs.clone(),
             self.rel.clone(),
             (expected.st_dev, expected.st_ino),
         ))
@@ -1129,10 +1138,10 @@ impl<F: EventVisitor> Walker<F> {
     fn load_ignores(
         &mut self,
         dir: BorrowedFd<'_>,
-        children: &[Child],
+        children: &Children,
         in_work_tree: bool,
     ) -> Ignores {
-        let listed = |name: &str| children.iter().any(|child| child.name == name);
+        let listed = |name: &str| children.contains(name);
         let ferretignore = listed(".ferretignore")
             .then(|| self.read_named(dir, ".ferretignore"))
             .flatten();
@@ -1152,7 +1161,7 @@ impl<F: EventVisitor> Walker<F> {
         let git_exclude = match &git {
             GitProbe::Directory(fd) => self.read_exclude(fd.as_fd()),
             GitProbe::File(bytes) => {
-                let base = self.abs.clone();
+                let base = self.root.join(bytes_path(&self.rel));
                 self.read_gitfile_exclude(&base, bytes)
             }
             GitProbe::Missing | GitProbe::Present => None,
@@ -1166,7 +1175,7 @@ impl<F: EventVisitor> Walker<F> {
     }
 
     fn read_named(&mut self, dir: BorrowedFd<'_>, name: &str) -> Option<String> {
-        self.push(name);
+        let length = self.push(name);
         let text = match open_ignore(dir, name) {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
             Ok(Opened::Missing | Opened::NotRegular) => None,
@@ -1175,7 +1184,7 @@ impl<F: EventVisitor> Walker<F> {
                 None
             }
         };
-        self.pop();
+        self.pop(length);
         text
     }
 
@@ -1183,25 +1192,25 @@ impl<F: EventVisitor> Walker<F> {
     /// since [`probe_git`](Self::probe_git). `exclude` itself is an ordinary
     /// ignore file: a symlink of that name is followed.
     fn read_exclude(&mut self, git: BorrowedFd<'_>) -> Option<String> {
-        self.push(".git");
-        self.push("info");
+        let git_length = self.push(".git");
+        let info_length = self.push("info");
         let info = match openat(git, "info", child_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => {
-                self.pop();
-                self.pop();
+                self.pop(info_length);
+                self.pop(git_length);
                 return None;
             }
             Err(error) => {
-                self.push("exclude");
+                let exclude_length = self.push("exclude");
                 self.fail(io::Error::from(error));
-                self.pop();
-                self.pop();
-                self.pop();
+                self.pop(exclude_length);
+                self.pop(info_length);
+                self.pop(git_length);
                 return None;
             }
         };
-        self.push("exclude");
+        let exclude_length = self.push("exclude");
         let text = match open_ignore(info.as_fd(), "exclude") {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
             Ok(Opened::Missing | Opened::NotRegular) => None,
@@ -1210,9 +1219,9 @@ impl<F: EventVisitor> Walker<F> {
                 None
             }
         };
-        self.pop();
-        self.pop();
-        self.pop();
+        self.pop(exclude_length);
+        self.pop(info_length);
+        self.pop(git_length);
         text
     }
 
@@ -1328,9 +1337,9 @@ impl<F: EventVisitor> Walker<F> {
     }
 
     fn fail_at_git(&mut self, error: io::Error) {
-        self.push(".git");
+        let length = self.push(".git");
         self.fail(error);
-        self.pop();
+        self.pop(length);
     }
 }
 

@@ -1,6 +1,8 @@
 //! Exercises the real work queue against the sequential event stream.
 
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
@@ -69,6 +71,23 @@ fn many_siblings_match_sequential() {
     }
     let (events, _) = compare(&tree.path, 8);
     assert_eq!(events.len(), 384);
+}
+
+/// The packed listing must preserve arbitrary filename bytes.
+#[test]
+fn a_non_utf8_name_survives_the_packed_listing() {
+    let tree = Scratch::new("parallel-raw-name");
+    let name = OsString::from_vec(b"raw-\xff".to_vec());
+    write(&tree.path.join(&name), "text");
+    let mut seen = false;
+    walk(&tree.path, None, Config::default(), |event| {
+        if let Event::Decided(decided) = event
+            && decided.path.as_os_str().as_bytes() == name.as_bytes()
+        {
+            seen = true;
+        }
+    });
+    assert!(seen);
 }
 
 /// A deep frontier must keep descriptors bounded instead of retaining a stack.
