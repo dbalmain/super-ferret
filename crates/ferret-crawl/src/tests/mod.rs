@@ -5,11 +5,13 @@ mod golden;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ferret_policy::{Config, DEFAULT_IGNORE, Decision, PatternError, Reason};
 
@@ -148,6 +150,11 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, bytes).unwrap();
+}
+
+fn mkfifo(path: &Path) {
+    let status = Command::new("mkfifo").arg(path).status().unwrap();
+    assert!(status.success(), "mkfifo {}: {status}", path.display());
 }
 
 #[test]
@@ -326,11 +333,7 @@ fn a_symlink_is_catalogued_and_not_followed() {
 #[test]
 fn a_fifo_is_skipped_and_not_opened() {
     let dir = Scratch::new("fifo");
-    let status = Command::new("mkfifo")
-        .arg(dir.join("pipe"))
-        .status()
-        .unwrap();
-    assert!(status.success(), "{status}");
+    mkfifo(&dir.join("pipe"));
     write(&dir.join("note.txt"), "a");
 
     let walked = walked(dir.path.as_path(), None, Config::default());
@@ -484,4 +487,153 @@ fn a_non_utf8_ignore_file_is_read_lossily_and_valid_lines_apply() {
     assert!(walked.patterns.is_empty(), "{:?}", walked.patterns);
     assert_eq!(decision(&walked, "a.log"), Decision::Skip);
     assert_eq!(decision(&walked, "b.txt"), Decision::Index);
+}
+
+#[test]
+fn a_special_ignore_file_does_not_stall_the_walk() {
+    // The child is this same test. Without `O_NONBLOCK`, opening a FIFO for
+    // reading waits for a writer and the child never exits.
+    if std::env::var_os("FERRET_FIFO_CHILD").is_some() {
+        let root = PathBuf::from(std::env::var_os("FERRET_FIFO_ROOT").unwrap());
+        let walked = walked(&root, None, Config::default());
+        assert!(walked.io.is_empty(), "{:?}", walked.io);
+        assert_eq!(decision(&walked, "note.txt"), Decision::Index);
+        assert_eq!(decision(&walked, "repo/note.txt"), Decision::Index);
+        assert_eq!(decision(&walked, "repo/kept.log"), Decision::Index);
+        // libtest swallows a passing test's stdout, so the parent checks a
+        // file.
+        fs::write(root.join(".walked"), b"1").unwrap();
+        return;
+    }
+
+    let dir = Scratch::new("fifo-ignore");
+    mkfifo(&dir.join(".ferretignore"));
+    mkfifo(&dir.join(".gitignore"));
+    fs::create_dir(dir.join("repo")).unwrap();
+    fs::create_dir(dir.join("repo/.git")).unwrap();
+    fs::create_dir(dir.join("repo/.git/info")).unwrap();
+    mkfifo(&dir.join("repo/.gitignore"));
+    mkfifo(&dir.join("repo/.git/info/exclude"));
+    write(&dir.join("note.txt"), "a");
+    write(&dir.join("repo/note.txt"), "b");
+    write(&dir.join("repo/kept.log"), "c");
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("tests::a_special_ignore_file_does_not_stall_the_walk")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("FERRET_FIFO_CHILD", "1")
+        .env("FERRET_FIFO_ROOT", &dir.path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if start.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("walk stalled on a special ignore file");
+        }
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        status.success(),
+        "child status {status}: {stderr}\n{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join(".walked")).ok().as_deref(),
+        Some("1"),
+        "child did not walk\n{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn an_ignore_file_of_one_mibibyte_still_applies() {
+    let dir = Scratch::new("ignore-bound");
+    let mut bytes = b"*.log\n".to_vec();
+    bytes.resize(1 << 20, b'#');
+    write(&dir.join(".ferretignore"), bytes);
+    write(&dir.join("a.log"), "x");
+    write(&dir.join("b.txt"), "y");
+
+    let walked = walked(dir.path.as_path(), None, Config::default());
+    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    assert_eq!(decision(&walked, "a.log"), Decision::Skip);
+    assert_eq!(decision(&walked, "b.txt"), Decision::Index);
+}
+
+#[test]
+fn an_ignore_file_over_one_mibibyte_is_a_fault_and_does_not_apply() {
+    let dir = Scratch::new("ignore-over");
+    let mut bytes = b"*.log\n".to_vec();
+    bytes.resize((1 << 20) + 1, b'#');
+    write(&dir.join(".ferretignore"), bytes);
+    write(&dir.join("a.log"), "x");
+    write(&dir.join("b.txt"), "y");
+
+    let walked = walked(dir.path.as_path(), None, Config::default());
+    assert_eq!(
+        walked.io,
+        vec![(PathBuf::from(".ferretignore"), io::ErrorKind::FileTooLarge)]
+    );
+    assert_eq!(decision(&walked, "a.log"), Decision::Index);
+    assert_eq!(decision(&walked, "b.txt"), Decision::Index);
+}
+
+#[test]
+fn gitignore_outside_a_work_tree_is_not_read() {
+    let dir = Scratch::new("gitignore-unread");
+    write(&dir.join(".gitignore"), "*.log\n");
+    fs::set_permissions(dir.join(".gitignore"), fs::Permissions::from_mode(0o000)).unwrap();
+    write(&dir.join("a.log"), "x");
+    fs::create_dir(dir.join("nested")).unwrap();
+    write(&dir.join("nested/.gitignore"), "*.txt\n");
+    fs::set_permissions(
+        dir.join("nested/.gitignore"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    write(&dir.join("nested/a.txt"), "y");
+
+    fs::create_dir_all(dir.join("repo/.git")).unwrap();
+    write(&dir.join("repo/.gitignore"), "*.o\n");
+    fs::set_permissions(
+        dir.join("repo/.gitignore"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    write(&dir.join("repo/a.o"), "z");
+    write(&dir.join("repo/a.c"), "z");
+
+    let walked = walked(dir.path.as_path(), None, Config::default());
+    assert_eq!(
+        walked.io,
+        vec![(
+            PathBuf::from("repo/.gitignore"),
+            io::ErrorKind::PermissionDenied
+        )]
+    );
+    assert_eq!(decision(&walked, "a.log"), Decision::Index);
+    assert_eq!(decision(&walked, "nested/a.txt"), Decision::Index);
+    assert_eq!(decision(&walked, "repo/a.o"), Decision::Index);
+    assert_eq!(decision(&walked, "repo/a.c"), Decision::Index);
 }

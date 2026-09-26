@@ -138,6 +138,17 @@ impl DirRules {
         }
     }
 
+    /// Whether `.gitignore` rules are in force here.
+    ///
+    /// True when this directory or an ancestor started a work tree
+    /// (`git_root`). The crawler uses it to skip reading `.gitignore` where
+    /// those rules cannot apply. A configured root whose `.git` sits above
+    /// it is outside a work tree (D22): [`root`](Self::root) does not look
+    /// above `root`.
+    pub fn in_work_tree(&self) -> bool {
+        self.git.is_some()
+    }
+
     /// Decides the entry at root-relative `path`, which must be a direct child
     /// of this directory. The crawler can pass its existing candidate path so
     /// decisions do not allocate a joined path for each entry.
@@ -452,5 +463,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn in_work_tree_starts_at_git_root_and_is_inherited() {
+        let (outside, _) = root(None, IgnoreFiles::default());
+        assert!(!outside.in_work_tree());
+        let (child, _) = outside.enter(OsStr::new("sub"), IgnoreFiles::default());
+        assert!(!child.in_work_tree());
+
+        let (inside, _) = root(
+            None,
+            IgnoreFiles {
+                git_root: true,
+                ..IgnoreFiles::default()
+            },
+        );
+        assert!(inside.in_work_tree());
+        let (deeper, _) = inside.enter(OsStr::new("sub"), IgnoreFiles::default());
+        assert!(deeper.in_work_tree());
+        assert!(inside.traverse(OsStr::new("sub")).in_work_tree());
     }
 }

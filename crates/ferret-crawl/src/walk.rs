@@ -4,12 +4,20 @@
 //! reads the tree and reports. It does not touch the catalog.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, FileType, Metadata};
-use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, FileType, Metadata, OpenOptions};
+use std::io::{self, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError, Reason};
+
+/// `O_NONBLOCK` from Linux `<fcntl.h>` (`04000`). std does not export it.
+const O_NONBLOCK: i32 = 0o4000;
+
+/// An ignore file larger than this is an [`Event::Io`] and counts as absent.
+/// One mebibyte is past any ignore file this tree has seen; the bound is what
+/// stops a hostile or accidental giant from being pulled into the walk.
+const MAX_IGNORE_BYTES: u64 = 1 << 20;
 
 /// `lstat` fields for an entry the walk did not skip.
 ///
@@ -101,14 +109,21 @@ pub enum Event<'a> {
 /// not an entry `decide` sees; the caller stats it if the roots table needs
 /// its inode. Faults that belong to the root use an empty path.
 ///
-/// Ignore files (`.ferretignore`, `.gitignore`, `.git`, and
-/// `.git/info/exclude` when `.git` is a real directory) are read when the
-/// walk enters a directory ([`Decision::Descend`]). A directory reached only
-/// so a `.ferretignore` `!` pattern can re-include beneath it
-/// ([`Decision::Traverse`]) is listed, and its ignore files are not read
-/// (D13). Bytes that are not UTF-8 are converted lossily. A missing file is
-/// absent, not a fault; a file that exists but cannot be read is a fault, and
-/// that file is then treated as absent.
+/// Ignore files are read when the walk enters a directory
+/// ([`Decision::Descend`]). A directory reached only so a `.ferretignore` `!`
+/// pattern can re-include beneath it ([`Decision::Traverse`]) is listed, and
+/// its ignore files are not read (D13). `.gitignore` is read only inside a
+/// work tree, where its rules can apply; the root counts as outside one unless
+/// it contains `.git` (D22). `.git/info/exclude` is read when `.git` is a real
+/// directory.
+///
+/// `.ferretignore`, `.gitignore` and `info/exclude` are opened without blocking
+/// (`O_NONBLOCK`) and read only when that open file is a regular file of at
+/// most 1 MiB. A larger file is an [`Event::Io`] and is then treated as
+/// absent. A missing file, or anything that is not a regular file, is absent
+/// and not a fault: a FIFO or directory of one of these names must not stall
+/// the walk. A regular file that exists but cannot be read is a fault, and is
+/// then treated as absent. Bytes that are not UTF-8 are converted lossily.
 ///
 /// File types come from `read_dir` (`d_type`, or `lstat` when the filesystem
 /// leaves the type unknown). `d_type` does not follow symlinks. Regular files
@@ -123,7 +138,8 @@ pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut
     let Some(children) = walker.list() else {
         return;
     };
-    let loaded = walker.load_ignores(&children);
+    // The root is outside a work tree unless it contains `.git` (D22).
+    let loaded = walker.load_ignores(&children, false);
     let (rules, errors) = DirRules::root(root, global, loaded.files(), config);
     walker.patterns(errors);
     walker.walk_listed(&rules, children);
@@ -376,7 +392,7 @@ where
         let Some(children) = self.list() else {
             return;
         };
-        let loaded = self.load_ignores(&children);
+        let loaded = self.load_ignores(&children, parent.in_work_tree());
         let (rules, errors) = parent.enter(name, loaded.files());
         self.patterns(errors);
         self.walk_listed(&rules, children);
@@ -394,18 +410,25 @@ where
 
     /// Only names in the listing are opened: a directory without ignore files,
     /// the usual case, costs no failed `open`s.
-    fn load_ignores(&mut self, children: &[Child]) -> Ignores {
+    ///
+    /// `in_work_tree` is the parent directory. The root passes `false`.
+    fn load_ignores(&mut self, children: &[Child], in_work_tree: bool) -> Ignores {
         let listed = |name: &str| children.iter().any(|child| child.name == name);
         let ferretignore = listed(".ferretignore")
             .then(|| self.read_named(".ferretignore"))
-            .flatten();
-        let gitignore = listed(".gitignore")
-            .then(|| self.read_named(".gitignore"))
             .flatten();
         let git = if listed(".git") {
             self.probe_git()
         } else {
             GitKind::Missing
+        };
+        // A `.gitignore` outside a work tree cannot affect decisions, so it is
+        // not opened. A FIFO of that name must not stall a walk that is not in
+        // a repository.
+        let gitignore = if (in_work_tree || git != GitKind::Missing) && listed(".gitignore") {
+            self.read_named(".gitignore")
+        } else {
+            None
         };
         let git_exclude = if git == GitKind::Directory {
             self.read_exclude()
@@ -438,13 +461,13 @@ where
         text
     }
 
-    /// `Ok` text, `None` if the file is absent. Any other error is reported
-    /// and the file is treated as absent so the rest of the directory still
-    /// walks.
+    /// Text of the file at the cursor, or `None` when it is absent or not a
+    /// regular file. Any other error is reported and the file is treated as
+    /// absent so the rest of the directory still walks.
     fn read_at_cursor(&mut self) -> Option<String> {
-        match fs::read(&self.abs) {
-            Ok(bytes) => Some(decode_lossy(bytes)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        match open_regular(&self.abs) {
+            Ok(Some(bytes)) => Some(decode_lossy(bytes)),
+            Ok(None) => None,
             Err(error) => {
                 self.fail(error);
                 None
@@ -466,6 +489,46 @@ where
         self.pop();
         kind
     }
+}
+
+/// Opens `path` for reading without blocking, and returns its bytes when the
+/// open file is a regular file of at most [`MAX_IGNORE_BYTES`].
+///
+/// `Ok(None)` is absence: nothing was there, or the opened inode is not a
+/// regular file (a FIFO, directory, or device of an ignore-file's name). The
+/// open uses `O_NONBLOCK` so a FIFO does not wait for a writer. The check is
+/// `fstat` on that file, not a prior `lstat`, so a name that changes between
+/// the listing and the open is classified from what was actually opened.
+fn open_regular(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    if meta.len() > MAX_IGNORE_BYTES {
+        return Err(ignore_too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_IGNORE_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_IGNORE_BYTES {
+        return Err(ignore_too_large());
+    }
+    Ok(Some(bytes))
+}
+
+fn ignore_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::FileTooLarge,
+        "ignore file is larger than 1 MiB",
+    )
 }
 
 fn decode_lossy(bytes: Vec<u8>) -> String {
