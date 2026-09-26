@@ -184,6 +184,7 @@ available parallelism capped at 16 (D24).
 A configured root is always walked, even when the enclosing work tree's rules
 exclude it or one of its ancestors: naming a root overrides `.gitignore` (D25),
 as it overrides the global ignore file. Those rules still apply below the root.
+The walk crosses into file systems mounted below a root (D20).
 
 Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
 and **content-indexed** (also hashed and tokenized). Binary files and files over

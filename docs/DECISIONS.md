@@ -35,7 +35,7 @@ Predecessors, carried forward where still open:
 | D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
 | D19 | Ignore matching: whole paths, or per-directory rule sets | open           | Dave leans B for the daemon; pushback: B saves <65 µs per 500-file burst; settle by re-running the replay      |
-| D20 | Walk across mount points, or stay on the root's device   | open           |                                                                                                                |
+| D20 | Walk across mount points, or stay on the root's device   | answered       | A: cross mount points below a root, as now                                                                     |
 | D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
 | D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
 | D23 | Recording work trees, so duplicate results can be hidden | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                        |
@@ -852,6 +852,12 @@ yet designed.
 not be indexed. The fact that would change it: a crawl of the configured root
 (likely `$HOME`, D10) whose time or catalog is dominated by another mounted file
 system.
+
+> Dave: I'm happy with your recommendation to stay with A on D20.
+
+**Answer (2026-09-27): A.** The walker crosses into mounted file systems below a
+configured root, as it does today. The walk example's `devices` count shows when
+a root spans more than one.
 
 ## D21 — Walk by path, or by directory handle
 
