@@ -144,9 +144,16 @@ tombstones, so there is one source of truth.
 themselves, fixed-width little-endian rows plus two heaps. The name heap holds
 NUL-terminated names in `(parent, name)` order (D28 A) and is contiguous on
 purpose: it is what filename search scans (D14). The strings heap holds root
-paths, link targets and work-tree paths. A reader reads the file into memory and
-validates it once: every offset, index and ordering it will follow is checked,
-so a corrupt or truncated file is an error, never a panic or a loop. The writer
+paths, link targets and work-tree paths. A reader opens the file by reading the header
+and table alone (200 B), and then reads each section positionally when a query
+first needs it (D38 B), together with the sections it is checked against (names
+need the heap; directory names need names; roots need directory names and
+strings; links and work trees need strings). Each section is validated as it
+loads: every offset, index and ordering a reader will follow is checked, so a
+corrupt or truncated file is an error from the load that reads the bad
+section, never a panic or a loop, and a query that does not read a section is
+not failed by it. A single inode row can be read without its section, for the
+few rows a name query reports. The writer
 holds an advisory lock on `lock` for the whole run, writes `catalog.tmp`, fsyncs
 it, renames it over `catalog` and fsyncs the directory; a reader holding the old
 generation keeps it (D32). Measured on `$HOME` (D28, D30): 51.2 MB for 435k
@@ -331,6 +338,20 @@ FST, …) is decided in S2 and is itself an experiment row.
    output by default; JSON lines behind a flag.
 
 A metadata-only or name-only query never touches the index.
+
+**S1's name and metadata queries** (`ferret-query`; grammar in its crate doc).
+The longest literal any name atom guarantees (a word, `ext:`'s `.EXT`, a glob's
+or a regex's longest literal run) drives a scan of the name heap with
+`ferret-verify`'s case-folding two-byte filter (D41); each hit is mapped to its
+name by galloping over name starts, tested once, and the scan resumes at the
+next name. A query with metadata atoms and no literal tests every inode row
+first and then walks the name rows for the inodes that pass. Everything else
+tests every name. A name query loads the name, directory, root, traversed and
+link sections, never the document rows, and reads inode rows one at a time for
+the rows it reports until that passes a 64th of the rows, when it loads the
+section instead. Paths are resolved once per parent directory. Measured
+(`ferret-bench`, D43): a rare word is 5 ms warm at `$HOME`, 206 ms at 10M and
+763 ms at 40M, nearly all of it the section loads.
 
 ## Experiments and metrics
 

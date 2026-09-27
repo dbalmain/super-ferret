@@ -58,6 +58,7 @@ Predecessors, carried forward where still open:
 | D40 | What entry count S1 is built for                         | answered       | B: about 10M catalogued entries, measured at about 40M                                                         |
 | D41 | The name scanner: `memchr::memmem`, or our own           | answered       | B: own case-folding filter, AVX2 + SWAR, vs memmem control                                                     |
 | D42 | A re-run's memory: the previous generation held          | open           |                                                                                                                |
+| D43 | A 10M name query costs its section loads, not its scan   | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1887,6 +1888,19 @@ for the case-sensitive path and keep B for case-folded search.
 an AVX2 arm under D11 plus a toolchain-ledger row and a safe SWAR fallback,
 benchmarked in slice 5 against `memchr::memmem` as the control.
 
+**Measured (slice 5a, 2026-09-28, `ferret-bench scan`, warm).** The AVX2 arm
+runs 16–33 GB/s on the synthetic 10M heap (244 MB) and 16–32 GB/s at 40M
+(974 MB); SWAR runs 3.2–3.6 GB/s everywhere, which is why the AVX2 arm is in
+the ledger. Against `memmem` on case-sensitive search, the arm takes 2–18%
+longer at 10M and 19–31% longer at 40M (`Flamegraph` 30.6 against 25.7 ms;
+`test`, with 592k hits, 43.5 against 33.1 ms, 24% less throughput). That is at
+the edge of the 30% line, so the `memmem` fallback was not added: it would
+put `memchr` in a product crate for about 10 ms on a query that spends 730 ms
+loading sections (D43). Folded, the arm is 16–24 GB/s; `memmem` on a
+lower-cased copy of the heap is faster (23–36 GB/s) but needs the second
+heap. A byte-frequency table taken from real name heaps, in place of the
+English one that picks the probe pair, is the obvious next tuning step.
+
 ## D42 — A re-run's memory: the previous generation held through the walk
 
 **Question:** A re-run holds the whole previous catalog in memory while it
@@ -1912,3 +1926,40 @@ On `$HOME` a first run peaks at 78 MB and a re-run at 110 MB.
 since C fixes writer and reader together. The fact that would change it: a real
 10M tree whose re-run peak matters on an 8–16 GB desktop, which makes B,
 self-contained, worth doing now.
+
+## D43 — A 10M name query costs its section loads, not its scan
+
+**Question:** At 10M entries a name query spends about 190 ms warm loading the
+name sections and under 15 ms scanning. Should the reader's open path change
+in slice 5b?
+
+Measured in slice 5a with `ferret-bench open` and `query`, the whole path from
+`Catalog::open` to the last row. Loads use positional reads into owned buffers
+(D38 B).
+
+| Catalog             | Name sections | Load, warm | Load, evicted | Rare word, warm | Scan alone |
+| ------------------- | ------------- | ---------- | ------------- | --------------- | ---------- |
+| `$HOME`, 441k names | 16.3 MB       | 4.6 ms     | 17.7 ms       | 5.1 ms          | 0.3 ms     |
+| synthetic 10M       | 371 MB        | 196 ms     | 329 ms        | 206 ms          | 7.4 ms     |
+| synthetic 40M       | 1.48 GB       | 729 ms     | 1,349 ms      | 763 ms          | 30.6 ms    |
+
+The 10M load, split by a second measurement (reading the same 371 MB from
+the file into a fresh buffer, then into the same buffer again): about 95 ms is
+page faults on the fresh buffers, 27 ms the copy, and about 74 ms, by
+difference, per-section validation. At 40M the same split is 354, 107 and
+about 270 ms. D38 said B stands unless it measures "more than a few
+milliseconds above C for a warm name query"; C is unmeasured, but the fault
+and copy costs alone, which C would remove, are 122 ms at 10M.
+
+| Option                                                                                                          | Costs                                                                                                                                                               | Buys                                                                                                                                     |
+| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Keep section reads (now)                                                                                     | About 200 ms warm per query at 10M and 760 ms at 40M, four times D41's 50 ms target. Nothing to write                                                               | Std only, reads are errors, every accessor infallible after load                                                                         |
+| B. `mmap` the snapshot (D38 C, D42 C), keeping per-section validation                                           | `unsafe` under D11 with a ledger-style note; SIGBUS if the file is truncated under the map (the writer only renames). Validation still touches every page it checks | Removes the faults into fresh memory and the copy: about 120 ms of the 196 at 10M (measured split, not a measured `mmap`). Fixes D42 too |
+| C. Validate at use: check a row's offsets and ids when a query follows them, rather than whole sections at load | A branch per followed row, in accessors that become fallible or clamp; the "a loaded section is sound" invariant becomes per-access                                 | About 74 ms at 10M; combines with A or B                                                                                                 |
+
+**Recommendation:** B and C measured together in slice 5b, as an experiment
+against today's reader, before the CLI's timings are published. B alone
+leaves about 74 ms of validation at 10M, which is still above the target, so C
+is what gets a warm 10M name query near 50 ms. The fact that would change it:
+a measured `mmap` open whose page-table and fault cost is not well below the
+122 ms it replaces, in which case A plus C is the safe answer.

@@ -266,7 +266,11 @@ mod avx2 {
         let block = |at: usize| {
             let probe = |k: usize, m, b| {
                 let bytes = load(at + pair.at[k]);
-                let bytes = if FOLD { _mm256_or_si256(bytes, m) } else { bytes };
+                let bytes = if FOLD {
+                    _mm256_or_si256(bytes, m)
+                } else {
+                    bytes
+                };
                 _mm256_cmpeq_epi8(bytes, b)
             };
             _mm256_and_si256(probe(0, m0, b0), probe(1, m1, b1))
@@ -289,10 +293,10 @@ mod avx2 {
         while start + 63 <= last {
             let (lo, hi) = (block(start), block(start + 32));
             let any = _mm256_or_si256(lo, hi);
-            if _mm256_testz_si256(any, any) == 0 {
-                if let Some(found) = verify(start, lo).or_else(|| verify(start + 32, hi)) {
-                    return (Some(found), start);
-                }
+            if _mm256_testz_si256(any, any) == 0
+                && let Some(found) = verify(start, lo).or_else(|| verify(start + 32, hi))
+            {
+                return (Some(found), start);
             }
             start += 64;
         }

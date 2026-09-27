@@ -26,7 +26,7 @@
 //!
 //! | item | where | measured effect if removed |
 //! |---|---|---|
-//! | AVX2 arm of the candidate filter | [`scan`](crate::scan) `mod avx2` | pending |
+//! | AVX2 arm of the candidate filter | [`scan`](crate::scan) `mod avx2` | 5–9× slower scans: on the synthetic 10M heap (244 MB, warm) SWAR runs 3.3–3.6 GB/s against AVX2's 16–33 GB/s; `flamegraph` folded goes from 10.3 ms to 68.6 ms (rustc 1.95.0, 2026-09-28) |
 
 /// The rustc the ledger above was last measured with.
 pub const RECHECKED_WITH: &str = "1.95.0";

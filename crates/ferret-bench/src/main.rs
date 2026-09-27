@@ -137,7 +137,10 @@ fn scan(dir: &Path, needles: &[String]) -> Result<()> {
     catalog.load(&[Section::NameHeap])?;
     let heap = catalog.name_heap();
     let lowered = heap.to_ascii_lowercase();
-    println!("heap {:.1} MB, warm, median of {WARM_RUNS}\n", heap.len() as f64 / 1e6);
+    println!(
+        "heap {:.1} MB, warm, median of {WARM_RUNS}\n",
+        heap.len() as f64 / 1e6
+    );
     println!("| needle | case | hits | arm | ms | GB/s |");
     println!("|---|---|---:|---|---:|---:|");
     let needles: Vec<&str> = if needles.is_empty() {
@@ -162,8 +165,7 @@ fn scan(dir: &Path, needles: &[String]) -> Result<()> {
                 (heap, needle.to_string())
             };
             let finder = memchr::memmem::Finder::new(pattern.as_bytes());
-            let (hits, time) =
-                time_all(|from| finder.find(&subject[from..]).map(|at| at + from));
+            let (hits, time) = time_all(|from| finder.find(&subject[from..]).map(|at| at + from));
             let label = if fold {
                 "memmem, lower-cased copy"
             } else {
@@ -279,8 +281,14 @@ fn fault_split(dir: &Path, name_sections: &[Section]) -> Result<()> {
         resident.push(start.elapsed());
     }
     black_box(&buffer);
-    println!("| {len} B into a fresh buffer | warm | {} | {len} |", ms(median(fresh)));
-    println!("| {len} B into a resident buffer | warm | {} | {len} |", ms(median(resident)));
+    println!(
+        "| {len} B into a fresh buffer | warm | {} | {len} |",
+        ms(median(fresh))
+    );
+    println!(
+        "| {len} B into a resident buffer | warm | {} | {len} |",
+        ms(median(resident))
+    );
     Ok(())
 }
 
