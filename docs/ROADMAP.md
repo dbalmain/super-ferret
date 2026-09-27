@@ -31,7 +31,7 @@ that holds every crate's dependencies to the graph in DESIGN.md, and a working
 guide for agents in [CLAUDE.md](../CLAUDE.md). The toolchain ledger is a rule in
 that guide, created by the first item that needs it rather than empty now.
 
-## S1 — Find, faster (first usable)
+## S1 — Find, faster (first usable) (done 2026-09-28)
 
 `ferret-policy`, `ferret-crawl`, `ferret-catalog`, and the CLI:
 
@@ -57,7 +57,7 @@ time; 32 threads, NVMe, ext4). "Cold" is the page cache emptied per file with
 `posix_fadvise(DONTNEED)`, checked with `fincore`. Without root, the dentry and
 inode caches stay warm, so cold crawls understate a reboot. Every `find` time is
 measured against the **D38 B reader** (positional section reads); D43 (mmap) is
-open. The full tables are in the slice 5b done-note.
+open.
 
 The `$HOME` census:
 
