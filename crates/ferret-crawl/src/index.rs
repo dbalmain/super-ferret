@@ -164,6 +164,9 @@ pub struct Counts {
     pub carried: u64,
     /// Of those, that took another name's observation from the cache.
     pub aliased: u64,
+    /// Of those aliases, that met their inode in flight on another worker
+    /// and were recorded after the walk.
+    pub deferred: u64,
     /// Of those, published with a content fault.
     pub content_faults: u64,
     /// Files opened and read (sniffed, and hashed unless binary).
@@ -190,6 +193,7 @@ impl Counts {
             indexed,
             carried,
             aliased,
+            deferred,
             content_faults,
             files_read,
             bytes_read,
@@ -205,6 +209,7 @@ impl Counts {
         self.indexed += indexed;
         self.carried += carried;
         self.aliased += aliased;
+        self.deferred += deferred;
         self.content_faults += content_faults;
         self.files_read += files_read;
         self.bytes_read += bytes_read;
@@ -525,6 +530,7 @@ impl<'a> Hasher<'a> {
             match self.cache.claim(key) {
                 Lookup::Claimed => {}
                 Lookup::InFlight => {
+                    self.out.counts.deferred += 1;
                     self.out.deferred.push(Deferred {
                         parent: decided.parent,
                         name: decided.name.as_bytes().to_vec(),
@@ -532,7 +538,7 @@ impl<'a> Hasher<'a> {
                         path: self.root.join(decided.path),
                     });
                     #[cfg(test)]
-                    hook(Probe::Deferred(decided.path));
+                    hook(self.root, Probe::Deferred(decided.path));
                     return;
                 }
                 Lookup::Done(stored) => {
@@ -543,7 +549,7 @@ impl<'a> Hasher<'a> {
                 }
             }
             #[cfg(test)]
-            hook(Probe::Claimed(decided.path));
+            hook(self.root, Probe::Claimed(decided.path));
         }
         let content = self.reader.read(file, &stat);
         if links > 1 {
@@ -554,7 +560,7 @@ impl<'a> Hasher<'a> {
             self.cache.complete(key, observation);
         }
         #[cfg(test)]
-        hook(Probe::Read(decided.path));
+        hook(self.root, Probe::Read(decided.path));
         self.record(decided, stat, content);
     }
 
@@ -656,7 +662,7 @@ impl EventVisitor for Hasher<'_> {
             }
             Event::Entered { dir, work_tree } => {
                 #[cfg(test)]
-                hook(Probe::Entered);
+                hook(self.root, Probe::Entered);
                 if let Some(wt) = work_tree {
                     let kind = match wt.kind {
                         WorkTreeKind::Main => ferret_catalog::WorkTreeKind::Main,
@@ -700,8 +706,8 @@ impl EventVisitor for Hasher<'_> {
 }
 
 /// Test seam: where a worker is in [`index`], for tests that must act
-/// between two steps. Called on the worker's thread, so a test sees it only
-/// with one worker, when the walk runs on the calling thread.
+/// between two steps. Hooks are registered per root path, so parallel tests
+/// see only their own walks, on whichever worker the event happens.
 #[cfg(test)]
 pub(crate) enum Probe<'a> {
     /// A directory was listed; its children have not been statted.
@@ -715,19 +721,21 @@ pub(crate) enum Probe<'a> {
 }
 
 #[cfg(test)]
-pub(crate) type ProbeHook = Box<dyn FnMut(Probe<'_>)>;
+pub(crate) type ProbeHook = std::sync::Arc<dyn Fn(Probe<'_>) + Send + Sync>;
 
 #[cfg(test)]
-thread_local! {
-    pub(crate) static PROBE: std::cell::RefCell<Option<ProbeHook>> =
-        const { std::cell::RefCell::new(None) };
-}
+pub(crate) static PROBES: std::sync::Mutex<Vec<(PathBuf, ProbeHook)>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-fn hook(probe: Probe<'_>) {
-    PROBE.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().as_mut() {
-            hook(probe);
-        }
-    });
+fn hook(root: &Path, probe: Probe<'_>) {
+    let found = PROBES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(r, _)| r == root)
+        .map(|(_, hook)| std::sync::Arc::clone(hook));
+    if let Some(hook) = found {
+        hook(probe);
+    }
 }
