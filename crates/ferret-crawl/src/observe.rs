@@ -16,6 +16,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ferret_catalog::{Content, Hash, Stat};
 use rustix::fs::{FileType, OFlags, fstat, openat};
@@ -159,6 +160,8 @@ pub(crate) struct Reader {
     buffer: Vec<u8>,
     pub(crate) files_read: u64,
     pub(crate) bytes_read: u64,
+    /// Time spent in [`Reader::read`]: sniffing and hashing.
+    pub(crate) read_time: Duration,
 }
 
 /// How much one `read` asks for.
@@ -180,6 +183,7 @@ impl Reader {
             buffer: vec![0; CHUNK],
             files_read: 0,
             bytes_read: 0,
+            read_time: Duration::ZERO,
         }
     }
 
@@ -209,6 +213,13 @@ impl Reader {
     /// Sniffs and hashes an open file. The caller then checks the result
     /// with [`bracket`].
     pub(crate) fn read(&mut self, file: &mut File) -> Result<Content, ContentFault> {
+        let started = Instant::now();
+        let content = self.sniff_and_hash(file);
+        self.read_time += started.elapsed();
+        content
+    }
+
+    fn sniff_and_hash(&mut self, file: &mut File) -> Result<Content, ContentFault> {
         self.files_read += 1;
         let mut head = 0;
         while head < ferret_policy::SNIFF_LEN {

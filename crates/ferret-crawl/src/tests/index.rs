@@ -15,7 +15,9 @@ use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind};
 use ferret_policy::Config;
 
 use crate::index::{PROBES, Probe};
-use crate::{ContentFault, IndexError, IndexOptions, IoOp, Refresh, Report, index};
+use crate::{
+    ContentFault, IndexError, IndexOptions, IoOp, Refresh, Report, RootChange, index, index_change,
+};
 
 /// A temp directory holding the walked tree (`tree/`) and the catalog
 /// (`cat/`), outside the tree. Cleanup is pure Rust: a spawned `chmod` would
@@ -686,6 +688,46 @@ fn removing_an_inner_root_refreshes_the_outer_one() {
         under(&rows, &outer),
         ["in", "in/f.txt", "top.txt"].map(PathBuf::from).to_vec()
     );
+}
+
+#[test]
+// The CLI's add and remove are changes to the roots the previous generation
+// holds, read under the lock. A caller passing a full set it read earlier
+// would drop a root another run added in between; here the "earlier read"
+// is simply not having `a` in the change, and `a` must survive.
+fn a_root_change_applies_to_the_previous_generation_s_roots() {
+    let tmp = Tmp::new("root-change");
+    tmp.write("a/f.txt", b"a\n");
+    tmp.write("b/g.txt", b"b\n");
+    let (a, b) = (tmp.at("a"), tmp.at("b"));
+    run(&tmp, std::slice::from_ref(&a), Refresh::All, 1);
+
+    let change = |add: &[PathBuf], remove: &[PathBuf], refresh| {
+        index_change(&tmp.cat(), RootChange { add, remove }, refresh, &options(1))
+    };
+    let added = std::slice::from_ref(&b);
+    let report = change(added, &[], Refresh::Only(added)).unwrap();
+    assert_eq!((report.refreshed, report.kept), (vec![b.clone()], vec![a.clone()]));
+
+    let report = change(&[], &[], Refresh::All).unwrap();
+    assert_eq!(report.refreshed, vec![a.clone(), b.clone()], "bare refresh");
+
+    let gone = std::slice::from_ref(&a);
+    let report = change(&[], gone, Refresh::Only(&[])).unwrap();
+    assert_eq!((report.dropped, report.kept), (vec![a.clone()], vec![b.clone()]));
+    let (catalog, _) = published(&tmp);
+    let roots: Vec<&[u8]> = catalog.roots().map(|(_, p)| p).collect();
+    assert_eq!(roots, [b.as_os_str().as_bytes()]);
+
+    match change(&[], gone, Refresh::Only(&[])) {
+        Err(IndexError::NotConfigured(path)) => assert_eq!(path, a),
+        other => panic!("removing an unknown root: {other:?}"),
+    }
+    let relative = [PathBuf::from("rel")];
+    assert!(matches!(
+        change(&relative, &[], Refresh::All),
+        Err(IndexError::BadRoot(_))
+    ));
 }
 
 #[test]

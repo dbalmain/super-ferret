@@ -388,6 +388,7 @@ const ACCESSORS: &[Accessor] = {
             (c.dir_count() + c.inode_count() + c.name_count() + c.doc_count()) as usize
                 + c.next_doc().0 as usize
                 + c.sniffer_version() as usize
+                + c.section_sizes().map(|(_, len)| len as usize).sum::<usize>()
         }),
         (None, "read_inode", |c| {
             inodes(c)

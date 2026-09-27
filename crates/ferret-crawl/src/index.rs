@@ -239,8 +239,16 @@ pub struct Report {
     pub pattern_errors: Vec<String>,
     /// Walking and hashing, over every refreshed root.
     pub walk_time: Duration,
+    /// Of the walk, time the workers spent sniffing and hashing file
+    /// content, summed over workers. Hashing runs on the walk's workers, so
+    /// with several it overlaps the walk and can exceed `walk_time`.
+    pub hash_time: Duration,
     /// Keeping roots, building, encoding, writing and syncing.
     pub commit_time: Duration,
+    /// After the commit, listing every name the published generation holds
+    /// as Fault (`content_faults`): a check of every inode row, and a scan
+    /// of the names when one is Fault.
+    pub fault_time: Duration,
     /// The published generation's shape, when one was published.
     pub published: Option<Published>,
 }
@@ -285,8 +293,71 @@ pub fn index(
     refresh: Refresh<'_>,
     options: &IndexOptions,
 ) -> Result<Report, IndexError> {
+    run(catalog_dir, |_| Ok(roots.to_vec()), refresh, options)
+}
+
+/// A change to the configured roots, made to the roots the previous
+/// generation holds.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RootChange<'a> {
+    /// Roots to add; one already configured is left as it is.
+    pub add: &'a [PathBuf],
+    /// Roots to remove; each must be configured.
+    pub remove: &'a [PathBuf],
+}
+
+/// [`index`], with the root set given as a change to the previous
+/// generation's roots rather than in full. The change is applied after the
+/// writer lock is taken, so two runs that each add a root cannot drop each
+/// other's: a caller that read the roots and passed the full set to
+/// [`index`] could. Removing a root that is not configured is
+/// [`IndexError::NotConfigured`]; a root to add or remove that is not
+/// absolute, or has `..`, is [`IndexError::BadRoot`].
+pub fn index_change(
+    catalog_dir: &Path,
+    change: RootChange<'_>,
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+) -> Result<Report, IndexError> {
+    run(
+        catalog_dir,
+        |previous| {
+            let mut roots: Vec<PathBuf> = previous
+                .map(|p| {
+                    p.roots()
+                        .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for gone in change.remove {
+                let gone = normalise(gone)?;
+                let before = roots.len();
+                roots.retain(|r| *r != gone);
+                if roots.len() == before {
+                    return Err(IndexError::NotConfigured(gone));
+                }
+            }
+            for added in change.add {
+                roots.push(normalise(added)?);
+            }
+            Ok(roots)
+        },
+        refresh,
+        options,
+    )
+}
+
+/// One run, with the configured roots decided by `roots` from the previous
+/// generation once the lock is held.
+fn run(
+    catalog_dir: &Path,
+    roots: impl FnOnce(Option<&Catalog>) -> Result<Vec<PathBuf>, IndexError>,
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+) -> Result<Report, IndexError> {
     let mut txn = Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
-    let plan = Plan::new(txn.previous(), roots, refresh, options.sniffer)?;
+    let roots = roots(txn.previous())?;
+    let plan = Plan::new(txn.previous(), &roots, refresh, options.sniffer)?;
     let mut report = Report {
         refreshed: plan.refresh.clone(),
         kept: plan.keep.clone(),
@@ -320,6 +391,7 @@ pub fn index(
     }
     for mut output in outputs {
         report.counts.add(&output.counts);
+        report.hash_time += output.read_time;
         report.content_faults.append(&mut output.content_faults);
         report.pattern_errors.append(&mut output.pattern_errors);
         txn.add(output.batch);
@@ -343,9 +415,11 @@ pub fn index(
     }
     let catalog = txn.commit().map_err(IndexError::Commit)?;
     report.commit_time = started.elapsed();
+    let started = Instant::now();
     let seen = std::mem::take(&mut report.content_faults);
     report.content_faults = content_faults(&catalog, &plan.refresh, seen);
     report.counts.content_faults = report.content_faults.len() as u64;
+    report.fault_time = started.elapsed();
     report.published = Some(Published::of(&catalog));
     Ok(report)
 }
@@ -527,6 +601,7 @@ struct Output {
     content_faults: Vec<(PathBuf, ContentFault)>,
     pattern_errors: Vec<String>,
     deferred: Vec<Deferred>,
+    read_time: Duration,
 }
 
 impl<'a> Hasher<'a> {
@@ -542,6 +617,7 @@ impl<'a> Hasher<'a> {
                 content_faults: Vec::new(),
                 pattern_errors: Vec::new(),
                 deferred: Vec::new(),
+                read_time: Duration::ZERO,
             },
             reader: Reader::new(),
         }
@@ -550,6 +626,7 @@ impl<'a> Hasher<'a> {
     fn finish(mut self, faults: &mut Vec<CoverageFault>) -> Output {
         self.out.counts.files_read = self.reader.files_read;
         self.out.counts.bytes_read = self.reader.bytes_read;
+        self.out.read_time = self.reader.read_time;
         faults.append(&mut self.out.faults);
         self.out
     }

@@ -267,6 +267,15 @@ impl Catalog {
         ((end - start) / DOC_ROW) as u32
     }
 
+    /// Each section and its size in bytes, in file order: what `ferret
+    /// stats` reports. Known from the section table; loads nothing.
+    pub fn section_sizes(&self) -> impl Iterator<Item = (Section, u64)> + '_ {
+        SECTIONS.iter().map(|&section| {
+            let (start, end) = self.layout.range(section);
+            (section, (end - start) as u64)
+        })
+    }
+
     // ── names ──
 
     /// Every name, NUL-terminated, in `NameId` order: the bytes a filename
