@@ -31,6 +31,8 @@
 //! truncated file is a [`DecodeError`] and never a panic: every offset and id
 //! is in range, every heap ends in NUL, and each directory's name edge points
 //! at a lower-numbered parent, so walking up from any name ends at a root.
+//! Each directory is the child of exactly its recorded name edge, so walking
+//! down from a root ends too.
 //! Field values that index nothing (times, sizes, a `DocId` in an inode row)
 //! are not checked; a flipped bit there reads back as a different value.
 //!
@@ -539,7 +541,11 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<(), DecodeError> 
 }
 
 /// Every directory's name edge names it, from a lower-numbered parent, so a
-/// walk upwards strictly descends and ends at a root.
+/// walk upwards strictly descends and ends at a root. And the converse: a
+/// name whose child is a directory must be that directory's recorded edge,
+/// so each directory has exactly one name and a root has none. Without it a
+/// name could make a root its own child, and a walk down (retention copying
+/// a kept root) would never end.
 fn check_dir_names(l: &Layout, dir_names: &[u8], rows: &[u8]) -> Result<(), DecodeError> {
     for (dir, at) in (0..l.dirs).zip((0..).step_by(4)) {
         let name = u32_at(dir_names, at);
@@ -551,6 +557,12 @@ fn check_dir_names(l: &Layout, dir_names: &[u8], rows: &[u8]) -> Result<(), Deco
             u32_at(rows, row + 4) as usize == dir && (u32_at(rows, row) as usize) < dir
         };
         if !ok {
+            return Err(DecodeError::Corrupt("dir names"));
+        }
+    }
+    for (name, row) in rows.chunks_exact(NAME_ROW).enumerate() {
+        let child = u32_at(row, 4) as usize;
+        if child < l.dirs && u32_at(dir_names, child * 4) as usize != name {
             return Err(DecodeError::Corrupt("dir names"));
         }
     }
