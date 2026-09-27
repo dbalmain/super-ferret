@@ -266,6 +266,16 @@ fn pack_bits(out: &mut Vec<u8>, values: impl Iterator<Item = u8>, width: usize) 
 
 // ── decoding ──
 
+/// The NUL bytes in `bytes`. Summed as `u8` per 255-byte chunk, which the
+/// compiler vectorises; a plain `filter().count()` measured about 4 ms over
+/// `$HOME`'s 10.6 MB heap, a third of the whole open.
+fn count_nuls(bytes: &[u8]) -> usize {
+    bytes
+        .chunks(255)
+        .map(|chunk| usize::from(chunk.iter().map(|&b| u8::from(b == 0)).sum::<u8>()))
+        .sum()
+}
+
 pub(crate) fn u32_at(bytes: &[u8], at: usize) -> u32 {
     let mut b = [0; 4];
     b.copy_from_slice(&bytes[at..at + 4]);
@@ -396,8 +406,13 @@ fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
     }
 
     // Each name is exactly the bytes up to the next name's offset: non-empty,
-    // no NUL inside, its NUL last. Siblings are in strictly increasing byte
-    // order, because `lookup` binary-searches them by name.
+    // its NUL last. The spans tile the heap from 0, so one NUL per name in
+    // the whole heap means none inside a name; one vectorised count is far
+    // cheaper than a search per name. Siblings are in strictly increasing
+    // byte order, because `lookup` binary-searches them by name.
+    if count_nuls(heap) != l.names {
+        return Err(DecodeError::Corrupt("name order"));
+    }
     let mut previous: Option<(u32, &[u8])> = None;
     for (i, row) in rows.chunks_exact(NAME_ROW).enumerate() {
         let start = u32_at(row, 8) as usize;
@@ -408,7 +423,7 @@ fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
         let parent = u32_at(row, 0);
         let (name, nul) = (&heap[start..end - 1], heap[end - 1]);
         let ordered = previous.is_none_or(|(p, prev)| p != parent || prev < name);
-        if name.is_empty() || nul != 0 || name.contains(&0) || !ordered {
+        if name.is_empty() || nul != 0 || !ordered {
             return Err(DecodeError::Corrupt("name order"));
         }
         previous = Some((parent, name));

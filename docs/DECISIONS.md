@@ -1536,13 +1536,15 @@ numbers are close.
 **Measured (2026-09-27).** The same 51,159,311 B `$HOME` snapshot, opened by a
 fresh process that reads the whole file and validates it (the `names` example's
 `open-bench`). Warm, over 30 processes: read 17.8 ms, validate 0.9 ms, the whole
-process 22.2 ms, median. Cold is per-file eviction (`dd iflag=nocache count=0`,
-checked with `fincore`), not `drop_caches`, which needs root: read 23–33 ms and
-the process 29 ms over two runs of 20, on NVMe with a load average near 2.5 from
-other work. So opening is reading, and reading costs more than the name scan
-itself (5–8 ms). The name sections (names, heap, directory names, traversed,
-roots, strings) are the first 16.1 MB of the file; reading only them took 5.0 ms
-warm and 16.8 ms evicted. See D38.
+process 22.2 ms, median. Validating sibling order and exact name spans, added in
+review so `lookup` agrees with iteration on any accepted file, raised validation
+to 3.9 ms and the process to 25.9 ms. Cold is per-file eviction
+(`dd iflag=nocache count=0`, checked with `fincore`), not `drop_caches`, which
+needs root: read 23–33 ms and the process 29 ms over two runs of 20, on NVMe
+with a load average near 2.5 from other work. So opening is reading, and reading
+costs more than the name scan itself (5–8 ms). The name sections (names, heap,
+directory names, traversed, roots, strings) are the first 16.1 MB of the file;
+reading only them took 5.0 ms warm and 16.8 ms evicted. See D38.
 
 ## D31 — One inode, several names
 
