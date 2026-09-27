@@ -109,6 +109,9 @@ struct Census {
     /// Documents held by more than one inode, the inodes beyond the first,
     /// and those inodes' bytes.
     duplicates: (u64, u64, u64),
+    /// File inodes naming a document the docs section does not hold: a
+    /// corrupt reference, since the decoder does not check an inode's DocId.
+    dangling: u64,
 }
 
 impl Census {
@@ -141,7 +144,10 @@ impl Census {
             }
         }
 
-        let mut holders = vec![0u32; catalog.next_doc().0 as usize];
+        // (document, bytes) per holding inode, in inode order. Counted by
+        // sorting, not by an array indexed by DocId: ids are sparse after
+        // churn, and nothing is sized by `next_doc` (D36 B).
+        let mut held = Vec::new();
         for id in (dirs..catalog.inode_count()).map(InoId) {
             if catalog.kind(id) == Kind::Symlink {
                 census.symlinks += 1;
@@ -159,17 +165,18 @@ impl Census {
                 census.linked.0 += 1;
                 census.linked.1 += u64::from(names - 1);
             }
-            if let Some(doc) = inode.doc {
-                let held = &mut holders[doc.0 as usize];
-                *held += 1;
-                if *held == 2 {
-                    census.duplicates.0 += 1;
-                }
-                if *held >= 2 {
-                    census.duplicates.1 += 1;
-                    census.duplicates.2 += size;
-                }
+            match inode.doc {
+                Some(doc) if catalog.doc_hash(doc).is_some() => held.push((doc.0, size)),
+                Some(_) => census.dangling += 1,
+                None => {}
             }
+        }
+        // Stable, so each document's first holder stays first.
+        held.sort_by_key(|&(doc, _)| doc);
+        for group in held.chunk_by(|a, b| a.0 == b.0).filter(|g| g.len() > 1) {
+            census.duplicates.0 += 1;
+            census.duplicates.1 += group.len() as u64 - 1;
+            census.duplicates.2 += group[1..].iter().map(|&(_, size)| size).sum::<u64>();
         }
         census
     }
@@ -255,6 +262,13 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
         "  duplicates: {docs} documents are held by {extra} more inodes, {}",
         bytes(extra_bytes)
     );
+    if census.dangling > 0 {
+        let _ = writeln!(
+            out,
+            "  corrupt: {} files name a document the index does not hold",
+            census.dangling
+        );
+    }
 
     let _ = writeln!(
         out,

@@ -276,6 +276,71 @@ fn exit_codes_are_stable() {
     }
 }
 
+/// Overwrites the little-endian u32 at `at` in the published catalog, as a
+/// flipped bit or a long history would leave it.
+fn patch_catalog(env: &Env, at: usize, value: u32) {
+    let path = env.index().join("catalog");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    fs::write(&path, bytes).unwrap();
+}
+
+#[test]
+// D36 B: stats once sized a counter array by `next_doc`, so a catalog with a
+// long history needed memory for every document ever assigned, and indexed
+// it by an inode's unchecked DocId, which panicked on a corrupt one.
+fn stats_counts_documents_sparsely_and_survives_a_corrupt_reference() {
+    let env = Env::new("stats-docs");
+    env.write("a.txt", b"same\n");
+    env.write("b.txt", b"same\n");
+    env.write("c.txt", b"other\n");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let duplicates = |output: &Output| {
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let line = text.lines().find(|l| l.contains("duplicates:"));
+        line.map(str::to_owned).unwrap_or_else(|| panic!("{text}"))
+    };
+    let before = duplicates(&env.run(&[os("stats")]));
+    assert!(
+        before.contains("1 documents are held by 1 more"),
+        "{before}"
+    );
+
+    // Two billion documents assigned in the past, three live: a dense
+    // counter would be 8 GB, past this 1 GB address-space limit.
+    patch_catalog(&env, 16, 1 << 31);
+    let limited = |env: &Env| {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(r#"ulimit -v 1048576 && exec "$@""#)
+            .arg("sh")
+            .arg(env!("CARGO_BIN_EXE_ferret"))
+            .arg("--index")
+            .arg(env.index())
+            .arg("stats")
+            .env("XDG_STATE_HOME", env.state())
+            .env("HOME", env.base.join("home"));
+        command.output().unwrap()
+    };
+    let sparse = limited(&env);
+    assert_eq!(sparse.status.code(), Some(0), "{}", stderr(&sparse));
+    assert_eq!(duplicates(&sparse), before);
+
+    // A file's DocId flipped past `next_doc`: decoding does not check it.
+    let catalog = fs::read(env.index().join("catalog")).unwrap();
+    let inodes = u64::from_le_bytes(catalog[24 + 6 * 16..][..8].try_into().unwrap()) as usize;
+    let row = (0..)
+        .map(|i| inodes + i * 64)
+        .find(|row| u32::from_le_bytes(catalog[row + 60..][..4].try_into().unwrap()) != u32::MAX)
+        .unwrap();
+    patch_catalog(&env, row + 60, u32::MAX - 1);
+    let corrupt = limited(&env);
+    assert_eq!(corrupt.status.code(), Some(0), "{}", stderr(&corrupt));
+    let text = String::from_utf8_lossy(&corrupt.stdout);
+    assert!(text.contains("corrupt: 1 files"), "{text}");
+}
+
 #[test]
 fn limit_stops_after_n_rows() {
     let env = Env::new("limit");
