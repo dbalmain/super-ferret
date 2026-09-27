@@ -201,7 +201,14 @@ impl Query {
                 d.finder.needle().escape_ascii(),
                 if d.finder.folds() { " (folded)" } else { "" }
             ),
-            (None, Strategy::InodeScan) => "inode scan".to_string(),
+            (None, Strategy::InodeScan) => format!(
+                "inode scan for {}",
+                self.meta
+                    .iter()
+                    .map(MetaTest::describe)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             (None, _) => "all names".to_string(),
         };
         let mut tests = Vec::new();
