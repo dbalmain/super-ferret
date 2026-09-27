@@ -96,6 +96,9 @@ pub enum ParseError {
     Regex(String, RegexError),
     /// An argument that is not UTF-8 where a pattern must be (`re:`).
     NotUtf8(Vec<u8>),
+    /// An argument containing a NUL byte. No name contains one (it ends a
+    /// name in the heap), so the atom could only match name boundaries.
+    Nul(Vec<u8>),
 }
 
 impl fmt::Display for ParseError {
@@ -107,6 +110,7 @@ impl fmt::Display for ParseError {
             Self::Empty(a) => write!(f, "`{a}` needs a value"),
             Self::Regex(a, e) => write!(f, "`{a}`: {e}"),
             Self::NotUtf8(a) => write!(f, "`{}`: a regex must be UTF-8", a.escape_ascii()),
+            Self::Nul(a) => write!(f, "`{}`: a query cannot contain NUL", a.escape_ascii()),
         }
     }
 }
@@ -143,6 +147,9 @@ impl Query {
         let mut literals: Vec<(Vec<u8>, bool, usize)> = Vec::new();
         for arg in args {
             let arg = arg.as_ref();
+            if arg.contains(&0) {
+                return Err(ParseError::Nul(arg.to_vec()));
+            }
             let (fold, atom) = match arg.strip_prefix(b"case:") {
                 Some(rest) => (false, rest),
                 None => (true, arg),
@@ -334,7 +341,8 @@ fn parse_size(v: &[u8]) -> Option<MetaTest> {
         b"t" => 40,
         _ => return None,
     };
-    Some(MetaTest::Size(cmp, n.checked_shl(shift)?))
+    // `checked_shl` only rejects a shift of 64 or more, not lost bits.
+    (n <= u64::MAX >> shift).then_some(MetaTest::Size(cmp, n << shift))
 }
 
 fn parse_age(v: &[u8]) -> Option<MetaTest> {

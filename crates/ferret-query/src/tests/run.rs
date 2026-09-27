@@ -154,7 +154,51 @@ fn a_metadata_query_scans_inodes_and_still_skips_documents() {
     assert_eq!(stats.candidates, 1);
     assert_eq!(stats.single_inode_reads, 0);
     assert!(catalog.is_loaded(Section::Inodes));
+    assert!(catalog.is_loaded(Section::NameHeap));
     assert!(!catalog.is_loaded(Section::Docs));
+}
+
+#[test]
+fn a_metadata_query_nothing_passes_never_reads_the_names() {
+    let scratch = Scratch::new("lazy-meta-empty");
+    let catalog = sample(&scratch);
+    let (found, stats) = find(&catalog, "size:>1T");
+    assert!(found.is_empty());
+    assert_eq!(stats.candidates, 0);
+    assert!(catalog.is_loaded(Section::Inodes));
+    for section in [
+        Section::Names,
+        Section::NameHeap,
+        Section::DirNames,
+        Section::Docs,
+    ] {
+        assert!(!catalog.is_loaded(section), "{section:?}");
+    }
+}
+
+#[test]
+fn an_extreme_mtime_is_an_age_not_an_overflow() {
+    // `now - mtime` overflows i64 for both of these; the file holds whatever
+    // it holds, so the age must be computed wide.
+    let scratch = Scratch::new("mtime-extremes");
+    let mut txn = Transaction::begin(&scratch.0, 1).unwrap();
+    let mut w = txn.batch();
+    let root = w.root(b"/x", dir(1));
+    let mut at = |ino, name: &[u8], mtime_sec| {
+        let mut stat = file(ino, 1, 0);
+        stat.mtime_sec = mtime_sec;
+        w.file(root, name, stat, Content::Unindexed);
+    };
+    at(2, b"ancient", i64::MIN);
+    at(3, b"future", i64::MAX);
+    txn.add(w);
+    txn.commit().unwrap();
+    let catalog = lazy(&scratch);
+    // Through the inode scan, and through a heap scan's metadata test.
+    assert_eq!(paths(&catalog, "mtime:>1y"), ["/x/ancient"]);
+    assert_eq!(paths(&catalog, "mtime:<1d"), ["/x/future"]);
+    assert_eq!(paths(&catalog, "e mtime:>1y"), ["/x/ancient"]);
+    assert_eq!(paths(&catalog, "e mtime:<1d"), ["/x/future"]);
 }
 
 #[test]

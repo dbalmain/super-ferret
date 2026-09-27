@@ -123,10 +123,34 @@ fn malformed_atoms_are_errors_that_name_the_argument() {
         Query::from_args([b"re:\xff".as_slice()], now()),
         Err(ParseError::NotUtf8(_))
     ));
+    // 2^54 KiB is 2^64 bytes: the shift loses the high bit, which must be
+    // an error, not `size:>0`.
+    assert_eq!(
+        error("size:>18014398509481984k"),
+        ParseError::Size("size:>18014398509481984k".into())
+    );
+    assert_eq!(
+        plan("size:>18014398509481983k").1,
+        "inode scan for size >18446744073709550592"
+    );
 }
 
 #[test]
 fn an_unknown_prefix_is_just_a_word() {
     // Names may contain `:`; only the documented prefixes are atoms.
     assert_eq!(plan("foo:bar").1, "heap scan for \"foo:bar\" (folded)");
+}
+
+#[test]
+fn a_nul_in_any_atom_is_refused() {
+    // A NUL is a name terminator in the heap: a word holding one would hit
+    // name boundaries and report names that contain no NUL.
+    for arg in [&b"\0"[..], b"a\0b", b"case:\0", b"path:a\0", b"*\0"] {
+        assert_eq!(
+            Query::from_args([arg], now()).unwrap_err(),
+            ParseError::Nul(arg.to_vec()),
+            "{}",
+            arg.escape_ascii()
+        );
+    }
 }

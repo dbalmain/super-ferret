@@ -26,9 +26,10 @@
 //! match  = word | glob | "re:" REGEX | "path:" TEXT | "ext:" EXT
 //! meta   = "size:" [<>] N [kKmMgGtT]   size in bytes, powers of 1024; no
 //!                                      comparison means exactly N
-//!        | "mtime:" [<>] N (s|m|h|d|w|y)
+//!        | "mtime:" (<|>) N (s|m|h|d|w|y)
 //!                                      age: mtime:<1d is modified within a
-//!                                      day, mtime:>1y more than a year ago
+//!                                      day, mtime:>1y more than a year ago;
+//!                                      the comparison is required
 //!        | "type:" (f|d|l|file|dir|link)
 //! ```
 //!

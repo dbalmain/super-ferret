@@ -73,13 +73,13 @@ impl Query {
     ///
     /// Loads only what the strategy needs: a name query never reads the
     /// document rows, and reads inode rows singly until that costs more than
-    /// the section (see [`Catalog::read_inode`]).
+    /// the section (see [`Catalog::read_inode`]); a metadata-only query reads
+    /// the name sections only once an inode has passed.
     pub fn run(
         &self,
         catalog: &Catalog,
         mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
-        catalog.load(&ROW_SECTIONS)?;
         let mut run = Run {
             query: self,
             catalog,
@@ -120,6 +120,7 @@ impl Run<'_, '_> {
             return Ok(());
         };
         let catalog = self.catalog;
+        catalog.load(&ROW_SECTIONS)?;
         let heap = catalog.name_heap();
         let count = catalog.name_count();
         let skip = matches!(query.names.get(driver.from), Some(NameTest::Substring(_)))
@@ -149,11 +150,18 @@ impl Run<'_, '_> {
         let catalog = self.catalog;
         catalog.load(&[Section::Inodes, Section::States])?;
         let mut pass = vec![0u64; (catalog.inode_count() as usize).div_ceil(64)];
+        let mut any = false;
         for id in 0..catalog.inode_count() {
             if self.meta_passes(InoId(id), &catalog.inode(InoId(id))) {
                 pass[id as usize / 64] |= 1 << (id % 64);
+                any = true;
             }
         }
+        // Nothing passed: no name can, so the name sections stay on disk.
+        if !any {
+            return Ok(());
+        }
+        catalog.load(&ROW_SECTIONS)?;
         for id in (0..catalog.name_count()).map(NameId) {
             let child = catalog.child(id).0;
             if pass[child as usize / 64] >> (child % 64) & 1 == 1 {
@@ -171,6 +179,7 @@ impl Run<'_, '_> {
         &mut self,
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<(), RunError> {
+        self.catalog.load(&ROW_SECTIONS)?;
         for id in (0..self.catalog.name_count()).map(NameId) {
             self.stats.candidates += 1;
             if self.consider(id, None, None, emit)?.is_break() {
@@ -230,7 +239,12 @@ impl Run<'_, '_> {
     fn meta_passes(&self, id: InoId, meta: &Inode) -> bool {
         self.query.meta.iter().all(|test| match *test {
             MetaTest::Size(cmp, n) => cmp.holds(meta.stat.size, n),
-            MetaTest::Age(cmp, secs) => cmp.holds(self.query.now - meta.stat.mtime_sec, secs),
+            // Widened: `mtime_sec` is whatever the file holds, and a corrupt
+            // or far-future value must not overflow.
+            MetaTest::Age(cmp, secs) => cmp.holds(
+                i128::from(self.query.now) - i128::from(meta.stat.mtime_sec),
+                i128::from(secs),
+            ),
             MetaTest::Type(kind) => self.catalog.kind(id) == kind,
         })
     }
