@@ -8,11 +8,11 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// A temp directory holding `tree/` (what is indexed), `index/`, and the
 /// XDG homes under `home/`.
@@ -77,6 +77,30 @@ impl Env {
             .env_remove("FERRET_INDEX")
             .stdin(Stdio::null());
         command
+    }
+
+    fn ignore_file(&self) -> PathBuf {
+        self.base.join("home/config/ferret/ignore")
+    }
+
+    /// Writes the global ignore file, so a run has no first-run note to
+    /// print before it publishes.
+    fn seed_ignore_file(&self) {
+        fs::create_dir_all(self.ignore_file().parent().unwrap()).unwrap();
+        fs::write(self.ignore_file(), "# seeded by the test\n").unwrap();
+    }
+
+    /// `file` is findable, and the log holds exactly one line: an index run
+    /// that published and exited with `exit`.
+    fn assert_published_and_logged(&self, file: &Path, exit: i32) {
+        let found = self.run(&[os("find"), file.file_name().unwrap()]);
+        assert_eq!(paths(&found), [file]);
+        let lines = self.log_lines();
+        let line = &lines[0];
+        assert!(line.contains(r#""cmd":"index","#), "{line}");
+        assert!(line.contains(r#""outcome":"published""#), "{line}");
+        assert!(line.contains(&format!(r#""exit":{exit},"#)), "{line}");
+        assert_eq!(lines.len(), 2, "the index line, then the find line");
     }
 
     fn log_lines(&self) -> Vec<String> {
@@ -465,29 +489,63 @@ fn the_index_comes_from_the_flag_then_the_environment_then_xdg() {
 }
 
 #[test]
-// A report the reader no longer wants must not undo a publish: the run
-// exits 0 and logs it. Both streams are closed, and this is the first run,
-// so stderr gets the "wrote the default ignore rules" note as well.
-fn index_into_a_closed_pipe_still_publishes_and_logs() {
+// The report of a published run goes to a reader that has gone: the run
+// still exits 0 and logs. The ignore file is seeded first, so nothing is
+// written to stdout or stderr before the publish, and the pipe error can
+// only come from the report after it.
+fn index_into_a_closed_stdout_still_publishes_and_logs() {
     let env = Env::new("index-epipe");
     env.write("a/f.txt", b"f\n");
+    env.seed_ignore_file();
     let status = env
         .command(&[os("index"), env.at("a").as_os_str()])
         .stdout(closed_pipe())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+    env.assert_published_and_logged(&env.at("a/f.txt"), 0);
+}
+
+#[test]
+// A closed stderr on a first run, which writes "wrote the default ignore
+// rules" before the walk: no panic, the run publishes and logs.
+fn index_with_a_closed_stderr_still_publishes_and_logs() {
+    let env = Env::new("index-stderr");
+    env.write("a/f.txt", b"f\n");
+    let status = env
+        .command(&[os("index"), env.at("a").as_os_str()])
+        .stdout(Stdio::null())
         .stderr(closed_pipe())
         .status()
         .unwrap();
     assert_eq!(status.code(), Some(0));
-    let found = env.run(&[os("find"), os("f.txt")]);
-    assert_eq!(paths(&found), [env.at("a/f.txt")]);
-    let lines = env.log_lines();
-    assert_eq!(lines.len(), 2, "the index line, then the find line");
-    assert!(lines[0].contains(r#""cmd":"index","#), "{}", lines[0]);
     assert!(
-        lines[0].contains(r#""outcome":"published""#),
-        "{}",
-        lines[0]
+        env.ignore_file().exists(),
+        "the first run seeds the ignore file"
     );
+    env.assert_published_and_logged(&env.at("a/f.txt"), 0);
+}
+
+#[test]
+// A report that cannot be written for a reason other than a closed pipe
+// is a failure (exit 3), as it is for `find` and `stats`, but the generation
+// it reports on is published and logged as such.
+fn index_into_a_full_device_publishes_and_exits_3() {
+    let env = Env::new("index-full");
+    env.write("a/f.txt", b"f\n");
+    env.seed_ignore_file();
+    let output = env
+        .command(&[os("index"), env.at("a").as_os_str()])
+        .stdout(File::create("/dev/full").unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 3);
+    assert!(
+        stderr(&output).contains("writing the report"),
+        "{}",
+        stderr(&output)
+    );
+    env.assert_published_and_logged(&env.at("a/f.txt"), 3);
 }
 
 #[test]
@@ -532,34 +590,72 @@ fn a_readable_log_is_made_private_before_it_is_written() {
 }
 
 #[test]
-// A line is appended only under the log's exclusive lock. With the lock
-// held here, `find` prints its rows and then waits; it appends once the
-// lock is released.
-fn a_log_line_waits_for_the_log_lock() {
+// The log is best-effort, so a stopped holder of its lock (SIGSTOP, a
+// debugger) must not hang a command that has finished its work. With the
+// lock held for the whole run, `find` prints its row, gives up on the lock
+// within its bound, warns, writes no line and exits 0.
+fn a_held_log_lock_drops_the_line_and_the_command_finishes() {
     let env = Env::new("log-lock");
     env.write("a/f.txt", b"f\n");
     assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
     let held = File::options().append(true).open(env.log()).unwrap();
     held.lock().unwrap();
 
+    let started = Instant::now();
     let mut child = env
         .command(&[os("find"), os("f.txt")])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut row = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut row)
-        .unwrap();
-    // The row is flushed just before the log append; without the lock the
-    // process would be gone well within this.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(child.try_wait().unwrap().is_none(), "find did not wait");
-    assert_eq!(env.log_lines().len(), 1);
-
+    // Poll rather than wait, so a regression to a blocking lock fails here
+    // instead of hanging the suite.
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(5) {
+            child.kill().unwrap();
+            panic!("find hung on the held log lock");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(code(&output), 0);
+    assert_eq!(paths(&output), [env.at("a/f.txt")]);
+    assert!(
+        stderr(&output).contains("not written"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(env.log_lines().len(), 1, "only the index line");
     held.unlock().unwrap();
-    assert_eq!(child.wait().unwrap().code(), Some(0));
-    assert_eq!(env.log_lines().len(), 2);
+}
+
+#[test]
+// Lines appended by processes racing for the lock are whole: eight
+// concurrent runs add eight lines, each one complete JSON object.
+fn concurrent_log_lines_are_whole() {
+    let env = Env::new("log-race");
+    env.write("a/f.txt", b"f\n");
+    assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
+    let children: Vec<_> = (0..8)
+        .map(|_| {
+            env.command(&[os("find"), os("f.txt")])
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut child in children {
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+    }
+    let lines = env.log_lines();
+    assert_eq!(lines.len(), 9);
+    for line in &lines[1..] {
+        assert!(
+            line.starts_with(r#"{"v":1,"cmd":"find","#) && line.ends_with('}'),
+            "{line}"
+        );
+        assert_eq!(line.matches(r#""v":1"#).count(), 1, "{line}");
+    }
 }
 
 #[test]

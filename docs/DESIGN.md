@@ -393,8 +393,10 @@ No field holds an id (D27 renumbers them), a result path or a root path. The
 query atoms are logged as typed, though, so query text may itself contain a path
 (`find path:/home/me/private`) or any name the user searched for (D45). The file
 is set to 0600 on every append, and each line is written under an exclusive
-`flock`, so concurrent processes never interleave within a line. Writing is
-best-effort: a line that cannot be written is a warning, never a failed command.
+`flock`, so concurrent processes never interleave within a line. The lock is
+tried for at most 150 ms, then the line is dropped with a warning, so a stopped
+lock holder cannot hang a finished command. Writing is best-effort: a line that
+cannot be written is a warning, never a failed command.
 
 The CLI's JSON lines write a path that is not UTF-8 as `path` (lossy text) plus
 `path_base64` (the exact bytes). The `ferret` crate doc states this contract.

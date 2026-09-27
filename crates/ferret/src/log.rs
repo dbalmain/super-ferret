@@ -21,19 +21,30 @@
 //! which leaves a partial last line; a reader should skip a line that does
 //! not parse.
 //!
+//! The lock is tried, not waited on: [`append`] retries for at most
+//! [`LOCK_WAIT`] and then drops the line with an error. A holder that has
+//! stopped (SIGSTOP, a debugger) must not hang a command whose work is done;
+//! the log is best-effort, and finishing the command wins.
+//!
 //! Best-effort: [`append`] returns the error and the caller only warns. A
 //! command never fails because its log line could not be written.
 
-use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::fs::{DirBuilder, File, OpenOptions, Permissions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::json::Object;
 
 /// The log's file name inside ferret's state directory.
 pub const FILE: &str = "log.jsonl";
+
+/// How long [`append`] retries the log's lock before dropping the line.
+/// Lines are held for one write, so a live holder releases it in well
+/// under a millisecond.
+pub const LOCK_WAIT: Duration = Duration::from_millis(150);
 
 /// The version of the line shape. Bump it when a field changes meaning.
 pub const VERSION: u8 = 1;
@@ -74,9 +85,31 @@ pub fn append(state: &Path, line: &[u8]) -> io::Result<()> {
     // fchmod on the open file, so it is the file written to that is
     // narrowed. Fails, and the line is not written, if another user owns it.
     file.set_permissions(Permissions::from_mode(0o600))?;
-    file.lock()?;
+    lock(&file)?;
     let mut bytes = Vec::with_capacity(line.len() + 1);
     bytes.extend_from_slice(line);
     bytes.push(b'\n');
     file.write_all(&bytes)
+}
+
+/// Takes the exclusive lock on `file`, retrying every few milliseconds for
+/// at most [`LOCK_WAIT`]. The lock is released when `file` is closed.
+fn lock(file: &File) -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(e)) => return Err(e),
+            Err(TryLockError::WouldBlock) if started.elapsed() >= LOCK_WAIT => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "another process has held the log's lock for over {} ms",
+                        LOCK_WAIT.as_millis()
+                    ),
+                ));
+            }
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
 }
