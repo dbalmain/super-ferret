@@ -22,6 +22,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -313,8 +314,24 @@ pub fn index(
         }
     }
     report.counts.cached_inodes = cache.len() as u64;
-    for mut output in outputs {
+    for output in &mut outputs {
         output.resolve(&cache);
+    }
+    // A clean name of an inode that another name faulted publishes unhashed
+    // too, since the build keeps one row per inode (D31): list it.
+    let faulted: HashSet<(u64, u64)> = outputs
+        .iter()
+        .flat_map(|o| o.fault_keys.iter().copied())
+        .collect();
+    for output in &mut outputs {
+        for (key, path) in std::mem::take(&mut output.linked) {
+            if faulted.contains(&key) {
+                output.counts.content_faults += 1;
+                output.content_faults.push((path, ContentFault::Alias));
+            }
+        }
+    }
+    for mut output in outputs {
         report.counts.add(&output.counts);
         report.content_faults.append(&mut output.content_faults);
         report.pattern_errors.append(&mut output.pattern_errors);
@@ -475,6 +492,12 @@ struct Output {
     content_faults: Vec<(PathBuf, ContentFault)>,
     pattern_errors: Vec<String>,
     deferred: Vec<Deferred>,
+    /// `(dev, ino)` of every name recorded as a content fault.
+    fault_keys: Vec<(u64, u64)>,
+    /// Names of multiply-linked inodes recorded clean. If another name of
+    /// the same inode faulted, the build faults the inode and this name
+    /// publishes unhashed too, so it is reported after the walk.
+    linked: Vec<((u64, u64), PathBuf)>,
 }
 
 impl<'a> Hasher<'a> {
@@ -490,6 +513,8 @@ impl<'a> Hasher<'a> {
                 content_faults: Vec::new(),
                 pattern_errors: Vec::new(),
                 deferred: Vec::new(),
+                fault_keys: Vec::new(),
+                linked: Vec::new(),
             },
             reader: Reader::new(),
         }
@@ -521,7 +546,7 @@ impl<'a> Hasher<'a> {
         let (file, links) = match Reader::open(decided.parent_fd, decided.name, &stat) {
             Opened::Ready { file, links } => (file, links),
             Opened::Fault(fault) => {
-                self.record(decided, stat, Err(fault));
+                self.record(decided, stat, Err(fault), 0);
                 return;
             }
         };
@@ -544,7 +569,7 @@ impl<'a> Hasher<'a> {
                 Lookup::Done(stored) => {
                     self.out.counts.aliased += 1;
                     let (stat, content) = observe::consume(stored, &stat);
-                    self.record(decided, stat, content);
+                    self.record(decided, stat, content, links);
                     return;
                 }
             }
@@ -565,22 +590,20 @@ impl<'a> Hasher<'a> {
         }
         #[cfg(test)]
         hook(self.root, Probe::Read(decided.path));
-        self.record(decided, stat, content);
+        self.record(decided, stat, content, links);
     }
 
+    /// Records a read or aliased file. `links` is its `st_nlink`, or 0 when
+    /// the open failed before it was known.
     fn record(
         &mut self,
         decided: &Decided<'_, DirToken>,
         stat: Stat,
         content: Result<Content, ContentFault>,
+        links: u64,
     ) {
-        let content = content.unwrap_or_else(|fault| {
-            self.out.counts.content_faults += 1;
-            self.out
-                .content_faults
-                .push((self.root.join(decided.path), fault));
-            Content::Fault
-        });
+        let path = self.root.join(decided.path);
+        let content = self.out.outcome(path, stat, content, links);
         self.out
             .batch
             .file(decided.parent, decided.name.as_bytes(), stat, content);
@@ -599,6 +622,33 @@ impl<'a> Hasher<'a> {
 
 impl Output {
     /// Records the deferred aliases from their inodes' finished observations.
+    /// The content to publish for one name, noting what the report needs:
+    /// a fault is listed and its inode noted, and a clean name of a
+    /// multiply-linked inode is kept in case another name faults it.
+    fn outcome(
+        &mut self,
+        path: PathBuf,
+        stat: Stat,
+        content: Result<Content, ContentFault>,
+        links: u64,
+    ) -> Content {
+        let key = (stat.dev, stat.ino);
+        match content {
+            Ok(content) => {
+                if links > 1 {
+                    self.linked.push((key, path));
+                }
+                content
+            }
+            Err(fault) => {
+                self.counts.content_faults += 1;
+                self.content_faults.push((path, fault));
+                self.fault_keys.push(key);
+                Content::Fault
+            }
+        }
+    }
+
     fn resolve(&mut self, cache: &Cache) {
         for alias in std::mem::take(&mut self.deferred) {
             self.counts.aliased += 1;
@@ -607,11 +657,9 @@ impl Output {
                 Some(stored) => observe::consume(stored, &alias.stat),
                 None => (alias.stat, Err(ContentFault::Alias)),
             };
-            let content = content.unwrap_or_else(|fault| {
-                self.counts.content_faults += 1;
-                self.content_faults.push((alias.path, fault));
-                Content::Fault
-            });
+            // A deferred name met its inode in the cache, so it has more
+            // than one link.
+            let content = self.outcome(alias.path, stat, content, 2);
             self.batch.file(alias.parent, &alias.name, stat, content);
         }
     }

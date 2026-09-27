@@ -33,7 +33,8 @@ pub enum ContentFault {
     /// it was read (the D33 bracket).
     Changed,
     /// Another name of the same inode was read this run and its version
-    /// differs from this name's `lstat` (D31).
+    /// differs from this name's `lstat`, or another name of it faulted: the
+    /// catalog keeps one row per inode, so every name publishes unhashed (D31).
     Alias,
 }
 

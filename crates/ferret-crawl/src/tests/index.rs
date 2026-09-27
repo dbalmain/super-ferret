@@ -395,11 +395,15 @@ fn an_edit_between_two_alias_visits_is_a_content_fault_in_either_order() {
         report.counts.files_read, 24,
         "the second name is never read"
     );
-    assert_eq!(report.counts.content_faults, 24);
+    // Both names of every pair publish unhashed, so both are reported: the
+    // alias that saw the edit, and the name read first.
+    assert_eq!(report.counts.content_faults, 48);
+    let reported: Vec<&PathBuf> = report.content_faults.iter().map(|(p, _)| p).collect();
     let (catalog, rows) = published(&tmp);
     let (mut x_first, mut y_first) = (0, 0);
     for (x, y) in &pairs {
         assert_eq!(rows[x].ino, rows[y].ino);
+        assert!(reported.contains(&x) && reported.contains(&y), "{}", x.display());
         assert_eq!(rows[x].state, ContentState::Fault, "{}", x.display());
         assert_eq!(rows[x].doc, None);
         if first_read.lock().unwrap().contains(x) {
