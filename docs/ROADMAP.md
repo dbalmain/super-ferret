@@ -35,9 +35,11 @@ that guide, created by the first item that needs it rather than empty now.
 
 `ferret-policy`, `ferret-crawl`, `ferret-catalog`, and the CLI:
 
-- `ferret index [roots]`: crawl, apply ignore rules (D13), write the catalog; a
-  re-run applies only changes. Hashing and doc ids are assigned here (D4) so S2
-  starts from a populated catalog.
+- `ferret index [roots]`: crawl, apply ignore rules (D13), write the catalog.
+  Every run rewrites the whole snapshot, kept roots included (D26 A′); a file
+  whose `(dev, ino, size, mtime, ctime)` is unchanged keeps its hash and doc id
+  without being re-read. Hashing and doc ids are assigned here (D4) so S2 starts
+  from a populated catalog.
 - `ferret find`: name substring, glob and regex by scanning the name heap (D14);
   metadata predicates (`ext:`, `size:`, `mtime:`, `type:`, `path:`). Output per
   path; JSON lines behind a flag.
@@ -83,6 +85,14 @@ The `$HOME` census:
 | `find test`, all rows: cold / fresh     | 62 / 29 ms                                        | 2,307 / 634 ms                     |
 | `find size:>100M`: cold / fresh         | 36 / 27 ms                                        | 592 / 367 ms                       |
 | `find` peak RSS                         | 19–46 MB                                          | 358–970 MB                         |
+
+## S1+ — Incremental catalog
+
+Next after S1, ahead of the daemon (D40): a re-run writes what changed rather
+than the whole snapshot (D26 B's change log over A's snapshot), so a refresh
+costs the change and not the catalog. The daemon's small inotify bursts need it.
+
+**Measure:** bytes written and time for a one-file change at 10M entries.
 
 ## S2 — Content index
 
