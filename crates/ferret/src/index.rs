@@ -156,12 +156,15 @@ fn ask_for_root() -> Option<Result<PathBuf, String>> {
     (!answer.is_empty()).then(|| new_root(Path::new(answer)))
 }
 
-/// The global ignore file's text: seeded with the defaults on first use
-/// (`setup`), and the built-in defaults when it cannot be read.
-fn global_ignore(context: &Context) -> String {
+/// The global ignore file's text, seeded with the defaults on first use
+/// (`setup`). A file that is missing even after setup (no config directory,
+/// or one setup could not write) is the defaults, which is what setup would
+/// have written. A file that exists and cannot be read is an error: the
+/// user's rules are unknown, so the run must not publish (D26 A′).
+fn global_ignore(context: &Context) -> Result<String, String> {
     let Some(dirs) = &context.dirs else {
         warn("no config directory; using the default ignore rules");
-        return DEFAULT_IGNORE.to_owned();
+        return Ok(DEFAULT_IGNORE.to_owned());
     };
     let path = dirs.ignore_file();
     match setup::write_ignore_file(&path) {
@@ -175,14 +178,19 @@ fn global_ignore(context: &Context) -> String {
         Err(e) => warn(&format!("{}: {e}", path.display())),
     }
     match fs::read(&path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             warn(&format!(
                 "{}: {e}; using the default ignore rules",
                 path.display()
             ));
-            DEFAULT_IGNORE.to_owned()
+            Ok(DEFAULT_IGNORE.to_owned())
         }
+        Err(e) => Err(format!(
+            "nothing published: the ignore file {} cannot be read ({e}), so the rules to apply \
+             are unknown; the previous index is unchanged",
+            path.display()
+        )),
     }
 }
 
@@ -190,8 +198,23 @@ fn global_ignore(context: &Context) -> String {
 fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refresh<'_>) -> Exit {
     let started = Instant::now();
     let now = SystemTime::now();
+    let global = match global_ignore(context) {
+        Ok(global) => global,
+        Err(message) => {
+            error(&message);
+            let mut line = Vec::new();
+            let mut object = crate::log::line(&mut line, command, now);
+            object
+                .str("outcome", "ignore-file")
+                .int("exit", Exit::Error as u8)
+                .int("total_us", started.elapsed().as_micros() as i128);
+            object.end();
+            context.log(&line);
+            return Exit::Error;
+        }
+    };
     let options = IndexOptions {
-        global: Some(global_ignore(context)),
+        global: Some(global),
         ..IndexOptions::default()
     };
     let result = index_change(&context.index, change, refresh, &options);

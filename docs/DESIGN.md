@@ -278,7 +278,8 @@ the first name to claim it reads it, a later name takes the stored observation
 whole if its own stat agrees and is a content fault if not, and a name that
 meets the inode in flight is set aside and resolved after the walk, so no worker
 ever waits on another. Faults are typed (D26 A′): a coverage fault — listing,
-opening or reopening a directory, reading an ignore file, probing git,
+opening or reopening a directory, reading an ignore file (the global one
+included: missing is the defaults, unreadable fails the run), probing git,
 `readlink`, anything on a root — publishes nothing and leaves the old
 generation; an entry that vanished before its `lstat` is a deletion; a content
 fault — open, stat or read failing, the bracket moving, aliases disagreeing —

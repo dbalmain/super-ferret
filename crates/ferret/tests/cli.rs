@@ -364,6 +364,54 @@ fn a_coverage_fault_publishes_nothing_and_fails() {
 }
 
 #[test]
+// D26 A′: an ignore file that exists but cannot be read leaves the rules
+// unknown. It once fell back to the defaults and published, so a user's
+// exclusion (here `private/`) silently lapsed.
+fn an_unreadable_ignore_file_publishes_nothing_and_fails() {
+    let env = Env::new("ignore-unreadable");
+    env.write("ok.txt", b"ok\n");
+    env.write("private/secret.txt", b"s\n");
+    fs::create_dir_all(env.ignore_file().parent().unwrap()).unwrap();
+    fs::write(env.ignore_file(), "private/\n").unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let before = fs::read(env.index().join("catalog")).unwrap();
+
+    env.write("new.txt", b"new\n");
+    fs::set_permissions(env.ignore_file(), fs::Permissions::from_mode(0o000)).unwrap();
+    let output = env.run(&[os("index")]);
+    fs::set_permissions(env.ignore_file(), fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert_eq!(code(&output), 3);
+    let message = stderr(&output);
+    assert!(message.contains("nothing published"), "{message}");
+    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
+    assert_eq!(code(&env.run(&[os("find"), os("new")])), 1);
+    assert_eq!(code(&env.run(&[os("find"), os("secret")])), 1);
+}
+
+#[test]
+// A missing ignore file that setup cannot create (its directory is read
+// only) is the defaults setup would have written: the run publishes.
+fn a_missing_ignore_file_is_the_defaults() {
+    let env = Env::new("ignore-missing");
+    env.write("ok.txt", b"ok\n");
+    let target = env.write("target/built.o", b"o\n");
+    let config = env.ignore_file().parent().unwrap().to_owned();
+    fs::create_dir_all(&config).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o500)).unwrap();
+    let output = env.run(&[os("index"), env.tree().as_os_str()]);
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!env.ignore_file().exists());
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(stderr(&output).contains("default ignore rules"));
+    assert_eq!(code(&env.run(&[os("find"), os("ok")])), 0);
+    assert_eq!(
+        code(&env.run(&[os("find"), target.file_name().unwrap()])),
+        1
+    );
+}
+
+#[test]
 // A file that cannot be read is a content fault: published without its
 // content, reported as a warning, and the run succeeds.
 fn a_content_fault_is_a_warning() {
