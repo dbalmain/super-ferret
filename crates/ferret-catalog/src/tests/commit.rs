@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use super::{SNIFFER, Scratch, commit, dir_stat, file_stat, paths, reopen};
-use crate::transaction::FAIL_SYNC_DIR;
+use crate::transaction::{FAIL_SYNC_DIR, SYNCED_DIRS};
 use crate::{BeginError, Catalog, CommitError, Content, Transaction};
 
 /// A generation with one root holding `names`.
@@ -167,4 +167,24 @@ fn a_corrupt_previous_generation_stops_the_writer() {
         Transaction::begin(&scratch.path, SNIFFER),
         Err(BeginError::Previous(_))
     ));
+}
+
+#[test]
+// The first generation's directory, and any missing ancestors, were made with
+// a bare `create_dir_all`: their entries in their parents were never synced,
+// so a crash could lose a publication commit had acknowledged.
+fn a_new_index_directory_is_synced_into_its_parent() {
+    let scratch = Scratch::new("durable-mkdir");
+    fs::create_dir_all(&scratch.path).unwrap();
+    let dir = scratch.path.join("a/b");
+    SYNCED_DIRS.with_borrow_mut(Vec::clear);
+    let mut txn = Transaction::begin(&dir, SNIFFER).unwrap();
+    fill(&mut txn, &["x"]);
+    txn.commit().unwrap();
+    let synced = SYNCED_DIRS.with_borrow_mut(std::mem::take);
+    assert_eq!(
+        synced,
+        [scratch.path.clone(), scratch.path.join("a"), dir],
+        "each new directory's parent, shallowest first, then the index directory after the rename"
+    );
 }

@@ -1,7 +1,8 @@
 //! The single writer: one run of `ferret index` (D26, D32, D34, D37).
 //!
 //! ```text
-//! begin(dir)   create dir, take dir/lock (refused if held), read the old
+//! begin(dir)   create dir (and fsync each new directory's parent), take
+//!              dir/lock (refused if held), read the old
 //!              generation and index it for carry-over
 //! batch()      mint an empty Batch; any thread, any number
 //! carry(stat)  the old content of an unchanged inode; any thread
@@ -163,12 +164,14 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Starts a write to the catalog in `dir`, creating the directory if it
-    /// is missing. `sniffer` is the current sniffer's version; when it
-    /// differs from the previous generation's, nothing is carried and every
-    /// root must be refreshed (D37).
+    /// Starts a write to the catalog in `dir`, creating the directory and any
+    /// missing ancestors durably: each new directory's name is an entry in
+    /// its parent, so the parent is synced, or a crash could lose the first
+    /// generation commit reported as published. `sniffer` is the current
+    /// sniffer's version; when it differs from the previous generation's,
+    /// nothing is carried and every root must be refreshed (D37).
     pub fn begin(dir: &Path, sniffer: u32) -> Result<Transaction, BeginError> {
-        fs::create_dir_all(dir).map_err(BeginError::Io)?;
+        create_dir_durably(dir).map_err(BeginError::Io)?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -424,7 +427,33 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     if FAIL_SYNC_DIR.get() {
         return Err(io::Error::other("injected directory fsync failure"));
     }
+    #[cfg(test)]
+    SYNCED_DIRS.with_borrow_mut(|synced| synced.push(dir.to_owned()));
     File::open(dir)?.sync_all()
+}
+
+/// `create_dir_all`, then syncs the parent of every directory it created,
+/// shallowest first, as `ferret`'s setup does for the config directory.
+fn create_dir_durably(dir: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = dir;
+    while !current.as_os_str().is_empty()
+        && matches!(fs::symlink_metadata(current), Err(e) if e.kind() == io::ErrorKind::NotFound)
+    {
+        missing.push(current);
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    fs::create_dir_all(dir)?;
+    for created in missing.iter().rev() {
+        match created.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,
+            _ => sync_dir(Path::new("."))?,
+        }
+    }
+    Ok(())
 }
 
 fn remove_temp(dir: &Path) -> io::Result<()> {
@@ -439,4 +468,7 @@ thread_local! {
     /// Test seam: makes the directory fsync after the rename fail, the one
     /// commit step no unprivileged test can make fail for real.
     pub(crate) static FAIL_SYNC_DIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: every directory synced on this thread, in order.
+    pub(crate) static SYNCED_DIRS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
