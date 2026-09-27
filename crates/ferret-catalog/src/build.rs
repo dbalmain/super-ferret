@@ -82,6 +82,7 @@ enum Child {
     File(usize, usize),
 }
 
+#[derive(Clone)]
 struct Edge {
     batch: usize,
     name: std::ops::Range<usize>,
@@ -123,46 +124,63 @@ pub(crate) fn build(
         }
     };
 
-    // Every edge, grouped by its parent's global index, and the roots.
+    // Every edge, grouped by its parent's global index, and the roots. The
+    // first pass resolves each edge's parent and counts edges per directory;
+    // the second scatters each edge into its directory's counted range, in
+    // the same order, so only each directory's children are ever sorted.
     let mut roots = Vec::new();
     let mut edges_per_dir = vec![0usize; total_dirs + 1];
-    let mut parents = Vec::new();
+    let mut parent_of = Vec::new();
     for (i, batch) in batches.iter().enumerate() {
         for (d, dir) in batch.dirs.iter().enumerate() {
             match dir.parent {
                 None => roots.push((&batch.bytes[dir.name.clone()], base[i] + d)),
-                Some(parent) => {
-                    let parent = resolve(parent)?;
-                    edges_per_dir[parent + 1] += 1;
-                    parents.push((
-                        parent,
-                        Edge {
-                            batch: i,
-                            name: dir.name.clone(),
-                            child: Child::Dir(base[i] + d),
-                        },
-                    ));
-                }
+                Some(parent) => parent_of.push(resolve(parent)?),
             }
         }
-        for (f, file) in batch.files.iter().enumerate() {
-            let parent = resolve(file.parent)?;
-            edges_per_dir[parent + 1] += 1;
-            parents.push((
-                parent,
-                Edge {
-                    batch: i,
-                    name: file.name.clone(),
-                    child: Child::File(i, f),
-                },
-            ));
+        for file in &batch.files {
+            parent_of.push(resolve(file.parent)?);
         }
+    }
+    for &parent in &parent_of {
+        edges_per_dir[parent + 1] += 1;
     }
     for d in 0..total_dirs {
         edges_per_dir[d + 1] += edges_per_dir[d];
     }
-    parents.sort_unstable_by_key(|&(parent, _)| parent);
-    let mut edges: Vec<Edge> = parents.into_iter().map(|(_, edge)| edge).collect();
+    let placeholder = Edge {
+        batch: 0,
+        name: 0..0,
+        child: Child::Dir(0),
+    };
+    let mut edges = vec![placeholder; parent_of.len()];
+    let mut cursor = edges_per_dir.clone();
+    let mut parents = parent_of.iter();
+    let mut place = |edge: Edge| {
+        if let Some(&parent) = parents.next() {
+            edges[cursor[parent]] = edge;
+            cursor[parent] += 1;
+        }
+    };
+    for (i, batch) in batches.iter().enumerate() {
+        for (d, dir) in batch.dirs.iter().enumerate() {
+            if dir.parent.is_some() {
+                place(Edge {
+                    batch: i,
+                    name: dir.name.clone(),
+                    child: Child::Dir(base[i] + d),
+                });
+            }
+        }
+        for (f, file) in batch.files.iter().enumerate() {
+            place(Edge {
+                batch: i,
+                name: file.name.clone(),
+                child: Child::File(i, f),
+            });
+        }
+    }
+    drop(parent_of);
 
     roots.sort_by(|a, b| a.0.cmp(b.0));
     if let Some(pair) = roots.windows(2).find(|w| w[0].0 == w[1].0) {
