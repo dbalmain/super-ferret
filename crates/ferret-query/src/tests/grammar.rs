@@ -24,7 +24,12 @@ fn each_atom_parses_to_its_test_and_the_plan_says_so() {
         (
             "ext:RS",
             Strategy::HeapScan,
-            "heap scan for \".rs\" (folded); then name ends \".rs\"",
+            "heap scan for \".rs\" (folded); then name ends \".RS\" (folded)",
+        ),
+        (
+            "case:ext:c",
+            Strategy::HeapScan,
+            "heap scan for \".c\"; then name ends \".c\"",
         ),
         (
             "*.rs",

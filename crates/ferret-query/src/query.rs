@@ -52,8 +52,8 @@ pub(crate) struct Driver {
 #[derive(Debug)]
 pub(crate) enum NameTest {
     Substring(Finder),
-    /// A name ending in `.ext`, ASCII-folded.
-    Ext(Vec<u8>),
+    /// A name ending in `.ext`, ASCII-folded when the flag is set.
+    Ext(Vec<u8>, bool),
     Glob(Regex, Vec<u8>),
     Regex(Regex, String),
 }
@@ -151,7 +151,7 @@ impl Query {
             match parse_atom(atom, fold, arg)? {
                 Atom::Name(test, literal) => {
                     if let Some(literal) = literal {
-                        literals.push((literal, fold_of(&test, fold), name_index));
+                        literals.push((literal, fold, name_index));
                     }
                     query.names.push(test);
                 }
@@ -231,13 +231,6 @@ impl Query {
     }
 }
 
-fn fold_of(test: &NameTest, fold: bool) -> bool {
-    match test {
-        NameTest::Ext(_) => true,
-        _ => fold,
-    }
-}
-
 enum Atom {
     /// A name test, and the literal every matching name contains.
     Name(NameTest, Option<Vec<u8>>),
@@ -267,8 +260,11 @@ fn parse_atom(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
     }
     if let Some(v) = value(b"ext:")? {
         let mut suffix = b".".to_vec();
-        suffix.extend(v.to_ascii_lowercase());
-        return Ok(Atom::Name(NameTest::Ext(suffix.clone()), Some(suffix)));
+        suffix.extend(v);
+        return Ok(Atom::Name(
+            NameTest::Ext(suffix.clone(), fold),
+            Some(suffix),
+        ));
     }
     if let Some(v) = value(b"path:")? {
         return Ok(Atom::Path(PathTest::Substring(Finder::new(v, fold))));
@@ -386,9 +382,16 @@ impl NameTest {
     pub(crate) fn matches(&self, name: &[u8]) -> bool {
         match self {
             NameTest::Substring(finder) => finder.is_match(name),
-            NameTest::Ext(suffix) => {
-                name.len() > suffix.len()
-                    && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+            NameTest::Ext(suffix, fold) => {
+                let Some(end) = name.len().checked_sub(suffix.len()).filter(|&at| at > 0) else {
+                    return false;
+                };
+                let end = &name[end..];
+                if *fold {
+                    end.eq_ignore_ascii_case(suffix)
+                } else {
+                    end == suffix.as_slice()
+                }
             }
             NameTest::Glob(regex, _) | NameTest::Regex(regex, _) => {
                 ferret_verify::Matcher::is_match(regex, name)
@@ -403,7 +406,11 @@ impl NameTest {
                 f.needle().escape_ascii(),
                 if f.folds() { " (folded)" } else { "" }
             ),
-            NameTest::Ext(suffix) => format!("name ends \"{}\"", suffix.escape_ascii()),
+            NameTest::Ext(suffix, fold) => format!(
+                "name ends \"{}\"{}",
+                suffix.escape_ascii(),
+                if *fold { " (folded)" } else { "" }
+            ),
             NameTest::Glob(_, glob) => format!("name glob {}", glob.escape_ascii()),
             NameTest::Regex(_, pattern) => format!("name regex {pattern}"),
         }

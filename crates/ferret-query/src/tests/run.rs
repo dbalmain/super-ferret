@@ -17,6 +17,8 @@ fn each_atom_finds_what_it_says() {
         ("case:README", &["/r/docs/README.md"]),
         ("case:readme", &["/r/docs/readme.txt"]),
         ("ext:MD", &["/r/docs/README.md"]),
+        ("case:ext:RS", &["/r/src/lib.RS"]),
+        ("ext:rst", &["/r/src/notes.rst"]),
         (
             "ext:rs",
             &[
@@ -37,6 +39,7 @@ fn each_atom_finds_what_it_says() {
                 "/r/src/deep/x.rs",
                 "/r/src/main.rs",
                 "/r/src/parse_HTTP.rs",
+                "/t/.rs",
                 "/t/a.rs",
             ],
         ),
@@ -51,7 +54,7 @@ fn each_atom_finds_what_it_says() {
             ],
         ),
         ("src/*/*.rs", &["/r/src/deep/x.rs"]),
-        ("/t/*", &["/t/a.rs"]),
+        ("/t/*", &["/t/.rs", "/t/a.rs"]),
         (
             r"re:^[a-z]\.rs$",
             &["/r/src/deep/src/y.rs", "/r/src/deep/x.rs", "/t/a.rs"],

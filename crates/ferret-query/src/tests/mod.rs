@@ -80,6 +80,7 @@ fn file(ino: u64, size: u64, age: i64) -> Stat {
 ///     deep/  x.rs  src/y.rs
 /// /t                          second root
 ///   a.rs
+///   .rs                       all extension: `*.rs`, but not `ext:rs`
 /// ```
 fn sample(scratch: &Scratch) -> Catalog {
     let mut txn = Transaction::begin(&scratch.0, 1).unwrap();
@@ -129,6 +130,7 @@ fn sample(scratch: &Scratch) -> Catalog {
     w.file(inner, b"y.rs", file(20, 1, 3 * DAY), Content::Unindexed);
     let t = w.root(b"/t", dir(7));
     w.file(t, b"a.rs", file(21, 5, DAY), Content::Unindexed);
+    w.file(t, b".rs", file(23, 50, DAY), Content::Unindexed);
     txn.add(w);
     txn.commit().unwrap();
     lazy(scratch)

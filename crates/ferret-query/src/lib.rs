@@ -40,12 +40,13 @@
 //!   and `?` stop at `/`; `**` as a component spans any number.
 //! - `re:REGEX` is a regex (the `regex` crate's syntax) searched in the name,
 //!   unanchored unless it anchors itself.
-//! - `ext:EXT` is a name ending in `.EXT`, always ASCII case-folded.
+//! - `ext:EXT` is a name ending in `.EXT` (a name that is only `.EXT` is not
+//!   one: `.rs` has no extension).
 //! - **Case:** every match atom folds ASCII case, except under `case:`, which
 //!   makes the one atom after it exact: `case:README`, `case:re:^[A-Z]`,
-//!   `case:*.C`. There is no smart-case rule, so a query means the same
-//!   whatever letters it is typed in. Folding is ASCII-only for words, globs
-//!   and `ext:`; `re:` folds with Unicode rules.
+//!   `case:*.C`, `case:ext:C`. There is no smart-case rule, so a query means
+//!   the same whatever letters it is typed in. Folding is ASCII-only for words,
+//!   globs and `ext:`; `re:` folds with Unicode rules.
 //! - A name is bytes; a match atom given bytes that are not UTF-8 matches them
 //!   as bytes (a `re:` pattern must be UTF-8).
 //!
