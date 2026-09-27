@@ -27,7 +27,7 @@ crate's `Cargo.toml` disagrees with it.
 ```text
 ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify, ferret-policy
 ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text
-ferret-crawl   → ferret-policy, ferret-catalog, rustix
+ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
 ferret-index   → ferret-text, intpack (git dependency, may be vendored — D11)
 ferret-catalog → (std only)
 ferret-verify  → regex

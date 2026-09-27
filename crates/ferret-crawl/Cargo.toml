@@ -11,6 +11,8 @@ publish.workspace = true
 ferret-policy.workspace = true
 ferret-catalog.workspace = true
 rustix.workspace = true
+# Content hashes (D4): CC0-1.0 OR Apache-2.0, default features.
+blake3 = "1"
 
 [lints]
 workspace = true
