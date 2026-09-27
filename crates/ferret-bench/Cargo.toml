@@ -1,0 +1,20 @@
+[package]
+name = "ferret-bench"
+description = "Benchmarks: the query mix over real and synthetic catalogs, and the name scanner against memchr::memmem."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ferret-catalog.workspace = true
+ferret-query.workspace = true
+ferret-verify.workspace = true
+# The scanner's control (D41), measured here and never in a product crate.
+memchr = "2"
+# posix_fadvise(DONTNEED), to evict the catalog before a cold measurement.
+rustix.workspace = true
+
+[lints]
+workspace = true
