@@ -8,8 +8,7 @@
 //!
 //! Pure: no file-system I/O. The crawler (`ferret-crawl`) walks the tree,
 //! reads ignore files and each file's head, and asks this crate what to do:
-//! [`DirRules::root`] once per configured root (or [`DirRules::root_within`]
-//! when that root sits inside a work tree), [`DirRules::enter`] or
+//! [`DirRules::root`] once per configured root, [`DirRules::enter`] or
 //! [`DirRules::traverse`] per directory it walks into, [`DirRules::decide`]
 //! per entry, and [`sniff`] per file it would index. Knows nothing about the
 //! catalog or the index. Tested against the golden corpus in `tests/golden/`.
@@ -28,7 +27,7 @@ mod rules;
 use std::fmt;
 use std::path::PathBuf;
 
-pub use rules::{AncestorGit, DirRules};
+pub use rules::DirRules;
 
 /// What setup writes to a new global ignore file: the M1 list, measured on
 /// Dave's tree (research M1), in sections a user can comment out. After that
@@ -95,8 +94,8 @@ pub struct IgnoreFiles<'a> {
     /// directory is inside a git work tree.
     pub gitignore: Option<&'a str>,
     /// True when this directory contains an entry named `.git`: it starts a
-    /// work tree, and the enclosing work tree's `.gitignore` files stop
-    /// applying (as in git and ripgrep).
+    /// work tree, and inherited `.gitignore` rules stop applying (as in git
+    /// and ripgrep).
     pub git_root: bool,
     /// Contents of `.git/info/exclude`; read only when `git_root` is true.
     pub git_exclude: Option<&'a str>,

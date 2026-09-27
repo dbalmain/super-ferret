@@ -153,7 +153,8 @@ then `enter` with that directory's ignore-file contents, or `traverse`), asks it
 to `decide` each entry using a borrowed root-relative path, and `sniff`s file
 heads; it is tested against a golden corpus of trees and expected decisions.
 Precedence, most specific first: a `.ferretignore` in the directory or an
-ancestor; `.gitignore` and `.git/info/exclude` inside a work tree (a `.git` file
+ancestor within the configured root; `.gitignore` and `.git/info/exclude`
+inside a work tree that starts at or below the configured root (a `.git` file
 contributes exclude from its gitdir, or from that gitdir's `commondir` when it
 has one; a symlinked `.git` contributes none, and a symlinked `.gitignore` is
 disregarded, as git does); the user's global ignore file
@@ -180,8 +181,8 @@ directory. An anchored one (`/build/`, `docs/**/*.tmp`) is followed by cursors,
 positions in the pattern stepped one component per directory entered, which put
 its last component into the list only where it can match. A run of `**/`
 compiles to one globstar, and a step marks positions in a bitset, so a pattern
-of k components costs O(k) per directory however its globstars fall. A layer
-above the root (D22) is stepped down to the root before the walk. The same
+of k components costs O(k) per directory however its globstars fall. Only
+ignore files at or below the configured root contribute rules (D22). The same
 cursors answer whether a `.ferretignore` `!` pattern reaches below an excluded
 directory. No whole path is ever matched.
 
@@ -212,10 +213,9 @@ from the root one checked step at a time, which bounds the walker at 128 + 4N
 descriptors. `walk` is the same code with one worker. By default N is the
 available parallelism capped at 16 (D24).
 
-A configured root is always walked, even when the enclosing work tree's rules
-exclude it or one of its ancestors: naming a root overrides `.gitignore` (D25),
-as it overrides the global ignore file. Those rules still apply below the root.
-The walk crosses into file systems mounted below a root (D20).
+A configured root is always walked. Ignore configuration above it is not read
+(D22); global rules and ignore files at the root and below still apply to its
+contents (D25). The walk crosses into file systems mounted below a root (D20).
 
 Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
 and **content-indexed** (also hashed and tokenized). Binary files and files over

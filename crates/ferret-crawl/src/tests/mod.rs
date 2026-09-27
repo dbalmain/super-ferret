@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used)]
 
-mod ancestor;
 mod gitfile;
 mod golden;
 mod parallel;
@@ -159,6 +158,63 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) {
 fn mkfifo(path: &Path) {
     let status = Command::new("mkfifo").arg(path).status().unwrap();
     assert!(status.success(), "mkfifo {}: {status}", path.display());
+}
+
+/// D22: a configured root ignores git configuration above it, even when the
+/// root is physically inside a work tree. This pins the root boundary in the
+/// real walker rather than only testing the policy constructor.
+#[test]
+fn a_root_inside_a_work_tree_ignores_gitignore_files_above_it() {
+    let scratch = Scratch::new("root-boundary");
+    let repo = scratch.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(&repo.join(".gitignore"), "b\n");
+    write(&repo.join("src/.gitignore"), "a\n");
+    write(&repo.join("src/a"), "a");
+    write(&repo.join("src/b"), "b");
+
+    let root = repo.join("src");
+    let walked = walked(&root, None, Config::default());
+    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    assert_eq!(decision(&walked, "a"), Decision::Index);
+    assert_eq!(decision(&walked, "b"), Decision::Index);
+}
+
+/// Positive control for D22: starting at the work-tree root applies both its
+/// rules and rules in descended directories. The named root itself is walked.
+#[test]
+fn a_work_tree_root_applies_its_gitignore_files_below_it() {
+    let scratch = Scratch::new("root-boundary-positive");
+    let repo = scratch.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(&repo.join(".gitignore"), "b\n");
+    write(&repo.join("src/.gitignore"), "a\n");
+    write(&repo.join("src/a"), "a");
+    write(&repo.join("src/b"), "b");
+
+    let walked = walked(&repo, None, Config::default());
+    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    assert_eq!(decision(&walked, "src/a"), Decision::Skip);
+    assert_eq!(decision(&walked, "src/b"), Decision::Skip);
+}
+
+/// `.ferretignore` at the configured root remains active when that root is
+/// physically inside a work tree; only git configuration above it is ignored.
+#[test]
+fn a_root_inside_a_work_tree_still_applies_its_ferretignore() {
+    let scratch = Scratch::new("root-boundary-ferretignore");
+    let repo = scratch.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    write(&repo.join(".gitignore"), "b\n");
+    write(&repo.join("src/.gitignore"), "a\n");
+    write(&repo.join("src/.ferretignore"), "a\n");
+    write(&repo.join("src/a"), "a");
+    write(&repo.join("src/b"), "b");
+
+    let walked = walked(&repo.join("src"), None, Config::default());
+    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    assert_eq!(decision(&walked, "a"), Decision::Skip);
+    assert_eq!(decision(&walked, "b"), Decision::Index);
 }
 
 #[test]

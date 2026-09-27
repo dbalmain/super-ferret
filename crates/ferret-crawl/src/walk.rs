@@ -28,17 +28,16 @@
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 
-use ferret_policy::{AncestorGit, Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
+use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
 use rustix::fs::{
     AtFlags, Dir, FileType, Mode, OFlags, fstat, open as open_path, openat, readlinkat, statat,
 };
@@ -147,18 +146,14 @@ pub enum Event<'a> {
 /// ([`Decision::Descend`]). A directory reached only so a `.ferretignore` `!`
 /// pattern can re-include beneath it ([`Decision::Traverse`]) is listed, and
 /// its ignore files are not read (D13). `.gitignore` is read only inside a
-/// work tree, where its rules can apply. The root is inside a work tree when
-/// it contains `.git`, or when a parent does, up to a filesystem boundary
-/// (D22): those
-/// parents' `.gitignore` files and the top's `info/exclude` apply, and a
-/// `.ferretignore` above the root does not. The search canonicalises the
-/// root and does not cross onto another device. `.git/info/exclude` is read
-/// when `.git` is a real
-/// directory. When `.git` is a regular file whose first line is `gitdir:
-/// <path>` (relative to the directory that holds the file), exclude is read
-/// from that gitdir, or from the directory named by a `commondir` file there:
-/// one line, relative to the gitdir, which is how a linked work tree points at
-/// the main repository. Nothing is opened through a symlinked `.git`.
+/// work tree, where its rules can apply. A configured root is self-contained:
+/// `.gitignore` and `info/exclude` above it do not apply (D22). A `.gitignore`
+/// applies at the root only when the root itself starts a work tree.
+/// `.git/info/exclude` applies when a work tree starts at or below the root.
+/// A `.git` file's first line (`gitdir: <path>`, relative to that directory)
+/// points to the gitdir. Exclude comes from that gitdir or its `commondir`,
+/// when present, as in a linked work tree. Nothing is opened through a
+/// symlinked `.git`.
 ///
 /// `.ferretignore`, `.gitignore` and `info/exclude` are opened without blocking
 /// (`O_NONBLOCK`) and read only when that open file is a regular file of at
@@ -168,7 +163,7 @@ pub enum Event<'a> {
 /// stall the walk. A name that cannot be opened at all (a socket, say) is a
 /// fault. A regular file that exists but cannot be read is a fault, and is
 /// then treated as absent. Bytes that are not UTF-8 are converted lossily. A
-/// symlinked `.gitignore` is absent, here and above the root, as git
+/// symlinked `.gitignore` is absent in descended directories, as git
 /// disregards it; a symlinked `.ferretignore` or `exclude` is followed; `info`
 /// is not, and neither is `.git`.
 ///
@@ -436,8 +431,6 @@ impl<F: EventVisitor> Walker<F> {
             }
         };
         self.root_id = Some((root_stat.st_dev, root_stat.st_ino));
-        let ancestors = self.discover(root);
-        let within = !ancestors.is_empty();
         let mut dir = match Dir::new(fd) {
             Ok(dir) => dir,
             Err(error) => {
@@ -447,27 +440,13 @@ impl<F: EventVisitor> Walker<F> {
         };
         let children = self.list(&mut dir)?;
         let loaded = match dir.fd() {
-            Ok(fd) => self.load_ignores(fd, &children, within),
+            Ok(fd) => self.load_ignores(fd, &children, false),
             Err(error) => {
                 self.fail(io::Error::from(error));
                 return None;
             }
         };
-        let borrowed: Vec<AncestorGit<'_>> = ancestors
-            .iter()
-            .map(|found| AncestorGit {
-                above: found.above.as_path(),
-                directory: found.directory.as_path(),
-                gitignore: found.gitignore.as_deref(),
-                git_exclude: found.git_exclude.as_deref(),
-                top: found.top,
-            })
-            .collect();
-        let (rules, errors) = if within {
-            DirRules::root_within(root, global, loaded.files(), &borrowed, config)
-        } else {
-            DirRules::root(root, global, loaded.files(), config)
-        };
+        let (rules, errors) = DirRules::root(root, global, loaded.files(), config);
         self.patterns(errors);
         Some(Job::new(
             dir,
@@ -491,15 +470,14 @@ fn nofollow_file_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-/// `.ferretignore`, `info/exclude` and discovery files follow a final
-/// symlink, as git does for `exclude`.
+/// `.ferretignore` and `info/exclude` follow a final symlink, as git does for
+/// `exclude`.
 fn ignore_flags() -> OFlags {
     OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC
 }
 
 /// Git disregards a `.gitignore` that is a symlink (it warns "unable to
-/// access"), in the walked directories and above the root alike, so it is
-/// opened `O_NOFOLLOW` and a symlink reads as absent.
+/// access"), so it is opened `O_NOFOLLOW` and a symlink reads as absent.
 fn gitignore_flags() -> OFlags {
     ignore_flags() | OFlags::NOFOLLOW
 }
@@ -584,20 +562,6 @@ impl GitProbe {
     fn is_root(&self) -> bool {
         !matches!(self, Self::Missing)
     }
-}
-
-struct Draft {
-    directory: PathBuf,
-    above: PathBuf,
-    top: bool,
-}
-
-struct Found {
-    directory: PathBuf,
-    above: PathBuf,
-    gitignore: Option<String>,
-    git_exclude: Option<String>,
-    top: bool,
 }
 
 struct Ignores {
@@ -1024,158 +988,6 @@ impl<F: EventVisitor> Walker<F> {
         }
     }
 
-    /// The work tree above `root`, top first. Empty when `root` itself holds
-    /// `.git`, or when no parent on the same device does.
-    ///
-    /// Git resolves the starting directory (`getcwd` / `git -C`) and refuses
-    /// to cross a filesystem boundary unless
-    /// `GIT_DISCOVERY_ACROSS_FILESYSTEM` is set. This follows that default:
-    /// [`fs::canonicalize`], then parents while `st_dev` matches the root's.
-    /// The ancestor directories are opened by that canonical path; `.gitignore`
-    /// and `info/exclude` are read relative to those descriptors.
-    fn discover(&mut self, root: &Path) -> Vec<Found> {
-        let canon = match fs::canonicalize(root) {
-            Ok(path) => path,
-            Err(error) => {
-                self.fail_abs(root, error);
-                return Vec::new();
-            }
-        };
-        if self.discovered_git(&canon) {
-            return Vec::new();
-        }
-        let root_dev = match device_of(&canon) {
-            Ok(dev) => dev,
-            Err(error) => {
-                self.fail_abs(&canon, error);
-                return Vec::new();
-            }
-        };
-        let mut above = match canon.file_name() {
-            Some(name) => PathBuf::from(name),
-            None => return Vec::new(),
-        };
-        let mut current = match canon.parent() {
-            Some(parent) => parent.to_path_buf(),
-            None => return Vec::new(),
-        };
-        let mut drafts = Vec::new();
-        loop {
-            let dev = match device_of(&current) {
-                Ok(dev) => dev,
-                Err(error) => {
-                    self.fail_abs(&current, error);
-                    break;
-                }
-            };
-            if dev != root_dev {
-                break;
-            }
-            let top = self.discovered_git(&current);
-            drafts.push(Draft {
-                directory: current.clone(),
-                above: above.clone(),
-                top,
-            });
-            if top {
-                break;
-            }
-            let Some(name) = current.file_name() else {
-                break;
-            };
-            above = Path::new(name).join(above);
-            let Some(parent) = current.parent() else {
-                break;
-            };
-            current = parent.to_path_buf();
-        }
-        if !drafts.iter().any(|draft| draft.top) {
-            return Vec::new();
-        }
-        drafts.reverse();
-        drafts
-            .into_iter()
-            .filter_map(|draft| self.read_ancestor(draft))
-            .collect()
-    }
-
-    fn discovered_git(&mut self, directory: &Path) -> bool {
-        match has_git(directory) {
-            Ok(found) => found,
-            Err(error) => {
-                self.fail_abs(&directory.join(".git"), error);
-                false
-            }
-        }
-    }
-
-    /// `None` for a non-top directory with no `.gitignore`. The top is always
-    /// returned, so the root is inside the work tree even when the top has
-    /// no patterns of its own.
-    fn read_ancestor(&mut self, draft: Draft) -> Option<Found> {
-        let fd = match open_path(&draft.directory, root_dir_flags(), Mode::empty()) {
-            Ok(fd) => fd,
-            Err(error) => {
-                self.fail_abs(&draft.directory, io::Error::from(error));
-                return draft.top.then_some(Found {
-                    directory: draft.directory,
-                    above: draft.above,
-                    gitignore: None,
-                    git_exclude: None,
-                    top: true,
-                });
-            }
-        };
-        let gitignore_path = draft.directory.join(".gitignore");
-        let gitignore = self.read_ancestor_ignore(fd.as_fd(), ".gitignore", &gitignore_path);
-        let git_exclude = if draft.top {
-            self.ancestor_exclude(fd.as_fd())
-        } else {
-            None
-        };
-        if !draft.top && gitignore.is_none() {
-            return None;
-        }
-        Some(Found {
-            directory: draft.directory,
-            above: draft.above,
-            gitignore,
-            git_exclude,
-            top: draft.top,
-        })
-    }
-
-    fn read_ancestor_ignore(
-        &mut self,
-        dir: BorrowedFd<'_>,
-        name: &str,
-        full: &Path,
-    ) -> Option<String> {
-        match open_ignore(dir, name) {
-            Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
-            Ok(Opened::Missing | Opened::NotRegular) => None,
-            Err(error) => {
-                self.fail_abs(full, error);
-                None
-            }
-        }
-    }
-
-    fn ancestor_exclude(&mut self, dir: BorrowedFd<'_>) -> Option<String> {
-        match self.probe_git(dir) {
-            GitProbe::Directory(fd) => self.read_exclude(fd),
-            GitProbe::File(bytes) => self.read_gitfile_exclude(dir, &bytes),
-            GitProbe::Missing | GitProbe::Present => None,
-        }
-    }
-
-    fn fail_abs(&mut self, path: &Path, error: io::Error) {
-        self.fail(io::Error::new(
-            error.kind(),
-            format!("{}: {error}", path.display()),
-        ));
-    }
-
     // ── ignore files ──
 
     /// Only names in the listing are opened: a directory without ignore files,
@@ -1508,128 +1320,6 @@ fn parse_gitdir(bytes: &[u8]) -> Option<&OsStr> {
     } else {
         Some(OsStr::from_bytes(raw))
     }
-}
-
-fn resolve_git_path(base: &Path, raw: &OsStr) -> PathBuf {
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    }
-}
-
-/// Whether `dir` is the top of a work tree, by the shapes `git rev-parse
-/// --is-inside-work-tree` accepts. Checked as a black box, not from git's
-/// source: a directory with `HEAD`, `refs` and `objects`; the same with
-/// `commondir` naming such a directory instead of `objects`; a `gitdir:`
-/// file pointing at one of those; a symlink to any of them. An empty
-/// directory named `.git` is not a repository.
-fn has_git(dir: &Path) -> io::Result<bool> {
-    is_git_path(&dir.join(".git"), 0)
-}
-
-fn is_git_path(path: &Path, depth: u32) -> io::Result<bool> {
-    if depth > 8 {
-        return Ok(false);
-    }
-    let Some(meta) = discovery_metadata(path, false)? else {
-        return Ok(false);
-    };
-    let kind = meta.file_type();
-    if kind.is_symlink() {
-        let target = fs::read_link(path)?;
-        let base = path.parent().unwrap_or(path);
-        return is_git_path(&resolve_git_path(base, target.as_os_str()), depth + 1);
-    }
-    if kind.is_dir() {
-        return is_git_dir(path, depth);
-    }
-    if kind.is_file() {
-        let Some(parent) = path.parent() else {
-            return Ok(false);
-        };
-        return is_git_file(parent, path, depth);
-    }
-    Ok(false)
-}
-
-fn is_git_dir(path: &Path, depth: u32) -> io::Result<bool> {
-    if depth > 8 {
-        return Ok(false);
-    }
-    let head = discovery_metadata(&path.join("HEAD"), true)?.is_some_and(|meta| meta.is_file());
-    let refs = discovery_metadata(&path.join("refs"), true)?.is_some_and(|meta| meta.is_dir());
-    if !(head && refs) {
-        return Ok(false);
-    }
-    if discovery_metadata(&path.join("objects"), true)?.is_some_and(|meta| meta.is_dir()) {
-        return Ok(true);
-    }
-    let commondir = path.join("commondir");
-    let bytes = match open_discovery_file(&commondir)? {
-        Opened::Bytes(bytes) => bytes,
-        Opened::Missing => return Ok(false),
-        Opened::NotRegular => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: not a regular file", commondir.display()),
-            ));
-        }
-    };
-    let Some(raw) = first_line(&bytes) else {
-        return Ok(false);
-    };
-    is_git_dir(&resolve_git_path(path, raw), depth + 1)
-}
-
-fn is_git_file(work_tree: &Path, file: &Path, depth: u32) -> io::Result<bool> {
-    let bytes = match open_discovery_file(file)? {
-        Opened::Bytes(bytes) => bytes,
-        Opened::Missing => return Ok(false),
-        Opened::NotRegular => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: not a regular file", file.display()),
-            ));
-        }
-    };
-    let Some(raw) = parse_gitdir(&bytes) else {
-        return Ok(false);
-    };
-    is_git_path(&resolve_git_path(work_tree, raw), depth + 1)
-}
-
-fn discovery_metadata(path: &Path, follow: bool) -> io::Result<Option<fs::Metadata>> {
-    let result = if follow {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    };
-    match result {
-        Ok(meta) => Ok(Some(meta)),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn open_discovery_file(path: &Path) -> io::Result<Opened> {
-    match open_path(path, ignore_flags(), Mode::empty()) {
-        Ok(fd) => read_opened(fd),
-        Err(Errno::NOENT | Errno::NOTDIR) => Ok(Opened::Missing),
-        Err(error) => Err(io::Error::from(error)),
-    }
-}
-
-fn device_of(path: &Path) -> io::Result<u64> {
-    fs::metadata(path).map(|meta| meta.dev())
 }
 
 fn file_type(stat: &rustix::fs::Stat) -> FileType {
