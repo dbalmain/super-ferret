@@ -53,8 +53,9 @@ Predecessors, carried forward where still open:
 | D35 | Work-tree context for a root inside a repository         | answered       | moot: with D22 A, no work-tree context above a root                                                            |
 | D36 | Dead documents before there is an index to merge         | answered       | B for S1: drop dead docs, keep the id counter; reactivation is S2's call                                       |
 | D37 | Remembering why a file has no document                   | answered       | B: 2-bit content state plus sniffer version                                                                    |
-| D38 | Reading the snapshot: whole file, or by section          | open           |                                                                                                                |
+| D38 | Reading the snapshot: whole file, or by section          | answered       | B: section-wise positional reads, in slice 5 (via D40)                                                         |
 | D39 | A checksum over the snapshot                             | open           |                                                                                                                |
+| D40 | What entry count S1 is built for                         | answered       | B: about 10M catalogued entries, measured at about 40M                                                         |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1775,6 +1776,9 @@ C's gain for a name query. The fact that would change it: B measured at more
 than a few milliseconds above C for a warm name query, which reopens C under
 D11.
 
+**Answer (2026-09-27): B, through D40.** Build for 10M; section reads land in
+slice 5.
+
 ## D39 — A checksum over the snapshot
 
 **Question:** Should the snapshot carry a checksum, so corruption in a value
@@ -1797,3 +1801,48 @@ corruption lives one run, and the writer already decodes what it wrote before
 publishing it. Revisit with C when D38 B lands, since the table is the natural
 place for it. The fact that would change it: a corrupt snapshot seen in
 practice.
+
+## D40 — What entry count S1 is built for
+
+**Question:** Everything through D39 assumed about 1M files. Dave expects his
+file count to grow 10–100× with agentic coding and his knowledge base
+(`~/w/lab`, `~/w/kb`), possibly before this machine is replaced. What count
+should S1 be built for?
+
+These are measured at `$HOME`'s 435k entries and scaled linearly, so every
+figure past 435k is an estimate:
+
+|                                      | 435k   | 10× (4.3M)     | 100× (43M)          |
+| ------------------------------------ | ------ | -------------- | ------------------- |
+| Snapshot                             | 51 MB  | 0.5 GB         | 5 GB                |
+| Name scan, warm (naive / SIMD-class) | 5–8 ms | 50–80 / ~10 ms | 0.5–0.8 s / ~100 ms |
+| Open by reading the whole file       | 22 ms  | ~0.2 s         | ~2 s                |
+| Full rebuild per run (D26)           | 0.66 s | ~7 s           | ~70 s, writing 5 GB |
+
+The catalog is derived data, so a later format change costs a re-index, not a
+migration. Much of the growth is also build output and linked work trees, which
+default ignores and D23 already absorb.
+
+The choices that do not scale are:
+
+- reading the whole file on every `find` (D38);
+- a rewrite on every run (D26);
+- a linear scan without a daemon (D14);
+- the 64 B inode row.
+
+| Option                                          | Costs                                                                                                                                               | Buys                                                                   |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| A. Keep ~1M; measure 10× and 100× synthetically | Likely rework of D26, D38 and the scan within months                                                                                                | S1 ships soonest                                                       |
+| B. Build for ~10M; measure at 100×              | Section reads (D38 B) and a SIMD-class scanner in slice 5; a synthetic 10M build under ~2 GB peak in slice 4; the incremental catalog next after S1 | `find` stays interactive without a daemon at the size expected soonest |
+| C. Build for ~50M now                           | Name trigrams or a suffix array, incremental writes and narrower rows, all in S1; weeks, designed before any usage data                             | No redesign later                                                      |
+
+**Recommendation:** B. A rebuildable catalog makes deferring 100× cheap, but not
+10×. The fact that would change it: the `ferret stats` census showing catalogued
+entries growing faster than about 2× a quarter, in which case move to C sooner.
+
+> Dave: Let's go for B. Build for 10M. Now that I think about it a little more,
+> I think that's a more realistic cap anyway.
+
+**Answer (2026-09-27): B.** S1 is built for about 10M catalogued entries and
+measured at about 40M. This also answers D38: B, section reads, in slice 5.
+After S1 the incremental catalog (D26 A) moves ahead of the daemon.
