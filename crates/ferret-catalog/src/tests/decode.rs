@@ -61,10 +61,25 @@ fn exercise(catalog: &Catalog) -> usize {
     touched
 }
 
+/// Every name is found by `lookup` in its parent under its own bytes: the
+/// binary search agrees with iteration. Validation must guarantee this for
+/// any file it accepts, not only avoid panics.
+fn assert_lookups_agree(catalog: &Catalog, context: &str) {
+    for (id, bytes) in catalog.names() {
+        assert_eq!(
+            catalog.lookup(catalog.name(id).parent, bytes),
+            Some(id),
+            "{context}: lookup of {:?} disagrees with iteration",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
 #[test]
 fn the_sample_decodes_and_every_section_is_populated() {
     let catalog = Catalog::from_bytes(sample("decode-populated")).unwrap();
     assert!(exercise(&catalog) > 0);
+    assert_lookups_agree(&catalog, "sample");
     assert_eq!(catalog.roots().count(), 2);
     assert_eq!(catalog.work_trees().count(), 1);
     assert_eq!(catalog.doc_count(), 2);
@@ -97,6 +112,7 @@ fn every_single_bit_flip_is_an_error_or_reads_safely() {
                 Err(_) => rejected += 1,
                 Ok(catalog) => {
                     exercise(&catalog);
+                    assert_lookups_agree(&catalog, &format!("flip at {at} bit {bit}"));
                     accepted += 1;
                     // The header and section table are fully checked.
                     assert!(
@@ -141,6 +157,32 @@ fn a_directory_whose_name_points_upwards_is_rejected() {
     assert_eq!(
         Catalog::from_bytes(bytes).err(),
         Some(DecodeError::Corrupt("dir names"))
+    );
+}
+
+#[test]
+fn siblings_out_of_order_are_rejected() {
+    // Root /s holds c, d and sub. Rewriting c to g leaves every offset,
+    // parent and terminator valid, but the siblings read g, d, sub, and
+    // `lookup(root, "d")` would binary-search past d and miss it.
+    let scratch = Scratch::new("decode-order");
+    let catalog = commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        let root = w.root(b"/s", dir_stat(1));
+        w.file(root, b"c", file_stat(10), Content::Unindexed);
+        w.file(root, b"d", file_stat(11), Content::Unindexed);
+        w.dir(root, b"sub", dir_stat(2));
+        txn.add(w);
+    });
+    assert_eq!(catalog.name(NameId(0)).bytes, b"c");
+
+    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let heap_start = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+    assert_eq!(bytes[heap_start], b'c');
+    bytes[heap_start] = b'g';
+    assert_eq!(
+        Catalog::from_bytes(bytes).err(),
+        Some(DecodeError::Corrupt("name order"))
     );
 }
 

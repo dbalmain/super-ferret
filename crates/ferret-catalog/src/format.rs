@@ -381,6 +381,25 @@ fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
         next_offset = u64::from(offset) + 1;
     }
 
+    // Each name is exactly the bytes up to the next name's offset: non-empty,
+    // no NUL inside, its NUL last. Siblings are in strictly increasing byte
+    // order, because `lookup` binary-searches them by name.
+    let mut previous: Option<(u32, &[u8])> = None;
+    for (i, row) in rows.chunks_exact(NAME_ROW).enumerate() {
+        let start = u32_at(row, 8) as usize;
+        let end = match rows.get((i + 1) * NAME_ROW..) {
+            Some(next) if !next.is_empty() => u32_at(next, 8) as usize,
+            _ => heap.len(),
+        };
+        let parent = u32_at(row, 0);
+        let (name, nul) = (&heap[start..end - 1], heap[end - 1]);
+        let ordered = previous.is_none_or(|(p, prev)| p != parent || prev < name);
+        if name.is_empty() || nul != 0 || name.contains(&0) || !ordered {
+            return Err(DecodeError::Corrupt("name order"));
+        }
+        previous = Some((parent, name));
+    }
+
     // Every directory's name edge names it, from a lower-numbered parent, so
     // a walk upwards strictly descends and ends at a root.
     let dir_names = section(Section::DirNames);
