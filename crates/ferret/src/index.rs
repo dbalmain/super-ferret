@@ -74,19 +74,10 @@ pub fn index(context: &Context, dirs: &[PathBuf]) -> Exit {
 pub fn remove(context: &Context, dirs: &[PathBuf]) -> Exit {
     let mut removed = Vec::with_capacity(dirs.len());
     for dir in dirs {
-        // A root whose directory is gone is still removable: its `..` can
-        // only be resolved lexically, which is safe here because the result
-        // must equal a stored root to remove anything.
-        let path = match root_path(dir) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                std::path::absolute(dir).map(|path| lexical(&path))
-            }
-            other => other,
-        };
-        match path {
+        match removal(context, dir) {
             Ok(path) => removed.push(path),
-            Err(e) => {
-                error(&format!("{}: {e}", dir.display()));
+            Err(message) => {
+                error(&message);
                 return Exit::Error;
             }
         }
@@ -96,6 +87,34 @@ pub fn remove(context: &Context, dirs: &[PathBuf]) -> Exit {
         remove: &removed,
     };
     run(context, "roots-remove", change, Refresh::Only(&[]))
+}
+
+/// The root `roots remove DIR` names. An existing directory is spelled as
+/// `index` spells it ([`root_path`]). A directory that is gone cannot be
+/// resolved, and resolving its `..` by name could cross a symlink to a
+/// different root, so it must be named exactly as stored, give or take `.`
+/// and trailing slashes.
+fn removal(context: &Context, dir: &Path) -> Result<PathBuf, String> {
+    let fail = |e: io::Error| format!("{}: {e}", dir.display());
+    match root_path(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let spelled: PathBuf = std::path::absolute(dir)
+                .map_err(fail)?
+                .components()
+                .collect();
+            let roots =
+                configured(context).map_err(|e| format!("{}: {e}", context.index.display()))?;
+            match roots.contains(&spelled) {
+                true => Ok(spelled),
+                false => Err(format!(
+                    "{}: no such directory, and not a configured root as spelled; name it as \
+                     `ferret roots list` shows it",
+                    dir.display()
+                )),
+            }
+        }
+        other => other.map_err(fail),
+    }
 }
 
 /// `ferret roots list`: each root's path, one per line, as raw bytes.
@@ -153,21 +172,6 @@ fn root_path(dir: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// `path` with `.` and `..` resolved by name alone.
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// Asks at a terminal for the first root. `None` when stdin or stderr is
 /// not a terminal, or the answer is empty.
 fn ask_for_root() -> Option<Result<PathBuf, String>> {
@@ -184,7 +188,8 @@ fn ask_for_root() -> Option<Result<PathBuf, String>> {
 /// The global ignore file's text, seeded with the defaults on first use
 /// (`setup`). A file that is missing even after setup (no config directory,
 /// or one setup could not write) is the defaults, which is what setup would
-/// have written. A file that exists and cannot be read is an error: the
+/// have written. A file that exists and cannot be read, or a symlink whose
+/// target is gone, is an error: the
 /// user's rules are unknown, so the run must not publish (D26 A′).
 fn global_ignore(context: &Context) -> Result<String, String> {
     let Some(dirs) = &context.dirs else {
@@ -204,7 +209,9 @@ fn global_ignore(context: &Context) -> Result<String, String> {
     }
     match fs::read(&path) {
         Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        // Only an absent destination means "no rules file". A dangling
+        // symlink also reads as NotFound, but the user's rules are behind it.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !exists(&path) => {
             warn(&format!(
                 "{}: {e}; using the default ignore rules",
                 path.display()
@@ -217,6 +224,12 @@ fn global_ignore(context: &Context) -> Result<String, String> {
             path.display()
         )),
     }
+}
+
+/// Whether anything, even a dangling symlink, is at `path`. An error other
+/// than NotFound counts as present, so it fails rather than defaulting.
+fn exists(path: &Path) -> bool {
+    !matches!(fs::symlink_metadata(path), Err(e) if e.kind() == io::ErrorKind::NotFound)
 }
 
 /// One index run: publish, report, log.

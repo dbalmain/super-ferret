@@ -219,11 +219,55 @@ fn a_root_is_removed_by_the_spelling_that_added_it() {
     run_in(&[os("roots"), os("remove"), os("../b")]);
     assert_eq!(paths(&env.run(&[os("roots"), os("list")])), [env.at("a")]);
 
-    // The same spelling after the directory is deleted.
+    // Once the directory is gone, `..` cannot be resolved: the spelling that
+    // added it is refused, and the stored spelling removes it.
     run_in(&[os("index"), os("../b")]);
     fs::remove_dir_all(env.at("b")).unwrap();
-    run_in(&[os("roots"), os("remove"), os("../b")]);
+    let refused = env
+        .command(&[os("roots"), os("remove"), os("../b")])
+        .current_dir(env.at("a"))
+        .output()
+        .unwrap();
+    assert_eq!(code(&refused), 3);
+    assert!(
+        stderr(&refused).contains("roots list"),
+        "{}",
+        stderr(&refused)
+    );
+    let stored = env.at("b").into_os_string();
+    run_in(&[os("roots"), os("remove"), &stored]);
     assert_eq!(paths(&env.run(&[os("roots"), os("list")])), [env.at("a")]);
+}
+
+#[test]
+// Resolving a gone root's `..` by name once removed a different root: with
+// `w/link -> data/sub`, `w/link/../project` added `data/project`, but after
+// that directory was deleted the same spelling removed `w/project`.
+fn a_gone_root_named_through_a_symlink_removes_nothing_else() {
+    let env = Env::new("dotdot-link");
+    fs::create_dir_all(env.at("data/sub")).unwrap();
+    env.write("data/project/d.txt", b"d\n");
+    env.write("w/project/w.txt", b"w\n");
+    std::os::unix::fs::symlink(env.at("data/sub"), env.at("w/link")).unwrap();
+    let through = env.at("w/link/../project").into_os_string();
+    let wp = env.at("w/project").into_os_string();
+    let indexed = env.run(&[os("index"), &through, &wp]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let both = [env.at("data/project"), env.at("w/project")];
+    assert_eq!(paths(&env.run(&[os("roots"), os("list")])), both);
+
+    fs::remove_dir_all(env.at("data/project")).unwrap();
+    let refused = env.run(&[os("roots"), os("remove"), &through]);
+    assert_eq!(code(&refused), 3, "{}", stderr(&refused));
+    assert_eq!(paths(&env.run(&[os("roots"), os("list")])), both);
+
+    let stored = env.at("data/project").into_os_string();
+    let removed = env.run(&[os("roots"), os("remove"), &stored]);
+    assert_eq!(code(&removed), 0, "{}", stderr(&removed));
+    assert_eq!(
+        paths(&env.run(&[os("roots"), os("list")])),
+        [env.at("w/project")]
+    );
 }
 
 #[test]
@@ -478,6 +522,28 @@ fn an_unreadable_ignore_file_publishes_nothing_and_fails() {
     assert!(message.contains("nothing published"), "{message}");
     assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
     assert_eq!(code(&env.run(&[os("find"), os("new")])), 1);
+    assert_eq!(code(&env.run(&[os("find"), os("secret")])), 1);
+}
+
+#[test]
+// A dangling ignore symlink read as NotFound and so as "no file": the run
+// published on the defaults and the user's `private/` exclusion lapsed.
+fn a_dangling_ignore_symlink_publishes_nothing_and_fails() {
+    let env = Env::new("ignore-dangling");
+    env.write("ok.txt", b"ok\n");
+    env.write("private/secret.txt", b"s\n");
+    let rules = env.base.join("rules");
+    fs::write(&rules, "private/\n").unwrap();
+    fs::create_dir_all(env.ignore_file().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&rules, env.ignore_file()).unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let before = fs::read(env.index().join("catalog")).unwrap();
+
+    fs::remove_file(&rules).unwrap();
+    let output = env.run(&[os("index")]);
+    assert_eq!(code(&output), 3, "{}", stderr(&output));
+    assert!(stderr(&output).contains("nothing published"));
+    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
     assert_eq!(code(&env.run(&[os("find"), os("secret")])), 1);
 }
 
