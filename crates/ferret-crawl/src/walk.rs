@@ -39,8 +39,7 @@ use std::thread;
 
 use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, RawDir, fstat, open as open_path, openat, readlinkat,
-    statat,
+    AtFlags, FileType, Mode, OFlags, RawDir, fstat, open as open_path, openat, readlinkat, statat,
 };
 use rustix::io::Errno;
 
@@ -619,7 +618,12 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<'_, V>, shared: &Shared<V::Dir
 }
 
 impl<V: EventVisitor> Walker<'_, V> {
-    fn root_job(&mut self, root: &Path, global: Option<&str>, config: Config) -> Option<Job<V::Dir>> {
+    fn root_job(
+        &mut self,
+        root: &Path,
+        global: Option<&str>,
+        config: Config,
+    ) -> Option<Job<V::Dir>> {
         let fd = match open_path(root, root_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {
@@ -764,6 +768,9 @@ impl<D> Job<D> {
         }
     }
 }
+
+/// A parent's continuation, and the child directory to walk next.
+type Descent<D> = (Job<D>, Job<D>);
 
 /// What `.git` is. A symlink is [`GitProbe::Present`]: nothing is opened
 /// through it. A real directory keeps the descriptor from the probe so
@@ -951,7 +958,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         }
     }
 
-    fn process(&mut self, mut job: Job<V::Dir>) -> Option<(Job<V::Dir>, Job<V::Dir>)> {
+    fn process(&mut self, mut job: Job<V::Dir>) -> Option<Descent<V::Dir>> {
         self.rel.clone_from(&job.rel);
         if job.dir.is_none() {
             job.dir = self.reopen(bytes_path(&job.rel), job.id, job.token);
@@ -1185,7 +1192,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
 
     /// Reports [`Event::Boundary`] when the current path is a boundary and
     /// `stat` is a directory with that boundary's identity, if it gives one.
-    fn at_boundary(&mut self, here: &Here<'_, V::Dir>, name: &OsStr, stat: &rustix::fs::Stat) -> bool {
+    fn at_boundary(
+        &mut self,
+        here: &Here<'_, V::Dir>,
+        name: &OsStr,
+        stat: &rustix::fs::Stat,
+    ) -> bool {
         if self.boundaries.is_empty() || file_type(stat) != FileType::Directory {
             return false;
         }
@@ -1433,7 +1445,9 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// tree; a regular file is read below.
     fn probe_git_failed(&mut self, dir: BorrowedFd<'_>, error: Errno, token: V::Dir) -> GitProbe {
         match statat(dir, DOT_GIT, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) if file_type(&stat) == FileType::RegularFile => self.probe_git_file(dir, token),
+            Ok(stat) if file_type(&stat) == FileType::RegularFile => {
+                self.probe_git_file(dir, token)
+            }
             Ok(stat) if file_type(&stat) == FileType::Directory => {
                 self.fail_at_git(io::Error::from(error), token);
                 GitProbe::Present
@@ -1574,7 +1588,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// nothing: a linked work tree's own directory is not where exclude lives,
     /// so it is not a fallback. Only a missing `commondir` means the gitdir is
     /// the common directory.
-    fn common_dir(&mut self, gitdir: OwnedFd, token: V::Dir) -> Option<(OwnedFd, Option<OsString>)> {
+    fn common_dir(
+        &mut self,
+        gitdir: OwnedFd,
+        token: V::Dir,
+    ) -> Option<(OwnedFd, Option<OsString>)> {
         let opened = match openat(
             gitdir.as_fd(),
             "commondir",

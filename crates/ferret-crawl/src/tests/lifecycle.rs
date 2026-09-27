@@ -25,12 +25,14 @@ use crate::{
 /// worker's table of directory paths.
 type Token = (usize, usize);
 
+type DecidedHook<'h> = &'h (dyn Fn(&Path, Decision) + Sync);
+
 /// Test-side hooks into the walk. Each runs inside the visitor callback named.
 #[derive(Default)]
 struct Hooks<'h> {
     on_root: Option<&'h (dyn Fn() + Sync)>,
     /// Called with each `Decided` path before the token is returned.
-    on_decided: Option<&'h (dyn Fn(&Path, Decision) + Sync)>,
+    on_decided: Option<DecidedHook<'h>>,
     on_pattern: Option<&'h (dyn Fn() + Sync)>,
     /// The visitor returns `None` for this directory.
     prune: Option<&'h Path>,
@@ -130,7 +132,8 @@ impl EventVisitor for Recorder<'_> {
                         Context::Child(parent, name.to_os_string())
                     }
                 };
-                self.io.push((path.to_path_buf(), op, context, error.kind()));
+                self.io
+                    .push((path.to_path_buf(), op, context, error.kind()));
             }
             Event::Pattern(_) => {
                 if let Some(hook) = self.hooks.on_pattern {
@@ -191,8 +194,12 @@ fn run(root: &Path, boundaries: Vec<Boundary>, workers: usize, hooks: &Hooks<'_>
         workers,
         boundaries,
     };
-    let visitors = walk_parallel(root, Some(DEFAULT_IGNORE), Config::default(), &options, || {
-        Recorder {
+    let visitors = walk_parallel(
+        root,
+        Some(DEFAULT_IGNORE),
+        Config::default(),
+        &options,
+        || Recorder {
             worker: next.fetch_add(1, Ordering::Relaxed),
             hooks,
             root_called: false,
@@ -203,8 +210,8 @@ fn run(root: &Path, boundaries: Vec<Boundary>, workers: usize, hooks: &Hooks<'_>
             io: Vec::new(),
             fd_checked: 0,
             fd_mismatches: Vec::new(),
-        }
-    });
+        },
+    );
     let mut paths = HashMap::new();
     for visitor in &visitors {
         for (index, path) in visitor.dirs.iter().enumerate() {
@@ -291,7 +298,12 @@ fn every_child_carries_its_parents_token_across_workers() {
     assert!(merged.io.is_empty(), "{:?}", merged.io);
     assert_eq!(merged.decided.len(), 24 * (1 + 6 * 5 + 1));
     for (parent, path, _) in &merged.decided {
-        assert_eq!(parent, &parent_of(path), "parent token of {}", path.display());
+        assert_eq!(
+            parent,
+            &parent_of(path),
+            "parent token of {}",
+            path.display()
+        );
     }
     assert!(
         merged.cross_worker > 0,
@@ -300,7 +312,11 @@ fn every_child_carries_its_parents_token_across_workers() {
 
     // Entered once per descended directory, plus the root, each under the
     // token that directory's `Decided` returned.
-    let mut entered: Vec<_> = merged.entered.iter().map(|(path, _)| path.clone()).collect();
+    let mut entered: Vec<_> = merged
+        .entered
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
     entered.sort();
     let mut descended: Vec<_> = merged
         .decided
@@ -312,7 +328,11 @@ fn every_child_carries_its_parents_token_across_workers() {
     descended.sort();
     assert_eq!(entered, descended);
 
-    assert!(merged.fd_mismatches.is_empty(), "{:?}", merged.fd_mismatches);
+    assert!(
+        merged.fd_mismatches.is_empty(),
+        "{:?}",
+        merged.fd_mismatches
+    );
     assert_eq!(merged.fd_checked, merged.decided.len());
 }
 
@@ -464,7 +484,10 @@ fn a_root_whose_listing_fails_is_a_list_fault_on_the_root() {
         merged.io_at(""),
         [(IoOp::List, Context::Root, io::ErrorKind::NotFound)]
     );
-    assert!(merged.entered("").is_none(), "an unlisted root is not entered");
+    assert!(
+        merged.entered("").is_none(),
+        "an unlisted root is not entered"
+    );
 }
 
 /// A directory that has a token but cannot be opened: the fault names it as a
@@ -540,11 +563,7 @@ fn ignore_and_git_faults_name_the_entry_in_the_entered_directory() {
     // A symlinked `.ferretignore` is followed, so its target's mode applies.
     write(&tree.join("linked/rules"), "x\n");
     symlink("rules", tree.join("linked/.ferretignore")).unwrap();
-    fs::set_permissions(
-        tree.join("linked/rules"),
-        fs::Permissions::from_mode(0o000),
-    )
-    .unwrap();
+    fs::set_permissions(tree.join("linked/rules"), fs::Permissions::from_mode(0o000)).unwrap();
     init(&tree.join("repo"));
     write(&tree.join("repo/.git/info/exclude"), "x\n");
     fs::set_permissions(
