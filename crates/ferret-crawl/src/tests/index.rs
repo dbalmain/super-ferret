@@ -22,6 +22,7 @@ use crate::{ContentFault, IndexError, IndexOptions, IoOp, Refresh, Report, index
 /// `begin` would see `Locked`.
 struct Tmp {
     base: PathBuf,
+    _fds: std::sync::RwLockReadGuard<'static, ()>,
 }
 
 impl Tmp {
@@ -30,7 +31,8 @@ impl Tmp {
         unlock(&base);
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("tree")).unwrap();
-        Self { base }
+        let fds = super::FDS.read().unwrap_or_else(|e| e.into_inner());
+        Self { base, _fds: fds }
     }
 
     fn tree(&self) -> PathBuf {

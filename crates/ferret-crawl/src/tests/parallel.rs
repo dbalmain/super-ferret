@@ -48,6 +48,7 @@ fn line(event: Event<'_, ()>) -> Option<String> {
 }
 
 fn compare(root: &Path, workers: usize) -> (Vec<String>, usize) {
+    let _fds = super::FDS.write().unwrap_or_else(|e| e.into_inner());
     let mut sequential = Vec::new();
     walk(root, None, Config::default(), |event| {
         sequential.extend(line(event));

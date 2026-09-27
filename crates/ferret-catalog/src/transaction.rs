@@ -143,7 +143,9 @@ impl std::error::Error for CommitError {}
 /// dropped; dropping it publishes nothing.
 pub struct Transaction {
     dir: PathBuf,
-    _lock: File,
+    /// Held for the transaction's life and released explicitly on drop; see
+    /// the `Drop` impl.
+    lock: File,
     sniffer: u32,
     previous: Option<Catalog>,
     /// Old file and symlink rows sorted by `(dev, ino)`, for carry-over:
@@ -194,7 +196,7 @@ impl Transaction {
         }
         Ok(Transaction {
             dir: dir.to_owned(),
-            _lock: lock,
+            lock,
             sniffer,
             previous,
             by_identity,
@@ -364,6 +366,28 @@ impl Transaction {
         };
         sync_dir(&self.dir).map_err(CommitError::Undurable)?;
         Ok(catalog)
+    }
+}
+
+/// Releases the lock with `LOCK_UN` rather than by closing the file. `flock`
+/// belongs to the open file description, which a child forked by any thread
+/// shares until it execs; closing only this process's descriptor then leaves
+/// the lock held, and the next `begin` sees `Locked`. Seen in the crawl tests,
+/// where other tests spawn `git` and `chmod` (slice 4). Unlocking releases it
+/// for every copy.
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        // Nothing to do if it fails: closing the file is the fallback.
+        let _ = self.lock.unlock();
+    }
+}
+
+#[cfg(test)]
+impl Transaction {
+    /// Test seam: a second descriptor for the lock's open file description,
+    /// as a forked child would hold.
+    pub(crate) fn lock_copy(&self) -> File {
+        self.lock.try_clone().expect("dup the lock descriptor")
     }
 }
 

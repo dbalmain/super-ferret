@@ -54,6 +54,22 @@ fn a_second_writer_is_refused_until_the_first_is_done() {
 }
 
 #[test]
+fn the_lock_is_released_even_while_a_forked_child_holds_its_descriptor() {
+    let scratch = Scratch::new("lock-fork");
+    let first = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    // What a child forked by another thread holds until it execs.
+    let child = first.lock_copy();
+    drop(first);
+    drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    let copy = txn.lock_copy();
+    fill(&mut txn, &["a"]);
+    txn.commit().unwrap();
+    drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
+    drop((child, copy));
+}
+
+#[test]
 fn a_failure_before_the_rename_publishes_nothing() {
     let scratch = Scratch::new("fail-before");
     commit(&scratch.path, |txn| fill(txn, &["old"]));
