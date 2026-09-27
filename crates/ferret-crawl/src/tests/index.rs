@@ -707,14 +707,20 @@ fn a_root_change_applies_to_the_previous_generation_s_roots() {
     };
     let added = std::slice::from_ref(&b);
     let report = change(added, &[], Refresh::Only(added)).unwrap();
-    assert_eq!((report.refreshed, report.kept), (vec![b.clone()], vec![a.clone()]));
+    assert_eq!(
+        (report.refreshed, report.kept),
+        (vec![b.clone()], vec![a.clone()])
+    );
 
     let report = change(&[], &[], Refresh::All).unwrap();
     assert_eq!(report.refreshed, vec![a.clone(), b.clone()], "bare refresh");
 
     let gone = std::slice::from_ref(&a);
     let report = change(&[], gone, Refresh::Only(&[])).unwrap();
-    assert_eq!((report.dropped, report.kept), (vec![a.clone()], vec![b.clone()]));
+    assert_eq!(
+        (report.dropped, report.kept),
+        (vec![a.clone()], vec![b.clone()])
+    );
     let (catalog, _) = published(&tmp);
     let roots: Vec<&[u8]> = catalog.roots().map(|(_, p)| p).collect();
     assert_eq!(roots, [b.as_os_str().as_bytes()]);

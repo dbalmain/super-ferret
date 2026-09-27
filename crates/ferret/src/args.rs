@@ -298,7 +298,10 @@ mod tests {
             (&["search"], UsageError::UnknownCommand("search".into())),
             (&["find", "-x"], UsageError::UnknownFlag("-x".into())),
             (&["find", "--jsn"], UsageError::UnknownFlag("--jsn".into())),
-            (&["find", "--json=1"], UsageError::UnknownFlag("--json=1".into())),
+            (
+                &["find", "--json=1"],
+                UsageError::UnknownFlag("--json=1".into()),
+            ),
             (&["find", "--limit"], UsageError::MissingValue("--limit")),
             (&["find", "--limit="], UsageError::MissingValue("--limit")),
             (&["stats", "--index"], UsageError::MissingValue("--index")),

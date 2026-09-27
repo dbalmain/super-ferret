@@ -1,10 +1,6 @@
-//! `ferret`: the command-line tool — config, argument parsing, human and
-//! JSON-lines output, and the local query log. Wiring only; behaviour lives
-//! in the library crates.
+//! `ferret`: the command-line tool. Everything is in the library's
+//! [`ferret::cli`].
 
-fn main() {
-    println!(
-        "ferret {}: nothing here yet — see docs/ROADMAP.md",
-        env!("CARGO_PKG_VERSION")
-    );
+fn main() -> std::process::ExitCode {
+    ferret::cli::main()
 }

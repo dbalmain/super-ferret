@@ -1,7 +1,7 @@
 //! JSON output: one object per line, for `find --json` and the query log.
 //!
 //! Hand-written because the surface is small: objects of strings, integers,
-//! milliseconds, nulls and nested objects, written straight into a buffer.
+//! nulls, arrays of strings and nested objects, written straight into a buffer.
 //!
 //! **Bytes that may not be UTF-8** (paths, query atoms) are written by
 //! [`Object::bytes`] as two fields. `KEY` is always present and is the text
@@ -101,13 +101,6 @@ impl<'a> Object<'a> {
         }
     }
 
-    /// `"key":M` with `M` in milliseconds, to the microsecond.
-    pub fn millis(&mut self, key: &str, value: std::time::Duration) -> &mut Self {
-        self.key(key);
-        let _ = write!(Utf8(self.out), "{:.3}", value.as_secs_f64() * 1e3);
-        self
-    }
-
     /// `"key":{…}`, filled in by `fill`.
     pub fn object(&mut self, key: &str, fill: impl FnOnce(&mut Object<'_>)) -> &mut Self {
         self.key(key);
@@ -154,8 +147,7 @@ fn string(out: &mut Vec<u8>, text: &str) {
 
 /// Standard base64 with padding.
 fn base64(out: &mut Vec<u8>, bytes: &[u8]) {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for chunk in bytes.chunks(3) {
         let n = chunk
             .iter()
@@ -235,13 +227,12 @@ mod tests {
             object(|o| {
                 o.int("a", -3i64)
                     .opt_int("b", None::<u32>)
-                    .millis("c", std::time::Duration::from_micros(1500))
                     .byte_strings("d", [&b"x"[..], b"\xff"])
                     .object("e", |inner| {
                         inner.int("f", 1u8);
                     });
             }),
-            r#"{"a":-3,"b":null,"c":1.500,"d":["x",{"base64":"/w=="}],"e":{"f":1}}"#
+            r#"{"a":-3,"b":null,"d":["x",{"base64":"/w=="}],"e":{"f":1}}"#
         );
     }
 }

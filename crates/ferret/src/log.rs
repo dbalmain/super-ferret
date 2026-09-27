@@ -48,7 +48,10 @@ pub fn line<'a>(out: &'a mut Vec<u8>, command: &str, at: SystemTime) -> Object<'
 /// on a file opened for append, so concurrent `ferret` processes do not
 /// interleave within a line.
 pub fn append(state: &Path, line: &[u8]) -> io::Result<()> {
-    DirBuilder::new().recursive(true).mode(0o700).create(state)?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(state)?;
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
