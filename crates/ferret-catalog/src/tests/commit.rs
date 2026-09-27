@@ -169,22 +169,35 @@ fn a_corrupt_previous_generation_stops_the_writer() {
     ));
 }
 
-#[test]
-// The first generation's directory, and any missing ancestors, were made with
-// a bare `create_dir_all`: their entries in their parents were never synced,
-// so a crash could lose a publication commit had acknowledged.
-fn a_new_index_directory_is_synced_into_its_parent() {
-    let scratch = Scratch::new("durable-mkdir");
-    fs::create_dir_all(&scratch.path).unwrap();
-    let dir = scratch.path.join("a/b");
+/// The directories synced while `run` publishes, in order.
+fn synced_during(run: impl FnOnce()) -> Vec<std::path::PathBuf> {
     SYNCED_DIRS.with_borrow_mut(Vec::clear);
-    let mut txn = Transaction::begin(&dir, SNIFFER).unwrap();
-    fill(&mut txn, &["x"]);
-    txn.commit().unwrap();
-    let synced = SYNCED_DIRS.with_borrow_mut(std::mem::take);
-    assert_eq!(
-        synced,
-        [scratch.path.clone(), scratch.path.join("a"), dir],
-        "each new directory's parent, shallowest first, then the index directory after the rename"
-    );
+    run();
+    SYNCED_DIRS.with_borrow_mut(std::mem::take)
+}
+
+#[test]
+// The first generation's directory and its ancestors were made with a bare
+// `create_dir_all`, so their entries in their parents were never synced and a
+// crash could lose a publication commit had acknowledged. Then they were
+// synced only by the writer that created them, before the lock: a writer
+// that found them already made (by one that lost the lock race before its
+// syncs) synced nothing. So the directories are pre-made here, as that
+// other writer would have left them, and the publisher must still sync the
+// whole chain.
+fn a_first_publication_syncs_every_ancestor_of_the_index_directory() {
+    let scratch = Scratch::new("durable-mkdir");
+    let dir = scratch.path.join("a/b");
+    fs::create_dir_all(&dir).unwrap();
+    let real = fs::canonicalize(&dir).unwrap();
+    let publish = || {
+        let mut txn = Transaction::begin(&dir, SNIFFER).unwrap();
+        fill(&mut txn, &["x"]);
+        txn.commit().unwrap();
+    };
+    let mut expected: Vec<_> = real.ancestors().skip(1).map(ToOwned::to_owned).collect();
+    expected.push(dir.clone());
+    assert_eq!(synced_during(publish), expected);
+    // Later generations sync only the index directory, after the rename.
+    assert_eq!(synced_during(publish), [dir]);
 }

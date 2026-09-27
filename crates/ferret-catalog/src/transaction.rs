@@ -1,8 +1,8 @@
 //! The single writer: one run of `ferret index` (D26, D32, D34, D37).
 //!
 //! ```text
-//! begin(dir)   create dir (and fsync each new directory's parent), take
-//!              dir/lock (refused if held), read the old
+//! begin(dir)   create dir, take dir/lock (refused if held); before a
+//!              first generation, fsync every ancestor of dir; read the old
 //!              generation and index it for carry-over
 //! batch()      mint an empty Batch; any thread, any number
 //! carry(stat)  the old content of an unchanged inode; any thread
@@ -164,14 +164,17 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Starts a write to the catalog in `dir`, creating the directory and any
-    /// missing ancestors durably: each new directory's name is an entry in
-    /// its parent, so the parent is synced, or a crash could lose the first
-    /// generation commit reported as published. `sniffer` is the current
+    /// Starts a write to the catalog in `dir`, creating the directory if it
+    /// is missing. Before a first generation, the writer syncs every
+    /// ancestor of `dir` under the lock: a directory's name is an entry in
+    /// its parent, and whoever created the directories (this writer, or one
+    /// that lost the lock race before syncing) cannot be trusted to have
+    /// made them durable. That is one fsync per level, once per index.
+    /// `sniffer` is the current
     /// sniffer's version; when it differs from the previous generation's,
     /// nothing is carried and every root must be refreshed (D37).
     pub fn begin(dir: &Path, sniffer: u32) -> Result<Transaction, BeginError> {
-        create_dir_durably(dir).map_err(BeginError::Io)?;
+        fs::create_dir_all(dir).map_err(BeginError::Io)?;
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -185,6 +188,9 @@ impl Transaction {
         }
         remove_temp(dir).map_err(BeginError::Io)?;
         let previous = Catalog::open(dir).map_err(BeginError::Previous)?;
+        if previous.is_none() {
+            sync_ancestors(dir).map_err(BeginError::Io)?;
+        }
         if let Some(old) = &previous {
             old.load_all().map_err(BeginError::Previous)?;
         }
@@ -432,28 +438,12 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// `create_dir_all`, then syncs the parent of every directory it created,
-/// shallowest first, as `ferret`'s setup does for the config directory.
-fn create_dir_durably(dir: &Path) -> io::Result<()> {
-    let mut missing = Vec::new();
-    let mut current = dir;
-    while !current.as_os_str().is_empty()
-        && matches!(fs::symlink_metadata(current), Err(e) if e.kind() == io::ErrorKind::NotFound)
-    {
-        missing.push(current);
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
-    fs::create_dir_all(dir)?;
-    for created in missing.iter().rev() {
-        match created.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,
-            _ => sync_dir(Path::new("."))?,
-        }
-    }
-    Ok(())
+/// Syncs every ancestor of `dir`, from its parent up to `/`, so the chain of
+/// entries naming it is on disk. Resolved first, so a symlinked component
+/// syncs the directory that actually holds the entry.
+fn sync_ancestors(dir: &Path) -> io::Result<()> {
+    let real = fs::canonicalize(dir)?;
+    real.ancestors().skip(1).try_for_each(sync_dir)
 }
 
 fn remove_temp(dir: &Path) -> io::Result<()> {
