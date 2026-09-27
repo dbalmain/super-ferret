@@ -2,7 +2,7 @@
 //! prefixes, built through the real [`Transaction`] with no files on disk.
 //!
 //! ```text
-//! cargo run --release -p ferret-catalog --example synthetic -- <dump.tsv> <dir> <copies> [rerun]
+//! cargo run --release -p ferret-catalog --example synthetic -- <dump.tsv> <dir> <copies> [rerun] [faults=N]
 //! ```
 //!
 //! The tree is one root, `/synthetic`, holding `p0 .. p<copies-1>`, each a copy
@@ -11,7 +11,9 @@
 //! entries are spread over 16 batches, one per copy modulo 16, as 16 workers
 //! would hand them over. With `rerun`, a previous generation must exist: every
 //! file is looked up with [`Transaction::carry`] as the walk would, which is
-//! what a re-run holds in memory.
+//! what a re-run holds in memory. With `faults=N`, every Nth indexed file
+//! is stored as [`Content::Fault`], for timing the crawl's post-commit
+//! content-fault pass at scale.
 //!
 //! Prints the RSS once the batches are filled, the commit time and the peak
 //! RSS (`VmHWM`), so batch memory and build memory can be told apart.
@@ -32,19 +34,29 @@ const BATCHES: usize = 16;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (dump, dir, copies, rerun) = match words.as_slice() {
-        [dump, dir, copies] => (dump, dir, copies, false),
-        [dump, dir, copies, "rerun"] => (dump, dir, copies, true),
-        _ => {
-            eprintln!("usage: synthetic <dump.tsv> <dir> <copies> [rerun]");
-            return ExitCode::from(2);
-        }
+    let usage = || {
+        eprintln!("usage: synthetic <dump.tsv> <dir> <copies> [rerun] [faults=N]");
+        ExitCode::from(2)
     };
+    let [dump, dir, copies, options @ ..] = words.as_slice() else {
+        return usage();
+    };
+    let (mut rerun, mut fault_every) = (false, None);
+    for option in options {
+        match (*option, option.strip_prefix("faults=")) {
+            ("rerun", _) => rerun = true,
+            (_, Some(n)) => match n.parse::<u64>() {
+                Ok(n) if n > 0 => fault_every = Some(n),
+                _ => return usage(),
+            },
+            _ => return usage(),
+        }
+    }
     let Ok(copies) = copies.parse::<usize>() else {
         eprintln!("synthetic: copies must be a number");
         return ExitCode::from(2);
     };
-    match run(Path::new(dump), Path::new(dir), copies, rerun) {
+    match run(Path::new(dump), Path::new(dir), copies, rerun, fault_every) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("synthetic: {error}");
@@ -93,7 +105,13 @@ fn rss(field: &str) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-fn run(dump: &Path, dir: &Path, copies: usize, rerun: bool) -> Result<()> {
+fn run(
+    dump: &Path,
+    dir: &Path,
+    copies: usize,
+    rerun: bool,
+    fault_every: Option<u64>,
+) -> Result<()> {
     let text = std::fs::read(dump)?;
     let mut dirs = Vec::new();
     let mut entries = Vec::new();
@@ -153,6 +171,9 @@ fn run(dump: &Path, dir: &Path, copies: usize, rerun: bool) -> Result<()> {
                         Some(content) => {
                             carried += 1;
                             content
+                        }
+                        None if fault_every.is_some_and(|n| ino.is_multiple_of(n)) => {
+                            Content::Fault
                         }
                         None => Content::Hashed(hash_of(ino)),
                     };

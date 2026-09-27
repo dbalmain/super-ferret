@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind};
 use ferret_policy::Config;
 
-use crate::index::{PROBES, Probe};
+use crate::index::{PROBES, Probe, content_faults};
 use crate::{
     ContentFault, IndexError, IndexOptions, IoOp, Refresh, Report, RootChange, index, index_change,
 };
@@ -919,5 +919,41 @@ fn an_alias_that_meets_its_inode_in_flight_is_recorded_after_the_walk() {
         assert_eq!(rows[y].ino, rows[x].ino);
         assert_eq!(rows[y].state, ContentState::Hashed);
         assert_eq!(rows[y].doc, rows[x].doc);
+    }
+}
+
+/// Times the post-commit content-fault pass on a large catalog, such as the
+/// 10M one from `ferret-catalog`'s `synthetic` example with `faults=N`. Run
+/// by hand, in release:
+///
+/// ```text
+/// FERRET_FAULT_BENCH=<dir> cargo test --release -p ferret-crawl -- --ignored --nocapture fault_pass
+/// ```
+///
+/// Every section is loaded first, as it is on the catalog `commit` returns,
+/// so the time is the pass's alone.
+#[test]
+#[ignore = "a measurement: needs FERRET_FAULT_BENCH naming a catalog directory"]
+fn fault_pass_timing() {
+    let dir = PathBuf::from(std::env::var_os("FERRET_FAULT_BENCH").unwrap());
+    let catalog = Catalog::open(&dir).unwrap().unwrap();
+    catalog.load_all().unwrap();
+    let roots: Vec<PathBuf> = catalog
+        .roots()
+        .map(|(_, path)| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+        .collect();
+    let faults = (catalog.dir_count()..catalog.inode_count())
+        .filter(|&i| catalog.inode(InoId(i)).state == ContentState::Fault)
+        .count();
+    for _ in 0..3 {
+        let started = Instant::now();
+        let listed = content_faults(&catalog, &roots, Vec::new());
+        println!(
+            "{} names, {} inodes, {faults} Fault inodes: {} paths listed in {:?}",
+            catalog.name_count(),
+            catalog.inode_count(),
+            listed.len(),
+            started.elapsed()
+        );
     }
 }

@@ -249,11 +249,13 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
         let (n, b) = census.states[state as usize];
         let _ = writeln!(out, "  {label:<10} {n:>10} {:>12}", bytes(b));
     }
-    let _ = writeln!(
-        out,
-        "  hard links: {} files have {} names beyond their first",
-        census.linked.0, census.linked.1
-    );
+    let _ = match census.linked {
+        (0, _) => writeln!(out, "  hard links: no file has a second name in the index"),
+        (files, extra) => writeln!(
+            out,
+            "  hard links: {files} files have {extra} names beyond their first"
+        ),
+    };
     let (docs, extra, extra_bytes) = census.duplicates;
     let _ = writeln!(
         out,

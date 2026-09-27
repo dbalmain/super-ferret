@@ -433,7 +433,7 @@ fn run(
 ///
 /// Paths come from the catalog, so the walk holds none; the scan over the
 /// names runs only when some inode is Fault.
-fn content_faults(
+pub(crate) fn content_faults(
     catalog: &Catalog,
     refresh: &[PathBuf],
     seen: Vec<(PathBuf, ContentFault)>,
