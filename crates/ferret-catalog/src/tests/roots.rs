@@ -193,7 +193,11 @@ fn keeping_and_refreshing_one_root_is_an_error() {
 /// subtree would collapse in the map, so the name count is checked too.
 fn exact_paths(catalog: &Catalog) -> Vec<String> {
     let all = paths(catalog);
-    assert_eq!(all.len(), catalog.name_count() as usize, "a path named twice");
+    assert_eq!(
+        all.len(),
+        catalog.name_count() as usize,
+        "a path named twice"
+    );
     all.into_keys().collect()
 }
 

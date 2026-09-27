@@ -147,79 +147,95 @@ pub(crate) struct Tables {
     pub(crate) docs: Vec<(u32, Hash)>,
 }
 
+/// Each section's encoded length, known before any byte is written.
+fn section_len(t: &Tables, section: Section) -> usize {
+    match section {
+        Section::Names => t.names.len() * NAME_ROW,
+        Section::NameHeap => t.name_heap.len(),
+        Section::DirNames => t.dir_names.len() * 4,
+        Section::Traversed => t.traversed.len().div_ceil(8),
+        Section::Roots => t.roots.len() * PAIR_ROW,
+        Section::Strings => t.strings.len(),
+        Section::Inodes => t.inodes.len() * INODE_ROW,
+        Section::States => t.states.len().div_ceil(4),
+        Section::Links => t.links.len() * PAIR_ROW,
+        Section::WorkTrees => t.work_trees.len() * WORK_TREE_ROW,
+        Section::Docs => t.docs.len() * DOC_ROW,
+    }
+}
+
+/// Encodes the whole file into one buffer allocated at its final size, so
+/// the peak is the tables plus the file, not the file twice.
 pub(crate) fn encode(t: &Tables) -> Vec<u8> {
-    let mut sections: Vec<Vec<u8>> = Vec::with_capacity(SECTIONS.len());
-    for section in SECTIONS {
-        let mut out = Vec::new();
-        match section {
-            Section::Names => {
-                out.reserve(t.names.len() * NAME_ROW);
-                for row in &t.names {
-                    put_u32(&mut out, row.parent);
-                    put_u32(&mut out, row.child);
-                    put_u32(&mut out, row.offset);
-                }
-            }
-            Section::NameHeap => out.extend_from_slice(&t.name_heap),
-            Section::DirNames => t.dir_names.iter().for_each(|&n| put_u32(&mut out, n)),
-            Section::Traversed => out = pack_bits(t.traversed.iter().map(|&b| u8::from(b)), 1),
-            Section::Roots => t.roots.iter().for_each(|&(a, b)| put_pair(&mut out, a, b)),
-            Section::Strings => out.extend_from_slice(&t.strings),
-            Section::Inodes => {
-                out.reserve(t.inodes.len() * INODE_ROW);
-                for (stat, doc) in &t.inodes {
-                    put_u64(&mut out, stat.dev);
-                    put_u64(&mut out, stat.ino);
-                    put_u64(&mut out, stat.size);
-                    out.extend_from_slice(&stat.mtime_sec.to_le_bytes());
-                    out.extend_from_slice(&stat.ctime_sec.to_le_bytes());
-                    put_u32(&mut out, stat.mtime_nsec);
-                    put_u32(&mut out, stat.ctime_nsec);
-                    put_u32(&mut out, stat.mode);
-                    put_u32(&mut out, stat.uid);
-                    put_u32(&mut out, stat.gid);
-                    put_u32(&mut out, *doc);
-                }
-            }
-            Section::States => out = pack_bits(t.states.iter().map(|&s| s as u8), 2),
-            Section::Links => t.links.iter().for_each(|&(a, b)| put_pair(&mut out, a, b)),
-            Section::WorkTrees => {
-                for row in &t.work_trees {
-                    put_u32(&mut out, row.dir);
-                    put_u32(&mut out, row.offset);
-                    put_u64(&mut out, row.common_id.0);
-                    put_u64(&mut out, row.common_id.1);
-                    out.push(row.kind);
-                    out.extend_from_slice(&[0; 7]);
-                }
-            }
-            Section::Docs => {
-                for (id, hash) in &t.docs {
-                    put_u32(&mut out, *id);
-                    out.extend_from_slice(hash);
-                }
+    let lens = SECTIONS.map(|section| section_len(t, section));
+    let mut out = Vec::with_capacity(DATA_START + lens.iter().sum::<usize>());
+    out.extend_from_slice(&MAGIC);
+    put_u32(&mut out, VERSION);
+    put_u32(&mut out, t.sniffer);
+    put_u32(&mut out, t.next_doc);
+    put_u32(&mut out, SECTIONS.len() as u32);
+    let mut offset = DATA_START as u64;
+    for len in lens {
+        put_u64(&mut out, offset);
+        put_u64(&mut out, len as u64);
+        offset += len as u64;
+    }
+    for (section, len) in SECTIONS.into_iter().zip(lens) {
+        let start = out.len();
+        encode_section(t, section, &mut out);
+        debug_assert_eq!(out.len() - start, len, "{section:?}");
+    }
+    out
+}
+
+fn encode_section(t: &Tables, section: Section, out: &mut Vec<u8>) {
+    match section {
+        Section::Names => {
+            for row in &t.names {
+                put_u32(out, row.parent);
+                put_u32(out, row.child);
+                put_u32(out, row.offset);
             }
         }
-        sections.push(out);
+        Section::NameHeap => out.extend_from_slice(&t.name_heap),
+        Section::DirNames => t.dir_names.iter().for_each(|&n| put_u32(out, n)),
+        Section::Traversed => pack_bits(out, t.traversed.iter().map(|&b| u8::from(b)), 1),
+        Section::Roots => t.roots.iter().for_each(|&(a, b)| put_pair(out, a, b)),
+        Section::Strings => out.extend_from_slice(&t.strings),
+        Section::Inodes => {
+            for (stat, doc) in &t.inodes {
+                put_u64(out, stat.dev);
+                put_u64(out, stat.ino);
+                put_u64(out, stat.size);
+                out.extend_from_slice(&stat.mtime_sec.to_le_bytes());
+                out.extend_from_slice(&stat.ctime_sec.to_le_bytes());
+                put_u32(out, stat.mtime_nsec);
+                put_u32(out, stat.ctime_nsec);
+                put_u32(out, stat.mode);
+                put_u32(out, stat.uid);
+                put_u32(out, stat.gid);
+                put_u32(out, *doc);
+            }
+        }
+        Section::States => pack_bits(out, t.states.iter().map(|&s| s as u8), 2),
+        Section::Links => t.links.iter().for_each(|&(a, b)| put_pair(out, a, b)),
+        Section::WorkTrees => {
+            for row in &t.work_trees {
+                put_u32(out, row.dir);
+                put_u32(out, row.offset);
+                put_u64(out, row.common_id.0);
+                put_u64(out, row.common_id.1);
+                out.push(row.kind);
+                out.extend_from_slice(&[0; 7]);
+            }
+        }
+        Section::Docs => {
+            for (id, hash) in &t.docs {
+                put_u32(out, *id);
+                out.extend_from_slice(hash);
+            }
+        }
     }
-
-    let total = DATA_START + sections.iter().map(Vec::len).sum::<usize>();
-    let mut file = Vec::with_capacity(total);
-    file.extend_from_slice(&MAGIC);
-    put_u32(&mut file, VERSION);
-    put_u32(&mut file, t.sniffer);
-    put_u32(&mut file, t.next_doc);
-    put_u32(&mut file, SECTIONS.len() as u32);
-    let mut offset = DATA_START as u64;
-    for section in &sections {
-        put_u64(&mut file, offset);
-        put_u64(&mut file, section.len() as u64);
-        offset += section.len() as u64;
-    }
-    for section in &sections {
-        file.extend_from_slice(section);
-    }
-    file
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -235,10 +251,9 @@ fn put_pair(out: &mut Vec<u8>, a: u32, b: u32) {
     put_u32(out, b);
 }
 
-/// Packs `width`-bit values (1 or 2) LSB first.
-fn pack_bits(values: impl Iterator<Item = u8>, width: usize) -> Vec<u8> {
+/// Appends `width`-bit values (1 or 2) to `out`, packed LSB first.
+fn pack_bits(out: &mut Vec<u8>, values: impl Iterator<Item = u8>, width: usize) {
     let per_byte = 8 / width;
-    let mut out = Vec::new();
     for (i, v) in values.enumerate() {
         if i % per_byte == 0 {
             out.push(0);
@@ -247,7 +262,6 @@ fn pack_bits(values: impl Iterator<Item = u8>, width: usize) -> Vec<u8> {
             *last |= v << ((i % per_byte) * width);
         }
     }
-    out
 }
 
 // ── decoding ──

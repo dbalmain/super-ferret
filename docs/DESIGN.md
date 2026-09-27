@@ -94,14 +94,14 @@ snapshot (D27); `docs` holds live documents only, keyed by a `DocId` that is
 never reused (D36); `roots`, `links` and `worktrees` hang off an existing
 `InoId`. Raw inode numbers are data, never keys.
 
-| Table       | Id       | Row                                                                                                                                                 |
-| ----------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`                                                                              |
-| `inodes`    | `InoId`  | `(dev, ino)`, size, mtime, ctime, mode, uid, gid, `DocId` or none; a 2-bit content state beside it (D37)                                            |
-| `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept); rows sorted by id, with holes where content died                                                              |
-| `roots`     | —        | configured root paths and the `InoId` of each; nested roots are separate trees                                                                      |
-| `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the strings heap)                                                                     |
-| `worktrees` | —        | a work tree's top directory `InoId`, kind (main / linked / submodule), repository id (the common directory's `(dev, ino)`) and its path for display |
+| Table       | Id       | Row                                                                                                                                                                     |
+| ----------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`                                                                                                  |
+| `inodes`    | `InoId`  | `(dev, ino)`, size, mtime, ctime, mode, uid, gid, `DocId` or none; a 2-bit content state beside it (D37)                                                                |
+| `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept); rows sorted by id, with holes where content died                                                                                  |
+| `roots`     | —        | configured root paths and the `InoId` of each; nested roots are separate trees, and adding or removing a root inside a kept root requires refreshing the kept one (D34) |
+| `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the strings heap)                                                                                         |
+| `worktrees` | —        | a work tree's top directory `InoId`, kind (main / linked / submodule), repository id (the common directory's `(dev, ino)`) and its path for display                     |
 
 Directories are numbered first, breadth-first from the roots in path order, so
 their `InoId`s are `0..dirs` and a parent's id is always below its child's; the

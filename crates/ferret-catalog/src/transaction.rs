@@ -302,16 +302,12 @@ impl Transaction {
         let Some(old) = &self.previous else {
             return Ok(());
         };
-        let fresh = self
-            .batches
-            .iter()
-            .filter(|b| !b.carried)
-            .flat_map(|b| {
-                b.dirs
-                    .iter()
-                    .filter(|d| d.parent.is_none())
-                    .map(|d| &b.bytes[d.name.clone()])
-            });
+        let fresh = self.batches.iter().filter(|b| !b.carried).flat_map(|b| {
+            b.dirs
+                .iter()
+                .filter(|d| d.parent.is_none())
+                .map(|d| &b.bytes[d.name.clone()])
+        });
         let new: HashSet<&[u8]> = fresh.chain(self.kept.iter().map(Vec::as_slice)).collect();
         let before: HashSet<&[u8]> = old.roots().map(|(_, path)| path).collect();
         for changed in new.symmetric_difference(&before) {
