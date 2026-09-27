@@ -144,22 +144,21 @@ tombstones, so there is one source of truth.
 themselves, fixed-width little-endian rows plus two heaps. The name heap holds
 NUL-terminated names in `(parent, name)` order (D28 A) and is contiguous on
 purpose: it is what filename search scans (D14). The strings heap holds root
-paths, link targets and work-tree paths. A reader opens the file by reading the header
-and table alone (200 B), and then reads each section positionally when a query
-first needs it (D38 B), together with the sections it is checked against (names
-need the heap; directory names need names; roots need directory names and
+paths, link targets and work-tree paths. A reader opens the file by reading the
+header and table alone (200 B), and then reads each section positionally when a
+query first needs it (D38 B), together with the sections it is checked against
+(names need the heap; directory names need names; roots need directory names and
 strings; links and work trees need strings). Each section is validated as it
 loads: every offset, index and ordering a reader will follow is checked, so a
-corrupt or truncated file is an error from the load that reads the bad
-section, never a panic or a loop, and a query that does not read a section is
-not failed by it. A single inode row can be read without its section, for the
-few rows a name query reports. The writer
-holds an advisory lock on `lock` for the whole run, writes `catalog.tmp`, fsyncs
-it, renames it over `catalog` and fsyncs the directory; a reader holding the old
-generation keeps it (D32). Measured on `$HOME` (D28, D30): 51.2 MB for 435k
-names, of which inode rows (64 B) are 27.8 MB, name rows (12 B) 5.2 MB, the name
-heap 10.6 MB and doc rows (20 B) 7.1 MB. The memory budget is a config value,
-defaulted from measurement (D5).
+corrupt or truncated file is an error from the load that reads the bad section,
+never a panic or a loop, and a query that does not read a section is not failed
+by it. A single inode row can be read without its section, for the few rows a
+name query reports. The writer holds an advisory lock on `lock` for the whole
+run, writes `catalog.tmp`, fsyncs it, renames it over `catalog` and fsyncs the
+directory; a reader holding the old generation keeps it (D32). Measured on
+`$HOME` (D28, D30): 51.2 MB for 435k names, of which inode rows (64 B) are 27.8
+MB, name rows (12 B) 5.2 MB, the name heap 10.6 MB and doc rows (20 B) 7.1 MB.
+The memory budget is a config value, defaulted from measurement (D5).
 
 The writer is built for 10M entries (D40). Workers fill columnar batches, about
 120 B per entry. The build first decides every id with a few `u32` index arrays
@@ -167,13 +166,13 @@ per entry, deduplicating inodes and documents by sorting rather than through
 maps, so every build error comes before a byte is written. It then streams the
 sections to `catalog.tmp` in file order, freeing batch names once the name
 sections are out, and reads the file back for the decode check only after the
-batches are gone. The old generation is released before the build. Synthetic
-10M (the `$HOME` dump under 23 prefixes; 1.18 GB file): first build peak
-1.66 GB, commit 5.5 s; a re-run peaks at 2.56 GB during the walk, since the old
-generation (read into memory) and the new batches are both live. 40M: 6.4 GB
-and 10.1 GB, commit 23 s. The writer releases its lock with `LOCK_UN` on drop,
-because a child forked by any thread shares the lock's file description until
-it execs.
+batches are gone. The old generation is released before the build. Synthetic 10M
+(the `$HOME` dump under 23 prefixes; 1.18 GB file): first build peak 1.66 GB,
+commit 5.5 s; a re-run peaks at 2.56 GB during the walk, since the old
+generation (read into memory) and the new batches are both live. 40M: 6.4 GB and
+10.1 GB, commit 23 s. The writer releases its lock with `LOCK_UN` on drop,
+because a child forked by any thread shares the lock's file description until it
+execs.
 
 **Change detection.** A re-crawl compares `(size, mtime, ctime)` with the
 catalog row; unchanged means no read and no hash. A reused `(dev, ino)` after a
@@ -266,28 +265,28 @@ Two levels of inclusion: **catalogued** (name searchable, metadata filterable)
 and **content-indexed** (also hashed and tokenized). Binary files and files over
 the size cap are catalogued, not content-indexed.
 
-`ferret_crawl::index` is one run: take the writer lock, widen the refresh set
-so that any root with a root added or removed strictly inside it is refreshed
+`ferret_crawl::index` is one run: take the writer lock, widen the refresh set so
+that any root with a root added or removed strictly inside it is refreshed
 (D34), walk each refreshed root with its inner roots as boundaries, keep the
 others, commit. On a worker, a file the policy sends to the index is first
 offered to carry-over (D26: equal `(dev, ino, size, mtime, ctime)` reuses the
 old hash, except an old `Unindexed`, which is read, D37); otherwise it is opened
 through its parent's descriptor, its `fstat` must match the walk's `lstat`, and
 it is sniffed and BLAKE3-hashed with a second `fstat` bracketing the read. A
-file with more than one link goes through a per-run cache keyed by
-`(dev, ino)`: the first name to claim it reads it, a later name takes the
-stored observation whole if its own stat agrees and is a content fault if not,
-and a name that meets the inode in flight is set aside and resolved after the
-walk, so no worker ever waits on another. Faults are typed (D26 A′): a
-coverage fault — listing, opening or reopening a directory, reading an ignore
-file, probing git, `readlink`, anything on a root — publishes nothing and
-leaves the old generation; an entry that vanished before its `lstat` is a
-deletion; a content fault — open, stat or read failing, the bracket moving,
-aliases disagreeing — publishes the file with content state failed and no
-document, and it is re-read next run. The build is the authority on which
-inodes fault, since only it sees every name's observation; the report lists
-every name, under a refreshed root, of an inode it published as a fault. Those
-paths are resolved from the new catalog, not held through the walk.
+file with more than one link goes through a per-run cache keyed by `(dev, ino)`:
+the first name to claim it reads it, a later name takes the stored observation
+whole if its own stat agrees and is a content fault if not, and a name that
+meets the inode in flight is set aside and resolved after the walk, so no worker
+ever waits on another. Faults are typed (D26 A′): a coverage fault — listing,
+opening or reopening a directory, reading an ignore file, probing git,
+`readlink`, anything on a root — publishes nothing and leaves the old
+generation; an entry that vanished before its `lstat` is a deletion; a content
+fault — open, stat or read failing, the bracket moving, aliases disagreeing —
+publishes the file with content state failed and no document, and it is re-read
+next run. The build is the authority on which inodes fault, since only it sees
+every name's observation; the report lists every name, under a refreshed root,
+of an inode it published as a fault. Those paths are resolved from the new
+catalog, not held through the walk.
 
 ## Content: documents, tokens, structures (D6, D8, D9)
 
@@ -346,13 +345,12 @@ or a regex's longest literal run) drives a scan of the name heap with
 name by galloping over name starts, tested once, and the scan resumes at the
 next name. A query with metadata atoms and no literal tests every inode row
 first and then walks the name rows for the inodes that pass, loading the name
-sections only if one does. Everything else
-tests every name. A name query loads the name, directory, root, traversed and
-link sections, never the document rows, and reads inode rows one at a time for
-the rows it reports until that passes a 64th of the rows, when it loads the
-section instead. Paths are resolved once per parent directory. Measured
-(`ferret-bench`, D43): a rare word is 5 ms warm at `$HOME`, 206 ms at 10M and
-763 ms at 40M, nearly all of it the section loads.
+sections only if one does. Everything else tests every name. A name query loads
+the name, directory, root, traversed and link sections, never the document rows,
+and reads inode rows one at a time for the rows it reports until that passes a
+64th of the rows, when it loads the section instead. Paths are resolved once per
+parent directory. Measured (`ferret-bench`, D43): a rare word is 5 ms warm at
+`$HOME`, 206 ms at 10M and 763 ms at 40M, nearly all of it the section loads.
 
 ## Experiments and metrics
 
@@ -368,6 +366,27 @@ Later, a structure that is not clearly better ships with an opt-in mode that
 builds both and logs one against the other on the user's corpus, and an opt-in
 upload of those logs and the local query log. The local query and timing log
 exists from S1 and is the source of both.
+
+The log is `$XDG_STATE_HOME/ferret/log.jsonl` (mode 0600), one JSON line per
+`find` and per index run (`ferret index`, `ferret roots remove`), each with
+`"v":1`. A `find` line records:
+
+- the query atoms, the plan (`explain()`) and the strategy;
+- `Stats`, the rows, the time to the first row and the total time;
+- the bytes the reader read, and the catalog's name and inode counts.
+
+An index line records:
+
+- the outcome and the exit status;
+- the walk, hash, commit and content-fault-pass times, and the peak RSS;
+- the crawl's counts and the published generation's counts.
+
+It holds no ids, which D27 renumbers, and no result or root paths. Query text is
+the one piece of the user's data in it. Writing is best-effort: a line that
+cannot be written is a warning, never a failed command.
+
+The CLI's JSON lines write a path that is not UTF-8 as `path` (lossy text) plus
+`path_base64` (the exact bytes). The `ferret` crate doc states this contract.
 
 ## Resident daemon (later, optional — D14)
 

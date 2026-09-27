@@ -50,6 +50,38 @@ query latency cold and warm; the `$HOME` census. **Decides:** the memory budget
 default (D5), and whether the document tier is big enough to move extraction
 earlier.
 
+**Measured** (slice 5b, 2026-09-28, the release `ferret` binary, one run at a
+time; 32 threads, NVMe, ext4). "Cold" is the page cache emptied per file with
+`posix_fadvise(DONTNEED)`, checked with `fincore`. Without root, the dentry and
+inode caches stay warm, so cold crawls understate a reboot. Every `find` time is
+measured against the **D38 B reader** (positional section reads); D43 (mmap) is
+open. The full tables are in the slice 5b done-note.
+
+The `$HOME` census:
+
+- 2.11M entries. The default global rules prune 1.28M of them (`target/` 30%,
+  `.cache/` 18%, `node_modules/` 7%, `.git/` 3%). Work-tree `.gitignore` rules
+  prune another 0.39M.
+- 441k are catalogued: 77k directories, 362k files and 1.5k symlinks, at a
+  median depth of 8 and a median name length of 20 B.
+- No file has a second name inside the index. The 330k hard-linked files in
+  `$HOME` have their other names under ignored `node_modules/`.
+- 109k documents, 19.5k of them held by more than one inode.
+- The document tier is small: 1,222 PDFs, 134 `.docx`, 74 `.xlsx`, 10 `.pptx`
+  and 4 `.epub`.
+
+| measure                                 | `$HOME` (441k names)                              | synthetic 10M                      |
+| --------------------------------------- | ------------------------------------------------- | ---------------------------------- |
+| catalog bytes                           | 46.9 MB, 106 B/name                               | 1.18 GB, 118 B/name                |
+| `index` peak RSS                        | 78 MB first run, 160 MB re-run (180 / 360 B/name) | 1.66 GB (the `synthetic` build)    |
+| `index`, first run                      | 0.83 s warm, 29.1 s cold (10.3 GB read)           | —                                  |
+| `index`, re-run                         | 0.45 s warm, 0.74 s cold                          | —                                  |
+| content-fault pass                      | 2 ms                                              | 52 ms with none, 289 ms with 8,142 |
+| `find flamegraph`: cold / fresh process | 15 / 12 ms                                        | 390 / 233 ms                       |
+| `find test`, all rows: cold / fresh     | 62 / 29 ms                                        | 2,307 / 634 ms                     |
+| `find size:>100M`: cold / fresh         | 36 / 27 ms                                        | 592 / 367 ms                       |
+| `find` peak RSS                         | 19–46 MB                                          | 358–970 MB                         |
+
 ## S2 — Content index
 
 `ferret-text`, `ferret-index`, `ferret-verify`, `ferret-query`:

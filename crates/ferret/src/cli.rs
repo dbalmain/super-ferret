@@ -89,7 +89,8 @@ query atoms (all must match; one atom per argument):
   case:ATOM       match ATOM case-sensitively. Otherwise words, globs and
                   ext: fold ASCII case only, and re: folds Unicode case.
 
-output: one path per line, raw bytes; --json prints one object per line:
+output: one path per line, raw bytes, in index order (unsorted);
+  --json prints one object per line:
   {\"path\":…,\"type\":\"file\"|\"dir\"|\"symlink\",\"size\":N,\"mtime\":SECONDS,\"doc\":N|null}
   and \"path_base64\" with the exact bytes when the path is not UTF-8.
 

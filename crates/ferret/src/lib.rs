@@ -9,6 +9,18 @@
 //! - [`log`]: the query and timing log.
 //! - [`xdg`] resolves directories from the environment and touches no files;
 //!   [`setup`] writes the files a new install starts with.
+//!
+//! **Paths that are not UTF-8.** Human output writes a path's raw bytes. In
+//! JSON lines, `path` is always a string: the path's text, with each invalid
+//! sequence replaced by U+FFFD. When the path is not valid UTF-8,
+//! `path_base64` follows, holding the exact bytes in standard padded base64
+//! (RFC 4648 § 4). A consumer that needs the real path reads `path_base64`
+//! when present and `path` otherwise. The query log writes query atoms the
+//! same way inside its `query` array: a string, or `{"base64":"…"}` for an
+//! atom that is not UTF-8. See [`json`].
+//!
+//! **Exit statuses** are stable ([`cli::Exit`]): 0 success, 1 `find` matched
+//! nothing, 2 usage error, 3 runtime error.
 
 pub mod args;
 pub mod cli;
