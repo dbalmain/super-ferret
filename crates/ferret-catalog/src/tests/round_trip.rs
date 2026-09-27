@@ -352,3 +352,32 @@ fn inconsistent_batches_publish_nothing() {
         "nothing was published"
     );
 }
+
+/// The name heap's limit counts the name being added: nine 10-byte entries
+/// (nine bytes and a NUL) then one of 20 end at 110, past a limit of 100,
+/// though the heap was below it before the last name.
+#[test]
+fn a_name_that_would_carry_the_heap_past_its_limit_is_too_large() {
+    let scratch = Scratch::new("heap-limit");
+    let build = |last: &[u8]| {
+        crate::build::HEAP_LIMIT.set(Some(100));
+        let mut txn = Transaction::begin(&scratch.path, super::SNIFFER).unwrap();
+        let mut b = txn.batch();
+        let root = b.root(b"/h", dir_stat(1));
+        for i in 0..9u8 {
+            let name = [b'a' + i; 9];
+            b.file(root, &name, file_stat(10 + u64::from(i)), Content::Unindexed);
+        }
+        b.file(root, last, file_stat(30), Content::Unindexed);
+        txn.add(b);
+        let result = txn.commit().map(|c| c.name_count());
+        crate::build::HEAP_LIMIT.set(None);
+        result
+    };
+    // Exactly at the limit: 100 bytes.
+    assert_eq!(build(b"zzzzzzzzz").unwrap(), 10);
+    match build(b"zzzzzzzzzzzzzzzzzzz") {
+        Err(CommitError::Build(BuildError::TooLarge)) => {}
+        other => panic!("expected TooLarge, got {:?}", other.map(|_| ())),
+    }
+}

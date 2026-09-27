@@ -323,10 +323,16 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
             if k > range.start && plan.name(batches, plan.edges[k - 1]) == name {
                 return Err(BuildError::DuplicateName(name.to_vec()));
             }
-            if name_id >= NONE as usize || plan.heap_len >= NONE as usize {
+            // The prospective end, not the current length: one long name must
+            // not carry the heap past what `write`'s `u32` offsets can hold.
+            if name_id >= NONE as usize {
                 return Err(BuildError::TooLarge);
             }
-            plan.heap_len += name.len() + 1;
+            plan.heap_len = plan
+                .heap_len
+                .checked_add(name.len() + 1)
+                .filter(|&end| end <= heap_limit())
+                .ok_or(BuildError::TooLarge)?;
             let entry = entry as usize;
             if entry < dirs {
                 plan.dir_id[entry] = plan.order.len() as u32;
@@ -652,6 +658,24 @@ pub(crate) fn write(
         out.write_all(&lo.to_be_bytes())?;
     }
     Ok(())
+}
+
+/// The largest name heap: its offsets, and the running offset [`write`]
+/// keeps, are `u32`.
+fn heap_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = HEAP_LIMIT.get() {
+        return limit;
+    }
+    NONE as usize
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: a lower name-heap limit, since a 4 GiB heap is too big to
+    /// build in a unit test. The check is the same code either way.
+    pub(crate) static HEAP_LIMIT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Mixes `(dev, ino)` into 64 bits for sorting. Equal identities always agree;
