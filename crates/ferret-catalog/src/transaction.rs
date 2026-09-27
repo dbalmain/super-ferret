@@ -337,15 +337,17 @@ impl Transaction {
     /// so the batches and the encoded file are never held at once (D40).
     pub fn commit(mut self) -> Result<Catalog, CommitError> {
         self.check_kept_roots()?;
+        // The old generation is done with once the batches are filled; only
+        // its documents and id counter reach the build.
+        let next_doc = self.previous.take().map_or(0, |old| old.next_doc().0);
+        self.by_identity = Vec::new();
         let known = Known {
             docs: &self.docs,
-            next_doc: self.previous.as_ref().map_or(0, |old| old.next_doc().0),
+            next_doc,
         };
         let plan = build::plan(&self.batches, self.sniffer, known).map_err(CommitError::Build)?;
         let batches = std::mem::take(&mut self.batches);
-        self.by_identity = Vec::new();
         self.docs = Vec::new();
-        self.previous = None;
 
         let temp = self.dir.join(TEMP);
         let checked = write_synced(&temp, |out| build::write(plan, batches, out))
