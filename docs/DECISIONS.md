@@ -56,6 +56,7 @@ Predecessors, carried forward where still open:
 | D38 | Reading the snapshot: whole file, or by section          | answered       | B: section-wise positional reads, in slice 5 (via D40)                                                         |
 | D39 | A checksum over the snapshot                             | open           |                                                                                                                |
 | D40 | What entry count S1 is built for                         | answered       | B: about 10M catalogued entries, measured at about 40M                                                         |
+| D41 | The name scanner: `memchr::memmem`, or our own           | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1846,3 +1847,27 @@ entries growing faster than about 2× a quarter, in which case move to C sooner.
 **Answer (2026-09-27): B.** S1 is built for about 10M catalogued entries and
 measured at about 40M. This also answers D38: B, section reads, in slice 5.
 After S1 the incremental catalog (D26 A) moves ahead of the daemon.
+
+## D41 — The name scanner: `memchr::memmem`, or our own
+
+**Question:** At 10M entries (D40) the name heap is about 230 MB. A substring
+scan must run at SIMD-class speed, 5 GB/s or more, to keep `find` near 50 ms
+warm without a daemon. Today's naive scan manages about 1.5 GB/s. Whose scanner
+should it be?
+
+Case-insensitive matching is the likely default, and it is what separates the
+options. `memmem` compares bytes exactly. A case-insensitive search through it
+needs a lowercased second heap (+10 MB at `$HOME`, +230 MB at 10M) or a
+different algorithm. A scanner of our own can fold ASCII case inside its
+candidate filter, testing two needle bytes each in both cases, at little cost.
+
+| Option                                                                                                                                                                      | Costs                                                                                                                                    | Buys                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A. `memchr::memmem` (MIT / Unlicense). It is already in the tree through `regex`                                                                                            | A direct `ferret-query → memchr` edge in DESIGN. Case-insensitive search needs a folded copy of the heap: density lost, or a slower path | Well-tuned and SIMD with runtime detection, with nothing to write                                                                                      |
+| B. Our own: a two-byte candidate filter with ASCII case folding. An AVX2 arm through `core::arch`, allowed per D11 with a toolchain-ledger entry, plus a safe SWAR fallback | A few days' work, plus `unsafe` on one audited item and its ledger row                                                                   | Case-insensitive search at full speed with no second heap. It is ours to learn and tune, and the same filter serves glob literals and regex prefilters |
+| C. Our own, safe SWAR only (u64 bit tricks, std)                                                                                                                            | About 2–4 GB/s (estimate), below the target at 10M                                                                                       | No `unsafe`, simple                                                                                                                                    |
+
+**Recommendation:** B. Benchmark it in slice 5 against `memmem` as the control,
+using the D40 query mix. The fact that would change it: B falling more than
+about 30% behind `memmem` on case-sensitive queries. In that case use `memmem`
+for the case-sensitive path and keep B for case-folded search.
