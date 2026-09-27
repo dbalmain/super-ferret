@@ -2,6 +2,7 @@
 
 mod gitfile;
 mod golden;
+mod lifecycle;
 mod parallel;
 mod race;
 

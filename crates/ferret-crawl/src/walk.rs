@@ -39,8 +39,8 @@ use std::thread;
 
 use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
 use rustix::fs::{
-    AtFlags, Dir as DirStream, FileType, Mode, OFlags, fstat, open as open_path, openat,
-    readlinkat, statat,
+    AtFlags, FileType, Mode, OFlags, RawDir, fstat, open as open_path, openat, readlinkat,
+    statat,
 };
 use rustix::io::Errno;
 
@@ -636,26 +636,13 @@ impl<V: EventVisitor> Walker<'_, V> {
         };
         self.root_id = Some((root_stat.st_dev, root_stat.st_ino));
         let token = self.visit.root(public_stat(&root_stat, None));
-        let mut dir = match DirStream::new(fd) {
-            Ok(dir) => dir,
-            Err(error) => {
-                self.fail(IoOp::List, FaultContext::Root, io::Error::from(error));
-                return None;
-            }
-        };
-        let children = self.list(&mut dir, FaultContext::Root)?;
-        let loaded = match dir.fd() {
-            Ok(fd) => self.load_ignores(fd, &children, false, token),
-            Err(error) => {
-                self.fail(IoOp::List, FaultContext::Root, io::Error::from(error));
-                return None;
-            }
-        };
+        let children = self.list(fd.as_fd(), FaultContext::Root)?;
+        let loaded = self.load_ignores(fd.as_fd(), &children, false, token);
         let (rules, errors) = DirRules::root(root, global, loaded.files(), config);
         self.patterns(errors);
         self.entered(token, loaded.work_tree.as_ref());
         Some(Job::new(
-            dir,
+            fd,
             rules,
             children,
             self.rel.clone(),
@@ -707,8 +694,15 @@ struct Walker<'b, F> {
     boundaries: &'b [Boundary],
     /// Root-relative path bytes. Empty at the root. Reused for every entry.
     rel: Vec<u8>,
+    /// The `getdents` buffer, reused for every listing: empty, with capacity
+    /// [`DENTS_BYTES`].
+    dents: Vec<u8>,
     visit: F,
 }
+
+/// A worker's `getdents` buffer. 32 KiB holds several hundred entries of
+/// typical name length, so most directories list in one call.
+const DENTS_BYTES: usize = 32 << 10;
 
 /// The directory whose entries are being considered.
 struct Here<'a, D> {
@@ -741,7 +735,7 @@ impl Children {
 }
 
 struct Job<D> {
-    dir: Option<DirStream>,
+    dir: Option<OwnedFd>,
     rules: DirRules,
     children: Children,
     next: usize,
@@ -752,7 +746,7 @@ struct Job<D> {
 
 impl<D> Job<D> {
     fn new(
-        dir: DirStream,
+        dir: OwnedFd,
         rules: DirRules,
         children: Children,
         rel: Vec<u8>,
@@ -830,6 +824,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             root_id: None,
             boundaries,
             rel: Vec::with_capacity(256),
+            dents: Vec::with_capacity(DENTS_BYTES),
             visit,
         }
     }
@@ -908,21 +903,25 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         self.emit(here, name, decision, Some(public_stat(stat, target)))
     }
 
-    /// Lists `dir`. An error from `getdents` with no entry yet is one fault
-    /// and `None`, so ignore files are not probed for a directory that could
-    /// not be listed. An error after some entries is reported and the entries
-    /// already read are kept.
-    fn list(
-        &mut self,
-        dir: &mut DirStream,
-        context: FaultContext<'_, V::Dir>,
-    ) -> Option<Children> {
+    /// Lists `dir` into the worker's `getdents` buffer. The listing stops at
+    /// the first error. An error with no entry yet is one fault and `None`, so
+    /// ignore files are not probed for a directory that could not be listed.
+    /// An error after some entries is reported and the entries already read
+    /// are kept.
+    ///
+    /// `ENOENT` is an error here: the kernel returns it for a directory
+    /// unlinked since it was opened, and for a `/proc` directory whose process
+    /// is gone. (`rustix::fs::Dir` reads it as the end of the listing, which
+    /// would report a vanished directory as entered and empty.)
+    fn list(&mut self, dir: BorrowedFd<'_>, context: FaultContext<'_, V::Dir>) -> Option<Children> {
         let mut children = Children {
             names: Vec::new(),
             entries: Vec::new(),
         };
         let mut failed = false;
-        while let Some(item) = dir.read() {
+        let mut dents = std::mem::take(&mut self.dents);
+        let mut raw = RawDir::new(dir, dents.spare_capacity_mut());
+        while let Some(item) = raw.next() {
             match item {
                 Ok(entry) => {
                     let bytes = entry.file_name().to_bytes();
@@ -940,9 +939,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 Err(error) => {
                     self.fail(IoOp::List, context, io::Error::from(error));
                     failed = true;
+                    break;
                 }
             }
         }
+        self.dents = dents;
         if failed && children.entries.is_empty() {
             None
         } else {
@@ -955,19 +956,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         if job.dir.is_none() {
             job.dir = self.reopen(bytes_path(&job.rel), job.id, job.token);
         }
-        let fd = match job.dir.as_ref()?.fd() {
-            Ok(fd) => fd,
-            Err(error) => {
-                self.fail(
-                    IoOp::List,
-                    FaultContext::Dir(job.token),
-                    io::Error::from(error),
-                );
-                return None;
-            }
-        };
         let here = Here {
-            fd,
+            fd: job.dir.as_ref()?.as_fd(),
             rules: &job.rules,
             token: job.token,
         };
@@ -988,7 +978,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// Reopen a spilled continuation one component at a time. Only the
     /// configured root is opened by path; every component below it uses
     /// `O_NOFOLLOW`. The root and final inode must match the first pass.
-    fn reopen(&mut self, rel: &Path, expected: (u64, u64), token: V::Dir) -> Option<DirStream> {
+    fn reopen(&mut self, rel: &Path, expected: (u64, u64), token: V::Dir) -> Option<OwnedFd> {
         let context = FaultContext::Dir(token);
         let root = match open_path(&self.root, root_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
@@ -1018,16 +1008,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 }
             };
         }
-        if !self.same_dir(&fd, expected, token) {
-            return None;
-        }
-        match DirStream::new(fd) {
-            Ok(dir) => Some(dir),
-            Err(error) => {
-                self.fail(IoOp::Reopen, context, io::Error::from(error));
-                None
-            }
-        }
+        self.same_dir(&fd, expected, token).then_some(fd)
     }
 
     fn same_dir(&mut self, fd: &OwnedFd, expected: (u64, u64), token: V::Dir) -> bool {
@@ -1250,15 +1231,9 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         expected: &rustix::fs::Stat,
         token: V::Dir,
     ) -> Option<Job<V::Dir>> {
-        let mut child = self.open_child(here, name, expected)?;
-        let children = self.list(&mut child, FaultContext::Dir(token))?;
-        let loaded = match child.fd() {
-            Ok(fd) => self.load_ignores(fd, &children, here.rules.in_work_tree(), token),
-            Err(error) => {
-                self.fail(IoOp::List, FaultContext::Dir(token), io::Error::from(error));
-                return None;
-            }
-        };
+        let child = self.open_child(here, name, expected)?;
+        let children = self.list(child.as_fd(), FaultContext::Dir(token))?;
+        let loaded = self.load_ignores(child.as_fd(), &children, here.rules.in_work_tree(), token);
         let (rules, errors) = here.rules.enter(name, loaded.files());
         self.patterns(errors);
         self.entered(token, loaded.work_tree.as_ref());
@@ -1279,8 +1254,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         expected: &rustix::fs::Stat,
         token: V::Dir,
     ) -> Option<Job<V::Dir>> {
-        let mut child = self.open_child(here, name, expected)?;
-        let children = self.list(&mut child, FaultContext::Dir(token))?;
+        let child = self.open_child(here, name, expected)?;
+        let children = self.list(child.as_fd(), FaultContext::Dir(token))?;
         let rules = here.rules.traverse(name);
         self.entered(token, None);
         Some(Job::new(
@@ -1301,7 +1276,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         here: &Here<'_, V::Dir>,
         name: &OsStr,
         expected: &rustix::fs::Stat,
-    ) -> Option<DirStream> {
+    ) -> Option<OwnedFd> {
         let fd = match openat(here.fd, name, child_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {
@@ -1328,13 +1303,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 return None;
             }
         }
-        match DirStream::new(fd) {
-            Ok(dir) => Some(dir),
-            Err(error) => {
-                self.fail_child(IoOp::OpenDir, here.token, name, io::Error::from(error));
-                None
-            }
-        }
+        Some(fd)
     }
 
     // ── ignore files ──
