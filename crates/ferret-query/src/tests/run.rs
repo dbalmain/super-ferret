@@ -168,6 +168,19 @@ fn a_metadata_query_scans_inodes_and_still_skips_documents() {
 }
 
 #[test]
+fn a_name_query_on_a_catalog_with_only_inodes_loaded() {
+    // A caller that loaded the inode rows for its own reasons: the query
+    // then takes rows from the section, whose decoding reads States.
+    let scratch = Scratch::new("inodes-preloaded");
+    sample(&scratch);
+    let catalog = lazy(&scratch);
+    catalog.load(&[Section::Inodes]).unwrap();
+    let (found, stats) = find(&catalog, "readme");
+    assert_eq!(found.len(), 2);
+    assert_eq!(stats.single_inode_reads, 0);
+}
+
+#[test]
 fn a_metadata_query_nothing_passes_never_reads_the_names() {
     let scratch = Scratch::new("lazy-meta-empty");
     let catalog = sample(&scratch);

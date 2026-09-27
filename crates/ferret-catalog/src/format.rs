@@ -380,19 +380,22 @@ const CHECK_ORDER: [Section; SECTIONS.len()] = [
 ];
 
 impl Section {
-    /// The sections whose bytes [`check`] reads to validate this one; they
-    /// must be loaded first. Everything else a check needs is a count or a
-    /// length from the table.
+    /// The sections loaded with this one: those whose bytes [`check`] reads
+    /// to validate it, which must be loaded first, and those an accessor
+    /// documented against this section also reads (inode rows decode their
+    /// content state from States). Everything else a check needs is a count
+    /// or a length from the table. `tests::decode` holds every public
+    /// accessor to this: loading its documented section alone is enough.
     pub(crate) fn needs(self) -> &'static [Section] {
         match self {
             Section::Names => &[Section::NameHeap],
             Section::DirNames => &[Section::Names],
+            Section::Inodes => &[Section::States],
             Section::Roots => &[Section::DirNames, Section::Strings],
             Section::Links | Section::WorkTrees => &[Section::Strings],
             Section::NameHeap
             | Section::Traversed
             | Section::Strings
-            | Section::Inodes
             | Section::States
             | Section::Docs => &[],
         }

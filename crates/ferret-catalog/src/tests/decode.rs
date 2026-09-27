@@ -364,3 +364,126 @@ fn header_errors_say_what_is_wrong() {
         Some(DecodeError::Version(99))
     );
 }
+
+/// Every public accessor, keyed by the one section its doc says it needs,
+/// exercised over every id the sample has. `None` is an accessor that needs
+/// no section (the table, or a read that loads for itself).
+type Accessor = (Option<Section>, &'static str, fn(&Catalog) -> usize);
+
+const ACCESSORS: &[Accessor] = {
+    use Section::*;
+    fn inodes(c: &Catalog) -> impl Iterator<Item = InoId> {
+        (0..c.inode_count()).map(InoId)
+    }
+    fn dirs(c: &Catalog) -> impl Iterator<Item = InoId> {
+        (0..c.dir_count()).map(InoId)
+    }
+    fn ids(c: &Catalog) -> impl Iterator<Item = NameId> {
+        (0..c.name_count()).map(NameId)
+    }
+    &[
+        (None, "counts", |c| {
+            (c.dir_count() + c.inode_count() + c.name_count() + c.doc_count()) as usize
+                + c.next_doc().0 as usize
+                + c.sniffer_version() as usize
+        }),
+        (None, "read_inode", |c| {
+            inodes(c)
+                .map(|i| c.read_inode(i).unwrap().stat.size as usize)
+                .sum()
+        }),
+        (Some(NameHeap), "name_heap", |c| c.name_heap().len()),
+        (Some(Names), "names", |c| {
+            c.names().map(|(_, b)| b.len()).sum()
+        }),
+        (Some(Names), "name", |c| {
+            ids(c).map(|i| c.name(i).bytes.len()).sum()
+        }),
+        (Some(Names), "name_start", |c| {
+            ids(c).map(|i| c.name_start(i)).sum()
+        }),
+        (Some(Names), "child", |c| {
+            ids(c).map(|i| c.child(i).0 as usize).sum()
+        }),
+        (Some(Names), "name_at", |c| {
+            (0..=c.name_heap().len())
+                .filter_map(|o| c.name_at(o))
+                .count()
+        }),
+        (Some(Names), "children", |c| {
+            dirs(c).map(|d| c.children(d).count()).sum()
+        }),
+        (Some(Names), "lookup", |c| {
+            ids(c)
+                .filter(|&i| c.lookup(c.name(i).parent, c.name(i).bytes).is_some())
+                .count()
+        }),
+        (Some(DirNames), "dir_name", |c| {
+            dirs(c).filter_map(|d| c.dir_name(d)).count()
+        }),
+        (Some(Roots), "roots", |c| {
+            c.roots().map(|(_, p)| p.len()).sum()
+        }),
+        (Some(Roots), "dir_path", |c| {
+            dirs(c)
+                .map(|d| {
+                    let mut out = Vec::new();
+                    c.dir_path(d, &mut out);
+                    out.len()
+                })
+                .sum()
+        }),
+        (Some(Roots), "path", |c| {
+            ids(c)
+                .map(|i| {
+                    let mut out = Vec::new();
+                    c.path(i, &mut out);
+                    out.len()
+                })
+                .sum()
+        }),
+        (Some(Traversed), "is_traversed", |c| {
+            dirs(c).filter(|&d| c.is_traversed(d)).count()
+        }),
+        (Some(Inodes), "inode", |c| {
+            inodes(c).map(|i| c.inode(i).state as usize).sum()
+        }),
+        (Some(Links), "link_target", |c| {
+            inodes(c).filter_map(|i| c.link_target(i)).count()
+        }),
+        (Some(Links), "kind", |c| {
+            inodes(c).map(|i| c.kind(i) as usize).sum()
+        }),
+        (Some(WorkTrees), "work_trees", |c| {
+            c.work_trees().map(|w| w.common_dir.len()).sum()
+        }),
+        (Some(WorkTrees), "work_tree", |c| {
+            dirs(c).filter_map(|d| c.work_tree(d)).count()
+        }),
+        (Some(Docs), "docs", |c| c.docs().count()),
+        (Some(Docs), "doc_hash", |c| {
+            (0..c.next_doc().0)
+                .filter_map(|d| c.doc_hash(crate::DocId(d)))
+                .count()
+        }),
+    ]
+};
+
+#[test]
+fn every_accessor_needs_only_the_section_it_documents() {
+    // A section's load must bring everything its accessors read (as Links
+    // brings Strings); otherwise a caller that loads exactly what the doc
+    // says panics on a section it never heard of. One fresh open per
+    // accessor, so nothing loaded for another can hide a gap.
+    let scratch = Scratch::new("decode-accessors");
+    write_catalog(&scratch.path, &sample("decode-accessors-src"));
+    for &(section, name, call) in ACCESSORS {
+        let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+        if let Some(section) = section {
+            catalog.load(&[section]).unwrap();
+        }
+        let touched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(&catalog)))
+            .unwrap_or_else(|_| panic!("{name} read a section loading {section:?} did not load"));
+        assert!(touched > 0, "{name}: the sample must exercise it");
+    }
+}

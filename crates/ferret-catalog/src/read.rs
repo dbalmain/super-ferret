@@ -270,19 +270,19 @@ impl Catalog {
     // ── names ──
 
     /// Every name, NUL-terminated, in `NameId` order: the bytes a filename
-    /// scan reads (D14, D28). A NUL never occurs inside a name, so a literal
-    /// match cannot straddle two; [`Catalog::name_at`] maps a match's offset
-    /// back to its name.
+    /// scan reads (D14, D28). Needs [`Section::NameHeap`]. A NUL never occurs
+    /// inside a name, so a literal match cannot straddle two;
+    /// [`Catalog::name_at`] maps a match's offset back to its name.
     pub fn name_heap(&self) -> &[u8] {
         self.section(Section::NameHeap)
     }
 
-    /// Every name with its id, in heap order.
+    /// Every name with its id, in heap order. Needs [`Section::Names`].
     pub fn names(&self) -> impl Iterator<Item = (NameId, &[u8])> + '_ {
         (0..self.name_count()).map(|i| (NameId(i), self.name(NameId(i)).bytes))
     }
 
-    /// One name edge.
+    /// One name edge. Needs [`Section::Names`].
     pub fn name(&self, id: NameId) -> Name<'_> {
         let row = &self.section(Section::Names)[id.0 as usize * NAME_ROW..][..NAME_ROW];
         let heap = self.name_heap();
@@ -312,7 +312,7 @@ impl Catalog {
     }
 
     /// The name whose bytes (or terminator) hold heap offset `offset`, or
-    /// `None` past the end of the heap.
+    /// `None` past the end of the heap. Needs [`Section::Names`].
     pub fn name_at(&self, offset: usize) -> Option<NameId> {
         if offset >= self.name_heap().len() {
             return None;
@@ -324,7 +324,8 @@ impl Catalog {
         Some(NameId(after as u32 - 1))
     }
 
-    /// The names in directory `dir`, in name order.
+    /// The names in directory `dir`, in name order. Needs
+    /// [`Section::Names`].
     pub fn children(&self, dir: InoId) -> impl Iterator<Item = NameId> + use<> {
         let (start, end) = self.child_range(dir);
         (start as u32..end as u32).map(NameId)
@@ -340,7 +341,7 @@ impl Catalog {
         )
     }
 
-    /// The entry called `name` in directory `dir`.
+    /// The entry called `name` in directory `dir`. Needs [`Section::Names`].
     pub fn lookup(&self, dir: InoId, name: &[u8]) -> Option<NameId> {
         let (start, end) = self.child_range(dir);
         let bytes = |i: usize| self.name(NameId((start + i) as u32)).bytes;
@@ -348,7 +349,8 @@ impl Catalog {
         (at < end - start && bytes(at) == name).then_some(NameId((start + at) as u32))
     }
 
-    /// A directory's own name edge; `None` for a root (D30).
+    /// A directory's own name edge; `None` for a root (D30). Needs
+    /// [`Section::DirNames`].
     pub fn dir_name(&self, dir: InoId) -> Option<NameId> {
         let name = u32_at(self.section(Section::DirNames), dir.0 as usize * 4);
         (name != NONE).then_some(NameId(name))
@@ -356,7 +358,7 @@ impl Catalog {
 
     /// Whether a directory is a structural row: walked through for
     /// re-included entries, but not catalogued itself (D29). Its name is in
-    /// the heap; a query should not report it.
+    /// the heap; a query should not report it. Needs [`Section::Traversed`].
     pub fn is_traversed(&self, dir: InoId) -> bool {
         let bits = self.section(Section::Traversed);
         bits[dir.0 as usize / 8] >> (dir.0 % 8) & 1 == 1
@@ -365,14 +367,15 @@ impl Catalog {
     // ── paths ──
 
     /// Appends the path of the entry `name` names: its root's path, then each
-    /// name below it, joined by `/`.
+    /// name below it, joined by `/`. Needs [`Section::Roots`], which loads
+    /// every section a path reads.
     pub fn path(&self, name: NameId, out: &mut Vec<u8>) {
         let name = self.name(name);
         self.dir_path(name.parent, out);
         push_component(out, name.bytes);
     }
 
-    /// Appends a directory's path.
+    /// Appends a directory's path. Needs [`Section::Roots`].
     pub fn dir_path(&self, dir: InoId, out: &mut Vec<u8>) {
         let mut up = Vec::new();
         let mut at = dir;
@@ -387,7 +390,8 @@ impl Catalog {
         }
     }
 
-    /// The configured roots, as `(top directory, path)`.
+    /// The configured roots, as `(top directory, path)`. Needs
+    /// [`Section::Roots`].
     pub fn roots(&self) -> impl Iterator<Item = (InoId, &[u8])> + '_ {
         self.section(Section::Roots)
             .chunks_exact(PAIR_ROW)
@@ -407,7 +411,8 @@ impl Catalog {
 
     // ── inodes ──
 
-    /// One inode row. Needs [`Section::Inodes`] and [`Section::States`].
+    /// One inode row. Needs [`Section::Inodes`], which loads
+    /// [`Section::States`].
     pub fn inode(&self, id: InoId) -> Inode {
         let row = &self.section(Section::Inodes)[id.0 as usize * INODE_ROW..][..INODE_ROW];
         self.decode_inode(id, row)
@@ -484,13 +489,15 @@ impl Catalog {
     // ── work trees and documents ──
 
     /// Every work tree whose top is at or below a root, by top directory.
+    /// Needs [`Section::WorkTrees`].
     pub fn work_trees(&self) -> impl Iterator<Item = WorkTree<'_>> + '_ {
         self.section(Section::WorkTrees)
             .chunks_exact(WORK_TREE_ROW)
             .map(|row| self.work_tree_row(row))
     }
 
-    /// The work tree whose top is `dir`, if it is one.
+    /// The work tree whose top is `dir`, if it is one. Needs
+    /// [`Section::WorkTrees`].
     pub fn work_tree(&self, dir: InoId) -> Option<WorkTree<'_>> {
         let rows = self.section(Section::WorkTrees);
         let n = rows.len() / WORK_TREE_ROW;
@@ -510,7 +517,7 @@ impl Catalog {
         }
     }
 
-    /// Every live document with its hash, by id.
+    /// Every live document with its hash, by id. Needs [`Section::Docs`].
     pub fn docs(&self) -> impl Iterator<Item = (DocId, Hash)> + '_ {
         self.section(Section::Docs)
             .chunks_exact(DOC_ROW)
@@ -518,6 +525,7 @@ impl Catalog {
     }
 
     /// A live document's hash; `None` if the id is dead or never assigned.
+    /// Needs [`Section::Docs`].
     pub fn doc_hash(&self, doc: DocId) -> Option<Hash> {
         let rows = self.section(Section::Docs);
         let n = rows.len() / DOC_ROW;
