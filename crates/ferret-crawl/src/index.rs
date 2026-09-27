@@ -7,6 +7,7 @@
 //! plan           which roots to walk, keep and drop; widen for overlaps
 //! walk + hash    per refreshed root, walk_parallel with a hashing visitor
 //! resolve        aliases that met an inode in flight take its observation
+//!                (drained during the walk too, so only in-flight ones wait)
 //! add, keep      hand the batches over, copy the kept roots forward
 //! commit         unless a coverage fault was seen
 //! ```
@@ -167,7 +168,7 @@ pub struct Counts {
     /// Of those, that took another name's observation from the cache.
     pub aliased: u64,
     /// Of those aliases, that met their inode in flight on another worker
-    /// and were recorded after the walk.
+    /// and were recorded once its observation was finished.
     pub deferred: u64,
     /// Of those, published with a content fault.
     pub content_faults: u64,
@@ -576,36 +577,44 @@ fn normalise(root: &Path) -> Result<PathBuf, IndexError> {
 }
 
 /// A name of a multiply-linked inode that was in flight on another worker
-/// when this one reached it; recorded once the walk is over.
-struct Deferred {
-    parent: DirToken,
-    name: Vec<u8>,
-    stat: Stat,
-    path: PathBuf,
+/// when this one reached it; recorded once that inode's observation is
+/// finished ([`Output::defer`]).
+pub(crate) struct Deferred {
+    pub(crate) parent: DirToken,
+    pub(crate) name: Vec<u8>,
+    pub(crate) stat: Stat,
+    pub(crate) path: PathBuf,
 }
 
 /// The per-worker visitor: fills one batch and reads the files it must.
-struct Hasher<'a> {
+pub(crate) struct Hasher<'a> {
     txn: &'a Transaction,
     cache: &'a Cache,
     root: &'a Path,
-    out: Output,
+    pub(crate) out: Output,
     reader: Reader,
 }
 
 /// What a worker leaves behind.
-struct Output {
-    batch: ferret_catalog::Batch,
-    counts: Counts,
+pub(crate) struct Output {
+    pub(crate) batch: ferret_catalog::Batch,
+    pub(crate) counts: Counts,
     faults: Vec<CoverageFault>,
-    content_faults: Vec<(PathBuf, ContentFault)>,
+    pub(crate) content_faults: Vec<(PathBuf, ContentFault)>,
     pattern_errors: Vec<String>,
-    deferred: Vec<Deferred>,
+    pub(crate) deferred: Vec<Deferred>,
+    /// The backlog length at which [`Output::defer`] next drains it.
+    drain_at: usize,
     read_time: Duration,
 }
 
+/// The smallest backlog [`Output::defer`] drains. Draining is a cache lookup
+/// per entry, and the threshold doubles past what stays, so the cost is
+/// amortised constant per alias.
+pub(crate) const DRAIN_MIN: usize = 64;
+
 impl<'a> Hasher<'a> {
-    fn new(txn: &'a Transaction, cache: &'a Cache, root: &'a Path) -> Self {
+    pub(crate) fn new(txn: &'a Transaction, cache: &'a Cache, root: &'a Path) -> Self {
         Self {
             txn,
             cache,
@@ -617,6 +626,7 @@ impl<'a> Hasher<'a> {
                 content_faults: Vec::new(),
                 pattern_errors: Vec::new(),
                 deferred: Vec::new(),
+                drain_at: DRAIN_MIN,
                 read_time: Duration::ZERO,
             },
             reader: Reader::new(),
@@ -659,13 +669,13 @@ impl<'a> Hasher<'a> {
             match self.cache.claim(key) {
                 Lookup::Claimed => {}
                 Lookup::InFlight => {
-                    self.out.counts.deferred += 1;
-                    self.out.deferred.push(Deferred {
+                    let alias = Deferred {
                         parent: decided.parent,
                         name: decided.name.as_bytes().to_vec(),
                         stat,
                         path: self.root.join(decided.path),
-                    });
+                    };
+                    self.out.defer(alias, self.cache);
                     #[cfg(test)]
                     hook(self.root, Probe::Deferred);
                     return;
@@ -736,18 +746,43 @@ impl Output {
         })
     }
 
-    /// Records the deferred aliases from their inodes' finished observations.
-    fn resolve(&mut self, cache: &Cache) {
-        for alias in std::mem::take(&mut self.deferred) {
-            self.counts.aliased += 1;
-            let key = (alias.stat.dev, alias.stat.ino);
-            let (stat, content) = match cache.finished(key) {
-                Some(stored) => observe::consume(stored, &alias.stat),
-                None => (alias.stat, Err(ContentFault::Alias)),
-            };
-            let content = self.outcome(|| alias.path, content);
-            self.batch.file(alias.parent, &alias.name, stat, content);
+    /// Sets `alias` aside until its inode's observation is finished. When
+    /// the backlog reaches `drain_at`, every alias whose inode has finished
+    /// since is recorded, so the backlog holds aliases of inodes still in
+    /// flight, not every alias deferred this run.
+    pub(crate) fn defer(&mut self, alias: Deferred, cache: &Cache) {
+        self.counts.deferred += 1;
+        self.deferred.push(alias);
+        if self.deferred.len() < self.drain_at {
+            return;
         }
+        for alias in std::mem::take(&mut self.deferred) {
+            match cache.finished((alias.stat.dev, alias.stat.ino)) {
+                Some(stored) => self.record_alias(alias, Some(stored)),
+                None => self.deferred.push(alias),
+            }
+        }
+        self.drain_at = (2 * self.deferred.len()).max(DRAIN_MIN);
+    }
+
+    /// Records the deferred aliases left once the walk is over.
+    pub(crate) fn resolve(&mut self, cache: &Cache) {
+        for alias in std::mem::take(&mut self.deferred) {
+            let stored = cache.finished((alias.stat.dev, alias.stat.ino));
+            self.record_alias(alias, stored);
+        }
+    }
+
+    /// Records one deferred alias from its inode's observation; `None`, a
+    /// claim never completed, is a fault.
+    fn record_alias(&mut self, alias: Deferred, stored: Option<Observation>) {
+        self.counts.aliased += 1;
+        let (stat, content) = match stored {
+            Some(stored) => observe::consume(stored, &alias.stat),
+            None => (alias.stat, Err(ContentFault::Alias)),
+        };
+        let content = self.outcome(|| alias.path, content);
+        self.batch.file(alias.parent, &alias.name, stat, content);
     }
 }
 

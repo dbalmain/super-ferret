@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind};
 use ferret_policy::Config;
 
-use crate::index::{PROBES, Probe, content_faults};
+use crate::index::{DRAIN_MIN, Deferred, Hasher, PROBES, Probe, content_faults};
 use crate::{
     ContentFault, IndexError, IndexOptions, IoOp, Refresh, Report, RootChange, index, index_change,
 };
@@ -920,6 +920,60 @@ fn an_alias_that_meets_its_inode_in_flight_is_recorded_after_the_walk() {
         assert_eq!(rows[y].state, ContentState::Hashed);
         assert_eq!(rows[y].doc, rows[x].doc);
     }
+}
+
+/// The deferred backlog holds only aliases of inodes still in flight. It
+/// once kept every deferred alias, with its full path, until all roots were
+/// walked, so slow reads of many linked inodes grew it without bound.
+/// Driven on one worker's output in a schedule the walk cannot force: 50
+/// inodes in turn, each met by 4 aliases while in flight, then finished.
+#[test]
+fn the_deferred_backlog_is_drained_as_inodes_finish() {
+    use crate::observe::{Cache, Lookup, Observation};
+    use std::ffi::OsStr;
+
+    let tmp = Tmp::new("drain");
+    let txn =
+        ferret_catalog::Transaction::begin(&tmp.cat(), ferret_policy::SNIFFER_VERSION).unwrap();
+    let cache = Cache::new();
+    let root = tmp.tree();
+    let mut hasher = Hasher::new(&txn, &cache, &root);
+    let parent = hasher
+        .out
+        .batch
+        .root(b"/r", ferret_catalog::Stat::default());
+    let mut peak = 0;
+    for ino in 0..50 {
+        let stat = ferret_catalog::Stat {
+            dev: 1,
+            ino,
+            size: 5,
+            ..Default::default()
+        };
+        assert!(matches!(cache.claim((1, ino)), Lookup::Claimed));
+        for alias in 0..4 {
+            let name = format!("{ino}-{alias}").into_bytes();
+            let path = root.join(OsStr::from_bytes(&name));
+            let deferred = Deferred {
+                parent,
+                name,
+                stat,
+                path,
+            };
+            hasher.out.defer(deferred, &cache);
+            peak = peak.max(hasher.out.deferred.len());
+        }
+        let content = Some(ferret_catalog::Content::Binary);
+        cache.complete((1, ino), Observation { stat, content });
+    }
+    assert!(peak <= DRAIN_MIN, "backlog peaked at {peak}");
+    hasher.out.resolve(&cache);
+    assert!(hasher.out.deferred.is_empty());
+    assert_eq!(
+        (hasher.out.counts.deferred, hasher.out.counts.aliased),
+        (200, 200)
+    );
+    assert!(hasher.out.content_faults.is_empty());
 }
 
 /// Times the post-commit content-fault pass on a large catalog, such as the
