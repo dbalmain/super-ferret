@@ -286,7 +286,15 @@ publishes the file with content state failed and no document, and it is re-read
 next run. The build is the authority on which inodes fault, since only it sees
 every name's observation; the report lists every name, under a refreshed root,
 of an inode it published as a fault. Those paths are resolved from the new
-catalog, not held through the walk.
+catalog, not held through the walk. That pass is timed as the report's
+`fault_time`, outside `commit_time`: 52 ms at 10M with no faults, 289 ms with
+8,142.
+
+`ferret_crawl::index_change` is the same run given a change to the root set
+(roots to add, roots to remove) rather than the whole set. It applies the change
+to the previous generation's roots under the writer lock, so two concurrent
+`ferret index` commands cannot each drop the root the other added. The CLI uses
+it for every command that touches roots.
 
 ## Content: documents, tokens, structures (D6, D8, D9)
 

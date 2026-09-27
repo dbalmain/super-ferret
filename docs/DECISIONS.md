@@ -59,6 +59,8 @@ Predecessors, carried forward where still open:
 | D41 | The name scanner: `memchr::memmem`, or our own           | answered       | B: own case-folding filter, AVX2 + SWAR, vs memmem control                                                     |
 | D42 | A re-run's memory: the previous generation held          | open           |                                                                                                                |
 | D43 | A 10M name query costs its section loads, not its scan   | open           |                                                                                                                |
+| D44 | Single inode reads against an evicted catalog            | open           |                                                                                                                |
+| D45 | Query text in the local log                              | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1973,3 +1975,59 @@ about 74 ms of validation at 10M, which is still above the target, so C is
 what gets a warm 10M name query near 50 ms. The fact that would change it:
 a measured `mmap` open whose page-table and fault cost is not well below the
 122 ms it replaces, in which case A plus C is the safe answer.
+
+## D44 — Single inode reads against an evicted catalog
+
+**Question:** Should a name query's choice between single inode reads and
+loading the Inodes section depend on whether the catalog is in the page cache?
+
+5a gave `run` a limit. A query reads result rows one at a time until it has read
+`max(inode_count / 64, 256)` rows (156,273 at 10M), then loads the section. The
+limit was tuned warm, and 5a's note asked 5b to revisit it for a cold file.
+Slice 5b measured it through the `ferret` binary on the synthetic 10M catalog,
+against the D38 B reader:
+
+| query        | rows    | single reads              | evicted  | fresh process, warm |
+| ------------ | ------- | ------------------------- | -------- | ------------------- |
+| `flamegraph` | 115     | 115                       | 390 ms   | 233 ms              |
+| `ext:jpg`    | 358,570 | 156,273, then the section | 970 ms   | 576 ms              |
+| `test`       | 157,527 | 156,273, then the section | 2,307 ms | 634 ms              |
+
+`test` pays for both paths: 156k scattered reads on a cold file, then the 640 MB
+section anyway. `ext:jpg` pays for the same count, but its rows are clustered,
+so its reads probably land on pages already read (inferred, not measured).
+
+| Option                                                                                                                   | Costs                                                                                                                                     | Buys                                                       |
+| ------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| A. Keep the limit                                                                                                        | A cold broad query at 10M costs up to 2.3 s. An evicted query that only loads the section (`size:>100M`) takes 0.6 s                      | Nothing to write                                           |
+| B. A lower fixed limit, such as `inode_count / 1024` (about 10k at 10M)                                                  | Warm, broad-but-rare queries pay the section load sooner: 5a measured `case:test` at 306 ms by single reads against 525 ms by the section | Bounds the cold worst case near one section load. Std only |
+| C. Ask the kernel: `cachestat(2)` (Linux 6.5+) on the Inodes range, and pick the path by residency                       | A syscall with no std wrapper: `rustix` in `ferret-catalog`, a new edge in the crate graph. Falls back to A or B on older kernels         | The right path both warm and cold, with no tuning          |
+| D. Let D43 decide: with an `mmap` reader, a single read is a page touch, and a load costs only its faults and validation | Waits on D43                                                                                                                              | The limit may vanish rather than being tuned               |
+
+**Recommendation:** D, then B if D43 keeps section reads. The limit exists
+because a section load costs 640 MB of reads and copies, which is exactly what
+D43 B would remove. The fact that would change it: D43 settling on A. In that
+case C is worth its dependency, since a daemonless CLI is often cold.
+
+## D45 — Query text in the local log
+
+**Question:** Should the local query log keep query text by default, with no way
+to turn it off?
+
+Slice 5b's log (`$XDG_STATE_HOME/ferret/log.jsonl`, mode 0600) keeps each
+query's atoms, plan, counts and times. It keeps no result paths and no root
+paths. Those would be the most revealing data, and the planned experiments do
+not need them. Query text stays, because the experiments are about which atom
+classes people use and what they cost, and an atom's class is only knowable from
+its text. The text can still reveal a name the user searched for.
+
+| Option                                                                                   | Costs                                                                               | Buys                                                            |
+| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| A. As built: keep the text; opt-in upload later redacts or asks                          | Searched-for names sit in a 0600 file in the user's own state directory             | The log is useful to Dave now, as the S1 "something to measure" |
+| B. A. plus a config switch (`log = false` / `log = "shape"`) when the config file exists | One setting; the config file does not exist yet                                     | A user who minds can turn it off, or keep only shapes           |
+| C. Log only the query's shape: atom kinds, literal lengths, the plan                     | Loses the text, so a regression on one real query cannot be reproduced from the log | Nothing identifying is ever written                             |
+
+**Recommendation:** A now, B with the config file. Redaction belongs to the
+upload step (S6), which has to decide what leaves the machine regardless. The
+fact that would change it: a plan to sync or upload the state directory before
+S6. In that case C should be the default.
