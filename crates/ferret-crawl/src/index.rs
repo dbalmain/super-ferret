@@ -538,7 +538,7 @@ impl<'a> Hasher<'a> {
                         path: self.root.join(decided.path),
                     });
                     #[cfg(test)]
-                    hook(self.root, Probe::Deferred(decided.path));
+                    hook(self.root, Probe::Deferred);
                     return;
                 }
                 Lookup::Done(stored) => {
@@ -549,7 +549,7 @@ impl<'a> Hasher<'a> {
                 }
             }
             #[cfg(test)]
-            hook(self.root, Probe::Claimed(decided.path));
+            hook(self.root, Probe::Claimed);
         }
         let content = self.reader.read(file, &stat);
         if links > 1 {
@@ -713,9 +713,9 @@ pub(crate) enum Probe<'a> {
     /// A directory was listed; its children have not been statted.
     Entered,
     /// Claimed an inode in the cache, before reading it.
-    Claimed(&'a Path),
+    Claimed,
     /// Met an inode in flight and deferred this name.
-    Deferred(&'a Path),
+    Deferred,
     /// Read a file (after the cache was completed).
     Read(&'a Path),
 }

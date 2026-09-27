@@ -106,6 +106,16 @@ struct Row {
     target: Option<Vec<u8>>,
 }
 
+impl Row {
+    /// Without the per-commit `InoId`.
+    fn stable(&self) -> Row {
+        Row {
+            ino: InoId(0),
+            ..self.clone()
+        }
+    }
+}
+
 fn listing(catalog: &Catalog) -> BTreeMap<PathBuf, Row> {
     let mut rows = BTreeMap::new();
     let mut path = Vec::new();
@@ -227,24 +237,24 @@ fn a_rerun_reads_nothing_unchanged() {
     for i in 0..40 {
         tmp.write(&format!("d{}/f{i}.txt", i % 5), format!("file {i}\n").as_bytes());
     }
-    let locked = tmp.write("d0/locked.txt", b"secret\n");
+    tmp.write("d0/extra.txt", b"extra\n");
     tmp.write("d1/bin", b"\0\0\0");
     let roots = [tmp.tree()];
     let first = run(&tmp, &roots, Refresh::All, 4);
-    eprintln!("{:?}", first.counts);
     assert_eq!(first.counts.files_read, 42);
     let (_, before) = published(&tmp);
 
-    // A file that can no longer be opened proves it was not opened: a read
-    // attempt would publish it as a content fault.
-    chmod(&locked, 0o000);
+    // Every file that is opened is either read or a content fault, so all
+    // carried with no read and no fault means none was opened. (Making a
+    // file unreadable cannot prove it: chmod moves ctime, which rightly
+    // defeats carry.)
     let second = run(&tmp, &roots, Refresh::All, 4);
-    eprintln!("{:?} {:?}", first.counts, second.counts);
+    assert_eq!(second.counts.indexed, 42);
+    assert_eq!(second.counts.carried, 42);
     assert_eq!(second.counts.files_read, 0);
     assert_eq!(second.counts.bytes_read, 0);
-    assert_eq!(second.counts.carried, 42);
+    assert_eq!(second.counts.content_faults, 0);
     let (_, after) = published(&tmp);
-    assert_eq!(after[&locked].state, ContentState::Hashed);
     assert_eq!(before, after);
 }
 
@@ -452,7 +462,12 @@ fn refreshing_one_root_leaves_another_untouched() {
     assert_eq!(report.refreshed, vec![a.clone()]);
     assert_eq!(report.kept, vec![b.clone()]);
     let (_, after) = published(&tmp);
-    assert_eq!(after[&b_file], before[&b_file], "kept as it was, edit unseen");
+    // InoIds renumber every commit (D27); everything else is as it was.
+    assert_eq!(
+        after[&b_file].stable(),
+        before[&b_file].stable(),
+        "kept as it was, edit unseen"
+    );
     assert!(after.contains_key(&tmp.at("a/three.txt")));
 }
 
@@ -523,7 +538,7 @@ fn refreshing_the_outer_root_stops_at_the_inner_one_and_keeps_it() {
     assert_eq!(report.counts.boundaries, 1);
     assert_eq!(report.counts.files_read, 0, "top.txt carried, in/ not walked");
     let (_, after) = published(&tmp);
-    assert_eq!(after[&inner_file], before[&inner_file]);
+    assert_eq!(after[&inner_file].stable(), before[&inner_file].stable());
     assert_eq!(
         under(&after, &outer),
         ["in/f.txt", "top.txt"].map(PathBuf::from).to_vec()
@@ -658,8 +673,8 @@ fn an_alias_that_meets_its_inode_in_flight_is_recorded_after_the_walk() {
     let _hook = Hook::set(&tree, {
         let deferred = Arc::clone(&deferred);
         move |probe| match probe {
-            Probe::Deferred(_) => *deferred.lock().unwrap() += 1,
-            Probe::Claimed(_) => {
+            Probe::Deferred => *deferred.lock().unwrap() += 1,
+            Probe::Claimed => {
                 let until = Instant::now() + Duration::from_secs(1);
                 while *deferred.lock().unwrap() == 0 && Instant::now() < until {
                     std::thread::sleep(Duration::from_millis(2));
