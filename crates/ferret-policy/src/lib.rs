@@ -63,6 +63,11 @@ __pycache__/
 /// How many leading bytes of a file the crawler reads for [`sniff`].
 pub const SNIFF_LEN: usize = 8192;
 
+/// The version of [`sniff`]'s rule. Bump it whenever `sniff` could classify
+/// some file differently: the catalog then refreshes every root instead of
+/// carrying old classifications forward (D37).
+pub const SNIFFER_VERSION: u32 = 1;
+
 /// Default [`Config::size_cap`]: 8 MiB. A judgement, not a measurement.
 pub const DEFAULT_SIZE_CAP: u64 = 8 << 20;
 

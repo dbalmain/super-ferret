@@ -4,11 +4,22 @@
 //! [`ferret_policy`] decides, with the `lstat` fields the catalog will store.
 //! The root is opened by the path the user named; every operation below it is
 //! relative to a directory handle, so a name swapped for a symlink cannot
-//! redirect the walk (D21). Change detection against the catalog and content
-//! hashing are later slices (DESIGN.md § Policy and crawl); this crate still
-//! knows nothing about queries or index formats.
+//! redirect the walk (D21).
+//!
+//! [`index`] turns walks into a published catalog generation: it takes the
+//! writer lock, walks the roots that need it with a visitor that carries,
+//! sniffs and hashes content on the worker (D26, D31, D33), and commits
+//! unless the walk may have missed entries. This crate knows nothing about
+//! queries or index formats.
 
+mod index;
+mod observe;
 mod walk;
+
+pub use index::{
+    CoverageFault, Counts, IndexError, IndexOptions, Published, Refresh, Report, index,
+};
+pub use observe::ContentFault;
 
 pub use walk::{
     Boundary, Decided, Event, EventVisitor, FaultContext, IoOp, Stat, WalkOptions, WorkTree,
