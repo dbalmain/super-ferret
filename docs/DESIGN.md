@@ -41,7 +41,7 @@ ferret-daemon  → later
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
 | `ferret-policy`  | `DirRules::decide(path, entry) -> Decision`, `sniff`; `.ferretignore` / `.gitignore` / global (D13); the defaults setup writes | the catalog, the index         |
 | `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing                                                          | query, index formats           |
-| `ferret-catalog` | names, inodes, documents, the snapshot + log store, name scan (D14)                                                            | tokens, postings               |
+| `ferret-catalog` | names, inodes, documents, the snapshot, name scan (D14)                                                                        | tokens, postings               |
 | `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                                         | files, ids                     |
 | `ferret-index`   | segments over doc ids; each structure implements `CandidateSource`                                                             | files, paths, inodes           |
 | `ferret-verify`  | re-reading a file and matching a query atom against its bytes                                                                  | how candidates were found      |
@@ -89,23 +89,28 @@ cursor, along with the cost units.
 
 ## The catalog (D4, D5)
 
-Six tables. `names`, `inodes` and `docs` have dense `u32` ids assigned by the
-catalog; `roots`, `links` and `worktrees` hang off an existing `InoId`. Raw
-inode numbers are data, never keys.
+Six tables. `names` and `inodes` have dense `u32` ids renumbered by each
+snapshot (D27); `docs` holds live documents only, keyed by a `DocId` that is
+never reused (D36); `roots`, `links` and `worktrees` hang off an existing
+`InoId`. Raw inode numbers are data, never keys.
 
-| Table       | Id       | Row                                                                                                                             |
-| ----------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`                                                          |
-| `inodes`    | `InoId`  | `(dev, ino)`, kind, size, mtime, ctime, mode, uid, gid, `DocId` or none                                                         |
-| `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept), live flag                                                                                 |
-| `roots`     | —        | configured root paths and the `InoId` of each                                                                                   |
-| `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the heap)                                                         |
-| `worktrees` | —        | a work tree's top directory `InoId`, kind (main / linked / submodule), repository id (the common directory's path, in the heap) |
+| Table       | Id       | Row                                                                                                                                                 |
+| ----------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`                                                                              |
+| `inodes`    | `InoId`  | `(dev, ino)`, size, mtime, ctime, mode, uid, gid, `DocId` or none; a 2-bit content state beside it (D37)                                            |
+| `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept); rows sorted by id, with holes where content died                                                              |
+| `roots`     | —        | configured root paths and the `InoId` of each; nested roots are separate trees                                                                      |
+| `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the strings heap)                                                                     |
+| `worktrees` | —        | a work tree's top directory `InoId`, kind (main / linked / submodule), repository id (the common directory's `(dev, ino)`) and its path for display |
 
-Derived at load: `hash → DocId`, `DocId → [InoId]`, `InoId → [NameId]`
-(directories have exactly one name), and each directory's work tree from the
-nearest `worktrees` row above it. A path is the walk from a name through its
-parent's name to a root.
+Directories are numbered first, breadth-first from the roots in path order, so
+their `InoId`s are `0..dirs` and a parent's id is always below its child's; the
+snapshot persists each directory's own `NameId` (none for a root) and a bitset
+of traversed directories, which exist only as parents and are excluded from
+search (D29). A path is the walk from a name through its parent's name to a
+root. Nothing else is derived at open (D30): `hash → DocId` is built by the
+writer only, and `DocId → [InoId]`, the full `InoId → [NameId]` and a
+directory's work tree are built when a query first needs them.
 
 A symlink is catalogued as itself — an `inodes` row of kind symlink, named like
 any file — and never followed. Its target text is stored now so that D18's
@@ -133,14 +138,21 @@ Liveness is catalog state: a doc is live while some inode points at it. The
 index reads a live-docs bitset from the catalog rather than keeping its own
 tombstones, so there is one source of truth.
 
-**Storage.** A snapshot of fixed-width rows plus a contiguous name heap, and an
-append log of row operations since the snapshot. A reader maps the snapshot and
-replays the log; the writer compacts the log into a new snapshot and swaps it in
-with the write-fsync-rename-fsync-dir sequence. The name heap is contiguous on
-purpose: it is what filename search scans (D14). Rough size: ~48 B per inode,
-~12 B per name plus name bytes — about 70–80 MB at 1M files (estimate; the first
-slice measures it). The memory budget is a config value, defaulted from
-measurement (D5).
+**Storage.** One snapshot file per catalog directory, rebuilt by every run
+(D26): a versioned header (magic, format version, sniffer version, next
+`DocId`), a table of eleven sections by offset and length, and the sections
+themselves, fixed-width little-endian rows plus two heaps. The name heap holds
+NUL-terminated names in `(parent, name)` order (D28 A) and is contiguous on
+purpose: it is what filename search scans (D14). The strings heap holds root
+paths, link targets and work-tree paths. A reader reads the file into memory and
+validates it once: every offset, index and ordering it will follow is checked,
+so a corrupt or truncated file is an error, never a panic or a loop. The writer
+holds an advisory lock on `lock` for the whole run, writes `catalog.tmp`, fsyncs
+it, renames it over `catalog` and fsyncs the directory; a reader holding the old
+generation keeps it (D32). Measured on `$HOME` (D28, D30): 51.2 MB for 435k
+names, of which inode rows (64 B) are 27.8 MB, name rows (12 B) 5.2 MB, the name
+heap 10.6 MB and doc rows (20 B) 7.1 MB. The memory budget is a config value,
+defaulted from measurement (D5).
 
 **Change detection.** A re-crawl compares `(size, mtime, ctime)` with the
 catalog row; unchanged means no read and no hash. A reused `(dev, ino)` after a

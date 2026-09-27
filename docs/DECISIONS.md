@@ -53,6 +53,8 @@ Predecessors, carried forward where still open:
 | D35 | Work-tree context for a root inside a repository         | answered       | moot: with D22 A, no work-tree context above a root                                                            |
 | D36 | Dead documents before there is an index to merge         | answered       | B for S1: drop dead docs, keep the id counter; reactivation is S2's call                                       |
 | D37 | Remembering why a file has no document                   | answered       | B: 2-bit content state plus sniffer version                                                                    |
+| D38 | Reading the snapshot: whole file, or by section          | open           |                                                                                                                |
+| D39 | A checksum over the snapshot                             | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1451,6 +1453,18 @@ measure front-coding before the format freezes. A suffix array, FM-index or name
 trigrams over the heap is a later experiment: the heap is exactly the text such
 an index is built on, so A forecloses none of them.
 
+**Measured (2026-09-27).** `$HOME`'s 434,846 names from the walker dump,
+committed through the real writer (`ferret-catalog`'s `names` example). The raw
+heap is 10,591,121 B (24.36 B per name with its NUL). Front-coded per directory
+against the previous sibling (a LEB128 prefix length, the suffix, a NUL), it is
+7,592,302 B (17.46 B): 3.0 MB saved, 28% of the heap but 5.9% of the 51.2 MB
+snapshot, whose largest part is the 64 B inode rows (27.8 MB). Warm scans, one
+scalar first-byte `position` plus a compare of the rest, median of 30, counting
+matching names: `ferret` (115 names) 6.8 ms raw vs 15.2 ms front-coded, `.js`
+(62,297) 7.8 vs 15.5 ms, `q` (18,102) 4.8 vs 13.3 ms. Front-coding doubles to
+nearly triples the scan, because each name is rebuilt before it is searched, to
+save 6% of the file. A stands; the format is not switched.
+
 ## D29 — How a parallel walk tells the catalog each entry's parent
 
 **Question:** How does the catalog writer learn the parent directory's row for
@@ -1518,6 +1532,17 @@ directory `InoId → NameId`. Cold `ferret find` without a daemon is a first-cla
 S1 measurement, in both forms (empty page cache; warm cache, fresh process), and
 a factor in choosing the on-disk format. Prefer the simpler format when the
 numbers are close.
+
+**Measured (2026-09-27).** The same 51,159,311 B `$HOME` snapshot, opened by a
+fresh process that reads the whole file and validates it (the `names` example's
+`open-bench`). Warm, over 30 processes: read 17.8 ms, validate 0.9 ms, the whole
+process 22.2 ms, median. Cold is per-file eviction (`dd iflag=nocache count=0`,
+checked with `fincore`), not `drop_caches`, which needs root: read 23–33 ms and
+the process 29 ms over two runs of 20, on NVMe with a load average near 2.5 from
+other work. So opening is reading, and reading costs more than the name scan
+itself (5–8 ms). The name sections (names, heap, directory names, traversed,
+roots, strings) are the first 16.1 MB of the file; reading only them took 5.0 ms
+warm and 16.8 ms evicted. See D38.
 
 ## D31 — One inode, several names
 
@@ -1724,3 +1749,49 @@ a measured re-sniff of `$HOME`'s binaries cheap enough to ignore.
 
 **Answer (2026-09-27): B.** A 2-bit content state per inode plus the sniffer
 version; a version change refreshes every root.
+
+## D38 — Reading the snapshot: whole file, or by section
+
+**Question:** Should a reader load the whole snapshot at open, or only the
+sections a query needs?
+
+Measured on `$HOME` (D30): opening a 51.2 MB snapshot costs a fresh process
+about 18 ms warm and 23–33 ms evicted, nearly all of it the read, against a 5–8
+ms warm name scan. A name-only `find` needs only the first 16.1 MB. The file
+already puts those sections first and every section is located by the table, so
+this is a reader change, not a format change.
+
+| Option                                                                                                        | Costs                                                                                                                                                                                                                                                                      | Buys                                                                                                                             |
+| ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| A. Read the whole file, then validate (now)                                                                   | 18 ms warm per fresh process at `$HOME`'s size, growing with every inode and document row a name query never reads.                                                                                                                                                        | One read, one validation pass, every accessor infallible after open.                                                             |
+| B. Read the header and table, then each section on first use with a positional read into its own buffer (std) | Validation splits per section, and cross-section checks (a name's child is below the inode count) move to when both are loaded. Accessors of a later section take a load step. A generation replaced mid-open is still safe: the reader holds the open file, not the path. | 5.0 ms warm and 16.8 ms evicted for a name-only query (measured), and a content query pays for the inode and doc rows only then. |
+| C. `mmap` the file                                                                                            | `unsafe` or a dependency (D11), and a file truncated under the mapping is SIGBUS rather than an error; validation then touches every page anyway unless it too is split as in B.                                                                                           | No copy: warm cost falls to page-table setup plus the pages touched.                                                             |
+
+**Recommendation:** B, in slice 5 when the name query exists to measure it end
+to end. It is std-only, keeps reads-are-errors semantics, and captures most of
+C's gain for a name query. The fact that would change it: B measured at more
+than a few milliseconds above C for a warm name query, which reopens C under
+D11.
+
+## D39 — A checksum over the snapshot
+
+**Question:** Should the snapshot carry a checksum, so corruption in a value
+nothing indexes by (a time, a hash, a name's bytes) is detected?
+
+Validation now proves every offset, index and ordering safe to follow, so a
+corrupt file never panics or loops (tested with every truncation and every
+single-bit flip of a sample). A flip in a stored value still reads back as a
+different value: a wrong mtime means one needless re-hash; a wrong content hash
+means a file's content is misattributed until it changes.
+
+| Option                                               | Costs                                                                                                                  | Buys                                                             |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| A. No checksum; structural validation only (now)     | Silent value corruption, which on a checksummed filesystem or ECC memory is rare.                                      | Nothing added to open, which is already the dominant cost (D38). |
+| B. One checksum over the file, checked at open       | Hashing all 51 MB at open (unmeasured, several ms at scalar speed), and it forces B of D38 back to reading everything. | Any corruption is detected.                                      |
+| C. A checksum per section, checked when it is loaded | 8 B per section in the table; the cost is paid per section read, which fits D38 B.                                     | Detection without reading sections a query never uses.           |
+
+**Recommendation:** A for S1. The snapshot is rebuilt each run (D26), so value
+corruption lives one run, and the writer already decodes what it wrote before
+publishing it. Revisit with C when D38 B lands, since the table is the natural
+place for it. The fact that would change it: a corrupt snapshot seen in
+practice.
