@@ -285,23 +285,47 @@ fn removing_a_root_inside_a_kept_root_needs_the_outer_refreshed() {
 
 #[test]
 fn a_kept_inner_root_allows_the_outer_to_change() {
-    // The overlap rule is one-way: a new outer walk stops at a kept inner
-    // root's boundary, so nothing is duplicated or lost. Sibling paths that
-    // share a prefix (`/a` and `/ab`) are not nested.
+    // The overlap rule is one-way: a fresh outer walk stops at a kept inner
+    // root's boundary, so nothing is duplicated or lost.
     let scratch = Scratch::new("roots-keep-inner");
     commit(&scratch.path, |txn| {
         let mut w = txn.batch();
         let b = w.root(b"/a/b", dir_stat(2));
         w.file(b, b"f", file_stat(11), Content::Unindexed);
-        w.root(b"/a", dir_stat(1));
         txn.add(w);
     });
+
+    // Add outer /a around the kept /a/b: the walk stops at `b`.
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    txn.keep(b"/a/b").unwrap();
+    let mut w = txn.batch();
+    let a = w.root(b"/a", dir_stat(1));
+    w.file(a, b"top", file_stat(10), Content::Unindexed);
+    txn.add(w);
+    let added = txn.commit().unwrap();
+    assert_eq!(exact_paths(&added), ["/a/b/f", "/a/top"]);
+    assert_eq!(roots_of(&added), ["/a", "/a/b"]);
+
+    // Refresh /a with a new file, /a/b still kept.
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    txn.keep(b"/a/b").unwrap();
+    let mut w = txn.batch();
+    let a = w.root(b"/a", dir_stat(1));
+    w.file(a, b"top", file_stat(10), Content::Unindexed);
+    w.file(a, b"new", file_stat(12), Content::Unindexed);
+    txn.add(w);
+    let refreshed = txn.commit().unwrap();
+    assert_eq!(exact_paths(&refreshed), ["/a/b/f", "/a/new", "/a/top"]);
+    assert_eq!(roots_of(&refreshed), ["/a", "/a/b"]);
+
+    // Remove /a, keep /a/b; a sibling sharing a byte prefix (`/ab`) is not
+    // nested in either.
     let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
     txn.keep(b"/a/b").unwrap();
     let mut w = txn.batch();
     w.root(b"/ab", dir_stat(3));
     txn.add(w);
-    let catalog = txn.commit().unwrap();
-    assert_eq!(exact_paths(&catalog), ["/a/b/f"]);
-    assert_eq!(roots_of(&catalog), ["/a/b", "/ab"]);
+    let removed = txn.commit().unwrap();
+    assert_eq!(exact_paths(&removed), ["/a/b/f"]);
+    assert_eq!(roots_of(&removed), ["/a/b", "/ab"]);
 }
