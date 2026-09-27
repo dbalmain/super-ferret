@@ -17,10 +17,16 @@
 //! file inodes and documents are global, and a file seen fresh anywhere
 //! supersedes the copy a kept root carries (D34).
 //!
+//! A kept root is copied as it was, so it is only valid while the roots
+//! nested inside it are unchanged: the old walk stopped at each old inner
+//! root and descended into everything else. Adding or removing a root strictly
+//! inside a kept one would duplicate or lose that subtree, so commit refuses
+//! it; the outer root must be refreshed in the same transaction.
+//!
 //! Readers never lock: they read whichever file `dir/catalog` names when they
 //! open it, and the rename is atomic (D32).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
@@ -96,6 +102,10 @@ pub enum CommitError {
     /// The new generation was renamed into place, so readers may already see
     /// it, but syncing the directory failed: it may not survive a crash.
     Undurable(io::Error),
+    /// A root strictly inside the kept root `kept` was added or removed by
+    /// this transaction, so the kept copy's boundaries are stale: refresh
+    /// `kept` instead (D34). Nothing was published.
+    KeptRootOverlaps { kept: Vec<u8>, changed: Vec<u8> },
 }
 
 impl CommitError {
@@ -111,6 +121,14 @@ impl fmt::Display for CommitError {
             Self::Build(e) => write!(f, "catalog not written: {e}"),
             Self::Encode(e) => write!(f, "catalog not written, it failed its own check: {e}"),
             Self::Write(e) => write!(f, "catalog not written: {e}"),
+            Self::KeptRootOverlaps { kept, changed } => write!(
+                f,
+                "catalog not written: root {} was added or removed inside kept root {}; \
+                 refresh {} instead",
+                String::from_utf8_lossy(changed),
+                String::from_utf8_lossy(kept),
+                String::from_utf8_lossy(kept),
+            ),
             Self::Undurable(e) => {
                 write!(f, "catalog written, but syncing its directory failed: {e}")
             }
@@ -134,6 +152,9 @@ pub struct Transaction {
     docs: HashMap<Hash, u32>,
     next_batch: AtomicU32,
     batches: Vec<Batch>,
+    /// Paths passed to [`Transaction::keep`], checked against the root
+    /// changes at commit.
+    kept: Vec<Vec<u8>>,
 }
 
 impl Transaction {
@@ -179,6 +200,7 @@ impl Transaction {
             docs,
             next_batch: AtomicU32::new(0),
             batches: Vec::new(),
+            kept: Vec::new(),
         })
     }
 
@@ -271,6 +293,35 @@ impl Transaction {
             }
         }
         self.batches.push(batch);
+        self.kept.push(path.to_vec());
+        Ok(())
+    }
+
+    /// Refuses a kept root with a root added or removed strictly inside it.
+    fn check_kept_roots(&self) -> Result<(), CommitError> {
+        let Some(old) = &self.previous else {
+            return Ok(());
+        };
+        let fresh = self
+            .batches
+            .iter()
+            .filter(|b| !b.carried)
+            .flat_map(|b| {
+                b.dirs
+                    .iter()
+                    .filter(|d| d.parent.is_none())
+                    .map(|d| &b.bytes[d.name.clone()])
+            });
+        let new: HashSet<&[u8]> = fresh.chain(self.kept.iter().map(Vec::as_slice)).collect();
+        let before: HashSet<&[u8]> = old.roots().map(|(_, path)| path).collect();
+        for changed in new.symmetric_difference(&before) {
+            if let Some(kept) = self.kept.iter().find(|k| is_inside(changed, k)) {
+                return Err(CommitError::KeptRootOverlaps {
+                    kept: kept.clone(),
+                    changed: changed.to_vec(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -278,6 +329,7 @@ impl Transaction {
     /// it, rename it over the old one, fsync the directory. Returns the new
     /// generation, already open. The lock is released either way.
     pub fn commit(mut self) -> Result<Catalog, CommitError> {
+        self.check_kept_roots()?;
         let known = Known {
             docs: &self.docs,
             next_doc: self.previous.as_ref().map_or(0, |old| old.next_doc().0),
@@ -300,6 +352,13 @@ impl Transaction {
         sync_dir(&self.dir).map_err(CommitError::Undurable)?;
         Ok(catalog)
     }
+}
+
+/// Whether root path `inner` lies strictly inside root path `outer`.
+fn is_inside(inner: &[u8], outer: &[u8]) -> bool {
+    inner.len() > outer.len()
+        && inner.starts_with(outer)
+        && (outer.ends_with(b"/") || inner[outer.len()] == b'/')
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {

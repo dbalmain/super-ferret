@@ -188,3 +188,116 @@ fn keeping_and_refreshing_one_root_is_an_error() {
         )))
     ));
 }
+
+/// Every path in `catalog`, asserting no path is named twice: a duplicated
+/// subtree would collapse in the map, so the name count is checked too.
+fn exact_paths(catalog: &Catalog) -> Vec<String> {
+    let all = paths(catalog);
+    assert_eq!(all.len(), catalog.name_count() as usize, "a path named twice");
+    all.into_keys().collect()
+}
+
+fn roots_of(catalog: &Catalog) -> Vec<String> {
+    catalog
+        .roots()
+        .map(|(_, p)| String::from_utf8_lossy(p).into_owned())
+        .collect()
+}
+
+fn overlap(kept: &str, changed: &str) -> crate::CommitError {
+    crate::CommitError::KeptRootOverlaps {
+        kept: kept.as_bytes().to_vec(),
+        changed: changed.as_bytes().to_vec(),
+    }
+}
+
+fn assert_overlap(result: Result<Catalog, crate::CommitError>, kept: &str, changed: &str) {
+    match result {
+        Err(e) => assert_eq!(format!("{e:?}"), format!("{:?}", overlap(kept, changed))),
+        Ok(_) => panic!("committed a kept root with {changed} changed inside it"),
+    }
+}
+
+/// `/a` holding `top` and `b/f`, walked with `b` as an ordinary directory.
+fn outer_only(txn: &mut Transaction) {
+    let mut w = txn.batch();
+    let a = w.root(b"/a", dir_stat(1));
+    w.file(a, b"top", file_stat(10), Content::Unindexed);
+    let b = w.dir(a, b"b", dir_stat(2));
+    w.file(b, b"f", file_stat(11), Content::Unindexed);
+    txn.add(w);
+}
+
+/// `/a` and `/a/b` as two roots: the outer walk stops at `b`.
+fn outer_and_inner(txn: &mut Transaction) {
+    let mut w = txn.batch();
+    let a = w.root(b"/a", dir_stat(1));
+    w.file(a, b"top", file_stat(10), Content::Unindexed);
+    let b = w.root(b"/a/b", dir_stat(2));
+    w.file(b, b"f", file_stat(11), Content::Unindexed);
+    txn.add(w);
+}
+
+#[test]
+fn adding_a_root_inside_a_kept_root_needs_the_outer_refreshed() {
+    let scratch = Scratch::new("roots-add-inner");
+    let first = commit(&scratch.path, outer_only);
+
+    // Keeping /a would copy b/f forward while the new root /a/b also holds it.
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    txn.keep(b"/a").unwrap();
+    let mut w = txn.batch();
+    let b = w.root(b"/a/b", dir_stat(2));
+    w.file(b, b"f", file_stat(11), Content::Unindexed);
+    txn.add(w);
+    assert_overlap(txn.commit(), "/a", "/a/b");
+    let unchanged = Catalog::open(&scratch.path).unwrap().unwrap();
+    assert_eq!(exact_paths(&unchanged), exact_paths(&first));
+
+    // Refreshing /a alongside the new root is the valid transition.
+    let second = commit(&scratch.path, outer_and_inner);
+    assert_eq!(exact_paths(&second), ["/a/b/f", "/a/top"]);
+    assert_eq!(roots_of(&second), ["/a", "/a/b"]);
+}
+
+#[test]
+fn removing_a_root_inside_a_kept_root_needs_the_outer_refreshed() {
+    let scratch = Scratch::new("roots-remove-inner");
+    let first = commit(&scratch.path, outer_and_inner);
+
+    // Keeping /a alone would drop /a/b and, with it, b/f: the old /a walk
+    // stopped at the boundary.
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    txn.keep(b"/a").unwrap();
+    assert_overlap(txn.commit(), "/a", "/a/b");
+    let unchanged = Catalog::open(&scratch.path).unwrap().unwrap();
+    assert_eq!(exact_paths(&unchanged), exact_paths(&first));
+
+    // `b` is an ordinary directory of /a again, with a name of its own.
+    let second = commit(&scratch.path, outer_only);
+    assert_eq!(exact_paths(&second), ["/a/b", "/a/b/f", "/a/top"]);
+    assert_eq!(roots_of(&second), ["/a"]);
+}
+
+#[test]
+fn a_kept_inner_root_allows_the_outer_to_change() {
+    // The overlap rule is one-way: a new outer walk stops at a kept inner
+    // root's boundary, so nothing is duplicated or lost. Sibling paths that
+    // share a prefix (`/a` and `/ab`) are not nested.
+    let scratch = Scratch::new("roots-keep-inner");
+    commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        let b = w.root(b"/a/b", dir_stat(2));
+        w.file(b, b"f", file_stat(11), Content::Unindexed);
+        w.root(b"/a", dir_stat(1));
+        txn.add(w);
+    });
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    txn.keep(b"/a/b").unwrap();
+    let mut w = txn.batch();
+    w.root(b"/ab", dir_stat(3));
+    txn.add(w);
+    let catalog = txn.commit().unwrap();
+    assert_eq!(exact_paths(&catalog), ["/a/b/f"]);
+    assert_eq!(roots_of(&catalog), ["/a/b", "/ab"]);
+}
