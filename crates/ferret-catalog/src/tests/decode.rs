@@ -5,7 +5,8 @@ use std::path::Path;
 
 use crate::format::SECTIONS;
 use crate::{
-    Catalog, Content, DecodeError, InoId, NameId, OpenError, Section, Transaction, WorkTreeKind,
+    BeginError, Catalog, Content, DecodeError, InoId, NameId, OpenError, Section, Transaction,
+    WorkTreeKind,
 };
 
 /// A small snapshot with every section non-empty, built in its own scratch
@@ -346,25 +347,14 @@ fn a_name_that_makes_a_directory_its_own_descendant_is_rejected() {
     let names_start = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
     bytes[names_start + 4..names_start + 8].copy_from_slice(&0u32.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
-    // Retention is the walk that looped (about 1 GB in 5 s before the fix).
-    // Bounded, so a regression fails here rather than hanging the suite.
-    let dir = scratch.path.clone();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let outcome = match Transaction::begin(&dir, SNIFFER) {
-            Ok(mut txn) => txn.keep(b"/s").map(|()| "kept"),
-            Err(_) => Ok("refused"),
-        };
-        let _ = sender.send(outcome.map_err(|e| e.to_string()));
-    });
-    let outcome = receiver
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("keep of a self-containing root did not finish");
-    assert_eq!(
-        outcome,
-        Ok("refused"),
-        "begin must refuse the corrupt generation"
-    );
+    // Retention is the walk that looped (about 1 GB in 5 s before the fix);
+    // the writer must refuse the generation before it can keep anything.
+    assert!(matches!(
+        Transaction::begin(&scratch.path, SNIFFER),
+        Err(BeginError::Previous(OpenError::Decode(
+            DecodeError::Corrupt("dir names")
+        )))
+    ));
     assert_eq!(
         Catalog::from_bytes(bytes).err(),
         Some(DecodeError::Corrupt("dir names"))
