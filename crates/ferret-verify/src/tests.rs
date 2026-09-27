@@ -18,7 +18,7 @@ fn reference(hay: &[u8], needle: &[u8], fold: bool) -> Vec<usize> {
         .filter(|(_, w)| {
             w.iter()
                 .zip(needle)
-                .all(|(&h, &n)| h == n || fold && h.to_ascii_lowercase() == n.to_ascii_lowercase())
+                .all(|(&h, &n)| h == n || fold && h.eq_ignore_ascii_case(&n))
         })
         .map(|(i, _)| i)
         .collect()
