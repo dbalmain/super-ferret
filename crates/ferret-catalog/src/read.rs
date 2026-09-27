@@ -295,6 +295,22 @@ impl Catalog {
         }
     }
 
+    /// Where a name's bytes start in [`Catalog::name_heap`]. Needs
+    /// [`Section::Names`]; the bytes run to the next name's start, less its
+    /// NUL.
+    pub fn name_start(&self, id: NameId) -> usize {
+        u32_at(self.section(Section::Names), id.0 as usize * NAME_ROW + 8) as usize
+    }
+
+    /// The inode a name edge names, without reading its bytes. Needs only
+    /// [`Section::Names`].
+    pub fn child(&self, id: NameId) -> InoId {
+        InoId(u32_at(
+            self.section(Section::Names),
+            id.0 as usize * NAME_ROW + 4,
+        ))
+    }
+
     /// The name whose bytes (or terminator) hold heap offset `offset`, or
     /// `None` past the end of the heap.
     pub fn name_at(&self, offset: usize) -> Option<NameId> {
