@@ -200,6 +200,33 @@ fn bare_index_refreshes_every_root_and_a_relative_root_is_made_absolute() {
 }
 
 #[test]
+// `index ../x` stored the canonical path while `roots remove ../x` kept the
+// `..` and was refused. Both now spell a root the same way, and a root whose
+// directory is gone is removed by the same spelling, resolved by name.
+fn a_root_is_removed_by_the_spelling_that_added_it() {
+    let env = Env::new("dotdot");
+    env.write("a/one.txt", b"1\n");
+    env.write("b/two.txt", b"2\n");
+    let run_in = |args: &[&OsStr]| {
+        let output = env.command(args).current_dir(env.at("a")).output().unwrap();
+        assert_eq!(code(&output), 0, "{args:?}: {}", stderr(&output));
+    };
+    run_in(&[os("index"), os("../b"), os("../a")]);
+    assert_eq!(
+        paths(&env.run(&[os("roots"), os("list")])),
+        [env.at("a"), env.at("b")]
+    );
+    run_in(&[os("roots"), os("remove"), os("../b")]);
+    assert_eq!(paths(&env.run(&[os("roots"), os("list")])), [env.at("a")]);
+
+    // The same spelling after the directory is deleted.
+    run_in(&[os("index"), os("../b")]);
+    fs::remove_dir_all(env.at("b")).unwrap();
+    run_in(&[os("roots"), os("remove"), os("../b")]);
+    assert_eq!(paths(&env.run(&[os("roots"), os("list")])), [env.at("a")]);
+}
+
+#[test]
 fn bare_index_with_no_roots_and_no_terminal_fails() {
     let env = Env::new("no-roots");
     let output = env.run(&[os("index")]);

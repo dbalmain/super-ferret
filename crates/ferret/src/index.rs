@@ -74,8 +74,17 @@ pub fn index(context: &Context, dirs: &[PathBuf]) -> Exit {
 pub fn remove(context: &Context, dirs: &[PathBuf]) -> Exit {
     let mut removed = Vec::with_capacity(dirs.len());
     for dir in dirs {
-        match std::path::absolute(dir) {
-            Ok(path) => removed.push(normalise(&path)),
+        // A root whose directory is gone is still removable: its `..` can
+        // only be resolved lexically, which is safe here because the result
+        // must equal a stored root to remove anything.
+        let path = match root_path(dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::path::absolute(dir).map(|path| lexical(&path))
+            }
+            other => other,
+        };
+        match path {
+            Ok(path) => removed.push(path),
             Err(e) => {
                 error(&format!("{}: {e}", dir.display()));
                 return Exit::Error;
@@ -119,17 +128,13 @@ fn configured(context: &Context) -> Result<Vec<PathBuf>, OpenError> {
         .collect())
 }
 
-/// A directory named on the command line, as the root the catalog stores:
-/// absolute, without `.` or trailing slashes, and a directory. A path with
-/// `..` is resolved by the kernel (symlinks too), because resolving `..`
-/// lexically can name a different directory.
+/// A directory named on the command line, as the root the catalog stores
+/// ([`root_path`]), and a directory. A path with `..` is resolved by the
+/// kernel (symlinks too), because resolving `..` lexically can name a
+/// different directory.
 fn new_root(dir: &Path) -> Result<PathBuf, String> {
     let fail = |e: io::Error| format!("{}: {e}", dir.display());
-    let absolute = std::path::absolute(dir).map_err(fail)?;
-    let root = match absolute.components().any(|c| c == Component::ParentDir) {
-        true => fs::canonicalize(&absolute).map_err(fail)?,
-        false => normalise(&absolute),
-    };
+    let root = root_path(dir).map_err(fail)?;
     match fs::metadata(&root) {
         Ok(meta) if meta.is_dir() => Ok(root),
         Ok(_) => Err(format!("{}: not a directory", dir.display())),
@@ -137,10 +142,30 @@ fn new_root(dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// `path` without `.` components or a trailing slash, as ferret-crawl
-/// compares roots.
-fn normalise(path: &Path) -> PathBuf {
-    path.components().collect()
+/// `dir` spelled as the catalog stores roots, for adding and removing alike:
+/// absolute, without `.` or trailing slashes, and with any `..` resolved by
+/// the kernel, which fails `NotFound` when the directory is gone.
+fn root_path(dir: &Path) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(dir)?;
+    match absolute.components().any(|c| c == Component::ParentDir) {
+        true => fs::canonicalize(&absolute),
+        false => Ok(absolute.components().collect()),
+    }
+}
+
+/// `path` with `.` and `..` resolved by name alone.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Asks at a terminal for the first root. `None` when stdin or stderr is
