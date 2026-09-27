@@ -1,0 +1,163 @@
+//! The writer lock, commit outcomes, and readers across commits (D32).
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+
+use super::{SNIFFER, Scratch, commit, dir_stat, file_stat, paths};
+use crate::transaction::FAIL_SYNC_DIR;
+use crate::{BeginError, Catalog, CommitError, Content, Transaction};
+
+/// A generation with one root holding `names`.
+fn fill(txn: &mut Transaction, names: &[&str]) {
+    let mut w = txn.batch();
+    let root = w.root(b"/g", dir_stat(1));
+    for (i, name) in names.iter().enumerate() {
+        w.file(
+            root,
+            name.as_bytes(),
+            file_stat(10 + i as u64),
+            Content::Unindexed,
+        );
+    }
+    txn.add(w);
+}
+
+fn names(catalog: &Catalog) -> Vec<String> {
+    paths(catalog).into_keys().collect()
+}
+
+fn leftovers(dir: &std::path::Path) -> Vec<String> {
+    let mut found: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn a_second_writer_is_refused_until_the_first_is_done() {
+    let scratch = Scratch::new("lock");
+    let first = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    assert!(matches!(
+        Transaction::begin(&scratch.path, SNIFFER),
+        Err(BeginError::Locked)
+    ));
+    drop(first);
+    let mut second = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    fill(&mut second, &["a"]);
+    // Readers take no lock.
+    assert!(Catalog::open(&scratch.path).unwrap().is_none());
+    second.commit().unwrap();
+    // The lock is released by commit.
+    drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
+}
+
+#[test]
+fn a_failure_before_the_rename_publishes_nothing() {
+    let scratch = Scratch::new("fail-before");
+    commit(&scratch.path, |txn| fill(txn, &["old"]));
+
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    fill(&mut txn, &["new"]);
+    // A real failure: the temp file cannot be created in a read-only
+    // directory.
+    fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o555)).unwrap();
+    let err = txn.commit().map(|_| ()).unwrap_err();
+    fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(matches!(err, CommitError::Write(_)), "{err:?}");
+    assert!(!err.published());
+    assert_eq!(
+        names(&Catalog::open(&scratch.path).unwrap().unwrap()),
+        ["/g/old"]
+    );
+    assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
+    drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
+}
+
+#[test]
+fn a_failure_after_the_rename_is_published_but_undurable() {
+    let scratch = Scratch::new("fail-after");
+    commit(&scratch.path, |txn| fill(txn, &["old"]));
+
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    fill(&mut txn, &["new"]);
+    FAIL_SYNC_DIR.set(true);
+    let result = txn.commit().map(|_| ());
+    FAIL_SYNC_DIR.set(false);
+    let err = result.unwrap_err();
+
+    assert!(matches!(err, CommitError::Undurable(_)), "{err:?}");
+    assert!(
+        err.published(),
+        "callers must not read this as nothing published"
+    );
+    assert_eq!(
+        names(&Catalog::open(&scratch.path).unwrap().unwrap()),
+        ["/g/new"]
+    );
+    assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
+    drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
+}
+
+#[test]
+fn dropping_a_transaction_publishes_nothing_and_a_stale_temp_is_cleared() {
+    let scratch = Scratch::new("drop");
+    commit(&scratch.path, |txn| fill(txn, &["old"]));
+    // What a writer killed mid-write leaves behind.
+    fs::write(scratch.path.join("catalog.tmp"), b"half a catalog").unwrap();
+
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    assert_eq!(
+        leftovers(&scratch.path),
+        ["catalog", "lock"],
+        "begin clears the stale temp"
+    );
+    fill(&mut txn, &["new"]);
+    drop(txn);
+
+    assert_eq!(
+        names(&Catalog::open(&scratch.path).unwrap().unwrap()),
+        ["/g/old"]
+    );
+    assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
+    drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
+}
+
+#[test]
+fn an_old_reader_keeps_its_generation_across_a_commit() {
+    let scratch = Scratch::new("reader");
+    commit(&scratch.path, |txn| fill(txn, &["one", "two"]));
+    let reader = Catalog::open(&scratch.path).unwrap().unwrap();
+
+    commit(&scratch.path, |txn| fill(txn, &["three"]));
+    assert_eq!(names(&reader), ["/g/one", "/g/two"]);
+    assert_eq!(
+        reader.inode(reader.name(crate::NameId(1)).child).stat,
+        file_stat(11)
+    );
+    assert_eq!(
+        names(&Catalog::open(&scratch.path).unwrap().unwrap()),
+        ["/g/three"]
+    );
+}
+
+#[test]
+fn a_corrupt_previous_generation_stops_the_writer() {
+    let scratch = Scratch::new("corrupt-previous");
+    commit(&scratch.path, |txn| fill(txn, &["a"]));
+    let file = scratch.path.join("catalog");
+    let mut bytes = fs::read(&file).unwrap();
+    bytes.truncate(bytes.len() - 1);
+    fs::write(&file, bytes).unwrap();
+
+    assert!(matches!(
+        Catalog::open(&scratch.path),
+        Err(crate::OpenError::Decode(_))
+    ));
+    assert!(matches!(
+        Transaction::begin(&scratch.path, SNIFFER),
+        Err(BeginError::Previous(_))
+    ));
+}

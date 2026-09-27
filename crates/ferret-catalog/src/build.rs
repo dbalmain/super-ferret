@@ -330,25 +330,33 @@ pub(crate) fn build(
     t.docs = docs;
     t.next_doc = next_doc;
 
+    // Sorted before their paths enter the heap, so the file does not depend
+    // on which batch reported which work tree.
+    let mut work_trees = Vec::new();
     for batch in batches {
         for wt in &batch.work_trees {
-            let dir = dir_id[resolve(wt.dir)?];
-            let path = &batch.bytes[wt.common_dir.clone()];
-            if path.contains(&0) {
-                return Err(BuildError::BadPath(path.to_vec()));
-            }
-            let offset = push_string(&mut t.strings, path)?;
-            t.work_trees.push(WorkTreeRow {
-                dir,
-                offset,
-                common_id: wt.common_id,
-                kind: wt.kind as u8,
-            });
+            work_trees.push((
+                dir_id[resolve(wt.dir)?],
+                wt,
+                &batch.bytes[wt.common_dir.clone()],
+            ));
         }
     }
-    t.work_trees.sort_unstable_by_key(|row| row.dir);
-    if t.work_trees.windows(2).any(|w| w[0].dir == w[1].dir) {
+    work_trees.sort_unstable_by_key(|&(dir, _, _)| dir);
+    if work_trees.windows(2).any(|w| w[0].0 == w[1].0) {
         return Err(BuildError::DuplicateWorkTree);
+    }
+    for (dir, wt, path) in work_trees {
+        if path.contains(&0) {
+            return Err(BuildError::BadPath(path.to_vec()));
+        }
+        let offset = push_string(&mut t.strings, path)?;
+        t.work_trees.push(WorkTreeRow {
+            dir,
+            offset,
+            common_id: wt.common_id,
+            kind: wt.kind as u8,
+        });
     }
     Ok(t)
 }

@@ -360,9 +360,10 @@ fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
         return Err(DecodeError::Corrupt("strings"));
     }
 
-    // Names: ids in range, offsets strictly increasing inside the heap,
-    // parents in order. Offsets and parents must be sorted because readers
-    // binary-search them.
+    // Names: ids in range, offsets strictly increasing inside the heap from
+    // 0, parents in order. Offsets and parents must be sorted because readers
+    // binary-search them, and the first name must start the heap so every
+    // heap byte belongs to a name.
     let rows = section(Section::Names);
     let (mut last_parent, mut next_offset) = (0, 0u64);
     for row in rows.chunks_exact(NAME_ROW) {
@@ -371,6 +372,7 @@ fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
             && (child as usize) < l.inodes
             && parent >= last_parent
             && u64::from(offset) >= next_offset
+            && (next_offset > 0 || offset == 0)
             && (offset as usize) < heap.len();
         if !ok {
             return Err(DecodeError::Corrupt("names"));
