@@ -244,7 +244,12 @@ fn gitignore_applies_inside_a_work_tree_and_not_outside_one() {
     write(&dir.join("linkgit/a.c"), "y");
 
     let walked = walked(dir.path.as_path(), Some(DEFAULT_IGNORE), Config::default());
-    assert!(walked.io.is_empty(), "{:?}", walked.io);
+    // The dangling gitdir is a fault: the exclude it would have supplied is
+    // unknown. The work tree still starts, so `.gitignore` applies.
+    assert_eq!(
+        walked.io,
+        [(PathBuf::from("filegit/.git"), io::ErrorKind::NotFound)]
+    );
     assert!(walked.patterns.is_empty(), "{:?}", walked.patterns);
 
     assert_eq!(decision(&walked, "a.log"), Decision::Index);

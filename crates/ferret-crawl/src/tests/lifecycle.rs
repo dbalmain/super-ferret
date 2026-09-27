@@ -528,6 +528,99 @@ fn a_directory_that_cannot_be_opened_is_a_child_fault() {
     assert!(merged.entered("gone").is_none());
 }
 
+/// A child directory unlinked after its open and before its listing: the
+/// kernel's `getdents` returns `ENOENT` for it. That is a listing fault on the
+/// directory's own token, and it is never entered. The window has no visitor
+/// callback, so the crate's test-only `AFTER_OPEN` seam removes it there.
+#[test]
+fn a_child_whose_listing_fails_is_a_list_fault_on_its_own_token() {
+    let tree = Scratch::new("fault-list-child");
+    fs::create_dir(tree.join("doomed")).unwrap();
+    write(&tree.join("kept/f"), "x");
+    let root = tree.path.clone();
+    let target = root.join("doomed");
+    crate::walk::AFTER_OPEN.set(Some(Box::new(move |rel: &Path| {
+        if rel == Path::new("doomed") {
+            fs::remove_dir(&target).unwrap();
+        }
+    })));
+    let merged = run(&root, Vec::new(), 1, &Hooks::default());
+    crate::walk::AFTER_OPEN.set(None);
+
+    assert_eq!(merged.decision("doomed"), Some(Decision::Descend));
+    assert_eq!(
+        merged.io_at("doomed"),
+        [(
+            IoOp::List,
+            Context::Dir(PathBuf::from("doomed")),
+            io::ErrorKind::NotFound
+        )]
+    );
+    assert!(merged.entered("doomed").is_none());
+    assert_eq!(merged.decision("kept/f"), Some(Decision::Index));
+}
+
+/// A `.git` file whose gitdir or common directory cannot be opened, or whose
+/// `commondir` is empty, is a `ProbeGit` fault on `.git`: the work tree's
+/// exclude rules and its record are unknown, not absent.
+#[test]
+fn a_gitfile_that_leads_nowhere_is_a_probe_fault() {
+    let tree = Scratch::new("fault-gitfile");
+    let root = tree.path.clone();
+    write(&root.join("dangling/.git"), "gitdir: ../gitdirs/missing\n");
+    write(&root.join("gitdirs/linked/commondir"), "../absent\n");
+    write(&root.join("far/.git"), "gitdir: ../gitdirs/linked\n");
+    write(&root.join("gitdirs/empty/commondir"), "");
+    write(&root.join("blank/.git"), "gitdir: ../gitdirs/empty\n");
+    write(&root.join("garbage/.git"), "not a pointer\n");
+
+    let merged = run(&root, Vec::new(), 1, &Hooks::default());
+    let not_found = io::ErrorKind::NotFound;
+    let invalid = io::ErrorKind::InvalidData;
+    assert_eq!(
+        merged.io_at("dangling/.git"),
+        [(IoOp::ProbeGit, child("dangling", ".git"), not_found)]
+    );
+    assert_eq!(
+        merged.io_at("far/.git"),
+        [(IoOp::ProbeGit, child("far", ".git"), not_found)]
+    );
+    assert_eq!(
+        merged.io_at("blank/.git"),
+        [(IoOp::ProbeGit, child("blank", ".git"), invalid)]
+    );
+    assert_eq!(
+        merged.io_at("garbage/.git"),
+        [(IoOp::ProbeGit, child("garbage", ".git"), invalid)]
+    );
+    for rel in ["dangling", "far", "blank", "garbage"] {
+        assert_eq!(merged.entered(rel), Some(&None), "{rel}");
+    }
+}
+
+/// Many boundaries, each found by its path; a directory that shares a
+/// boundary's name at another depth is walked. `./` and a trailing `/` in a
+/// boundary are the same path; an absolute path never matches.
+#[test]
+fn boundaries_are_found_by_path_among_many() {
+    let tree = Scratch::new("boundary-many");
+    for index in 0..50 {
+        write(&tree.join(&format!("p{index}/inner/f")), "x");
+    }
+    write(&tree.join("inner/f"), "x");
+    write(&tree.join("q/f"), "x");
+    let mut boundaries: Vec<_> = (0..50)
+        .map(|index| boundary(&format!("./p{index}/inner/"), None))
+        .collect();
+    boundaries.push(boundary(tree.join("q").to_str().unwrap(), None));
+    let merged = run(&tree.path, boundaries, 1, &Hooks::default());
+
+    assert_eq!(merged.boundaries.len(), 50);
+    assert_eq!(merged.decision("p7/inner/f"), None);
+    assert_eq!(merged.decision("inner/f"), Some(Decision::Index));
+    assert_eq!(merged.decision("q/f"), Some(Decision::Index));
+}
+
 /// A listed name removed before its `lstat`. The pattern error fires after
 /// the root is listed and before any child is considered.
 #[test]

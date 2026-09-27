@@ -131,8 +131,11 @@ pub enum WorkTreeKind {
 ///
 /// Only work trees at or below the root are reported: nothing above a root is
 /// read (D22). A symlinked `.git`, a `.git` file that names no readable gitdir,
-/// or a gitdir whose `commondir` cannot be read still makes the directory a
-/// work tree for ignore rules, and reports no `WorkTree`.
+/// or a gitdir whose `commondir` cannot be read or is empty still makes the
+/// directory a work tree for ignore rules, and reports no `WorkTree`. Each of
+/// those except the symlink is also an [`IoOp::ProbeGit`] fault on `.git`, a
+/// missing gitdir included: the work tree's exclude rules and record are
+/// unknown, not absent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkTree<'a> {
     /// Main, linked or submodule.
@@ -153,7 +156,9 @@ pub struct WorkTree<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoOp {
     /// Reading a directory's entries (`getdents`). Entries read before the
-    /// error are still walked.
+    /// error are still walked. `NotFound` here is uncertain coverage, not a
+    /// vanished path (D26 A′): the opened directory could not be listed, and
+    /// its path may since name a replacement.
     List,
     /// Opening a directory, or checking that what opened is the inode that was
     /// statted.
@@ -340,7 +345,8 @@ impl Default for WalkOptions {
 /// Mount points are crossed: the walk does not compare `st_dev` with the
 /// root. See the module docs for the descriptor bound.
 pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut(Event<'_, ()>)) {
-    let mut walker = Walker::new(root, &[], visit);
+    let boundaries = BoundaryIndex::default();
+    let mut walker = Walker::new(root, &boundaries, visit);
     let Some(root_job) = walker.root_job(root, global, config) else {
         return;
     };
@@ -436,7 +442,8 @@ pub fn walk_parallel<V: EventVisitor + Send>(
     make_visitor: impl Fn() -> V + Sync,
 ) -> Vec<V> {
     let count = options.workers.max(1);
-    let boundaries = options.boundaries.as_slice();
+    let index = BoundaryIndex::new(&options.boundaries);
+    let boundaries = &index;
     let mut first = Walker::new(root, boundaries, make_visitor());
     let Some(root_job) = first.root_job(root, global, config) else {
         return vec![first.visit];
@@ -695,7 +702,7 @@ const DOT_GIT: &str = ".git";
 struct Walker<'b, F> {
     root: PathBuf,
     root_id: Option<(u64, u64)>,
-    boundaries: &'b [Boundary],
+    boundaries: &'b BoundaryIndex,
     /// Root-relative path bytes. Empty at the root. Reused for every entry.
     rel: Vec<u8>,
     /// The `getdents` buffer, reused for every listing: empty, with capacity
@@ -769,6 +776,78 @@ impl<D> Job<D> {
     }
 }
 
+/// [`WalkOptions::boundaries`] keyed by root-relative path bytes, so a
+/// directory's check is one hash lookup however many boundaries there are.
+/// Paths are joined from their normal components with `/`, the form of the
+/// walker's own path buffer; one with a root, `..` or a prefix is not
+/// root-relative and can never match, so it is left out.
+#[derive(Default)]
+struct BoundaryIndex {
+    by_path: std::collections::HashMap<Vec<u8>, Vec<Option<(u64, u64)>>>,
+}
+
+impl BoundaryIndex {
+    fn new(boundaries: &[Boundary]) -> Self {
+        let mut by_path: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
+        'next: for boundary in boundaries {
+            let mut key = Vec::new();
+            for component in boundary.path.components() {
+                match component {
+                    Component::Normal(name) => {
+                        if !key.is_empty() {
+                            key.push(b'/');
+                        }
+                        key.extend_from_slice(name.as_bytes());
+                    }
+                    Component::CurDir => {}
+                    Component::RootDir | Component::ParentDir | Component::Prefix(_) => {
+                        continue 'next;
+                    }
+                }
+            }
+            if !key.is_empty() {
+                by_path.entry(key).or_default().push(boundary.id);
+            }
+        }
+        Self { by_path }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_path.is_empty()
+    }
+
+    /// The identities wanted at `rel`, `None` inside meaning any. Free when
+    /// there are no boundaries.
+    fn ids(&self, rel: &[u8]) -> Option<&[Option<(u64, u64)>]> {
+        if self.by_path.is_empty() {
+            return None;
+        }
+        self.by_path.get(rel).map(Vec::as_slice)
+    }
+}
+
+#[cfg(test)]
+pub(crate) type AfterOpen = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs with a child directory's root-relative path after it is
+    /// opened and before it is listed, on the worker that opened it. No
+    /// visitor callback falls in that window, and it is the one a listing
+    /// fault below the root needs. Compiled only into this crate's tests.
+    pub(crate) static AFTER_OPEN: std::cell::RefCell<Option<AfterOpen>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_open(rel: &[u8]) {
+    AFTER_OPEN.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(bytes_path(rel));
+        }
+    });
+}
+
 /// A parent's continuation, and the child directory to walk next.
 type Descent<D> = (Job<D>, Job<D>);
 
@@ -825,7 +904,7 @@ enum Opened {
 }
 
 impl<'b, V: EventVisitor> Walker<'b, V> {
-    fn new(root: &Path, boundaries: &'b [Boundary], visit: V) -> Self {
+    fn new(root: &Path, boundaries: &'b BoundaryIndex, visit: V) -> Self {
         Self {
             root: root.to_path_buf(),
             root_id: None,
@@ -919,7 +998,9 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// `ENOENT` is an error here: the kernel returns it for a directory
     /// unlinked since it was opened, and for a `/proc` directory whose process
     /// is gone. (`rustix::fs::Dir` reads it as the end of the listing, which
-    /// would report a vanished directory as entered and empty.)
+    /// would report a vanished directory as entered and empty.) Callers treat
+    /// it as uncertain coverage like any other listing fault (D26 A′): it says
+    /// the opened directory is gone, not that its path is.
     fn list(&mut self, dir: BorrowedFd<'_>, context: FaultContext<'_, V::Dir>) -> Option<Children> {
         let mut children = Children {
             names: Vec::new(),
@@ -1184,10 +1265,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// Whether the current path is some boundary's, before its identity is
     /// known. Free when there are no boundaries.
     fn may_be_boundary(&self) -> bool {
-        !self.boundaries.is_empty() && {
-            let path = bytes_path(&self.rel);
-            self.boundaries.iter().any(|boundary| boundary.path == path)
-        }
+        self.boundaries.ids(&self.rel).is_some()
     }
 
     /// Reports [`Event::Boundary`] when the current path is a boundary and
@@ -1201,13 +1279,13 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         if self.boundaries.is_empty() || file_type(stat) != FileType::Directory {
             return false;
         }
-        let path = bytes_path(&self.rel);
         let id = (stat.st_dev, stat.st_ino);
         let hit = self
             .boundaries
-            .iter()
-            .any(|boundary| boundary.path == path && boundary.id.is_none_or(|want| want == id));
+            .ids(&self.rel)
+            .is_some_and(|ids| ids.iter().any(|want| want.is_none_or(|want| want == id)));
         if hit {
+            let path = bytes_path(&self.rel);
             self.visit.visit(Event::Boundary {
                 parent: here.token,
                 name,
@@ -1244,6 +1322,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         token: V::Dir,
     ) -> Option<Job<V::Dir>> {
         let child = self.open_child(here, name, expected)?;
+        #[cfg(test)]
+        after_open(&self.rel);
         let children = self.list(child.as_fd(), FaultContext::Dir(token))?;
         let loaded = self.load_ignores(child.as_fd(), &children, here.rules.in_work_tree(), token);
         let (rules, errors) = here.rules.enter(name, loaded.files());
@@ -1267,6 +1347,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         token: V::Dir,
     ) -> Option<Job<V::Dir>> {
         let child = self.open_child(here, name, expected)?;
+        #[cfg(test)]
+        after_open(&self.rel);
         let children = self.list(child.as_fd(), FaultContext::Dir(token))?;
         let rules = here.rules.traverse(name);
         self.entered(token, None);
@@ -1512,6 +1594,10 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         token: V::Dir,
     ) -> (Option<FoundWorkTree>, Option<String>) {
         let Some(raw) = parse_gitdir(bytes) else {
+            self.fail_at_git(
+                io::Error::new(io::ErrorKind::InvalidData, "not a `gitdir:` file"),
+                token,
+            );
             return (None, None);
         };
         let Some(gitdir) = self.open_git_directory(work, raw, token) else {
@@ -1572,9 +1658,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         } else {
             openat(base, path, root_dir_flags(), Mode::empty())
         };
+        // A missing gitdir or common directory is a fault like any other: the
+        // `.git` file says a work tree starts here, and its exclude rules and
+        // work-tree record are lost without it.
         match opened {
             Ok(fd) => Some(fd),
-            Err(Errno::NOENT) => None,
             Err(error) => {
                 self.fail_at_git(io::Error::from(error), token);
                 None
@@ -1584,10 +1672,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
 
     /// The gitdir itself when it has no `commondir` file, with `None` as the
     /// second value; otherwise the directory `commondir` names and its text.
-    /// `None` when that file cannot be read, is not a regular file, or names
-    /// nothing: a linked work tree's own directory is not where exclude lives,
-    /// so it is not a fallback. Only a missing `commondir` means the gitdir is
-    /// the common directory.
+    /// `None`, after a [`IoOp::ProbeGit`] fault, when that file cannot be
+    /// read, is not a regular file, names nothing, or names a directory that
+    /// cannot be opened: a linked work tree's own directory is not where
+    /// exclude lives, so it is not a fallback. Only a missing `commondir`
+    /// means the gitdir is the common directory.
     fn common_dir(
         &mut self,
         gitdir: OwnedFd,
@@ -1616,7 +1705,13 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 None
             }
             Ok(Opened::Bytes(bytes)) => {
-                let raw = first_line(&bytes)?;
+                let Some(raw) = first_line(&bytes) else {
+                    self.fail_at_git(
+                        io::Error::new(io::ErrorKind::InvalidData, "commondir is empty"),
+                        token,
+                    );
+                    return None;
+                };
                 let common = self.open_git_directory(gitdir.as_fd(), raw, token)?;
                 Some((common, Some(raw.to_os_string())))
             }
