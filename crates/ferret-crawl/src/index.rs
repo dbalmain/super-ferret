@@ -551,7 +551,11 @@ impl<'a> Hasher<'a> {
             #[cfg(test)]
             hook(self.root, Probe::Claimed);
         }
-        let content = self.reader.read(file, &stat);
+        let mut file = file;
+        let content = self.reader.read(&mut file);
+        #[cfg(test)]
+        hook(self.root, Probe::Hashed(decided.path));
+        let content = content.and_then(|c| observe::bracket(&file, &stat, c));
         if links > 1 {
             let observation = Observation {
                 stat,
@@ -716,6 +720,8 @@ pub(crate) enum Probe<'a> {
     Claimed,
     /// Met an inode in flight and deferred this name.
     Deferred,
+    /// Hashed a file, before the second `fstat`.
+    Hashed(&'a Path),
     /// Read a file (after the cache was completed).
     Read(&'a Path),
 }

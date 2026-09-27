@@ -382,6 +382,37 @@ fn an_edit_between_two_alias_visits_is_a_content_fault_in_either_order() {
 }
 
 #[test]
+fn a_file_written_while_it_is_hashed_is_a_content_fault() {
+    let tmp = Tmp::new("bracket");
+    let moving = tmp.write("moving.txt", b"before\n");
+    tmp.write("still.txt", b"still\n");
+    let tree = tmp.tree();
+    let _hook = Hook::set(&tree, {
+        let moving = moving.clone();
+        let tree = tree.clone();
+        move |probe| {
+            if let Probe::Hashed(rel) = probe
+                && tree.join(rel) == moving
+            {
+                let mut file = OpenOptions::new().append(true).open(&moving).unwrap();
+                file.write_all(b"during\n").unwrap();
+            }
+        }
+    });
+    let report = run(&tmp, std::slice::from_ref(&tree), Refresh::All, 1);
+    assert_eq!(report.counts.files_read, 2);
+    let faults: Vec<_> = report.content_faults.iter().map(|(p, f)| (p.clone(), f)).collect();
+    assert!(
+        matches!(faults.as_slice(), [(path, ContentFault::Changed)] if *path == moving),
+        "{faults:?}"
+    );
+    let (_, rows) = published(&tmp);
+    assert_eq!(rows[&moving].state, ContentState::Fault);
+    assert_eq!(rows[&moving].doc, None);
+    assert_eq!(rows[&tmp.at("still.txt")].state, ContentState::Hashed);
+}
+
+#[test]
 fn an_unreadable_directory_blocks_publication_and_keeps_the_old_generation() {
     let tmp = Tmp::new("coverage");
     tmp.write("open/a.txt", b"a\n");

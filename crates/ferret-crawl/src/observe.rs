@@ -198,9 +198,9 @@ impl Reader {
         }
     }
 
-    /// Sniffs and hashes an open file, bracketed by a second `fstat` that
-    /// must agree with `walked` (already checked against the first).
-    pub(crate) fn read(&mut self, mut file: File, walked: &Stat) -> Result<Content, ContentFault> {
+    /// Sniffs and hashes an open file. The caller then checks the result
+    /// with [`bracket`].
+    pub(crate) fn read(&mut self, file: &mut File) -> Result<Content, ContentFault> {
         self.files_read += 1;
         let mut head = 0;
         while head < ferret_policy::SNIFF_LEN {
@@ -234,11 +234,18 @@ impl Reader {
                 Content::Hashed(hash)
             }
         };
-        match fstat(file.as_fd()) {
-            Ok(after) if catalog_stat(&after).same_version(walked) => Ok(content),
-            Ok(_) => Err(ContentFault::Changed),
-            Err(e) => Err(ContentFault::Stat(e.into())),
-        }
+        Ok(content)
+    }
+}
+
+/// Closes the stat bracket around a read: `content` holds only if a second
+/// `fstat` still agrees with `walked`, which the first already matched. A
+/// write during the read changes mtime, so the hash may mix two versions.
+pub(crate) fn bracket(file: &File, walked: &Stat, content: Content) -> Result<Content, ContentFault> {
+    match fstat(file.as_fd()) {
+        Ok(after) if catalog_stat(&after).same_version(walked) => Ok(content),
+        Ok(_) => Err(ContentFault::Changed),
+        Err(e) => Err(ContentFault::Stat(e.into())),
     }
 }
 
