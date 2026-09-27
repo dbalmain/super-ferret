@@ -153,8 +153,8 @@ then `enter` with that directory's ignore-file contents, or `traverse`), asks it
 to `decide` each entry using a borrowed root-relative path, and `sniff`s file
 heads; it is tested against a golden corpus of trees and expected decisions.
 Precedence, most specific first: a `.ferretignore` in the directory or an
-ancestor within the configured root; `.gitignore` and `.git/info/exclude`
-inside a work tree that starts at or below the configured root (a `.git` file
+ancestor within the configured root; `.gitignore` and `.git/info/exclude` inside
+a work tree that starts at or below the configured root (a `.git` file
 contributes exclude from its gitdir, or from that gitdir's `commondir` when it
 has one; a symlinked `.git` contributes none, and a symlinked `.gitignore` is
 disregarded, as git does); the user's global ignore file
@@ -181,9 +181,9 @@ directory. An anchored one (`/build/`, `docs/**/*.tmp`) is followed by cursors,
 positions in the pattern stepped one component per directory entered, which put
 its last component into the list only where it can match. A run of `**/`
 compiles to one globstar, and a step marks positions in a bitset, so a pattern
-of k components costs O(k) per directory however its globstars fall. Only
-ignore files at or below the configured root contribute rules (D22). The same
-cursors answer whether a `.ferretignore` `!` pattern reaches below an excluded
+of k components costs O(k) per directory however its globstars fall. Only ignore
+files at or below the configured root contribute rules (D22). The same cursors
+answer whether a `.ferretignore` `!` pattern reaches below an excluded
 directory. No whole path is ever matched.
 
 A list is identified by its rules' text and flags in order, band included: a
@@ -212,6 +212,18 @@ with no lock. At most 128 waiting listings keep a descriptor. The rest reopen
 from the root one checked step at a time, which bounds the walker at 128 + 4N
 descriptors. `walk` is the same code with one worker. By default N is the
 available parallelism capped at 16 (D24).
+
+What the walker hands the catalog, besides decisions and stats: each directory
+it enters carries a small token the visitor chose, returned from that
+directory's `Decided` (or from `root` for the root), and every child event
+carries its parent's token, on whichever worker reports it (D29). `Entered`
+marks a directory as listed, with the work tree whose top it is — main, linked
+or submodule, and the common directory's path and `(dev, ino)` (D23, D33). A
+file's `Decided` lends its parent's descriptor and its name, for a race-free
+`openat` (D33). Faults are typed by operation and by what they are about: the
+root, a directory that has its token, or a named entry of one (D26). Inner roots
+are given as boundaries, matched by root-relative path and optionally checked by
+`(dev, ino)`; the walk reports each and does not enter it (D34).
 
 A configured root is always walked. Ignore configuration above it is not read
 (D22); global rules and ignore files at the root and below still apply to its
