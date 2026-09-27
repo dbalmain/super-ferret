@@ -54,6 +54,17 @@ fn each_atom_finds_what_it_says() {
             ],
         ),
         ("src/*/*.rs", &["/r/src/deep/x.rs"]),
+        // A negated class stays inside its component: `deep/x.rs` would
+        // match if `[!x]` could consume the `/`.
+        (
+            "src/*[!x]*.rs",
+            &[
+                "/r/src/deep/src/y.rs",
+                "/r/src/lib.RS",
+                "/r/src/main.rs",
+                "/r/src/parse_HTTP.rs",
+            ],
+        ),
         ("/t/*", &["/t/.rs", "/t/a.rs"]),
         (
             r"re:^[a-z]\.rs$",

@@ -118,6 +118,15 @@ fn malformed_atoms_are_errors_that_name_the_argument() {
     assert_eq!(error("mtime:<1x"), ParseError::Age("mtime:<1x".into()));
     assert_eq!(error("type:socket"), ParseError::Type("type:socket".into()));
     assert_eq!(error("ext:"), ParseError::Empty("ext:".into()));
+    // One empty argument, as the shell passes `''`: `parse` would split it
+    // to no arguments at all. An empty word matched past the last name.
+    for arg in ["", "case:", "case:ext:", "case:path:"] {
+        assert_eq!(
+            Query::from_args([arg], now()).unwrap_err(),
+            ParseError::Empty(arg.into()),
+            "{arg:?}"
+        );
+    }
     assert!(matches!(error("re:("), ParseError::Regex(arg, _) if arg == "re:("));
     assert!(matches!(
         Query::from_args([b"re:\xff".as_slice()], now()),

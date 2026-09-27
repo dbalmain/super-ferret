@@ -233,6 +233,9 @@ fn exit_codes_are_stable() {
         (&["find", "--limit"], 2),
         (&["find", "size:huge"], 2),
         (&["find", "re:("], 2),
+        // An empty atom once reached the heap scan and panicked (101).
+        (&["find", ""], 2),
+        (&["find", "case:"], 2),
         (&["frobnicate"], 2),
         (&["stats"], 0),
         (&["roots", "list"], 0),

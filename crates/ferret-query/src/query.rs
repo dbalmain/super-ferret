@@ -90,7 +90,8 @@ pub enum ParseError {
     Age(String),
     /// `type:` needs `f`, `d` or `l` (or `file`, `dir`, `link`).
     Type(String),
-    /// A prefix with nothing after it, such as `ext:`.
+    /// An empty argument, or a prefix with nothing after it, such as
+    /// `ext:` or `case:`. An empty word would match at every name boundary.
     Empty(String),
     /// A `re:` pattern that does not compile.
     Regex(String, RegexError),
@@ -107,6 +108,7 @@ impl fmt::Display for ParseError {
             Self::Size(a) => write!(f, "`{a}`: size is N, <N or >N, with k, M, G or T"),
             Self::Age(a) => write!(f, "`{a}`: mtime is <N or >N with s, m, h, d, w or y"),
             Self::Type(a) => write!(f, "`{a}`: type is f, d or l"),
+            Self::Empty(a) if a.is_empty() => write!(f, "an empty argument is not a query"),
             Self::Empty(a) => write!(f, "`{a}` needs a value"),
             Self::Regex(a, e) => write!(f, "`{a}`: {e}"),
             Self::NotUtf8(a) => write!(f, "`{}`: a regex must be UTF-8", a.escape_ascii()),
@@ -250,6 +252,9 @@ enum Atom {
 
 fn parse_atom(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
     let text = || String::from_utf8_lossy(arg).into_owned();
+    if atom.is_empty() {
+        return Err(ParseError::Empty(text()));
+    }
     let value = |prefix: &[u8]| -> Result<Option<&[u8]>, ParseError> {
         match atom.strip_prefix(prefix) {
             Some([]) => Err(ParseError::Empty(text())),

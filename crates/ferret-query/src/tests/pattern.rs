@@ -89,6 +89,12 @@ fn globs_lower_to_regexes_with_path_rules() {
         (b"[!ab].c", b"z.c", true),
         (b"[a-c]x", b"bx", true),
         (b"a.c", b"abc", false),
+        // A class never matches `/`, negated or as a range spanning it
+        // (`.` is 0x2e, `0` is 0x30).
+        (b"src/*[!x]*.rs", b"/w/src/a/b.rs", false),
+        (b"src/*[!x]*.rs", b"/w/src/ab.rs", true),
+        (b"d/a[.-0]b", b"/w/d/a/b", false),
+        (b"d/a[.-0]b", b"/w/d/a.b", true),
         // Regex syntax in a glob is literal.
         (b"a+(b)", b"a+(b)", true),
         (b"a+(b)", b"aab", false),

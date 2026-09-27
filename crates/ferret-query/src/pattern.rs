@@ -8,9 +8,9 @@
 /// A glob lowered to a regex over name bytes (or path bytes, if the glob has
 /// a `/`), for [`ferret_verify::Regex`]. Matching is bytewise: `*` and `?`
 /// match any bytes but `/`, `**` as a whole component matches any number of
-/// components, `[...]` is a byte class (`[!...]` or `[^...]` negated), and
-/// everything else is literal. Case folding, when asked for, is ASCII only,
-/// like the scanner's.
+/// components, `[...]` is a byte class (`[!...]` or `[^...]` negated) that
+/// never matches `/`, and everything else is literal. Case folding, when asked
+/// for, is ASCII only, like the scanner's.
 ///
 /// A glob without `/` must match the whole name. A glob with one matches a
 /// path's trailing components: `src/**/*.rs` matches `/w/x/src/a/b.rs`, and
@@ -52,7 +52,9 @@ fn component_regex(component: &[u8], out: &mut String) {
             b'?' => out.push_str("[^/]"),
             b'[' => match class_end(component, i) {
                 Some(end) => {
-                    out.push('[');
+                    // Intersected with `[^/]`: a negated class, or a range
+                    // such as `.-0`, would otherwise cross a component.
+                    out.push_str("[[");
                     let mut body = &component[i + 1..end];
                     if let Some((b'!' | b'^', rest)) = body.split_first() {
                         out.push('^');
@@ -66,7 +68,7 @@ fn component_regex(component: &[u8], out: &mut String) {
                             push_byte(b, out);
                         }
                     }
-                    out.push(']');
+                    out.push_str("]&&[^/]]");
                     i = end;
                 }
                 None => push_byte(b'[', out),
