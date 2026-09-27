@@ -37,22 +37,22 @@ Predecessors, carried forward where still open:
 | D19 | Ignore matching: whole paths, or per-directory rule sets | answered       | B-flat-indexed: one shared, indexed rule list per directory; last match wins                                   |
 | D20 | Walk across mount points, or stay on the root's device   | answered       | A: cross mount points below a root, as now                                                                     |
 | D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
-| D22 | A root inside a git work tree                            | answered       | B: the enclosing work tree's `.gitignore` and exclude apply; a `.ferretignore` above the root does not         |
+| D22 | A root inside a git work tree                            | answered       | A (revised 2026-09-27): nothing above a root applies; a root inside a work tree is treated as outside one      |
 | D23 | Recording work trees, so duplicate results can be hidden | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                        |
 | D24 | How many walk workers by default                         | answered       | B: `min(16, cores)`, fastest cold (2.50 s vs 3.08 s at 8); `default_workers()`                                 |
 | D25 | A configured root that git ignores                       | answered       | B: a configured root is always walked; rules apply below it                                                    |
-| D26 | A re-run: rebuild the snapshot, or mutate through a log  | open           |                                                                                                                |
-| D27 | `InoId` and `NameId`: stable, or renumbered              | open           |                                                                                                                |
-| D28 | Name layout: raw sorted by parent, or front-coded        | open           |                                                                                                                |
-| D29 | How a parallel walk tells the catalog each parent        | open           |                                                                                                                |
-| D30 | What `ferret find` builds when it opens the catalog      | open           |                                                                                                                |
-| D31 | One inode, several names                                 | open           |                                                                                                                |
-| D32 | A reader while `ferret index` runs                       | open           |                                                                                                                |
-| D33 | What the walker must also hand the catalog               | open           |                                                                                                                |
-| D34 | Which roots a re-run replaces                            | open           |                                                                                                                |
-| D35 | Work-tree context for a root inside a repository         | open           |                                                                                                                |
-| D36 | Dead documents before there is an index to merge         | open           |                                                                                                                |
-| D37 | Remembering why a file has no document                   | open           |                                                                                                                |
+| D26 | A re-run: rebuild the snapshot, or mutate through a log  | answered       | A′: rebuild each run; any walker fault blocks publication until faults are typed                               |
+| D27 | `InoId` and `NameId`: stable, or renumbered              | answered       | A: renumber each snapshot; C once indexing is incremental                                                      |
+| D28 | Name layout: raw sorted by parent, or front-coded        | answered       | A: raw NUL-terminated heap by (parent, name); suffix array a later experiment                                  |
+| D29 | How a parallel walk tells the catalog each parent        | answered       | A: the walker carries a per-directory value                                                                    |
+| D30 | What `ferret find` builds when it opens the catalog      | answered       | C: lazy, plus a persisted directory `InoId → NameId`; cold find measured                                       |
+| D31 | One inode, several names                                 | answered       | C: one row per file inode, per directory name; shared per-run hash cache                                       |
+| D32 | A reader while `ferret index` runs                       | answered       | A: generations plus a single-writer lock                                                                       |
+| D33 | What the walker must also hand the catalog               | answered       | A: walker hands over the directory handle and work-tree kind                                                   |
+| D34 | Which roots a re-run replaces                            | answered       | B: roots stored with the index; explicit removal; innermost root owns its subtree                              |
+| D35 | Work-tree context for a root inside a repository         | answered       | moot: with D22 A, no work-tree context above a root                                                            |
+| D36 | Dead documents before there is an index to merge         | answered       | B for S1: drop dead docs, keep the id counter; reactivation is S2's call                                       |
+| D37 | Remembering why a file has no document                   | answered       | B: 2-bit content state plus sniffer version                                                                    |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1148,6 +1148,13 @@ it.
 `.gitignore` files and `info/exclude` from the top down to the root; a
 `.ferretignore` above the root does not apply.
 
+**Revised (2026-09-27): A.** Dave: configuration above a root is ignored, full
+stop. Nobody here needs a root inside a work tree, and there is no way to know
+whether such a user would expect the ancestors' rules to apply, so the simpler,
+self-contained root wins. D13's git semantics hold for work trees that start at
+or below a root. The walker's ancestor discovery (`discover` in `walk.rs`) is
+removed.
+
 ## D23 — Recording work trees, so duplicate results can be hidden
 
 **Premise (Dave, 2026-09-26):** the catalog records that a file is in a git work
@@ -1312,7 +1319,8 @@ Settled without a brief (object if wrong):
 - **Hashing and sniffing stay in `ferret-crawl`**, as DESIGN § Crates has it;
   the catalog receives results, never file contents.
 - **`DocId` is never renumbered by the catalog.** Postings are keyed by it (D4);
-  only an index merge may reclaim a dead doc, and that is S2's business.
+  only an index merge may reclaim a dead doc, and that is S2's business. In S1
+  dead rows are simply dropped and the counter never goes back (D36).
 - **New `DocId`s are assigned at the merge, in merge order.** Assigning them in
   one place means two workers that hash equal content concurrently still produce
   one `DocId`; the walk gives no cross-worker order to preserve, and keeping one
@@ -1366,6 +1374,15 @@ never publish and so make A necessary; or a measured snapshot write that a
 person would notice on a re-run, over about a second at 1M entries, which
 favours B.
 
+> Dave: Agree with A′. I hope we get to incremental indexing before moving to A
+> makes sense.
+
+**Answer (2026-09-27): A′.** Rebuild the snapshot each run with hash carry-over;
+every `Event::Io` blocks publication until the walker tags its faults, after
+which only an entry's `lstat` NotFound is exempt and a content fault publishes
+the file unhashed. Move to A when typed faults exist, and ideally only once
+incremental indexing makes it worth it.
+
 ## D27 — `InoId` and `NameId`: stable, or renumbered each snapshot
 
 **Question:** When an entry is deleted, what happens to its dense ids?
@@ -1380,6 +1397,18 @@ favours B.
 stays stable regardless. The fact that would change it: a structure outside the
 catalog that must key by inode. The daemon's watch table is the likely one, and
 it can key by `(dev, ino)` instead.
+
+> Dave: Agree, but assume C when we get to incremental index. I'm not sure how
+> this will work for metadata indexes though. For example, if I change the
+> permissions on a file, the permissions will need to be reindexed. However, we
+> don't want to re-index the contents for such a small change, so creating a new
+> docId doesn't make sense. I _think_ the docId will change or remain stable
+> depending on the type of change.
+
+**Answer (2026-09-27): A now; C once indexing is incremental.** A metadata
+change (permissions, mtime, owner, a rename) touches only inode and name rows. A
+`DocId` changes only when content does, so metadata predicates never go through
+documents.
 
 ## D28 — Name layout: raw bytes sorted by parent, or front-coded
 
@@ -1407,6 +1436,21 @@ snapshot bytes and scan latency together, since density comes first in this
 project. The fact that would change it: B saving enough of the whole snapshot to
 matter at a scan cost that stays within the name-query target.
 
+> Dave: I think this one is worth discussing. Since this is going to be in
+> memory anyway and since we've already invested time into inpacking algorithms,
+> what about a suffix array where each element references the name in the
+> catalogue. So the catalogue has an entry for every indexed file or directory
+> which includes metadata like permission byte, created at or last-updated
+> timestamps, etc. These are referenced by docIds. We create a giant suffix
+> array which I _think_ makes super fast search possible for all or most of the
+> different query types, including regex. Otherwise, I agree with your
+> recommendation.
+
+**Answer (2026-09-27): A.** Raw NUL-terminated heap sorted by (parent, name);
+measure front-coding before the format freezes. A suffix array, FM-index or name
+trigrams over the heap is a later experiment: the heap is exactly the text such
+an index is built on, so A forecloses none of them.
+
 ## D29 — How a parallel walk tells the catalog each entry's parent
 
 **Question:** How does the catalog writer learn the parent directory's row for
@@ -1432,6 +1476,8 @@ value costs a field, and the catalog never handles a path. The value is a
 per-worker local id (worker, sequence), resolved to a dense `InoId` at the
 merge. The fact that would change it: a measured merge cost that makes a single
 writer (C) cheaper overall.
+
+**Answer (2026-09-27): A,** as recommended (no comment).
 
 ## D30 — What `ferret find` builds when it opens the catalog
 
@@ -1460,6 +1506,18 @@ serve `stats` and, from S2, content results; they are built when first needed,
 and one is persisted when a measured query shows its build dominating. The fact
 that would change it: a measured S1 query whose latency is mostly that build,
 which moves that structure to B.
+
+> Dave: I'm not sure where it fits in the schedule but I want this to be fast on
+> devices where the daemon isn't running so we should measure the options. Speed
+> to search from scratch should be one fasctor in deciding on the catalogue disk
+> format. I'd err on the side of simplicity though. Otherwise, I'm fine with C
+> for now.
+
+**Answer (2026-09-27): C.** Nothing derived at open beyond the persisted
+directory `InoId → NameId`. Cold `ferret find` without a daemon is a first-class
+S1 measurement, in both forms (empty page cache; warm cache, fresh process), and
+a factor in choosing the on-disk format. Prefer the simpler format when the
+numbers are close.
 
 ## D31 — One inode, several names
 
@@ -1496,11 +1554,23 @@ against while hard-link prevalence is unmeasured. The fact that would add the
 cache: a census showing enough hard-linked bytes that the duplicate reads show
 in crawl time.
 
+> Dave: Would a central cache really make that much of a difference to
+> performance? I imagine it would be quick enough not to have much impact while
+> having a net complexity benefit. Happy either way, but I think this is worth
+> measuring unless you're confident this isn't the case.
+
 Without the cache, two workers can hash one inode on either side of an edit,
 each passing D33's stat bracket. The merge never combines one observation's
 metadata with another's hash: differing metadata or hashes for one `(dev, ino)`
 in a run are a D26 content fault, and the inode is published with one coherent
 metadata observation and no `DocId` until the next run.
+
+**Answer (2026-09-27): C, with a shared per-run cache after all.** Workers probe
+and insert into a sharded `(dev, ino)` map directly (there is no cache thread);
+a probe is about 100 ns and hashing stays on the worker, so the cost is peak
+memory only: the map holds inodes hashed this run, about 20 MB on `$HOME`'s
+first run and 50 MB at 1M (estimates), small on re-runs. Each inode is observed
+once per run, so the conflicting-observation rule below is no longer needed.
 
 ## D32 — A reader while `ferret index` runs
 
@@ -1515,6 +1585,10 @@ metadata observation and no `DocId` until the next run.
 plus a lock file. The fact that would change it: readers pinning old generations
 long enough to exceed the disk or memory budget, as a resident daemon might,
 which would call for a reader handshake before the old file is released.
+
+> Dave: Agreed
+
+**Answer (2026-09-27): A.**
 
 ## D33 — What the walker must also hand the catalog
 
@@ -1542,6 +1616,10 @@ measurably defeating crawl throughput, which would change how handles are passed
 (a queue of opened descriptors for hashing workers) while keeping
 handle-relative opens.
 
+> Dave: Agreed
+
+**Answer (2026-09-27): A.**
+
 ## D34 — Which roots a re-run replaces
 
 **Question:** After `ferret index /a /b`, does `ferret index /a` refresh `/a`
@@ -1561,6 +1639,22 @@ published, never copied. The fact that would change it: roots never overlapping
 in practice, which would let B drop the ownership rule but not the explicit
 removal.
 
+> Dave: Interesting question. I think you should be able to name an index
+> location with an optional ENV VAR override. In any case, asking to index a
+> directory should update the roots in the index config (either default location
+> or specified location). There should also be a CLI command for removing a
+> root, and `ferret index` should index the current roots or prompt the user to
+> specify if there are none. Let me know if I'm missing the point of this
+> question.
+
+**Answer (2026-09-27): B.** The index lives in `$XDG_DATA_HOME/ferret` by
+default, overridden by `--index <dir>` or `FERRET_INDEX`, and its roots are
+stored with it. `ferret index <dir>` adds the root and refreshes it;
+`ferret roots remove <dir>` drops one; bare `ferret index` refreshes every root,
+prompting at a terminal when there are none and failing with a message
+otherwise. The innermost root owns its subtree. Roots are independent: removing
+`~` leaves `~/w/x` indexed, and adding `~` does not absorb `~/w/x`.
+
 ## D35 — Work-tree context for a root inside a repository
 
 **Question:** For root `repo/src` (D22), the work tree's top directory is above
@@ -1574,6 +1668,14 @@ context live?
 
 **Recommendation:** A. The fact that would change it: ancestors outside roots
 becoming searchable, which D18's later "links that pull content in" might bring.
+
+> Dave: I'm inclined to say that a root within a repo loses all context outside
+> of that repo so it would be treated as outside of a git repo, let alone know
+> anything about worktrees. Tell me that isn't even an optoin here.
+
+**Answer (2026-09-27): moot.** D22 is revised to A, so a root inside a work tree
+is treated as outside one and carries no work-tree context. `worktrees` covers
+only work trees whose top is at or below a root.
 
 ## D36 — Dead documents before there is an index to merge
 
@@ -1594,6 +1696,15 @@ gets a new `DocId` and is indexed again. The fact that would change it: measured
 churn making the history a material share of the catalog before S2's merge
 lands, in which case B.
 
+> Dave: When would you even find out a document is dead? For S1, I thought we
+> were doing a full reindex for each update and the index was otherwise static?
+
+**Answer (2026-09-27): B for S1.** A document is dead when no inode in the new
+snapshot carries its hash, which each rebuild finds. S1 has no postings, so
+nothing needs a dead `DocId`: drop the rows and keep the next-id counter so ids
+are never reused. Whether a revert reactivates its old `DocId` is an S2
+decision, where postings make it worth something.
+
 ## D37 — Remembering why a file has no document
 
 **Question:** `DocId = none` means too large, binary, or failed to hash. After
@@ -1608,3 +1719,8 @@ again?
 **Recommendation:** B. Current policy decides eligibility each run; the stored
 state only says what the last observation found. The fact that would change it:
 a measured re-sniff of `$HOME`'s binaries cheap enough to ignore.
+
+> Dave: B is cheap. Let's do it.
+
+**Answer (2026-09-27): B.** A 2-bit content state per inode plus the sniffer
+version; a version change refreshes every root.
