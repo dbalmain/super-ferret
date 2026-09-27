@@ -253,6 +253,34 @@ fn open(dir: &Path) -> Result<()> {
             println!("| {label} | {cache} | {} | {bytes} |", ms(median(times)));
         }
     }
+    fault_split(dir, &name_sections)
+}
+
+/// Splits a warm name-section load into its page faults and its copy: the
+/// same number of bytes read from the file into a fresh buffer, whose pages
+/// the kernel faults in as the read fills them, and again into the same
+/// buffer, now resident.
+fn fault_split(dir: &Path, name_sections: &[Section]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let catalog = open_catalog(dir)?;
+    catalog.load(name_sections)?;
+    let len = catalog.bytes_read() as usize;
+    drop(catalog);
+    let file = File::open(dir.join("catalog"))?;
+    let (mut fresh, mut resident) = (Vec::new(), Vec::new());
+    let mut buffer = Vec::new();
+    for _ in 0..WARM_RUNS {
+        buffer = vec![0u8; len];
+        let start = Instant::now();
+        file.read_exact_at(&mut buffer, 0)?;
+        fresh.push(start.elapsed());
+        let start = Instant::now();
+        file.read_exact_at(&mut buffer, 0)?;
+        resident.push(start.elapsed());
+    }
+    black_box(&buffer);
+    println!("| {len} B into a fresh buffer | warm | {} | {len} |", ms(median(fresh)));
+    println!("| {len} B into a resident buffer | warm | {} | {len} |", ms(median(resident)));
     Ok(())
 }
 
