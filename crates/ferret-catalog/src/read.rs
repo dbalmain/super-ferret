@@ -459,7 +459,8 @@ impl Catalog {
         }
     }
 
-    /// Whether an inode is a directory, file or symlink.
+    /// Whether an inode is a directory, file or symlink. Needs
+    /// [`Section::Links`] for any inode that is not a directory.
     pub fn kind(&self, id: InoId) -> Kind {
         if id.0 < self.dir_count() {
             Kind::Dir
@@ -470,7 +471,8 @@ impl Catalog {
         }
     }
 
-    /// A symlink's target, as `readlink` returned it.
+    /// A symlink's target, as `readlink` returned it. Needs
+    /// [`Section::Links`], which loads [`Section::Strings`].
     pub fn link_target(&self, id: InoId) -> Option<&[u8]> {
         let links = self.section(Section::Links);
         let n = links.len() / PAIR_ROW;

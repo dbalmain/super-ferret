@@ -54,9 +54,15 @@ impl From<OpenError> for RunError {
     }
 }
 
-/// What a row needs besides the names: paths, whether a directory is
-/// structural (D29), and link rows to tell a symlink from a file. All are
-/// small beside the heap and the inode rows.
+/// What testing and emitting a name needs, by the accessor that reads it:
+/// `name`, `name_start` and `child` read Names and NameHeap; `dir_path`
+/// reads DirNames, Names and Roots (Roots loads Strings); `is_traversed`
+/// reads Traversed; `kind`, for a row and for `type:`, reads Links (which
+/// loads Strings). Inode rows come through [`Inodes`], which reads them
+/// singly or loads their section. All of these are small beside the heap
+/// and the inode rows. Every strategy loads this set before its first
+/// `consider`; the inode scan loads its own set, [`Query::meta_sections`],
+/// before its first metadata test.
 const ROW_SECTIONS: [Section; 6] = [
     Section::Names,
     Section::NameHeap,
@@ -148,7 +154,7 @@ impl Run<'_, '_> {
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<(), RunError> {
         let catalog = self.catalog;
-        catalog.load(&[Section::Inodes, Section::States])?;
+        catalog.load(&self.query.meta_sections())?;
         let mut pass = vec![0u64; (catalog.inode_count() as usize).div_ceil(64)];
         let mut any = false;
         for id in 0..catalog.inode_count() {
@@ -269,6 +275,22 @@ impl Run<'_, '_> {
 }
 
 type RunResult = Result<ControlFlow<()>, RunError>;
+
+impl Query {
+    /// What testing whole inode rows against the metadata atoms reads: the
+    /// rows, their states, and whatever each test declares.
+    fn meta_sections(&self) -> Vec<Section> {
+        let mut sections = vec![Section::Inodes, Section::States];
+        for test in &self.meta {
+            for &section in test.sections() {
+                if !sections.contains(&section) {
+                    sections.push(section);
+                }
+            }
+        }
+        sections
+    }
+}
 
 /// The name holding heap offset `hit`, searching forwards from `from`:
 /// hits arrive in heap order, so a gallop from the last hit's successor

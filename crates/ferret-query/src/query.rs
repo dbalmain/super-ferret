@@ -4,7 +4,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ferret_catalog::Kind;
+use ferret_catalog::{Kind, Section};
 use ferret_verify::{Finder, Regex, RegexError};
 
 use crate::pattern::{glob_literal, glob_regex, regex_literal};
@@ -442,6 +442,17 @@ impl PathTest {
 }
 
 impl MetaTest {
+    /// The catalog sections evaluating this test reads, beyond the inode
+    /// row itself: [`Catalog::kind`](ferret_catalog::Catalog::kind) looks a
+    /// non-directory up in the link rows. A metadata-first scan loads the
+    /// union of these before it tests a row.
+    pub(crate) fn sections(&self) -> &'static [Section] {
+        match self {
+            MetaTest::Size(..) | MetaTest::Age(..) => &[],
+            MetaTest::Type(_) => &[Section::Links],
+        }
+    }
+
     fn describe(&self) -> String {
         match self {
             MetaTest::Size(cmp, n) => format!("size {}{n}", cmp.symbol()),

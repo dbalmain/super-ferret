@@ -80,6 +80,8 @@ fn each_atom_finds_what_it_says() {
         ),
         ("size:100", &["/r/src/lib.RS", "/r/src/main.rs"]),
         ("type:l", &["/r/link"]),
+        ("type:f size:>100M", &["/r/src/big.bin"]),
+        ("type:l mtime:<2d", &["/r/link"]),
         (
             "type:d",
             &["/r/docs", "/r/src", "/r/src/deep", "/r/src/deep/src"],
@@ -92,8 +94,15 @@ fn each_atom_finds_what_it_says() {
         ("rs mtime:<1d type:f", &["/r/src/main.rs"]),
         ("nothing-has-this", &[]),
     ];
+    // Each query on its own fresh open, so no earlier query has loaded a
+    // section it needs: a missing load panics here rather than passing.
     for &(text, expect) in cases {
-        assert_eq!(paths(&catalog, text), expect, "{text:?}");
+        assert_eq!(paths(&lazy(&scratch), text), expect, "{text:?} (fresh)");
+    }
+    // Then all of them on one catalog, as a long-lived reader would: loads
+    // accumulate and must not change any answer.
+    for &(text, expect) in cases {
+        assert_eq!(paths(&catalog, text), expect, "{text:?} (shared)");
     }
 }
 
@@ -102,8 +111,8 @@ fn a_structural_directory_is_never_a_result_but_its_contents_are() {
     let scratch = Scratch::new("traversed");
     let catalog = sample(&scratch);
     assert_eq!(paths(&catalog, "skip"), Vec::<String>::new());
-    assert_eq!(paths(&catalog, "type:d mtime:>1d").len(), 4);
-    assert_eq!(paths(&catalog, "kept"), ["/r/skip/kept.rs"]);
+    assert_eq!(paths(&lazy(&scratch), "type:d mtime:>1d").len(), 4);
+    assert_eq!(paths(&lazy(&scratch), "kept"), ["/r/skip/kept.rs"]);
 }
 
 #[test]
