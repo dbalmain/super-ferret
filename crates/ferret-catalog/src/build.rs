@@ -403,21 +403,34 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
     keys.sort_unstable();
 
     // Each identity's observations, in name order, become one group: the
-    // observation it keeps, and whether it is a fault.
+    // observation it keeps, and whether it is a fault. Nearly every run is
+    // one file, which is its own winner and cannot disagree with itself, so
+    // only longer runs read the stats, which lie scattered in fingerprint
+    // order (a cache miss apiece: 112 ms of a 270 ms plan at 358k files
+    // before this shortcut).
     let mut group_of = vec![NONE; index.files];
     let mut groups: Vec<(u32, bool)> = Vec::new();
     let mut members = Vec::new();
     let mut start = 0;
     while start < keys.len() {
-        let end = start + keys[start..].partition_point(|k| k.0 == keys[start].0);
+        let fp = keys[start].0;
+        let end = start + keys[start..].iter().take_while(|k| k.0 == fp).count();
         let run = &mut keys[start..end];
-        if run.iter().any(|k| identity(k.2) != identity(run[0].2)) {
+        start = end;
+        if let [single] = run {
+            let group = u32::try_from(groups.len()).map_err(|_| BuildError::TooLarge)?;
+            groups.push((single.2, false));
+            group_of[single.2 as usize] = group;
+            continue;
+        }
+        let first = identity(run[0].2);
+        if run.iter().any(|k| identity(k.2) != first) {
             run.sort_unstable_by_key(|k| (identity(k.2), k.1));
         }
         let mut at = 0;
         while at < run.len() {
             let id = identity(run[at].2);
-            let len = run[at..].partition_point(|k| identity(k.2) == id);
+            let len = run[at..].iter().take_while(|k| identity(k.2) == id).count();
             members.clear();
             members.extend(run[at..at + len].iter().map(|k| k.2));
             let group = u32::try_from(groups.len()).map_err(|_| BuildError::TooLarge)?;
@@ -427,7 +440,6 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
             }
             at += len;
         }
-        start = end;
     }
     drop(keys);
 
@@ -491,11 +503,14 @@ fn same_observation(index: &Index, batches: &[Batch], a: u32, b: u32) -> bool {
 /// Gives each hashed inode its document: the old `DocId` for known content,
 /// else a new one, assigned in inode order of first appearance (D36 B).
 fn assign_docs(plan: &mut Plan, batches: &[Batch], known: &[(Hash, u32)]) -> Result<(), BuildError> {
-    let mut hashed: Vec<(Hash, u32)> = Vec::new();
+    // Hashes as big-endian `u64` pairs: the same order as the bytes, which
+    // `known` is sorted in, and compared in two instructions rather than a
+    // 16-byte `memcmp`.
+    let mut hashed: Vec<((u64, u64), u32)> = Vec::new();
     for (k, &file) in plan.winner.iter().enumerate() {
         let (b, f) = plan.index.file(file as usize);
         if let (false, Content::Hashed(hash)) = (plan.fault[k], batches[b].contents[f]) {
-            hashed.push((hash, k as u32));
+            hashed.push((split_hash(&hash), k as u32));
         }
     }
     hashed.sort_unstable();
@@ -505,8 +520,8 @@ fn assign_docs(plan: &mut Plan, batches: &[Batch], known: &[(Hash, u32)]) -> Res
     let mut start = 0;
     while start < hashed.len() {
         let hash = hashed[start].0;
-        let end = start + hashed[start..].partition_point(|h| h.0 == hash);
-        match known.binary_search_by(|probe| probe.0.cmp(&hash)) {
+        let end = start + hashed[start..].iter().take_while(|h| h.0 == hash).count();
+        match known.binary_search_by(|probe| split_hash(&probe.0).cmp(&hash)) {
             Ok(at) => {
                 for &(_, k) in &hashed[start..end] {
                     plan.doc[k as usize] = known[at].1;
@@ -531,11 +546,24 @@ fn assign_docs(plan: &mut Plan, batches: &[Batch], known: &[(Hash, u32)]) -> Res
     hashed.dedup_by_key(|h| h.0);
     let mut docs: Vec<(u32, Hash)> = hashed
         .into_iter()
-        .map(|(hash, k)| (plan.doc[k as usize], hash))
+        .map(|((hi, lo), k)| {
+            let mut hash = [0; 16];
+            hash[..8].copy_from_slice(&hi.to_be_bytes());
+            hash[8..].copy_from_slice(&lo.to_be_bytes());
+            (plan.doc[k as usize], hash)
+        })
         .collect();
     docs.sort_unstable_by_key(|&(id, _)| id);
     plan.docs = docs;
     Ok(())
+}
+
+fn split_hash(hash: &Hash) -> (u64, u64) {
+    let (hi, lo) = hash.split_at(8);
+    (
+        u64::from_be_bytes(hi.try_into().expect("8 bytes")),
+        u64::from_be_bytes(lo.try_into().expect("8 bytes")),
+    )
 }
 
 /// Streams the planned generation to `out` in file order, freeing each
