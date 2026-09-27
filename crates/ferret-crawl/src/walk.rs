@@ -200,6 +200,40 @@ pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut
 
 /// A worker-local visitor. The returned visitors retain their accumulated
 /// state, so callers can merge it after the walk without locking per entry.
+///
+/// # Directory lifecycle
+///
+/// Each directory the walk enters is named by a token of the visitor's
+/// choosing, [`EventVisitor::Dir`] (`Copy + Send`; D29). The walk stores the
+/// token in its per-directory job and hands it back with every event about
+/// that directory's entries, so a visitor can attach a child to its parent
+/// without a path map, whichever worker reports the child.
+///
+/// ```text
+/// root:   open, fstat -> root(stat) = token
+///         list, read ignore files, probe .git -> Entered { dir: token, work_tree }
+/// child:  Decided { parent, .. }  (before any open)
+///           returns Some(token) for Descend / Traverse; None prunes it
+///         Descend:  open, fstat, list, ignore files, .git -> Entered { dir, work_tree }
+///         Traverse: open, fstat, list                     -> Entered { dir, work_tree: None }
+///         its children: Decided { parent: token, .. }, Io, Boundary, ...
+/// ```
+///
+/// - A directory's [`Decided`] fires before it is opened, as for every entry.
+///   The value the visitor returns is that directory's token. For a directory
+///   the policy would enter ([`Decision::Descend`] or [`Decision::Traverse`])
+///   `None` prunes it: it is not opened and nothing below it is reported. For
+///   every other event the return value is ignored.
+/// - [`Event::Entered`] fires once the directory is open, listed, and, for
+///   `Descend`, its ignore files are read and `.git` probed. A directory that
+///   has a token but never gets `Entered` was not listed: its coverage is
+///   uncertain, and an [`Event::Io`] says why.
+/// - The root gets its token from [`EventVisitor::root`], called after the root
+///   is opened and statted and before it is listed; then `Entered`.
+/// - Every child event carries its parent's token: [`Decided::parent`],
+///   [`Event::Boundary`], and [`Event::Io`]'s [`FaultContext`]. Tokens travel
+///   with the job across workers, so a child can be reported on a different
+///   worker from the one that minted its parent's token.
 pub trait EventVisitor {
     /// Receives one event; borrowed paths are valid only during this call.
     fn visit(&mut self, event: Event<'_>);
