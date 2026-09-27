@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ferret_crawl::{Event, EventVisitor, walk_parallel};
+use ferret_crawl::{Event, EventVisitor, Stat, WalkOptions, walk_parallel};
 use ferret_policy::{Config, DEFAULT_IGNORE, Decision, Reason};
 
 fn main() -> ExitCode {
@@ -54,7 +54,10 @@ fn main() -> ExitCode {
         Path::new(&root),
         Some(&global),
         Config::default(),
-        workers,
+        &WalkOptions {
+            workers,
+            ..WalkOptions::default()
+        },
         CountsVisitor::default,
     );
     for visitor in visitors {
@@ -89,7 +92,11 @@ struct CountsVisitor {
 }
 
 impl EventVisitor for CountsVisitor {
-    fn visit(&mut self, event: Event<'_>) {
+    type Dir = ();
+
+    fn root(&mut self, _stat: Stat<'_>) {}
+
+    fn visit(&mut self, event: Event<'_, ()>) -> Option<()> {
         match event {
             Event::Decided(decided) => {
                 if let Some(stat) = decided.stat {
@@ -105,7 +112,9 @@ impl EventVisitor for CountsVisitor {
                 }
             }
             Event::Io { .. } | Event::Pattern(_) => self.counts.errors += 1,
+            Event::Entered { .. } | Event::Boundary { .. } => {}
         }
+        Some(())
     }
 }
 

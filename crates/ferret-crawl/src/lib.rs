@@ -10,7 +10,10 @@
 
 mod walk;
 
-pub use walk::{Decided, Event, EventVisitor, Stat, default_workers, walk, walk_parallel};
+pub use walk::{
+    Boundary, Decided, Event, EventVisitor, FaultContext, IoOp, Stat, WalkOptions, WorkTree,
+    WorkTreeKind, default_workers, walk, walk_parallel,
+};
 
 #[cfg(test)]
 mod tests;

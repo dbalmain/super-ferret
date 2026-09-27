@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use ferret_crawl::{Event, EventVisitor, walk_parallel};
+use ferret_crawl::{Event, EventVisitor, Stat, WalkOptions, walk_parallel};
 use ferret_policy::{Config, DEFAULT_IGNORE};
 
 fn main() -> ExitCode {
@@ -44,7 +44,10 @@ fn main() -> ExitCode {
         Path::new(&root),
         Some(&global),
         Config::default(),
-        workers,
+        &WalkOptions {
+            workers,
+            ..WalkOptions::default()
+        },
         Dump::default,
     )
     .into_iter()
@@ -71,14 +74,21 @@ struct Dump {
 }
 
 impl EventVisitor for Dump {
-    fn visit(&mut self, event: Event<'_>) {
+    type Dir = ();
+
+    fn root(&mut self, _stat: Stat<'_>) {}
+
+    fn visit(&mut self, event: Event<'_, ()>) -> Option<()> {
         let line = match event {
             Event::Decided(decided) => {
                 format!("{}\t{:?}", decided.path.display(), decided.decision)
             }
-            Event::Io { path, .. } => format!("{}\tio", path.display()),
+            Event::Entered { .. } => return Some(()),
+            Event::Boundary { path, .. } => format!("{}\tboundary", path.display()),
+            Event::Io { path, op, .. } => format!("{}\tio {op:?}", path.display()),
             Event::Pattern(error) => format!("-\tpattern {error:?}"),
         };
         self.lines.push(line);
+        Some(())
     }
 }

@@ -32,14 +32,15 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 
 use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, fstat, open as open_path, openat, readlinkat, statat,
+    AtFlags, Dir as DirStream, FileType, Mode, OFlags, fstat, open as open_path, openat,
+    readlinkat, statat,
 };
 use rustix::io::Errno;
 
@@ -88,12 +89,20 @@ pub struct Stat<'a> {
 /// One entry [`DirRules::decide`] classified.
 ///
 /// `path` is relative to the walk's root and borrows the walker's path
-/// buffer. It is valid only for the callback that receives it. `stat` is
-/// absent for [`Decision::Skip`] and present for every other decision. If
-/// `lstat` fails, or `readlink` fails for a catalogued symlink, the walk
-/// emits [`Event::Io`] and does not emit `Decided`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Decided<'a> {
+/// buffer. It, `name` and `parent_fd` are valid only for the callback that
+/// receives them. `stat` is absent for [`Decision::Skip`] and present for every
+/// other decision. If `lstat` fails, or `readlink` fails for a catalogued
+/// symlink, the walk emits [`Event::Io`] and does not emit `Decided`.
+#[derive(Clone, Copy, Debug)]
+pub struct Decided<'a, D> {
+    /// The token of the directory that holds this entry.
+    pub parent: D,
+    /// That directory, open. `openat(parent_fd, name, O_NOFOLLOW)` reaches the
+    /// entry without resolving a path, and a `(dev, ino)` check against
+    /// `stat` proves it is the inode this event describes (D33).
+    pub parent_fd: BorrowedFd<'a>,
+    /// The entry's name in `parent`: the last component of `path`.
+    pub name: &'a OsStr,
     /// Root-relative path of the entry.
     pub path: &'a Path,
     /// What the policy said to do with `path`.
@@ -103,17 +112,121 @@ pub struct Decided<'a> {
     pub stat: Option<Stat<'a>>,
 }
 
+/// How a work tree found at or below the root is attached to its repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkTreeKind {
+    /// A `.git` directory, or a `.git` file whose gitdir has no `commondir`
+    /// outside any work tree the walk has seen (`git init
+    /// --separate-git-dir`).
+    Main,
+    /// A `.git` file whose gitdir names a `commondir` (`git worktree add`).
+    Linked,
+    /// A `.git` file whose gitdir has no `commondir`, in a directory already
+    /// inside a work tree the walk has seen. That is a submodule's layout; a
+    /// separate-git-dir repository nested in another work tree reads the
+    /// same and is reported the same.
+    Submodule,
+}
+
+/// A work tree whose top is the directory being entered (D23, D33).
+///
+/// Only work trees at or below the root are reported: nothing above a root is
+/// read (D22). A symlinked `.git`, a `.git` file that names no readable gitdir,
+/// or a gitdir whose `commondir` cannot be read still makes the directory a
+/// work tree for ignore rules, and reports no `WorkTree`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkTree<'a> {
+    /// Main, linked or submodule.
+    pub kind: WorkTreeKind,
+    /// The common directory's path: the root as the caller gave it (made
+    /// absolute), joined with the relative path and `.git` for a `.git`
+    /// directory, or the gitdir and `commondir` text for a `.git` file, with
+    /// `.` and `..` resolved lexically. A display name for the repository.
+    pub common_dir: &'a Path,
+    /// `(st_dev, st_ino)` of the common directory, from the descriptor the
+    /// walk opened. Two work trees of one repository agree on this even when
+    /// their paths to it are spelled differently; it is the repository's
+    /// identity within a run.
+    pub common_id: (u64, u64),
+}
+
+/// The operation that failed, for [`Event::Io`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoOp {
+    /// Reading a directory's entries (`getdents`). Entries read before the
+    /// error are still walked.
+    List,
+    /// Opening a directory, or checking that what opened is the inode that was
+    /// statted.
+    OpenDir,
+    /// Reopening a spilled continuation from the root, one component at a
+    /// time; this includes the check that the directory is still the same
+    /// inode.
+    Reopen,
+    /// `lstat` of an entry (`statat`, or `fstat` of its `O_PATH` descriptor).
+    Lstat,
+    /// `readlink` of a catalogued symlink.
+    Readlink,
+    /// Opening or reading `.ferretignore`, `.gitignore` or `info/exclude`.
+    ReadIgnore,
+    /// Classifying `.git`, reading a `.git` file, or opening the gitdir or its
+    /// `commondir`.
+    ProbeGit,
+}
+
+/// Which directory or entry an [`Event::Io`] is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultContext<'a, D> {
+    /// The root itself: opening it, statting it or listing it. This can come
+    /// before [`EventVisitor::root`] gave the root a token.
+    Root,
+    /// A directory below the root that already has its token: listing it, or
+    /// reopening it as a spilled continuation.
+    Dir(D),
+    /// An entry of `parent` with no token of its own: a file's `lstat` or
+    /// `readlink`, a named ignore file, the `.git` probe (`name` is `.git`
+    /// for faults on the gitdir, `commondir` and `info/exclude` too), or a
+    /// directory whose open failed.
+    Child {
+        /// The token of the directory holding the entry.
+        parent: D,
+        /// The entry's name in `parent`.
+        name: &'a OsStr,
+    },
+}
+
 /// What the walk reports, in the order it happens.
 ///
 /// A directory is reported before its children in [`walk`]. Its siblings come
 /// out in directory order, which is not sorted. [`walk_parallel`] gives no
-/// cross-worker event order. Paths borrow a worker's buffer and must be copied
-/// to be kept.
+/// cross-worker event order, but a directory's `Decided`, then its `Entered`,
+/// then its children's events are always in that order. Paths borrow a
+/// worker's buffer and must be copied to be kept. `D` is the visitor's
+/// directory token ([`EventVisitor::Dir`]).
 #[derive(Debug)]
-pub enum Event<'a> {
+pub enum Event<'a, D> {
     /// An entry `decide` classified.
-    Decided(Decided<'a>),
-    /// A directory listing, `lstat`, `readlink` or ignore-file read failed.
+    Decided(Decided<'a, D>),
+    /// The directory `dir` is open and listed and its children follow. For a
+    /// descended directory its ignore files have been read and `.git` probed;
+    /// a traversed directory reads neither and always has `work_tree: None`.
+    Entered {
+        /// The directory's token.
+        dir: D,
+        /// The work tree whose top this directory is, if one starts here.
+        work_tree: Option<WorkTree<'a>>,
+    },
+    /// A directory at a [`Boundary`] of [`WalkOptions::boundaries`]. It is not
+    /// classified, not opened and not descended: another root owns it (D34).
+    Boundary {
+        /// The token of the directory holding it.
+        parent: D,
+        /// Its name in `parent`.
+        name: &'a OsStr,
+        /// Its root-relative path.
+        path: &'a Path,
+    },
+    /// An open, stat, listing, `readlink` or ignore-file read failed.
     ///
     /// `path` is root-relative. It is empty when the root itself cannot be
     /// opened or listed, and it is the directory being listed when `getdents`
@@ -121,6 +234,10 @@ pub enum Event<'a> {
     Io {
         /// Root-relative path the operation was about.
         path: &'a Path,
+        /// What was being done.
+        op: IoOp,
+        /// Which directory or entry it was done to.
+        context: FaultContext<'a, D>,
         /// The OS error.
         error: io::Error,
     },
@@ -129,18 +246,51 @@ pub enum Event<'a> {
     Pattern(PatternError),
 }
 
-/// Walks one configured root.
+/// A directory the walk stops at because another root owns it (D34).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Boundary {
+    /// Root-relative path of the directory, compared by components.
+    pub path: PathBuf,
+    /// `(st_dev, st_ino)` the directory must have. When given, a directory at
+    /// `path` with a different identity is not this boundary and is walked
+    /// normally. A directory with this identity at another path (a bind
+    /// mount, say) is walked too: the match is by path.
+    pub id: Option<(u64, u64)>,
+}
+
+/// How [`walk_parallel`] runs, apart from what the policy decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WalkOptions {
+    /// Worker threads. Zero means one.
+    pub workers: usize,
+    /// Directories to stop at, reported as [`Event::Boundary`].
+    pub boundaries: Vec<Boundary>,
+}
+
+impl Default for WalkOptions {
+    /// [`default_workers`] and no boundaries.
+    fn default() -> Self {
+        Self {
+            workers: default_workers(),
+            boundaries: Vec::new(),
+        }
+    }
+}
+
+/// Walks one configured root on the calling thread, with no boundaries.
 ///
 /// `global` is the text of the global ignore file, or `None` when there is no
 /// such file (nothing is excluded by default). `visit` is called for every
 /// entry and every fault as the walk goes, so a catalog can record about a
 /// million entries without this function retaining them. A callback is the
 /// shape that allows that: the root-relative path is one reused buffer, and a
-/// lending iterator is not expressible in stable Rust.
+/// lending iterator is not expressible in stable Rust. Its directory token is
+/// `()`, and it enters every directory the policy enters; a visitor that needs
+/// tokens or boundaries uses [`walk_parallel`] with one worker.
 ///
-/// The root directory itself is not an event. It is where the walk starts,
-/// not an entry `decide` sees; the caller stats it if the roots table needs
-/// its inode. Faults that belong to the root use an empty path.
+/// The root directory itself is not a [`Decided`] event. It is where the walk
+/// starts, not an entry `decide` sees; [`EventVisitor::root`] receives its
+/// stat. Faults that belong to the root use an empty path.
 ///
 /// Ignore files are read when the walk enters a directory
 /// ([`Decision::Descend`]). A directory reached only so a `.ferretignore` `!`
@@ -190,8 +340,8 @@ pub enum Event<'a> {
 ///
 /// Mount points are crossed: the walk does not compare `st_dev` with the
 /// root. See the module docs for the descriptor bound.
-pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut(Event<'_>)) {
-    let mut walker = Walker::new(root, visit);
+pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut(Event<'_, ()>)) {
+    let mut walker = Walker::new(root, &[], visit);
     let Some(root_job) = walker.root_job(root, global, config) else {
         return;
     };
@@ -235,13 +385,29 @@ pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut
 ///   with the job across workers, so a child can be reported on a different
 ///   worker from the one that minted its parent's token.
 pub trait EventVisitor {
+    /// A directory's token: small, chosen by the visitor, carried by the walk.
+    type Dir: Copy + Send;
+
+    /// The root, opened and statted; returns its token. Called once per walk,
+    /// on the first visitor, before any other event except a root fault.
+    fn root(&mut self, stat: Stat<'_>) -> Self::Dir;
+
     /// Receives one event; borrowed paths are valid only during this call.
-    fn visit(&mut self, event: Event<'_>);
+    /// Returns the token for a directory's [`Event::Decided`] (see the
+    /// lifecycle above); ignored otherwise.
+    fn visit(&mut self, event: Event<'_, Self::Dir>) -> Option<Self::Dir>;
 }
 
-impl<F: FnMut(Event<'_>)> EventVisitor for F {
-    fn visit(&mut self, event: Event<'_>) {
+/// A closure sees every event, has no tokens (`()`), and enters every
+/// directory the policy enters.
+impl<F: FnMut(Event<'_, ()>)> EventVisitor for F {
+    type Dir = ();
+
+    fn root(&mut self, _stat: Stat<'_>) {}
+
+    fn visit(&mut self, event: Event<'_, ()>) -> Option<()> {
         self(event);
+        Some(())
     }
 }
 
@@ -257,18 +423,22 @@ pub fn default_workers() -> usize {
     std::thread::available_parallelism().map_or(1, |threads| threads.get().min(MAX_DEFAULT_WORKERS))
 }
 
-/// Walks with `workers` worker-local visitors and returns them for merging.
-/// Zero workers means one. Event order is unspecified across workers. When the
-/// root fails before threads start, only its fault visitor is returned.
+/// Walks with `options.workers` worker-local visitors and returns them for
+/// merging. Event order is unspecified across workers. When the root fails
+/// before threads start, only its fault visitor is returned. Directories in
+/// `options.boundaries` are reported as [`Event::Boundary`] and not entered.
+/// See [`walk`] for what is read and when, and [`EventVisitor`] for the
+/// directory lifecycle.
 pub fn walk_parallel<V: EventVisitor + Send>(
     root: &Path,
     global: Option<&str>,
     config: Config,
-    workers: usize,
+    options: &WalkOptions,
     make_visitor: impl Fn() -> V + Sync,
 ) -> Vec<V> {
-    let count = workers.max(1);
-    let mut first = Walker::new(root, make_visitor());
+    let count = options.workers.max(1);
+    let boundaries = options.boundaries.as_slice();
+    let mut first = Walker::new(root, boundaries, make_visitor());
     let Some(root_job) = first.root_job(root, global, config) else {
         return vec![first.visit];
     };
@@ -282,7 +452,7 @@ pub fn walk_parallel<V: EventVisitor + Send>(
         handles.push(scope.spawn(|| run_guarded(first, &shared)));
         for _ in 1..count {
             let visitor = make_visitor();
-            let mut walker = Walker::new(root, visitor);
+            let mut walker = Walker::new(root, boundaries, visitor);
             walker.root_id = root_id;
             handles.push(scope.spawn(|| run_guarded(walker, &shared)));
         }
@@ -298,8 +468,8 @@ pub fn walk_parallel<V: EventVisitor + Send>(
 
 const MAX_OPEN_JOBS: usize = 128;
 
-struct Shared {
-    jobs: Mutex<Vec<Job>>,
+struct Shared<D> {
+    jobs: Mutex<Vec<Job<D>>>,
     ready: Condvar,
     idle: AtomicUsize,
     outstanding: AtomicUsize,
@@ -307,8 +477,8 @@ struct Shared {
     cancelled: AtomicBool,
 }
 
-impl Shared {
-    fn new(root: Job) -> Self {
+impl<D> Shared<D> {
+    fn new(root: Job<D>) -> Self {
         Self {
             jobs: Mutex::new(vec![root]),
             ready: Condvar::new(),
@@ -319,7 +489,7 @@ impl Shared {
         }
     }
 
-    fn take(&self) -> Option<Job> {
+    fn take(&self) -> Option<Job<D>> {
         let mut jobs = self
             .jobs
             .lock()
@@ -350,7 +520,7 @@ impl Shared {
         }
     }
 
-    fn reserve_or_spill(&self, parent: &mut Job) {
+    fn reserve_or_spill(&self, parent: &mut Job<D>) {
         let reserved = self
             .open_jobs
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
@@ -361,13 +531,13 @@ impl Shared {
         }
     }
 
-    fn release_open(&self, job: &Job) {
+    fn release_open(&self, job: &Job<D>) {
         if job.dir.is_some() {
             self.open_jobs.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
-    fn share_oldest(&self, local: &mut VecDeque<Job>) {
+    fn share_oldest(&self, local: &mut VecDeque<Job<D>>) {
         if local.is_empty() || self.idle.load(Ordering::SeqCst) == 0 {
             return;
         }
@@ -398,7 +568,7 @@ impl Shared {
     }
 }
 
-fn run_guarded<V: EventVisitor>(walker: Walker<V>, shared: &Shared) -> V {
+fn run_guarded<V: EventVisitor>(walker: Walker<'_, V>, shared: &Shared<V::Dir>) -> V {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_worker(walker, shared))) {
         Ok(visitor) => visitor,
         Err(panic) => {
@@ -413,7 +583,7 @@ fn run_guarded<V: EventVisitor>(walker: Walker<V>, shared: &Shared) -> V {
     }
 }
 
-fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &Shared) -> V {
+fn run_worker<V: EventVisitor>(mut walker: Walker<'_, V>, shared: &Shared<V::Dir>) -> V {
     let mut local = VecDeque::new();
     let Some(mut current) = shared.take() else {
         return walker.visit;
@@ -448,46 +618,49 @@ fn run_worker<V: EventVisitor>(mut walker: Walker<V>, shared: &Shared) -> V {
     }
 }
 
-impl<F: EventVisitor> Walker<F> {
-    fn root_job(&mut self, root: &Path, global: Option<&str>, config: Config) -> Option<Job> {
+impl<V: EventVisitor> Walker<'_, V> {
+    fn root_job(&mut self, root: &Path, global: Option<&str>, config: Config) -> Option<Job<V::Dir>> {
         let fd = match open_path(root, root_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail(IoOp::OpenDir, FaultContext::Root, io::Error::from(error));
                 return None;
             }
         };
         let root_stat = match fstat(&fd) {
             Ok(stat) => stat,
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail(IoOp::OpenDir, FaultContext::Root, io::Error::from(error));
                 return None;
             }
         };
         self.root_id = Some((root_stat.st_dev, root_stat.st_ino));
-        let mut dir = match Dir::new(fd) {
+        let token = self.visit.root(public_stat(&root_stat, None));
+        let mut dir = match DirStream::new(fd) {
             Ok(dir) => dir,
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail(IoOp::List, FaultContext::Root, io::Error::from(error));
                 return None;
             }
         };
-        let children = self.list(&mut dir)?;
+        let children = self.list(&mut dir, FaultContext::Root)?;
         let loaded = match dir.fd() {
-            Ok(fd) => self.load_ignores(fd, &children, false),
+            Ok(fd) => self.load_ignores(fd, &children, false, token),
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail(IoOp::List, FaultContext::Root, io::Error::from(error));
                 return None;
             }
         };
         let (rules, errors) = DirRules::root(root, global, loaded.files(), config);
         self.patterns(errors);
+        self.entered(token, loaded.work_tree.as_ref());
         Some(Job::new(
             dir,
             rules,
             children,
             self.rel.clone(),
             (root_stat.st_dev, root_stat.st_ino),
+            token,
         ))
     }
 }
@@ -524,14 +697,24 @@ fn bytes_path(bytes: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(bytes))
 }
 
+const DOT_GIT: &str = ".git";
+
 // ── walk state ──
 
-struct Walker<F> {
+struct Walker<'b, F> {
     root: PathBuf,
     root_id: Option<(u64, u64)>,
+    boundaries: &'b [Boundary],
     /// Root-relative path bytes. Empty at the root. Reused for every entry.
     rel: Vec<u8>,
     visit: F,
+}
+
+/// The directory whose entries are being considered.
+struct Here<'a, D> {
+    fd: BorrowedFd<'a>,
+    rules: &'a DirRules,
+    token: D,
 }
 
 struct Child {
@@ -557,17 +740,25 @@ impl Children {
     }
 }
 
-struct Job {
-    dir: Option<Dir>,
+struct Job<D> {
+    dir: Option<DirStream>,
     rules: DirRules,
     children: Children,
     next: usize,
     rel: Vec<u8>,
     id: (u64, u64),
+    token: D,
 }
 
-impl Job {
-    fn new(dir: Dir, rules: DirRules, children: Children, rel: Vec<u8>, id: (u64, u64)) -> Self {
+impl<D> Job<D> {
+    fn new(
+        dir: DirStream,
+        rules: DirRules,
+        children: Children,
+        rel: Vec<u8>,
+        id: (u64, u64),
+        token: D,
+    ) -> Self {
         Self {
             dir: Some(dir),
             rules,
@@ -575,6 +766,7 @@ impl Job {
             next: 0,
             rel,
             id,
+            token,
         }
     }
 }
@@ -598,11 +790,20 @@ impl GitProbe {
     }
 }
 
+/// A [`WorkTree`] held until [`Event::Entered`] lends it. One per work tree,
+/// so the path allocation is not per entry.
+struct FoundWorkTree {
+    kind: WorkTreeKind,
+    common_dir: PathBuf,
+    common_id: (u64, u64),
+}
+
 struct Ignores {
     ferretignore: Option<String>,
     gitignore: Option<String>,
     git_root: bool,
     git_exclude: Option<String>,
+    work_tree: Option<FoundWorkTree>,
 }
 
 impl Ignores {
@@ -622,11 +823,12 @@ enum Opened {
     Bytes(Vec<u8>),
 }
 
-impl<F: EventVisitor> Walker<F> {
-    fn new(root: &Path, visit: F) -> Self {
+impl<'b, V: EventVisitor> Walker<'b, V> {
+    fn new(root: &Path, boundaries: &'b [Boundary], visit: V) -> Self {
         Self {
             root: root.to_path_buf(),
             root_id: None,
+            boundaries,
             rel: Vec::with_capacity(256),
             visit,
         }
@@ -645,11 +847,18 @@ impl<F: EventVisitor> Walker<F> {
         self.rel.truncate(length);
     }
 
-    fn fail(&mut self, error: io::Error) {
+    fn fail(&mut self, op: IoOp, context: FaultContext<'_, V::Dir>, error: io::Error) {
         self.visit.visit(Event::Io {
             path: bytes_path(&self.rel),
+            op,
+            context,
             error,
         });
+    }
+
+    /// A fault on entry `name` of the directory `parent`.
+    fn fail_child(&mut self, op: IoOp, parent: V::Dir, name: &OsStr, error: io::Error) {
+        self.fail(op, FaultContext::Child { parent, name }, error);
     }
 
     fn patterns(&mut self, errors: Vec<PatternError>) {
@@ -658,27 +867,56 @@ impl<F: EventVisitor> Walker<F> {
         }
     }
 
-    fn emit(&mut self, decision: Decision, stat: Option<Stat<'_>>) {
+    fn entered(&mut self, dir: V::Dir, work_tree: Option<&FoundWorkTree>) {
+        let work_tree = work_tree.map(|found| WorkTree {
+            kind: found.kind,
+            common_dir: &found.common_dir,
+            common_id: found.common_id,
+        });
+        self.visit.visit(Event::Entered { dir, work_tree });
+    }
+
+    fn emit(
+        &mut self,
+        here: &Here<'_, V::Dir>,
+        name: &OsStr,
+        decision: Decision,
+        stat: Option<Stat<'_>>,
+    ) -> Option<V::Dir> {
         self.visit.visit(Event::Decided(Decided {
+            parent: here.token,
+            parent_fd: here.fd,
+            name,
             path: bytes_path(&self.rel),
             decision,
             stat,
-        }));
+        }))
     }
 
-    fn emit_skip(&mut self) {
-        self.emit(Decision::Skip, None);
+    fn emit_skip(&mut self, here: &Here<'_, V::Dir>, name: &OsStr) {
+        self.emit(here, name, Decision::Skip, None);
     }
 
-    fn emit_stat(&mut self, decision: Decision, stat: &rustix::fs::Stat, target: Option<&OsStr>) {
-        self.emit(decision, Some(public_stat(stat, target)));
+    fn emit_stat(
+        &mut self,
+        here: &Here<'_, V::Dir>,
+        name: &OsStr,
+        decision: Decision,
+        stat: &rustix::fs::Stat,
+        target: Option<&OsStr>,
+    ) -> Option<V::Dir> {
+        self.emit(here, name, decision, Some(public_stat(stat, target)))
     }
 
     /// Lists `dir`. An error from `getdents` with no entry yet is one fault
     /// and `None`, so ignore files are not probed for a directory that could
     /// not be listed. An error after some entries is reported and the entries
     /// already read are kept.
-    fn list(&mut self, dir: &mut Dir) -> Option<Children> {
+    fn list(
+        &mut self,
+        dir: &mut DirStream,
+        context: FaultContext<'_, V::Dir>,
+    ) -> Option<Children> {
         let mut children = Children {
             names: Vec::new(),
             entries: Vec::new(),
@@ -700,7 +938,7 @@ impl<F: EventVisitor> Walker<F> {
                     });
                 }
                 Err(error) => {
-                    self.fail(io::Error::from(error));
+                    self.fail(IoOp::List, context, io::Error::from(error));
                     failed = true;
                 }
             }
@@ -712,24 +950,33 @@ impl<F: EventVisitor> Walker<F> {
         }
     }
 
-    fn process(&mut self, mut job: Job) -> Option<(Job, Job)> {
+    fn process(&mut self, mut job: Job<V::Dir>) -> Option<(Job<V::Dir>, Job<V::Dir>)> {
         self.rel.clone_from(&job.rel);
         if job.dir.is_none() {
-            job.dir = self.reopen(bytes_path(&job.rel), job.id);
+            job.dir = self.reopen(bytes_path(&job.rel), job.id, job.token);
         }
-        let dir = job.dir.as_ref()?;
+        let fd = match job.dir.as_ref()?.fd() {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.fail(
+                    IoOp::List,
+                    FaultContext::Dir(job.token),
+                    io::Error::from(error),
+                );
+                return None;
+            }
+        };
+        let here = Here {
+            fd,
+            rules: &job.rules,
+            token: job.token,
+        };
         while job.next < job.children.entries.len() {
             let child = &job.children.entries[job.next];
             let name = job.children.name(child);
             job.next += 1;
             let length = self.push(name);
-            let descended = match dir.fd() {
-                Ok(fd) => self.consider(fd, &job.rules, name, child.kind),
-                Err(error) => {
-                    self.fail(io::Error::from(error));
-                    None
-                }
-            };
+            let descended = self.consider(&here, name, child.kind);
             self.pop(length);
             if let Some(descended) = descended {
                 return Some((job, descended));
@@ -741,58 +988,65 @@ impl<F: EventVisitor> Walker<F> {
     /// Reopen a spilled continuation one component at a time. Only the
     /// configured root is opened by path; every component below it uses
     /// `O_NOFOLLOW`. The root and final inode must match the first pass.
-    fn reopen(&mut self, rel: &Path, expected: (u64, u64)) -> Option<Dir> {
+    fn reopen(&mut self, rel: &Path, expected: (u64, u64), token: V::Dir) -> Option<DirStream> {
+        let context = FaultContext::Dir(token);
         let root = match open_path(&self.root, root_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail(IoOp::Reopen, context, io::Error::from(error));
                 return None;
             }
         };
         let Some(root_id) = self.root_id else {
-            self.fail(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "missing root identity",
-            ));
+            self.fail(
+                IoOp::Reopen,
+                context,
+                io::Error::new(io::ErrorKind::InvalidData, "missing root identity"),
+            );
             return None;
         };
         let mut fd = root;
-        if !self.same_dir(&fd, root_id) {
+        if !self.same_dir(&fd, root_id, token) {
             return None;
         }
         for name in rel.iter() {
             fd = match openat(&fd, name, child_dir_flags(), Mode::empty()) {
                 Ok(next) => next,
                 Err(error) => {
-                    self.fail(io::Error::from(error));
+                    self.fail(IoOp::Reopen, context, io::Error::from(error));
                     return None;
                 }
             };
         }
-        if !self.same_dir(&fd, expected) {
+        if !self.same_dir(&fd, expected, token) {
             return None;
         }
-        match Dir::new(fd) {
+        match DirStream::new(fd) {
             Ok(dir) => Some(dir),
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail(IoOp::Reopen, context, io::Error::from(error));
                 None
             }
         }
     }
 
-    fn same_dir(&mut self, fd: &OwnedFd, expected: (u64, u64)) -> bool {
+    fn same_dir(&mut self, fd: &OwnedFd, expected: (u64, u64), token: V::Dir) -> bool {
+        let context = FaultContext::Dir(token);
         match fstat(fd) {
             Ok(stat) if (stat.st_dev, stat.st_ino) == expected => true,
             Ok(_) => {
-                self.fail(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory changed before resume",
-                ));
+                self.fail(
+                    IoOp::Reopen,
+                    context,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory changed before resume",
+                    ),
+                );
                 false
             }
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail(IoOp::Reopen, context, io::Error::from(error));
                 false
             }
         }
@@ -800,56 +1054,65 @@ impl<F: EventVisitor> Walker<F> {
 
     fn consider(
         &mut self,
-        dir: BorrowedFd<'_>,
-        rules: &DirRules,
+        here: &Here<'_, V::Dir>,
         name: &OsStr,
         kind: FileType,
-    ) -> Option<Job> {
+    ) -> Option<Job<V::Dir>> {
         match kind {
             FileType::RegularFile | FileType::Unknown => {
-                let stat = self.stat_child(dir, name)?;
-                self.decide_statted(dir, rules, name, stat)
+                let stat = self.stat_child(here, name)?;
+                self.decide_statted(here, name, stat)
             }
             FileType::Symlink => {
-                let decision = rules.decide(bytes_path(&self.rel), Entry::Symlink);
+                let decision = here.rules.decide(bytes_path(&self.rel), Entry::Symlink);
                 if decision == Decision::Skip {
-                    self.emit_skip();
+                    self.emit_skip(here, name);
                     return None;
                 }
-                self.finish_link(dir, rules, name, decision)
+                self.finish_link(here, name, decision)
             }
-            FileType::Directory => self.consider_dir(dir, rules, name),
+            FileType::Directory => self.consider_dir(here, name),
             _ => {
-                if rules.decide(bytes_path(&self.rel), Entry::Other) == Decision::Skip {
-                    self.emit_skip();
+                if here.rules.decide(bytes_path(&self.rel), Entry::Other) == Decision::Skip {
+                    self.emit_skip(here, name);
                     return None;
                 }
-                let stat = self.stat_child(dir, name)?;
-                self.decide_statted(dir, rules, name, stat)
+                let stat = self.stat_child(here, name)?;
+                self.decide_statted(here, name, stat)
             }
         }
     }
 
-    fn consider_dir(&mut self, dir: BorrowedFd<'_>, rules: &DirRules, name: &OsStr) -> Option<Job> {
-        let mut decision = rules.decide(bytes_path(&self.rel), Entry::Dir);
-        if decision == Decision::Skip {
-            self.emit_skip();
+    fn consider_dir(&mut self, here: &Here<'_, V::Dir>, name: &OsStr) -> Option<Job<V::Dir>> {
+        let mut decision = here.rules.decide(bytes_path(&self.rel), Entry::Dir);
+        // A boundary is checked whatever the policy says here: the inner root
+        // owns it (D34). Only a name that could be one is statted when
+        // skipped.
+        if decision == Decision::Skip && !self.may_be_boundary() {
+            self.emit_skip(here, name);
             return None;
         }
-        let stat = self.stat_child(dir, name)?;
+        let stat = self.stat_child(here, name)?;
+        if self.at_boundary(here, name, &stat) {
+            return None;
+        }
+        if decision == Decision::Skip {
+            self.emit_skip(here, name);
+            return None;
+        }
         let seen = entry_from_stat(&stat);
         if seen != Entry::Dir {
-            decision = rules.decide(bytes_path(&self.rel), seen);
+            decision = here.rules.decide(bytes_path(&self.rel), seen);
             if decision == Decision::Skip {
-                self.emit_skip();
+                self.emit_skip(here, name);
                 return None;
             }
             if seen == Entry::Symlink {
-                return self.finish_link(dir, rules, name, decision);
+                return self.finish_link(here, name, decision);
             }
         }
-        self.emit_stat(decision, &stat, None);
-        self.follow(dir, rules, name, decision, &stat)
+        let token = self.emit_stat(here, name, decision, &stat, None);
+        self.follow(here, name, decision, &stat, token)
     }
 
     /// `stat` came from `statat` (`d_type` was a file, unknown, or disagreed).
@@ -857,129 +1120,176 @@ impl<F: EventVisitor> Walker<F> {
     /// one observation.
     fn decide_statted(
         &mut self,
-        dir: BorrowedFd<'_>,
-        rules: &DirRules,
+        here: &Here<'_, V::Dir>,
         name: &OsStr,
         stat: rustix::fs::Stat,
-    ) -> Option<Job> {
+    ) -> Option<Job<V::Dir>> {
+        if self.at_boundary(here, name, &stat) {
+            return None;
+        }
         let entry = entry_from_stat(&stat);
-        let decision = rules.decide(bytes_path(&self.rel), entry);
+        let decision = here.rules.decide(bytes_path(&self.rel), entry);
         if decision == Decision::Skip {
-            self.emit_skip();
+            self.emit_skip(here, name);
             return None;
         }
         if entry == Entry::Symlink {
-            return self.finish_link(dir, rules, name, decision);
+            return self.finish_link(here, name, decision);
         }
-        self.emit_stat(decision, &stat, None);
-        self.follow(dir, rules, name, decision, &stat)
+        let token = self.emit_stat(here, name, decision, &stat, None);
+        self.follow(here, name, decision, &stat, token)
     }
 
     /// Opens `name` with `O_PATH | O_NOFOLLOW`. The stat and, when it is a
     /// symlink, the target come from that descriptor.
     fn finish_link(
         &mut self,
-        dir: BorrowedFd<'_>,
-        rules: &DirRules,
+        here: &Here<'_, V::Dir>,
         name: &OsStr,
         decision: Decision,
-    ) -> Option<Job> {
-        let (stat, target) = match observe_link(dir, name) {
+    ) -> Option<Job<V::Dir>> {
+        let (stat, target) = match observe_link(here.fd, name) {
             Ok(pair) => pair,
-            Err(error) => {
-                self.fail(error);
+            Err((op, error)) => {
+                self.fail_child(op, here.token, name, error);
                 return None;
             }
         };
         let seen = entry_from_stat(&stat);
         if seen != Entry::Symlink {
-            let decision = rules.decide(bytes_path(&self.rel), seen);
-            if decision == Decision::Skip {
-                self.emit_skip();
+            if self.at_boundary(here, name, &stat) {
                 return None;
             }
-            self.emit_stat(decision, &stat, None);
-            return self.follow(dir, rules, name, decision, &stat);
+            let decision = here.rules.decide(bytes_path(&self.rel), seen);
+            if decision == Decision::Skip {
+                self.emit_skip(here, name);
+                return None;
+            }
+            let token = self.emit_stat(here, name, decision, &stat, None);
+            return self.follow(here, name, decision, &stat, token);
         }
         let Some(target) = target else {
-            self.fail(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "symlink has no target",
-            ));
+            self.fail_child(
+                IoOp::Readlink,
+                here.token,
+                name,
+                io::Error::new(io::ErrorKind::InvalidData, "symlink has no target"),
+            );
             return None;
         };
-        self.emit_stat(decision, &stat, Some(target.as_os_str()));
+        self.emit_stat(here, name, decision, &stat, Some(target.as_os_str()));
         None
     }
 
-    fn stat_child(&mut self, dir: BorrowedFd<'_>, name: &OsStr) -> Option<rustix::fs::Stat> {
-        match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+    fn stat_child(&mut self, here: &Here<'_, V::Dir>, name: &OsStr) -> Option<rustix::fs::Stat> {
+        match statat(here.fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => Some(stat),
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail_child(IoOp::Lstat, here.token, name, io::Error::from(error));
                 None
             }
         }
     }
 
+    // ── boundaries ──
+
+    /// Whether the current path is some boundary's, before its identity is
+    /// known. Free when there are no boundaries.
+    fn may_be_boundary(&self) -> bool {
+        !self.boundaries.is_empty() && {
+            let path = bytes_path(&self.rel);
+            self.boundaries.iter().any(|boundary| boundary.path == path)
+        }
+    }
+
+    /// Reports [`Event::Boundary`] when the current path is a boundary and
+    /// `stat` is a directory with that boundary's identity, if it gives one.
+    fn at_boundary(&mut self, here: &Here<'_, V::Dir>, name: &OsStr, stat: &rustix::fs::Stat) -> bool {
+        if self.boundaries.is_empty() || file_type(stat) != FileType::Directory {
+            return false;
+        }
+        let path = bytes_path(&self.rel);
+        let id = (stat.st_dev, stat.st_ino);
+        let hit = self
+            .boundaries
+            .iter()
+            .any(|boundary| boundary.path == path && boundary.id.is_none_or(|want| want == id));
+        if hit {
+            self.visit.visit(Event::Boundary {
+                parent: here.token,
+                name,
+                path,
+            });
+        }
+        hit
+    }
+
+    // ── entering ──
+
+    /// `token` is what the visitor returned for this directory's `Decided`;
+    /// `None` prunes it.
     fn follow(
         &mut self,
-        parent: BorrowedFd<'_>,
-        rules: &DirRules,
+        here: &Here<'_, V::Dir>,
         name: &OsStr,
         decision: Decision,
         expected: &rustix::fs::Stat,
-    ) -> Option<Job> {
+        token: Option<V::Dir>,
+    ) -> Option<Job<V::Dir>> {
         match decision {
-            Decision::Descend => self.enter_and_list(parent, rules, name, expected),
-            Decision::Traverse => self.traverse_and_list(parent, rules, name, expected),
+            Decision::Descend => self.enter_and_list(here, name, expected, token?),
+            Decision::Traverse => self.traverse_and_list(here, name, expected, token?),
             Decision::Skip | Decision::Catalog(_) | Decision::Index => None,
         }
     }
 
     fn enter_and_list(
         &mut self,
-        parent: BorrowedFd<'_>,
-        parent_rules: &DirRules,
+        here: &Here<'_, V::Dir>,
         name: &OsStr,
         expected: &rustix::fs::Stat,
-    ) -> Option<Job> {
-        let mut child = self.open_child(parent, name, expected)?;
-        let children = self.list(&mut child)?;
+        token: V::Dir,
+    ) -> Option<Job<V::Dir>> {
+        let mut child = self.open_child(here, name, expected)?;
+        let children = self.list(&mut child, FaultContext::Dir(token))?;
         let loaded = match child.fd() {
-            Ok(fd) => self.load_ignores(fd, &children, parent_rules.in_work_tree()),
+            Ok(fd) => self.load_ignores(fd, &children, here.rules.in_work_tree(), token),
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail(IoOp::List, FaultContext::Dir(token), io::Error::from(error));
                 return None;
             }
         };
-        let (rules, errors) = parent_rules.enter(name, loaded.files());
+        let (rules, errors) = here.rules.enter(name, loaded.files());
         self.patterns(errors);
+        self.entered(token, loaded.work_tree.as_ref());
         Some(Job::new(
             child,
             rules,
             children,
             self.rel.clone(),
             (expected.st_dev, expected.st_ino),
+            token,
         ))
     }
 
     fn traverse_and_list(
         &mut self,
-        parent: BorrowedFd<'_>,
-        parent_rules: &DirRules,
+        here: &Here<'_, V::Dir>,
         name: &OsStr,
         expected: &rustix::fs::Stat,
-    ) -> Option<Job> {
-        let mut child = self.open_child(parent, name, expected)?;
-        let children = self.list(&mut child)?;
-        let rules = parent_rules.traverse(name);
+        token: V::Dir,
+    ) -> Option<Job<V::Dir>> {
+        let mut child = self.open_child(here, name, expected)?;
+        let children = self.list(&mut child, FaultContext::Dir(token))?;
+        let rules = here.rules.traverse(name);
+        self.entered(token, None);
         Some(Job::new(
             child,
             rules,
             children,
             self.rel.clone(),
             (expected.st_dev, expected.st_ino),
+            token,
         ))
     }
 
@@ -988,35 +1298,40 @@ impl<F: EventVisitor> Walker<F> {
     /// event already described the inode `decide` saw.
     fn open_child(
         &mut self,
-        parent: BorrowedFd<'_>,
+        here: &Here<'_, V::Dir>,
         name: &OsStr,
         expected: &rustix::fs::Stat,
-    ) -> Option<Dir> {
-        let fd = match openat(parent, name, child_dir_flags(), Mode::empty()) {
+    ) -> Option<DirStream> {
+        let fd = match openat(here.fd, name, child_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail_child(IoOp::OpenDir, here.token, name, io::Error::from(error));
                 return None;
             }
         };
         match fstat(&fd) {
             Ok(stat) if stat.st_dev == expected.st_dev && stat.st_ino == expected.st_ino => {}
             Ok(_) => {
-                self.fail(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "directory changed between stat and open",
-                ));
+                self.fail_child(
+                    IoOp::OpenDir,
+                    here.token,
+                    name,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory changed between stat and open",
+                    ),
+                );
                 return None;
             }
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail_child(IoOp::OpenDir, here.token, name, io::Error::from(error));
                 return None;
             }
         }
-        match Dir::new(fd) {
+        match DirStream::new(fd) {
             Ok(dir) => Some(dir),
             Err(error) => {
-                self.fail(io::Error::from(error));
+                self.fail_child(IoOp::OpenDir, here.token, name, io::Error::from(error));
                 None
             }
         }
@@ -1030,19 +1345,20 @@ impl<F: EventVisitor> Walker<F> {
     /// `in_work_tree` is the parent directory. The root passes `false`.
     /// `.git`, when it is a directory, is opened here and that descriptor is
     /// what `info/exclude` is read from, including across the `.gitignore`
-    /// callback below.
+    /// callback below. `token` is the directory being loaded.
     fn load_ignores(
         &mut self,
         dir: BorrowedFd<'_>,
         children: &Children,
         in_work_tree: bool,
+        token: V::Dir,
     ) -> Ignores {
         let listed = |name: &str| children.contains(name);
         let ferretignore = listed(".ferretignore")
-            .then(|| self.read_named(dir, ".ferretignore"))
+            .then(|| self.read_named(dir, ".ferretignore", token))
             .flatten();
-        let git = if listed(".git") {
-            self.probe_git(dir)
+        let git = if listed(DOT_GIT) {
+            self.probe_git(dir, token)
         } else {
             GitProbe::Missing
         };
@@ -1050,31 +1366,35 @@ impl<F: EventVisitor> Walker<F> {
         // not opened. A FIFO of that name must not stall a walk that is not in
         // a repository.
         let gitignore = if (in_work_tree || git.is_root()) && listed(".gitignore") {
-            self.read_named(dir, ".gitignore")
+            self.read_named(dir, ".gitignore", token)
         } else {
             None
         };
         let git_root = git.is_root();
-        let git_exclude = match git {
-            GitProbe::Directory(fd) => self.read_exclude(fd),
-            GitProbe::File(bytes) => self.read_gitfile_exclude(dir, &bytes),
-            GitProbe::Missing | GitProbe::Present => None,
+        let (work_tree, git_exclude) = match git {
+            GitProbe::Directory(fd) => {
+                let work_tree = self.main_work_tree(&fd, token);
+                (work_tree, self.read_exclude(fd, token))
+            }
+            GitProbe::File(bytes) => self.read_gitfile(dir, &bytes, in_work_tree, token),
+            GitProbe::Missing | GitProbe::Present => (None, None),
         };
         Ignores {
             ferretignore,
             gitignore,
             git_root,
             git_exclude,
+            work_tree,
         }
     }
 
-    fn read_named(&mut self, dir: BorrowedFd<'_>, name: &str) -> Option<String> {
+    fn read_named(&mut self, dir: BorrowedFd<'_>, name: &str, token: V::Dir) -> Option<String> {
         let length = self.push(name);
         let text = match open_ignore(dir, name) {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
             Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
-                self.fail(error);
+                self.fail_child(IoOp::ReadIgnore, token, OsStr::new(name), error);
                 None
             }
         };
@@ -1085,27 +1405,29 @@ impl<F: EventVisitor> Walker<F> {
     /// `info` is opened `O_NOFOLLOW` relative to the held git directory (or
     /// common directory). `exclude` is an ordinary ignore file: a symlink of
     /// that name is followed.
-    fn read_exclude(&mut self, git: OwnedFd) -> Option<String> {
-        let git_length = self.push(".git");
+    fn read_exclude(&mut self, git: OwnedFd, token: V::Dir) -> Option<String> {
+        let git_length = self.push(DOT_GIT);
         let info_length = self.push("info");
         let info = match openat(git.as_fd(), "info", child_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => {
-                self.pop(info_length);
                 self.pop(git_length);
                 return None;
             }
             Err(error) => {
-                let exclude_length = self.push("exclude");
-                self.fail(io::Error::from(error));
-                self.pop(exclude_length);
-                self.pop(info_length);
+                self.push("exclude");
+                self.fail_child(
+                    IoOp::ReadIgnore,
+                    token,
+                    OsStr::new(DOT_GIT),
+                    io::Error::from(error),
+                );
                 self.pop(git_length);
                 return None;
             }
         };
         drop(git);
-        let exclude_length = self.push("exclude");
+        self.push("exclude");
         let opened = match openat(info.as_fd(), "exclude", ignore_flags(), Mode::empty()) {
             Ok(fd) => {
                 drop(info);
@@ -1118,40 +1440,39 @@ impl<F: EventVisitor> Walker<F> {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
             Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
-                self.fail(error);
+                self.fail_child(IoOp::ReadIgnore, token, OsStr::new(DOT_GIT), error);
                 None
             }
         };
-        self.pop(exclude_length);
         self.pop(info_length);
         self.pop(git_length);
         text
     }
 
-    fn probe_git(&mut self, dir: BorrowedFd<'_>) -> GitProbe {
-        match openat(dir, ".git", child_dir_flags(), Mode::empty()) {
+    fn probe_git(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
+        match openat(dir, DOT_GIT, child_dir_flags(), Mode::empty()) {
             Ok(fd) => GitProbe::Directory(fd),
             Err(Errno::NOENT) => GitProbe::Missing,
             Err(Errno::LOOP) => GitProbe::Present,
-            Err(Errno::NOTDIR) => self.probe_git_file(dir),
-            Err(error) => self.probe_git_failed(dir, error),
+            Err(Errno::NOTDIR) => self.probe_git_file(dir, token),
+            Err(error) => self.probe_git_failed(dir, error, token),
         }
     }
 
     /// The directory open failed for a reason other than "not a directory"
     /// or "a symlink". A directory we cannot search still starts a work
     /// tree; a regular file is read below.
-    fn probe_git_failed(&mut self, dir: BorrowedFd<'_>, error: Errno) -> GitProbe {
-        match statat(dir, ".git", AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) if file_type(&stat) == FileType::RegularFile => self.probe_git_file(dir),
+    fn probe_git_failed(&mut self, dir: BorrowedFd<'_>, error: Errno, token: V::Dir) -> GitProbe {
+        match statat(dir, DOT_GIT, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if file_type(&stat) == FileType::RegularFile => self.probe_git_file(dir, token),
             Ok(stat) if file_type(&stat) == FileType::Directory => {
-                self.fail_at_git(io::Error::from(error));
+                self.fail_at_git(io::Error::from(error), token);
                 GitProbe::Present
             }
             Ok(_) => GitProbe::Present,
             Err(Errno::NOENT) => GitProbe::Missing,
             Err(stat_err) => {
-                self.fail_at_git(io::Error::from(stat_err));
+                self.fail_at_git(io::Error::from(stat_err), token);
                 GitProbe::Missing
             }
         }
@@ -1159,47 +1480,109 @@ impl<F: EventVisitor> Walker<F> {
 
     /// `.git` is not a directory. `O_NOFOLLOW` so a symlink that appeared
     /// since the listing is not a gitdir file.
-    fn probe_git_file(&mut self, dir: BorrowedFd<'_>) -> GitProbe {
-        match openat(dir, ".git", nofollow_file_flags(), Mode::empty()) {
+    fn probe_git_file(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
+        match openat(dir, DOT_GIT, nofollow_file_flags(), Mode::empty()) {
             Ok(fd) => match read_regular(fd) {
                 Ok(Some(bytes)) => GitProbe::File(bytes),
                 Ok(None) => GitProbe::Present,
                 Err(error) => {
-                    self.fail_at_git(error);
+                    self.fail_at_git(error, token);
                     GitProbe::Present
                 }
             },
             Err(Errno::NOENT) => GitProbe::Missing,
             Err(Errno::LOOP) => GitProbe::Present,
-            Err(error) => match statat(dir, ".git", AtFlags::SYMLINK_NOFOLLOW) {
+            Err(error) => match statat(dir, DOT_GIT, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) if file_type(&stat) == FileType::RegularFile => {
-                    self.fail_at_git(io::Error::from(error));
+                    self.fail_at_git(io::Error::from(error), token);
                     GitProbe::Present
                 }
                 Ok(_) => GitProbe::Present,
                 Err(Errno::NOENT) => GitProbe::Missing,
                 Err(stat_err) => {
-                    self.fail_at_git(io::Error::from(stat_err));
+                    self.fail_at_git(io::Error::from(stat_err), token);
                     GitProbe::Missing
                 }
             },
         }
     }
 
+    /// A `.git` directory: the work tree is main and `.git` is its common
+    /// directory.
+    fn main_work_tree(&mut self, git: &OwnedFd, token: V::Dir) -> Option<FoundWorkTree> {
+        let common_id = self.git_identity(git, token)?;
+        Some(FoundWorkTree {
+            kind: WorkTreeKind::Main,
+            common_dir: normalize(&self.here_path().join(DOT_GIT)),
+            common_id,
+        })
+    }
+
     /// Follow git's `gitdir:` and optional `commondir` from held descriptors.
     /// A relative path may include `..`, as git's format requires. An
     /// absolute gitdir is opened by path because it is outside the tree.
-    fn read_gitfile_exclude(&mut self, work: BorrowedFd<'_>, bytes: &[u8]) -> Option<String> {
-        let raw = parse_gitdir(bytes)?;
-        let gitdir = self.open_git_directory(work, raw)?;
-        let common = self.common_dir(gitdir)?;
-        self.read_exclude(common)
+    fn read_gitfile(
+        &mut self,
+        work: BorrowedFd<'_>,
+        bytes: &[u8],
+        in_work_tree: bool,
+        token: V::Dir,
+    ) -> (Option<FoundWorkTree>, Option<String>) {
+        let Some(raw) = parse_gitdir(bytes) else {
+            return (None, None);
+        };
+        let Some(gitdir) = self.open_git_directory(work, raw, token) else {
+            return (None, None);
+        };
+        let gitdir_path = self.here_path().join(raw);
+        let Some((common, commondir)) = self.common_dir(gitdir, token) else {
+            return (None, None);
+        };
+        let (kind, common_path) = match commondir {
+            Some(text) => (WorkTreeKind::Linked, gitdir_path.join(text)),
+            None if in_work_tree => (WorkTreeKind::Submodule, gitdir_path),
+            None => (WorkTreeKind::Main, gitdir_path),
+        };
+        let work_tree = self
+            .git_identity(&common, token)
+            .map(|common_id| FoundWorkTree {
+                kind,
+                common_dir: normalize(&common_path),
+                common_id,
+            });
+        (work_tree, self.read_exclude(common, token))
+    }
+
+    /// The directory being loaded, as a path: the root the caller gave, made
+    /// absolute, joined with the root-relative path. Only for work trees.
+    fn here_path(&self) -> PathBuf {
+        let root = std::path::absolute(&self.root).unwrap_or_else(|_| self.root.clone());
+        if self.rel.is_empty() {
+            root
+        } else {
+            root.join(bytes_path(&self.rel))
+        }
+    }
+
+    fn git_identity(&mut self, git: &OwnedFd, token: V::Dir) -> Option<(u64, u64)> {
+        match fstat(git) {
+            Ok(stat) => Some((stat.st_dev, stat.st_ino)),
+            Err(error) => {
+                self.fail_at_git(io::Error::from(error), token);
+                None
+            }
+        }
     }
 
     /// Symlinks are followed, as git follows them: the gitdir's text can
     /// already name any directory, so `O_NOFOLLOW` here would protect nothing.
     /// What the handle protects is `base`, which a rename cannot redirect.
-    fn open_git_directory(&mut self, base: BorrowedFd<'_>, raw: &OsStr) -> Option<OwnedFd> {
+    fn open_git_directory(
+        &mut self,
+        base: BorrowedFd<'_>,
+        raw: &OsStr,
+        token: V::Dir,
+    ) -> Option<OwnedFd> {
         let path = Path::new(raw);
         let opened = if path.is_absolute() {
             open_path(path, root_dir_flags(), Mode::empty())
@@ -1210,18 +1593,19 @@ impl<F: EventVisitor> Walker<F> {
             Ok(fd) => Some(fd),
             Err(Errno::NOENT) => None,
             Err(error) => {
-                self.fail_at_git(io::Error::from(error));
+                self.fail_at_git(io::Error::from(error), token);
                 None
             }
         }
     }
 
-    /// The gitdir itself when it has no `commondir` file. `None` when that
-    /// file cannot be read, is not a regular file, or names nothing: a linked
-    /// work tree's own directory is not where exclude lives, so it is not a
-    /// fallback. Only a missing `commondir` means the gitdir is the common
-    /// directory.
-    fn common_dir(&mut self, gitdir: OwnedFd) -> Option<OwnedFd> {
+    /// The gitdir itself when it has no `commondir` file, with `None` as the
+    /// second value; otherwise the directory `commondir` names and its text.
+    /// `None` when that file cannot be read, is not a regular file, or names
+    /// nothing: a linked work tree's own directory is not where exclude lives,
+    /// so it is not a fallback. Only a missing `commondir` means the gitdir is
+    /// the common directory.
+    fn common_dir(&mut self, gitdir: OwnedFd, token: V::Dir) -> Option<(OwnedFd, Option<OsString>)> {
         let opened = match openat(
             gitdir.as_fd(),
             "commondir",
@@ -1233,48 +1617,75 @@ impl<F: EventVisitor> Walker<F> {
             Err(error) => Err(io::Error::from(error)),
         };
         match opened {
-            Ok(Opened::Missing) => Some(gitdir),
+            Ok(Opened::Missing) => Some((gitdir, None)),
             Ok(Opened::NotRegular) => {
-                self.fail_at_git(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "commondir is not a regular file",
-                ));
+                self.fail_at_git(
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "commondir is not a regular file",
+                    ),
+                    token,
+                );
                 None
             }
             Ok(Opened::Bytes(bytes)) => {
                 let raw = first_line(&bytes)?;
-                self.open_git_directory(gitdir.as_fd(), raw)
+                let common = self.open_git_directory(gitdir.as_fd(), raw, token)?;
+                Some((common, Some(raw.to_os_string())))
             }
             Err(error) => {
-                self.fail_at_git(error);
+                self.fail_at_git(error, token);
                 None
             }
         }
     }
 
-    fn fail_at_git(&mut self, error: io::Error) {
-        let length = self.push(".git");
-        self.fail(error);
+    fn fail_at_git(&mut self, error: io::Error, token: V::Dir) {
+        let length = self.push(DOT_GIT);
+        self.fail_child(IoOp::ProbeGit, token, OsStr::new(DOT_GIT), error);
         self.pop(length);
     }
 }
 
+/// `.` and `..` resolved lexically; `..` at the top stays at the top. Git
+/// writes gitdir and `commondir` as real paths, so a symlink that makes `..`
+/// mean something else is not expected there; [`WorkTree::common_id`] is the
+/// identity either way.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// `O_PATH | O_NOFOLLOW`, then `fstat` and, for a symlink, `readlinkat` of
 /// that descriptor. `Ok`'s stat is the inode the descriptor refers to, which
-/// may no longer be a symlink; then the target is `None`.
+/// may no longer be a symlink; then the target is `None`. An error says which
+/// step failed.
 fn observe_link(
     dir: BorrowedFd<'_>,
     name: &OsStr,
-) -> io::Result<(rustix::fs::Stat, Option<OsString>)> {
-    let fd = openat(dir, name, link_flags(), Mode::empty())?;
-    let stat = fstat(&fd)?;
+) -> Result<(rustix::fs::Stat, Option<OsString>), (IoOp, io::Error)> {
+    let lstat = |error: Errno| (IoOp::Lstat, io::Error::from(error));
+    let fd = openat(dir, name, link_flags(), Mode::empty()).map_err(lstat)?;
+    let stat = fstat(&fd).map_err(lstat)?;
     if file_type(&stat) != FileType::Symlink {
         return Ok((stat, None));
     }
     // An empty path reads the link the `O_PATH` descriptor already refers
     // to (Linux 2.6.39), so the target cannot be a different inode from
     // `stat`.
-    let raw = readlinkat(&fd, "", Vec::new())?;
+    let raw = readlinkat(&fd, "", Vec::new())
+        .map_err(|error| (IoOp::Readlink, io::Error::from(error)))?;
     Ok((stat, Some(OsString::from_vec(raw.into_bytes()))))
 }
 
