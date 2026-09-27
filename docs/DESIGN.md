@@ -345,7 +345,8 @@ or a regex's longest literal run) drives a scan of the name heap with
 `ferret-verify`'s case-folding two-byte filter (D41); each hit is mapped to its
 name by galloping over name starts, tested once, and the scan resumes at the
 next name. A query with metadata atoms and no literal tests every inode row
-first and then walks the name rows for the inodes that pass. Everything else
+first and then walks the name rows for the inodes that pass, loading the name
+sections only if one does. Everything else
 tests every name. A name query loads the name, directory, root, traversed and
 link sections, never the document rows, and reads inode rows one at a time for
 the rows it reports until that passes a 64th of the rows, when it loads the

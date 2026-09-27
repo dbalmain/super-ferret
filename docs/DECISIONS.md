@@ -1892,11 +1892,15 @@ benchmarked in slice 5 against `memchr::memmem` as the control.
 runs 16–33 GB/s on the synthetic 10M heap (244 MB) and 16–32 GB/s at 40M
 (974 MB); SWAR runs 3.2–3.6 GB/s everywhere, which is why the AVX2 arm is in
 the ledger. Against `memmem` on case-sensitive search, the arm takes 2–18%
-longer at 10M and 19–31% longer at 40M (`Flamegraph` 30.6 against 25.7 ms;
-`test`, with 592k hits, 43.5 against 33.1 ms, 24% less throughput). That is at
-the edge of the 30% line, so the `memmem` fallback was not added: it would
-put `memchr` in a product crate for about 10 ms on a query that spends 730 ms
-loading sections (D43). Folded, the arm is 16–24 GB/s; `memmem` on a
+longer at 10M and 19–31% longer at 40M (`Flamegraph` 30.6 against 25.7 ms).
+The worst case, `test` at 40M with 592k hits (43.5 against 33.1 ms), is on one
+side of the 30% line or the other depending on the metric: 31.4% longer in
+time, but 23.9% lower in throughput. "Falling more than about 30% behind" in
+the recommendation above does not say which, so the measurement neither
+clearly triggers nor clearly clears it. The `memmem` fallback was not added:
+it would put `memchr` in a product crate for about 10 ms on a query that
+spends 730 ms loading sections (D43). Whether that stands is put to Dave to
+confirm. Folded, the arm is 16–24 GB/s; `memmem` on a
 lower-cased copy of the heap is faster (23–36 GB/s) but needs the second
 heap. A byte-frequency table taken from real name heaps, in place of the
 English one that picks the probe pair, is the obvious next tuning step.
@@ -1947,19 +1951,25 @@ The 10M load, split by a second measurement (reading the same 371 MB from
 the file into a fresh buffer, then into the same buffer again): about 95 ms is
 page faults on the fresh buffers, 27 ms the copy, and about 74 ms, by
 difference, per-section validation. At 40M the same split is 354, 107 and
-about 270 ms. D38 said B stands unless it measures "more than a few
-milliseconds above C for a warm name query"; C is unmeasured, but the fault
-and copy costs alone, which C would remove, are 122 ms at 10M.
+about 270 ms. These are a subtraction between two measurements, not a
+measured `mmap`. D38 said B stands unless it measures "more than a few
+milliseconds above C for a warm name query". The 122 ms of fault and copy at
+10M is an **upper bound** on what C (`mmap`) could save, not a saving: a
+mapped file still faults its pages in as validation and the scan traverse
+them, cheaper per page than faulting fresh anonymous memory and copying, but
+not free. What settles it is an `mmap` open measured with the same
+validation.
 
-| Option                                                                                                          | Costs                                                                                                                                                               | Buys                                                                                                                                     |
-| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| A. Keep section reads (now)                                                                                     | About 200 ms warm per query at 10M and 760 ms at 40M, four times D41's 50 ms target. Nothing to write                                                               | Std only, reads are errors, every accessor infallible after load                                                                         |
-| B. `mmap` the snapshot (D38 C, D42 C), keeping per-section validation                                           | `unsafe` under D11 with a ledger-style note; SIGBUS if the file is truncated under the map (the writer only renames). Validation still touches every page it checks | Removes the faults into fresh memory and the copy: about 120 ms of the 196 at 10M (measured split, not a measured `mmap`). Fixes D42 too |
-| C. Validate at use: check a row's offsets and ids when a query follows them, rather than whole sections at load | A branch per followed row, in accessors that become fallible or clamp; the "a loaded section is sound" invariant becomes per-access                                 | About 74 ms at 10M; combines with A or B                                                                                                 |
+| Option                                                                                                          | Costs                                                                                                                                                               | Buys                                                                                                                                                                |
+| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Keep section reads (now)                                                                                     | About 200 ms warm per query at 10M and 760 ms at 40M, four times D41's 50 ms target. Nothing to write                                                               | Std only, reads are errors, every accessor infallible after load                                                                                                    |
+| B. `mmap` the snapshot (D38 C, D42 C), keeping per-section validation                                           | `unsafe` under D11 with a ledger-style note; SIGBUS if the file is truncated under the map (the writer only renames). Validation still touches every page it checks | Removes the copy and the faults into fresh memory, at most 122 ms of the 196 at 10M, less the cost of faulting the mapped pages, which is unmeasured. Fixes D42 too |
+| C. Validate at use: check a row's offsets and ids when a query follows them, rather than whole sections at load | A branch per followed row, in accessors that become fallible or clamp; the "a loaded section is sound" invariant becomes per-access                                 | About 74 ms at 10M; combines with A or B                                                                                                                            |
 
 **Recommendation:** B and C measured together in slice 5b, as an experiment
-against today's reader, before the CLI's timings are published. B alone
-leaves about 74 ms of validation at 10M, which is still above the target, so C
-is what gets a warm 10M name query near 50 ms. The fact that would change it:
+against today's reader, before the CLI's timings are published: an `mmap`
+open with today's validation, then with validation at use. B alone leaves
+about 74 ms of validation at 10M, which is still above the target, so C is
+what gets a warm 10M name query near 50 ms. The fact that would change it:
 a measured `mmap` open whose page-table and fault cost is not well below the
 122 ms it replaces, in which case A plus C is the safe answer.
