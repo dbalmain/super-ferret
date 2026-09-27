@@ -7,8 +7,9 @@
 //! carry(stat)  the old content of an unchanged inode; any thread
 //! add(batch)   hand a filled batch back
 //! keep(root)   copy an old root forward unchanged
-//! commit()     build, encode, self-check, write dir/catalog.tmp, fsync,
-//!              rename over dir/catalog, fsync dir, release the lock
+//! commit()     plan, stream dir/catalog.tmp, fsync, read it back and
+//!              self-check, rename over dir/catalog, fsync dir, release the
+//!              lock
 //! ```
 //!
 //! Roots are refreshed by adding batches that record them, and kept with
@@ -26,10 +27,10 @@
 //! Readers never lock: they read whichever file `dir/catalog` names when they
 //! open it, and the rename is atomic (D32).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -145,11 +146,13 @@ pub struct Transaction {
     _lock: File,
     sniffer: u32,
     previous: Option<Catalog>,
-    /// Old file and symlink rows by `(dev, ino)`, for carry-over. Empty when
-    /// the sniffer changed, since old classifications no longer hold.
-    by_identity: HashMap<(u64, u64), InoId>,
-    /// Old live documents by hash, so known content keeps its `DocId`.
-    docs: HashMap<Hash, u32>,
+    /// Old file and symlink rows sorted by `(dev, ino)`, for carry-over:
+    /// 4 B per inode where a map measured 40 (D40). Empty when the sniffer
+    /// changed, since old classifications no longer hold.
+    by_identity: Vec<u32>,
+    /// Old live documents as `(hash, DocId)` sorted by hash, so known content
+    /// keeps its `DocId`.
+    docs: Vec<(Hash, u32)>,
     next_batch: AtomicU32,
     batches: Vec<Batch>,
     /// Paths passed to [`Transaction::keep`], checked against the root
@@ -178,18 +181,16 @@ impl Transaction {
         remove_temp(dir).map_err(BeginError::Io)?;
         let previous = Catalog::open(dir).map_err(BeginError::Previous)?;
 
-        let mut by_identity = HashMap::new();
-        let mut docs = HashMap::new();
+        let mut by_identity = Vec::new();
+        let mut docs = Vec::new();
         if let Some(old) = &previous {
             if old.sniffer_version() == sniffer {
-                by_identity.reserve((old.inode_count() - old.dir_count()) as usize);
-                for id in old.dir_count()..old.inode_count() {
-                    let stat = old.inode(InoId(id)).stat;
-                    by_identity.insert((stat.dev, stat.ino), InoId(id));
-                }
+                by_identity.extend(old.dir_count()..old.inode_count());
+                by_identity.sort_unstable_by_key(|&id| identity(old, id));
             }
             docs.reserve(old.doc_count() as usize);
             docs.extend(old.docs().map(|(doc, hash)| (hash, doc.0)));
+            docs.sort_unstable();
         }
         Ok(Transaction {
             dir: dir.to_owned(),
@@ -224,8 +225,11 @@ impl Transaction {
     /// file the policy now sends to the index must be read (D37).
     pub fn carry(&self, stat: &Stat) -> Option<Content> {
         let old = self.previous.as_ref()?;
-        let &id = self.by_identity.get(&(stat.dev, stat.ino))?;
-        let inode = old.inode(id);
+        let at = self
+            .by_identity
+            .binary_search_by_key(&(stat.dev, stat.ino), |&id| identity(old, id))
+            .ok()?;
+        let inode = old.inode(InoId(self.by_identity[at]));
         if !inode.stat.same_version(stat) {
             return None;
         }
@@ -306,7 +310,7 @@ impl Transaction {
             b.dirs
                 .iter()
                 .filter(|d| d.parent.is_none())
-                .map(|d| &b.bytes[d.name.clone()])
+                .map(|d| d.name.of(&b.names))
         });
         let new: HashSet<&[u8]> = fresh.chain(self.kept.iter().map(Vec::as_slice)).collect();
         let before: HashSet<&[u8]> = old.roots().map(|(_, path)| path).collect();
@@ -321,30 +325,43 @@ impl Transaction {
         Ok(())
     }
 
-    /// Builds the new generation and publishes it: write a temp file, fsync
-    /// it, rename it over the old one, fsync the directory. Returns the new
-    /// generation, already open. The lock is released either way.
+    /// Builds the new generation and publishes it: stream it to a temp
+    /// file, fsync it, read it back and decode it as a self-check, rename it
+    /// over the old one, fsync the directory. Returns the new generation,
+    /// already open. The lock is released either way.
+    ///
+    /// Every [`BuildError`] is found before the temp file is created. The
+    /// batches are freed while the file is written, before it is read back,
+    /// so the batches and the encoded file are never held at once (D40).
     pub fn commit(mut self) -> Result<Catalog, CommitError> {
         self.check_kept_roots()?;
         let known = Known {
             docs: &self.docs,
             next_doc: self.previous.as_ref().map_or(0, |old| old.next_doc().0),
         };
-        let tables =
-            build::build(&self.batches, self.sniffer, known).map_err(CommitError::Build)?;
-        self.batches = Vec::new();
-        let bytes = crate::format::encode(&tables);
-        drop(tables);
-        let catalog = Catalog::from_bytes(bytes).map_err(CommitError::Encode)?;
+        let plan = build::plan(&self.batches, self.sniffer, known).map_err(CommitError::Build)?;
+        let batches = std::mem::take(&mut self.batches);
+        self.by_identity = Vec::new();
+        self.docs = Vec::new();
+        self.previous = None;
 
         let temp = self.dir.join(TEMP);
-        let written = write_synced(&temp, catalog.bytes())
-            .and_then(|()| fs::rename(&temp, self.dir.join(read::FILE)));
-        if let Err(e) = written {
-            // Best effort: the error that matters is the write's.
-            let _ = remove_temp(&self.dir);
-            return Err(CommitError::Write(e));
-        }
+        let checked = write_synced(&temp, |out| build::write(plan, batches, out))
+            .map_err(CommitError::Write)
+            .and_then(|()| fs::read(&temp).map_err(CommitError::Write))
+            .and_then(|bytes| Catalog::from_bytes(bytes).map_err(CommitError::Encode))
+            .and_then(|catalog| {
+                fs::rename(&temp, self.dir.join(read::FILE)).map_err(CommitError::Write)?;
+                Ok(catalog)
+            });
+        let catalog = match checked {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                // Best effort: the error that matters is the first.
+                let _ = remove_temp(&self.dir);
+                return Err(e);
+            }
+        };
         sync_dir(&self.dir).map_err(CommitError::Undurable)?;
         Ok(catalog)
     }
@@ -357,9 +374,19 @@ fn is_inside(inner: &[u8], outer: &[u8]) -> bool {
         && (outer.ends_with(b"/") || inner[outer.len()] == b'/')
 }
 
-fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(bytes)?;
+/// A file inode's `(dev, ino)`, the carry-over key.
+fn identity(old: &Catalog, id: u32) -> (u64, u64) {
+    let stat = old.inode(InoId(id)).stat;
+    (stat.dev, stat.ino)
+}
+
+fn write_synced(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut out = BufWriter::with_capacity(1 << 20, File::create(path)?);
+    write(&mut out)?;
+    let file = out.into_inner().map_err(io::IntoInnerError::into_error)?;
     file.sync_all()
 }
 

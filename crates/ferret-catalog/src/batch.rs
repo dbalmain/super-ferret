@@ -10,8 +10,6 @@
 //! Nothing is validated here: names, tokens and roots are checked at commit,
 //! where a bad one is a [`BuildError`](crate::BuildError).
 
-use std::ops::Range;
-
 use crate::{ContentState, Hash};
 
 /// A directory, as minted by the batch that recorded it. Valid only within the
@@ -107,41 +105,69 @@ impl WorkTreeKind {
     }
 }
 
+/// Where a byte string lies in one of a batch's buffers. 32-bit, so a
+/// batch holds at most 4 GiB of names; past that the batch is marked and the
+/// commit fails with `TooLarge`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Span {
+    pub(crate) start: u32,
+    pub(crate) len: u32,
+}
+
+impl Span {
+    pub(crate) fn of(self, bytes: &[u8]) -> &[u8] {
+        &bytes[self.start as usize..self.start as usize + self.len as usize]
+    }
+}
+
 pub(crate) struct DirEntry {
     /// `None` for a root, whose `name` is then the root's path.
     pub(crate) parent: Option<DirToken>,
-    pub(crate) name: Range<usize>,
-    pub(crate) stat: Stat,
+    pub(crate) name: Span,
     pub(crate) traversed: bool,
 }
 
+/// A file or symlink's place in the tree. Its stat, content and any link
+/// target are in the batch's parallel columns, so the build can free the
+/// structure once the name sections are written (D40).
 pub(crate) struct FileEntry {
     pub(crate) parent: DirToken,
-    pub(crate) name: Range<usize>,
-    pub(crate) stat: Stat,
-    pub(crate) content: Content,
-    /// A symlink's target; `None` for a regular file.
-    pub(crate) target: Option<Range<usize>>,
+    pub(crate) name: Span,
 }
 
 pub(crate) struct WorkTreeEntry {
     pub(crate) dir: DirToken,
     pub(crate) kind: WorkTreeKind,
-    pub(crate) common_dir: Range<usize>,
+    /// In the batch's `strings`.
+    pub(crate) common_dir: Span,
     pub(crate) common_id: (u64, u64),
 }
 
 /// The rows one worker recorded. Fill it, then hand it to
 /// [`Transaction::add`](crate::Transaction::add).
+///
+/// Stored as columns: about 100 B per file plus its name, where one struct
+/// per file with byte ranges took 136 B. At 10M entries that difference is
+/// most of a gigabyte (D40).
 pub struct Batch {
     pub(crate) id: u32,
     /// Set for a root copied forward from the previous generation, whose file
     /// observations yield to fresh ones (D34).
     pub(crate) carried: bool,
     pub(crate) dirs: Vec<DirEntry>,
+    pub(crate) dir_stats: Vec<Stat>,
     pub(crate) files: Vec<FileEntry>,
+    pub(crate) file_stats: Vec<Stat>,
+    pub(crate) contents: Vec<Content>,
+    /// (file index, target in `strings`), in file order.
+    pub(crate) targets: Vec<(u32, Span)>,
     pub(crate) work_trees: Vec<WorkTreeEntry>,
-    pub(crate) bytes: Vec<u8>,
+    /// Entry names, and root paths.
+    pub(crate) names: Vec<u8>,
+    /// Link targets and work-tree paths.
+    pub(crate) strings: Vec<u8>,
+    /// A buffer outgrew 32-bit spans.
+    pub(crate) overflow: bool,
 }
 
 impl Batch {
@@ -150,9 +176,15 @@ impl Batch {
             id,
             carried,
             dirs: Vec::new(),
+            dir_stats: Vec::new(),
             files: Vec::new(),
+            file_stats: Vec::new(),
+            contents: Vec::new(),
+            targets: Vec::new(),
             work_trees: Vec::new(),
-            bytes: Vec::new(),
+            names: Vec::new(),
+            strings: Vec::new(),
+            overflow: false,
         }
     }
 
@@ -178,27 +210,18 @@ impl Batch {
     /// Records a regular file. Each name of a hard-linked file is recorded
     /// with the same observation; the commit keeps one inode row (D31).
     pub fn file(&mut self, parent: DirToken, name: &[u8], stat: Stat, content: Content) {
-        let name = self.push_bytes(name);
-        self.files.push(FileEntry {
-            parent,
-            name,
-            stat,
-            content,
-            target: None,
-        });
+        let name = push(&mut self.names, name, &mut self.overflow);
+        self.files.push(FileEntry { parent, name });
+        self.file_stats.push(stat);
+        self.contents.push(content);
     }
 
     /// Records a symlink with its target as `readlink` returned it.
     pub fn symlink(&mut self, parent: DirToken, name: &[u8], stat: Stat, target: &[u8]) {
-        let name = self.push_bytes(name);
-        let target = Some(self.push_bytes(target));
-        self.files.push(FileEntry {
-            parent,
-            name,
-            stat,
-            content: Content::Unindexed,
-            target,
-        });
+        let index = self.files.len() as u32;
+        self.file(parent, name, stat, Content::Unindexed);
+        let target = push(&mut self.strings, target, &mut self.overflow);
+        self.targets.push((index, target));
     }
 
     /// Records that `dir` is the top of a work tree (D23). `common_id` is the
@@ -210,13 +233,28 @@ impl Batch {
         common_dir: &[u8],
         common_id: (u64, u64),
     ) {
-        let common_dir = self.push_bytes(common_dir);
+        let common_dir = push(&mut self.strings, common_dir, &mut self.overflow);
         self.work_trees.push(WorkTreeEntry {
             dir,
             kind,
             common_dir,
             common_id,
         });
+    }
+
+    /// A symlink's target, for file `index`.
+    pub(crate) fn target(&self, index: usize) -> Option<&[u8]> {
+        let at = self
+            .targets
+            .binary_search_by_key(&(index as u32), |&(i, _)| i)
+            .ok()?;
+        Some(self.targets[at].1.of(&self.strings))
+    }
+
+    /// Drops what only the name sections need: every entry's parent and name.
+    pub(crate) fn drop_structure(&mut self) {
+        self.files = Vec::new();
+        self.names = Vec::new();
     }
 
     fn push_dir(
@@ -226,7 +264,7 @@ impl Batch {
         stat: Stat,
         traversed: bool,
     ) -> DirToken {
-        let name = self.push_bytes(name);
+        let name = push(&mut self.names, name, &mut self.overflow);
         let token = DirToken {
             batch: self.id,
             index: self.dirs.len() as u32,
@@ -234,15 +272,22 @@ impl Batch {
         self.dirs.push(DirEntry {
             parent,
             name,
-            stat,
             traversed,
         });
+        self.dir_stats.push(stat);
         token
     }
+}
 
-    fn push_bytes(&mut self, bytes: &[u8]) -> Range<usize> {
-        let start = self.bytes.len();
-        self.bytes.extend_from_slice(bytes);
-        start..self.bytes.len()
+fn push(buffer: &mut Vec<u8>, bytes: &[u8], overflow: &mut bool) -> Span {
+    match (u32::try_from(buffer.len()), u32::try_from(bytes.len())) {
+        (Ok(start), Ok(len)) if start.checked_add(len).is_some() => {
+            buffer.extend_from_slice(bytes);
+            Span { start, len }
+        }
+        _ => {
+            *overflow = true;
+            Span::default()
+        }
     }
 }

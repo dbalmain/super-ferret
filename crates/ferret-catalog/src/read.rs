@@ -114,10 +114,6 @@ impl Catalog {
         Ok(Catalog { bytes, layout })
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
     fn section(&self, section: Section) -> &[u8] {
         self.layout.section(&self.bytes, section)
     }

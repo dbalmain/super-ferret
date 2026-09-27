@@ -35,9 +35,9 @@
 //! are not checked; a flipped bit there reads back as a different value.
 
 use std::fmt;
+use std::io::{self, Write};
 
 use crate::batch::Stat;
-use crate::{ContentState, Hash};
 
 pub(crate) const MAGIC: [u8; 8] = *b"FERRETCT";
 pub(crate) const VERSION: u32 = 1;
@@ -110,157 +110,104 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-// ── tables: what the builder produces and the encoder writes ──
+// ── encoding: the builder streams sections through these ──
 
-pub(crate) struct NameRow {
-    pub(crate) parent: u32,
-    pub(crate) child: u32,
-    pub(crate) offset: u32,
-}
-
-pub(crate) struct WorkTreeRow {
-    pub(crate) dir: u32,
-    pub(crate) offset: u32,
-    pub(crate) common_id: (u64, u64),
-    pub(crate) kind: u8,
-}
-
-/// One generation, decoded into owned rows. Built by `build`, written by
-/// [`encode`].
-#[derive(Default)]
-pub(crate) struct Tables {
-    pub(crate) sniffer: u32,
-    pub(crate) next_doc: u32,
-    pub(crate) names: Vec<NameRow>,
-    pub(crate) name_heap: Vec<u8>,
-    pub(crate) dir_names: Vec<u32>,
-    pub(crate) traversed: Vec<bool>,
-    /// (root InoId, path offset in strings).
-    pub(crate) roots: Vec<(u32, u32)>,
-    pub(crate) strings: Vec<u8>,
-    /// Stat and DocId (or NONE) per inode.
-    pub(crate) inodes: Vec<(Stat, u32)>,
-    pub(crate) states: Vec<ContentState>,
-    /// (symlink InoId, target offset in strings).
-    pub(crate) links: Vec<(u32, u32)>,
-    pub(crate) work_trees: Vec<WorkTreeRow>,
-    pub(crate) docs: Vec<(u32, Hash)>,
-}
-
-/// Each section's encoded length, known before any byte is written.
-fn section_len(t: &Tables, section: Section) -> usize {
-    match section {
-        Section::Names => t.names.len() * NAME_ROW,
-        Section::NameHeap => t.name_heap.len(),
-        Section::DirNames => t.dir_names.len() * 4,
-        Section::Traversed => t.traversed.len().div_ceil(8),
-        Section::Roots => t.roots.len() * PAIR_ROW,
-        Section::Strings => t.strings.len(),
-        Section::Inodes => t.inodes.len() * INODE_ROW,
-        Section::States => t.states.len().div_ceil(4),
-        Section::Links => t.links.len() * PAIR_ROW,
-        Section::WorkTrees => t.work_trees.len() * WORK_TREE_ROW,
-        Section::Docs => t.docs.len() * DOC_ROW,
-    }
-}
-
-/// Encodes the whole file into one buffer allocated at its final size, so
-/// the peak is the tables plus the file, not the file twice.
-pub(crate) fn encode(t: &Tables) -> Vec<u8> {
-    let lens = SECTIONS.map(|section| section_len(t, section));
-    let mut out = Vec::with_capacity(DATA_START + lens.iter().sum::<usize>());
-    out.extend_from_slice(&MAGIC);
-    put_u32(&mut out, VERSION);
-    put_u32(&mut out, t.sniffer);
-    put_u32(&mut out, t.next_doc);
-    put_u32(&mut out, SECTIONS.len() as u32);
+/// Writes the header and the section table. `lens` are the sections'
+/// lengths in [`SECTIONS`] order, all known before any section is written.
+pub(crate) fn write_header(
+    out: &mut impl Write,
+    sniffer: u32,
+    next_doc: u32,
+    lens: &[usize; SECTIONS.len()],
+) -> io::Result<()> {
+    out.write_all(&MAGIC)?;
+    out.write_all(&VERSION.to_le_bytes())?;
+    out.write_all(&sniffer.to_le_bytes())?;
+    out.write_all(&next_doc.to_le_bytes())?;
+    out.write_all(&(SECTIONS.len() as u32).to_le_bytes())?;
     let mut offset = DATA_START as u64;
-    for len in lens {
-        put_u64(&mut out, offset);
-        put_u64(&mut out, len as u64);
+    for &len in lens {
+        out.write_all(&offset.to_le_bytes())?;
+        out.write_all(&(len as u64).to_le_bytes())?;
         offset += len as u64;
     }
-    for (section, len) in SECTIONS.into_iter().zip(lens) {
-        let start = out.len();
-        encode_section(t, section, &mut out);
-        debug_assert_eq!(out.len() - start, len, "{section:?}");
+    Ok(())
+}
+
+pub(crate) fn put_u32(out: &mut impl Write, v: u32) -> io::Result<()> {
+    out.write_all(&v.to_le_bytes())
+}
+
+pub(crate) fn put_pair(out: &mut impl Write, a: u32, b: u32) -> io::Result<()> {
+    put_u32(out, a)?;
+    put_u32(out, b)
+}
+
+/// One inode row: dev, ino, size, mtime s, ctime s, mtime ns, ctime ns,
+/// mode, uid, gid, DocId (or NONE).
+pub(crate) fn put_inode(out: &mut impl Write, stat: &Stat, doc: u32) -> io::Result<()> {
+    let mut row = [0u8; INODE_ROW];
+    row[0..8].copy_from_slice(&stat.dev.to_le_bytes());
+    row[8..16].copy_from_slice(&stat.ino.to_le_bytes());
+    row[16..24].copy_from_slice(&stat.size.to_le_bytes());
+    row[24..32].copy_from_slice(&stat.mtime_sec.to_le_bytes());
+    row[32..40].copy_from_slice(&stat.ctime_sec.to_le_bytes());
+    row[40..44].copy_from_slice(&stat.mtime_nsec.to_le_bytes());
+    row[44..48].copy_from_slice(&stat.ctime_nsec.to_le_bytes());
+    row[48..52].copy_from_slice(&stat.mode.to_le_bytes());
+    row[52..56].copy_from_slice(&stat.uid.to_le_bytes());
+    row[56..60].copy_from_slice(&stat.gid.to_le_bytes());
+    row[60..64].copy_from_slice(&doc.to_le_bytes());
+    out.write_all(&row)
+}
+
+/// One work-tree row.
+pub(crate) fn put_work_tree(
+    out: &mut impl Write,
+    dir: u32,
+    offset: u32,
+    common_id: (u64, u64),
+    kind: u8,
+) -> io::Result<()> {
+    put_pair(out, dir, offset)?;
+    out.write_all(&common_id.0.to_le_bytes())?;
+    out.write_all(&common_id.1.to_le_bytes())?;
+    out.write_all(&[kind, 0, 0, 0, 0, 0, 0, 0])
+}
+
+/// Packs `width`-bit values (1 or 2) LSB first as they are pushed.
+pub(crate) struct Bits {
+    width: usize,
+    byte: u8,
+    count: usize,
+}
+
+impl Bits {
+    pub(crate) fn new(width: usize) -> Self {
+        Self {
+            width,
+            byte: 0,
+            count: 0,
+        }
     }
-    out
-}
 
-fn encode_section(t: &Tables, section: Section, out: &mut Vec<u8>) {
-    match section {
-        Section::Names => {
-            for row in &t.names {
-                put_u32(out, row.parent);
-                put_u32(out, row.child);
-                put_u32(out, row.offset);
-            }
+    pub(crate) fn push(&mut self, out: &mut impl Write, value: u8) -> io::Result<()> {
+        let per_byte = 8 / self.width;
+        self.byte |= value << ((self.count % per_byte) * self.width);
+        self.count += 1;
+        if self.count % per_byte == 0 {
+            out.write_all(&[self.byte])?;
+            self.byte = 0;
         }
-        Section::NameHeap => out.extend_from_slice(&t.name_heap),
-        Section::DirNames => t.dir_names.iter().for_each(|&n| put_u32(out, n)),
-        Section::Traversed => pack_bits(out, t.traversed.iter().map(|&b| u8::from(b)), 1),
-        Section::Roots => t.roots.iter().for_each(|&(a, b)| put_pair(out, a, b)),
-        Section::Strings => out.extend_from_slice(&t.strings),
-        Section::Inodes => {
-            for (stat, doc) in &t.inodes {
-                put_u64(out, stat.dev);
-                put_u64(out, stat.ino);
-                put_u64(out, stat.size);
-                out.extend_from_slice(&stat.mtime_sec.to_le_bytes());
-                out.extend_from_slice(&stat.ctime_sec.to_le_bytes());
-                put_u32(out, stat.mtime_nsec);
-                put_u32(out, stat.ctime_nsec);
-                put_u32(out, stat.mode);
-                put_u32(out, stat.uid);
-                put_u32(out, stat.gid);
-                put_u32(out, *doc);
-            }
-        }
-        Section::States => pack_bits(out, t.states.iter().map(|&s| s as u8), 2),
-        Section::Links => t.links.iter().for_each(|&(a, b)| put_pair(out, a, b)),
-        Section::WorkTrees => {
-            for row in &t.work_trees {
-                put_u32(out, row.dir);
-                put_u32(out, row.offset);
-                put_u64(out, row.common_id.0);
-                put_u64(out, row.common_id.1);
-                out.push(row.kind);
-                out.extend_from_slice(&[0; 7]);
-            }
-        }
-        Section::Docs => {
-            for (id, hash) in &t.docs {
-                put_u32(out, *id);
-                out.extend_from_slice(hash);
-            }
-        }
+        Ok(())
     }
-}
 
-fn put_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
-fn put_pair(out: &mut Vec<u8>, a: u32, b: u32) {
-    put_u32(out, a);
-    put_u32(out, b);
-}
-
-/// Appends `width`-bit values (1 or 2) to `out`, packed LSB first.
-fn pack_bits(out: &mut Vec<u8>, values: impl Iterator<Item = u8>, width: usize) {
-    let per_byte = 8 / width;
-    for (i, v) in values.enumerate() {
-        if i % per_byte == 0 {
-            out.push(0);
+    /// Writes a final partial byte.
+    pub(crate) fn finish(self, out: &mut impl Write) -> io::Result<()> {
+        if self.count % (8 / self.width) != 0 {
+            out.write_all(&[self.byte])?;
         }
-        if let Some(last) = out.last_mut() {
-            *last |= v << ((i % per_byte) * width);
-        }
+        Ok(())
     }
 }
 
