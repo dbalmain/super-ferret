@@ -840,6 +840,19 @@ thread_local! {
 }
 
 #[cfg(test)]
+pub(crate) type FailReadlink = Box<dyn Fn(&OsStr) -> bool>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: makes `readlink` fail for the names it accepts. The walker
+    /// reads a link through the `O_PATH` descriptor it just statted, which no
+    /// unprivileged test can make fail. Like [`AFTER_OPEN`], it reaches only
+    /// walks on the calling thread (one worker).
+    pub(crate) static FAIL_READLINK: std::cell::RefCell<Option<FailReadlink>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 fn after_open(rel: &[u8]) {
     AFTER_OPEN.with_borrow_mut(|hook| {
         if let Some(hook) = hook {
@@ -1766,6 +1779,13 @@ fn observe_link(
     // An empty path reads the link the `O_PATH` descriptor already refers
     // to (Linux 2.6.39), so the target cannot be a different inode from
     // `stat`.
+    #[cfg(test)]
+    if FAIL_READLINK.with_borrow(|fail| fail.as_ref().is_some_and(|fail| fail(name))) {
+        return Err((
+            IoOp::Readlink,
+            io::Error::other("injected readlink failure"),
+        ));
+    }
     let raw = readlinkat(&fd, "", Vec::new())
         .map_err(|error| (IoOp::Readlink, io::Error::from(error)))?;
     Ok((stat, Some(OsString::from_vec(raw.into_bytes()))))

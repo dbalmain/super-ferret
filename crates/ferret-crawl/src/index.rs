@@ -18,11 +18,11 @@
 //! is published with [`ContentState::Fault`](ferret_catalog::ContentState) and
 //! no document, and the next run reads it again.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 

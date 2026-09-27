@@ -366,7 +366,12 @@ fn a_name_that_would_carry_the_heap_past_its_limit_is_too_large() {
         let root = b.root(b"/h", dir_stat(1));
         for i in 0..9u8 {
             let name = [b'a' + i; 9];
-            b.file(root, &name, file_stat(10 + u64::from(i)), Content::Unindexed);
+            b.file(
+                root,
+                &name,
+                file_stat(10 + u64::from(i)),
+                Content::Unindexed,
+            );
         }
         b.file(root, last, file_stat(30), Content::Unindexed);
         txn.add(b);

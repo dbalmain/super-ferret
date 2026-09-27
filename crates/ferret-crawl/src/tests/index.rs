@@ -403,7 +403,11 @@ fn an_edit_between_two_alias_visits_is_a_content_fault_in_either_order() {
     let (mut x_first, mut y_first) = (0, 0);
     for (x, y) in &pairs {
         assert_eq!(rows[x].ino, rows[y].ino);
-        assert!(reported.contains(&x) && reported.contains(&y), "{}", x.display());
+        assert!(
+            reported.contains(&x) && reported.contains(&y),
+            "{}",
+            x.display()
+        );
         assert_eq!(rows[x].state, ContentState::Fault, "{}", x.display());
         assert_eq!(rows[x].doc, None);
         if first_read.lock().unwrap().contains(x) {
@@ -476,6 +480,32 @@ fn an_unreadable_directory_blocks_publication_and_keeps_the_old_generation() {
     assert_eq!(faults[0].path, Path::new("shut"));
     assert_eq!(faults[0].error.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(report.published.is_none());
+    assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+}
+
+/// A `readlink` failure is a coverage fault (the walker reads through a
+/// held descriptor, so it is never a deletion race): nothing is published.
+#[test]
+fn a_readlink_failure_blocks_publication_and_keeps_the_old_generation() {
+    let tmp = Tmp::new("readlink");
+    tmp.write("f.txt", b"f\n");
+    std::os::unix::fs::symlink("f.txt", tmp.at("link")).unwrap();
+    let roots = [tmp.tree()];
+    run(&tmp, &roots, Refresh::All, 1);
+    let before = fs::read(tmp.cat().join("catalog")).unwrap();
+
+    tmp.write("new.txt", b"new\n");
+    crate::walk::FAIL_READLINK.set(Some(Box::new(|name| name == "link")));
+    let result = index(&tmp.cat(), &roots, Refresh::All, &options(1));
+    crate::walk::FAIL_READLINK.set(None);
+    let error = result.unwrap_err();
+    let IndexError::Coverage { faults, .. } = error else {
+        panic!("expected a coverage fault, got {error}");
+    };
+    assert!(
+        matches!(faults.as_slice(), [f] if f.op == IoOp::Readlink && f.path.ends_with("link")),
+        "{faults:?}"
+    );
     assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
 }
 
