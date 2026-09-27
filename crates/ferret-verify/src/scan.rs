@@ -10,7 +10,7 @@
 //!
 //! Two arms run the filter:
 //!
-//! - [`Arm::Avx2`], 32 starts per step through `core::arch`, chosen at runtime
+//! - [`Arm::Avx2`], 64 starts per step through `core::arch`, chosen at runtime
 //!   when the CPU has AVX2. It is the crate's one `unsafe` item and its
 //!   toolchain-ledger row ([`crate::toolchain`]).
 //! - [`Arm::Swar`], 8 starts per step in a `u64`, safe and portable: the
@@ -24,7 +24,7 @@
 pub enum Arm {
     /// 8 starts per step in a `u64`; runs everywhere.
     Swar,
-    /// 32 starts per step with AVX2; x86_64 with AVX2 only.
+    /// 64 starts per step with AVX2; x86_64 with AVX2 only.
     Avx2,
 }
 
@@ -226,7 +226,7 @@ fn swar(finder: &Finder, hay: &[u8], from: usize) -> Option<usize> {
 mod avx2 {
     use core::arch::x86_64::{
         __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-        _mm256_or_si256, _mm256_set1_epi8,
+        _mm256_or_si256, _mm256_set1_epi8, _mm256_testz_si256,
     };
 
     use super::{Finder, swar};
@@ -237,14 +237,21 @@ mod avx2 {
 
     pub(super) fn find(finder: &Finder, hay: &[u8], from: usize) -> Option<usize> {
         // SAFETY: `Finder::with_arm` refuses Avx2 unless the CPU has it.
-        let (found, next) = unsafe { scan(finder, hay, from) };
+        let (found, next) = unsafe {
+            if finder.pair.mask == [0, 0] {
+                scan::<false>(finder, hay, from)
+            } else {
+                scan::<true>(finder, hay, from)
+            }
+        };
         found.or_else(|| swar(finder, hay, next))
     }
 
-    /// Runs the filter 32 starts at a time. Returns the first match, or
-    /// where the SWAR arm must take over.
+    /// Runs the filter 64 starts at a time, then 32. Returns the first
+    /// match, or where the SWAR arm must take over. `FOLD` is false when
+    /// neither probe folds, which drops two ORs from every block.
     #[target_feature(enable = "avx2")]
-    fn scan(finder: &Finder, hay: &[u8], from: usize) -> (Option<usize>, usize) {
+    fn scan<const FOLD: bool>(finder: &Finder, hay: &[u8], from: usize) -> (Option<usize>, usize) {
         let pair = &finder.pair;
         let last = hay.len() - finder.needle.len();
         let splat = |b: u8| _mm256_set1_epi8(b as i8);
@@ -254,19 +261,45 @@ mod avx2 {
             // SAFETY: the loop bound keeps `at + 32 <= hay.len()`.
             unsafe { _mm256_loadu_si256(hay.as_ptr().add(at).cast()) }
         };
-        let mut start = from;
-        // Starts `start..start + 32` are all at most `last`, so every probe
-        // byte lies before `start + far + 32 <= hay.len()`.
-        while start + 31 <= last {
-            let e0 = _mm256_cmpeq_epi8(_mm256_or_si256(load(start + pair.at[0]), m0), b0);
-            let e1 = _mm256_cmpeq_epi8(_mm256_or_si256(load(start + pair.at[1]), m1), b1);
-            let mut hits = _mm256_movemask_epi8(_mm256_and_si256(e0, e1)) as u32;
+        // The candidates among the 32 starts from `at`, as a vector whose
+        // bytes are all ones where both probes agree.
+        let block = |at: usize| {
+            let probe = |k: usize, m, b| {
+                let bytes = load(at + pair.at[k]);
+                let bytes = if FOLD { _mm256_or_si256(bytes, m) } else { bytes };
+                _mm256_cmpeq_epi8(bytes, b)
+            };
+            _mm256_and_si256(probe(0, m0, b0), probe(1, m1, b1))
+        };
+        let verify = |at: usize, v: __m256i| {
+            let mut hits = _mm256_movemask_epi8(v) as u32;
             while hits != 0 {
-                let candidate = start + hits.trailing_zeros() as usize;
+                let candidate = at + hits.trailing_zeros() as usize;
                 if finder.matches_at(hay, candidate) {
-                    return (Some(candidate), start);
+                    return Some(candidate);
                 }
                 hits &= hits - 1;
+            }
+            None
+        };
+        let mut start = from;
+        // Starts `start..start + 64` are all at most `last`, so every probe
+        // byte lies before `start + far + 64 <= hay.len()`. Two blocks per
+        // step, tested together, halve the branches on a candidate-free run.
+        while start + 63 <= last {
+            let (lo, hi) = (block(start), block(start + 32));
+            let any = _mm256_or_si256(lo, hi);
+            if _mm256_testz_si256(any, any) == 0 {
+                if let Some(found) = verify(start, lo).or_else(|| verify(start + 32, hi)) {
+                    return (Some(found), start);
+                }
+            }
+            start += 64;
+        }
+        // The same bound for one block.
+        while start + 31 <= last {
+            if let Some(found) = verify(start, block(start)) {
+                return (Some(found), start);
             }
             start += 32;
         }
