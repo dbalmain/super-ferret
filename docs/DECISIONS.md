@@ -54,9 +54,10 @@ Predecessors, carried forward where still open:
 | D36 | Dead documents before there is an index to merge         | answered       | B for S1: drop dead docs, keep the id counter; reactivation is S2's call                                       |
 | D37 | Remembering why a file has no document                   | answered       | B: 2-bit content state plus sniffer version                                                                    |
 | D38 | Reading the snapshot: whole file, or by section          | answered       | B: section-wise positional reads, in slice 5 (via D40)                                                         |
-| D39 | A checksum over the snapshot                             | open           |                                                                                                                |
+| D39 | A checksum over the snapshot                             | answered       | A: none in S1; revisit with incremental indexing                                                               |
 | D40 | What entry count S1 is built for                         | answered       | B: about 10M catalogued entries, measured at about 40M                                                         |
-| D41 | The name scanner: `memchr::memmem`, or our own           | open           |                                                                                                                |
+| D41 | The name scanner: `memchr::memmem`, or our own           | answered       | B: own case-folding filter, AVX2 + SWAR, vs memmem control                                                     |
+| D42 | A re-run's memory: the previous generation held          | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1803,6 +1804,14 @@ publishing it. Revisit with C when D38 B lands, since the table is the natural
 place for it. The fact that would change it: a corrupt snapshot seen in
 practice.
 
+> Dave: Agreed. S1 is about having something to measure so we can pick the right
+> data structures. Once we have incremental indexing, we can start thinking
+> about things like checksumming.
+
+**Answer (2026-09-27): A.** No checksum in S1, which exists to measure what the
+right data structures are; checksumming is revisited once incremental indexing
+lands.
+
 ## D40 — What entry count S1 is built for
 
 **Question:** Everything through D39 assumed about 1M files. Dave expects his
@@ -1871,3 +1880,35 @@ candidate filter, testing two needle bytes each in both cases, at little cost.
 using the D40 query mix. The fact that would change it: B falling more than
 about 30% behind `memmem` on case-sensitive queries. In that case use `memmem`
 for the case-sensitive path and keep B for case-folded search.
+
+> Dave: Agree, and I like your reasoning.
+
+**Answer (2026-09-27): B.** Our own case-folding two-byte candidate filter, with
+an AVX2 arm under D11 plus a toolchain-ledger row and a safe SWAR fallback,
+benchmarked in slice 5 against `memchr::memmem` as the control.
+
+## D42 — A re-run's memory: the previous generation held through the walk
+
+**Question:** A re-run holds the whole previous catalog in memory while it
+walks, for hash carry-over and for copying kept roots forward. Should that be
+cut?
+
+Measured on synthetic trees (slice 4):
+
+| Build       | 10M entries                | 40M entries   |
+| ----------- | -------------------------- | ------------- |
+| First build | 1.66 GB peak, 5.5 s commit | 6.4 GB, 23 s  |
+| Re-run      | 2.56 GB peak, 7.6–8.9 s    | 10.1 GB, 24 s |
+
+On `$HOME` a first run peaks at 78 MB and a re-run at 110 MB.
+
+| Option                                                                                                                                       | Costs                                                                                                                                                              | Buys                                                                            |
+| -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| A. Accept it                                                                                                                                 | Nothing now; 2.56 GB at 10M, about 10 GB at 40M                                                                                                                    | Nothing foreclosed                                                              |
+| B. Compact carry table: at `begin`, extract `(dev, ino, size, mtime, ctime, state, hash)`, run `keep`, then drop the catalog before the walk | About a day; `previous()` narrows                                                                                                                                  | Re-run peak about 1.9 GB at 10M (carry table about 0.45 GB)                     |
+| C. `mmap` the snapshot, for readers and for the writer's previous generation                                                                 | `unsafe` under D11 with a measurement to justify it; SIGBUS if the file is truncated under the map (the writer only renames); cuts across D38 B's positional reads | File-backed, reclaimable pages; fixes writer peak and reader open time together |
+
+**Recommendation:** A for S1, then C when S2 designs the reader's open path,
+since C fixes writer and reader together. The fact that would change it: a real
+10M tree whose re-run peak matters on an 8–16 GB desktop, which makes B,
+self-contained, worth doing now.
