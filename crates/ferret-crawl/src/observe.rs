@@ -16,6 +16,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use ferret_catalog::{Content, Hash, Stat};
@@ -86,12 +87,18 @@ const SHARDS: usize = 64;
 /// more than one link.
 pub(crate) struct Cache {
     shards: Vec<Mutex<HashMap<(u64, u64), Slot>>>,
+    /// Deferred aliases not yet recorded, across the run's workers, and
+    /// the most there have been at once.
+    backlog: AtomicI64,
+    backlog_peak: AtomicI64,
 }
 
 impl Cache {
     pub(crate) fn new() -> Self {
         Self {
             shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            backlog: AtomicI64::new(0),
+            backlog_peak: AtomicI64::new(0),
         }
     }
 
@@ -127,6 +134,18 @@ impl Cache {
             Some(Slot::Done(observation)) => Some(*observation),
             _ => None,
         }
+    }
+
+    /// Counts `change` aliases into (positive) or out of the deferred
+    /// backlog.
+    pub(crate) fn deferred(&self, change: i64) {
+        let now = self.backlog.fetch_add(change, Ordering::Relaxed) + change;
+        self.backlog_peak.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// The largest the deferred backlog has been.
+    pub(crate) fn deferred_peak(&self) -> u64 {
+        self.backlog_peak.load(Ordering::Relaxed).max(0) as u64
     }
 
     /// Inodes held, for the report.

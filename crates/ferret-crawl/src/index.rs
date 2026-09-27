@@ -6,8 +6,8 @@
 //! begin          take the writer lock, read the old generation
 //! plan           which roots to walk, keep and drop; widen for overlaps
 //! walk + hash    per refreshed root, walk_parallel with a hashing visitor
-//! resolve        aliases that met an inode in flight take its observation
-//!                (drained during the walk too, so only in-flight ones wait)
+//! resolve        aliases that met an inode in flight take its observation:
+//!                drained during the walk, and the rest as each root ends
 //! add, keep      hand the batches over, copy the kept roots forward
 //! commit         unless a coverage fault was seen
 //! ```
@@ -170,6 +170,9 @@ pub struct Counts {
     /// Of those aliases, that met their inode in flight on another worker
     /// and were recorded once its observation was finished.
     pub deferred: u64,
+    /// The most deferred aliases held unrecorded at once, across all workers
+    /// and roots: the backlog's real footprint, which `deferred` is not.
+    pub deferred_peak: u64,
     /// Of those, published with a content fault.
     pub content_faults: u64,
     /// Files opened and read (sniffed, and hashed unless binary).
@@ -197,6 +200,7 @@ impl Counts {
             carried,
             aliased,
             deferred,
+            deferred_peak,
             content_faults,
             files_read,
             bytes_read,
@@ -213,6 +217,7 @@ impl Counts {
         self.carried += carried;
         self.aliased += aliased;
         self.deferred += deferred;
+        self.deferred_peak = self.deferred_peak.max(deferred_peak);
         self.content_faults += content_faults;
         self.files_read += files_read;
         self.bytes_read += bytes_read;
@@ -369,7 +374,6 @@ fn run(
     let started = Instant::now();
     let cache = Cache::new();
     let mut faults = Vec::new();
-    let mut outputs = Vec::new();
     for root in &plan.refresh {
         let walk_options = WalkOptions {
             workers: options.workers,
@@ -382,21 +386,24 @@ fn run(
             &walk_options,
             || Hasher::new(&txn, &cache, root),
         );
-        for visitor in visitors {
-            outputs.push(visitor.finish(&mut faults));
+        let outputs: Vec<Output> = visitors
+            .into_iter()
+            .map(|v| v.finish(&mut faults))
+            .collect();
+        // Every inode this root's workers claimed is finished now (roots are
+        // walked one at a time), so its deferred aliases resolve here rather
+        // than riding along through later roots.
+        for mut output in outputs {
+            output.resolve(&cache);
+            report.counts.add(&output.counts);
+            report.hash_time += output.read_time;
+            report.content_faults.append(&mut output.content_faults);
+            report.pattern_errors.append(&mut output.pattern_errors);
+            txn.add(output.batch);
         }
     }
     report.counts.cached_inodes = cache.len() as u64;
-    for output in &mut outputs {
-        output.resolve(&cache);
-    }
-    for mut output in outputs {
-        report.counts.add(&output.counts);
-        report.hash_time += output.read_time;
-        report.content_faults.append(&mut output.content_faults);
-        report.pattern_errors.append(&mut output.pattern_errors);
-        txn.add(output.batch);
-    }
+    report.counts.deferred_peak = cache.deferred_peak();
     drop(cache);
     report.content_faults.sort_by(|a, b| a.0.cmp(&b.0));
     report.counts.content_faults = report.content_faults.len() as u64;
@@ -748,17 +755,23 @@ impl Output {
 
     /// Sets `alias` aside until its inode's observation is finished. When
     /// the backlog reaches `drain_at`, every alias whose inode has finished
-    /// since is recorded, so the backlog holds aliases of inodes still in
-    /// flight, not every alias deferred this run.
+    /// since is recorded, and the rest resolve when the root's walk ends.
+    ///
+    /// So a worker holds, within one root, the aliases of inodes still in
+    /// flight plus at most `max(DRAIN_MIN, 2 × what stayed at its last
+    /// drain)` finished ones; nothing survives into the next root. Aliases of
+    /// one inode are bounded by its link count on one filesystem, but not
+    /// across bind mounts, which show the same inode under several paths.
     pub(crate) fn defer(&mut self, alias: Deferred, cache: &Cache) {
         self.counts.deferred += 1;
+        cache.deferred(1);
         self.deferred.push(alias);
         if self.deferred.len() < self.drain_at {
             return;
         }
         for alias in std::mem::take(&mut self.deferred) {
             match cache.finished((alias.stat.dev, alias.stat.ino)) {
-                Some(stored) => self.record_alias(alias, Some(stored)),
+                Some(stored) => self.record_alias(alias, Some(stored), cache),
                 None => self.deferred.push(alias),
             }
         }
@@ -769,14 +782,15 @@ impl Output {
     pub(crate) fn resolve(&mut self, cache: &Cache) {
         for alias in std::mem::take(&mut self.deferred) {
             let stored = cache.finished((alias.stat.dev, alias.stat.ino));
-            self.record_alias(alias, stored);
+            self.record_alias(alias, stored, cache);
         }
     }
 
     /// Records one deferred alias from its inode's observation; `None`, a
     /// claim never completed, is a fault.
-    fn record_alias(&mut self, alias: Deferred, stored: Option<Observation>) {
+    fn record_alias(&mut self, alias: Deferred, stored: Option<Observation>, cache: &Cache) {
         self.counts.aliased += 1;
+        cache.deferred(-1);
         let (stat, content) = match stored {
             Some(stored) => observe::consume(stored, &alias.stat),
             None => (alias.stat, Err(ContentFault::Alias)),

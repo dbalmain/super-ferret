@@ -343,6 +343,7 @@ fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
                 .int("carried", c.carried)
                 .int("aliased", c.aliased)
                 .int("deferred", c.deferred)
+                .int("deferred_peak", c.deferred_peak)
                 .int("content_faults", c.content_faults)
                 .int("files_read", c.files_read)
                 .int("bytes_read", c.bytes_read)

@@ -976,6 +976,63 @@ fn the_deferred_backlog_is_drained_as_inodes_finish() {
     assert!(hasher.out.content_faults.is_empty());
 }
 
+/// Each root's deferred aliases are recorded when that root's walk ends. They
+/// were held until every root had been walked, so a run over many roots, each
+/// with a slow inode that finished after its last deferral, carried every
+/// root's backlog to the end. The peak backlog is now at most one root's.
+#[test]
+fn the_deferred_backlog_does_not_carry_across_roots() {
+    let tmp = Tmp::new("deferred-roots");
+    let mut roots = Vec::new();
+    let mut counters = Vec::new();
+    let mut hooks = Vec::new();
+    for r in 0..4 {
+        for i in 0..8 {
+            let x = tmp.write(
+                &format!("r{r}/x{i}/f"),
+                format!("root {r} file {i}\n").as_bytes(),
+            );
+            let y = tmp.at(&format!("r{r}/y{i}/g"));
+            fs::create_dir_all(y.parent().unwrap()).unwrap();
+            fs::hard_link(&x, &y).unwrap();
+            tmp.write(&format!("r{r}/pad{i}/p"), b"padding\n");
+        }
+        let root = tmp.at(&format!("r{r}"));
+        // The claimant holds its read until an alias has been deferred on
+        // this root (or a second passes), so the inode finishes after it.
+        let deferred = Arc::new(Mutex::new(0u64));
+        hooks.push(Hook::set(&root, {
+            let deferred = Arc::clone(&deferred);
+            move |probe| match probe {
+                Probe::Deferred => *deferred.lock().unwrap() += 1,
+                Probe::Claimed => {
+                    let until = Instant::now() + Duration::from_secs(1);
+                    while *deferred.lock().unwrap() == 0 && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                _ => {}
+            }
+        }));
+        roots.push(root);
+        counters.push(deferred);
+    }
+    let report = run(&tmp, &roots, Refresh::All, 8);
+    let per_root: Vec<u64> = counters.iter().map(|c| *c.lock().unwrap()).collect();
+    assert!(
+        per_root.iter().filter(|&&n| n > 0).count() >= 2,
+        "too few roots deferred anything: {per_root:?}"
+    );
+    assert_eq!(report.counts.deferred, per_root.iter().sum::<u64>());
+    assert!(
+        report.counts.deferred_peak <= *per_root.iter().max().unwrap(),
+        "peak {} across roots that deferred {per_root:?}",
+        report.counts.deferred_peak
+    );
+    assert_eq!(report.counts.content_faults, 0);
+    drop(hooks);
+}
+
 /// Times the post-commit content-fault pass on a large catalog, such as the
 /// 10M one from `ferret-catalog`'s `synthetic` example with `faults=N`. Run
 /// by hand, in release:
