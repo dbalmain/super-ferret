@@ -307,7 +307,8 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
         let global = plan.order[next] as usize;
         let range = plan.edge_start[global] as usize..plan.edge_start[global + 1] as usize;
         let mut edges = std::mem::take(&mut plan.edges);
-        edges[range.clone()].sort_unstable_by(|&a, &b| plan.name(batches, a).cmp(plan.name(batches, b)));
+        edges[range.clone()]
+            .sort_unstable_by(|&a, &b| plan.name(batches, a).cmp(plan.name(batches, b)));
         plan.edges = edges;
         for k in range.clone() {
             let entry = plan.edges[k];
@@ -485,9 +486,9 @@ fn choose(index: &Index, batches: &[Batch], members: &[u32]) -> (u32, bool) {
         .copied()
         .find(|&f| !carried(f))
         .unwrap_or(members[0]);
-    let fault = members.iter().any(|&f| {
-        carried(f) == carried(winner) && !same_observation(index, batches, winner, f)
-    });
+    let fault = members
+        .iter()
+        .any(|&f| carried(f) == carried(winner) && !same_observation(index, batches, winner, f));
     (winner, fault)
 }
 
@@ -502,7 +503,11 @@ fn same_observation(index: &Index, batches: &[Batch], a: u32, b: u32) -> bool {
 
 /// Gives each hashed inode its document: the old `DocId` for known content,
 /// else a new one, assigned in inode order of first appearance (D36 B).
-fn assign_docs(plan: &mut Plan, batches: &[Batch], known: &[(Hash, u32)]) -> Result<(), BuildError> {
+fn assign_docs(
+    plan: &mut Plan,
+    batches: &[Batch],
+    known: &[(Hash, u32)],
+) -> Result<(), BuildError> {
     // Hashes as big-endian `u64` pairs: the same order as the bytes, which
     // `known` is sorted in, and compared in two instructions rather than a
     // 16-byte `memcmp`.
@@ -554,17 +559,20 @@ fn assign_docs(plan: &mut Plan, batches: &[Batch], known: &[(Hash, u32)]) -> Res
 }
 
 fn split_hash(hash: &Hash) -> (u64, u64) {
-    let (hi, lo) = hash.split_at(8);
-    (
-        u64::from_be_bytes(hi.try_into().expect("8 bytes")),
-        u64::from_be_bytes(lo.try_into().expect("8 bytes")),
-    )
+    let (mut hi, mut lo) = ([0; 8], [0; 8]);
+    hi.copy_from_slice(&hash[..8]);
+    lo.copy_from_slice(&hash[8..]);
+    (u64::from_be_bytes(hi), u64::from_be_bytes(lo))
 }
 
 /// Streams the planned generation to `out` in file order, freeing each
 /// batch's names once the name sections are written and the batches once the
 /// inode sections are.
-pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &mut impl Write) -> io::Result<()> {
+pub(crate) fn write(
+    mut plan: Plan,
+    mut batches: Vec<Batch>,
+    out: &mut impl Write,
+) -> io::Result<()> {
     format::write_header(out, plan.sniffer, plan.next_doc, &plan.lens())?;
     let dirs = plan.index.dirs;
 

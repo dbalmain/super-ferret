@@ -195,7 +195,7 @@ impl Bits {
         let per_byte = 8 / self.width;
         self.byte |= value << ((self.count % per_byte) * self.width);
         self.count += 1;
-        if self.count % per_byte == 0 {
+        if self.count.is_multiple_of(per_byte) {
             out.write_all(&[self.byte])?;
             self.byte = 0;
         }
@@ -204,7 +204,7 @@ impl Bits {
 
     /// Writes a final partial byte.
     pub(crate) fn finish(self, out: &mut impl Write) -> io::Result<()> {
-        if self.count % (8 / self.width) != 0 {
+        if !self.count.is_multiple_of(8 / self.width) {
             out.write_all(&[self.byte])?;
         }
         Ok(())

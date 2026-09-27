@@ -173,7 +173,9 @@ impl Hook {
 
 impl Drop for Hook {
     fn drop(&mut self) {
-        let mut probes = PROBES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut probes = PROBES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         probes.retain(|(root, _)| root != &self.root);
     }
 }
@@ -210,15 +212,28 @@ fn a_crawl_publishes_what_the_tree_holds_and_a_recrawl_reproduces_it() {
     let row = |rel: &str| rows[&tmp.at(rel)].clone();
     assert_eq!(row("a.txt").state, ContentState::Hashed);
     assert_eq!(row("a.txt").hash, Some(blake3_128(b"hello\n")));
-    assert_eq!(row("same.txt").doc, row("a.txt").doc, "equal content, one doc");
+    assert_eq!(
+        row("same.txt").doc,
+        row("a.txt").doc,
+        "equal content, one doc"
+    );
     assert_ne!(row("same.txt").ino, row("a.txt").ino);
     assert_eq!(row("bin.dat").state, ContentState::Binary);
-    assert_eq!(row("big.txt").state, ContentState::Unindexed, "over the cap");
-    assert_eq!(row("sub/deep/c.rs").hash, Some(blake3_128(b"fn main() {}\n")));
+    assert_eq!(
+        row("big.txt").state,
+        ContentState::Unindexed,
+        "over the cap"
+    );
+    assert_eq!(
+        row("sub/deep/c.rs").hash,
+        Some(blake3_128(b"fn main() {}\n"))
+    );
     assert_eq!(row("link").kind, Kind::Symlink);
     assert_eq!(row("link").target.as_deref(), Some(&b"a.txt"[..]));
     assert_eq!(row("sub/deep").kind, Kind::Dir);
-    let repo = catalog.work_tree(row("repo").ino).expect("repo is a work tree");
+    let repo = catalog
+        .work_tree(row("repo").ino)
+        .expect("repo is a work tree");
     assert_eq!(repo.kind, ferret_catalog::WorkTreeKind::Main);
     let git = fs::metadata(tmp.at("repo/.git")).unwrap();
     assert_eq!(repo.common_id, (git.dev(), git.ino()));
@@ -230,14 +245,20 @@ fn a_crawl_publishes_what_the_tree_holds_and_a_recrawl_reproduces_it() {
     assert_eq!(again.counts.files_read, 0);
     assert_eq!(again.counts.carried, 5);
     let second = fs::read(tmp.cat().join("catalog")).unwrap();
-    assert!(first == second, "an unchanged tree republishes byte for byte");
+    assert!(
+        first == second,
+        "an unchanged tree republishes byte for byte"
+    );
 }
 
 #[test]
 fn a_rerun_reads_nothing_unchanged() {
     let tmp = Tmp::new("carry");
     for i in 0..40 {
-        tmp.write(&format!("d{}/f{i}.txt", i % 5), format!("file {i}\n").as_bytes());
+        tmp.write(
+            &format!("d{}/f{i}.txt", i % 5),
+            format!("file {i}\n").as_bytes(),
+        );
     }
     tmp.write("d0/extra.txt", b"extra\n");
     tmp.write("d1/bin", b"\0\0\0");
@@ -274,7 +295,10 @@ fn a_changed_mtime_alone_defeats_carry() {
     assert_eq!(report.counts.files_read, 1);
     let (_, after) = published(&tmp);
     assert_ne!(after[&touched].mtime, before[&touched].mtime);
-    assert_eq!(after[&touched].doc, before[&touched].doc, "same content, same doc");
+    assert_eq!(
+        after[&touched].doc, before[&touched].doc,
+        "same content, same doc"
+    );
 }
 
 #[test]
@@ -300,7 +324,10 @@ fn concurrent_hard_links_are_one_inode_row_and_one_read() {
     let tmp = Tmp::new("links");
     let mut groups = Vec::new();
     for i in 0..60 {
-        let first = tmp.write(&format!("a{}/n{i}", i % 7), format!("linked {i}\n").as_bytes());
+        let first = tmp.write(
+            &format!("a{}/n{i}", i % 7),
+            format!("linked {i}\n").as_bytes(),
+        );
         let mut names = vec![first.clone()];
         for copy in 0..(1 + i % 3) {
             let alias = tmp.at(&format!("b{}/m{i}-{copy}", (i + copy) % 11));
@@ -311,7 +338,10 @@ fn concurrent_hard_links_are_one_inode_row_and_one_read() {
         groups.push(names);
     }
     for i in 0..100 {
-        tmp.write(&format!("c{}/plain{i}", i % 13), format!("plain {i}\n").as_bytes());
+        tmp.write(
+            &format!("c{}/plain{i}", i % 13),
+            format!("plain {i}\n").as_bytes(),
+        );
     }
     let report = run(&tmp, &[tmp.tree()], Refresh::All, 8);
     assert_eq!(report.counts.files_read, 60 + 100, "each inode read once");
@@ -361,7 +391,10 @@ fn an_edit_between_two_alias_visits_is_a_content_fault_in_either_order() {
         }
     });
     let report = run(&tmp, std::slice::from_ref(&tree), Refresh::All, 1);
-    assert_eq!(report.counts.files_read, 24, "the second name is never read");
+    assert_eq!(
+        report.counts.files_read, 24,
+        "the second name is never read"
+    );
     assert_eq!(report.counts.content_faults, 24);
     let (catalog, rows) = published(&tmp);
     let (mut x_first, mut y_first) = (0, 0);
@@ -375,7 +408,10 @@ fn an_edit_between_two_alias_visits_is_a_content_fault_in_either_order() {
             y_first += 1;
         }
     }
-    assert!(x_first > 0 && y_first > 0, "both orders: {x_first} x first, {y_first} y first");
+    assert!(
+        x_first > 0 && y_first > 0,
+        "both orders: {x_first} x first, {y_first} y first"
+    );
     assert_eq!(catalog.doc_count(), 0);
     let faults: Vec<_> = report.content_faults.iter().map(|(_, f)| f).collect();
     assert!(faults.iter().all(|f| matches!(f, ContentFault::Alias)));
@@ -401,7 +437,11 @@ fn a_file_written_while_it_is_hashed_is_a_content_fault() {
     });
     let report = run(&tmp, std::slice::from_ref(&tree), Refresh::All, 1);
     assert_eq!(report.counts.files_read, 2);
-    let faults: Vec<_> = report.content_faults.iter().map(|(p, f)| (p.clone(), f)).collect();
+    let faults: Vec<_> = report
+        .content_faults
+        .iter()
+        .map(|(p, f)| (p.clone(), f))
+        .collect();
     assert!(
         matches!(faults.as_slice(), [(path, ContentFault::Changed)] if *path == moving),
         "{faults:?}"
@@ -445,7 +485,9 @@ fn an_unreadable_file_publishes_unhashed() {
     assert_eq!(report.counts.content_faults, 1);
     let (path, fault) = &report.content_faults[0];
     assert_eq!(path, &shut);
-    assert!(matches!(fault, ContentFault::Open(e) if e.kind() == std::io::ErrorKind::PermissionDenied));
+    assert!(
+        matches!(fault, ContentFault::Open(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    );
     let (_, rows) = published(&tmp);
     assert_eq!(rows[&shut].state, ContentState::Fault);
     assert_eq!(rows[&shut].doc, None);
@@ -569,7 +611,10 @@ fn refreshing_the_outer_root_stops_at_the_inner_one_and_keeps_it() {
     assert_eq!(report.refreshed, vec![outer.clone()]);
     assert_eq!(report.kept, vec![inner.clone()]);
     assert_eq!(report.counts.boundaries, 1);
-    assert_eq!(report.counts.files_read, 0, "top.txt carried, in/ not walked");
+    assert_eq!(
+        report.counts.files_read, 0,
+        "top.txt carried, in/ not walked"
+    );
     let (_, after) = published(&tmp);
     assert_eq!(after[&inner_file].stable(), before[&inner_file].stable());
     assert_eq!(
@@ -594,9 +639,15 @@ fn a_sniffer_version_change_refreshes_every_root() {
     let report = index(&tmp.cat(), &roots, Refresh::Only(&[]), &bumped).unwrap();
     assert_eq!(report.refreshed, roots.to_vec());
     assert!(report.kept.is_empty());
-    assert_eq!(report.counts.files_read, 2, "nothing carried across versions");
+    assert_eq!(
+        report.counts.files_read, 2,
+        "nothing carried across versions"
+    );
     let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
-    assert_eq!(catalog.sniffer_version(), ferret_policy::SNIFFER_VERSION + 1);
+    assert_eq!(
+        catalog.sniffer_version(),
+        ferret_policy::SNIFFER_VERSION + 1
+    );
 }
 
 #[test]
@@ -717,7 +768,10 @@ fn an_alias_that_meets_its_inode_in_flight_is_recorded_after_the_walk() {
         }
     });
     let report = run(&tmp, std::slice::from_ref(&tree), Refresh::All, 8);
-    assert!(report.counts.deferred > 0, "no alias met its inode in flight");
+    assert!(
+        report.counts.deferred > 0,
+        "no alias met its inode in flight"
+    );
     assert_eq!(report.counts.files_read, 8 + 8);
     assert_eq!(report.counts.content_faults, 0);
     let (_, rows) = published(&tmp);

@@ -17,7 +17,7 @@ mod observe;
 mod walk;
 
 pub use index::{
-    CoverageFault, Counts, IndexError, IndexOptions, Published, Refresh, Report, index,
+    Counts, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report, index,
 };
 pub use observe::ContentFault;
 

@@ -134,7 +134,9 @@ impl Cache {
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A poisoned shard means a worker panicked while holding it; the panic
     // ends the walk anyway, and the map itself is never left half-written.
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// What an alias records, given the stored observation and its own `lstat`:
@@ -162,7 +164,10 @@ const CHUNK: usize = 256 << 10;
 /// The outcome of opening a file for reading.
 pub(crate) enum Opened {
     /// Open and statted; the stat matched the walk's.
-    Ready { file: File, links: u64 },
+    Ready {
+        file: File,
+        links: u64,
+    },
     Fault(ContentFault),
 }
 
@@ -241,7 +246,11 @@ impl Reader {
 /// Closes the stat bracket around a read: `content` holds only if a second
 /// `fstat` still agrees with `walked`, which the first already matched. A
 /// write during the read changes mtime, so the hash may mix two versions.
-pub(crate) fn bracket(file: &File, walked: &Stat, content: Content) -> Result<Content, ContentFault> {
+pub(crate) fn bracket(
+    file: &File,
+    walked: &Stat,
+    content: Content,
+) -> Result<Content, ContentFault> {
     match fstat(file.as_fd()) {
         Ok(after) if catalog_stat(&after).same_version(walked) => Ok(content),
         Ok(_) => Err(ContentFault::Changed),
