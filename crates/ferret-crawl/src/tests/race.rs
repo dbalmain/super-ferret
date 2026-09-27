@@ -14,12 +14,13 @@ use ferret_policy::{Config, Decision};
 use super::{Scratch, Walked, write};
 use crate::{Decided, Event, walk};
 
-fn record(out: &mut Walked, event: Event<'_>) {
+fn record(out: &mut Walked, event: Event<'_, ()>) {
     match event {
         Event::Decided(Decided {
             path,
             decision,
             stat,
+            ..
         }) => {
             out.rows.insert(
                 path.to_path_buf(),
@@ -29,8 +30,9 @@ fn record(out: &mut Walked, event: Event<'_>) {
                 },
             );
         }
-        Event::Io { path, error } => out.io.push((path.to_path_buf(), error.kind())),
+        Event::Io { path, error, .. } => out.io.push((path.to_path_buf(), error.kind())),
         Event::Pattern(error) => out.patterns.push(error),
+        Event::Entered { .. } | Event::Boundary { .. } => {}
     }
 }
 
@@ -104,7 +106,7 @@ fn a_swapped_git_dir_does_not_apply_an_outside_exclude() {
     let mut swapped = false;
     let mut out = fresh();
     walk(&root, None, Config::default(), |event| {
-        if let Event::Io { path, error } = &event
+        if let Event::Io { path, error, .. } = &event
             && *path == Path::new(".gitignore")
             && error.kind() == io::ErrorKind::PermissionDenied
         {
@@ -153,7 +155,7 @@ fn a_swapped_gitfile_parent_does_not_apply_an_outside_exclude() {
     let mut swapped = false;
     let mut out = fresh();
     walk(&root, None, Config::default(), |event| {
-        if let Event::Io { path, error } = &event
+        if let Event::Io { path, error, .. } = &event
             && *path == Path::new("work/.gitignore")
             && error.kind() == io::ErrorKind::PermissionDenied
         {

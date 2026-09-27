@@ -10,7 +10,7 @@ use std::process::Command;
 use ferret_policy::{Config, Decision};
 
 use super::{Scratch, write};
-use crate::{Event, EventVisitor, walk, walk_parallel};
+use crate::{Event, EventVisitor, Stat, WalkOptions, walk, walk_parallel};
 
 #[derive(Default)]
 struct Collected {
@@ -19,33 +19,50 @@ struct Collected {
 }
 
 impl EventVisitor for Collected {
-    fn visit(&mut self, event: Event<'_>) {
-        self.events.push(line(event));
+    type Dir = ();
+
+    fn root(&mut self, _stat: Stat<'_>) {}
+
+    fn visit(&mut self, event: Event<'_, ()>) -> Option<()> {
+        self.events.extend(line(event));
         let count = fs::read_dir("/proc/self/fd").unwrap().count();
         self.max_fds = self.max_fds.max(count);
+        Some(())
     }
 }
 
-fn line(event: Event<'_>) -> String {
-    match event {
+/// `None` for [`Event::Entered`], which has no path to sort by.
+fn line(event: Event<'_, ()>) -> Option<String> {
+    Some(match event {
         Event::Decided(decided) => format!(
             "{} {:?} {:?}",
             decided.path.display(),
             decided.decision,
             decided.stat
         ),
-        Event::Io { path, error } => format!("{} io {:?}", path.display(), error.kind()),
+        Event::Io { path, error, .. } => format!("{} io {:?}", path.display(), error.kind()),
         Event::Pattern(error) => format!("pattern {error:?}"),
-    }
+        Event::Boundary { path, .. } => format!("{} boundary", path.display()),
+        Event::Entered { .. } => return None,
+    })
 }
 
 fn compare(root: &Path, workers: usize) -> (Vec<String>, usize) {
     let mut sequential = Vec::new();
     walk(root, None, Config::default(), |event| {
-        sequential.push(line(event))
+        sequential.extend(line(event));
     });
     sequential.sort_unstable();
-    let visitors = walk_parallel(root, None, Config::default(), workers, Collected::default);
+    let visitors = walk_parallel(
+        root,
+        None,
+        Config::default(),
+        &WalkOptions {
+            workers,
+            boundaries: Vec::new(),
+        },
+        Collected::default,
+    );
     let max_fds = visitors
         .iter()
         .map(|visitor| visitor.max_fds)
@@ -189,7 +206,7 @@ fn a_spilled_parent_does_not_follow_a_swapped_ancestor() {
             symlink(&outside, root.join("d")).unwrap();
             swapped = true;
         }
-        events.push(line(event));
+        events.extend(line(event));
     });
     assert!(swapped);
     assert!(events.iter().any(|event| event.contains(" io ")));
@@ -219,16 +236,29 @@ fn one_fault_does_not_stop_other_subtrees() {
 fn a_panicking_visitor_does_not_strand_idle_workers() {
     struct Panic;
 
+    // The root's `Entered` comes before the threads start; the panic must
+    // come from a worker.
     impl EventVisitor for Panic {
-        fn visit(&mut self, _: Event<'_>) {
-            panic!("visitor panic");
+        type Dir = ();
+
+        fn root(&mut self, _stat: Stat<'_>) {}
+
+        fn visit(&mut self, event: Event<'_, ()>) -> Option<()> {
+            if matches!(event, Event::Decided(_)) {
+                panic!("visitor panic");
+            }
+            Some(())
         }
     }
 
     let tree = Scratch::new("parallel-panic");
     write(&tree.join("file"), "text");
     let result = std::panic::catch_unwind(|| {
-        walk_parallel(&tree.path, None, Config::default(), 8, || Panic);
+        let options = WalkOptions {
+            workers: 8,
+            boundaries: Vec::new(),
+        };
+        walk_parallel(&tree.path, None, Config::default(), &options, || Panic);
     });
     assert!(result.is_err());
 }

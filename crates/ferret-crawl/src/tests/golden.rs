@@ -174,10 +174,11 @@ fn mismatches(tree: &Path, case: &Case) -> Vec<String> {
         Event::Decided(decided) => {
             got.insert(decided.path.to_path_buf(), label(decided.decision));
         }
-        Event::Io { path, error } => {
+        Event::Io { path, error, .. } => {
             faults.push(format!("io {}: {error}", path.display()));
         }
         Event::Pattern(error) => faults.push(format!("pattern {error}")),
+        Event::Entered { .. } | Event::Boundary { .. } => {}
     });
     let mut out = faults;
     for (path, node) in &case.nodes {

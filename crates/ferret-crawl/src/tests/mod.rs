@@ -111,6 +111,7 @@ fn walked(root: &Path, global: Option<&str>, config: Config) -> Walked {
             path,
             decision,
             stat,
+            ..
         }) => {
             out.rows.insert(
                 path.to_path_buf(),
@@ -120,8 +121,9 @@ fn walked(root: &Path, global: Option<&str>, config: Config) -> Walked {
                 },
             );
         }
-        Event::Io { path, error } => out.io.push((path.to_path_buf(), error.kind())),
+        Event::Io { path, error, .. } => out.io.push((path.to_path_buf(), error.kind())),
         Event::Pattern(error) => out.patterns.push(error),
+        Event::Entered { .. } | Event::Boundary { .. } => {}
     });
     out
 }
@@ -758,6 +760,7 @@ fn on_pattern(dir: &Scratch, body: impl FnOnce(&Path)) -> Walked {
             path,
             decision,
             stat,
+            ..
         }) => {
             out.rows.insert(
                 path.to_path_buf(),
@@ -767,7 +770,8 @@ fn on_pattern(dir: &Scratch, body: impl FnOnce(&Path)) -> Walked {
                 },
             );
         }
-        Event::Io { path, error } => out.io.push((path.to_path_buf(), error.kind())),
+        Event::Io { path, error, .. } => out.io.push((path.to_path_buf(), error.kind())),
+        Event::Entered { .. } | Event::Boundary { .. } => {}
     });
     assert!(body.is_none(), "the pattern hook did not run");
     out
