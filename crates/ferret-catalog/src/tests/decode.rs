@@ -365,9 +365,11 @@ fn header_errors_say_what_is_wrong() {
     );
 }
 
-/// Every public accessor, keyed by the one section its doc says it needs,
-/// exercised over every id the sample has. `None` is an accessor that needs
-/// no section (the table, or a read that loads for itself).
+/// Every public accessor of catalog content, keyed by the one section its doc
+/// says it needs, exercised over every id the sample has. `None` is an
+/// accessor that needs no section (the table, or a read that loads for
+/// itself). The load-state probes `is_loaded` and `bytes_read` are left out:
+/// they report on the reader and read no section.
 type Accessor = (Option<Section>, &'static str, fn(&Catalog) -> usize);
 
 const ACCESSORS: &[Accessor] = {
