@@ -162,8 +162,8 @@ pub(crate) struct Plan {
     links: Vec<(u32, u32)>,
     /// (dir InoId, offset in strings, common id, kind), sorted by dir.
     work_trees: Vec<(u32, u32, (u64, u64), u8)>,
-    /// (DocId, hash), sorted by id.
-    docs: Vec<(u32, Hash)>,
+    /// (hash as big-endian halves, DocId), sorted by id.
+    docs: Vec<((u64, u64), u32)>,
 }
 
 impl Plan {
@@ -543,18 +543,13 @@ fn assign_docs(plan: &mut Plan, batches: &[Batch], known: &[(Hash, u32)]) -> Res
     if plan.next_doc == NONE {
         return Err(BuildError::TooLarge);
     }
+    // The docs rows, made in place: one per distinct hash, sorted by id.
     hashed.dedup_by_key(|h| h.0);
-    let mut docs: Vec<(u32, Hash)> = hashed
-        .into_iter()
-        .map(|((hi, lo), k)| {
-            let mut hash = [0; 16];
-            hash[..8].copy_from_slice(&hi.to_be_bytes());
-            hash[8..].copy_from_slice(&lo.to_be_bytes());
-            (plan.doc[k as usize], hash)
-        })
-        .collect();
-    docs.sort_unstable_by_key(|&(id, _)| id);
-    plan.docs = docs;
+    for row in &mut hashed {
+        row.1 = plan.doc[row.1 as usize];
+    }
+    hashed.sort_unstable_by_key(|&(_, id)| id);
+    plan.docs = hashed;
     Ok(())
 }
 
@@ -643,9 +638,10 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &mut impl Writ
     for &(dir, offset, common_id, kind) in &plan.work_trees {
         format::put_work_tree(out, dir, offset, common_id, kind)?;
     }
-    for (id, hash) in &plan.docs {
-        format::put_u32(out, *id)?;
-        out.write_all(hash)?;
+    for &((hi, lo), id) in &plan.docs {
+        format::put_u32(out, id)?;
+        out.write_all(&hi.to_be_bytes())?;
+        out.write_all(&lo.to_be_bytes())?;
     }
     Ok(())
 }
