@@ -18,7 +18,7 @@
 //! is published with [`ContentState::Fault`](ferret_catalog::ContentState) and
 //! no document, and the next run reads it again.
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
@@ -27,7 +27,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ferret_catalog::{
-    BeginError, Catalog, CommitError, Content, DirToken, KeepError, Stat, Transaction,
+    BeginError, Catalog, CommitError, Content, ContentState, DirToken, InoId, KeepError, NameId,
+    Stat, Transaction,
 };
 use ferret_policy::{Config, Decision, Reason};
 
@@ -317,20 +318,6 @@ pub fn index(
     for output in &mut outputs {
         output.resolve(&cache);
     }
-    // A clean name of an inode that another name faulted publishes unhashed
-    // too, since the build keeps one row per inode (D31): list it.
-    let faulted: HashSet<(u64, u64)> = outputs
-        .iter()
-        .flat_map(|o| o.fault_keys.iter().copied())
-        .collect();
-    for output in &mut outputs {
-        for (key, path) in std::mem::take(&mut output.linked) {
-            if faulted.contains(&key) {
-                output.counts.content_faults += 1;
-                output.content_faults.push((path, ContentFault::Alias));
-            }
-        }
-    }
     for mut output in outputs {
         report.counts.add(&output.counts);
         report.content_faults.append(&mut output.content_faults);
@@ -339,6 +326,7 @@ pub fn index(
     }
     drop(cache);
     report.content_faults.sort_by(|a, b| a.0.cmp(&b.0));
+    report.counts.content_faults = report.content_faults.len() as u64;
     report.walk_time = started.elapsed();
 
     if !faults.is_empty() {
@@ -355,8 +343,55 @@ pub fn index(
     }
     let catalog = txn.commit().map_err(IndexError::Commit)?;
     report.commit_time = started.elapsed();
+    let seen = std::mem::take(&mut report.content_faults);
+    report.content_faults = content_faults(&catalog, &plan.refresh, seen);
+    report.counts.content_faults = report.content_faults.len() as u64;
     report.published = Some(Published::of(&catalog));
     Ok(report)
+}
+
+/// Every name under a refreshed root whose inode the catalog published as
+/// Fault, merged with the faults the workers saw. The build is the
+/// authority: it faults an inode when its names' observations disagree
+/// (D31), which no single worker can see, so each such name is listed as
+/// [`ContentFault::Alias`] unless a worker recorded its own error. Kept
+/// roots are skipped: their faults are last run's, already reported.
+///
+/// Paths come from the catalog, so the walk holds none; the scan over the
+/// names runs only when some inode is Fault.
+fn content_faults(
+    catalog: &Catalog,
+    refresh: &[PathBuf],
+    seen: Vec<(PathBuf, ContentFault)>,
+) -> Vec<(PathBuf, ContentFault)> {
+    let fault = |id: InoId| catalog.inode(id).state == ContentState::Fault;
+    let mut listed: BTreeMap<PathBuf, ContentFault> = seen.into_iter().collect();
+    if !(catalog.dir_count()..catalog.inode_count()).any(|i| fault(InoId(i))) {
+        return listed.into_iter().collect();
+    }
+    let refreshed: Vec<InoId> = catalog
+        .roots()
+        .filter(|(_, path)| refresh.iter().any(|r| r.as_os_str().as_bytes() == *path))
+        .map(|(id, _)| id)
+        .collect();
+    let root_of = |mut dir: InoId| {
+        while let Some(name) = catalog.dir_name(dir) {
+            dir = catalog.name(name).parent;
+        }
+        dir
+    };
+    let mut buf = Vec::new();
+    for id in (0..catalog.name_count()).map(NameId) {
+        let name = catalog.name(id);
+        if !fault(name.child) || !refreshed.contains(&root_of(name.parent)) {
+            continue;
+        }
+        buf.clear();
+        catalog.path(id, &mut buf);
+        let path = PathBuf::from(OsStr::from_bytes(&buf));
+        listed.entry(path).or_insert(ContentFault::Alias);
+    }
+    listed.into_iter().collect()
 }
 
 /// Which roots a run walks, keeps and drops.
@@ -492,12 +527,6 @@ struct Output {
     content_faults: Vec<(PathBuf, ContentFault)>,
     pattern_errors: Vec<String>,
     deferred: Vec<Deferred>,
-    /// `(dev, ino)` of every name recorded as a content fault.
-    fault_keys: Vec<(u64, u64)>,
-    /// Names of multiply-linked inodes recorded clean. If another name of
-    /// the same inode faulted, the build faults the inode and this name
-    /// publishes unhashed too, so it is reported after the walk.
-    linked: Vec<((u64, u64), PathBuf)>,
 }
 
 impl<'a> Hasher<'a> {
@@ -513,8 +542,6 @@ impl<'a> Hasher<'a> {
                 content_faults: Vec::new(),
                 pattern_errors: Vec::new(),
                 deferred: Vec::new(),
-                fault_keys: Vec::new(),
-                linked: Vec::new(),
             },
             reader: Reader::new(),
         }
@@ -546,7 +573,7 @@ impl<'a> Hasher<'a> {
         let (file, links) = match Reader::open(decided.parent_fd, decided.name, &stat) {
             Opened::Ready { file, links } => (file, links),
             Opened::Fault(fault) => {
-                self.record(decided, stat, Err(fault), 0);
+                self.record(decided, stat, Err(fault));
                 return;
             }
         };
@@ -569,7 +596,7 @@ impl<'a> Hasher<'a> {
                 Lookup::Done(stored) => {
                     self.out.counts.aliased += 1;
                     let (stat, content) = observe::consume(stored, &stat);
-                    self.record(decided, stat, content, links);
+                    self.record(decided, stat, content);
                     return;
                 }
             }
@@ -590,20 +617,17 @@ impl<'a> Hasher<'a> {
         }
         #[cfg(test)]
         hook(self.root, Probe::Read(decided.path));
-        self.record(decided, stat, content, links);
+        self.record(decided, stat, content);
     }
 
-    /// Records a read or aliased file. `links` is its `st_nlink`, or 0 when
-    /// the open failed before it was known.
+    /// Records a read or aliased file.
     fn record(
         &mut self,
         decided: &Decided<'_, DirToken>,
         stat: Stat,
         content: Result<Content, ContentFault>,
-        links: u64,
     ) {
-        let path = self.root.join(decided.path);
-        let content = self.out.outcome(path, stat, content, links);
+        let content = self.out.outcome(|| self.root.join(decided.path), content);
         self.out
             .batch
             .file(decided.parent, decided.name.as_bytes(), stat, content);
@@ -621,34 +645,21 @@ impl<'a> Hasher<'a> {
 }
 
 impl Output {
-    /// Records the deferred aliases from their inodes' finished observations.
-    /// The content to publish for one name, noting what the report needs:
-    /// a fault is listed and its inode noted, and a clean name of a
-    /// multiply-linked inode is kept in case another name faults it.
+    /// The content to publish for one name, listing a fault with its path.
+    /// These are the faults a worker saw, with their errors; the build may
+    /// fault more names, which `index` lists from the published catalog.
     fn outcome(
         &mut self,
-        path: PathBuf,
-        stat: Stat,
+        path: impl FnOnce() -> PathBuf,
         content: Result<Content, ContentFault>,
-        links: u64,
     ) -> Content {
-        let key = (stat.dev, stat.ino);
-        match content {
-            Ok(content) => {
-                if links > 1 {
-                    self.linked.push((key, path));
-                }
-                content
-            }
-            Err(fault) => {
-                self.counts.content_faults += 1;
-                self.content_faults.push((path, fault));
-                self.fault_keys.push(key);
-                Content::Fault
-            }
-        }
+        content.unwrap_or_else(|fault| {
+            self.content_faults.push((path(), fault));
+            Content::Fault
+        })
     }
 
+    /// Records the deferred aliases from their inodes' finished observations.
     fn resolve(&mut self, cache: &Cache) {
         for alias in std::mem::take(&mut self.deferred) {
             self.counts.aliased += 1;
@@ -657,9 +668,7 @@ impl Output {
                 Some(stored) => observe::consume(stored, &alias.stat),
                 None => (alias.stat, Err(ContentFault::Alias)),
             };
-            // A deferred name met its inode in the cache, so it has more
-            // than one link.
-            let content = self.outcome(alias.path, stat, content, 2);
+            let content = self.outcome(|| alias.path, content);
             self.batch.file(alias.parent, &alias.name, stat, content);
         }
     }

@@ -32,9 +32,11 @@ pub enum ContentFault {
     /// The open file was not the version the walk statted, or changed while
     /// it was read (the D33 bracket).
     Changed,
-    /// Another name of the same inode was read this run and its version
-    /// differs from this name's `lstat`, or another name of it faulted: the
-    /// catalog keeps one row per inode, so every name publishes unhashed (D31).
+    /// The names of this inode disagreed: another name was read this run at
+    /// a version that differs from this name's `lstat`, or faulted, or
+    /// carried a different version. The catalog keeps one row per inode, so
+    /// every name publishes unhashed (D31). The build decides this; the
+    /// report lists every name of an inode it published as a fault.
     Alias,
 }
 

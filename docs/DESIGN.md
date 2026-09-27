@@ -277,7 +277,10 @@ file, probing git, `readlink`, anything on a root — publishes nothing and
 leaves the old generation; an entry that vanished before its `lstat` is a
 deletion; a content fault — open, stat or read failing, the bracket moving,
 aliases disagreeing — publishes the file with content state failed and no
-document, and it is re-read next run.
+document, and it is re-read next run. The build is the authority on which
+inodes fault, since only it sees every name's observation; the report lists
+every name, under a refreshed root, of an inode it published as a fault. Those
+paths are resolved from the new catalog, not held through the walk.
 
 ## Content: documents, tokens, structures (D6, D8, D9)
 

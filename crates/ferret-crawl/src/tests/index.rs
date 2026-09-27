@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -423,6 +424,62 @@ fn an_edit_between_two_alias_visits_is_a_content_fault_in_either_order() {
     assert_eq!(catalog.doc_count(), 0);
     let faults: Vec<_> = report.content_faults.iter().map(|(_, f)| f).collect();
     assert!(faults.iter().all(|f| matches!(f, ContentFault::Alias)));
+}
+
+#[test]
+fn a_fault_only_the_build_sees_is_reported_for_every_name() {
+    let tmp = Tmp::new("build-fault");
+    let a_name = tmp.write("a/f.txt", b"shared\n");
+    let b_name = tmp.at("b/g.txt");
+    fs::create_dir_all(tmp.at("b")).unwrap();
+    fs::hard_link(&a_name, &b_name).unwrap();
+    tmp.write("c/other.txt", b"other\n");
+    let (a, b, c) = (tmp.at("a"), tmp.at("b"), tmp.at("c"));
+    let roots = [a.clone(), b.clone(), c.clone()];
+    run(&tmp, &roots, Refresh::All, 1);
+
+    // Roots are walked in path order, so `a`'s name carries the old hash
+    // before `b` is entered; the edit there makes `b`'s name read the new
+    // content. Each worker saw a clean file: only the build, which keeps one
+    // row per inode, sees the two disagree.
+    let edited = AtomicBool::new(false);
+    let _hook = Hook::set(&b, {
+        let b_name = b_name.clone();
+        move |probe| {
+            if matches!(probe, Probe::Entered) && !edited.swap(true, Ordering::SeqCst) {
+                let mut file = OpenOptions::new().append(true).open(&b_name).unwrap();
+                file.write_all(b"edited\n").unwrap();
+            }
+        }
+    });
+    let report = run(&tmp, &roots, Refresh::All, 1);
+    assert_eq!(report.counts.carried, 2, "a's name and c's file");
+    assert_eq!(report.counts.files_read, 1, "b's name");
+    let (_, rows) = published(&tmp);
+    assert_eq!(rows[&a_name].ino, rows[&b_name].ino);
+    assert_eq!(rows[&a_name].state, ContentState::Fault);
+    assert_eq!(rows[&a_name].doc, None);
+    let reported: Vec<&PathBuf> = report.content_faults.iter().map(|(p, _)| p).collect();
+    assert_eq!(reported, [&a_name, &b_name]);
+    assert!(
+        report
+            .content_faults
+            .iter()
+            .all(|(_, f)| matches!(f, ContentFault::Alias))
+    );
+    assert_eq!(report.counts.content_faults, 2);
+
+    // A kept root's faults are last run's, already reported.
+    let report = run(&tmp, &roots, Refresh::Only(std::slice::from_ref(&c)), 1);
+    assert_eq!(report.kept, vec![a, b]);
+    let (_, rows) = published(&tmp);
+    assert_eq!(rows[&a_name].state, ContentState::Fault, "still published");
+    assert!(
+        report.content_faults.is_empty(),
+        "{:?}",
+        report.content_faults
+    );
+    assert_eq!(report.counts.content_faults, 0);
 }
 
 #[test]
