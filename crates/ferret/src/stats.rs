@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{self, Write};
 
 use ferret_catalog::{Catalog, ContentState, InoId, Kind, NameId};
 
@@ -35,13 +34,7 @@ pub fn run(context: &Context) -> Exit {
     let mut text = String::new();
     let _ = writeln!(text, "index {}", context.index.display());
     report(&catalog, &mut Census::of(&catalog), &mut text);
-    match io::stdout().write_all(text.as_bytes()) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
-            error(&format!("writing stats: {e}"));
-            Exit::Error
-        }
-        _ => Exit::Ok,
-    }
+    crate::cli::print("stats", text.as_bytes())
 }
 
 /// Buckets `0`, `1`, `2–3`, `4–7`, …: bucket `i > 0` holds `2^(i-1)` up to

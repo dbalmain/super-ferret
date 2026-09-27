@@ -7,7 +7,8 @@
 #![allow(clippy::unwrap_used)]
 
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -109,6 +110,15 @@ fn paths(output: &Output) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A pipe whose reader is already closed: the first write to it fails with
+/// `EPIPE`, as when `ferret … | head` has exited. Rust ignores SIGPIPE, so
+/// the process sees the error rather than being killed.
+fn closed_pipe() -> Stdio {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    Stdio::from(writer)
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
@@ -203,6 +213,7 @@ fn exit_codes_are_stable() {
         (&["stats"], 0),
         (&["roots", "list"], 0),
         (&["help"], 0),
+        (&["help", "typo"], 2),
     ];
     for (args, expected) in cases {
         let args: Vec<&OsStr> = args.iter().map(os).collect();
@@ -451,4 +462,129 @@ fn the_index_comes_from_the_flag_then_the_environment_then_xdg() {
         from_flag.join("catalog").exists(),
         "--index beats FERRET_INDEX"
     );
+}
+
+#[test]
+// A report the reader no longer wants must not undo a publish: the run
+// exits 0 and logs it. Both streams are closed, and this is the first run,
+// so stderr gets the "wrote the default ignore rules" note as well.
+fn index_into_a_closed_pipe_still_publishes_and_logs() {
+    let env = Env::new("index-epipe");
+    env.write("a/f.txt", b"f\n");
+    let status = env
+        .command(&[os("index"), env.at("a").as_os_str()])
+        .stdout(closed_pipe())
+        .stderr(closed_pipe())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+    let found = env.run(&[os("find"), os("f.txt")]);
+    assert_eq!(paths(&found), [env.at("a/f.txt")]);
+    let lines = env.log_lines();
+    assert_eq!(lines.len(), 2, "the index line, then the find line");
+    assert!(lines[0].contains(r#""cmd":"index","#), "{}", lines[0]);
+    assert!(
+        lines[0].contains(r#""outcome":"published""#),
+        "{}",
+        lines[0]
+    );
+}
+
+#[test]
+// Every command that writes to stdout treats a reader that went away as
+// done, not failed. `find` has written rows (more than its 64 KiB buffer,
+// so the error comes mid-stream) and exits 0 as it would have.
+fn every_command_exits_normally_into_a_closed_pipe() {
+    let env = Env::new("epipe");
+    for i in 0..2000 {
+        env.write(&format!("d/a-long-enough-file-name-{i:04}.txt"), b"x\n");
+    }
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let cases: &[&[&str]] = &[
+        &["find", "txt"],
+        &["find", "--json", "txt"],
+        &["roots", "list"],
+        &["stats"],
+        &["help"],
+        &["--version"],
+    ];
+    for args in cases {
+        let args: Vec<&OsStr> = args.iter().map(os).collect();
+        let output = env.command(&args).stdout(closed_pipe()).output().unwrap();
+        assert_eq!(code(&output), 0, "{args:?}: {}", stderr(&output));
+        assert_eq!(stderr(&output), "", "{args:?}");
+    }
+}
+
+#[test]
+// A log another version or the user left world-readable is narrowed to
+// 0600 before the next line goes in.
+fn a_readable_log_is_made_private_before_it_is_written() {
+    let env = Env::new("log-mode");
+    env.write("a/f.txt", b"f\n");
+    fs::create_dir_all(env.log().parent().unwrap()).unwrap();
+    fs::write(env.log(), "{\"v\":1}\n").unwrap();
+    fs::set_permissions(env.log(), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
+    let mode = fs::metadata(env.log()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(env.log_lines().len(), 2);
+}
+
+#[test]
+// A line is appended only under the log's exclusive lock. With the lock
+// held here, `find` prints its rows and then waits; it appends once the
+// lock is released.
+fn a_log_line_waits_for_the_log_lock() {
+    let env = Env::new("log-lock");
+    env.write("a/f.txt", b"f\n");
+    assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
+    let held = File::options().append(true).open(env.log()).unwrap();
+    held.lock().unwrap();
+
+    let mut child = env
+        .command(&[os("find"), os("f.txt")])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut row = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut row)
+        .unwrap();
+    // The row is flushed just before the log append; without the lock the
+    // process would be gone well within this.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(child.try_wait().unwrap().is_none(), "find did not wait");
+    assert_eq!(env.log_lines().len(), 1);
+
+    held.unlock().unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(env.log_lines().len(), 2);
+}
+
+#[test]
+// A second index run while one holds the writer lock fails at once with a
+// message that says why, and publishes nothing.
+fn an_index_run_while_another_holds_the_lock_fails_clearly() {
+    let env = Env::new("locked");
+    env.write("a/f.txt", b"f\n");
+    assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
+    let before = fs::read(env.index().join("catalog")).unwrap();
+    let lock = File::open(env.index().join("lock")).unwrap();
+    lock.lock().unwrap();
+
+    env.write("a/g.txt", b"g\n");
+    let output = env.run(&[os("index")]);
+    assert_eq!(code(&output), 3);
+    assert!(
+        stderr(&output).contains("another `ferret index` holds the catalog lock"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
+    let lines = env.log_lines();
+    assert!(lines[1].contains(r#""outcome":"error""#), "{}", lines[1]);
+
+    lock.unlock().unwrap();
+    assert_eq!(code(&env.run(&[os("index")])), 0);
 }

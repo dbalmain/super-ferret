@@ -2015,11 +2015,14 @@ case C is worth its dependency, since a daemonless CLI is often cold.
 to turn it off?
 
 Slice 5b's log (`$XDG_STATE_HOME/ferret/log.jsonl`, mode 0600) keeps each
-query's atoms, plan, counts and times. It keeps no result paths and no root
-paths. Those would be the most revealing data, and the planned experiments do
-not need them. Query text stays, because the experiments are about which atom
-classes people use and what they cost, and an atom's class is only knowable from
-its text. The text can still reveal a name the user searched for.
+query's atoms as typed, with the plan, counts and times. No field holds a result
+path, a root path or an id: results and roots would be the most revealing data,
+and the planned experiments do not need them. Query text stays, because the
+experiments are about which atom classes people use and what they cost, and an
+atom's class is only knowable from its text. That text is user data, and it can
+itself be a path: `find path:/home/dave/private` logs `/home/dave/private`, and
+a word or glob logs the name searched for. So the log is not path-free, only
+free of paths ferret chose to write.
 
 | Option                                                                                   | Costs                                                                               | Buys                                                            |
 | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------- |

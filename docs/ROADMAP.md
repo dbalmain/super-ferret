@@ -64,8 +64,10 @@ The `$HOME` census:
   prune another 0.39M.
 - 441k are catalogued: 77k directories, 362k files and 1.5k symlinks, at a
   median depth of 8 and a median name length of 20 B.
-- No file has a second name inside the index. The 330k hard-linked files in
-  `$HOME` have their other names under ignored `node_modules/`.
+- No indexed file has a second indexed name. `$HOME` holds 330k files with a
+  link count above 1, so their other names lie outside the index. One was
+  checked: its other name is under an ignored `node_modules/`. The rest were not
+  traced and may sit in other ignored trees (`.cache/`, package stores).
 - 109k documents, 19.5k of them held by more than one inode.
 - The document tier is small: 1,222 PDFs, 134 `.docx`, 74 `.xlsx`, 10 `.pptx`
   and 4 `.epub`.

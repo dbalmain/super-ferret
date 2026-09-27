@@ -3,15 +3,30 @@
 //!
 //! It is the future source of the opt-in upload and of structure choices
 //! (DESIGN § Experiments and metrics), so it records query text, plans,
-//! counts and timings, and never ids (D27 renumbers them) or result paths.
-//! Root paths are left out too; a line says how many roots a run touched.
+//! counts and timings. No field holds an id (D27 renumbers them), a result
+//! path or a root path; a line says how many rows or roots there were. The
+//! query atoms are logged as typed, though, so **query text may itself
+//! contain a path** (`find path:/home/me/private`) or any other name the
+//! user searched for (D45).
+//!
+//! The file is private: [`append`] sets it to 0600 on every write, not only
+//! when it creates it, so a log left readable by an older version or by hand
+//! is narrowed before another line goes in.
+//!
+//! **Whole lines.** Each line and its newline go in one `write_all` while
+//! the process holds an exclusive `flock` on the file, and every writer
+//! takes that lock. So concurrent `ferret` processes never interleave within
+//! a line, even when a write is short and `write_all` writes the rest in a
+//! second call. The lock does not guard against a process killed mid-line,
+//! which leaves a partial last line; a reader should skip a line that does
+//! not parse.
 //!
 //! Best-effort: [`append`] returns the error and the caller only warns. A
 //! command never fails because its log line could not be written.
 
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::{DirBuilder, OpenOptions, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,9 +59,8 @@ pub fn line<'a>(out: &'a mut Vec<u8>, command: &str, at: SystemTime) -> Object<'
 }
 
 /// Appends `line` and a newline to the log in `state`, creating the
-/// directory (0700, as XDG asks) and the file (0600). One `write` per line,
-/// on a file opened for append, so concurrent `ferret` processes do not
-/// interleave within a line.
+/// directory (0700, as XDG asks) and the file. The file is set to 0600 and
+/// the line is written under an exclusive lock; see the module doc.
 pub fn append(state: &Path, line: &[u8]) -> io::Result<()> {
     DirBuilder::new()
         .recursive(true)
@@ -57,6 +71,10 @@ pub fn append(state: &Path, line: &[u8]) -> io::Result<()> {
         .create(true)
         .mode(0o600)
         .open(path(state))?;
+    // fchmod on the open file, so it is the file written to that is
+    // narrowed. Fails, and the line is not written, if another user owns it.
+    file.set_permissions(Permissions::from_mode(0o600))?;
+    file.lock()?;
     let mut bytes = Vec::with_capacity(line.len() + 1);
     bytes.extend_from_slice(line);
     bytes.push(b'\n');

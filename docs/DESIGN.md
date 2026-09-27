@@ -389,9 +389,12 @@ An index line records:
 - the walk, hash, commit and content-fault-pass times, and the peak RSS;
 - the crawl's counts and the published generation's counts.
 
-It holds no ids, which D27 renumbers, and no result or root paths. Query text is
-the one piece of the user's data in it. Writing is best-effort: a line that
-cannot be written is a warning, never a failed command.
+No field holds an id (D27 renumbers them), a result path or a root path. The
+query atoms are logged as typed, though, so query text may itself contain a path
+(`find path:/home/me/private`) or any name the user searched for (D45). The file
+is set to 0600 on every append, and each line is written under an exclusive
+`flock`, so concurrent processes never interleave within a line. Writing is
+best-effort: a line that cannot be written is a warning, never a failed command.
 
 The CLI's JSON lines write a path that is not UTF-8 as `path` (lossy text) plus
 `path_base64` (the exact bytes). The `ferret` crate doc states this contract.

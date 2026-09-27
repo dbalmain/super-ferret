@@ -182,7 +182,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             match other {
                 b"index" => Command::Index(paths(rest)),
                 b"stats" => none("stats", rest).map(|()| Command::Stats)?,
-                b"help" => Command::Help,
+                b"help" => none("help", rest).map(|()| Command::Help)?,
                 _ => roots(rest)?,
             }
         }
@@ -319,6 +319,10 @@ mod tests {
                 UsageError::NotFor("--limit", "index"),
             ),
             (&["stats", "x"], UsageError::Unexpected("stats", "x".into())),
+            (
+                &["help", "typo"],
+                UsageError::Unexpected("help", "typo".into()),
+            ),
             (
                 &["roots", "list", "x"],
                 UsageError::Unexpected("roots list", "x".into()),

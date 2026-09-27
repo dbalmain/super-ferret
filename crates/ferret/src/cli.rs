@@ -98,8 +98,9 @@ exit status: 0 success (find printed a row), 1 find matched nothing,
   2 usage error, 3 runtime error (no index, I/O, lock held, walk faults).
 
 each find and index run appends one JSON line to
-$XDG_STATE_HOME/ferret/log.jsonl: the query, its plan, counts and timings,
-never result paths.
+$XDG_STATE_HOME/ferret/log.jsonl (mode 0600): the query as typed, its plan,
+counts and timings. No field holds a result path, a root path or an id, but
+the query text may itself contain a path (find path:/some/dir).
 ";
 
 /// Runs `ferret` with the process's arguments and environment.
@@ -116,13 +117,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         }
     };
     match args.command {
-        Command::Help => {
-            let _ = io::stdout().write_all(USAGE.as_bytes());
-            return Exit::Ok;
-        }
+        Command::Help => return print("usage", USAGE.as_bytes()),
         Command::Version => {
-            println!("ferret {}", env!("CARGO_PKG_VERSION"));
-            return Exit::Ok;
+            let version = format!("ferret {}\n", env!("CARGO_PKG_VERSION"));
+            return print("the version", version.as_bytes());
         }
         _ => {}
     }
@@ -156,12 +154,37 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
     }
 }
 
+/// Writes a command's whole report to stdout. A reader that went away
+/// (`ferret … | head`) is not an error: what it read was delivered, and the
+/// command's own outcome stands. Any other write failure is reported and is
+/// [`Exit::Error`], since the output was the point. `what` names the output
+/// in that message.
+///
+/// Rust ignores SIGPIPE, so without this a closed pipe is an `EPIPE` that
+/// `println!` turns into a panic, exit 101, before the command logs.
+pub fn print(what: &str, bytes: &[u8]) -> Exit {
+    let mut out = io::stdout().lock();
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
+            error(&format!("writing {what}: {e}"));
+            Exit::Error
+        }
+        _ => Exit::Ok,
+    }
+}
+
+/// Writes to stderr, ignoring failure: a closed or full stderr has nowhere
+/// to be reported, and must not panic as `eprintln!` would.
+pub fn note(text: &str) {
+    let _ = io::stderr().lock().write_all(text.as_bytes());
+}
+
 /// Prints `ferret: MESSAGE` to stderr.
 pub fn error(message: &str) {
-    eprintln!("ferret: {message}");
+    note(&format!("ferret: {message}\n"));
 }
 
 /// Prints `ferret: warning: MESSAGE` to stderr.
 pub fn warn(message: &str) {
-    eprintln!("ferret: warning: {message}");
+    note(&format!("ferret: warning: {message}\n"));
 }

@@ -10,9 +10,10 @@
 //! each other's roots.
 
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::io::{self, BufRead, IsTerminal};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -20,7 +21,7 @@ use ferret_catalog::{Catalog, OpenError, Section};
 use ferret_crawl::{IndexError, IndexOptions, Refresh, Report, RootChange, index_change};
 use ferret_policy::DEFAULT_IGNORE;
 
-use crate::cli::{Context, Exit, error, warn};
+use crate::cli::{Context, Exit, error, note, print, warn};
 use crate::setup::{self, Written};
 
 /// At most this many faults of each kind are printed; the rest are counted.
@@ -92,19 +93,12 @@ pub fn remove(context: &Context, dirs: &[PathBuf]) -> Exit {
 pub fn list(context: &Context) -> Exit {
     match configured(context) {
         Ok(roots) => {
-            let mut out = io::stdout().lock();
+            let mut text = Vec::new();
             for root in roots {
-                let mut line = root.into_os_string().into_vec();
-                line.push(b'\n');
-                if let Err(e) = out.write_all(&line) {
-                    if e.kind() == io::ErrorKind::BrokenPipe {
-                        break;
-                    }
-                    error(&format!("writing roots: {e}"));
-                    return Exit::Error;
-                }
+                text.extend_from_slice(root.as_os_str().as_bytes());
+                text.push(b'\n');
             }
-            Exit::Ok
+            print("roots", &text)
         }
         Err(e) => {
             error(&format!("{}: {e}", context.index.display()));
@@ -155,7 +149,7 @@ fn ask_for_root() -> Option<Result<PathBuf, String>> {
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return None;
     }
-    eprint!("ferret: no roots yet. Directory to index (empty to cancel): ");
+    note("ferret: no roots yet. Directory to index (empty to cancel): ");
     let mut answer = String::new();
     io::stdin().lock().read_line(&mut answer).ok()?;
     let answer = answer.trim_end_matches(['\n', '\r']);
@@ -172,10 +166,10 @@ fn global_ignore(context: &Context) -> String {
     let path = dirs.ignore_file();
     match setup::write_ignore_file(&path) {
         Ok(Written::Created) => {
-            eprintln!(
-                "ferret: wrote the default ignore rules to {}",
+            note(&format!(
+                "ferret: wrote the default ignore rules to {}\n",
                 path.display()
-            );
+            ));
         }
         Ok(Written::Kept) => {}
         Err(e) => warn(&format!("{}: {e}", path.display())),
@@ -203,11 +197,16 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
     let result = index_change(&context.index, change, refresh, &options);
     let total = started.elapsed();
 
+    // The outcome is decided before anything is printed, and printing
+    // cannot panic: a published generation is logged even when the reader
+    // of the report has gone away.
     let (exit, outcome) = match &result {
         Ok(report) => {
-            print_report(report);
             print_content_faults(report);
-            (Exit::Ok, "published")
+            (
+                print("the report", report_text(report).as_bytes()),
+                "published",
+            )
         }
         Err(IndexError::Coverage { faults, report }) => {
             print_content_faults(report);
@@ -216,15 +215,19 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
                  have missed entries; the previous index is unchanged",
                 faults.len()
             ));
+            let mut text = String::new();
             for fault in faults.iter().take(SHOWN) {
-                eprintln!("  {fault}");
+                let _ = writeln!(text, "  {fault}");
             }
             if faults.len() > SHOWN {
-                eprintln!("  … and {} more", faults.len() - SHOWN);
+                let _ = writeln!(text, "  … and {} more", faults.len() - SHOWN);
             }
             if faults.iter().any(|f| f.on_root) {
-                eprintln!("  a root that is gone can be dropped with `ferret roots remove DIR`");
+                text.push_str(
+                    "  a root that is gone can be dropped with `ferret roots remove DIR`\n",
+                );
             }
+            note(&text);
             (Exit::Error, "coverage")
         }
         Err(IndexError::Commit(e)) if e.published() => {
@@ -297,17 +300,21 @@ fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
     }
 }
 
-fn print_report(report: &Report) {
-    let list = |label: &str, roots: &[PathBuf]| {
+/// The human report of a published run, for stdout. Ignore patterns that
+/// were skipped go to stderr as warnings.
+fn report_text(report: &Report) -> String {
+    let mut text = String::new();
+    let mut list = |label: &str, roots: &[PathBuf]| {
         for root in roots {
-            println!("{label} {}", root.display());
+            let _ = writeln!(text, "{label} {}", root.display());
         }
     };
     list("indexed", &report.refreshed);
     list("kept   ", &report.kept);
     list("dropped", &report.dropped);
     let c = &report.counts;
-    println!(
+    let _ = writeln!(
+        text,
         "{} directories, {} files, {} symlinks; read {} files ({}), {} unchanged",
         c.dirs,
         c.files,
@@ -317,7 +324,8 @@ fn print_report(report: &Report) {
         c.carried
     );
     if let Some(p) = report.published {
-        println!(
+        let _ = writeln!(
+            text,
             "published {} names, {} inodes, {} documents in {:.2} s \
              (walk {:.2} s, commit {:.2} s)",
             p.names,
@@ -331,6 +339,7 @@ fn print_report(report: &Report) {
     for pattern in &report.pattern_errors {
         warn(&format!("ignore pattern skipped: {pattern}"));
     }
+    text
 }
 
 /// Content faults are warnings: the file is indexed without its content and
@@ -344,12 +353,14 @@ fn print_content_faults(report: &Report) {
         "{} file(s) indexed without their content, to be read again next run:",
         faults.len()
     ));
+    let mut text = String::new();
     for (path, fault) in faults.iter().take(SHOWN) {
-        eprintln!("  {}: {fault}", path.display());
+        let _ = writeln!(text, "  {}: {fault}", path.display());
     }
     if faults.len() > SHOWN {
-        eprintln!("  … and {} more", faults.len() - SHOWN);
+        let _ = writeln!(text, "  … and {} more", faults.len() - SHOWN);
     }
+    note(&text);
 }
 
 /// `n` bytes, in the largest unit that keeps it at least 1.

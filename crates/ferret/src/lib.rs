@@ -6,7 +6,8 @@
 //! - [`args`]: the command line, parsed; pure.
 //! - [`find`], [`index`] (with `roots`), [`stats`]: one module per command.
 //! - [`json`]: the JSON writer, and how non-UTF-8 bytes are encoded.
-//! - [`log`]: the query and timing log.
+//! - [`log`]: the query and timing log. No field holds a result path, a root
+//!   path or an id, but query text is logged as typed and may contain a path.
 //! - [`xdg`] resolves directories from the environment and touches no files;
 //!   [`setup`] writes the files a new install starts with.
 //!
