@@ -1858,7 +1858,8 @@ entries growing faster than about 2× a quarter, in which case move to C sooner.
 
 **Answer (2026-09-27): B.** S1 is built for about 10M catalogued entries and
 measured at about 40M. This also answers D38: B, section reads, in slice 5.
-After S1 the incremental catalog (D26 A) moves ahead of the daemon.
+After S1 the incremental catalog (D26 B, the change log) moves ahead of the
+daemon.
 
 ## D41 — The name scanner: `memchr::memmem`, or our own
 
