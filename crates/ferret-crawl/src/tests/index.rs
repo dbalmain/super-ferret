@@ -144,6 +144,7 @@ fn listing(catalog: &Catalog) -> BTreeMap<PathBuf, Row> {
 
 fn published(tmp: &Tmp) -> (Catalog, BTreeMap<PathBuf, Row>) {
     let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
+    catalog.load_all().unwrap();
     let rows = listing(&catalog);
     assert_eq!(rows.len(), catalog.name_count() as usize);
     (catalog, rows)

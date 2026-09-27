@@ -1,6 +1,6 @@
 //! Batches → commit → reopen, numbering, hard links and path resolution.
 
-use super::{Scratch, at, commit, dir_stat, file_stat, hash, link_stat, paths};
+use super::{Scratch, at, commit, dir_stat, file_stat, hash, link_stat, paths, reopen};
 use crate::{
     Batch, BuildError, Catalog, CommitError, Content, ContentState, DocId, InoId, Kind, NameId,
     Transaction, WorkTreeKind,
@@ -47,7 +47,7 @@ fn commit_tree(dir: &std::path::Path, order: [usize; 3]) -> Catalog {
 fn batches_commit_and_reopen() {
     let scratch = Scratch::new("round-trip");
     let committed = commit_tree(&scratch.path, [0, 1, 2]);
-    let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+    let catalog = reopen(&scratch.path);
 
     let all = paths(&catalog);
     let expect = [

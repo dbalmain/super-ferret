@@ -1,32 +1,47 @@
 //! [`Catalog`]: one opened generation, and everything a query reads from it.
 //!
-//! Opening reads the snapshot into memory and validates it; nothing else is
-//! derived (D30 C). Accessors decode fixed-width rows in place. The catalog
-//! applies no matching: `ferret-query` scans [`Catalog::name_heap`] or
-//! iterates [`Catalog::names`], and comes back here with the `NameId`s it hit.
+//! Opening reads the header and the section table; each section is read with
+//! a positional read on first use and validated then (D38 B). Nothing else
+//! is derived (D30 C). Accessors decode fixed-width rows in place. The
+//! catalog applies no matching: `ferret-query` scans [`Catalog::name_heap`]
+//! or iterates [`Catalog::names`], and comes back here with the `NameId`s it
+//! hit.
+//!
+//! Loading is explicit and fallible: [`Catalog::load`] reads and validates
+//! the sections a caller names, with any they depend on. Every accessor after
+//! that is infallible. Reading a section that was never loaded panics, like
+//! an id out of range: both are caller bugs. [`Catalog::read_inode`] is the
+//! one fallible accessor; it reads a single inode row when the whole section
+//! would cost more than the query needs.
 //!
 //! Ids passed in must come from this generation; an id out of range panics,
 //! as indexing a slice does. Anything read from the file cannot panic: that is
-//! what decoding validated.
+//! what loading validated.
 
 use std::fmt;
+use std::fs::File;
 use std::io;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::batch::{Stat, WorkTreeKind};
 use crate::format::{
-    self, DOC_ROW, INODE_ROW, Layout, NAME_ROW, NONE, PAIR_ROW, Section, WORK_TREE_ROW, u32_at,
-    u64_at,
+    self, DOC_ROW, INODE_ROW, Layout, NAME_ROW, NONE, PAIR_ROW, SECTIONS, Section, TABLE_END,
+    WORK_TREE_ROW, u32_at, u64_at,
 };
 use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
 
 /// The snapshot's file name inside the catalog directory.
 pub(crate) const FILE: &str = "catalog";
 
-/// Why [`Catalog::open`] failed.
+/// Why [`Catalog::open`], [`Catalog::load`] or [`Catalog::read_inode`]
+/// failed.
 #[derive(Debug)]
 pub enum OpenError {
-    /// Reading the file failed.
+    /// Reading the file failed. A file truncated under an open reader is
+    /// `UnexpectedEof` here.
     Io(io::Error),
     /// The file is not a valid catalog.
     Decode(DecodeError),
@@ -90,32 +105,132 @@ pub struct WorkTree<'a> {
     pub common_dir: &'a [u8],
 }
 
-/// One generation of the catalog, read into memory. It stays valid however
-/// many commits follow.
+/// One generation of the catalog. It stays valid however many commits
+/// follow: an opened catalog holds its file, not its path, so a generation
+/// replaced mid-query stays readable (D32).
 pub struct Catalog {
-    bytes: Vec<u8>,
     layout: Layout,
+    source: Source,
+}
+
+enum Source {
+    /// A whole file in memory, every section validated
+    /// ([`Catalog::from_bytes`]).
+    Whole(Vec<u8>),
+    /// An open file whose sections load on demand.
+    File {
+        file: File,
+        sections: Box<[OnceLock<Box<[u8]>>; SECTIONS.len()]>,
+        /// Bytes read from the file so far, header and table included.
+        read: AtomicU64,
+    },
 }
 
 impl Catalog {
-    /// Reads and validates the catalog in `dir`. `Ok(None)` when nothing has
-    /// been committed there yet.
+    /// Opens the catalog in `dir`, reading and checking only the header and
+    /// section table; no section is loaded. `Ok(None)` when nothing has been
+    /// committed there yet.
     pub fn open(dir: &Path) -> Result<Option<Catalog>, OpenError> {
-        match std::fs::read(dir.join(FILE)) {
-            Ok(bytes) => Self::from_bytes(bytes).map(Some).map_err(OpenError::Decode),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(OpenError::Io(e)),
+        let file = match File::open(dir.join(FILE)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(OpenError::Io(e)),
+        };
+        let len = file.metadata().map_err(OpenError::Io)?.len();
+        let mut head = vec![0; (len as usize).min(TABLE_END)];
+        file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
+        let layout = format::decode_table(&head, len).map_err(OpenError::Decode)?;
+        Ok(Some(Catalog {
+            layout,
+            source: Source::File {
+                file,
+                sections: Default::default(),
+                read: AtomicU64::new(head.len() as u64),
+            },
+        }))
+    }
+
+    /// Validates `bytes` as a whole snapshot file. Every section is loaded.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Catalog, DecodeError> {
+        let layout = format::decode(&bytes)?;
+        Ok(Catalog {
+            layout,
+            source: Source::Whole(bytes),
+        })
+    }
+
+    /// Loads `sections`, and each section they depend on, validating each as
+    /// it arrives. A section already loaded is not read again. After this
+    /// succeeds, every accessor that reads only these sections is
+    /// infallible. A failure leaves whatever loaded before it loaded.
+    pub fn load(&self, sections: &[Section]) -> Result<(), OpenError> {
+        sections.iter().try_for_each(|&s| self.load_one(s))
+    }
+
+    /// Loads every section: what a caller that reads the whole generation
+    /// (the writer's previous generation, a test) needs.
+    pub fn load_all(&self) -> Result<(), OpenError> {
+        self.load(&SECTIONS)
+    }
+
+    fn load_one(&self, section: Section) -> Result<(), OpenError> {
+        let Source::File {
+            file,
+            sections,
+            read,
+        } = &self.source
+        else {
+            return Ok(());
+        };
+        let slot = &sections[section as usize];
+        if slot.get().is_some() {
+            return Ok(());
+        }
+        self.load(section.needs())?;
+        let (start, end) = self.layout.range(section);
+        let mut bytes = vec![0; end - start].into_boxed_slice();
+        file.read_exact_at(&mut bytes, start as u64)
+            .map_err(OpenError::Io)?;
+        read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        format::check(section, &self.layout, |s| {
+            if s == section {
+                &bytes[..]
+            } else {
+                self.section(s)
+            }
+        })
+        .map_err(OpenError::Decode)?;
+        // A racing loader may have set it first; its bytes are the same.
+        let _ = slot.set(bytes);
+        Ok(())
+    }
+
+    /// Whether `section` is loaded. A reader from [`Catalog::from_bytes`]
+    /// has every section.
+    pub fn is_loaded(&self, section: Section) -> bool {
+        match &self.source {
+            Source::Whole(_) => true,
+            Source::File { sections, .. } => sections[section as usize].get().is_some(),
         }
     }
 
-    /// Validates `bytes` as a snapshot file.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Catalog, DecodeError> {
-        let layout = format::decode(&bytes)?;
-        Ok(Catalog { bytes, layout })
+    /// Bytes read from the file so far: the header and table, each loaded
+    /// section and each single row [`Catalog::read_inode`] read. For a
+    /// reader from [`Catalog::from_bytes`], the whole file.
+    pub fn bytes_read(&self) -> u64 {
+        match &self.source {
+            Source::Whole(bytes) => bytes.len() as u64,
+            Source::File { read, .. } => read.load(Ordering::Relaxed),
+        }
     }
 
     fn section(&self, section: Section) -> &[u8] {
-        self.layout.section(&self.bytes, section)
+        match &self.source {
+            Source::Whole(bytes) => self.layout.section(bytes, section),
+            Source::File { sections, .. } => sections[section as usize]
+                .get()
+                .unwrap_or_else(|| panic!("catalog section {section:?} read before it was loaded")),
+        }
     }
 
     // ── counts and header ──
@@ -146,9 +261,10 @@ impl Catalog {
         self.layout.names as u32
     }
 
-    /// Live documents.
+    /// Live documents. Known from the section table; loads nothing.
     pub fn doc_count(&self) -> u32 {
-        (self.section(Section::Docs).len() / DOC_ROW) as u32
+        let (start, end) = self.layout.range(Section::Docs);
+        ((end - start) / DOC_ROW) as u32
     }
 
     // ── names ──
@@ -275,9 +391,35 @@ impl Catalog {
 
     // ── inodes ──
 
-    /// One inode row.
+    /// One inode row. Needs [`Section::Inodes`] and [`Section::States`].
     pub fn inode(&self, id: InoId) -> Inode {
         let row = &self.section(Section::Inodes)[id.0 as usize * INODE_ROW..][..INODE_ROW];
+        self.decode_inode(id, row)
+    }
+
+    /// One inode row, read alone from the file when [`Section::Inodes`] is
+    /// not loaded: a query that reports a few rows pays a few positional
+    /// reads rather than the whole section (64 B per inode). Loads
+    /// [`Section::States`], which is 2 bits per inode. An inode row indexes
+    /// nothing, so it needs no validation.
+    pub fn read_inode(&self, id: InoId) -> Result<Inode, OpenError> {
+        self.load(&[Section::States])?;
+        let Source::File { file, read, .. } = &self.source else {
+            return Ok(self.inode(id));
+        };
+        if self.is_loaded(Section::Inodes) {
+            return Ok(self.inode(id));
+        }
+        assert!(id.0 < self.inode_count(), "inode {id:?} out of range");
+        let mut row = [0; INODE_ROW];
+        let at = self.layout.range(Section::Inodes).0 + id.0 as usize * INODE_ROW;
+        file.read_exact_at(&mut row, at as u64)
+            .map_err(OpenError::Io)?;
+        read.fetch_add(INODE_ROW as u64, Ordering::Relaxed);
+        Ok(self.decode_inode(id, &row))
+    }
+
+    fn decode_inode(&self, id: InoId, row: &[u8]) -> Inode {
         let i64_at = |at| u64_at(row, at) as i64;
         let stat = Stat {
             dev: u64_at(row, 0),

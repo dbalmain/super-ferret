@@ -25,7 +25,7 @@ mod tests;
 
 pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
 pub use build::BuildError;
-pub use format::DecodeError;
+pub use format::{DecodeError, Section};
 pub use read::{Catalog, Inode, Kind, Name, OpenError, WorkTree};
 pub use transaction::{BeginError, CommitError, KeepError, Transaction};
 

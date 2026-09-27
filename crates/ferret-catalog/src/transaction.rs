@@ -182,6 +182,9 @@ impl Transaction {
         }
         remove_temp(dir).map_err(BeginError::Io)?;
         let previous = Catalog::open(dir).map_err(BeginError::Previous)?;
+        if let Some(old) = &previous {
+            old.load_all().map_err(BeginError::Previous)?;
+        }
 
         let mut by_identity = Vec::new();
         let mut docs = Vec::new();

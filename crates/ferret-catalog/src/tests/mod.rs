@@ -95,6 +95,13 @@ fn commit(dir: &Path, fill: impl FnOnce(&mut Transaction)) -> Catalog {
     txn.commit().unwrap()
 }
 
+/// Opens the committed catalog in `dir` with every section loaded.
+fn reopen(dir: &Path) -> Catalog {
+    let catalog = Catalog::open(dir).unwrap().unwrap();
+    catalog.load_all().unwrap();
+    catalog
+}
+
 /// Every name's full path, mapped to the inode it names.
 fn paths(catalog: &Catalog) -> BTreeMap<String, InoId> {
     catalog

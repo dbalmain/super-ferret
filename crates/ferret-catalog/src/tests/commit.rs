@@ -3,7 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use super::{SNIFFER, Scratch, commit, dir_stat, file_stat, paths};
+use super::{SNIFFER, Scratch, commit, dir_stat, file_stat, paths, reopen};
 use crate::transaction::FAIL_SYNC_DIR;
 use crate::{BeginError, Catalog, CommitError, Content, Transaction};
 
@@ -84,10 +84,7 @@ fn a_failure_before_the_rename_publishes_nothing() {
 
     assert!(matches!(err, CommitError::Write(_)), "{err:?}");
     assert!(!err.published());
-    assert_eq!(
-        names(&Catalog::open(&scratch.path).unwrap().unwrap()),
-        ["/g/old"]
-    );
+    assert_eq!(names(&reopen(&scratch.path)), ["/g/old"]);
     assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
@@ -109,10 +106,7 @@ fn a_failure_after_the_rename_is_published_but_undurable() {
         err.published(),
         "callers must not read this as nothing published"
     );
-    assert_eq!(
-        names(&Catalog::open(&scratch.path).unwrap().unwrap()),
-        ["/g/new"]
-    );
+    assert_eq!(names(&reopen(&scratch.path)), ["/g/new"]);
     assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
@@ -133,10 +127,7 @@ fn dropping_a_transaction_publishes_nothing_and_a_stale_temp_is_cleared() {
     fill(&mut txn, &["new"]);
     drop(txn);
 
-    assert_eq!(
-        names(&Catalog::open(&scratch.path).unwrap().unwrap()),
-        ["/g/old"]
-    );
+    assert_eq!(names(&reopen(&scratch.path)), ["/g/old"]);
     assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
@@ -145,18 +136,18 @@ fn dropping_a_transaction_publishes_nothing_and_a_stale_temp_is_cleared() {
 fn an_old_reader_keeps_its_generation_across_a_commit() {
     let scratch = Scratch::new("reader");
     commit(&scratch.path, |txn| fill(txn, &["one", "two"]));
+    // Opened lazily: nothing but the header is read before the next commit
+    // replaces the file, so every section comes from the held descriptor.
     let reader = Catalog::open(&scratch.path).unwrap().unwrap();
 
     commit(&scratch.path, |txn| fill(txn, &["three"]));
+    reader.load_all().unwrap();
     assert_eq!(names(&reader), ["/g/one", "/g/two"]);
     assert_eq!(
         reader.inode(reader.name(crate::NameId(1)).child).stat,
         file_stat(11)
     );
-    assert_eq!(
-        names(&Catalog::open(&scratch.path).unwrap().unwrap()),
-        ["/g/three"]
-    );
+    assert_eq!(names(&reopen(&scratch.path)), ["/g/three"]);
 }
 
 #[test]

@@ -313,6 +313,7 @@ fn ms(d: Duration) -> f64 {
 
 fn layout(dir: &Path, runs: usize) -> Result<()> {
     let catalog = Catalog::open(dir)?.ok_or("no catalog")?;
+    catalog.load_all()?;
     let heap = catalog.name_heap();
     let coded = front_code(&catalog);
     let names = catalog.name_count() as usize;

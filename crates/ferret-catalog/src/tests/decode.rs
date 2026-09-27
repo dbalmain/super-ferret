@@ -1,7 +1,10 @@
 //! A corrupt or truncated snapshot is an error, never a panic.
 
 use super::{Scratch, commit, dir_stat, file_stat, hash, link_stat};
-use crate::{Catalog, Content, DecodeError, InoId, NameId, WorkTreeKind};
+use std::path::Path;
+
+use crate::format::SECTIONS;
+use crate::{Catalog, Content, DecodeError, InoId, NameId, OpenError, Section, WorkTreeKind};
 
 /// A small snapshot with every section non-empty, built in its own scratch
 /// directory `name`.
@@ -24,41 +27,91 @@ fn sample(name: &str) -> Vec<u8> {
     std::fs::read(scratch.path.join("catalog")).unwrap()
 }
 
-/// Reads everything a decoded catalog offers, through every accessor. A
-/// panic anywhere here is the failure the decoder exists to prevent.
+/// Reads everything a catalog offers through every accessor whose sections
+/// are loaded. A panic anywhere here is the failure validation exists to
+/// prevent.
 fn exercise(catalog: &Catalog) -> usize {
+    use Section::*;
+    let has = |sections: &[Section]| sections.iter().all(|&s| catalog.is_loaded(s));
     let mut touched = 0;
     let mut path = Vec::new();
-    for (id, bytes) in catalog.names() {
-        path.clear();
-        catalog.path(id, &mut path);
-        let name = catalog.name(id);
-        touched +=
-            bytes.len() + path.len() + usize::from(catalog.lookup(name.parent, bytes).is_some());
+    if has(&[Names, NameHeap]) {
+        let paths = has(&[DirNames, Roots, Strings]);
+        for (id, bytes) in catalog.names() {
+            if paths {
+                path.clear();
+                catalog.path(id, &mut path);
+            }
+            let name = catalog.name(id);
+            touched += bytes.len()
+                + path.len()
+                + usize::from(catalog.lookup(name.parent, bytes).is_some());
+        }
+        for offset in 0..=catalog.name_heap().len() {
+            touched += catalog.name_at(offset).map_or(0, |n| n.0 as usize);
+        }
+        for dir in 0..catalog.dir_count() {
+            touched += catalog.children(InoId(dir)).count();
+        }
     }
-    for offset in 0..=catalog.name_heap().len() {
-        touched += catalog.name_at(offset).map_or(0, |n| n.0 as usize);
+    for id in (0..catalog.inode_count()).map(InoId) {
+        if has(&[Inodes, States]) {
+            touched += catalog.inode(id).doc.map_or(0, |d| d.0 as usize);
+        }
+        // Reads a single row when the section is not loaded; never fails on
+        // a file that has not changed since it was opened.
+        let inode = catalog.read_inode(id).unwrap();
+        if has(&[Docs]) {
+            touched += inode
+                .doc
+                .and_then(|d| catalog.doc_hash(d))
+                .map_or(0, |h| h[0] as usize);
+        }
+        if has(&[Links, Strings]) {
+            touched += catalog.link_target(id).map_or(0, <[u8]>::len);
+            touched += catalog.kind(id) as usize;
+        }
+        if has(&[WorkTrees, Strings]) {
+            touched += catalog.work_tree(id).map_or(0, |w| w.common_dir.len());
+        }
     }
-    for id in 0..catalog.inode_count() {
-        let id = InoId(id);
-        let inode = catalog.inode(id);
-        touched += inode
-            .doc
-            .and_then(|d| catalog.doc_hash(d))
-            .map_or(0, |h| h[0] as usize);
-        touched += catalog.link_target(id).map_or(0, <[u8]>::len);
-        touched += catalog.kind(id) as usize;
-        touched += catalog.work_tree(id).map_or(0, |w| w.common_dir.len());
+    for dir in (0..catalog.dir_count()).map(InoId) {
+        if has(&[DirNames, Names, NameHeap, Roots, Strings]) {
+            path.clear();
+            catalog.dir_path(dir, &mut path);
+            touched += path.len();
+        }
+        if has(&[Traversed]) {
+            touched += usize::from(catalog.is_traversed(dir));
+        }
+        if has(&[DirNames]) {
+            touched += catalog.dir_name(dir).map_or(0, |n| n.0 as usize);
+        }
     }
-    for dir in 0..catalog.dir_count() {
-        path.clear();
-        catalog.dir_path(InoId(dir), &mut path);
-        touched += path.len() + usize::from(catalog.is_traversed(InoId(dir)));
-        touched += catalog.dir_name(InoId(dir)).map_or(0, |n| n.0 as usize);
-        touched += catalog.children(InoId(dir)).count();
+    if has(&[Roots, Strings]) {
+        touched += catalog.roots().count();
     }
-    touched += catalog.roots().count() + catalog.work_trees().count() + catalog.docs().count();
+    if has(&[WorkTrees, Strings]) {
+        touched += catalog.work_trees().count();
+    }
+    if has(&[Docs]) {
+        touched += catalog.docs().count();
+    }
     touched
+}
+
+/// Writes `bytes` as a catalog file in `dir`, for the lazy reader.
+fn write_catalog(dir: &Path, bytes: &[u8]) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("catalog"), bytes).unwrap();
+}
+
+/// Opens `dir` lazily and loads `sections`: `None` when the open or the load
+/// is refused.
+fn lazy(dir: &Path, sections: &[Section]) -> Option<Catalog> {
+    let catalog = Catalog::open(dir).ok()??;
+    catalog.load(sections).ok()?;
+    Some(catalog)
 }
 
 /// Every name is found by `lookup` in its parent under its own bytes: the
@@ -89,30 +142,82 @@ fn the_sample_decodes_and_every_section_is_populated() {
 #[test]
 fn every_truncation_is_an_error() {
     let bytes = sample("decode-truncate");
+    let scratch = Scratch::new("decode-truncate-lazy");
     for len in 0..bytes.len() {
         assert!(
             Catalog::from_bytes(bytes[..len].to_vec()).is_err(),
             "truncated to {len}"
         );
+        // The lazy reader refuses at open: the table no longer tiles the
+        // file, so no section is ever read from a truncated one.
+        write_catalog(&scratch.path, &bytes[..len]);
+        assert!(
+            Catalog::open(&scratch.path).is_err(),
+            "lazily opened truncated to {len}"
+        );
     }
     let mut longer = bytes;
     longer.push(0);
+    write_catalog(&scratch.path, &longer);
+    assert!(matches!(
+        Catalog::open(&scratch.path),
+        Err(OpenError::Decode(DecodeError::Layout))
+    ));
     assert_eq!(Catalog::from_bytes(longer).err(), Some(DecodeError::Layout));
+}
+
+#[test]
+fn a_file_truncated_under_an_open_reader_is_an_error_on_load() {
+    // The writer only renames, but a file truncated in place (by anything
+    // else) must fail the next section read, not hand back short bytes.
+    let bytes = sample("decode-shrink");
+    let scratch = Scratch::new("decode-shrink-lazy");
+    write_catalog(&scratch.path, &bytes);
+    let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+    catalog.load(&[Section::Names]).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(scratch.path.join("catalog"))
+        .unwrap()
+        .set_len(bytes.len() as u64 - 30)
+        .unwrap();
+    assert!(matches!(
+        catalog.load(&[Section::Docs]),
+        Err(OpenError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+    assert!(catalog.is_loaded(Section::Names) && !catalog.is_loaded(Section::Docs));
 }
 
 #[test]
 fn every_single_bit_flip_is_an_error_or_reads_safely() {
     let bytes = sample("decode-flip");
+    let scratch = Scratch::new("decode-flip-lazy");
     let (mut rejected, mut accepted) = (0, 0);
     for at in 0..bytes.len() {
         for bit in 0..8 {
             let mut flipped = bytes.clone();
             flipped[at] ^= 1 << bit;
-            match Catalog::from_bytes(flipped) {
-                Err(_) => rejected += 1,
-                Ok(catalog) => {
+            let context = format!("flip at {at} bit {bit}");
+            write_catalog(&scratch.path, &flipped);
+            // Loading any one section (with what it needs) either fails or
+            // leaves every accessor it enables safe.
+            for section in SECTIONS {
+                if let Some(catalog) = lazy(&scratch.path, &[section]) {
                     exercise(&catalog);
-                    assert_lookups_agree(&catalog, &format!("flip at {at} bit {bit}"));
+                }
+            }
+            // Loaded lazily, a whole file is accepted exactly when the
+            // whole-file decoder accepts it.
+            let whole = lazy(&scratch.path, &SECTIONS);
+            match Catalog::from_bytes(flipped) {
+                Err(_) => {
+                    assert!(whole.is_none(), "{context}: accepted only lazily");
+                    rejected += 1;
+                }
+                Ok(catalog) => {
+                    assert!(whole.is_some(), "{context}: refused only lazily");
+                    exercise(&catalog);
+                    assert_lookups_agree(&catalog, &context);
                     accepted += 1;
                     // The header and section table are fully checked.
                     assert!(
@@ -128,6 +233,63 @@ fn every_single_bit_flip_is_an_error_or_reads_safely() {
     assert!(
         rejected > 0 && accepted > 0,
         "{rejected} rejected, {accepted} accepted"
+    );
+}
+
+#[test]
+fn a_corrupt_section_fails_only_the_load_that_reads_it() {
+    // A flipped doc id (made to repeat its predecessor) is invisible to a
+    // name query, which never reads the docs; loading them refuses.
+    let mut bytes = sample("decode-partial");
+    let docs = Catalog::from_bytes(bytes.clone()).unwrap();
+    assert_eq!(docs.doc_count(), 2);
+    let table = 24 + Section::Docs as usize * 16;
+    let start = u64::from_le_bytes(bytes[table..table + 8].try_into().unwrap()) as usize;
+    let first = bytes[start..start + 4].to_vec();
+    bytes[start + 20..start + 24].copy_from_slice(&first);
+    let scratch = Scratch::new("decode-partial-lazy");
+    write_catalog(&scratch.path, &bytes);
+
+    let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+    let names = [
+        Section::Names,
+        Section::NameHeap,
+        Section::DirNames,
+        Section::Roots,
+    ];
+    catalog.load(&names).unwrap();
+    assert!(exercise(&catalog) > 0);
+    assert!(matches!(
+        catalog.load(&[Section::Docs]),
+        Err(OpenError::Decode(DecodeError::Corrupt("docs")))
+    ));
+    assert!(!catalog.is_loaded(Section::Docs));
+}
+
+#[test]
+fn a_section_loads_what_it_is_checked_against() {
+    // The dir-names check reads the name rows, which read the heap; roots
+    // read dir names and strings. Loading the dependent loads the rest, so a
+    // cross-section check never runs against a section that is not there.
+    let scratch = Scratch::new("decode-needs");
+    write_catalog(&scratch.path, &sample("decode-needs-sample"));
+    let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+    assert!(SECTIONS.iter().all(|&s| !catalog.is_loaded(s)));
+    assert_eq!(catalog.bytes_read(), 200);
+    catalog.load(&[Section::Roots]).unwrap();
+    let loaded: Vec<Section> = SECTIONS
+        .into_iter()
+        .filter(|&s| catalog.is_loaded(s))
+        .collect();
+    assert_eq!(
+        loaded,
+        [
+            Section::Names,
+            Section::NameHeap,
+            Section::DirNames,
+            Section::Roots,
+            Section::Strings
+        ]
     );
 }
 

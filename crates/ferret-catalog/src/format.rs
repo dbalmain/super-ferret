@@ -8,8 +8,8 @@
 //! ```
 //!
 //! All integers are little-endian and every row is fixed-width. The sections
-//! a name query reads come first, so a reader that ever loads sections lazily
-//! can stop early (D30).
+//! a name query reads come first, and a reader loads each on first use
+//! (D38 B).
 //!
 //! ```text
 //! names       12 B  parent InoId, child InoId, offset in name heap
@@ -33,6 +33,12 @@
 //! at a lower-numbered parent, so walking up from any name ends at a root.
 //! Field values that index nothing (times, sizes, a `DocId` in an inode row)
 //! are not checked; a flipped bit there reads back as a different value.
+//!
+//! Validation is split so that it can run per section: [`decode_table`]
+//! checks the header, the table and every count and length at open, and
+//! [`check`] validates one section when it is loaded. A check that spans
+//! sections (a directory's name edge against the name rows) runs when the
+//! later one loads, after the sections it [needs](Section::needs).
 
 use std::fmt;
 use std::io::{self, Write};
@@ -50,18 +56,32 @@ pub(crate) const PAIR_ROW: usize = 8;
 pub(crate) const WORK_TREE_ROW: usize = 32;
 pub(crate) const DOC_ROW: usize = 20;
 
+/// One section of the snapshot file, in file order. A reader loads sections
+/// one at a time ([`Catalog::load`](crate::Catalog::load)); the ones a name
+/// query needs come first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Section {
+pub enum Section {
+    /// Name rows: parent, child, heap offset.
     Names,
+    /// The name bytes a filename scan reads (D14, D28).
     NameHeap,
+    /// Each directory's own name edge (D30).
     DirNames,
+    /// The traversed-directory bitset (D29).
     Traversed,
+    /// Root directories and their paths.
     Roots,
+    /// Root paths, link targets and work-tree paths.
     Strings,
+    /// Inode rows: stat and document.
     Inodes,
+    /// Each inode's content state (D37).
     States,
+    /// Symlink targets.
     Links,
+    /// Work-tree rows (D23).
     WorkTrees,
+    /// Live documents and their hashes.
     Docs,
 }
 
@@ -235,7 +255,9 @@ pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b)
 }
 
-/// Where each section lies in a validated file, and the header's counters.
+/// Where each section lies, and the counts the section table implies. Built
+/// from the header and table alone, so every check below that needs only a
+/// count or a length runs at open, before any section is read.
 #[derive(Clone, Debug)]
 pub(crate) struct Layout {
     pub(crate) sniffer: u32,
@@ -251,33 +273,47 @@ impl Layout {
         let (start, end) = self.sections[section as usize];
         &bytes[start..end]
     }
+
+    pub(crate) fn range(&self, section: Section) -> (usize, usize) {
+        self.sections[section as usize]
+    }
+
+    fn len(&self, section: Section) -> usize {
+        let (start, end) = self.range(section);
+        end - start
+    }
 }
 
-/// Validates `bytes` as a snapshot. See the module doc for what is checked.
-pub(crate) fn decode(bytes: &[u8]) -> Result<Layout, DecodeError> {
-    if bytes.len() < HEADER || bytes[..8] != MAGIC {
+/// The bytes of the header and section table.
+pub(crate) const TABLE_END: usize = DATA_START;
+
+/// Validates the header and section table. `head` is the file's first
+/// [`TABLE_END`] bytes, or all of it if shorter; `file_len` is the whole
+/// file's length, which the sections must tile exactly.
+pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeError> {
+    if head.len() < HEADER || head[..8] != MAGIC {
         return Err(DecodeError::NotACatalog);
     }
-    let version = u32_at(bytes, 8);
+    let version = u32_at(head, 8);
     if version != VERSION {
         return Err(DecodeError::Version(version));
     }
-    if bytes.len() < DATA_START || u32_at(bytes, 20) as usize != SECTIONS.len() {
+    if head.len() < DATA_START || u32_at(head, 20) as usize != SECTIONS.len() {
         return Err(DecodeError::Layout);
     }
     let mut sections = [(0, 0); SECTIONS.len()];
     let mut expect = DATA_START as u64;
     for (i, slot) in sections.iter_mut().enumerate() {
-        let offset = u64_at(bytes, HEADER + i * 16);
-        let len = u64_at(bytes, HEADER + i * 16 + 8);
+        let offset = u64_at(head, HEADER + i * 16);
+        let len = u64_at(head, HEADER + i * 16 + 8);
         let end = offset.checked_add(len).ok_or(DecodeError::Layout)?;
-        if offset != expect || end > bytes.len() as u64 {
+        if offset != expect || end > file_len {
             return Err(DecodeError::Layout);
         }
         *slot = (offset as usize, end as usize);
         expect = end;
     }
-    if expect != bytes.len() as u64 {
+    if expect != file_len {
         return Err(DecodeError::Layout);
     }
 
@@ -305,37 +341,163 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Layout, DecodeError> {
     if len(Section::States) != inodes.div_ceil(4) {
         return Err(DecodeError::Corrupt("states"));
     }
+    if (len(Section::NameHeap) == 0) != (names == 0) {
+        return Err(DecodeError::Corrupt("name heap"));
+    }
 
-    let layout = Layout {
-        sniffer: u32_at(bytes, 12),
-        next_doc: u32_at(bytes, 16),
+    Ok(Layout {
+        sniffer: u32_at(head, 12),
+        next_doc: u32_at(head, 16),
         sections,
         dirs,
         inodes,
         names,
-    };
-    validate(bytes, &layout)?;
+    })
+}
+
+/// Validates a whole file held in memory: the table, then every section.
+pub(crate) fn decode(bytes: &[u8]) -> Result<Layout, DecodeError> {
+    let layout = decode_table(bytes, bytes.len() as u64)?;
+    for section in CHECK_ORDER {
+        check(section, &layout, |s| layout.section(bytes, s))?;
+    }
     Ok(layout)
 }
 
-fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
-    let section = |s| l.section(bytes, s);
+/// Every section, each after those it [needs](Section::needs).
+const CHECK_ORDER: [Section; SECTIONS.len()] = [
+    Section::NameHeap,
+    Section::Names,
+    Section::DirNames,
+    Section::Traversed,
+    Section::Strings,
+    Section::Roots,
+    Section::Inodes,
+    Section::States,
+    Section::Links,
+    Section::WorkTrees,
+    Section::Docs,
+];
+
+impl Section {
+    /// The sections whose bytes [`check`] reads to validate this one; they
+    /// must be loaded first. Everything else a check needs is a count or a
+    /// length from the table.
+    pub(crate) fn needs(self) -> &'static [Section] {
+        match self {
+            Section::Names => &[Section::NameHeap],
+            Section::DirNames => &[Section::Names],
+            Section::Roots => &[Section::DirNames, Section::Strings],
+            Section::Links | Section::WorkTrees => &[Section::Strings],
+            Section::NameHeap
+            | Section::Traversed
+            | Section::Strings
+            | Section::Inodes
+            | Section::States
+            | Section::Docs => &[],
+        }
+    }
+}
+
+/// Validates one section, given its bytes and those of every section it
+/// [needs](Section::needs), through `get`. See the module doc for what is
+/// checked. Traversed, inodes and states have nothing beyond their lengths,
+/// which [`decode_table`] checked.
+pub(crate) fn check<'a>(
+    section: Section,
+    l: &Layout,
+    get: impl Fn(Section) -> &'a [u8],
+) -> Result<(), DecodeError> {
     let terminated = |heap: &[u8]| heap.last().is_none_or(|&b| b == 0);
-
-    let heap = section(Section::NameHeap);
-    if !terminated(heap) || heap.is_empty() != (l.names == 0) {
-        return Err(DecodeError::Corrupt("name heap"));
+    let strings_len = l.len(Section::Strings);
+    match section {
+        Section::NameHeap => {
+            if !terminated(get(Section::NameHeap)) {
+                return Err(DecodeError::Corrupt("name heap"));
+            }
+        }
+        Section::Strings => {
+            if !terminated(get(Section::Strings)) {
+                return Err(DecodeError::Corrupt("strings"));
+            }
+        }
+        Section::Names => check_names(l, get(Section::Names), get(Section::NameHeap))?,
+        Section::DirNames => check_dir_names(l, get(Section::DirNames), get(Section::Names))?,
+        Section::Roots => {
+            let (roots, dir_names) = (get(Section::Roots), get(Section::DirNames));
+            let unnamed = dir_names
+                .chunks_exact(4)
+                .filter(|c| u32_at(c, 0) == NONE)
+                .count();
+            let mut last = None;
+            for pair in roots.chunks_exact(PAIR_ROW) {
+                let (dir, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
+                let ok = (dir as usize) < l.dirs
+                    && u32_at(dir_names, dir as usize * 4) == NONE
+                    && last.is_none_or(|last| dir > last)
+                    && offset < strings_len;
+                if !ok {
+                    return Err(DecodeError::Corrupt("roots"));
+                }
+                last = Some(dir);
+            }
+            if roots.len() / PAIR_ROW != unnamed {
+                return Err(DecodeError::Corrupt("roots"));
+            }
+        }
+        Section::Links => {
+            let mut last = None;
+            for pair in get(Section::Links).chunks_exact(PAIR_ROW) {
+                let (ino, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
+                let ok = (l.dirs..l.inodes).contains(&(ino as usize))
+                    && last.is_none_or(|last| ino > last)
+                    && offset < strings_len;
+                if !ok {
+                    return Err(DecodeError::Corrupt("links"));
+                }
+                last = Some(ino);
+            }
+        }
+        Section::WorkTrees => {
+            let mut last = None;
+            for row in get(Section::WorkTrees).chunks_exact(WORK_TREE_ROW) {
+                let (dir, offset) = (u32_at(row, 0), u32_at(row, 4) as usize);
+                let ok = (dir as usize) < l.dirs
+                    && last.is_none_or(|last| dir > last)
+                    && offset < strings_len
+                    && crate::WorkTreeKind::from_byte(row[24]).is_some();
+                if !ok {
+                    return Err(DecodeError::Corrupt("work trees"));
+                }
+                last = Some(dir);
+            }
+        }
+        Section::Docs => {
+            let mut last = None;
+            for row in get(Section::Docs).chunks_exact(DOC_ROW) {
+                let id = u32_at(row, 0);
+                if id >= l.next_doc || last.is_some_and(|last| id <= last) {
+                    return Err(DecodeError::Corrupt("docs"));
+                }
+                last = Some(id);
+            }
+        }
+        Section::Traversed | Section::Inodes | Section::States => {}
     }
-    let strings = section(Section::Strings);
-    if !terminated(strings) {
-        return Err(DecodeError::Corrupt("strings"));
-    }
+    Ok(())
+}
 
-    // Names: ids in range, offsets strictly increasing inside the heap from
-    // 0, parents in order. Offsets and parents must be sorted because readers
-    // binary-search them, and the first name must start the heap so every
-    // heap byte belongs to a name.
-    let rows = section(Section::Names);
+/// Name rows: ids in range, offsets strictly increasing inside the heap from
+/// 0, parents in order. Offsets and parents must be sorted because readers
+/// binary-search them, and the first name must start the heap so every heap
+/// byte belongs to a name.
+///
+/// Each name is exactly the bytes up to the next name's offset: non-empty,
+/// its NUL last. The spans tile the heap from 0, so one NUL per name in the
+/// whole heap means none inside a name; one vectorised count is far cheaper
+/// than a search per name. Siblings are in strictly increasing byte order,
+/// because `lookup` binary-searches them by name.
+fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<(), DecodeError> {
     let (mut last_parent, mut next_offset) = (0, 0u64);
     for row in rows.chunks_exact(NAME_ROW) {
         let (parent, child, offset) = (u32_at(row, 0), u32_at(row, 4), u32_at(row, 8));
@@ -352,11 +514,6 @@ fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
         next_offset = u64::from(offset) + 1;
     }
 
-    // Each name is exactly the bytes up to the next name's offset: non-empty,
-    // its NUL last. The spans tile the heap from 0, so one NUL per name in
-    // the whole heap means none inside a name; one vectorised count is far
-    // cheaper than a search per name. Siblings are in strictly increasing
-    // byte order, because `lookup` binary-searches them by name.
     if count_nuls(heap) != l.names {
         return Err(DecodeError::Corrupt("name order"));
     }
@@ -375,15 +532,15 @@ fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
         }
         previous = Some((parent, name));
     }
+    Ok(())
+}
 
-    // Every directory's name edge names it, from a lower-numbered parent, so
-    // a walk upwards strictly descends and ends at a root.
-    let dir_names = section(Section::DirNames);
-    let mut unnamed = 0;
+/// Every directory's name edge names it, from a lower-numbered parent, so a
+/// walk upwards strictly descends and ends at a root.
+fn check_dir_names(l: &Layout, dir_names: &[u8], rows: &[u8]) -> Result<(), DecodeError> {
     for (dir, at) in (0..l.dirs).zip((0..).step_by(4)) {
         let name = u32_at(dir_names, at);
         if name == NONE {
-            unnamed += 1;
             continue;
         }
         let ok = (name as usize) < l.names && {
@@ -393,58 +550,6 @@ fn validate(bytes: &[u8], l: &Layout) -> Result<(), DecodeError> {
         if !ok {
             return Err(DecodeError::Corrupt("dir names"));
         }
-    }
-
-    // Roots: exactly the unnamed directories, sorted by InoId.
-    let roots = section(Section::Roots);
-    let mut last = None;
-    for pair in roots.chunks_exact(PAIR_ROW) {
-        let (dir, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
-        let ok = (dir as usize) < l.dirs
-            && u32_at(dir_names, dir as usize * 4) == NONE
-            && last.is_none_or(|last| dir > last)
-            && offset < strings.len();
-        if !ok {
-            return Err(DecodeError::Corrupt("roots"));
-        }
-        last = Some(dir);
-    }
-    if roots.len() / PAIR_ROW != unnamed {
-        return Err(DecodeError::Corrupt("roots"));
-    }
-
-    let mut last = None;
-    for pair in section(Section::Links).chunks_exact(PAIR_ROW) {
-        let (ino, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
-        let ok = (l.dirs..l.inodes).contains(&(ino as usize))
-            && last.is_none_or(|last| ino > last)
-            && offset < strings.len();
-        if !ok {
-            return Err(DecodeError::Corrupt("links"));
-        }
-        last = Some(ino);
-    }
-
-    let mut last = None;
-    for row in section(Section::WorkTrees).chunks_exact(WORK_TREE_ROW) {
-        let (dir, offset) = (u32_at(row, 0), u32_at(row, 4) as usize);
-        let ok = (dir as usize) < l.dirs
-            && last.is_none_or(|last| dir > last)
-            && offset < strings.len()
-            && crate::WorkTreeKind::from_byte(row[24]).is_some();
-        if !ok {
-            return Err(DecodeError::Corrupt("work trees"));
-        }
-        last = Some(dir);
-    }
-
-    let mut last = None;
-    for row in section(Section::Docs).chunks_exact(DOC_ROW) {
-        let id = u32_at(row, 0);
-        if id >= l.next_doc || last.is_some_and(|last| id <= last) {
-            return Err(DecodeError::Corrupt("docs"));
-        }
-        last = Some(id);
     }
     Ok(())
 }

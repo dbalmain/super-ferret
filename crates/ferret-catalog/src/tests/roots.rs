@@ -1,6 +1,6 @@
 //! Which roots a commit refreshes, keeps or drops (D34).
 
-use super::{SNIFFER, Scratch, at, commit, dir_stat, file_stat, hash, link_stat, paths};
+use super::{SNIFFER, Scratch, at, commit, dir_stat, file_stat, hash, link_stat, paths, reopen};
 use crate::{Catalog, Content, ContentState, KeepError, Stat, Transaction, WorkTreeKind};
 
 /// Everything observable about one root's subtree, keyed by path, with ids
@@ -255,7 +255,7 @@ fn adding_a_root_inside_a_kept_root_needs_the_outer_refreshed() {
     w.file(b, b"f", file_stat(11), Content::Unindexed);
     txn.add(w);
     assert_overlap(txn.commit(), "/a", "/a/b");
-    let unchanged = Catalog::open(&scratch.path).unwrap().unwrap();
+    let unchanged = reopen(&scratch.path);
     assert_eq!(exact_paths(&unchanged), exact_paths(&first));
 
     // Refreshing /a alongside the new root is the valid transition.
@@ -274,7 +274,7 @@ fn removing_a_root_inside_a_kept_root_needs_the_outer_refreshed() {
     let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
     txn.keep(b"/a").unwrap();
     assert_overlap(txn.commit(), "/a", "/a/b");
-    let unchanged = Catalog::open(&scratch.path).unwrap().unwrap();
+    let unchanged = reopen(&scratch.path);
     assert_eq!(exact_paths(&unchanged), exact_paths(&first));
 
     // `b` is an ordinary directory of /a again, with a name of its own.
