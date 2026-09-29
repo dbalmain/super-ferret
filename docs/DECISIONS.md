@@ -61,9 +61,10 @@ Predecessors, carried forward where still open:
 | D43 | A 10M name query costs its section loads, not its scan   | answered       | B later: compaction, then a name index, then mmap                                                              |
 | D44 | Single inode reads against an evicted catalog            | answered       | superseded by D46                                                                                              |
 | D45 | Query text in the local log                              | answered       | A: keep query text; switch with the config file                                                                |
-| D46 | Is the daemon the only mode of operation?                | open           |                                                                                                                |
-| D47 | `ferret find` as a drop-in for find(1)                   | open           |                                                                                                                |
+| D46 | Is the daemon the only mode of operation?                | answered       | C, plus a batch mode for CI and tests                                                                          |
+| D47 | `ferret find` as a drop-in for find(1)                   | answered       | C: find semantics except ignore rules                                                                          |
 | D48 | The next move after S1                                   | open           |                                                                                                                |
+| D49 | A one-shot query with no daemon running                  | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2163,6 +2164,33 @@ optional and moves up, after S1+ since a watcher needs incremental updates
 (D40). The fact that would change it: if agents always run where the user's
 daemon socket is reachable, C, with its single path, is simpler.
 
+> Dave (2026-09-30): I haven't had issues with agents being able to reach my
+> daemons in other tools. The CI is a good point though. For testing, could we
+> possibly open it in a kind of script mode where we pass a number of queries
+> and collect the output in a single run. So it's still opening the same way as
+> it would in daemon mode, i.e. it reads the whole catalogue into memory. CI is
+> unlikely to have that much data in the index, so reading the full catalogue
+> into memory for every test might not be that onerous, but I'd still like it to
+> run as fast as possible.
+
+**Answer (2026-09-30): C, plus a batch mode.** The daemon is the mode of
+operation, and there is one engine: open the catalog the resident way (names and
+inodes read in full, indexes mapped) and answer queries from memory. It runs in
+two hosts:
+
+- **`ferretd`**, which keeps the engine resident and serves the CLI over a
+  socket.
+- **A batch run** (`ferret batch`, name open), which builds the same engine in
+  process, reads many queries (JSON lines on stdin or a file), writes one tagged
+  result block per query, and exits. This is how CI and the test suites run: one
+  load per run, not per query, through the code path the daemon uses.
+
+The S1 direct reader is not kept as a separately tuned path; D44's cold-read
+tuning is dropped. Opening fast still matters, since every batch run and every
+daemon start pays it, so compaction (D48 A) and a load that is one sequential
+read per section are the budget. What a one-shot `ferret find` does with no
+daemon running is D49.
+
 ## D47 — `ferret find` as a drop-in for find(1)
 
 **Question:** Dave wants `ferret find` to be a drop-in replacement for `find`,
@@ -2220,6 +2248,30 @@ The fact that would change it: if Dave wants ignored trees excluded even in
 corpus and harness are cheap-agent work, and can start before `find` itself is
 built, since the extension ranking feeds its scope.
 
+> Dave (2026-09-30): D47, let's go with C and keep it simple for now. We want to
+> match find's behaviour _except_ that we respect .gitignore and .ferretignore.
+
+**Answer (2026-09-30): C.** `ferret find` takes find syntax (POSIX floor, GNU
+extensions by use) over the index, and matches `find` exactly **except** that
+paths excluded by the ignore rules (D13: global rules, `.gitignore`,
+`.ferretignore`) do not exist to it. No live walk.
+
+That makes the test oracle exact after one filter: GNU `find` on the same tree,
+with its output passed through `git check-ignore` (git as a black-box oracle
+only) and the ferret-only rules, must equal `ferret find`. Commands whose
+effects depend on an ignored path are excluded from the corpus or flagged.
+
+Three follow-on calls, recorded as defaults (object if wrong):
+
+- **The S1 grammar** (bare words, `ext:`, `size:>100M`) moves to
+  `ferret search`, which in S2 composes content terms with exactly those
+  predicates. `ferret find` becomes find syntax only.
+- **`-links`:** the link count goes into the catalog, costing a few bits a row
+  after compaction.
+- **`-atime`:** stat the candidates live after every other predicate has
+  filtered them, rather than storing atime, which goes stale on every read and
+  which the watcher does not see change.
+
 ## D48 — The next move after S1
 
 **Question:** S1 is done. What comes next?
@@ -2236,3 +2288,21 @@ compaction does not depend on either. Then C or S1+, depending on D46. The fact
 that would change it: if "establish the optimal index format" (Dave, on D43)
 means settling the content index (S2) format before the catalog layout, then S2
 design comes first.
+
+## D49 — A one-shot query with no daemon running
+
+**Question:** With the daemon as the mode of operation (D46 C), what does a
+single `ferret find` do when no daemon is running?
+
+| Option                                                               | Costs                                                                                                | Buys                                                                 |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| A. Start the daemon, then query it                                   | Spawn logic and a wait on the first query; the first query pays the load anyway                      | Every later query is resident; nothing to set up                     |
+| B. Build the engine in process for this one query, as a batch of one | Every query pays the full load until a daemon exists (tens of ms at `$HOME`, about 1 s at 10M today) | No background process appears unasked; one code path with batch mode |
+| C. Fail with a message saying to start `ferretd`                     | A bare install does not answer anything                                                              | Simplest; the user decides when a process runs                       |
+
+**Recommendation:** A where a user session exists (spawn on first use, or a
+systemd user unit), falling back to B when a background process is not allowed
+or `FERRET_NO_DAEMON` is set, which is what CI and sandboxes get. B alone is the
+cheap first step, since batch mode already builds it. The fact that would change
+it: if you would rather a daemon never starts without being asked, B plus an
+explicit `ferretd` is the whole design.
