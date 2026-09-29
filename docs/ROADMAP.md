@@ -5,8 +5,9 @@ that can change the next slice. Design detail is in [DESIGN.md](DESIGN.md),
 decisions in [DECISIONS.md](DECISIONS.md).
 
 Order follows D3: a usable tool first, so query and usage data accumulate while
-the index is built; then the index; then the agent skill. The daemon comes after
-the skill; extraction plugins, TUI and GUI much later.
+the index is built; then the index; then the agent skill. Since D46 the daemon
+comes with S1b, before the content index; extraction plugins, TUI and GUI much
+later.
 
 ## Done before this roadmap
 
@@ -86,13 +87,54 @@ The `$HOME` census:
 | `find size:>100M`: cold / fresh         | 36 / 27 ms                                        | 592 / 367 ms                       |
 | `find` peak RSS                         | 19–46 MB                                          | 358–970 MB                         |
 
+## Re-plan after S1 (2026-09-30)
+
+D46–D49 reorder what follows S1: the daemon is the mode of operation (D46), with
+one engine hosted by `ferretd` or by an in-process batch run; `ferret find`
+takes find(1) syntax (D47); compaction comes first (D48). The order below runs
+through complete `find` support before S2.
+
+## S1a — Catalog compaction
+
+Bit-packed fixed-width columns sized from the catalog, per-catalog dictionaries
+for dev, mode and (uid, gid), then names (D43, D48). The row gains nlink and
+each directory's raw entry count, which `find`'s `-links` and `-empty` need
+(D47).
+
+**Measure:** bytes per name, open time and query time on `$HOME` and synthetic
+10M, against S1's table.
+
 ## S1+ — Incremental catalog
 
-Next after S1, ahead of the daemon (D40): a re-run writes what changed rather
-than the whole snapshot (D26 B's change log over A's snapshot), so a refresh
-costs the change and not the catalog. The daemon's small inotify bursts need it.
+After S1a, ahead of the daemon (D40): a re-run writes what changed rather than
+the whole snapshot (D26 B's change log over A's snapshot), so a refresh costs
+the change and not the catalog. The daemon's small inotify bursts need it.
 
 **Measure:** bytes written and time for a one-file change at 10M entries.
+
+## S1b — The engine, batch mode and the daemon
+
+One engine: open the catalog resident (names and inodes read in full, indexes
+mapped) and answer from memory (D46). Hosts: `ferret batch` (many queries in one
+run: CI and the test suites) and `ferretd` (inotify with a re-crawl backstop,
+directory entry counts kept current, idle-priority indexing, the politeness
+controller from the research). A one-shot query starts the daemon, or builds the
+engine in process when it cannot (D49).
+
+**Measure:** open time and resident bytes per name at 10M, against D48's 1 GB
+line.
+
+## S1c — `ferret find` in find(1) syntax
+
+POSIX.1-2024 `find` over the index, plus GNU extensions ranked by real use,
+matching GNU `find` except that ignored paths do not exist (D47). The S1 atom
+grammar moves to `ferret search`. Tested with our own cases, written from what
+the private differential corpus (`~/w/find-compat`) teaches, against GNU find,
+bfs and fd.
+
+**Measure:** the 10M catalog's resident size with full `find` support. Under 1
+GB, with scan latency acceptable, means no name index (D48); otherwise a name
+index experiment (suffix array, terms, trigrams) comes before S2.
 
 ## S2 — Content index
 
@@ -127,11 +169,10 @@ A Claude Code skill that routes AI agents' file and content search through
 `ferret` (JSON lines, stable exit codes, byte offsets). Its usage log is the
 second source of real queries.
 
-## S5 — Resident daemon (optional)
+## S5 — Daemon for the content index
 
-`ferretd`: inotify with re-crawl backstop, catalog and hot index files resident
-(D14), idle-priority indexing, the politeness controller from the research. The
-CLI keeps working without it.
+S1b's daemon extended to the content index: postings kept current from its
+change events, hot index files resident (D14).
 
 ## S6 — Opt-in experiments and metrics
 

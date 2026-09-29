@@ -63,8 +63,8 @@ Predecessors, carried forward where still open:
 | D45 | Query text in the local log                              | answered       | A: keep query text; switch with the config file                                                                |
 | D46 | Is the daemon the only mode of operation?                | answered       | C, plus a batch mode for CI and tests                                                                          |
 | D47 | `ferret find` as a drop-in for find(1)                   | answered       | C: find semantics except ignore rules                                                                          |
-| D48 | The next move after S1                                   | open           |                                                                                                                |
-| D49 | A one-shot query with no daemon running                  | open           |                                                                                                                |
+| D48 | The next move after S1                                   | answered       | A: compaction; name index only if 10M misses 1 GB                                                              |
+| D49 | A one-shot query with no daemon running                  | answered       | A: spawn on first use, in-process fallback                                                                     |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2272,6 +2272,42 @@ Three follow-on calls, recorded as defaults (object if wrong):
   filtered them, rather than storing atime, which goes stale on every read and
   which the watcher does not see change.
 
+> Dave (2026-09-30), on the ignore-sensitive cases: `-empty`, do whatever is
+> faster. If we must stat directories to know they're empty anyway, match find;
+> if the index answers faster, respect the ignore rules — unless inotify on the
+> directories we index can keep an up-to-date count of their contents at little
+> cost, which I'd prefer, so `-empty` is correct even when every child is
+> ignored. `-links` and `-size` on directories: the same, fastest response.
+> `-newer` should fail if the file is not in our index. `-delete` should fail if
+> the directory is not empty. Generally, match find where it doesn't cost us
+> much, erring towards performance. We can also test against fdfind. Corpus
+> licensing is a good point: build the corpus in a separate private repo, and
+> use what it teaches to write our own tests, which need not reuse other repos'
+> commands.
+
+**Answer (2026-09-30):** all three directory predicates match `find` at almost
+no cost, so they match it:
+
+- **`-links` and `-size` on a directory** are the directory's own `st_nlink` and
+  `st_size`. The crawler already stats every directory (`observe.rs` reads
+  `st_nlink`), and ignored children are counted in both, as `find` sees them.
+  The catalog stores them (nlink joins the row; size is already there).
+- **`-empty` on a directory** needs the count of all its entries, ignored ones
+  included. The walker already reads every entry of each directory it enters,
+  before policy drops any, so the crawl records the raw count for nothing. The
+  daemon keeps it current: an inotify watch on an indexed directory reports
+  creates and deletes of every child, ignored or not, so no ignored tree needs
+  watching. `-empty` on a file is its size.
+- **`-newer REF`** fails, exit 1 with a message, when REF is not in the index.
+- **`-delete`** of a directory that still holds entries fails, as `find` does
+  for a non-empty directory; ignored contents are what keep it non-empty.
+
+The corpus and its differential runner live in a private repo,
+`~/w/find-compat`, never published. Super Ferret's own find tests are written
+from what it teaches, not copied from it. Targets: GNU find (the oracle), bfs,
+busybox, fd (for its gitignore handling and speed; fd's syntax differs, so its
+adapter translates the subset it can express), and ferret.
+
 ## D48 — The next move after S1
 
 **Question:** S1 is done. What comes next?
@@ -2288,6 +2324,18 @@ compaction does not depend on either. Then C or S1+, depending on D46. The fact
 that would change it: if "establish the optimal index format" (Dave, on D43)
 means settling the content index (S2) format before the catalog layout, then S2
 design comes first.
+
+> Dave (2026-09-30): Agreed. By optimal index, I meant whether we want to
+> include a suffix array or term and possibly trigram indexes for the names. If,
+> after we build full find support, we can still read a 10M file catalogue into
+> 1Gb of memory, they're probably not necessary.
+
+**Answer (2026-09-30): A, catalog compaction next.** A name index (suffix array,
+terms, trigrams) is decided by measurement, not built on speculation: once
+`find` is complete, if a 10M catalog loads resident in under 1 GB and scans fast
+enough, there is no name index. Today's 10M catalog is 1.18 GB on disk and
+`find` peaks at 358–970 MB, before compaction and before nlink and entry counts
+join the row.
 
 ## D49 — A one-shot query with no daemon running
 
@@ -2306,3 +2354,8 @@ or `FERRET_NO_DAEMON` is set, which is what CI and sandboxes get. B alone is the
 cheap first step, since batch mode already builds it. The fact that would change
 it: if you would rather a daemon never starts without being asked, B plus an
 explicit `ferretd` is the whole design.
+
+> Dave (2026-09-30): Agree.
+
+**Answer (2026-09-30): A.** Start the daemon on first use; build the engine in
+process when a background process is not allowed or `FERRET_NO_DAEMON` is set.
