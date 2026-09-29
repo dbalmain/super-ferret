@@ -2176,6 +2176,26 @@ and the operators `( ) ! -a -o`. `-size n` counts 512-byte blocks (`c` for
 bytes). `-maxdepth` is GNU, not POSIX. Output order is unspecified, so a fuzz
 oracle compares sorted output.
 
+POSIX is the floor, not the target. Dave (2026-09-30): "If people are using
+`-maxdepth`, we should support that too." So the supported set is POSIX plus
+whichever GNU extensions real scripts use, ranked by use. Likely candidates are
+`-maxdepth`, `-mindepth`, `-regex`, `-newermt`, `-empty`, `-delete` and
+`-printf`; the corpus decides.
+
+**Testing (Dave's proposal):** mine GitHub for `find` invocations in shell
+scripts and run them as differential tests against GNU `find`. Three things make
+that work:
+
+- **A corpus of commands, not scripts.** Extract each `find` command line
+  (through `gh` code search) with its source recorded, and keep only the
+  commands. The primary counts from the same corpus rank the GNU extensions.
+- **Trees to run them on.** A script's paths refer to its own repository, so
+  each command runs against generated trees, and against the cloned repository
+  where that is cheap.
+- **A sandbox.** `-exec`, `-ok` and `-delete` have side effects. Run every
+  command in a throwaway copy inside a user namespace with no network, and
+  compare the effects as well as the output.
+
 Four conflicts with S1 as built:
 
 1. **Syntax.** S1's `ferret find` takes bare words and `ext:`/`size:>100M`
@@ -2196,7 +2216,9 @@ Four conflicts with S1 as built:
 **Recommendation:** A, with the index as an accelerator and a live walk as the
 fallback, because a drop-in that silently omits whole trees is not a drop-in.
 The fact that would change it: if Dave wants ignored trees excluded even in
-`find` mode, the result cannot match `find`, and C is the honest shape.
+`find` mode, the result cannot match `find`, and C is the honest shape. The
+corpus and harness are cheap-agent work, and can start before `find` itself is
+built, since the extension ranking feeds its scope.
 
 ## D48 — The next move after S1
 
