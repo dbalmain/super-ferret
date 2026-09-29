@@ -57,10 +57,13 @@ Predecessors, carried forward where still open:
 | D39 | A checksum over the snapshot                             | answered       | A: none in S1; revisit with incremental indexing                                                               |
 | D40 | What entry count S1 is built for                         | answered       | B: about 10M catalogued entries, measured at about 40M                                                         |
 | D41 | The name scanner: `memchr::memmem`, or our own           | answered       | B: own case-folding filter, AVX2 + SWAR, vs memmem control                                                     |
-| D42 | A re-run's memory: the previous generation held          | open           |                                                                                                                |
-| D43 | A 10M name query costs its section loads, not its scan   | open           |                                                                                                                |
-| D44 | Single inode reads against an evicted catalog            | open           |                                                                                                                |
-| D45 | Query text in the local log                              | open           |                                                                                                                |
+| D42 | A re-run's memory: the previous generation held          | replied        | A stands; reply explains carry-over and kept roots                                                             |
+| D43 | A 10M name query costs its section loads, not its scan   | answered       | B later: compaction, then a name index, then mmap                                                              |
+| D44 | Single inode reads against an evicted catalog            | answered       | superseded by D46                                                                                              |
+| D45 | Query text in the local log                              | answered       | A: keep query text; switch with the config file                                                                |
+| D46 | Is the daemon the only mode of operation?                | open           |                                                                                                                |
+| D47 | `ferret find` as a drop-in for find(1)                   | open           |                                                                                                                |
+| D48 | The next move after S1                                   | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1892,21 +1895,27 @@ an AVX2 arm under D11 plus a toolchain-ledger row and a safe SWAR fallback,
 benchmarked in slice 5 against `memchr::memmem` as the control.
 
 **Measured (slice 5a, 2026-09-28, `ferret-bench scan`, warm).** The AVX2 arm
-runs 16–33 GB/s on the synthetic 10M heap (244 MB) and 16–32 GB/s at 40M
-(974 MB); SWAR runs 3.2–3.6 GB/s everywhere, which is why the AVX2 arm is in
-the ledger. Against `memmem` on case-sensitive search, the arm takes 2–18%
-longer at 10M and 19–31% longer at 40M (`Flamegraph` 30.6 against 25.7 ms).
-The worst case, `test` at 40M with 592k hits (43.5 against 33.1 ms), is on one
-side of the 30% line or the other depending on the metric: 31.4% longer in
-time, but 23.9% lower in throughput. "Falling more than about 30% behind" in
-the recommendation above does not say which, so the measurement neither
-clearly triggers nor clearly clears it. The `memmem` fallback was not added:
-it would put `memchr` in a product crate for about 10 ms on a query that
-spends 730 ms loading sections (D43). Whether that stands is put to Dave to
-confirm. Folded, the arm is 16–24 GB/s; `memmem` on a
-lower-cased copy of the heap is faster (23–36 GB/s) but needs the second
-heap. A byte-frequency table taken from real name heaps, in place of the
-English one that picks the probe pair, is the obvious next tuning step.
+runs 16–33 GB/s on the synthetic 10M heap (244 MB) and 16–32 GB/s at 40M (974
+MB); SWAR runs 3.2–3.6 GB/s everywhere, which is why the AVX2 arm is in the
+ledger. Against `memmem` on case-sensitive search, the arm takes 2–18% longer at
+10M and 19–31% longer at 40M (`Flamegraph` 30.6 against 25.7 ms). The worst
+case, `test` at 40M with 592k hits (43.5 against 33.1 ms), is on one side of the
+30% line or the other depending on the metric: 31.4% longer in time, but 23.9%
+lower in throughput. "Falling more than about 30% behind" in the recommendation
+above does not say which, so the measurement neither clearly triggers nor
+clearly clears it. The `memmem` fallback was not added: it would put `memchr` in
+a product crate for about 10 ms on a query that spends 730 ms loading sections
+(D43). Whether that stands is put to Dave to confirm. Folded, the arm is 16–24
+GB/s; `memmem` on a lower-cased copy of the heap is faster (23–36 GB/s) but
+needs the second heap. A byte-frequency table taken from real name heaps, in
+place of the English one that picks the probe pair, is the obvious next tuning
+step.
+
+> Dave: Definitely happy to keep our own version here. Tuning is not a high
+> priority right now. We can look at that later.
+
+**Answer (2026-09-30): own scanner, no `memmem` fallback.** Tuning the probe
+pair from real name heaps waits.
 
 ## D42 — A re-run's memory: the previous generation held through the walk
 
@@ -1934,11 +1943,38 @@ since C fixes writer and reader together. The fact that would change it: a real
 10M tree whose re-run peak matters on an 8–16 GB desktop, which makes B,
 self-contained, worth doing now.
 
+> Dave: I'm not sure I understand why we're keeping the previous run around,
+> when it seems like we're not saving time by doing so. Perhaps you could
+> explain that. Why do we need hash carry-over and what does it mean to copy
+> kept roots forward. Is that because we don't have a roots config yet? That
+> seems like a minor issue. You could read the roots and then throw away the old
+> generation before even start the new generation.
+
+**Reply (2026-09-30).** The previous generation does two jobs during a run, and
+both save time. Neither is about the roots config, which is already stored with
+the index (D34).
+
+- **Hash carry-over.** A file whose `(dev, ino, size, mtime, ctime)` is
+  unchanged keeps its hash and `DocId` without being read. That is the whole
+  difference between a first run and a re-run on `$HOME`: 29.1 s and 10.3 GB
+  read cold, against 0.74 s. Without it every re-run re-reads every file.
+- **Kept roots.** `ferret index ~/w` walks only `~/w`. Because S1 rewrites the
+  whole snapshot (D26 A′), every other root's rows are copied from the previous
+  generation rather than re-walked.
+
+Dropping the old generation before the walk loses both. What _is_ held longer
+than it needs to be is everything else in it (names, heaps, links): only the
+carry table, about 45 B per inode, has to live through the walk, which is option
+B. S1+ (the incremental catalog) removes the question, because the previous
+generation becomes the base a change log applies to rather than a source to copy
+from, and compaction (D48 A) shrinks it in the meantime. Recommendation
+unchanged: A, with B only if a re-run's peak bites before S1+.
+
 ## D43 — A 10M name query costs its section loads, not its scan
 
 **Question:** At 10M entries a name query spends about 190 ms warm loading the
-name sections and under 15 ms scanning. Should the reader's open path change
-in slice 5b?
+name sections and under 15 ms scanning. Should the reader's open path change in
+slice 5b?
 
 Measured in slice 5a with `ferret-bench open` and `query`, the whole path from
 `Catalog::open` to the last row. Loads use positional reads into owned buffers
@@ -1950,18 +1986,17 @@ Measured in slice 5a with `ferret-bench open` and `query`, the whole path from
 | synthetic 10M       | 371 MB        | 196 ms     | 329 ms        | 206 ms          | 7.4 ms     |
 | synthetic 40M       | 1.48 GB       | 729 ms     | 1,349 ms      | 763 ms          | 30.6 ms    |
 
-The 10M load, split by a second measurement (reading the same 371 MB from
-the file into a fresh buffer, then into the same buffer again): about 95 ms is
-page faults on the fresh buffers, 27 ms the copy, and about 74 ms, by
-difference, per-section validation. At 40M the same split is 354, 107 and
-about 270 ms. These are a subtraction between two measurements, not a
-measured `mmap`. D38 said B stands unless it measures "more than a few
-milliseconds above C for a warm name query". The 122 ms of fault and copy at
-10M is an **upper bound** on what C (`mmap`) could save, not a saving: a
-mapped file still faults its pages in as validation and the scan traverse
-them, cheaper per page than faulting fresh anonymous memory and copying, but
-not free. What settles it is an `mmap` open measured with the same
-validation.
+The 10M load, split by a second measurement (reading the same 371 MB from the
+file into a fresh buffer, then into the same buffer again): about 95 ms is page
+faults on the fresh buffers, 27 ms the copy, and about 74 ms, by difference,
+per-section validation. At 40M the same split is 354, 107 and about 270 ms.
+These are a subtraction between two measurements, not a measured `mmap`. D38
+said B stands unless it measures "more than a few milliseconds above C for a
+warm name query". The 122 ms of fault and copy at 10M is an **upper bound** on
+what C (`mmap`) could save, not a saving: a mapped file still faults its pages
+in as validation and the scan traverse them, cheaper per page than faulting
+fresh anonymous memory and copying, but not free. What settles it is an `mmap`
+open measured with the same validation.
 
 | Option                                                                                                          | Costs                                                                                                                                                               | Buys                                                                                                                                                                |
 | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1970,12 +2005,53 @@ validation.
 | C. Validate at use: check a row's offsets and ids when a query follows them, rather than whole sections at load | A branch per followed row, in accessors that become fallible or clamp; the "a loaded section is sound" invariant becomes per-access                                 | About 74 ms at 10M; combines with A or B                                                                                                                            |
 
 **Recommendation:** B and C measured together in slice 5b, as an experiment
-against today's reader, before the CLI's timings are published: an `mmap`
-open with today's validation, then with validation at use. B alone leaves
-about 74 ms of validation at 10M, which is still above the target, so C is
-what gets a warm 10M name query near 50 ms. The fact that would change it:
-a measured `mmap` open whose page-table and fault cost is not well below the
-122 ms it replaces, in which case A plus C is the safe answer.
+against today's reader, before the CLI's timings are published: an `mmap` open
+with today's validation, then with validation at use. B alone leaves about 74 ms
+of validation at 10M, which is still above the target, so C is what gets a warm
+10M name query near 50 ms. The fact that would change it: a measured `mmap` open
+whose page-table and fault cost is not well below the 122 ms it replaces, in
+which case A plus C is the safe answer.
+
+> Dave: I think mmap make sense in some cases, but I'm not sure how much
+> difference it will make here. The name heap needs to be read in full to do a
+> full scan, and I think it should stay resident in memory in the daemon. The
+> would change if we had an index. Also, looking at the data structures, I see a
+> lot of opportunities for compression. I think I'd rather address that first,
+> and possibly even before that, establish the optimal index format.
+>
+> On the topic of better compression, I think we should introduce bitfield. If
+> we know how many files we have, we know how many bits we need for the InoIds.
+> Surely mtime and ctime don't need 12 bytes each. UID and GUID only need two
+> bytes I believe. If I know the maximum file size, I know how many bits I need
+> for the size. etc. My estimate is that we'd be able to halve the size of
+> Inodes section.
+>
+> So in summary, yes to mmap, but we need to look at better optimising the size
+> of data structures on disk and in memory to ensure we can read the full
+> catalogue into memory, and we need to look at indexing for larger cataloges so
+> that we don't need to read the full name list into memory to search it. Then
+> looking at mmap makes more sense to me.
+
+**Answer (2026-09-30): B later, after compaction and a name index.** The order
+is: compact the catalog's structures on disk and in memory, then index names for
+large catalogs so a query need not read the whole name list, then `mmap`, mainly
+for indexes. D48 puts the next step to Dave.
+
+Notes for the compaction slice, from today's layout. An inode row is 64 B: dev
+8, ino 8, size 8, mtime s 8, ctime s 8, mtime ns 4, ctime ns 4, mode 4, uid 4,
+gid 4, `DocId` 4. On `$HOME` Inodes are 65 of the catalog's 106 B per name.
+
+- Fixed-width bit-packed columns, each width taken from the catalog's own
+  maximum (the bitfield idea), keep O(1) row access, which single inode reads
+  rely on. Variable-length codes would not.
+- `dev`, `mode` and `(uid, gid)` have a handful of distinct values per catalog,
+  so a per-catalog dictionary and a few bits beat fixed narrow ints. Two bytes
+  is not enough for uid/gid in general: rootless containers' subordinate ranges
+  start at 100000, and such files are under `~/.local/share/containers`.
+- Times as an offset from the catalog's earliest, plus nanoseconds, which change
+  detection needs on ext4 and btrfs.
+- A rough estimate: about 26 B per row against 64, better than half. The
+  compaction slice measures it rather than trusting this.
 
 ## D44 — Single inode reads against an evicted catalog
 
@@ -2010,6 +2086,19 @@ because a section load costs 640 MB of reads and copies, which is exactly what
 D43 B would remove. The fact that would change it: D43 settling on A. In that
 case C is worth its dependency, since a daemonless CLI is often cold.
 
+> Dave: I've kind of answered this above. Yes to mmap. I'd like this to be fast
+> when running a find and we don't have a daemon running, but I'd like to
+> optimise for daemon use. In fact, perhaps we simplify things for ourselves if
+> we say the only mode of operation is with a daemon. Most of these questions
+> seem to expect that. Otherwise, every search is a read from disk. So what we
+> end up tuning is how much memory we allow ferret to use, and how we optimise
+> our mmap cache swapping. I.e. go we read the names and inodes into memory in
+> full, and only mmap indexes. I'd guess this would be the right answer, at
+> least up to 1M files.
+
+**Answer (2026-09-30): superseded by D46.** Whether cold reads get tuned at all
+depends on whether the daemon is the only mode, which D46 asks.
+
 ## D45 — Query text in the local log
 
 **Question:** Should the local query log keep query text by default, with no way
@@ -2035,3 +2124,93 @@ free of paths ferret chose to write.
 upload step (S6), which has to decide what leaves the machine regardless. The
 fact that would change it: a plan to sync or upload the state directory before
 S6. In that case C should be the default.
+
+> Dave: Agree
+
+**Answer (2026-09-30): A.** The log keeps query text; a config switch (B) comes
+with the config file.
+
+## Slice 5b's CLI calls (answered 2026-09-29, on the decisions page)
+
+- **`stats --json`: yes.** Dave: "always make choice to optimise the tool for
+  agents." That is a standing rule for CLI choices, not only this one.
+- **Bare `index` with no roots: not an error.** Once there is a config file,
+  prompt for roots; without a terminal, index `$HOME`.
+- **`find -0`:** folded into D47, since `ferret find` is to be a drop-in for
+  find(1), which has `-print0`.
+- **`index_change`:** an internal API with no user-visible effect. The CLI hands
+  the crawl "add these roots, remove those" rather than a whole new list, so two
+  `ferret index` runs started together cannot lose each other's new root. It
+  needed no decision.
+
+## D46 — Is the daemon the only mode of operation?
+
+**Question:** Dave, on D44: "perhaps we simplify things for ourselves if we say
+the only mode of operation is with a daemon". Is the daemon required, or the
+primary mode with a direct read kept as a fallback?
+
+D14 and D30 today say the daemon is optional and a cold `find` without one must
+be fast. D43 and D44 are both questions about that cold path.
+
+| Option                                                                                                                     | Costs                                                                                                                                                                                   | Buys                                                                                                                                           |
+| -------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Optional, both paths tuned (today)                                                                                      | Every layout question is answered twice, cold and resident; D44-style tuning goes on                                                                                                    | Works anywhere with no background process                                                                                                      |
+| B. Daemon primary; direct read kept correct but untuned: without a daemon, `find` reads the catalog itself, as S1 does now | Daemon lifecycle work (a socket, and a systemd user unit or spawn on first use); a second path that is frozen, not deleted                                                              | Tuning targets resident memory and the budget Dave describes; agents in sandboxes, containers and CI still get correct answers; D44 is dropped |
+| C. Daemon required: `find` is a client, and without a daemon it starts one or fails                                        | A sandboxed agent may be unable to reach the user's socket or to leave a background process running, so the tool fails exactly where agents run, against the "optimise for agents" rule | One code path; results are always as fresh as the watcher                                                                                      |
+
+**Recommendation:** B. The daemon becomes the design centre, and S5 stops being
+optional and moves up, after S1+ since a watcher needs incremental updates
+(D40). The fact that would change it: if agents always run where the user's
+daemon socket is reachable, C, with its single path, is simpler.
+
+## D47 — `ferret find` as a drop-in for find(1)
+
+**Question:** Dave wants `ferret find` to be a drop-in replacement for `find`,
+matching POSIX at minimum, with agent-driven fuzz testing against it once it is
+implemented. What shape gets there?
+
+POSIX.1-2024 (Issue 8) `find` is `find [-H|-L] path... [expression]`, with
+primaries
+`-name -iname -path -type -size -mtime -ctime -atime -newer -perm -user -group -nouser -nogroup -links -xdev -mount -prune -depth -print -print0 -exec -ok`
+and the operators `( ) ! -a -o`. `-size n` counts 512-byte blocks (`c` for
+bytes). `-maxdepth` is GNU, not POSIX. Output order is unspecified, so a fuzz
+oracle compares sorted output.
+
+Four conflicts with S1 as built:
+
+1. **Syntax.** S1's `ferret find` takes bare words and `ext:`/`size:>100M`
+   atoms. That cannot also be `find path... expression`.
+2. **Ignored trees.** `find` sees `target/`, `node_modules/` and `.git/`, which
+   ferret does not catalog (D13). An index answer silently misses them.
+3. **Missing fields.** `-atime` and `-links` need atime and the link count,
+   which the catalog does not keep.
+4. **Freshness.** `find` reads the disk now; ferret answers as of the last index
+   run, unless a daemon is watching (D46).
+
+| Option                                                                                                                                                              | Costs                                                                                                                        | Buys                                                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| A. `ferret find` takes POSIX syntax; S1's grammar moves to another verb. Any subtree the index cannot answer (ignored, outside every root, or stale) is walked live | A live-walk path inside `find`; the catalog gains nlink (and atime, or `-atime` walks live); the S1 grammar needs a new name | A true drop-in: same answers as `find`, faster wherever the index covers. The fuzz oracle is exact |
+| B. One verb, told apart by shape: a leading path or a `-primary` means POSIX syntax                                                                                 | Ambiguity at the edges: a search word that starts with `-`, or a bare word that is also a directory name                     | Keeps one command name                                                                             |
+| C. Index-only find syntax: POSIX primaries over what is indexed, ignored trees excluded, and documented as different                                                | Not a drop-in; scripts that rely on `find` seeing `node_modules/` break silently                                             | Simplest; no live walk                                                                             |
+
+**Recommendation:** A, with the index as an accelerator and a live walk as the
+fallback, because a drop-in that silently omits whole trees is not a drop-in.
+The fact that would change it: if Dave wants ignored trees excluded even in
+`find` mode, the result cannot match `find`, and C is the honest shape.
+
+## D48 — The next move after S1
+
+**Question:** S1 is done. What comes next?
+
+| Option                                                                                                                                                                                                  | Costs                                                                                        | Buys                                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Catalog compaction (D43): bit-packed fixed-width columns, per-catalog dictionaries for dev, mode and uid/gid, then names. Measure bytes per name, open and query time on `$HOME` and 10M, against S1 | One slice and a bench; the format changes again later for S1+'s change log                   | Dave's stated first priority. It fixes the layout that the incremental log, the daemon's resident set and `mmap` all build on, and S1's tooling already measures it |
+| B. S1+ incremental catalog first, as ROADMAP now says                                                                                                                                                   | Built on a layout about to change                                                            | Cheap re-runs sooner; the daemon's prerequisite                                                                                                                     |
+| C. A name index for large catalogs first (trigram, or D28's suffix array), as a `ferret-bench` experiment                                                                                               | Its value depends on D46: with a resident daemon, a scanned heap may do up to about 1M names | Queries that do not read the whole name list at 10M                                                                                                                 |
+| D. Settle D46 and D47, then re-plan ROADMAP before any code                                                                                                                                             | A pause in code                                                                              | The daemon and `find` answers reorder several milestones                                                                                                            |
+
+**Recommendation:** A now, with D46 and D47 answered alongside it, since
+compaction does not depend on either. Then C or S1+, depending on D46. The fact
+that would change it: if "establish the optimal index format" (Dave, on D43)
+means settling the content index (S2) format before the catalog layout, then S2
+design comes first.
