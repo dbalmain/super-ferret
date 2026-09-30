@@ -93,6 +93,7 @@ impl Query {
             meta_loaded: false,
             stats: Stats::default(),
             dir: None,
+            up: None,
             path: Vec::new(),
         };
         match self.strategy() {
@@ -114,6 +115,11 @@ struct Run<'q, 'c> {
     /// length. Names arrive grouped by parent, so a directory's path is
     /// resolved once for all its hits.
     dir: Option<(InoId, usize)>,
+    /// `dir`'s parent and the length of its path, with a trailing `/`, at
+    /// the start of `path`. Directories are numbered breadth first, so the
+    /// next directory is most often a sibling of the last, and its path is
+    /// this plus its name rather than a walk to the root.
+    up: Option<(InoId, usize)>,
     path: Vec<u8>,
 }
 
@@ -227,7 +233,7 @@ impl<'c> Run<'_, 'c> {
         if structural || !names_pass {
             return Ok(ControlFlow::Continue(()));
         }
-        if !tested {
+        if !tested && !self.query.meta.is_empty() {
             self.load_meta()?;
             if !self.meta_passes(name.child) {
                 return Ok(ControlFlow::Continue(()));
@@ -307,18 +313,42 @@ impl<'c> Run<'_, 'c> {
     fn resolve(&mut self, parent: InoId, name: &[u8]) {
         let prefix = match self.dir {
             Some((dir, len)) if dir == parent => len,
-            _ => {
-                self.path.clear();
-                self.catalog.dir_path(parent, &mut self.path);
-                if self.path.last() != Some(&b'/') {
-                    self.path.push(b'/');
-                }
-                self.dir = Some((parent, self.path.len()));
-                self.path.len()
-            }
+            _ => self.enter(parent),
         };
         self.path.truncate(prefix);
         self.path.extend_from_slice(name);
+    }
+
+    /// Sets `path` to `dir`'s path and a `/`, and returns its length.
+    fn enter(&mut self, dir: InoId) -> usize {
+        let catalog = self.catalog;
+        let edge = catalog.dir_name(dir).map(|edge| catalog.name(edge));
+        match (edge, self.up) {
+            (Some(edge), Some((up, len))) if up == edge.parent => self.path.truncate(len),
+            (Some(edge), _) => {
+                self.path.clear();
+                catalog.dir_path(edge.parent, &mut self.path);
+                push_slash(&mut self.path);
+                self.up = Some((edge.parent, self.path.len()));
+            }
+            (None, _) => {
+                self.path.clear();
+                self.up = None;
+            }
+        }
+        match edge {
+            Some(edge) => self.path.extend_from_slice(edge.bytes),
+            None => catalog.dir_path(dir, &mut self.path),
+        }
+        push_slash(&mut self.path);
+        self.dir = Some((dir, self.path.len()));
+        self.path.len()
+    }
+}
+
+fn push_slash(path: &mut Vec<u8>) {
+    if path.last() != Some(&b'/') {
+        path.push(b'/');
     }
 }
 
