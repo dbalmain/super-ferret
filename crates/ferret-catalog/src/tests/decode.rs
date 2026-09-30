@@ -78,7 +78,10 @@ fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
         }
         _ => (start, placed.desc.width, row),
     };
-    assert!(raw <= packed::mask(width), "{raw} does not fit {width} bits");
+    assert!(
+        raw <= packed::mask(width),
+        "{raw} does not fit {width} bits"
+    );
     let width = width as usize;
     for bit in 0..width {
         let at = row * width + bit;
@@ -366,8 +369,16 @@ fn doc_ids_that_stop_increasing_are_rejected() {
     // column that is not sorted.
     let scratch = Scratch::new("decode-doc-order");
     let file = |name: &[u8], ino, n| (name.to_vec(), file_stat(ino), Content::Hashed(hash(n)));
-    let files = [file(b"a", 10, 1), file(b"b", 11, 2), file(b"c", 12, 3), file(b"d", 13, 4)];
-    for kept in [&files[..], &[files[0].clone(), files[2].clone(), files[3].clone()]] {
+    let files = [
+        file(b"a", 10, 1),
+        file(b"b", 11, 2),
+        file(b"c", 12, 3),
+        file(b"d", 13, 4),
+    ];
+    for kept in [
+        &files[..],
+        &[files[0].clone(), files[2].clone(), files[3].clone()],
+    ] {
         commit(&scratch.path, |txn| {
             let mut w = txn.batch();
             let root = w.root(b"/s", dir_stat(1));

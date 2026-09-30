@@ -599,9 +599,15 @@ impl Catalog {
     /// Needs [`Section::Docs`]. Where the generation's ids have no holes, the
     /// row is the id less the first; otherwise a binary search.
     pub fn doc_hash(&self, doc: DocId) -> Option<Hash> {
-        let (ids, n, doc) = (self.column(Column::DocId), self.layout.docs, u64::from(doc.0));
+        let (ids, n, doc) = (
+            self.column(Column::DocId),
+            self.layout.docs,
+            u64::from(doc.0),
+        );
         let at = match ids.dense() {
-            Some(first) => doc.checked_sub(first).map_or(n, |row| row.min(n as u64) as usize),
+            Some(first) => doc
+                .checked_sub(first)
+                .map_or(n, |row| row.min(n as u64) as usize),
             None => partition_point(n, |i| ids.sequence(i) < doc),
         };
         (at < n && ids.sequence(at) == doc).then(|| self.hash(at))

@@ -795,17 +795,14 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
     for field in STAT_COLUMNS {
         stat_columns.push((field, column(field)?));
     }
-    let (mut doc, mut states, mut state_bits) = (
-        column(Column::Doc)?,
-        section(Section::States),
-        Bits::new(2),
-    );
+    let (mut doc, mut states, mut state_bits) =
+        (column(Column::Doc)?, section(Section::States), Bits::new(2));
     let doc_live = head.columns[Column::Doc as usize].width > 0;
-    let live = |field: Column| {
-        field.coding() == Coding::Blocked || head.columns[field as usize].width > 0
-    };
-    let (mut live_columns, mut idle): (Vec<_>, Vec<_>) =
-        stat_columns.into_iter().partition(|&(field, _)| live(field));
+    let live =
+        |field: Column| field.coding() == Coding::Blocked || head.columns[field as usize].width > 0;
+    let (mut live_columns, mut idle): (Vec<_>, Vec<_>) = stat_columns
+        .into_iter()
+        .partition(|&(field, _)| live(field));
     for (stat, doc_id, state) in plan.inode_rows(&batches) {
         for (field, column) in &mut live_columns {
             let value = stat_field(*field, stat);

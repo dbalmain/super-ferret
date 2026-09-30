@@ -61,12 +61,12 @@
 //!   its own base and width, found through a table of 16 B entries at the
 //!   column's start (`packed::Blocked`). For a column whose neighbouring rows
 //!   are close: name offsets only grow, and nlink is nearly always 1. The
-//!   descriptor's base is the bytes of packed values after the table, and
-//!   its width the widest block's.
+//!   descriptor's base is the bytes of packed values after the table, and its
+//!   width the widest block's.
 //! - **Sequence:** row `i`'s value is `base + i + packed`, for ids sorted
 //!   strictly increasing. Ids without holes are all `packed` 0: width 0, no
-//!   bytes but the padding, and a row found from its id by subtraction. A
-//!   hole widens the column only to the bits of the holes' total.
+//!   bytes but the padding, and a row found from its id by subtraction. A hole
+//!   widens the column only to the bits of the holes' total.
 //!
 //! `base + packed` wraps, so no descriptor can make a read overflow.
 //!
@@ -870,10 +870,7 @@ impl Layout {
             Coding::Blocked => View {
                 base: 0,
                 dict,
-                values: Stored::Blocked(Blocked::new(
-                    values,
-                    self.count(column.rows()) as u32,
-                )),
+                values: Stored::Blocked(Blocked::new(values, self.count(column.rows()) as u32)),
             },
             _ => View {
                 base: desc.base,
@@ -971,8 +968,7 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     }
     // The docs section's hashes follow its id column.
     let hashes = used[Section::Docs as usize];
-    used[Section::Docs as usize] =
-        hashes.saturating_add(u64::from(docs) * HASH_ROW as u64);
+    used[Section::Docs as usize] = hashes.saturating_add(u64::from(docs) * HASH_ROW as u64);
     for column in COLUMNS {
         let section = column.section();
         if used[section as usize] != len(section) {

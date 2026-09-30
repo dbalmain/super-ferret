@@ -226,12 +226,18 @@ fn doc_ids_with_and_without_holes_read_back_by_id() {
     let (a, b, c) = (file("a", 20, 7), file("b", 21, 8), file("c", 22, 9));
     generation(&scratch.path, &[a, b, c]);
     let sparse = generation(&scratch.path, &[a, c]);
-    assert_eq!(sparse.docs().map(|(id, _)| id.0).collect::<Vec<_>>(), [0, 2]);
+    assert_eq!(
+        sparse.docs().map(|(id, _)| id.0).collect::<Vec<_>>(),
+        [0, 2]
+    );
     assert!(doc_id_width(&sparse) > 0);
     let (d, e) = (file("d", 23, 10), file("e", 24, 11));
     generation(&scratch.path, &[a, c, d, e]);
     let sparse = generation(&scratch.path, &[a, c, e]);
-    assert_eq!(sparse.docs().map(|(id, _)| id.0).collect::<Vec<_>>(), [0, 2, 4]);
+    assert_eq!(
+        sparse.docs().map(|(id, _)| id.0).collect::<Vec<_>>(),
+        [0, 2, 4]
+    );
     assert!(doc_id_width(&sparse) > 0);
     for id in 0..6 {
         let expect = [(0, 7), (2, 9), (4, 11)]

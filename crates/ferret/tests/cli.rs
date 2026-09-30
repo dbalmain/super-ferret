@@ -421,9 +421,10 @@ fn stats_counts_documents_sparsely_and_survives_a_corrupt_reference() {
     assert_eq!(duplicates(&sparse), before);
 
     // Every file's DocId moved past `next_doc`, by the doc column's base
-    // (the last of the column descriptors that end the file's 644 B head):
-    // decoding does not check an inode's DocId.
-    patch_catalog(&env, 644 - 16, u32::MAX - 2);
+    // (the second last of the column descriptors that end the file's 664 B
+    // head, before the docs' own id column): decoding does not check an
+    // inode's DocId.
+    patch_catalog(&env, 664 - 32, u32::MAX - 2);
     let corrupt = limited(&env);
     assert_eq!(corrupt.status.code(), Some(0), "{}", stderr(&corrupt));
     let text = String::from_utf8_lossy(&corrupt.stdout);

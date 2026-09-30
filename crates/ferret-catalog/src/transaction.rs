@@ -367,7 +367,8 @@ impl Transaction {
             docs: &self.docs,
             next_doc,
         };
-        let plan = build::plan(&mut self.batches, self.sniffer, known).map_err(CommitError::Build)?;
+        let plan =
+            build::plan(&mut self.batches, self.sniffer, known).map_err(CommitError::Build)?;
         let batches = std::mem::take(&mut self.batches);
         self.docs = Vec::new();
 

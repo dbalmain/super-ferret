@@ -528,7 +528,11 @@ mod tests {
         for count in [0, 1, 8, 127, 128, 129, 1000, 65 * BLOCK_ROWS + 3] {
             let values = blocked_values(count);
             let (bytes, len, widest) = pack_blocked(&values);
-            assert_eq!(bytes.len() as u64, blocked_len(count as u32, len), "n {count}");
+            assert_eq!(
+                bytes.len() as u64,
+                blocked_len(count as u32, len),
+                "n {count}"
+            );
             let column = Blocked::new(&bytes, count as u32);
             assert!(column.check(widest, len), "n {count}");
             for (i, &v) in values.iter().enumerate() {
@@ -571,7 +575,10 @@ mod tests {
             bad[at..at + 8].copy_from_slice(&(offset << 8 | width).to_le_bytes());
             bad
         };
-        assert!(Blocked::new(&set(1, 48, 9), 300).check(widest, len), "unchanged");
+        assert!(
+            Blocked::new(&set(1, 48, 9), 300).check(widest, len),
+            "unchanged"
+        );
         for (what, bad) in [
             ("wider than the column", set(1, 48, 10)),
             ("wider than 64", set(2, 192, 200)),
