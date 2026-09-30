@@ -404,7 +404,13 @@ fn a_blocked_column_whose_table_misplaces_a_block_is_rejected_on_load() {
     let bytes = sample("decode-blocked");
     let layout = format::decode_table(&bytes, bytes.len() as u64).unwrap();
     let scratch = Scratch::new("decode-blocked-lazy");
-    for column in [Column::NameOffset, Column::Nlink] {
+    for column in [
+        Column::NameOffset,
+        Column::Size,
+        Column::Mtime,
+        Column::Ctime,
+        Column::Nlink,
+    ] {
         let placed = layout.columns[column as usize];
         let entry = section_start(&bytes, column.section()) + placed.start + 8;
         let width = u64::from(placed.desc.width);

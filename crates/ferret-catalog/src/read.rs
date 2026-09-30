@@ -487,31 +487,29 @@ impl Catalog {
 
     /// An inode's `st_size`. Needs [`Section::Size`].
     pub fn size(&self, id: InoId) -> u64 {
-        self.column(Column::Size).get(id.0 as usize)
+        self.blocked(Column::Size).get(id.0 as usize)
     }
 
     /// An inode's mtime, in whole seconds. Needs [`Section::Mtime`].
     pub fn mtime(&self, id: InoId) -> i64 {
-        format::unorder(self.column(Column::Mtime).get(id.0 as usize))
+        format::unorder(self.blocked(Column::Mtime).get(id.0 as usize))
     }
 
     /// Every inode's `st_size`, in inode order: a pass decoded a run at a
     /// time. Needs [`Section::Size`].
     pub fn sizes(&self) -> impl Iterator<Item = u64> + '_ {
-        self.column(Column::Size).values(self.layout.inodes)
+        self.blocked(Column::Size).values()
     }
 
     /// Every inode's mtime in whole seconds, in inode order. Needs
     /// [`Section::Mtime`].
     pub fn mtimes(&self) -> impl Iterator<Item = i64> + '_ {
-        self.column(Column::Mtime)
-            .values(self.layout.inodes)
-            .map(format::unorder)
+        self.blocked(Column::Mtime).values().map(format::unorder)
     }
 
     /// An inode's ctime, in whole seconds. Needs [`Section::Ctime`].
     pub fn ctime(&self, id: InoId) -> i64 {
-        format::unorder(self.column(Column::Ctime).get(id.0 as usize))
+        format::unorder(self.blocked(Column::Ctime).get(id.0 as usize))
     }
 
     /// An inode's `st_mode`: type and permission bits. Needs

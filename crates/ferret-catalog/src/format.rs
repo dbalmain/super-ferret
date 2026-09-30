@@ -25,10 +25,10 @@
 //! strings     root paths, link targets, work-tree paths; NUL-terminated
 //! dev         column per inode, dictionary
 //! ino         column per inode
-//! size        column per inode
-//! mtime       column per inode: whole seconds, signed
+//! size        column per inode (blocked)
+//! mtime       column per inode: whole seconds, signed (blocked)
 //! mtime ns    column per inode
-//! ctime       column per inode: whole seconds, signed
+//! ctime       column per inode: whole seconds, signed (blocked)
 //! ctime ns    column per inode
 //! mode        column per inode, dictionary
 //! owner       column per inode, dictionary of uid << 32 | gid
@@ -60,9 +60,10 @@
 //! - **Blocked:** a frame of reference per block of 128 rows, each block with
 //!   its own base and width, found through a table of 16 B entries at the
 //!   column's start (`packed::Blocked`). For a column whose neighbouring rows
-//!   are close: name offsets only grow, and nlink is nearly always 1. The
-//!   descriptor's base is the bytes of packed values after the table, and its
-//!   width the widest block's.
+//!   are close: name offsets only grow, nlink is nearly always 1, and files
+//!   numbered by name sit beside their siblings, which share sizes and times
+//!   far more than the whole tree does. The descriptor's base is the bytes of
+//!   packed values after the table, and its width the widest block's.
 //! - **Sequence:** row `i`'s value is `base + i + packed`, for ids sorted
 //!   strictly increasing. Ids without holes are all `packed` 0: width 0, no
 //!   bytes but the padding, and a row found from its id by subtraction. A hole
@@ -274,15 +275,14 @@ impl Column {
         match self {
             Column::DirName | Column::Entries | Column::Doc => Coding::Nullable,
             Column::Dev | Column::Mode | Column::Owner => Coding::Dictionary,
-            Column::NameOffset | Column::Nlink => Coding::Blocked,
+            Column::NameOffset | Column::Size | Column::Mtime | Column::Ctime | Column::Nlink => {
+                Coding::Blocked
+            }
             Column::DocId => Coding::Sequence,
             Column::NameParent
             | Column::NameChild
             | Column::Ino
-            | Column::Size
-            | Column::Mtime
             | Column::MtimeNs
-            | Column::Ctime
             | Column::CtimeNs => Coding::Frame,
         }
     }
