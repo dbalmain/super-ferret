@@ -11,7 +11,7 @@
 //! tab-separated after the decision, for the `synthetic` example in
 //! `ferret-catalog` to replay. Two lines come first, unsorted: a header
 //! naming the columns (`<tab>columns<tab>size<tab>...`), so a reader takes
-//! them by name and a later column (`nlink`) is an addition, not a break, and
+//! them by name and a later column is an addition, not a break, and
 //! the root's own stat (`<tab>root<tab>...`). Both start with an empty path,
 //! which no entry has. Stats change as files do, so the default output stays
 //! stat-free: that is the one to diff.
@@ -94,7 +94,7 @@ fn usage() -> ExitCode {
 }
 
 /// The `--stat` columns, in order. Add a column at the end.
-const COLUMNS: [&str; 10] = [
+const COLUMNS: [&str; 11] = [
     "size",
     "mtime_sec",
     "mtime_nsec",
@@ -105,12 +105,13 @@ const COLUMNS: [&str; 10] = [
     "gid",
     "dev",
     "ino",
+    "nlink",
 ];
 
 /// A stat as the tab-separated values of [`COLUMNS`].
 fn columns(stat: &Stat<'_>) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         stat.size,
         stat.mtime_sec,
         stat.mtime_nsec,
@@ -120,7 +121,8 @@ fn columns(stat: &Stat<'_>) -> String {
         stat.uid,
         stat.gid,
         stat.dev,
-        stat.ino
+        stat.ino,
+        stat.nlink
     )
 }
 

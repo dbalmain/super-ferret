@@ -15,13 +15,15 @@
 //! which pack to nothing and flatter any compaction. Copy `c` adds
 //! `c * stride` to each real inode number, where the stride is the dump's
 //! largest inode number plus one: the values stay as scattered as on the
-//! disk they came from, and never collide across copies. The
-//! entries are spread over 16 batches, one per copy modulo 16, as 16 workers
-//! would hand them over. With `rerun`, a previous generation must exist: every
-//! file is looked up with [`Transaction::carry`] as the walk would, which is
-//! what a re-run holds in memory. With `faults=N`, every Nth indexed file
-//! is stored as [`Content::Fault`], for timing the crawl's post-commit
-//! content-fault pass at scale.
+//! disk they came from, and never collide across copies. Each directory's entry
+//! count is the number of its children in the dump, ignored ones included: a
+//! lower bound on the real `getdents` count. The entries are spread over 16
+//! batches, one per copy modulo 16, as 16 workers would hand them over. With
+//! `rerun`, a previous generation must exist: every file is looked up with
+//! [`Transaction::carry`] as the walk would, which is what a re-run holds in
+//! memory. With `faults=N`, every Nth indexed file is stored as
+//! [`Content::Fault`], for timing the crawl's post-commit content-fault pass at
+//! scale.
 //!
 //! Prints the RSS once the batches are filled, the commit time and the peak
 //! RSS (`VmHWM`), so batch memory and build memory can be told apart.
@@ -86,7 +88,7 @@ fn plain_stat(mode: u32) -> Stat {
         mode,
         uid: 1000,
         gid: 100,
-        nlink: 1,
+        nlink: if mode & 0o170_000 == 0o040_000 { 2 } else { 1 },
     }
 }
 
@@ -103,6 +105,7 @@ enum Column {
     Gid,
     Dev,
     Ino,
+    Nlink,
     /// A name this build does not know, such as a column added since.
     Unknown,
 }
@@ -120,6 +123,7 @@ impl Column {
             b"gid" => Column::Gid,
             b"dev" => Column::Dev,
             b"ino" => Column::Ino,
+            b"nlink" => Column::Nlink,
             _ => Column::Unknown,
         }
     }
@@ -144,6 +148,7 @@ fn parse_stat<'a>(
             Column::Gid => stat.gid = text.parse()?,
             Column::Dev => stat.dev = text.parse()?,
             Column::Ino => stat.ino = text.parse()?,
+            Column::Nlink => stat.nlink = text.parse()?,
             Column::Unknown => {}
         }
     }
@@ -194,6 +199,11 @@ fn run(
     let mut root_stat = plain_stat(0o040_755);
     let mut dirs = Vec::new();
     let mut entries = Vec::new();
+    // Each directory's children as the dump lists them, `Skip` lines
+    // included: a lower bound on what `getdents` returned, since the walker
+    // prints nothing for a directory it does not read. `None` is the copy's
+    // top directory.
+    let mut child_counts: HashMap<Option<&[u8]>, u32> = HashMap::new();
     for line in text.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         let mut fields = line.split(|&b| b == b'\t');
         let (path, decision) = (fields.next().unwrap_or_default(), fields.next());
@@ -206,6 +216,7 @@ fn run(
             }
             continue;
         }
+        *child_counts.entry(split(path).0).or_default() += 1;
         let mode = match decision {
             b"Descend" => 0o040_755,
             b"Catalog(Symlink)" => 0o120_777,
@@ -263,6 +274,7 @@ fn run(
     for copy in 0..copies {
         let batch = &mut batches[copy % BATCHES];
         let top = batch.dir(root, format!("p{copy}").as_bytes(), moved(&root_stat, copy));
+        batch.entry_count(top, child_counts.get(&None).copied().unwrap_or(0));
         tokens.clear();
         let parent_of = |tokens: &HashMap<&[u8], DirToken>, parent: Option<&[u8]>| match parent {
             None => Ok(top),
@@ -275,6 +287,10 @@ fn run(
             let (parent, name) = split(dir.path);
             let stat = moved(&dir.stat, copy);
             let token = batch.dir(parent_of(&tokens, parent)?, name, stat);
+            batch.entry_count(
+                token,
+                child_counts.get(&Some(dir.path)).copied().unwrap_or(0),
+            );
             tokens.insert(dir.path, token);
         }
         for entry in &entries {
