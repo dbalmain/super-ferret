@@ -320,9 +320,16 @@ fn run(
             }
         }
     }
+    // The fixture is spent: drop it before the commit, so the commit's peak
+    // is the builder's (its batches included) and not the dump's.
     drop(tokens);
+    drop((dirs, entries, child_counts));
+    drop(text);
     let filled = started.elapsed();
-    let filled_rss = rss("VmRSS:");
+    let (fill_peak, filled_rss) = (rss("VmHWM:"), rss("VmRSS:"));
+    // Restart the peak (Linux's clear_refs 5), so VmHWM after the commit is
+    // the commit's own. Best effort: without it the peak is the process's.
+    let reset = std::fs::write("/proc/self/clear_refs", "5").is_ok();
     for batch in batches {
         txn.add(batch);
     }
@@ -336,10 +343,15 @@ fn run(
         catalog.doc_count()
     );
     println!(
-        "file {size} B; begin {} ms, filled at {} ms (rss {filled_rss}), commit {} ms; peak rss {}",
+        "file {size} B; begin {} ms, filled at {} ms (peak {fill_peak}, then rss {filled_rss} \
+         without the fixture), commit {} ms; {} {}",
         opened.as_millis(),
         filled.as_millis(),
         (committed - filled).as_millis(),
+        match reset {
+            true => "commit peak rss",
+            false => "peak rss",
+        },
         rss("VmHWM:")
     );
     Ok(())
