@@ -2,11 +2,12 @@
 //!
 //! ```text
 //! header       magic "FERRETCT" | version u32 | sniffer u32 | next_doc u32 |
-//!              section count u32 | dirs u32 | inodes u32 | names u32  (36 B)
+//!              section count u32 | dirs u32 | inodes u32 | names u32 |
+//!              docs u32                                               (40 B)
 //! table        (offset u64, length u64) per section, in SECTIONS order (352 B)
 //! descriptors  (base u64, width u32, dictionary length u32) per column, in
-//!              COLUMNS order                                         (256 B)
-//! sections     contiguous from byte 644 to the end of the file, in order
+//!              COLUMNS order                                         (272 B)
+//! sections     contiguous from byte 664 to the end of the file, in order
 //! ```
 //!
 //! All integers are little-endian. The sections a name query reads come
@@ -14,6 +15,7 @@
 //!
 //! ```text
 //! names       3 columns: parent InoId, child InoId, offset in name heap
+//!             (blocked)
 //! name heap   names, each NUL-terminated, in NameId order (D28)
 //! dir names   column, per directory InoId: its NameId, none for a root
 //! entries     column, per directory: the entries `getdents` returned, minus
@@ -30,21 +32,21 @@
 //! ctime ns    column per inode
 //! mode        column per inode, dictionary
 //! owner       column per inode, dictionary of uid << 32 | gid
-//! nlink       column per inode
+//! nlink       column per inode (blocked)
 //! doc         column per inode: DocId, none when it has no document
 //! states      2 bits per inode: ContentState (D37), LSB first
 //! links       8 B rows: symlink InoId, offset of its target in strings
 //! work trees  32 B rows: top InoId, offset of common dir in strings, common
 //!             dev, common ino, kind u8, 7 B zero
-//! docs        20 B rows: DocId, hash; sorted by id, live documents only
-//!             (D36 B)
+//! docs        column per document: its DocId (sequence), then 16 B rows:
+//!             its hash; sorted by id, live documents only (D36 B)
 //! ```
 //!
 //! A column is its dictionary (`u64` values, present only in a dictionary
 //! column) and then one value per row of its table, bit-packed at the
 //! descriptor's width (`packed`), then 8 bytes of padding (written as zeros,
 //! not checked: reads never depend on it). Each column is sized to this
-//! catalog's values (D43), in one of three codings:
+//! catalog's values (D43), in one of five codings:
 //!
 //! - **Frame of reference:** the value is `base + packed`, and the width is
 //!   that of the largest value less the smallest, which is the base. Signed
@@ -55,13 +57,25 @@
 //!   value is all ones.
 //! - **Dictionary:** the packed value is `base + index` into the column's
 //!   dictionary. The writer stores base 0 and the sorted distinct values.
+//! - **Blocked:** a frame of reference per block of 128 rows, each block with
+//!   its own base and width, found through a table of 16 B entries at the
+//!   column's start (`packed::Blocked`). For a column whose neighbouring rows
+//!   are close: name offsets only grow, and nlink is nearly always 1. The
+//!   descriptor's base is the bytes of packed values after the table, and
+//!   its width the widest block's.
+//! - **Sequence:** row `i`'s value is `base + i + packed`, for ids sorted
+//!   strictly increasing. Ids without holes are all `packed` 0: width 0, no
+//!   bytes but the padding, and a row found from its id by subtraction. A
+//!   hole widens the column only to the bits of the holes' total.
 //!
 //! `base + packed` wraps, so no descriptor can make a read overflow.
 //!
 //! Decoding validates everything an accessor indexes by, so a corrupt or
 //! truncated file is a [`DecodeError`] and never a panic: every width is at
 //! most 64 and every column section's length is exactly its columns'
-//! dictionaries and padded values; every offset, id and dictionary index is
+//! dictionaries and padded values (and the docs section's hashes); every
+//! blocked column's table places each block exactly after the one before it,
+//! no wider than the descriptor says; every offset, id and dictionary index is
 //! in range, every heap ends in NUL, and each directory's name edge points at
 //! a lower-numbered parent, so walking up from any name ends at a root. Each
 //! directory is the child of exactly its recorded name edge, so walking down
@@ -77,9 +91,12 @@
 //! when the later one loads, after the sections it [needs](Section::needs).
 
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
+use std::sync::OnceLock;
 
-use crate::packed::{self, Packed};
+use crate::packed::{self, Blocked, Packed};
 
 pub(crate) const MAGIC: [u8; 8] = *b"FERRETCT";
 /// 1: fixed-width rows (S1). 2: bit-packed columns (S1a).
@@ -89,7 +106,8 @@ pub(crate) const NONE: u32 = u32::MAX;
 
 pub(crate) const PAIR_ROW: usize = 8;
 pub(crate) const WORK_TREE_ROW: usize = 32;
-pub(crate) const DOC_ROW: usize = 20;
+/// A document's hash row, after the docs section's id column.
+pub(crate) const HASH_ROW: usize = 16;
 
 /// One section of the snapshot file, in file order. A reader loads sections
 /// one at a time ([`Catalog::load`](crate::Catalog::load)); the ones a name
@@ -168,7 +186,8 @@ pub(crate) const SECTIONS: [Section; 22] = [
 ];
 
 /// One bit-packed column. Each lies in one section, in this order; only the
-/// name rows' three share one.
+/// name rows' three share one, and the docs' ids share theirs with the
+/// hashes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Column {
     NameParent,
@@ -187,9 +206,10 @@ pub(crate) enum Column {
     Owner,
     Nlink,
     Doc,
+    DocId,
 }
 
-pub(crate) const COLUMNS: [Column; 16] = [
+pub(crate) const COLUMNS: [Column; 17] = [
     Column::NameParent,
     Column::NameChild,
     Column::NameOffset,
@@ -206,6 +226,7 @@ pub(crate) const COLUMNS: [Column; 16] = [
     Column::Owner,
     Column::Nlink,
     Column::Doc,
+    Column::DocId,
 ];
 
 /// How a column's packed values become field values; see the module doc.
@@ -214,6 +235,8 @@ pub(crate) enum Coding {
     Frame,
     Nullable,
     Dictionary,
+    Blocked,
+    Sequence,
 }
 
 /// Which table a column has a row for.
@@ -222,6 +245,7 @@ pub(crate) enum Rows {
     Names,
     Dirs,
     Inodes,
+    Docs,
 }
 
 impl Column {
@@ -241,6 +265,7 @@ impl Column {
             Column::Owner => Section::Owner,
             Column::Nlink => Section::Nlink,
             Column::Doc => Section::Doc,
+            Column::DocId => Section::Docs,
         }
     }
 
@@ -248,16 +273,16 @@ impl Column {
         match self {
             Column::DirName | Column::Entries | Column::Doc => Coding::Nullable,
             Column::Dev | Column::Mode | Column::Owner => Coding::Dictionary,
+            Column::NameOffset | Column::Nlink => Coding::Blocked,
+            Column::DocId => Coding::Sequence,
             Column::NameParent
             | Column::NameChild
-            | Column::NameOffset
             | Column::Ino
             | Column::Size
             | Column::Mtime
             | Column::MtimeNs
             | Column::Ctime
-            | Column::CtimeNs
-            | Column::Nlink => Coding::Frame,
+            | Column::CtimeNs => Coding::Frame,
         }
     }
 
@@ -265,12 +290,14 @@ impl Column {
         match self {
             Column::NameParent | Column::NameChild | Column::NameOffset => Rows::Names,
             Column::DirName | Column::Entries => Rows::Dirs,
+            Column::DocId => Rows::Docs,
             _ => Rows::Inodes,
         }
     }
 }
 
-const HEADER: usize = 36;
+/// The header's bytes, before the section table.
+pub(crate) const HEADER: usize = 40;
 const TABLE: usize = SECTIONS.len() * 16;
 const DESCRIPTORS: usize = COLUMNS.len() * 16;
 
@@ -360,9 +387,24 @@ impl Descriptor {
         }
     }
 
-    /// The column's bytes for `count` rows: dictionary, then values.
-    pub(crate) fn len(self, count: u32) -> u64 {
-        u64::from(self.dict_len) * 8 + packed::len(count, self.width)
+    /// A blocked column whose blocks hold `values` bytes, the widest
+    /// `width` bits.
+    pub(crate) fn blocked((values, width): (u64, u32)) -> Self {
+        Self {
+            base: values,
+            width,
+            dict_len: 0,
+        }
+    }
+
+    /// The column's bytes for `count` rows: dictionary, then values; for a
+    /// blocked column, its table and blocks. Saturates on a blocked
+    /// descriptor no file could hold.
+    pub(crate) fn len(self, coding: Coding, count: u32) -> u64 {
+        match coding {
+            Coding::Blocked => packed::blocked_len(count, self.base),
+            _ => u64::from(self.dict_len) * 8 + packed::len(count, self.width),
+        }
     }
 }
 
@@ -389,10 +431,12 @@ pub(crate) struct Head {
     pub(crate) dirs: u32,
     pub(crate) inodes: u32,
     pub(crate) names: u32,
+    pub(crate) docs: u32,
     /// Column descriptors, in [`COLUMNS`] order.
     pub(crate) columns: [Descriptor; COLUMNS.len()],
-    /// Every section's length in [`SECTIONS`] order. A column section's entry
-    /// is ignored: its length follows from its descriptors.
+    /// Every section's length in [`SECTIONS`] order, less its columns: a
+    /// column section's length adds its columns' to this (only the docs
+    /// section has bytes of its own, its hashes, after its column).
     pub(crate) lens: [u64; SECTIONS.len()],
 }
 
@@ -402,89 +446,196 @@ impl Head {
             Rows::Names => self.names,
             Rows::Dirs => self.dirs,
             Rows::Inodes => self.inodes,
+            Rows::Docs => self.docs,
         }
     }
 
     fn section_lens(&self) -> [u64; SECTIONS.len()] {
         let mut lens = self.lens;
-        for column in COLUMNS {
-            lens[column.section() as usize] = 0;
-        }
         for (column, desc) in COLUMNS.into_iter().zip(self.columns) {
-            lens[column.section() as usize] += desc.len(self.count(column.rows()));
+            lens[column.section() as usize] += desc.len(column.coding(), self.count(column.rows()));
         }
         lens
     }
-}
 
-/// Writes the header, the section table and the column descriptors.
-pub(crate) fn write_head(out: &mut impl Write, head: &Head) -> io::Result<()> {
-    out.write_all(&MAGIC)?;
-    for v in [
-        VERSION,
-        head.sniffer,
-        head.next_doc,
-        SECTIONS.len() as u32,
-        head.dirs,
-        head.inodes,
-        head.names,
-    ] {
-        put_u32(out, v)?;
-    }
-    let mut offset = TABLE_END as u64;
-    for len in head.section_lens() {
-        out.write_all(&offset.to_le_bytes())?;
-        out.write_all(&len.to_le_bytes())?;
-        offset += len;
-    }
-    for desc in head.columns {
-        out.write_all(&desc.base.to_le_bytes())?;
-        put_pair(out, desc.width, desc.dict_len)?;
-    }
-    Ok(())
-}
-
-/// Streams one column: its dictionary, then its values as they are pushed.
-pub(crate) struct ColumnWriter {
-    desc: Descriptor,
-    packed: packed::Writer,
-}
-
-impl ColumnWriter {
-    /// Starts a column, writing its dictionary, which must have the
-    /// descriptor's length.
-    pub(crate) fn start(out: &mut impl Write, desc: Descriptor, dict: &[u64]) -> io::Result<Self> {
-        debug_assert_eq!(dict.len(), desc.dict_len as usize);
-        for &value in dict {
-            out.write_all(&value.to_le_bytes())?;
+    /// The head of the file: header, section table and column descriptors,
+    /// and the whole file's length.
+    pub(crate) fn encode(&self) -> ([u8; TABLE_END], u64) {
+        let mut out = Vec::with_capacity(TABLE_END);
+        out.extend_from_slice(&MAGIC);
+        for v in [
+            VERSION,
+            self.sniffer,
+            self.next_doc,
+            SECTIONS.len() as u32,
+            self.dirs,
+            self.inodes,
+            self.names,
+            self.docs,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
         }
+        let mut offset = TABLE_END as u64;
+        for len in self.section_lens() {
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+            offset += len;
+        }
+        for desc in self.columns {
+            out.extend_from_slice(&desc.base.to_le_bytes());
+            out.extend_from_slice(&desc.width.to_le_bytes());
+            out.extend_from_slice(&desc.dict_len.to_le_bytes());
+        }
+        let mut head = [0; TABLE_END];
+        head.copy_from_slice(&out);
+        (head, offset)
+    }
+}
+
+/// Buffered writes at a fixed place in a file, moving on as they go: each
+/// section, and each column's values, writes through its own, so the builder
+/// can fill several at once (D40: bounded buffers, never a whole column).
+pub(crate) struct At<'f> {
+    file: &'f File,
+    pos: u64,
+    buf: Vec<u8>,
+}
+
+/// What an [`At`] holds before writing it out.
+const AT_BUFFER: usize = 64 << 10;
+
+impl<'f> At<'f> {
+    pub(crate) fn new(file: &'f File, pos: u64) -> Self {
+        Self {
+            file,
+            pos,
+            buf: Vec::with_capacity(AT_BUFFER),
+        }
+    }
+
+    /// Writes out what is buffered; returns where the next byte would go.
+    pub(crate) fn finish(mut self) -> io::Result<u64> {
+        self.flush()?;
+        Ok(self.pos)
+    }
+}
+
+impl Write for At<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() >= AT_BUFFER {
+            self.flush()?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.write_all_at(&self.buf, self.pos)?;
+        self.pos += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+/// Streams one column to its place in the file: its dictionary, then its
+/// values as they are pushed, each through a bounded buffer.
+pub(crate) struct ColumnWriter<'f> {
+    desc: Descriptor,
+    coding: Coding,
+    /// Rows pushed so far, for a sequence column.
+    rows: u64,
+    out: At<'f>,
+    values: Values<'f>,
+    end: u64,
+}
+
+enum Values<'f> {
+    Packed(packed::Writer),
+    /// The writer and the table's output; the blocks go to `out`.
+    Blocked(Box<packed::BlockedWriter>, At<'f>),
+}
+
+impl<'f> ColumnWriter<'f> {
+    /// Starts `column` at its place in `file`, as `layout` (decoded from the
+    /// head just written) places it, writing its dictionary, which must have
+    /// the descriptor's length.
+    pub(crate) fn start(
+        file: &'f File,
+        layout: &Layout,
+        column: Column,
+        dict: &[u64],
+    ) -> io::Result<Self> {
+        let Placed { desc, start } = layout.columns[column as usize];
+        let (coding, count) = (column.coding(), layout.count(column.rows()));
+        debug_assert_eq!(dict.len(), desc.dict_len as usize);
+        let at = (layout.range(column.section()).0 + start) as u64;
+        let end = at + desc.len(coding, count as u32);
+        // A dictionary, or a blocked column's table, comes first.
+        let mut first = At::new(file, at);
+        for &value in dict {
+            first.write_all(&value.to_le_bytes())?;
+        }
+        let (out, values) = match coding {
+            Coding::Blocked => {
+                let table = packed::blocks(count as u32) * packed::BLOCK_ENTRY;
+                let writer = Box::new(packed::BlockedWriter::new());
+                (At::new(file, at + table), Values::Blocked(writer, first))
+            }
+            _ => (first, Values::Packed(packed::Writer::new(desc.width))),
+        };
         Ok(Self {
             desc,
-            packed: packed::Writer::new(desc.width),
+            coding,
+            rows: 0,
+            out,
+            values,
+            end,
         })
     }
 
-    /// A frame-of-reference value, inside the range the descriptor was made
-    /// from.
-    pub(crate) fn value(&mut self, out: &mut impl Write, value: u64) -> io::Result<()> {
-        self.packed.push(out, value - self.desc.base)
+    fn push(&mut self, raw: u64) -> io::Result<()> {
+        self.rows += 1;
+        match &mut self.values {
+            Values::Packed(writer) => writer.push(&mut self.out, raw),
+            Values::Blocked(writer, table) => writer.push(table, &mut self.out, raw),
+        }
+    }
+
+    /// A frame-of-reference or blocked value, inside the range the
+    /// descriptor was made from.
+    pub(crate) fn value(&mut self, value: u64) -> io::Result<()> {
+        match self.coding {
+            Coding::Blocked => self.push(value),
+            Coding::Sequence => self.push(value - self.rows - self.desc.base),
+            _ => self.push(value - self.desc.base),
+        }
     }
 
     /// A nullable column's value, or none.
-    pub(crate) fn nullable(&mut self, out: &mut impl Write, value: Option<u64>) -> io::Result<()> {
+    pub(crate) fn nullable(&mut self, value: Option<u64>) -> io::Result<()> {
         match value {
-            Some(value) => self.value(out, value),
-            None => self.packed.push(out, packed::mask(self.desc.width)),
+            Some(value) => self.value(value),
+            None => self.push(packed::mask(self.desc.width)),
         }
     }
 
     /// A dictionary column's index.
-    pub(crate) fn index(&mut self, out: &mut impl Write, index: usize) -> io::Result<()> {
-        self.packed.push(out, index as u64)
+    pub(crate) fn index(&mut self, index: usize) -> io::Result<()> {
+        self.push(index as u64)
     }
 
-    pub(crate) fn finish(self, out: &mut impl Write) -> io::Result<()> {
-        self.packed.finish(out)
+    /// Writes the padding, and any last block, and flushes.
+    pub(crate) fn finish(mut self) -> io::Result<()> {
+        match self.values {
+            Values::Packed(writer) => writer.finish(&mut self.out)?,
+            Values::Blocked(writer, mut table) => {
+                writer.finish(&mut table, &mut self.out)?;
+                table.finish()?;
+            }
+        }
+        let end = self.out.finish()?;
+        debug_assert_eq!(end, self.end, "column ends where the head placed its end");
+        Ok(())
     }
 }
 
@@ -583,19 +734,49 @@ pub(crate) struct Placed {
 pub(crate) struct View<'a> {
     base: u64,
     dict: &'a [u8],
-    packed: Packed<'a>,
+    values: Stored<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum Stored<'a> {
+    Packed(Packed<'a>),
+    /// Carries its own bases: the view's is 0.
+    Blocked(Blocked<'a>),
 }
 
 impl View<'_> {
-    /// A frame-of-reference value, or a dictionary index.
+    /// A frame-of-reference or blocked value, or a dictionary index.
     pub(crate) fn get(&self, row: usize) -> u64 {
-        self.base.wrapping_add(self.packed.get(row))
+        match self.values {
+            Stored::Packed(packed) => self.base.wrapping_add(packed.get(row)),
+            Stored::Blocked(blocked) => blocked.get(row),
+        }
+    }
+
+    /// The packed values of a column that is not blocked.
+    fn packed(&self) -> Packed<'_> {
+        match self.values {
+            Stored::Packed(packed) => packed,
+            Stored::Blocked(_) => panic!("a blocked column has no single width"),
+        }
     }
 
     /// A nullable value.
     pub(crate) fn nullable(&self, row: usize) -> Option<u64> {
-        let raw = self.packed.get(row);
-        (raw != packed::mask(self.packed.width())).then(|| self.base.wrapping_add(raw))
+        let packed = self.packed();
+        let raw = packed.get(row);
+        (raw != packed::mask(packed.width())).then(|| self.base.wrapping_add(raw))
+    }
+
+    /// A sequence column's value at `row`.
+    pub(crate) fn sequence(&self, row: usize) -> u64 {
+        self.get(row).wrapping_add(row as u64)
+    }
+
+    /// Whether a sequence column is `base + row` throughout: its row for a
+    /// value is found by subtraction.
+    pub(crate) fn dense(&self) -> Option<u64> {
+        (self.packed().width() == 0).then_some(self.base)
     }
 
     /// A dictionary value. Decoding checked every index.
@@ -606,9 +787,14 @@ impl View<'_> {
     /// [`View::get`] of rows `first..first + out.len()`, into `out`; `first`
     /// is a multiple of 8. See [`Packed::decode`].
     pub(crate) fn decode(&self, first: usize, out: &mut [u64]) {
-        self.packed.decode(first, out);
-        for value in out {
-            *value = self.base.wrapping_add(*value);
+        match self.values {
+            Stored::Packed(packed) => {
+                packed.decode(first, out);
+                for value in out {
+                    *value = self.base.wrapping_add(*value);
+                }
+            }
+            Stored::Blocked(blocked) => blocked.decode(first, out),
         }
     }
 
@@ -625,7 +811,7 @@ impl View<'_> {
 
     /// [`View::nullable`] of rows `0..count`, in order.
     pub(crate) fn nullables(&self, count: usize) -> impl Iterator<Item = Option<u64>> + '_ {
-        let none = self.base.wrapping_add(packed::mask(self.packed.width()));
+        let none = self.base.wrapping_add(packed::mask(self.packed().width()));
         self.values(count)
             .map(move |value| (value != none).then_some(value))
     }
@@ -647,9 +833,21 @@ pub(crate) struct Layout {
     pub(crate) dirs: usize,
     pub(crate) inodes: usize,
     pub(crate) names: usize,
+    pub(crate) docs: usize,
+    /// Where the hashes start in the docs section: after its id column.
+    pub(crate) hashes: usize,
 }
 
 impl Layout {
+    pub(crate) fn count(&self, rows: Rows) -> usize {
+        match rows {
+            Rows::Names => self.names,
+            Rows::Dirs => self.dirs,
+            Rows::Inodes => self.inodes,
+            Rows::Docs => self.docs,
+        }
+    }
+
     pub(crate) fn section<'a>(&self, bytes: &'a [u8], section: Section) -> &'a [u8] {
         let (start, end) = self.sections[section as usize];
         &bytes[start..end]
@@ -668,10 +866,20 @@ impl Layout {
     pub(crate) fn view<'a>(&self, column: Column, section: &'a [u8]) -> View<'a> {
         let Placed { desc, start } = self.columns[column as usize];
         let (dict, values) = section[start..].split_at(desc.dict_len as usize * 8);
-        View {
-            base: desc.base,
-            dict,
-            packed: Packed::new(values, desc.width),
+        match column.coding() {
+            Coding::Blocked => View {
+                base: 0,
+                dict,
+                values: Stored::Blocked(Blocked::new(
+                    values,
+                    self.count(column.rows()) as u32,
+                )),
+            },
+            _ => View {
+                base: desc.base,
+                dict,
+                values: Stored::Packed(Packed::new(values, desc.width)),
+            },
         }
     }
 }
@@ -707,6 +915,7 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     }
 
     let (dirs, inodes, names) = (u32_at(head, 24), u32_at(head, 28), u32_at(head, 32));
+    let docs = u32_at(head, 36);
     if inodes == NONE || names == NONE || dirs > inodes {
         return Err(DecodeError::Corrupt("counts"));
     }
@@ -715,7 +924,6 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
         (Section::Roots, PAIR_ROW),
         (Section::Links, PAIR_ROW),
         (Section::WorkTrees, WORK_TREE_ROW),
-        (Section::Docs, DOC_ROW),
     ] {
         if !len(section).is_multiple_of(row as u64) {
             return Err(DecodeError::Corrupt(section.label()));
@@ -752,13 +960,19 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
             Rows::Names => names,
             Rows::Dirs => dirs,
             Rows::Inodes => inodes,
+            Rows::Docs => docs,
         };
         columns[i] = Placed {
             desc,
             start: used[section as usize] as usize,
         };
-        used[section as usize] += desc.len(count);
+        used[section as usize] =
+            used[section as usize].saturating_add(desc.len(column.coding(), count));
     }
+    // The docs section's hashes follow its id column.
+    let hashes = used[Section::Docs as usize];
+    used[Section::Docs as usize] =
+        hashes.saturating_add(u64::from(docs) * HASH_ROW as u64);
     for column in COLUMNS {
         let section = column.section();
         if used[section as usize] != len(section) {
@@ -774,16 +988,28 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
         dirs: dirs as usize,
         inodes: inodes as usize,
         names: names as usize,
+        docs: docs as usize,
+        hashes: hashes as usize,
     })
 }
 
 /// Validates a whole file held in memory: the table, then every section.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Layout, DecodeError> {
     let layout = decode_table(bytes, bytes.len() as u64)?;
+    let facts = Facts::default();
     for section in CHECK_ORDER {
-        check(section, &layout, |s| layout.section(bytes, s))?;
+        check(section, &layout, &facts, |s| layout.section(bytes, s))?;
     }
     Ok(layout)
+}
+
+/// What one section's check found that a later check reuses, so that no
+/// check decodes a column a check before it already decoded. Kept by the
+/// reader for as long as it loads sections.
+#[derive(Debug, Default)]
+pub(crate) struct Facts {
+    /// Names whose child is a directory, counted by the name-rows check.
+    dir_children: OnceLock<usize>,
 }
 
 /// Every section, each after those it [needs](Section::needs).
@@ -882,10 +1108,20 @@ impl Section {
 pub(crate) fn check<'a>(
     section: Section,
     l: &Layout,
+    facts: &Facts,
     get: impl Fn(Section) -> &'a [u8],
 ) -> Result<(), DecodeError> {
     let terminated = |heap: &[u8]| heap.last().is_none_or(|&b| b == 0);
     let strings_len = l.len(Section::Strings);
+    for column in COLUMNS {
+        if column.section() == section && column.coding() == Coding::Blocked {
+            let Placed { desc, start } = l.columns[column as usize];
+            let count = l.count(column.rows()) as u32;
+            if !Blocked::new(&get(section)[start..], count).check(desc.width, desc.base) {
+                return Err(DecodeError::Corrupt(section.label()));
+            }
+        }
+    }
     match section {
         Section::NameHeap => {
             if !terminated(get(Section::NameHeap)) {
@@ -897,8 +1133,17 @@ pub(crate) fn check<'a>(
                 return Err(DecodeError::Corrupt("strings"));
             }
         }
-        Section::Names => check_names(l, get(Section::Names), get(Section::NameHeap))?,
-        Section::DirNames => check_dir_names(l, get(Section::DirNames), get(Section::Names))?,
+        Section::Names => {
+            let dir_children = check_names(l, get(Section::Names), get(Section::NameHeap))?;
+            // A racing loader may have set it first; its count is the same.
+            let _ = facts.dir_children.set(dir_children);
+        }
+        Section::DirNames => {
+            let dir_children = *facts.dir_children.get().unwrap_or_else(|| {
+                panic!("dir names checked before the names they need");
+            });
+            check_dir_names(l, get(Section::DirNames), get(Section::Names), dir_children)?;
+        }
         Section::Dev => check_dictionary(l, Column::Dev, get(Section::Dev))?,
         Section::Mode => check_dictionary(l, Column::Mode, get(Section::Mode))?,
         Section::Owner => check_dictionary(l, Column::Owner, get(Section::Owner))?,
@@ -950,10 +1195,12 @@ pub(crate) fn check<'a>(
             }
         }
         Section::Docs => {
+            // Each id as the reader decodes it: sorted, and assigned.
+            let ids = l.view(Column::DocId, get(Section::Docs));
             let mut last = None;
-            for row in get(Section::Docs).chunks_exact(DOC_ROW) {
-                let id = u32_at(row, 0);
-                if id >= l.next_doc || last.is_some_and(|last| id <= last) {
+            for (row, id) in ids.values(l.docs).enumerate() {
+                let id = id.wrapping_add(row as u64);
+                if id >= u64::from(l.next_doc) || last.is_some_and(|last| id <= last) {
                     return Err(DecodeError::Corrupt("docs"));
                 }
                 last = Some(id);
@@ -1002,8 +1249,9 @@ fn check_dictionary(l: &Layout, column: Column, bytes: &[u8]) -> Result<(), Deco
 /// because `lookup` binary-searches them by name.
 ///
 /// One pass decodes each column once: name `i - 1`'s span is checked when
-/// row `i`'s offset, its end, has been.
-fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<(), DecodeError> {
+/// row `i`'s offset, its end, has been. Returns the names whose child is a
+/// directory, for [`check_dir_names`].
+fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeError> {
     if count_nuls(heap) != l.names {
         return Err(DecodeError::Corrupt("name order"));
     }
@@ -1026,7 +1274,7 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<(), DecodeError> 
         previous = Some((parent, name));
         Ok(())
     };
-    let (mut last_parent, mut next_offset) = (0, 0);
+    let (mut last_parent, mut next_offset, mut dir_children) = (0, 0, 0);
     let mut block = [[0; BLOCK]; 3];
     for first in (0..l.names).step_by(BLOCK) {
         let n = BLOCK.min(l.names - first);
@@ -1049,9 +1297,11 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<(), DecodeError> 
             open = Some((parent, offset as usize));
             last_parent = parent;
             next_offset = offset + 1;
+            dir_children += usize::from(child < l.dirs as u64);
         }
     }
-    close(heap.len(), open)
+    close(heap.len(), open)?;
+    Ok(dir_children)
 }
 
 /// Every directory's name edge names it, from a lower-numbered parent, so a
@@ -1064,9 +1314,15 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<(), DecodeError> 
 /// The converse is a count. The first loop proves each named directory's
 /// edge names it, so those edges are distinct names with directory children;
 /// if no other name has a directory child, every such name is some
-/// directory's edge. Counting them reads the child column in order, where a
-/// check per name looked up its child's edge at random.
-fn check_dir_names(l: &Layout, dir_names: &[u8], rows: &[u8]) -> Result<(), DecodeError> {
+/// directory's edge. The names with a directory child, `dir_children`, were
+/// counted as [`check_names`] decoded the child column, where a check per
+/// name looked up its child's edge at random.
+fn check_dir_names(
+    l: &Layout,
+    dir_names: &[u8],
+    rows: &[u8],
+    dir_children: usize,
+) -> Result<(), DecodeError> {
     let dir_names = l.view(Column::DirName, dir_names);
     let parents = l.view(Column::NameParent, rows);
     let children = l.view(Column::NameChild, rows);
@@ -1084,10 +1340,6 @@ fn check_dir_names(l: &Layout, dir_names: &[u8], rows: &[u8]) -> Result<(), Deco
         }
         named += 1;
     }
-    let dir_children = children
-        .values(l.names)
-        .filter(|&child| child < l.dirs as u64)
-        .count();
     if dir_children != named {
         return Err(DecodeError::Corrupt("dir names"));
     }

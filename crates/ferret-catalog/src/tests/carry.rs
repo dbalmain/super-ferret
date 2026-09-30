@@ -182,3 +182,62 @@ fn dead_docs_are_dropped_and_the_counter_never_goes_back() {
     let state = third.inode(at(&third, "/c/x")).state;
     assert_eq!(state, ContentState::Hashed);
 }
+
+/// The docs' id column's width: 0 when the ids have no holes.
+fn doc_id_width(catalog: &crate::Catalog) -> u32 {
+    let widths: Vec<u32> = catalog
+        .column_widths()
+        .filter(|&(section, _, _)| section == crate::Section::Docs)
+        .map(|(_, width, _)| width)
+        .collect();
+    assert_eq!(widths.len(), 1);
+    widths[0]
+}
+
+#[test]
+fn doc_ids_with_and_without_holes_read_back_by_id() {
+    // Ids 0, 1, 2 have no holes; with x dead, 1 and 2 have none either but
+    // start above 0; then x's content returns under id 3, leaving 1, 2, 3.
+    // With z dead, 1 and 3 leave a hole. Each generation must read every
+    // live id back, dead and unassigned ids as none, both through the dense
+    // path (width 0, a row by subtraction) and the sparse one (a search).
+    let scratch = Scratch::new("doc-id-holes");
+    let file = |name, ino, n| (name, file_stat(ino), Content::Hashed(hash(n)));
+    let (x, y, z) = (file("x", 10, 1), file("y", 11, 2), file("z", 12, 3));
+    let steps: [(&[_], &[u32], u32); 4] = [
+        (&[x, y, z], &[0, 1, 2], 0),
+        (&[y, z], &[1, 2], 0),
+        (&[y, z, file("w", 13, 1)], &[1, 2, 3], 0),
+        (&[y, file("w", 13, 1)], &[1, 3], 1),
+    ];
+    for (files, ids, width) in steps {
+        let catalog = generation(&scratch.path, files);
+        let live: Vec<u32> = catalog.docs().map(|(id, _)| id.0).collect();
+        assert_eq!(live, ids);
+        assert_eq!(doc_id_width(&catalog), width, "ids {ids:?}");
+        for id in 0..catalog.next_doc().0 + 2 {
+            let expect = catalog.docs().find(|&(d, _)| d.0 == id).map(|(_, h)| h);
+            assert_eq!(catalog.doc_hash(DocId(id)), expect, "ids {ids:?}, id {id}");
+        }
+    }
+
+    // Ids 0 and 2, then 0, 2 and 5: holes of one and three, sparse.
+    let scratch = Scratch::new("doc-id-sparse");
+    let (a, b, c) = (file("a", 20, 7), file("b", 21, 8), file("c", 22, 9));
+    generation(&scratch.path, &[a, b, c]);
+    let sparse = generation(&scratch.path, &[a, c]);
+    assert_eq!(sparse.docs().map(|(id, _)| id.0).collect::<Vec<_>>(), [0, 2]);
+    assert!(doc_id_width(&sparse) > 0);
+    let (d, e) = (file("d", 23, 10), file("e", 24, 11));
+    generation(&scratch.path, &[a, c, d, e]);
+    let sparse = generation(&scratch.path, &[a, c, e]);
+    assert_eq!(sparse.docs().map(|(id, _)| id.0).collect::<Vec<_>>(), [0, 2, 4]);
+    assert!(doc_id_width(&sparse) > 0);
+    for id in 0..6 {
+        let expect = [(0, 7), (2, 9), (4, 11)]
+            .into_iter()
+            .find(|&(d, _)| d == id)
+            .map(|(_, n)| hash(n));
+        assert_eq!(sparse.doc_hash(DocId(id)), expect, "id {id}");
+    }
+}

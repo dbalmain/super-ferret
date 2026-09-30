@@ -3,7 +3,7 @@
 use super::{SNIFFER, Scratch, commit, dir_stat, file_stat, hash, link_stat};
 use std::path::Path;
 
-use crate::format::{self, COLUMNS, Column, SECTIONS, TABLE_END};
+use crate::format::{self, COLUMNS, Coding, Column, HEADER, SECTIONS, TABLE_END};
 use crate::packed;
 use crate::{
     BeginError, Catalog, Content, DecodeError, InoId, NameId, OpenError, Section, Stat,
@@ -50,7 +50,7 @@ fn sample(name: &str) -> Vec<u8> {
 
 /// Where `section` starts in `bytes`, from its table.
 fn section_start(bytes: &[u8], section: Section) -> usize {
-    let at = 36 + section as usize * 16;
+    let at = HEADER + section as usize * 16;
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
 }
 
@@ -60,17 +60,26 @@ fn descriptor(column: Column) -> usize {
 }
 
 /// Overwrites row `row` of `column` with the packed value `raw`, leaving
-/// everything else as it was.
+/// everything else as it was. In a blocked column, `raw` is above the row's
+/// block's base, at its block's width.
 fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
     let layout = format::decode_table(bytes, bytes.len() as u64).unwrap();
     let placed = layout.columns[column as usize];
-    let width = placed.desc.width as usize;
-    assert!(
-        raw <= packed::mask(placed.desc.width),
-        "{raw} does not fit {width} bits"
-    );
-    let values =
+    let start =
         section_start(bytes, column.section()) + placed.start + placed.desc.dict_len as usize * 8;
+    let (values, width, row) = match column.coding() {
+        Coding::Blocked => {
+            let count = layout.count(column.rows()) as u32;
+            let entry = start + row / packed::BLOCK_ROWS * packed::BLOCK_ENTRY as usize + 8;
+            let word = u64::from_le_bytes(bytes[entry..entry + 8].try_into().unwrap());
+            let table = (packed::blocks(count) * packed::BLOCK_ENTRY) as usize;
+            let values = start + table + (word >> 8) as usize;
+            (values, (word & 0xFF) as u32, row % packed::BLOCK_ROWS)
+        }
+        _ => (start, placed.desc.width, row),
+    };
+    assert!(raw <= packed::mask(width), "{raw} does not fit {width} bits");
+    let width = width as usize;
     for bit in 0..width {
         let at = row * width + bit;
         let byte = &mut bytes[values + at / 8];
@@ -323,14 +332,14 @@ fn every_single_bit_flip_is_an_error_or_reads_safely() {
 
 #[test]
 fn a_corrupt_section_fails_only_the_load_that_reads_it() {
-    // A flipped doc id (made to repeat its predecessor) is invisible to a
-    // name query, which never reads the docs; loading them refuses.
+    // Doc ids moved past the next DocId (the id column's base set to it) are
+    // invisible to a name query, which never reads the docs; loading them
+    // refuses.
     let mut bytes = sample("decode-partial");
     let docs = Catalog::from_bytes(bytes.clone()).unwrap();
     assert_eq!(docs.doc_count(), 2);
-    let start = section_start(&bytes, Section::Docs);
-    let first = bytes[start..start + 4].to_vec();
-    bytes[start + 20..start + 24].copy_from_slice(&first);
+    let next = u64::from(docs.next_doc().0);
+    set_descriptor(&mut bytes, Column::DocId, 0, &next.to_le_bytes());
     let scratch = Scratch::new("decode-partial-lazy");
     write_catalog(&scratch.path, &bytes);
 
@@ -348,6 +357,67 @@ fn a_corrupt_section_fails_only_the_load_that_reads_it() {
         Err(OpenError::Decode(DecodeError::Corrupt("docs")))
     ));
     assert!(!catalog.is_loaded(Section::Docs));
+}
+
+#[test]
+fn doc_ids_that_stop_increasing_are_rejected() {
+    // Ids 0, 2 and 3 (1 died) are stored as 0, 1, 1 above each row; the last
+    // set to 0 reads back as id 2 again, and `doc_hash` would search a
+    // column that is not sorted.
+    let scratch = Scratch::new("decode-doc-order");
+    let file = |name: &[u8], ino, n| (name.to_vec(), file_stat(ino), Content::Hashed(hash(n)));
+    let files = [file(b"a", 10, 1), file(b"b", 11, 2), file(b"c", 12, 3), file(b"d", 13, 4)];
+    for kept in [&files[..], &[files[0].clone(), files[2].clone(), files[3].clone()]] {
+        commit(&scratch.path, |txn| {
+            let mut w = txn.batch();
+            let root = w.root(b"/s", dir_stat(1));
+            for (name, stat, content) in kept {
+                w.file(root, name, *stat, *content);
+            }
+            txn.add(w);
+        });
+    }
+    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let catalog = Catalog::from_bytes(bytes.clone()).unwrap();
+    let ids: Vec<u32> = catalog.docs().map(|(id, _)| id.0).collect();
+    assert_eq!(ids, [0, 2, 3]);
+    set_raw(&mut bytes, Column::DocId, 2, 0);
+    assert_corrupt(bytes, "docs");
+}
+
+#[test]
+fn a_blocked_column_whose_table_misplaces_a_block_is_rejected_on_load() {
+    // The first block's entry moved one byte on, or made wider than the
+    // descriptor's widest block: its reads would land on the wrong bits, or
+    // past the column's end.
+    let bytes = sample("decode-blocked");
+    let layout = format::decode_table(&bytes, bytes.len() as u64).unwrap();
+    let scratch = Scratch::new("decode-blocked-lazy");
+    for column in [Column::NameOffset, Column::Nlink] {
+        let placed = layout.columns[column as usize];
+        let entry = section_start(&bytes, column.section()) + placed.start + 8;
+        let width = u64::from(placed.desc.width);
+        for (what, word) in [("offset", 1 << 8 | width), ("width", width + 1)] {
+            let mut bad = bytes.clone();
+            bad[entry..entry + 8].copy_from_slice(&word.to_le_bytes());
+            let label = column.section().label();
+            let context = format!("{column:?} {what}");
+            assert_eq!(
+                Catalog::from_bytes(bad.clone()).err(),
+                Some(DecodeError::Corrupt(label)),
+                "{context}"
+            );
+            write_catalog(&scratch.path, &bad);
+            let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+            assert!(
+                matches!(
+                    catalog.load(&[column.section()]),
+                    Err(OpenError::Decode(DecodeError::Corrupt(l))) if l == label
+                ),
+                "{context}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -568,7 +638,7 @@ fn directories_with_swapped_name_edges_are_rejected() {
 /// only the section's own length check can object. Bytes are added as zeros
 /// and removed from the end.
 fn resize_section(bytes: &[u8], section: Section, delta: isize) -> Vec<u8> {
-    let table = |i: usize| 36 + i * 16;
+    let table = |i: usize| HEADER + i * 16;
     let at = section as usize;
     let read = |i: usize, off: usize| {
         u64::from_le_bytes(bytes[table(i) + off..][..8].try_into().unwrap()) as usize

@@ -31,7 +31,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, BufWriter};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -367,7 +367,7 @@ impl Transaction {
             docs: &self.docs,
             next_doc,
         };
-        let plan = build::plan(&self.batches, self.sniffer, known).map_err(CommitError::Build)?;
+        let plan = build::plan(&mut self.batches, self.sniffer, known).map_err(CommitError::Build)?;
         let batches = std::mem::take(&mut self.batches);
         self.docs = Vec::new();
 
@@ -427,13 +427,9 @@ fn identity(old: &Catalog, id: u32) -> (u64, u64) {
     old.identity(InoId(id))
 }
 
-fn write_synced(
-    path: &Path,
-    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
-) -> io::Result<()> {
-    let mut out = BufWriter::with_capacity(1 << 20, File::create(path)?);
-    write(&mut out)?;
-    let file = out.into_inner().map_err(io::IntoInnerError::into_error)?;
+fn write_synced(path: &Path, write: impl FnOnce(&File) -> io::Result<()>) -> io::Result<()> {
+    let file = File::create(path)?;
+    write(&file)?;
     file.sync_all()
 }
 

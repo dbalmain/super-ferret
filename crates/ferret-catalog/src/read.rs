@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::batch::{Stat, WorkTreeKind};
 use crate::format::{
-    self, COLUMNS, Column, DOC_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
+    self, COLUMNS, Column, Facts, HASH_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
     WORK_TREE_ROW, u32_at, u64_at,
 };
 use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
@@ -122,6 +122,8 @@ enum Source {
         sections: Box<[OnceLock<Box<[u8]>>; SECTIONS.len()]>,
         /// Bytes read from the file so far, header and table included.
         read: AtomicU64,
+        /// What the checks of loaded sections found, for later checks.
+        facts: Facts,
     },
 }
 
@@ -145,6 +147,7 @@ impl Catalog {
                 file,
                 sections: Default::default(),
                 read: AtomicU64::new(head.len() as u64),
+                facts: Facts::default(),
             },
         }))
     }
@@ -177,6 +180,7 @@ impl Catalog {
             file,
             sections,
             read,
+            facts,
         } = &self.source
         else {
             return Ok(());
@@ -191,7 +195,7 @@ impl Catalog {
         file.read_exact_at(&mut bytes, start as u64)
             .map_err(OpenError::Io)?;
         read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        format::check(section, &self.layout, |s| {
+        format::check(section, &self.layout, facts, |s| {
             if s == section {
                 &bytes[..]
             } else {
@@ -263,10 +267,9 @@ impl Catalog {
         self.layout.names as u32
     }
 
-    /// Live documents. Known from the section table; loads nothing.
+    /// Live documents. Known from the head of the file; loads nothing.
     pub fn doc_count(&self) -> u32 {
-        let (start, end) = self.layout.range(Section::Docs);
-        ((end - start) / DOC_ROW) as u32
+        self.layout.docs as u32
     }
 
     /// The bytes before the first section: header, section table and column
@@ -588,28 +591,29 @@ impl Catalog {
 
     /// Every live document with its hash, by id. Needs [`Section::Docs`].
     pub fn docs(&self) -> impl Iterator<Item = (DocId, Hash)> + '_ {
-        self.section(Section::Docs)
-            .chunks_exact(DOC_ROW)
-            .map(doc_row)
+        let ids = self.column(Column::DocId);
+        (0..self.layout.docs).map(move |row| (DocId(ids.sequence(row) as u32), self.hash(row)))
     }
 
     /// A live document's hash; `None` if the id is dead or never assigned.
-    /// Needs [`Section::Docs`].
+    /// Needs [`Section::Docs`]. Where the generation's ids have no holes, the
+    /// row is the id less the first; otherwise a binary search.
     pub fn doc_hash(&self, doc: DocId) -> Option<Hash> {
-        let rows = self.section(Section::Docs);
-        let n = rows.len() / DOC_ROW;
-        let at = partition_point(n, |i| u32_at(rows, i * DOC_ROW) < doc.0);
-        (at < n)
-            .then(|| doc_row(&rows[at * DOC_ROW..][..DOC_ROW]))
-            .filter(|&(id, _)| id == doc)
-            .map(|(_, h)| h)
+        let (ids, n, doc) = (self.column(Column::DocId), self.layout.docs, u64::from(doc.0));
+        let at = match ids.dense() {
+            Some(first) => doc.checked_sub(first).map_or(n, |row| row.min(n as u64) as usize),
+            None => partition_point(n, |i| ids.sequence(i) < doc),
+        };
+        (at < n && ids.sequence(at) == doc).then(|| self.hash(at))
     }
-}
 
-fn doc_row(row: &[u8]) -> (DocId, Hash) {
-    let mut hash = [0; 16];
-    hash.copy_from_slice(&row[4..20]);
-    (DocId(u32_at(row, 0)), hash)
+    /// Document row `row`'s hash.
+    fn hash(&self, row: usize) -> Hash {
+        let at = self.layout.hashes + row * HASH_ROW;
+        let mut hash = [0; HASH_ROW];
+        hash.copy_from_slice(&self.section(Section::Docs)[at..at + HASH_ROW]);
+        hash
+    }
 }
 
 fn push_component(out: &mut Vec<u8>, name: &[u8]) {

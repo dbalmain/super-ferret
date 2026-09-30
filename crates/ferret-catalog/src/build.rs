@@ -25,20 +25,25 @@
 //! `u32`s per entry and never copies an entry: edges are entry numbers grouped
 //! by parent with a counting pass, files are deduplicated by sorting
 //! `(fingerprint, name position, file)` triples rather than through a map, and
-//! documents by sorting `(hash, inode)` pairs. [`write`] then streams the
-//! sections to the output in file order, so the encoded generation is never
-//! held in memory, and frees each batch's names once the name sections are
-//! out.
+//! documents by sorting `(hash, inode)` pairs; each batch's entry counts are
+//! freed as soon as the plan has them. [`write`] then writes every section
+//! to its place in the file through a bounded buffer per column, filling all
+//! of a table's columns in one pass over its rows, so the encoded generation
+//! is never held in memory; it frees each batch's names once the name
+//! sections are out.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
 
 use crate::batch::{Batch, Content, DirToken, Stat};
 use crate::format::{
-    self, Bits, COLUMNS, Coding, Column, ColumnWriter, DOC_ROW, Descriptor, Head, NONE, PAIR_ROW,
-    Range, SECTIONS, Section, WORK_TREE_ROW,
+    self, At, Bits, COLUMNS, Coding, Column, ColumnWriter, Descriptor, HASH_ROW, Head, NONE,
+    PAIR_ROW, Range, SECTIONS, Section, WORK_TREE_ROW,
 };
+use crate::packed::BlockSizer;
 use crate::{ContentState, Hash};
 
 /// Why a set of batches could not be built into a generation. Nothing is
@@ -158,6 +163,8 @@ pub(crate) struct Plan {
     /// Each file inode's DocId, or NONE.
     doc: Vec<u32>,
     heap_len: usize,
+    /// The name offsets' blocks: bytes of packed values, widest block.
+    offset_blocks: (u64, u32),
     /// (root InoId, offset in strings), sorted by path.
     roots: Vec<(u32, u32)>,
     strings: Vec<u8>,
@@ -186,32 +193,40 @@ impl Plan {
         &self.edges[self.edge_start[d] as usize..self.edge_start[d + 1] as usize]
     }
 
-    /// Each inode row's stat and `DocId` (or NONE), in inode order:
-    /// directories, then files and symlinks.
-    fn inode_rows<'a>(&'a self, batches: &'a [Batch]) -> impl Iterator<Item = (&'a Stat, u32)> {
+    /// Each inode row's stat, `DocId` (or NONE) and content state, in inode
+    /// order: directories, then files and symlinks.
+    fn inode_rows<'a>(
+        &'a self,
+        batches: &'a [Batch],
+    ) -> impl Iterator<Item = (&'a Stat, u32, ContentState)> {
         let dirs = self.order.iter().map(|&dir| {
             let (b, d) = self.index.dir(dir as usize);
-            (&batches[b].dir_stats[d], NONE)
+            (&batches[b].dir_stats[d], NONE, ContentState::Unindexed)
         });
-        let files = self.winner.iter().zip(&self.doc).map(|(&file, &doc)| {
+        let files = self.winner.iter().enumerate().map(|(k, &file)| {
             let (b, f) = self.index.file(file as usize);
-            (&batches[b].file_stats[f], doc)
+            let state = match self.fault[k] {
+                true => ContentState::Fault,
+                false => batches[b].contents[f].state(),
+            };
+            (&batches[b].file_stats[f], self.doc[k], state)
         });
         dirs.chain(files)
     }
 
     /// The head of the file, and each dictionary column's sorted values.
-    /// One pass over the inode rows finds every stat column's range and
-    /// distinct values; the id columns are sized from the counts.
+    /// One pass over the inode rows finds every stat column's range, blocks
+    /// and distinct values; the id columns are sized from the counts.
     fn head(&self, batches: &[Batch]) -> (Head, [Vec<u64>; COLUMNS.len()]) {
         let dirs = self.index.dirs;
         let (inodes, names) = (dirs + self.winner.len(), self.edges.len());
         let mut ranges = [Range::default(); COLUMNS.len()];
         let mut sets: [HashSet<u64>; COLUMNS.len()] = Default::default();
+        let mut blocks: [BlockSizer; COLUMNS.len()] = Default::default();
         // Neighbouring rows nearly always share a dictionary value; skipping
         // the repeat saves a hash per row.
         let mut last = [None; COLUMNS.len()];
-        for (stat, doc) in self.inode_rows(batches) {
+        for (stat, doc, _) in self.inode_rows(batches) {
             for column in STAT_COLUMNS {
                 let (c, value) = (column as usize, stat_field(column, stat));
                 match column.coding() {
@@ -220,7 +235,8 @@ impl Plan {
                         last[c] = Some(value);
                     }
                     Coding::Dictionary => {}
-                    Coding::Frame | Coding::Nullable => ranges[c].add(value),
+                    Coding::Blocked => blocks[c].push(value),
+                    Coding::Frame | Coding::Nullable | Coding::Sequence => ranges[c].add(value),
                 }
             }
             if doc != NONE {
@@ -237,16 +253,22 @@ impl Plan {
         if names > 0 {
             ranges[Column::NameParent as usize] = below(dirs);
             ranges[Column::NameChild as usize] = below(inodes);
-            ranges[Column::NameOffset as usize] = below(self.heap_len);
         }
         ranges[Column::DirName as usize] = below(names);
+        for (row, &(_, id)) in self.docs.iter().enumerate() {
+            ranges[Column::DocId as usize].add(u64::from(id) - row as u64);
+        }
 
         let mut dicts: [Vec<u64>; COLUMNS.len()] = Default::default();
         let columns = COLUMNS.map(|column| {
             let c = column as usize;
             match column.coding() {
-                Coding::Frame => Descriptor::frame(ranges[c]),
+                Coding::Frame | Coding::Sequence => Descriptor::frame(ranges[c]),
                 Coding::Nullable => Descriptor::nullable(ranges[c]),
+                Coding::Blocked if column == Column::NameOffset => {
+                    Descriptor::blocked(self.offset_blocks)
+                }
+                Coding::Blocked => Descriptor::blocked(std::mem::take(&mut blocks[c]).finish()),
                 Coding::Dictionary => {
                     let mut dict: Vec<u64> = std::mem::take(&mut sets[c]).into_iter().collect();
                     dict.sort_unstable();
@@ -265,7 +287,7 @@ impl Plan {
             (Section::States, inodes.div_ceil(4)),
             (Section::Links, self.links.len() * PAIR_ROW),
             (Section::WorkTrees, self.work_trees.len() * WORK_TREE_ROW),
-            (Section::Docs, self.docs.len() * DOC_ROW),
+            (Section::Docs, self.docs.len() * HASH_ROW),
         ] {
             lens[section as usize] = len as u64;
         }
@@ -275,6 +297,7 @@ impl Plan {
             dirs: dirs as u32,
             inodes: inodes as u32,
             names: names as u32,
+            docs: self.docs.len() as u32,
             columns,
             lens,
         };
@@ -315,8 +338,13 @@ fn stat_field(column: Column, stat: &Stat) -> u64 {
 }
 
 /// Decides every id of the new generation, or finds why it cannot be built.
-/// Writes nothing, so every [`BuildError`] comes before the first byte.
-pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<Plan, BuildError> {
+/// Writes nothing, so every [`BuildError`] comes before the first byte. Takes
+/// each batch's entry counts, which nothing needs once they are in the plan.
+pub(crate) fn plan(
+    batches: &mut [Batch],
+    sniffer: u32,
+    known: Known<'_>,
+) -> Result<Plan, BuildError> {
     if batches.iter().any(|b| b.overflow) {
         return Err(BuildError::TooLarge);
     }
@@ -325,17 +353,16 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
     if dirs + files >= NONE as usize {
         return Err(BuildError::TooLarge);
     }
-    let position: HashMap<u32, usize> =
-        batches.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
-    let dir_base = index.dir_base.clone();
+    // Each batch's first directory number and its directories, by batch id.
+    let position: HashMap<u32, (usize, usize)> = batches
+        .iter()
+        .zip(&index.dir_base)
+        .map(|(b, &base)| (b.id, (base, b.dirs.len())))
+        .collect();
     let resolve = |token: DirToken| -> Result<usize, BuildError> {
-        let &i = position
-            .get(&token.batch)
-            .ok_or(BuildError::UnknownToken(token))?;
-        if (token.index as usize) < batches[i].dirs.len() {
-            Ok(dir_base[i] + token.index as usize)
-        } else {
-            Err(BuildError::UnknownToken(token))
+        match position.get(&token.batch) {
+            Some(&(base, len)) if (token.index as usize) < len => Ok(base + token.index as usize),
+            _ => Err(BuildError::UnknownToken(token)),
         }
     };
 
@@ -393,6 +420,7 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
         fault: Vec::new(),
         doc: Vec::new(),
         heap_len: 0,
+        offset_blocks: (0, 0),
         roots: Vec::with_capacity(roots.len()),
         strings: Vec::new(),
         links: Vec::new(),
@@ -414,6 +442,7 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
     // child directories, and note each file's first name position.
     let mut file_pos = vec![NONE; files];
     let mut name_id = 0usize;
+    let mut offsets = BlockSizer::default();
     let mut next = 0;
     while next < plan.order.len() {
         let global = plan.order[next] as usize;
@@ -440,6 +469,7 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
             if name_id >= NONE as usize {
                 return Err(BuildError::TooLarge);
             }
+            offsets.push(plan.heap_len as u64);
             plan.heap_len = plan
                 .heap_len
                 .checked_add(name.len() + 1)
@@ -460,9 +490,10 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
     if plan.order.len() != dirs {
         return Err(BuildError::Unreachable);
     }
+    plan.offset_blocks = offsets.finish();
 
-    for batch in batches {
-        for &(dir, count) in &batch.entry_counts {
+    for batch in batches.iter_mut() {
+        for (dir, count) in std::mem::take(&mut batch.entry_counts) {
             plan.entry_count[resolve(dir)?] = count;
         }
     }
@@ -689,54 +720,45 @@ fn split_hash(hash: &Hash) -> (u64, u64) {
     (u64::from_be_bytes(hi), u64::from_be_bytes(lo))
 }
 
-/// Streams the planned generation to `out` in file order, freeing each
-/// batch's names once the name sections are written and the batches once the
-/// inode sections are. Each inode column is one pass over the rows.
-pub(crate) fn write(
-    mut plan: Plan,
-    mut batches: Vec<Batch>,
-    out: &mut impl Write,
-) -> io::Result<()> {
+/// Writes the planned generation to `out`: the head, then each section at the
+/// place the head gives it. Each table's columns fill in one pass over its
+/// rows, each column through its own bounded buffer (D40). Frees each batch's
+/// names once the name sections are written, and the batches once the inode
+/// sections are.
+pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::Result<()> {
     let (head, dicts) = plan.head(&batches);
-    format::write_head(out, &head)?;
-    let start = |out: &mut _, column: Column| {
-        ColumnWriter::start(out, head.columns[column as usize], &dicts[column as usize])
-    };
+    let (bytes, len) = head.encode();
+    out.write_all_at(&bytes, 0)?;
+    // The reader's placement of every section and column, from the head just
+    // made: the writer puts each exactly where a reader will look.
+    let layout = format::decode_table(&bytes, len).map_err(io::Error::other)?;
+    let column = |c: Column| ColumnWriter::start(out, &layout, c, &dicts[c as usize]);
+    let section = |s: Section| At::new(out, layout.range(s).0 as u64);
     let dirs = plan.index.dirs;
 
-    let mut column = start(out, Column::NameParent)?;
+    let (mut parents, mut children) = (column(Column::NameParent)?, column(Column::NameChild)?);
+    let (mut offsets, mut heap) = (column(Column::NameOffset)?, section(Section::NameHeap));
+    let mut offset = 0;
     for (id, &dir) in plan.order.iter().enumerate() {
-        for _ in plan.children(dir) {
-            column.value(out, id as u64)?;
-        }
-    }
-    column.finish(out)?;
-    let mut column = start(out, Column::NameChild)?;
-    for &dir in &plan.order {
         for &entry in plan.children(dir) {
             let e = entry as usize;
             let child = match e < dirs {
                 true => plan.dir_id[e],
                 false => plan.inode_of_file[e - dirs],
             };
-            column.value(out, u64::from(child))?;
+            let name = plan.name(&batches, entry);
+            parents.value(id as u64)?;
+            children.value(u64::from(child))?;
+            offsets.value(offset)?;
+            heap.write_all(name)?;
+            heap.write_all(&[0])?;
+            offset += name.len() as u64 + 1;
         }
     }
-    column.finish(out)?;
-    let (mut column, mut offset) = (start(out, Column::NameOffset)?, 0);
-    for &dir in &plan.order {
-        for &entry in plan.children(dir) {
-            column.value(out, offset)?;
-            offset += plan.name(&batches, entry).len() as u64 + 1;
-        }
-    }
-    column.finish(out)?;
-    for &dir in &plan.order {
-        for &entry in plan.children(dir) {
-            out.write_all(plan.name(&batches, entry))?;
-            out.write_all(&[0])?;
-        }
-    }
+    parents.finish()?;
+    children.finish()?;
+    offsets.finish()?;
+    heap.finish()?;
     plan.edges = Vec::new();
     plan.edge_start = Vec::new();
     plan.inode_of_file = Vec::new();
@@ -744,82 +766,89 @@ pub(crate) fn write(
     batches.iter_mut().for_each(Batch::drop_structure);
 
     let known = |id: u32| (id != NONE).then_some(u64::from(id));
-    let mut column = start(out, Column::DirName)?;
-    for &dir in &plan.order {
-        column.nullable(out, known(plan.name_of_dir[dir as usize]))?;
-    }
-    column.finish(out)?;
-    let mut column = start(out, Column::Entries)?;
-    for &dir in &plan.order {
-        column.nullable(out, known(plan.entry_count[dir as usize]))?;
-    }
-    column.finish(out)?;
-    let mut bits = Bits::new(1);
+    let (mut dir_names, mut entries) = (column(Column::DirName)?, column(Column::Entries)?);
+    let (mut traversed, mut bits) = (section(Section::Traversed), Bits::new(1));
     for &dir in &plan.order {
         let (b, d) = plan.index.dir(dir as usize);
-        bits.push(out, u8::from(batches[b].dirs[d].traversed))?;
+        dir_names.nullable(known(plan.name_of_dir[dir as usize]))?;
+        entries.nullable(known(plan.entry_count[dir as usize]))?;
+        bits.push(&mut traversed, u8::from(batches[b].dirs[d].traversed))?;
     }
-    bits.finish(out)?;
+    dir_names.finish()?;
+    entries.finish()?;
+    bits.finish(&mut traversed)?;
+    traversed.finish()?;
+    plan.entry_count = Vec::new();
+    let mut roots = section(Section::Roots);
     for &(dir, offset) in &plan.roots {
-        format::put_pair(out, dir, offset)?;
+        format::put_pair(&mut roots, dir, offset)?;
     }
-    out.write_all(&plan.strings)?;
+    roots.finish()?;
+    let mut strings = section(Section::Strings);
+    strings.write_all(&plan.strings)?;
+    strings.finish()?;
 
-    // Each stat column is its own pass over the rows. Finding each row's
-    // batch by binary search on every pass cost 1.2 s of the 10M build's
-    // 9.8 s of CPU, so each row's stat is found once: 8 B per inode, allocated
-    // after the names are freed, below the build's peak.
-    let stats: Vec<&Stat> = plan.inode_rows(&batches).map(|(stat, _)| stat).collect();
+    // Every inode column in one pass over the rows, each row's stat found
+    // once. A column of width 0 holds nothing per row, so it is only started
+    // and finished.
+    let mut stat_columns = Vec::new();
     for field in STAT_COLUMNS {
-        let dict = &dicts[field as usize];
-        let mut column = start(out, field)?;
-        for &stat in &stats {
-            let value = stat_field(field, stat);
+        stat_columns.push((field, column(field)?));
+    }
+    let (mut doc, mut states, mut state_bits) = (
+        column(Column::Doc)?,
+        section(Section::States),
+        Bits::new(2),
+    );
+    let doc_live = head.columns[Column::Doc as usize].width > 0;
+    let live = |field: Column| {
+        field.coding() == Coding::Blocked || head.columns[field as usize].width > 0
+    };
+    let (mut live_columns, mut idle): (Vec<_>, Vec<_>) =
+        stat_columns.into_iter().partition(|&(field, _)| live(field));
+    for (stat, doc_id, state) in plan.inode_rows(&batches) {
+        for (field, column) in &mut live_columns {
+            let value = stat_field(*field, stat);
             match field.coding() {
                 Coding::Dictionary => {
-                    column.index(out, dict.partition_point(|&known| known < value))?;
+                    let dict = &dicts[*field as usize];
+                    column.index(dict.partition_point(|&known| known < value))?;
                 }
-                Coding::Frame | Coding::Nullable => column.value(out, value)?,
+                _ => column.value(value)?,
             }
         }
-        column.finish(out)?;
+        if doc_live {
+            doc.nullable(known(doc_id))?;
+        }
+        state_bits.push(&mut states, state as u8)?;
     }
-    drop(stats);
-    let mut column = start(out, Column::Doc)?;
-    for _ in 0..dirs {
-        column.nullable(out, None)?;
+    for (_, column) in live_columns.drain(..).chain(idle.drain(..)) {
+        column.finish()?;
     }
-    for &doc in &plan.doc {
-        column.nullable(out, known(doc))?;
-    }
-    column.finish(out)?;
-    let mut bits = Bits::new(2);
-    for _ in 0..dirs {
-        bits.push(out, ContentState::Unindexed as u8)?;
-    }
-    for (k, &file) in plan.winner.iter().enumerate() {
-        let (b, f) = plan.index.file(file as usize);
-        let state = if plan.fault[k] {
-            ContentState::Fault
-        } else {
-            batches[b].contents[f].state()
-        };
-        bits.push(out, state as u8)?;
-    }
-    bits.finish(out)?;
+    doc.finish()?;
+    state_bits.finish(&mut states)?;
+    states.finish()?;
     drop(batches);
 
+    let mut links = section(Section::Links);
     for &(inode, offset) in &plan.links {
-        format::put_pair(out, inode, offset)?;
+        format::put_pair(&mut links, inode, offset)?;
     }
+    links.finish()?;
+    let mut work_trees = section(Section::WorkTrees);
     for &(dir, offset, common_id, kind) in &plan.work_trees {
-        format::put_work_tree(out, dir, offset, common_id, kind)?;
+        format::put_work_tree(&mut work_trees, dir, offset, common_id, kind)?;
     }
+    work_trees.finish()?;
+    let mut ids = column(Column::DocId)?;
+    let mut hashes = At::new(out, (layout.range(Section::Docs).0 + layout.hashes) as u64);
     for &((hi, lo), id) in &plan.docs {
-        format::put_u32(out, id)?;
-        out.write_all(&hi.to_be_bytes())?;
-        out.write_all(&lo.to_be_bytes())?;
+        ids.value(u64::from(id))?;
+        hashes.write_all(&hi.to_be_bytes())?;
+        hashes.write_all(&lo.to_be_bytes())?;
     }
+    ids.finish()?;
+    hashes.finish()?;
     Ok(())
 }
 

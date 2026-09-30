@@ -12,7 +12,8 @@
 //! padding.
 //!
 //! The values are raw: frame of reference, dictionaries and the none
-//! sentinel are the format's business (see `format`).
+//! sentinel are the format's business (see `format`), except in a
+//! [`Blocked`] column, which carries a frame per block of [`BLOCK_ROWS`] rows.
 
 use std::io::{self, Write};
 
@@ -145,9 +146,228 @@ impl Writer {
 
     /// Writes the last partial word and the padding.
     pub(crate) fn finish(self, out: &mut impl Write) -> io::Result<()> {
-        let tail = self.filled.div_ceil(8) as usize;
-        out.write_all(&self.pending.to_le_bytes()[..tail])?;
+        self.flush(out)?;
         out.write_all(&[0; PAD as usize])
+    }
+
+    /// Writes the last partial word, without padding: the end of one block.
+    fn flush(self, out: &mut impl Write) -> io::Result<()> {
+        let tail = self.filled.div_ceil(8) as usize;
+        out.write_all(&self.pending.to_le_bytes()[..tail])
+    }
+}
+
+/// Rows per block of a [`Blocked`] column. A power of two and a multiple of
+/// 64, so a validation run ([`Packed::decode`]'s) never spans two blocks and
+/// every full block ends on a byte. Measured on the synthetic 10M catalog's
+/// columns, from 64 to 4096: 128 is within 2% of the best size for name
+/// offsets, sizes and times, and 256 or more for nlink, whose blocks are
+/// nearly all width 0; 128 was the smallest total over those columns.
+pub(crate) const BLOCK_ROWS: usize = 128;
+
+/// Bytes per block in a blocked column's table: the block's base, then its
+/// values' byte offset shifted left 8 with its width in the low byte.
+pub(crate) const BLOCK_ENTRY: u64 = 16;
+
+/// The blocks a blocked column of `count` rows has.
+pub(crate) fn blocks(count: u32) -> u64 {
+    u64::from(count).div_ceil(BLOCK_ROWS as u64)
+}
+
+/// A blocked column's exact length in bytes: its block table, `values` bytes
+/// of packed blocks, and the padding. Saturates rather than overflow, since
+/// `values` comes from the file: no section is that long.
+pub(crate) fn blocked_len(count: u32, values: u64) -> u64 {
+    (blocks(count) * BLOCK_ENTRY)
+        .saturating_add(values)
+        .saturating_add(PAD)
+}
+
+/// The bytes of block `k`'s values for its `rows` rows at `width` bits.
+fn block_bytes(rows: usize, width: u32) -> u64 {
+    (rows as u64 * u64::from(width)).div_ceil(8)
+}
+
+/// A column in blocks of [`BLOCK_ROWS`] rows, each with its own frame of
+/// reference: value `i` is its block's base plus a packed value at the
+/// block's own width. A column whose neighbouring rows are close (offsets,
+/// which only grow; nlink, which is nearly always 1) is narrower per block
+/// than over the whole catalog. A read is two table loads more than
+/// [`Packed`]'s, and O(1).
+///
+/// ```text
+/// table    per block: base u64, (offset << 8 | width) u64    (BLOCK_ENTRY)
+/// values   each block's values, packed LSB first from a byte boundary
+/// padding  PAD bytes
+/// ```
+#[derive(Clone, Copy)]
+pub(crate) struct Blocked<'a> {
+    table: &'a [u8],
+    values: &'a [u8],
+    count: usize,
+}
+
+impl<'a> Blocked<'a> {
+    /// `bytes` must hold at least the table of a `count`-row column; the
+    /// decoder checked its exact length, and [`Blocked::check`] every entry,
+    /// before any read.
+    pub(crate) fn new(bytes: &'a [u8], count: u32) -> Self {
+        let (table, values) = bytes.split_at((blocks(count) * BLOCK_ENTRY) as usize);
+        Self {
+            table,
+            values,
+            count: count as usize,
+        }
+    }
+
+    /// Block `k`'s base, values offset and width.
+    fn entry(&self, k: usize) -> (u64, usize, u32) {
+        let at = k * BLOCK_ENTRY as usize;
+        let word = |at: usize| {
+            let mut b = [0; 8];
+            b.copy_from_slice(&self.table[at..at + 8]);
+            u64::from_le_bytes(b)
+        };
+        let (base, packed) = (word(at), word(at + 8));
+        (base, (packed >> 8) as usize, (packed & 0xFF) as u32)
+    }
+
+    /// Whether every entry is one a read can trust: each offset exactly
+    /// where the blocks before it end, the last block ending at `values`
+    /// bytes (the length the descriptor gave the values), and the widest
+    /// block exactly `max_width`, which is at most [`MAX_WIDTH`]: so every
+    /// width is too, and the descriptor is exact.
+    pub(crate) fn check(&self, max_width: u32, values: u64) -> bool {
+        let (mut end, mut widest) = (0, 0);
+        for k in 0..self.table.len() / BLOCK_ENTRY as usize {
+            let (_, offset, width) = self.entry(k);
+            if offset as u64 != end {
+                return false;
+            }
+            end += block_bytes(BLOCK_ROWS.min(self.count - k * BLOCK_ROWS), width);
+            widest = widest.max(width);
+        }
+        end == values && widest == max_width
+    }
+
+    /// Value `i`. Panics past the column's end, as indexing a slice does.
+    pub(crate) fn get(&self, i: usize) -> u64 {
+        let (base, offset, width) = self.entry(i / BLOCK_ROWS);
+        base.wrapping_add(Packed::new(&self.values[offset..], width).get(i % BLOCK_ROWS))
+    }
+
+    /// Values `first..first + out.len()` into `out`, a run of a pass over the
+    /// column; `first` is a multiple of 8. See [`Packed::decode`].
+    pub(crate) fn decode(&self, first: usize, out: &mut [u64]) {
+        let mut done = 0;
+        while done < out.len() {
+            let row = first + done;
+            let (base, offset, width) = self.entry(row / BLOCK_ROWS);
+            let n = (BLOCK_ROWS - row % BLOCK_ROWS).min(out.len() - done);
+            let run = &mut out[done..done + n];
+            Packed::new(&self.values[offset..], width).decode(row % BLOCK_ROWS, run);
+            for value in run {
+                *value = base.wrapping_add(*value);
+            }
+            done += n;
+        }
+    }
+}
+
+/// Finds a blocked column's values length and widest block from its values
+/// in order, holding one block's range.
+#[derive(Default)]
+pub(crate) struct BlockSizer {
+    range: Option<(u64, u64)>,
+    rows: usize,
+    values: u64,
+    width: u32,
+}
+
+impl BlockSizer {
+    pub(crate) fn push(&mut self, value: u64) {
+        let (min, max) = self.range.unwrap_or((value, value));
+        self.range = Some((min.min(value), max.max(value)));
+        self.rows += 1;
+        if self.rows == BLOCK_ROWS {
+            self.close();
+        }
+    }
+
+    fn close(&mut self) {
+        if let Some((min, max)) = self.range.take() {
+            let w = width(max - min);
+            self.values += block_bytes(self.rows, w);
+            self.width = self.width.max(w);
+        }
+        self.rows = 0;
+    }
+
+    /// The bytes of packed values, and the widest block.
+    pub(crate) fn finish(mut self) -> (u64, u32) {
+        self.close();
+        (self.values, self.width)
+    }
+}
+
+/// Streams a blocked column: holds one block of values, then writes its
+/// table entry to one output and its packed values to another, so neither
+/// the table nor the values are ever held whole.
+pub(crate) struct BlockedWriter {
+    block: [u64; BLOCK_ROWS],
+    rows: usize,
+    offset: u64,
+}
+
+impl BlockedWriter {
+    pub(crate) fn new() -> Self {
+        Self {
+            block: [0; BLOCK_ROWS],
+            rows: 0,
+            offset: 0,
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        table: &mut impl Write,
+        values: &mut impl Write,
+        value: u64,
+    ) -> io::Result<()> {
+        self.block[self.rows] = value;
+        self.rows += 1;
+        if self.rows == BLOCK_ROWS {
+            self.close(table, values)?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self, table: &mut impl Write, values: &mut impl Write) -> io::Result<()> {
+        let block = &self.block[..self.rows];
+        let (Some(&min), Some(&max)) = (block.iter().min(), block.iter().max()) else {
+            return Ok(());
+        };
+        let w = width(max - min);
+        table.write_all(&min.to_le_bytes())?;
+        table.write_all(&(self.offset << 8 | u64::from(w)).to_le_bytes())?;
+        let mut writer = Writer::new(w);
+        for &value in block {
+            writer.push(values, value - min)?;
+        }
+        writer.flush(values)?;
+        self.offset += block_bytes(self.rows, w);
+        self.rows = 0;
+        Ok(())
+    }
+
+    /// Writes the last partial block and the padding.
+    pub(crate) fn finish(
+        mut self,
+        table: &mut impl Write,
+        values: &mut impl Write,
+    ) -> io::Result<()> {
+        self.close(table, values)?;
+        values.write_all(&[0; PAD as usize])
     }
 }
 
@@ -268,6 +488,106 @@ mod tests {
         assert_eq!(pack(0, &[0; 1000]), [0; PAD as usize]);
         assert_eq!(pack(64, &[]), [0; PAD as usize]);
         assert_eq!(Packed::new(&[0; 8], 0).get(999_999), 0);
+    }
+
+    /// A blocked column of `values`: its bytes, values length and widest
+    /// block, as a sizing pass and the writer find them.
+    fn pack_blocked(values: &[u64]) -> (Vec<u8>, u64, u32) {
+        let mut sizer = BlockSizer::default();
+        values.iter().for_each(|&v| sizer.push(v));
+        let (len, widest) = sizer.finish();
+        let (mut table, mut packed) = (Vec::new(), Vec::new());
+        let mut writer = BlockedWriter::new();
+        for &v in values {
+            writer.push(&mut table, &mut packed, v).unwrap();
+        }
+        writer.finish(&mut table, &mut packed).unwrap();
+        table.extend(packed);
+        (table, len, widest)
+    }
+
+    /// Blocks of every width from 0 to 64, each block's values spread over
+    /// its width above a base that differs per block; the last block short.
+    fn blocked_values(count: usize) -> Vec<u64> {
+        (0..count)
+            .map(|i| {
+                let (block, row) = (i / BLOCK_ROWS, i % BLOCK_ROWS);
+                let w = (block * 7 % 65) as u32;
+                let spread = values(w, BLOCK_ROWS)[row];
+                // Width 64 has no room for a base; the others sit above one.
+                let base = if w == 64 { 0 } else { (block as u64) << 40 };
+                base.wrapping_add(spread)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_blocked_column_round_trips_at_every_block_width() {
+        let widths: Vec<u32> = (0..65).map(|b| (b * 7 % 65) as u32).collect();
+        assert!(widths.contains(&0) && widths.contains(&64));
+        for count in [0, 1, 8, 127, 128, 129, 1000, 65 * BLOCK_ROWS + 3] {
+            let values = blocked_values(count);
+            let (bytes, len, widest) = pack_blocked(&values);
+            assert_eq!(bytes.len() as u64, blocked_len(count as u32, len), "n {count}");
+            let column = Blocked::new(&bytes, count as u32);
+            assert!(column.check(widest, len), "n {count}");
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(column.get(i), v, "n {count} i {i}");
+            }
+            // Runs from multiples of 8, some across a block boundary.
+            for first in (0..count).step_by(8) {
+                for len in [1, 8, 64, 200] {
+                    let end = (first + len).min(count);
+                    let mut out = vec![0; end - first];
+                    column.decode(first, &mut out);
+                    assert_eq!(out, values[first..end], "n {count} {first}..{end}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_blocked_column_of_equal_values_is_only_its_table_and_padding() {
+        let (bytes, len, widest) = pack_blocked(&[5; 300]);
+        assert_eq!((len, widest), (0, 0));
+        assert_eq!(bytes.len() as u64, 3 * BLOCK_ENTRY + PAD);
+        let column = Blocked::new(&bytes, 300);
+        assert!((0..300).all(|i| column.get(i) == 5));
+    }
+
+    #[test]
+    fn a_blocked_table_that_misplaces_or_widens_a_block_is_refused() {
+        // Three blocks: widths 3, 9 and 3 (the last short), so the second
+        // block starts at 48 bytes and the third at 192.
+        let values: Vec<u64> = (0..300)
+            .map(|i| (i % 8) as u64 * if i / BLOCK_ROWS == 1 { 64 } else { 1 })
+            .collect();
+        let (bytes, len, widest) = pack_blocked(&values);
+        assert_eq!(widest, 9);
+        assert!(Blocked::new(&bytes, 300).check(widest, len));
+        let set = |k: usize, offset: u64, width: u64| {
+            let mut bad = bytes.clone();
+            let at = k * BLOCK_ENTRY as usize + 8;
+            bad[at..at + 8].copy_from_slice(&(offset << 8 | width).to_le_bytes());
+            bad
+        };
+        assert!(Blocked::new(&set(1, 48, 9), 300).check(widest, len), "unchanged");
+        for (what, bad) in [
+            ("wider than the column", set(1, 48, 10)),
+            ("wider than 64", set(2, 192, 200)),
+            ("an offset past its predecessor's end", set(1, 49, 9)),
+            ("an offset before it", set(1, 47, 9)),
+            // Narrower keeps the next offset wrong: the third block no
+            // longer starts where the second ends.
+            ("narrower than written", set(1, 48, 8)),
+        ] {
+            assert!(!Blocked::new(&bad, 300).check(widest, len), "{what}");
+        }
+        // The blocks agree with each other but not with the values length,
+        // or no block is as wide as the descriptor says.
+        let column = Blocked::new(&bytes, 300);
+        assert!(!column.check(widest, len + 1) && !column.check(widest, len - 1));
+        assert!(!column.check(widest + 1, len));
     }
 
     #[test]
