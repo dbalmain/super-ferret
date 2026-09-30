@@ -146,6 +146,8 @@ pub(crate) struct Plan {
     dir_id: Vec<u32>,
     /// Each directory's own NameId; NONE for a root.
     name_of_dir: Vec<u32>,
+    /// Raw entry count by directory (global number); NONE if unknown.
+    entry_count: Vec<u32>,
     /// InoId by file.
     inode_of_file: Vec<u32>,
     /// The file whose observation each file inode row takes, in inode order.
@@ -190,6 +192,7 @@ impl Plan {
         [
             self.edges.len() * NAME_ROW,
             self.heap_len,
+            dirs * 4,
             dirs * 4,
             dirs.div_ceil(8),
             self.roots.len() * PAIR_ROW,
@@ -276,6 +279,7 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
         order: Vec::with_capacity(dirs),
         dir_id: vec![NONE; dirs],
         name_of_dir: vec![NONE; dirs],
+        entry_count: vec![NONE; dirs],
         inode_of_file: Vec::new(),
         winner: Vec::new(),
         fault: Vec::new(),
@@ -347,6 +351,12 @@ pub(crate) fn plan(batches: &[Batch], sniffer: u32, known: Known<'_>) -> Result<
     }
     if plan.order.len() != dirs {
         return Err(BuildError::Unreachable);
+    }
+
+    for batch in batches {
+        for &(dir, count) in &batch.entry_counts {
+            plan.entry_count[resolve(dir)?] = count;
+        }
     }
 
     number_files(&mut plan, batches, file_pos)?;
@@ -610,6 +620,9 @@ pub(crate) fn write(
 
     for &dir in &plan.order {
         format::put_u32(out, plan.name_of_dir[dir as usize])?;
+    }
+    for &dir in &plan.order {
+        format::put_u32(out, plan.entry_count[dir as usize])?;
     }
     let mut bits = Bits::new(1);
     for &dir in &plan.order {

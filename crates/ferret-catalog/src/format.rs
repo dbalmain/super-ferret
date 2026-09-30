@@ -3,8 +3,8 @@
 //! ```text
 //! header   magic "FERRETCT" | version u32 | sniffer u32 | next_doc u32 |
 //!          section count u32                                    (24 B)
-//! table    (offset u64, length u64) per section, in SECTIONS order (176 B)
-//! sections contiguous from byte 200 to the end of the file, in order
+//! table    (offset u64, length u64) per section, in SECTIONS order (192 B)
+//! sections contiguous from byte 216 to the end of the file, in order
 //! ```
 //!
 //! All integers are little-endian and every row is fixed-width. The sections
@@ -15,11 +15,14 @@
 //! names       12 B  parent InoId, child InoId, offset in name heap
 //! name heap    1 B  names, each NUL-terminated, in NameId order (D28)
 //! dir names    4 B  per directory InoId: its NameId, or NONE for a root
+//! entries      4 B  per directory InoId: the entries `getdents` returned, minus
+//!                   `.` and `..`, before ignore rules; NONE if unknown
 //! traversed  1 bit  per directory: a structural row (D29), LSB first
 //! roots        8 B  root InoId, offset of its path in strings
 //! strings      1 B  root paths, link targets, work-tree paths; NUL-terminated
-//! inodes      64 B  dev, ino, size, mtime s, ctime s (u64/i64), mtime ns,
-//!                   ctime ns, mode, uid, gid, DocId or NONE (u32)
+//! inodes      72 B  dev, ino, size, mtime s, ctime s (u64/i64), mtime ns,
+//!                   ctime ns, mode, uid, gid, DocId or NONE (u32), nlink
+//!                   (u64)
 //! states     2 bit  per inode: ContentState (D37), LSB first
 //! links        8 B  symlink InoId, offset of its target in strings
 //! work trees  32 B  top InoId, offset of common dir in strings, common dev,
@@ -52,7 +55,7 @@ pub(crate) const VERSION: u32 = 1;
 /// "No id" in any id column.
 pub(crate) const NONE: u32 = u32::MAX;
 
-pub(crate) const INODE_ROW: usize = 64;
+pub(crate) const INODE_ROW: usize = 72;
 pub(crate) const NAME_ROW: usize = 12;
 pub(crate) const PAIR_ROW: usize = 8;
 pub(crate) const WORK_TREE_ROW: usize = 32;
@@ -69,6 +72,8 @@ pub enum Section {
     NameHeap,
     /// Each directory's own name edge (D30).
     DirNames,
+    /// Each directory's raw entry count, NONE when unknown (D47).
+    Entries,
     /// The traversed-directory bitset (D29).
     Traversed,
     /// Root directories and their paths.
@@ -87,10 +92,11 @@ pub enum Section {
     Docs,
 }
 
-pub(crate) const SECTIONS: [Section; 11] = [
+pub(crate) const SECTIONS: [Section; 12] = [
     Section::Names,
     Section::NameHeap,
     Section::DirNames,
+    Section::Entries,
     Section::Traversed,
     Section::Roots,
     Section::Strings,
@@ -166,7 +172,7 @@ pub(crate) fn put_pair(out: &mut impl Write, a: u32, b: u32) -> io::Result<()> {
 }
 
 /// One inode row: dev, ino, size, mtime s, ctime s, mtime ns, ctime ns,
-/// mode, uid, gid, DocId (or NONE).
+/// mode, uid, gid, DocId (or NONE), nlink.
 pub(crate) fn put_inode(out: &mut impl Write, stat: &Stat, doc: u32) -> io::Result<()> {
     let mut row = [0u8; INODE_ROW];
     row[0..8].copy_from_slice(&stat.dev.to_le_bytes());
@@ -180,6 +186,7 @@ pub(crate) fn put_inode(out: &mut impl Write, stat: &Stat, doc: u32) -> io::Resu
     row[52..56].copy_from_slice(&stat.uid.to_le_bytes());
     row[56..60].copy_from_slice(&stat.gid.to_le_bytes());
     row[60..64].copy_from_slice(&doc.to_le_bytes());
+    row[64..72].copy_from_slice(&stat.nlink.to_le_bytes());
     out.write_all(&row)
 }
 
@@ -337,6 +344,9 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     if inodes >= NONE as usize || names >= NONE as usize || dirs > inodes {
         return Err(DecodeError::Corrupt("inodes"));
     }
+    if len(Section::Entries) != dirs * 4 {
+        return Err(DecodeError::Corrupt("entries"));
+    }
     if len(Section::Traversed) != dirs.div_ceil(8) {
         return Err(DecodeError::Corrupt("traversed"));
     }
@@ -371,6 +381,7 @@ const CHECK_ORDER: [Section; SECTIONS.len()] = [
     Section::NameHeap,
     Section::Names,
     Section::DirNames,
+    Section::Entries,
     Section::Traversed,
     Section::Strings,
     Section::Roots,
@@ -396,6 +407,7 @@ impl Section {
             Section::Roots => &[Section::DirNames, Section::Strings],
             Section::Links | Section::WorkTrees => &[Section::Strings],
             Section::NameHeap
+            | Section::Entries
             | Section::Traversed
             | Section::Strings
             | Section::States
@@ -406,8 +418,8 @@ impl Section {
 
 /// Validates one section, given its bytes and those of every section it
 /// [needs](Section::needs), through `get`. See the module doc for what is
-/// checked. Traversed, inodes and states have nothing beyond their lengths,
-/// which [`decode_table`] checked.
+/// checked. Entries, traversed, inodes and states have nothing beyond their
+/// lengths, which [`decode_table`] checked.
 pub(crate) fn check<'a>(
     section: Section,
     l: &Layout,
@@ -487,7 +499,7 @@ pub(crate) fn check<'a>(
                 last = Some(id);
             }
         }
-        Section::Traversed | Section::Inodes | Section::States => {}
+        Section::Entries | Section::Traversed | Section::Inodes | Section::States => {}
     }
     Ok(())
 }

@@ -304,6 +304,7 @@ fn catalog_stat(stat: &rustix::fs::Stat) -> Stat {
         mode: stat.st_mode,
         uid: stat.st_uid,
         gid: stat.st_gid,
+        nlink: stat.st_nlink,
     }
 }
 
@@ -320,5 +321,6 @@ pub(crate) fn from_walk(stat: &crate::Stat<'_>) -> Stat {
         mode: stat.mode,
         uid: stat.uid,
         gid: stat.gid,
+        nlink: stat.nlink,
     }
 }

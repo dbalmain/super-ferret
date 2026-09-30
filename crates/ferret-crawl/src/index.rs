@@ -847,7 +847,11 @@ impl EventVisitor for Hasher<'_> {
                     }
                 }
             }
-            Event::Entered { dir, work_tree } => {
+            Event::Entered {
+                dir,
+                work_tree,
+                entries,
+            } => {
                 #[cfg(test)]
                 hook(self.root, Probe::Entered);
                 if let Some(wt) = work_tree {
@@ -862,6 +866,9 @@ impl EventVisitor for Hasher<'_> {
                         wt.common_dir.as_os_str().as_bytes(),
                         wt.common_id,
                     );
+                }
+                if let Some(count) = entries {
+                    self.out.batch.entry_count(dir, count);
                 }
                 None
             }

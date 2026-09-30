@@ -51,6 +51,7 @@ fn stat(ino: u64, mode: u32, size: u64, age: i64) -> Stat {
         mode,
         uid: 1000,
         gid: 1000,
+        nlink: 1,
     }
 }
 

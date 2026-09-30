@@ -1068,3 +1068,108 @@ fn fault_pass_timing() {
         );
     }
 }
+
+// ── link counts and raw entry counts (D47) ──
+
+/// A file's link count is read from the walk's `lstat`, so it counts names
+/// outside the root as well as inside it; a directory's is its own.
+#[test]
+fn link_counts_come_from_lstat_including_names_outside_the_root() {
+    let tmp = Tmp::new("nlink");
+    let inside = tmp.write("root/inside.txt", b"x\n");
+    fs::hard_link(&inside, tmp.at("root/second.txt")).unwrap();
+    fs::hard_link(&inside, tmp.at("outside.txt")).unwrap();
+    tmp.write("root/solo.txt", b"y\n");
+    fs::create_dir_all(tmp.at("root/sub/deeper")).unwrap();
+    fs::create_dir_all(tmp.at("root/sub/other")).unwrap();
+    let root = tmp.at("root");
+    run(&tmp, std::slice::from_ref(&root), Refresh::All, 2);
+
+    let (catalog, rows) = published(&tmp);
+    let nlink = |path: &Path| catalog.inode(rows[path].ino).stat.nlink;
+    assert_eq!(nlink(&inside), 3, "two names inside, one outside");
+    assert_eq!(nlink(&tmp.at("root/second.txt")), 3);
+    assert_eq!(nlink(&tmp.at("root/solo.txt")), 1);
+    for dir in ["root/sub", "root/sub/deeper"] {
+        let real = fs::metadata(tmp.at(dir)).unwrap().nlink();
+        assert_eq!(nlink(&tmp.at(dir)), real, "{dir}");
+    }
+    assert!(
+        nlink(&tmp.at("root/sub")) >= 2,
+        "a directory has . and its name"
+    );
+}
+
+/// The count is taken before ignore rules, so a directory whose children are
+/// all ignored is not empty, and a directory nothing listed reads unknown.
+#[test]
+fn entry_counts_survive_the_pipeline_and_count_ignored_children() {
+    let tmp = Tmp::new("entries");
+    tmp.write(".ferretignore", b"*.log\n");
+    tmp.write("mixed/keep.txt", b"k\n");
+    tmp.write("mixed/drop.log", b"d\n");
+    tmp.write("allignored/a.log", b"a\n");
+    tmp.write("allignored/b.log", b"b\n");
+    fs::create_dir(tmp.at("empty")).unwrap();
+    run(&tmp, &[tmp.tree()], Refresh::All, 4);
+
+    let (catalog, rows) = published(&tmp);
+    assert!(!rows.contains_key(&tmp.at("allignored/a.log")), "ignored");
+    let count = |rel: &str| catalog.entry_count(rows[&tmp.at(rel)].ino);
+    assert_eq!(count("mixed"), Some(2));
+    assert_eq!(count("allignored"), Some(2));
+    assert_eq!(count("empty"), Some(0));
+    assert_eq!(
+        catalog.entry_count(catalog.roots().next().unwrap().0),
+        Some(4),
+        ".ferretignore and the three directories"
+    );
+}
+
+/// A root copied forward by `keep` keeps the counts and link counts it had.
+/// (A directory the walk cannot list blocks publication, so unknown counts
+/// are covered in the catalog's own tests.)
+#[test]
+fn a_kept_root_keeps_its_entry_and_link_counts() {
+    let tmp = Tmp::new("entries-keep");
+    let (outer, inner) = (tmp.at("outer"), tmp.at("inner"));
+    tmp.write("outer/top.txt", b"t\n");
+    tmp.write("inner/f.txt", b"f\n");
+    tmp.write("inner/g.log", b"g\n");
+    let f = tmp.at("inner/f.txt");
+    fs::hard_link(&f, tmp.at("inner/f2.txt")).unwrap();
+    fs::create_dir(tmp.at("inner/nothing")).unwrap();
+    let roots = [outer.clone(), inner.clone()];
+    run(&tmp, &roots, Refresh::All, 2);
+    let (before, rows) = published(&tmp);
+    let root_of = |catalog: &Catalog, path: &Path| {
+        catalog
+            .roots()
+            .find(|&(_, p)| p == path.as_os_str().as_bytes())
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| panic!("no root {}", path.display()))
+    };
+    assert_eq!(before.entry_count(root_of(&before, &inner)), Some(4));
+    assert_eq!(before.inode(rows[&f].ino).stat.nlink, 2);
+
+    fs::write(tmp.at("outer/new.txt"), b"n\n").unwrap();
+    run(&tmp, &roots, Refresh::Only(std::slice::from_ref(&outer)), 2);
+    let (after, rows) = published(&tmp);
+    let count = |rel: &Path| after.entry_count(rows[rel].ino);
+    assert_eq!(
+        after.entry_count(root_of(&after, &inner)),
+        Some(4),
+        "kept root"
+    );
+    assert_eq!(
+        count(&tmp.at("inner/nothing")),
+        Some(0),
+        "kept subdirectory"
+    );
+    assert_eq!(
+        after.entry_count(root_of(&after, &outer)),
+        Some(2),
+        "refreshed root"
+    );
+    assert_eq!(after.inode(rows[&f].ino).stat.nlink, 2, "kept file");
+}

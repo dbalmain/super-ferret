@@ -81,6 +81,9 @@ pub struct Stat<'a> {
     pub uid: u32,
     /// `st_gid`.
     pub gid: u32,
+    /// `st_nlink`: for a directory, 2 plus its subdirectories on most
+    /// filesystems, but whatever the filesystem reports.
+    pub nlink: u64,
     /// Raw `readlink` text when this entry is a catalogued symlink.
     pub link_target: Option<&'a OsStr>,
 }
@@ -219,6 +222,11 @@ pub enum Event<'a, D> {
         dir: D,
         /// The work tree whose top this directory is, if one starts here.
         work_tree: Option<WorkTree<'a>>,
+        /// Every entry `getdents` returned, minus `.` and `..`, counted
+        /// before any policy drops one, so a directory whose children are all
+        /// ignored still counts them (`find -empty`, D47). `None` when the
+        /// listing failed partway, which leaves the count uncertain.
+        entries: Option<u32>,
     },
     /// A directory at a [`Boundary`] of [`WalkOptions::boundaries`]. It is not
     /// classified, not opened and not descended: another root owns it (D34).
@@ -651,7 +659,7 @@ impl<V: EventVisitor> Walker<'_, V> {
         let loaded = self.load_ignores(fd.as_fd(), &children, false, token);
         let (rules, errors) = DirRules::root(root, global, loaded.files(), config);
         self.patterns(errors);
-        self.entered(token, loaded.work_tree.as_ref());
+        self.entered(token, loaded.work_tree.as_ref(), children.count());
         Some(Job::new(
             fd,
             rules,
@@ -731,9 +739,19 @@ struct Child {
 struct Children {
     names: Vec<u8>,
     entries: Vec<Child>,
+    /// The listing reached its end. False after an error partway, when
+    /// `entries` holds only what was read before it.
+    complete: bool,
 }
 
 impl Children {
+    /// The raw entry count for [`Event::Entered`]: `None` if the listing is
+    /// incomplete, and saturated to fit a `u32`.
+    fn count(&self) -> Option<u32> {
+        self.complete
+            .then(|| u32::try_from(self.entries.len()).unwrap_or(u32::MAX))
+    }
+
     fn name(&self, child: &Child) -> &OsStr {
         OsStr::from_bytes(&self.names[child.start..child.end])
     }
@@ -961,13 +979,17 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         }
     }
 
-    fn entered(&mut self, dir: V::Dir, work_tree: Option<&FoundWorkTree>) {
+    fn entered(&mut self, dir: V::Dir, work_tree: Option<&FoundWorkTree>, entries: Option<u32>) {
         let work_tree = work_tree.map(|found| WorkTree {
             kind: found.kind,
             common_dir: &found.common_dir,
             common_id: found.common_id,
         });
-        self.visit.visit(Event::Entered { dir, work_tree });
+        self.visit.visit(Event::Entered {
+            dir,
+            work_tree,
+            entries,
+        });
     }
 
     fn emit(
@@ -1018,8 +1040,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         let mut children = Children {
             names: Vec::new(),
             entries: Vec::new(),
+            complete: true,
         };
-        let mut failed = false;
         let mut dents = std::mem::take(&mut self.dents);
         let mut raw = RawDir::new(dir, dents.spare_capacity_mut());
         while let Some(item) = raw.next() {
@@ -1039,13 +1061,13 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 }
                 Err(error) => {
                     self.fail(IoOp::List, context, io::Error::from(error));
-                    failed = true;
+                    children.complete = false;
                     break;
                 }
             }
         }
         self.dents = dents;
-        if failed && children.entries.is_empty() {
+        if !children.complete && children.entries.is_empty() {
             None
         } else {
             Some(children)
@@ -1341,7 +1363,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         let loaded = self.load_ignores(child.as_fd(), &children, here.rules.in_work_tree(), token);
         let (rules, errors) = here.rules.enter(name, loaded.files());
         self.patterns(errors);
-        self.entered(token, loaded.work_tree.as_ref());
+        self.entered(token, loaded.work_tree.as_ref(), children.count());
         Some(Job::new(
             child,
             rules,
@@ -1364,7 +1386,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         after_open(&self.rel);
         let children = self.list(child.as_fd(), FaultContext::Dir(token))?;
         let rules = here.rules.traverse(name);
-        self.entered(token, None);
+        self.entered(token, None, children.count());
         Some(Job::new(
             child,
             rules,
@@ -1896,6 +1918,7 @@ fn public_stat<'a>(stat: &rustix::fs::Stat, target: Option<&'a OsStr>) -> Stat<'
         mode: stat.st_mode,
         uid: stat.st_uid,
         gid: stat.st_gid,
+        nlink: stat.st_nlink,
         link_target: target,
     }
 }

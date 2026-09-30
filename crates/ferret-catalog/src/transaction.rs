@@ -277,6 +277,9 @@ impl Transaction {
         let token = batch.root(path, old.inode(root).stat);
         let mut queue = vec![(root, token)];
         while let Some((dir, token)) = queue.pop() {
+            if let Some(count) = old.entry_count(dir) {
+                batch.entry_count(token, count);
+            }
             if let Some(wt) = old.work_tree(dir) {
                 batch.work_tree(token, wt.kind, wt.common_dir, wt.common_id);
             }

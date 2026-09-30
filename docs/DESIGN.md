@@ -145,7 +145,7 @@ themselves, fixed-width little-endian rows plus two heaps. The name heap holds
 NUL-terminated names in `(parent, name)` order (D28 A) and is contiguous on
 purpose: it is what filename search scans (D14). The strings heap holds root
 paths, link targets and work-tree paths. A reader opens the file by reading the
-header and table alone (200 B), and then reads each section positionally when a
+header and table alone (216 B), and then reads each section positionally when a
 query first needs it (D38 B), together with the sections it is checked against
 (names need the heap; directory names need names; roots need directory names and
 strings; links and work trees need strings). Each section is validated as it

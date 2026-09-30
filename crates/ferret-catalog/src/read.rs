@@ -429,7 +429,7 @@ impl Catalog {
 
     /// One inode row, read alone from the file when [`Section::Inodes`] is
     /// not loaded: a query that reports a few rows pays a few positional
-    /// reads rather than the whole section (64 B per inode). Loads
+    /// reads rather than the whole section (72 B per inode). Loads
     /// [`Section::States`], which is 2 bits per inode. An inode row indexes
     /// nothing, so it needs no validation.
     pub fn read_inode(&self, id: InoId) -> Result<Inode, OpenError> {
@@ -462,6 +462,7 @@ impl Catalog {
             mode: u32_at(row, 48),
             uid: u32_at(row, 52),
             gid: u32_at(row, 56),
+            nlink: u64_at(row, 64),
         };
         let doc = u32_at(row, 60);
         let state_byte = self.section(Section::States)[id.0 as usize / 4];
@@ -471,6 +472,16 @@ impl Catalog {
             state,
             doc: (doc != NONE).then_some(DocId(doc)),
         }
+    }
+
+    /// The entries the walk's `getdents` returned for directory `dir`, minus
+    /// `.` and `..`, counted before ignore rules dropped any (D47). `None`
+    /// when the walk did not list it: unreadable, listing failed partway, or
+    /// carried from a generation that did not know. Needs
+    /// [`Section::Entries`].
+    pub fn entry_count(&self, dir: InoId) -> Option<u32> {
+        let count = u32_at(self.section(Section::Entries), dir.0 as usize * 4);
+        (count != NONE).then_some(count)
     }
 
     /// Whether an inode is a directory, file or symlink. Needs

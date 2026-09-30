@@ -10,6 +10,7 @@
 //! Nothing is validated here: names, tokens and roots are checked at commit,
 //! where a bad one is a [`BuildError`](crate::BuildError).
 
+use crate::format::NONE;
 use crate::{ContentState, Hash};
 
 /// A directory, as minted by the batch that recorded it. Valid only within the
@@ -45,6 +46,10 @@ pub struct Stat {
     pub uid: u32,
     /// `st_gid`.
     pub gid: u32,
+    /// `st_nlink`. Not part of [`Stat::same_version`]: a link added or removed
+    /// bumps ctime, which is. Derived equality does compare it; see
+    /// `build::same_observation`.
+    pub nlink: u64,
 }
 
 impl Stat {
@@ -162,6 +167,8 @@ pub struct Batch {
     /// (file index, target in `strings`), in file order.
     pub(crate) targets: Vec<(u32, Span)>,
     pub(crate) work_trees: Vec<WorkTreeEntry>,
+    /// Raw entry counts, by directory. A directory with none is unknown.
+    pub(crate) entry_counts: Vec<(DirToken, u32)>,
     /// Entry names, and root paths.
     pub(crate) names: Vec<u8>,
     /// Link targets and work-tree paths.
@@ -182,6 +189,7 @@ impl Batch {
             contents: Vec::new(),
             targets: Vec::new(),
             work_trees: Vec::new(),
+            entry_counts: Vec::new(),
             names: Vec::new(),
             strings: Vec::new(),
             overflow: false,
@@ -240,6 +248,15 @@ impl Batch {
             common_dir,
             common_id,
         });
+    }
+
+    /// Records how many entries `getdents` returned for `dir`, minus `.` and
+    /// `..`, before any ignore rule dropped one. A directory never given a
+    /// count (unreadable, or not listed) is unknown to the reader. A count of
+    /// `u32::MAX` or more is saturated to `u32::MAX - 1`, since `u32::MAX`
+    /// stands for unknown in the file.
+    pub fn entry_count(&mut self, dir: DirToken, count: u32) {
+        self.entry_counts.push((dir, count.min(NONE - 1)));
     }
 
     /// A symlink's target, for file `index`.

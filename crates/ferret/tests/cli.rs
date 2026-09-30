@@ -373,9 +373,9 @@ fn stats_counts_documents_sparsely_and_survives_a_corrupt_reference() {
 
     // A file's DocId flipped past `next_doc`: decoding does not check it.
     let catalog = fs::read(env.index().join("catalog")).unwrap();
-    let inodes = u64::from_le_bytes(catalog[24 + 6 * 16..][..8].try_into().unwrap()) as usize;
+    let inodes = u64::from_le_bytes(catalog[24 + 7 * 16..][..8].try_into().unwrap()) as usize;
     let row = (0..)
-        .map(|i| inodes + i * 64)
+        .map(|i| inodes + i * 72)
         .find(|row| u32::from_le_bytes(catalog[row + 60..][..4].try_into().unwrap()) != u32::MAX)
         .unwrap();
     patch_catalog(&env, row + 60, u32::MAX - 1);

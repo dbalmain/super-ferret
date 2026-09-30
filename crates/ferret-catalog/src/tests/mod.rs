@@ -66,6 +66,7 @@ fn file_stat(ino: u64) -> Stat {
         mode: 0o100_644,
         uid: 1000,
         gid: 100,
+        nlink: 1,
     }
 }
 

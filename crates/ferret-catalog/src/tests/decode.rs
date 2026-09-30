@@ -23,6 +23,7 @@ fn sample(name: &str) -> Vec<u8> {
         w.file(root, b"c", file_stat(12), Content::Hashed(hash(2)));
         w.symlink(root, b"d", link_stat(13), b"sub/a.rs");
         w.work_tree(sub, WorkTreeKind::Linked, b"/repo/.git", (1, 2));
+        w.entry_count(sub, 2);
         let other = w.root(b"/t", dir_stat(4));
         w.file(other, b"e", file_stat(14), Content::Fault);
         txn.add(w);
@@ -86,6 +87,9 @@ fn exercise(catalog: &Catalog) -> usize {
         }
         if has(&[Traversed]) {
             touched += usize::from(catalog.is_traversed(dir));
+        }
+        if has(&[Entries]) {
+            touched += catalog.entry_count(dir).map_or(0, |n| n as usize);
         }
         if has(&[DirNames]) {
             touched += catalog.dir_name(dir).map_or(0, |n| n.0 as usize);
@@ -224,7 +228,7 @@ fn every_single_bit_flip_is_an_error_or_reads_safely() {
                     accepted += 1;
                     // The header and section table are fully checked.
                     assert!(
-                        at >= 200 || (12..20).contains(&at),
+                        at >= 216 || (12..20).contains(&at),
                         "flip at {at} bit {bit} accepted"
                     );
                 }
@@ -278,7 +282,7 @@ fn a_section_loads_what_it_is_checked_against() {
     write_catalog(&scratch.path, &sample("decode-needs-sample"));
     let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
     assert!(SECTIONS.iter().all(|&s| !catalog.is_loaded(s)));
-    assert_eq!(catalog.bytes_read(), 200);
+    assert_eq!(catalog.bytes_read(), 216);
     catalog.load(&[Section::Roots]).unwrap();
     let loaded: Vec<Section> = SECTIONS
         .into_iter()
@@ -387,6 +391,55 @@ fn siblings_out_of_order_are_rejected() {
     );
 }
 
+/// Resizes `section` by `delta` bytes (a multiple of 4), keeping the table
+/// tiling the file, so only the section's own length check can object.
+fn resize_section(bytes: &[u8], section: Section, delta: isize) -> Vec<u8> {
+    let table = |i: usize| 24 + i * 16;
+    let at = section as usize;
+    let read = |i: usize, off: usize| {
+        u64::from_le_bytes(bytes[table(i) + off..][..8].try_into().unwrap()) as usize
+    };
+    let (start, len) = (read(at, 0), read(at, 8));
+    let end = start + len;
+    let mut out = bytes[..start].to_vec();
+    if delta < 0 {
+        out.extend_from_slice(&bytes[start..end - delta.unsigned_abs()]);
+    } else {
+        out.extend_from_slice(&bytes[start..end]);
+        out.extend(std::iter::repeat_n(0, delta.unsigned_abs()));
+    }
+    out.extend_from_slice(&bytes[end..]);
+    let new_len = (len as isize + delta) as u64;
+    out[table(at) + 8..][..8].copy_from_slice(&new_len.to_le_bytes());
+    for i in at + 1..SECTIONS.len() {
+        let offset = (read(i, 0) as isize + delta) as u64;
+        out[table(i)..][..8].copy_from_slice(&offset.to_le_bytes());
+    }
+    out
+}
+
+/// One entry count per directory: a section with a row too few or too many
+/// is refused at open, before any section is read.
+#[test]
+fn an_entries_section_of_the_wrong_length_is_rejected() {
+    let bytes = sample("decode-entries-length");
+    assert!(Catalog::from_bytes(bytes.clone()).is_ok());
+    let scratch = Scratch::new("decode-entries-length-lazy");
+    for delta in [-4, 4] {
+        let bad = resize_section(&bytes, Section::Entries, delta);
+        assert_eq!(
+            Catalog::from_bytes(bad.clone()).err(),
+            Some(DecodeError::Corrupt("entries")),
+            "{delta}"
+        );
+        write_catalog(&scratch.path, &bad);
+        assert!(matches!(
+            Catalog::open(&scratch.path),
+            Err(OpenError::Decode(DecodeError::Corrupt("entries")))
+        ));
+    }
+}
+
 #[test]
 fn header_errors_say_what_is_wrong() {
     let bytes = sample("decode-header");
@@ -485,6 +538,9 @@ const ACCESSORS: &[Accessor] = {
                     out.len()
                 })
                 .sum()
+        }),
+        (Some(Entries), "entry_count", |c| {
+            dirs(c).filter_map(|d| c.entry_count(d)).count()
         }),
         (Some(Traversed), "is_traversed", |c| {
             dirs(c).filter(|&d| c.is_traversed(d)).count()

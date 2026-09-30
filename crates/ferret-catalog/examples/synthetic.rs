@@ -77,6 +77,7 @@ fn stat(ino: u64, mode: u32) -> Stat {
         mode,
         uid: 1000,
         gid: 100,
+        nlink: 1,
     }
 }
 

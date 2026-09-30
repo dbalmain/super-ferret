@@ -225,7 +225,7 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
 
     let _ = writeln!(
         out,
-        "\nsections  {} in all, {:.1} B per name (the 200 B header and table aside)",
+        "\nsections  {} in all, {:.1} B per name (the 216 B header and table aside)",
         bytes(total),
         per_name(total)
     );

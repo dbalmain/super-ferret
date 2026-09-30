@@ -46,6 +46,7 @@ struct Recorder<'h> {
     dirs: Vec<PathBuf>,
     decided: Vec<(Token, PathBuf, Decision)>,
     entered: Vec<(Token, Option<OwnedWorkTree>)>,
+    entry_counts: Vec<(Token, Option<u32>)>,
     boundaries: Vec<(Token, PathBuf, OsString)>,
     io: Vec<(PathBuf, IoOp, Context<Token>, io::ErrorKind)>,
     /// `Decided` events whose `parent_fd` + `name` reached the statted inode.
@@ -107,13 +108,18 @@ impl EventVisitor for Recorder<'_> {
                 }
                 return Some(self.mint(decided.path));
             }
-            Event::Entered { dir, work_tree } => {
+            Event::Entered {
+                dir,
+                work_tree,
+                entries,
+            } => {
                 let owned = work_tree.map(|tree| OwnedWorkTree {
                     kind: tree.kind,
                     common_dir: tree.common_dir.to_path_buf(),
                     common_id: tree.common_id,
                 });
                 self.entered.push((dir, owned));
+                self.entry_counts.push((dir, entries));
             }
             Event::Boundary { parent, name, path } => {
                 self.boundaries
@@ -154,6 +160,8 @@ struct Merged {
     /// (parent path, path, decision).
     decided: Vec<(PathBuf, PathBuf, Decision)>,
     entered: Vec<(PathBuf, Option<OwnedWorkTree>)>,
+    /// The `entries` of each `Entered`.
+    entry_counts: Vec<(PathBuf, Option<u32>)>,
     /// (parent path, path, name).
     boundaries: Vec<(PathBuf, PathBuf, OsString)>,
     io: Vec<(PathBuf, IoOp, Context<PathBuf>, io::ErrorKind)>,
@@ -177,6 +185,15 @@ impl Merged {
             .iter()
             .find(|(path, _)| path == Path::new(rel))
             .map(|(_, tree)| tree)
+    }
+
+    /// The raw entry count `Entered` reported for `rel`; `None` if it was
+    /// never entered.
+    fn entries(&self, rel: &str) -> Option<Option<u32>> {
+        self.entry_counts
+            .iter()
+            .find(|(path, _)| path == Path::new(rel))
+            .map(|&(_, count)| count)
     }
 
     fn io_at(&self, rel: &str) -> Vec<(IoOp, Context<PathBuf>, io::ErrorKind)> {
@@ -206,6 +223,7 @@ fn run(root: &Path, boundaries: Vec<Boundary>, workers: usize, hooks: &Hooks<'_>
             dirs: Vec::new(),
             decided: Vec::new(),
             entered: Vec::new(),
+            entry_counts: Vec::new(),
             boundaries: Vec::new(),
             io: Vec::new(),
             fd_checked: 0,
@@ -237,6 +255,9 @@ fn run(root: &Path, boundaries: Vec<Boundary>, workers: usize, hooks: &Hooks<'_>
         }
         for (dir, tree) in visitor.entered {
             merged.entered.push((resolve(&dir), tree));
+        }
+        for (dir, count) in visitor.entry_counts {
+            merged.entry_counts.push((resolve(&dir), count));
         }
         for (parent, path, name) in visitor.boundaries {
             merged.boundaries.push((resolve(&parent), path, name));
@@ -443,6 +464,68 @@ fn a_traversed_directory_is_entered_without_a_work_tree() {
     assert_eq!(merged.decision("target"), Some(Decision::Traverse));
     assert_eq!(merged.entered("target"), Some(&None));
     assert_eq!(merged.decision("target/doc/x.txt"), Some(Decision::Index));
+}
+
+// ── raw entry counts (D47) ──
+
+/// Counts every entry `getdents` returned, whatever the policy then does with
+/// it: the discriminating case is a directory whose children are all ignored,
+/// which a count of catalogued children would call empty.
+#[test]
+fn a_directory_reports_every_entry_it_listed_including_ignored_ones() {
+    let tree = Scratch::new("entries-raw");
+    write(&tree.join(".ferretignore"), "*.log\ntarget/\n");
+    write(&tree.join("kept.txt"), "x");
+    write(&tree.join("a.log"), "x");
+    write(&tree.join("mixed/keep.txt"), "x");
+    write(&tree.join("mixed/drop.log"), "x");
+    write(&tree.join("allignored/one.log"), "x");
+    write(&tree.join("allignored/two.log"), "x");
+    write(&tree.join("target/inner"), "x");
+    fs::create_dir(tree.join("empty")).unwrap();
+
+    let merged = run(&tree.path, Vec::new(), 1, &Hooks::default());
+    // .ferretignore, kept.txt, a.log, mixed, allignored, target, empty.
+    assert_eq!(merged.entries(""), Some(Some(7)));
+    assert_eq!(merged.entries("mixed"), Some(Some(2)));
+    assert_eq!(merged.entries("allignored"), Some(Some(2)));
+    assert_eq!(merged.entries("empty"), Some(Some(0)));
+    // Ignored directories are skipped, never listed.
+    assert_eq!(merged.decision("target"), Some(Decision::Skip));
+    assert_eq!(merged.entries("target"), None);
+    assert_eq!(merged.decision("allignored/one.log"), Some(Decision::Skip));
+}
+
+/// A traversed directory is listed too, and reports its count.
+#[test]
+fn a_traversed_directory_reports_its_entry_count() {
+    let tree = Scratch::new("entries-traverse");
+    write(&tree.join(".ferretignore"), "target/\n!/target/doc/**\n");
+    write(&tree.join("target/doc/x.txt"), "x");
+    write(&tree.join("target/junk"), "x");
+    write(&tree.join("target/more"), "x");
+
+    let merged = run(&tree.path, Vec::new(), 1, &Hooks::default());
+    assert_eq!(merged.decision("target"), Some(Decision::Traverse));
+    assert_eq!(merged.entries("target"), Some(Some(3)));
+    assert_eq!(merged.entries("target/doc"), Some(Some(1)));
+}
+
+/// The count is the same however many workers list the tree.
+#[test]
+fn entry_counts_do_not_depend_on_the_worker_count() {
+    let tree = Scratch::new("entries-parallel");
+    for d in 0..6 {
+        for f in 0..d {
+            write(&tree.join(&format!("d{d}/f{f}")), "x");
+        }
+    }
+    fs::create_dir(tree.join("d0")).ok();
+    let merged = run(&tree.path, Vec::new(), 4, &Hooks::default());
+    for d in 0..6u32 {
+        assert_eq!(merged.entries(&format!("d{d}")), Some(Some(d)), "d{d}");
+    }
+    assert_eq!(merged.entries(""), Some(Some(6)));
 }
 
 // ── faults ──

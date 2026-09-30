@@ -3,7 +3,7 @@
 use super::{Scratch, at, commit, dir_stat, file_stat, hash, link_stat, paths, reopen};
 use crate::{
     Batch, BuildError, Catalog, CommitError, Content, ContentState, DocId, InoId, Kind, NameId,
-    Transaction, WorkTreeKind,
+    Stat, Transaction, WorkTreeKind,
 };
 
 /// Fills `/r` across three batches, the way three walk workers would: each
@@ -385,4 +385,87 @@ fn a_name_that_would_carry_the_heap_past_its_limit_is_too_large() {
         Err(CommitError::Build(BuildError::TooLarge)) => {}
         other => panic!("expected TooLarge, got {:?}", other.map(|_| ())),
     }
+}
+
+/// A stat with a link count, to tell rows apart.
+fn linked(stat: Stat, nlink: u64) -> Stat {
+    Stat { nlink, ..stat }
+}
+
+/// Fills `/r` with raw entry counts on all its directories but `unknown`,
+/// recorded from batches other than the ones that minted the directories, as
+/// the walk's `Entered` may be.
+fn fill_counts(txn: &Transaction) -> Vec<Batch> {
+    let (mut a, mut b) = (txn.batch(), txn.batch());
+    let root = a.root(b"/r", linked(dir_stat(1), 5));
+    let full = b.dir(root, b"full", linked(dir_stat(2), 2));
+    let empty = a.dir(root, b"empty", linked(dir_stat(3), 2));
+    b.dir(root, b"unknown", linked(dir_stat(4), 2));
+    let traversed = a.traversed_dir(root, b"traversed", linked(dir_stat(5), 2));
+    a.file(full, b"one", linked(file_stat(10), 3), Content::Binary);
+    b.file(root, b"two", linked(file_stat(10), 3), Content::Binary);
+    a.file(root, b"solo", linked(file_stat(11), 1), Content::Binary);
+    b.symlink(root, b"ln", linked(link_stat(12), 1), b"solo");
+    b.entry_count(root, 6);
+    a.entry_count(full, 1);
+    b.entry_count(empty, 0);
+    b.entry_count(traversed, 40);
+    vec![a, b]
+}
+
+fn assert_counts(catalog: &Catalog) {
+    let count = |path: &str| catalog.entry_count(at(catalog, path));
+    let nlink = |path: &str| catalog.inode(at(catalog, path)).stat.nlink;
+    let root = catalog.roots().next().unwrap().0;
+    assert_eq!(catalog.entry_count(root), Some(6));
+    assert_eq!(count("/r/full"), Some(1));
+    assert_eq!(count("/r/empty"), Some(0), "zero is a count, not unknown");
+    assert_eq!(count("/r/unknown"), None);
+    assert_eq!(count("/r/traversed"), Some(40));
+    assert_eq!(catalog.inode(root).stat.nlink, 5);
+    assert_eq!(nlink("/r/full"), 2);
+    assert_eq!(nlink("/r/two"), 3);
+    assert_eq!(nlink("/r/full/one"), 3, "one row for both names");
+    assert_eq!(nlink("/r/solo"), 1);
+    assert_eq!(nlink("/r/ln"), 1);
+}
+
+#[test]
+fn entry_counts_and_link_counts_round_trip_and_unknown_reads_none() {
+    let scratch = Scratch::new("round-trip-counts");
+    let committed = commit(&scratch.path, |txn| {
+        for batch in fill_counts(txn) {
+            txn.add(batch);
+        }
+    });
+    assert_counts(&committed);
+    assert_counts(&reopen(&scratch.path));
+}
+
+/// A root copied forward carries what it recorded, unknown included.
+#[test]
+fn keep_carries_entry_counts_and_link_counts() {
+    let scratch = Scratch::new("round-trip-keep-counts");
+    commit(&scratch.path, |txn| {
+        for batch in fill_counts(txn) {
+            txn.add(batch);
+        }
+    });
+    let kept = commit(&scratch.path, |txn| txn.keep(b"/r").unwrap());
+    assert_counts(&kept);
+    assert_counts(&reopen(&scratch.path));
+}
+
+/// A count past what the file can hold stays a count; only "unknown" is the
+/// sentinel.
+#[test]
+fn an_enormous_entry_count_is_not_mistaken_for_unknown() {
+    let scratch = Scratch::new("round-trip-count-saturates");
+    let catalog = commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        let root = w.root(b"/r", dir_stat(1));
+        w.entry_count(root, u32::MAX);
+        txn.add(w);
+    });
+    assert_eq!(catalog.entry_count(InoId(0)), Some(u32::MAX - 1));
 }
