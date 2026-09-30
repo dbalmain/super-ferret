@@ -75,7 +75,8 @@
 //! most 64 and every column section's length is exactly its columns'
 //! dictionaries and padded values (and the docs section's hashes); every
 //! blocked column's table places each block exactly after the one before it,
-//! no wider than the descriptor says; every offset, id and dictionary index is
+//! and its widest block is exactly the descriptor's width; document ids rise
+//! strictly and stay below `next_doc`; every offset, id and dictionary index is
 //! in range, every heap ends in NUL, and each directory's name edge points at
 //! a lower-numbered parent, so walking up from any name ends at a root. Each
 //! directory is the child of exactly its recorded name edge, so walking down

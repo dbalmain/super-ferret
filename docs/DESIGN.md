@@ -98,7 +98,7 @@ never reused (D36); `roots`, `links` and `worktrees` hang off an existing
 | ----------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`                                                                                                  |
 | `inodes`    | `InoId`  | `(dev, ino)`, size, mtime, ctime, mode, uid, gid, nlink, `DocId` or none; a 2-bit content state beside it (D37); a directory's raw entry count (D47)                    |
-| `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept); rows sorted by id, with holes where content died                                                                                  |
+| `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept); rows sorted by id, with holes where content died, the ids a sequence column (implicit when there are no holes)                    |
 | `roots`     | —        | configured root paths and the `InoId` of each; nested roots are separate trees, and adding or removing a root inside a kept root requires refreshing the kept one (D34) |
 | `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the strings heap)                                                                                         |
 | `worktrees` | —        | a work tree's top directory `InoId`, kind (main / linked / submodule), repository id (the common directory's `(dev, ino)`) and its path for display                     |
@@ -140,7 +140,7 @@ tombstones, so there is one source of truth.
 
 **Storage.** One snapshot file per catalog directory, rebuilt by every run
 (D26): a versioned header (magic, format version, sniffer version, next
-`DocId`, the directory, inode and name counts), a table of 22 sections by
+`DocId`, the directory, inode, name and document counts), a table of 22 sections by
 offset and length, a descriptor per packed column, and the sections themselves.
 Every id and inode field is a bit-packed column (S1a): `count` values of
 `width` bits, least significant bit first, ending in 8 bytes of padding
@@ -151,13 +151,20 @@ base, width and dictionary length. Plain fields are frame of reference (value
 minus the column's minimum; times order-mapped from `i64` first); nullable ones
 (a directory's name and entry count, an inode's `DocId`) reserve all ones for
 none; `dev`, `mode` and the `(uid, gid)` pair are indexes into a sorted
-dictionary at the head of their section. Each inode field is its own section,
+dictionary at the head of their section. Name offsets and `nlink` are blocked:
+a frame of reference per 128 rows, through a table of 16 B entries (base,
+offset and width) ahead of the values, so a read stays O(1) and one outlier
+widens only its block. At 10M names this took offsets from 35.9 to 16.3 MB and
+`nlink` from 12.8 to 1.8 MB; 64 and 256 rows measured within 1 MB either way.
+Document ids are a sequence column, row `i` holding `id - i`: with no holes it
+is width 0 and a row is found from its id by subtraction, and holes widen it
+only to the bits of their total. Each inode field is its own section,
 so a query loads only the fields it tests; the three name columns share one
 section, since every name read needs all three. The name heap holds
 NUL-terminated names in `(parent, name)` order (D28 A) and is contiguous on
 purpose: it is what filename search scans (D14). The strings heap holds root
-paths, link targets and work-tree paths; roots, links, work trees and documents
-stay fixed-width rows. A reader opens the file by reading its head alone (644
+paths, link targets and work-tree paths; roots, links, work trees and document
+hashes stay fixed-width rows. A reader opens the file by reading its head alone (664
 B), which fixes every section's and column's exact length, and then reads each
 section positionally when a query first needs it (D38 B), together with the
 sections it is checked against (names need the heap; directory names need names;

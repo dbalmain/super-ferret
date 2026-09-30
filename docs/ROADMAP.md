@@ -202,8 +202,38 @@ What changed the numbers, separated as far as the data allows (`perf` on the
   peak) took 1.2 s off, a cheaper packer 0.2 s. Of the 2.2 s that remain,
   0.4 s is the synthetic's own filling (it now counts entries and reads
   nlink); the rest is ten scattered passes where v1 made one, plus the pass
-  that sizes columns and collects dictionaries. Closing it means holding
-  encoded columns in memory, which D40 rules out.
+  that sizes columns and collects dictionaries. (Closing it did not need
+  encoded columns held in memory, as this note first said: see below.)
+
+**After the first review round** (2026-09-30, same harness, base = the
+commit above rebuilt from a detached worktree, A/B interleaved at load average
+5-11 from another session's harness; bytes exact, times plus or minus 10%).
+Name offsets and `nlink` became blocked columns (a frame of reference per 128
+rows), document ids a sequence column that is width 0 without holes, and the
+build writes every column positionally in one pass over the inode rows.
+
+| measure                                  | before `$HOME` | after `$HOME` | before 10M     | after 10M      |
+| ---------------------------------------- | -------------- | ------------- | -------------- | -------------- |
+| catalog bytes                            | 63.73 B/n      | 60.25 B/n     | 799 MB, 78.02  | 735 MB, 71.78  |
+| Names (offsets blocked)                  |                |               | 9.13 B/n       | 7.21           |
+| Nlink                                    |                |               | 12.81 MB       | 1.77 MB        |
+| Docs (ids implicit)                      |                |               | 16.29 B/n      | 13.03          |
+| `find` peak RSS, name / metadata queries |                |               | 333 / 372-377 MB | 315 / 354-358 MB |
+| `open`, name sections, warm / evicted    | 7.1 / 12.7 ms  | 6.9 / 11.5 ms | 246-252 / 346-356 ms | 243-251 / 344-348 ms |
+| `find flamegraph`, fresh                 |                |               | 292 ms         | 281 ms         |
+| `find re:^[0-9a-f]{8}$`, fresh           |                |               | 535 ms         | 571 ms         |
+| `find '*'`, fresh                        |                |               | 2,290 ms       | 2,469 ms       |
+| `synthetic` build, wall (two runs)       |                |               | 11.0 / 12.8 s  | 9.5 / 9.5 s    |
+| same, user / sys                         |                |               | 8.4 / 1.3-1.5 s | 8.1 / 1.3 s   |
+| same, peak RSS                           |                |               | 1,881 MB       | 1,858 MB       |
+
+A scan of every name is 7-8% slower (user 2.12 to 2.28 s at 10M): each
+offset read now goes through its block's table entry. It was 11% until blocked
+columns were read through their own type; a view that branched on the coding
+stopped `get` inlining into the name loop. Reading the names in decoded runs
+(the review's finding 7) is the planned recovery. Blocking would also pay on
+child (30.7 to 19.6 MB), size (44.8 to 18.8), mtime (39.7 to 15.8) and ctime
+(30.7 to 12.8); not done.
 
 ## S1+ — Incremental catalog
 
