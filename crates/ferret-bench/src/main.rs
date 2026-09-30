@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! ferret-bench scan  <catalog-dir> [needle...]   scanner arms against memmem
-//! ferret-bench open  <catalog-dir>               a name-only open
+//! ferret-bench open  <catalog-dir>               open and load, by section set
+//! ferret-bench sections <catalog-dir>            bytes per name, per section
 //! ferret-bench query <catalog-dir> [query...]    the D40 query mix
 //! ```
 //!
@@ -73,6 +74,7 @@ fn main() -> ExitCode {
         Some((command, rest)) => match (command.as_str(), rest) {
             ("scan", [dir, needles @ ..]) => scan(Path::new(dir), needles),
             ("open", [dir]) => open(Path::new(dir)),
+            ("sections", [dir]) => sections(Path::new(dir)),
             ("query", [dir, queries @ ..]) => query(Path::new(dir), queries),
             _ => return usage(),
         },
@@ -91,6 +93,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: ferret-bench scan <catalog-dir> [needle...]\n       \
          ferret-bench open <catalog-dir>\n       \
+         ferret-bench sections <catalog-dir>\n       \
          ferret-bench query <catalog-dir> [query...]"
     );
     ExitCode::from(2)
@@ -204,6 +207,29 @@ fn time_all(find: impl Fn(usize) -> Option<usize>) -> (u64, Duration) {
         })
         .collect();
     (hits, median(times))
+}
+
+// ── sections ──
+
+/// Every section's exact size and its bytes per name, and the file's: the
+/// figure a format change moves. Reads only the section table.
+fn sections(dir: &Path) -> Result<()> {
+    let catalog = open_catalog(dir)?;
+    describe(dir, &catalog)?;
+    let names = f64::from(catalog.name_count());
+    let file = std::fs::metadata(dir.join("catalog"))?.len();
+    println!("\n| section | bytes | B/name |");
+    println!("|---|---:|---:|");
+    for (section, len) in catalog.section_sizes() {
+        println!("| {section:?} | {len} | {:.2} |", len as f64 / names);
+    }
+    let other = file - catalog.section_sizes().map(|(_, len)| len).sum::<u64>();
+    println!(
+        "| header, table and padding | {other} | {:.2} |",
+        other as f64 / names
+    );
+    println!("| **file** | {file} | {:.2} |", file as f64 / names);
+    Ok(())
 }
 
 // ── open ──
