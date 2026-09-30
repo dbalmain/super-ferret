@@ -446,7 +446,7 @@ pub(crate) fn content_faults(
     refresh: &[PathBuf],
     seen: Vec<(PathBuf, ContentFault)>,
 ) -> Vec<(PathBuf, ContentFault)> {
-    let fault = |id: InoId| catalog.inode(id).state == ContentState::Fault;
+    let fault = |id: InoId| catalog.state(id) == ContentState::Fault;
     let mut listed: BTreeMap<PathBuf, ContentFault> = seen.into_iter().collect();
     if !(catalog.dir_count()..catalog.inode_count()).any(|i| fault(InoId(i))) {
         return listed.into_iter().collect();

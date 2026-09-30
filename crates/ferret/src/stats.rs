@@ -137,7 +137,7 @@ impl Census {
             census.depth.add_kept(depth[name.parent.0 as usize] + 1);
             census.name_len.add_kept(name.bytes.len() as u32);
             if kind == Kind::File {
-                let size = catalog.inode(name.child).stat.size;
+                let size = catalog.size(name.child);
                 let entry = census.extensions.entry(extension(name.bytes)).or_default();
                 entry.0 += 1;
                 entry.1 += size;
@@ -154,10 +154,9 @@ impl Census {
                 continue;
             }
             census.files += 1;
-            let inode = catalog.inode(id);
-            let size = inode.stat.size;
+            let size = catalog.size(id);
             census.file_size.add(size);
-            let state = &mut census.states[inode.state as usize];
+            let state = &mut census.states[catalog.state(id) as usize];
             state.0 += 1;
             state.1 += size;
             let names = names_of[id.0 as usize];
@@ -165,7 +164,7 @@ impl Census {
                 census.linked.0 += 1;
                 census.linked.1 += u64::from(names - 1);
             }
-            match inode.doc {
+            match catalog.doc(id) {
                 Some(doc) if catalog.doc_hash(doc).is_some() => held.push((doc.0, size)),
                 Some(_) => census.dangling += 1,
                 None => {}
