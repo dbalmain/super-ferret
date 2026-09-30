@@ -90,6 +90,17 @@ fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
     }
 }
 
+/// Overwrites the base of block `block` of the blocked column `column`: every
+/// row of the block moves with it.
+fn set_block_base(bytes: &mut [u8], column: Column, block: usize, base: u64) {
+    let layout = format::decode_table(bytes, bytes.len() as u64).unwrap();
+    let placed = layout.columns[column as usize];
+    let entry = section_start(bytes, column.section())
+        + placed.start
+        + block * packed::BLOCK_ENTRY as usize;
+    bytes[entry..entry + 8].copy_from_slice(&base.to_le_bytes());
+}
+
 /// Reads everything a catalog offers through every accessor whose sections
 /// are loaded. A panic anywhere here is the failure validation exists to
 /// prevent.
@@ -406,6 +417,7 @@ fn a_blocked_column_whose_table_misplaces_a_block_is_rejected_on_load() {
     let scratch = Scratch::new("decode-blocked-lazy");
     for column in [
         Column::NameOffset,
+        Column::NameChild,
         Column::Size,
         Column::Mtime,
         Column::Ctime,
@@ -510,7 +522,8 @@ fn a_name_that_makes_a_directory_its_own_descendant_is_rejected() {
 
     let path = scratch.path.join("catalog");
     let mut bytes = std::fs::read(&path).unwrap();
-    set_raw(&mut bytes, Column::NameChild, 0, 0);
+    // One name: its child's block is width 0, so the value is the base.
+    set_block_base(&mut bytes, Column::NameChild, 0, 0);
     std::fs::write(&path, &bytes).unwrap();
     // Retention is the walk that looped (about 1 GB in 5 s before the fix);
     // the writer must refuse the generation before it can keep anything.

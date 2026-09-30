@@ -188,6 +188,15 @@ impl Plan {
         }
     }
 
+    /// The inode an entry names.
+    fn child(&self, entry: u32) -> u32 {
+        let e = entry as usize;
+        match e < self.index.dirs {
+            true => self.dir_id[e],
+            false => self.inode_of_file[e - self.index.dirs],
+        }
+    }
+
     fn children(&self, dir: u32) -> &[u32] {
         let d = dir as usize;
         &self.edges[self.edge_start[d] as usize..self.edge_start[d + 1] as usize]
@@ -252,7 +261,12 @@ impl Plan {
         let below = |n: usize| Range((n > 0).then(|| (0, n as u64 - 1)));
         if names > 0 {
             ranges[Column::NameParent as usize] = below(dirs);
-            ranges[Column::NameChild as usize] = below(inodes);
+        }
+        let child = &mut blocks[Column::NameChild as usize];
+        for &dir in &self.order {
+            for &entry in self.children(dir) {
+                child.push(u64::from(self.child(entry)));
+            }
         }
         ranges[Column::DirName as usize] = below(names);
         for (row, &(_, id)) in self.docs.iter().enumerate() {
@@ -734,18 +748,12 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
     let layout = format::decode_table(&bytes, len).map_err(io::Error::other)?;
     let column = |c: Column| ColumnWriter::start(out, &layout, c, &dicts[c as usize]);
     let section = |s: Section| At::new(out, layout.range(s).0 as u64);
-    let dirs = plan.index.dirs;
-
     let (mut parents, mut children) = (column(Column::NameParent)?, column(Column::NameChild)?);
     let (mut offsets, mut heap) = (column(Column::NameOffset)?, section(Section::NameHeap));
     let mut offset = 0;
     for (id, &dir) in plan.order.iter().enumerate() {
         for &entry in plan.children(dir) {
-            let e = entry as usize;
-            let child = match e < dirs {
-                true => plan.dir_id[e],
-                false => plan.inode_of_file[e - dirs],
-            };
+            let child = plan.child(entry);
             let name = plan.name(&batches, entry);
             parents.value(id as u64)?;
             children.value(u64::from(child))?;

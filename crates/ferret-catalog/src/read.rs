@@ -328,7 +328,7 @@ impl Catalog {
             heap: self.name_heap(),
             offsets: self.layout.blocked(Column::NameOffset, rows),
             parents: self.layout.view(Column::NameParent, rows),
-            children: self.layout.view(Column::NameChild, rows),
+            children: self.layout.blocked(Column::NameChild, rows),
             count: self.layout.names,
         }
     }
@@ -348,7 +348,7 @@ impl Catalog {
     /// The inode a name edge names, without reading its bytes. Needs only
     /// [`Section::Names`].
     pub fn child(&self, id: NameId) -> InoId {
-        InoId(self.column(Column::NameChild).get(id.0 as usize) as u32)
+        InoId(self.blocked(Column::NameChild).get(id.0 as usize) as u32)
     }
 
     /// The name whose bytes (or terminator) hold heap offset `offset`, or
@@ -661,7 +661,7 @@ pub struct NameReader<'c> {
     heap: &'c [u8],
     offsets: Blocked<'c>,
     parents: View<'c>,
-    children: View<'c>,
+    children: Blocked<'c>,
     count: usize,
 }
 

@@ -14,8 +14,8 @@
 //! first, and a reader loads each on first use (D38 B).
 //!
 //! ```text
-//! names       3 columns: parent InoId, child InoId, offset in name heap
-//!             (blocked)
+//! names       3 columns: parent InoId, child InoId (blocked), offset in
+//!             name heap (blocked)
 //! name heap   names, each NUL-terminated, in NameId order (D28)
 //! dir names   column, per directory InoId: its NameId, none for a root
 //! entries     column, per directory: the entries `getdents` returned, minus
@@ -60,10 +60,11 @@
 //! - **Blocked:** a frame of reference per block of 128 rows, each block with
 //!   its own base and width, found through a table of 16 B entries at the
 //!   column's start (`packed::Blocked`). For a column whose neighbouring rows
-//!   are close: name offsets only grow, nlink is nearly always 1, and files
-//!   numbered by name sit beside their siblings, which share sizes and times
-//!   far more than the whole tree does. The descriptor's base is the bytes of
-//!   packed values after the table, and its width the widest block's.
+//!   are close: name offsets only grow, a directory's children are numbered
+//!   together, nlink is nearly always 1, and files numbered by name sit beside
+//!   their siblings, which share sizes and times far more than the whole tree
+//!   does. The descriptor's base is the bytes of packed values after the table,
+//!   and its width the widest block's.
 //! - **Sequence:** row `i`'s value is `base + i + packed`, for ids sorted
 //!   strictly increasing. Ids without holes are all `packed` 0: width 0, no
 //!   bytes but the padding, and a row found from its id by subtraction. A hole
@@ -275,15 +276,14 @@ impl Column {
         match self {
             Column::DirName | Column::Entries | Column::Doc => Coding::Nullable,
             Column::Dev | Column::Mode | Column::Owner => Coding::Dictionary,
-            Column::NameOffset | Column::Size | Column::Mtime | Column::Ctime | Column::Nlink => {
-                Coding::Blocked
-            }
-            Column::DocId => Coding::Sequence,
-            Column::NameParent
+            Column::NameOffset
             | Column::NameChild
-            | Column::Ino
-            | Column::MtimeNs
-            | Column::CtimeNs => Coding::Frame,
+            | Column::Size
+            | Column::Mtime
+            | Column::Ctime
+            | Column::Nlink => Coding::Blocked,
+            Column::DocId => Coding::Sequence,
+            Column::NameParent | Column::Ino | Column::MtimeNs | Column::CtimeNs => Coding::Frame,
         }
     }
 
@@ -1225,7 +1225,7 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeErro
         return Err(DecodeError::Corrupt("name order"));
     }
     let parents = l.view(Column::NameParent, rows);
-    let children = l.view(Column::NameChild, rows);
+    let children = l.blocked(Column::NameChild, rows);
     let offsets = l.blocked(Column::NameOffset, rows);
     // The name before this row: its parent and where its bytes start; and
     // the one before that, for sibling order.
@@ -1294,7 +1294,7 @@ fn check_dir_names(
 ) -> Result<(), DecodeError> {
     let dir_names = l.view(Column::DirName, dir_names);
     let parents = l.view(Column::NameParent, rows);
-    let children = l.view(Column::NameChild, rows);
+    let children = l.blocked(Column::NameChild, rows);
     let mut named = 0;
     for (dir, name) in dir_names.nullables(l.dirs).enumerate() {
         let Some(name) = name else {
