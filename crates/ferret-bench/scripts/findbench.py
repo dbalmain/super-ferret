@@ -37,9 +37,10 @@ Per query it measures:
            one warm-up run.
   in-proc  the same runs' total_us / first_row_us from the query log, which
            exclude exec, dynamic loading and teardown.
-  max RSS  ru_maxrss from wait4, the child's peak. It includes a floor from
-           this interpreter's own image at fork (the `--version` row measures
-           it: subtract that, or compare like with like).
+  max RSS  ru_maxrss from wait4 (KiB), the child's peak, printed in MiB. It
+           includes a floor from this interpreter's own image at fork (the
+           `--version` row measures it: subtract that, or compare like with
+           like). Bytes read are decimal MB.
 
 With --bench it appends `ferret-bench sections` (exact bytes and bytes per name
 per section) and `ferret-bench open` (open and load_all, warm and evicted).
@@ -198,7 +199,7 @@ def main():
             " ".join(q),
             f"evicted {med(ev, 'wall'):.1f} ms, fresh {med(fr, 'wall'):.1f} ms, "
             f"in-proc {med(fr, 'total'):.1f} ms, rows {fr[0]['rows']}, "
-            f"rss {med(fr, 'rss') / 1024:.0f} MB",
+            f"rss {med(fr, 'rss') / 1024:.0f} MiB",
             flush=True,
         )
     load_after = loadavg()
@@ -213,7 +214,7 @@ def main():
             "ms. Evicted and fresh are process wall clock (exec to exit); "
             "in-proc is the query log's total_us, first is first_row_us. Max RSS "
             f"is the process's peak; a bare `--version` run reads "
-            f"{floor / 1024:.0f} MB on the same path, the floor.\n\n"
+            f"{floor / 1024:.0f} MiB on the same path, the floor.\n\n"
         )
         f.write(
             "| query | strategy | rows | evicted first / wall | fresh wall "
@@ -226,7 +227,7 @@ def main():
                 f"{med(ev, 'first'):.1f} / {med(ev, 'wall'):.1f} | "
                 f"{med(fr, 'wall'):.1f} | "
                 f"{med(fr, 'first'):.1f} / {med(fr, 'total'):.1f} | "
-                f"{med(fr, 'rss') / 1024:.0f} MB | "
+                f"{med(fr, 'rss') / 1024:.0f} MiB | "
                 f"{fr[0]['read'] / 1e6:.1f} MB |\n"
             )
         if args.bench:

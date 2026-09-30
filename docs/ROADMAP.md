@@ -123,23 +123,30 @@ lower bound on the raw `getdents` count, since the dump omits what the walker
 never lists); every copy shares those values, which is what makes the packed
 widths a fair worst case only for inodes and dev, not for sizes and times.
 
-| measure                                      | before `$HOME`             | after `$HOME`                  | before 10M       | after 10M        |
-| -------------------------------------------- | -------------------------- | ------------------------------ | ---------------- | ---------------- |
-| catalog bytes                                | 47.3 MB, 106.2 B/n         | 28.4 MB, 63.7 B/n              | 1,202 MB, 117.4  | 799 MB, 78.0     |
-| Names (offsets + lengths)                    | 12.00 B/n                  | 7.50                           | 12.00            | 9.13             |
-| NameHeap                                     | 24.13                      | 24.13                          | 24.13            | 24.13            |
-| DirNames                                     | 0.70                       | 0.42                           | 0.70             | 0.53             |
-| Entries (new: raw directory counts)          | —                          | 0.26                           | —                | 0.26             |
-| inode columns (was `Inodes`, fixed 64 B)     | 64.00                      | 26.00                          | 64.00            | 27.38            |
-| States, Traversed, Strings, Links, WorkTrees | 0.48                       | 0.48                           | 0.32             | 0.32             |
-| Docs                                         | 4.91                       | 4.91                           | 16.29            | 16.29            |
-| `ferret-bench open`, name sections, warm     | 5.0 ms (16.5 MB)           | 7.1 ms (14.4 MB)               | 207 ms (378 MB)  | 254 ms (347 MB)  |
-| same, evicted                                | 18.2 ms                    | 20.0 ms                        | 333 ms           | 371 ms           |
-| `load_all`, warm / evicted                   | 9.1 / 42.4 ms              | 9.7 / 37.7 ms                  | 472 / 840 ms     | 439 / 784 ms     |
-| `index`, first run / re-run                  | 55.6 s (cold-ish) / 0.50 s | 43.1 s (cold-ish) / 0.87 s (a) | —                | —                |
-| `index` peak RSS, first / re-run             | 78 / 161 MB                | 84 / 100 MB                    | —                | —                |
-| `synthetic` build, time / peak RSS           | —                          | —                              | 9.4 s / 1,748 MB | 9.7 s / 1,880 MB |
-| same, CPU (user + sys), same sitting         | —                          | —                              | 7.3 s            | 9.5 s            |
+Units: RSS is in MiB throughout this section. `findbench.py` reports
+`ru_maxrss` / 1024, so its figures were MiB all along and only the label
+changed; the `synthetic` and `time` figures are KiB, first written as kB / 1000
+"MB" and now converted from the recorded KiB. The `index` rows' raw KiB were not
+kept and are converted from the MB as written (plus or minus 1 MiB). Catalog
+and section bytes, and bytes read, stay decimal MB unless marked MiB.
+
+| measure                                      | before `$HOME`             | after `$HOME`                  | before 10M        | after 10M         |
+| -------------------------------------------- | -------------------------- | ------------------------------ | ----------------- | ----------------- |
+| catalog bytes                                | 47.3 MB, 106.2 B/n         | 28.4 MB, 63.7 B/n              | 1,202 MB, 117.4   | 799 MB, 78.0      |
+| Names (offsets + lengths)                    | 12.00 B/n                  | 7.50                           | 12.00             | 9.13              |
+| NameHeap                                     | 24.13                      | 24.13                          | 24.13             | 24.13             |
+| DirNames                                     | 0.70                       | 0.42                           | 0.70              | 0.53              |
+| Entries (new: raw directory counts)          | —                          | 0.26                           | —                 | 0.26              |
+| inode columns (was `Inodes`, fixed 64 B)     | 64.00                      | 26.00                          | 64.00             | 27.38             |
+| States, Traversed, Strings, Links, WorkTrees | 0.48                       | 0.48                           | 0.32              | 0.32              |
+| Docs                                         | 4.91                       | 4.91                           | 16.29             | 16.29             |
+| `ferret-bench open`, name sections, warm     | 5.0 ms (16.5 MB)           | 7.1 ms (14.4 MB)               | 207 ms (378 MB)   | 254 ms (347 MB)   |
+| same, evicted                                | 18.2 ms                    | 20.0 ms                        | 333 ms            | 371 ms            |
+| `load_all`, warm / evicted                   | 9.1 / 42.4 ms              | 9.7 / 37.7 ms                  | 472 / 840 ms      | 439 / 784 ms      |
+| `index`, first run / re-run                  | 55.6 s (cold-ish) / 0.50 s | 43.1 s (cold-ish) / 0.87 s (a) | —                 | —                 |
+| `index` peak RSS, first / re-run             | 76 / 157 MiB               | 82 / 98 MiB                    | —                 | —                 |
+| `synthetic` build, time / peak RSS           | —                          | —                              | 9.4 s / 1,707 MiB | 9.7 s / 1,836 MiB |
+| same, CPU (user + sys), same sitting         | —                          | —                              | 7.3 s             | 9.5 s             |
 
 (a) Measured before the build fix; not re-measured on the final code, as the
 machine was not quiet (load 5, another session's find-compat harness running).
@@ -154,23 +161,23 @@ entry near 1,000); a frame-of-reference or exception scheme would take it to
 about 1 bit. Ino at 30 bits is the synthetic's copy stride (`$HOME` alone is 25
 bits, 3.1 B).
 
-| `find` (fresh process, ms) | before `$HOME` | after `$HOME` |   before 10M |  after 10M |
-| -------------------------- | -------------: | ------------: | -----------: | ---------: |
-| `flamegraph` fresh         |           12.3 |          14.2 |          243 |        295 |
-| `flamegraph` evicted       |           22.6 |          23.9 |          380 |        406 |
-| `test` fresh               |           30.5 |          15.6 |          643 |        362 |
-| `test` evicted             |          110.0 |          26.1 |        2,324 |        492 |
-| `size:>100M` fresh         |           29.4 |          21.2 |          612 |        453 |
-| `size:>100M` evicted       |           50.4 |          34.0 |          924 |        613 |
-| `*` fresh                  |          110.0 |          97.2 |        2,488 |      2,315 |
-| `*` evicted                |          131.0 |         105.1 |        2,825 |      2,417 |
-| peak RSS, name queries     |       19-46 MB |         17 MB |   365-991 MB | 333-334 MB |
-| bytes read, name queries   |   16.6-45.5 MB |       14.4 MB | 380-1,046 MB |     347 MB |
+| `find` (fresh process, ms) | before `$HOME` | after `$HOME` |   before 10M |   after 10M |
+| -------------------------- | -------------: | ------------: | -----------: | ----------: |
+| `flamegraph` fresh         |           12.3 |          14.2 |          243 |         295 |
+| `flamegraph` evicted       |           22.6 |          23.9 |          380 |         406 |
+| `test` fresh               |           30.5 |          15.6 |          643 |         362 |
+| `test` evicted             |          110.0 |          26.1 |        2,324 |         492 |
+| `size:>100M` fresh         |           29.4 |          21.2 |          612 |         453 |
+| `size:>100M` evicted       |           50.4 |          34.0 |          924 |         613 |
+| `*` fresh                  |          110.0 |          97.2 |        2,488 |       2,315 |
+| `*` evicted                |          131.0 |         105.1 |        2,825 |       2,417 |
+| peak RSS, name queries     |      19-46 MiB |        17 MiB |  365-991 MiB | 333-334 MiB |
+| bytes read, name queries   |   16.6-45.5 MB |       14.4 MB | 380-1,046 MB |      347 MB |
 
-Peak `find` RSS at 10M is now 333 MB for a name query and 372-376 MB with a
-metadata atom, a third of D48's 1 GB line (it was 990 MB). The 15 MB Python
+Peak `find` RSS at 10M is now 333 MiB for a name query and 372-376 MiB with a
+metadata atom, a third of D48's 1 GB line (it was 990 MiB). The 15 MiB Python
 floor is in every RSS figure on both sides. `find --json` reads the three
-columns it prints: `flamegraph` 0.33 s, `test` 0.49 s, 452 MB at 10M.
+columns it prints: `flamegraph` 0.33 s, `test` 0.49 s, 452 MB read at 10M.
 
 What changed the numbers, separated as far as the data allows (`perf` on the 10M
 catalog, user space only).
@@ -216,14 +223,14 @@ writes every column positionally in one pass over the inode rows.
 | Names (offsets blocked)                  |                |               | 9.13 B/n             | 7.21                 |
 | Nlink                                    |                |               | 12.81 MB             | 1.77 MB              |
 | Docs (ids implicit)                      |                |               | 16.29 B/n            | 13.03                |
-| `find` peak RSS, name / metadata queries |                |               | 333 / 372-377 MB     | 315 / 354-358 MB     |
+| `find` peak RSS, name / metadata queries |                |               | 333 / 372-377 MiB    | 315 / 354-358 MiB    |
 | `open`, name sections, warm / evicted    | 7.1 / 12.7 ms  | 6.9 / 11.5 ms | 246-252 / 346-356 ms | 243-251 / 344-348 ms |
 | `find flamegraph`, fresh                 |                |               | 292 ms               | 281 ms               |
 | `find re:^[0-9a-f]{8}$`, fresh           |                |               | 535 ms               | 571 ms               |
 | `find '*'`, fresh                        |                |               | 2,290 ms             | 2,469 ms             |
 | `synthetic` build, wall (two runs)       |                |               | 11.0 / 12.8 s        | 9.5 / 9.5 s          |
 | same, user / sys                         |                |               | 8.4 / 1.3-1.5 s      | 8.1 / 1.3 s          |
-| same, peak RSS                           |                |               | 1,881 MB             | 1,858 MB             |
+| same, peak RSS                           |                |               | 1,837 MiB            | 1,814 MiB            |
 
 A scan of every name is 7-8% slower (user 2.12 to 2.28 s at 10M): each offset
 read now goes through its block's table entry. It was 11% until blocked columns
@@ -243,21 +250,21 @@ finding 2 asked for a child-range table in place of the parent column; blocked
 parents are smaller, 6.1 MB against 7.2, and keep a name's parent one read
 away).
 
-| measure                                  | before `$HOME` | after `$HOME` | before 10M           | after 10M        |
-| ---------------------------------------- | -------------- | ------------- | -------------------- | ---------------- |
-| catalog bytes                            | 60.25 B/n      | 51.37 B/n     | 735 MB, 71.78        | 635 MB, 62.03    |
-| Names (all three blocked)                |                |               | 7.21 B/n             | 4.10             |
-| Size + Mtime + Ctime                     |                |               | 115.2 MB             | 47.3 MB          |
-| `find` peak RSS, name / metadata queries |                |               | 315 / 354-358 MB     | 284 / 301-304 MB |
-| `open`, name sections, warm / evicted    |                |               | 243-251 / 344-348 ms | 247 / 354 ms     |
-| `find '*'`, fresh                        |                |               | 2,469 ms             | 1,520 ms         |
-| `find re:^[0-9a-f]{8}$`, fresh           |                |               | 571 ms               | 475 ms           |
-| `find flamegraph`, fresh                 |                |               | 281 ms               | 290 ms           |
-| `find test`, fresh                       |                |               | 363 ms               | 338 ms           |
-| `find mtime:<1d`, fresh                  |                |               | 476 ms               | 366 ms           |
-| `find size:>100M`, fresh                 |                |               | 443 ms               | 351 ms           |
-| `synthetic` build, user (two runs)       |                |               | 8.13 / 8.21 s        | 8.37 / 8.41 s    |
-| same, peak RSS                           |                |               | 1,858 MB             | 1,857 MB         |
+| measure                                  | before `$HOME` | after `$HOME` | before 10M           | after 10M         |
+| ---------------------------------------- | -------------- | ------------- | -------------------- | ----------------- |
+| catalog bytes                            | 60.25 B/n      | 51.37 B/n     | 735 MB, 71.78        | 635 MB, 62.03     |
+| Names (all three blocked)                |                |               | 7.21 B/n             | 4.10              |
+| Size + Mtime + Ctime                     |                |               | 115.2 MB             | 47.3 MB           |
+| `find` peak RSS, name / metadata queries |                |               | 315 / 354-358 MiB    | 284 / 301-304 MiB |
+| `open`, name sections, warm / evicted    |                |               | 243-251 / 344-348 ms | 247 / 354 ms      |
+| `find '*'`, fresh                        |                |               | 2,469 ms             | 1,520 ms          |
+| `find re:^[0-9a-f]{8}$`, fresh           |                |               | 571 ms               | 475 ms            |
+| `find flamegraph`, fresh                 |                |               | 281 ms               | 290 ms            |
+| `find test`, fresh                       |                |               | 363 ms               | 338 ms            |
+| `find mtime:<1d`, fresh                  |                |               | 476 ms               | 366 ms            |
+| `find size:>100M`, fresh                 |                |               | 443 ms               | 351 ms            |
+| `synthetic` build, user (two runs)       |                |               | 8.13 / 8.21 s        | 8.37 / 8.41 s     |
+| same, peak RSS                           |                |               | 1,814 MiB            | 1,813 MiB         |
 
 A scan of every name is now 35% faster than before S1a's first review round (`*`
 2,290 ms at `5d2bf7d`), not 7% slower. By step, in user time for `*`: 2.31 s,
@@ -269,6 +276,64 @@ child (before that change, 5% slower). About 30% of what remains in `*` is the
 regex that `*` compiles to, run on every name. Flamegraph at 281 against 290 ms
 is load; `perf stat` put the two within 2%, with blocked parents ahead. The
 build's 0.2 s more user time is sizing the extra blocked columns.
+
+**After the third review round** (2026-09-30; before = the round above,
+`897d670`'s code, on its catalogs; load average 3-11 from another session's
+harness, so the close comparisons are `perf stat -r 10`, each variant's binary
+on its own catalog, interleaved, and the builds three interleaved rounds). The
+remaining plain inode columns became blocked: ino and both nanosecond columns
+plainly, `DocId` and entry counts in a nullable blocked coding (each block
+framed by its real values, a flag beside the width when it holds a none, width
+0 when it holds nothing else). A metadata pass loads its column as it begins,
+skips runs of 64 inodes an earlier test cleared, and a pass that clears every
+bit ends the query. The build frees the batches' content hashes once document
+ids are decided, and writes every column through a bounded 64 KiB buffer.
+
+| measure                                  | before `$HOME`      | after `$HOME`   | before 10M            | after 10M             |
+| ---------------------------------------- | ------------------- | --------------- | --------------------- | --------------------- |
+| catalog bytes                            | 22.91 MB, 51.36 B/n | 21.31 MB, 47.76 | 635.5 MB, 62.03       | 579.8 MB, 56.59       |
+| Ino                                      |                     |                 | 36.6 MiB              | 17.9 MiB              |
+| MtimeNs + CtimeNs                        |                     |                 | 73.2 MiB              | 60.4 MiB              |
+| Doc (nullable blocked)                   |                     |                 | 28.1 MiB              | 8.3 MiB               |
+| Entries (nullable blocked)               |                     |                 | 2.6 MiB               | 1.0 MiB               |
+| `find` peak RSS, name / metadata queries |                     |                 | 284-285 / 301-304 MiB | 284-285 / 301-304 MiB |
+| `find '*'`, task-clock                   |                     |                 | 1,478 ms              | 1,484-1,491 ms        |
+| `find size:>1T mtime:<1d`, task-clock    |                     |                 | 107 ms                | 31 ms                 |
+| `find size:>100M mtime:<1d`, task-clock  |                     |                 | 412 ms                | 339 ms                |
+| `find mtime:<1d` / `size:>100M`          |                     |                 | 371 / 357 ms          | 348 / 334 ms          |
+| `synthetic` build, peak RSS              |                     |                 | 1,813 MiB             | 1,604 MiB             |
+| same, fill peak / commit peak            |                     |                 | — / —                 | 1,401 / 1,604 MiB     |
+
+The build's peak fell 209 MiB in two steps. The `synthetic` driver held its
+81.8 MB dump and parsed rows through the commit: dropping them took the
+process's peak from 1,813 to 1,688 MiB, and it now reports a fill peak and a
+commit peak apart, the latter after resetting `VmHWM` (the commit peak read
+1,688-1,700 MiB across runs of that binary). The builder kept every batch's
+content hashes alive through the document sort: freeing them took the commit
+peak from 1,700 to 1,604 MiB, run for run. The column codings
+changed the peak by less than 1 MiB. The bounded buffer changes no figure here
+(the synthetic's link targets are short); before it, a section written in one
+call, the strings, was copied whole into the buffer.
+
+A second generation, timed on the same code with the old codings (a detached
+worktree reverting only the column codings) against the new, three rounds
+each: a re-run that carries every file begins 12% faster (5.98 to 5.25 s: it
+loads the previous catalog whole and sorts its inodes by `(dev, ino)`), then
+carries 8% slower (6.26 to 6.75 s: 8.3M binary searches over blocked inode
+numbers), for user time 18.89 against 18.82 s and a peak of 2,069 against
+2,013 MiB. A run that keeps the root whole instead (`synthetic ... keep`)
+begins 5.26 s against 6.00, keeps in 2.69 s against 2.74, and uses 14.10 s of
+user time against 14.87. The commit's wall time ranges 7.7-14.4 s on both, all
+of it `fsync`.
+
+Every changed column paid except directory names: blocked, they were 5.1 to
+2.1 MiB, and a scan of every name took 1.5-2% longer (1,517 / 1,527 against
+1,495 / 1,491 ms, the same code with only that column reverted), since it reads
+one per directory it enters. They stay one nullable frame. Ctime nanoseconds
+save the least (2.6 MiB) and cost nothing measurable: a keep, which reads every
+inode's whole row once, is no slower. The impossible-then-costly query
+(`size:>1T mtime:<1d`) now leaves the mtime column on disk, which a test through
+the real run path checks.
 
 ## S1+ — Incremental catalog
 

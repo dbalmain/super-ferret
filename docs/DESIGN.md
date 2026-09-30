@@ -147,21 +147,30 @@ Every id and inode field is a bit-packed column (S1a): `count` values of
 (written as zeros, not checked; reads never depend on it) so a read is one
 unaligned 8-byte load, a shift and a mask, plus a ninth byte at widths 58 to 63
 when the value straddles. A descriptor holds the column's
-base, width and dictionary length. Plain fields are frame of reference (value
-minus the column's minimum; times order-mapped from `i64` first); nullable ones
-(a directory's name and entry count, an inode's `DocId`) reserve all ones for
-none; `dev`, `mode` and the `(uid, gid)` pair are indexes into a sorted
-dictionary at the head of their section. The three name columns, size, mtime,
-ctime and `nlink` are blocked: a frame of reference per 128 rows, through a
-table of 16 B entries (base, offset and width) ahead of the values, so a read
-stays O(1) and one outlier widens only its block. Neighbouring rows are close:
-offsets only grow, parents only rise, a directory's children are numbered
-together, and files numbered by name sit beside siblings that share sizes and
-times. At 10M names blocking took offsets from 35.9 to 16.3 MB, parents from
-26.9 to 6.1 MB (smaller than a per-directory child-range table, 7.2 MB, and
-still O(1) from a name to its parent), children from 30.7 to 19.6 MB, size,
-mtime and ctime from 115.2 to 47.3 MB together, and `nlink` from 12.8 to 1.8
-MB; 64 and 256 rows measured within 1 MB either way on offsets. A scan reads
+base, width and dictionary length. Every coding is a frame of reference
+(value minus the minimum; times order-mapped from `i64` first). A directory's
+name is one frame for the column that reserves all ones for none; `dev`,
+`mode` and the `(uid, gid)` pair are indexes into a sorted dictionary at the
+head of their section. The three name columns and every other inode field
+(ino, size, the four time columns, `nlink`) are blocked: a frame of reference
+per 128 rows, through a table of 16 B entries (base, offset and width) ahead
+of the values, so a read stays O(1) and one outlier widens only its block. An
+inode's `DocId` and a directory's entry count are nullable blocked: each block
+is framed by its real values alone, and one that holds a none flags it beside
+its width and reserves that width's all ones; a block of nothing but nones is
+width 0. Neighbouring rows are close: offsets only grow, parents only rise, a
+directory's children are numbered together, files numbered by name sit beside
+siblings that share sizes, times and nearby inode numbers, and directories and
+unhashed files leave document ids out in runs. At 10M names blocking took
+offsets from 35.9 to 16.3 MB, parents from 26.9 to 6.1 MB (smaller than a
+per-directory child-range table, 7.2 MB, and still O(1) from a name to its
+parent), children from 30.7 to 19.6 MB, size, mtime and ctime from 115.2 to
+47.3 MB together, `nlink` from 12.8 to 1.8 MB, ino from 36.6 to 17.9 MiB, the
+nanoseconds from 73.2 to 60.4 MiB, `DocId` from 28.1 to 8.3 MiB and entry
+counts from 2.6 to 1.0 MiB; 64 and 256 rows measured within 1 MB either way on
+offsets. Directory names stay one frame: blocked, they were 3 MiB smaller and a
+scan of every name, which reads one per directory it enters, took 1.5-2%
+longer. A scan reads
 the name columns a block at a time, each name's end carried from the next
 one's start, so a pass costs no table read per row.
 Document ids are a sequence column, row `i` holding `id - i`: with no holes it
@@ -196,14 +205,18 @@ The memory budget is a config value, defaulted from measurement (D5).
 The writer is built for 10M entries (D40). Workers fill columnar batches, about
 120 B per entry. The build first decides every id with a few `u32` index arrays
 per entry, deduplicating inodes and documents by sorting rather than through
-maps, so every build error comes before a byte is written. It then streams the
-sections to `catalog.tmp` in file order, freeing batch names once the name
-sections are out, and reads the file back for the decode check only after the
-batches are gone. The old generation is released before the build. Synthetic 10M
-(the `$HOME` dump under 23 prefixes; 1.18 GB file): first build peak 1.66 GB,
-commit 5.5 s; a re-run peaks at 2.56 GB during the walk, since the old
-generation (read into memory) and the new batches are both live. 40M: 6.4 GB and
-10.1 GB, commit 23 s. The writer releases its lock with `LOCK_UN` on drop,
+maps, so every build error comes before a byte is written. Once the document
+ids are decided it keeps each file inode's content state and frees the batches'
+hashes. It then streams the columns to their places in `catalog.tmp`, each
+through a bounded 64 KiB buffer that a larger write bypasses, freeing batch
+names once the name sections are out, and reads the file back for the decode
+check only after the batches are gone. The old generation is released before
+the build. Synthetic 10M (the `$HOME` dump under 23 prefixes; 1.18 GB file at
+S1): first build peak 1.66 GB, commit 5.5 s; a re-run peaks at 2.56 GB during
+the walk, since the old generation (read into memory) and the new batches are
+both live. 40M: 6.4 GB and 10.1 GB, commit 23 s. After S1a (580 MB file) the
+first build peaks at 1,604 MiB in the commit and 1,401 MiB while filling, and a
+re-run that carries every file at 2,014 MiB. The writer releases its lock with `LOCK_UN` on drop,
 because a child forked by any thread shares the lock's file description until it
 execs.
 
@@ -389,7 +402,9 @@ name by galloping over name starts, tested once, and the scan resumes at the
 next name. A query with metadata atoms and no literal tests every inode row
 first and then walks the name rows for the inodes that pass, loading the name
 sections only if one does; the inode test is a pass over each column it reads,
-decoded a run at a time. Everything else tests every name, read in decoded
+loading the column as its pass begins and decoding only the runs of 64 inodes
+that an earlier test left a bit set in, and a test that leaves none ends the
+conjunction with the later columns unread. Everything else tests every name, read in decoded
 runs. A name query loads
 the name, directory, root, traversed and link sections, never the document rows,
 and no inode columns for plain output (`--json` loads Size, Mtime and Doc); a
