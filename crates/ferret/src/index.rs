@@ -58,7 +58,8 @@ pub fn index(context: &Context, dirs: &[PathBuf]) -> Exit {
                 return Exit::Error;
             }
         }
-    } else if let Err(e @ OpenError::Decode(DecodeError::Version(_))) = Catalog::open(&context.index)
+    } else if let Err(e @ OpenError::Decode(DecodeError::Version(_))) =
+        Catalog::open(&context.index)
     {
         warn(&format!(
             "{}: {e}; rebuilding it from scratch with only the roots named here",
@@ -108,8 +109,7 @@ fn removal(context: &Context, dir: &Path) -> Result<PathBuf, String> {
                 .map_err(fail)?
                 .components()
                 .collect();
-            let roots =
-                configured(context).map_err(|e| open_failed(context, &e))?;
+            let roots = configured(context).map_err(|e| open_failed(context, &e))?;
             match roots.contains(&spelled) {
                 true => Ok(spelled),
                 false => Err(format!(

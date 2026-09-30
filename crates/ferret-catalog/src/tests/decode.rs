@@ -35,7 +35,13 @@ fn sample(name: &str) -> Vec<u8> {
         w.symlink(root, b"d", link_stat(13), b"sub/a.rs");
         w.work_tree(sub, WorkTreeKind::Linked, b"/repo/.git", (1, 2));
         w.entry_count(sub, 2);
-        let other = w.root(b"/t", Stat { dev: 9, ..dir_stat(4) });
+        let other = w.root(
+            b"/t",
+            Stat {
+                dev: 9,
+                ..dir_stat(4)
+            },
+        );
         w.file(other, b"e", file_stat(14), Content::Fault);
         txn.add(w);
     });
@@ -59,10 +65,12 @@ fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
     let layout = format::decode_table(bytes, bytes.len() as u64).unwrap();
     let placed = layout.columns[column as usize];
     let width = placed.desc.width as usize;
-    assert!(raw <= packed::mask(placed.desc.width), "{raw} does not fit {width} bits");
-    let values = section_start(bytes, column.section())
-        + placed.start
-        + placed.desc.dict_len as usize * 8;
+    assert!(
+        raw <= packed::mask(placed.desc.width),
+        "{raw} does not fit {width} bits"
+    );
+    let values =
+        section_start(bytes, column.section()) + placed.start + placed.desc.dict_len as usize * 8;
     for bit in 0..width {
         let at = row * width + bit;
         let byte = &mut bytes[values + at / 8];
@@ -126,10 +134,12 @@ fn exercise(catalog: &Catalog) -> usize {
             touched = touched.wrapping_add(catalog.state(id) as usize);
         }
         if has(&[Doc, Docs]) {
-            touched = touched.wrapping_add(catalog
-                .doc(id)
-                .and_then(|d| catalog.doc_hash(d))
-                .map_or(0, |h| h[0] as usize));
+            touched = touched.wrapping_add(
+                catalog
+                    .doc(id)
+                    .and_then(|d| catalog.doc_hash(d))
+                    .map_or(0, |h| h[0] as usize),
+            );
         }
         if has(&[Links, Strings]) {
             touched += catalog.link_target(id).map_or(0, <[u8]>::len);
@@ -654,9 +664,7 @@ const ACCESSORS: &[Accessor] = {
                     .sum::<usize>()
         }),
         (&[NameHeap], "name_heap", |c| c.name_heap().len()),
-        (&[Names], "names", |c| {
-            c.names().map(|(_, b)| b.len()).sum()
-        }),
+        (&[Names], "names", |c| c.names().map(|(_, b)| b.len()).sum()),
         (&[Names], "name", |c| {
             ids(c).map(|i| c.name(i).bytes.len()).sum()
         }),
@@ -682,9 +690,7 @@ const ACCESSORS: &[Accessor] = {
         (&[DirNames], "dir_name", |c| {
             dirs(c).filter_map(|d| c.dir_name(d)).count()
         }),
-        (&[Roots], "roots", |c| {
-            c.roots().map(|(_, p)| p.len()).sum()
-        }),
+        (&[Roots], "roots", |c| c.roots().map(|(_, p)| p.len()).sum()),
         (&[Roots], "dir_path", |c| {
             dirs(c)
                 .map(|d| {
@@ -712,21 +718,27 @@ const ACCESSORS: &[Accessor] = {
         (&Section::INODE, "inode", |c| {
             inodes(c).map(|i| c.inode(i).stat.ino as usize).sum()
         }),
-        (&[Size], "size", |c| inodes(c).map(|i| c.size(i) as usize).sum()),
+        (&[Size], "size", |c| {
+            inodes(c).map(|i| c.size(i) as usize).sum()
+        }),
         (&[Mtime], "mtime", |c| {
             inodes(c).map(|i| c.mtime(i).unsigned_abs() as usize).sum()
         }),
         (&[Ctime], "ctime", |c| {
             inodes(c).map(|i| c.ctime(i).unsigned_abs() as usize).sum()
         }),
-        (&[Mode], "mode", |c| inodes(c).map(|i| c.mode(i) as usize).sum()),
+        (&[Mode], "mode", |c| {
+            inodes(c).map(|i| c.mode(i) as usize).sum()
+        }),
         (&[Owner], "owner", |c| {
             inodes(c).map(|i| c.owner(i).1 as usize).sum()
         }),
         (&[Nlink], "nlink", |c| {
             inodes(c).map(|i| c.nlink(i) as usize).sum()
         }),
-        (&[Doc], "doc", |c| inodes(c).filter_map(|i| c.doc(i)).count()),
+        (&[Doc], "doc", |c| {
+            inodes(c).filter_map(|i| c.doc(i)).count()
+        }),
         (&[States], "state", |c| {
             inodes(c).map(|i| c.state(i) as usize).sum()
         }),

@@ -320,6 +320,55 @@ fn exit_codes_are_stable() {
     }
 }
 
+#[test]
+fn a_catalog_from_another_version_says_how_to_rebuild_and_index_replaces_it() {
+    // Written by ferret at format version 1 (main at `ccd1dab`): the same
+    // file the catalog crate's version test reads.
+    let env = Env::new("old-version");
+    env.seed_ignore_file();
+    let file = env.write("hit.txt", b"x\n");
+    fs::create_dir_all(env.index()).unwrap();
+    fs::write(
+        env.index().join("catalog"),
+        include_bytes!("../../ferret-catalog/src/tests/v1.catalog"),
+    )
+    .unwrap();
+
+    for args in [
+        &["find", "hit"][..],
+        &["stats"],
+        &["roots", "list"],
+        &["index"],
+    ] {
+        let args: Vec<&OsStr> = args.iter().map(os).collect();
+        let output = env.run(&args);
+        assert_eq!(code(&output), 3, "{args:?}");
+        let text = stderr(&output);
+        assert!(
+            text.contains("catalog format version 1, expected"),
+            "{args:?}: {text}"
+        );
+        assert!(
+            text.contains("run `ferret index DIR...`"),
+            "{args:?}: {text}"
+        );
+    }
+
+    let rebuilt = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&rebuilt), 0, "{}", stderr(&rebuilt));
+    assert!(
+        stderr(&rebuilt).contains("rebuilding it from scratch with only the roots named here"),
+        "{}",
+        stderr(&rebuilt)
+    );
+    assert_eq!(paths(&env.run(&[os("find"), os("hit")])), [file]);
+    assert_eq!(
+        code(&env.run(&[os("index")])),
+        0,
+        "the new roots are configured"
+    );
+}
+
 /// Overwrites the little-endian u32 at `at` in the published catalog, as a
 /// flipped bit or a long history would leave it.
 fn patch_catalog(env: &Env, at: usize, value: u32) {

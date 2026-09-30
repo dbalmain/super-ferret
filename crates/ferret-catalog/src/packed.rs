@@ -94,7 +94,11 @@ impl Writer {
 
     /// Appends `value`, which must fit the width.
     pub(crate) fn push(&mut self, out: &mut impl Write, value: u64) -> io::Result<()> {
-        debug_assert!(value <= mask(self.width), "{value} does not fit {}", self.width);
+        debug_assert!(
+            value <= mask(self.width),
+            "{value} does not fit {}",
+            self.width
+        );
         self.pending |= u128::from(value & mask(self.width)) << self.filled;
         self.filled += self.width;
         if self.filled >= u64::BITS {
@@ -203,7 +207,9 @@ mod tests {
         // wholesale.
         for w in WIDTHS {
             for hot in 0..10 {
-                let values: Vec<u64> = (0..10).map(|i| if i == hot { mask(w) } else { 0 }).collect();
+                let values: Vec<u64> = (0..10)
+                    .map(|i| if i == hot { mask(w) } else { 0 })
+                    .collect();
                 let bytes = pack(w, &values);
                 let column = Packed::new(&bytes, w);
                 for (i, &v) in values.iter().enumerate() {

@@ -169,6 +169,30 @@ fn a_corrupt_previous_generation_stops_the_writer() {
     ));
 }
 
+/// A catalog written by ferret at format version 1 (main at `ccd1dab`,
+/// indexing a two-file tree): the last format before S1a's packed columns.
+const V1_CATALOG: &[u8] = include_bytes!("v1.catalog");
+
+#[test]
+fn a_catalog_from_another_format_version_is_replaced_not_read() {
+    let scratch = Scratch::new("old-version");
+    fs::create_dir_all(&scratch.path).unwrap();
+    fs::write(scratch.path.join("catalog"), V1_CATALOG).unwrap();
+
+    assert!(matches!(
+        Catalog::open(&scratch.path),
+        Err(crate::OpenError::Decode(crate::DecodeError::Version(1)))
+    ));
+    let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
+    assert!(
+        txn.previous().is_none(),
+        "an old format is no previous generation"
+    );
+    fill(&mut txn, &["a"]);
+    txn.commit().unwrap();
+    assert_eq!(names(&reopen(&scratch.path)), ["/g/a"]);
+}
+
 /// The directories synced while `run` publishes, in order.
 fn synced_during(run: impl FnOnce()) -> Vec<std::path::PathBuf> {
     SYNCED_DIRS.with_borrow_mut(Vec::clear);

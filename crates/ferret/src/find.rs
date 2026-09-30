@@ -62,7 +62,8 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
         .int("bytes_read", outcome.bytes_read);
     if let Some(stats) = outcome.stats {
         object.object("stats", |o| {
-            o.int("candidates", stats.candidates).int("rows", stats.rows);
+            o.int("candidates", stats.candidates)
+                .int("rows", stats.rows);
         });
     }
     if let Some((names, inodes)) = outcome.size {

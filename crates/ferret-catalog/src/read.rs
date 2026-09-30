@@ -280,9 +280,10 @@ impl Catalog {
     /// stats` reports beside the section sizes. Known from the head of the
     /// file; loads nothing.
     pub fn column_widths(&self) -> impl Iterator<Item = (Section, u32, u32)> + '_ {
-        COLUMNS.iter().zip(&self.layout.columns).map(|(column, placed)| {
-            (column.section(), placed.desc.width, placed.desc.dict_len)
-        })
+        COLUMNS
+            .iter()
+            .zip(&self.layout.columns)
+            .map(|(column, placed)| (column.section(), placed.desc.width, placed.desc.dict_len))
     }
 
     /// Each section and its size in bytes, in file order: what `ferret
@@ -343,9 +344,7 @@ impl Catalog {
             return None;
         }
         let offsets = self.column(Column::NameOffset);
-        let after = partition_point(self.layout.names, |i| {
-            offsets.get(i) as usize <= offset
-        });
+        let after = partition_point(self.layout.names, |i| offsets.get(i) as usize <= offset);
         Some(NameId(after as u32 - 1))
     }
 
