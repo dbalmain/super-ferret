@@ -33,9 +33,9 @@ Now each entry carries its real size, mtime/ctime with nanoseconds, mode, uid,
 gid, dev and inode number from the walker's `lstat`, directories included (the
 root's stat, for each `pN` top, is the walk root's). Inode numbers: copy `c`
 uses `real_ino + c * stride`, `stride` = the dump's largest inode number + 1.
-Why: the values keep the scatter of a real ext4 (this `$HOME`'s span about
-2^27, so ~27+ bits at full width, the worst case for delta packing, as on a
-real disk), every copy is disjoint from the others, and `(dev, ino)` stays
+Why: the values keep the scatter of a real ext4 (this `$HOME`'s inodes reach 38.7M, 26 bits, one device; with 23
+strides the 10M reaches about 890M, 30 bits, and within a copy the order is
+the walk's, not the disk's, so deltas are large as on a real disk), every copy is disjoint from the others, and `(dev, ino)` stays
 unique. The `/synthetic` root takes the stride after the last copy. Copies still
 share sizes and times, since they are copies; that is the honest limit (the
 values' distribution is real, their per-copy repetition is not).
@@ -208,8 +208,8 @@ crates/ferret-bench/scripts/findbench.py --bin target/release/ferret \
 - All checkable claims held: fixed size 100, one mtime (also ctime, uid, gid,
   dev, mode, sequential ino). `ferret-bench open` already calls `load_all`
   (its third case, "every section"), so no new mode was needed.
-- The prompt's 441k names: now 445,194 (the tree grew, plus my own scratch
-  files under `$HOME`? No: scratch is under /tmp). Not a policy difference.
+- The prompt's 441k names: now 445,194 (the tree grew since S1; scratch is
+  under /tmp, not `$HOME`). Not a policy difference.
 - The 10M is 23 copies (S1's figure; 22 copies would be 9.8M).
 - `ru_maxrss` has a floor from the launching interpreter (15 MB), see above.
 - If the sibling's `nlink` lands in `ferret_catalog::Stat`, the `Stat { .. }`
