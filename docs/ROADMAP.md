@@ -137,10 +137,13 @@ case only for inodes and dev, not for sizes and times.
 | `ferret-bench open`, name sections, warm    | 5.0 ms (16.5 MB)    | 7.1 ms (14.4 MB)    | 207 ms (378 MB)   | 254 ms (347 MB)   |
 | same, evicted                               | 18.2 ms             | 20.0 ms             | 333 ms            | 371 ms            |
 | `load_all`, warm / evicted                  | 9.1 / 42.4 ms       | 9.7 / 37.7 ms       | 472 / 840 ms      | 439 / 784 ms      |
-| `index`, first run / re-run                 | 55.6 s (cold-ish) / 0.50 s | 43.1 s (cold-ish) / 0.87 s | —  | —              |
+| `index`, first run / re-run                 | 55.6 s (cold-ish) / 0.50 s | 43.1 s (cold-ish) / 0.87 s (a) | —  | —          |
 | `index` peak RSS, first / re-run            | 78 / 161 MB         | 84 / 100 MB         | —                 | —                 |
 | `synthetic` build, time / peak RSS          | —                   | —                   | 9.4 s / 1,748 MB  | 9.7 s / 1,880 MB  |
 | same, CPU (user + sys), same sitting        | —                   | —                   | 7.3 s             | 9.5 s             |
+
+(a) Measured before the build fix; not re-measured on the final code, as the machine was
+not quiet (load 5, another session's find-compat harness running).
 
 Per name the inode row went from 64 B to 26 B on `$HOME` and 27.4 B on the
 synthetic (nlink and the entry counts are new and included). Widths in the

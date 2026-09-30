@@ -4,11 +4,12 @@
 //!
 //! A read is one unaligned 8-byte load, a shift and a mask, plus one more
 //! byte when the value straddles the 8-byte window (`shift + width > 64`,
-//! which only widths 58 to 63 can: width 64 always has shift 0). Every column ends in [`PAD`] bytes of
-//! padding, so the load never runs off the end: the writer writes zeros, the
-//! decoder does not check them (reads never depend on them), and [`len`] is
-//! the exact length, which the decoder does hold each column to. Width 0 is
-//! legal: every value is 0, and the column is only its padding.
+//! which only widths 58 to 63 can: width 64 always has shift 0). Every column
+//! ends in [`PAD`] bytes of padding, so the load never runs off the end: the
+//! writer writes zeros, the decoder does not check them (reads never depend on
+//! them), and [`len`] is the exact length, which the decoder does hold each
+//! column to. Width 0 is legal: every value is 0, and the column is only its
+//! padding.
 //!
 //! The values are raw: frame of reference, dictionaries and the none
 //! sentinel are the format's business (see `format`).
@@ -94,7 +95,8 @@ impl<'a> Packed<'a> {
             *value = u64::from_le_bytes(word) >> (bit % 8) & self.mask;
         }
         if width > 57 {
-            // Only widths 58 to 63 can straddle the 8-byte window (64 has shift 0).
+            // Only widths 58 to 63 can straddle the 8-byte window (64 has shift
+            // 0).
             for (j, value) in out.iter_mut().enumerate() {
                 let (bit, shift) = (j * width, (j * width % 8) as u32);
                 if shift as usize + width > 64 {
