@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! cargo run --release -p ferret-crawl --example dump -- --stat <root> > dump.tsv
-//! cargo run --release -p ferret-catalog --example synthetic -- <dump.tsv> <dir> <copies> [rerun] [faults=N]
+//! cargo run --release -p ferret-catalog --example synthetic -- <dump.tsv> <dir> <copies> [rerun|keep] [faults=N]
 //! ```
 //!
 //! The tree is one root, `/synthetic`, holding `p0 .. p<copies-1>`, each a copy
@@ -21,7 +21,9 @@
 //! batches, one per copy modulo 16, as 16 workers would hand them over. With
 //! `rerun`, a previous generation must exist: every file is looked up with
 //! [`Transaction::carry`] as the walk would, which is what a re-run holds in
-//! memory. With `faults=N`, every Nth indexed file is stored as
+//! memory. With `keep`, the previous generation's root is kept whole with
+//! [`Transaction::keep`] instead, as a run that refreshes other roots does, and
+//! the dump is not read. With `faults=N`, every Nth indexed file is stored as
 //! [`Content::Fault`], for timing the crawl's post-commit content-fault pass at
 //! scale.
 //!
@@ -45,16 +47,17 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     let usage = || {
-        eprintln!("usage: synthetic <dump.tsv> <dir> <copies> [rerun] [faults=N]");
+        eprintln!("usage: synthetic <dump.tsv> <dir> <copies> [rerun|keep] [faults=N]");
         ExitCode::from(2)
     };
     let [dump, dir, copies, options @ ..] = words.as_slice() else {
         return usage();
     };
-    let (mut rerun, mut fault_every) = (false, None);
+    let (mut rerun, mut keep, mut fault_every) = (false, false, None);
     for option in options {
         match (*option, option.strip_prefix("faults=")) {
             ("rerun", _) => rerun = true,
+            ("keep", _) => keep = true,
             (_, Some(n)) => match n.parse::<u64>() {
                 Ok(n) if n > 0 => fault_every = Some(n),
                 _ => return usage(),
@@ -66,7 +69,11 @@ fn main() -> ExitCode {
         eprintln!("synthetic: copies must be a number");
         return ExitCode::from(2);
     };
-    match run(Path::new(dump), Path::new(dir), copies, rerun, fault_every) {
+    let result = match keep {
+        true => keep_root(Path::new(dir)),
+        false => run(Path::new(dump), Path::new(dir), copies, rerun, fault_every),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("synthetic: {error}");
@@ -185,6 +192,28 @@ fn rss(field: &str) -> String {
                 .map(|v| v.trim().to_owned())
         })
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Commits a generation that keeps the previous one's root whole.
+fn keep_root(dir: &Path) -> Result<()> {
+    let started = Instant::now();
+    let mut txn = Transaction::begin(dir, SNIFFER)?;
+    let opened = started.elapsed();
+    txn.keep(b"/synthetic")?;
+    let kept = started.elapsed();
+    let catalog = txn.commit()?;
+    let committed = started.elapsed();
+    println!(
+        "keep: {} names, {} inodes, {} docs; begin {} ms, keep {} ms, commit {} ms; peak rss {}",
+        catalog.name_count(),
+        catalog.inode_count(),
+        catalog.doc_count(),
+        opened.as_millis(),
+        (kept - opened).as_millis(),
+        (committed - kept).as_millis(),
+        rss("VmHWM:")
+    );
+    Ok(())
 }
 
 fn run(
