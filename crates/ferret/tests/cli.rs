@@ -371,18 +371,14 @@ fn stats_counts_documents_sparsely_and_survives_a_corrupt_reference() {
     assert_eq!(sparse.status.code(), Some(0), "{}", stderr(&sparse));
     assert_eq!(duplicates(&sparse), before);
 
-    // A file's DocId flipped past `next_doc`: decoding does not check it.
-    let catalog = fs::read(env.index().join("catalog")).unwrap();
-    let inodes = u64::from_le_bytes(catalog[24 + 7 * 16..][..8].try_into().unwrap()) as usize;
-    let row = (0..)
-        .map(|i| inodes + i * 72)
-        .find(|row| u32::from_le_bytes(catalog[row + 60..][..4].try_into().unwrap()) != u32::MAX)
-        .unwrap();
-    patch_catalog(&env, row + 60, u32::MAX - 1);
+    // Every file's DocId moved past `next_doc`, by the doc column's base
+    // (the last of the column descriptors that end the file's 644 B head):
+    // decoding does not check an inode's DocId.
+    patch_catalog(&env, 644 - 16, u32::MAX - 2);
     let corrupt = limited(&env);
     assert_eq!(corrupt.status.code(), Some(0), "{}", stderr(&corrupt));
     let text = String::from_utf8_lossy(&corrupt.stdout);
-    assert!(text.contains("corrupt: 1 files"), "{text}");
+    assert!(text.contains("corrupt: 3 files"), "{text}");
 }
 
 #[test]

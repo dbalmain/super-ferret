@@ -62,9 +62,7 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
         .int("bytes_read", outcome.bytes_read);
     if let Some(stats) = outcome.stats {
         object.object("stats", |o| {
-            o.int("candidates", stats.candidates)
-                .int("rows", stats.rows)
-                .int("single_inode_reads", stats.single_inode_reads);
+            o.int("candidates", stats.candidates).int("rows", stats.rows);
         });
     }
     if let Some((names, inodes)) = outcome.size {
@@ -97,7 +95,7 @@ fn search(
             return Exit::Error;
         }
         Err(e) => {
-            error(&format!("{}: {e}", context.index.display()));
+            error(&crate::index::open_failed(context, &e));
             outcome.error = Some("open");
             return Exit::Error;
         }

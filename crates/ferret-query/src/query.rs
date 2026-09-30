@@ -29,8 +29,8 @@ pub struct Query {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
     /// Scan the name heap for the driving literal; test only the names it
-    /// hits (D14). Reads the name sections, and inode rows one at a time for
-    /// the rows it reports.
+    /// hits (D14). Reads the name sections, and the inode sections once a
+    /// name passes.
     HeapScan,
     /// Test every inode row against the metadata atoms, then walk the name
     /// rows for the inodes that pass. For a query with metadata atoms and no
@@ -447,13 +447,15 @@ impl PathTest {
 }
 
 impl MetaTest {
-    /// The catalog sections evaluating this test reads, beyond the inode
-    /// row itself: [`Catalog::kind`](ferret_catalog::Catalog::kind) looks a
-    /// non-directory up in the link rows. A metadata-first scan loads the
-    /// union of these before it tests a row.
+    /// The catalog sections evaluating this test reads: the one inode
+    /// field it tests, or for a type the link rows, where
+    /// [`Catalog::kind`](ferret_catalog::Catalog::kind) looks a
+    /// non-directory up. A metadata-first scan loads the union of these
+    /// before it tests a row, and nothing else.
     pub(crate) fn sections(&self) -> &'static [Section] {
         match self {
-            MetaTest::Size(..) | MetaTest::Age(..) => &[],
+            MetaTest::Size(..) => &[Section::Size],
+            MetaTest::Age(..) => &[Section::Mtime],
             MetaTest::Type(_) => &[Section::Links],
         }
     }

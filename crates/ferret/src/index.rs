@@ -17,7 +17,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use ferret_catalog::{Catalog, OpenError, Section};
+use ferret_catalog::{Catalog, DecodeError, OpenError, Section};
 use ferret_crawl::{IndexError, IndexOptions, Refresh, Report, RootChange, index_change};
 use ferret_policy::DEFAULT_IGNORE;
 
@@ -54,10 +54,16 @@ pub fn index(context: &Context, dirs: &[PathBuf]) -> Exit {
                 }
             },
             Err(e) => {
-                error(&format!("{}: {e}", context.index.display()));
+                error(&open_failed(context, &e));
                 return Exit::Error;
             }
         }
+    } else if let Err(e @ OpenError::Decode(DecodeError::Version(_))) = Catalog::open(&context.index)
+    {
+        warn(&format!(
+            "{}: {e}; rebuilding it from scratch with only the roots named here",
+            context.index.display()
+        ));
     }
     let refresh = match added.is_empty() {
         true => Refresh::All,
@@ -103,7 +109,7 @@ fn removal(context: &Context, dir: &Path) -> Result<PathBuf, String> {
                 .components()
                 .collect();
             let roots =
-                configured(context).map_err(|e| format!("{}: {e}", context.index.display()))?;
+                configured(context).map_err(|e| open_failed(context, &e))?;
             match roots.contains(&spelled) {
                 true => Ok(spelled),
                 false => Err(format!(
@@ -129,9 +135,23 @@ pub fn list(context: &Context) -> Exit {
             print("roots", &text)
         }
         Err(e) => {
-            error(&format!("{}: {e}", context.index.display()));
+            error(&open_failed(context, &e));
             Exit::Error
         }
+    }
+}
+
+/// What to tell the user when the catalog cannot be opened. A catalog in
+/// another format version cannot be read at all, roots included, but
+/// `ferret index DIR...` replaces it.
+pub fn open_failed(context: &Context, e: &OpenError) -> String {
+    match e {
+        OpenError::Decode(DecodeError::Version(_)) => format!(
+            "{}: {e}, from another version of ferret; run `ferret index DIR...` with your roots \
+             to rebuild it",
+            context.index.display()
+        ),
+        _ => format!("{}: {e}", context.index.display()),
     }
 }
 

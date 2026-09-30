@@ -172,7 +172,9 @@ impl Transaction {
     /// made them durable. That is one fsync per level, once per index.
     /// `sniffer` is the current
     /// sniffer's version; when it differs from the previous generation's,
-    /// nothing is carried and every root must be refreshed (D37).
+    /// nothing is carried and every root must be refreshed (D37). A catalog
+    /// in another format version counts as no previous generation: nothing
+    /// is carried or kept, and the commit replaces it.
     pub fn begin(dir: &Path, sniffer: u32) -> Result<Transaction, BeginError> {
         fs::create_dir_all(dir).map_err(BeginError::Io)?;
         let lock = OpenOptions::new()
@@ -187,7 +189,12 @@ impl Transaction {
             Err(TryLockError::Error(e)) => return Err(BeginError::Io(e)),
         }
         remove_temp(dir).map_err(BeginError::Io)?;
-        let previous = Catalog::open(dir).map_err(BeginError::Previous)?;
+        let previous = match Catalog::open(dir) {
+            // Another format: nothing can be carried, and the commit
+            // replaces it (S1a). Re-hashing once is the migration.
+            Err(OpenError::Decode(DecodeError::Version(_))) => None,
+            other => other.map_err(BeginError::Previous)?,
+        };
         if previous.is_none() {
             sync_ancestors(dir).map_err(BeginError::Io)?;
         }
@@ -417,8 +424,7 @@ fn is_inside(inner: &[u8], outer: &[u8]) -> bool {
 
 /// A file inode's `(dev, ino)`, the carry-over key.
 fn identity(old: &Catalog, id: u32) -> (u64, u64) {
-    let stat = old.inode(InoId(id)).stat;
-    (stat.dev, stat.ino)
+    old.identity(InoId(id))
 }
 
 fn write_synced(

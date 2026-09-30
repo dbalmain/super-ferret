@@ -150,16 +150,16 @@ fn a_row_carries_the_inode_it_names() {
 }
 
 #[test]
-fn a_name_query_reads_neither_documents_nor_the_inode_section() {
+fn a_name_query_reads_no_documents_and_inodes_only_for_a_hit() {
     let scratch = Scratch::new("lazy-name");
     let catalog = sample(&scratch);
-    let (found, stats) = find(&catalog, "readme");
-    assert_eq!(found.len(), 2);
-    // Two rows, two single inode reads: the section itself stays on disk.
-    assert_eq!(stats.single_inode_reads, 2);
-    assert!(!catalog.is_loaded(Section::Inodes));
-    assert!(!catalog.is_loaded(Section::Docs));
+    assert!(find(&catalog, "nothing-has-this").0.is_empty());
     assert!(catalog.is_loaded(Section::NameHeap));
+    assert!(Section::INODE.iter().all(|&s| !catalog.is_loaded(s)));
+    let (found, _) = find(&catalog, "readme");
+    assert_eq!(found.len(), 2);
+    assert!(Section::INODE.iter().all(|&s| catalog.is_loaded(s)));
+    assert!(!catalog.is_loaded(Section::Docs));
 }
 
 #[test]
@@ -170,35 +170,38 @@ fn a_metadata_query_scans_inodes_and_still_skips_documents() {
     assert_eq!(query.strategy(), Strategy::InodeScan);
     let (found, stats) = find(&catalog, "size:>100M");
     assert_eq!(found, ["/r/src/big.bin"]);
-    // Only the inode that passed is a candidate; no single reads.
+    // Only the inode that passed is a candidate; its row loads the rest of
+    // the inode sections.
     assert_eq!(stats.candidates, 1);
-    assert_eq!(stats.single_inode_reads, 0);
-    assert!(catalog.is_loaded(Section::Inodes));
+    assert!(Section::INODE.iter().all(|&s| catalog.is_loaded(s)));
     assert!(catalog.is_loaded(Section::NameHeap));
     assert!(!catalog.is_loaded(Section::Docs));
 }
 
 #[test]
 fn a_name_query_on_a_catalog_with_only_inodes_loaded() {
-    // A caller that loaded the inode rows for its own reasons: the query
-    // then takes rows from the section, whose decoding reads States.
+    // A caller that loaded the inode sections for its own reasons: the
+    // query takes rows from them and loads only what it lacks.
     let scratch = Scratch::new("inodes-preloaded");
     sample(&scratch);
     let catalog = lazy(&scratch);
-    catalog.load(&[Section::Inodes]).unwrap();
-    let (found, stats) = find(&catalog, "readme");
+    catalog.load(&Section::INODE).unwrap();
+    let (found, _) = find(&catalog, "readme");
     assert_eq!(found.len(), 2);
-    assert_eq!(stats.single_inode_reads, 0);
+    assert!(!catalog.is_loaded(Section::Docs));
 }
 
 #[test]
-fn a_metadata_query_nothing_passes_never_reads_the_names() {
+fn a_metadata_query_nothing_passes_reads_only_its_field() {
     let scratch = Scratch::new("lazy-meta-empty");
     let catalog = sample(&scratch);
     let (found, stats) = find(&catalog, "size:>1T");
     assert!(found.is_empty());
     assert_eq!(stats.candidates, 0);
-    assert!(catalog.is_loaded(Section::Inodes));
+    assert!(catalog.is_loaded(Section::Size));
+    for &section in Section::INODE.iter().filter(|&&s| s != Section::Size) {
+        assert!(!catalog.is_loaded(section), "{section:?}");
+    }
     for section in [
         Section::Names,
         Section::NameHeap,
@@ -315,28 +318,18 @@ fn hits_far_apart_map_to_their_names() {
 }
 
 #[test]
-fn inode_rows_are_read_singly_until_the_section_is_cheaper() {
-    let scratch = Scratch::new("adaptive");
+fn every_row_carries_its_own_inode() {
+    let scratch = Scratch::new("rows-own-inode");
     let catalog = many(&scratch, 300);
     let query = Query::parse("f", now()).unwrap();
     let mut sizes = Vec::new();
-    let stats = query
+    query
         .run(&catalog, |row| {
             sizes.push(row.meta.stat.size);
             ControlFlow::Continue(())
         })
         .unwrap();
-    // 301 inodes: the limit is the floor, 256 single reads; then the
-    // section, and the rows after the switch still carry their own inode.
-    assert_eq!(stats.single_inode_reads, 256);
-    assert!(catalog.is_loaded(Section::Inodes));
     assert_eq!(sizes, (0..300).collect::<Vec<u64>>());
-
-    let small = Scratch::new("adaptive-small");
-    let catalog = many(&small, 300);
-    let (_, stats) = find(&catalog, "f1");
-    assert_eq!(stats.single_inode_reads, 100);
-    assert!(!catalog.is_loaded(Section::Inodes));
 }
 
 #[test]

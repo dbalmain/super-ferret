@@ -1,18 +1,18 @@
 //! [`Catalog`]: one opened generation, and everything a query reads from it.
 //!
-//! Opening reads the header and the section table; each section is read with
-//! a positional read on first use and validated then (D38 B). Nothing else
-//! is derived (D30 C). Accessors decode fixed-width rows in place. The
-//! catalog applies no matching: `ferret-query` scans [`Catalog::name_heap`]
-//! or iterates [`Catalog::names`], and comes back here with the `NameId`s it
-//! hit.
+//! Opening reads the header, the section table and the column descriptors;
+//! each section is read with a positional read on first use and validated
+//! then (D38 B). Nothing else is derived (D30 C). Accessors decode columns and
+//! rows in place. The catalog applies no matching: `ferret-query` scans
+//! [`Catalog::name_heap`] or iterates [`Catalog::names`], and comes back here
+//! with the `NameId`s it hit.
 //!
 //! Loading is explicit and fallible: [`Catalog::load`] reads and validates
 //! the sections a caller names, with any they depend on. Every accessor after
 //! that is infallible. Reading a section that was never loaded panics, like
-//! an id out of range: both are caller bugs. [`Catalog::read_inode`] is the
-//! one fallible accessor; it reads a single inode row when the whole section
-//! would cost more than the query needs.
+//! an id out of range: both are caller bugs. Each inode field is its own
+//! section, so a query that tests one field loads only that one; a whole
+//! [`Inode`] needs [`Section::INODE`].
 //!
 //! Ids passed in must come from this generation; an id out of range panics,
 //! as indexing a slice does. Anything read from the file cannot panic: that is
@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::batch::{Stat, WorkTreeKind};
 use crate::format::{
-    self, DOC_ROW, INODE_ROW, Layout, NAME_ROW, NONE, PAIR_ROW, SECTIONS, Section, TABLE_END,
+    self, COLUMNS, Column, DOC_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
     WORK_TREE_ROW, u32_at, u64_at,
 };
 use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
@@ -36,8 +36,7 @@ use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
 /// The snapshot's file name inside the catalog directory.
 pub(crate) const FILE: &str = "catalog";
 
-/// Why [`Catalog::open`], [`Catalog::load`] or [`Catalog::read_inode`]
-/// failed.
+/// Why [`Catalog::open`] or [`Catalog::load`] failed.
 #[derive(Debug)]
 pub enum OpenError {
     /// Reading the file failed. A file truncated under an open reader is
@@ -214,14 +213,17 @@ impl Catalog {
         }
     }
 
-    /// Bytes read from the file so far: the header and table, each loaded
-    /// section and each single row [`Catalog::read_inode`] read. For a
-    /// reader from [`Catalog::from_bytes`], the whole file.
+    /// Bytes read from the file so far: the head of the file and each loaded
+    /// section. For a reader from [`Catalog::from_bytes`], the whole file.
     pub fn bytes_read(&self) -> u64 {
         match &self.source {
             Source::Whole(bytes) => bytes.len() as u64,
             Source::File { read, .. } => read.load(Ordering::Relaxed),
         }
+    }
+
+    fn column(&self, column: Column) -> View<'_> {
+        self.layout.view(column, self.section(column.section()))
     }
 
     fn section(&self, section: Section) -> &[u8] {
@@ -267,6 +269,22 @@ impl Catalog {
         ((end - start) / DOC_ROW) as u32
     }
 
+    /// The bytes before the first section: header, section table and column
+    /// descriptors.
+    pub fn head_len(&self) -> u64 {
+        TABLE_END as u64
+    }
+
+    /// Each bit-packed column: its section, its width in bits, and its
+    /// dictionary's length (0 unless it is a dictionary). What `ferret
+    /// stats` reports beside the section sizes. Known from the head of the
+    /// file; loads nothing.
+    pub fn column_widths(&self) -> impl Iterator<Item = (Section, u32, u32)> + '_ {
+        COLUMNS.iter().zip(&self.layout.columns).map(|(column, placed)| {
+            (column.section(), placed.desc.width, placed.desc.dict_len)
+        })
+    }
+
     /// Each section and its size in bytes, in file order: what `ferret
     /// stats` reports. Known from the section table; loads nothing.
     pub fn section_sizes(&self) -> impl Iterator<Item = (Section, u64)> + '_ {
@@ -293,13 +311,14 @@ impl Catalog {
 
     /// One name edge. Needs [`Section::Names`].
     pub fn name(&self, id: NameId) -> Name<'_> {
-        let row = &self.section(Section::Names)[id.0 as usize * NAME_ROW..][..NAME_ROW];
+        let rows = self.section(Section::Names);
         let heap = self.name_heap();
-        let start = u32_at(row, 8) as usize;
+        let i = id.0 as usize;
+        let start = self.layout.view(Column::NameOffset, rows).get(i) as usize;
         let len = heap[start..].iter().position(|&b| b == 0).unwrap_or(0);
         Name {
-            parent: InoId(u32_at(row, 0)),
-            child: InoId(u32_at(row, 4)),
+            parent: InoId(self.layout.view(Column::NameParent, rows).get(i) as u32),
+            child: InoId(self.layout.view(Column::NameChild, rows).get(i) as u32),
             bytes: &heap[start..start + len],
         }
     }
@@ -308,16 +327,13 @@ impl Catalog {
     /// [`Section::Names`]; the bytes run to the next name's start, less its
     /// NUL.
     pub fn name_start(&self, id: NameId) -> usize {
-        u32_at(self.section(Section::Names), id.0 as usize * NAME_ROW + 8) as usize
+        self.column(Column::NameOffset).get(id.0 as usize) as usize
     }
 
     /// The inode a name edge names, without reading its bytes. Needs only
     /// [`Section::Names`].
     pub fn child(&self, id: NameId) -> InoId {
-        InoId(u32_at(
-            self.section(Section::Names),
-            id.0 as usize * NAME_ROW + 4,
-        ))
+        InoId(self.column(Column::NameChild).get(id.0 as usize) as u32)
     }
 
     /// The name whose bytes (or terminator) hold heap offset `offset`, or
@@ -326,9 +342,9 @@ impl Catalog {
         if offset >= self.name_heap().len() {
             return None;
         }
-        let rows = self.section(Section::Names);
+        let offsets = self.column(Column::NameOffset);
         let after = partition_point(self.layout.names, |i| {
-            u32_at(rows, i * NAME_ROW + 8) as usize <= offset
+            offsets.get(i) as usize <= offset
         });
         Some(NameId(after as u32 - 1))
     }
@@ -341,12 +357,12 @@ impl Catalog {
     }
 
     fn child_range(&self, dir: InoId) -> (usize, usize) {
-        let rows = self.section(Section::Names);
-        let parent = |i: usize| u32_at(rows, i * NAME_ROW);
-        let start = partition_point(self.layout.names, |i| parent(i) < dir.0);
+        let parents = self.column(Column::NameParent);
+        let dir = u64::from(dir.0);
+        let start = partition_point(self.layout.names, |i| parents.get(i) < dir);
         (
             start,
-            start + partition_point(self.layout.names - start, |i| parent(start + i) <= dir.0),
+            start + partition_point(self.layout.names - start, |i| parents.get(start + i) <= dir),
         )
     }
 
@@ -361,8 +377,9 @@ impl Catalog {
     /// A directory's own name edge; `None` for a root (D30). Needs
     /// [`Section::DirNames`].
     pub fn dir_name(&self, dir: InoId) -> Option<NameId> {
-        let name = u32_at(self.section(Section::DirNames), dir.0 as usize * 4);
-        (name != NONE).then_some(NameId(name))
+        self.column(Column::DirName)
+            .nullable(dir.0 as usize)
+            .map(|name| NameId(name as u32))
     }
 
     /// Whether a directory is a structural row: walked through for
@@ -420,58 +437,85 @@ impl Catalog {
 
     // ── inodes ──
 
-    /// One inode row. Needs [`Section::Inodes`], which loads
-    /// [`Section::States`].
+    /// One inode's whole row. Needs every section in [`Section::INODE`].
     pub fn inode(&self, id: InoId) -> Inode {
-        let row = &self.section(Section::Inodes)[id.0 as usize * INODE_ROW..][..INODE_ROW];
-        self.decode_inode(id, row)
-    }
-
-    /// One inode row, read alone from the file when [`Section::Inodes`] is
-    /// not loaded: a query that reports a few rows pays a few positional
-    /// reads rather than the whole section (72 B per inode). Loads
-    /// [`Section::States`], which is 2 bits per inode. An inode row indexes
-    /// nothing, so it needs no validation.
-    pub fn read_inode(&self, id: InoId) -> Result<Inode, OpenError> {
-        self.load(&[Section::States])?;
-        let Source::File { file, read, .. } = &self.source else {
-            return Ok(self.inode(id));
-        };
-        if self.is_loaded(Section::Inodes) {
-            return Ok(self.inode(id));
-        }
-        assert!(id.0 < self.inode_count(), "inode {id:?} out of range");
-        let mut row = [0; INODE_ROW];
-        let at = self.layout.range(Section::Inodes).0 + id.0 as usize * INODE_ROW;
-        file.read_exact_at(&mut row, at as u64)
-            .map_err(OpenError::Io)?;
-        read.fetch_add(INODE_ROW as u64, Ordering::Relaxed);
-        Ok(self.decode_inode(id, &row))
-    }
-
-    fn decode_inode(&self, id: InoId, row: &[u8]) -> Inode {
-        let i64_at = |at| u64_at(row, at) as i64;
+        let (owner, i) = (self.owner(id), id.0 as usize);
         let stat = Stat {
-            dev: u64_at(row, 0),
-            ino: u64_at(row, 8),
-            size: u64_at(row, 16),
-            mtime_sec: i64_at(24),
-            ctime_sec: i64_at(32),
-            mtime_nsec: u32_at(row, 40),
-            ctime_nsec: u32_at(row, 44),
-            mode: u32_at(row, 48),
-            uid: u32_at(row, 52),
-            gid: u32_at(row, 56),
-            nlink: u64_at(row, 64),
+            dev: self.column(Column::Dev).lookup(i),
+            ino: self.column(Column::Ino).get(i),
+            size: self.size(id),
+            mtime_sec: self.mtime(id),
+            mtime_nsec: self.column(Column::MtimeNs).get(i) as u32,
+            ctime_sec: self.ctime(id),
+            ctime_nsec: self.column(Column::CtimeNs).get(i) as u32,
+            mode: self.mode(id),
+            uid: owner.0,
+            gid: owner.1,
+            nlink: self.nlink(id),
         };
-        let doc = u32_at(row, 60);
-        let state_byte = self.section(Section::States)[id.0 as usize / 4];
-        let state = ContentState::from_bits(state_byte >> (id.0 % 4 * 2));
         Inode {
             stat,
-            state,
-            doc: (doc != NONE).then_some(DocId(doc)),
+            state: self.state(id),
+            doc: self.doc(id),
         }
+    }
+
+    /// An inode's `(st_dev, st_ino)`. Needs [`Section::Dev`] and
+    /// [`Section::Ino`].
+    pub(crate) fn identity(&self, id: InoId) -> (u64, u64) {
+        let i = id.0 as usize;
+        (
+            self.column(Column::Dev).lookup(i),
+            self.column(Column::Ino).get(i),
+        )
+    }
+
+    /// An inode's `st_size`. Needs [`Section::Size`].
+    pub fn size(&self, id: InoId) -> u64 {
+        self.column(Column::Size).get(id.0 as usize)
+    }
+
+    /// An inode's mtime, in whole seconds. Needs [`Section::Mtime`].
+    pub fn mtime(&self, id: InoId) -> i64 {
+        format::unorder(self.column(Column::Mtime).get(id.0 as usize))
+    }
+
+    /// An inode's ctime, in whole seconds. Needs [`Section::Ctime`].
+    pub fn ctime(&self, id: InoId) -> i64 {
+        format::unorder(self.column(Column::Ctime).get(id.0 as usize))
+    }
+
+    /// An inode's `st_mode`: type and permission bits. Needs
+    /// [`Section::Mode`].
+    pub fn mode(&self, id: InoId) -> u32 {
+        self.column(Column::Mode).lookup(id.0 as usize) as u32
+    }
+
+    /// An inode's `(st_uid, st_gid)`. Needs [`Section::Owner`].
+    pub fn owner(&self, id: InoId) -> (u32, u32) {
+        let pair = self.column(Column::Owner).lookup(id.0 as usize);
+        ((pair >> 32) as u32, pair as u32)
+    }
+
+    /// An inode's `st_nlink`: for a directory, as the filesystem counts it,
+    /// ignored children included (D47). Needs [`Section::Nlink`].
+    pub fn nlink(&self, id: InoId) -> u64 {
+        self.column(Column::Nlink).get(id.0 as usize)
+    }
+
+    /// An inode's document, when its state is `Hashed`. Needs
+    /// [`Section::Doc`].
+    pub fn doc(&self, id: InoId) -> Option<DocId> {
+        self.column(Column::Doc)
+            .nullable(id.0 as usize)
+            .map(|doc| DocId(doc as u32))
+    }
+
+    /// What the last observation learnt about an inode's content (D37).
+    /// Needs [`Section::States`].
+    pub fn state(&self, id: InoId) -> ContentState {
+        let byte = self.section(Section::States)[id.0 as usize / 4];
+        ContentState::from_bits(byte >> (id.0 % 4 * 2))
     }
 
     /// The entries the walk's `getdents` returned for directory `dir`, minus
@@ -480,8 +524,9 @@ impl Catalog {
     /// carried from a generation that did not know. Needs
     /// [`Section::Entries`].
     pub fn entry_count(&self, dir: InoId) -> Option<u32> {
-        let count = u32_at(self.section(Section::Entries), dir.0 as usize * 4);
-        (count != NONE).then_some(count)
+        self.column(Column::Entries)
+            .nullable(dir.0 as usize)
+            .map(|count| count as u32)
     }
 
     /// Whether an inode is a directory, file or symlink. Needs

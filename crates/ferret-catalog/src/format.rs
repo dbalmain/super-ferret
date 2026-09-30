@@ -574,7 +574,7 @@ pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Placed {
     pub(crate) desc: Descriptor,
-    start: usize,
+    pub(crate) start: usize,
 }
 
 /// A column's bytes, decoded in place per its coding.
@@ -816,7 +816,7 @@ impl Section {
     }
 
     /// What a [`DecodeError::Corrupt`] calls it.
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Section::Names => "names",
             Section::NameHeap => "name heap",

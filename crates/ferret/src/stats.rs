@@ -23,7 +23,7 @@ pub fn run(context: &Context) -> Exit {
             return Exit::Error;
         }
         Err(e) => {
-            error(&format!("{}: {e}", context.index.display()));
+            error(&crate::index::open_failed(context, &e));
             return Exit::Error;
         }
     };
@@ -225,18 +225,28 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
 
     let _ = writeln!(
         out,
-        "\nsections  {} in all, {:.1} B per name (the 216 B header and table aside)",
+        "\nsections  {} in all, {:.1} B per name (the {} B head of the file aside)",
         bytes(total),
-        per_name(total)
+        per_name(total),
+        catalog.head_len()
     );
     for (section, len) in catalog.section_sizes() {
-        let _ = writeln!(
+        let _ = write!(
             out,
             "  {:<10} {:>12} {:>9.1} B/name",
             format!("{section:?}"),
             bytes(len),
             per_name(len)
         );
+        // A packed column's width, and its dictionary's size if it has one.
+        let columns = catalog.column_widths().filter(|&(s, ..)| s == section);
+        for (i, (_, width, dict)) in columns.enumerate() {
+            let _ = write!(out, "{}{width}", if i == 0 { "  bits " } else { "+" });
+            if dict > 0 {
+                let _ = write!(out, " ({dict} values)");
+            }
+        }
+        out.push('\n');
     }
 
     let _ = writeln!(out, "\ncontent (file inodes)");

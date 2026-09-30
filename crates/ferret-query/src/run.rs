@@ -32,8 +32,6 @@ pub struct Stats {
     pub candidates: u64,
     /// Rows emitted.
     pub rows: u64,
-    /// Inode rows read one at a time rather than with their section.
-    pub single_inode_reads: u64,
 }
 
 /// A run that could not read the catalog.
@@ -58,11 +56,11 @@ impl From<OpenError> for RunError {
 /// `name`, `name_start` and `child` read Names and NameHeap; `dir_path`
 /// reads DirNames, Names and Roots (Roots loads Strings); `is_traversed`
 /// reads Traversed; `kind`, for a row and for `type:`, reads Links (which
-/// loads Strings). Inode rows come through [`Inodes`], which reads them
-/// singly or loads their section. All of these are small beside the heap
-/// and the inode rows. Every strategy loads this set before its first
-/// `consider`; the inode scan loads its own set, [`Query::meta_sections`],
-/// before its first metadata test.
+/// loads Strings). All of these are small beside the heap. Every strategy
+/// loads this set before its first `consider`; the inode scan loads its own
+/// set, [`Query::meta_sections`], before its first metadata test. The inode
+/// sections a [`Row`] carries load when the first name passes its name
+/// tests ([`Run::inode`]).
 const ROW_SECTIONS: [Section; 6] = [
     Section::Names,
     Section::NameHeap,
@@ -78,9 +76,9 @@ impl Query {
     /// it is lent is valid only for the call.
     ///
     /// Loads only what the strategy needs: a name query never reads the
-    /// document rows, and reads inode rows singly until that costs more than
-    /// the section (see [`Catalog::read_inode`]); a metadata-only query reads
-    /// the name sections only once an inode has passed.
+    /// document rows, and reads the inode sections only once a name passes
+    /// its name tests; a metadata-only query reads the one field each test
+    /// needs, and the name sections only once an inode has passed.
     pub fn run(
         &self,
         catalog: &Catalog,
@@ -89,7 +87,7 @@ impl Query {
         let mut run = Run {
             query: self,
             catalog,
-            inodes: Inodes::new(catalog),
+            inodes_loaded: false,
             stats: Stats::default(),
             dir: None,
             path: Vec::new(),
@@ -99,7 +97,6 @@ impl Query {
             Strategy::InodeScan => run.inode_scan(&mut emit)?,
             Strategy::AllNames => run.all_names(&mut emit)?,
         }
-        run.stats.single_inode_reads = run.inodes.singles;
         Ok(run.stats)
     }
 }
@@ -107,7 +104,8 @@ impl Query {
 struct Run<'q, 'c> {
     query: &'q Query,
     catalog: &'c Catalog,
-    inodes: Inodes<'c>,
+    /// Whether [`Run::inode`] has loaded the sections a row reads.
+    inodes_loaded: bool,
     stats: Stats,
     /// The directory whose path `path` starts with, and that prefix's
     /// length. Names arrive grouped by parent, so a directory's path is
@@ -142,7 +140,7 @@ impl Run<'_, '_> {
                 heap.len()
             };
             self.stats.candidates += 1;
-            if self.consider(id, skip, None, emit)?.is_break() {
+            if self.consider(id, skip, false, emit)?.is_break() {
                 break;
             }
         }
@@ -158,7 +156,7 @@ impl Run<'_, '_> {
         let mut pass = vec![0u64; (catalog.inode_count() as usize).div_ceil(64)];
         let mut any = false;
         for id in 0..catalog.inode_count() {
-            if self.meta_passes(InoId(id), &catalog.inode(InoId(id))) {
+            if self.meta_passes(InoId(id)) {
                 pass[id as usize / 64] |= 1 << (id % 64);
                 any = true;
             }
@@ -172,8 +170,7 @@ impl Run<'_, '_> {
             let child = catalog.child(id).0;
             if pass[child as usize / 64] >> (child % 64) & 1 == 1 {
                 self.stats.candidates += 1;
-                let meta = catalog.inode(InoId(child));
-                if self.consider(id, None, Some(meta), emit)?.is_break() {
+                if self.consider(id, None, true, emit)?.is_break() {
                     break;
                 }
             }
@@ -188,7 +185,7 @@ impl Run<'_, '_> {
         self.catalog.load(&ROW_SECTIONS)?;
         for id in (0..self.catalog.name_count()).map(NameId) {
             self.stats.candidates += 1;
-            if self.consider(id, None, None, emit)?.is_break() {
+            if self.consider(id, None, false, emit)?.is_break() {
                 break;
             }
         }
@@ -196,14 +193,14 @@ impl Run<'_, '_> {
     }
 
     /// Tests one name and emits it if everything passes. Cheapest first:
-    /// name bytes, then the inode row, then the path. `skip` is a name test
-    /// the candidate source already proved; `meta` an inode row it already
-    /// read and tested.
+    /// name bytes, then the inode's fields, then the path. `skip` is a name
+    /// test the candidate source already proved; `tested` says the source
+    /// already tested the inode.
     fn consider(
         &mut self,
         id: NameId,
         skip: Option<usize>,
-        meta: Option<Inode>,
+        tested: bool,
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> RunResult {
         let catalog = self.catalog;
@@ -218,16 +215,10 @@ impl Run<'_, '_> {
         if structural || !names_pass {
             return Ok(ControlFlow::Continue(()));
         }
-        let meta = match meta {
-            Some(meta) => meta,
-            None => {
-                let meta = self.inodes.get(name.child)?;
-                if !self.meta_passes(name.child, &meta) {
-                    return Ok(ControlFlow::Continue(()));
-                }
-                meta
-            }
-        };
+        let meta = self.inode(name.child)?;
+        if !tested && !self.meta_passes(name.child) {
+            return Ok(ControlFlow::Continue(()));
+        }
         self.resolve(name.parent, name.bytes);
         if !self.query.paths.iter().all(|t| t.matches(&self.path)) {
             return Ok(ControlFlow::Continue(()));
@@ -242,17 +233,31 @@ impl Run<'_, '_> {
         }))
     }
 
-    fn meta_passes(&self, id: InoId, meta: &Inode) -> bool {
+    /// Whether an inode passes every metadata test, read one field at a time
+    /// from the sections [`Query::meta_sections`] names.
+    fn meta_passes(&self, id: InoId) -> bool {
+        let catalog = self.catalog;
         self.query.meta.iter().all(|test| match *test {
-            MetaTest::Size(cmp, n) => cmp.holds(meta.stat.size, n),
-            // Widened: `mtime_sec` is whatever the file holds, and a corrupt
-            // or far-future value must not overflow.
+            MetaTest::Size(cmp, n) => cmp.holds(catalog.size(id), n),
+            // Widened: mtime is whatever the file holds, and a corrupt or
+            // far-future value must not overflow.
             MetaTest::Age(cmp, secs) => cmp.holds(
-                i128::from(self.query.now) - i128::from(meta.stat.mtime_sec),
+                i128::from(self.query.now) - i128::from(catalog.mtime(id)),
                 i128::from(secs),
             ),
-            MetaTest::Type(kind) => self.catalog.kind(id) == kind,
+            MetaTest::Type(kind) => catalog.kind(id) == kind,
         })
+    }
+
+    /// An inode's whole row, for a [`Row`]. The first call loads every
+    /// section it reads, and the metadata tests' sections with them.
+    fn inode(&mut self, id: InoId) -> Result<Inode, OpenError> {
+        if !self.inodes_loaded {
+            self.catalog.load(&Section::INODE)?;
+            self.catalog.load(&self.query.meta_sections())?;
+            self.inodes_loaded = true;
+        }
+        Ok(self.catalog.inode(id))
     }
 
     /// Sets `path` to `parent`'s path plus `name`.
@@ -277,10 +282,10 @@ impl Run<'_, '_> {
 type RunResult = Result<ControlFlow<()>, RunError>;
 
 impl Query {
-    /// What testing whole inode rows against the metadata atoms reads: the
-    /// rows, their states, and whatever each test declares.
+    /// What testing inodes against the metadata atoms reads: whatever each
+    /// test declares.
     fn meta_sections(&self) -> Vec<Section> {
-        let mut sections = vec![Section::Inodes, Section::States];
+        let mut sections = Vec::new();
         for test in &self.meta {
             for &section in test.sections() {
                 if !sections.contains(&section) {
@@ -315,37 +320,4 @@ fn locate(catalog: &Catalog, hit: usize, from: u32) -> NameId {
         }
     }
     NameId(lo)
-}
-
-/// Inode rows for results: read one at a time while that is cheaper than
-/// the whole section, then the section.
-struct Inodes<'c> {
-    catalog: &'c Catalog,
-    singles: u64,
-    /// Single reads before the section is loaded instead: a 64th of the
-    /// rows. A single read costs a syscall per row where the section costs
-    /// a copy per byte; at this count the two are about equal on the
-    /// measured machine (see the bench's `name + metadata` rows).
-    limit: u64,
-}
-
-impl<'c> Inodes<'c> {
-    fn new(catalog: &'c Catalog) -> Self {
-        Self {
-            catalog,
-            singles: 0,
-            limit: (u64::from(catalog.inode_count()) / 64).max(256),
-        }
-    }
-
-    fn get(&mut self, id: InoId) -> Result<Inode, OpenError> {
-        if !self.catalog.is_loaded(Section::Inodes) {
-            if self.singles < self.limit {
-                self.singles += 1;
-                return self.catalog.read_inode(id);
-            }
-            self.catalog.load(&[Section::Inodes, Section::States])?;
-        }
-        Ok(self.catalog.inode(id))
-    }
 }

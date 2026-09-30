@@ -30,13 +30,14 @@
 //! held in memory, and frees each batch's names once the name sections are
 //! out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 
 use crate::batch::{Batch, Content, DirToken, Stat};
 use crate::format::{
-    self, Bits, DOC_ROW, INODE_ROW, NAME_ROW, NONE, PAIR_ROW, SECTIONS, WORK_TREE_ROW,
+    self, Bits, COLUMNS, Coding, Column, ColumnWriter, DOC_ROW, Descriptor, Head, NONE, PAIR_ROW,
+    Range, SECTIONS, Section, WORK_TREE_ROW,
 };
 use crate::{ContentState, Hash};
 
@@ -185,24 +186,131 @@ impl Plan {
         &self.edges[self.edge_start[d] as usize..self.edge_start[d + 1] as usize]
     }
 
-    /// Every section's length, in [`SECTIONS`] order.
-    fn lens(&self) -> [usize; SECTIONS.len()] {
+    /// Each inode row's stat and `DocId` (or NONE), in inode order:
+    /// directories, then files and symlinks.
+    fn inode_rows<'a>(&'a self, batches: &'a [Batch]) -> impl Iterator<Item = (&'a Stat, u32)> {
+        let dirs = self.order.iter().map(|&dir| {
+            let (b, d) = self.index.dir(dir as usize);
+            (&batches[b].dir_stats[d], NONE)
+        });
+        let files = self.winner.iter().zip(&self.doc).map(|(&file, &doc)| {
+            let (b, f) = self.index.file(file as usize);
+            (&batches[b].file_stats[f], doc)
+        });
+        dirs.chain(files)
+    }
+
+    /// The head of the file, and each dictionary column's sorted values.
+    /// One pass over the inode rows finds every stat column's range and
+    /// distinct values; the id columns are sized from the counts.
+    fn head(&self, batches: &[Batch]) -> (Head, [Vec<u64>; COLUMNS.len()]) {
         let dirs = self.index.dirs;
-        let inodes = dirs + self.winner.len();
-        [
-            self.edges.len() * NAME_ROW,
-            self.heap_len,
-            dirs * 4,
-            dirs * 4,
-            dirs.div_ceil(8),
-            self.roots.len() * PAIR_ROW,
-            self.strings.len(),
-            inodes * INODE_ROW,
-            inodes.div_ceil(4),
-            self.links.len() * PAIR_ROW,
-            self.work_trees.len() * WORK_TREE_ROW,
-            self.docs.len() * DOC_ROW,
-        ]
+        let (inodes, names) = (dirs + self.winner.len(), self.edges.len());
+        let mut ranges = [Range::default(); COLUMNS.len()];
+        let mut sets: [HashSet<u64>; COLUMNS.len()] = Default::default();
+        // Neighbouring rows nearly always share a dictionary value; skipping
+        // the repeat saves a hash per row.
+        let mut last = [None; COLUMNS.len()];
+        for (stat, doc) in self.inode_rows(batches) {
+            for column in STAT_COLUMNS {
+                let (c, value) = (column as usize, stat_field(column, stat));
+                match column.coding() {
+                    Coding::Dictionary if last[c] != Some(value) => {
+                        sets[c].insert(value);
+                        last[c] = Some(value);
+                    }
+                    Coding::Dictionary => {}
+                    Coding::Frame | Coding::Nullable => ranges[c].add(value),
+                }
+            }
+            if doc != NONE {
+                ranges[Column::Doc as usize].add(u64::from(doc));
+            }
+        }
+        for &count in &self.entry_count {
+            if count != NONE {
+                ranges[Column::Entries as usize].add(u64::from(count));
+            }
+        }
+        // Ids are sized by what they index: the counts and the heap.
+        let below = |n: usize| Range((n > 0).then(|| (0, n as u64 - 1)));
+        if names > 0 {
+            ranges[Column::NameParent as usize] = below(dirs);
+            ranges[Column::NameChild as usize] = below(inodes);
+            ranges[Column::NameOffset as usize] = below(self.heap_len);
+        }
+        ranges[Column::DirName as usize] = below(names);
+
+        let mut dicts: [Vec<u64>; COLUMNS.len()] = Default::default();
+        let columns = COLUMNS.map(|column| {
+            let c = column as usize;
+            match column.coding() {
+                Coding::Frame => Descriptor::frame(ranges[c]),
+                Coding::Nullable => Descriptor::nullable(ranges[c]),
+                Coding::Dictionary => {
+                    let mut dict: Vec<u64> = std::mem::take(&mut sets[c]).into_iter().collect();
+                    dict.sort_unstable();
+                    let len = dict.len() as u32;
+                    dicts[c] = dict;
+                    Descriptor::dictionary(len)
+                }
+            }
+        });
+        let mut lens = [0; SECTIONS.len()];
+        for (section, len) in [
+            (Section::NameHeap, self.heap_len),
+            (Section::Traversed, dirs.div_ceil(8)),
+            (Section::Roots, self.roots.len() * PAIR_ROW),
+            (Section::Strings, self.strings.len()),
+            (Section::States, inodes.div_ceil(4)),
+            (Section::Links, self.links.len() * PAIR_ROW),
+            (Section::WorkTrees, self.work_trees.len() * WORK_TREE_ROW),
+            (Section::Docs, self.docs.len() * DOC_ROW),
+        ] {
+            lens[section as usize] = len as u64;
+        }
+        let head = Head {
+            sniffer: self.sniffer,
+            next_doc: self.next_doc,
+            dirs: dirs as u32,
+            inodes: inodes as u32,
+            names: names as u32,
+            columns,
+            lens,
+        };
+        (head, dicts)
+    }
+}
+
+/// The inode columns read straight from a [`Stat`]: all but the `DocId`.
+const STAT_COLUMNS: [Column; 10] = [
+    Column::Dev,
+    Column::Ino,
+    Column::Size,
+    Column::Mtime,
+    Column::MtimeNs,
+    Column::Ctime,
+    Column::CtimeNs,
+    Column::Mode,
+    Column::Owner,
+    Column::Nlink,
+];
+
+/// One of [`STAT_COLUMNS`]' values, as the column stores it; the reader's
+/// accessors invert it.
+fn stat_field(column: Column, stat: &Stat) -> u64 {
+    match column {
+        Column::Dev => stat.dev,
+        Column::Ino => stat.ino,
+        Column::Size => stat.size,
+        Column::Mtime => format::order(stat.mtime_sec),
+        Column::MtimeNs => u64::from(stat.mtime_nsec),
+        Column::Ctime => format::order(stat.ctime_sec),
+        Column::CtimeNs => u64::from(stat.ctime_nsec),
+        Column::Mode => u64::from(stat.mode),
+        Column::Owner => u64::from(stat.uid) << 32 | u64::from(stat.gid),
+        Column::Nlink => stat.nlink,
+        _ => unreachable!("{column:?} is not a stat column"),
     }
 }
 
@@ -583,29 +691,46 @@ fn split_hash(hash: &Hash) -> (u64, u64) {
 
 /// Streams the planned generation to `out` in file order, freeing each
 /// batch's names once the name sections are written and the batches once the
-/// inode sections are.
+/// inode sections are. Each inode column is one pass over the rows.
 pub(crate) fn write(
     mut plan: Plan,
     mut batches: Vec<Batch>,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    format::write_header(out, plan.sniffer, plan.next_doc, &plan.lens())?;
+    let (head, dicts) = plan.head(&batches);
+    format::write_head(out, &head)?;
+    let start = |out: &mut _, column: Column| {
+        ColumnWriter::start(out, head.columns[column as usize], &dicts[column as usize])
+    };
     let dirs = plan.index.dirs;
 
-    let mut offset = 0u32;
+    let mut column = start(out, Column::NameParent)?;
     for (id, &dir) in plan.order.iter().enumerate() {
-        for &entry in plan.children(dir) {
-            let e = entry as usize;
-            let child = if e < dirs {
-                plan.dir_id[e]
-            } else {
-                plan.inode_of_file[e - dirs]
-            };
-            format::put_pair(out, id as u32, child)?;
-            format::put_u32(out, offset)?;
-            offset += plan.name(&batches, entry).len() as u32 + 1;
+        for _ in plan.children(dir) {
+            column.value(out, id as u64)?;
         }
     }
+    column.finish(out)?;
+    let mut column = start(out, Column::NameChild)?;
+    for &dir in &plan.order {
+        for &entry in plan.children(dir) {
+            let e = entry as usize;
+            let child = match e < dirs {
+                true => plan.dir_id[e],
+                false => plan.inode_of_file[e - dirs],
+            };
+            column.value(out, u64::from(child))?;
+        }
+    }
+    column.finish(out)?;
+    let (mut column, mut offset) = (start(out, Column::NameOffset)?, 0);
+    for &dir in &plan.order {
+        for &entry in plan.children(dir) {
+            column.value(out, offset)?;
+            offset += plan.name(&batches, entry).len() as u64 + 1;
+        }
+    }
+    column.finish(out)?;
     for &dir in &plan.order {
         for &entry in plan.children(dir) {
             out.write_all(plan.name(&batches, entry))?;
@@ -618,12 +743,17 @@ pub(crate) fn write(
     plan.dir_id = Vec::new();
     batches.iter_mut().for_each(Batch::drop_structure);
 
+    let known = |id: u32| (id != NONE).then_some(u64::from(id));
+    let mut column = start(out, Column::DirName)?;
     for &dir in &plan.order {
-        format::put_u32(out, plan.name_of_dir[dir as usize])?;
+        column.nullable(out, known(plan.name_of_dir[dir as usize]))?;
     }
+    column.finish(out)?;
+    let mut column = start(out, Column::Entries)?;
     for &dir in &plan.order {
-        format::put_u32(out, plan.entry_count[dir as usize])?;
+        column.nullable(out, known(plan.entry_count[dir as usize]))?;
     }
+    column.finish(out)?;
     let mut bits = Bits::new(1);
     for &dir in &plan.order {
         let (b, d) = plan.index.dir(dir as usize);
@@ -635,14 +765,25 @@ pub(crate) fn write(
     }
     out.write_all(&plan.strings)?;
 
-    for &dir in &plan.order {
-        let (b, d) = plan.index.dir(dir as usize);
-        format::put_inode(out, &batches[b].dir_stats[d], NONE)?;
+    for field in STAT_COLUMNS {
+        let dict = &dicts[field as usize];
+        let mut column = start(out, field)?;
+        for (stat, _) in plan.inode_rows(&batches) {
+            let value = stat_field(field, stat);
+            match field.coding() {
+                Coding::Dictionary => {
+                    column.index(out, dict.partition_point(|&known| known < value))?;
+                }
+                Coding::Frame | Coding::Nullable => column.value(out, value)?,
+            }
+        }
+        column.finish(out)?;
     }
-    for (k, &file) in plan.winner.iter().enumerate() {
-        let (b, f) = plan.index.file(file as usize);
-        format::put_inode(out, &batches[b].file_stats[f], plan.doc[k])?;
+    let mut column = start(out, Column::Doc)?;
+    for (_, doc) in plan.inode_rows(&batches) {
+        column.nullable(out, known(doc))?;
     }
+    column.finish(out)?;
     let mut bits = Bits::new(2);
     for _ in 0..dirs {
         bits.push(out, ContentState::Unindexed as u8)?;

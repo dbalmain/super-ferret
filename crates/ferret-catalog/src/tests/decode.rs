@@ -3,14 +3,17 @@
 use super::{SNIFFER, Scratch, commit, dir_stat, file_stat, hash, link_stat};
 use std::path::Path;
 
-use crate::format::SECTIONS;
+use crate::format::{self, COLUMNS, Column, SECTIONS, TABLE_END};
+use crate::packed;
 use crate::{
-    BeginError, Catalog, Content, DecodeError, InoId, NameId, OpenError, Section, Transaction,
-    WorkTreeKind,
+    BeginError, Catalog, Content, DecodeError, InoId, NameId, OpenError, Section, Stat,
+    Transaction, WorkTreeKind,
 };
 
-/// A small snapshot with every section non-empty, built in its own scratch
-/// directory `name`.
+/// A small snapshot with every section non-empty and every column wider
+/// than 0 bits, built in its own scratch directory `name`. Dev and mode have
+/// three values, so their dictionary checks read every index; owner has two,
+/// so its check reads none.
 fn sample(name: &str) -> Vec<u8> {
     let scratch = Scratch::new(name);
     commit(&scratch.path, |txn| {
@@ -19,16 +22,52 @@ fn sample(name: &str) -> Vec<u8> {
         let sub = w.dir(root, b"sub", dir_stat(2));
         let skip = w.traversed_dir(sub, b"skip", dir_stat(3));
         w.file(sub, b"a.rs", file_stat(10), Content::Hashed(hash(1)));
-        w.file(skip, b"b.bin", file_stat(11), Content::Binary);
+        let odd = Stat {
+            dev: 8,
+            uid: 100_000,
+            gid: 100_000,
+            mtime_sec: -86_400,
+            nlink: 3,
+            ..file_stat(11)
+        };
+        w.file(skip, b"b.bin", odd, Content::Binary);
         w.file(root, b"c", file_stat(12), Content::Hashed(hash(2)));
         w.symlink(root, b"d", link_stat(13), b"sub/a.rs");
         w.work_tree(sub, WorkTreeKind::Linked, b"/repo/.git", (1, 2));
         w.entry_count(sub, 2);
-        let other = w.root(b"/t", dir_stat(4));
+        let other = w.root(b"/t", Stat { dev: 9, ..dir_stat(4) });
         w.file(other, b"e", file_stat(14), Content::Fault);
         txn.add(w);
     });
     std::fs::read(scratch.path.join("catalog")).unwrap()
+}
+
+/// Where `section` starts in `bytes`, from its table.
+fn section_start(bytes: &[u8], section: Section) -> usize {
+    let at = 36 + section as usize * 16;
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
+}
+
+/// Where `column`'s descriptor lies in `bytes`.
+fn descriptor(column: Column) -> usize {
+    TABLE_END - (COLUMNS.len() - column as usize) * 16
+}
+
+/// Overwrites row `row` of `column` with the packed value `raw`, leaving
+/// everything else as it was.
+fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
+    let layout = format::decode_table(bytes, bytes.len() as u64).unwrap();
+    let placed = layout.columns[column as usize];
+    let width = placed.desc.width as usize;
+    assert!(raw <= packed::mask(placed.desc.width), "{raw} does not fit {width} bits");
+    let values = section_start(bytes, column.section())
+        + placed.start
+        + placed.desc.dict_len as usize * 8;
+    for bit in 0..width {
+        let at = row * width + bit;
+        let byte = &mut bytes[values + at / 8];
+        *byte = (*byte & !(1 << (at % 8))) | (((raw >> bit) & 1) as u8) << (at % 8);
+    }
 }
 
 /// Reads everything a catalog offers through every accessor whose sections
@@ -59,17 +98,38 @@ fn exercise(catalog: &Catalog) -> usize {
         }
     }
     for id in (0..catalog.inode_count()).map(InoId) {
-        if has(&[Inodes, States]) {
-            touched += catalog.inode(id).doc.map_or(0, |d| d.0 as usize);
+        if has(&Section::INODE) {
+            touched = touched.wrapping_add(catalog.inode(id).stat.dev as usize);
         }
-        // Reads a single row when the section is not loaded; never fails on
-        // a file that has not changed since it was opened.
-        let inode = catalog.read_inode(id).unwrap();
-        if has(&[Docs]) {
-            touched += inode
-                .doc
+        if has(&[Dev, Ino]) {
+            touched = touched.wrapping_add(catalog.identity(id).0 as usize);
+        }
+        if has(&[Size]) {
+            touched = touched.wrapping_add(catalog.size(id) as usize);
+        }
+        if has(&[Mtime]) {
+            touched = touched.wrapping_add(catalog.mtime(id) as usize);
+        }
+        if has(&[Ctime]) {
+            touched = touched.wrapping_add(catalog.ctime(id) as usize);
+        }
+        if has(&[Mode]) {
+            touched = touched.wrapping_add(catalog.mode(id) as usize);
+        }
+        if has(&[Owner]) {
+            touched = touched.wrapping_add(catalog.owner(id).0 as usize);
+        }
+        if has(&[Nlink]) {
+            touched = touched.wrapping_add(catalog.nlink(id) as usize);
+        }
+        if has(&[States]) {
+            touched = touched.wrapping_add(catalog.state(id) as usize);
+        }
+        if has(&[Doc, Docs]) {
+            touched = touched.wrapping_add(catalog
+                .doc(id)
                 .and_then(|d| catalog.doc_hash(d))
-                .map_or(0, |h| h[0] as usize);
+                .map_or(0, |h| h[0] as usize));
         }
         if has(&[Links, Strings]) {
             touched += catalog.link_target(id).map_or(0, <[u8]>::len);
@@ -226,9 +286,17 @@ fn every_single_bit_flip_is_an_error_or_reads_safely() {
                     exercise(&catalog);
                     assert_lookups_agree(&catalog, &context);
                     accepted += 1;
-                    // The header and section table are fully checked.
+                    // The head of the file is fully checked, but for the
+                    // sniffer, the next DocId, the counts and the columns'
+                    // bases. A count can flip into another consistent
+                    // catalog: one more directory, when padding bits read as
+                    // a name edge that fits, makes the first file a
+                    // directory. The table and every width and dictionary
+                    // length are exact.
+                    let descriptors = descriptor(Column::NameParent);
+                    let base = at >= descriptors && (at - descriptors) % 16 < 8;
                     assert!(
-                        at >= 216 || (12..20).contains(&at),
+                        at >= TABLE_END || (12..20).contains(&at) || (24..36).contains(&at) || base,
                         "flip at {at} bit {bit} accepted"
                     );
                 }
@@ -250,8 +318,7 @@ fn a_corrupt_section_fails_only_the_load_that_reads_it() {
     let mut bytes = sample("decode-partial");
     let docs = Catalog::from_bytes(bytes.clone()).unwrap();
     assert_eq!(docs.doc_count(), 2);
-    let table = 24 + Section::Docs as usize * 16;
-    let start = u64::from_le_bytes(bytes[table..table + 8].try_into().unwrap()) as usize;
+    let start = section_start(&bytes, Section::Docs);
     let first = bytes[start..start + 4].to_vec();
     bytes[start + 20..start + 24].copy_from_slice(&first);
     let scratch = Scratch::new("decode-partial-lazy");
@@ -282,7 +349,7 @@ fn a_section_loads_what_it_is_checked_against() {
     write_catalog(&scratch.path, &sample("decode-needs-sample"));
     let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
     assert!(SECTIONS.iter().all(|&s| !catalog.is_loaded(s)));
-    assert_eq!(catalog.bytes_read(), 216);
+    assert_eq!(catalog.bytes_read(), TABLE_END as u64);
     catalog.load(&[Section::Roots]).unwrap();
     let loaded: Vec<Section> = SECTIONS
         .into_iter()
@@ -320,9 +387,7 @@ fn a_directory_whose_name_points_upwards_is_rejected() {
     assert_eq!((sub, catalog.name(sub).parent), (NameId(1), InoId(0)));
 
     let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
-    let names_start = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-    let parent_field = names_start + sub.0 as usize * 12;
-    bytes[parent_field..parent_field + 4].copy_from_slice(&1u32.to_le_bytes());
+    set_raw(&mut bytes, Column::NameParent, sub.0 as usize, 1);
     assert_eq!(
         Catalog::from_bytes(bytes).err(),
         Some(DecodeError::Corrupt("dir names"))
@@ -348,8 +413,7 @@ fn a_name_that_makes_a_directory_its_own_descendant_is_rejected() {
 
     let path = scratch.path.join("catalog");
     let mut bytes = std::fs::read(&path).unwrap();
-    let names_start = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-    bytes[names_start + 4..names_start + 8].copy_from_slice(&0u32.to_le_bytes());
+    set_raw(&mut bytes, Column::NameChild, 0, 0);
     std::fs::write(&path, &bytes).unwrap();
     // Retention is the walk that looped (about 1 GB in 5 s before the fix);
     // the writer must refuse the generation before it can keep anything.
@@ -382,7 +446,7 @@ fn siblings_out_of_order_are_rejected() {
     assert_eq!(catalog.name(NameId(0)).bytes, b"c");
 
     let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
-    let heap_start = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+    let heap_start = section_start(&bytes, Section::NameHeap);
     assert_eq!(bytes[heap_start], b'c');
     bytes[heap_start] = b'g';
     assert_eq!(
@@ -391,10 +455,11 @@ fn siblings_out_of_order_are_rejected() {
     );
 }
 
-/// Resizes `section` by `delta` bytes (a multiple of 4), keeping the table
-/// tiling the file, so only the section's own length check can object.
+/// Resizes `section` by `delta` bytes, keeping the table tiling the file, so
+/// only the section's own length check can object. Bytes are added as zeros
+/// and removed from the end.
 fn resize_section(bytes: &[u8], section: Section, delta: isize) -> Vec<u8> {
-    let table = |i: usize| 24 + i * 16;
+    let table = |i: usize| 36 + i * 16;
     let at = section as usize;
     let read = |i: usize, off: usize| {
         u64::from_le_bytes(bytes[table(i) + off..][..8].try_into().unwrap()) as usize
@@ -418,25 +483,125 @@ fn resize_section(bytes: &[u8], section: Section, delta: isize) -> Vec<u8> {
     out
 }
 
-/// One entry count per directory: a section with a row too few or too many
-/// is refused at open, before any section is read.
+/// A column section holds exactly its columns' dictionaries and padded
+/// values: a byte too few or too many, or a whole value's worth, is refused
+/// at open, before any section is read.
 #[test]
-fn an_entries_section_of_the_wrong_length_is_rejected() {
-    let bytes = sample("decode-entries-length");
+fn a_column_section_of_the_wrong_length_is_rejected_at_open() {
+    let bytes = sample("decode-column-length");
     assert!(Catalog::from_bytes(bytes.clone()).is_ok());
-    let scratch = Scratch::new("decode-entries-length-lazy");
-    for delta in [-4, 4] {
-        let bad = resize_section(&bytes, Section::Entries, delta);
+    let scratch = Scratch::new("decode-column-length-lazy");
+    let mut sections: Vec<Section> = COLUMNS.iter().map(|c| c.section()).collect();
+    sections.dedup();
+    for section in sections {
+        for delta in [-8, -1, 1, 8] {
+            let bad = resize_section(&bytes, section, delta);
+            let expect = DecodeError::Corrupt(section.label());
+            assert_eq!(
+                Catalog::from_bytes(bad.clone()).err(),
+                Some(expect),
+                "{section:?} {delta}"
+            );
+            write_catalog(&scratch.path, &bad);
+            assert!(
+                matches!(
+                    Catalog::open(&scratch.path),
+                    Err(OpenError::Decode(DecodeError::Corrupt(what))) if what == section.label()
+                ),
+                "{section:?} {delta}"
+            );
+        }
+    }
+}
+
+/// Sets `column`'s descriptor field at `offset` (0 base, 8 width, 12
+/// dictionary length) to `value`.
+fn set_descriptor(bytes: &mut [u8], column: Column, offset: usize, value: &[u8]) {
+    let at = descriptor(column) + offset;
+    bytes[at..at + value.len()].copy_from_slice(value);
+}
+
+#[test]
+fn a_width_over_64_is_rejected_even_where_no_value_is_read() {
+    // With no names, a names column is only its padding at any width, so the
+    // length check passes; a width of 65 must still not reach a mask.
+    let scratch = Scratch::new("decode-width");
+    commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        w.root(b"/s", dir_stat(1));
+        txn.add(w);
+    });
+    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    assert!(Catalog::from_bytes(bytes.clone()).is_ok());
+    set_descriptor(&mut bytes, Column::NameParent, 8, &65u32.to_le_bytes());
+    assert_eq!(
+        Catalog::from_bytes(bytes).err(),
+        Some(DecodeError::Corrupt("names"))
+    );
+}
+
+#[test]
+fn a_dictionary_on_a_column_that_has_none_is_rejected() {
+    // A size column claiming one dictionary value, and 8 bytes longer to
+    // match: without the check its values would be read 8 bytes late.
+    let mut bytes = resize_section(&sample("decode-stray-dict"), Section::Size, 8);
+    set_descriptor(&mut bytes, Column::Size, 12, &1u32.to_le_bytes());
+    assert_eq!(
+        Catalog::from_bytes(bytes).err(),
+        Some(DecodeError::Corrupt("size"))
+    );
+}
+
+#[test]
+fn a_dictionary_index_past_the_end_is_rejected_on_load() {
+    // Mode has three values in two bits, so index 3 fits the width and
+    // misses the dictionary.
+    let bytes = sample("decode-dict-index");
+    let mut bad = bytes.clone();
+    set_raw(&mut bad, Column::Mode, 0, 3);
+    let scratch = Scratch::new("decode-dict-index-lazy");
+    write_catalog(&scratch.path, &bad);
+    let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+    assert!(matches!(
+        catalog.load(&[Section::Mode]),
+        Err(OpenError::Decode(DecodeError::Corrupt("mode")))
+    ));
+    assert_eq!(
+        Catalog::from_bytes(bad).err(),
+        Some(DecodeError::Corrupt("mode"))
+    );
+}
+
+#[test]
+fn a_dictionary_base_that_reaches_past_the_end_is_rejected() {
+    // Owner has two values in one bit, so its check reads no index; a base
+    // of 1, or one that wraps, moves the indices past the end and must make
+    // it read them all.
+    let bytes = sample("decode-dict-base");
+    for base in [1, u64::MAX] {
+        let mut bad = bytes.clone();
+        set_descriptor(&mut bad, Column::Owner, 0, &base.to_le_bytes());
         assert_eq!(
-            Catalog::from_bytes(bad.clone()).err(),
-            Some(DecodeError::Corrupt("entries")),
-            "{delta}"
+            Catalog::from_bytes(bad).err(),
+            Some(DecodeError::Corrupt("owner")),
+            "base {base}"
         );
-        write_catalog(&scratch.path, &bad);
-        assert!(matches!(
-            Catalog::open(&scratch.path),
-            Err(OpenError::Decode(DecodeError::Corrupt("entries")))
-        ));
+    }
+}
+
+#[test]
+fn counts_that_cannot_hold_are_rejected_at_open() {
+    // More directories than inodes, and the id space's "none" as a count.
+    let bytes = sample("decode-counts");
+    let inodes = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
+    for (at, value) in [(24, inodes + 1), (28, u32::MAX), (32, u32::MAX)] {
+        let mut bad = bytes.clone();
+        bad[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        assert_eq!(
+            Catalog::from_bytes(bad).err(),
+            Some(DecodeError::Corrupt("counts")),
+            "at {at}"
+        );
     }
 }
 
@@ -457,12 +622,12 @@ fn header_errors_say_what_is_wrong() {
     );
 }
 
-/// Every public accessor of catalog content, keyed by the one section its doc
-/// says it needs, exercised over every id the sample has. `None` is an
-/// accessor that needs no section (the table, or a read that loads for
-/// itself). The load-state probes `is_loaded` and `bytes_read` are left out:
-/// they report on the reader and read no section.
-type Accessor = (Option<Section>, &'static str, fn(&Catalog) -> usize);
+/// Every public accessor of catalog content, keyed by the sections its doc
+/// says it needs, exercised over every id the sample has. No sections is an
+/// accessor that reads only the head of the file. The load-state probes
+/// `is_loaded` and `bytes_read` are left out: they report on the reader and
+/// read no section.
+type Accessor = (&'static [Section], &'static str, fn(&Catalog) -> usize);
 
 const ACCESSORS: &[Accessor] = {
     use Section::*;
@@ -476,52 +641,51 @@ const ACCESSORS: &[Accessor] = {
         (0..c.name_count()).map(NameId)
     }
     &[
-        (None, "counts", |c| {
+        (&[], "counts", |c| {
             (c.dir_count() + c.inode_count() + c.name_count() + c.doc_count()) as usize
                 + c.next_doc().0 as usize
                 + c.sniffer_version() as usize
+                + c.head_len() as usize
                 + c.section_sizes()
                     .map(|(_, len)| len as usize)
                     .sum::<usize>()
+                + c.column_widths()
+                    .map(|(_, width, dict)| (width + dict) as usize)
+                    .sum::<usize>()
         }),
-        (None, "read_inode", |c| {
-            inodes(c)
-                .map(|i| c.read_inode(i).unwrap().stat.size as usize)
-                .sum()
-        }),
-        (Some(NameHeap), "name_heap", |c| c.name_heap().len()),
-        (Some(Names), "names", |c| {
+        (&[NameHeap], "name_heap", |c| c.name_heap().len()),
+        (&[Names], "names", |c| {
             c.names().map(|(_, b)| b.len()).sum()
         }),
-        (Some(Names), "name", |c| {
+        (&[Names], "name", |c| {
             ids(c).map(|i| c.name(i).bytes.len()).sum()
         }),
-        (Some(Names), "name_start", |c| {
+        (&[Names], "name_start", |c| {
             ids(c).map(|i| c.name_start(i)).sum()
         }),
-        (Some(Names), "child", |c| {
+        (&[Names], "child", |c| {
             ids(c).map(|i| c.child(i).0 as usize).sum()
         }),
-        (Some(Names), "name_at", |c| {
+        (&[Names], "name_at", |c| {
             (0..=c.name_heap().len())
                 .filter_map(|o| c.name_at(o))
                 .count()
         }),
-        (Some(Names), "children", |c| {
+        (&[Names], "children", |c| {
             dirs(c).map(|d| c.children(d).count()).sum()
         }),
-        (Some(Names), "lookup", |c| {
+        (&[Names], "lookup", |c| {
             ids(c)
                 .filter(|&i| c.lookup(c.name(i).parent, c.name(i).bytes).is_some())
                 .count()
         }),
-        (Some(DirNames), "dir_name", |c| {
+        (&[DirNames], "dir_name", |c| {
             dirs(c).filter_map(|d| c.dir_name(d)).count()
         }),
-        (Some(Roots), "roots", |c| {
+        (&[Roots], "roots", |c| {
             c.roots().map(|(_, p)| p.len()).sum()
         }),
-        (Some(Roots), "dir_path", |c| {
+        (&[Roots], "dir_path", |c| {
             dirs(c)
                 .map(|d| {
                     let mut out = Vec::new();
@@ -530,7 +694,7 @@ const ACCESSORS: &[Accessor] = {
                 })
                 .sum()
         }),
-        (Some(Roots), "path", |c| {
+        (&[Roots], "path", |c| {
             ids(c)
                 .map(|i| {
                     let mut out = Vec::new();
@@ -539,29 +703,47 @@ const ACCESSORS: &[Accessor] = {
                 })
                 .sum()
         }),
-        (Some(Entries), "entry_count", |c| {
+        (&[Entries], "entry_count", |c| {
             dirs(c).filter_map(|d| c.entry_count(d)).count()
         }),
-        (Some(Traversed), "is_traversed", |c| {
+        (&[Traversed], "is_traversed", |c| {
             dirs(c).filter(|&d| c.is_traversed(d)).count()
         }),
-        (Some(Inodes), "inode", |c| {
-            inodes(c).map(|i| c.inode(i).state as usize).sum()
+        (&Section::INODE, "inode", |c| {
+            inodes(c).map(|i| c.inode(i).stat.ino as usize).sum()
         }),
-        (Some(Links), "link_target", |c| {
+        (&[Size], "size", |c| inodes(c).map(|i| c.size(i) as usize).sum()),
+        (&[Mtime], "mtime", |c| {
+            inodes(c).map(|i| c.mtime(i).unsigned_abs() as usize).sum()
+        }),
+        (&[Ctime], "ctime", |c| {
+            inodes(c).map(|i| c.ctime(i).unsigned_abs() as usize).sum()
+        }),
+        (&[Mode], "mode", |c| inodes(c).map(|i| c.mode(i) as usize).sum()),
+        (&[Owner], "owner", |c| {
+            inodes(c).map(|i| c.owner(i).1 as usize).sum()
+        }),
+        (&[Nlink], "nlink", |c| {
+            inodes(c).map(|i| c.nlink(i) as usize).sum()
+        }),
+        (&[Doc], "doc", |c| inodes(c).filter_map(|i| c.doc(i)).count()),
+        (&[States], "state", |c| {
+            inodes(c).map(|i| c.state(i) as usize).sum()
+        }),
+        (&[Links], "link_target", |c| {
             inodes(c).filter_map(|i| c.link_target(i)).count()
         }),
-        (Some(Links), "kind", |c| {
+        (&[Links], "kind", |c| {
             inodes(c).map(|i| c.kind(i) as usize).sum()
         }),
-        (Some(WorkTrees), "work_trees", |c| {
+        (&[WorkTrees], "work_trees", |c| {
             c.work_trees().map(|w| w.common_dir.len()).sum()
         }),
-        (Some(WorkTrees), "work_tree", |c| {
+        (&[WorkTrees], "work_tree", |c| {
             dirs(c).filter_map(|d| c.work_tree(d)).count()
         }),
-        (Some(Docs), "docs", |c| c.docs().count()),
-        (Some(Docs), "doc_hash", |c| {
+        (&[Docs], "docs", |c| c.docs().count()),
+        (&[Docs], "doc_hash", |c| {
             (0..c.next_doc().0)
                 .filter_map(|d| c.doc_hash(crate::DocId(d)))
                 .count()
@@ -577,13 +759,11 @@ fn every_accessor_needs_only_the_section_it_documents() {
     // accessor, so nothing loaded for another can hide a gap.
     let scratch = Scratch::new("decode-accessors");
     write_catalog(&scratch.path, &sample("decode-accessors-src"));
-    for &(section, name, call) in ACCESSORS {
+    for &(sections, name, call) in ACCESSORS {
         let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
-        if let Some(section) = section {
-            catalog.load(&[section]).unwrap();
-        }
+        catalog.load(sections).unwrap();
         let touched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(&catalog)))
-            .unwrap_or_else(|_| panic!("{name} read a section loading {section:?} did not load"));
+            .unwrap_or_else(|_| panic!("{name} read a section loading {sections:?} did not load"));
         assert!(touched > 0, "{name}: the sample must exercise it");
     }
 }
