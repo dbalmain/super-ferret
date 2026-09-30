@@ -42,8 +42,9 @@
 //!
 //! A column is its dictionary (`u64` values, present only in a dictionary
 //! column) and then one value per row of its table, bit-packed at the
-//! descriptor's width (`packed`). Each column is sized to this catalog's
-//! values (D43), in one of three codings:
+//! descriptor's width (`packed`), then 8 bytes of padding (written as zeros,
+//! not checked: reads never depend on it). Each column is sized to this
+//! catalog's values (D43), in one of three codings:
 //!
 //! - **Frame of reference:** the value is `base + packed`, and the width is
 //!   that of the largest value less the smallest, which is the base. Signed

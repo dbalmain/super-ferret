@@ -143,8 +143,10 @@ tombstones, so there is one source of truth.
 `DocId`, the directory, inode and name counts), a table of 22 sections by
 offset and length, a descriptor per packed column, and the sections themselves.
 Every id and inode field is a bit-packed column (S1a): `count` values of
-`width` bits, least significant bit first, ending in 8 zero bytes so a read is
-one unaligned 8-byte load, a shift and a mask. A descriptor holds the column's
+`width` bits, least significant bit first, ending in 8 bytes of padding
+(written as zeros, not checked; reads never depend on it) so a read is one
+unaligned 8-byte load, a shift and a mask, plus a ninth byte at widths 58 to 64
+when the value straddles. A descriptor holds the column's
 base, width and dictionary length. Plain fields are frame of reference (value
 minus the column's minimum; times order-mapped from `i64` first); nullable ones
 (a directory's name and entry count, an inode's `DocId`) reserve all ones for

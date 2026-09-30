@@ -60,7 +60,7 @@ impl From<OpenError> for RunError {
 /// loads this set before its first `consider`; the inode scan loads its own
 /// set, [`Query::meta_sections`], before its first metadata test. The inode
 /// sections a [`Row`] carries load when the first name passes its name
-/// tests ([`Run::inode`]).
+/// tests, the path tests and the metadata tests ([`Run::inode`]).
 const ROW_SECTIONS: [Section; 6] = [
     Section::Names,
     Section::NameHeap,
@@ -87,6 +87,7 @@ impl Query {
         let mut run = Run {
             query: self,
             catalog,
+            meta_loaded: false,
             inodes_loaded: false,
             stats: Stats::default(),
             dir: None,
@@ -104,6 +105,8 @@ impl Query {
 struct Run<'q, 'c> {
     query: &'q Query,
     catalog: &'c Catalog,
+    /// Whether [`Run::load_meta`] has loaded the metadata tests' sections.
+    meta_loaded: bool,
     /// Whether [`Run::inode`] has loaded the sections a row reads.
     inodes_loaded: bool,
     stats: Stats,
@@ -215,14 +218,18 @@ impl Run<'_, '_> {
         if structural || !names_pass {
             return Ok(ControlFlow::Continue(()));
         }
-        let meta = self.inode(name.child)?;
-        if !tested && !self.meta_passes(name.child) {
-            return Ok(ControlFlow::Continue(()));
+        if !tested {
+            self.load_meta()?;
+            if !self.meta_passes(name.child) {
+                return Ok(ControlFlow::Continue(()));
+            }
         }
         self.resolve(name.parent, name.bytes);
         if !self.query.paths.iter().all(|t| t.matches(&self.path)) {
             return Ok(ControlFlow::Continue(()));
         }
+        // Only a row that will be emitted needs its whole inode.
+        let meta = self.inode(name.child)?;
         self.stats.rows += 1;
         Ok(emit(&Row {
             path: &self.path,
@@ -249,12 +256,20 @@ impl Run<'_, '_> {
         })
     }
 
+    /// Loads the sections the metadata tests read, once, before the first test.
+    fn load_meta(&mut self) -> Result<(), OpenError> {
+        if !self.meta_loaded {
+            self.catalog.load(&self.query.meta_sections())?;
+            self.meta_loaded = true;
+        }
+        Ok(())
+    }
+
     /// An inode's whole row, for a [`Row`]. The first call loads every
-    /// section it reads, and the metadata tests' sections with them.
+    /// section it reads.
     fn inode(&mut self, id: InoId) -> Result<Inode, OpenError> {
         if !self.inodes_loaded {
             self.catalog.load(&Section::INODE)?;
-            self.catalog.load(&self.query.meta_sections())?;
             self.inodes_loaded = true;
         }
         Ok(self.catalog.inode(id))

@@ -213,6 +213,23 @@ fn a_metadata_query_nothing_passes_reads_only_its_field() {
 }
 
 #[test]
+fn a_heap_scan_with_a_metadata_atom_nothing_passes_loads_only_its_field() {
+    // `ext:rs` names candidates for a heap scan; none passes `size:>1T`, so no
+    // row is built and the inode columns the row would read stay on disk.
+    let scratch = Scratch::new("lazy-meta-heap");
+    let catalog = sample(&scratch);
+    let query = Query::parse("ext:rs size:>1T", now()).unwrap();
+    assert_eq!(query.strategy(), Strategy::HeapScan);
+    let (found, stats) = find(&catalog, "ext:rs size:>1T");
+    assert!(found.is_empty());
+    assert!(stats.candidates > 0);
+    assert!(catalog.is_loaded(Section::Size));
+    for &section in Section::INODE.iter().filter(|&&s| s != Section::Size) {
+        assert!(!catalog.is_loaded(section), "{section:?}");
+    }
+}
+
+#[test]
 fn an_extreme_mtime_is_an_age_not_an_overflow() {
     // `now - mtime` overflows i64 for both of these; the file holds whatever
     // it holds, so the age must be computed wide.

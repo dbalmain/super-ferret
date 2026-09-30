@@ -4,17 +4,18 @@
 //!
 //! A read is one unaligned 8-byte load, a shift and a mask, plus one more
 //! byte when the value straddles the 8-byte window (`shift + width > 64`,
-//! which only widths above 57 can). Every column ends in [`PAD`] zero bytes,
-//! so the load never runs off the end: [`len`] is the exact length, and the
-//! decoder holds each column to it. Width 0 is legal: every value is 0, and
-//! the column is only its padding.
+//! which only widths above 57 can). Every column ends in [`PAD`] bytes of
+//! padding, so the load never runs off the end: the writer writes zeros, the
+//! decoder does not check them (reads never depend on them), and [`len`] is
+//! the exact length, which the decoder does hold each column to. Width 0 is
+//! legal: every value is 0, and the column is only its padding.
 //!
 //! The values are raw: frame of reference, dictionaries and the none
 //! sentinel are the format's business (see `format`).
 
 use std::io::{self, Write};
 
-/// Zero bytes after every column's last value.
+/// Bytes of padding after every column's last value, written as zeros.
 pub(crate) const PAD: u64 = 8;
 
 /// The widest a column can be.
