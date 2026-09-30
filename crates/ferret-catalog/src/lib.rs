@@ -17,6 +17,7 @@
 pub mod batch;
 mod build;
 mod format;
+mod packed;
 pub mod read;
 pub mod transaction;
 
