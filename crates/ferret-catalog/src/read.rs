@@ -35,6 +35,10 @@ use crate::format::{
 use crate::packed::{self, Blocked};
 use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
 
+/// Inodes in one run of [`Catalog::size_run`] and [`Catalog::mtime_run`]:
+/// a bitset word's worth.
+pub const RUN: usize = packed::RUN;
+
 /// The snapshot's file name inside the catalog directory.
 pub(crate) const FILE: &str = "catalog";
 
@@ -496,16 +500,35 @@ impl Catalog {
         format::unorder(self.blocked(Column::Mtime).get(id.0 as usize))
     }
 
-    /// Every inode's `st_size`, in inode order: a pass decoded a run at a
-    /// time. Needs [`Section::Size`].
-    pub fn sizes(&self) -> impl Iterator<Item = u64> + '_ {
-        self.blocked(Column::Size).values()
+    /// The `st_size`s of inodes `64 * run` onwards, up to 64 of them, decoded
+    /// together: one word of a bitset over inodes, for a pass that skips the
+    /// words it has already cleared. Empty past the last inode. Needs
+    /// [`Section::Size`].
+    pub fn size_run<'o>(&self, run: usize, out: &'o mut [u64; RUN]) -> &'o [u64] {
+        let out = &mut out[..self.run_len(run)];
+        self.blocked(Column::Size)
+            .decode(run.saturating_mul(RUN), out);
+        out
     }
 
-    /// Every inode's mtime in whole seconds, in inode order. Needs
-    /// [`Section::Mtime`].
-    pub fn mtimes(&self) -> impl Iterator<Item = i64> + '_ {
-        self.blocked(Column::Mtime).values().map(format::unorder)
+    /// The mtimes, in whole seconds, of inodes `64 * run` onwards: as
+    /// [`Catalog::size_run`]. Needs [`Section::Mtime`].
+    pub fn mtime_run<'o>(&self, run: usize, out: &'o mut [i64; RUN]) -> &'o [i64] {
+        let mut raw = [0; RUN];
+        let raw = &mut raw[..self.run_len(run)];
+        self.blocked(Column::Mtime)
+            .decode(run.saturating_mul(RUN), raw);
+        for (time, &value) in out.iter_mut().zip(&*raw) {
+            *time = format::unorder(value);
+        }
+        &out[..raw.len()]
+    }
+
+    /// How many inodes run `run` of [`Catalog::size_run`] holds.
+    fn run_len(&self, run: usize) -> usize {
+        (self.inode_count() as usize)
+            .saturating_sub(run.saturating_mul(RUN))
+            .min(RUN)
     }
 
     /// An inode's ctime, in whole seconds. Needs [`Section::Ctime`].

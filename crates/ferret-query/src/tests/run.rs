@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 
 use ferret_catalog::{Catalog, Content, ContentState, Kind, Section, Transaction};
 
-use super::{DAY, Scratch, dir, file, find, lazy, now, paths, sample};
+use super::{DAY, Scratch, dir, file, find, lazy, now, paths, sample, stat};
 use crate::{Query, Strategy};
 
 #[test]
@@ -370,4 +370,71 @@ fn a_root_at_slash_does_not_double_its_separator() {
     let catalog = lazy(&scratch);
     assert_eq!(paths(&catalog, ""), ["/etc", "/etc/passwd", "/vmlinuz"]);
     assert_eq!(paths(&catalog, "/etc/*"), ["/etc/passwd"]);
+}
+
+#[test]
+fn a_metadata_pass_that_leaves_nothing_leaves_later_tests_sections_on_disk() {
+    // Nothing is over a terabyte, so the size pass clears every bit and the
+    // mtime and type passes never begin: their sections stay on disk.
+    let scratch = Scratch::new("meta-short-circuit");
+    sample(&scratch);
+    for text in ["size:>1T mtime:<1d", "size:>1T type:l"] {
+        let catalog = lazy(&scratch);
+        let (found, stats) = find(&catalog, text);
+        assert!(found.is_empty(), "{text:?}");
+        assert_eq!(stats.candidates, 0, "{text:?}");
+        assert!(catalog.is_loaded(Section::Size), "{text:?}");
+        assert!(!catalog.is_loaded(Section::Mtime), "{text:?}");
+        assert!(!catalog.is_loaded(Section::Links), "{text:?}");
+    }
+    // The control: main.rs passes `mtime:<1d`, so the size pass runs.
+    let catalog = lazy(&scratch);
+    assert!(find(&catalog, "mtime:<1d size:>1T").0.is_empty());
+    assert!(catalog.is_loaded(Section::Mtime));
+    assert!(catalog.is_loaded(Section::Size));
+}
+
+#[test]
+fn metadata_passes_over_many_runs_match_each_inode_tested_alone() {
+    // 300 inodes: the size pass clears the first runs of 64 whole, so the
+    // mtime and type passes skip them, and the rest are partly set.
+    let scratch = Scratch::new("meta-runs");
+    let mut txn = Transaction::begin(&scratch.0, 1).unwrap();
+    let mut w = txn.batch();
+    let root = w.root(b"/w", dir(1));
+    for j in 0..300u64 {
+        let name = format!("f{j}");
+        let age = (j % 7) as i64 * DAY + 1;
+        if j % 10 == 0 {
+            let link = stat(100 + j, 0o120_777, j, age);
+            w.symlink(root, name.as_bytes(), link, b"x");
+        } else {
+            w.file(
+                root,
+                name.as_bytes(),
+                file(100 + j, j, age),
+                Content::Unindexed,
+            );
+        }
+    }
+    txn.add(w);
+    txn.commit().unwrap();
+    let expect = |keep: &dyn Fn(u64) -> bool| {
+        let mut paths: Vec<_> = (0..300)
+            .filter(|&j| keep(j))
+            .map(|j| format!("/w/f{j}"))
+            .collect();
+        paths.sort();
+        paths
+    };
+    let cases: [(&str, &dyn Fn(u64) -> bool); 3] = [
+        ("size:>200 mtime:<3d", &|j| j > 200 && j % 7 <= 2),
+        ("size:>200 type:l mtime:<3d", &|j| {
+            j > 200 && j % 10 == 0 && j % 7 <= 2
+        }),
+        ("mtime:<1d size:<150", &|j| j < 150 && j % 7 == 0),
+    ];
+    for (text, keep) in cases {
+        assert_eq!(paths(&lazy(&scratch), text), expect(keep), "{text:?}");
+    }
 }

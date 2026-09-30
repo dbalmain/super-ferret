@@ -272,11 +272,6 @@ impl<'a> Blocked<'a> {
             done += n;
         }
     }
-
-    /// [`Blocked::get`] of rows `0..count`, in order.
-    pub(crate) fn values(self) -> impl Iterator<Item = u64> + 'a {
-        runs(self.count, move |first, out| self.decode(first, out))
-    }
 }
 
 /// Values in one decoded run of a pass over a column.

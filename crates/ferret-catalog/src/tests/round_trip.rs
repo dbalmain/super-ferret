@@ -3,7 +3,7 @@
 use super::{Scratch, at, commit, dir_stat, file_stat, hash, link_stat, paths, reopen};
 use crate::{
     Batch, BuildError, Catalog, CommitError, Content, ContentState, DocId, InoId, Kind, NameId,
-    Stat, Transaction, WorkTreeKind,
+    RUN, Stat, Transaction, WorkTreeKind,
 };
 
 /// Fills `/r` across three batches, the way three walk workers would: each
@@ -552,9 +552,16 @@ fn a_pass_over_sizes_and_mtimes_matches_each_inode_read_alone() {
     commit_wide(&scratch.path);
     let catalog = reopen(&scratch.path);
     let ids = || (0..catalog.inode_count()).map(InoId);
-    let sizes: Vec<_> = catalog.sizes().collect();
+    let runs = (catalog.inode_count() as usize).div_ceil(RUN);
+    assert!(runs > 2, "a partial last run after full ones");
+    let (mut sizes, mut mtimes) = (Vec::new(), Vec::new());
+    for run in 0..runs {
+        sizes.extend_from_slice(catalog.size_run(run, &mut [0; RUN]));
+        mtimes.extend_from_slice(catalog.mtime_run(run, &mut [0; RUN]));
+    }
     assert_eq!(sizes, ids().map(|i| catalog.size(i)).collect::<Vec<_>>());
-    let mtimes: Vec<_> = catalog.mtimes().collect();
     assert_eq!(mtimes, ids().map(|i| catalog.mtime(i)).collect::<Vec<_>>());
     assert!(mtimes.iter().any(|&t| t != mtimes[0]));
+    assert!(catalog.size_run(runs, &mut [0; RUN]).is_empty());
+    assert!(catalog.mtime_run(usize::MAX, &mut [0; RUN]).is_empty());
 }

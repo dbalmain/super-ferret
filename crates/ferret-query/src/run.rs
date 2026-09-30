@@ -5,7 +5,7 @@
 use std::fmt;
 use std::ops::ControlFlow;
 
-use ferret_catalog::{Catalog, InoId, Kind, Kinds, Name, NameId, OpenError, Section};
+use ferret_catalog::{Catalog, InoId, Kind, Kinds, Name, NameId, OpenError, RUN, Section};
 
 use crate::query::{Cmp, MetaTest, NameTest, Query, Strategy};
 
@@ -61,9 +61,10 @@ impl From<OpenError> for RunError {
 /// reads DirNames, Names and Roots (Roots loads Strings); `is_traversed`
 /// reads Traversed; `kind`, for a row and for `type:`, reads Links (which
 /// loads Strings). All of these are small beside the heap. Every strategy
-/// loads this set before its first `consider`; the inode scan loads its own
-/// set, [`Query::meta_sections`], before its first metadata test, and a
-/// name-driven strategy loads it when the first name passes its name tests.
+/// loads this set before its first `consider`; the inode scan loads each
+/// metadata test's sections as that test's pass begins, and none after a
+/// pass leaves nothing, and a name-driven strategy loads
+/// [`Query::meta_sections`] when the first name passes its name tests.
 const ROW_SECTIONS: [Section; 6] = [
     Section::Names,
     Section::NameHeap,
@@ -166,8 +167,7 @@ impl<'c> Run<'_, 'c> {
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<(), RunError> {
         let catalog = self.catalog;
-        catalog.load(&self.query.meta_sections())?;
-        let pass = self.meta_pass();
+        let pass = self.meta_pass()?;
         // Nothing passed: no name can, so the name sections stay on disk.
         if pass.iter().all(|&word| word == 0) {
             return Ok(());
@@ -263,31 +263,56 @@ impl<'c> Run<'_, 'c> {
         })
     }
 
-    /// [`Run::meta_passes`] of every inode, as a bitset by `InoId`: each
-    /// test is a pass over its column, decoded a run at a time.
-    fn meta_pass(&self) -> Vec<u64> {
+    /// [`Run::meta_passes`] of every inode, as a bitset by `InoId`. Each test
+    /// is a pass over its column, loading its sections as the pass begins
+    /// and decoding only the runs of 64 inodes that still have a bit set; a
+    /// pass that clears every bit ends the conjunction, so a later test's
+    /// sections stay on disk.
+    fn meta_pass(&self) -> Result<Vec<u64>, OpenError> {
         let catalog = self.catalog;
         let n = catalog.inode_count() as usize;
         let mut pass = vec![!0; n.div_ceil(64)];
+        if let Some(last) = pass.last_mut()
+            && !n.is_multiple_of(64)
+        {
+            *last = (1 << (n % 64)) - 1;
+        }
+        let (mut sizes, mut times) = ([0; RUN], [0; RUN]);
         for test in &self.query.meta {
+            if pass.iter().all(|&word| word == 0) {
+                break;
+            }
+            catalog.load(test.sections())?;
             match *test {
-                MetaTest::Size(cmp, v) => {
-                    and_bits(&mut pass, catalog.sizes().map(|s| cmp.holds(s, v)))
-                }
-                MetaTest::Age(cmp, secs) => and_bits(
-                    &mut pass,
-                    catalog.mtimes().map(|t| self.age_holds(cmp, secs, t)),
-                ),
+                MetaTest::Size(cmp, v) => and_runs(&mut pass, |run, _| {
+                    word(
+                        catalog
+                            .size_run(run, &mut sizes)
+                            .iter()
+                            .map(|&s| cmp.holds(s, v)),
+                    )
+                }),
+                MetaTest::Age(cmp, secs) => and_runs(&mut pass, |run, _| {
+                    let times = catalog.mtime_run(run, &mut times);
+                    word(times.iter().map(|&t| self.age_holds(cmp, secs, t)))
+                }),
                 MetaTest::Type(kind) => {
                     let mut kinds = catalog.kinds();
-                    and_bits(
-                        &mut pass,
-                        (0..n as u32).map(|id| kinds.kind(InoId(id)) == kind),
-                    );
+                    and_runs(&mut pass, |run, live| {
+                        let mut out = 0;
+                        let mut rest = live;
+                        while rest != 0 {
+                            let bit = rest.trailing_zeros();
+                            rest &= rest - 1;
+                            let id = InoId((run * RUN) as u32 + bit);
+                            out |= u64::from(kinds.kind(id) == kind) << bit;
+                        }
+                        out
+                    });
                 }
             }
         }
-        pass
+        Ok(pass)
     }
 
     /// Whether a file modified at `mtime` is `cmp` `secs` old. Widened: mtime
@@ -370,19 +395,21 @@ impl Query {
     }
 }
 
-/// ANDs `bits`, one per row in order, into the bitset `pass`.
-fn and_bits(pass: &mut [u64], bits: impl Iterator<Item = bool>) {
-    let (mut word, mut at) = (0u64, 0);
-    for (i, bit) in bits.enumerate() {
-        word |= u64::from(bit) << (i % 64);
-        if i % 64 == 63 {
-            pass[at] &= word;
-            (word, at) = (0, at + 1);
+/// ANDs into each word of the bitset `pass` that still has a bit set the
+/// word `test(run, word)` returns for its run of 64 inodes; a cleared word's
+/// run is never decoded.
+fn and_runs(pass: &mut [u64], mut test: impl FnMut(usize, u64) -> u64) {
+    for (run, word) in pass.iter_mut().enumerate() {
+        if *word != 0 {
+            *word &= test(run, *word);
         }
     }
-    if let Some(last) = pass.get_mut(at) {
-        *last &= word;
-    }
+}
+
+/// A word with bit `i` set when the `i`th of up to 64 `bits` is true.
+fn word(bits: impl Iterator<Item = bool>) -> u64 {
+    bits.enumerate()
+        .fold(0, |word, (i, bit)| word | u64::from(bit) << i)
 }
 
 /// The name holding heap offset `hit`, searching forwards from `from`:
