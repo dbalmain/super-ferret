@@ -158,8 +158,13 @@ pub(crate) struct Plan {
     inode_of_file: Vec<u32>,
     /// The file whose observation each file inode row takes, in inode order.
     winner: Vec<u32>,
-    /// Whether fresh observations of each file inode disagreed.
+    /// Whether fresh observations of each file inode disagreed; freed once
+    /// `state` holds it.
     fault: Vec<bool>,
+    /// Each file inode's content state, in inode order: taken as the
+    /// documents are assigned, so the batches' contents can go before the
+    /// hashes are sorted.
+    state: Vec<ContentState>,
     /// Each file inode's DocId, or NONE.
     doc: Vec<u32>,
     heap_len: usize,
@@ -214,11 +219,7 @@ impl Plan {
         });
         let files = self.winner.iter().enumerate().map(|(k, &file)| {
             let (b, f) = self.index.file(file as usize);
-            let state = match self.fault[k] {
-                true => ContentState::Fault,
-                false => batches[b].contents[f].state(),
-            };
-            (&batches[b].file_stats[f], self.doc[k], state)
+            (&batches[b].file_stats[f], self.doc[k], self.state[k])
         });
         dirs.chain(files)
     }
@@ -432,6 +433,7 @@ pub(crate) fn plan(
         inode_of_file: Vec::new(),
         winner: Vec::new(),
         fault: Vec::new(),
+        state: Vec::new(),
         doc: Vec::new(),
         heap_len: 0,
         offset_blocks: (0, 0),
@@ -672,20 +674,33 @@ fn same_observation(index: &Index, batches: &[Batch], a: u32, b: u32) -> bool {
 
 /// Gives each hashed inode its document: the old `DocId` for known content,
 /// else a new one, assigned in inode order of first appearance (D36 B).
+/// Takes each inode's content state on the way, then frees the batches'
+/// contents and the fault flags: every hash they held is in `hashed` by then,
+/// and the inode rows need only the state.
 fn assign_docs(
     plan: &mut Plan,
-    batches: &[Batch],
+    batches: &mut [Batch],
     known: &[(Hash, u32)],
 ) -> Result<(), BuildError> {
     // Hashes as big-endian `u64` pairs: the same order as the bytes, which
     // `known` is sorted in, and compared in two instructions rather than a
     // 16-byte `memcmp`.
     let mut hashed: Vec<((u64, u64), u32)> = Vec::new();
+    plan.state.reserve_exact(plan.winner.len());
     for (k, &file) in plan.winner.iter().enumerate() {
         let (b, f) = plan.index.file(file as usize);
-        if let (false, Content::Hashed(hash)) = (plan.fault[k], batches[b].contents[f]) {
+        let content = batches[b].contents[f];
+        plan.state.push(match plan.fault[k] {
+            true => ContentState::Fault,
+            false => content.state(),
+        });
+        if let (false, Content::Hashed(hash)) = (plan.fault[k], content) {
             hashed.push((split_hash(&hash), k as u32));
         }
+    }
+    plan.fault = Vec::new();
+    for batch in batches.iter_mut() {
+        batch.contents = Vec::new();
     }
     hashed.sort_unstable();
     plan.doc = vec![NONE; plan.winner.len()];
