@@ -105,135 +105,170 @@ each directory's raw entry count, which `find`'s `-links` and `-empty` need
 10M, against S1's table.
 
 **Measured** (2026-09-30, the release `ferret` at the S1a branch, the same
-method as the baseline: `crates/ferret-bench/scripts/findbench.py`, isolated
-XDG dirs, one run at a time, 32 threads, NVMe, ext4; the medians are of 3
-evicted and 5 warm runs). The baseline is the same harness on the version-1
-catalog. Machine: load average 3-5 (another session's agents alive, none
-compiling), so read the times as plus or minus 20%; the byte counts are exact.
-`$HOME` has drifted: 445,194 names then, 445,442 now (the 10M is built from a
-fresh dump, 10,245,189 names against 10,239,255), so compare B/name and
-ratios. The "after" `find`, `open` and build figures are from the perf
-fixes that followed the first after-measurement (below the tables), re-run on
-the same two catalogs at load average 2.1-4.3 with nothing compiling; the
-catalogs are byte-identical to what the fixed build writes. Evicted times
-swing most (`test` at 10M evicted read 1,216 ms and 788 ms in two runs of one
-binary). The `index` rows are the first after-measurement's and were not
-re-run. The synthetic now carries the walker's real `nlink` and, for each
-directory, the count of its children in the dump (a lower bound on the raw
-`getdents` count, since the dump omits what the walker never lists); every
-copy shares those values, which is what makes the packed widths a fair worst
-case only for inodes and dev, not for sizes and times.
+method as the baseline: `crates/ferret-bench/scripts/findbench.py`, isolated XDG
+dirs, one run at a time, 32 threads, NVMe, ext4; the medians are of 3 evicted
+and 5 warm runs). The baseline is the same harness on the version-1 catalog.
+Machine: load average 3-5 (another session's agents alive, none compiling), so
+read the times as plus or minus 20%; the byte counts are exact. `$HOME` has
+drifted: 445,194 names then, 445,442 now (the 10M is built from a fresh dump,
+10,245,189 names against 10,239,255), so compare B/name and ratios. The "after"
+`find`, `open` and build figures are from the perf fixes that followed the first
+after-measurement (below the tables), re-run on the same two catalogs at load
+average 2.1-4.3 with nothing compiling; the catalogs are byte-identical to what
+the fixed build writes. Evicted times swing most (`test` at 10M evicted read
+1,216 ms and 788 ms in two runs of one binary). The `index` rows are the first
+after-measurement's and were not re-run. The synthetic now carries the walker's
+real `nlink` and, for each directory, the count of its children in the dump (a
+lower bound on the raw `getdents` count, since the dump omits what the walker
+never lists); every copy shares those values, which is what makes the packed
+widths a fair worst case only for inodes and dev, not for sizes and times.
 
-| measure                                     | before `$HOME`      | after `$HOME`       | before 10M        | after 10M         |
-| ------------------------------------------- | ------------------- | ------------------- | ----------------- | ----------------- |
-| catalog bytes                               | 47.3 MB, 106.2 B/n  | 28.4 MB, 63.7 B/n   | 1,202 MB, 117.4   | 799 MB, 78.0      |
-| Names (offsets + lengths)                   | 12.00 B/n           | 7.50                | 12.00             | 9.13              |
-| NameHeap                                    | 24.13               | 24.13               | 24.13             | 24.13             |
-| DirNames                                    | 0.70                | 0.42                | 0.70              | 0.53              |
-| Entries (new: raw directory counts)         | —                   | 0.26                | —                 | 0.26              |
-| inode columns (was `Inodes`, fixed 64 B)    | 64.00               | 26.00               | 64.00             | 27.38             |
-| States, Traversed, Strings, Links, WorkTrees | 0.48               | 0.48                | 0.32              | 0.32              |
-| Docs                                        | 4.91                | 4.91                | 16.29             | 16.29             |
-| `ferret-bench open`, name sections, warm    | 5.0 ms (16.5 MB)    | 7.1 ms (14.4 MB)    | 207 ms (378 MB)   | 254 ms (347 MB)   |
-| same, evicted                               | 18.2 ms             | 20.0 ms             | 333 ms            | 371 ms            |
-| `load_all`, warm / evicted                  | 9.1 / 42.4 ms       | 9.7 / 37.7 ms       | 472 / 840 ms      | 439 / 784 ms      |
-| `index`, first run / re-run                 | 55.6 s (cold-ish) / 0.50 s | 43.1 s (cold-ish) / 0.87 s (a) | —  | —          |
-| `index` peak RSS, first / re-run            | 78 / 161 MB         | 84 / 100 MB         | —                 | —                 |
-| `synthetic` build, time / peak RSS          | —                   | —                   | 9.4 s / 1,748 MB  | 9.7 s / 1,880 MB  |
-| same, CPU (user + sys), same sitting        | —                   | —                   | 7.3 s             | 9.5 s             |
+| measure                                      | before `$HOME`             | after `$HOME`                  | before 10M       | after 10M        |
+| -------------------------------------------- | -------------------------- | ------------------------------ | ---------------- | ---------------- |
+| catalog bytes                                | 47.3 MB, 106.2 B/n         | 28.4 MB, 63.7 B/n              | 1,202 MB, 117.4  | 799 MB, 78.0     |
+| Names (offsets + lengths)                    | 12.00 B/n                  | 7.50                           | 12.00            | 9.13             |
+| NameHeap                                     | 24.13                      | 24.13                          | 24.13            | 24.13            |
+| DirNames                                     | 0.70                       | 0.42                           | 0.70             | 0.53             |
+| Entries (new: raw directory counts)          | —                          | 0.26                           | —                | 0.26             |
+| inode columns (was `Inodes`, fixed 64 B)     | 64.00                      | 26.00                          | 64.00            | 27.38            |
+| States, Traversed, Strings, Links, WorkTrees | 0.48                       | 0.48                           | 0.32             | 0.32             |
+| Docs                                         | 4.91                       | 4.91                           | 16.29            | 16.29            |
+| `ferret-bench open`, name sections, warm     | 5.0 ms (16.5 MB)           | 7.1 ms (14.4 MB)               | 207 ms (378 MB)  | 254 ms (347 MB)  |
+| same, evicted                                | 18.2 ms                    | 20.0 ms                        | 333 ms           | 371 ms           |
+| `load_all`, warm / evicted                   | 9.1 / 42.4 ms              | 9.7 / 37.7 ms                  | 472 / 840 ms     | 439 / 784 ms     |
+| `index`, first run / re-run                  | 55.6 s (cold-ish) / 0.50 s | 43.1 s (cold-ish) / 0.87 s (a) | —                | —                |
+| `index` peak RSS, first / re-run             | 78 / 161 MB                | 84 / 100 MB                    | —                | —                |
+| `synthetic` build, time / peak RSS           | —                          | —                              | 9.4 s / 1,748 MB | 9.7 s / 1,880 MB |
+| same, CPU (user + sys), same sitting         | —                          | —                              | 7.3 s            | 9.5 s            |
 
-(a) Measured before the build fix; not re-measured on the final code, as the machine was
-not quiet (load 5, another session's find-compat harness running).
+(a) Measured before the build fix; not re-measured on the final code, as the
+machine was not quiet (load 5, another session's find-compat harness running).
 
 Per name the inode row went from 64 B to 26 B on `$HOME` and 27.4 B on the
-synthetic (nlink and the entry counts are new and included). Widths in the
-10M catalog: ino 30 bits, size 35, mtime 31, mtime nanoseconds 30, ctime 24,
-ctime nanoseconds 30, nlink 10, doc 23, dev 0 (one value), mode 5 (20 values),
-owner 1 (two values). The nanosecond columns are 7.6 B of the 27.4 and cannot
-pack: they are entropy. `nlink` costs 10 bits on every name for one outlier
-directory (an entry near 1,000); a frame-of-reference or exception scheme would
-take it to about 1 bit. Ino at 30 bits is the synthetic's copy stride
-(`$HOME` alone is 25 bits, 3.1 B).
+synthetic (nlink and the entry counts are new and included). Widths in the 10M
+catalog: ino 30 bits, size 35, mtime 31, mtime nanoseconds 30, ctime 24, ctime
+nanoseconds 30, nlink 10, doc 23, dev 0 (one value), mode 5 (20 values), owner 1
+(two values). The nanosecond columns are 7.6 B of the 27.4 and cannot pack: they
+are entropy. `nlink` costs 10 bits on every name for one outlier directory (an
+entry near 1,000); a frame-of-reference or exception scheme would take it to
+about 1 bit. Ino at 30 bits is the synthetic's copy stride (`$HOME` alone is 25
+bits, 3.1 B).
 
-| `find` (fresh process, ms)         | before `$HOME` | after `$HOME` | before 10M | after 10M |
-| ---------------------------------- | -------------: | ------------: | ---------: | --------: |
-| `flamegraph` fresh                 | 12.3           | 14.2          | 243        | 295       |
-| `flamegraph` evicted               | 22.6           | 23.9          | 380        | 406       |
-| `test` fresh                       | 30.5           | 15.6          | 643        | 362       |
-| `test` evicted                     | 110.0          | 26.1          | 2,324      | 492       |
-| `size:>100M` fresh                 | 29.4           | 21.2          | 612        | 453       |
-| `size:>100M` evicted               | 50.4           | 34.0          | 924        | 613       |
-| `*` fresh                          | 110.0          | 97.2          | 2,488      | 2,315     |
-| `*` evicted                        | 131.0          | 105.1         | 2,825      | 2,417     |
-| peak RSS, name queries             | 19-46 MB       | 17 MB         | 365-991 MB | 333-334 MB |
-| bytes read, name queries           | 16.6-45.5 MB   | 14.4 MB       | 380-1,046 MB | 347 MB  |
+| `find` (fresh process, ms) | before `$HOME` | after `$HOME` |   before 10M |  after 10M |
+| -------------------------- | -------------: | ------------: | -----------: | ---------: |
+| `flamegraph` fresh         |           12.3 |          14.2 |          243 |        295 |
+| `flamegraph` evicted       |           22.6 |          23.9 |          380 |        406 |
+| `test` fresh               |           30.5 |          15.6 |          643 |        362 |
+| `test` evicted             |          110.0 |          26.1 |        2,324 |        492 |
+| `size:>100M` fresh         |           29.4 |          21.2 |          612 |        453 |
+| `size:>100M` evicted       |           50.4 |          34.0 |          924 |        613 |
+| `*` fresh                  |          110.0 |          97.2 |        2,488 |      2,315 |
+| `*` evicted                |          131.0 |         105.1 |        2,825 |      2,417 |
+| peak RSS, name queries     |       19-46 MB |         17 MB |   365-991 MB | 333-334 MB |
+| bytes read, name queries   |   16.6-45.5 MB |       14.4 MB | 380-1,046 MB |     347 MB |
 
 Peak `find` RSS at 10M is now 333 MB for a name query and 372-376 MB with a
 metadata atom, a third of D48's 1 GB line (it was 990 MB). The 15 MB Python
 floor is in every RSS figure on both sides. `find --json` reads the three
 columns it prints: `flamegraph` 0.33 s, `test` 0.49 s, 452 MB at 10M.
 
-What changed the numbers, separated as far as the data allows (`perf` on the
-10M catalog, user space only).
+What changed the numbers, separated as far as the data allows (`perf` on the 10M
+catalog, user space only).
 
 - **Bytes read.** A row carries no decoded inode now; a caller that prints
   metadata loads those columns and reads them by the row's inode id. So a name
   query reads only the name sections (347 MB at 10M, against v1's 380 MB for a
   rare needle and 1,046 MB for a common one, which paid single 64 B row reads).
   The first after-measurement loaded all twelve inode columns (283 MB) for the
-  first reported row: 630 MB for every query, the larger half of the
-  rare-needle regression (0.26 s of system time against 0.14 s now).
-- **Decode.** The rest is unpacking. Validating the name sections decodes
-  every packed offset, parent and child where v1 read aligned `u32`s: a
-  `flamegraph` query spends 0.14 s of user time against v1's 0.09 s (0.18 s
-  before the fixes, which decoded runs of 64 values in one pass instead of
-  one value at a time in two). That, not bytes, is why `flamegraph` is still
-  50 ms behind v1 while every query that reports many rows is ahead.
-- **`*`** went from 2.49 to 3.70 s and is now 2.32 s: about 1.1 s was
-  decoding every inode field for rows that print only a path, and 0.2 s was
-  finding each name's end by a NUL search, which the next name's offset now
-  gives.
+  first reported row: 630 MB for every query, the larger half of the rare-needle
+  regression (0.26 s of system time against 0.14 s now).
+- **Decode.** The rest is unpacking. Validating the name sections decodes every
+  packed offset, parent and child where v1 read aligned `u32`s: a `flamegraph`
+  query spends 0.14 s of user time against v1's 0.09 s (0.18 s before the fixes,
+  which decoded runs of 64 values in one pass instead of one value at a time in
+  two). That, not bytes, is why `flamegraph` is still 50 ms behind v1 while
+  every query that reports many rows is ahead.
+- **`*`** went from 2.49 to 3.70 s and is now 2.32 s: about 1.1 s was decoding
+  every inode field for rows that print only a path, and 0.2 s was finding each
+  name's end by a NUL search, which the next name's offset now gives.
 - **Build.** The 19.4 s first measured was mostly load (56% CPU at load
-  average 8) and `fsync` of the 800 MB file, which alone varies from 0.5 to
-  8 s between runs; v1 in the same sitting ranged 7.5-10.4 s. On CPU, S1a
-  took 10.9 s against v1's 7.3 s: each stat column is its own pass over the
-  inode rows, and each pass found each row's batch by binary search again.
-  Resolving each row's stat once (8 B per inode, allocated below the build's
-  peak) took 1.2 s off, a cheaper packer 0.2 s. Of the 2.2 s that remain,
-  0.4 s is the synthetic's own filling (it now counts entries and reads
-  nlink); the rest is ten scattered passes where v1 made one, plus the pass
-  that sizes columns and collects dictionaries. (Closing it did not need
-  encoded columns held in memory, as this note first said: see below.)
+  average 8) and `fsync` of the 800 MB file, which alone varies from 0.5 to 8 s
+  between runs; v1 in the same sitting ranged 7.5-10.4 s. On CPU, S1a took 10.9
+  s against v1's 7.3 s: each stat column is its own pass over the inode rows,
+  and each pass found each row's batch by binary search again. Resolving each
+  row's stat once (8 B per inode, allocated below the build's peak) took 1.2 s
+  off, a cheaper packer 0.2 s. Of the 2.2 s that remain, 0.4 s is the
+  synthetic's own filling (it now counts entries and reads nlink); the rest is
+  ten scattered passes where v1 made one, plus the pass that sizes columns and
+  collects dictionaries. (Closing it did not need encoded columns held in
+  memory, as this note first said: see below.)
 
-**After the first review round** (2026-09-30, same harness, base = the
-commit above rebuilt from a detached worktree, A/B interleaved at load average
-5-11 from another session's harness; bytes exact, times plus or minus 10%).
-Name offsets and `nlink` became blocked columns (a frame of reference per 128
-rows), document ids a sequence column that is width 0 without holes, and the
-build writes every column positionally in one pass over the inode rows.
+**After the first review round** (2026-09-30, same harness, base = the commit
+above rebuilt from a detached worktree, A/B interleaved at load average 5-11
+from another session's harness; bytes exact, times plus or minus 10%). Name
+offsets and `nlink` became blocked columns (a frame of reference per 128 rows),
+document ids a sequence column that is width 0 without holes, and the build
+writes every column positionally in one pass over the inode rows.
 
-| measure                                  | before `$HOME` | after `$HOME` | before 10M     | after 10M      |
-| ---------------------------------------- | -------------- | ------------- | -------------- | -------------- |
-| catalog bytes                            | 63.73 B/n      | 60.25 B/n     | 799 MB, 78.02  | 735 MB, 71.78  |
-| Names (offsets blocked)                  |                |               | 9.13 B/n       | 7.21           |
-| Nlink                                    |                |               | 12.81 MB       | 1.77 MB        |
-| Docs (ids implicit)                      |                |               | 16.29 B/n      | 13.03          |
-| `find` peak RSS, name / metadata queries |                |               | 333 / 372-377 MB | 315 / 354-358 MB |
+| measure                                  | before `$HOME` | after `$HOME` | before 10M           | after 10M            |
+| ---------------------------------------- | -------------- | ------------- | -------------------- | -------------------- |
+| catalog bytes                            | 63.73 B/n      | 60.25 B/n     | 799 MB, 78.02        | 735 MB, 71.78        |
+| Names (offsets blocked)                  |                |               | 9.13 B/n             | 7.21                 |
+| Nlink                                    |                |               | 12.81 MB             | 1.77 MB              |
+| Docs (ids implicit)                      |                |               | 16.29 B/n            | 13.03                |
+| `find` peak RSS, name / metadata queries |                |               | 333 / 372-377 MB     | 315 / 354-358 MB     |
 | `open`, name sections, warm / evicted    | 7.1 / 12.7 ms  | 6.9 / 11.5 ms | 246-252 / 346-356 ms | 243-251 / 344-348 ms |
-| `find flamegraph`, fresh                 |                |               | 292 ms         | 281 ms         |
-| `find re:^[0-9a-f]{8}$`, fresh           |                |               | 535 ms         | 571 ms         |
-| `find '*'`, fresh                        |                |               | 2,290 ms       | 2,469 ms       |
-| `synthetic` build, wall (two runs)       |                |               | 11.0 / 12.8 s  | 9.5 / 9.5 s    |
-| same, user / sys                         |                |               | 8.4 / 1.3-1.5 s | 8.1 / 1.3 s   |
-| same, peak RSS                           |                |               | 1,881 MB       | 1,858 MB       |
+| `find flamegraph`, fresh                 |                |               | 292 ms               | 281 ms               |
+| `find re:^[0-9a-f]{8}$`, fresh           |                |               | 535 ms               | 571 ms               |
+| `find '*'`, fresh                        |                |               | 2,290 ms             | 2,469 ms             |
+| `synthetic` build, wall (two runs)       |                |               | 11.0 / 12.8 s        | 9.5 / 9.5 s          |
+| same, user / sys                         |                |               | 8.4 / 1.3-1.5 s      | 8.1 / 1.3 s          |
+| same, peak RSS                           |                |               | 1,881 MB             | 1,858 MB             |
 
-A scan of every name is 7-8% slower (user 2.12 to 2.28 s at 10M): each
-offset read now goes through its block's table entry. It was 11% until blocked
-columns were read through their own type; a view that branched on the coding
-stopped `get` inlining into the name loop. Reading the names in decoded runs
-(the review's finding 7) is the planned recovery. Blocking would also pay on
-child (30.7 to 19.6 MB), size (44.8 to 18.8), mtime (39.7 to 15.8) and ctime
-(30.7 to 12.8); not done.
+A scan of every name is 7-8% slower (user 2.12 to 2.28 s at 10M): each offset
+read now goes through its block's table entry. It was 11% until blocked columns
+were read through their own type; a view that branched on the coding stopped
+`get` inlining into the name loop. Reading the names in decoded runs (the
+review's finding 7) is the planned recovery; it followed, below.
+
+**After the second review round** (2026-09-30, same harness; before = the round
+above, `075f428`; load average 4-9 from another session's harness, so the close
+comparisons below were also taken with `perf stat -r 10`, each variant's binary
+on its own catalog, interleaved). Scans read the name columns a block at a time,
+carrying each name's end from the next one's start, and test metadata by a pass
+over each column; a symlink check gallops from the last one; a directory's path
+is built from its parent's when the directory before it was a sibling. Then the
+parent, child, size, mtime and ctime columns became blocked too (the review's
+finding 2 asked for a child-range table in place of the parent column; blocked
+parents are smaller, 6.1 MB against 7.2, and keep a name's parent one read
+away).
+
+| measure                                  | before `$HOME` | after `$HOME` | before 10M           | after 10M        |
+| ---------------------------------------- | -------------- | ------------- | -------------------- | ---------------- |
+| catalog bytes                            | 60.25 B/n      | 51.37 B/n     | 735 MB, 71.78        | 635 MB, 62.03    |
+| Names (all three blocked)                |                |               | 7.21 B/n             | 4.10             |
+| Size + Mtime + Ctime                     |                |               | 115.2 MB             | 47.3 MB          |
+| `find` peak RSS, name / metadata queries |                |               | 315 / 354-358 MB     | 284 / 301-304 MB |
+| `open`, name sections, warm / evicted    |                |               | 243-251 / 344-348 ms | 247 / 354 ms     |
+| `find '*'`, fresh                        |                |               | 2,469 ms             | 1,520 ms         |
+| `find re:^[0-9a-f]{8}$`, fresh           |                |               | 571 ms               | 475 ms           |
+| `find flamegraph`, fresh                 |                |               | 281 ms               | 290 ms           |
+| `find test`, fresh                       |                |               | 363 ms               | 338 ms           |
+| `find mtime:<1d`, fresh                  |                |               | 476 ms               | 366 ms           |
+| `find size:>100M`, fresh                 |                |               | 443 ms               | 351 ms           |
+| `synthetic` build, user (two runs)       |                |               | 8.13 / 8.21 s        | 8.37 / 8.41 s    |
+| same, peak RSS                           |                |               | 1,858 MB             | 1,857 MB         |
+
+A scan of every name is now 35% faster than before S1a's first review round (`*`
+2,290 ms at `5d2bf7d`), not 7% slower. By step, in user time for `*`: 2.31 s,
+1.76 s with decoded runs and the symlink cursor, 1.33 s with paths built from
+the parent's. Blocking the child column cost a full scan 0.1-0.9% of task-clock
+and saved 11.2 MB; blocking parents cost nothing measurable in a query, and a
+path read in isolation got 13% faster once it stopped decoding each level's
+child (before that change, 5% slower). About 30% of what remains in `*` is the
+regex that `*` compiles to, run on every name. Flamegraph at 281 against 290 ms
+is load; `perf stat` put the two within 2%, with blocked parents ahead. The
+build's 0.2 s more user time is sizing the extra blocked columns.
 
 ## S1+ — Incremental catalog
 

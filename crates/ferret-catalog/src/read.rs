@@ -4,8 +4,9 @@
 //! each section is read with a positional read on first use and validated
 //! then (D38 B). Nothing else is derived (D30 C). Accessors decode columns and
 //! rows in place. The catalog applies no matching: `ferret-query` scans
-//! [`Catalog::name_heap`] or iterates [`Catalog::names`], and comes back here
-//! with the `NameId`s it hit.
+//! [`Catalog::name_heap`] and reads its hits through a [`NameReader`], or
+//! passes over every name with [`NameReader::runs_from`], which decodes the
+//! name columns a block at a time.
 //!
 //! Loading is explicit and fallible: [`Catalog::load`] reads and validates
 //! the sections a caller names, with any they depend on. Every accessor after

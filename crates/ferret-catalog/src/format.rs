@@ -60,11 +60,11 @@
 //! - **Blocked:** a frame of reference per block of 128 rows, each block with
 //!   its own base and width, found through a table of 16 B entries at the
 //!   column's start (`packed::Blocked`). For a column whose neighbouring rows
-//!   are close: name offsets only grow, a directory's children are numbered
-//!   together, nlink is nearly always 1, and files numbered by name sit beside
-//!   their siblings, which share sizes and times far more than the whole tree
-//!   does. The descriptor's base is the bytes of packed values after the table,
-//!   and its width the widest block's.
+//!   are close: name offsets only grow, parents only rise, a directory's
+//!   children are numbered together, nlink is nearly always 1, and files
+//!   numbered by name sit beside their siblings, which share sizes and times
+//!   far more than the whole tree does. The descriptor's base is the bytes of
+//!   packed values after the table, and its width the widest block's.
 //! - **Sequence:** row `i`'s value is `base + i + packed`, for ids sorted
 //!   strictly increasing. Ids without holes are all `packed` 0: width 0, no
 //!   bytes but the padding, and a row found from its id by subtraction. A hole

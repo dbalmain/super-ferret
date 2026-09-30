@@ -151,11 +151,19 @@ base, width and dictionary length. Plain fields are frame of reference (value
 minus the column's minimum; times order-mapped from `i64` first); nullable ones
 (a directory's name and entry count, an inode's `DocId`) reserve all ones for
 none; `dev`, `mode` and the `(uid, gid)` pair are indexes into a sorted
-dictionary at the head of their section. Name offsets and `nlink` are blocked:
-a frame of reference per 128 rows, through a table of 16 B entries (base,
-offset and width) ahead of the values, so a read stays O(1) and one outlier
-widens only its block. At 10M names this took offsets from 35.9 to 16.3 MB and
-`nlink` from 12.8 to 1.8 MB; 64 and 256 rows measured within 1 MB either way.
+dictionary at the head of their section. The three name columns, size, mtime,
+ctime and `nlink` are blocked: a frame of reference per 128 rows, through a
+table of 16 B entries (base, offset and width) ahead of the values, so a read
+stays O(1) and one outlier widens only its block. Neighbouring rows are close:
+offsets only grow, parents only rise, a directory's children are numbered
+together, and files numbered by name sit beside siblings that share sizes and
+times. At 10M names blocking took offsets from 35.9 to 16.3 MB, parents from
+26.9 to 6.1 MB (smaller than a per-directory child-range table, 7.2 MB, and
+still O(1) from a name to its parent), children from 30.7 to 19.6 MB, size,
+mtime and ctime from 115.2 to 47.3 MB together, and `nlink` from 12.8 to 1.8
+MB; 64 and 256 rows measured within 1 MB either way on offsets. A scan reads
+the name columns a block at a time, each name's end carried from the next
+one's start, so a pass costs no table read per row.
 Document ids are a sequence column, row `i` holding `id - i`: with no holes it
 is width 0 and a row is found from its id by subtraction, and holes widen it
 only to the bits of their total. Each inode field is its own section,
@@ -380,11 +388,14 @@ or a regex's longest literal run) drives a scan of the name heap with
 name by galloping over name starts, tested once, and the scan resumes at the
 next name. A query with metadata atoms and no literal tests every inode row
 first and then walks the name rows for the inodes that pass, loading the name
-sections only if one does. Everything else tests every name. A name query loads
+sections only if one does; the inode test is a pass over each column it reads,
+decoded a run at a time. Everything else tests every name, read in decoded
+runs. A name query loads
 the name, directory, root, traversed and link sections, never the document rows,
 and no inode columns for plain output (`--json` loads Size, Mtime and Doc); a
 metadata test loads only the columns it reads. Paths are resolved once per
-parent directory. Measured (`ferret-bench`, D43): a rare word is 5 ms warm at
+parent directory, and a directory's from its parent's when the directory before
+it was a sibling, which breadth-first numbering makes the common case. Measured (`ferret-bench`, D43): a rare word is 5 ms warm at
 `$HOME`, 206 ms at 10M and 763 ms at 40M, nearly all of it the section loads.
 
 ## Experiments and metrics
