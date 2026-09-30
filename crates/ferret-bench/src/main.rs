@@ -386,7 +386,7 @@ fn run_query(dir: &Path, text: &str, now: SystemTime) -> Result<Timed> {
             first = Some(start.elapsed());
         }
         // Touch the materialised path and the row, then discard them.
-        sink = sink.wrapping_add(row.path.len()) ^ row.meta.stat.size as usize;
+        sink = sink.wrapping_add(row.path.len()) ^ row.inode.0 as usize;
         ControlFlow::Continue(())
     })?;
     let all = start.elapsed();

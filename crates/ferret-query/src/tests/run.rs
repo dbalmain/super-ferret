@@ -131,10 +131,11 @@ fn a_row_carries_the_inode_it_names() {
     let scratch = Scratch::new("rows");
     let catalog = sample(&scratch);
     let query = Query::parse("case:main.rs", now()).unwrap();
+    catalog.load(&Section::INODE).unwrap();
     let mut rows = Vec::new();
     query
         .run(&catalog, |row| {
-            rows.push((row.path.to_vec(), row.kind, row.meta));
+            rows.push((row.path.to_vec(), row.kind, catalog.inode(row.inode)));
             ControlFlow::Continue(())
         })
         .unwrap();
@@ -150,16 +151,18 @@ fn a_row_carries_the_inode_it_names() {
 }
 
 #[test]
-fn a_name_query_reads_no_documents_and_inodes_only_for_a_hit() {
+fn a_name_query_reads_no_documents_and_no_inodes_even_for_a_hit() {
+    // Rows once carried a decoded inode, so the first hit loaded every inode
+    // column: 283 MB at 10M names for a listing that prints only paths.
     let scratch = Scratch::new("lazy-name");
     let catalog = sample(&scratch);
     assert!(find(&catalog, "nothing-has-this").0.is_empty());
     assert!(catalog.is_loaded(Section::NameHeap));
-    assert!(Section::INODE.iter().all(|&s| !catalog.is_loaded(s)));
     let (found, _) = find(&catalog, "readme");
     assert_eq!(found.len(), 2);
-    assert!(Section::INODE.iter().all(|&s| catalog.is_loaded(s)));
-    assert!(!catalog.is_loaded(Section::Docs));
+    for &section in Section::INODE.iter().chain(&[Section::Docs]) {
+        assert!(!catalog.is_loaded(section), "{section:?}");
+    }
 }
 
 #[test]
@@ -170,11 +173,14 @@ fn a_metadata_query_scans_inodes_and_still_skips_documents() {
     assert_eq!(query.strategy(), Strategy::InodeScan);
     let (found, stats) = find(&catalog, "size:>100M");
     assert_eq!(found, ["/r/src/big.bin"]);
-    // Only the inode that passed is a candidate; its row loads the rest of
-    // the inode sections.
+    // Only the inode that passed is a candidate; the row reads no other
+    // inode field.
     assert_eq!(stats.candidates, 1);
-    assert!(Section::INODE.iter().all(|&s| catalog.is_loaded(s)));
+    assert!(catalog.is_loaded(Section::Size));
     assert!(catalog.is_loaded(Section::NameHeap));
+    for &section in Section::INODE.iter().filter(|&&s| s != Section::Size) {
+        assert!(!catalog.is_loaded(section), "{section:?}");
+    }
     assert!(!catalog.is_loaded(Section::Docs));
 }
 
@@ -339,10 +345,11 @@ fn every_row_carries_its_own_inode() {
     let scratch = Scratch::new("rows-own-inode");
     let catalog = many(&scratch, 300);
     let query = Query::parse("f", now()).unwrap();
+    catalog.load(&[Section::Size]).unwrap();
     let mut sizes = Vec::new();
     query
         .run(&catalog, |row| {
-            sizes.push(row.meta.stat.size);
+            sizes.push(catalog.size(row.inode));
             ControlFlow::Continue(())
         })
         .unwrap();

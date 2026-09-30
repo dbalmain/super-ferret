@@ -9,7 +9,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -501,6 +501,16 @@ fn json_round_trips_a_path_that_is_not_utf8() {
         };
         let path = PathBuf::from(OsStr::from_bytes(&path));
         assert!(path.exists(), "{} does not name the file", path.display());
+        // Metadata comes from columns the plain listing never loads.
+        let meta = fs::metadata(&path).unwrap();
+        assert!(
+            line.contains(&format!("\"size\":{},", meta.len())),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!("\"mtime\":{},", meta.mtime())),
+            "{line}"
+        );
         seen.push(path);
     }
     seen.sort();

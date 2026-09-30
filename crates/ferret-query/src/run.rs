@@ -5,11 +5,17 @@
 use std::fmt;
 use std::ops::ControlFlow;
 
-use ferret_catalog::{Catalog, InoId, Inode, Kind, NameId, OpenError, Section};
+use ferret_catalog::{Catalog, InoId, Kind, NameId, OpenError, Section};
 
 use crate::query::{MetaTest, NameTest, Query, Strategy};
 
-/// One result: a path, and what the catalog knows about what it names.
+/// One result: a path, and the ids to read anything else about it from the
+/// catalog.
+///
+/// A row carries no metadata: a caller that prints some loads those fields'
+/// sections before the run and reads them by [`Row::inode`]. Decoding every
+/// field for every row would cost a plain path listing all the inode columns
+/// (283 MB at 10M names) for fields it never prints.
 #[derive(Clone, Copy, Debug)]
 pub struct Row<'a> {
     /// The full path: the root's path, then each name below it.
@@ -20,8 +26,6 @@ pub struct Row<'a> {
     pub inode: InoId,
     /// Directory, file or symlink.
     pub kind: Kind,
-    /// The inode row: `stat`, content state, and its document, if any.
-    pub meta: Inode,
 }
 
 /// What a run did, for the query log and for tests.
@@ -58,9 +62,8 @@ impl From<OpenError> for RunError {
 /// reads Traversed; `kind`, for a row and for `type:`, reads Links (which
 /// loads Strings). All of these are small beside the heap. Every strategy
 /// loads this set before its first `consider`; the inode scan loads its own
-/// set, [`Query::meta_sections`], before its first metadata test. The inode
-/// sections a [`Row`] carries load when the first name passes its name
-/// tests, the path tests and the metadata tests ([`Run::inode`]).
+/// set, [`Query::meta_sections`], before its first metadata test, and a
+/// name-driven strategy loads it when the first name passes its name tests.
 const ROW_SECTIONS: [Section; 6] = [
     Section::Names,
     Section::NameHeap,
@@ -76,9 +79,9 @@ impl Query {
     /// it is lent is valid only for the call.
     ///
     /// Loads only what the strategy needs: a name query never reads the
-    /// document rows, and reads the inode sections only once a name passes
-    /// its name tests; a metadata-only query reads the one field each test
-    /// needs, and the name sections only once an inode has passed.
+    /// document rows or an inode section; a metadata test reads the one
+    /// field it needs, and a metadata-only query reads the name sections only
+    /// once an inode has passed.
     pub fn run(
         &self,
         catalog: &Catalog,
@@ -88,7 +91,6 @@ impl Query {
             query: self,
             catalog,
             meta_loaded: false,
-            inodes_loaded: false,
             stats: Stats::default(),
             dir: None,
             path: Vec::new(),
@@ -107,8 +109,6 @@ struct Run<'q, 'c> {
     catalog: &'c Catalog,
     /// Whether [`Run::load_meta`] has loaded the metadata tests' sections.
     meta_loaded: bool,
-    /// Whether [`Run::inode`] has loaded the sections a row reads.
-    inodes_loaded: bool,
     stats: Stats,
     /// The directory whose path `path` starts with, and that prefix's
     /// length. Names arrive grouped by parent, so a directory's path is
@@ -228,15 +228,12 @@ impl Run<'_, '_> {
         if !self.query.paths.iter().all(|t| t.matches(&self.path)) {
             return Ok(ControlFlow::Continue(()));
         }
-        // Only a row that will be emitted needs its whole inode.
-        let meta = self.inode(name.child)?;
         self.stats.rows += 1;
         Ok(emit(&Row {
             path: &self.path,
             name: id,
             inode: name.child,
             kind: catalog.kind(name.child),
-            meta,
         }))
     }
 
@@ -263,16 +260,6 @@ impl Run<'_, '_> {
             self.meta_loaded = true;
         }
         Ok(())
-    }
-
-    /// An inode's whole row, for a [`Row`]. The first call loads every
-    /// section it reads.
-    fn inode(&mut self, id: InoId) -> Result<Inode, OpenError> {
-        if !self.inodes_loaded {
-            self.catalog.load(&Section::INODE)?;
-            self.inodes_loaded = true;
-        }
-        Ok(self.catalog.inode(id))
     }
 
     /// Sets `path` to `parent`'s path plus `name`.

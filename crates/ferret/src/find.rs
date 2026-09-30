@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, Instant, SystemTime};
 
-use ferret_catalog::{Catalog, Kind};
+use ferret_catalog::{Catalog, Kind, Section};
 use ferret_query::{Query, Row, Stats};
 
 use crate::cli::{Context, Exit, error};
@@ -102,6 +102,12 @@ fn search(
         }
     };
     outcome.size = Some((catalog.name_count(), catalog.inode_count()));
+    // A plain listing prints only paths, so it reads no inode column.
+    if json && let Err(e) = catalog.load(&JSON_SECTIONS) {
+        error(&format!("{}: {e}", context.index.display()));
+        outcome.error = Some("read");
+        return Exit::Error;
+    }
 
     let stdout = io::stdout();
     let tty = stdout.is_terminal();
@@ -111,7 +117,7 @@ fn search(
     let result = query.run(&catalog, |row| {
         line.clear();
         if json {
-            json_row(&mut line, row);
+            json_row(&mut line, &catalog, row);
         } else {
             line.extend_from_slice(row.path);
         }
@@ -160,13 +166,16 @@ fn search(
     }
 }
 
+/// What [`json_row`] reads beyond the row itself.
+const JSON_SECTIONS: [Section; 3] = [Section::Size, Section::Mtime, Section::Doc];
+
 /// One `--json` row: `path` (and `path_base64` when it is not UTF-8; see
 /// [`crate::json`]), `type`, `size` in bytes, `mtime` in Unix seconds, and
 /// `doc`, the content's document id, or null when the file has none
 /// (a directory, a symlink, a binary or unread file). Document ids are
 /// stable across index runs (D4); inode and name ids are not (D27), so
 /// they are not printed.
-fn json_row(out: &mut Vec<u8>, row: &Row<'_>) {
+fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
     let kind = match row.kind {
         Kind::Dir => "dir",
         Kind::File => "file",
@@ -176,8 +185,8 @@ fn json_row(out: &mut Vec<u8>, row: &Row<'_>) {
     object
         .bytes("path", row.path)
         .str("type", kind)
-        .int("size", row.meta.stat.size)
-        .int("mtime", row.meta.stat.mtime_sec)
-        .opt_int("doc", row.meta.doc.map(|d| d.0));
+        .int("size", catalog.size(row.inode))
+        .int("mtime", catalog.mtime(row.inode))
+        .opt_int("doc", catalog.doc(row.inode).map(|d| d.0));
     object.end();
 }
