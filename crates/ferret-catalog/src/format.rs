@@ -602,7 +602,37 @@ impl View<'_> {
     pub(crate) fn lookup(&self, row: usize) -> u64 {
         u64_at(self.dict, self.get(row) as usize * 8)
     }
+
+    /// [`View::get`] of rows `first..first + out.len()`, into `out`; `first`
+    /// is a multiple of 8. See [`Packed::decode`].
+    pub(crate) fn decode(&self, first: usize, out: &mut [u64]) {
+        self.packed.decode(first, out);
+        for value in out {
+            *value = self.base.wrapping_add(*value);
+        }
+    }
+
+    /// [`View::get`] of rows `0..count`, in order: a validation pass over
+    /// one column, decoded a [`BLOCK`] at a time.
+    pub(crate) fn values(&self, count: usize) -> impl Iterator<Item = u64> + '_ {
+        (0..count).step_by(BLOCK).flat_map(move |first| {
+            let mut block = [0; BLOCK];
+            let n = BLOCK.min(count - first);
+            self.decode(first, &mut block[..n]);
+            block.into_iter().take(n)
+        })
+    }
+
+    /// [`View::nullable`] of rows `0..count`, in order.
+    pub(crate) fn nullables(&self, count: usize) -> impl Iterator<Item = Option<u64>> + '_ {
+        let none = self.base.wrapping_add(packed::mask(self.packed.width()));
+        self.values(count)
+            .map(move |value| (value != none).then_some(value))
+    }
 }
+
+/// Rows a validation pass decodes at once: [`View::decode`]'s run.
+const BLOCK: usize = 64;
 
 /// Where each section lies, the counts, and how each column is packed.
 /// Built from the head of the file alone, so every check below that needs
@@ -875,9 +905,7 @@ pub(crate) fn check<'a>(
         Section::Roots => {
             let roots = get(Section::Roots);
             let dir_names = l.view(Column::DirName, get(Section::DirNames));
-            let unnamed = (0..l.dirs)
-                .filter(|&d| dir_names.nullable(d).is_none())
-                .count();
+            let unnamed = dir_names.nullables(l.dirs).filter(Option::is_none).count();
             let mut last = None;
             for pair in roots.chunks_exact(PAIR_ROW) {
                 let (dir, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
@@ -956,8 +984,7 @@ fn check_dictionary(l: &Layout, column: Column, bytes: &[u8]) -> Result<(), Deco
     if reach.is_some_and(|reach| reach < len) {
         return Ok(());
     }
-    let view = l.view(column, bytes);
-    if (0..l.inodes).any(|i| view.get(i) >= len) {
+    if l.view(column, bytes).values(l.inodes).any(|i| i >= len) {
         return Err(DecodeError::Corrupt(column.section().label()));
     }
     Ok(())
@@ -973,45 +1000,58 @@ fn check_dictionary(l: &Layout, column: Column, bytes: &[u8]) -> Result<(), Deco
 /// whole heap means none inside a name; one vectorised count is far cheaper
 /// than a search per name. Siblings are in strictly increasing byte order,
 /// because `lookup` binary-searches them by name.
+///
+/// One pass decodes each column once: name `i - 1`'s span is checked when
+/// row `i`'s offset, its end, has been.
 fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<(), DecodeError> {
-    let parents = l.view(Column::NameParent, rows);
-    let children = l.view(Column::NameChild, rows);
-    let offsets = l.view(Column::NameOffset, rows);
-    let (mut last_parent, mut next_offset) = (0, 0);
-    for i in 0..l.names {
-        let (parent, child, offset) = (parents.get(i), children.get(i), offsets.get(i));
-        let ok = parent < l.dirs as u64
-            && child < l.inodes as u64
-            && parent >= last_parent
-            && offset >= next_offset
-            && (next_offset > 0 || offset == 0)
-            && offset < heap.len() as u64;
-        if !ok {
-            return Err(DecodeError::Corrupt("names"));
-        }
-        last_parent = parent;
-        next_offset = offset + 1;
-    }
-
     if count_nuls(heap) != l.names {
         return Err(DecodeError::Corrupt("name order"));
     }
+    let parents = l.view(Column::NameParent, rows);
+    let children = l.view(Column::NameChild, rows);
+    let offsets = l.view(Column::NameOffset, rows);
+    // The name before this row: its parent and where its bytes start; and
+    // the one before that, for sibling order.
+    let mut open: Option<(u64, usize)> = None;
     let mut previous: Option<(u64, &[u8])> = None;
-    for i in 0..l.names {
-        let start = offsets.get(i) as usize;
-        let end = match i + 1 < l.names {
-            true => offsets.get(i + 1) as usize,
-            false => heap.len(),
+    let mut close = |end: usize, open: Option<(u64, usize)>| {
+        let Some((parent, start)) = open else {
+            return Ok(());
         };
-        let parent = parents.get(i);
         let (name, nul) = (&heap[start..end - 1], heap[end - 1]);
         let ordered = previous.is_none_or(|(p, prev)| p != parent || prev < name);
         if name.is_empty() || nul != 0 || !ordered {
             return Err(DecodeError::Corrupt("name order"));
         }
         previous = Some((parent, name));
+        Ok(())
+    };
+    let (mut last_parent, mut next_offset) = (0, 0);
+    let mut block = [[0; BLOCK]; 3];
+    for first in (0..l.names).step_by(BLOCK) {
+        let n = BLOCK.min(l.names - first);
+        let [p, c, o] = &mut block;
+        parents.decode(first, &mut p[..n]);
+        children.decode(first, &mut c[..n]);
+        offsets.decode(first, &mut o[..n]);
+        for j in 0..n {
+            let (parent, child, offset) = (p[j], c[j], o[j]);
+            let ok = parent < l.dirs as u64
+                && child < l.inodes as u64
+                && parent >= last_parent
+                && offset >= next_offset
+                && (next_offset > 0 || offset == 0)
+                && offset < heap.len() as u64;
+            if !ok {
+                return Err(DecodeError::Corrupt("names"));
+            }
+            close(offset as usize, open)?;
+            open = Some((parent, offset as usize));
+            last_parent = parent;
+            next_offset = offset + 1;
+        }
     }
-    Ok(())
+    close(heap.len(), open)
 }
 
 /// Every directory's name edge names it, from a lower-numbered parent, so a
@@ -1020,12 +1060,19 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<(), DecodeError> 
 /// so each directory has exactly one name and a root has none. Without it a
 /// name could make a root its own child, and a walk down (retention copying
 /// a kept root) would never end.
+///
+/// The converse is a count. The first loop proves each named directory's
+/// edge names it, so those edges are distinct names with directory children;
+/// if no other name has a directory child, every such name is some
+/// directory's edge. Counting them reads the child column in order, where a
+/// check per name looked up its child's edge at random.
 fn check_dir_names(l: &Layout, dir_names: &[u8], rows: &[u8]) -> Result<(), DecodeError> {
     let dir_names = l.view(Column::DirName, dir_names);
     let parents = l.view(Column::NameParent, rows);
     let children = l.view(Column::NameChild, rows);
-    for dir in 0..l.dirs {
-        let Some(name) = dir_names.nullable(dir) else {
+    let mut named = 0;
+    for (dir, name) in dir_names.nullables(l.dirs).enumerate() {
+        let Some(name) = name else {
             continue;
         };
         let ok = name < l.names as u64 && {
@@ -1035,12 +1082,14 @@ fn check_dir_names(l: &Layout, dir_names: &[u8], rows: &[u8]) -> Result<(), Deco
         if !ok {
             return Err(DecodeError::Corrupt("dir names"));
         }
+        named += 1;
     }
-    for name in 0..l.names {
-        let child = children.get(name);
-        if child < l.dirs as u64 && dir_names.nullable(child as usize) != Some(name as u64) {
-            return Err(DecodeError::Corrupt("dir names"));
-        }
+    let dir_children = children
+        .values(l.names)
+        .filter(|&child| child < l.dirs as u64)
+        .count();
+    if dir_children != named {
+        return Err(DecodeError::Corrupt("dir names"));
     }
     Ok(())
 }
