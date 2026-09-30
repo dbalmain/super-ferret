@@ -177,7 +177,7 @@ bits, 3.1 B).
 Peak `find` RSS at 10M is now 333 MiB for a name query and 372-376 MiB with a
 metadata atom, a third of D48's 1 GB line (it was 990 MiB). The 15 MiB Python
 floor is in every RSS figure on both sides. `find --json` reads the three
-columns it prints: `flamegraph` 0.33 s, `test` 0.49 s, 452 MB read at 10M.
+columns it prints: `flamegraph` 0.33 s, `test` 0.49 s at 10M.
 
 What changed the numbers, separated as far as the data allows (`perf` on the 10M
 catalog, user space only).
