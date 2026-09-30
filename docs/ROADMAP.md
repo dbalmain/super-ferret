@@ -112,7 +112,11 @@ catalog. Machine: load average 3-5 (another session's agents alive, none
 compiling), so read the times as plus or minus 20%; the byte counts are exact.
 `$HOME` has drifted: 445,194 names then, 445,442 now (the 10M is built from a
 fresh dump, 10,245,189 names against 10,239,255), so compare B/name and
-ratios. The synthetic now carries the walker's real `nlink` and, for each
+ratios. The `find` rows are from a second run after the `Run::consider` fix
+(metadata tests load only their own sections before a row is built); the mix
+did not move by more than the noise, since no query in it is one that nothing
+passes. Evicted times swing most (`test` at 10M evicted read 1,216 ms before
+the fix and 788 ms after, with nothing changed for it). The synthetic now carries the walker's real `nlink` and, for each
 directory, the count of its children in the dump (a lower bound on the raw
 `getdents` count, since the dump omits what the walker never lists); every
 copy shares those values, which is what makes the packed widths a fair worst
@@ -128,9 +132,9 @@ case only for inodes and dev, not for sizes and times.
 | inode columns (was `Inodes`, fixed 64 B)    | 64.00               | 26.00               | 64.00             | 27.38             |
 | States, Traversed, Strings, Links, WorkTrees | 0.48               | 0.48                | 0.32              | 0.32              |
 | Docs                                        | 4.91                | 4.91                | 16.29             | 16.29             |
-| `ferret-bench open`, name sections, warm    | 5.0 ms (16.5 MB)    | 9.3 ms (14.4 MB)    | 207 ms (378 MB)   | 285 ms (347 MB)   |
-| same, evicted                               | 18.2 ms             | 22.8 ms             | 333 ms            | 402 ms            |
-| `load_all`, warm / evicted                  | 9.1 / 42.4 ms       | 10.7 / 39.7 ms      | 472 / 840 ms      | 457 / 749 ms      |
+| `ferret-bench open`, name sections, warm    | 5.0 ms (16.5 MB)    | 8.3 ms (14.4 MB)    | 207 ms (378 MB)   | 280 ms (347 MB)   |
+| same, evicted                               | 18.2 ms             | 21.0 ms             | 333 ms            | 390 ms            |
+| `load_all`, warm / evicted                  | 9.1 / 42.4 ms       | 10.6 / 39.7 ms      | 472 / 840 ms      | 448 / 749 ms      |
 | `index`, first run / re-run                 | 55.6 s (cold-ish) / 0.50 s | 43.1 s (cold-ish) / 0.87 s | —  | —              |
 | `index` peak RSS, first / re-run            | 78 / 161 MB         | 84 / 100 MB         | —                 | —                 |
 | `synthetic` build, time / peak RSS          | —                   | —                   | 9.4 s / 1,748 MB  | 19.4 s / 1,882 MB |
@@ -147,14 +151,14 @@ take it to about 1 bit. Ino at 30 bits is the synthetic's copy stride
 
 | `find` (fresh process, ms)         | before `$HOME` | after `$HOME` | before 10M | after 10M |
 | ---------------------------------- | -------------: | ------------: | ---------: | --------: |
-| `flamegraph` fresh                 | 12.3           | 20.3          | 243        | 446       |
-| `flamegraph` evicted               | 22.6           | 38.4          | 380        | 728       |
-| `test` fresh                       | 30.5           | 25.5          | 643        | 560       |
-| `test` evicted                     | 110.0          | 44.3          | 2,324      | 1,216     |
-| `size:>100M` fresh                 | 29.4           | 26.1          | 612        | 568       |
-| `size:>100M` evicted               | 50.4           | 47.2          | 924        | 854       |
-| `*` fresh                          | 110.0          | 159.6         | 2,488      | 3,722     |
-| `*` evicted                        | 131.0          | 175.6         | 2,825      | 3,928     |
+| `flamegraph` fresh                 | 12.3           | 21.6          | 243        | 440       |
+| `flamegraph` evicted               | 22.6           | 40.5          | 380        | 673       |
+| `test` fresh                       | 30.5           | 26.0          | 643        | 557       |
+| `test` evicted                     | 110.0          | 43.5          | 2,324      | 788       |
+| `size:>100M` fresh                 | 29.4           | 28.9          | 612        | 562       |
+| `size:>100M` evicted               | 50.4           | 45.5          | 924        | 824       |
+| `*` fresh                          | 110.0          | 156.5         | 2,488      | 3,696     |
+| `*` evicted                        | 131.0          | 189.0         | 2,825      | 3,915     |
 | peak RSS, name queries             | 19-46 MB       | 28-29 MB      | 365-991 MB | 603-604 MB |
 | bytes read, name queries           | 16.6-45.5 MB   | 26.1 MB       | 380-1,046 MB | 630 MB  |
 
@@ -167,14 +171,14 @@ reader has no single-row inode reads, so a reported row loads all the inode
 columns (283 MB packed at 10M): every query that reports a row now reads 630
 MB, where before a rare needle read 380 MB and a common one 1,046 MB (name
 sections plus 160k 64 B rows at page granularity). That is why `flamegraph`
-and the other rare-needle queries got slower (243 to 446 ms fresh at 10M) and
+and the other rare-needle queries got slower (243 to 440 ms fresh at 10M) and
 `test` and `size:` faster: the loss of single reads costs the first and pays
 the second. Compaction alone is visible in the name-section rows above: 378
-to 347 MB read, but 207 to 285 ms warm to load, because the packed offsets are
+to 347 MB read, but 207 to 280 ms warm to load, because the packed offsets are
 decoded where the old `u32` columns were read as is (the old fresh-buffer
 read of 378 MB was 128 ms, a resident one 28 ms). The remaining ~100 ms of the
 rare-needle regression is the inode columns. `*` (10.2M rows) went from 2.49 to
-3.72 s fresh: 1.2 s more, all in reporting, since each row now unpacks about
+3.70 s fresh: 1.2 s more, all in reporting, since each row now unpacks about
 ten columns. Decoding is the cost of compaction; a query that needs no inode
 column for its rows (`-print` of names only, no predicate) should not load them,
 and neither of these has been done yet.
