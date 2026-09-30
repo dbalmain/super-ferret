@@ -395,7 +395,7 @@ impl Catalog {
     /// A directory's own name edge; `None` for a root (D30). Needs
     /// [`Section::DirNames`].
     pub fn dir_name(&self, dir: InoId) -> Option<NameId> {
-        self.column(Column::DirName)
+        self.blocked(Column::DirName)
             .nullable(dir.0 as usize)
             .map(|name| NameId(name as u32))
     }
@@ -421,7 +421,7 @@ impl Catalog {
 
     /// Appends a directory's path. Needs [`Section::Roots`].
     pub fn dir_path(&self, dir: InoId, out: &mut Vec<u8>) {
-        let (names, dir_names) = (self.name_reader(), self.column(Column::DirName));
+        let (names, dir_names) = (self.name_reader(), self.blocked(Column::DirName));
         let mut up = Vec::new();
         let mut at = dir;
         while let Some(name) = dir_names.nullable(at.0 as usize) {
@@ -462,12 +462,12 @@ impl Catalog {
         let (owner, i) = (self.owner(id), id.0 as usize);
         let stat = Stat {
             dev: self.column(Column::Dev).lookup(i),
-            ino: self.column(Column::Ino).get(i),
+            ino: self.blocked(Column::Ino).get(i),
             size: self.size(id),
             mtime_sec: self.mtime(id),
-            mtime_nsec: self.column(Column::MtimeNs).get(i) as u32,
+            mtime_nsec: self.blocked(Column::MtimeNs).get(i) as u32,
             ctime_sec: self.ctime(id),
-            ctime_nsec: self.column(Column::CtimeNs).get(i) as u32,
+            ctime_nsec: self.blocked(Column::CtimeNs).get(i) as u32,
             mode: self.mode(id),
             uid: owner.0,
             gid: owner.1,
@@ -486,7 +486,7 @@ impl Catalog {
         let i = id.0 as usize;
         (
             self.column(Column::Dev).lookup(i),
-            self.column(Column::Ino).get(i),
+            self.blocked(Column::Ino).get(i),
         )
     }
 
@@ -557,7 +557,7 @@ impl Catalog {
     /// An inode's document, when its state is `Hashed`. Needs
     /// [`Section::Doc`].
     pub fn doc(&self, id: InoId) -> Option<DocId> {
-        self.column(Column::Doc)
+        self.blocked(Column::Doc)
             .nullable(id.0 as usize)
             .map(|doc| DocId(doc as u32))
     }
@@ -575,7 +575,7 @@ impl Catalog {
     /// carried from a generation that did not know. Needs
     /// [`Section::Entries`].
     pub fn entry_count(&self, dir: InoId) -> Option<u32> {
-        self.column(Column::Entries)
+        self.blocked(Column::Entries)
             .nullable(dir.0 as usize)
             .map(|count| count as u32)
     }

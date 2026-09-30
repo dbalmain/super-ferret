@@ -169,6 +169,11 @@ pub(crate) const BLOCK_ROWS: usize = 128;
 /// values' byte offset shifted left 8 with its width in the low byte.
 pub(crate) const BLOCK_ENTRY: u64 = 16;
 
+/// Set beside the width in a nullable blocked column's table entry when the
+/// block holds a none: the width's all-ones value is then none, and a block
+/// of nothing else is width 0. A block with no none keeps its plain width.
+pub(crate) const NULLS: u64 = 0x80;
+
 /// The blocks a blocked column of `count` rows has.
 pub(crate) fn blocks(count: u32) -> u64 {
     u64::from(count).div_ceil(BLOCK_ROWS as u64)
@@ -195,8 +200,12 @@ fn block_bytes(rows: usize, width: u32) -> u64 {
 /// than over the whole catalog. A read is two table loads more than
 /// [`Packed`]'s, and O(1).
 ///
+/// A nullable blocked column frames each block by its real values alone,
+/// and marks a block that holds a none with [`NULLS`].
+///
 /// ```text
-/// table    per block: base u64, (offset << 8 | width) u64    (BLOCK_ENTRY)
+/// table    per block: base u64, (offset << 8 | nulls | width) u64
+///                                                          (BLOCK_ENTRY)
 /// values   each block's values, packed LSB first from a byte boundary
 /// padding  PAD bytes
 /// ```
@@ -222,26 +231,32 @@ impl<'a> Blocked<'a> {
 
     /// Block `k`'s base, values offset and width.
     fn entry(&self, k: usize) -> (u64, usize, u32) {
+        let (base, packed) = self.words(k);
+        (base, (packed >> 8) as usize, (packed & 0x7F) as u32)
+    }
+
+    /// Block `k`'s two table words.
+    fn words(&self, k: usize) -> (u64, u64) {
         let at = k * BLOCK_ENTRY as usize;
         let word = |at: usize| {
             let mut b = [0; 8];
             b.copy_from_slice(&self.table[at..at + 8]);
             u64::from_le_bytes(b)
         };
-        let (base, packed) = (word(at), word(at + 8));
-        (base, (packed >> 8) as usize, (packed & 0xFF) as u32)
+        (word(at), word(at + 8))
     }
 
     /// Whether every entry is one a read can trust: each offset exactly
     /// where the blocks before it end, the last block ending at `values`
     /// bytes (the length the descriptor gave the values), and the widest
     /// block exactly `max_width`, which is at most [`MAX_WIDTH`]: so every
-    /// width is too, and the descriptor is exact.
-    pub(crate) fn check(&self, max_width: u32, values: u64) -> bool {
+    /// width is too, and the descriptor is exact. [`NULLS`] is set only in
+    /// a `nullable` column.
+    pub(crate) fn check(&self, max_width: u32, values: u64, nullable: bool) -> bool {
         let (mut end, mut widest) = (0, 0);
         for k in 0..self.table.len() / BLOCK_ENTRY as usize {
             let (_, offset, width) = self.entry(k);
-            if offset as u64 != end {
+            if offset as u64 != end || (!nullable && self.words(k).1 & NULLS != 0) {
                 return false;
             }
             end += block_bytes(BLOCK_ROWS.min(self.count - k * BLOCK_ROWS), width);
@@ -254,6 +269,30 @@ impl<'a> Blocked<'a> {
     pub(crate) fn get(&self, i: usize) -> u64 {
         let (base, offset, width) = self.entry(i / BLOCK_ROWS);
         base.wrapping_add(Packed::new(&self.values[offset..], width).get(i % BLOCK_ROWS))
+    }
+
+    /// Value `i` of a nullable column, or `None` where it holds none.
+    pub(crate) fn nullable(&self, i: usize) -> Option<u64> {
+        let (base, packed) = self.words(i / BLOCK_ROWS);
+        let (offset, width) = ((packed >> 8) as usize, (packed & 0x7F) as u32);
+        let raw = Packed::new(&self.values[offset..], width).get(i % BLOCK_ROWS);
+        (packed & NULLS == 0 || raw != mask(width)).then(|| base.wrapping_add(raw))
+    }
+
+    /// [`Blocked::nullable`] of every row, in order: a pass over the column,
+    /// decoded a block at a time.
+    pub(crate) fn nullables(self) -> impl Iterator<Item = Option<u64>> + 'a {
+        (0..self.count).step_by(BLOCK_ROWS).flat_map(move |first| {
+            let (base, packed) = self.words(first / BLOCK_ROWS);
+            let (offset, width) = ((packed >> 8) as usize, (packed & 0x7F) as u32);
+            let (mut block, n) = ([0; BLOCK_ROWS], BLOCK_ROWS.min(self.count - first));
+            Packed::new(&self.values[offset..], width).decode(0, &mut block[..n]);
+            let none = (packed & NULLS != 0).then(|| mask(width));
+            block
+                .into_iter()
+                .take(n)
+                .map(move |raw| (Some(raw) != none).then(|| base.wrapping_add(raw)))
+        })
     }
 
     /// Values `first..first + out.len()` into `out`, a run of a pass over the
@@ -293,6 +332,7 @@ pub(crate) fn runs(count: usize, decode: impl Fn(usize, &mut [u64])) -> impl Ite
 #[derive(Default)]
 pub(crate) struct BlockSizer {
     range: Option<(u64, u64)>,
+    nulls: bool,
     rows: usize,
     values: u64,
     width: u32,
@@ -302,6 +342,16 @@ impl BlockSizer {
     pub(crate) fn push(&mut self, value: u64) {
         let (min, max) = self.range.unwrap_or((value, value));
         self.range = Some((min.min(value), max.max(value)));
+        self.next();
+    }
+
+    /// A nullable column's none.
+    pub(crate) fn push_null(&mut self) {
+        self.nulls = true;
+        self.next();
+    }
+
+    fn next(&mut self) {
         self.rows += 1;
         if self.rows == BLOCK_ROWS {
             self.close();
@@ -310,11 +360,11 @@ impl BlockSizer {
 
     fn close(&mut self) {
         if let Some((min, max)) = self.range.take() {
-            let w = width(max - min);
+            let w = block_width(min, max, self.nulls);
             self.values += block_bytes(self.rows, w);
             self.width = self.width.max(w);
         }
-        self.rows = 0;
+        (self.rows, self.nulls) = (0, false);
     }
 
     /// The bytes of packed values, and the widest block.
@@ -324,11 +374,21 @@ impl BlockSizer {
     }
 }
 
+/// A block's width for real values from `min` to `max`: one more value's
+/// worth when the block holds a none, whose all-ones must be past them all.
+/// A nullable column's values span less than `u64::MAX` (the builder's are
+/// `u32`s).
+fn block_width(min: u64, max: u64, nulls: bool) -> u32 {
+    width(max - min + u64::from(nulls))
+}
+
 /// Streams a blocked column: holds one block of values, then writes its
 /// table entry to one output and its packed values to another, so neither
 /// the table nor the values are ever held whole.
 pub(crate) struct BlockedWriter {
     block: [u64; BLOCK_ROWS],
+    /// Bit `i` set: row `i` of the block is none.
+    nulls: u128,
     rows: usize,
     offset: u64,
 }
@@ -337,6 +397,7 @@ impl BlockedWriter {
     pub(crate) fn new() -> Self {
         Self {
             block: [0; BLOCK_ROWS],
+            nulls: 0,
             rows: 0,
             offset: 0,
         }
@@ -349,6 +410,20 @@ impl BlockedWriter {
         value: u64,
     ) -> io::Result<()> {
         self.block[self.rows] = value;
+        self.next(table, values)
+    }
+
+    /// A nullable column's none.
+    pub(crate) fn push_null(
+        &mut self,
+        table: &mut impl Write,
+        values: &mut impl Write,
+    ) -> io::Result<()> {
+        self.nulls |= 1 << self.rows;
+        self.next(table, values)
+    }
+
+    fn next(&mut self, table: &mut impl Write, values: &mut impl Write) -> io::Result<()> {
         self.rows += 1;
         if self.rows == BLOCK_ROWS {
             self.close(table, values)?;
@@ -357,20 +432,29 @@ impl BlockedWriter {
     }
 
     fn close(&mut self, table: &mut impl Write, values: &mut impl Write) -> io::Result<()> {
-        let block = &self.block[..self.rows];
-        let (Some(&min), Some(&max)) = (block.iter().min(), block.iter().max()) else {
+        if self.rows == 0 {
             return Ok(());
+        }
+        let nulls = self.nulls;
+        let is_null = |i: usize| nulls >> i & 1 == 1;
+        let block = &self.block[..self.rows];
+        let real = || (0..block.len()).filter(|&i| !is_null(i)).map(|i| block[i]);
+        // A block of nothing but nones has base 0 and width 0.
+        let (min, w) = match (real().min(), real().max()) {
+            (Some(min), Some(max)) => (min, block_width(min, max, nulls != 0)),
+            _ => (0, 0),
         };
-        let w = width(max - min);
+        let flag = if nulls == 0 { 0 } else { NULLS };
         table.write_all(&min.to_le_bytes())?;
-        table.write_all(&(self.offset << 8 | u64::from(w)).to_le_bytes())?;
+        table.write_all(&(self.offset << 8 | flag | u64::from(w)).to_le_bytes())?;
         let mut writer = Writer::new(w);
-        for &value in block {
-            writer.push(values, value - min)?;
+        for (i, &value) in block.iter().enumerate() {
+            let raw = if is_null(i) { mask(w) } else { value - min };
+            writer.push(values, raw)?;
         }
         writer.flush(values)?;
         self.offset += block_bytes(self.rows, w);
-        self.rows = 0;
+        (self.rows, self.nulls) = (0, 0);
         Ok(())
     }
 
@@ -548,7 +632,7 @@ mod tests {
                 "n {count}"
             );
             let column = Blocked::new(&bytes, count as u32);
-            assert!(column.check(widest, len), "n {count}");
+            assert!(column.check(widest, len, false), "n {count}");
             for (i, &v) in values.iter().enumerate() {
                 assert_eq!(column.get(i), v, "n {count} i {i}");
             }
@@ -582,7 +666,7 @@ mod tests {
             .collect();
         let (bytes, len, widest) = pack_blocked(&values);
         assert_eq!(widest, 9);
-        assert!(Blocked::new(&bytes, 300).check(widest, len));
+        assert!(Blocked::new(&bytes, 300).check(widest, len, false));
         let set = |k: usize, offset: u64, width: u64| {
             let mut bad = bytes.clone();
             let at = k * BLOCK_ENTRY as usize + 8;
@@ -590,7 +674,7 @@ mod tests {
             bad
         };
         assert!(
-            Blocked::new(&set(1, 48, 9), 300).check(widest, len),
+            Blocked::new(&set(1, 48, 9), 300).check(widest, len, false),
             "unchanged"
         );
         for (what, bad) in [
@@ -602,13 +686,88 @@ mod tests {
             // longer starts where the second ends.
             ("narrower than written", set(1, 48, 8)),
         ] {
-            assert!(!Blocked::new(&bad, 300).check(widest, len), "{what}");
+            assert!(!Blocked::new(&bad, 300).check(widest, len, false), "{what}");
         }
         // The blocks agree with each other but not with the values length,
         // or no block is as wide as the descriptor says.
         let column = Blocked::new(&bytes, 300);
-        assert!(!column.check(widest, len + 1) && !column.check(widest, len - 1));
-        assert!(!column.check(widest + 1, len));
+        assert!(!column.check(widest, len + 1, false) && !column.check(widest, len - 1, false));
+        assert!(!column.check(widest + 1, len, false));
+    }
+
+    /// A nullable blocked column of `values`, as [`pack_blocked`].
+    fn pack_nullable(values: &[Option<u64>]) -> (Vec<u8>, u64, u32) {
+        let mut sizer = BlockSizer::default();
+        for &v in values {
+            match v {
+                Some(v) => sizer.push(v),
+                None => sizer.push_null(),
+            }
+        }
+        let (len, widest) = sizer.finish();
+        let (mut table, mut packed) = (Vec::new(), Vec::new());
+        let mut writer = BlockedWriter::new();
+        for &v in values {
+            match v {
+                Some(v) => writer.push(&mut table, &mut packed, v).unwrap(),
+                None => writer.push_null(&mut table, &mut packed).unwrap(),
+            }
+        }
+        writer.finish(&mut table, &mut packed).unwrap();
+        table.extend(packed);
+        (table, len, widest)
+    }
+
+    #[test]
+    fn a_nullable_blocked_column_round_trips_nones_in_every_kind_of_block() {
+        // Per block: no none (plain width, no flag), a few nones among
+        // values (one more value's worth), nothing but nones (width 0),
+        // one value and nones (width 1), and a spread of 63 bits with a
+        // none (width 64); then the blocked values' widths, every third a
+        // none. The last block is short.
+        let kinds = 5 + 65;
+        let count = kinds * BLOCK_ROWS + 3;
+        let spread = blocked_values(count);
+        let values: Vec<Option<u64>> = (0..count)
+            .map(|i| {
+                let (block, row) = (i / BLOCK_ROWS, i % BLOCK_ROWS);
+                let base = (block as u64) << 32;
+                match block {
+                    0 => Some(base + row as u64),
+                    1 => (row % 9 != 4).then_some(base + row as u64),
+                    2 => None,
+                    3 => (row == 17).then_some(base),
+                    4 if row == 5 => None,
+                    4 => Some(mask(63) & values(63, BLOCK_ROWS)[row]),
+                    _ if row % 3 == 0 => None,
+                    // Width 64 cannot hold a none past its values; the
+                    // spread stays below all ones.
+                    _ => Some(spread[i].min(u64::MAX - 1)),
+                }
+            })
+            .collect();
+        let (bytes, len, widest) = pack_nullable(&values);
+        assert_eq!(bytes.len() as u64, blocked_len(count as u32, len));
+        let column = Blocked::new(&bytes, count as u32);
+        assert!(column.check(widest, len, true));
+        assert!(!column.check(widest, len, false), "a none's flag");
+        let width = |k: usize| column.entry(k).2;
+        assert_eq!((width(0), width(1), width(2), width(3)), (7, 8, 0, 1));
+        assert_eq!(width(4), 64);
+        for (i, &v) in values.iter().enumerate() {
+            assert_eq!(column.nullable(i), v, "i {i}");
+        }
+        assert_eq!(column.nullables().collect::<Vec<_>>(), values);
+    }
+
+    #[test]
+    fn a_nullable_blocked_column_of_nothing_but_nones_is_only_its_table() {
+        let (bytes, len, widest) = pack_nullable(&[None; 300]);
+        assert_eq!((len, widest), (0, 0));
+        assert_eq!(bytes.len() as u64, 3 * BLOCK_ENTRY + PAD);
+        let column = Blocked::new(&bytes, 300);
+        assert!(column.check(0, 0, true));
+        assert!((0..300).all(|i| column.nullable(i).is_none()));
     }
 
     #[test]

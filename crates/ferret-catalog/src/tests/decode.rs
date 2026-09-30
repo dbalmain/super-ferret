@@ -68,13 +68,13 @@ fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
     let start =
         section_start(bytes, column.section()) + placed.start + placed.desc.dict_len as usize * 8;
     let (values, width, row) = match column.coding() {
-        Coding::Blocked => {
+        coding if coding.is_blocked() => {
             let count = layout.count(column.rows()) as u32;
             let entry = start + row / packed::BLOCK_ROWS * packed::BLOCK_ENTRY as usize + 8;
             let word = u64::from_le_bytes(bytes[entry..entry + 8].try_into().unwrap());
             let table = (packed::blocks(count) * packed::BLOCK_ENTRY) as usize;
             let values = start + table + (word >> 8) as usize;
-            (values, (word & 0xFF) as u32, row % packed::BLOCK_ROWS)
+            (values, (word & 0x7F) as u32, row % packed::BLOCK_ROWS)
         }
         _ => (start, placed.desc.width, row),
     };
@@ -415,15 +415,9 @@ fn a_blocked_column_whose_table_misplaces_a_block_is_rejected_on_load() {
     let bytes = sample("decode-blocked");
     let layout = format::decode_table(&bytes, bytes.len() as u64).unwrap();
     let scratch = Scratch::new("decode-blocked-lazy");
-    for column in [
-        Column::NameParent,
-        Column::NameOffset,
-        Column::NameChild,
-        Column::Size,
-        Column::Mtime,
-        Column::Ctime,
-        Column::Nlink,
-    ] {
+    let blocked = COLUMNS.into_iter().filter(|c| c.coding().is_blocked());
+    assert_eq!(blocked.clone().count(), 13);
+    for column in blocked {
         let placed = layout.columns[column as usize];
         let entry = section_start(&bytes, column.section()) + placed.start + 8;
         let width = u64::from(placed.desc.width);

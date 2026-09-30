@@ -246,20 +246,21 @@ impl Plan {
                     }
                     Coding::Dictionary => {}
                     Coding::Blocked => blocks[c].push(value),
-                    Coding::Frame | Coding::Nullable | Coding::Sequence => ranges[c].add(value),
+                    Coding::Frame
+                    | Coding::Nullable
+                    | Coding::NullableBlocked
+                    | Coding::Sequence => ranges[c].add(value),
                 }
             }
-            if doc != NONE {
-                ranges[Column::Doc as usize].add(u64::from(doc));
-            }
+            push_known(&mut blocks[Column::Doc as usize], doc);
         }
-        for &count in &self.entry_count {
-            if count != NONE {
-                ranges[Column::Entries as usize].add(u64::from(count));
-            }
+        // In the order the directory columns are written: by InoId.
+        for &dir in &self.order {
+            let dir = dir as usize;
+            push_known(&mut blocks[Column::DirName as usize], self.name_of_dir[dir]);
+            push_known(&mut blocks[Column::Entries as usize], self.entry_count[dir]);
         }
         // Ids are sized by what they index: the counts and the heap.
-        let below = |n: usize| Range((n > 0).then(|| (0, n as u64 - 1)));
         let [parent, child] = blocks
             .get_disjoint_mut([Column::NameParent as usize, Column::NameChild as usize])
             .unwrap_or_else(|_| unreachable!("two columns"));
@@ -269,7 +270,6 @@ impl Plan {
                 child.push(u64::from(self.child(entry)));
             }
         }
-        ranges[Column::DirName as usize] = below(names);
         for (row, &(_, id)) in self.docs.iter().enumerate() {
             ranges[Column::DocId as usize].add(u64::from(id) - row as u64);
         }
@@ -283,7 +283,9 @@ impl Plan {
                 Coding::Blocked if column == Column::NameOffset => {
                     Descriptor::blocked(self.offset_blocks)
                 }
-                Coding::Blocked => Descriptor::blocked(std::mem::take(&mut blocks[c]).finish()),
+                Coding::Blocked | Coding::NullableBlocked => {
+                    Descriptor::blocked(std::mem::take(&mut blocks[c]).finish())
+                }
                 Coding::Dictionary => {
                     let mut dict: Vec<u64> = std::mem::take(&mut sets[c]).into_iter().collect();
                     dict.sort_unstable();
@@ -742,6 +744,14 @@ fn assign_docs(
     Ok(())
 }
 
+/// A nullable id to a blocked column's sizer: none for [`NONE`].
+fn push_known(sizer: &mut BlockSizer, id: u32) {
+    match id {
+        NONE => sizer.push_null(),
+        id => sizer.push(u64::from(id)),
+    }
+}
+
 fn split_hash(hash: &Hash) -> (u64, u64) {
     let (mut hi, mut lo) = ([0; 8], [0; 8]);
     hi.copy_from_slice(&hash[..8]);
@@ -820,9 +830,8 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
     }
     let (mut doc, mut states, mut state_bits) =
         (column(Column::Doc)?, section(Section::States), Bits::new(2));
-    let doc_live = head.columns[Column::Doc as usize].width > 0;
     let live =
-        |field: Column| field.coding() == Coding::Blocked || head.columns[field as usize].width > 0;
+        |field: Column| field.coding().is_blocked() || head.columns[field as usize].width > 0;
     let (mut live_columns, mut idle): (Vec<_>, Vec<_>) = stat_columns
         .into_iter()
         .partition(|&(field, _)| live(field));
@@ -837,9 +846,7 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
                 _ => column.value(value)?,
             }
         }
-        if doc_live {
-            doc.nullable(known(doc_id))?;
-        }
+        doc.nullable(known(doc_id))?;
         state_bits.push(&mut states, state as u8)?;
     }
     for (_, column) in live_columns.drain(..).chain(idle.drain(..)) {

@@ -420,11 +420,13 @@ fn stats_counts_documents_sparsely_and_survives_a_corrupt_reference() {
     assert_eq!(sparse.status.code(), Some(0), "{}", stderr(&sparse));
     assert_eq!(duplicates(&sparse), before);
 
-    // Every file's DocId moved past `next_doc`, by the doc column's base
-    // (the second last of the column descriptors that end the file's 664 B
-    // head, before the docs' own id column): decoding does not check an
-    // inode's DocId.
-    patch_catalog(&env, 664 - 32, u32::MAX - 2);
+    // Every file's DocId moved past `next_doc`, by the base of the doc
+    // column's one block: the first word of the doc section (the 18th
+    // section, whose offset is in the table after the 40 B header).
+    // Decoding does not check an inode's DocId.
+    let bytes = fs::read(env.index().join("catalog")).unwrap();
+    let doc_section = u64::from_le_bytes(bytes[40 + 17 * 16..][..8].try_into().unwrap());
+    patch_catalog(&env, doc_section as usize, u32::MAX - 2);
     let corrupt = limited(&env);
     assert_eq!(corrupt.status.code(), Some(0), "{}", stderr(&corrupt));
     let text = String::from_utf8_lossy(&corrupt.stdout);

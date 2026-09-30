@@ -239,7 +239,16 @@ pub(crate) enum Coding {
     Nullable,
     Dictionary,
     Blocked,
+    /// Blocked, and nullable per block.
+    NullableBlocked,
     Sequence,
+}
+
+impl Coding {
+    /// Whether the column is in blocks, read through [`Layout::blocked`].
+    pub(crate) fn is_blocked(self) -> bool {
+        matches!(self, Coding::Blocked | Coding::NullableBlocked)
+    }
 }
 
 /// Which table a column has a row for.
@@ -274,17 +283,19 @@ impl Column {
 
     pub(crate) fn coding(self) -> Coding {
         match self {
-            Column::DirName | Column::Entries | Column::Doc => Coding::Nullable,
+            Column::DirName | Column::Entries | Column::Doc => Coding::NullableBlocked,
             Column::Dev | Column::Mode | Column::Owner => Coding::Dictionary,
             Column::NameParent
             | Column::NameOffset
             | Column::NameChild
+            | Column::Ino
             | Column::Size
             | Column::Mtime
+            | Column::MtimeNs
             | Column::Ctime
+            | Column::CtimeNs
             | Column::Nlink => Coding::Blocked,
             Column::DocId => Coding::Sequence,
-            Column::Ino | Column::MtimeNs | Column::CtimeNs => Coding::Frame,
         }
     }
 
@@ -404,7 +415,7 @@ impl Descriptor {
     /// descriptor no file could hold.
     pub(crate) fn len(self, coding: Coding, count: u32) -> u64 {
         match coding {
-            Coding::Blocked => packed::blocked_len(count, self.base),
+            Coding::Blocked | Coding::NullableBlocked => packed::blocked_len(count, self.base),
             _ => u64::from(self.dict_len) * 8 + packed::len(count, self.width),
         }
     }
@@ -592,7 +603,7 @@ impl<'f> ColumnWriter<'f> {
             first.write_all(&value.to_le_bytes())?;
         }
         let (out, values) = match coding {
-            Coding::Blocked => {
+            Coding::Blocked | Coding::NullableBlocked => {
                 let table = packed::blocks(count as u32) * packed::BLOCK_ENTRY;
                 let writer = Box::new(packed::BlockedWriter::new());
                 (At::new(file, at + table), Values::Blocked(writer, first))
@@ -621,7 +632,7 @@ impl<'f> ColumnWriter<'f> {
     /// descriptor was made from.
     pub(crate) fn value(&mut self, value: u64) -> io::Result<()> {
         match self.coding {
-            Coding::Blocked => self.push(value),
+            Coding::Blocked | Coding::NullableBlocked => self.push(value),
             Coding::Sequence => self.push(value - self.rows - self.desc.base),
             _ => self.push(value - self.desc.base),
         }
@@ -629,9 +640,13 @@ impl<'f> ColumnWriter<'f> {
 
     /// A nullable column's value, or none.
     pub(crate) fn nullable(&mut self, value: Option<u64>) -> io::Result<()> {
-        match value {
-            Some(value) => self.value(value),
-            None => self.push(packed::mask(self.desc.width)),
+        match (value, &mut self.values) {
+            (Some(value), _) => self.value(value),
+            (None, Values::Blocked(writer, table)) => {
+                self.rows += 1;
+                writer.push_null(table, &mut self.out)
+            }
+            (None, Values::Packed(_)) => self.push(packed::mask(self.desc.width)),
         }
     }
 
@@ -852,7 +867,7 @@ impl Layout {
 
     /// `column`, given the bytes of its section. Not a blocked column.
     pub(crate) fn view<'a>(&self, column: Column, section: &'a [u8]) -> View<'a> {
-        debug_assert_ne!(column.coding(), Coding::Blocked, "{column:?}");
+        debug_assert!(!column.coding().is_blocked(), "{column:?}");
         let Placed { desc, start } = self.columns[column as usize];
         let (dict, values) = section[start..].split_at(desc.dict_len as usize * 8);
         View {
@@ -864,7 +879,7 @@ impl Layout {
 
     /// Blocked `column`, given the bytes of its section.
     pub(crate) fn blocked<'a>(&self, column: Column, section: &'a [u8]) -> Blocked<'a> {
-        debug_assert_eq!(column.coding(), Coding::Blocked, "{column:?}");
+        debug_assert!(column.coding().is_blocked(), "{column:?}");
         let start = self.columns[column as usize].start;
         Blocked::new(&section[start..], self.count(column.rows()) as u32)
     }
@@ -1099,9 +1114,11 @@ pub(crate) fn check<'a>(
     let terminated = |heap: &[u8]| heap.last().is_none_or(|&b| b == 0);
     let strings_len = l.len(Section::Strings);
     for column in COLUMNS {
-        if column.section() == section && column.coding() == Coding::Blocked {
+        let coding = column.coding();
+        if column.section() == section && coding.is_blocked() {
             let desc = l.columns[column as usize].desc;
-            if !l.blocked(column, get(section)).check(desc.width, desc.base) {
+            let nullable = coding == Coding::NullableBlocked;
+            if !l.blocked(column, get(section)).check(desc.width, desc.base, nullable) {
                 return Err(DecodeError::Corrupt(section.label()));
             }
         }
@@ -1133,8 +1150,8 @@ pub(crate) fn check<'a>(
         Section::Owner => check_dictionary(l, Column::Owner, get(Section::Owner))?,
         Section::Roots => {
             let roots = get(Section::Roots);
-            let dir_names = l.view(Column::DirName, get(Section::DirNames));
-            let unnamed = dir_names.nullables(l.dirs).filter(Option::is_none).count();
+            let dir_names = l.blocked(Column::DirName, get(Section::DirNames));
+            let unnamed = dir_names.nullables().filter(Option::is_none).count();
             let mut last = None;
             for pair in roots.chunks_exact(PAIR_ROW) {
                 let (dir, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
@@ -1307,11 +1324,11 @@ fn check_dir_names(
     rows: &[u8],
     dir_children: usize,
 ) -> Result<(), DecodeError> {
-    let dir_names = l.view(Column::DirName, dir_names);
+    let dir_names = l.blocked(Column::DirName, dir_names);
     let parents = l.blocked(Column::NameParent, rows);
     let children = l.blocked(Column::NameChild, rows);
     let mut named = 0;
-    for (dir, name) in dir_names.nullables(l.dirs).enumerate() {
+    for (dir, name) in dir_names.nullables().enumerate() {
         let Some(name) = name else {
             continue;
         };
