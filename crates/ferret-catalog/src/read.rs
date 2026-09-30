@@ -395,7 +395,7 @@ impl Catalog {
     /// A directory's own name edge; `None` for a root (D30). Needs
     /// [`Section::DirNames`].
     pub fn dir_name(&self, dir: InoId) -> Option<NameId> {
-        self.blocked(Column::DirName)
+        self.column(Column::DirName)
             .nullable(dir.0 as usize)
             .map(|name| NameId(name as u32))
     }
@@ -421,7 +421,7 @@ impl Catalog {
 
     /// Appends a directory's path. Needs [`Section::Roots`].
     pub fn dir_path(&self, dir: InoId, out: &mut Vec<u8>) {
-        let (names, dir_names) = (self.name_reader(), self.blocked(Column::DirName));
+        let (names, dir_names) = (self.name_reader(), self.column(Column::DirName));
         let mut up = Vec::new();
         let mut at = dir;
         while let Some(name) = dir_names.nullable(at.0 as usize) {

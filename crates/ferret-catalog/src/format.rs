@@ -18,22 +18,25 @@
 //!             name heap
 //! name heap   names, each NUL-terminated, in NameId order (D28)
 //! dir names   column, per directory InoId: its NameId, none for a root
+//!             (nullable)
 //! entries     column, per directory: the entries `getdents` returned, minus
 //!             `.` and `..`, before ignore rules; none if unknown (D47)
+//!             (nullable blocked)
 //! traversed   1 bit per directory: a structural row (D29), LSB first
 //! roots       8 B rows: root InoId, offset of its path in strings
 //! strings     root paths, link targets, work-tree paths; NUL-terminated
 //! dev         column per inode, dictionary
-//! ino         column per inode
+//! ino         column per inode (blocked)
 //! size        column per inode (blocked)
 //! mtime       column per inode: whole seconds, signed (blocked)
-//! mtime ns    column per inode
+//! mtime ns    column per inode (blocked)
 //! ctime       column per inode: whole seconds, signed (blocked)
-//! ctime ns    column per inode
+//! ctime ns    column per inode (blocked)
 //! mode        column per inode, dictionary
 //! owner       column per inode, dictionary of uid << 32 | gid
 //! nlink       column per inode (blocked)
 //! doc         column per inode: DocId, none when it has no document
+//!             (nullable blocked)
 //! states      2 bits per inode: ContentState (D37), LSB first
 //! links       8 B rows: symlink InoId, offset of its target in strings
 //! work trees  32 B rows: top InoId, offset of common dir in strings, common
@@ -46,15 +49,17 @@
 //! column) and then one value per row of its table, bit-packed at the
 //! descriptor's width (`packed`), then 8 bytes of padding (written as zeros,
 //! not checked: reads never depend on it). Each column is sized to this
-//! catalog's values (D43), in one of five codings:
+//! catalog's values (D43), in one of five codings, each built on a frame of
+//! reference: a value is `base + packed`, and the width is that of the largest
+//! value less the smallest, which is the base. Signed times are stored with
+//! the sign bit flipped ([`order`]), which maps `i64` onto `u64` in order, so
+//! any two times' difference fits.
 //!
-//! - **Frame of reference:** the value is `base + packed`, and the width is
-//!   that of the largest value less the smallest, which is the base. Signed
-//!   times are stored with the sign bit flipped ([`order`]), which maps `i64`
-//!   onto `u64` in order, so any two times' difference fits.
-//! - **Nullable:** frame of reference, except that the all-ones value of the
-//!   width means none. The writer makes the width wide enough that no real
-//!   value is all ones.
+//! - **Nullable:** one frame for the column, except that the all-ones value of
+//!   the width means none. The writer makes the width wide enough that no real
+//!   value is all ones. Only dir names: blocked, they were 3 MiB smaller at 10M
+//!   names and a full-name scan, which reads one per directory it enters, took
+//!   1.5–2% longer.
 //! - **Dictionary:** the packed value is `base + index` into the column's
 //!   dictionary. The writer stores base 0 and the sorted distinct values.
 //! - **Blocked:** a frame of reference per block of 128 rows, each block with
@@ -63,8 +68,15 @@
 //!   are close: name offsets only grow, parents only rise, a directory's
 //!   children are numbered together, nlink is nearly always 1, and files
 //!   numbered by name sit beside their siblings, which share sizes and times
-//!   far more than the whole tree does. The descriptor's base is the bytes of
-//!   packed values after the table, and its width the widest block's.
+//!   far more than the whole tree does; inode numbers and nanoseconds, of files
+//!   made together, share their high bits. The descriptor's base is the bytes
+//!   of packed values after the table, and its width the widest block's.
+//! - **Nullable blocked:** blocked, with each block framed by its real values
+//!   alone. A block that holds a none sets `packed::NULLS` beside its width,
+//!   and its width's all-ones value is none; a block of nothing but nones is
+//!   width 0, and a block without one keeps its plain width. For the inodes'
+//!   documents, which directories and unhashed files leave out in runs, and
+//!   entry counts.
 //! - **Sequence:** row `i`'s value is `base + i + packed`, for ids sorted
 //!   strictly increasing. Ids without holes are all `packed` 0: width 0, no
 //!   bytes but the padding, and a row found from its id by subtraction. A hole
@@ -77,7 +89,8 @@
 //! most 64 and every column section's length is exactly its columns'
 //! dictionaries and padded values (and the docs section's hashes); every
 //! blocked column's table places each block exactly after the one before it,
-//! and its widest block is exactly the descriptor's width; document ids rise
+//! and its widest block is exactly the descriptor's width, and only a
+//! nullable blocked column flags a block as holding a none; document ids rise
 //! strictly and stay below `next_doc`; every offset, id and dictionary index is
 //! in range, every heap ends in NUL, and each directory's name edge points at
 //! a lower-numbered parent, so walking up from any name ends at a root. Each
@@ -235,7 +248,6 @@ pub(crate) const COLUMNS: [Column; 17] = [
 /// How a column's packed values become field values; see the module doc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Coding {
-    Frame,
     Nullable,
     Dictionary,
     Blocked,
@@ -283,7 +295,8 @@ impl Column {
 
     pub(crate) fn coding(self) -> Coding {
         match self {
-            Column::DirName | Column::Entries | Column::Doc => Coding::NullableBlocked,
+            Column::DirName => Coding::Nullable,
+            Column::Entries | Column::Doc => Coding::NullableBlocked,
             Column::Dev | Column::Mode | Column::Owner => Coding::Dictionary,
             Column::NameParent
             | Column::NameOffset
@@ -1118,7 +1131,10 @@ pub(crate) fn check<'a>(
         if column.section() == section && coding.is_blocked() {
             let desc = l.columns[column as usize].desc;
             let nullable = coding == Coding::NullableBlocked;
-            if !l.blocked(column, get(section)).check(desc.width, desc.base, nullable) {
+            if !l
+                .blocked(column, get(section))
+                .check(desc.width, desc.base, nullable)
+            {
                 return Err(DecodeError::Corrupt(section.label()));
             }
         }
@@ -1150,8 +1166,8 @@ pub(crate) fn check<'a>(
         Section::Owner => check_dictionary(l, Column::Owner, get(Section::Owner))?,
         Section::Roots => {
             let roots = get(Section::Roots);
-            let dir_names = l.blocked(Column::DirName, get(Section::DirNames));
-            let unnamed = dir_names.nullables().filter(Option::is_none).count();
+            let dir_names = l.view(Column::DirName, get(Section::DirNames));
+            let unnamed = dir_names.nullables(l.dirs).filter(Option::is_none).count();
             let mut last = None;
             for pair in roots.chunks_exact(PAIR_ROW) {
                 let (dir, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
@@ -1324,11 +1340,11 @@ fn check_dir_names(
     rows: &[u8],
     dir_children: usize,
 ) -> Result<(), DecodeError> {
-    let dir_names = l.blocked(Column::DirName, dir_names);
+    let dir_names = l.view(Column::DirName, dir_names);
     let parents = l.blocked(Column::NameParent, rows);
     let children = l.blocked(Column::NameChild, rows);
     let mut named = 0;
-    for (dir, name) in dir_names.nullables().enumerate() {
+    for (dir, name) in dir_names.nullables(l.dirs).enumerate() {
         let Some(name) = name else {
             continue;
         };

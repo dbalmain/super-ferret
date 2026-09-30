@@ -565,3 +565,43 @@ fn a_pass_over_sizes_and_mtimes_matches_each_inode_read_alone() {
     assert!(catalog.size_run(runs, &mut [0; RUN]).is_empty());
     assert!(catalog.mtime_run(usize::MAX, &mut [0; RUN]).is_empty());
 }
+
+#[test]
+fn nullable_blocked_columns_read_back_across_their_blocks() {
+    // 300 directories come first in inode order, so the doc column's first
+    // two blocks are nothing but nones (width 0) and its third mixes nones
+    // with documents; the entry counts mix known and unknown in each block.
+    // Files alternate hashed, each with its own document, and unindexed.
+    let scratch = Scratch::new("nullable-blocked");
+    let hash_of = |d: u64| -> crate::Hash {
+        let mut hash = [7; 16];
+        hash[..8].copy_from_slice(&d.to_le_bytes());
+        hash
+    };
+    commit(&scratch.path, |txn| {
+        let mut b = txn.batch();
+        let root = b.root(b"/n", dir_stat(1));
+        for d in 0..300u64 {
+            let dir = b.dir(root, format!("d{d:03}").as_bytes(), dir_stat(2 + d));
+            if d % 5 != 0 {
+                b.entry_count(dir, d as u32 * 3);
+            }
+            let content = match d % 2 {
+                0 => Content::Hashed(hash_of(d)),
+                _ => Content::Unindexed,
+            };
+            b.file(dir, b"f", file_stat(1000 + d), content);
+        }
+        txn.add(b);
+    });
+    let catalog = reopen(&scratch.path);
+    for d in 0..300u64 {
+        let dir = at(&catalog, &format!("/n/d{d:03}"));
+        let count = (d % 5 != 0).then_some(d as u32 * 3);
+        assert_eq!(catalog.entry_count(dir), count, "d{d:03}");
+        assert_eq!(catalog.doc(dir), None, "d{d:03}");
+        let file = at(&catalog, &format!("/n/d{d:03}/f"));
+        let hash = catalog.doc(file).and_then(|doc| catalog.doc_hash(doc));
+        assert_eq!(hash, (d % 2 == 0).then(|| hash_of(d)), "d{d:03}/f");
+    }
+}

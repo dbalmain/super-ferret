@@ -3,7 +3,7 @@
 use super::{SNIFFER, Scratch, commit, dir_stat, file_stat, hash, link_stat};
 use std::path::Path;
 
-use crate::format::{self, COLUMNS, Coding, Column, HEADER, SECTIONS, TABLE_END};
+use crate::format::{self, COLUMNS, Column, HEADER, SECTIONS, TABLE_END};
 use crate::packed;
 use crate::{
     BeginError, Catalog, Content, DecodeError, InoId, NameId, OpenError, Section, Stat,
@@ -416,7 +416,7 @@ fn a_blocked_column_whose_table_misplaces_a_block_is_rejected_on_load() {
     let layout = format::decode_table(&bytes, bytes.len() as u64).unwrap();
     let scratch = Scratch::new("decode-blocked-lazy");
     let blocked = COLUMNS.into_iter().filter(|c| c.coding().is_blocked());
-    assert_eq!(blocked.clone().count(), 13);
+    assert_eq!(blocked.clone().count(), 12);
     for column in blocked {
         let placed = layout.columns[column as usize];
         let entry = section_start(&bytes, column.section()) + placed.start + 8;

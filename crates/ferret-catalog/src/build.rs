@@ -246,10 +246,9 @@ impl Plan {
                     }
                     Coding::Dictionary => {}
                     Coding::Blocked => blocks[c].push(value),
-                    Coding::Frame
-                    | Coding::Nullable
-                    | Coding::NullableBlocked
-                    | Coding::Sequence => ranges[c].add(value),
+                    Coding::Nullable | Coding::NullableBlocked | Coding::Sequence => {
+                        ranges[c].add(value)
+                    }
                 }
             }
             push_known(&mut blocks[Column::Doc as usize], doc);
@@ -257,10 +256,10 @@ impl Plan {
         // In the order the directory columns are written: by InoId.
         for &dir in &self.order {
             let dir = dir as usize;
-            push_known(&mut blocks[Column::DirName as usize], self.name_of_dir[dir]);
             push_known(&mut blocks[Column::Entries as usize], self.entry_count[dir]);
         }
         // Ids are sized by what they index: the counts and the heap.
+        ranges[Column::DirName as usize] = Range((names > 0).then(|| (0, names as u64 - 1)));
         let [parent, child] = blocks
             .get_disjoint_mut([Column::NameParent as usize, Column::NameChild as usize])
             .unwrap_or_else(|_| unreachable!("two columns"));
@@ -278,7 +277,7 @@ impl Plan {
         let columns = COLUMNS.map(|column| {
             let c = column as usize;
             match column.coding() {
-                Coding::Frame | Coding::Sequence => Descriptor::frame(ranges[c]),
+                Coding::Sequence => Descriptor::frame(ranges[c]),
                 Coding::Nullable => Descriptor::nullable(ranges[c]),
                 Coding::Blocked if column == Column::NameOffset => {
                     Descriptor::blocked(self.offset_blocks)

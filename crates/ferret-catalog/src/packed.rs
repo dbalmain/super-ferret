@@ -279,22 +279,6 @@ impl<'a> Blocked<'a> {
         (packed & NULLS == 0 || raw != mask(width)).then(|| base.wrapping_add(raw))
     }
 
-    /// [`Blocked::nullable`] of every row, in order: a pass over the column,
-    /// decoded a block at a time.
-    pub(crate) fn nullables(self) -> impl Iterator<Item = Option<u64>> + 'a {
-        (0..self.count).step_by(BLOCK_ROWS).flat_map(move |first| {
-            let (base, packed) = self.words(first / BLOCK_ROWS);
-            let (offset, width) = ((packed >> 8) as usize, (packed & 0x7F) as u32);
-            let (mut block, n) = ([0; BLOCK_ROWS], BLOCK_ROWS.min(self.count - first));
-            Packed::new(&self.values[offset..], width).decode(0, &mut block[..n]);
-            let none = (packed & NULLS != 0).then(|| mask(width));
-            block
-                .into_iter()
-                .take(n)
-                .map(move |raw| (Some(raw) != none).then(|| base.wrapping_add(raw)))
-        })
-    }
-
     /// Values `first..first + out.len()` into `out`, a run of a pass over the
     /// column; `first` is a multiple of 8. See [`Packed::decode`].
     pub(crate) fn decode(&self, first: usize, out: &mut [u64]) {
@@ -757,7 +741,6 @@ mod tests {
         for (i, &v) in values.iter().enumerate() {
             assert_eq!(column.nullable(i), v, "i {i}");
         }
-        assert_eq!(column.nullables().collect::<Vec<_>>(), values);
     }
 
     #[test]
