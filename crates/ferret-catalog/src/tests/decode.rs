@@ -465,6 +465,105 @@ fn siblings_out_of_order_are_rejected() {
     );
 }
 
+/// A snapshot of root `/s` holding the given files, and its bytes.
+fn files_under_root(name: &str, files: &[&[u8]]) -> Vec<u8> {
+    let scratch = Scratch::new(name);
+    commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        let root = w.root(b"/s", dir_stat(1));
+        for (i, file) in files.iter().enumerate() {
+            w.file(root, file, file_stat(10 + i as u64), Content::Unindexed);
+        }
+        txn.add(w);
+    });
+    std::fs::read(scratch.path.join("catalog")).unwrap()
+}
+
+fn assert_corrupt(bytes: Vec<u8>, what: &'static str) {
+    assert_eq!(
+        Catalog::from_bytes(bytes).err(),
+        Some(DecodeError::Corrupt(what))
+    );
+}
+
+#[test]
+fn a_heap_with_a_nul_inside_a_name_is_rejected() {
+    // One file `ab`: heap `ab\0`. Rewritten to `a\0\0` the single name span
+    // still starts at 0, is non-empty and ends in NUL, so only the count of
+    // NULs against names (two against one) sees the NUL inside it.
+    let mut bytes = files_under_root("decode-nul-inside", &[b"ab"]);
+    let heap = section_start(&bytes, Section::NameHeap);
+    assert_eq!(&bytes[heap..heap + 3], b"ab\0");
+    bytes[heap + 1] = 0;
+    assert_corrupt(bytes, "name order");
+}
+
+#[test]
+fn a_first_name_that_does_not_start_the_heap_is_rejected() {
+    // Files `ab` and `cd`: heap `ab\0cd\0`, offsets 0 and 3. Offset 0 set to 1
+    // is still below offset 1, inside the heap, and names `b` with its NUL
+    // last, so only the first-offset-is-zero rule rejects it. Accepted, the
+    // heap byte 0 belongs to no name and `name_at(0)` underflows.
+    let mut bytes = files_under_root("decode-first-offset", &[b"ab", b"cd"]);
+    set_raw(&mut bytes, Column::NameOffset, 0, 1);
+    assert_corrupt(bytes, "names");
+}
+
+#[test]
+fn a_name_not_ending_in_nul_is_rejected() {
+    // Files `abc` and `de`: heap `abc\0de\0`, offsets 0 and 4. Offset 1 set to
+    // 5 makes the first span `abc\0d`, ending in `d`, and the second `e`. The
+    // heap is untouched so the NUL count holds, both names are non-empty, and
+    // they are in order, so only the terminator check rejects it.
+    let mut bytes = files_under_root("decode-nul-last", &[b"abc", b"de"]);
+    set_raw(&mut bytes, Column::NameOffset, 1, 5);
+    assert_corrupt(bytes, "name order");
+}
+
+#[test]
+fn an_empty_name_is_rejected() {
+    // Files `a` and `bc`: heap `a\0bc\0`, offsets 0 and 2. The heap becomes
+    // `\0bcd\0` and offset 1 is set to 1: two NULs for two names, each span
+    // ending in NUL and in order, but the first span is just the NUL.
+    let mut bytes = files_under_root("decode-empty-name", &[b"a", b"bc"]);
+    let heap = section_start(&bytes, Section::NameHeap);
+    assert_eq!(&bytes[heap..heap + 5], b"a\0bc\0");
+    bytes[heap..heap + 5].copy_from_slice(b"\0bcd\0");
+    set_raw(&mut bytes, Column::NameOffset, 1, 1);
+    assert_corrupt(bytes, "name order");
+}
+
+#[test]
+fn a_dropped_root_row_is_rejected() {
+    // Roots `/s` and `/t` are the two unnamed directories. Dropping the last
+    // row leaves a well-formed table of one, so only the count against the
+    // unnamed directories sees it; accepted, paths under `/t` read wrong.
+    let bytes = sample("decode-roots-dropped");
+    assert_corrupt(resize_section(&bytes, Section::Roots, -8), "roots");
+}
+
+#[test]
+fn directories_with_swapped_name_edges_are_rejected() {
+    // Root holds directories `a` (dir 1, name 0) and `b` (dir 2, name 1).
+    // Swapping their edges keeps every parent lower and the count of
+    // directory-child names, so only the check that a directory's edge names
+    // it sees it; accepted, `dir_path` returns the other directory's name.
+    let scratch = Scratch::new("decode-swapped-edges");
+    let catalog = commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        let root = w.root(b"/s", dir_stat(1));
+        w.dir(root, b"a", dir_stat(2));
+        w.dir(root, b"b", dir_stat(3));
+        txn.add(w);
+    });
+    assert_eq!(catalog.dir_name(InoId(1)), Some(NameId(0)));
+    assert_eq!(catalog.dir_name(InoId(2)), Some(NameId(1)));
+    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    set_raw(&mut bytes, Column::DirName, 1, 1);
+    set_raw(&mut bytes, Column::DirName, 2, 0);
+    assert_corrupt(bytes, "dir names");
+}
+
 /// Resizes `section` by `delta` bytes, keeping the table tiling the file, so
 /// only the section's own length check can object. Bytes are added as zeros
 /// and removed from the end.
