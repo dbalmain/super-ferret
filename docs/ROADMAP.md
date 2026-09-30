@@ -112,11 +112,13 @@ catalog. Machine: load average 3-5 (another session's agents alive, none
 compiling), so read the times as plus or minus 20%; the byte counts are exact.
 `$HOME` has drifted: 445,194 names then, 445,442 now (the 10M is built from a
 fresh dump, 10,245,189 names against 10,239,255), so compare B/name and
-ratios. The `find` rows are from a second run after the `Run::consider` fix
-(metadata tests load only their own sections before a row is built); the mix
-did not move by more than the noise, since no query in it is one that nothing
-passes. Evicted times swing most (`test` at 10M evicted read 1,216 ms before
-the fix and 788 ms after, with nothing changed for it). The synthetic now carries the walker's real `nlink` and, for each
+ratios. The "after" `find`, `open` and build figures are from the perf
+fixes that followed the first after-measurement (below the tables), re-run on
+the same two catalogs at load average 2.1-4.3 with nothing compiling; the
+catalogs are byte-identical to what the fixed build writes. Evicted times
+swing most (`test` at 10M evicted read 1,216 ms and 788 ms in two runs of one
+binary). The `index` rows are the first after-measurement's and were not
+re-run. The synthetic now carries the walker's real `nlink` and, for each
 directory, the count of its children in the dump (a lower bound on the raw
 `getdents` count, since the dump omits what the walker never lists); every
 copy shares those values, which is what makes the packed widths a fair worst
@@ -132,12 +134,13 @@ case only for inodes and dev, not for sizes and times.
 | inode columns (was `Inodes`, fixed 64 B)    | 64.00               | 26.00               | 64.00             | 27.38             |
 | States, Traversed, Strings, Links, WorkTrees | 0.48               | 0.48                | 0.32              | 0.32              |
 | Docs                                        | 4.91                | 4.91                | 16.29             | 16.29             |
-| `ferret-bench open`, name sections, warm    | 5.0 ms (16.5 MB)    | 8.3 ms (14.4 MB)    | 207 ms (378 MB)   | 280 ms (347 MB)   |
-| same, evicted                               | 18.2 ms             | 21.0 ms             | 333 ms            | 390 ms            |
-| `load_all`, warm / evicted                  | 9.1 / 42.4 ms       | 10.6 / 39.7 ms      | 472 / 840 ms      | 448 / 749 ms      |
+| `ferret-bench open`, name sections, warm    | 5.0 ms (16.5 MB)    | 7.1 ms (14.4 MB)    | 207 ms (378 MB)   | 254 ms (347 MB)   |
+| same, evicted                               | 18.2 ms             | 20.0 ms             | 333 ms            | 371 ms            |
+| `load_all`, warm / evicted                  | 9.1 / 42.4 ms       | 9.7 / 37.7 ms       | 472 / 840 ms      | 439 / 784 ms      |
 | `index`, first run / re-run                 | 55.6 s (cold-ish) / 0.50 s | 43.1 s (cold-ish) / 0.87 s | —  | —              |
 | `index` peak RSS, first / re-run            | 78 / 161 MB         | 84 / 100 MB         | —                 | —                 |
-| `synthetic` build, time / peak RSS          | —                   | —                   | 9.4 s / 1,748 MB  | 19.4 s / 1,882 MB |
+| `synthetic` build, time / peak RSS          | —                   | —                   | 9.4 s / 1,748 MB  | 9.7 s / 1,880 MB  |
+| same, CPU (user + sys), same sitting        | —                   | —                   | 7.3 s             | 9.5 s             |
 
 Per name the inode row went from 64 B to 26 B on `$HOME` and 27.4 B on the
 synthetic (nlink and the entry counts are new and included). Widths in the
@@ -151,37 +154,53 @@ take it to about 1 bit. Ino at 30 bits is the synthetic's copy stride
 
 | `find` (fresh process, ms)         | before `$HOME` | after `$HOME` | before 10M | after 10M |
 | ---------------------------------- | -------------: | ------------: | ---------: | --------: |
-| `flamegraph` fresh                 | 12.3           | 21.6          | 243        | 440       |
-| `flamegraph` evicted               | 22.6           | 40.5          | 380        | 673       |
-| `test` fresh                       | 30.5           | 26.0          | 643        | 557       |
-| `test` evicted                     | 110.0          | 43.5          | 2,324      | 788       |
-| `size:>100M` fresh                 | 29.4           | 28.9          | 612        | 562       |
-| `size:>100M` evicted               | 50.4           | 45.5          | 924        | 824       |
-| `*` fresh                          | 110.0          | 156.5         | 2,488      | 3,696     |
-| `*` evicted                        | 131.0          | 189.0         | 2,825      | 3,915     |
-| peak RSS, name queries             | 19-46 MB       | 28-29 MB      | 365-991 MB | 603-604 MB |
-| bytes read, name queries           | 16.6-45.5 MB   | 26.1 MB       | 380-1,046 MB | 630 MB  |
+| `flamegraph` fresh                 | 12.3           | 14.2          | 243        | 295       |
+| `flamegraph` evicted               | 22.6           | 23.9          | 380        | 406       |
+| `test` fresh                       | 30.5           | 15.6          | 643        | 362       |
+| `test` evicted                     | 110.0          | 26.1          | 2,324      | 492       |
+| `size:>100M` fresh                 | 29.4           | 21.2          | 612        | 453       |
+| `size:>100M` evicted               | 50.4           | 34.0          | 924        | 613       |
+| `*` fresh                          | 110.0          | 97.2          | 2,488      | 2,315     |
+| `*` evicted                        | 131.0          | 105.1         | 2,825      | 2,417     |
+| peak RSS, name queries             | 19-46 MB       | 17 MB         | 365-991 MB | 333-334 MB |
+| bytes read, name queries           | 16.6-45.5 MB   | 14.4 MB       | 380-1,046 MB | 347 MB  |
 
-Peak `find` RSS at 10M is now 604 MB for every query, under D48's 1 GB line
-with 40% to spare (it was 990 MB). The 15 MB Python floor is in every RSS
-figure on both sides.
+Peak `find` RSS at 10M is now 333 MB for a name query and 372-376 MB with a
+metadata atom, a third of D48's 1 GB line (it was 990 MB). The 15 MB Python
+floor is in every RSS figure on both sides. `find --json` reads the three
+columns it prints: `flamegraph` 0.33 s, `test` 0.49 s, 452 MB at 10M.
 
-What changed the query numbers, separated as far as the data allows. The new
-reader has no single-row inode reads, so a reported row loads all the inode
-columns (283 MB packed at 10M): every query that reports a row now reads 630
-MB, where before a rare needle read 380 MB and a common one 1,046 MB (name
-sections plus 160k 64 B rows at page granularity). That is why `flamegraph`
-and the other rare-needle queries got slower (243 to 440 ms fresh at 10M) and
-`test` and `size:` faster: the loss of single reads costs the first and pays
-the second. Compaction alone is visible in the name-section rows above: 378
-to 347 MB read, but 207 to 280 ms warm to load, because the packed offsets are
-decoded where the old `u32` columns were read as is (the old fresh-buffer
-read of 378 MB was 128 ms, a resident one 28 ms). The remaining ~100 ms of the
-rare-needle regression is the inode columns. `*` (10.2M rows) went from 2.49 to
-3.70 s fresh: 1.2 s more, all in reporting, since each row now unpacks about
-ten columns. Decoding is the cost of compaction; a query that needs no inode
-column for its rows (`-print` of names only, no predicate) should not load them,
-and neither of these has been done yet.
+What changed the numbers, separated as far as the data allows (`perf` on the
+10M catalog, user space only).
+
+- **Bytes read.** A row carries no decoded inode now; a caller that prints
+  metadata loads those columns and reads them by the row's inode id. So a name
+  query reads only the name sections (347 MB at 10M, against v1's 380 MB for a
+  rare needle and 1,046 MB for a common one, which paid single 64 B row reads).
+  The first after-measurement loaded all twelve inode columns (283 MB) for the
+  first reported row: 630 MB for every query, the larger half of the
+  rare-needle regression (0.26 s of system time against 0.14 s now).
+- **Decode.** The rest is unpacking. Validating the name sections decodes
+  every packed offset, parent and child where v1 read aligned `u32`s: a
+  `flamegraph` query spends 0.14 s of user time against v1's 0.09 s (0.18 s
+  before the fixes, which decoded runs of 64 values in one pass instead of
+  one value at a time in two). That, not bytes, is why `flamegraph` is still
+  50 ms behind v1 while every query that reports many rows is ahead.
+- **`*`** went from 2.49 to 3.70 s and is now 2.32 s: about 1.1 s was
+  decoding every inode field for rows that print only a path, and 0.2 s was
+  finding each name's end by a NUL search, which the next name's offset now
+  gives.
+- **Build.** The 19.4 s first measured was mostly load (56% CPU at load
+  average 8) and `fsync` of the 800 MB file, which alone varies from 0.5 to
+  8 s between runs; v1 in the same sitting ranged 7.5-10.4 s. On CPU, S1a
+  took 10.9 s against v1's 7.3 s: each stat column is its own pass over the
+  inode rows, and each pass found each row's batch by binary search again.
+  Resolving each row's stat once (8 B per inode, allocated below the build's
+  peak) took 1.2 s off, a cheaper packer 0.2 s. Of the 2.2 s that remain,
+  0.4 s is the synthetic's own filling (it now counts entries and reads
+  nlink); the rest is ten scattered passes where v1 made one, plus the pass
+  that sizes columns and collects dictionaries. Closing it means holding
+  encoded columns in memory, which D40 rules out.
 
 ## S1+ — Incremental catalog
 
