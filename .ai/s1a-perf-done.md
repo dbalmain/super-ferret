@@ -22,8 +22,25 @@ Quiet machine (load 1.6-2.8), same catalogs as `s1a-measure-done.md`.
   `inode_rows` (`Index::file`/`Index::dir` partition_point per row per column,
   12 passes) is ~22% of samples, ~2.3 s. Hypothesis 1 holds.
 
-## Changes
-(pending)
+## Changes (commits on `wt/s1a-compact`)
+- `d15d070` Rows carry no decoded inode (`Row::meta` removed). Callers that
+  print metadata load its sections and read by `Row::inode`; `find --json`
+  loads Size, Mtime, Doc (3 columns, not 12). Chose this over a run option
+  or `Option<Inode>`: the catalog's contract is already "load, then
+  infallible accessors", and no flag threads through `Query::run`.
+- `74e5874` Name-section checks: `Packed::decode` fills runs of 64 values;
+  `check_names` is one pass (was two, decoding offsets and parents twice);
+  the converse dir-names check is a count (named dirs vs names with a
+  directory child; equal counts plus the forward check imply every such
+  name is its directory's edge) instead of a random lookup per name.
+  A bit-buffer iterator (tried first) was no faster than `get`; a block
+  iterator was slower (not inlined).
+- `5c19743` Build: each inode row's `&Stat` resolved once (8 B/row, after
+  names are freed; peak RSS unchanged at 1.88 GB); doc column no longer
+  looks rows up; `packed::Writer` keeps its mask and a u64 buffer. Output
+  byte-identical to the measured 10M catalog (`cmp`).
+- `107959c` `Catalog::name` ends a name at the next offset instead of a NUL
+  search: -0.21 s on `*` at 10M.
 
 ## Numbers
 (pending)
