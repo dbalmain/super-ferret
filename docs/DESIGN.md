@@ -97,7 +97,7 @@ never reused (D36); `roots`, `links` and `worktrees` hang off an existing
 | Table       | Id       | Row                                                                                                                                                                     |
 | ----------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`                                                                                                  |
-| `inodes`    | `InoId`  | `(dev, ino)`, size, mtime, ctime, mode, uid, gid, `DocId` or none; a 2-bit content state beside it (D37)                                                                |
+| `inodes`    | `InoId`  | `(dev, ino)`, size, mtime, ctime, mode, uid, gid, nlink, `DocId` or none; a 2-bit content state beside it (D37); a directory's raw entry count (D47)                    |
 | `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept); rows sorted by id, with holes where content died                                                                                  |
 | `roots`     | —        | configured root paths and the `InoId` of each; nested roots are separate trees, and adding or removing a root inside a kept root requires refreshing the kept one (D34) |
 | `links`     | —        | a symlink's `InoId`, its target as `readlink` returned it (in the strings heap)                                                                                         |
@@ -140,24 +140,40 @@ tombstones, so there is one source of truth.
 
 **Storage.** One snapshot file per catalog directory, rebuilt by every run
 (D26): a versioned header (magic, format version, sniffer version, next
-`DocId`), a table of eleven sections by offset and length, and the sections
-themselves, fixed-width little-endian rows plus two heaps. The name heap holds
+`DocId`, the directory, inode and name counts), a table of 22 sections by
+offset and length, a descriptor per packed column, and the sections themselves.
+Every id and inode field is a bit-packed column (S1a): `count` values of
+`width` bits, least significant bit first, ending in 8 zero bytes so a read is
+one unaligned 8-byte load, a shift and a mask. A descriptor holds the column's
+base, width and dictionary length. Plain fields are frame of reference (value
+minus the column's minimum; times order-mapped from `i64` first); nullable ones
+(a directory's name and entry count, an inode's `DocId`) reserve all ones for
+none; `dev`, `mode` and the `(uid, gid)` pair are indexes into a sorted
+dictionary at the head of their section. Each inode field is its own section,
+so a query loads only the fields it tests; the three name columns share one
+section, since every name read needs all three. The name heap holds
 NUL-terminated names in `(parent, name)` order (D28 A) and is contiguous on
 purpose: it is what filename search scans (D14). The strings heap holds root
-paths, link targets and work-tree paths. A reader opens the file by reading the
-header and table alone (216 B), and then reads each section positionally when a
-query first needs it (D38 B), together with the sections it is checked against
-(names need the heap; directory names need names; roots need directory names and
-strings; links and work trees need strings). Each section is validated as it
-loads: every offset, index and ordering a reader will follow is checked, so a
-corrupt or truncated file is an error from the load that reads the bad section,
-never a panic or a loop, and a query that does not read a section is not failed
-by it. A single inode row can be read without its section, for the few rows a
-name query reports. The writer holds an advisory lock on `lock` for the whole
-run, writes `catalog.tmp`, fsyncs it, renames it over `catalog` and fsyncs the
-directory; a reader holding the old generation keeps it (D32). Measured on
-`$HOME` (D28, D30): 51.2 MB for 435k names, of which inode rows (64 B) are 27.8
-MB, name rows (12 B) 5.2 MB, the name heap 10.6 MB and doc rows (20 B) 7.1 MB.
+paths, link targets and work-tree paths; roots, links, work trees and documents
+stay fixed-width rows. A reader opens the file by reading its head alone (644
+B), which fixes every section's and column's exact length, and then reads each
+section positionally when a query first needs it (D38 B), together with the
+sections it is checked against (names need the heap; directory names need names;
+roots need directory names and strings; links and work trees need strings).
+Each section is validated as it loads: every offset, index, dictionary index
+and ordering a reader will follow is checked, so a corrupt or truncated file is
+an error from the load that reads the bad section, never a panic or a loop, and
+a query that does not read a section is not failed by it. A file in another
+format version is not read at all: a query says to re-index, and `ferret index
+DIR...` replaces it as though there were no previous generation. The writer
+holds an advisory lock on `lock` for the whole run, writes `catalog.tmp`, fsyncs
+it, renames it over `catalog` and fsyncs the directory; a reader holding the old
+generation keeps it (D32). Measured on `$HOME` before S1a (D28, D30): 51.2 MB
+for 435k names, of which inode rows (64 B) were 27.8 MB, name rows (12 B) 5.2
+MB, the name heap 10.6 MB and doc rows (20 B) 7.1 MB. A sanity check after S1a
+on an 88k-name source tree: 51.0 B per name against 97.8 B, the inode fields
+23 B against 64 B and the name columns 6.4 B against 12 B; the sub-second times
+(30 bits each) are the largest inode fields.
 The memory budget is a config value, defaulted from measurement (D5).
 
 The writer is built for 10M entries (D40). Workers fill columnar batches, about
@@ -357,8 +373,8 @@ next name. A query with metadata atoms and no literal tests every inode row
 first and then walks the name rows for the inodes that pass, loading the name
 sections only if one does. Everything else tests every name. A name query loads
 the name, directory, root, traversed and link sections, never the document rows,
-and reads inode rows one at a time for the rows it reports until that passes a
-64th of the rows, when it loads the section instead. Paths are resolved once per
+and loads the inode columns once it has a row to report; a metadata test loads
+only the columns it reads. Paths are resolved once per
 parent directory. Measured (`ferret-bench`, D43): a rare word is 5 ms warm at
 `$HOME`, 206 ms at 10M and 763 ms at 40M, nearly all of it the section loads.
 
