@@ -109,8 +109,9 @@ impl<'a> Packed<'a> {
 /// without being held.
 pub(crate) struct Writer {
     width: u32,
+    mask: u64,
     /// Bits not yet written, low first; fewer than 64 between pushes.
-    pending: u128,
+    pending: u64,
     filled: u32,
 }
 
@@ -119,6 +120,7 @@ impl Writer {
         debug_assert!(width <= MAX_WIDTH);
         Self {
             width,
+            mask: mask(width),
             pending: 0,
             filled: 0,
         }
@@ -126,17 +128,15 @@ impl Writer {
 
     /// Appends `value`, which must fit the width.
     pub(crate) fn push(&mut self, out: &mut impl Write, value: u64) -> io::Result<()> {
-        debug_assert!(
-            value <= mask(self.width),
-            "{value} does not fit {}",
-            self.width
-        );
-        self.pending |= u128::from(value & mask(self.width)) << self.filled;
+        debug_assert!(value <= self.mask, "{value} does not fit {}", self.width);
+        let value = value & self.mask;
+        self.pending |= value << self.filled;
         self.filled += self.width;
         if self.filled >= u64::BITS {
-            out.write_all(&(self.pending as u64).to_le_bytes())?;
-            self.pending >>= u64::BITS;
+            out.write_all(&self.pending.to_le_bytes())?;
             self.filled -= u64::BITS;
+            // The bits that did not fit: none when the word was empty.
+            self.pending = value.checked_shr(self.width - self.filled).unwrap_or(0);
         }
         Ok(())
     }
@@ -144,7 +144,7 @@ impl Writer {
     /// Writes the last partial word and the padding.
     pub(crate) fn finish(self, out: &mut impl Write) -> io::Result<()> {
         let tail = self.filled.div_ceil(8) as usize;
-        out.write_all(&(self.pending as u64).to_le_bytes()[..tail])?;
+        out.write_all(&self.pending.to_le_bytes()[..tail])?;
         out.write_all(&[0; PAD as usize])
     }
 }

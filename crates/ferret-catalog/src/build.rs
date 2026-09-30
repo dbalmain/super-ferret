@@ -765,10 +765,15 @@ pub(crate) fn write(
     }
     out.write_all(&plan.strings)?;
 
+    // Each stat column is its own pass over the rows. Finding each row's
+    // batch by binary search on every pass cost 1.2 s of the 10M build's
+    // 9.8 s of CPU, so each row's stat is found once: 8 B per inode, allocated
+    // after the names are freed, below the build's peak.
+    let stats: Vec<&Stat> = plan.inode_rows(&batches).map(|(stat, _)| stat).collect();
     for field in STAT_COLUMNS {
         let dict = &dicts[field as usize];
         let mut column = start(out, field)?;
-        for (stat, _) in plan.inode_rows(&batches) {
+        for &stat in &stats {
             let value = stat_field(field, stat);
             match field.coding() {
                 Coding::Dictionary => {
@@ -779,8 +784,12 @@ pub(crate) fn write(
         }
         column.finish(out)?;
     }
+    drop(stats);
     let mut column = start(out, Column::Doc)?;
-    for (_, doc) in plan.inode_rows(&batches) {
+    for _ in 0..dirs {
+        column.nullable(out, None)?;
+    }
+    for &doc in &plan.doc {
         column.nullable(out, known(doc))?;
     }
     column.finish(out)?;
