@@ -416,6 +416,7 @@ fn a_blocked_column_whose_table_misplaces_a_block_is_rejected_on_load() {
     let layout = format::decode_table(&bytes, bytes.len() as u64).unwrap();
     let scratch = Scratch::new("decode-blocked-lazy");
     for column in [
+        Column::NameParent,
         Column::NameOffset,
         Column::NameChild,
         Column::Size,

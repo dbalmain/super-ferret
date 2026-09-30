@@ -259,12 +259,12 @@ impl Plan {
         }
         // Ids are sized by what they index: the counts and the heap.
         let below = |n: usize| Range((n > 0).then(|| (0, n as u64 - 1)));
-        if names > 0 {
-            ranges[Column::NameParent as usize] = below(dirs);
-        }
-        let child = &mut blocks[Column::NameChild as usize];
-        for &dir in &self.order {
+        let [parent, child] = blocks
+            .get_disjoint_mut([Column::NameParent as usize, Column::NameChild as usize])
+            .unwrap_or_else(|_| unreachable!("two columns"));
+        for (id, &dir) in self.order.iter().enumerate() {
             for &entry in self.children(dir) {
+                parent.push(id as u64);
                 child.push(u64::from(self.child(entry)));
             }
         }

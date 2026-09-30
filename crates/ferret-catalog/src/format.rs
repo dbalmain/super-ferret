@@ -14,8 +14,8 @@
 //! first, and a reader loads each on first use (D38 B).
 //!
 //! ```text
-//! names       3 columns: parent InoId, child InoId (blocked), offset in
-//!             name heap (blocked)
+//! names       3 blocked columns: parent InoId, child InoId, offset in
+//!             name heap
 //! name heap   names, each NUL-terminated, in NameId order (D28)
 //! dir names   column, per directory InoId: its NameId, none for a root
 //! entries     column, per directory: the entries `getdents` returned, minus
@@ -276,14 +276,15 @@ impl Column {
         match self {
             Column::DirName | Column::Entries | Column::Doc => Coding::Nullable,
             Column::Dev | Column::Mode | Column::Owner => Coding::Dictionary,
-            Column::NameOffset
+            Column::NameParent
+            | Column::NameOffset
             | Column::NameChild
             | Column::Size
             | Column::Mtime
             | Column::Ctime
             | Column::Nlink => Coding::Blocked,
             Column::DocId => Coding::Sequence,
-            Column::NameParent | Column::Ino | Column::MtimeNs | Column::CtimeNs => Coding::Frame,
+            Column::Ino | Column::MtimeNs | Column::CtimeNs => Coding::Frame,
         }
     }
 
@@ -1224,7 +1225,7 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeErro
     if count_nuls(heap) != l.names {
         return Err(DecodeError::Corrupt("name order"));
     }
-    let parents = l.view(Column::NameParent, rows);
+    let parents = l.blocked(Column::NameParent, rows);
     let children = l.blocked(Column::NameChild, rows);
     let offsets = l.blocked(Column::NameOffset, rows);
     // The name before this row: its parent and where its bytes start; and
@@ -1293,7 +1294,7 @@ fn check_dir_names(
     dir_children: usize,
 ) -> Result<(), DecodeError> {
     let dir_names = l.view(Column::DirName, dir_names);
-    let parents = l.view(Column::NameParent, rows);
+    let parents = l.blocked(Column::NameParent, rows);
     let children = l.blocked(Column::NameChild, rows);
     let mut named = 0;
     for (dir, name) in dir_names.nullables(l.dirs).enumerate() {

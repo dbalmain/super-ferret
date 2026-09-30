@@ -327,7 +327,7 @@ impl Catalog {
         NameReader {
             heap: self.name_heap(),
             offsets: self.layout.blocked(Column::NameOffset, rows),
-            parents: self.layout.view(Column::NameParent, rows),
+            parents: self.layout.blocked(Column::NameParent, rows),
             children: self.layout.blocked(Column::NameChild, rows),
             count: self.layout.names,
         }
@@ -370,7 +370,7 @@ impl Catalog {
     }
 
     fn child_range(&self, dir: InoId) -> (usize, usize) {
-        let parents = self.column(Column::NameParent);
+        let parents = self.blocked(Column::NameParent);
         let dir = u64::from(dir.0);
         let start = partition_point(self.layout.names, |i| parents.get(i) < dir);
         (
@@ -409,9 +409,9 @@ impl Catalog {
     /// name below it, joined by `/`. Needs [`Section::Roots`], which loads
     /// every section a path reads.
     pub fn path(&self, name: NameId, out: &mut Vec<u8>) {
-        let name = self.name(name);
-        self.dir_path(name.parent, out);
-        push_component(out, name.bytes);
+        let (parent, bytes) = self.name_reader().edge(name);
+        self.dir_path(parent, out);
+        push_component(out, bytes);
     }
 
     /// Appends a directory's path. Needs [`Section::Roots`].
@@ -420,10 +420,10 @@ impl Catalog {
         let mut up = Vec::new();
         let mut at = dir;
         while let Some(name) = dir_names.nullable(at.0 as usize) {
-            let name = names.get(NameId(name as u32));
-            up.push(name.bytes);
+            let (parent, bytes) = names.edge(NameId(name as u32));
+            up.push(bytes);
             // Decoding checked that the parent's id is lower, so this ends.
-            at = name.parent;
+            at = parent;
         }
         out.extend_from_slice(self.root_path(at).unwrap_or_default());
         for name in up.iter().rev() {
@@ -660,7 +660,7 @@ impl Catalog {
 pub struct NameReader<'c> {
     heap: &'c [u8],
     offsets: Blocked<'c>,
-    parents: View<'c>,
+    parents: Blocked<'c>,
     children: Blocked<'c>,
     count: usize,
 }
@@ -668,6 +668,17 @@ pub struct NameReader<'c> {
 impl<'c> NameReader<'c> {
     /// One name edge, read by itself: for a sparse hit.
     pub fn get(&self, id: NameId) -> Name<'c> {
+        let (parent, bytes) = self.edge(id);
+        Name {
+            parent,
+            child: InoId(self.children.get(id.0 as usize) as u32),
+            bytes,
+        }
+    }
+
+    /// A name's directory and bytes, without its child: what a path reads
+    /// at each level.
+    pub fn edge(&self, id: NameId) -> (InoId, &'c [u8]) {
         let i = id.0 as usize;
         // A name runs to the next one's start, less its NUL: decoding checked
         // that the spans tile the heap. One decode is cheaper than a search.
@@ -675,11 +686,10 @@ impl<'c> NameReader<'c> {
             true => self.offsets.get(i + 1) as usize,
             false => self.heap.len(),
         };
-        Name {
-            parent: InoId(self.parents.get(i) as u32),
-            child: InoId(self.children.get(i) as u32),
-            bytes: &self.heap[self.offsets.get(i) as usize..end - 1],
-        }
+        (
+            InoId(self.parents.get(i) as u32),
+            &self.heap[self.offsets.get(i) as usize..end - 1],
+        )
     }
 
     /// The names from `from` on, in order, decoded a run at a time.
