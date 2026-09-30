@@ -523,10 +523,24 @@ impl<'f> At<'f> {
 }
 
 impl Write for At<'_> {
+    /// Holds at most [`AT_BUFFER`] bytes: a write that would pass it fills
+    /// the buffer and writes it out, and a remainder as large as the buffer
+    /// goes straight to the file, so a whole heap written at once is never
+    /// copied.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(bytes);
-        if self.buf.len() >= AT_BUFFER {
-            self.flush()?;
+        let room = AT_BUFFER - self.buf.len();
+        if bytes.len() < room {
+            self.buf.extend_from_slice(bytes);
+            return Ok(bytes.len());
+        }
+        let (fill, rest) = bytes.split_at(room);
+        self.buf.extend_from_slice(fill);
+        self.flush()?;
+        if rest.len() >= AT_BUFFER {
+            self.file.write_all_at(rest, self.pos)?;
+            self.pos += rest.len() as u64;
+        } else {
+            self.buf.extend_from_slice(rest);
         }
         Ok(bytes.len())
     }
@@ -1314,4 +1328,56 @@ fn check_dir_names(
         return Err(DecodeError::Corrupt("dir names"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::io::Write;
+
+    use super::{AT_BUFFER, At};
+
+    #[test]
+    fn a_positional_writer_never_holds_more_than_its_buffer() {
+        let path = std::env::temp_dir().join(format!("ferret-at-{}", std::process::id()));
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // After a 3-byte gap: a small write; one that exactly fills the
+        // buffer; one that fills it and leaves a remainder larger than the
+        // buffer, written directly; two halves, the second overflowing into a
+        // small buffered remainder; a tail. The bytes land in order.
+        let pattern = |n: usize, seed: u8| -> Vec<u8> {
+            (0..n).map(|i| (i as u8).wrapping_mul(31) ^ seed).collect()
+        };
+        let parts = [
+            pattern(10, 1),
+            pattern(AT_BUFFER - 10, 2),
+            pattern(3 * AT_BUFFER + 7, 3),
+            pattern(AT_BUFFER / 2, 4),
+            pattern(AT_BUFFER / 2 + 5, 5),
+            pattern(5, 6),
+        ];
+        let mut at = At::new(&file, 3);
+        for part in &parts {
+            at.write_all(part).unwrap();
+            assert!(at.buf.len() < AT_BUFFER, "{} buffered", at.buf.len());
+            assert_eq!(at.buf.capacity(), AT_BUFFER, "the buffer grew");
+        }
+        let end = at.finish().unwrap();
+        let expected: Vec<u8> = [&[0u8; 3][..]]
+            .into_iter()
+            .chain(parts.iter().map(Vec::as_slice))
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(end, expected.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        let _ = std::fs::remove_file(&path);
+    }
 }
