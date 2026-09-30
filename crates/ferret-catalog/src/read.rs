@@ -31,6 +31,7 @@ use crate::format::{
     self, COLUMNS, Column, Facts, HASH_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
     WORK_TREE_ROW, u32_at, u64_at,
 };
+use crate::packed::Blocked;
 use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
 
 /// The snapshot's file name inside the catalog directory.
@@ -230,6 +231,10 @@ impl Catalog {
         self.layout.view(column, self.section(column.section()))
     }
 
+    fn blocked(&self, column: Column) -> Blocked<'_> {
+        self.layout.blocked(column, self.section(column.section()))
+    }
+
     fn section(&self, section: Section) -> &[u8] {
         match &self.source {
             Source::Whole(bytes) => self.layout.section(bytes, section),
@@ -318,7 +323,7 @@ impl Catalog {
         let rows = self.section(Section::Names);
         let heap = self.name_heap();
         let i = id.0 as usize;
-        let offsets = self.layout.view(Column::NameOffset, rows);
+        let offsets = self.layout.blocked(Column::NameOffset, rows);
         // A name runs to the next one's start, less its NUL: decoding checked
         // that the spans tile the heap. One decode is cheaper than a search.
         let end = match i + 1 < self.layout.names {
@@ -336,7 +341,7 @@ impl Catalog {
     /// [`Section::Names`]; the bytes run to the next name's start, less its
     /// NUL.
     pub fn name_start(&self, id: NameId) -> usize {
-        self.column(Column::NameOffset).get(id.0 as usize) as usize
+        self.blocked(Column::NameOffset).get(id.0 as usize) as usize
     }
 
     /// The inode a name edge names, without reading its bytes. Needs only
@@ -351,7 +356,7 @@ impl Catalog {
         if offset >= self.name_heap().len() {
             return None;
         }
-        let offsets = self.column(Column::NameOffset);
+        let offsets = self.blocked(Column::NameOffset);
         let after = partition_point(self.layout.names, |i| offsets.get(i) as usize <= offset);
         Some(NameId(after as u32 - 1))
     }
@@ -507,7 +512,7 @@ impl Catalog {
     /// An inode's `st_nlink`: for a directory, as the filesystem counts it,
     /// ignored children included (D47). Needs [`Section::Nlink`].
     pub fn nlink(&self, id: InoId) -> u64 {
-        self.column(Column::Nlink).get(id.0 as usize)
+        self.blocked(Column::Nlink).get(id.0 as usize)
     }
 
     /// An inode's document, when its state is `Hashed`. Needs

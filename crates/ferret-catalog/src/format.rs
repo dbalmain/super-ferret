@@ -729,43 +729,28 @@ pub(crate) struct Placed {
     pub(crate) start: usize,
 }
 
-/// A column's bytes, decoded in place per its coding.
+/// A column's bytes, decoded in place per its coding; any but a blocked
+/// column, which is a [`Blocked`] ([`Layout::blocked`]). The coding is fixed
+/// per column, so no read branches on it: a `View` that also held blocked
+/// columns stopped `View::get` being inlined into `Catalog::name`, and a name
+/// scan at 10M names took 11% longer.
 #[derive(Clone, Copy)]
 pub(crate) struct View<'a> {
     base: u64,
     dict: &'a [u8],
-    values: Stored<'a>,
-}
-
-#[derive(Clone, Copy)]
-enum Stored<'a> {
-    Packed(Packed<'a>),
-    /// Carries its own bases: the view's is 0.
-    Blocked(Blocked<'a>),
+    packed: Packed<'a>,
 }
 
 impl View<'_> {
-    /// A frame-of-reference or blocked value, or a dictionary index.
+    /// A frame-of-reference value, or a dictionary index.
     pub(crate) fn get(&self, row: usize) -> u64 {
-        match self.values {
-            Stored::Packed(packed) => self.base.wrapping_add(packed.get(row)),
-            Stored::Blocked(blocked) => blocked.get(row),
-        }
-    }
-
-    /// The packed values of a column that is not blocked.
-    fn packed(&self) -> Packed<'_> {
-        match self.values {
-            Stored::Packed(packed) => packed,
-            Stored::Blocked(_) => panic!("a blocked column has no single width"),
-        }
+        self.base.wrapping_add(self.packed.get(row))
     }
 
     /// A nullable value.
     pub(crate) fn nullable(&self, row: usize) -> Option<u64> {
-        let packed = self.packed();
-        let raw = packed.get(row);
-        (raw != packed::mask(packed.width())).then(|| self.base.wrapping_add(raw))
+        let raw = self.packed.get(row);
+        (raw != packed::mask(self.packed.width())).then(|| self.base.wrapping_add(raw))
     }
 
     /// A sequence column's value at `row`.
@@ -773,10 +758,10 @@ impl View<'_> {
         self.get(row).wrapping_add(row as u64)
     }
 
-    /// Whether a sequence column is `base + row` throughout: its row for a
-    /// value is found by subtraction.
+    /// For a sequence column that is `base + row` throughout, `base`: its
+    /// row for a value is found by subtraction.
     pub(crate) fn dense(&self) -> Option<u64> {
-        (self.packed().width() == 0).then_some(self.base)
+        (self.packed.width() == 0).then_some(self.base)
     }
 
     /// A dictionary value. Decoding checked every index.
@@ -787,14 +772,9 @@ impl View<'_> {
     /// [`View::get`] of rows `first..first + out.len()`, into `out`; `first`
     /// is a multiple of 8. See [`Packed::decode`].
     pub(crate) fn decode(&self, first: usize, out: &mut [u64]) {
-        match self.values {
-            Stored::Packed(packed) => {
-                packed.decode(first, out);
-                for value in out {
-                    *value = self.base.wrapping_add(*value);
-                }
-            }
-            Stored::Blocked(blocked) => blocked.decode(first, out),
+        self.packed.decode(first, out);
+        for value in out {
+            *value = self.base.wrapping_add(*value);
         }
     }
 
@@ -811,7 +791,7 @@ impl View<'_> {
 
     /// [`View::nullable`] of rows `0..count`, in order.
     pub(crate) fn nullables(&self, count: usize) -> impl Iterator<Item = Option<u64>> + '_ {
-        let none = self.base.wrapping_add(packed::mask(self.packed().width()));
+        let none = self.base.wrapping_add(packed::mask(self.packed.width()));
         self.values(count)
             .map(move |value| (value != none).then_some(value))
     }
@@ -862,22 +842,23 @@ impl Layout {
         end - start
     }
 
-    /// `column`, given the bytes of its section.
+    /// `column`, given the bytes of its section. Not a blocked column.
     pub(crate) fn view<'a>(&self, column: Column, section: &'a [u8]) -> View<'a> {
+        debug_assert_ne!(column.coding(), Coding::Blocked, "{column:?}");
         let Placed { desc, start } = self.columns[column as usize];
         let (dict, values) = section[start..].split_at(desc.dict_len as usize * 8);
-        match column.coding() {
-            Coding::Blocked => View {
-                base: 0,
-                dict,
-                values: Stored::Blocked(Blocked::new(values, self.count(column.rows()) as u32)),
-            },
-            _ => View {
-                base: desc.base,
-                dict,
-                values: Stored::Packed(Packed::new(values, desc.width)),
-            },
+        View {
+            base: desc.base,
+            dict,
+            packed: Packed::new(values, desc.width),
         }
+    }
+
+    /// Blocked `column`, given the bytes of its section.
+    pub(crate) fn blocked<'a>(&self, column: Column, section: &'a [u8]) -> Blocked<'a> {
+        debug_assert_eq!(column.coding(), Coding::Blocked, "{column:?}");
+        let start = self.columns[column as usize].start;
+        Blocked::new(&section[start..], self.count(column.rows()) as u32)
     }
 }
 
@@ -1111,9 +1092,8 @@ pub(crate) fn check<'a>(
     let strings_len = l.len(Section::Strings);
     for column in COLUMNS {
         if column.section() == section && column.coding() == Coding::Blocked {
-            let Placed { desc, start } = l.columns[column as usize];
-            let count = l.count(column.rows()) as u32;
-            if !Blocked::new(&get(section)[start..], count).check(desc.width, desc.base) {
+            let desc = l.columns[column as usize].desc;
+            if !l.blocked(column, get(section)).check(desc.width, desc.base) {
                 return Err(DecodeError::Corrupt(section.label()));
             }
         }
@@ -1253,7 +1233,7 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeErro
     }
     let parents = l.view(Column::NameParent, rows);
     let children = l.view(Column::NameChild, rows);
-    let offsets = l.view(Column::NameOffset, rows);
+    let offsets = l.blocked(Column::NameOffset, rows);
     // The name before this row: its parent and where its bytes start; and
     // the one before that, for sibling order.
     let mut open: Option<(u64, usize)> = None;
