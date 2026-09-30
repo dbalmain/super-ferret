@@ -469,3 +469,92 @@ fn an_enormous_entry_count_is_not_mistaken_for_unknown() {
     });
     assert_eq!(catalog.entry_count(InoId(0)), Some(u32::MAX - 1));
 }
+
+/// Three directories of 120 entries each, every third a symlink and every
+/// seventh a hard link to the first file, with mtimes that vary: more names
+/// than one decoded run, and file ids that a pass over names meets out of
+/// order.
+fn commit_wide(dir: &std::path::Path) -> Catalog {
+    commit(dir, |txn| {
+        let mut b = txn.batch();
+        let root = b.root(b"/w", dir_stat(1));
+        for d in 0..3u64 {
+            let sub = b.dir(root, format!("d{d}").as_bytes(), dir_stat(2 + d));
+            for i in 0..120u64 {
+                let name = format!("n{i:03}");
+                let ino = 100 + d * 1000 + i;
+                let stat = Stat {
+                    mtime_sec: 1_700_000_000 - (ino as i64 * 37) % 5000,
+                    ..file_stat(ino)
+                };
+                match i {
+                    _ if i % 3 == 0 => b.symlink(sub, name.as_bytes(), link_stat(ino), b"t"),
+                    _ if i % 7 == 0 => {
+                        b.file(sub, name.as_bytes(), file_stat(100), Content::Unindexed)
+                    }
+                    _ => b.file(sub, name.as_bytes(), stat, Content::Unindexed),
+                }
+            }
+        }
+        txn.add(b);
+    })
+}
+
+#[test]
+fn names_read_in_runs_match_names_read_one_at_a_time() {
+    let scratch = Scratch::new("name-runs");
+    commit_wide(&scratch.path);
+    let catalog = reopen(&scratch.path);
+    let (names, n) = (catalog.name_reader(), catalog.name_count());
+    assert!(n > 256, "{n} names: fewer than three runs");
+    // Mid-run, on and around run boundaries, the last name, and past it.
+    for from in [0, 1, 127, 128, 129, 255, 256, n - 1, n] {
+        let runs: Vec<_> = names.runs_from(NameId(from)).collect();
+        let one: Vec<_> = (from..n)
+            .map(|i| (NameId(i), catalog.name(NameId(i))))
+            .collect();
+        assert_eq!(runs, one, "from {from}");
+    }
+    let children: Vec<_> = names.children().collect();
+    let one: Vec<_> = (0..n).map(|i| catalog.child(NameId(i))).collect();
+    assert_eq!(children, one);
+}
+
+#[test]
+fn a_kinds_cursor_agrees_with_kind_in_any_order() {
+    let scratch = Scratch::new("kinds");
+    commit_wide(&scratch.path);
+    let catalog = reopen(&scratch.path);
+    let inodes = catalog.inode_count();
+    let symlinks = (0..inodes)
+        .filter(|&i| catalog.kind(InoId(i)) == Kind::Symlink)
+        .count();
+    assert!(symlinks > 100, "{symlinks} symlinks");
+    let orders: [Vec<u32>; 4] = [
+        // Name order: rising, with hard links falling back.
+        catalog.names().map(|(id, _)| catalog.child(id).0).collect(),
+        (0..inodes).collect(),
+        (0..inodes).rev().collect(),
+        // Jumps both ways, far enough to gallop.
+        (0..inodes).map(|i| i * 97 % inodes).collect(),
+    ];
+    for order in orders {
+        let mut kinds = catalog.kinds();
+        for id in order.into_iter().map(InoId) {
+            assert_eq!(kinds.kind(id), catalog.kind(id), "{id:?}");
+        }
+    }
+}
+
+#[test]
+fn a_pass_over_sizes_and_mtimes_matches_each_inode_read_alone() {
+    let scratch = Scratch::new("passes");
+    commit_wide(&scratch.path);
+    let catalog = reopen(&scratch.path);
+    let ids = || (0..catalog.inode_count()).map(InoId);
+    let sizes: Vec<_> = catalog.sizes().collect();
+    assert_eq!(sizes, ids().map(|i| catalog.size(i)).collect::<Vec<_>>());
+    let mtimes: Vec<_> = catalog.mtimes().collect();
+    assert_eq!(mtimes, ids().map(|i| catalog.mtime(i)).collect::<Vec<_>>());
+    assert!(mtimes.iter().any(|&t| t != mtimes[0]));
+}

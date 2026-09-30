@@ -97,7 +97,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::OnceLock;
 
-use crate::packed::{self, Blocked, Packed};
+use crate::packed::{self, Blocked, Packed, RUN};
 
 pub(crate) const MAGIC: [u8; 8] = *b"FERRETCT";
 /// 1: fixed-width rows (S1). 2: bit-packed columns (S1a).
@@ -742,7 +742,7 @@ pub(crate) struct View<'a> {
     packed: Packed<'a>,
 }
 
-impl View<'_> {
+impl<'a> View<'a> {
     /// A frame-of-reference value, or a dictionary index.
     pub(crate) fn get(&self, row: usize) -> u64 {
         self.base.wrapping_add(self.packed.get(row))
@@ -779,27 +779,19 @@ impl View<'_> {
         }
     }
 
-    /// [`View::get`] of rows `0..count`, in order: a validation pass over
-    /// one column, decoded a [`BLOCK`] at a time.
-    pub(crate) fn values(&self, count: usize) -> impl Iterator<Item = u64> + '_ {
-        (0..count).step_by(BLOCK).flat_map(move |first| {
-            let mut block = [0; BLOCK];
-            let n = BLOCK.min(count - first);
-            self.decode(first, &mut block[..n]);
-            block.into_iter().take(n)
-        })
+    /// [`View::get`] of rows `0..count`, in order: a pass over one column,
+    /// decoded a run at a time.
+    pub(crate) fn values(self, count: usize) -> impl Iterator<Item = u64> + 'a {
+        packed::runs(count, move |first, out| self.decode(first, out))
     }
 
     /// [`View::nullable`] of rows `0..count`, in order.
-    pub(crate) fn nullables(&self, count: usize) -> impl Iterator<Item = Option<u64>> + '_ {
+    pub(crate) fn nullables(self, count: usize) -> impl Iterator<Item = Option<u64>> + 'a {
         let none = self.base.wrapping_add(packed::mask(self.packed.width()));
         self.values(count)
             .map(move |value| (value != none).then_some(value))
     }
 }
-
-/// Rows a validation pass decodes at once: [`View::decode`]'s run.
-const BLOCK: usize = 64;
 
 /// Where each section lies, the counts, and how each column is packed.
 /// Built from the head of the file alone, so every check below that needs
@@ -1252,9 +1244,9 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeErro
         Ok(())
     };
     let (mut last_parent, mut next_offset, mut dir_children) = (0, 0, 0);
-    let mut block = [[0; BLOCK]; 3];
-    for first in (0..l.names).step_by(BLOCK) {
-        let n = BLOCK.min(l.names - first);
+    let mut block = [[0; RUN]; 3];
+    for first in (0..l.names).step_by(RUN) {
+        let n = RUN.min(l.names - first);
         let [p, c, o] = &mut block;
         parents.decode(first, &mut p[..n]);
         children.decode(first, &mut c[..n]);

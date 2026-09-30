@@ -5,9 +5,9 @@
 use std::fmt;
 use std::ops::ControlFlow;
 
-use ferret_catalog::{Catalog, InoId, Kind, NameId, OpenError, Section};
+use ferret_catalog::{Catalog, InoId, Kind, Kinds, Name, NameId, OpenError, Section};
 
-use crate::query::{MetaTest, NameTest, Query, Strategy};
+use crate::query::{Cmp, MetaTest, NameTest, Query, Strategy};
 
 /// One result: a path, and the ids to read anything else about it from the
 /// catalog.
@@ -117,7 +117,7 @@ struct Run<'q, 'c> {
     path: Vec<u8>,
 }
 
-impl Run<'_, '_> {
+impl<'c> Run<'_, 'c> {
     fn heap_scan(
         &mut self,
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
@@ -128,7 +128,8 @@ impl Run<'_, '_> {
         };
         let catalog = self.catalog;
         catalog.load(&ROW_SECTIONS)?;
-        let heap = catalog.name_heap();
+        let (heap, names, mut kinds) =
+            (catalog.name_heap(), catalog.name_reader(), catalog.kinds());
         let count = catalog.name_count();
         let skip = matches!(query.names.get(driver.from), Some(NameTest::Substring(_)))
             .then_some(driver.from);
@@ -143,7 +144,11 @@ impl Run<'_, '_> {
                 heap.len()
             };
             self.stats.candidates += 1;
-            if self.consider(id, skip, false, emit)?.is_break() {
+            let name = names.get(id);
+            if self
+                .consider(&mut kinds, id, name, skip, false, emit)?
+                .is_break()
+            {
                 break;
             }
         }
@@ -156,24 +161,22 @@ impl Run<'_, '_> {
     ) -> Result<(), RunError> {
         let catalog = self.catalog;
         catalog.load(&self.query.meta_sections())?;
-        let mut pass = vec![0u64; (catalog.inode_count() as usize).div_ceil(64)];
-        let mut any = false;
-        for id in 0..catalog.inode_count() {
-            if self.meta_passes(InoId(id)) {
-                pass[id as usize / 64] |= 1 << (id % 64);
-                any = true;
-            }
-        }
+        let pass = self.meta_pass();
         // Nothing passed: no name can, so the name sections stay on disk.
-        if !any {
+        if pass.iter().all(|&word| word == 0) {
             return Ok(());
         }
         catalog.load(&ROW_SECTIONS)?;
-        for id in (0..catalog.name_count()).map(NameId) {
-            let child = catalog.child(id).0;
+        let (names, mut kinds) = (catalog.name_reader(), catalog.kinds());
+        for (id, child) in names.children().enumerate() {
+            let child = child.0;
             if pass[child as usize / 64] >> (child % 64) & 1 == 1 {
                 self.stats.candidates += 1;
-                if self.consider(id, None, true, emit)?.is_break() {
+                let id = NameId(id as u32);
+                if self
+                    .consider(&mut kinds, id, names.get(id), None, true, emit)?
+                    .is_break()
+                {
                     break;
                 }
             }
@@ -185,29 +188,35 @@ impl Run<'_, '_> {
         &mut self,
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<(), RunError> {
-        self.catalog.load(&ROW_SECTIONS)?;
-        for id in (0..self.catalog.name_count()).map(NameId) {
+        let catalog = self.catalog;
+        catalog.load(&ROW_SECTIONS)?;
+        let (names, mut kinds) = (catalog.name_reader(), catalog.kinds());
+        for (id, name) in names.runs_from(NameId(0)) {
             self.stats.candidates += 1;
-            if self.consider(id, None, false, emit)?.is_break() {
+            if self
+                .consider(&mut kinds, id, name, None, false, emit)?
+                .is_break()
+            {
                 break;
             }
         }
         Ok(())
     }
 
-    /// Tests one name and emits it if everything passes. Cheapest first:
-    /// name bytes, then the inode's fields, then the path. `skip` is a name
-    /// test the candidate source already proved; `tested` says the source
-    /// already tested the inode.
+    /// Tests one name, already read, and emits it if everything passes.
+    /// Cheapest first: name bytes, then the inode's fields, then the path.
+    /// `skip` is a name test the candidate source already proved; `tested`
+    /// says the source already tested the inode.
     fn consider(
         &mut self,
+        kinds: &mut Kinds<'c>,
         id: NameId,
+        name: Name<'_>,
         skip: Option<usize>,
         tested: bool,
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> RunResult {
         let catalog = self.catalog;
-        let name = catalog.name(id);
         let structural = name.child.0 < catalog.dir_count() && catalog.is_traversed(name.child);
         let names_pass = self
             .query
@@ -233,24 +242,56 @@ impl Run<'_, '_> {
             path: &self.path,
             name: id,
             inode: name.child,
-            kind: catalog.kind(name.child),
+            kind: kinds.kind(name.child),
         }))
     }
 
     /// Whether an inode passes every metadata test, read one field at a time
-    /// from the sections [`Query::meta_sections`] names.
+    /// from the sections [`Query::meta_sections`] names: for a sparse hit.
     fn meta_passes(&self, id: InoId) -> bool {
         let catalog = self.catalog;
         self.query.meta.iter().all(|test| match *test {
             MetaTest::Size(cmp, n) => cmp.holds(catalog.size(id), n),
-            // Widened: mtime is whatever the file holds, and a corrupt or
-            // far-future value must not overflow.
-            MetaTest::Age(cmp, secs) => cmp.holds(
-                i128::from(self.query.now) - i128::from(catalog.mtime(id)),
-                i128::from(secs),
-            ),
+            MetaTest::Age(cmp, secs) => self.age_holds(cmp, secs, catalog.mtime(id)),
             MetaTest::Type(kind) => catalog.kind(id) == kind,
         })
+    }
+
+    /// [`Run::meta_passes`] of every inode, as a bitset by `InoId`: each
+    /// test is a pass over its column, decoded a run at a time.
+    fn meta_pass(&self) -> Vec<u64> {
+        let catalog = self.catalog;
+        let n = catalog.inode_count() as usize;
+        let mut pass = vec![!0; n.div_ceil(64)];
+        for test in &self.query.meta {
+            match *test {
+                MetaTest::Size(cmp, v) => {
+                    and_bits(&mut pass, catalog.sizes().map(|s| cmp.holds(s, v)))
+                }
+                MetaTest::Age(cmp, secs) => and_bits(
+                    &mut pass,
+                    catalog.mtimes().map(|t| self.age_holds(cmp, secs, t)),
+                ),
+                MetaTest::Type(kind) => {
+                    let mut kinds = catalog.kinds();
+                    and_bits(
+                        &mut pass,
+                        (0..n as u32).map(|id| kinds.kind(InoId(id)) == kind),
+                    );
+                }
+            }
+        }
+        pass
+    }
+
+    /// Whether a file modified at `mtime` is `cmp` `secs` old. Widened: mtime
+    /// is whatever the file holds, and a corrupt or far-future value must not
+    /// overflow.
+    fn age_holds(&self, cmp: Cmp, secs: i64, mtime: i64) -> bool {
+        cmp.holds(
+            i128::from(self.query.now) - i128::from(mtime),
+            i128::from(secs),
+        )
     }
 
     /// Loads the sections the metadata tests read, once, before the first test.
@@ -296,6 +337,21 @@ impl Query {
             }
         }
         sections
+    }
+}
+
+/// ANDs `bits`, one per row in order, into the bitset `pass`.
+fn and_bits(pass: &mut [u64], bits: impl Iterator<Item = bool>) {
+    let (mut word, mut at) = (0u64, 0);
+    for (i, bit) in bits.enumerate() {
+        word |= u64::from(bit) << (i % 64);
+        if i % 64 == 63 {
+            pass[at] &= word;
+            (word, at) = (0, at + 1);
+        }
+    }
+    if let Some(last) = pass.get_mut(at) {
+        *last &= word;
     }
 }
 

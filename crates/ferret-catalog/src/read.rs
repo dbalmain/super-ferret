@@ -31,7 +31,7 @@ use crate::format::{
     self, COLUMNS, Column, Facts, HASH_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
     WORK_TREE_ROW, u32_at, u64_at,
 };
-use crate::packed::Blocked;
+use crate::packed::{self, Blocked};
 use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
 
 /// The snapshot's file name inside the catalog directory.
@@ -315,26 +315,27 @@ impl Catalog {
 
     /// Every name with its id, in heap order. Needs [`Section::Names`].
     pub fn names(&self) -> impl Iterator<Item = (NameId, &[u8])> + '_ {
-        (0..self.name_count()).map(|i| (NameId(i), self.name(NameId(i)).bytes))
+        self.name_reader()
+            .runs_from(NameId(0))
+            .map(|(id, name)| (id, name.bytes))
+    }
+
+    /// The name columns and the heap, resolved once: what a pass over many
+    /// names holds. Needs [`Section::Names`].
+    pub fn name_reader(&self) -> NameReader<'_> {
+        let rows = self.section(Section::Names);
+        NameReader {
+            heap: self.name_heap(),
+            offsets: self.layout.blocked(Column::NameOffset, rows),
+            parents: self.layout.view(Column::NameParent, rows),
+            children: self.layout.view(Column::NameChild, rows),
+            count: self.layout.names,
+        }
     }
 
     /// One name edge. Needs [`Section::Names`].
     pub fn name(&self, id: NameId) -> Name<'_> {
-        let rows = self.section(Section::Names);
-        let heap = self.name_heap();
-        let i = id.0 as usize;
-        let offsets = self.layout.blocked(Column::NameOffset, rows);
-        // A name runs to the next one's start, less its NUL: decoding checked
-        // that the spans tile the heap. One decode is cheaper than a search.
-        let end = match i + 1 < self.layout.names {
-            true => offsets.get(i + 1) as usize,
-            false => heap.len(),
-        };
-        Name {
-            parent: InoId(self.layout.view(Column::NameParent, rows).get(i) as u32),
-            child: InoId(self.layout.view(Column::NameChild, rows).get(i) as u32),
-            bytes: &heap[offsets.get(i) as usize..end - 1],
-        }
+        self.name_reader().get(id)
     }
 
     /// Where a name's bytes start in [`Catalog::name_heap`]. Needs
@@ -415,16 +416,18 @@ impl Catalog {
 
     /// Appends a directory's path. Needs [`Section::Roots`].
     pub fn dir_path(&self, dir: InoId, out: &mut Vec<u8>) {
+        let (names, dir_names) = (self.name_reader(), self.column(Column::DirName));
         let mut up = Vec::new();
         let mut at = dir;
-        while let Some(name) = self.dir_name(at) {
-            up.push(name);
+        while let Some(name) = dir_names.nullable(at.0 as usize) {
+            let name = names.get(NameId(name as u32));
+            up.push(name.bytes);
             // Decoding checked that the parent's id is lower, so this ends.
-            at = self.name(name).parent;
+            at = name.parent;
         }
         out.extend_from_slice(self.root_path(at).unwrap_or_default());
-        for &name in up.iter().rev() {
-            push_component(out, self.name(name).bytes);
+        for name in up.iter().rev() {
+            push_component(out, name);
         }
     }
 
@@ -492,6 +495,20 @@ impl Catalog {
         format::unorder(self.column(Column::Mtime).get(id.0 as usize))
     }
 
+    /// Every inode's `st_size`, in inode order: a pass decoded a run at a
+    /// time. Needs [`Section::Size`].
+    pub fn sizes(&self) -> impl Iterator<Item = u64> + '_ {
+        self.column(Column::Size).values(self.layout.inodes)
+    }
+
+    /// Every inode's mtime in whole seconds, in inode order. Needs
+    /// [`Section::Mtime`].
+    pub fn mtimes(&self) -> impl Iterator<Item = i64> + '_ {
+        self.column(Column::Mtime)
+            .values(self.layout.inodes)
+            .map(format::unorder)
+    }
+
     /// An inode's ctime, in whole seconds. Needs [`Section::Ctime`].
     pub fn ctime(&self, id: InoId) -> i64 {
         format::unorder(self.column(Column::Ctime).get(id.0 as usize))
@@ -550,6 +567,17 @@ impl Catalog {
             Kind::Symlink
         } else {
             Kind::File
+        }
+    }
+
+    /// [`Catalog::kind`] for inodes asked for mostly in rising order, as a
+    /// pass over names or inodes asks: each search starts where the last
+    /// ended. Needs [`Section::Links`].
+    pub fn kinds(&self) -> Kinds<'_> {
+        Kinds {
+            dirs: self.dir_count(),
+            links: self.section(Section::Links),
+            at: 0,
         }
     }
 
@@ -624,6 +652,159 @@ impl Catalog {
         let mut hash = [0; HASH_ROW];
         hash.copy_from_slice(&self.section(Section::Docs)[at..at + HASH_ROW]);
         hash
+    }
+}
+
+/// The name columns and the name heap of one generation, resolved once
+/// ([`Catalog::name_reader`]), so that a query reading many names looks up
+/// no section per name.
+#[derive(Clone, Copy)]
+pub struct NameReader<'c> {
+    heap: &'c [u8],
+    offsets: Blocked<'c>,
+    parents: View<'c>,
+    children: View<'c>,
+    count: usize,
+}
+
+impl<'c> NameReader<'c> {
+    /// One name edge, read by itself: for a sparse hit.
+    pub fn get(&self, id: NameId) -> Name<'c> {
+        let i = id.0 as usize;
+        // A name runs to the next one's start, less its NUL: decoding checked
+        // that the spans tile the heap. One decode is cheaper than a search.
+        let end = match i + 1 < self.count {
+            true => self.offsets.get(i + 1) as usize,
+            false => self.heap.len(),
+        };
+        Name {
+            parent: InoId(self.parents.get(i) as u32),
+            child: InoId(self.children.get(i) as u32),
+            bytes: &self.heap[self.offsets.get(i) as usize..end - 1],
+        }
+    }
+
+    /// The names from `from` on, in order, decoded a run at a time.
+    pub fn runs_from(&self, from: NameId) -> NameRuns<'c> {
+        NameRuns {
+            names: *self,
+            next: from.0 as usize,
+            first: 0,
+            len: 0,
+            offsets: [0; NAME_RUN + 1],
+            parents: [0; NAME_RUN],
+            children: [0; NAME_RUN],
+        }
+    }
+
+    /// Every name's child, in name order: a pass over the child column
+    /// alone.
+    pub fn children(&self) -> impl Iterator<Item = InoId> + 'c {
+        let children = self.children;
+        packed::runs(self.count, move |first, out| children.decode(first, out))
+            .map(|child| InoId(child as u32))
+    }
+}
+
+/// Rows a [`NameRuns`] decodes at once: one block of the offset column.
+const NAME_RUN: usize = packed::BLOCK_ROWS;
+
+/// Names in order from a [`NameReader`], each column decoded a run at a
+/// time. A name's end is the next one's start, so each offset is decoded
+/// once: the run decodes one offset past its last row.
+pub struct NameRuns<'c> {
+    names: NameReader<'c>,
+    /// The next name to yield.
+    next: usize,
+    /// The decoded run: rows `first..first + len`.
+    first: usize,
+    len: usize,
+    offsets: [u64; NAME_RUN + 1],
+    parents: [u64; NAME_RUN],
+    children: [u64; NAME_RUN],
+}
+
+impl NameRuns<'_> {
+    /// Decodes the run holding `next`, starting at its block's first row.
+    fn fill(&mut self) {
+        let names = &self.names;
+        let first = self.next / NAME_RUN * NAME_RUN;
+        let len = NAME_RUN.min(names.count - first);
+        let more = first + len < names.count;
+        names
+            .offsets
+            .decode(first, &mut self.offsets[..len + usize::from(more)]);
+        if !more {
+            self.offsets[len] = names.heap.len() as u64;
+        }
+        names.parents.decode(first, &mut self.parents[..len]);
+        names.children.decode(first, &mut self.children[..len]);
+        (self.first, self.len) = (first, len);
+    }
+}
+
+impl<'c> Iterator for NameRuns<'c> {
+    type Item = (NameId, Name<'c>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.next;
+        if i >= self.names.count {
+            return None;
+        }
+        if i >= self.first + self.len || i < self.first {
+            self.fill();
+        }
+        let j = i - self.first;
+        self.next += 1;
+        let (start, end) = (self.offsets[j] as usize, self.offsets[j + 1] as usize);
+        Some((
+            NameId(i as u32),
+            Name {
+                parent: InoId(self.parents[j] as u32),
+                child: InoId(self.children[j] as u32),
+                bytes: &self.names.heap[start..end - 1],
+            },
+        ))
+    }
+}
+
+/// [`Catalog::kind`] with a memory of where the last search ended
+/// ([`Catalog::kinds`]): a rising id gallops forwards from there, and one
+/// that falls searches again. Names in order ask for rising file ids, since
+/// files are numbered by their first name.
+pub struct Kinds<'c> {
+    dirs: u32,
+    links: &'c [u8],
+    /// The first link row whose inode is at or past the last id asked for.
+    at: usize,
+}
+
+impl Kinds<'_> {
+    /// Whether an inode is a directory, file or symlink.
+    pub fn kind(&mut self, id: InoId) -> Kind {
+        if id.0 < self.dirs {
+            return Kind::Dir;
+        }
+        let links = self.links;
+        let n = links.len() / PAIR_ROW;
+        let key = |i: usize| u32_at(links, i * PAIR_ROW);
+        let below = |i: usize| key(i) < id.0;
+        if self.at > 0 && !below(self.at - 1) {
+            self.at = partition_point(self.at, below);
+        } else {
+            // Gallop: `lo` is at or before the answer, `hi` past it or `n`.
+            let (mut lo, mut hi, mut step) = (self.at, self.at, 1);
+            while hi < n && below(hi) {
+                lo = hi + 1;
+                hi = (hi + step).min(n);
+                step *= 2;
+            }
+            self.at = lo + partition_point(hi - lo, |i| below(lo + i));
+        }
+        match self.at < n && key(self.at) == id.0 {
+            true => Kind::Symlink,
+            false => Kind::File,
+        }
     }
 }
 

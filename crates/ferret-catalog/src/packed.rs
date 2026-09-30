@@ -274,6 +274,20 @@ impl<'a> Blocked<'a> {
     }
 }
 
+/// Values in one decoded run of a pass over a column.
+pub(crate) const RUN: usize = 64;
+
+/// Rows `0..count` of a column in order, `decode`d [`RUN`] at a time: a pass
+/// over the whole column, for a validation or a scan.
+pub(crate) fn runs(count: usize, decode: impl Fn(usize, &mut [u64])) -> impl Iterator<Item = u64> {
+    (0..count).step_by(RUN).flat_map(move |first| {
+        let mut run = [0; RUN];
+        let n = RUN.min(count - first);
+        decode(first, &mut run[..n]);
+        run.into_iter().take(n)
+    })
+}
+
 /// Finds a blocked column's values length and widest block from its values
 /// in order, holding one block's range.
 #[derive(Default)]
