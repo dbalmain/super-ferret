@@ -315,12 +315,17 @@ impl Catalog {
         let rows = self.section(Section::Names);
         let heap = self.name_heap();
         let i = id.0 as usize;
-        let start = self.layout.view(Column::NameOffset, rows).get(i) as usize;
-        let len = heap[start..].iter().position(|&b| b == 0).unwrap_or(0);
+        let offsets = self.layout.view(Column::NameOffset, rows);
+        // A name runs to the next one's start, less its NUL: decoding checked
+        // that the spans tile the heap. One decode is cheaper than a search.
+        let end = match i + 1 < self.layout.names {
+            true => offsets.get(i + 1) as usize,
+            false => heap.len(),
+        };
         Name {
             parent: InoId(self.layout.view(Column::NameParent, rows).get(i) as u32),
             child: InoId(self.layout.view(Column::NameChild, rows).get(i) as u32),
-            bytes: &heap[start..start + len],
+            bytes: &heap[offsets.get(i) as usize..end - 1],
         }
     }
 
