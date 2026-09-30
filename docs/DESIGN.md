@@ -145,7 +145,7 @@ offset and length, a descriptor per packed column, and the sections themselves.
 Every id and inode field is a bit-packed column (S1a): `count` values of
 `width` bits, least significant bit first, ending in 8 bytes of padding
 (written as zeros, not checked; reads never depend on it) so a read is one
-unaligned 8-byte load, a shift and a mask, plus a ninth byte at widths 58 to 64
+unaligned 8-byte load, a shift and a mask, plus a ninth byte at widths 58 to 63
 when the value straddles. A descriptor holds the column's
 base, width and dictionary length. Plain fields are frame of reference (value
 minus the column's minimum; times order-mapped from `i64` first); nullable ones
@@ -375,8 +375,8 @@ next name. A query with metadata atoms and no literal tests every inode row
 first and then walks the name rows for the inodes that pass, loading the name
 sections only if one does. Everything else tests every name. A name query loads
 the name, directory, root, traversed and link sections, never the document rows,
-and loads the inode columns once it has a row to report; a metadata test loads
-only the columns it reads. Paths are resolved once per
+and no inode columns for plain output (`--json` loads Size, Mtime and Doc); a
+metadata test loads only the columns it reads. Paths are resolved once per
 parent directory. Measured (`ferret-bench`, D43): a rare word is 5 ms warm at
 `$HOME`, 206 ms at 10M and 763 ms at 40M, nearly all of it the section loads.
 

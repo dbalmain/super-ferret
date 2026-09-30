@@ -29,8 +29,8 @@ pub struct Query {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Strategy {
     /// Scan the name heap for the driving literal; test only the names it
-    /// hits (D14). Reads the name sections, and the inode sections once a
-    /// name passes.
+    /// hits (D14). Reads the name sections, and no inode sections for plain
+    /// output.
     HeapScan,
     /// Test every inode row against the metadata atoms, then walk the name
     /// rows for the inodes that pass. For a query with metadata atoms and no

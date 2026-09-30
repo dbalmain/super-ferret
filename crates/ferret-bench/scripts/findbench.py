@@ -217,19 +217,17 @@ def main():
         )
         f.write(
             "| query | strategy | rows | evicted first / wall | fresh wall "
-            "| in-proc first / total | max RSS | bytes read | single reads |\n"
+            "| in-proc first / total | max RSS | bytes read |\n"
         )
-        f.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        f.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
         for q, ev, fr in rows:
-            s = fr[0]["stats"]
             f.write(
                 f"| `{' '.join(q)}` | {fr[0]['strategy']} | {fr[0]['rows']} | "
                 f"{med(ev, 'first'):.1f} / {med(ev, 'wall'):.1f} | "
                 f"{med(fr, 'wall'):.1f} | "
                 f"{med(fr, 'first'):.1f} / {med(fr, 'total'):.1f} | "
                 f"{med(fr, 'rss') / 1024:.0f} MB | "
-                f"{fr[0]['read'] / 1e6:.1f} MB | "
-                f"{s.get('single_inode_reads', '')} |\n"
+                f"{fr[0]['read'] / 1e6:.1f} MB |\n"
             )
         if args.bench:
             f.write("\n## Sections\n\n")
