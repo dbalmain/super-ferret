@@ -45,7 +45,7 @@ Predecessors, carried forward where still open:
 | D27 | `InoId` and `NameId`: stable, or renumbered              | answered       | A: renumber each snapshot; C once indexing is incremental                                                      |
 | D28 | Name layout: raw sorted by parent, or front-coded        | answered       | A: raw NUL-terminated heap by (parent, name); suffix array a later experiment                                  |
 | D29 | How a parallel walk tells the catalog each parent        | answered       | A: the walker carries a per-directory value                                                                    |
-| D30 | What `ferret find` builds when it opens the catalog      | answered       | C: lazy, plus a persisted directory `InoId → NameId`; cold find measured                                       |
+| D30 | What `ferret find` builds when it opens the catalog      | answered       | C: lazy, plus a persisted directory `InoId → NameId`; amended: only load and unloaded parts measured cold      |
 | D31 | One inode, several names                                 | answered       | C: one row per file inode, per directory name; shared per-run hash cache                                       |
 | D32 | A reader while `ferret index` runs                       | answered       | A: generations plus a single-writer lock                                                                       |
 | D33 | What the walker must also hand the catalog               | answered       | A: walker hands over the directory handle and work-tree kind                                                   |
@@ -1555,6 +1555,24 @@ with a load average near 2.5 from other work. So opening is reading, and reading
 costs more than the name scan itself (5–8 ms). The name sections (names, heap,
 directory names, traversed, roots, strings) are the first 16.1 MB of the file;
 reading only them took 5.0 ms warm and 16.8 ms evicted. See D38.
+
+**Amended (2026-10-03).** The daemon is the normal mode (D46, D49), so a cold
+query without one is no longer a first-class measurement or a factor in the
+format. Two cold costs still count:
+
+- **Index load at start-up**: the time for a daemon, or a one-shot process, to
+  open and load what it keeps in memory.
+- **Cold reads of index parts that are not loaded at start-up**, such as the
+  trigram postings. A query pays these even with a live daemon.
+
+Otherwise, query speed is measured warm, as find-compat's timing already does.
+Default `ferret find` answers from the index (stored columns, catalog order). It
+will not be advertised until the daemon keeps the index current.
+
+> Dave: The only cold read I care about now is the index load time on start-up
+> and cold reads of the parts of the index that _don't_ get loaded into memory
+> on start up. These will be the indexes like the trigrams and will still cost
+> time when searching with a live daemon.
 
 ## D31 — One inode, several names
 
