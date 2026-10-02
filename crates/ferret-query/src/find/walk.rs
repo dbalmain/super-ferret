@@ -10,6 +10,7 @@
 //! neither.
 
 use std::cell::OnceCell;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, FileType, Metadata};
 use std::io;
@@ -18,7 +19,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
 
@@ -79,6 +80,9 @@ pub struct Entry {
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
     target: Option<Target>,
+    parent: Option<InoId>,
+    /// Shared across a walk so action workers can update counts safely.
+    removed_children: Option<Arc<Mutex<BTreeMap<InoId, u32>>>>,
     pub(super) catalog: Option<Arc<Catalog>>,
 }
 
@@ -108,6 +112,8 @@ impl Entry {
             kind: Some(kind),
             metadata: OnceCell::new(),
             target: None,
+            parent: None,
+            removed_children: None,
             catalog: None,
         }
     }
@@ -164,7 +170,25 @@ impl Entry {
         let Target::Inode(id) = self.target? else {
             return None;
         };
-        self.catalog.as_ref()?.has_children(id)
+        let count = self.catalog.as_ref()?.entry_count(id)?;
+        let removed = self.removed_children.as_ref().map_or(0, |children| {
+            children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&id)
+                .copied()
+                .unwrap_or(0)
+        });
+        Some(count > removed)
+    }
+    pub(super) fn note_deleted(&self) {
+        if let (Some(parent), Some(children)) = (self.parent, &self.removed_children) {
+            let mut removed = children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let count = removed.entry(parent).or_default();
+            *count = count.saturating_add(1);
+        }
     }
     pub(super) fn link_target(&self) -> io::Result<Vec<u8>> {
         if let (Some(catalog), Some(Target::Inode(id))) = (&self.catalog, self.target) {
@@ -376,6 +400,7 @@ struct Saved {
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
     target: Option<Target>,
+    parent: Option<InoId>,
     catalog: Option<Arc<Catalog>>,
 }
 
@@ -389,6 +414,7 @@ impl Saved {
             kind: entry.kind,
             metadata: std::mem::take(&mut entry.metadata),
             target: entry.target,
+            parent: entry.parent,
             catalog: entry.catalog.clone(),
         }
     }
@@ -402,6 +428,7 @@ impl Saved {
         entry.check_directory = false;
         entry.metadata = self.metadata;
         entry.target = self.target;
+        entry.parent = self.parent;
         entry.catalog = self.catalog;
     }
 }
@@ -412,6 +439,7 @@ struct Child {
     name: (usize, usize),
     kind: Option<FileKind>,
     target: Option<Target>,
+    parent: Option<InoId>,
 }
 
 /// An open directory. Its children occupy `start..end` of the walk's child
@@ -455,6 +483,8 @@ enum Loaded {
 /// A descriptor exhaustion error is reported just like a listing failure.
 pub struct LiveWalk {
     catalog: Option<Arc<Catalog>>,
+    /// Counts only successful catalog-child removals made by this walk.
+    removed_children: Option<Arc<Mutex<BTreeMap<InoId, u32>>>>,
     nested_roots: Vec<(InoId, InoId, Vec<u8>)>,
     paths: std::vec::IntoIter<PathBuf>,
     options: Options,
@@ -473,6 +503,7 @@ impl LiveWalk {
     pub(super) fn new(paths: Vec<PathBuf>, options: Options) -> Self {
         Self {
             catalog: None,
+            removed_children: None,
             nested_roots: Vec::new(),
             paths: paths.into_iter(),
             options,
@@ -559,6 +590,7 @@ impl LiveWalk {
                     name: (name_start, self.names.len()),
                     kind: Some(catalog_kind(child.kind)),
                     target: Some(child.target),
+                    parent: Some(dir),
                 });
             }
             // Nested roots have no name row in the outer crawl (D34).
@@ -577,6 +609,7 @@ impl LiveWalk {
                     name: (name_start, self.names.len()),
                     kind: Some(FileKind::Directory),
                     target: Some(Target::Inode(*id)),
+                    parent: Some(dir),
                 });
             }
             if added {
@@ -661,6 +694,7 @@ impl LiveWalk {
                 name: (name_start, self.names.len()),
                 kind,
                 target,
+                parent: None,
             });
         }
         if self.children.len() > start
@@ -706,6 +740,7 @@ impl LiveWalk {
                 let path = self.paths.next()?;
                 let follow = self.options.follow != Follow::Physical;
                 self.entry = Entry::new(path, 0, FileKind::File);
+                self.entry.removed_children = self.removed_children.clone();
                 if let Some(catalog) = &self.catalog {
                     let resolved = match resolve(catalog, self.entry.path(), follow || self.entry.path.ends_with(b"/")) {
                         Ok(Some(resolved)) => resolved,
@@ -771,6 +806,8 @@ impl LiveWalk {
             entry.check_directory = false;
             entry.metadata = OnceCell::new();
             entry.target = child.target;
+            entry.parent = child.parent;
+            entry.removed_children = self.removed_children.clone();
             if child.target.is_some() {
                 if entry.catalog.is_none() {
                     entry.catalog = self.catalog.clone();
@@ -953,6 +990,7 @@ pub struct CatalogSource {
 impl CatalogSource {
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
         let mut walk = LiveWalk::new(paths, options);
+        walk.removed_children = Some(Arc::new(Mutex::new(BTreeMap::new())));
         for (id, path) in catalog.roots() {
             let path = Path::new(OsStr::from_bytes(path));
             if let Some(parent) = path.parent()

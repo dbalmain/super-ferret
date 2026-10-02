@@ -72,6 +72,8 @@ usage:
                                 GNU find syntax; -I walks without an index
                                 default uses catalog visibility and respects ignore rules
                                 pasted find ... -delete skips ignored files and still exits 0
+                                -empty sees this walk's -delete removals, not -exec removals;
+                                use -delete or -I for deletion-aware emptiness
   ferret search [--json] [--limit N] [--] ATOM...
                                 print each path that matches every ATOM
   ferret stats                  counts, sizes and a census of the index
@@ -112,6 +114,8 @@ find exit status: 0 success, 1 error (including invalid syntax).
   $XDG_CONFIG_HOME/ferret/config: find_no_ignore = true makes -I the default.
   Pasted find ... -delete skips ignored files and still exits 0; a failed
   deletion (for example a directory still holding ignored files) exits 1.
+  In default mode -empty sees this walk's -delete removals, not removals by
+  -exec commands; use -delete or -I for deletion-aware emptiness.
 
 search exit status: 0 success (search printed a row), 1 search matched nothing,
   2 usage error, 3 runtime error (no index, I/O, lock held, walk faults).

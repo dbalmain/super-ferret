@@ -192,7 +192,10 @@ pub(super) fn evaluate(
                 fs::remove_file(entry.path())
             };
             match result {
-                Ok(()) => Ok(true),
+                Ok(()) => {
+                    entry.note_deleted();
+                    Ok(true)
+                }
                 Err(error) => {
                     effects.error(&WalkError {
                         path: entry.path().to_owned(),

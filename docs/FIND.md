@@ -41,9 +41,10 @@ observe which catalog names still exist when entering each directory, and open
 directories for descent errors and execdir handles. A later sibling removal
 does not hide a name already observed; a removed directory fails descent.
 Names created by actions remain absent from the snapshot. Stored predicates
-retain their indexed values. In particular, indexed `-empty` can leave a
-directory emptied by earlier deletions; that effectful contract is still open
-under milestone 5a's correctness rule.
+retain their indexed values. In default mode, `-empty` starts with the raw
+indexed child count, including ignored children, and subtracts successful
+removals made by this walk's `-delete`. It does not see removals made by
+`-exec` commands. Use `-delete` for this accounting or `-I` for live emptiness.
 
 Validation, full-corpus classification, missing-field costs and the complete
 warm timing table are recorded in

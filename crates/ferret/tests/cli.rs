@@ -1480,8 +1480,8 @@ fn catalog_find_keeps_indexed_mtime_after_live_timestamps_change() {
 }
 
 #[test]
-fn catalog_find_keeps_indexed_emptiness_after_deleting_children_in_depth_order() {
-    // The original raw count includes children that -delete has now removed.
+fn catalog_find_counts_its_own_deletions_for_indexed_emptiness() {
+    // Successful child deletes reduce the indexed count before -empty runs.
     let env = catalog_delete_tree("catalog-delete-empty");
     let output = env
         .command(&[
@@ -1506,9 +1506,78 @@ fn catalog_find_keeps_indexed_emptiness_after_deleting_children_in_depth_order()
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(output.stderr.is_empty());
     for dir in ["sub", "node_modules", "target/doc"] {
-        assert!(env.at(dir).exists(), "{dir} used live emptiness");
+        assert!(
+            !env.at(dir).exists(),
+            "{dir} remained after its last child was deleted"
+        );
     }
+    assert!(
+        env.at("target").exists(),
+        "ignored child must count toward -empty"
+    );
     assert!(env.at("target/hidden").exists());
+}
+
+#[test]
+fn catalog_find_failed_delete_does_not_reduce_indexed_emptiness() {
+    let env = Env::new("catalog-delete-empty-failure");
+    env.seed_ignore_file();
+    env.write("kept/file", b"contents");
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-depth"),
+            os("-type"),
+            os("d"),
+            os("-delete"),
+            os("-o"),
+            os("-empty"),
+            os("-print"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(env.at("kept").exists());
+    assert!(
+        !output
+            .stdout
+            .windows(b"./kept\n".len())
+            .any(|w| w == b"./kept\n")
+    );
+}
+
+#[test]
+fn catalog_find_exec_rmdir_removals_do_not_change_indexed_emptiness() {
+    // The child command removes `inner`; its parent still sees the raw count.
+    let env = Env::new("catalog-exec-rmdir-empty");
+    env.seed_ignore_file();
+    fs::create_dir_all(env.at("outer/inner")).unwrap();
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let output = env
+        .command(&[
+            os("find"),
+            os("outer"),
+            os("-depth"),
+            os("-type"),
+            os("d"),
+            os("-empty"),
+            os("-exec"),
+            os("rmdir"),
+            os("{}"),
+            os(";"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(env.at("outer").exists());
+    assert!(!env.at("outer/inner").exists());
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
