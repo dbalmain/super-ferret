@@ -4,6 +4,7 @@
 
 mod glob;
 mod parse;
+mod test;
 mod walk;
 
 use std::ffi::OsString;
@@ -13,7 +14,7 @@ use std::path::Path;
 pub use parse::{ParseError, Plan};
 pub use walk::{Entry, EntrySource, FileKind, LiveWalk, WalkError};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Expression {
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
@@ -26,6 +27,7 @@ enum Expression {
     Print(bool),
     Prune,
     Quit,
+    Test(test::Test),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,6 +94,11 @@ impl Plan {
     /// Whether `-I` / `--no-ignore` selected the live, GNU-compatible mode.
     pub fn no_ignore(&self) -> bool {
         self.no_ignore
+    }
+
+    /// Whether parsing observed GNU's warning-producing `-perm /000` form.
+    pub fn permission_warning(&self) -> bool {
+        self.permission_warning
     }
 
     /// The first feature that parses but is not evaluated in this milestone.
@@ -204,6 +211,7 @@ fn evaluate(
             control.quit = true;
             true
         }
+        Expression::Test(test) => test.evaluate(entry).map_err(EvaluationError::Metadata)?,
     })
 }
 

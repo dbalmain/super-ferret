@@ -25,6 +25,11 @@ pub fn run(args: &[OsString]) -> Exit {
         );
         return Exit::NoMatch;
     }
+    if plan.permission_warning() {
+        cli::error(
+            "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form",
+        );
+    }
     let stdout = io::stdout();
     let mut effects = Output {
         writer: BufWriter::new(stdout.lock()),
