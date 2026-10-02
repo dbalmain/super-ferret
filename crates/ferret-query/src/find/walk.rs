@@ -1,15 +1,17 @@
 //! Sequential, prunable depth-first traversal in readdir order. Paths keep the
-//! spelling of each start operand. DirEntry::file_type uses d_type on Linux;
-//! metadata is cached only when traversal or a predicate needs it.
+//! spelling of each start operand. Raw d_type stays optional; an unknown type
+//! shares the entry's one lstat cache with metadata predicates.
 
 use std::cell::OnceCell;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, FileType, Metadata, ReadDir};
+use std::fs::{self, FileType, Metadata};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+use rustix::fs::{Dir, FileType as RawType, Mode, OFlags, open};
 
 use super::Options;
 
@@ -56,7 +58,7 @@ fn kind(value: FileType) -> FileKind {
 pub struct Entry {
     path: PathBuf,
     depth: usize,
-    kind: FileKind,
+    kind: Option<FileKind>,
     metadata: Rc<OnceCell<io::Result<Metadata>>>,
 }
 
@@ -66,7 +68,7 @@ impl Entry {
         Self {
             path,
             depth,
-            kind,
+            kind: Some(kind),
             metadata: Rc::new(OnceCell::new()),
         }
     }
@@ -79,9 +81,10 @@ impl Entry {
     pub fn depth(&self) -> usize {
         self.depth
     }
-    /// Type from the source, generally d_type for live children.
-    pub fn kind(&self) -> FileKind {
+    /// Type from d_type if known, otherwise from the single cached lstat.
+    pub fn kind(&self) -> Result<FileKind, &io::Error> {
         self.kind
+            .map_or_else(|| self.metadata().map(|stat| kind(stat.file_type())), Ok)
     }
     /// Final path component as bytes, including `.` and `..` in start operands.
     /// Trailing slashes are omitted, except for an all-slash root operand.
@@ -125,7 +128,7 @@ pub trait EntrySource {
 
 struct Directory {
     entry: Entry,
-    children: ReadDir,
+    children: Dir,
     root_dev: u64,
 }
 
@@ -136,13 +139,15 @@ enum Task {
 }
 
 /// The live source: sequential depth-first readdir, without ignore rules.
-/// It holds one ReadDir per ancestor, never collects or sorts child names.
+/// It holds one directory handle per ancestor and never sorts child names.
 /// A descriptor exhaustion error is reported just like a listing failure.
 pub struct LiveWalk {
     paths: std::vec::IntoIter<PathBuf>,
     tasks: Vec<Task>,
     pending: Option<(Entry, u64)>,
     options: Options,
+    #[cfg(test)]
+    pub(super) force_unknown: bool,
 }
 
 impl LiveWalk {
@@ -152,12 +157,19 @@ impl LiveWalk {
             tasks: Vec::new(),
             pending: None,
             options,
+            #[cfg(test)]
+            force_unknown: false,
         }
     }
 
     fn descend(&mut self, entry: Entry, root_dev: u64) -> Result<(), WalkError> {
-        if entry.kind != FileKind::Directory
-            || self.options.max_depth.is_some_and(|max| entry.depth >= max)
+        if self.options.max_depth.is_some_and(|max| entry.depth >= max) {
+            return Ok(());
+        }
+        if entry.kind().map_err(|error| WalkError {
+            path: entry.path.clone(),
+            error: copy_error(error),
+        })? != FileKind::Directory
         {
             return Ok(());
         }
@@ -173,7 +185,13 @@ impl LiveWalk {
                 }
             }
         }
-        match fs::read_dir(&entry.path) {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let flags = if entry.depth == 0 {
+            flags
+        } else {
+            flags | OFlags::NOFOLLOW
+        };
+        match open(&entry.path, flags, Mode::empty()).and_then(Dir::new) {
             Ok(children) => self.tasks.push(Task::Children(Directory {
                 entry,
                 children,
@@ -184,7 +202,10 @@ impl LiveWalk {
                 if self.options.depth_first {
                     self.tasks.push(Task::After(entry));
                 }
-                return Err(WalkError { path, error });
+                return Err(WalkError {
+                    path,
+                    error: io::Error::from(error),
+                });
             }
         }
         Ok(())
@@ -217,8 +238,16 @@ impl EntrySource for LiveWalk {
             match task {
                 Task::Visit(entry, root_dev) => {
                     if self.options.depth_first
-                        && entry.kind == FileKind::Directory
                         && self.options.max_depth.is_none_or(|max| entry.depth < max)
+                        && match entry.kind() {
+                            Ok(kind) => kind == FileKind::Directory,
+                            Err(error) => {
+                                return Some(Err(WalkError {
+                                    path: entry.path.clone(),
+                                    error: copy_error(error),
+                                }));
+                            }
+                        }
                     {
                         // xdev directories still evaluate, even when not
                         // descended.
@@ -238,26 +267,36 @@ impl EntrySource for LiveWalk {
                     }
                 }
                 Task::After(entry) => return Some(Ok(entry)),
-                Task::Children(mut directory) => match directory.children.next() {
+                Task::Children(mut directory) => match directory.children.read() {
                     Some(Ok(child)) => {
-                        let path = join(directory.entry.path(), &child.file_name());
+                        let name = child.file_name().to_bytes();
+                        if name == b"." || name == b".." {
+                            self.tasks.push(Task::Children(directory));
+                            continue;
+                        }
+                        let path = join(directory.entry.path(), OsStr::from_bytes(name));
                         let depth = directory.entry.depth + 1;
                         let root_dev = directory.root_dev;
                         self.tasks.push(Task::Children(directory));
-                        match child.file_type() {
-                            Ok(file_type) => self.tasks.push(Task::Visit(
-                                Entry::new(path, depth, kind(file_type)),
-                                root_dev,
-                            )),
-                            Err(error) => return Some(Err(WalkError { path, error })),
+                        let mut entry = Entry::new(path, depth, FileKind::File);
+                        entry.kind = raw_kind(child.file_type());
+                        #[cfg(test)]
+                        if self.force_unknown {
+                            entry.kind = None;
                         }
+                        self.tasks.push(Task::Visit(entry, root_dev));
                     }
                     Some(Err(error)) => {
                         let path = directory.entry.path.clone();
                         self.tasks.push(Task::Children(directory));
-                        return Some(Err(WalkError { path, error }));
+                        return Some(Err(WalkError {
+                            path,
+                            error: io::Error::from(error),
+                        }));
                     }
                     None => {
+                        // An open directory unlinked after enumeration can
+                        // finish without a diagnostic for name-only queries.
                         if self.options.depth_first {
                             return Some(Ok(directory.entry));
                         }
@@ -277,9 +316,22 @@ fn join(parent: &Path, name: &OsStr) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes))
 }
 
-fn copy_error(error: &io::Error) -> io::Error {
+pub(super) fn copy_error(error: &io::Error) -> io::Error {
     error.raw_os_error().map_or_else(
         || io::Error::new(error.kind(), error.to_string()),
         io::Error::from_raw_os_error,
     )
+}
+
+fn raw_kind(value: RawType) -> Option<FileKind> {
+    Some(match value {
+        RawType::RegularFile => FileKind::File,
+        RawType::Directory => FileKind::Directory,
+        RawType::Symlink => FileKind::Symlink,
+        RawType::Fifo => FileKind::Fifo,
+        RawType::Socket => FileKind::Socket,
+        RawType::BlockDevice => FileKind::Block,
+        RawType::CharacterDevice => FileKind::Character,
+        RawType::Unknown => return None,
+    })
 }

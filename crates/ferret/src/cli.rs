@@ -1,9 +1,9 @@
-//! The program: parse the command line, search the index and ferret's
+//! The program: parse the command line, locate the index and ferret's
 //! directories, run one command, and map its outcome to an exit status.
 //!
-//! Each command lives in its own module ([`crate::search`], [`crate::index`],
-//! [`crate::stats`]) and returns an [`Exit`]; this module is the only one
-//! that reads the process environment.
+//! Each command lives in its own module ([`crate::find`], [`crate::search`],
+//! [`crate::index`], [`crate::stats`]) and returns an [`Exit`]; this module is
+//! the only one that reads the process environment.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -14,12 +14,12 @@ use crate::args::{self, Command};
 use crate::xdg::Dirs;
 
 /// ferret's exit statuses. They are stable: scripts and the agent skill
-/// depend on them. grep's convention, with usage and runtime errors split.
+/// depend on them. Search follows grep's convention; find uses GNU's 0/1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
     /// The command succeeded; for `search`, at least one row was printed.
     Ok = 0,
-    /// `search` ran and matched nothing.
+    /// `search` matched nothing, or `find` encountered an error.
     NoMatch = 1,
     /// The command line, or a query atom in it, is not valid. Nothing ran.
     Usage = 2,
@@ -68,9 +68,10 @@ usage:
                                 with none, re-index every root
   ferret roots list             print the roots, one per line
   ferret roots remove DIR...    stop indexing DIR (roots inside it stay)
-  ferret find [-I|--no-ignore] [-H|-L|-P] [PATH...] [EXPRESSION]
+  ferret find [-I|--no-ignore] [-P] [PATH...] [EXPRESSION]
                                 GNU find syntax; -I walks without an index
                                 default ignore mode is not implemented yet
+                                -H/-L and later primaries parse but are deferred
   ferret search [--json] [--limit N] [--] ATOM...
                                 print each path that matches every ATOM
   ferret stats                  counts, sizes and a census of the index
@@ -78,6 +79,14 @@ usage:
 
   --index DIR   the index to use; else $FERRET_INDEX, else
                 $XDG_DATA_HOME/ferret (~/.local/share/ferret)
+
+find expressions:
+  -name/-iname GLOB, -path/-ipath GLOB, -wholename/-iwholename GLOB
+  -type f,d,l,p,s,b,c          one type or a comma list
+  -maxdepth N, -mindepth N, -depth, -xdev/-mount
+  -print, -print0, -prune, -quit, -true, -false
+  ( EXPR ), !/-not, -a/-and, -o/-or, comma; adjacent tests imply AND
+  No action adds -print to the entire expression. Stars match dots and slashes.
 
 query atoms (all must match; one atom per argument):
   WORD            the name contains WORD; with a '/', the path does

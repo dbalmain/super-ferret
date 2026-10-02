@@ -25,21 +25,20 @@ pub fn run(args: &[OsString]) -> Exit {
         );
         return Exit::NoMatch;
     }
-    if let Some(feature) = plan.unsupported() {
-        cli::error(&format!(
-            "find: {}: not implemented yet",
-            feature.to_string_lossy()
-        ));
-        return Exit::NoMatch;
-    }
-    if plan.debug_requested() {
-        cli::warn("find: debug requested; sequential evaluator, no expression optimization");
-    }
     let stdout = io::stdout();
     let mut effects = Output {
         writer: BufWriter::new(stdout.lock()),
     };
-    let outcome = plan.run(&mut plan.live_source(), &mut effects);
+    let outcome = match plan.run(&mut plan.live_source(), &mut effects) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            cli::error(&format!(
+                "find: {}: not implemented yet",
+                error.feature.to_string_lossy()
+            ));
+            return Exit::NoMatch;
+        }
+    };
     let flushed = effects.writer.flush();
     if let Err(error) = flushed {
         cli::error(&format!("find: writing stdout: {error}"));

@@ -4,7 +4,8 @@
 //! Flags may come before or after the command, as `--flag VALUE` or
 //! `--flag=VALUE`. `--` ends the flags, so a query atom that starts with `-`
 //! is written `ferret search -- -atom`. Every other argument that starts with
-//! `-` is a flag, and an unknown one is an error rather than an atom.
+//! `-` is a flag, and an unknown one is an error rather than an atom. Find's
+//! arguments pass intact to its own parser once its command name is seen.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;

@@ -26,7 +26,7 @@ crate's `Cargo.toml` disagrees with it.
 
 ```text
 ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify, ferret-policy
-ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text
+ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text, rustix
 ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
 ferret-index   → ferret-text, intpack (git dependency, may be vendored — D11)
 ferret-catalog → (std only)
@@ -324,11 +324,13 @@ the first name to claim it reads it, a later name takes the stored observation
 whole if its own stat agrees and is a content fault if not, and a name that
 meets the inode in flight is set aside and resolved once the inode is finished
 (the backlog is drained as inodes finish, and the rest when its root's walk
-ends, so no root's backlog outlives it), so no worker ever waits on another. Faults are typed (D26 A′): a coverage fault — listing,
-opening or reopening a directory, reading an ignore file (the global one
-included: missing is the defaults, unreadable fails the run), probing git,
-`readlink`, anything on a root — publishes nothing and leaves the old
-generation; an entry that vanished before its `lstat` is a deletion; a content
+ends, so no root's backlog outlives it), so no worker ever waits on another.
+Faults are typed (D26 A′, amended): EACCES from opening or listing a directory
+publishes its row without children and with an unknown entry count. Other
+coverage faults — listing, opening or reopening a directory, reading an ignore
+file (the global one included: missing is the defaults, unreadable fails the
+run), probing git, `readlink`, a root's lstat — publish nothing and leave the
+old generation; an entry that vanished before its `lstat` is a deletion; a content
 fault — open, stat or read failing, the bracket moving, aliases disagreeing —
 publishes the file with content state failed and no document, and it is re-read
 next run. The build is the authority on which inodes fault, since only it sees
@@ -380,15 +382,16 @@ FST, …) is decided in S2 and is itself an experiment row.
 ## Find syntax (milestone 1)
 
 `ferret-query::find` owns the GNU argument parser, expression evaluator and
-entry-source interface. Its live source uses `std::fs::read_dir` in sequential
-depth-first directory order, with physical symlink handling, pre-order by
+entry-source interface. Its live source uses safe `rustix` getdents iteration
+in sequential depth-first directory order, with physical symlink handling, pre-order by
 default and post-order under `-depth`. Each entry carries its exact path
 spelling and d_type-derived kind, and caches a lazy lstat observation (including
 failure). Starting paths are statted to establish existence. Directory metadata
 is read for `-xdev`; cheap name/type tests do not stat ordinary child entries.
 The engine sends prune feedback to the source and stops fetching on quit.
-`ferret` implements the output/diagnostic effects interface. No crate edge is
-added, and the existing policy-driven parallel crawler stays separate.
+`ferret` implements the output/diagnostic effects interface. The new crate edge
+is `ferret-query → rustix` for raw d_type access. The existing policy-driven
+parallel crawler stays separate.
 
 `ferret find -I` / `--no-ignore` uses this engine without opening an index,
 reading user config or writing a query log. Until milestone 4, the default

@@ -19,14 +19,13 @@ enum Expression {
     Or(Box<Self>, Box<Self>),
     Comma(Box<Self>, Box<Self>),
     Not(Box<Self>),
-    Name(Vec<u8>, bool),
-    Path(Vec<u8>, bool),
+    Name(glob::Pattern),
+    Path(glob::Pattern),
     Type(Vec<FileKind>),
     Constant(bool),
     Print(bool),
     Prune,
     Quit,
-    Unsupported(OsString),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,11 +45,36 @@ pub trait Effects {
     fn error(&mut self, error: &WalkError);
 }
 
+/// A recognized feature that this evaluator does not implement yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unsupported {
+    /// The primary or leading option that cannot execute.
+    pub feature: OsString,
+}
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unsupported find feature {}",
+            self.feature.to_string_lossy()
+        )
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
 /// Execution outcome; zero errors is success even when nothing matched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
     /// Traversal, metadata and output errors reported to the host.
     pub errors: u64,
+}
+
+#[derive(Debug)]
+enum EvaluationError {
+    Metadata(io::Error),
+    Output(io::Error),
 }
 
 #[derive(Default)]
@@ -76,22 +100,25 @@ impl Plan {
         self.unsupported.as_deref()
     }
 
-    /// Leading debug flags request diagnostics. The host may report that its
-    /// evaluator performs no GNU optimizations; this does not fail the query.
-    pub fn debug_requested(&self) -> bool {
-        self.debug
-    }
-
     /// Creates the sequential live source. It never opens a catalog.
     pub fn live_source(&self) -> LiveWalk {
         LiveWalk::new(self.paths.clone(), self.options)
     }
 
     /// Evaluates this plan over a source configured for its traversal options.
-    /// The caller must reject `unsupported()` before execution. The source
+    /// Unsupported features fail before the source is fetched. The source
     /// receives the previous entry's descent decision; `-quit` stops fetching
     /// entries immediately, including across multiple starting paths.
-    pub fn run(&self, source: &mut impl EntrySource, effects: &mut impl Effects) -> Outcome {
+    pub fn run(
+        &self,
+        source: &mut impl EntrySource,
+        effects: &mut impl Effects,
+    ) -> Result<Outcome, Unsupported> {
+        if let Some(feature) = &self.unsupported {
+            return Err(Unsupported {
+                feature: feature.clone(),
+            });
+        }
         let mut outcome = Outcome::default();
         let mut descend = true;
         while let Some(item) = source.next(descend) {
@@ -109,19 +136,27 @@ impl Plan {
             }
             let mut control = Control::default();
             if let Err(error) = evaluate(&self.expression, &entry, effects, &mut control) {
+                let (error, stop) = match error {
+                    EvaluationError::Metadata(error) => (error, false),
+                    EvaluationError::Output(error) => (error, true),
+                };
                 effects.error(&WalkError {
                     path: entry.path().to_owned(),
                     error,
                 });
                 outcome.errors += 1;
-                break;
+                descend = false;
+                if stop {
+                    break;
+                }
+                continue;
             }
             descend = !control.prune;
             if control.quit {
                 break;
             }
         }
-        outcome
+        Ok(outcome)
     }
 }
 
@@ -130,7 +165,7 @@ fn evaluate(
     entry: &Entry,
     effects: &mut impl Effects,
     control: &mut Control,
-) -> io::Result<bool> {
+) -> Result<bool, EvaluationError> {
     use std::os::unix::ffi::OsStrExt;
     if control.quit {
         return Ok(false);
@@ -147,14 +182,18 @@ fn evaluate(
             evaluate(right, entry, effects, control)?
         }
         Expression::Not(inner) => !evaluate(inner, entry, effects, control)?,
-        Expression::Name(pattern, fold) => glob::matches(pattern, entry.name(), *fold),
-        Expression::Path(pattern, fold) => {
-            glob::matches(pattern, entry.path().as_os_str().as_bytes(), *fold)
-        }
-        Expression::Type(kinds) => kinds.contains(&entry.kind()),
+        Expression::Name(pattern) => pattern.matches(entry.name()),
+        Expression::Path(pattern) => pattern.matches(entry.path().as_os_str().as_bytes()),
+        Expression::Type(kinds) => kinds.contains(
+            &entry
+                .kind()
+                .map_err(|error| EvaluationError::Metadata(walk::copy_error(error)))?,
+        ),
         Expression::Constant(value) => *value,
         Expression::Print(nul) => {
-            effects.print(entry.path(), *nul)?;
+            effects
+                .print(entry.path(), *nul)
+                .map_err(EvaluationError::Output)?;
             true
         }
         Expression::Prune => {
@@ -165,7 +204,6 @@ fn evaluate(
             control.quit = true;
             true
         }
-        Expression::Unsupported(_) => false,
     })
 }
 

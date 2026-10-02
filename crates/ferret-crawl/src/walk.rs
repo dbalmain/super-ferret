@@ -1087,6 +1087,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 }
                 Err(error) => {
                     self.fail(IoOp::List, context, io::Error::from(error));
+                    if error == Errno::ACCESS {
+                        // A denied directory is a catalogued opaque row,
+                        // even if the filesystem returned a partial batch.
+                        children.entries.clear();
+                        children.names.clear();
+                    }
                     children.complete = false;
                     break;
                 }

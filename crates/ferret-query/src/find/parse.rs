@@ -16,7 +16,6 @@ pub struct Plan {
     pub(super) options: Options,
     pub(super) no_ignore: bool,
     pub(super) unsupported: Option<OsString>,
-    pub(super) debug: bool,
 }
 
 /// Invalid find syntax. The host maps every variant to exit status 1.
@@ -62,7 +61,6 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         unsupported: None,
     };
     let mut no_ignore = false;
-    let mut debug = false;
     let mut follow = None;
     while let Some(arg) = parser.peek() {
         match arg {
@@ -73,7 +71,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
             b"-D" => {
                 parser.at += 1;
                 parser.argument(OsStr::new("-D"))?;
-                debug = true;
+                parser.unsupported(OsStr::new("-D"));
                 continue;
             }
             bytes if bytes.starts_with(b"-O") => {
@@ -88,7 +86,9 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         }
         parser.at += 1;
     }
-    parser.unsupported = follow;
+    if parser.unsupported.is_none() {
+        parser.unsupported = follow;
+    }
     let mut paths = Vec::new();
     while let Some(bytes) = parser.peek() {
         if bytes.starts_with(b"-") || bytes == b"(" || bytes == b"!" {
@@ -119,7 +119,6 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         options: parser.options,
         no_ignore,
         unsupported: parser.unsupported,
-        debug,
     })
 }
 
@@ -201,9 +200,9 @@ impl Parser<'_> {
                 let pattern = self.argument(&primary)?.as_bytes().to_vec();
                 let fold = primary.as_bytes()[1] == b'i';
                 if primary == "-name" || primary == "-iname" {
-                    Expression::Name(pattern, fold)
+                    Expression::Name(super::glob::Pattern::new(&pattern, fold))
                 } else {
-                    Expression::Path(pattern, fold)
+                    Expression::Path(super::glob::Pattern::new(&pattern, fold))
                 }
             }
             b"-type" => {
@@ -212,7 +211,9 @@ impl Parser<'_> {
             }
             b"-maxdepth" | b"-mindepth" => {
                 let value = self.argument(&primary)?;
-                let number = decimal(value.as_bytes()).filter(|&n| n <= i32::MAX as usize).ok_or_else(|| invalid(&primary, value))?;
+                let number = decimal(value.as_bytes())
+                    .filter(|&n| n <= i32::MAX as usize)
+                    .ok_or_else(|| invalid(&primary, value))?;
                 if primary == "-maxdepth" {
                     self.options.max_depth = Some(number);
                 } else {
@@ -273,15 +274,31 @@ impl Parser<'_> {
             | b"--help"
             | b"-version"
             | b"--version" => self.unsupported(&primary),
-            b"-lname" | b"-ilname" | b"-regex" | b"-iregex" | b"-fstype"
-            | b"-context" | b"-user" | b"-group" | b"-newer" | b"-anewer" | b"-cnewer"
-            | b"-samefile" | b"-files0-from" => {
+            b"-lname" | b"-ilname" | b"-regex" | b"-iregex" | b"-fstype" | b"-context"
+            | b"-user" | b"-group" | b"-newer" | b"-anewer" | b"-cnewer" | b"-samefile"
+            | b"-files0-from" => {
                 self.argument(&primary)?;
                 self.unsupported(&primary)
             }
             b"-regextype" => {
                 let value = self.argument(&primary)?;
-                if ![b"findutils-default".as_slice(), b"awk", b"ed", b"egrep", b"emacs", b"gnu-awk", b"grep", b"posix-awk", b"posix-basic", b"posix-egrep", b"posix-extended", b"posix-minimal-basic", b"sed"].contains(&value.as_bytes()) {
+                if ![
+                    b"findutils-default".as_slice(),
+                    b"awk",
+                    b"ed",
+                    b"egrep",
+                    b"emacs",
+                    b"gnu-awk",
+                    b"grep",
+                    b"posix-awk",
+                    b"posix-basic",
+                    b"posix-egrep",
+                    b"posix-extended",
+                    b"posix-minimal-basic",
+                    b"sed",
+                ]
+                .contains(&value.as_bytes())
+                {
                     return Err(invalid(&primary, value));
                 }
                 self.unsupported(&primary)
@@ -349,7 +366,7 @@ impl Parser<'_> {
         if self.unsupported.is_none() {
             self.unsupported = Some(primary.to_owned());
         }
-        Expression::Unsupported(primary.to_owned())
+        Expression::Constant(true)
     }
 
     fn exec(&mut self, primary: &OsStr) -> Result<(), ParseError> {
@@ -421,7 +438,9 @@ fn kinds(primary: &OsStr, value: &OsStr) -> Result<Vec<FileKind>, ParseError> {
             b"c" => FileKind::Character,
             _ => return Err(invalid(primary, value)),
         };
-        if kinds.contains(&kind) { return Err(invalid(primary, value)); }
+        if kinds.contains(&kind) {
+            return Err(invalid(primary, value));
+        }
         kinds.push(kind);
     }
     Ok(kinds)

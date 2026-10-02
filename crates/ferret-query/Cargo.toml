@@ -12,6 +12,7 @@ ferret-catalog.workspace = true
 ferret-index.workspace = true
 ferret-text.workspace = true
 ferret-verify.workspace = true
+rustix.workspace = true
 
 [lints]
 workspace = true

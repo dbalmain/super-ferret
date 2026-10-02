@@ -87,7 +87,7 @@ fn run(args: &[OsString]) -> (Outcome, Output) {
     let plan = Plan::parse(args).unwrap();
     assert!(plan.unsupported().is_none());
     let mut output = Output::default();
-    let outcome = plan.run(&mut plan.live_source(), &mut output);
+    let outcome = plan.run(&mut plan.live_source(), &mut output).unwrap();
     (outcome, output)
 }
 
@@ -337,7 +337,7 @@ fn a_directory_removed_after_its_visit_faults_without_losing_siblings() {
         remove: Some(tree.0.join("dir")),
         ..Output::default()
     };
-    let outcome = plan.run(&mut plan.live_source(), &mut output);
+    let outcome = plan.run(&mut plan.live_source(), &mut output).unwrap();
     assert_eq!(outcome.errors, 1);
     assert_eq!(output.errors, [tree.0.join("dir")]);
     assert!(
@@ -388,6 +388,11 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
         &["-type", "q"],
         &["-type", "f,"],
         &["-type", "ff"],
+        &["-type", "f,f"],
+        &["-type", "D"],
+        &["-maxdepth", "2147483648"],
+        &["-perm", "u+ug"],
+        &["-regextype", "help"],
         &["-type", ""],
         &["-perm", "+066"],
         &["-perm", "888"],
@@ -485,6 +490,12 @@ fn differential_against_pinned_gnu() {
         &["-name", "["],
         &["-name", "*\\"],
         &["-name", "[[:space:]]*"],
+        &["-iname", "[[:upper:]]*"],
+        &["-iname", "[![:upper:]]*"],
+        &["-iname", "[A-z]*"],
+        &["-iname", "[Z-a]*"],
+        &["-iname", "[[=a=]]*"],
+        &["-iname", "[[.a.]-[.c.]]*"],
     ];
     for expression in expressions {
         let gnu = Command::new(binary)
@@ -513,6 +524,164 @@ fn differential_against_pinned_gnu() {
             output.errors.is_empty(),
             gnu.stderr.is_empty(),
             "stderr {expression:?}"
+        );
+    }
+}
+
+#[test]
+fn c_locale_case_folding_distinguishes_ranges_classes_and_collating_symbols() {
+    let tree = Tree::new("classes");
+    for name in ["a", "A", "b", "B", "Z", "z", "_", "[[:bogus:]]"] {
+        fs::write(tree.0.join(name), b"").unwrap();
+    }
+    let cases: &[(&[&str], &[&str])] = &[
+        (&["-iname", "[[:upper:]]"], &["A", "B", "Z"]),
+        (&["-iname", "[[:lower:]]"], &["a", "b", "z"]),
+        (&["-iname", "[A-z]"], &["a", "A", "b", "B", "Z", "z"]),
+        (&["-iname", "[Z-a]"], &[]),
+        (&["-iname", "[[=a=]]"], &["a"]),
+        (&["-iname", "[[.a.]]"], &["a"]),
+        (&["-iname", "[[.a.]-[.b.]]"], &["a", "A", "b", "B"]),
+        (&["-name", "[[.ab.]]"], &[]),
+        (&["-name", "[[:bogus:]]"], &[]),
+    ];
+    for (expression, expected) in cases {
+        let (_, output) = tree.run(expression);
+        assert_eq!(
+            records(&output.bytes, b'\n'),
+            paths(&tree, expected),
+            "{expression:?}"
+        );
+    }
+}
+
+#[test]
+fn unknown_dtype_uses_one_lazy_stat_and_a_failed_stat_keeps_walking() {
+    let tree = Tree::new("unknown");
+    let plan = Plan::parse(&tree.args(&["-type", "f"])).unwrap();
+    let mut live = plan.live_source();
+    live.force_unknown = true;
+    struct Vanishing {
+        live: LiveWalk,
+        victim: PathBuf,
+    }
+    impl EntrySource for Vanishing {
+        fn next(&mut self, descend: bool) -> Option<Result<Entry, WalkError>> {
+            let item = self.live.next(descend)?;
+            if let Ok(entry) = &item
+                && entry.path() == self.victim
+            {
+                fs::remove_file(&self.victim).unwrap();
+            }
+            Some(item)
+        }
+    }
+    let mut source = Vanishing {
+        live,
+        victim: tree.0.join("a.c"),
+    };
+    let mut output = Output::default();
+    let outcome = plan.run(&mut source, &mut output).unwrap();
+    assert_eq!(outcome.errors, 1);
+    assert_eq!(output.errors, [tree.0.join("a.c")]);
+    assert!(
+        records(&output.bytes, b'\n')
+            .contains(&tree.0.join("b.txt").as_os_str().as_bytes().to_vec())
+    );
+
+    // With a depth limit and a name-only test, unknown d_type needs no stat.
+    let plan = Plan::parse(&tree.args(&["-maxdepth", "1", "-name", "b.txt"])).unwrap();
+    let mut live = plan.live_source();
+    live.force_unknown = true;
+    let mut source = Vanishing {
+        live,
+        victim: tree.0.join("b.txt"),
+    };
+    let mut output = Output::default();
+    let outcome = plan.run(&mut source, &mut output).unwrap();
+    assert_eq!(outcome.errors, 0);
+    assert_eq!(records(&output.bytes, b'\n'), paths(&tree, &["b.txt"]));
+}
+
+#[test]
+fn parser_precedence_and_implicit_action_are_visible_in_the_ast() {
+    let args = ["-false", "-o", "!", "-false", "-a", "-true", ",", "-false"].map(OsString::from);
+    let plan = Plan::parse(&args).unwrap();
+    let Expression::And(expression, print) = plan.expression else {
+        panic!("implicit print must wrap expression");
+    };
+    assert_eq!(*print, Expression::Print(false));
+    let Expression::Comma(left, right) = *expression else {
+        panic!("comma binds weakest");
+    };
+    assert_eq!(*right, Expression::Constant(false));
+    let Expression::Or(left, right) = *left else {
+        panic!("OR precedes comma");
+    };
+    assert_eq!(*left, Expression::Constant(false));
+    let Expression::And(left, right) = *right else {
+        panic!("AND binds inside OR");
+    };
+    assert_eq!(
+        *left,
+        Expression::Not(Box::new(Expression::Constant(false)))
+    );
+    assert_eq!(*right, Expression::Constant(true));
+}
+
+#[test]
+fn unsupported_plans_fail_before_the_source_or_effects_are_used() {
+    let plan =
+        Plan::parse(&["-I", "missing", "-printf", "%p", "-name", "x"].map(OsString::from)).unwrap();
+    let mut output = Output::default();
+    let error = plan.run(&mut plan.live_source(), &mut output).unwrap_err();
+    assert_eq!(error.feature, "-printf");
+    assert!(output.errors.is_empty());
+    assert!(output.bytes.is_empty());
+}
+
+#[test]
+fn xdev_and_mount_evaluate_a_mount_point_without_entering_it() {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(parent), Ok(child)) = (fs::metadata("/proc"), fs::metadata("/proc/sys")) else {
+        return;
+    };
+    if parent.dev() == child.dev() {
+        return;
+    }
+    let expression = [
+        "-maxdepth",
+        "2",
+        "-path",
+        "/proc",
+        "-o",
+        "-path",
+        "/proc/sys*",
+        "-o",
+        "-prune",
+        "-a",
+        "-false",
+    ];
+    let base: Vec<OsString> = ["-I", "/proc"]
+        .into_iter()
+        .chain(expression)
+        .map(OsString::from)
+        .collect();
+    let (outcome, output) = run(&base);
+    assert_eq!(outcome.errors, 0);
+    assert!(
+        records(&output.bytes, b'\n')
+            .iter()
+            .any(|path| path.starts_with(b"/proc/sys/"))
+    );
+    for flag in ["-xdev", "-mount"] {
+        let mut args = base.clone();
+        args.push(flag.into());
+        let (outcome, output) = run(&args);
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(
+            records(&output.bytes, b'\n'),
+            [b"/proc".to_vec(), b"/proc/sys".to_vec()]
         );
     }
 }

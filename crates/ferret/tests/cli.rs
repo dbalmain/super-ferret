@@ -943,3 +943,97 @@ fn an_index_run_while_another_holds_the_lock_fails_clearly() {
     lock.unlock().unwrap();
     assert_eq!(code(&env.run(&[os("index")])), 0);
 }
+
+#[test]
+fn find_probe_needs_no_index_config_home_or_log() {
+    let env = Env::new("find-probe");
+    let tree = env.tree();
+    let args = [
+        os("find"),
+        os("-I"),
+        tree.as_os_str(),
+        os("-maxdepth"),
+        os("0"),
+        os("-print"),
+    ];
+    let output = env
+        .command(&args)
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, [tree.as_os_str().as_bytes(), b"\n"].concat());
+    assert!(output.stderr.is_empty());
+    assert!(!env.index().exists());
+    assert!(!env.log().exists());
+
+    env.seed_ignore_file();
+    let other = env.base.join("other");
+    fs::create_dir(&other).unwrap();
+    assert_eq!(code(&env.run(&[os("index"), other.as_os_str()])), 0);
+    let before = fs::read(env.index().join("catalog")).unwrap();
+    fs::set_permissions(
+        env.index().join("catalog"),
+        fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    fs::set_permissions(env.index(), fs::Permissions::from_mode(0o500)).unwrap();
+    let output = env.run(&args);
+    fs::set_permissions(env.index(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, [tree.as_os_str().as_bytes(), b"\n"].concat());
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
+    assert_eq!(env.log_lines().len(), 1, "only index logged");
+}
+
+#[test]
+fn find_reports_usage_and_unsupported_features_with_status_one() {
+    let env = Env::new("find-errors");
+    let tree = env.tree();
+    let cases: &[(&[&str], bool)] = &[
+        (&["-name"], false),
+        (&["-unknown"], false),
+        (&["-type", "q"], false),
+        (&["-type", "f,f"], false),
+        (&["-type", "D"], false),
+        (&["-perm", "+066"], false),
+        (&["(", ")"], false),
+        (&["-perm", "0644"], true),
+        (&["-exec", "echo", "{}", "+"], true),
+        (&["-printf", "%p"], true),
+        (&["-fprintf", "out", "%p"], true),
+        (&["-regex", ".*"], true),
+        (&["-xtype", "l"], true),
+        (&["-delete"], true),
+    ];
+    for (expression, unsupported) in cases {
+        let mut args = vec![os("find"), os("-I"), tree.as_os_str()];
+        args.extend(expression.iter().map(os));
+        let output = env.run(&args);
+        assert_eq!(code(&output), 1, "{expression:?}: {}", stderr(&output));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            stderr(&output).contains("not implemented yet"),
+            *unsupported,
+            "{expression:?}"
+        );
+    }
+    let output = env.run(&[os("find"), tree.as_os_str(), os("-maxdepth"), os("0")]);
+    assert_eq!(code(&output), 1);
+    assert!(stderr(&output).contains("not implemented yet"));
+    let output = env.run(&[
+        os("find"),
+        os("--no-ignore"),
+        os("-P"),
+        os("-O3"),
+        tree.as_os_str(),
+        os("-false"),
+    ]);
+    assert_eq!(code(&output), 0);
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
