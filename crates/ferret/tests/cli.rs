@@ -991,6 +991,26 @@ fn find_probe_needs_no_index_config_home_or_log() {
 }
 
 #[test]
+fn find_perm_zero_any_mode_warns_but_still_matches() {
+    let env = Env::new("find-perm-warning");
+    let tree = env.tree();
+    for mode in ["/000", "-000"] {
+        let output = env.run(&[
+            os("find"),
+            os("-I"),
+            tree.as_os_str(),
+            os("-maxdepth"),
+            os("0"),
+            os("-perm"),
+            os(mode),
+        ]);
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        assert_eq!(output.stdout, [tree.as_os_str().as_bytes(), b"\n"].concat());
+        assert_eq!(output.stderr.is_empty(), mode == "-000");
+    }
+}
+
+#[test]
 fn find_reports_usage_and_unsupported_features_with_status_one() {
     let env = Env::new("find-errors");
     let tree = env.tree();
@@ -1002,7 +1022,6 @@ fn find_reports_usage_and_unsupported_features_with_status_one() {
         (&["-type", "D"], false),
         (&["-perm", "+066"], false),
         (&["(", ")"], false),
-        (&["-perm", "0644"], true),
         (&["-exec", "echo", "{}", "+"], true),
         (&["-printf", "%p"], true),
         (&["-fprintf", "out", "%p"], true),
