@@ -93,7 +93,7 @@ impl Env {
     /// `file` is findable, and the log holds exactly one line: an index run
     /// that published and exited with `exit`.
     fn assert_published_and_logged(&self, file: &Path, exit: i32) {
-        let found = self.run(&[os("find"), file.file_name().unwrap()]);
+        let found = self.run(&[os("search"), file.file_name().unwrap()]);
         assert_eq!(paths(&found), [file]);
         let lines = self.log_lines();
         let line = &lines[0];
@@ -158,7 +158,7 @@ fn index_find_remove_find() {
 
     let indexed = env.run(&[os("index"), outer.as_os_str(), inner.as_os_str()]);
     assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
-    let found = env.run(&[os("find"), os(".txt")]);
+    let found = env.run(&[os("search"), os(".txt")]);
     assert_eq!(code(&found), 0);
     let mut rows = paths(&found);
     rows.sort();
@@ -168,7 +168,7 @@ fn index_find_remove_find() {
 
     let removed = env.run(&[os("roots"), os("remove"), outer.as_os_str()]);
     assert_eq!(code(&removed), 0, "{}", stderr(&removed));
-    let found = env.run(&[os("find"), os(".txt")]);
+    let found = env.run(&[os("search"), os(".txt")]);
     assert_eq!(paths(&found), [inner_file]);
     let roots = env.run(&[os("roots"), os("list")]);
     assert_eq!(paths(&roots), std::slice::from_ref(&inner));
@@ -180,7 +180,7 @@ fn index_find_remove_find() {
     // Removing the last root publishes an empty catalog.
     let removed = env.run(&[os("roots"), os("remove"), inner.as_os_str()]);
     assert_eq!(code(&removed), 0, "{}", stderr(&removed));
-    assert_eq!(code(&env.run(&[os("find"), os(".txt")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os(".txt")])), 1);
     assert!(paths(&env.run(&[os("roots"), os("list")])).is_empty());
 }
 
@@ -196,7 +196,7 @@ fn bare_index_refreshes_every_root_and_a_relative_root_is_made_absolute() {
     let two = env.write("a/two.txt", b"2\n");
     let refreshed = env.run(&[os("index")]);
     assert_eq!(code(&refreshed), 0, "{}", stderr(&refreshed));
-    assert_eq!(paths(&env.run(&[os("find"), os("two")])), [two]);
+    assert_eq!(paths(&env.run(&[os("search"), os("two")])), [two]);
 }
 
 #[test]
@@ -286,7 +286,7 @@ fn bare_index_with_no_roots_and_no_terminal_fails() {
 fn exit_codes_are_stable() {
     let env = Env::new("exit");
     env.write("hit.txt", b"x\n");
-    let no_index = env.run(&[os("find"), os("hit")]);
+    let no_index = env.run(&[os("search"), os("hit")]);
     assert_eq!(code(&no_index), 3, "find before any index");
     assert!(stderr(&no_index).contains("no index"));
     assert_eq!(code(&env.run(&[os("stats")])), 3, "stats before any index");
@@ -297,16 +297,16 @@ fn exit_codes_are_stable() {
 
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
     let cases: &[(&[&str], i32)] = &[
-        (&["find", "hit"], 0),
-        (&["find", "--limit", "1", "hit"], 0),
-        (&["find", "miss"], 1),
-        (&["find", "--nope", "hit"], 2),
-        (&["find", "--limit"], 2),
-        (&["find", "size:huge"], 2),
-        (&["find", "re:("], 2),
+        (&["search", "hit"], 0),
+        (&["search", "--limit", "1", "hit"], 0),
+        (&["search", "miss"], 1),
+        (&["search", "--nope", "hit"], 2),
+        (&["search", "--limit"], 2),
+        (&["search", "size:huge"], 2),
+        (&["search", "re:("], 2),
         // An empty atom once reached the heap scan and panicked (101).
-        (&["find", ""], 2),
-        (&["find", "case:"], 2),
+        (&["search", ""], 2),
+        (&["search", "case:"], 2),
         (&["frobnicate"], 2),
         (&["stats"], 0),
         (&["roots", "list"], 0),
@@ -335,7 +335,7 @@ fn a_catalog_from_another_version_says_how_to_rebuild_and_index_replaces_it() {
     .unwrap();
 
     for args in [
-        &["find", "hit"][..],
+        &["search", "hit"][..],
         &["stats"],
         &["roots", "list"],
         &["index"],
@@ -361,7 +361,7 @@ fn a_catalog_from_another_version_says_how_to_rebuild_and_index_replaces_it() {
         "{}",
         stderr(&rebuilt)
     );
-    assert_eq!(paths(&env.run(&[os("find"), os("hit")])), [file]);
+    assert_eq!(paths(&env.run(&[os("search"), os("hit")])), [file]);
     assert_eq!(
         code(&env.run(&[os("index")])),
         0,
@@ -440,9 +440,9 @@ fn limit_stops_after_n_rows() {
         env.write(&format!("f{i}.txt"), b"x\n");
     }
     env.run(&[os("index"), env.tree().as_os_str()]);
-    let all = env.run(&[os("find"), os("txt")]);
+    let all = env.run(&[os("search"), os("txt")]);
     assert_eq!(paths(&all).len(), 5);
-    let two = env.run(&[os("find"), os("--limit=2"), os("txt")]);
+    let two = env.run(&[os("search"), os("--limit=2"), os("txt")]);
     assert_eq!(paths(&two), paths(&all)[..2]);
 }
 
@@ -489,7 +489,7 @@ fn json_round_trips_a_path_that_is_not_utf8() {
     let plain = env.write("caf\u{e9}-plain.txt", b"plain\n");
     env.run(&[os("index"), env.tree().as_os_str()]);
 
-    let output = env.run(&[os("find"), os("--json"), os("caf")]);
+    let output = env.run(&[os("search"), os("--json"), os("caf")]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let text = String::from_utf8(output.stdout).expect("JSON output is UTF-8");
     let lines: Vec<&str> = text.lines().collect();
@@ -554,7 +554,7 @@ fn a_coverage_fault_publishes_nothing_and_fails() {
         "the fault names the path: {message}"
     );
     assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
-    assert_eq!(code(&env.run(&[os("find"), os("new")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("new")])), 1);
 }
 
 #[test]
@@ -579,8 +579,8 @@ fn an_unreadable_ignore_file_publishes_nothing_and_fails() {
     let message = stderr(&output);
     assert!(message.contains("nothing published"), "{message}");
     assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
-    assert_eq!(code(&env.run(&[os("find"), os("new")])), 1);
-    assert_eq!(code(&env.run(&[os("find"), os("secret")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("new")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
 }
 
 #[test]
@@ -602,7 +602,7 @@ fn a_dangling_ignore_symlink_publishes_nothing_and_fails() {
     assert_eq!(code(&output), 3, "{}", stderr(&output));
     assert!(stderr(&output).contains("nothing published"));
     assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
-    assert_eq!(code(&env.run(&[os("find"), os("secret")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
 }
 
 #[test]
@@ -620,9 +620,9 @@ fn a_missing_ignore_file_is_the_defaults() {
     assert!(!env.ignore_file().exists());
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(stderr(&output).contains("default ignore rules"));
-    assert_eq!(code(&env.run(&[os("find"), os("ok")])), 0);
+    assert_eq!(code(&env.run(&[os("search"), os("ok")])), 0);
     assert_eq!(
-        code(&env.run(&[os("find"), target.file_name().unwrap()])),
+        code(&env.run(&[os("search"), target.file_name().unwrap()])),
         1
     );
 }
@@ -640,7 +640,7 @@ fn a_content_fault_is_a_warning() {
     let message = stderr(&output);
     assert!(message.contains("warning"), "{message}");
     assert!(message.contains("private.txt"), "{message}");
-    let json = env.run(&[os("find"), os("--json"), os("private")]);
+    let json = env.run(&[os("search"), os("--json"), os("private")]);
     assert!(String::from_utf8_lossy(&json.stdout).contains("\"doc\":null"));
 }
 
@@ -650,9 +650,9 @@ fn the_log_gains_one_line_per_find_and_index_run() {
     env.write("a/f.txt", b"f\n");
     let steps: &[(&[&str], usize)] = &[
         (&["index", "a"], 1),
-        (&["find", "f.txt"], 1),
-        (&["find", "missing"], 1),
-        (&["find", "size:bad"], 0),
+        (&["search", "f.txt"], 1),
+        (&["search", "missing"], 1),
+        (&["search", "size:bad"], 0),
         (&["stats"], 0),
         (&["roots", "list"], 0),
         (&["index"], 1),
@@ -668,7 +668,7 @@ fn the_log_gains_one_line_per_find_and_index_run() {
     let lines = env.log_lines();
     let find = &lines[1];
     for key in [
-        "\"cmd\":\"find\"",
+        "\"cmd\":\"search\"",
         "\"query\":[\"f.txt\"]",
         "\"plan\":",
         "\"rows\":1",
@@ -709,7 +709,7 @@ fn a_log_that_cannot_be_written_does_not_fail_the_command() {
     fs::write(env.state(), b"not a directory").unwrap();
     let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
     assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
-    let found = env.run(&[os("find"), os("f.txt")]);
+    let found = env.run(&[os("search"), os("f.txt")]);
     assert_eq!(code(&found), 0);
     assert_eq!(paths(&found), [env.at("f.txt")]);
     assert!(stderr(&found).contains("query log"), "{}", stderr(&found));
@@ -795,7 +795,7 @@ fn index_with_a_closed_stderr_still_publishes_and_logs() {
 
 #[test]
 // A report that cannot be written for a reason other than a closed pipe
-// is a failure (exit 3), as it is for `find` and `stats`, but the generation
+// is a failure (exit 3), as it is for `search` and `stats`, but the generation
 // it reports on is published and logged as such.
 fn index_into_a_full_device_publishes_and_exits_3() {
     let env = Env::new("index-full");
@@ -817,7 +817,7 @@ fn index_into_a_full_device_publishes_and_exits_3() {
 
 #[test]
 // Every command that writes to stdout treats a reader that went away as
-// done, not failed. `find` has written rows (more than its 64 KiB buffer,
+// done, not failed. `search` has written rows (more than its 64 KiB buffer,
 // so the error comes mid-stream) and exits 0 as it would have.
 fn every_command_exits_normally_into_a_closed_pipe() {
     let env = Env::new("epipe");
@@ -826,8 +826,8 @@ fn every_command_exits_normally_into_a_closed_pipe() {
     }
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
     let cases: &[&[&str]] = &[
-        &["find", "txt"],
-        &["find", "--json", "txt"],
+        &["search", "txt"],
+        &["search", "--json", "txt"],
         &["roots", "list"],
         &["stats"],
         &["help"],
@@ -859,7 +859,7 @@ fn a_readable_log_is_made_private_before_it_is_written() {
 #[test]
 // The log is best-effort, so a stopped holder of its lock (SIGSTOP, a
 // debugger) must not hang a command that has finished its work. With the
-// lock held for the whole run, `find` prints its row, gives up on the lock
+// lock held for the whole run, `search` prints its row, gives up on the lock
 // within its bound, warns, writes no line and exits 0.
 fn a_held_log_lock_drops_the_line_and_the_command_finishes() {
     let env = Env::new("log-lock");
@@ -870,7 +870,7 @@ fn a_held_log_lock_drops_the_line_and_the_command_finishes() {
 
     let started = Instant::now();
     let mut child = env
-        .command(&[os("find"), os("f.txt")])
+        .command(&[os("search"), os("f.txt")])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -905,7 +905,7 @@ fn concurrent_log_lines_are_whole() {
     assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
     let children: Vec<_> = (0..8)
         .map(|_| {
-            env.command(&[os("find"), os("f.txt")])
+            env.command(&[os("search"), os("f.txt")])
                 .stdout(Stdio::null())
                 .spawn()
                 .unwrap()
@@ -918,7 +918,7 @@ fn concurrent_log_lines_are_whole() {
     assert_eq!(lines.len(), 9);
     for line in &lines[1..] {
         assert!(
-            line.starts_with(r#"{"v":1,"cmd":"find","#) && line.ends_with('}'),
+            line.starts_with(r#"{"v":1,"cmd":"search","#) && line.ends_with('}'),
             "{line}"
         );
         assert_eq!(line.matches(r#""v":1"#).count(), 1, "{line}");

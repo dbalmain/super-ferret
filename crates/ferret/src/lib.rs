@@ -4,7 +4,7 @@
 //!
 //! - [`cli`]: the entry point, exit statuses, where the index is, usage.
 //! - [`args`]: the command line, parsed; pure.
-//! - [`find`], [`index`] (with `roots`), [`stats`]: one module per command.
+//! - [`find`], [`search`], [`index`] (with `roots`), [`stats`]: one module per command.
 //! - [`json`]: the JSON writer, and how non-UTF-8 bytes are encoded.
 //! - [`log`]: the query and timing log. No field holds a result path, a root
 //!   path or an id, but query text is logged as typed and may contain a path.
@@ -20,12 +20,13 @@
 //! same way inside its `query` array: a string, or `{"base64":"…"}` for an
 //! atom that is not UTF-8. See [`json`].
 //!
-//! **Exit statuses** are stable ([`cli::Exit`]): 0 success, 1 `find` matched
+//! **Exit statuses** are stable ([`cli::Exit`]): 0 success, 1 `search` matched
 //! nothing, 2 usage error, 3 runtime error.
 
 pub mod args;
 pub mod cli;
 pub mod find;
+pub mod search;
 pub mod index;
 pub mod json;
 pub mod log;

@@ -3,7 +3,7 @@
 //!
 //! Flags may come before or after the command, as `--flag VALUE` or
 //! `--flag=VALUE`. `--` ends the flags, so a query atom that starts with `-`
-//! is written `ferret find -- -atom`. Every other argument that starts with
+//! is written `ferret search -- -atom`. Every other argument that starts with
 //! `-` is a flag, and an unknown one is an error rather than an atom.
 
 use std::ffi::{OsStr, OsString};
@@ -31,8 +31,8 @@ pub enum Command {
     RootsList,
     /// `roots remove DIR...`.
     RootsRemove(Vec<PathBuf>),
-    /// `find [--json] [--limit N] ATOM...`.
-    Find {
+    /// `search [--json] [--limit N] ATOM...`.
+    Search {
         /// One query atom per argument, as bytes: a name need not be UTF-8.
         atoms: Vec<OsString>,
         /// JSON lines instead of one path per line.
@@ -40,6 +40,8 @@ pub enum Command {
         /// Stop after this many rows.
         limit: Option<u64>,
     },
+    /// `find [OPTIONS] [PATH...] [EXPRESSION]`, passed intact to the find parser.
+    Find(Vec<OsString>),
     /// `stats`.
     Stats,
     /// `help`, `-h` or `--help`.
@@ -106,6 +108,15 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
     let mut flags_done = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        if operands.is_empty() && arg == "find" {
+            if json {
+                return Err(UsageError::NotFor("--json", "find"));
+            }
+            if limit.is_some() {
+                return Err(UsageError::NotFor("--limit", "find"));
+            }
+            return Ok(Args { index, command: Command::Find(args.collect()) });
+        }
         let bytes = arg.as_bytes();
         if flags_done || bytes.len() < 2 || bytes[0] != b'-' {
             operands.push(arg);
@@ -160,7 +171,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
     };
     let paths = |rest: Vec<OsString>| rest.into_iter().map(PathBuf::from).collect();
     let command = match name.as_bytes() {
-        b"find" => Command::Find {
+        b"search" => Command::Search {
             atoms: rest,
             json,
             limit,
@@ -237,27 +248,27 @@ mod tests {
             ),
             (&["stats"], Command::Stats),
             (&["help"], Command::Help),
-            (&["find", "--help"], Command::Help),
+            (&["search", "--help"], Command::Help),
             (&["--version"], Command::Version),
             (
-                &["find", "a", "size:>1k"],
-                Command::Find {
+                &["search", "a", "size:>1k"],
+                Command::Search {
                     atoms: vec!["a".into(), "size:>1k".into()],
                     json: false,
                     limit: None,
                 },
             ),
             (
-                &["--json", "find", "--limit", "3", "a"],
-                Command::Find {
+                &["--json", "search", "--limit", "3", "a"],
+                Command::Search {
                     atoms: vec!["a".into()],
                     json: true,
                     limit: Some(3),
                 },
             ),
             (
-                &["find", "--limit=7", "--", "-a", "--json"],
-                Command::Find {
+                &["search", "--limit=7", "--", "-a", "--json"],
+                Command::Search {
                     atoms: vec!["-a".into(), "--json".into()],
                     json: false,
                     limit: Some(7),
@@ -265,8 +276,8 @@ mod tests {
             ),
             // A lone `-` is an operand, as it is to most tools.
             (
-                &["find", "-"],
-                Command::Find {
+                &["search", "-"],
+                Command::Search {
                     atoms: vec!["-".into()],
                     json: false,
                     limit: None,
@@ -295,22 +306,22 @@ mod tests {
     fn bad_command_lines_are_usage_errors() {
         let cases: &[(&[&str], UsageError)] = &[
             (&[], UsageError::NoCommand),
-            (&["search"], UsageError::UnknownCommand("search".into())),
-            (&["find", "-x"], UsageError::UnknownFlag("-x".into())),
-            (&["find", "--jsn"], UsageError::UnknownFlag("--jsn".into())),
+            (&["unknown"], UsageError::UnknownCommand("unknown".into())),
+            (&["search", "-x"], UsageError::UnknownFlag("-x".into())),
+            (&["search", "--jsn"], UsageError::UnknownFlag("--jsn".into())),
             (
-                &["find", "--json=1"],
+                &["search", "--json=1"],
                 UsageError::UnknownFlag("--json=1".into()),
             ),
-            (&["find", "--limit"], UsageError::MissingValue("--limit")),
-            (&["find", "--limit="], UsageError::MissingValue("--limit")),
+            (&["search", "--limit"], UsageError::MissingValue("--limit")),
+            (&["search", "--limit="], UsageError::MissingValue("--limit")),
             (&["stats", "--index"], UsageError::MissingValue("--index")),
             (
-                &["find", "--limit", "0"],
+                &["search", "--limit", "0"],
                 UsageError::BadValue("--limit", "0".into()),
             ),
             (
-                &["find", "--limit", "x"],
+                &["search", "--limit", "x"],
                 UsageError::BadValue("--limit", "x".into()),
             ),
             (&["stats", "--json"], UsageError::NotFor("--json", "stats")),
@@ -344,10 +355,10 @@ mod tests {
     #[test]
     fn operands_keep_their_bytes() {
         let atom = OsString::from(OsStr::from_bytes(b"caf\xe9"));
-        let parsed = parse([OsString::from("find"), atom.clone()]).unwrap();
+        let parsed = parse([OsString::from("search"), atom.clone()]).unwrap();
         assert_eq!(
             parsed.command,
-            Command::Find {
+            Command::Search {
                 atoms: vec![atom],
                 json: false,
                 limit: None,
