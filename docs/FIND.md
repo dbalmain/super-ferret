@@ -6,13 +6,23 @@ nanoseconds) describe the last indexing observation. New names are absent;
 deleted names and old metadata remain queryable until re-indexing. Re-index
 when changing ignore policy. The daemon will maintain freshness in a later slice.
 
-Default output follows catalog order, including `-quit`. A parent precedes its
-children; `-depth` and `-delete` visit children first; `-prune` stops descent.
-Sibling order need not match GNU find. There is no order-sensitive plan class.
+Each start operand is an independent walk; starts and siblings may interleave.
+A parent's expression completes before its children start; `-depth` and
+`-delete` complete children first. `-prune` stops descent. There is no
+order-sensitive plan class. Live traversal, including default-mode live
+fallbacks, uses a bounded worker pool. Catalog work also uses workers where
+measurements show a gain; shallow catalog walks stay on the caller thread.
+
+Workers evaluate whole expressions and run actions concurrently. `-exec`'s
+exit status gates its remaining expression. Each child's stdout is captured
+and emitted whole; print/printf records and file output records are atomic.
+Interactive prompts are serialized. Batch argument order and boundaries are
+free. `-quit` cancels all further expression and traversal work; collected
+batches flush at exit. Errors are reported on stderr and set exit status 1.
 
 The catalog's raw directory entry count includes ignored names, so `-empty`
-answers exact **indexed** emptiness. Actions that remove children do not rewrite
-that observation. Nested indexed roots supply their missing boundary edges from
+answers exact **indexed** emptiness. Successful `-delete` actions subtract this walk's removals from
+that observation, including across worker tasks. Nested indexed roots supply their missing boundary edges from
 root records. Re-included ancestors are ordinary visible directories.
 
 Explicit ignored starts, suffixes below opaque markers, and unreadable opaque

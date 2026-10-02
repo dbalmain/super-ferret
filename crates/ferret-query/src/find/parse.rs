@@ -1,7 +1,6 @@
 //! Recursive descent in GNU precedence order: comma, OR, AND, negation.
 //! Global options affect traversal even in a branch that never evaluates.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -9,7 +8,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use ferret_verify::{Dialect, FindRegex};
 
@@ -198,7 +197,7 @@ struct Parser<'a> {
     warnings: Vec<String>,
     message: Option<String>,
     dialect: Dialect,
-    streams: HashMap<PathBuf, Rc<RefCell<BufWriter<File>>>>,
+    streams: HashMap<PathBuf, Arc<Mutex<BufWriter<File>>>>,
     exec_id: usize,
     delete: bool,
     prune: bool,
@@ -557,7 +556,7 @@ impl Parser<'_> {
         let file = match self.streams.get(&path) {
             Some(file) => file.clone(),
             None => {
-                let file = Rc::new(RefCell::new(BufWriter::with_capacity(
+                let file = Arc::new(Mutex::new(BufWriter::with_capacity(
                     4096,
                     File::create(&path).map_err(|error| {
                         ParseError::Feature(format!("{}: {error}", path.display()))

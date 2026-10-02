@@ -1,7 +1,6 @@
 //! Process, deletion and output primaries. Compiled actions are immutable;
 //! pending exec batches belong to one run. Output files open during parsing.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -10,7 +9,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use ferret_verify::FindRegex;
 
@@ -31,7 +30,7 @@ pub(super) enum Action {
 #[derive(Clone, Debug)]
 pub(super) enum Target {
     Stdout,
-    File(PathBuf, Rc<RefCell<BufWriter<File>>>),
+    File(PathBuf, Arc<Mutex<BufWriter<File>>>),
 }
 
 impl PartialEq for Target {
@@ -49,7 +48,10 @@ impl Target {
     fn write(&self, bytes: &[u8], effects: &mut impl Effects) -> io::Result<()> {
         match self {
             Self::Stdout => effects.write(bytes),
-            Self::File(_, file) => file.borrow_mut().write_all(bytes),
+            Self::File(_, file) => file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_all(bytes),
         }
     }
 }
@@ -66,7 +68,7 @@ pub(super) struct Exec {
 struct Batch {
     exec: Exec,
     directory: Option<PathBuf>,
-    handle: Option<Rc<File>>,
+    handle: Option<Arc<File>>,
     paths: Vec<OsString>,
     bytes: usize,
 }
@@ -76,14 +78,16 @@ pub(super) struct State {
     batches: BTreeMap<usize, Batch>,
     buffer: Vec<u8>,
     limit: Option<usize>,
-    files: Vec<Rc<RefCell<BufWriter<File>>>>,
+    files: Vec<Arc<Mutex<BufWriter<File>>>>,
     pub errors: u64,
 }
 
 impl State {
     fn flush_files(&self) -> io::Result<()> {
         for file in &self.files {
-            file.borrow_mut().flush()?;
+            file.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .flush()?;
         }
         Ok(())
     }
@@ -247,7 +251,7 @@ fn register_file(state: &mut State, target: &Target) {
         && !state
             .files
             .iter()
-            .any(|existing| Rc::ptr_eq(existing, file))
+            .any(|existing| Arc::ptr_eq(existing, file))
     {
         state.files.push(file.clone());
     }
@@ -272,7 +276,7 @@ fn execute(
     let handle = if exec.directory {
         Some(match entry.directory_handle() {
             Some(handle) => handle,
-            None => Rc::new(File::open(directory.as_deref().unwrap_or(Path::new(".")))?),
+            None => Arc::new(File::open(directory.as_deref().unwrap_or(Path::new(".")))?),
         })
     } else {
         None
@@ -289,7 +293,9 @@ fn execute(
         let bytes = path.as_bytes().len() + 1;
         if batch.directory != directory || batch.bytes + bytes > limit {
             for file in &state.files {
-                file.borrow_mut().flush()?;
+                file.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .flush()?;
             }
             state.errors += u64::from(!batch.run(effects)?);
         }
@@ -401,6 +407,10 @@ fn spawn(
 }
 
 pub(super) fn confirm(program: &OsStr, path: &Path) -> io::Result<bool> {
+    static PROMPT: Mutex<()> = Mutex::new(());
+    let _prompt = PROMPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut stderr = io::stderr().lock();
     stderr.write_all(b"< ")?;
     stderr.write_all(program.as_bytes())?;

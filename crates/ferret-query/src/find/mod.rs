@@ -4,6 +4,7 @@
 
 mod action;
 mod glob;
+mod parallel;
 mod parse;
 mod printf;
 mod test;
@@ -119,6 +120,7 @@ enum EvaluationError {
 
 #[derive(Default)]
 struct Control {
+    cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     prune: bool,
     quit: bool,
     actions: action::State,
@@ -172,6 +174,11 @@ impl Plan {
         sections.sort_unstable_by_key(|section| *section as usize);
         sections.dedup();
         sections
+    }
+
+    /// Creates the shared DFS engine for parallel catalog execution.
+    pub fn parallel_catalog_source(&self, catalog: ferret_catalog::Catalog) -> LiveWalk {
+        self.catalog_source(catalog).walk
     }
 
     /// Creates a catalog walk. Load `catalog_sections()` before construction.
@@ -263,7 +270,12 @@ impl Plan {
                 continue;
             }
             descend = !control.prune;
-            if control.quit {
+            if control.quit
+                || control
+                    .cancelled
+                    .as_ref()
+                    .is_some_and(|quit| quit.load(std::sync::atomic::Ordering::Acquire))
+            {
                 break;
             }
         }
@@ -374,7 +386,12 @@ fn evaluate(
     control: &mut Control,
 ) -> Result<bool, EvaluationError> {
     use std::os::unix::ffi::OsStrExt;
-    if control.quit {
+    if control.quit
+        || control
+            .cancelled
+            .as_ref()
+            .is_some_and(|quit| quit.load(std::sync::atomic::Ordering::Acquire))
+    {
         return Ok(false);
     }
     Ok(match expression {
@@ -419,6 +436,9 @@ fn evaluate(
         }
         Expression::Quit => {
             control.quit = true;
+            if let Some(quit) = &control.cancelled {
+                quit.store(true, std::sync::atomic::Ordering::Release);
+            }
             true
         }
         Expression::Test(test) => test.evaluate(entry).map_err(EvaluationError::Metadata)?,

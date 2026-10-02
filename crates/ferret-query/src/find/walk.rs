@@ -18,7 +18,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
@@ -74,7 +74,7 @@ pub struct Entry {
     root_len: usize,
     follow: bool,
     followed_symlink: bool,
-    directory: Option<Rc<File>>,
+    directory: Option<Arc<File>>,
     check_directory: bool,
     depth: usize,
     kind: Option<FileKind>,
@@ -196,8 +196,26 @@ impl Entry {
         }
         Ok(fs::read_link(self.path())?.into_os_string().into_vec())
     }
-    pub(super) fn directory_handle(&self) -> Option<Rc<File>> {
+    pub(super) fn directory_handle(&self) -> Option<Arc<File>> {
         self.directory.clone()
+    }
+
+    fn duplicate(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            root_len: self.root_len,
+            follow: self.follow,
+            followed_symlink: self.followed_symlink,
+            directory: self.directory.clone(),
+            check_directory: self.check_directory,
+            depth: self.depth,
+            kind: self.kind,
+            metadata: duplicate_metadata(&self.metadata),
+            target: self.target,
+            parent: self.parent,
+            removed_children: self.removed_children.clone(),
+            catalog: self.catalog.clone(),
+        }
     }
 
     fn follow_catalog(&mut self) -> io::Result<()> {
@@ -395,7 +413,7 @@ const LISTING_BUFFER: usize = 64 * 1024;
 struct Saved {
     follow: bool,
     followed_symlink: bool,
-    directory: Option<Rc<File>>,
+    directory: Option<Arc<File>>,
     depth: usize,
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
@@ -404,7 +422,27 @@ struct Saved {
     catalog: Option<Arc<Catalog>>,
 }
 
+fn duplicate_metadata(cell: &OnceCell<io::Result<Metadata>>) -> OnceCell<io::Result<Metadata>> {
+    cell.get().map_or_else(OnceCell::new, |value| {
+        OnceCell::from(value.as_ref().map_err(copy_error).cloned())
+    })
+}
+
 impl Saved {
+    fn duplicate(&self) -> Self {
+        Self {
+            follow: self.follow,
+            followed_symlink: self.followed_symlink,
+            directory: self.directory.clone(),
+            depth: self.depth,
+            kind: self.kind,
+            metadata: duplicate_metadata(&self.metadata),
+            target: self.target,
+            parent: self.parent,
+            catalog: self.catalog.clone(),
+        }
+    }
+
     fn take(entry: &mut Entry) -> Self {
         Self {
             follow: entry.follow,
@@ -445,7 +483,9 @@ struct Child {
 /// An open directory. Its children occupy `start..end` of the walk's child
 /// stack, so levels pop in the order they were pushed.
 struct Level {
-    handle: Option<Rc<File>>,
+    catalogued: bool,
+    pending: Arc<AtomicUsize>,
+    handle: Option<Arc<File>>,
     /// The directory's own path is `entry.path[..path_len]`.
     path_len: usize,
     separator: bool,
@@ -457,6 +497,27 @@ struct Level {
     /// directory.
     first: Option<io::Result<Metadata>>,
     own: Saved,
+}
+
+impl Level {
+    fn duplicate(&self) -> Self {
+        Self {
+            catalogued: self.catalogued,
+            pending: self.pending.clone(),
+            handle: self.handle.clone(),
+            path_len: self.path_len,
+            separator: self.separator,
+            start: self.start,
+            next: self.next,
+            end: self.end,
+            names_start: self.names_start,
+            first: self
+                .first
+                .as_ref()
+                .map(|value| value.as_ref().map_err(copy_error).cloned()),
+            own: self.own.duplicate(),
+        }
+    }
 }
 
 /// What the lent entry holds between fetches.
@@ -492,6 +553,8 @@ pub struct LiveWalk {
     slot: Slot,
     root_dev: u64,
     levels: Vec<Level>,
+    boundary: usize,
+    suspended: bool,
     children: Vec<Child>,
     names: Vec<u8>,
     buffer: Vec<MaybeUninit<u8>>,
@@ -511,12 +574,88 @@ impl LiveWalk {
             slot: Slot::Empty,
             root_dev: 0,
             levels: Vec::new(),
+            boundary: 0,
+            suspended: false,
             children: Vec::new(),
             names: Vec::new(),
             buffer: Vec::new(),
             #[cfg(test)]
             force_unknown: false,
         }
+    }
+
+    // Five warm samples on the 300k fixture: 16 workers win live stat-heavy
+    // rows (48 ms versus 69 ms at 8); 8 win typical catalog scans (21–23 ms
+    // versus 23–24). Shallow live traversal also avoids the extra startup.
+    pub(super) fn worker_limit(&self, workers: usize) -> usize {
+        if self.catalog.is_some() || self.options.max_depth.is_some_and(|depth| depth <= 2) {
+            workers.min(8)
+        } else {
+            workers
+        }
+    }
+
+    pub(super) fn suspended(&self) -> bool {
+        self.suspended
+    }
+
+    pub(super) fn waiting(&self) -> bool {
+        self.slot == Slot::Empty
+            && self.levels.last().is_some_and(|level| {
+                level.next == level.end && level.pending.load(Ordering::Acquire) != 0
+            })
+    }
+
+    // Donate siblings already observed by readdir. Ancestor levels remain in
+    // the donated walk solely for loop detection and start/device identity.
+    // Its boundary excludes their evaluation; the donor owns their completion.
+    pub(super) fn split(&mut self) -> Option<(Self, Arc<AtomicUsize>)> {
+        // At depth two, catalog donation costs 7.4 ms versus 6.6 ms on the
+        // caller. Live fallback levels still donate, even in this mode.
+        let index = self
+            .levels
+            .iter()
+            .enumerate()
+            .skip(self.boundary.saturating_sub(1))
+            .find_map(|(index, level)| {
+                (level.end - level.next >= 2
+                    && !(level.catalogued && self.options.max_depth.is_some_and(|max| max <= 2)))
+                .then_some(index)
+            })?;
+        let level = &self.levels[index];
+        let middle = level.next + (level.end - level.next) / 2;
+        let pending = level.pending.clone();
+        let mut levels: Vec<_> = self.levels[..=index].iter().map(Level::duplicate).collect();
+        let donated = &mut levels[index];
+        donated.next = middle;
+        donated.pending = Arc::new(AtomicUsize::new(0));
+        donated.first = None;
+        let mut walk = Self::new(Vec::new(), self.options.clone());
+        walk.catalog = self.catalog.clone();
+        walk.removed_children = self.removed_children.clone();
+        walk.nested_roots = self.nested_roots.clone();
+        walk.entry = self.entry.duplicate();
+        walk.root_dev = self.root_dev;
+        walk.levels = levels;
+        walk.boundary = index + 1;
+        walk.children = self.children[..level.end].to_vec();
+        walk.names = self.names.clone();
+        #[cfg(test)]
+        {
+            walk.force_unknown = self.force_unknown;
+        }
+        self.levels[index].end = middle;
+        pending.fetch_add(1, Ordering::Relaxed);
+        Some((walk, pending))
+    }
+
+    pub(super) fn split_start(&mut self) -> Option<Self> {
+        let path = self.paths.next()?;
+        let mut walk = Self::new(vec![path], self.options.clone());
+        walk.catalog = self.catalog.clone();
+        walk.removed_children = self.removed_children.clone();
+        walk.nested_roots = self.nested_roots.clone();
+        Some(walk)
     }
 
     /// Lists the lent entry's directory and makes it the innermost level.
@@ -624,6 +763,8 @@ impl LiveWalk {
             let separator = !entry.path.ends_with(b"/");
             let own = Saved::take(entry);
             self.levels.push(Level {
+                catalogued: true,
+                pending: Arc::new(AtomicUsize::new(0)),
                 handle,
                 path_len,
                 separator,
@@ -709,6 +850,8 @@ impl LiveWalk {
         }
         let own = Saved::take(entry);
         self.levels.push(Level {
+            catalogued: false,
+            pending: Arc::new(AtomicUsize::new(0)),
             handle: Some(handle),
             path_len,
             separator,
@@ -726,6 +869,19 @@ impl LiveWalk {
     /// into the lent entry.
     fn advance(&mut self) -> Option<Result<Loaded, WalkError>> {
         loop {
+            if self.waiting() {
+                self.suspended = true;
+                return None;
+            }
+            if self.boundary != 0
+                && self.levels.len() == self.boundary
+                && self
+                    .levels
+                    .last()
+                    .is_some_and(|level| level.next == level.end)
+            {
+                return None;
+            }
             if let Some(level) = self.levels.pop_if(|level| level.next == level.end) {
                 self.children.truncate(level.start);
                 self.names.truncate(level.names_start);
@@ -917,6 +1073,7 @@ impl LiveWalk {
         descend: bool,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
     ) -> Option<Result<&Entry, WalkError>> {
+        self.suspended = false;
         let mut loaded = match std::mem::replace(&mut self.slot, Slot::Empty) {
             Slot::Pending if descend => {
                 if let Err(error) = self.descend(before_directory) {
@@ -949,6 +1106,9 @@ impl LiveWalk {
 }
 
 impl EntrySource for LiveWalk {
+    fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_deref()
+    }
     fn next(&mut self, descend: bool) -> Option<Result<&Entry, WalkError>> {
         self.next_entry(descend, &mut || Ok(()))
     }
@@ -984,7 +1144,7 @@ fn raw_kind(value: RawType) -> Option<FileKind> {
 /// Catalog order, visibility and stored metadata. Explicit ignored starts and
 /// opaque directories use live entries. The caller loads the plan's sections.
 pub struct CatalogSource {
-    walk: LiveWalk,
+    pub(super) walk: LiveWalk,
 }
 
 impl CatalogSource {
@@ -1043,14 +1203,14 @@ fn catalog_kind(kind: Kind) -> FileKind {
     }
 }
 
-fn open_directory(entry: &Entry) -> io::Result<Rc<File>> {
+fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     let flags = if entry.depth == 0 || entry.follow {
         flags
     } else {
         flags | OFlags::NOFOLLOW
     };
-    Ok(Rc::new(File::from(open(
+    Ok(Arc::new(File::from(open(
         entry.path(),
         flags,
         Mode::empty(),

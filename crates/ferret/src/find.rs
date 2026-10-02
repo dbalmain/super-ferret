@@ -5,6 +5,8 @@ use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use ferret_catalog::Catalog;
 
@@ -95,13 +97,21 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
             "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form",
         );
     }
-    let stdout = io::stdout();
     let mut effects = Output {
-        writer: BufWriter::with_capacity(OUTPUT_BUFFER, stdout.lock()),
+        writer: Arc::new(Mutex::new(BufWriter::with_capacity(
+            OUTPUT_BUFFER,
+            io::stdout(),
+        ))),
+        buffer: Vec::with_capacity(OUTPUT_BUFFER),
     };
+    let workers = ferret_crawl::default_workers();
     let result = match catalog {
-        Some(catalog) => plan.run(&mut plan.catalog_source(catalog), &mut effects),
-        None => plan.run(&mut plan.live_source(), &mut effects),
+        Some(catalog) => plan.run_parallel(
+            plan.parallel_catalog_source(catalog),
+            effects.clone(),
+            workers,
+        ),
+        None => plan.run_parallel(plan.live_source(), effects.clone(), workers),
     };
     let outcome = match result {
         Ok(outcome) => outcome,
@@ -113,7 +123,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
             return Exit::NoMatch;
         }
     };
-    let flushed = effects.writer.flush();
+    let flushed = effects.flush();
     if let Err(error) = flushed {
         cli::error(&format!("find: writing stdout: {error}"));
         return Exit::NoMatch;
@@ -125,22 +135,63 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     }
 }
 
-struct Output<W> {
-    writer: W,
+struct Output {
+    writer: Arc<Mutex<BufWriter<io::Stdout>>>,
+    buffer: Vec<u8>,
 }
 
-impl<W: Write> Effects for Output<W> {
+impl Clone for Output {
+    fn clone(&self) -> Self {
+        Self {
+            writer: self.writer.clone(),
+            buffer: Vec::with_capacity(OUTPUT_BUFFER),
+        }
+    }
+}
+
+impl Output {
+    fn record(&mut self, bytes: &[u8], terminator: &[u8]) -> io::Result<()> {
+        if self.buffer.len() + bytes.len() + terminator.len() > OUTPUT_BUFFER {
+            self.flush()?;
+        }
+        self.buffer.extend_from_slice(bytes);
+        self.buffer.extend_from_slice(terminator);
+        Ok(())
+    }
+}
+
+impl Effects for Output {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
-        self.writer.write_all(path.as_os_str().as_bytes())?;
-        self.writer.write_all(if nul { b"\0" } else { b"\n" })
+        self.record(path.as_os_str().as_bytes(), if nul { b"\0" } else { b"\n" })
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.writer.write_all(bytes)
+        self.record(bytes, b"")
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        writer.write_all(&self.buffer)?;
+        self.buffer.clear();
+        writer.flush()
+    }
+
+    fn command(&mut self, command: &mut Command) -> io::Result<bool> {
+        let output = command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .output()?;
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        writer.write_all(&output.stdout)?;
+        writer.flush()?;
+        Ok(output.status.success())
     }
 
     fn warning(&mut self, message: &str) {

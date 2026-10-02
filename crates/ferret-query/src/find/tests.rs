@@ -53,13 +53,6 @@ impl Tree {
     fn run(&self, expression: &[&str]) -> (Outcome, Output) {
         run(&self.args(expression))
     }
-    fn run_args(&self, expression: &[OsString]) -> (Outcome, Output) {
-        let args = [OsString::from("-I"), self.0.as_os_str().to_owned()]
-            .into_iter()
-            .chain(expression.iter().cloned())
-            .collect::<Vec<_>>();
-        run(&args)
-    }
 }
 
 impl Drop for Tree {
@@ -111,6 +104,29 @@ fn run(args: &[OsString]) -> (Outcome, Output) {
     assert!(plan.unsupported().is_none());
     let mut output = Output::default();
     let outcome = plan.run(&mut plan.live_source(), &mut output).unwrap();
+    (outcome, output)
+}
+
+#[derive(Clone, Default)]
+struct ParallelOutput(std::sync::Arc<std::sync::Mutex<Output>>);
+impl Effects for ParallelOutput {
+    fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
+        self.0.lock().unwrap().print(path, nul)
+    }
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0.lock().unwrap().write(bytes)
+    }
+    fn error(&mut self, error: &WalkError) {
+        self.0.lock().unwrap().error(error);
+    }
+}
+
+fn run_parallel(args: &[OsString]) -> (Outcome, ParallelOutput) {
+    let plan = Plan::parse(args).unwrap();
+    let output = ParallelOutput::default();
+    let outcome = plan
+        .run_parallel(plan.live_source(), output.clone(), 16)
+        .unwrap();
     (outcome, output)
 }
 
@@ -567,6 +583,14 @@ fn differential_against_pinned_gnu() {
                 }
             })
             .collect::<Vec<_>>();
+        // Quit can legally defer the denied branch. Keep its differential
+        // fixture free of order-dependent errors; error cases still use 000.
+        let quitting = template.contains(&"-quit");
+        fs::set_permissions(
+            tree.0.join("denied"),
+            fs::Permissions::from_mode(if quitting { 0o700 } else { 0o000 }),
+        )
+        .unwrap();
         let gnu = Command::new(binary)
             .arg(&tree.0)
             .args(&expression)
@@ -574,7 +598,12 @@ fn differential_against_pinned_gnu() {
             .env("TZ", "UTC")
             .output()
             .unwrap();
-        let (outcome, output) = tree.run_args(&expression);
+        let args: Vec<_> = [OsString::from("-I"), tree.0.clone().into_os_string()]
+            .into_iter()
+            .chain(expression.iter().cloned())
+            .collect();
+        let (outcome, output) = run_parallel(&args);
+        let output = output.0.lock().unwrap();
         let delimiter = if expression.iter().any(|arg| arg == "-print0") {
             0
         } else {
@@ -585,11 +614,24 @@ fn differential_against_pinned_gnu() {
             gnu.status.code().unwrap(),
             "status {expression:?}"
         );
-        assert_eq!(
-            records(&output.bytes, delimiter),
-            records(&gnu.stdout, delimiter),
-            "stdout {expression:?}"
-        );
+        if quitting {
+            let all: Vec<_> = expression.iter().filter(|arg| *arg != "-quit").collect();
+            let all = Command::new(binary)
+                .arg(&tree.0)
+                .args(all)
+                .output()
+                .unwrap();
+            let candidates = records(&all.stdout, delimiter);
+            for record in records(&output.bytes, delimiter) {
+                assert!(candidates.contains(&record));
+            }
+        } else {
+            assert_eq!(
+                records(&output.bytes, delimiter),
+                records(&gnu.stdout, delimiter),
+                "stdout {expression:?}"
+            );
+        }
         assert_eq!(
             output.errors.is_empty(),
             gnu.stderr.is_empty(),

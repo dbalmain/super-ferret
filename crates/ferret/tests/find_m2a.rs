@@ -78,27 +78,32 @@ fn process_stdout_is_interleaved_with_flushed_find_output() {
 #[test]
 fn a_child_runs_after_every_earlier_record_even_past_the_stdout_buffer() {
     // Regression guard for the 64 KiB stdout buffer (m3b): output is flushed
-    // before each child, so records and child lines strictly alternate even
-    // when the walk's output far exceeds the buffer.
+    // before its child, even when other workers interleave whole records and
+    // the walk's output far exceeds the buffer.
     let tree = Tree::new("alternate");
     let name = "n".repeat(200);
     for index in 0..1000 {
         fs::write(tree.0.join("d").join(format!("{name}{index}")), b"").unwrap();
     }
     let output = tree.run(&[
-        "-I", "d", "-type", "f", "-print", "-exec", "echo", "child", ";",
+        "-I", "d", "-type", "f", "-print", "-exec", "echo", "child", "{}", ";",
     ]);
     assert_eq!(output.status.code(), Some(0));
     let lines: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
     assert_eq!(lines.len(), 2001);
-    for pair in lines[..2000].chunks(2) {
-        assert!(
-            pair[0].starts_with(b"d/n"),
-            "{:?}",
-            String::from_utf8_lossy(pair[0])
-        );
-        assert_eq!(pair[1], b"child");
+    let mut printed = std::collections::HashSet::new();
+    let mut children = 0;
+    for line in &lines[..2000] {
+        if let Some(path) = line.strip_prefix(b"child ") {
+            assert!(printed.contains(path), "child ran before its own record");
+            children += 1;
+        } else {
+            assert!(line.starts_with(b"d/n"));
+            assert!(printed.insert(*line));
+        }
     }
+    assert_eq!(printed.len(), 1000);
+    assert_eq!(children, 1000);
 }
 
 #[test]
@@ -378,4 +383,152 @@ fn backreference_budget_failure_reports_an_error_and_the_walk_continues() {
     // An evaluation error aborts this entry's expression, then the walk
     // continues.
     assert!(!records.contains(&format!("./{long_name}").as_bytes()));
+}
+
+#[test]
+fn concurrent_print_printf_files_and_child_output_are_whole_records() {
+    let tree = Tree::new("whole-records");
+    for index in 0..64 {
+        fs::write(tree.0.join("d").join(format!("f{index}")), b"").unwrap();
+    }
+    let format = format!("%p|{}|%p\n", "x".repeat(20000));
+    for primary in ["-printf", "-fprintf"] {
+        let mut args = vec!["-I", "d", "-type", "f", primary];
+        if primary == "-fprintf" {
+            args.push("records");
+        }
+        args.push(&format);
+        let output = tree.run(&args);
+        assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+        let bytes = if primary == "-fprintf" {
+            fs::read(tree.0.join("records")).unwrap()
+        } else {
+            output.stdout
+        };
+        let records: Vec<_> = bytes
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(records.len(), 64);
+        for record in records {
+            let fields: Vec<_> = record.split(|&b| b == b'|').collect();
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0], fields[2]);
+            assert_eq!(fields[1], vec![b'x'; 20000]);
+        }
+    }
+    let output = tree.run(&[
+        "-I",
+        "d",
+        "-type",
+        "f",
+        "-exec",
+        "sh",
+        "-c",
+        "printf '%s:' \"$1\"; sleep 0.001; printf '%s\\n' \"$1\"",
+        "sh",
+        "{}",
+        ";",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+    let records: Vec<_> = output
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(records.len(), 64);
+    for record in records {
+        let fields: Vec<_> = record.split(|&b| b == b':').collect();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0], fields[1]);
+    }
+}
+
+#[test]
+fn concurrent_ok_and_okdir_prompts_are_serialized() {
+    let tree = Tree::new("serial-prompts");
+    for index in 0..64 {
+        fs::write(tree.0.join("d").join(format!("f{index}")), b"").unwrap();
+    }
+    for primary in ["-ok", "-okdir"] {
+        let mut child = tree
+            .command(&[
+                "-I", "d", "-type", "f", primary, "true", "{}", ";", "-print",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all("yes\n".repeat(64).as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let prompts = std::str::from_utf8(&output.stderr).unwrap();
+        let prompts: Vec<_> = prompts.split(" > ? ").collect();
+        assert_eq!(prompts.len(), 65);
+        assert_eq!(prompts[64], "");
+        for prompt in &prompts[..64] {
+            assert!(prompt.starts_with("< true ... d/f"));
+            assert_eq!(prompt.matches('<').count(), 1);
+        }
+        assert_eq!(
+            output
+                .stdout
+                .split(|&b| b == b'\n')
+                .filter(|line| !line.is_empty())
+                .count(),
+            64
+        );
+    }
+}
+
+#[test]
+fn catalog_empty_accounts_for_concurrent_deletion_and_ignored_children() {
+    for ignored in [false, true] {
+        let tree = Tree::new(if ignored {
+            "delete-ignored"
+        } else {
+            "delete-all"
+        });
+        for branch in 0..32 {
+            let path = tree.0.join("d").join(format!("b{branch}/one/two/three"));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("file"), b"x").unwrap();
+            if ignored {
+                fs::create_dir(path.join(".git")).unwrap();
+                fs::write(path.join(".git/keep"), b"x").unwrap();
+            }
+        }
+        let index = tree.0.join("index");
+        let mut command = Command::new(FERRET);
+        let output = command
+            .args(["--index"])
+            .arg(&index)
+            .arg("index")
+            .arg(tree.0.join("d"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+        let output = tree
+            .command(&[
+                "d", "-depth", "(", "-type", "f", "-o", "-type", "d", "-empty", ")", "-delete",
+            ])
+            .env("FERRET_INDEX", &index)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+        assert_eq!(tree.0.join("d").exists(), ignored);
+        if ignored {
+            for branch in 0..32 {
+                let path = tree.0.join("d").join(format!("b{branch}/one/two/three"));
+                assert!(!path.join("file").exists());
+                assert!(path.join(".git/keep").exists());
+            }
+        }
+    }
 }
