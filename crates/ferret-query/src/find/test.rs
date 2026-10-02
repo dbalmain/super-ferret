@@ -22,9 +22,17 @@ pub(super) struct Number {
     value: f64,
 }
 
-/// One parsed metadata predicate. References are resolved once when parsing.
+/// One parsed metadata predicate. References resolve once against the selected
+/// source before execution.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Test {
+    Reference {
+        path: PathBuf,
+        follow: bool,
+        field: TimeField,
+        reference_field: TimeField,
+        same_file: bool,
+    },
     Perm {
         mode: u32,
         conditional: u32,
@@ -75,6 +83,44 @@ pub(super) enum TimeField {
 }
 
 impl Test {
+    pub(super) fn sections(&self, out: &mut Vec<ferret_catalog::Section>) {
+        use ferret_catalog::Section::*;
+        let time = |field| match field {
+            TimeField::Modify => vec![Mtime, MtimeNs],
+            TimeField::Change => vec![Ctime, CtimeNs],
+            _ => vec![],
+        };
+        out.extend(match self {
+            Self::Reference {
+                field,
+                reference_field,
+                same_file,
+                ..
+            } => {
+                let mut fields = time(*field);
+                fields.extend(time(*reference_field));
+                if *same_file {
+                    fields.extend([Dev, Ino]);
+                }
+                fields
+            }
+            Self::Perm { .. } => vec![Mode],
+            Self::Size { .. } | Self::Empty => vec![Size],
+            Self::Time { field, .. } | Self::Newer { field, .. } => time(*field),
+            Self::Used { .. } => vec![Ctime, CtimeNs],
+            Self::Links(_) => vec![Nlink],
+            Self::Inum(_) => vec![Dev, Ino],
+            Self::Uid(_)
+            | Self::Gid(_)
+            | Self::User(_)
+            | Self::Group(_)
+            | Self::NoUser
+            | Self::NoGroup => vec![Owner],
+            Self::SameFile { .. } | Self::FsType(_) => vec![Dev, Ino],
+            Self::Access(_) => vec![],
+        });
+    }
+
     pub(super) fn perm(bytes: &[u8]) -> Option<Self> {
         let (order, mode) = match bytes.first() {
             Some(b'-') => (Order::Greater, &bytes[1..]),
@@ -146,70 +192,118 @@ impl Test {
     }
 
     pub(super) fn reference(primary: &[u8], path: PathBuf, follow: bool) -> Option<Self> {
-        let path = if follow {
-            fs::canonicalize(path).ok()?
-        } else {
-            path
-        };
-        let entry = Entry::new(path, 0, FileKind::File);
-        let stat = entry.metadata().ok()?;
-        if primary == b"-samefile" {
-            return Some(Self::SameFile {
-                dev: stat.dev(),
-                ino: stat.ino(),
-            });
-        }
-        // The entry's atime or ctime is compared with the reference's mtime
-        // (GNU: `-cnewer ref` matches ref itself once its ctime moved on).
-        let field = match primary {
-            b"-anewer" => TimeField::Access,
-            b"-cnewer" => TimeField::Change,
-            _ => TimeField::Modify,
-        };
-        let stamp = stat_stamp(stat, TimeField::Modify);
-        Some(Self::Newer { field, stamp })
+        Some(Self::Reference {
+            path,
+            follow,
+            field: match primary {
+                b"-anewer" => TimeField::Access,
+                b"-cnewer" => TimeField::Change,
+                _ => TimeField::Modify,
+            },
+            reference_field: TimeField::Modify,
+            same_file: primary == b"-samefile",
+        })
     }
 
     pub(super) fn newer_xy(
         x: u8,
         y: u8,
         path: PathBuf,
-        now: SystemTime,
+        _now: SystemTime,
         follow: bool,
     ) -> Option<Self> {
-        let path = if follow {
-            fs::canonicalize(path).ok()?
+        fn field(code: u8) -> TimeField {
+            match code {
+                b'a' => TimeField::Access,
+                b'B' => TimeField::Birth,
+                b'c' => TimeField::Change,
+                _ => TimeField::Modify,
+            }
+        }
+        Some(Self::Reference {
+            path,
+            follow,
+            field: field(x),
+            reference_field: field(y),
+            same_file: false,
+        })
+    }
+
+    pub(super) fn resolve_reference(
+        &mut self,
+        catalog: Option<&ferret_catalog::Catalog>,
+    ) -> std::io::Result<()> {
+        let Self::Reference {
+            path,
+            follow,
+            field,
+            reference_field,
+            same_file,
+        } = self
+        else {
+            return Ok(());
+        };
+        let mut entry = Entry::new(path.clone(), 0, FileKind::File);
+        if let Some(catalog) = catalog {
+            let resolved = super::walk::resolve(catalog, path, *follow)?.ok_or_else(|| {
+                std::io::Error::other(
+                    "reference is outside the catalog or the index is stale; re-index or use -I",
+                )
+            })?;
+            if let (ferret_catalog::Target::Inode(id), false) = resolved {
+                *self = if *same_file {
+                    let (dev, ino) = catalog.identity(id);
+                    Self::SameFile { dev, ino }
+                } else {
+                    let stamp = match reference_field {
+                        TimeField::Modify => timestamp(catalog.mtime(id), catalog.mtime_nsec(id)),
+                        TimeField::Change => timestamp(catalog.ctime(id), catalog.ctime_nsec(id)),
+                        TimeField::Access => stat_stamp(
+                            entry.metadata().map_err(super::walk::copy_error)?,
+                            TimeField::Access,
+                        ),
+                        TimeField::Birth => birth_stamp(entry.path())
+                            .ok_or_else(|| std::io::Error::other("birth time unavailable"))?,
+                    };
+                    Self::Newer {
+                        field: *field,
+                        stamp,
+                    }
+                };
+                return Ok(());
+            }
+        }
+        if *follow {
+            entry = Entry::new(fs::canonicalize(&*path)?, 0, FileKind::File);
+        }
+        let stat = entry.metadata().map_err(super::walk::copy_error)?;
+        *self = if *same_file {
+            Self::SameFile {
+                dev: stat.dev(),
+                ino: stat.ino(),
+            }
         } else {
-            path
+            Self::Newer {
+                field: *field,
+                stamp: if *reference_field == TimeField::Birth {
+                    birth_stamp(entry.path())
+                        .ok_or_else(|| std::io::Error::other("birth time unavailable"))?
+                } else {
+                    stat_stamp(stat, *reference_field)
+                },
+            }
         };
-        let entry = Entry::new(path, 0, FileKind::File);
-        let stat = entry.metadata().ok()?;
-        let field = match x {
-            b'a' => TimeField::Access,
-            b'B' => TimeField::Birth,
-            b'c' => TimeField::Change,
-            _ => TimeField::Modify,
-        };
-        let ref_field = match y {
-            b'a' => TimeField::Access,
-            b'B' => TimeField::Birth,
-            b'c' => TimeField::Change,
-            _ => TimeField::Modify,
-        };
-        let stamp = if ref_field == TimeField::Birth {
-            birth_stamp(entry.path())?
-        } else {
-            stat_stamp(stat, ref_field)
-        };
-        let _ = now;
-        Some(Self::Newer { field, stamp })
+        Ok(())
     }
 
     pub(super) fn evaluate(&self, entry: &Entry) -> std::io::Result<bool> {
-        let stat = entry
-            .metadata()
-            .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?;
+        let stat = entry.stat()?;
         Ok(match self {
+            Self::Reference { .. } => {
+                let mut test = self.clone();
+                test.resolve_reference(None)?;
+                return test.evaluate(entry);
+            }
             Self::Perm {
                 mode,
                 conditional,
@@ -244,7 +338,7 @@ impl Test {
                 daystart,
                 minutes,
             } => {
-                let delta = age_nanos(stat, *field, *now, *daystart);
+                let delta = age_nanos(entry_stamp(entry, *field)?, *now, *daystart);
                 let unit_nanos = if *minutes {
                     60_000_000_000i128
                 } else {
@@ -276,8 +370,8 @@ impl Test {
                 }
             }
             Self::Used { age, now } => {
-                let access = timestamp(stat.atime(), stat.atime_nsec());
-                let changed = timestamp(stat.ctime(), stat.ctime_nsec());
+                let access = entry_stamp(entry, TimeField::Access)?;
+                let changed = entry_stamp(entry, TimeField::Change)?;
                 let days = (access - changed) as f64 / 86_400_000_000_000.0;
                 let _ = now;
                 if days < 0.0 {
@@ -307,7 +401,7 @@ impl Test {
                         )
                     })?
                 } else {
-                    stat_stamp(stat, *field)
+                    entry_stamp(entry, *field)?
                 };
                 actual > *stamp
             }
@@ -319,13 +413,14 @@ impl Test {
                 FileKind::File => stat.size() == 0,
                 // Child actions can change emptiness after indexing or after
                 // descent. Count what is on disk, including ignored names.
-                FileKind::Directory => fs::read_dir(entry.path())?.next().transpose()?.is_none(),
+                FileKind::Directory => match entry.has_children() {
+                    Some(has_children) => !has_children,
+                    None => fs::read_dir(entry.path())?.next().transpose()?.is_none(),
+                },
                 _ => false,
             },
             Self::Access(access) => rustix::fs::access(entry.path(), *access).is_ok(),
-            Self::FsType(wanted) => entry
-                .metadata()
-                .is_ok_and(|stat| filesystem_type(stat.dev()) == Some(wanted.as_str())),
+            Self::FsType(wanted) => filesystem_type(stat.dev()) == Some(wanted.as_str()),
         })
     }
 }
@@ -452,12 +547,19 @@ fn parse_mode(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((mode, conditional))
 }
 
-fn age_nanos(stat: &fs::Metadata, field: TimeField, now: SystemTime, daystart: bool) -> i128 {
-    let (sec, nsec) = match field {
-        TimeField::Access => (stat.atime(), stat.atime_nsec()),
-        TimeField::Change => (stat.ctime(), stat.ctime_nsec()),
-        _ => (stat.mtime(), stat.mtime_nsec()),
-    };
+fn entry_stamp(entry: &Entry, field: TimeField) -> std::io::Result<i128> {
+    let stat = entry.stat()?;
+    Ok(match field {
+        TimeField::Access => {
+            let live = entry.metadata().map_err(super::walk::copy_error)?;
+            timestamp(live.atime(), live.atime_nsec())
+        }
+        TimeField::Change => timestamp(stat.ctime(), stat.ctime_nsec()),
+        _ => timestamp(stat.mtime(), stat.mtime_nsec()),
+    })
+}
+
+fn age_nanos(stamp: i128, now: SystemTime, daystart: bool) -> i128 {
     let now = if daystart {
         let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
         // GNU measures -daystart ages from the end of today (observed: a file
@@ -470,7 +572,7 @@ fn age_nanos(stat: &fs::Metadata, field: TimeField, now: SystemTime, daystart: b
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as i128;
-    now_ns - timestamp(sec, nsec)
+    now_ns - stamp
 }
 
 fn timestamp(sec: i64, nsec: i64) -> i128 {
@@ -744,7 +846,7 @@ fn civil_date(days: i64) -> (i64, u32, u32) {
 /// `major:minor` (mountinfo field 3) is the entry's own `st_dev`. Matching on
 /// the device rather than the path means a symlink is typed where it lives, not
 /// where it points, and costs no path resolution per entry.
-fn filesystem_type(dev: u64) -> Option<&'static str> {
+pub(super) fn filesystem_type(dev: u64) -> Option<&'static str> {
     static MOUNTS: std::sync::OnceLock<Vec<(u64, String)>> = std::sync::OnceLock::new();
     let mounts = MOUNTS.get_or_init(|| {
         fs::read_to_string("/proc/self/mountinfo")

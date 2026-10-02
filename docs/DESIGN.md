@@ -249,7 +249,7 @@ EACCES while opening or
 listing a directory retains its ordinary directory inode, no children and an
 unknown raw entry count. Other coverage faults still prevent publication.
 
-The read API for 4b is `Catalog::entries(dir)` (name id, raw basename, kind and
+The read API for find is `Catalog::entries(dir)` (name id, raw basename, kind and
 `Target::Inode(id)` or `Target::Ignored(kind)`), `contents(target)` (catalogued,
 ignored opaque, or unreadable opaque), `has_children(dir)` (raw count nonzero,
 unknown if unreadable), and `resolve(absolute_bytes)`. Resolution returns a root

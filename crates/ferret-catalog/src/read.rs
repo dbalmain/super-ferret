@@ -695,7 +695,7 @@ impl Catalog {
 
     /// An inode's `(st_dev, st_ino)`. Needs [`Section::Dev`] and
     /// [`Section::Ino`].
-    pub(crate) fn identity(&self, id: InoId) -> (u64, u64) {
+    pub fn identity(&self, id: InoId) -> (u64, u64) {
         let i = id.0 as usize;
         (
             self.column(Column::Dev).lookup(i),
@@ -747,6 +747,16 @@ impl Catalog {
     /// An inode's ctime, in whole seconds. Needs [`Section::Ctime`].
     pub fn ctime(&self, id: InoId) -> i64 {
         format::unorder(self.blocked(Column::Ctime).get(id.0 as usize))
+    }
+
+    /// Subsecond modification time. Needs MtimeNs.
+    pub fn mtime_nsec(&self, id: InoId) -> i64 {
+        self.blocked(Column::MtimeNs).get(id.0 as usize) as i64
+    }
+
+    /// Subsecond change time. Needs CtimeNs.
+    pub fn ctime_nsec(&self, id: InoId) -> i64 {
+        self.blocked(Column::CtimeNs).get(id.0 as usize) as i64
     }
 
     /// An inode's `st_mode`: type and permission bits. Needs

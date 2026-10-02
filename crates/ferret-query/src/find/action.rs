@@ -230,8 +230,8 @@ pub(super) fn evaluate(
             if entry.kind().map_err(metadata_error)? != FileKind::Symlink {
                 return Ok(false);
             }
-            let target = fs::read_link(entry.path()).map_err(EvaluationError::Metadata)?;
-            Ok(pattern.matches(target.as_os_str().as_bytes()))
+            let target = entry.link_target().map_err(EvaluationError::Metadata)?;
+            Ok(pattern.matches(&target))
         }
         Action::Xtype(kinds) => {
             Ok(kinds.contains(&entry.opposite_kind().map_err(EvaluationError::Metadata)?))

@@ -154,8 +154,25 @@ impl Plan {
         LiveWalk::new(self.paths.clone(), self.options)
     }
 
-    /// Creates the catalog source after the caller loads its name, kind,
-    /// root and raw entry-count sections. Stat columns are never used.
+    /// Sections needed for traversal and the stored fields this plan reads.
+    pub fn catalog_sections(&self) -> Vec<ferret_catalog::Section> {
+        use ferret_catalog::Section;
+        let mut sections = vec![
+            Section::Names,
+            Section::Links,
+            Section::Roots,
+            Section::Entries,
+        ];
+        if self.options.xdev || self.options.follow != Follow::Physical {
+            sections.extend([Section::Dev, Section::Ino]);
+        }
+        expression_sections(&self.expression, &mut sections);
+        sections.sort_unstable_by_key(|section| *section as usize);
+        sections.dedup();
+        sections
+    }
+
+    /// Creates a catalog walk. Load `catalog_sections()` before construction.
     pub fn catalog_source(&self, catalog: ferret_catalog::Catalog) -> CatalogSource {
         CatalogSource::new(catalog, self.paths.clone(), self.options)
     }
@@ -188,6 +205,15 @@ impl Plan {
             }
             return Ok(outcome);
         }
+        let mut expression = self.expression.clone();
+        if let Err(error) = resolve_references(&mut expression, source.catalog()) {
+            effects.error(&WalkError {
+                path: ".".into(),
+                error,
+            });
+            outcome.errors += 1;
+            return Ok(outcome);
+        }
         let mut control = Control::default();
         let mut descend = true;
         while let Some(item) =
@@ -215,11 +241,7 @@ impl Plan {
                 outcome.errors += 1;
                 break;
             }
-            if let Err(error) = evaluate(&self.expression, entry, effects, &mut control) {
-                if matches!(error, EvaluationError::Metadata(_)) && entry.vanished() {
-                    descend = false;
-                    continue;
-                }
+            if let Err(error) = evaluate(&expression, entry, effects, &mut control) {
                 let (error, stop) = match error {
                     EvaluationError::Metadata(error) => (error, false),
                     EvaluationError::Output(error) => (error, true),
@@ -249,6 +271,43 @@ impl Plan {
         }
         outcome.errors += control.actions.errors;
         Ok(outcome)
+    }
+}
+
+fn expression_sections(expression: &Expression, out: &mut Vec<ferret_catalog::Section>) {
+    match expression {
+        Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
+            expression_sections(a, out);
+            expression_sections(b, out);
+        }
+        Expression::Not(inner) => expression_sections(inner, out),
+        Expression::Test(test) => test.sections(out),
+        Expression::Action(action::Action::Output(_, format)) => format.sections(out),
+        Expression::Action(action::Action::List(_)) => out.extend([
+            ferret_catalog::Section::Dev,
+            ferret_catalog::Section::Ino,
+            ferret_catalog::Section::Size,
+            ferret_catalog::Section::Mode,
+            ferret_catalog::Section::Nlink,
+            ferret_catalog::Section::Owner,
+            ferret_catalog::Section::Mtime,
+        ]),
+        _ => {}
+    }
+}
+
+fn resolve_references(
+    expression: &mut Expression,
+    catalog: Option<&ferret_catalog::Catalog>,
+) -> io::Result<()> {
+    match expression {
+        Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
+            resolve_references(a, catalog)?;
+            resolve_references(b, catalog)
+        }
+        Expression::Not(inner) => resolve_references(inner, catalog),
+        Expression::Test(test) => test.resolve_reference(catalog),
+        _ => Ok(()),
     }
 }
 
@@ -291,7 +350,7 @@ fn evaluate(
         Expression::Prune => {
             // GNU needs the stat of anything but a directory here: a file an
             // earlier -exec removed makes `-prune` report it and exit 1.
-            if !matches!(entry.kind(), Ok(FileKind::Directory)) {
+            if entry.catalog.is_none() && !matches!(entry.kind(), Ok(FileKind::Directory)) {
                 entry
                     .metadata()
                     .map_err(|error| EvaluationError::Metadata(walk::copy_error(error)))?;

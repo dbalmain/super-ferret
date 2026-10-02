@@ -1,6 +1,6 @@
-//! Sequential, prunable depth-first traversal in readdir order. Paths keep the
-//! spelling of each start operand. Raw d_type stays optional; an unknown type
-//! shares the entry's one lstat cache with metadata predicates.
+//! Prunable depth-first traversal over catalog children or live readdir. Paths
+//! keep each start operand's spelling. Stored fields are decoded on demand;
+//! fields absent from the catalog share one lazy live metadata observation.
 //!
 //! Speed (m3b): the walk lends one entry and allocates nothing per name. Its
 //! path buffer is truncated and extended per child, child names sit on one
@@ -10,7 +10,6 @@
 //! needs one.
 
 use std::cell::OnceCell;
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, FileType, Metadata};
 use std::io;
@@ -19,10 +18,11 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
 
-use ferret_catalog::{Catalog, Contents, Kind, Target};
+use ferret_catalog::{Catalog, Contents, InoId, Kind, Target};
 
 use super::{Follow, Options};
 
@@ -67,18 +67,30 @@ pub(super) fn kind(value: FileType) -> FileKind {
 /// are cached too, so repeated predicates never retry a vanished name. The live
 /// source lends one entry at a time and reuses its path buffer, so a borrowed
 /// entry is gone at the next fetch; nothing in an entry allocates per name.
-#[derive(Debug)]
 pub struct Entry {
     path: Vec<u8>,
     /// The start operand's spelling is always a prefix of `path`.
     root_len: usize,
     follow: bool,
+    followed_symlink: bool,
     directory: Option<Rc<File>>,
     check_directory: bool,
     depth: usize,
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
     target: Option<Target>,
+    pub(super) catalog: Option<Arc<Catalog>>,
+}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("path", &self.path())
+            .field("depth", &self.depth)
+            .field("kind", &self.kind)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Entry {
@@ -89,12 +101,14 @@ impl Entry {
             root_len: path.len(),
             path,
             follow: false,
+            followed_symlink: false,
             directory: None,
             check_directory: false,
             depth,
             kind: Some(kind),
             metadata: OnceCell::new(),
             target: None,
+            catalog: None,
         }
     }
 
@@ -112,8 +126,12 @@ impl Entry {
     }
     /// Type from d_type if known, otherwise from the single cached lstat.
     pub fn kind(&self) -> Result<FileKind, &io::Error> {
-        (if self.follow { None } else { self.kind })
-            .map_or_else(|| self.metadata().map(|stat| kind(stat.file_type())), Ok)
+        (if self.follow && self.catalog.is_none() {
+            None
+        } else {
+            self.kind
+        })
+        .map_or_else(|| self.metadata().map(|stat| kind(stat.file_type())), Ok)
     }
     /// Final path component as bytes, including `.` and `..` in start operands.
     /// Trailing slashes are omitted, except for an all-slash root operand.
@@ -136,14 +154,80 @@ impl Entry {
             .get_or_init(|| metadata(self.path(), self.follow))
             .as_ref()
     }
-    pub(super) fn vanished(&self) -> bool {
-        self.target.is_some() && self.metadata.get().is_some_and(Result::is_err)
+    pub(super) fn stat(&self) -> io::Result<Stat<'_>> {
+        match (&self.catalog, self.target) {
+            (Some(catalog), Some(Target::Inode(id))) => Ok(Stat::Stored(catalog, id)),
+            _ => self.metadata().map(Stat::Live).map_err(copy_error),
+        }
+    }
+    pub(super) fn has_children(&self) -> Option<bool> {
+        let Target::Inode(id) = self.target? else {
+            return None;
+        };
+        self.catalog.as_ref()?.has_children(id)
+    }
+    pub(super) fn link_target(&self) -> io::Result<Vec<u8>> {
+        if let (Some(catalog), Some(Target::Inode(id))) = (&self.catalog, self.target) {
+            return Ok(catalog.link_target(id).unwrap_or_default().to_vec());
+        }
+        Ok(fs::read_link(self.path())?.into_os_string().into_vec())
     }
     pub(super) fn directory_handle(&self) -> Option<Rc<File>> {
         self.directory.clone()
     }
 
+    fn follow_catalog(&mut self) -> io::Result<()> {
+        if !self.follow || self.kind != Some(FileKind::Symlink) {
+            return Ok(());
+        }
+        let Some(catalog) = &self.catalog else {
+            return Ok(());
+        };
+        if let Some((Target::Inode(id), false)) = resolve(catalog, self.path(), true)? {
+            self.followed_symlink = true;
+            self.target = Some(Target::Inode(id));
+            self.kind = Some(catalog_kind(catalog.kind(id)));
+            return Ok(());
+        }
+        // A target outside the indexed trees has no catalog metadata.
+        self.catalog = None;
+        self.target = None;
+        Ok(())
+    }
+
+    pub(super) fn referenced_kind(&self) -> io::Result<FileKind> {
+        if self.catalog.is_some() {
+            if self.kind != Some(FileKind::Symlink) {
+                return self.kind().map_err(copy_error);
+            }
+            let mut entry = Entry::new(self.path().to_owned(), self.depth, FileKind::Symlink);
+            entry.catalog = self.catalog.clone();
+            entry.target = self.target;
+            entry.follow = true;
+            entry.follow_catalog()?;
+            if entry.catalog.is_some() {
+                return entry.kind().map_err(copy_error);
+            }
+        }
+        fs::metadata(self.path()).map(|stat| kind(stat.file_type()))
+    }
+
     pub(super) fn opposite_kind(&self) -> io::Result<FileKind> {
+        if self.catalog.is_some() {
+            if self.followed_symlink {
+                return Ok(FileKind::Symlink);
+            }
+            if self.kind != Some(FileKind::Symlink) {
+                return self.kind().map_err(copy_error);
+            }
+            return self.referenced_kind().or_else(|error| {
+                if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(40) {
+                    Ok(FileKind::Symlink)
+                } else {
+                    Err(error)
+                }
+            });
+        }
         metadata(self.path(), !self.follow)
             .or_else(|error| {
                 if error.raw_os_error() == Some(40) {
@@ -159,6 +243,80 @@ impl Entry {
         WalkError {
             path: self.path().to_owned(),
             error: copy_error(error),
+        }
+    }
+}
+
+pub(super) enum Stat<'a> {
+    Stored(&'a Catalog, InoId),
+    Live(&'a Metadata),
+}
+
+impl Stat<'_> {
+    pub(super) fn size(&self) -> u64 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.size(id),
+            Self::Live(stat) => stat.size(),
+        }
+    }
+    pub(super) fn mode(&self) -> u32 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.mode(id),
+            Self::Live(stat) => stat.mode(),
+        }
+    }
+    pub(super) fn uid(&self) -> u32 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.owner(id).0,
+            Self::Live(stat) => stat.uid(),
+        }
+    }
+    pub(super) fn gid(&self) -> u32 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.owner(id).1,
+            Self::Live(stat) => stat.gid(),
+        }
+    }
+    pub(super) fn nlink(&self) -> u64 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.nlink(id),
+            Self::Live(stat) => stat.nlink(),
+        }
+    }
+    pub(super) fn dev(&self) -> u64 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.identity(id).0,
+            Self::Live(stat) => stat.dev(),
+        }
+    }
+    pub(super) fn ino(&self) -> u64 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.identity(id).1,
+            Self::Live(stat) => stat.ino(),
+        }
+    }
+    pub(super) fn mtime(&self) -> i64 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.mtime(id),
+            Self::Live(stat) => stat.mtime(),
+        }
+    }
+    pub(super) fn mtime_nsec(&self) -> i64 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.mtime_nsec(id),
+            Self::Live(stat) => stat.mtime_nsec(),
+        }
+    }
+    pub(super) fn ctime(&self) -> i64 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.ctime(id),
+            Self::Live(stat) => stat.ctime(),
+        }
+    }
+    pub(super) fn ctime_nsec(&self) -> i64 {
+        match *self {
+            Self::Stored(catalog, id) => catalog.ctime_nsec(id),
+            Self::Live(stat) => stat.ctime_nsec(),
         }
     }
 }
@@ -188,6 +346,10 @@ pub struct WalkError {
 /// entry, `next(false)` prevents descent; post-order sources already descended.
 /// Entries are lent: each one is valid until the next fetch.
 pub trait EntrySource {
+    /// Catalog snapshot used by this source, if any, for reference operands.
+    fn catalog(&self) -> Option<&Catalog> {
+        None
+    }
     /// Fetches the next entry or recoverable error. No work follows exhaustion.
     fn next(&mut self, descend: bool) -> Option<Result<&Entry, WalkError>>;
     /// Flushes directory-local batches after names are cached and before
@@ -206,36 +368,41 @@ pub trait EntrySource {
 const LISTING_BUFFER: usize = 64 * 1024;
 
 /// A directory entry's own fields while its children use the lent entry.
-#[derive(Debug)]
 struct Saved {
     follow: bool,
+    followed_symlink: bool,
     directory: Option<Rc<File>>,
     depth: usize,
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
     target: Option<Target>,
+    catalog: Option<Arc<Catalog>>,
 }
 
 impl Saved {
     fn take(entry: &mut Entry) -> Self {
         Self {
             follow: entry.follow,
+            followed_symlink: entry.followed_symlink,
             directory: entry.directory.take(),
             depth: entry.depth,
             kind: entry.kind,
             metadata: std::mem::take(&mut entry.metadata),
             target: entry.target,
+            catalog: entry.catalog.clone(),
         }
     }
 
     fn restore(self, entry: &mut Entry) {
         entry.follow = self.follow;
+        entry.followed_symlink = self.followed_symlink;
         entry.directory = self.directory;
         entry.depth = self.depth;
         entry.kind = self.kind;
         entry.check_directory = false;
         entry.metadata = self.metadata;
         entry.target = self.target;
+        entry.catalog = self.catalog;
     }
 }
 
@@ -249,9 +416,8 @@ struct Child {
 
 /// An open directory. Its children occupy `start..end` of the walk's child
 /// stack, so levels pop in the order they were pushed.
-#[derive(Debug)]
 struct Level {
-    handle: Rc<File>,
+    handle: Option<Rc<File>>,
     /// The directory's own path is `entry.path[..path_len]`.
     path_len: usize,
     separator: bool,
@@ -283,11 +449,12 @@ enum Loaded {
     Directory,
 }
 
-/// The live source: sequential depth-first readdir, without ignore rules.
+/// Sequential DFS. The unrestricted source uses readdir without ignore rules;
+/// the catalog source shares the stack and substitutes catalog child listings.
 /// It holds one directory handle per ancestor and never sorts child names.
 /// A descriptor exhaustion error is reported just like a listing failure.
 pub struct LiveWalk {
-    catalog: Option<Catalog>,
+    catalog: Option<Arc<Catalog>>,
     paths: std::vec::IntoIter<PathBuf>,
     options: Options,
     entry: Entry,
@@ -331,18 +498,62 @@ impl LiveWalk {
         if entry.kind().map_err(|error| entry.error(error))? != FileKind::Directory {
             return Ok(());
         }
-        // Preserve the directory observation before child actions change its
-        // timestamps. Saved carries it through post-order evaluation; regular
-        // files still obtain metadata only when a predicate needs it.
-        if entry.target.is_some() {
-            entry.metadata().map_err(|error| entry.error(error))?;
+        if self.options.xdev
+            && entry.stat().map_err(|error| entry.error(&error))?.dev() != self.root_dev
+        {
+            return Ok(());
         }
-        if self.options.xdev {
-            match entry.metadata() {
-                Ok(stat) if stat.dev() != self.root_dev => return Ok(()),
-                Ok(_) => {}
-                Err(error) => return Err(entry.error(error)),
+        if let Some(catalog) = &self.catalog
+            && let Some(target @ Target::Inode(dir)) = entry.target
+            && catalog.contents(target) == Some(Contents::Catalogued)
+        {
+            let start = self.children.len();
+            let names_start = self.names.len();
+            for child in catalog.entries(dir) {
+                if matches!(child.target, Target::Ignored(_)) {
+                    continue;
+                }
+                let name_start = self.names.len();
+                self.names.extend_from_slice(child.bytes);
+                self.children.push(Child {
+                    name: (name_start, self.names.len()),
+                    kind: Some(catalog_kind(child.kind)),
+                    target: Some(child.target),
+                });
             }
+            // Nested roots have no name row in the outer crawl (D34).
+            let absolute = absolute(entry.path()).map_err(|error| entry.error(&error))?;
+            for (id, path) in catalog.roots() {
+                let path = Path::new(OsStr::from_bytes(path));
+                if path.parent() == Some(absolute.as_path()) {
+                    let name = path.file_name().unwrap_or(OsStr::new("")).as_bytes();
+                    let name_start = self.names.len();
+                    self.names.extend_from_slice(name);
+                    self.children.push(Child {
+                        name: (name_start, self.names.len()),
+                        kind: Some(FileKind::Directory),
+                        target: Some(Target::Inode(id)),
+                    });
+                }
+            }
+            if self.children.len() > start {
+                before_directory().map_err(|error| entry.error(&error))?;
+            }
+            let path_len = entry.path.len();
+            let separator = !entry.path.ends_with(b"/");
+            let own = Saved::take(entry);
+            self.levels.push(Level {
+                handle: None,
+                path_len,
+                separator,
+                start,
+                next: start,
+                end: self.children.len(),
+                names_start,
+                first: None,
+                own,
+            });
+            return Ok(());
         }
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
         let flags = if entry.depth == 0 || entry.follow {
@@ -371,20 +582,6 @@ impl LiveWalk {
         if self.buffer.is_empty() {
             self.buffer.resize(LISTING_BUFFER, MaybeUninit::uninit());
         }
-        // Catalog names are sorted; the kernel listing supplies only their
-        // observable traversal order. Opaque subtrees retain the live source.
-        let catalog_children = self.catalog.as_ref().and_then(|catalog| {
-            let target = entry.target?;
-            let Target::Inode(dir) = target else {
-                return None;
-            };
-            (catalog.contents(target) == Some(Contents::Catalogued)).then(|| {
-                catalog
-                    .entries(dir)
-                    .map(|child| (child.bytes, child))
-                    .collect::<HashMap<_, _>>()
-            })
-        });
         let mut reader = RawDir::new(&*handle, &mut self.buffer);
         while let Some(item) = reader.next() {
             let item = match item {
@@ -402,30 +599,8 @@ impl LiveWalk {
             if name == b"." || name == b".." {
                 continue;
             }
-            let (name, kind, target) = if let Some(children) = &catalog_children {
-                if let Some(child) = children.get(name) {
-                    if matches!(child.target, Target::Ignored(_)) {
-                        continue;
-                    }
-                    (
-                        child.bytes,
-                        Some(catalog_kind(child.kind)),
-                        Some(child.target),
-                    )
-                } else if let Some((name, target)) = self.catalog.as_ref().and_then(|catalog| {
-                    (raw_kind(item.file_type()) == Some(FileKind::Directory))
-                        .then(|| root_child(catalog, entry.path(), name))
-                        .flatten()
-                }) {
-                    (name, Some(FileKind::Directory), Some(target))
-                } else {
-                    // New names are visible until the next index. A new
-                    // directory has no catalog target, so its subtree is live.
-                    (name, raw_kind(item.file_type()), None)
-                }
-            } else {
-                (name, raw_kind(item.file_type()), None)
-            };
+            let kind = raw_kind(item.file_type());
+            let target = None;
             #[cfg(test)]
             let kind = if self.force_unknown { None } else { kind };
             // GNU observes the first child's directory metadata before a cwd
@@ -461,7 +636,7 @@ impl LiveWalk {
         }
         let own = Saved::take(entry);
         self.levels.push(Level {
-            handle,
+            handle: Some(handle),
             path_len,
             separator,
             start,
@@ -491,40 +666,41 @@ impl LiveWalk {
             let Some(level) = self.levels.last_mut() else {
                 let path = self.paths.next()?;
                 let follow = self.options.follow != Follow::Physical;
-                let stat = match metadata(&path, follow) {
-                    Ok(stat) => stat,
-                    Err(error) => return Some(Err(WalkError { path, error })),
-                };
-                self.root_dev = stat.dev();
-                self.entry = Entry::new(path, 0, kind(stat.file_type()));
+                self.entry = Entry::new(path, 0, FileKind::File);
                 if let Some(catalog) = &self.catalog {
-                    let absolute = if self.entry.kind == Some(FileKind::Symlink) && !follow {
-                        let absolute = std::path::absolute(self.entry.path());
-                        absolute.and_then(|path| {
-                            let parent = path.parent().unwrap_or(Path::new("/"));
-                            Ok(fs::canonicalize(parent)?
-                                .join(path.file_name().unwrap_or(OsStr::new(""))))
-                        })
-                    } else {
-                        fs::canonicalize(self.entry.path())
-                    };
-                    let resolved = absolute
-                        .as_ref()
-                        .ok()
-                        .and_then(|path| catalog.resolve(path.as_os_str().as_bytes()));
-                    let Some(resolved) = resolved else {
-                        return Some(Err(self.entry.error(&io::Error::other(
+                    let resolved = match resolve(catalog, self.entry.path(), follow || self.entry.path.ends_with(b"/")) {
+                        Ok(Some(resolved)) => resolved,
+                        Ok(None) => return Some(Err(self.entry.error(&io::Error::other(
                             "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
-                        ))));
+                        )))),
+                        Err(error) => return Some(Err(self.entry.error(&error))),
                     };
-                    if resolved.remainder.is_empty() && matches!(resolved.target, Target::Inode(_))
+                    if !resolved.1
+                        && let Target::Inode(id) = resolved.0
                     {
-                        self.entry.target = Some(resolved.target);
-                        if let Target::Inode(id) = resolved.target {
-                            self.entry.kind = Some(catalog_kind(catalog.kind(id)));
+                        self.entry.target = Some(resolved.0);
+                        self.entry.catalog = Some(catalog.clone());
+                        self.entry.kind = Some(catalog_kind(catalog.kind(id)));
+                        self.entry.follow = follow || self.entry.path.ends_with(b"/");
+                        self.entry.followed_symlink = resolve(catalog, self.entry.path(), false)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|(target, _)| target != resolved.0);
+                        if let Err(error) = self.entry.follow_catalog() {
+                            return Some(Err(self.entry.error(&error)));
                         }
+                        if self.options.xdev {
+                            self.root_dev = catalog.identity(id).0;
+                        }
+                        return Some(Ok(Loaded::Entry));
                     }
                 }
+                let stat = match metadata(self.entry.path(), follow) {
+                    Ok(stat) => stat,
+                    Err(error) => return Some(Err(self.entry.error(&error))),
+                };
+                self.root_dev = stat.dev();
+                self.entry.kind = Some(kind(stat.file_type()));
                 self.entry.follow = follow;
                 self.entry.metadata = OnceCell::from(Ok(stat));
                 return Some(Ok(Loaded::Entry));
@@ -541,12 +717,17 @@ impl LiveWalk {
                 .path
                 .extend_from_slice(&self.names[child.name.0..child.name.1]);
             entry.follow = self.options.follow == Follow::All;
-            entry.directory = Some(Rc::clone(&level.handle));
+            entry.followed_symlink = false;
+            entry.directory = level.handle.clone();
             entry.depth = level.own.depth + 1;
             entry.kind = child.kind;
             entry.check_directory = false;
             entry.metadata = OnceCell::new();
             entry.target = child.target;
+            entry.catalog = child.target.and(self.catalog.clone());
+            if let Err(error) = entry.follow_catalog() {
+                return Some(Err(entry.error(&error)));
+            }
             if child.target.is_none() && child.kind == Some(FileKind::Directory) {
                 match level.first.take() {
                     Some(stat) if index == level.start => entry.metadata = OnceCell::from(stat),
@@ -572,6 +753,27 @@ impl LiveWalk {
                 let error = entry.error(error);
                 self.slot = Slot::Visit;
                 return Err(error);
+            }
+        }
+        if self.options.follow != Follow::Physical
+            && entry.catalog.is_some()
+            && entry.kind == Some(FileKind::Directory)
+        {
+            let stat = entry.stat().map_err(|error| entry.error(&error))?;
+            if self.levels.iter().any(|level| {
+                level
+                    .own
+                    .catalog
+                    .as_ref()
+                    .zip(level.own.target)
+                    .is_some_and(|(catalog, target)| {
+                        let Target::Inode(id) = target else {
+                            return false;
+                        };
+                        catalog.identity(id) == (stat.dev(), stat.ino())
+                    })
+            }) {
+                return Err(entry.error(&io::Error::other("File system loop detected")));
             }
         }
         if entry.follow && entry.kind().map_err(|error| entry.error(error))? == FileKind::Directory
@@ -609,11 +811,7 @@ impl LiveWalk {
             return Ok(true);
         }
         // xdev directories still evaluate, even when not descended.
-        if self.options.xdev
-            && entry
-                .metadata()
-                .is_ok_and(|stat| stat.dev() != self.root_dev)
-        {
+        if self.options.xdev && entry.stat().is_ok_and(|stat| stat.dev() != self.root_dev) {
             return Ok(true);
         }
         self.descend(before_directory)?;
@@ -689,9 +887,8 @@ fn raw_kind(value: RawType) -> Option<FileKind> {
     })
 }
 
-/// Catalog visibility and kinds with the live walk's ordered traversal.
-/// Explicit ignored starts and unreadable opaque directories use live entries.
-/// The caller must load Names, Links, Roots and Entries before constructing it.
+/// Catalog order, visibility and stored metadata. Explicit ignored starts and
+/// opaque directories use live entries. The caller loads the plan's sections.
 pub struct CatalogSource {
     walk: LiveWalk,
 }
@@ -699,12 +896,15 @@ pub struct CatalogSource {
 impl CatalogSource {
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
         let mut walk = LiveWalk::new(paths, options);
-        walk.catalog = Some(catalog);
+        walk.catalog = Some(Arc::new(catalog));
         Self { walk }
     }
 }
 
 impl EntrySource for CatalogSource {
+    fn catalog(&self) -> Option<&Catalog> {
+        self.walk.catalog.as_deref()
+    }
     fn next(&mut self, descend: bool) -> Option<Result<&Entry, WalkError>> {
         self.walk.next(descend)
     }
@@ -729,16 +929,67 @@ fn catalog_kind(kind: Kind) -> FileKind {
     }
 }
 
-// The outer crawl stops before emitting an inner root's name (D34). Its
-// root record supplies that edge when find reaches it through recursion.
-fn root_child<'a>(catalog: &'a Catalog, parent: &Path, name: &[u8]) -> Option<(&'a [u8], Target)> {
-    let absolute = fs::canonicalize(parent).ok()?.join(OsStr::from_bytes(name));
-    catalog.roots().find_map(|(id, path)| {
-        (path == absolute.as_os_str().as_bytes()).then(|| {
-            (
-                path.rsplit(|&byte| byte == b'/').next().unwrap_or(path),
-                Target::Inode(id),
-            )
-        })
-    })
+// Resolve links from the snapshot, including intermediate components. A ..
+// after a link applies to the target's parent, not to the link's lexical
+// parent.
+pub(super) fn resolve(
+    catalog: &Catalog,
+    path: &Path,
+    follow: bool,
+) -> io::Result<Option<(Target, bool)>> {
+    let mut pending = std::path::absolute(path)?;
+    for _ in 0..40 {
+        let mut prefix = PathBuf::new();
+        let parts: Vec<_> = pending.components().collect();
+        let mut redirected = None;
+        for (at, part) in parts.iter().enumerate() {
+            match part {
+                std::path::Component::ParentDir => {
+                    prefix.pop();
+                }
+                std::path::Component::CurDir => {}
+                part => prefix.push(part.as_os_str()),
+            }
+            if (follow || at + 1 < parts.len())
+                && let Some(resolved) = catalog.resolve(prefix.as_os_str().as_bytes())
+                && resolved.remainder.is_empty()
+                && let Target::Inode(id) = resolved.target
+                && catalog.kind(id) == Kind::Symlink
+            {
+                let target = Path::new(OsStr::from_bytes(
+                    catalog.link_target(id).unwrap_or_default(),
+                ));
+                let mut next = prefix.parent().unwrap_or(Path::new("/")).join(target);
+                for part in &parts[at + 1..] {
+                    next.push(part.as_os_str());
+                }
+                redirected = Some(std::path::absolute(next)?);
+                break;
+            }
+        }
+        match redirected {
+            Some(next) => pending = next,
+            None => {
+                return Ok(catalog
+                    .resolve(prefix.as_os_str().as_bytes())
+                    .map(|resolved| (resolved.target, !resolved.remainder.is_empty())));
+            }
+        }
+    }
+    Err(io::Error::from_raw_os_error(40))
+}
+
+pub(super) fn absolute(path: &Path) -> io::Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    let mut normalized = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => normalized.push(part.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }

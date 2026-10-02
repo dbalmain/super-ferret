@@ -1103,9 +1103,18 @@ mod find_expressions {
     include!("../../ferret-query/src/find/tests/expressions.rs");
 }
 
+fn sorted_records(bytes: &[u8], separator: u8) -> Vec<&[u8]> {
+    let mut records: Vec<_> = bytes
+        .split(|&byte| byte == separator || (separator == b' ' && byte == b'\n'))
+        .filter(|record| !record.is_empty())
+        .collect();
+    records.sort_unstable();
+    records
+}
+
 #[test]
-fn catalog_find_matches_live_across_the_differential_expressions_in_exact_order() {
-    // Regression guard for name-sorted catalog rows changing -quit and batches.
+fn catalog_find_matches_live_across_the_differential_expressions_as_sorted_records() {
+    // Sibling order is catalog order; GNU sibling order is not promised.
     let env = Env::new("catalog-equivalence");
     env.seed_ignore_file();
     for name in [
@@ -1161,7 +1170,30 @@ fn catalog_find_matches_live_across_the_differential_expressions_in_exact_order(
                 "status {start} {template:?}: {}",
                 stderr(&catalog)
             );
-            assert_eq!(catalog.stdout, live.stdout, "order {start} {template:?}");
+            if template.contains(&"-quit") {
+                let all: Vec<_> = args
+                    .iter()
+                    .copied()
+                    .filter(|arg| *arg != os("-quit"))
+                    .collect();
+                let all = env.command(&all).current_dir(env.tree()).output().unwrap();
+                let records = sorted_records(&catalog.stdout, b'\n');
+                assert!(records.len() <= 1);
+                for record in records {
+                    assert!(sorted_records(&all.stdout, b'\n').contains(&record));
+                }
+            } else {
+                let separator = if template.contains(&"-print0") {
+                    0
+                } else {
+                    b'\n'
+                };
+                assert_eq!(
+                    sorted_records(&catalog.stdout, separator),
+                    sorted_records(&live.stdout, separator),
+                    "set {start} {template:?}"
+                );
+            }
             assert_eq!(
                 catalog.stderr.is_empty(),
                 live.stderr.is_empty(),
@@ -1186,7 +1218,16 @@ fn catalog_find_matches_live_across_the_differential_expressions_in_exact_order(
             "{expression:?}: {}",
             stderr(&catalog)
         );
-        assert_eq!(catalog.stdout, live.stdout, "{expression:?}");
+        let separator = if expression.contains(&"-printf") {
+            b'\n'
+        } else {
+            b' '
+        };
+        assert_eq!(
+            sorted_records(&catalog.stdout, separator),
+            sorted_records(&live.stdout, separator),
+            "{expression:?}"
+        );
         assert_eq!(catalog.stderr.is_empty(), live.stderr.is_empty());
     }
     assert_eq!(env.log_lines().len(), 1, "find does not append query logs");
@@ -1246,6 +1287,7 @@ fn catalog_find_skips_ignored_recursion_but_walks_explicit_starts_and_references
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(!env.at("visible").exists());
     assert!(env.at("hidden.tmp").exists());
+    assert_eq!(code(&env.run(&[os("index")])), 0);
     let output = run(&["find", ".", "-type", "f", "-delete"]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(env.at("hidden.tmp").exists());
@@ -1254,7 +1296,7 @@ fn catalog_find_skips_ignored_recursion_but_walks_explicit_starts_and_references
 }
 
 #[test]
-fn catalog_find_uses_live_stat_and_handles_deleted_names_and_unreadable_directories() {
+fn catalog_find_uses_stored_stat_and_names_and_walks_opaque_directories_live() {
     let env = Env::new("catalog-stat");
     env.seed_ignore_file();
     env.write("changed", b"old");
@@ -1273,29 +1315,28 @@ fn catalog_find_uses_live_stat_and_handles_deleted_names_and_unreadable_director
             .output()
             .unwrap()
     };
-    // A catalog name/type expression never stats a child, even after an
-    // earlier command removes it. A stat predicate below drops its vanished
-    // child without reporting a traversal error.
+    // Stored name, kind and stat fields remain usable after an action removes
+    // this entry. New entries still need existence checks before effects.
     let output = run(&[
         "find", ".", "-name", "cheap", "-exec", "rm", "{}", ";", "-type", "f", "-print",
     ]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(output.stdout, b"./cheap\n");
     fs::hard_link(env.at("changed"), env.base.join("alias")).unwrap();
-    let output = run(&["find", ".", "-name", "changed", "-links", "2"]);
+    let output = run(&["find", ".", "-name", "changed", "-links", "1"]);
     assert_eq!(code(&output), 0);
     assert_eq!(output.stdout, b"./changed\n");
-    let output = run(&["find", ".", "-name", "changed", "-size", "8c"]);
+    let output = run(&["find", ".", "-name", "changed", "-size", "3c"]);
     assert_eq!(code(&output), 0);
     assert_eq!(output.stdout, b"./changed\n");
     let output = run(&["find", ".", "-name", "deleted"]);
     assert_eq!(code(&output), 0);
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"./deleted\n");
     let output = run(&[
-        "find", ".", "-name", "changed", "-exec", "rm", "{}", ";", "-size", "8c",
+        "find", ".", "-name", "changed", "-exec", "rm", "{}", ";", "-size", "3c", "-print",
     ]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"./changed\n");
     fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o000)).unwrap();
     let readable = fs::read_dir(env.at("denied")).is_ok();
     let output = run(&["find", "."]);
@@ -1332,7 +1373,7 @@ fn catalog_find_refuses_unresolved_starts_and_config_can_select_live_mode() {
     let output = run(&["find", "."]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(output.stderr.is_empty());
-    assert!(paths(&output).contains(&PathBuf::from("./new-after-index")));
+    assert!(!paths(&output).contains(&PathBuf::from("./new-after-index")));
     fs::write(
         env.base.join("home/config/ferret/config"),
         b"find_no_ignore = true\n",
@@ -1423,28 +1464,24 @@ fn catalog_delete_tree(name: &str) -> Env {
 }
 
 #[test]
-fn catalog_find_observes_directory_mtime_before_deleting_its_children() {
+fn catalog_find_keeps_indexed_mtime_after_live_timestamps_change() {
     let env = catalog_delete_tree("catalog-delete-mtime");
     let output = env
         .command(&[os("find"), os("."), os("-mmin"), os("+720"), os("-delete")])
         .current_dir(env.tree())
         .output()
         .unwrap();
-    assert_eq!(code(&output), 1, "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("Directory not empty"),
-        "{}",
-        stderr(&output)
-    );
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
     for dir in ["sub", "node_modules", "target/doc"] {
-        assert!(!env.at(dir).exists(), "{dir} was not deleted");
+        assert!(env.at(dir).exists(), "{dir} used live mtime");
     }
     assert!(env.at("target/hidden").exists());
     assert!(env.tree().exists());
 }
 
 #[test]
-fn catalog_find_checks_live_emptiness_after_deleting_children_in_depth_order() {
+fn catalog_find_keeps_indexed_emptiness_after_deleting_children_in_depth_order() {
     // The original raw count includes children that -delete has now removed.
     let env = catalog_delete_tree("catalog-delete-empty");
     let output = env
@@ -1470,13 +1507,13 @@ fn catalog_find_checks_live_emptiness_after_deleting_children_in_depth_order() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(output.stderr.is_empty());
     for dir in ["sub", "node_modules", "target/doc"] {
-        assert!(!env.at(dir).exists(), "{dir} was not deleted");
+        assert!(env.at(dir).exists(), "{dir} used live emptiness");
     }
     assert!(env.at("target/hidden").exists());
 }
 
 #[test]
-fn catalog_find_evaluates_names_created_by_exec_as_visible() {
+fn catalog_find_does_not_evaluate_names_created_by_exec() {
     // A directory's pre-order -exec creates a name before its listing.
     let env = Env::new("catalog-exec-touch-new");
     env.seed_ignore_file();
@@ -1513,14 +1550,14 @@ fn catalog_find_evaluates_names_created_by_exec_as_visible() {
         ("./parent/new.tmp", "parent/new.tmp"),
         ("./parent/child/new.tmp", "parent/child/new.tmp"),
     ] {
-        assert!(found.contains(&PathBuf::from(printed)), "{found:?}");
+        assert!(!found.contains(&PathBuf::from(printed)), "{found:?}");
         assert!(env.at(path).exists());
     }
-    assert_eq!(found.len(), 3, "{found:?}");
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[test]
-fn catalog_find_walks_uncatalogued_directories_live_as_visible() {
+fn catalog_find_excludes_directories_created_after_indexing() {
     let env = Env::new("catalog-new-directory");
     env.seed_ignore_file();
     env.write(".ferretignore", b"*.tmp\n");
@@ -1542,5 +1579,101 @@ fn catalog_find_walks_uncatalogued_directories_live_as_visible() {
         .unwrap();
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(output.stderr.is_empty());
-    assert_eq!(output.stdout, b"./new-dir/nested/new.tmp\n");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn catalog_find_keeps_metadata_and_reference_values_after_live_entries_vanish() {
+    // A pure index query must work even when the entire indexed tree is gone.
+    let env = Env::new("catalog-vanished-tree");
+    env.seed_ignore_file();
+    env.write("reference", b"reference");
+    env.write("child", b"old");
+    std::os::unix::fs::symlink("child", env.at("link")).unwrap();
+    let old = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+    File::open(env.at("reference"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    // Move the live reference forward; default still compares against the old
+    // catalog value, while -I sees the newly modified reference.
+    File::open(env.at("reference"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+        .unwrap();
+    let reference = env.at("reference");
+    let tree = env.tree();
+    let args = [
+        os("find"),
+        tree.as_os_str(),
+        os("-name"),
+        os("child"),
+        os("-newer"),
+        reference.as_os_str(),
+    ];
+    let output = env.run(&args);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [env.at("child")]);
+    fs::remove_dir_all(env.tree()).unwrap();
+    let output = env.run(&args);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [env.at("child")]);
+    let output = env.run(&[
+        os("find"),
+        env.tree().as_os_str(),
+        os("-name"),
+        os("child"),
+        os("-size"),
+        os("3c"),
+        os("-links"),
+        os("1"),
+        os("-printf"),
+        os("%s|%n|%y\\n"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"3|1|f\n");
+    let output = env.run(&[
+        os("find"),
+        env.tree().as_os_str(),
+        os("-lname"),
+        os("child"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [env.at("link")]);
+}
+
+#[test]
+fn catalog_find_guarantees_parent_order_depth_order_and_prune() {
+    let env = Env::new("catalog-order");
+    env.seed_ignore_file();
+    for path in ["z/child", "a/child", "middle"] {
+        env.write(path, b"contents");
+    }
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let run = |expression: &[&OsStr]| {
+        let tree = env.tree();
+        let mut args = vec![os("find"), tree.as_os_str()];
+        args.extend(expression);
+        env.run(&args)
+    };
+    for expression in [vec![], vec![os("-depth")]] {
+        let output = run(&expression);
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        let found = paths(&output);
+        for dir in [".", "a", "z"] {
+            let parent = if dir == "." { env.tree() } else { env.at(dir) };
+            let parent_at = found.iter().position(|path| *path == parent).unwrap();
+            for (at, child) in found.iter().enumerate() {
+                if child != &parent && child.starts_with(&parent) {
+                    assert_eq!(parent_at < at, expression.is_empty());
+                }
+            }
+        }
+    }
+    let output = run(&[os("-name"), os("a"), os("-prune"), os("-o"), os("-print")]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(!paths(&output).contains(&env.at("a/child")));
+    let output = run(&[os("-type"), os("f"), os("-print"), os("-quit")]);
+    assert_eq!(paths(&output), [env.at("a/child")]);
 }

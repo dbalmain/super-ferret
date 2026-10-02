@@ -6,7 +6,7 @@ use std::io::{self, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use ferret_catalog::{Catalog, Section};
+use ferret_catalog::Catalog;
 
 use ferret_query::find::{Effects, Plan, WalkError};
 
@@ -81,12 +81,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
                     return Exit::NoMatch;
                 }
             };
-            if let Err(error) = catalog.load(&[
-                Section::Names,
-                Section::Links,
-                Section::Roots,
-                Section::Entries,
-            ]) {
+            if let Err(error) = catalog.load(&plan.catalog_sections()) {
                 cli::error(&format!(
                     "find: cannot read index: {error}; re-index or use -I"
                 ));
