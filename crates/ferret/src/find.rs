@@ -9,6 +9,10 @@ use ferret_query::find::{Effects, Plan, WalkError};
 
 use crate::cli::{self, Exit};
 
+/// Stdout buffer. The engine flushes it before every child process, so a
+/// larger buffer changes only how often a plain walk writes.
+const OUTPUT_BUFFER: usize = 64 * 1024;
+
 /// Runs a find command. Find errors and usage errors both exit 1; no matches
 /// is success. This path never reads config, opens an index or writes a log.
 pub fn run(args: &[OsString]) -> Exit {
@@ -32,7 +36,7 @@ pub fn run(args: &[OsString]) -> Exit {
     }
     let stdout = io::stdout();
     let mut effects = Output {
-        writer: BufWriter::new(stdout.lock()),
+        writer: BufWriter::with_capacity(OUTPUT_BUFFER, stdout.lock()),
     };
     let outcome = match plan.run(&mut plan.live_source(), &mut effects) {
         Ok(outcome) => outcome,

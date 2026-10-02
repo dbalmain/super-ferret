@@ -667,7 +667,7 @@ fn unknown_dtype_uses_one_lazy_stat_and_a_failed_stat_keeps_walking() {
         victim: PathBuf,
     }
     impl EntrySource for Vanishing {
-        fn next(&mut self, descend: bool) -> Option<Result<Entry, WalkError>> {
+        fn next(&mut self, descend: bool) -> Option<Result<&Entry, WalkError>> {
             let item = self.live.next(descend)?;
             if let Ok(entry) = &item
                 && entry.path() == self.victim
