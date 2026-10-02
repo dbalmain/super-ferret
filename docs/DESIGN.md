@@ -243,7 +243,9 @@ content and no document. A sparse `Specials` section holds `(InoId, kind)` pairs
 for those visible types, in inode order. `Links` loads this small table too, so
 kind lookup and name search need no mode-column load. Search continues to return
 only regular files, directories and symlinks; special entries are available to
-find through the catalog API. EACCES while opening or
+find through the catalog API. Search tests special kinds after its existing
+name, metadata and path filters, so rejected path matches need no kind lookup.
+EACCES while opening or
 listing a directory retains its ordinary directory inode, no children and an
 unknown raw entry count. Other coverage faults still prevent publication.
 
