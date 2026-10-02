@@ -2477,3 +2477,24 @@ explicit `ferretd` is the whole design.
 
 **Answer (2026-09-30): A.** Start the daemon on first use; build the engine in
 process when a background process is not allowed or `FERRET_NO_DAEMON` is set.
+
+## Find M5b — quit while an action is running (open)
+
+**Question.** Does F11's “stops every worker promptly” require terminating
+a command or interactive prompt already started on another worker, or
+only cancelling further traversal and expression evaluation? The M5b
+implementation does the latter, flushes collected batches, and reaps children.
+An asynchronous clarification was sent; no answer has been received.
+
+| Option | Behavior | Tradeoff |
+| --- | --- | --- |
+| A. Finish started actions | Cancel new traversal/evaluation immediately; flush collected batches; await already-started commands/prompts | Preserves completed child output and external effects with the existing process interface; exit can wait for a slow command or unanswered prompt |
+| B. Terminate started actions | Add cancellation to process-group execution, pipe collection and prompt input; terminate running commands and stop prompts | Bounds cancellation latency, but can leave partial external effects/output and changes command completion semantics; needs a cancellation-aware host interface |
+
+**Recommendation.** A unless finite quit-exit latency, including slow or
+blocked actions, is a requirement. That latency requirement or an explicit
+instruction to terminate subprocesses is the fact that changes the answer.
+The checked code retains A's existing started-process behavior; B has not
+been implemented or assumed authorized. Parallel walking/actions, all gates,
+all timing gates and the full corpus are checked independently of this
+choice. The done-note records the exact validation and this remaining limit.

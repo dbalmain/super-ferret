@@ -40,7 +40,11 @@ Workspace: 390 passed, four pre-existing ignored; formatter and workspace
 clippy -D warnings pass. Parallel GNU differential: 105 expressions, green.
 Default/live self-check: 105 expressions x seven starts, green. Seed harness:
 247 default agreements / 315 live agreements, no differences or errors.
-The full 135693-row final run remains in progress.
+The full 135693-row final run is complete: zero real differences and zero
+errors for both targets after manual classification. Raw remaining differences
+are 61 default / 129 live; all 190 rows are individually explained in the
+M5b done-note. Three default / six live both-timeouts are inconclusive.
+The fd stretch goal meets two of eight comparable rows.
 
 Five warm samples, milliseconds; each cell includes host load 1/5/15 at its median sample. fd 10.4.2. Start load 2.16/2.36/2.35. No competing benchmark or compiler.
 
@@ -60,3 +64,30 @@ Five warm samples, milliseconds; each cell includes host load 1/5/15 at its medi
 | `-regex .*\.\(c\|h\)` | 308.1 (1.65/2.17/2.29) | 90.5 (1.65/2.17/2.29) | unsupported | 40.6 (1.84/2.20/2.30) | 29.3 (1.84/2.20/2.30) |
 
 All 12 live-versus-bfs gates pass; all 12 default rows beat M5a. bfs regex emits zero bytes versus 1558848 for GNU/ferret, so its regex comparison has different result work. Output-byte policy differences with fd/default are retained in the JSON.
+
+## Final result and remaining policy
+
+The final corpus ran once, with no competing benchmark or compiler. It took
+1773.929 seconds at start load 1.43/2.07/2.25. Default: 52575 agree,
+301 agree-unordered, 61 manually classified differences, 7368 skipped and
+3 both-timeouts. Live: 66964 agree, 321 agree-unordered, 129 manually
+classified differences, 7965 skipped and 6 both-timeouts. There are zero
+real differences and zero errors after inspection. No harness code changed.
+
+The full row explanations and raw artifact paths are in
+`/home/dave/w/super-ferret/.ai/find-m5b-done.md`. A two-command rm binary
+probe reproduced the empty-parent outcome from overlapping recursive batches.
+A type-d syscall profile, load 2.74/4.82/5.31, sees 7734 statx calls for
+ferret versus 8 for fd 10.4.2, and the same 15456 getdents64 calls.
+Ferret spawns 15 threads versus fd's 33 clone3 calls. These observations
+explain remaining metadata and concurrency costs; they are not traced timing
+comparisons. No dependency, unsafe or directory-fd rewrite was needed.
+
+Quit cancels new work and waits for started actions. Whether it should
+terminate running commands/prompts instead is an open decision, with A/B
+options in DECISIONS.md. Forced termination and finite quit latency are not
+claimed by this checkpoint.
+
+Release binary: `/home/dave/w/super-ferret-wt/find-m5b/target/release/ferret`.
+All workspace gates and development oracles pass; 390 tests pass and four
+pre-existing tests remain ignored. No manifest/lockfile changes or push.

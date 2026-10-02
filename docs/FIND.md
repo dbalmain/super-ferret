@@ -18,7 +18,10 @@ exit status gates its remaining expression. Each child's stdout is captured
 and emitted whole; print/printf records and file output records are atomic.
 Interactive prompts are serialized. Batch argument order and boundaries are
 free. `-quit` cancels all further expression and traversal work; collected
-batches flush at exit. Errors are reported on stderr and set exit status 1.
+batches flush at exit. Started commands and prompts are awaited; the
+termination policy is an open M5b decision. Errors are reported on stderr
+and set exit status 1, except that GNU treats a failed `-exec … ;` launch as
+a false test without changing exit status.
 
 The catalog's raw directory entry count includes ignored names, so `-empty`
 answers exact **indexed** emptiness. Successful `-delete` actions subtract this walk's removals from
