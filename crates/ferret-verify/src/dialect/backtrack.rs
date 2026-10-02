@@ -13,7 +13,8 @@ const STACK_BYTES: usize = 8 * 1024 * 1024;
 /// A backreference search could not finish within its resource budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatchLimit {
-    /// The search used its instruction/byte comparison allowance.
+    /// The search used its instruction, byte comparison or state copy
+    /// allowance.
     Steps,
     /// Pending alternatives would exceed the stack memory allowance.
     PendingStates,
@@ -247,7 +248,7 @@ impl Program {
                     state.pc += 1;
                 }
                 Instruction::Split(other) => {
-                    push(&mut pending, &state, other, stack_limit)?;
+                    push(&mut pending, &state, other, stack_limit, &mut budget)?;
                     state.pc += 1;
                 }
                 Instruction::Jump(to) => state.pc = to,
@@ -267,7 +268,7 @@ impl Program {
                         max.is_none_or(|max| count < max) && !(stop && last == Some(state.at));
                     if enter {
                         if stop {
-                            push(&mut pending, &state, end, stack_limit)?;
+                            push(&mut pending, &state, end, stack_limit, &mut budget)?;
                         }
                         state.repetitions[slot] = (count + 1, Some(state.at));
                         state.pc += 1;
@@ -311,10 +312,17 @@ fn push(
     state: &State,
     pc: usize,
     limit: usize,
+    budget: &mut usize,
 ) -> Result<(), MatchLimit> {
     if pending.len() >= limit {
         return Err(MatchLimit::PendingStates);
     }
+    // A large pattern must not make each counted step copy thousands of
+    // repetition slots for free. Charge for every copied machine word.
+    spend(
+        budget,
+        std::mem::size_of::<State>() / std::mem::size_of::<usize>() + state.repetitions.len() * 3,
+    )?;
     let mut alternative = state.clone();
     alternative.pc = pc;
     pending.push(alternative);

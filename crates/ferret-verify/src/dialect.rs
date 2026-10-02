@@ -225,20 +225,37 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<(String, bo
             match byte {
                 b'(' => {
                     group_count += 1;
-                    groups.push((group_count, out.len()));
+                    groups.push((group_count, out.len(), closed, [false; 9]));
                     can_repeat = false;
                 }
                 b')' => {
-                    let (number, start) = groups
+                    let (number, start, _, branches) = groups
                         .pop()
                         .ok_or_else(|| RegexError("unmatched group closer".into()))?;
+                    for (group, branch) in closed.iter_mut().zip(branches) {
+                        *group |= branch;
+                    }
                     if number <= 9 {
                         closed[number - 1] = true;
                     }
                     atom_start = start;
                     can_repeat = true;
                 }
-                b'|' | b'\n' | b'^' | b'$' => can_repeat = false,
+                b'|' | b'\n' => {
+                    // References in a sibling branch cannot see captures
+                    // closed only in earlier branches. On closing a group,
+                    // their union becomes available to its continuation.
+                    if let Some((_, _, inherited, branches)) = groups.last_mut() {
+                        for (branch, group) in branches.iter_mut().zip(closed) {
+                            *branch |= group;
+                        }
+                        closed = *inherited;
+                    } else {
+                        closed = [false; 9];
+                    }
+                    can_repeat = false;
+                }
+                b'^' | b'$' => can_repeat = false,
                 _ => {
                     atom_start = out.len();
                     can_repeat = true;

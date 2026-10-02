@@ -328,3 +328,28 @@ fn regex_dialects_against_pinned_gnu() {
         cases.len()
     );
 }
+
+#[test]
+fn backreference_budget_failure_reports_an_error_and_the_walk_continues() {
+    let tree = Tree::new("regex-budget");
+    let long_name = "a".repeat(32);
+    fs::write(tree.0.join(&long_name), b"").unwrap();
+    fs::write(tree.0.join("after"), b"").unwrap();
+    let output = tree.run(&[
+        "-I",
+        ".",
+        "-regextype",
+        "posix-extended",
+        "-regex",
+        r".*/(a|aa)*\1b",
+        ",",
+        "-print0",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("matching budget"));
+    let records = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+    assert!(records.contains(&b"./after".as_slice()));
+    // An evaluation error aborts this entry's expression, then the walk
+    // continues.
+    assert!(!records.contains(&format!("./{long_name}").as_bytes()));
+}

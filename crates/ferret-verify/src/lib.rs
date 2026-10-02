@@ -6,6 +6,8 @@
 //!   content will reuse.
 //! - [`matcher`]: [`Matcher`], the narrow interface to the regex engine (D17),
 //!   and [`Regex`].
+//! - `dialect`: [`FindRegex`], GNU find syntax over whole-path bytes, with
+//!   bounded backreference matching and fallible budget reporting.
 //! - [`toolchain`]: the ledger for the scanner's AVX2 arm (D11).
 //!
 //! A file whose `(size, mtime)` no longer matches the catalog is reported as

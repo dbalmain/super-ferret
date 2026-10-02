@@ -26,6 +26,9 @@ pub fn cases() -> Vec<(String, String, bool)> {
                 format!(".*/a${operator}"),
             ] { add(pattern, false); }
         }
+        for pattern in [r".*/\b*a", r".*/\b+a", r".*/\b?a", r".*/\b{2}a", r".*/\b\{2\}a", r".*/\B*a"] {
+            add(pattern.into(), false);
+        }
         for fragment in [
             "{2}", "{x", "${regex}", "{,3}", "{3,1}", "{99999}", "{", "{2",
             "{2,x}", "{2,}", "{,}", "{}", "}", "{0}", "{32767}", "{32768}",
@@ -46,6 +49,11 @@ pub fn cases() -> Vec<(String, String, bool)> {
             format!(r".*/{open}[^/]+{close}/\1$"),
             format!(r".*/{open}a{close}{open}b{close}\2\1"),
             format!(r".*/{open}a{close}{open}b{close}\1\2"),
+        ] { add(pattern, false); }
+        for pattern in [
+            format!(r".*/{open}a{close}{alternate}\1"),
+            format!(r".*/{open}{open}a{close}{alternate}b{close}\2"),
+            format!(r".*/{open}a{close}{open}b{alternate}\1{close}"),
         ] { add(pattern, false); }
         add(format!(r".*/{open}a{close}\1"), true);
         for number in 1..=9 {

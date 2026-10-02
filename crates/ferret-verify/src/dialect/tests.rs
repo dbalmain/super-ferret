@@ -187,3 +187,34 @@ fn invalid_references_and_unmatched_captures_do_not_guess() {
     assert!(regex.is_match(b"abab"));
     assert!(!regex.is_match(b"aba"));
 }
+
+#[test]
+fn references_obey_branch_scope_and_capture_numbering() {
+    for pattern in [br"(a)|\1".as_slice(), br"((a)|\2)", br"(a)|(b)\1"] {
+        assert!(FindRegex::new(pattern, Dialect::Extended, false).is_err());
+    }
+    for (pattern, bytes) in [
+        (br"((a)|b)\2".as_slice(), b"aa".as_slice()),
+        (br"(a)(b|\1)", b"aa"),
+        (br"(a)(b)(c)(d)(e)(f)(g)(h)(i)\9\1", b"abcdefghiia"),
+        (br"(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)\9", b"abcdefghiji"),
+    ] {
+        let regex = FindRegex::new(pattern, Dialect::Extended, false).unwrap();
+        assert_eq!(regex.try_is_match(bytes), Ok(true));
+    }
+}
+
+#[test]
+fn backreference_dot_and_boundaries_share_the_linear_engines_byte_semantics() {
+    for (dialect, pattern) in [
+        (Dialect::Emacs, br"\(.\)\1".as_slice()),
+        (Dialect::Extended, br"(.)\1"),
+    ] {
+        let regex = FindRegex::new(pattern, dialect, false).unwrap();
+        assert!(regex.is_match(b"\xff\xff"));
+        assert_eq!(regex.is_match(b"\n\n"), dialect != Dialect::Emacs);
+    }
+    let regex = FindRegex::new(br"\b(a)\1\b", Dialect::Extended, false).unwrap();
+    assert!(regex.is_match(b"aa"));
+    assert!(!regex.is_match(b"!aa"));
+}
