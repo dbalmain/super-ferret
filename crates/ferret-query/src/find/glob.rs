@@ -16,46 +16,67 @@ enum Token {
 pub(super) struct Pattern {
     tokens: Vec<Token>,
     fold: bool,
+    suffix: bool,
 }
 
 impl Pattern {
     pub fn new(pattern: &[u8], fold: bool) -> Self {
+        let tokens = compile(pattern, fold);
+        let suffix = matches!(tokens.first(), Some(Token::Star))
+            && tokens[1..]
+                .iter()
+                .all(|token| !matches!(token, Token::Star));
         Self {
-            tokens: compile(pattern, fold),
+            tokens,
             fold,
+            suffix,
         }
     }
 
     pub fn matches(&self, text: &[u8]) -> bool {
-        let mut row = vec![false; text.len() + 1];
-        row[0] = true;
-        for token in &self.tokens {
-            let mut next = vec![false; row.len()];
-            if matches!(token, Token::Star) {
-                next[0] = row[0];
-                for i in 1..next.len() {
-                    next[i] = row[i] || next[i - 1];
-                }
-            } else {
-                for (i, &byte) in text.iter().enumerate() {
-                    next[i + 1] = row[i]
-                        && match token {
-                            Token::Literal(want) => {
-                                if self.fold {
-                                    want.eq_ignore_ascii_case(&byte)
-                                } else {
-                                    *want == byte
-                                }
-                            }
-                            Token::Any => true,
-                            Token::Class(set) => set[usize::from(byte)],
-                            Token::Never | Token::Star => false,
-                        };
-                }
-            }
-            row = next;
+        if self.suffix {
+            let suffix = &self.tokens[1..];
+            let Some(start) = text.len().checked_sub(suffix.len()) else {
+                return false;
+            };
+            return suffix
+                .iter()
+                .zip(&text[start..])
+                .all(|(token, &byte)| token_matches(token, byte, self.fold));
         }
-        row[text.len()]
+        let (mut token, mut at) = (0, 0);
+        let mut star = None;
+        loop {
+            match self.tokens.get(token) {
+                Some(Token::Star) => {
+                    token += 1;
+                    star = Some((token, at));
+                }
+                Some(atom) if at < text.len() && token_matches(atom, text[at], self.fold) => {
+                    token += 1;
+                    at += 1;
+                }
+                None if at == text.len() => return true,
+                _ => match star {
+                    Some((resume, consumed)) if consumed < text.len() => {
+                        token = resume;
+                        at = consumed + 1;
+                        star = Some((resume, at));
+                    }
+                    _ => return false,
+                },
+            }
+        }
+    }
+}
+
+fn token_matches(token: &Token, byte: u8, fold: bool) -> bool {
+    match token {
+        Token::Literal(want) if fold => want.eq_ignore_ascii_case(&byte),
+        Token::Literal(want) => *want == byte,
+        Token::Any => true,
+        Token::Class(set) => set[usize::from(byte)],
+        Token::Never | Token::Star => false,
     }
 }
 
@@ -213,4 +234,80 @@ fn class(name: &[u8], byte: u8) -> Option<bool> {
         b"xdigit" => byte.is_ascii_hexdigit(),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Pattern, Token};
+
+    // Independent dynamic-programming specification for the allocation-free
+    // matcher. Overlapping stars must retry the suffix at later positions.
+    fn reference(pattern: &Pattern, text: &[u8]) -> bool {
+        let mut row = vec![false; text.len() + 1];
+        row[0] = true;
+        for token in &pattern.tokens {
+            let mut next = vec![false; row.len()];
+            if matches!(token, Token::Star) {
+                next[0] = row[0];
+                for at in 1..next.len() {
+                    next[at] = row[at] || next[at - 1];
+                }
+            } else {
+                for (at, &byte) in text.iter().enumerate() {
+                    next[at + 1] = row[at]
+                        && match token {
+                            Token::Literal(want) if pattern.fold => {
+                                want.eq_ignore_ascii_case(&byte)
+                            }
+                            Token::Literal(want) => *want == byte,
+                            Token::Any => true,
+                            Token::Class(set) => set[usize::from(byte)],
+                            Token::Never | Token::Star => false,
+                        };
+                }
+            }
+            row = next;
+        }
+        row[text.len()]
+    }
+
+    fn words(alphabet: &[&[u8]], length: usize) -> Vec<Vec<u8>> {
+        let mut words = vec![Vec::new()];
+        let mut level = vec![Vec::new()];
+        for _ in 0..length {
+            level = level
+                .iter()
+                .flat_map(|prefix| {
+                    alphabet.iter().map(|suffix| {
+                        let mut word = prefix.clone();
+                        word.extend_from_slice(suffix);
+                        word
+                    })
+                })
+                .collect();
+            words.extend(level.iter().cloned());
+        }
+        words
+    }
+
+    #[test]
+    fn stars_and_fixed_width_suffixes_match_the_language_specification() {
+        let patterns = words(
+            &[b"a", b"b", b"*", b"?", b"[ab]", b"[!ab]", b"\\*", b"\\"],
+            3,
+        );
+        let texts = words(&[b"a", b"b", b"A", b"/", b".", b"\xff"], 3);
+        for fold in [false, true] {
+            for bytes in &patterns {
+                let pattern = Pattern::new(bytes, fold);
+                for text in &texts {
+                    assert_eq!(
+                        pattern.matches(text),
+                        reference(&pattern, text),
+                        "{bytes:?} {text:?} {fold}"
+                    );
+                }
+            }
+        }
+    }
 }

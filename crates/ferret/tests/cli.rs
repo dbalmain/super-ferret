@@ -1791,4 +1791,62 @@ fn catalog_find_reports_removed_directory_descent_and_skips_deleted_files_on_rep
     assert!(output.stderr.is_empty());
     assert!(env.at("sub").is_dir());
     assert!(!env.at("sub/child").exists());
+    let env = Env::new("catalog-effect-listed-sibling");
+    env.seed_ignore_file();
+    env.write("a", b"a");
+    env.write("b", b"b");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-name"),
+            os("a"),
+            os("-exec"),
+            os("rm"),
+            os("./b"),
+            os(";"),
+            os("-o"),
+            os("-name"),
+            os("b"),
+            os("-print"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"./b\n");
+}
+
+#[test]
+fn catalog_find_kind_guards_preserve_earlier_effects_and_followed_directory_links() {
+    let env = Env::new("catalog-kind-guards");
+    env.seed_ignore_file();
+    env.write("dir/file", b"contents");
+    std::os::unix::fs::symlink("dir", env.at("link")).unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    for expression in [
+        vec!["-print", "-type", "d"],
+        vec!["-type", "d", "-o", "-print"],
+        vec!["-type", "f", "-o", "-type", "d"],
+        vec!["-follow", "-type", "d"],
+    ] {
+        let mut args = vec![os("find"), os(".")];
+        args.extend(expression.iter().map(os));
+        let catalog = env.command(&args).current_dir(env.tree()).output().unwrap();
+        args.insert(1, os("-I"));
+        let live = env.command(&args).current_dir(env.tree()).output().unwrap();
+        assert_eq!(
+            code(&catalog),
+            code(&live),
+            "{expression:?}: {}",
+            stderr(&catalog)
+        );
+        assert_eq!(
+            sorted_records(&catalog.stdout, b'\n'),
+            sorted_records(&live.stdout, b'\n'),
+            "{expression:?}"
+        );
+        assert_eq!(catalog.stderr.is_empty(), live.stderr.is_empty());
+    }
 }

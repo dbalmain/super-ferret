@@ -40,6 +40,8 @@ pub(crate) struct Options {
     pub depth_first: bool,
     pub xdev: bool,
     pub follow: Follow,
+    pub live_checks: bool,
+    pub kinds: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -174,7 +176,10 @@ impl Plan {
 
     /// Creates a catalog walk. Load `catalog_sections()` before construction.
     pub fn catalog_source(&self, catalog: ferret_catalog::Catalog) -> CatalogSource {
-        CatalogSource::new(catalog, self.paths.clone(), self.options)
+        let mut options = self.options;
+        options.live_checks = has_actions(&self.expression);
+        options.kinds = leading_kinds(&self.expression);
+        CatalogSource::new(catalog, self.paths.clone(), options)
     }
 
     /// Evaluates this plan over a source configured for its traversal options.
@@ -271,6 +276,31 @@ impl Plan {
         }
         outcome.errors += control.actions.errors;
         Ok(outcome)
+    }
+}
+
+// Only guards that reject before any effects may remove candidates. This is
+// independent of traversal order; directories still carry descendant work.
+fn leading_kinds(expression: &Expression) -> Option<u8> {
+    match expression {
+        Expression::Type(kinds) => Some(kinds.iter().fold(0, |mask, kind| mask | 1 << *kind as u8)),
+        Expression::And(left, _) => leading_kinds(left),
+        Expression::Or(left, right) => Some(leading_kinds(left)? | leading_kinds(right)?),
+        Expression::Not(inner) if matches!(&**inner, Expression::Type(_)) => {
+            Some(0x7f ^ leading_kinds(inner)?)
+        }
+        _ => None,
+    }
+}
+
+fn has_actions(expression: &Expression) -> bool {
+    match expression {
+        Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
+            has_actions(a) || has_actions(b)
+        }
+        Expression::Not(inner) => has_actions(inner),
+        Expression::Action(action::Action::Exec(_) | action::Action::Delete) => true,
+        _ => false,
     }
 }
 

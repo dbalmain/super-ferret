@@ -509,11 +509,48 @@ impl LiveWalk {
             && let Some(target @ Target::Inode(dir)) = entry.target
             && catalog.contents(target) == Some(Contents::Catalogued)
         {
+            let handle = if self.options.live_checks {
+                match open_directory(entry) {
+                    Ok(handle) => Some(handle),
+                    Err(error) => {
+                        if self.options.depth_first {
+                            self.slot = Slot::After;
+                        }
+                        return Err(entry.error(&error));
+                    }
+                }
+            } else {
+                None
+            };
             let start = self.children.len();
             let names_start = self.names.len();
             for child in catalog.entries(dir) {
                 if matches!(child.target, Target::Ignored(_)) {
                     continue;
+                }
+                if child.kind != Kind::Dir
+                    && !(self.options.follow == Follow::All && child.kind == Kind::Symlink)
+                    && self
+                        .options
+                        .kinds
+                        .is_some_and(|mask| mask & (1 << catalog_kind(child.kind) as u8) == 0)
+                {
+                    continue;
+                }
+                // Test membership before child actions. A later sibling
+                // removal must not erase a name already observed here.
+                if self.options.live_checks && child.kind != Kind::Dir {
+                    let own_len = entry.path.len();
+                    if !entry.path.ends_with(b"/") {
+                        entry.path.push(b'/');
+                    }
+                    entry.path.extend_from_slice(child.bytes);
+                    let missing = fs::symlink_metadata(entry.path())
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+                    entry.path.truncate(own_len);
+                    if missing {
+                        continue;
+                    }
                 }
                 let name_start = self.names.len();
                 self.names.extend_from_slice(child.bytes);
@@ -546,14 +583,14 @@ impl LiveWalk {
                     self.names[a.name.0..a.name.1].cmp(&self.names[b.name.0..b.name.1])
                 });
             }
-            if self.children.len() > start {
+            if catalog.has_children(dir) == Some(true) || added {
                 before_directory().map_err(|error| entry.error(&error))?;
             }
             let path_len = entry.path.len();
             let separator = !entry.path.ends_with(b"/");
             let own = Saved::take(entry);
             self.levels.push(Level {
-                handle: None,
+                handle,
                 path_len,
                 separator,
                 start,
@@ -565,22 +602,13 @@ impl LiveWalk {
             });
             return Ok(());
         }
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        let flags = if entry.depth == 0 || entry.follow {
-            flags
-        } else {
-            flags | OFlags::NOFOLLOW
-        };
-        let handle = match open(entry.path(), flags, Mode::empty()) {
-            Ok(fd) => Rc::new(File::from(fd)),
+        let handle = match open_directory(entry) {
+            Ok(handle) => handle,
             Err(error) => {
                 if self.options.depth_first {
                     self.slot = Slot::After;
                 }
-                return Err(WalkError {
-                    path: entry.path().to_owned(),
-                    error: error.into(),
-                });
+                return Err(entry.error(&error));
             }
         };
         let path_len = entry.path.len();
@@ -702,6 +730,11 @@ impl LiveWalk {
                         if let Err(error) = self.entry.follow_catalog() {
                             return Some(Err(self.entry.error(&error)));
                         }
+                        if self.options.live_checks
+                            && let Err(error) = self.entry.metadata()
+                        {
+                            return Some(Err(self.entry.error(error)));
+                        }
                         if self.options.xdev {
                             self.root_dev = catalog.identity(id).0;
                         }
@@ -737,11 +770,19 @@ impl LiveWalk {
             entry.check_directory = false;
             entry.metadata = OnceCell::new();
             entry.target = child.target;
-            entry.catalog = child.target.and(self.catalog.clone());
+            if child.target.is_some() {
+                if entry.catalog.is_none() {
+                    entry.catalog = self.catalog.clone();
+                }
+            } else {
+                entry.catalog = None;
+            }
             if let Err(error) = entry.follow_catalog() {
                 return Some(Err(entry.error(&error)));
             }
-            if child.target.is_none() && child.kind == Some(FileKind::Directory) {
+            if child.kind == Some(FileKind::Directory)
+                && (child.target.is_none() || self.options.live_checks)
+            {
                 match level.first.take() {
                     Some(stat) if index == level.start => entry.metadata = OnceCell::from(stat),
                     _ => entry.check_directory = true,
@@ -961,6 +1002,20 @@ fn catalog_kind(kind: Kind) -> FileKind {
         Kind::Block => FileKind::Block,
         Kind::Character => FileKind::Character,
     }
+}
+
+fn open_directory(entry: &Entry) -> io::Result<Rc<File>> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let flags = if entry.depth == 0 || entry.follow {
+        flags
+    } else {
+        flags | OFlags::NOFOLLOW
+    };
+    Ok(Rc::new(File::from(open(
+        entry.path(),
+        flags,
+        Mode::empty(),
+    )?)))
 }
 
 // Resolve links from the snapshot, including intermediate components. A ..

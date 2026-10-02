@@ -477,12 +477,17 @@ impl Catalog {
     /// Children, visible and ignored, with raw names, kinds and optional stat
     /// rows. Needs Names and Links. Ignored rows never load stat columns.
     pub fn entries(&self, dir: InoId) -> impl Iterator<Item = Entry<'_>> {
-        self.children(dir).map(|id| self.entry(id))
+        let names = self.name_reader();
+        self.children(dir)
+            .map(move |id| self.typed_entry(id, names.get(id)))
     }
 
     /// One typed name row. Needs Names and Links for a visible non-directory.
     pub fn entry(&self, id: NameId) -> Entry<'_> {
-        let name = self.name(id);
+        self.typed_entry(id, self.name(id))
+    }
+
+    fn typed_entry<'a>(&self, id: NameId, name: Name<'a>) -> Entry<'a> {
         let target = name.target();
         let kind = match target {
             Target::Inode(inode) => self.kind(inode),
