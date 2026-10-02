@@ -224,6 +224,17 @@ execs.
 catalog row; unchanged means no read and no hash. A reused `(dev, ino)` after a
 delete carries a new ctime, so it is re-read and re-hashed like any change.
 
+**Milestone 4a (in progress, 2026-10-02).** The current v2 child column is
+blocked frame-of-reference (128 names per block); near-`u32::MAX` ignored-type
+sentinels widen mixed blocks. Before changing its encoding, measure the existing
+10M synthetic catalog and name search, then compare ignored-name encodings on
+the same dump. Ignored entries will have names and types without inode rows;
+ignored directories without visible descendants will be opaque. Re-included
+ancestors will be ordinary directories. Special files will retain stat data
+without content. Directory entry counts already include ignored names, and
+EACCES already publishes an unlisted directory with an unknown count. The read
+API will expose children, optional inode ids, kinds, opacity and path lookup.
+
 ## Policy and crawl (D10, D13)
 
 `ferret-policy` is pure: the crawler carries a `DirRules` per directory (`root`,
