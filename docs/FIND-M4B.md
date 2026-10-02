@@ -24,12 +24,15 @@ with ENOTEMPTY and exit 1.
 
 ## Correctness checks
 
-The committed CLI self-check shares every expression with the GNU differential
+The committed CLI self-check shares all 105 expressions with the GNU differential
 suite and compares **exact** output order, exit status and stderr emptiness
 against `-I` for seven start spellings, with no ignore rules. It also compares
 `-exec +`, `-execdir +` and printf. Dedicated cases cover ignored starts and
 references, re-inclusion/prune, changed size/link counts, deleted names,
-permission denial, config, unresolved/stale starts and nested indexed roots.
+permission denial, config (even without an unused XDG state base),
+unresolved/stale starts and nested indexed roots. Name/type-only queries are
+also tested after a command removes the child, so accidental lstat calls fail
+the guard. Neither mode appends query logs.
 
 Seed corpus, both targets, clean plus all four ignore trees, jobs 4:
 
@@ -45,7 +48,8 @@ GNU result mismatch. Every supported seed comparison agrees. The harness is
 unchanged; its old control-3 catalog grammar is also unchanged.
 
 Artifacts: `/home/dave/w/find-compat/.scratch/ferret-impl/m4b/`:
-`seed-progress-initial.jsonl`, `seed-summary-initial.json`, `seed-initial.log`.
+`seed-progress-final-*.jsonl`, `seed-summary.json`, `seed-final.log` (final
+release; same counts as the initial run).
 The runner wrapper only redirects temporary/output directories into this slice.
 The full corpus remains Dave's acceptance run; its old unrestricted baseline
 67,394 agree / 20 differ / 6 harness-failure was not re-run here.
@@ -133,3 +137,12 @@ cannot remove the live traversal floor demonstrated by the unrestricted rows.
 
 The functional slice is implemented. It is **not a completed milestone** under
 the speed gate; the report records the measured constraint and proposed shapes.
+
+
+## Final validation
+
+Pinned `nix run .#fmt`, workspace clippy with `-D warnings`, and workspace tests
+pass with zero compiler warnings. 371 tests pass, 4 pre-existing tests are
+ignored; the two layering tests pass. No manifests or lockfile changed. The
+final seed release gives the same counts above. Release binary:
+`/home/dave/w/super-ferret-wt/find-m4b/target/release/ferret`.

@@ -1189,6 +1189,7 @@ fn catalog_find_matches_live_across_the_differential_expressions_in_exact_order(
         assert_eq!(catalog.stdout, live.stdout, "{expression:?}");
         assert_eq!(catalog.stderr.is_empty(), live.stderr.is_empty());
     }
+    assert_eq!(env.log_lines().len(), 1, "find does not append query logs");
 }
 
 #[test]
@@ -1245,6 +1246,11 @@ fn catalog_find_skips_ignored_recursion_but_walks_explicit_starts_and_references
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(!env.at("visible").exists());
     assert!(env.at("hidden.tmp").exists());
+    let output = run(&["find", ".", "-type", "f", "-delete"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(env.at("hidden.tmp").exists());
+    assert!(env.at("build/nested/result.tmp").exists());
+    assert!(env.at("target/hidden.tmp").exists());
 }
 
 #[test]
@@ -1252,6 +1258,7 @@ fn catalog_find_uses_live_stat_and_handles_deleted_names_and_unreadable_director
     let env = Env::new("catalog-stat");
     env.seed_ignore_file();
     env.write("changed", b"old");
+    env.write("cheap", b"old");
     env.write("deleted", b"old");
     env.write("denied/file", b"contents");
     fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o000)).unwrap();
@@ -1266,6 +1273,14 @@ fn catalog_find_uses_live_stat_and_handles_deleted_names_and_unreadable_director
             .output()
             .unwrap()
     };
+    // A catalog name/type expression never stats a child, even after an
+    // earlier command removes it. A stat predicate below drops its vanished
+    // child without reporting a traversal error.
+    let output = run(&[
+        "find", ".", "-name", "cheap", "-exec", "rm", "{}", ";", "-type", "f", "-print",
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"./cheap\n");
     fs::hard_link(env.at("changed"), env.base.join("alias")).unwrap();
     let output = run(&["find", ".", "-name", "changed", "-links", "2"]);
     assert_eq!(code(&output), 0);
@@ -1325,6 +1340,15 @@ fn catalog_find_refuses_unresolved_starts_and_config_can_select_live_mode() {
     let configured = run(&["find", "../outside"]);
     assert_eq!(code(&configured), 0, "{}", stderr(&configured));
     assert_eq!(configured.stdout, run(&["find", "-I", "../outside"]).stdout);
+    // Config lookup must not depend on the unused state/cache directories.
+    let configured = env
+        .command(&[os("find"), os("../outside")])
+        .current_dir(env.tree())
+        .env_remove("HOME")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(code(&configured), 0, "{}", stderr(&configured));
     fs::write(env.base.join("home/config/ferret/config"), b"invalid\n").unwrap();
     assert_eq!(code(&run(&["find", "."])), 1);
     assert_eq!(code(&run(&["find", "-I", "."])), 0);

@@ -39,15 +39,13 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
         None
     } else {
         let dirs = Dirs::from_env();
-        let no_ignore = match dirs
-            .as_ref()
-            .ok()
-            .map(|dirs| read_config(&dirs.config.join("config")))
-            .transpose()
-        {
+        let config = Dirs::config_from_env().ok().map(|dir| dir.join("config"));
+        let no_ignore = match config.as_ref().map(|path| read_config(path)).transpose() {
             Ok(value) => value.unwrap_or(false),
             Err(error) => {
-                cli::error(&format!("find: config: {error}"));
+                if let Some(path) = config {
+                    cli::error(&format!("find: {}: {error}", path.display()));
+                }
                 return Exit::NoMatch;
             }
         };

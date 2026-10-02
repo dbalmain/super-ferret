@@ -2374,7 +2374,8 @@ name states the behavior directly and matches `--no-ignore`. The smallest
 shape is one `key = true|false` line, optional whitespace, blank lines and `#`
 comments; missing/empty means false. Unknown keys, duplicate keys and malformed
 values fail with status 1. No dependency or general-purpose format parser.
-Explicit `-I` bypasses both config and index; help/version bypass them too.
+Config lookup resolves only its XDG base, independent of unused state/cache
+bases. Explicit `-I` bypasses both config and index; help/version bypass them too.
 
 The catalog's name order cannot reproduce readdir order. 4b retains live
 name listings solely for traversal order and intersects them with catalog
@@ -2384,6 +2385,31 @@ using stale stat columns. The cost is measured in [the 4b report](FIND-M4B.md).
 A pasted `find … -delete` skips ignored files and still exits 0 when the
 selected deletions succeed. Deleting a visible directory that still contains
 ignored files can fail with ENOTEMPTY and exit 1, as a live deletion does.
+
+**4b stat freshness brief (2026-10-03).** Does the measured stat cost justify
+changing the settled lazy-live policy? A: live lstat, current metadata but one
+syscall per matching entry (size 443 ms, mtime 459 ms). B: snapshot columns,
+size/mtime about 170 ms with the same ordered source, but stale metadata and
+missed deletions. C: the later watch-backed stat cache, current within the
+watched set but requiring daemon work. **Recommendation: retain A**; Dave must
+choose any move to B. The fact that changes it: an explicit acceptable freshness
+contract. Trial patch is preserved and unapplied, with loads and all measurements
+in [FIND-M4B.md](FIND-M4B.md); eager size/mtime decoding costs about 5 ms on the
+name/type controls. B alone still misses fd's roughly 51 ms stat median.
+
+**4b order/speed brief (2026-10-03).** How should exact current traversal order
+coexist with the speed gate? A: live name listings (implemented), preserving
+order but costing 160–220 ms on cheap queries; fd is 23–39 ms. B: persist
+traversal order during indexing and keep it current through watches, adding
+storage/crawl/daemon work but making catalog traversal possible. C: allow
+catalog order for read-only plans without quit/commands, fast for names but
+changing plain output order and the brief's exact-order contract. Existing
+catalog-only search takes 12–21 ms here, under a different output/order contract.
+**Recommendation: investigate B and measure its storage/freshness costs**, or
+explicitly choose C if that ordering relaxation is acceptable. No ordering
+relaxation is selected. The fact that changes it: Dave accepting catalog order
+for those plans, or evidence that persisted order can stay current cheaply.
+The functional implementation therefore does not complete the speed gate.
 
 ## D48 — The next move after S1
 
