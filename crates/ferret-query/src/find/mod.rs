@@ -4,6 +4,7 @@
 
 mod action;
 mod glob;
+mod output;
 mod parallel;
 mod parse;
 mod printf;
@@ -69,9 +70,47 @@ pub trait Effects {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
-    /// Executes a prepared command with inherited standard descriptors.
+    /// Executes a prepared command, draining stdout through the host capture
+    /// hook.
     fn command(&mut self, command: &mut std::process::Command) -> io::Result<bool> {
-        Ok(command.status()?.success())
+        self.capture(command, &mut io::stdout().lock())
+    }
+    /// Drains a child's stdout into the entry buffer while it runs. Stderr and
+    /// stdin retain the host's normal process policy.
+    fn capture(
+        &mut self,
+        command: &mut std::process::Command,
+        output: &mut dyn std::io::Write,
+    ) -> io::Result<bool> {
+        use std::process::Stdio;
+        let mut child = command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let copied = match child.stdout.take() {
+            Some(mut stdout) => io::copy(&mut stdout, output).map(|_| ()),
+            None => Ok(()),
+        };
+        let status = child.wait();
+        copied?;
+        Ok(status?.success())
+    }
+    /// Commits this entry and latches cancellation. Hosts normally use the
+    /// evaluator's entry adapter rather than overriding this hook.
+    fn quit(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    /// Writes an output-file record through the evaluator's entry adapter.
+    fn file(
+        &mut self,
+        file: &std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        use std::io::Write;
+        file.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_all(bytes)
     }
     /// Prompts and reads one answer line. Only initial y/Y is yes in C locale.
     fn confirm(&mut self, program: &std::ffi::OsStr, path: &Path) -> io::Result<bool> {
@@ -228,6 +267,10 @@ impl Plan {
         }
         let mut control = Control::default();
         let mut descend = true;
+        let buffered = output::needs_record(&expression);
+        let mut record = output::Record::default();
+        let gate = std::sync::Mutex::new(());
+        let quit = std::sync::atomic::AtomicBool::new(false);
         while let Some(item) =
             source.next_with(descend, &mut || control.actions.flush(effects, true))
         {
@@ -253,7 +296,22 @@ impl Plan {
                 outcome.errors += 1;
                 break;
             }
-            if let Err(error) = evaluate(&expression, entry, effects, &mut control) {
+            let result = if buffered {
+                let mut output = output::EntryEffects {
+                    host: effects,
+                    record: &mut record,
+                    gate: &gate,
+                    quit: &quit,
+                };
+                let result = evaluate(&expression, entry, &mut output, &mut control);
+                let committed = output.commit(false);
+                committed
+                    .map_err(EvaluationError::Output)
+                    .and(result.map(|_| ()))
+            } else {
+                evaluate(&expression, entry, effects, &mut control).map(|_| ())
+            };
+            if let Err(error) = result {
                 let (error, stop) = match error {
                     EvaluationError::Metadata(error) => (error, false),
                     EvaluationError::Output(error) => (error, true),
@@ -286,6 +344,14 @@ impl Plan {
             });
             outcome.errors += 1;
         }
+        outcome.errors +=
+            action::flush_shared(&control.actions.shared, effects).unwrap_or_else(|error| {
+                effects.error(&WalkError {
+                    path: ".".into(),
+                    error,
+                });
+                1
+            });
         outcome.errors += control.actions.errors;
         Ok(outcome)
     }
@@ -436,9 +502,7 @@ fn evaluate(
         }
         Expression::Quit => {
             control.quit = true;
-            if let Some(quit) = &control.cancelled {
-                quit.store(true, std::sync::atomic::Ordering::Release);
-            }
+            effects.quit().map_err(EvaluationError::Output)?;
             true
         }
         Expression::Test(test) => test.evaluate(entry).map_err(EvaluationError::Metadata)?,

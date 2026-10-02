@@ -1,6 +1,7 @@
 //! Bounded sibling donation over the ordinary DFS engine. Suspended parents
 //! return to the queue rather than occupying a worker while descendants run.
-//! Each task owns its expression control and pending batches; effects are
+//! Tasks own expression control and directory-local batches; ordinary batches
+//! are shared across the run. Effects are
 //! worker-local handles to the host's synchronized output and prompt sinks.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -17,6 +18,9 @@ struct Task {
     descend: bool,
     completion: Option<Arc<AtomicUsize>>,
     errors: u64,
+    record: super::output::Record,
+    gate: Arc<Mutex<()>>,
+    quit: Arc<AtomicBool>,
 }
 
 impl Task {
@@ -30,10 +34,19 @@ impl Task {
             descend: true,
             completion,
             errors: 0,
+            record: super::output::Record::default(),
+            gate: Arc::new(Mutex::new(())),
+            quit: quit.clone(),
         }
     }
 
-    fn step(&mut self, plan: &Plan, expression: &Expression, effects: &mut impl Effects) -> bool {
+    fn step(
+        &mut self,
+        plan: &Plan,
+        expression: &Expression,
+        effects: &mut impl Effects,
+        buffered: bool,
+    ) -> bool {
         let Some(item) = self.walk.next_with(self.descend, &mut || {
             self.control.actions.flush(effects, true)
         }) else {
@@ -61,7 +74,22 @@ impl Task {
             self.control.quit = true;
             return false;
         }
-        if let Err(error) = evaluate(expression, entry, effects, &mut self.control) {
+        let result = if buffered {
+            let mut output = super::output::EntryEffects {
+                host: effects,
+                record: &mut self.record,
+                gate: &self.gate,
+                quit: &self.quit,
+            };
+            let result = evaluate(expression, entry, &mut output, &mut self.control);
+            let committed = output.commit(false);
+            committed
+                .map_err(EvaluationError::Output)
+                .and(result.map(|_| ()))
+        } else {
+            evaluate(expression, entry, effects, &mut self.control).map(|_| ())
+        };
+        if let Err(error) = result {
             let (error, stop) = match error {
                 EvaluationError::Metadata(error) => (error, false),
                 EvaluationError::Output(error) => (error, true),
@@ -80,11 +108,11 @@ impl Task {
     }
 
     fn donate(&mut self, quit: &Arc<AtomicBool>) -> Option<Self> {
-        if let Some(walk) = self.walk.split_start() {
-            return Some(Self::new(walk, None, quit));
-        }
         let (walk, completion) = self.walk.split()?;
-        Some(Self::new(walk, Some(completion), quit))
+        let mut task = Self::new(walk, Some(completion), quit);
+        task.gate = self.gate.clone();
+        task.control.actions.shared = self.control.actions.shared.clone();
+        Some(task)
     }
 
     fn flush(&mut self, effects: &mut impl Effects) {
@@ -126,6 +154,7 @@ struct Pool {
 impl Pool {
     fn worker(&self, plan: &Plan, expression: &Expression, mut effects: impl Effects) -> u64 {
         let mut errors = 0;
+        let buffered = super::output::needs_record(expression);
         loop {
             let mut queue = self
                 .queue
@@ -149,7 +178,9 @@ impl Pool {
             };
             drop(queue);
             let mut steps = 0usize;
-            while !self.quit.load(Ordering::Acquire) && task.step(plan, expression, &mut effects) {
+            while !self.quit.load(Ordering::Acquire)
+                && task.step(plan, expression, &mut effects, buffered)
+            {
                 if task.control.quit {
                     self.quit.store(true, Ordering::Release);
                     break;
@@ -211,7 +242,8 @@ impl Plan {
     /// Executes a live or catalog DFS on at most `workers` threads. Cloned
     /// effects must synchronize records and prompts, and capture child stdout
     /// without holding the output lock while the child runs. Threads start only
-    /// after traversal discovers independent sibling or start-operand work.
+    /// after traversal discovers independent sibling work; start operands
+    /// complete in sequence.
     pub fn run_parallel<E: Effects + Clone + Send>(
         &self,
         mut source: LiveWalk,
@@ -250,9 +282,11 @@ impl Plan {
             source.catalog().is_some() && self.options.max_depth.is_some_and(|depth| depth <= 2);
         let quit = Arc::new(AtomicBool::new(false));
         let mut task = Task::new(source, None, &quit);
-        // Until donation there is no other worker to cancel this expression.
         task.control.cancelled = None;
-        while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects) {
+        let buffered = super::output::needs_record(&expression);
+        let shared = task.control.actions.shared.clone();
+        while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects, buffered)
+        {
             if task.control.quit {
                 break;
             }
@@ -309,12 +343,26 @@ impl Plan {
                         .into_iter()
                         .map(|task| task.finish(&mut effects))
                         .sum::<u64>();
+                let errors = errors
+                    + super::action::flush_shared(&shared, &mut effects).unwrap_or_else(|error| {
+                        effects.error(&WalkError {
+                            path: ".".into(),
+                            error,
+                        });
+                        1
+                    });
                 return Ok(Outcome { errors });
             }
         }
-        Ok(Outcome {
-            errors: task.finish(&mut effects),
-        })
+        let errors = task.finish(&mut effects)
+            + super::action::flush_shared(&shared, &mut effects).unwrap_or_else(|error| {
+                effects.error(&WalkError {
+                    path: ".".into(),
+                    error,
+                });
+                1
+            });
+        Ok(Outcome { errors })
     }
 }
 

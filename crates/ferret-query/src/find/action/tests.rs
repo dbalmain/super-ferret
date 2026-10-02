@@ -90,10 +90,16 @@ impl Effects for Output {
         Ok(())
     }
     fn command(&mut self, command: &mut Command) -> io::Result<bool> {
+        let mut bytes = Vec::new();
+        let result = self.capture(command, &mut bytes)?;
+        self.write(&bytes)?;
+        Ok(result)
+    }
+    fn capture(&mut self, command: &mut Command, sink: &mut dyn io::Write) -> io::Result<bool> {
         self.batches
             .push(command.get_args().map(OsStr::to_owned).collect());
         let output = command.output()?;
-        self.bytes.extend_from_slice(&output.stdout);
+        sink.write_all(&output.stdout)?;
         if !output.stderr.is_empty() {
             self.diagnostics
                 .push(String::from_utf8_lossy(&output.stderr).into_owned());
@@ -129,7 +135,7 @@ fn exec_substitution_truth_and_spawn_errors_use_the_real_process_path() {
     assert_eq!(outcome.errors, 0);
     let path = tree.0.to_string_lossy();
     assert_eq!(output.bytes, format!("x{path}y:{path}{path}\n").as_bytes());
-    assert_eq!(output.flushes, 1);
+    assert_eq!(output.flushes, 2); // Before spawning, then while committing the entry.
     let (outcome, output) = tree.run(&["-maxdepth", "0", "-exec", "false", ";", "-o", "-print"]);
     assert_eq!(outcome.errors, 0);
     assert!(!output.bytes.is_empty());

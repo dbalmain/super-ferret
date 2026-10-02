@@ -2478,7 +2478,7 @@ explicit `ferretd` is the whole design.
 **Answer (2026-09-30): A.** Start the daemon on first use; build the engine in
 process when a background process is not allowed or `FERRET_NO_DAEMON` is set.
 
-## Find M5b — quit while an action is running (open)
+## Find M5b — quit while an action is running (answered)
 
 **Question.** Does F11's “stops every worker promptly” require terminating
 a command or interactive prompt already started on another worker, or
@@ -2491,10 +2491,36 @@ An asynchronous clarification was sent; no answer has been received.
 | A. Finish started actions | Cancel new traversal/evaluation immediately; flush collected batches; await already-started commands/prompts | Preserves completed child output and external effects with the existing process interface; exit can wait for a slow command or unanswered prompt |
 | B. Terminate started actions | Add cancellation to process-group execution, pipe collection and prompt input; terminate running commands and stop prompts | Bounds cancellation latency, but can leave partial external effects/output and changes command completion semantics; needs a cancellation-aware host interface |
 
-**Recommendation.** A unless finite quit-exit latency, including slow or
-blocked actions, is a requirement. That latency requirement or an explicit
-instruction to terminate subprocesses is the fact that changes the answer.
-The checked code retains A's existing started-process behavior; B has not
-been implemented or assumed authorized. Parallel walking/actions, all gates,
-all timing gates and the full corpus are checked independently of this
-choice. The done-note records the exact validation and this remaining limit.
+**Answer (2026-10-03): A.** Dave's M5c instruction settles the policy: already
+running commands finish and are awaited, with no forced termination. Quit is
+an output latch: the first entry reaching it commits under the output lock;
+entries finishing later discard their buffered output. Side effects already
+performed remain. Collected batches flush at exit. This accepts exit latency
+from a slow command or unanswered prompt and avoids cancellation machinery.
+
+## Find M5c — measured batching and many-start costs (open)
+
+Fifteen warm samples, one benchmark at a time, same 300k timing tree and index.
+The fixture has 368 directory start operands. Median-sample load was
+2.30/2.39/2.55 for M5b many starts and 2.20/2.36/2.54 for M5c live starts.
+`find $(ls) -name x`: M5b default/live 17.261/26.694 ms; M5c 21.565/130.593 ms.
+Sequential starts retain the required semantics but repeatedly drain sibling
+work before admitting the next root. This is a real cost on many small roots.
+
+Shared `-type f -exec true {} +` batches: M5b default/live 76.342/48.539 ms;
+M5c 189.923/243.461 ms. Median-sample load 2.74/2.47/2.58. Name-selected batches:
+24.052/39.964 ms versus 32.289/58.118 ms, load 2.20/2.36/2.54. The command uses
+the pinned absolute coreutils true binary. Raw samples are in
+`/home/dave/w/find-compat/.scratch/ferret-impl/m5c/probes.json`.
+
+| Option | Benefit | Cost |
+| --- | --- | --- |
+| A. Keep the shared mutex | Smallest implementation; one minimal batch partition | Every selected entry contends on the batch lock; full-batch processes hold it while running |
+| B. Stage small worker chunks, append to the shared batch | Amortizes lock acquisitions while keeping one spawning batch per action | Adds bounded path staging and a final merge before shared exit flush; quit must retain staged arguments |
+| C. Change start scheduling without overlapping roots | Try fewer workers or caller-thread traversal for narrow roots | Requires additional measurements and a scheduler policy; cannot recover concurrency between independent small starts |
+
+Recommendation: B is the cheapest batching improvement. Keep start sequencing;
+measure C before adopting any heuristic. Reverting to independent start walks
+would reintroduce the overlapping-delete errors that M5c must fix. Dave asked
+for a write-up before accepting real speed or complexity costs; these timings
+are reported rather than silently expanding the implementation.

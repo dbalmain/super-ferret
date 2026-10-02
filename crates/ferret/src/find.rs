@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use ferret_catalog::Catalog;
@@ -180,18 +180,14 @@ impl Effects for Output {
     }
 
     fn command(&mut self, command: &mut Command) -> io::Result<bool> {
-        let output = command
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .output()?;
-        let mut writer = self
-            .writer
+        self.flush()?;
+        let shared = self.writer.clone();
+        let mut writer = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer.write_all(&output.stdout)?;
+        let success = self.capture(command, &mut *writer)?;
         writer.flush()?;
-        Ok(output.status.success())
+        Ok(success)
     }
 
     fn warning(&mut self, message: &str) {

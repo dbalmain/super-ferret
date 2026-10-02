@@ -255,7 +255,9 @@ fn exec_batch_sizes_against_pinned_gnu() {
                 "stack {stack}, pad {pad}: {:?}",
                 actual.stderr
             );
-            // F11 permits smaller batches and arbitrary argument order.
+            // Shared batches keep GNU's 128 KiB string budget. Constrained
+            // stacks also reserve Linux's argv-pointer space. Argument order is
+            // free.
             let totals = |bytes: &[u8]| {
                 std::str::from_utf8(bytes).unwrap().lines().fold(
                     (0usize, 0usize),
@@ -280,7 +282,7 @@ fn exec_batch_sizes_against_pinned_gnu() {
                 assert_eq!(totals(&actual.stdout), totals(&expected.stdout));
             } else {
                 // GNU's larger batch can exceed the kernel's argument limit
-                // at a low stack limit; F11 permits smaller successful batches.
+                // at a low stack limit; reserving pointer space avoids E2BIG.
                 assert!(!expected.stderr.is_empty());
             }
         }

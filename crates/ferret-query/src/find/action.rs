@@ -48,10 +48,7 @@ impl Target {
     fn write(&self, bytes: &[u8], effects: &mut impl Effects) -> io::Result<()> {
         match self {
             Self::Stdout => effects.write(bytes),
-            Self::File(_, file) => file
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .write_all(bytes),
+            Self::File(_, file) => effects.file(file, bytes),
         }
     }
 }
@@ -65,7 +62,7 @@ pub(super) struct Exec {
     pub prompt: bool,
 }
 
-struct Batch {
+pub(super) struct Batch {
     exec: Exec,
     directory: Option<PathBuf>,
     handle: Option<Arc<File>>,
@@ -76,8 +73,9 @@ struct Batch {
 #[derive(Default)]
 pub(super) struct State {
     batches: BTreeMap<usize, Batch>,
+    pub shared: Arc<Mutex<BTreeMap<usize, Batch>>>,
     buffer: Vec<u8>,
-    limit: Option<usize>,
+    limit: Option<Budget>,
     files: Vec<Arc<Mutex<BufWriter<File>>>>,
     pub errors: u64,
 }
@@ -132,6 +130,21 @@ impl State {
     }
 }
 
+pub(super) fn flush_shared(
+    shared: &Mutex<BTreeMap<usize, Batch>>,
+    effects: &mut impl Effects,
+) -> io::Result<u64> {
+    let mut errors = 0;
+    for batch in shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values_mut()
+    {
+        errors += u64::from(!batch.run(effects)?);
+    }
+    Ok(errors)
+}
+
 impl Batch {
     fn run(&mut self, effects: &mut impl Effects) -> io::Result<bool> {
         if self.paths.is_empty() {
@@ -154,7 +167,13 @@ fn command_bytes(args: &[OsString]) -> usize {
     args.iter().map(|arg| arg.as_bytes().len() + 1).sum()
 }
 
-fn batch_limit() -> usize {
+#[derive(Clone, Copy)]
+struct Budget {
+    strings: usize,
+    kernel: usize,
+}
+
+fn batch_limit() -> Budget {
     // GNU's default observed buffer is 128 KiB. Linux ARG_MAX is a quarter of
     // the stack limit, with a 128 KiB floor; environment strings and safety
     // slack only shrink that default on a constrained process.
@@ -171,12 +190,17 @@ fn batch_limit() -> usize {
         })
         .unwrap_or(8 * 1024 * 1024);
     let environment: usize = std::env::vars_os()
-        .map(|(key, value)| key.as_bytes().len() + value.as_bytes().len() + 2)
+        .map(|(key, value)| {
+            key.as_bytes().len() + value.as_bytes().len() + 2 + std::mem::size_of::<usize>()
+        })
         .sum();
-    (stack / 4)
+    let kernel = (stack / 4)
         .max(128 * 1024)
-        .saturating_sub(environment + 2048)
-        .min(128 * 1024)
+        .saturating_sub(environment + 2048);
+    Budget {
+        strings: kernel.min(128 * 1024),
+        kernel,
+    }
 }
 
 pub(super) fn evaluate(
@@ -283,7 +307,17 @@ fn execute(
     };
     if exec.batch {
         let limit = *state.limit.get_or_insert_with(batch_limit);
-        let batch = state.batches.entry(exec.id).or_insert_with(|| Batch {
+        let mut shared;
+        let batches = if exec.directory {
+            &mut state.batches
+        } else {
+            shared = state
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            &mut *shared
+        };
+        let batch = batches.entry(exec.id).or_insert_with(|| Batch {
             exec: exec.clone(),
             directory: directory.clone(),
             handle: handle.clone(),
@@ -291,7 +325,14 @@ fn execute(
             bytes: command_bytes(&exec.args),
         });
         let bytes = path.as_bytes().len() + 1;
-        if batch.directory != directory || batch.bytes + bytes > limit {
+        // Linux counts argv pointers as well as strings against ARG_MAX.
+        // Shared batches can reach this limit even at a 256 KiB stack; the
+        // old worker-local partitions happened to hide that accounting gap.
+        let pointers = (exec.args.len() + batch.paths.len() + 2) * std::mem::size_of::<usize>();
+        if batch.directory != directory
+            || batch.bytes + bytes > limit.strings
+            || batch.bytes + bytes + pointers > limit.kernel
+        {
             for file in &state.files {
                 file.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -660,15 +660,6 @@ impl LiveWalk {
         Some((walk, pending))
     }
 
-    pub(super) fn split_start(&mut self) -> Option<Self> {
-        let path = self.paths.next()?;
-        let mut walk = Self::new(vec![path], self.options.clone());
-        walk.catalog = self.catalog.clone();
-        walk.removed_children = self.removed_children.clone();
-        walk.nested_roots = self.nested_roots.clone();
-        Some(walk)
-    }
-
     /// Lists the lent entry's directory and makes it the innermost level.
     fn descend(
         &mut self,

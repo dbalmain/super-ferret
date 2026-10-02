@@ -84,12 +84,18 @@ impl Effects for Output {
         self.errors.lock().unwrap().push(error.path.clone());
     }
     fn command(&mut self, command: &mut Command) -> io::Result<bool> {
+        let mut bytes = Vec::new();
+        let result = self.capture(command, &mut bytes)?;
+        self.write(&bytes)?;
+        Ok(result)
+    }
+    fn capture(&mut self, command: &mut Command, sink: &mut dyn io::Write) -> io::Result<bool> {
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
         let output = command.output();
         self.active.fetch_sub(1, Ordering::SeqCst);
         let output = output?;
-        self.write(&output.stdout)?;
+        sink.write_all(&output.stdout)?;
         Ok(output.status.success())
     }
 }
@@ -177,8 +183,7 @@ fn prune_and_quit_control_all_real_workers() {
     let (outcome, output) = tree.run(&["-name", "keep", "-print", "-quit"], 16);
     assert_eq!(outcome.errors, 0);
     let records = output.records.lock().unwrap();
-    assert!(!records.is_empty());
-    assert!(records.len() <= 16);
+    assert_eq!(records.len(), 1);
     assert!(records.iter().all(|path| path.ends_with(b"/keep")));
 }
 

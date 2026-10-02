@@ -86,8 +86,14 @@ impl Effects for Output {
     }
 
     fn command(&mut self, command: &mut Command) -> io::Result<bool> {
+        let mut bytes = Vec::new();
+        let result = self.capture(command, &mut bytes)?;
+        self.write(&bytes)?;
+        Ok(result)
+    }
+    fn capture(&mut self, command: &mut Command, sink: &mut dyn io::Write) -> io::Result<bool> {
         let output = command.output()?;
-        self.bytes.extend_from_slice(&output.stdout);
+        sink.write_all(&output.stdout)?;
         if !output.stderr.is_empty() {
             self.errors.push(PathBuf::from("child stderr"));
         }

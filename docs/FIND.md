@@ -6,7 +6,7 @@ nanoseconds) describe the last indexing observation. New names are absent;
 deleted names and old metadata remain queryable until re-indexing. Re-index
 when changing ignore policy. The daemon will maintain freshness in a later slice.
 
-Each start operand is an independent walk; starts and siblings may interleave.
+Start operands run one after another; siblings within each start may interleave.
 A parent's expression completes before its children start; `-depth` and
 `-delete` complete children first. `-prune` stops descent. There is no
 order-sensitive plan class. Live traversal, including default-mode live
@@ -14,13 +14,19 @@ fallbacks, uses a bounded worker pool. Catalog work also uses workers where
 measurements show a gain; shallow catalog walks stay on the caller thread.
 
 Workers evaluate whole expressions and run actions concurrently. `-exec`'s
-exit status gates its remaining expression. Each child's stdout is captured
-and emitted whole; print/printf records and file output records are atomic.
-Interactive prompts are serialized. Batch argument order and boundaries are
-free. `-quit` cancels all further expression and traversal work; collected
-batches flush at exit. Started commands and prompts are awaited; the
-termination policy is an open M5b decision. Errors are reported on stderr
-and set exit status 1, except that GNU treats a failed `-exec … ;` launch as
+exit status gates its remaining expression. Everything one entry produces,
+including child stdout and output-file records,
+commits together when its expression ends. Child stdout is drained while the
+command runs; output above 64 KiB per stream spills to a private, unlinked
+temporary file. Temporary storage grows with the entry's output, while memory
+stays bounded per stream and worker. Interactive prompts are serialized.
+Each ordinary `-exec … {} +` action has one shared batch across workers and
+starts, flushed at the argument limit and once at exit. Argument order is free;
+`-execdir` retains directory-local boundaries. `-quit` commits the winning entry
+under the output lock and discards entries finishing later. Collected batches
+still flush at exit. Started commands and prompts finish and are awaited
+(DECISIONS option A). Errors are reported on stderr and set exit status 1,
+except that GNU treats a failed `-exec … ;` launch as
 a false test without changing exit status.
 
 The catalog's raw directory entry count includes ignored names, so `-empty`
@@ -64,3 +70,6 @@ warm timing table are recorded in
 `/home/dave/w/super-ferret/.ai/find-m5a-done.md`. The checked checkpoint passes
 all workspace gates and all eight fd-comparable timing rows. Milestone 5a is
 not complete until its two decision conflicts above are resolved.
+
+M5c's parallel-idiom contract and validation are recorded in FIND-M5C.md and
+`/home/dave/w/super-ferret/.ai/find-m5c-done.md`.
