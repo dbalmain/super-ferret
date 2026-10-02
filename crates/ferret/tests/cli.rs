@@ -1819,8 +1819,8 @@ fn catalog_find_reports_removed_directory_descent_and_skips_deleted_files_on_rep
 }
 
 #[test]
-fn catalog_find_kind_guards_preserve_earlier_effects_and_followed_directory_links() {
-    let env = Env::new("catalog-kind-guards");
+fn catalog_find_candidate_guards_preserve_earlier_effects_and_followed_directory_links() {
+    let env = Env::new("catalog-candidate-guards");
     env.seed_ignore_file();
     env.write("dir/file", b"contents");
     std::os::unix::fs::symlink("dir", env.at("link")).unwrap();
@@ -1830,6 +1830,11 @@ fn catalog_find_kind_guards_preserve_earlier_effects_and_followed_directory_link
         vec!["-type", "d", "-o", "-print"],
         vec!["-type", "f", "-o", "-type", "d"],
         vec!["-follow", "-type", "d"],
+        vec!["-print", "-name", "file"],
+        vec!["-name", "file", "-o", "-print"],
+        vec!["-name", "file", "-o", "-name", "link"],
+        vec!["-name", "file", "-exec", "echo", "{}", ";"],
+        vec!["-not", "-name", "file"],
     ] {
         let mut args = vec![os("find"), os(".")];
         args.extend(expression.iter().map(os));

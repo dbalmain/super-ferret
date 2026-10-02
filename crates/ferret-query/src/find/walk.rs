@@ -2,12 +2,12 @@
 //! keep each start operand's spelling. Stored fields are decoded on demand;
 //! fields absent from the catalog share one lazy live metadata observation.
 //!
-//! Speed (m3b): the walk lends one entry and allocates nothing per name. Its
-//! path buffer is truncated and extended per child, child names sit on one
-//! stack-shaped arena, and listings reuse one getdents buffer over the
-//! directory's own handle rather than a dup. What remains is kernel time: an
-//! lstat per directory (GNU's observable checks) and per entry wherever a test
-//! needs one.
+//! Both sources lend one entry and reuse its path buffer and stack-shaped name
+//! arena. Catalog leaves rejected by a leading pure guard need no path buffer
+//! work. Live listings reuse one getdents buffer over the directory's own
+//! handle. Effectful catalog plans observe names when entering a directory and
+//! open it for descent errors and execdir; read-only stored-field queries do
+//! neither.
 
 use std::cell::OnceCell;
 use std::ffi::OsStr;
@@ -532,8 +532,9 @@ impl LiveWalk {
                     && !(self.options.follow == Follow::All && child.kind == Kind::Symlink)
                     && self
                         .options
-                        .kinds
-                        .is_some_and(|mask| mask & (1 << catalog_kind(child.kind) as u8) == 0)
+                        .guard
+                        .as_ref()
+                        .is_some_and(|guard| !guard.matches(catalog_kind(child.kind), child.bytes))
                 {
                     continue;
                 }

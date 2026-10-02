@@ -33,7 +33,7 @@ enum Expression {
     Test(test::Test),
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Options {
     pub max_depth: Option<usize>,
     pub min_depth: usize,
@@ -41,7 +41,7 @@ pub(crate) struct Options {
     pub xdev: bool,
     pub follow: Follow,
     pub live_checks: bool,
-    pub kinds: Option<u8>,
+    guard: Option<CandidateGuard>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -153,7 +153,7 @@ impl Plan {
 
     /// Creates the sequential live source. It never opens a catalog.
     pub fn live_source(&self) -> LiveWalk {
-        LiveWalk::new(self.paths.clone(), self.options)
+        LiveWalk::new(self.paths.clone(), self.options.clone())
     }
 
     /// Sections needed for traversal and the stored fields this plan reads.
@@ -176,9 +176,9 @@ impl Plan {
 
     /// Creates a catalog walk. Load `catalog_sections()` before construction.
     pub fn catalog_source(&self, catalog: ferret_catalog::Catalog) -> CatalogSource {
-        let mut options = self.options;
+        let mut options = self.options.clone();
         options.live_checks = has_actions(&self.expression);
-        options.kinds = leading_kinds(&self.expression);
+        options.guard = leading_guard(&self.expression);
         CatalogSource::new(catalog, self.paths.clone(), options)
     }
 
@@ -281,14 +281,40 @@ impl Plan {
 
 // Only guards that reject before any effects may remove candidates. This is
 // independent of traversal order; directories still carry descendant work.
-fn leading_kinds(expression: &Expression) -> Option<u8> {
-    match expression {
-        Expression::Type(kinds) => Some(kinds.iter().fold(0, |mask, kind| mask | 1 << *kind as u8)),
-        Expression::And(left, _) => leading_kinds(left),
-        Expression::Or(left, right) => Some(leading_kinds(left)? | leading_kinds(right)?),
-        Expression::Not(inner) if matches!(&**inner, Expression::Type(_)) => {
-            Some(0x7f ^ leading_kinds(inner)?)
+#[derive(Clone, Debug)]
+enum CandidateGuard {
+    Kind(u8),
+    Name(glob::Pattern),
+    Or(Box<Self>, Box<Self>),
+}
+
+impl CandidateGuard {
+    fn matches(&self, kind: FileKind, name: &[u8]) -> bool {
+        match self {
+            Self::Kind(mask) => mask & (1 << kind as u8) != 0,
+            Self::Name(pattern) => pattern.matches(name),
+            Self::Or(left, right) => left.matches(kind, name) || right.matches(kind, name),
         }
+    }
+}
+
+fn leading_guard(expression: &Expression) -> Option<CandidateGuard> {
+    match expression {
+        Expression::Type(kinds) => Some(CandidateGuard::Kind(
+            kinds.iter().fold(0, |mask, kind| mask | 1 << *kind as u8),
+        )),
+        Expression::Name(pattern) => Some(CandidateGuard::Name(pattern.clone())),
+        Expression::And(left, _) => leading_guard(left),
+        Expression::Or(left, right) => Some(CandidateGuard::Or(
+            Box::new(leading_guard(left)?),
+            Box::new(leading_guard(right)?),
+        )),
+        Expression::Not(inner) => match leading_guard(inner)? {
+            CandidateGuard::Kind(mask) if matches!(&**inner, Expression::Type(_)) => {
+                Some(CandidateGuard::Kind(0x7f ^ mask))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }

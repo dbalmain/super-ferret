@@ -20,7 +20,10 @@ directories walk live without nested ignore rules. Ignored reference operands
 use live metadata; indexed references use stored metadata. Fields not stored
 (access time, birth time, allocated blocks, and device major/minor numbers) need
 live observations only when the corresponding primary or format asks for them.
-Their storage/performance choice is being measured in milestone 5a.
+Atime and block-column measurements are complete; their storage/fallback
+tradeoff remains open under milestone 5a's decision rule. Logical symlink
+following uses stored targets where indexed and live targets where no row
+exists.
 
 `ferret find -I` / `--no-ignore` is the unrestricted live mode. It opens no index
 and reads no configuration. Set `find_no_ignore = true` in
@@ -33,6 +36,17 @@ and re-index/`-I` guidance. Successful selected deletions exit 0, including when
 ignored files were skipped. A visible directory containing ignored files can
 fail with ENOTEMPTY and exit 1.
 
-Validation and warm timing results are recorded in
-`/home/dave/w/super-ferret/.ai/find-m5a-done.md`. Action disappearance behavior,
-full-corpus classification and the speed gate are still being validated.
+Effectful plans (`-exec`, `-execdir`, `-ok`, `-delete`) validate live starts,
+observe which catalog names still exist when entering each directory, and open
+directories for descent errors and execdir handles. A later sibling removal
+does not hide a name already observed; a removed directory fails descent.
+Names created by actions remain absent from the snapshot. Stored predicates
+retain their indexed values. In particular, indexed `-empty` can leave a
+directory emptied by earlier deletions; that effectful contract is still open
+under milestone 5a's correctness rule.
+
+Validation, full-corpus classification, missing-field costs and the complete
+warm timing table are recorded in
+`/home/dave/w/super-ferret/.ai/find-m5a-done.md`. The checked checkpoint passes
+all workspace gates and all eight fd-comparable timing rows. Milestone 5a is
+not complete until its two decision conflicts above are resolved.

@@ -114,6 +114,13 @@ the walk from a name through its parent's name to a root. Nothing else is derive
 writer only, and `DocId → [InoId]`, the full `InoId → [NameId]` and a
 directory's work tree are built when a query first needs them.
 
+Default `ferret find` traverses those catalog edges and reads stored stat
+columns with snapshot freshness. It guarantees parent/child ordering, reverses
+it for depth/delete, and honours prune; sibling GNU order is not promised.
+Explicit ignored starts and opaque subtrees walk live. `-I` is unrestricted
+live traversal. [FIND.md](FIND.md) describes field fallbacks and effectful
+observations.
+
 A symlink is catalogued as itself — an `inodes` row of kind symlink, named like
 any file — and never followed. Its target text is stored now so that D18's
 reverse map (target path → links) and content matches through links can be

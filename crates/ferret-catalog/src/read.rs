@@ -478,19 +478,20 @@ impl Catalog {
     /// rows. Needs Names and Links. Ignored rows never load stat columns.
     pub fn entries(&self, dir: InoId) -> impl Iterator<Item = Entry<'_>> {
         let names = self.name_reader();
+        let mut kinds = self.kinds();
         self.children(dir)
-            .map(move |id| self.typed_entry(id, names.get(id)))
+            .map(move |id| Self::typed_entry(id, names.get(id), &mut kinds))
     }
 
     /// One typed name row. Needs Names and Links for a visible non-directory.
     pub fn entry(&self, id: NameId) -> Entry<'_> {
-        self.typed_entry(id, self.name(id))
+        Self::typed_entry(id, self.name(id), &mut self.kinds())
     }
 
-    fn typed_entry<'a>(&self, id: NameId, name: Name<'a>) -> Entry<'a> {
+    fn typed_entry<'a>(id: NameId, name: Name<'a>, kinds: &mut Kinds<'_>) -> Entry<'a> {
         let target = name.target();
         let kind = match target {
-            Target::Inode(inode) => self.kind(inode),
+            Target::Inode(inode) => kinds.kind(inode),
             Target::Ignored(kind) => kind,
         };
         Entry {

@@ -415,8 +415,8 @@ impl Test {
                 .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?
             {
                 FileKind::File => stat.size() == 0,
-                // Child actions can change emptiness after indexing or after
-                // descent. Count what is on disk, including ignored names.
+                // Raw indexed counts include ignored names. Opaque/live
+                // directories have no count and use their live listing.
                 FileKind::Directory => match entry.has_children() {
                     Some(has_children) => !has_children,
                     None => fs::read_dir(entry.path())?.next().transpose()?.is_none(),
