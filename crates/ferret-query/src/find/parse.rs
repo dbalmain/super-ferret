@@ -27,6 +27,7 @@ pub struct Plan {
     pub(super) unsupported: Option<OsString>,
     pub(super) warnings: Vec<String>,
     pub(super) message: Option<String>,
+    pub(super) permission_warning: bool,
 }
 
 /// Invalid find syntax. The host maps every variant to exit status 1.
@@ -82,6 +83,9 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         delete: false,
         prune: false,
         explicit_depth: false,
+        daystart: false,
+        now: std::time::SystemTime::now(),
+        permission_warning: false,
     };
     let mut no_ignore = false;
     while let Some(arg) = parser.peek() {
@@ -181,6 +185,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         unsupported: parser.unsupported,
         warnings: parser.warnings,
         message: parser.message,
+        permission_warning: parser.permission_warning,
     })
 }
 
@@ -198,6 +203,9 @@ struct Parser<'a> {
     delete: bool,
     prune: bool,
     explicit_depth: bool,
+    daystart: bool,
+    now: std::time::SystemTime,
+    permission_warning: bool,
 }
 
 impl Parser<'_> {
@@ -371,20 +379,16 @@ impl Parser<'_> {
                     primary == "-ilname",
                 )))
             }
-            b"-daystart"
-            | b"-noleaf"
+            b"-daystart" => {
+                self.daystart = true;
+                constant
+            }
+            b"-noleaf"
             | b"-ignore_readdir_race"
             | b"-noignore_readdir_race"
             | b"-warn"
-            | b"-nowarn"
-            | b"-empty"
-            | b"-readable"
-            | b"-writable"
-            | b"-executable"
-            | b"-nouser"
-            | b"-nogroup" => self.unsupported(&primary),
-            b"-fstype" | b"-context" | b"-user" | b"-group" | b"-newer" | b"-anewer"
-            | b"-cnewer" | b"-samefile" | b"-files0-from" => {
+            | b"-nowarn" => constant,
+            b"-context" | b"-files0-from" => {
                 self.argument(&primary)?;
                 self.unsupported(&primary)
             }
@@ -399,40 +403,117 @@ impl Parser<'_> {
             }
             b"-perm" => {
                 let value = self.argument(&primary)?;
-                if !valid_mode(value.as_bytes()) {
+                if value.as_bytes().starts_with(b"+") || !valid_mode(value.as_bytes()) {
                     return Err(invalid(&primary, value));
                 }
-                self.unsupported(&primary)
+                let test = super::test::Test::perm(value.as_bytes())
+                    .ok_or_else(|| invalid(&primary, value))?;
+                if value.as_bytes().starts_with(b"/")
+                    && value.as_bytes()[1..].iter().all(|byte| *byte == b'0')
+                {
+                    self.permission_warning = true;
+                }
+                Expression::Test(test)
             }
             b"-size" => {
                 let value = self.argument(&primary)?;
-                let mut bytes = value.as_bytes();
-                if bytes.last().is_some_and(|b| b"bcwkMG".contains(b)) {
-                    bytes = &bytes[..bytes.len() - 1];
-                }
-                if !comparison_number(bytes, false) {
-                    return Err(invalid(&primary, value));
-                }
-                self.unsupported(&primary)
+                Expression::Test(
+                    super::test::Test::size(value.as_bytes())
+                        .ok_or_else(|| invalid(&primary, value))?,
+                )
             }
             b"-mtime" | b"-atime" | b"-ctime" | b"-mmin" | b"-amin" | b"-cmin" | b"-used"
             | b"-links" | b"-inum" | b"-uid" | b"-gid" => {
+                let now = self.now;
+                let daystart = self.daystart;
                 let value = self.argument(&primary)?;
-                let fractional = matches!(
+                let parsed = if matches!(
                     primary.as_bytes(),
                     b"-mtime" | b"-atime" | b"-ctime" | b"-mmin" | b"-amin" | b"-cmin" | b"-used"
+                ) {
+                    super::test::Test::time(primary.as_bytes(), value.as_bytes(), now, daystart)
+                } else {
+                    super::test::Test::number(primary.as_bytes(), value.as_bytes())
+                };
+                Expression::Test(parsed.ok_or_else(|| invalid(&primary, value))?)
+            }
+            b"-user" | b"-group" => {
+                let value = self.argument(&primary)?;
+                let id = super::test::identity(primary.as_bytes(), value)
+                    .ok_or_else(|| invalid(&primary, value))?;
+                Expression::Test(if primary == "-user" {
+                    super::test::Test::User(id)
+                } else {
+                    super::test::Test::Group(id)
+                })
+            }
+            b"-empty" => Expression::Test(super::test::Test::Empty),
+            b"-readable" => {
+                Expression::Test(super::test::Test::Access(rustix::fs::Access::READ_OK))
+            }
+            b"-writable" => {
+                Expression::Test(super::test::Test::Access(rustix::fs::Access::WRITE_OK))
+            }
+            b"-executable" => {
+                Expression::Test(super::test::Test::Access(rustix::fs::Access::EXEC_OK))
+            }
+            b"-nouser" => Expression::Test(super::test::Test::NoUser),
+            b"-nogroup" => Expression::Test(super::test::Test::NoGroup),
+            b"-fstype" => {
+                let value = self.argument(&primary)?;
+                Expression::Test(super::test::Test::FsType(
+                    value.to_string_lossy().into_owned(),
+                ))
+            }
+            b"-samefile" | b"-newer" | b"-anewer" | b"-cnewer" => {
+                let follow_references = self.options.follow != Follow::Physical;
+                let value = self.argument(&primary)?;
+                let test = super::test::Test::reference(
+                    primary.as_bytes(),
+                    std::path::PathBuf::from(value),
+                    follow_references,
                 );
-                if !comparison_number(value.as_bytes(), fractional) {
-                    return Err(invalid(&primary, value));
-                }
-                self.unsupported(&primary)
+                Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
+            }
+            b"-newermt" => {
+                let now = self.now;
+                let value = self.argument(&primary)?;
+                let stamp =
+                    super::test::parse_date(value, now).ok_or_else(|| invalid(&primary, value))?;
+                Expression::Test(super::test::Test::Newer {
+                    field: super::test::TimeField::Modify,
+                    stamp,
+                })
             }
             bytes if bytes.starts_with(b"-newer") && bytes.len() == 8 => {
                 if !b"aBcm".contains(&bytes[6]) || !b"aBcmt".contains(&bytes[7]) {
                     return Err(ParseError::Unknown(primary));
                 }
-                self.argument(&primary)?;
-                self.unsupported(&primary)
+                let now = self.now;
+                let follow_references = self.options.follow != Follow::Physical;
+                let value = self.argument(&primary)?;
+                let x = bytes[6];
+                let y = bytes[7];
+                let test = if y == b't' {
+                    super::test::parse_date(value, now).map(|stamp| super::test::Test::Newer {
+                        field: match x {
+                            b'a' => super::test::TimeField::Access,
+                            b'B' => super::test::TimeField::Birth,
+                            b'c' => super::test::TimeField::Change,
+                            _ => super::test::TimeField::Modify,
+                        },
+                        stamp,
+                    })
+                } else {
+                    super::test::Test::newer_xy(
+                        x,
+                        y,
+                        std::path::PathBuf::from(value),
+                        now,
+                        follow_references,
+                    )
+                };
+                Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }
             b")" | b"," | b"-o" | b"-or" | b"-a" | b"-and" => {
                 return Err(ParseError::Expression(Some(primary)));
@@ -563,21 +644,6 @@ fn decimal(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-fn comparison_number(bytes: &[u8], fractional: bool) -> bool {
-    let bytes = bytes
-        .strip_prefix(b"+")
-        .or_else(|| bytes.strip_prefix(b"-"))
-        .unwrap_or(bytes);
-    if fractional {
-        std::str::from_utf8(bytes)
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .is_some_and(|n| n.is_finite() && n >= 0.0)
-    } else {
-        decimal(bytes).is_some()
-    }
 }
 
 fn kinds(primary: &OsStr, value: &OsStr) -> Result<Vec<FileKind>, ParseError> {

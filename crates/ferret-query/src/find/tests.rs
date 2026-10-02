@@ -51,6 +51,13 @@ impl Tree {
     fn run(&self, expression: &[&str]) -> (Outcome, Output) {
         run(&self.args(expression))
     }
+    fn run_args(&self, expression: &[OsString]) -> (Outcome, Output) {
+        let args = [OsString::from("-I"), self.0.as_os_str().to_owned()]
+            .into_iter()
+            .chain(expression.iter().cloned())
+            .collect::<Vec<_>>();
+        run(&args)
+    }
 }
 
 impl Drop for Tree {
@@ -396,6 +403,10 @@ fn metadata_observations_and_failures_are_cached_and_name_tests_are_lazy() {
 
 #[test]
 fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
+    let warning = Plan::parse(&["-I", ".", "-perm", "/000"].map(OsString::from)).unwrap();
+    assert!(warning.permission_warning());
+    let quiet = Plan::parse(&["-I", ".", "-perm", "-000"].map(OsString::from)).unwrap();
+    assert!(!quiet.permission_warning());
     let invalid: &[&[&str]] = &[
         &["-unknown"],
         &["-name"],
@@ -422,6 +433,10 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
         &["-name", "x", "path"],
         &["-size", "1T"],
         &["-mtime", "1h"],
+        &["-mtime", ""],
+        &["-user", "ferret-user-that-does-not-exist"],
+        &["-group", "ferret-group-that-does-not-exist"],
+        &["-newermt", "not-a-date"],
         &["-exec", "echo", "{}"],
         &["-exec", "echo", "{}", "suffix", "+"],
         &["-exec", "echo", "{}", "{}", "+"],
@@ -435,14 +450,7 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
             "{args:?}"
         );
     }
-    let cases: &[&[&str]] = &[
-        &["-perm", "u=rw,g+r"],
-        &["-size", "+1M"],
-        &["-mtime", "-0.1"],
-        &["-newermt", "yesterday"],
-        &["-samefile", "ref"],
-        &["-empty"],
-    ];
+    let cases: &[&[&str]] = &[];
     for args in cases {
         let plan = Plan::parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
         assert!(plan.unsupported().is_some(), "{args:?}");
@@ -462,6 +470,7 @@ fn differential_against_pinned_gnu() {
         return;
     }
     let tree = Tree::new("oracle");
+    fs::write(tree.0.join("reference"), b"ref").unwrap();
     fs::create_dir(tree.0.join("denied")).unwrap();
     fs::set_permissions(tree.0.join("denied"), fs::Permissions::from_mode(0o000)).unwrap();
     let expressions: &[&[&str]] = &[
@@ -501,17 +510,103 @@ fn differential_against_pinned_gnu() {
         &["-iname", "[Z-a]*"],
         &["-iname", "[[=a=]]*"],
         &["-iname", "[[.a.]-[.c.]]*"],
+        &["-perm", "644"],
+        &["-perm", "-u+r"],
+        &["-perm", "u=rw,g+r"],
+        &["-perm", "a+x"],
+        &["-perm", "o-w"],
+        &["-perm", "a+X"],
+        &["-perm", "u+s"],
+        &["-perm", "a+t"],
+        &["-perm", "/000"],
+        &["-perm", "-000"],
+        &["-size", "0c"],
+        &["-size", "-1k"],
+        &["-size", "2k"],
+        &["-size", "0"],
+        &["-size", "-1"],
+        &["-size", "1w"],
+        &["-size", "1b"],
+        &["-size", "1M"],
+        &["-size", "1G"],
+        &["-mtime", "0"],
+        &["-atime", "0"],
+        &["-ctime", "0"],
+        &["-mmin", "+1"],
+        &["-amin", "1"],
+        &["-cmin", "1"],
+        &["-mmin", "0.5"],
+        &["-mtime", "1.5"],
+        &["-mtime", "18446744073709551616"],
+        &["-daystart", "-mtime", "0"],
+        &["-used", "0"],
+        &["-links", "1"],
+        &["-inum", "0"],
+        &["-uid", "0"],
+        &["-gid", "0"],
+        &["-user", "root"],
+        &["-group", "root"],
+        &["-nouser"],
+        &["-nogroup"],
+        &["-readable"],
+        &["-writable"],
+        &["-executable"],
+        &["-empty"],
+        &["-newer", "@REFERENCE@"],
+        &["-anewer", "@REFERENCE@"],
+        &["-cnewer", "@REFERENCE@"],
+        &["-newermm", "@REFERENCE@"],
+        &["-neweram", "@REFERENCE@"],
+        &["-newercm", "@REFERENCE@"],
+        &["-newermc", "@REFERENCE@"],
+        &["-newermt", "-30 minutes"],
+        &["-newermt", "-10 minutes"],
+        &["-newermt", "1 hour ago"],
+        &["-newermt", "-2 hours"],
+        &["-newermt", "-6 hours"],
+        &["-newermt", "-5 minutes"],
+        &["-newermt", "-300 seconds"],
+        &["-newermt", "-1 day"],
+        &["-newermt", "-1 hour"],
+        &["-newermt", "now"],
+        &["-newermt", "@0"],
+        &["-newermt", "2021-02-15 00:00:00"],
+        &["-newermt", "today"],
+        &["-newermt", "yesterday"],
+        &["-newermt", "1970-01-01"],
+        &["-samefile", "@REFERENCE@"],
+        &["-fstype", "proc"],
+        &["-fstype", "local"],
+        &["-fstype", "rdonly"],
+        &[
+            "-noleaf",
+            "-warn",
+            "-nowarn",
+            "-ignore_readdir_race",
+            "-noignore_readdir_race",
+        ],
     ];
     super::action::tests::differential();
-    for expression in expressions {
+    for template in expressions {
+        let expression = template
+            .iter()
+            .map(|arg| {
+                if *arg == "@REFERENCE@" {
+                    tree.0.join("reference").into_os_string()
+                } else {
+                    OsString::from(arg)
+                }
+            })
+            .collect::<Vec<_>>();
         let gnu = Command::new(binary)
             .arg(&tree.0)
-            .args(*expression)
+            .args(&expression)
             .env("LC_ALL", "C")
+            .env("TZ", "UTC")
             .output()
             .unwrap();
-        let (outcome, output) = tree.run(expression);
-        let delimiter = if expression.contains(&"-print0") {
+        let (outcome, output) = tree.run_args(&expression);
+        let delimiter = if expression.iter().any(|arg| arg == "-print0") {
             0
         } else {
             b'\n'
@@ -637,10 +732,11 @@ fn parser_precedence_and_implicit_action_are_visible_in_the_ast() {
 
 #[test]
 fn unsupported_plans_fail_before_the_source_or_effects_are_used() {
-    let plan = Plan::parse(&["-I", "missing", "-empty", "-name", "x"].map(OsString::from)).unwrap();
+    let plan =
+        Plan::parse(&["-I", "missing", "-context", "x", "-name", "x"].map(OsString::from)).unwrap();
     let mut output = Output::default();
     let error = plan.run(&mut plan.live_source(), &mut output).unwrap_err();
-    assert_eq!(error.feature, "-empty");
+    assert_eq!(error.feature, "-context");
     assert!(output.errors.is_empty());
     assert!(output.bytes.is_empty());
 }
