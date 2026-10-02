@@ -1395,6 +1395,13 @@ which only an entry's `lstat` NotFound is exempt and a content fault publishes
 the file unhashed. Move to A when typed faults exist, and ideally only once
 incremental indexing makes it worth it.
 
+**Amendment (2026-10-02, find milestone 1):** the walker now tags operations.
+EACCES while opening or listing a directory is permanent user-chosen state:
+publish its directory row without traversing it, with an unknown entry count.
+Every other coverage fault still blocks publication, including EACCES from an
+ignore-file read. An entry's lstat NotFound remains a deletion; content faults
+remain publishable as unhashed files.
+
 ## D27 — `InoId` and `NameId`: stable, or renumbered each snapshot
 
 **Question:** When an entry is deleted, what happens to its dense ids?
@@ -2307,6 +2314,19 @@ The corpus and its differential runner live in a private repo,
 from what it teaches, not copied from it. Targets: GNU find (the oracle), bfs,
 busybox, fd (for its gitignore handling and speed; fd's syntax differs, so its
 adapter translates the subset it can express), and ferret.
+
+**Amendment (2026-10-02, compatibility handoff):** find has one evaluator over
+catalog and live entry sources. Default mode respects ignore rules; `-I` /
+`--no-ignore` selects GNU-exact behaviour. Ignored means uncatalogued beneath
+an opaque marker, not nonexistent: an explicitly named ignored start walks live
+without nested ignore rules, and ignored reference operands resolve normally.
+Re-included descendants have ordinary catalogued directory ancestors. Special
+files get name/stat rows without content. Ignored regular files get name-only
+rows; ignored directories with nothing visible beneath get opaque markers.
+The global setting making `-I` the default is deferred to milestone 4. Docs at
+that milestone must explain that a pasted `find ... -delete` skips ignored
+files and still exits 0. Milestone 1 builds the live engine and rejects default
+mode until those catalog and policy changes land.
 
 ## D48 — The next move after S1
 

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind};
+use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind, NameId};
 use ferret_policy::Config;
 
 use crate::index::{DRAIN_MIN, Deferred, Hasher, PROBES, Probe, content_faults};
@@ -520,27 +520,66 @@ fn a_file_written_while_it_is_hashed_is_a_content_fault() {
     assert_eq!(rows[&tmp.at("still.txt")].state, ContentState::Hashed);
 }
 
+/// D26: a permanent EACCES publishes the directory with unknown contents;
+/// any other listing fault keeps the previous generation byte for byte.
 #[test]
-fn an_unreadable_directory_blocks_publication_and_keeps_the_old_generation() {
+fn an_unreadable_directory_publishes_but_other_listing_faults_do_not() {
     let tmp = Tmp::new("coverage");
     tmp.write("open/a.txt", b"a\n");
-    let roots = [tmp.tree()];
-    run(&tmp, &roots, Refresh::All, 2);
-    let before = fs::read(tmp.cat().join("catalog")).unwrap();
-
     tmp.write("shut/b.txt", b"b\n");
+    let roots = [tmp.tree()];
+    run(&tmp, &roots, Refresh::All, 1);
     chmod(&tmp.at("shut"), 0o000);
     tmp.write("open/new.txt", b"new\n");
-    let error = index(&tmp.cat(), &roots, Refresh::All, &options(2)).unwrap_err();
-    let IndexError::Coverage { faults, report } = error else {
-        panic!("expected a coverage fault, got {error}");
+    let report = index(&tmp.cat(), &roots, Refresh::All, &options(1)).unwrap();
+    assert!(report.published.is_some());
+    let (_, rows) = published(&tmp);
+    assert!(rows.contains_key(&tmp.at("shut")));
+    assert!(!rows.contains_key(&tmp.at("shut/b.txt")));
+    let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
+    catalog.load_all().unwrap();
+    let dir = (0..catalog.name_count())
+        .map(NameId)
+        .find_map(|id| {
+            let mut path = Vec::new();
+            catalog.path(id, &mut path);
+            (path == tmp.at("shut").as_os_str().as_bytes()).then(|| catalog.name(id).child)
+        })
+        .unwrap();
+    assert_eq!(catalog.entry_count(dir), None);
+    drop(catalog);
+    let before = fs::read(tmp.cat().join("catalog")).unwrap();
+
+    // Same tree: the accessible directory now encounters an actual listing
+    // error from the injected getdents seam, rather than a mirrored classifier.
+    crate::walk::FAIL_LIST.set(Some(Box::new(|path| {
+        (path == Path::new("open")).then(|| std::io::Error::from_raw_os_error(5))
+    })));
+    let result = index(&tmp.cat(), &roots, Refresh::All, &options(1));
+    crate::walk::FAIL_LIST.set(None);
+    let IndexError::Coverage { faults, report } = result.unwrap_err() else {
+        panic!("expected a coverage fault");
     };
     assert_eq!(faults.len(), 1);
-    assert_eq!(faults[0].op, IoOp::OpenDir);
-    assert_eq!(faults[0].path, Path::new("shut"));
-    assert_eq!(faults[0].error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(faults[0].op, IoOp::List);
+    assert_eq!(faults[0].path, Path::new("open"));
+    assert_eq!(faults[0].error.raw_os_error(), Some(5));
     assert!(report.published.is_none());
     assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+}
+
+#[test]
+fn a_denied_root_is_catalogued_with_unknown_contents() {
+    let tmp = Tmp::new("denied-root");
+    tmp.write("hidden.txt", b"hidden");
+    chmod(&tmp.tree(), 0o000);
+    let report = index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options(1)).unwrap();
+    assert!(report.published.is_some());
+    let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
+    assert_eq!(catalog.dir_count(), 1);
+    assert_eq!(catalog.name_count(), 0);
+    catalog.load_all().unwrap();
+    assert_eq!(catalog.entry_count(InoId(0)), None);
 }
 
 /// A `readlink` failure is a coverage fault (the walker reads through a

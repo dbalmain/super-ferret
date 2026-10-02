@@ -1,0 +1,518 @@
+//! Real temp trees drive the parser, evaluator and traversal together. The
+//! ignored oracle suite is clean-room: only the pinned binary is consulted.
+
+// Helpers build real fixtures; a setup failure should panic with its location.
+#![allow(clippy::unwrap_used)]
+
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use super::*;
+
+struct Tree(PathBuf);
+
+impl Tree {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("ferret-find-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(path.join("dir/sub")).unwrap();
+        fs::create_dir(path.join("empty")).unwrap();
+        for name in [
+            "a.c",
+            "b.txt",
+            ".hidden",
+            "ABC",
+            "a1",
+            "[",
+            "dir/file",
+            "dir/sub/deep.c",
+            "back\\slash",
+        ] {
+            fs::write(path.join(name), b"").unwrap();
+        }
+        fs::write(path.join(OsStr::from_bytes(b"nonutf8-\xff")), b"").unwrap();
+        symlink("dir", path.join("link")).unwrap();
+        symlink("missing", path.join("broken")).unwrap();
+        Self(path)
+    }
+
+    fn args(&self, expression: &[&str]) -> Vec<OsString> {
+        [OsString::from("-I"), self.0.as_os_str().to_owned()]
+            .into_iter()
+            .chain(expression.iter().map(OsString::from))
+            .collect()
+    }
+
+    fn run(&self, expression: &[&str]) -> (Outcome, Output) {
+        run(&self.args(expression))
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.0.join("denied"), fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Default)]
+struct Output {
+    bytes: Vec<u8>,
+    errors: Vec<PathBuf>,
+    remove: Option<PathBuf>,
+}
+
+impl Effects for Output {
+    fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
+        self.bytes.extend_from_slice(path.as_os_str().as_bytes());
+        self.bytes.push(if nul { 0 } else { b'\n' });
+        if self.remove.as_deref() == Some(path) {
+            fs::remove_dir_all(path)?;
+            self.remove = None;
+        }
+        Ok(())
+    }
+
+    fn error(&mut self, error: &WalkError) {
+        self.errors.push(error.path.clone());
+    }
+}
+
+fn run(args: &[OsString]) -> (Outcome, Output) {
+    let plan = Plan::parse(args).unwrap();
+    assert!(plan.unsupported().is_none());
+    let mut output = Output::default();
+    let outcome = plan.run(&mut plan.live_source(), &mut output);
+    (outcome, output)
+}
+
+fn records(bytes: &[u8], delimiter: u8) -> Vec<Vec<u8>> {
+    let mut records: Vec<_> = bytes
+        .split(|&b| b == delimiter)
+        .map(<[u8]>::to_vec)
+        .collect();
+    if records.last().is_some_and(Vec::is_empty) {
+        records.pop();
+    }
+    records.sort();
+    records
+}
+
+fn paths(tree: &Tree, names: &[&str]) -> Vec<Vec<u8>> {
+    let mut result: Vec<_> = names
+        .iter()
+        .map(|name| {
+            if name.is_empty() {
+                tree.0.clone()
+            } else {
+                tree.0.join(name)
+            }
+            .as_os_str()
+            .as_bytes()
+            .to_vec()
+        })
+        .collect();
+    result.sort();
+    result
+}
+
+#[test]
+fn implicit_print_wraps_or_but_explicit_print_belongs_to_its_branch() {
+    let tree = Tree::new("print");
+    let (_, implicit) = tree.run(&["-name", "*.c", "-o", "-name", "*.txt"]);
+    assert_eq!(
+        records(&implicit.bytes, b'\n'),
+        paths(&tree, &["a.c", "b.txt", "dir/sub/deep.c"])
+    );
+    let (_, explicit) = tree.run(&["-name", "*.c", "-o", "-name", "*.txt", "-print"]);
+    assert_eq!(records(&explicit.bytes, b'\n'), paths(&tree, &["b.txt"]));
+    let (_, prune) = tree.run(&["-prune"]);
+    assert_eq!(records(&prune.bytes, b'\n'), paths(&tree, &[""]));
+}
+
+#[test]
+fn operators_obey_precedence_short_circuit_and_comma_sequence() {
+    let tree = Tree::new("operators");
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["-name", "a.c", "-o", "-name", "b.txt", "-a", "-false"],
+            &["a.c"],
+        ),
+        (
+            &[
+                "(", "-name", "a.c", "-or", "-name", "b.txt", ")", "-and", "!", "-false",
+            ],
+            &["a.c", "b.txt"],
+        ),
+        (&["-true", "-o", "-print"], &[]),
+        (&["-false", "-a", "-print"], &[]),
+        (&["-maxdepth", "0", "-false", ",", "-print"], &[""]),
+        (&["-not", "-true"], &[]),
+    ];
+    for (expression, expected) in cases {
+        let (outcome, output) = tree.run(expression);
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(
+            records(&output.bytes, b'\n'),
+            paths(&tree, expected),
+            "{expression:?}"
+        );
+    }
+}
+
+#[test]
+fn depth_limits_prune_and_quit_drive_the_real_walk() {
+    let tree = Tree::new("control");
+    let (_, output) = tree.run(&["-maxdepth", "1", "-mindepth", "1", "-type", "d"]);
+    assert_eq!(
+        records(&output.bytes, b'\n'),
+        paths(&tree, &["dir", "empty"])
+    );
+    let (_, output) = tree.run(&["-name", "dir", "-prune", "-o", "-name", "*.c", "-print"]);
+    assert_eq!(records(&output.bytes, b'\n'), paths(&tree, &["a.c"]));
+    let (_, output) = tree.run(&["-name", "dir", "-prune"]);
+    assert_eq!(records(&output.bytes, b'\n'), paths(&tree, &["dir"]));
+    let (_, output) = tree.run(&["-depth", "-print", "-prune"]);
+    assert!(
+        records(&output.bytes, b'\n').contains(
+            &tree
+                .0
+                .join("dir/sub/deep.c")
+                .as_os_str()
+                .as_bytes()
+                .to_vec()
+        )
+    );
+    assert!(
+        output
+            .bytes
+            .ends_with(&[tree.0.as_os_str().as_bytes(), b"\n"].concat())
+    );
+    let (_, output) = tree.run(&["-print", "-quit", "-print"]);
+    assert_eq!(records(&output.bytes, b'\n'), paths(&tree, &[""]));
+    let (_, output) = tree.run(&["-quit"]);
+    assert!(output.bytes.is_empty());
+}
+
+#[test]
+fn name_and_path_globs_use_find_semantics_including_c_classes() {
+    let tree = Tree::new("glob");
+    let cases: &[(&[&str], &[&str])] = &[
+        (&["-name", "*.c"], &["a.c", "dir/sub/deep.c"]),
+        (&["-iname", "abc"], &["ABC"]),
+        (&["-name", ".*"], &[".hidden"]),
+        (&["-name", "[[:upper:]][[:upper:]][[:upper:]]"], &["ABC"]),
+        (&["-iname", "[!a]*", "-name", "ABC"], &[]),
+        (&["-name", "[a-z][[:digit:]]"], &["a1"]),
+        (&["-name", "[^a]1"], &[]),
+        (&["-name", "["], &["["]),
+        (&["-name", "\\.*"], &[".hidden"]),
+        (&["-name", "back\\\\slash"], &["back\\slash"]),
+        (&["-path", "*dir*deep.c"], &["dir/sub/deep.c"]),
+        (&["-ipath", "*abc"], &["ABC"]),
+        (&["-wholename", "*dir/file"], &["dir/file"]),
+        (&["-iwholename", "*DIR/FILE"], &["dir/file"]),
+    ];
+    for (expression, expected) in cases {
+        let (_, output) = tree.run(expression);
+        assert_eq!(
+            records(&output.bytes, b'\n'),
+            paths(&tree, expected),
+            "{expression:?}"
+        );
+    }
+    let (_, wildcard) = tree.run(&["-name", "*"]);
+    assert!(
+        records(&wildcard.bytes, b'\n')
+            .contains(&tree.0.join(".hidden").as_os_str().as_bytes().to_vec())
+    );
+    assert!(
+        records(&wildcard.bytes, b'\n').contains(
+            &tree
+                .0
+                .join(OsStr::from_bytes(b"nonutf8-\xff"))
+                .as_os_str()
+                .as_bytes()
+                .to_vec()
+        )
+    );
+}
+
+#[test]
+fn type_lists_do_not_follow_links_and_print0_preserves_filename_bytes() {
+    let tree = Tree::new("types");
+    let (_, output) = tree.run(&["-type", "l"]);
+    assert_eq!(
+        records(&output.bytes, b'\n'),
+        paths(&tree, &["link", "broken"])
+    );
+    let (_, output) = tree.run(&["-type", "d,l"]);
+    assert_eq!(
+        records(&output.bytes, b'\n'),
+        paths(&tree, &["", "dir", "dir/sub", "empty", "link", "broken"])
+    );
+    fs::write(tree.0.join("line\nbreak"), b"").unwrap();
+    let (_, output) = tree.run(&["-name", "line*", "-print0"]);
+    assert_eq!(records(&output.bytes, 0), paths(&tree, &["line\nbreak"]));
+}
+
+#[test]
+fn start_path_spelling_is_retained_for_children_and_root_names() {
+    let tree = Tree::new("spelling");
+    for suffix in ["/", "///", "/.", "/dir/.."] {
+        let start = OsString::from_vec([tree.0.as_os_str().as_bytes(), suffix.as_bytes()].concat());
+        let (_, output) = run(&["-I".into(), start.clone(), "-maxdepth".into(), "1".into()]);
+        let expected = [
+            start.as_bytes(),
+            if suffix.ends_with('/') { b"" } else { b"/" },
+            b"a.c\n",
+        ]
+        .concat();
+        assert!(
+            output
+                .bytes
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "{suffix}"
+        );
+        assert!(
+            output
+                .bytes
+                .starts_with(&[start.as_bytes(), b"\n"].concat())
+        );
+    }
+    let (_, output) = run(&[
+        "-I".into(),
+        tree.0.join("link/").into_os_string(),
+        "-maxdepth".into(),
+        "0".into(),
+        "-type".into(),
+        "d".into(),
+    ]);
+    assert!(
+        !output.bytes.is_empty(),
+        "the kernel follows a trailing-slash root link"
+    );
+}
+
+#[test]
+fn errors_continue_across_starts_and_missing_matches_succeed() {
+    let tree = Tree::new("errors");
+    let (outcome, output) = run(&[
+        "-I".into(),
+        tree.0.join("missing").into_os_string(),
+        tree.0.clone().into_os_string(),
+        "-maxdepth".into(),
+        "0".into(),
+    ]);
+    assert_eq!(outcome.errors, 1);
+    assert_eq!(output.errors, [tree.0.join("missing")]);
+    assert_eq!(records(&output.bytes, b'\n'), paths(&tree, &[""]));
+    let (outcome, output) = tree.run(&["-false"]);
+    assert_eq!(outcome.errors, 0);
+    assert!(output.bytes.is_empty());
+    fs::create_dir(tree.0.join("denied")).unwrap();
+    fs::set_permissions(tree.0.join("denied"), fs::Permissions::from_mode(0o000)).unwrap();
+    let (outcome, output) = tree.run(&[]);
+    assert_eq!(outcome.errors, 1);
+    assert_eq!(output.errors, [tree.0.join("denied")]);
+    assert!(
+        records(&output.bytes, b'\n')
+            .contains(&tree.0.join("denied").as_os_str().as_bytes().to_vec())
+    );
+    let (outcome, _) = tree.run(&["-maxdepth", "1"]);
+    assert_eq!(outcome.errors, 0, "a depth limit avoids the denied listing");
+}
+
+#[test]
+fn a_directory_removed_after_its_visit_faults_without_losing_siblings() {
+    let tree = Tree::new("vanish");
+    let plan = Plan::parse(&tree.args(&["-print"])).unwrap();
+    let mut output = Output {
+        remove: Some(tree.0.join("dir")),
+        ..Output::default()
+    };
+    let outcome = plan.run(&mut plan.live_source(), &mut output);
+    assert_eq!(outcome.errors, 1);
+    assert_eq!(output.errors, [tree.0.join("dir")]);
+    assert!(
+        records(&output.bytes, b'\n').contains(&tree.0.join("a.c").as_os_str().as_bytes().to_vec())
+    );
+}
+
+#[test]
+fn metadata_observations_and_failures_are_cached_and_name_tests_are_lazy() {
+    let tree = Tree::new("stat");
+    let plan = Plan::parse(&tree.args(&["-name", "a.c"])).unwrap();
+    let mut source = plan.live_source();
+    while let Some(item) = source.next(true) {
+        let entry = item.unwrap();
+        if entry.path() == tree.0.join("a.c") {
+            fs::remove_file(entry.path()).unwrap();
+            assert!(
+                evaluate(
+                    &plan.expression,
+                    &entry,
+                    &mut Output::default(),
+                    &mut Control::default()
+                )
+                .unwrap()
+            );
+            assert!(
+                entry.metadata().is_err(),
+                "neither source nor name predicate cached stat"
+            );
+        }
+        if entry.path() == tree.0.join("b.txt") {
+            let size = entry.metadata().unwrap().len();
+            fs::remove_file(entry.path()).unwrap();
+            assert_eq!(entry.metadata().unwrap().len(), size);
+        }
+    }
+    let entry = Entry::new(tree.0.join("missing"), 1, FileKind::File);
+    assert!(entry.metadata().is_err());
+    fs::write(entry.path(), b"later").unwrap();
+    assert!(entry.metadata().is_err());
+}
+
+#[test]
+fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
+    let invalid: &[&[&str]] = &[
+        &["-unknown"],
+        &["-name"],
+        &["-type", "q"],
+        &["-type", "f,"],
+        &["-type", "ff"],
+        &["-type", ""],
+        &["-perm", "+066"],
+        &["-perm", "888"],
+        &["-maxdepth", "+1"],
+        &["-maxdepth", "-1"],
+        &["-maxdepth", "1.0"],
+        &["(", ")"],
+        &["("],
+        &["-true", ")"],
+        &["-true", "-o"],
+        &["!"],
+        &["-a", "-true"],
+        &["-name", "x", "path"],
+        &["-size", "1T"],
+        &["-mtime", "1h"],
+        &["-exec", "echo", "{}"],
+        &["-exec", "echo", "{}", "suffix", "+"],
+        &["-exec", "echo", "{}", "{}", "+"],
+        &["-O"],
+        &["-D"],
+        &["-newerXY", "ref"],
+    ];
+    for args in invalid {
+        assert!(
+            Plan::parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).is_err(),
+            "{args:?}"
+        );
+    }
+    let cases: &[&[&str]] = &[
+        &["-exec", "echo", "{}", ";"],
+        &["-execdir", "echo", "{}", "+"],
+        &["-ok", "echo", "{}", ";"],
+        &["-fprintf", "out", "%p"],
+        &["-fprint", "out"],
+        &["-printf", "%p"],
+        &["-regextype", "posix-extended", "-regex", ".*"],
+        &["-perm", "u=rw,g+r"],
+        &["-size", "+1M"],
+        &["-mtime", "-0.1"],
+        &["-newermt", "yesterday"],
+        &["-xtype", "f,l"],
+        &["-samefile", "ref"],
+        &["-empty"],
+        &["-delete"],
+    ];
+    for args in cases {
+        let plan = Plan::parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+        assert!(plan.unsupported().is_some(), "{args:?}");
+    }
+    let plan = Plan::parse(&["-L", "-I", "-O3", "-P", "a", "b", "-type", "f"].map(OsString::from))
+        .unwrap();
+    assert!(plan.no_ignore());
+    assert!(plan.unsupported().is_none());
+    assert_eq!(plan.paths, [PathBuf::from("a"), PathBuf::from("b")]);
+}
+
+#[test]
+#[ignore = "development oracle uses the machine-specific pinned GNU binary"]
+fn differential_against_pinned_gnu() {
+    let binary = Path::new("/nix/store/i9wgqa0l88aprvpwfaq5hkfa6pklhlv0-findutils-4.11.0/bin/find");
+    if !binary.exists() {
+        return;
+    }
+    let tree = Tree::new("oracle");
+    fs::create_dir(tree.0.join("denied")).unwrap();
+    fs::set_permissions(tree.0.join("denied"), fs::Permissions::from_mode(0o000)).unwrap();
+    let expressions: &[&[&str]] = &[
+        &[],
+        &["-name", "*"],
+        &["-type", "f,d"],
+        &["-type", "l"],
+        &["-false"],
+        &["-maxdepth", "0", "-print"],
+        &["-depth"],
+        &["-depth", "-maxdepth", "1"],
+        &["-mindepth", "2"],
+        &["-xdev"],
+        &["-mount", "-name", "*.c"],
+        &["-name", "dir", "-prune", "-o", "-print"],
+        &["-depth", "-prune"],
+        &["-print", "-quit"],
+        &["-quit"],
+        &["-name", "*.c", "-print", "-quit"],
+        &["-name", "*.c", "-o", "-name", "*.txt"],
+        &["-name", "*.c", "-o", "-name", "*.txt", "-print"],
+        &["(", "-name", "*.c", "-o", "-name", "*.txt", ")", "-print0"],
+        &["-false", ",", "-name", "a.c"],
+        &["!", "-type", "d"],
+        &["-name", "[[:alpha:]]*"],
+        &["-iname", "[^a]*"],
+        &["-name", "[]a]*"],
+        &["-name", "[a-z]*"],
+        &["-name", "\\.*"],
+        &["-path", "*dir*file"],
+        &["-name", "["],
+        &["-name", "*\\"],
+        &["-name", "[[:space:]]*"],
+    ];
+    for expression in expressions {
+        let gnu = Command::new(binary)
+            .arg(&tree.0)
+            .args(*expression)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        let (outcome, output) = tree.run(expression);
+        let delimiter = if expression.contains(&"-print0") {
+            0
+        } else {
+            b'\n'
+        };
+        assert_eq!(
+            i32::from(outcome.errors != 0),
+            gnu.status.code().unwrap(),
+            "status {expression:?}"
+        );
+        assert_eq!(
+            records(&output.bytes, delimiter),
+            records(&gnu.stdout, delimiter),
+            "stdout {expression:?}"
+        );
+        assert_eq!(
+            output.errors.is_empty(),
+            gnu.stderr.is_empty(),
+            "stderr {expression:?}"
+        );
+    }
+}

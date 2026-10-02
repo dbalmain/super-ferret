@@ -40,7 +40,8 @@ pub enum Command {
         /// Stop after this many rows.
         limit: Option<u64>,
     },
-    /// `find [OPTIONS] [PATH...] [EXPRESSION]`, passed intact to the find parser.
+    /// `find [OPTIONS] [PATH...] [EXPRESSION]`, passed intact to the find
+    /// parser.
     Find(Vec<OsString>),
     /// `stats`.
     Stats,
@@ -115,7 +116,10 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             if limit.is_some() {
                 return Err(UsageError::NotFor("--limit", "find"));
             }
-            return Ok(Args { index, command: Command::Find(args.collect()) });
+            return Ok(Args {
+                index,
+                command: Command::Find(args.collect()),
+            });
         }
         let bytes = arg.as_bytes();
         if flags_done || bytes.len() < 2 || bytes[0] != b'-' {
@@ -308,7 +312,10 @@ mod tests {
             (&[], UsageError::NoCommand),
             (&["unknown"], UsageError::UnknownCommand("unknown".into())),
             (&["search", "-x"], UsageError::UnknownFlag("-x".into())),
-            (&["search", "--jsn"], UsageError::UnknownFlag("--jsn".into())),
+            (
+                &["search", "--jsn"],
+                UsageError::UnknownFlag("--jsn".into()),
+            ),
             (
                 &["search", "--json=1"],
                 UsageError::UnknownFlag("--json=1".into()),

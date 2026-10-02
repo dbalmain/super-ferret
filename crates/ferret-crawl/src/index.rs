@@ -13,11 +13,13 @@
 //! ```
 //!
 //! A **coverage fault** is any [`Event::Io`] except an entry's `lstat`
-//! NotFound, which is a deletion. It means the walk may have missed entries
-//! or applied the wrong ignore rules, so nothing is published and the old
-//! generation stays. A **content fault** leaves the namespace intact: the file
-//! is published with [`ContentState::Fault`](ferret_catalog::ContentState) and
-//! no document, and the next run reads it again.
+//! NotFound (a deletion), and EACCES from opening or listing a directory
+//! (a catalogued directory with unknown contents, D26 amendment). It means the
+//! walk may have missed entries or applied the wrong ignore rules, so nothing
+//! is published and the old generation stays. A **content fault** leaves the
+//! namespace intact: the file is published with
+//! [`ContentState::Fault`](ferret_catalog::ContentState) and no document, and
+//! the next run reads it again.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -292,7 +294,8 @@ impl Published {
 ///   because its kept copy stopped at the old inner roots (D34).
 ///
 /// The writer lock is taken first and held until the commit. A coverage
-/// fault anywhere publishes nothing ([`IndexError::Coverage`]).
+/// fault other than a directory listing/open EACCES publishes nothing
+/// ([`IndexError::Coverage`]).
 pub fn index(
     catalog_dir: &Path,
     roots: &[PathBuf],
@@ -885,6 +888,11 @@ impl EventVisitor for Hasher<'_> {
                 let on_root = matches!(context, FaultContext::Root);
                 if op == IoOp::Lstat && !on_root && error.kind() == io::ErrorKind::NotFound {
                     self.out.counts.vanished += 1;
+                } else if matches!(op, IoOp::OpenDir | IoOp::List)
+                    && error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())
+                {
+                    // The directory row precedes its open/list. No Entered
+                    // event sets a count, so it remains unknown (D26).
                 } else {
                     self.fault(path, op, on_root, error);
                 }

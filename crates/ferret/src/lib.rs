@@ -4,7 +4,8 @@
 //!
 //! - [`cli`]: the entry point, exit statuses, where the index is, usage.
 //! - [`args`]: the command line, parsed; pure.
-//! - [`find`], [`search`], [`index`] (with `roots`), [`stats`]: one module per command.
+//! - [`find`], [`search`], [`index`] (with `roots`), [`stats`]: one module per
+//!   command.
 //! - [`json`]: the JSON writer, and how non-UTF-8 bytes are encoded.
 //! - [`log`]: the query and timing log. No field holds a result path, a root
 //!   path or an id, but query text is logged as typed and may contain a path.
@@ -26,10 +27,10 @@
 pub mod args;
 pub mod cli;
 pub mod find;
-pub mod search;
 pub mod index;
 pub mod json;
 pub mod log;
+pub mod search;
 pub mod setup;
 pub mod stats;
 pub mod xdg;

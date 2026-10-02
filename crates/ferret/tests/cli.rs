@@ -528,9 +528,9 @@ fn json_round_trips_a_path_that_is_not_utf8() {
 }
 
 #[test]
-// D26 A′: a walk fault may hide entries, so nothing is published and the
-// previous generation stays byte for byte.
-fn a_coverage_fault_publishes_nothing_and_fails() {
+// D26 amendment: a denied listing is permanent state, and publishes the
+// directory but no children. Other coverage faults still block publication.
+fn an_unreadable_directory_publishes_its_row_and_other_changes() {
     let env = Env::new("coverage");
     env.write("ok.txt", b"ok\n");
     let locked = env
@@ -539,22 +539,14 @@ fn a_coverage_fault_publishes_nothing_and_fails() {
         .unwrap()
         .to_owned();
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
-    let before = fs::read(env.index().join("catalog")).unwrap();
-
     env.write("new.txt", b"new\n");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     let output = env.run(&[os("index")]);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-
-    assert_eq!(code(&output), 3);
-    let message = stderr(&output);
-    assert!(message.contains("nothing published"), "{message}");
-    assert!(
-        message.contains("locked"),
-        "the fault names the path: {message}"
-    );
-    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
-    assert_eq!(code(&env.run(&[os("search"), os("new")])), 1);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&env.run(&[os("search"), os("locked")])), [locked]);
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("new")])), 0);
 }
 
 #[test]

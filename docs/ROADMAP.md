@@ -41,7 +41,7 @@ that guide, created by the first item that needs it rather than empty now.
   whose `(dev, ino, size, mtime, ctime)` is unchanged keeps its hash and doc id
   without being re-read. Hashing and doc ids are assigned here (D4) so S2 starts
   from a populated catalog.
-- `ferret find`: name substring, glob and regex by scanning the name heap (D14);
+- `ferret search`: name substring, glob and regex by scanning the name heap (D14);
   metadata predicates (`ext:`, `size:`, `mtime:`, `type:`, `path:`). Output per
   path; JSON lines behind a flag.
 - `ferret stats`: file and byte census by extension, size histogram, directory
@@ -176,7 +176,7 @@ bits, 3.1 B).
 
 Peak `find` RSS at 10M is now 333 MiB for a name query and 372-376 MiB with a
 metadata atom, a third of D48's 1 GB line (it was 990 MiB). The 15 MiB Python
-floor is in every RSS figure on both sides. `find --json` reads the three
+floor is in every RSS figure on both sides. `search --json` reads the three
 columns it prints: `flamegraph` 0.33 s, `test` 0.49 s at 10M.
 
 What changed the numbers, separated as far as the data allows (`perf` on the 10M
@@ -358,8 +358,8 @@ line.
 ## S1c — `ferret find` in find(1) syntax
 
 POSIX.1-2024 `find` over the index, plus GNU extensions ranked by real use,
-matching GNU `find` except that ignored paths do not exist (D47). The S1 atom
-grammar moves to `ferret search`. Tested with our own cases, written from what
+matching GNU `find` in `-I` mode and respecting ignore rules by default (D47).
+The S1 atom grammar moves to `ferret search`. Tested with our own cases, written from what
 the private differential corpus (`~/w/find-compat`) teaches, against GNU find,
 bfs and fd.
 

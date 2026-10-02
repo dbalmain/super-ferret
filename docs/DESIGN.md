@@ -377,6 +377,27 @@ experiments replace it with measurements.
 manifest rename. The term dictionary's structure (sorted front-coded blocks, an
 FST, …) is decided in S2 and is itself an experiment row.
 
+## Find syntax (milestone 1)
+
+`ferret-query::find` owns the GNU argument parser, expression evaluator and
+entry-source interface. Its live source uses `std::fs::read_dir` in sequential
+depth-first directory order, with physical symlink handling, pre-order by
+default and post-order under `-depth`. Each entry carries its exact path
+spelling and d_type-derived kind, and caches a lazy lstat observation (including
+failure). Starting paths are statted to establish existence. Directory metadata
+is read for `-xdev`; cheap name/type tests do not stat ordinary child entries.
+The engine sends prune feedback to the source and stops fetching on quit.
+`ferret` implements the output/diagnostic effects interface. No crate edge is
+added, and the existing policy-driven parallel crawler stays separate.
+
+`ferret find -I` / `--no-ignore` uses this engine without opening an index,
+reading user config or writing a query log. Until milestone 4, the default
+ignore-respecting mode fails with status 1 and a not-implemented diagnostic.
+Recognized but unevaluated primaries consume their complete operands and fail
+before traversal with the same diagnostic. Symlink following is deferred.
+`ferret search` retains the S1 atom grammar, flags, output and exit conventions.
+Find exits 0 even for no matches; invalid syntax and traversal errors exit 1.
+
 ## Query (S1 for names and metadata, S2 onwards for content)
 
 1. **Parse** into atoms combined with AND / OR / NOT: `term`, `"phrase"`,
@@ -429,8 +450,8 @@ upload of those logs and the local query log. The local query and timing log
 exists from S1 and is the source of both.
 
 The log is `$XDG_STATE_HOME/ferret/log.jsonl` (mode 0600), one JSON line per
-`find` and per index run (`ferret index`, `ferret roots remove`), each with
-`"v":1`. A `find` line records:
+`search` and per index run (`ferret index`, `ferret roots remove`), each with
+`"v":1`. A `search` line records:
 
 - the query atoms, the plan (`explain()`) and the strategy;
 - `Stats`, the rows, the time to the first row and the total time;
@@ -444,7 +465,7 @@ An index line records:
 
 No field holds an id (D27 renumbers them), a result path or a root path. The
 query atoms are logged as typed, though, so query text may itself contain a path
-(`find path:/home/me/private`) or any name the user searched for (D45). The file
+(`search path:/home/me/private`) or any name the user searched for (D45). The file
 is set to 0600 on every append, and each line is written under an exclusive
 `flock`, so concurrent processes never interleave within a line. The lock is
 tried for at most 150 ms, then the line is dropped with a warning, so a stopped

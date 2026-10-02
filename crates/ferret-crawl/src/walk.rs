@@ -642,6 +642,19 @@ impl<V: EventVisitor> Walker<'_, V> {
         let fd = match open_path(root, root_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {
+                if error == Errno::ACCESS {
+                    // A root denied at open still has a catalog row, just as
+                    // a denied child does. Follow the user's root symlink.
+                    match statat(rustix::fs::CWD, root, AtFlags::empty()) {
+                        Ok(stat) if file_type(&stat) == FileType::Directory => {
+                            self.visit.root(public_stat(&stat, None));
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.fail(IoOp::Lstat, FaultContext::Root, io::Error::from(error))
+                        }
+                    }
+                }
                 self.fail(IoOp::OpenDir, FaultContext::Root, io::Error::from(error));
                 return None;
             }
@@ -861,7 +874,13 @@ thread_local! {
 pub(crate) type FailReadlink = Box<dyn Fn(&OsStr) -> bool>;
 
 #[cfg(test)]
+pub(crate) type FailList = Box<dyn Fn(&Path) -> Option<io::Error>>;
+
+#[cfg(test)]
 thread_local! {
+    /// Injects a listing error into the real walker on the calling thread.
+    pub(crate) static FAIL_LIST: std::cell::RefCell<Option<FailList>> =
+        const { std::cell::RefCell::new(None) };
     /// Test seam: makes `readlink` fail for the names it accepts. The walker
     /// reads a link through the `O_PATH` descriptor it just statted, which no
     /// unprivileged test can make fail. Like [`AFTER_OPEN`], it reaches only
@@ -1037,6 +1056,13 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// it as uncertain coverage like any other listing fault (D26 A′): it says
     /// the opened directory is gone, not that its path is.
     fn list(&mut self, dir: BorrowedFd<'_>, context: FaultContext<'_, V::Dir>) -> Option<Children> {
+        #[cfg(test)]
+        if let Some(error) =
+            FAIL_LIST.with_borrow(|hook| hook.as_ref().and_then(|hook| hook(bytes_path(&self.rel))))
+        {
+            self.fail(IoOp::List, context, error);
+            return None;
+        }
         let mut children = Children {
             names: Vec::new(),
             entries: Vec::new(),
