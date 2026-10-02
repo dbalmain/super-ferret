@@ -455,6 +455,7 @@ enum Loaded {
 /// A descriptor exhaustion error is reported just like a listing failure.
 pub struct LiveWalk {
     catalog: Option<Arc<Catalog>>,
+    nested_roots: Vec<(InoId, InoId, Vec<u8>)>,
     paths: std::vec::IntoIter<PathBuf>,
     options: Options,
     entry: Entry,
@@ -472,6 +473,7 @@ impl LiveWalk {
     pub(super) fn new(paths: Vec<PathBuf>, options: Options) -> Self {
         Self {
             catalog: None,
+            nested_roots: Vec::new(),
             paths: paths.into_iter(),
             options,
             entry: Entry::new(PathBuf::new(), 0, FileKind::File),
@@ -522,19 +524,27 @@ impl LiveWalk {
                 });
             }
             // Nested roots have no name row in the outer crawl (D34).
-            let absolute = absolute(entry.path()).map_err(|error| entry.error(&error))?;
-            for (id, path) in catalog.roots() {
-                let path = Path::new(OsStr::from_bytes(path));
-                if path.parent() == Some(absolute.as_path()) {
-                    let name = path.file_name().unwrap_or(OsStr::new("")).as_bytes();
-                    let name_start = self.names.len();
-                    self.names.extend_from_slice(name);
-                    self.children.push(Child {
-                        name: (name_start, self.names.len()),
-                        kind: Some(FileKind::Directory),
-                        target: Some(Target::Inode(id)),
-                    });
-                }
+            let first = self
+                .nested_roots
+                .partition_point(|(parent, _, _)| *parent < dir);
+            let roots = self.nested_roots[first..]
+                .iter()
+                .take_while(|(parent, _, _)| *parent == dir);
+            let mut added = false;
+            for (_, id, name) in roots {
+                added = true;
+                let name_start = self.names.len();
+                self.names.extend_from_slice(name);
+                self.children.push(Child {
+                    name: (name_start, self.names.len()),
+                    kind: Some(FileKind::Directory),
+                    target: Some(Target::Inode(*id)),
+                });
+            }
+            if added {
+                self.children[start..].sort_unstable_by(|a, b| {
+                    self.names[a.name.0..a.name.1].cmp(&self.names[b.name.0..b.name.1])
+                });
             }
             if self.children.len() > start {
                 before_directory().map_err(|error| entry.error(&error))?;
@@ -670,9 +680,12 @@ impl LiveWalk {
                 if let Some(catalog) = &self.catalog {
                     let resolved = match resolve(catalog, self.entry.path(), follow || self.entry.path.ends_with(b"/")) {
                         Ok(Some(resolved)) => resolved,
-                        Ok(None) => return Some(Err(self.entry.error(&io::Error::other(
-                            "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
-                        )))),
+                        Ok(None) => match resolve(catalog, self.entry.path(), false) {
+                            Ok(Some(resolved)) => resolved,
+                            _ => return Some(Err(self.entry.error(&io::Error::other(
+                                "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
+                            )))),
+                        },
                         Err(error) => return Some(Err(self.entry.error(&error))),
                     };
                     if !resolved.1
@@ -776,7 +789,9 @@ impl LiveWalk {
                 return Err(entry.error(&io::Error::other("File system loop detected")));
             }
         }
-        if entry.follow && entry.kind().map_err(|error| entry.error(error))? == FileKind::Directory
+        if entry.follow
+            && entry.catalog.is_none()
+            && entry.kind().map_err(|error| entry.error(error))? == FileKind::Directory
         {
             let stat = entry.metadata().map_err(|error| entry.error(error))?;
             let path = &entry.path;
@@ -896,6 +911,25 @@ pub struct CatalogSource {
 impl CatalogSource {
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
         let mut walk = LiveWalk::new(paths, options);
+        for (id, path) in catalog.roots() {
+            let path = Path::new(OsStr::from_bytes(path));
+            if let Some(parent) = path.parent()
+                && let Some(resolved) = catalog.resolve(parent.as_os_str().as_bytes())
+                && resolved.remainder.is_empty()
+                && let Target::Inode(parent) = resolved.target
+            {
+                walk.nested_roots.push((
+                    parent,
+                    id,
+                    path.file_name()
+                        .unwrap_or(OsStr::new(""))
+                        .as_bytes()
+                        .to_vec(),
+                ));
+            }
+        }
+        walk.nested_roots
+            .sort_unstable_by_key(|(parent, _, _)| *parent);
         walk.catalog = Some(Arc::new(catalog));
         Self { walk }
     }
@@ -977,19 +1011,4 @@ pub(super) fn resolve(
         }
     }
     Err(io::Error::from_raw_os_error(40))
-}
-
-pub(super) fn absolute(path: &Path) -> io::Result<PathBuf> {
-    let path = std::path::absolute(path)?;
-    let mut normalized = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            std::path::Component::CurDir => {}
-            part => normalized.push(part.as_os_str()),
-        }
-    }
-    Ok(normalized)
 }

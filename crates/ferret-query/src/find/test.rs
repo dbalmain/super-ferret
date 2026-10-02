@@ -258,10 +258,14 @@ impl Test {
                     let stamp = match reference_field {
                         TimeField::Modify => timestamp(catalog.mtime(id), catalog.mtime_nsec(id)),
                         TimeField::Change => timestamp(catalog.ctime(id), catalog.ctime_nsec(id)),
-                        TimeField::Access => stat_stamp(
-                            entry.metadata().map_err(super::walk::copy_error)?,
-                            TimeField::Access,
-                        ),
+                        TimeField::Access => {
+                            let stat = if *follow {
+                                fs::metadata(&*path)?
+                            } else {
+                                fs::symlink_metadata(&*path)?
+                            };
+                            stat_stamp(&stat, TimeField::Access)
+                        }
                         TimeField::Birth => birth_stamp(entry.path())
                             .ok_or_else(|| std::io::Error::other("birth time unavailable"))?,
                     };

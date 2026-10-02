@@ -1438,9 +1438,8 @@ fn catalog_delete_tree(name: &str) -> Env {
     }
     let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
     assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
-    // Stamp after indexing so using stale catalog metadata cannot pass this
-    // regression for post-order stat timing after -delete changes parent
-    // mtimes.
+    // Change live mtimes after indexing to guard the decided snapshot contract
+    // even when a deletion expression asks for those times.
     let old = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
     for path in [
         ".ferretignore",
@@ -1676,4 +1675,120 @@ fn catalog_find_guarantees_parent_order_depth_order_and_prune() {
     assert!(!paths(&output).contains(&env.at("a/child")));
     let output = run(&[os("-type"), os("f"), os("-print"), os("-quit")]);
     assert_eq!(paths(&output), [env.at("a/child")]);
+}
+
+#[test]
+fn catalog_find_resolves_symlink_starts_and_references_from_the_snapshot() {
+    // Resolving aliases through canonicalize would fail after the live tree
+    // vanished, and lexical .. would choose the link's parent incorrectly.
+    let env = Env::new("catalog-snapshot-links");
+    env.seed_ignore_file();
+    env.write("place/inside/file", b"old");
+    let reference = env.write("reference", b"reference");
+    File::open(&reference)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(86_400)),
+        )
+        .unwrap();
+    std::os::unix::fs::symlink("place/inside", env.at("alias")).unwrap();
+    std::os::unix::fs::symlink("reference", env.at("ref-link")).unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    fs::remove_dir_all(env.tree()).unwrap();
+    let start = env.at("alias/..");
+    let output = env.run(&[
+        os("find"),
+        start.as_os_str(),
+        os("-name"),
+        os("file"),
+        os("-size"),
+        os("3c"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [start.join("inside/file")]);
+    let start = env.at("alias");
+    let link = env.at("ref-link");
+    let output = env.run(&[
+        os("find"),
+        os("-H"),
+        start.as_os_str(),
+        os("-name"),
+        os("file"),
+        os("-newer"),
+        link.as_os_str(),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [start.join("file")]);
+    let output = env.run(&[
+        os("find"),
+        os("-H"),
+        start.as_os_str(),
+        os("-maxdepth"),
+        os("0"),
+        os("-xtype"),
+        os("l"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [start]);
+    let output = env.run(&[
+        os("find"),
+        env.at("ref-link").as_os_str(),
+        os("-printf"),
+        os("%Y|%l\\n"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"f|reference\n");
+}
+
+#[test]
+fn catalog_find_reports_removed_directory_descent_and_skips_deleted_files_on_repeated_starts() {
+    // Catalog children outlive rm -rf and repeated -delete operands. GNU
+    // faults on the removed directory, but relisting a kept directory sees
+    // no previously deleted files and therefore performs no second deletion.
+    let env = Env::new("catalog-effect-descent");
+    env.seed_ignore_file();
+    env.write("sub/child", b"contents");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-type"),
+            os("d"),
+            os("-name"),
+            os("sub"),
+            os("-exec"),
+            os("rm"),
+            os("-rf"),
+            os("{}"),
+            os(";"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(stderr(&output).contains("No such file or directory"));
+    assert!(!env.at("sub").exists());
+
+    let env = Env::new("catalog-effect-repeated-starts");
+    env.seed_ignore_file();
+    env.write("sub/child", b"contents");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("sub"),
+            os("sub"),
+            os("-type"),
+            os("f"),
+            os("-delete"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    assert!(env.at("sub").is_dir());
+    assert!(!env.at("sub/child").exists());
 }
