@@ -159,16 +159,14 @@ impl Test {
                 ino: stat.ino(),
             });
         }
+        // The entry's atime or ctime is compared with the reference's mtime
+        // (GNU: `-cnewer ref` matches ref itself once its ctime moved on).
         let field = match primary {
             b"-anewer" => TimeField::Access,
             b"-cnewer" => TimeField::Change,
             _ => TimeField::Modify,
         };
-        let stamp = if field == TimeField::Birth {
-            birth_stamp(entry.path())?
-        } else {
-            stat_stamp(stat, field)
-        };
+        let stamp = stat_stamp(stat, TimeField::Modify);
         Some(Self::Newer { field, stamp })
     }
 
@@ -247,7 +245,6 @@ impl Test {
                 minutes,
             } => {
                 let delta = age_nanos(stat, *field, *now, *daystart);
-                let delta = if *daystart { delta.max(0) } else { delta };
                 let unit_nanos = if *minutes {
                     60_000_000_000i128
                 } else {
@@ -262,6 +259,10 @@ impl Test {
                         Order::Greater => raw > age.value,
                         Order::Less => raw < age.value,
                     }
+                } else if *minutes && age.order == Order::Less {
+                    // GNU compares the unrounded age here: a 359 s file is
+                    // `-mmin -6` although its whole-minute bucket is 6.
+                    delta < age.value as i128 * unit_nanos
                 } else {
                     let value = if *minutes {
                         (delta + unit_nanos - 1).div_euclid(unit_nanos)
@@ -375,92 +376,70 @@ fn parse_mode(bytes: &[u8]) -> Option<(u32, u32)> {
     let mut mode = 0u32;
     let mut conditional = 0u32;
     for clause in bytes.split(|b| *b == b',') {
+        // chmod grammar: who* (op perm*)+, applied to a zero starting mode.
         let op_at = clause.iter().position(|b| b"+-=".contains(b))?;
         let who = &clause[..op_at];
+        if !who.iter().all(|w| b"ugoa".contains(w)) {
+            return None;
+        }
         let who = if who.is_empty() || who.contains(&b'a') {
             b"ugo".as_slice()
         } else {
             who
         };
-        let mut selected = 0;
-        for w in who {
-            selected |= match w {
+        let selected = who.iter().fold(0, |acc, w| {
+            acc | match w {
                 b'u' => 0o4700,
                 b'g' => 0o2070,
                 _ => 0o1007,
-            };
-        }
-        let op = clause[op_at];
-        let mut bits = 0u32;
-        let mut xbits = 0u32;
-        for c in &clause[op_at + 1..] {
-            match c {
-                b'r' => {
-                    for w in who {
-                        bits |= match w {
-                            b'u' => 0o400,
-                            b'g' => 0o040,
-                            _ => 0o004,
-                        };
-                    }
-                }
-                b'w' => {
-                    for w in who {
-                        bits |= match w {
-                            b'u' => 0o200,
-                            b'g' => 0o020,
-                            _ => 0o002,
-                        };
-                    }
-                }
-                b'x' => {
-                    for w in who {
-                        bits |= match w {
-                            b'u' => 0o100,
-                            b'g' => 0o010,
-                            _ => 0o001,
-                        };
-                    }
-                }
-                b'X' => {
-                    for w in who {
-                        xbits |= match w {
-                            b'u' => 0o100,
-                            b'g' => 0o010,
-                            _ => 0o001,
-                        };
-                    }
-                }
-                b's' => {
-                    for w in who {
-                        bits |= if *w == b'u' {
-                            0o4000
-                        } else if *w == b'g' {
-                            0o2000
-                        } else {
-                            0
-                        };
-                    }
-                }
-                b't' => bits |= 0o1000,
-                b'u' | b'g' | b'o' => {}
-                _ => return None,
             }
-        }
-        match op {
-            b'+' => {
-                mode |= bits;
-                conditional |= xbits;
+        });
+        let class = |u, g, o| {
+            who.iter().fold(0u32, |acc, w| {
+                acc | match w {
+                    b'u' => u,
+                    b'g' => g,
+                    _ => o,
+                }
+            })
+        };
+        let mut rest = &clause[op_at..];
+        while let Some((&op, tail)) = rest.split_first() {
+            let end = tail
+                .iter()
+                .position(|b| b"+-=".contains(b))
+                .unwrap_or(tail.len());
+            let (perms, next) = tail.split_at(end);
+            rest = next;
+            let mut bits = 0u32;
+            let mut xbits = 0u32;
+            for c in perms {
+                match c {
+                    b'r' => bits |= class(0o400, 0o040, 0o004),
+                    b'w' => bits |= class(0o200, 0o020, 0o002),
+                    b'x' => bits |= class(0o100, 0o010, 0o001),
+                    b'X' => xbits |= class(0o100, 0o010, 0o001),
+                    b's' => bits |= class(0o4000, 0o2000, 0),
+                    b't' => bits |= 0o1000,
+                    // Copying a class from the zero starting mode adds nothing.
+                    b'u' | b'g' | b'o' => {}
+                    _ => return None,
+                }
             }
-            b'-' => {
-                mode &= !(bits | xbits);
-                conditional &= !(bits | xbits);
+            match op {
+                b'+' => {
+                    mode |= bits;
+                    conditional |= xbits;
+                }
+                b'-' => {
+                    mode &= !(bits | xbits);
+                    conditional &= !(bits | xbits);
+                }
+                _ => {
+                    mode = (mode & !selected) | bits;
+                    conditional = (conditional & !selected) | xbits;
+                }
             }
-            b'=' => {
-                mode = (mode & !selected) | bits;
-                conditional = (conditional & !selected) | xbits;
-            }
-            _ => return None,
         }
     }
     Some((mode, conditional))
@@ -474,7 +453,9 @@ fn age_nanos(stat: &fs::Metadata, field: TimeField, now: SystemTime, daystart: b
     };
     let now = if daystart {
         let duration = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-        UNIX_EPOCH + Duration::from_secs(duration.as_secs() / 86_400 * 86_400)
+        // GNU measures -daystart ages from the end of today (observed: a file
+        // from 23:00 the day before yesterday is `-daystart -mtime 1`).
+        UNIX_EPOCH + Duration::from_secs(duration.as_secs() / 86_400 * 86_400 + 86_400)
     } else {
         now
     };
@@ -525,20 +506,20 @@ pub(super) fn identity(primary: &[u8], name: &OsStr) -> Option<u32> {
     } else {
         "/etc/group"
     };
-    let contents = fs::read_to_string(path).ok()?;
     let bytes = name.as_bytes();
-    contents.lines().find_map(|line| {
-        let mut fields = line.split(':');
-        let entry_name = fields.next()?;
-        let id: u32 = fields.nth(1)?.parse().ok()?;
-        ((entry_name.as_bytes() == bytes || bytes == id.to_string().as_bytes())
-            && if primary == b"-user" {
-                user_exists(id)
-            } else {
-                group_exists(id)
+    // A name first, then a number, which names an id even without a database
+    // entry (GNU accepts `-user 99999`).
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                let mut fields = line.split(':');
+                let entry_name = fields.next()?;
+                let id = fields.nth(1)?.parse().ok()?;
+                (entry_name.as_bytes() == bytes).then_some(id)
             })
-        .then_some(id)
-    })
+        })
+        .or_else(|| std::str::from_utf8(bytes).ok()?.trim_start().parse().ok())
 }
 
 /// Parses the deliberately bounded GNU date subset used by the find corpus.
@@ -936,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn daystart_uses_today_midnight_and_future_timestamps_remain_negative_ages() {
+    fn daystart_measures_from_the_end_of_today_and_future_timestamps_remain_negative_ages() {
         let fixture = Fixture::new();
         let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
         let midnight = 2_000_000_000u64 / 86_400 * 86_400;
@@ -947,23 +928,20 @@ mod tests {
             .open(&path)
             .unwrap()
             .set_times(
-                FileTimes::new()
-                    .set_modified(UNIX_EPOCH + Duration::from_secs(midnight - 23 * 3600)),
+                FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(midnight - 3600)),
             )
             .unwrap();
         let entry = Entry::new(path, 0, FileKind::File);
-        assert!(
-            !Test::time(b"-mtime", b"0", now, false)
+        // 4.5 hours old by the clock, 25 hours old from the end of today.
+        let matches = |age: &[u8], daystart| {
+            Test::time(b"-mtime", age, now, daystart)
                 .unwrap()
                 .evaluate(&entry)
                 .unwrap()
-        );
-        assert!(
-            Test::time(b"-mtime", b"0", now, true)
-                .unwrap()
-                .evaluate(&entry)
-                .unwrap()
-        );
+        };
+        assert!(matches(b"0", false));
+        assert!(!matches(b"0", true));
+        assert!(matches(b"1", true));
         let future_path = fixture.0.join("future");
         fs::write(&future_path, b"").unwrap();
         fs::File::options()
@@ -1094,6 +1072,61 @@ mod tests {
                 .unwrap()
         );
         fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn minute_less_than_compares_the_unrounded_age() {
+        let fixture = Fixture::new();
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let entry = fixture.file("almost-six", 0, 359);
+        let matches = |age: &[u8]| {
+            Test::time(b"-mmin", age, now, false)
+                .unwrap()
+                .evaluate(&entry)
+                .unwrap()
+        };
+        // Bucket 6 by rounding up, yet younger than six minutes.
+        assert!(matches(b"6"));
+        assert!(matches(b"-6"));
+        assert!(!matches(b"-5"));
+        assert!(matches(b"+5"));
+    }
+
+    #[test]
+    fn symbolic_perm_clauses_take_several_operators_and_a_leading_operator() {
+        assert_eq!(parse_mode(b"+u+x"), Some((0o111, 0)));
+        assert_eq!(parse_mode(b"u+x+w"), Some((0o300, 0)));
+        assert_eq!(parse_mode(b"u+"), Some((0, 0)));
+        assert_eq!(parse_mode(b"u=rwx,g=rx,o=x"), Some((0o751, 0)));
+        assert_eq!(parse_mode(b"+066"), None);
+        assert_eq!(parse_mode(b"z+x"), None);
+    }
+
+    #[test]
+    fn cnewer_compares_the_entry_ctime_with_the_reference_mtime() {
+        let fixture = Fixture::new();
+        // Setting an old mtime moves ctime to now, so the reference is
+        // -cnewer than itself and not -newer than itself.
+        let path = fixture.0.join("reference");
+        fs::write(&path, b"").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000)))
+            .unwrap();
+        let reference = Entry::new(path, 0, FileKind::File);
+        let cnewer = Test::reference(b"-cnewer", reference.path().to_owned(), false).unwrap();
+        let newer = Test::reference(b"-newer", reference.path().to_owned(), false).unwrap();
+        assert!(cnewer.evaluate(&reference).unwrap());
+        assert!(!newer.evaluate(&reference).unwrap());
+    }
+
+    #[test]
+    fn numeric_identities_need_no_database_entry_but_names_do() {
+        assert_eq!(identity(b"-user", OsStr::new("3999999")), Some(3_999_999));
+        assert_eq!(identity(b"-group", OsStr::new(" 42")), Some(42));
+        assert_eq!(identity(b"-user", OsStr::new("ferret-no-such-user")), None);
     }
 
     #[test]
