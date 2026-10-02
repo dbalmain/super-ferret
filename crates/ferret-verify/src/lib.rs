@@ -21,6 +21,6 @@ pub mod toolchain;
 #[cfg(test)]
 mod tests;
 
-pub use dialect::{Dialect, FindRegex};
+pub use dialect::{Dialect, FindRegex, MatchLimit};
 pub use matcher::{Matcher, Regex, RegexError};
 pub use scan::{Arm, Finder};

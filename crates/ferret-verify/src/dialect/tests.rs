@@ -57,9 +57,27 @@ fn basic_midpattern_anchors_are_literals_but_extended_anchors_assert() {
 }
 
 #[test]
-fn backreferences_are_explicitly_refused() {
-    let error = FindRegex::new(br".*\(a\)\1", Dialect::Emacs, false).unwrap_err();
-    assert!(error.to_string().contains("backreferences"));
+fn backreferences_backtrack_into_groups_and_fold_only_ascii() {
+    for (dialect, pattern) in [
+        (Dialect::Emacs, br"\(a*\)\1".as_slice()),
+        (Dialect::Basic, br"\(a*\)\1"),
+        (Dialect::Extended, br"(a*)\1"),
+        (Dialect::PosixAwk, br"(a*)\1"),
+        (Dialect::GnuAwk, br"(a*)\1"),
+    ] {
+        let regex = FindRegex::new(pattern, dialect, false).unwrap();
+        assert_eq!(regex.try_is_match(b"aaaa"), Ok(true));
+        assert_eq!(regex.try_is_match(b"aaa"), Ok(false));
+        assert_eq!(regex.try_is_match(b""), Ok(true));
+    }
+    let regex = FindRegex::new(br"([^/]+)/\1", Dialect::Extended, true).unwrap();
+    assert_eq!(regex.try_is_match(b"Ab/aB"), Ok(true));
+    assert_eq!(regex.try_is_match(b"\xff/\xff"), Ok(true));
+    assert_eq!(regex.try_is_match(b"\xc0/\xe0"), Ok(false));
+    assert_eq!(regex.try_is_match(b"Ab/ac"), Ok(false));
+    let regex = FindRegex::new(br"(a)\1", Dialect::Awk, false).unwrap();
+    assert!(regex.is_match(b"a1"));
+    assert!(!regex.is_match(b"aa"));
 }
 
 #[test]
@@ -95,4 +113,77 @@ fn awk_escapes_letters_literally_and_grep_pattern_newline_is_alternation() {
         assert!(regex.is_match(b"./a"));
         assert!(regex.is_match(b"./b"));
     }
+}
+
+#[test]
+fn missing_repetition_operand_is_literal_ignored_or_an_error() {
+    for (dialect, pattern, matching) in [
+        (Dialect::Emacs, br"*.py[co]".as_slice(), b"*.pyc".as_slice()),
+        (Dialect::Emacs, br"\(*a\|b\)", b"*a"),
+        (Dialect::Basic, br"^*a", b"*a"),
+        (Dialect::GnuAwk, br"(*a)", b"*a"),
+        (Dialect::Egrep, br"(*a)", b"a"),
+        // GNU egrep ignores only the opening brace at branch start.
+        (Dialect::Egrep, br"{2}a", b"2}a"),
+    ] {
+        let regex = FindRegex::new(pattern, dialect, false).unwrap();
+        assert!(regex.is_match(matching), "{dialect:?} {pattern:?}");
+        assert!(!regex.is_match(b"other"));
+    }
+    for dialect in [Dialect::Extended, Dialect::PosixAwk] {
+        for pattern in [
+            br"*a".as_slice(),
+            br"(*a)",
+            br"b|+a",
+            br"^?a",
+            br"a${regex}",
+        ] {
+            assert!(FindRegex::new(pattern, dialect, false).is_err());
+        }
+    }
+    assert!(FindRegex::new(br"\{2\}a", Dialect::Basic, false).is_err());
+}
+
+#[test]
+fn interval_validation_uses_gnu_syntax_and_bound_limit() {
+    for (dialect, patterns) in [
+        (
+            Dialect::Extended,
+            [br"a{x".as_slice(), br"a{3,1}", br"a{99999}", br"a{}"],
+        ),
+        (
+            Dialect::Basic,
+            [br"a\{x", br"a\{3,1\}", br"a\{99999\}", br"a\{\}"],
+        ),
+    ] {
+        for pattern in patterns {
+            assert!(FindRegex::new(pattern, dialect, false).is_err());
+        }
+    }
+    for dialect in [
+        Dialect::Extended,
+        Dialect::Egrep,
+        Dialect::GnuAwk,
+        Dialect::PosixAwk,
+    ] {
+        let regex = FindRegex::new(br"a{,3}", dialect, false).unwrap();
+        assert!(regex.is_match(b""));
+        assert!(regex.is_match(b"aaa"));
+        assert!(!regex.is_match(b"aaaa"));
+    }
+    let regex = FindRegex::new(br"a{x", Dialect::Egrep, false).unwrap();
+    assert!(regex.is_match(b"a{x"));
+}
+
+#[test]
+fn invalid_references_and_unmatched_captures_do_not_guess() {
+    for pattern in [br"\1".as_slice(), br"(a\1)", br"(a)\2", br"\1(a)"] {
+        assert!(FindRegex::new(pattern, Dialect::Extended, false).is_err());
+    }
+    let regex = FindRegex::new(br"(a)?\1", Dialect::Extended, false).unwrap();
+    assert!(regex.is_match(b"aa"));
+    assert!(!regex.is_match(b""));
+    let regex = FindRegex::new(br"(a|ab)\1", Dialect::Extended, false).unwrap();
+    assert!(regex.is_match(b"abab"));
+    assert!(!regex.is_match(b"aba"));
 }

@@ -406,7 +406,7 @@ pub(in crate::find) fn differential() {
     }
     eprintln!(
         "lane A differential: {} expressions",
-        expressions.len() + differential_extra(&tree)
+        expressions.len() + differential_extra(&tree) + differential_regex()
     );
 }
 
@@ -434,7 +434,14 @@ fn compare(tree: &Tree, args: &[OsString]) {
         .env("TZ", "UTC")
         .output()
         .unwrap();
-    let (outcome, output) = run(args);
+    let Ok(plan) = Plan::parse(args) else {
+        assert_eq!(expected.status.code(), Some(1), "status {args:?}");
+        assert!(expected.stdout.is_empty(), "stdout {args:?}");
+        assert!(!expected.stderr.is_empty(), "stderr {args:?}");
+        return;
+    };
+    let mut output = Output::default();
+    let outcome = plan.run(&mut plan.live_source(), &mut output).unwrap();
     assert_eq!(
         i32::from(outcome.errors != 0),
         expected.status.code().unwrap(),
@@ -749,4 +756,39 @@ fn execdir_caches_names_before_a_batch_unlinks_its_directory() {
     assert!(output.bytes.windows(3).any(|bytes| bytes == b"/a\n"));
     assert!(output.bytes.windows(3).any(|bytes| bytes == b"/b\n"));
     assert_eq!(output.batches.len(), 2);
+}
+
+mod regex_cases {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../ferret/tests/support/regex_cases.rs"
+    ));
+}
+
+fn differential_regex() -> usize {
+    let tree = Tree::new();
+    for name in regex_cases::NAMES {
+        fs::write(tree.0.join(name), b"").unwrap();
+    }
+    fs::create_dir_all(tree.0.join("same/same")).unwrap();
+    for name in [b"\xff".as_slice(), b"\xff\xff", b"\xc0\xe0"] {
+        fs::write(tree.0.join(OsStr::from_bytes(name)), b"").unwrap();
+    }
+    let cases = regex_cases::cases();
+    for (dialect, pattern, fold) in &cases {
+        compare(
+            &tree,
+            &tree.args(&[
+                "-regextype",
+                dialect,
+                if *fold { "-iregex" } else { "-regex" },
+                pattern,
+            ]),
+        );
+    }
+    eprintln!(
+        "milestone 3a regex differential: {} expressions",
+        cases.len()
+    );
+    cases.len()
 }

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
-use ferret_verify::{FindRegex, Matcher};
+use ferret_verify::FindRegex;
 
 use super::printf::Format;
 use super::{Effects, Entry, EvaluationError, FileKind, WalkError, glob, walk};
@@ -218,7 +218,9 @@ pub(super) fn evaluate(
                 .map_err(EvaluationError::Output)?;
             Ok(true)
         }
-        Action::Regex(regex) => Ok(regex.is_match(entry.path().as_os_str().as_bytes())),
+        Action::Regex(regex) => regex
+            .try_is_match(entry.path().as_os_str().as_bytes())
+            .map_err(|error| EvaluationError::Metadata(io::Error::other(error))),
         Action::Link(pattern) => {
             if entry.kind().map_err(metadata_error)? != FileKind::Symlink {
                 return Ok(false);

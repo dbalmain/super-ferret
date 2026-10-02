@@ -260,3 +260,71 @@ fn interactive_commands_have_closed_stdin_after_the_answer() {
     assert_eq!(output.stdout, b"d\n");
     assert!(String::from_utf8_lossy(&output.stderr).contains("Bad file descriptor"));
 }
+
+mod regex_cases {
+    include!("support/regex_cases.rs");
+}
+
+#[test]
+#[ignore = "development oracle uses the machine-specific pinned GNU binary"]
+fn regex_dialects_against_pinned_gnu() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    if !Path::new(GNU).exists() {
+        return;
+    }
+    let tree = Tree::new("regex-m3a");
+    for name in regex_cases::NAMES {
+        fs::write(tree.0.join(name), b"").unwrap();
+    }
+    fs::create_dir_all(tree.0.join("same/same")).unwrap();
+    for name in [b"\xff".as_slice(), b"\xff\xff", b"\xc0\xe0"] {
+        fs::write(tree.0.join(OsStr::from_bytes(name)), b"").unwrap();
+    }
+    let records = |bytes: &[u8]| {
+        let mut records = bytes
+            .split(|byte| *byte == 0)
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        records.sort();
+        records
+    };
+    let cases = regex_cases::cases();
+    for (dialect, pattern, fold) in &cases {
+        let args = [
+            ".",
+            "-regextype",
+            dialect,
+            if *fold { "-iregex" } else { "-regex" },
+            pattern,
+            "-print0",
+        ];
+        let expected = Command::new(GNU)
+            .args(args)
+            .current_dir(&tree.0)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        let actual = tree.command(&["-I"]).args(args).output().unwrap();
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "status {dialect} {pattern:?}: {:?}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            records(&actual.stdout),
+            records(&expected.stdout),
+            "stdout {dialect} {pattern:?}"
+        );
+        assert_eq!(
+            actual.stderr.is_empty(),
+            expected.stderr.is_empty(),
+            "stderr {dialect} {pattern:?}"
+        );
+    }
+    eprintln!(
+        "milestone 3a CLI regex differential: {} expressions",
+        cases.len()
+    );
+}
