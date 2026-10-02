@@ -368,7 +368,7 @@ impl Parser<'_> {
             b"-help" | b"--help" | b"-version" | b"--version" => {
                 self.at = self.args.len();
                 self.message = Some(if primary.as_bytes().ends_with(b"help") {
-                    "Usage: ferret find [-I] [-H|-L|-P] [paths] [expression]\nDefault mode answers from the index, including stored metadata and freshness.\nIt respects ignore rules and prints in catalog order; -I is the live mode.\nParents precede children; -depth/-delete reverse this; -prune stops descent.\nPasted find ... -delete skips ignored files and still exits 0.\nFailed deletions and traversal errors exit 1.\n".into()
+                    "Usage: ferret find [-I] [-H|-L|-P] [paths] [expression]\nDefault mode answers from the index, including stored metadata and freshness.\nIt respects ignore rules; starts and siblings may interleave. -I walks live.\nParents precede children; -depth/-delete reverse this; -prune stops descent.\nPasted find ... -delete skips ignored files and still exits 0.\nFailed deletions and traversal errors exit 1.\n".into()
                 } else {
                     "ferret find (GNU find compatible syntax)\n".into()
                 });

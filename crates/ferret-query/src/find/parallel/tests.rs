@@ -222,7 +222,17 @@ fn concurrent_exec_status_is_a_test_and_batches_flush_on_completion_and_quit() {
         assert_eq!(outcome.errors, 0);
         let records = output.records.lock().unwrap();
         if quit {
-            assert_eq!(records.len(), 1);
+            // Several workers may collect an argument before the first quit;
+            // every collected argument must still flush exactly once.
+            assert!(!records.is_empty());
+            assert!(records.len() <= 16);
+            let unique: std::collections::HashSet<_> = records.iter().collect();
+            assert_eq!(unique.len(), records.len());
+            assert!(
+                records
+                    .iter()
+                    .all(|path| Path::new(std::ffi::OsStr::from_bytes(path)).is_file())
+            );
         } else {
             assert_eq!(records.len(), 32 * 6 * 3);
         }

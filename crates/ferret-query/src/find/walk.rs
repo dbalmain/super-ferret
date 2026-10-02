@@ -484,7 +484,7 @@ struct Child {
 /// stack, so levels pop in the order they were pushed.
 struct Level {
     catalogued: bool,
-    pending: Arc<AtomicUsize>,
+    pending: Option<Arc<AtomicUsize>>,
     handle: Option<Arc<File>>,
     /// The directory's own path is `entry.path[..path_len]`.
     path_len: usize,
@@ -595,6 +595,10 @@ impl LiveWalk {
         }
     }
 
+    pub(super) fn in_live_directory(&self) -> bool {
+        self.levels.last().is_some_and(|level| !level.catalogued)
+    }
+
     pub(super) fn suspended(&self) -> bool {
         self.suspended
     }
@@ -602,7 +606,11 @@ impl LiveWalk {
     pub(super) fn waiting(&self) -> bool {
         self.slot == Slot::Empty
             && self.levels.last().is_some_and(|level| {
-                level.next == level.end && level.pending.load(Ordering::Acquire) != 0
+                level.next == level.end
+                    && level
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.load(Ordering::Acquire) != 0)
             })
     }
 
@@ -622,13 +630,16 @@ impl LiveWalk {
                     && !(level.catalogued && self.options.max_depth.is_some_and(|max| max <= 2)))
                 .then_some(index)
             })?;
+        let pending = self.levels[index]
+            .pending
+            .get_or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
         let level = &self.levels[index];
         let middle = level.next + (level.end - level.next) / 2;
-        let pending = level.pending.clone();
         let mut levels: Vec<_> = self.levels[..=index].iter().map(Level::duplicate).collect();
         let donated = &mut levels[index];
         donated.next = middle;
-        donated.pending = Arc::new(AtomicUsize::new(0));
+        donated.pending = None;
         donated.first = None;
         let mut walk = Self::new(Vec::new(), self.options.clone());
         walk.catalog = self.catalog.clone();
@@ -764,7 +775,7 @@ impl LiveWalk {
             let own = Saved::take(entry);
             self.levels.push(Level {
                 catalogued: true,
-                pending: Arc::new(AtomicUsize::new(0)),
+                pending: None,
                 handle,
                 path_len,
                 separator,
@@ -851,7 +862,7 @@ impl LiveWalk {
         let own = Saved::take(entry);
         self.levels.push(Level {
             catalogued: false,
-            pending: Arc::new(AtomicUsize::new(0)),
+            pending: None,
             handle: Some(handle),
             path_len,
             separator,

@@ -164,7 +164,12 @@ impl Pool {
                     {
                         // Publish earlier records before children can
                         // evaluate.
-                        if let Err(error) = effects.flush() {
+                        if let Err(error) = task
+                            .control
+                            .actions
+                            .flush_files()
+                            .and_then(|()| effects.flush())
+                        {
                             effects.error(&WalkError {
                                 path: ".".into(),
                                 error,
@@ -241,14 +246,26 @@ impl Plan {
             });
             return Ok(Outcome { errors: 1 });
         }
+        let shallow_catalog =
+            source.catalog().is_some() && self.options.max_depth.is_some_and(|depth| depth <= 2);
         let quit = Arc::new(AtomicBool::new(false));
         let mut task = Task::new(source, None, &quit);
+        // Until donation there is no other worker to cancel this expression.
+        task.control.cancelled = None;
         while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects) {
             if task.control.quit {
                 break;
             }
-            if let Some(donated) = task.donate(&quit) {
-                if let Err(error) = effects.flush() {
+            if (!shallow_catalog || task.walk.in_live_directory())
+                && let Some(donated) = task.donate(&quit)
+            {
+                task.control.cancelled = Some(quit.clone());
+                if let Err(error) = task
+                    .control
+                    .actions
+                    .flush_files()
+                    .and_then(|()| effects.flush())
+                {
                     effects.error(&WalkError {
                         path: ".".into(),
                         error,

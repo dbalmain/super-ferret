@@ -83,7 +83,7 @@ pub(super) struct State {
 }
 
 impl State {
-    fn flush_files(&self) -> io::Result<()> {
+    pub(super) fn flush_files(&self) -> io::Result<()> {
         for file in &self.files {
             file.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -15,8 +15,8 @@ its code.
 
 `ferret index DIR` adds an indexed root. `ferret find [PATH...] [EXPRESSION]`
 then uses GNU find syntax over catalog visibility, respecting ignore rules.
-It uses catalog order and stored metadata, including freshness: changes appear
-after re-indexing. Parents precede children; `-depth` and `-delete` reverse that
+It uses parallel tree traversal and stored metadata: changes appear after
+re-indexing. Parents precede children; `-depth` and `-delete` reverse that
 relationship, and `-prune` stops descent. Sibling order need not match GNU find.
 An explicitly named ignored start is walked live, with no nested ignore rules.
 Use `ferret find -I ...` or `--no-ignore` for an unrestricted live walk without

@@ -251,11 +251,38 @@ fn exec_batch_sizes_against_pinned_gnu() {
             let actual = execute(FERRET, &["find", "-I"]);
             assert_eq!(
                 actual.status.code(),
-                expected.status.code(),
+                Some(0),
+                "stack {stack}, pad {pad}: {:?}",
+                actual.stderr
+            );
+            // F11 permits smaller batches and arbitrary argument order.
+            let totals = |bytes: &[u8]| {
+                std::str::from_utf8(bytes).unwrap().lines().fold(
+                    (0usize, 0usize),
+                    |(count, size), line| {
+                        let fields: Vec<usize> = line
+                            .split_whitespace()
+                            .map(|field| field.parse().unwrap())
+                            .collect();
+                        assert_eq!(fields.len(), 2);
+                        assert!(fields[1] <= 128 * 1024);
+                        (count + fields[0], size + fields[1])
+                    },
+                )
+            };
+            assert_eq!(
+                totals(&actual.stdout),
+                (1300, 1300 * 233),
                 "stack {stack}, pad {pad}"
             );
-            assert_eq!(actual.stdout, expected.stdout, "stack {stack}, pad {pad}");
-            assert_eq!(actual.stderr.is_empty(), expected.stderr.is_empty());
+            assert!(actual.stderr.is_empty());
+            if expected.status.success() {
+                assert_eq!(totals(&actual.stdout), totals(&expected.stdout));
+            } else {
+                // GNU's larger batch can exceed the kernel's argument limit
+                // at a low stack limit; F11 permits smaller successful batches.
+                assert!(!expected.stderr.is_empty());
+            }
         }
     }
 }

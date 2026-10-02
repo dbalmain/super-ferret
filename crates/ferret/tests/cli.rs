@@ -1178,7 +1178,7 @@ fn catalog_find_matches_live_across_the_differential_expressions_as_sorted_recor
                     .collect();
                 let all = env.command(&all).current_dir(env.tree()).output().unwrap();
                 let records = sorted_records(&catalog.stdout, b'\n');
-                assert!(records.len() <= 1);
+                assert!(records.len() <= 16);
                 for record in records {
                     assert!(sorted_records(&all.stdout, b'\n').contains(&record));
                 }
