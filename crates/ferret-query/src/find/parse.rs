@@ -280,6 +280,14 @@ impl Parser<'_> {
                 if primary == "-name" || primary == "-iname" {
                     Expression::Name(super::glob::Pattern::new(&pattern, fold))
                 } else {
+                    // GNU warns even under -nowarn; a path never ends in '/'.
+                    if pattern.ends_with(b"/") {
+                        self.warnings.push(format!(
+                            "{} {} will not match anything because it ends with /.",
+                            primary.to_string_lossy(),
+                            String::from_utf8_lossy(&pattern)
+                        ));
+                    }
                     Expression::Path(super::glob::Pattern::new(&pattern, fold))
                 }
             }
@@ -299,7 +307,8 @@ impl Parser<'_> {
                 }
                 constant
             }
-            b"-depth" => {
+            // `-d` is GNU's silent BSD spelling of `-depth`.
+            b"-depth" | b"-d" => {
                 self.explicit_depth = true;
                 self.options.depth_first = true;
                 constant

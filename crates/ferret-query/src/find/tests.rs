@@ -786,3 +786,22 @@ fn xdev_and_mount_evaluate_a_mount_point_without_entering_it() {
         );
     }
 }
+
+#[test]
+fn prune_stats_a_removed_non_directory_but_not_a_removed_directory() {
+    let tree = Tree::new("prune-removed");
+    let (outcome, output) = tree.run(&["-name", "a.c", "-exec", "rm", "{}", ";", "-prune"]);
+    assert_eq!(outcome.errors, 1);
+    assert_eq!(output.errors, [tree.0.join("a.c")]);
+    let (outcome, output) = tree.run(&["-name", "dir", "-exec", "rm", "-rf", "{}", ";", "-prune"]);
+    assert_eq!(outcome.errors, 0, "{:?}", output.errors);
+}
+
+#[test]
+fn d_spells_depth_and_a_path_ending_in_slash_warns() {
+    let plan = Plan::parse(&["-I", ".", "-d", "-path", "./"].map(OsString::from)).unwrap();
+    assert!(plan.options.depth_first);
+    assert_eq!(plan.warnings.len(), 1);
+    let plan = Plan::parse(&["-I", ".", "-name", "a/"].map(OsString::from)).unwrap();
+    assert!(plan.warnings.is_empty());
+}

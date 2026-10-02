@@ -256,6 +256,9 @@ impl Test {
                     match age.order {
                         Order::Equal if *minutes => raw > age.value - 1.0 && raw <= age.value,
                         Order::Equal => raw >= age.value && raw < age.value + 1.0,
+                        // GNU: `-mtime +0.5` is older than 1.5 days, the
+                        // fractional analogue of `+N` meaning "N+1 or more".
+                        Order::Greater if !*minutes => raw > age.value + 1.0,
                         Order::Greater => raw > age.value,
                         Order::Less => raw < age.value,
                     }
@@ -1090,6 +1093,25 @@ mod tests {
         assert!(matches(b"-6"));
         assert!(!matches(b"-5"));
         assert!(matches(b"+5"));
+    }
+
+    #[test]
+    fn fractional_days_greater_than_means_a_whole_day_past_the_value() {
+        let fixture = Fixture::new();
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let matches = |age_secs, arg: &[u8]| {
+            let entry = fixture.file(&format!("age{age_secs}"), 0, age_secs);
+            Test::time(b"-mtime", arg, now, false)
+                .unwrap()
+                .evaluate(&entry)
+                .unwrap()
+        };
+        // GNU: 1.0 and 1.4999 days are not `-mtime +0.5`; 1.5001 days is.
+        assert!(!matches(86_400, b"+0.5"));
+        assert!(!matches(129_590, b"+0.5"));
+        assert!(matches(129_610, b"+0.5"));
+        assert!(matches(43_190, b"-0.5"));
+        assert!(!matches(43_210, b"-0.5"));
     }
 
     #[test]

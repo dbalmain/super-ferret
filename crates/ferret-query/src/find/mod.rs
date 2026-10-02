@@ -279,6 +279,13 @@ fn evaluate(
             true
         }
         Expression::Prune => {
+            // GNU needs the stat of anything but a directory here: a file an
+            // earlier -exec removed makes `-prune` report it and exit 1.
+            if !matches!(entry.kind(), Ok(FileKind::Directory)) {
+                entry
+                    .metadata()
+                    .map_err(|error| EvaluationError::Metadata(walk::copy_error(error)))?;
+            }
             control.prune = true;
             true
         }
