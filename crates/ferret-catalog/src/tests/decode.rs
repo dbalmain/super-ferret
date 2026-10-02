@@ -1040,6 +1040,21 @@ fn ignored_tags_and_special_rows_validate_before_access() {
     }
     assert_eq!(catalog.inode_count(), 2);
     assert_eq!(catalog.entry(NameId(7)).kind, Kind::Fifo);
+    assert_eq!(
+        catalog.resolve(b"/r/ignored-1").unwrap().target,
+        Target::Ignored(Kind::File)
+    );
+    for path in [
+        b"/r/ignored-1/".as_slice(),
+        b"/r/visible/.",
+        b"/r/missing",
+        b"/r/../r",
+    ] {
+        assert!(catalog.resolve(path).is_none(), "{path:?}");
+    }
+    let marker = catalog.resolve(b"/r/.///ignored-0/child").unwrap();
+    assert_eq!(marker.target, Target::Ignored(Kind::Dir));
+    assert_eq!(marker.remainder, b"child");
     let original = std::fs::read(scratch.path.join("catalog")).unwrap();
     let mut tombstone = original.clone();
     // The mixed block spans a real id and high tags, so it has room for all

@@ -449,7 +449,8 @@ impl Catalog {
         self.blocked(Column::NameOffset).get(id.0 as usize) as usize
     }
 
-    /// The inode a name edge names, without reading its bytes. Needs only
+    /// The raw child column, without reading name bytes. Ignored rows carry
+    /// type tags, so use `Name::target()` before reading stat columns. Needs
     /// [`Section::Names`].
     pub fn child(&self, id: NameId) -> InoId {
         InoId(self.blocked(Column::NameChild).get(id.0 as usize) as u32)
@@ -518,7 +519,8 @@ impl Catalog {
     }
 
     /// Resolves an absolute byte path in the innermost configured root.
-    /// Needs Roots and Names. Does not follow symlinks or `..`. A path below
+    /// Needs Roots and Entries (Roots also loads Names). Does not follow
+    /// symlinks or `..`. A path below
     /// an opaque marker returns that marker and its unresolved suffix.
     pub fn resolve<'p>(&self, path: &'p [u8]) -> Option<Resolved<'p>> {
         let (root, prefix) = self
@@ -534,7 +536,16 @@ impl Catalog {
         let mut name = None;
         let mut rest = &path[prefix.len()..];
         loop {
-            rest = rest.strip_prefix(b"/").unwrap_or(rest);
+            let separator = rest.starts_with(b"/");
+            while let Some(next) = rest.strip_prefix(b"/") {
+                rest = next;
+            }
+            if separator
+                && !matches!(target, Target::Ignored(Kind::Dir))
+                && !matches!(target, Target::Inode(dir) if dir.0 < self.dir_count())
+            {
+                return None;
+            }
             if rest.is_empty() {
                 return Some(Resolved {
                     name,
@@ -602,9 +613,9 @@ impl Catalog {
             .map(|name| NameId(name as u32))
     }
 
-    /// Whether a directory is a structural row: walked through for
-    /// re-included entries, but not catalogued itself (D29). Its name is in
-    /// the heap; a query should not report it. Needs [`Section::Traversed`].
+    /// Whether search should suppress this ancestor of a re-included entry
+    /// (D29 compatibility). Find sees an ordinary directory inode. Needs
+    /// [`Section::Traversed`].
     pub fn is_traversed(&self, dir: InoId) -> bool {
         let bits = self.section(Section::Traversed);
         bits[dir.0 as usize / 8] >> (dir.0 % 8) & 1 == 1
@@ -782,8 +793,8 @@ impl Catalog {
             .map(|count| count as u32)
     }
 
-    /// Whether an inode is a directory, file or symlink. Needs
-    /// [`Section::Links`] for any inode that is not a directory.
+    /// The inode's file type. Needs [`Section::Links`] for a non-directory;
+    /// it also loads the sparse Specials table. No stat column is read.
     pub fn kind(&self, id: InoId) -> Kind {
         if id.0 < self.dir_count() {
             Kind::Dir

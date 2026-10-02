@@ -1256,6 +1256,7 @@ fn ignored_names_opaque_directories_and_special_stats_round_trip() {
             report.counts.files_read, 2,
             "only rules and re-included file read"
         );
+        assert_eq!(report.counts.specials, 2);
         let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
         catalog.load_all().unwrap();
         let root = catalog.roots().next().unwrap().0;
@@ -1335,6 +1336,13 @@ fn ignored_names_opaque_directories_and_special_stats_round_trip() {
         // child ids.
         drop(catalog);
         let before = fs::read(tmp.cat().join("catalog")).unwrap();
+        // An ignored file's content, size and timestamps have no snapshot
+        // representation: changing it must neither read content nor churn
+        // bytes.
+        tmp.write("regular.ignored", b"changed ignored content and size");
+        let report = run(&tmp, &[tmp.tree()], Refresh::All, workers);
+        assert_eq!(report.counts.files_read, 0);
+        assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
         let mut txn = ferret_catalog::Transaction::begin(&tmp.cat(), 1).unwrap();
         txn.keep(tmp.tree().as_os_str().as_bytes()).unwrap();
         txn.commit().unwrap();

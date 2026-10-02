@@ -1053,3 +1053,44 @@ fn find_reports_usage_and_unsupported_features_with_status_one() {
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 }
+
+/// 4a: the real binary's search must hide name-only rows, while stats must
+/// count their types without indexing reserved child tags as stat-row ids.
+#[test]
+fn ignored_names_and_special_files_survive_index_search_and_stats() {
+    let env = Env::new("ignored-special-stats");
+    env.seed_ignore_file();
+    env.write(".ferretignore", b"*.ignored\nbuild/\n");
+    env.write("kept.txt", b"visible");
+    env.write("hidden.ignored", b"ignored");
+    env.write("build/hidden.txt", b"ignored");
+    let pipe = env.at("pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _socket = std::os::unix::net::UnixListener::bind(env.at("socket")).unwrap();
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let output = env.run(&[os("search"), os("*")]);
+    let found = paths(&output);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(found.contains(&env.at("kept.txt")));
+    assert!(found.contains(&pipe));
+    assert!(found.contains(&env.at("socket")));
+    for missing in ["hidden.ignored", "build", "build/hidden.txt"] {
+        assert!(!found.contains(&env.at(missing)), "{found:?}");
+    }
+    let stats = env.run(&[os("stats")]);
+    assert_eq!(code(&stats), 0, "{}", stderr(&stats));
+    let text = String::from_utf8(stats.stdout).unwrap();
+    assert!(
+        text.contains("ignored   2 names without inode rows"),
+        "{text}"
+    );
+    assert!(text.contains("1 FIFO names, 1 socket names"), "{text}");
+    assert!(text.contains("2 visible inodes"), "{text}");
+}

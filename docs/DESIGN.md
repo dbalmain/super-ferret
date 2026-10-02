@@ -109,8 +109,8 @@ snapshot persists each directory's own `NameId` (none for a root) and a bitset
 of traversed directories, retained to exclude structural ancestors from
 `ferret search` (D29). For find these ancestors are ordinary visible directories
 when traversal found a re-included descendant. Traversal that finds none is
-collapsed to one ignored directory name, with no inode or children. A path is the walk from a name through its parent's name to a
-root. Nothing else is derived at open (D30): `hash → DocId` is built by the
+collapsed to one ignored directory name, with no inode or children. A path is
+the walk from a name through its parent's name to a root. Nothing else is derived at open (D30): `hash → DocId` is built by the
 writer only, and `DocId → [InoId]`, the full `InoId → [NameId]` and a
 directory's work tree are built when a query first needs them.
 
@@ -183,7 +183,7 @@ section, since every name read needs all three. The name heap holds
 NUL-terminated names in `(parent, name)` order (D28 A) and is contiguous on
 purpose: it is what filename search scans (D14). The strings heap holds root
 paths, link targets and work-tree paths; roots, links, work trees and document
-hashes stay fixed-width rows. A reader opens the file by reading its head alone (664
+hashes stay fixed-width rows. A reader opens the file by reading its head alone (680
 B), which fixes every section's and column's exact length, and then reads each
 section positionally when a query first needs it (D38 B), together with the
 sections it is checked against (names need the heap; directory names need names;
@@ -255,8 +255,17 @@ and Links; contents/emptiness need Entries; resolution needs Roots and Entries.
 The legacy name accessors expose the raw tagged child; callers must check
 `Name::target()` before using it as an inode id. Search filters ignored tags
 before stat reads in every candidate strategy, and content-fault reporting and
-root carry-forward do the same. Format v2 is refused with the version error and
+root carry-forward do the same. The stats census counts ignored names by type
+without reading a stat row and reports visible special inodes separately. Format v2 is refused with the version error and
 re-indexed by the writer.
+
+Measured at 10M (D40/D43): v2 592.6 MB, v3 594.8 MB for 43,010 additional
+ignored names, with identical inode/document counts and stat-column sizes;
+peak build RSS 1,630 → 1,641 MiB. The high-sentinel encoding is retained after
+measuring an adjacent tag range that saved 1.18 MB (0.20% of the snapshot).
+Name-search row counts stay identical; the warm full listing costs 2.2% more.
+See [the 4a report](FIND-M4A.md) for per-section bytes, build time, load averages,
+query timings and the encoding comparison.
 
 ## Policy and crawl (D10, D13)
 

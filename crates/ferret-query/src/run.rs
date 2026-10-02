@@ -223,7 +223,8 @@ impl<'c> Run<'_, 'c> {
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> RunResult {
         let catalog = self.catalog;
-        if matches!(name.target(), ferret_catalog::Target::Ignored(_)) {
+        // Validated children are either real inode ids or ignored type tags.
+        if name.child.0 >= catalog.inode_count() {
             return Ok(ControlFlow::Continue(()));
         }
         let structural = name.child.0 < catalog.dir_count() && catalog.is_traversed(name.child);

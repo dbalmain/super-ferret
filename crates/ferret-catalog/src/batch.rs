@@ -217,8 +217,9 @@ impl Batch {
     }
 
     /// Records a directory the walk passes through without cataloguing it
-    /// (`Traverse`): a structural row that holds re-included entries' names
-    /// and is excluded from search (D29).
+    /// (`Traverse`). The writer retains it as an ordinary directory when it
+    /// has a visible descendant, preserving its search-suppression flag
+    /// (D29). Otherwise it becomes one ignored marker without an inode.
     pub fn traversed_dir(&mut self, parent: DirToken, name: &[u8], stat: Stat) -> DirToken {
         self.push_dir(Some(parent), name, stat, true)
     }
