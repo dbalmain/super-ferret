@@ -1022,7 +1022,7 @@ fn find_reports_usage_and_unsupported_features_with_status_one() {
         (&["-type", "D"], false),
         (&["-perm", "+066"], false),
         (&["(", ")"], false),
-        (&["-regex", r".*\(a\)\1"], false),
+        (&["-regex", r".*\(a\)\2"], false),
         (&["-printf", "%"], false),
         (&["-prune", "-delete"], false),
     ];

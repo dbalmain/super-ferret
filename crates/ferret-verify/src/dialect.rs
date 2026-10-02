@@ -1,8 +1,11 @@
 //! GNU find dialect translation, derived from the pinned binary. Matching is
-//! over C-locale bytes and covers the entire path. Backreferences are refused
-//! because the linear-time regex executor cannot represent them.
+//! over C-locale bytes and covers the entire path. Ordinary patterns use the
+//! regex crate; backreferences use the bounded executor in `backtrack`.
 
 use super::{Matcher, Regex, RegexError};
+
+mod backtrack;
+pub use backtrack::MatchLimit;
 
 /// The regular expression syntaxes accepted by GNU find.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,7 +53,13 @@ impl Dialect {
 #[derive(Clone, Debug)]
 pub struct FindRegex {
     translated: String,
-    regex: Regex,
+    engine: Engine,
+}
+
+#[derive(Clone, Debug)]
+enum Engine {
+    Linear(Regex),
+    Backtrack(backtrack::Program),
 }
 
 impl PartialEq for FindRegex {
@@ -61,18 +70,32 @@ impl PartialEq for FindRegex {
 impl Eq for FindRegex {}
 
 impl FindRegex {
-    /// Translates and compiles a GNU pattern. Unsupported backreferences and
-    /// GNU word-start/end assertions return a diagnostic instead of guessing.
+    /// Translates and compiles a GNU pattern over C-locale bytes.
     pub fn new(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<Self, RegexError> {
-        let translated = translate(pattern, dialect, fold)?;
-        let regex = Regex::new(&translated, false)?;
-        Ok(Self { translated, regex })
+        let (translated, has_reference) = translate(pattern, dialect, fold)?;
+        let engine = if has_reference {
+            Engine::Backtrack(backtrack::Program::new(&translated)?)
+        } else {
+            Engine::Linear(Regex::new(&translated, false)?)
+        };
+        Ok(Self { translated, engine })
+    }
+
+    /// Matches the entire path. A backreference search that exhausts its step
+    /// budget returns an error; callers executing find should report it.
+    pub fn try_is_match(&self, bytes: &[u8]) -> Result<bool, MatchLimit> {
+        match &self.engine {
+            Engine::Linear(regex) => Ok(regex.is_match(bytes)),
+            Engine::Backtrack(program) => program.is_match(bytes),
+        }
     }
 }
 
 impl Matcher for FindRegex {
     fn is_match(&self, bytes: &[u8]) -> bool {
-        self.regex.is_match(bytes)
+        // The infallible trait treats an unfinished search as a non-match.
+        // Find uses try_is_match so budget exhaustion is never silent there.
+        self.try_is_match(bytes).unwrap_or(false)
     }
 }
 
@@ -82,7 +105,7 @@ fn literal(out: &mut String, byte: u8) {
     let _ = write!(out, "\\x{byte:02x}");
 }
 
-fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<String, RegexError> {
+fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<(String, bool), RegexError> {
     let basic = matches!(
         dialect,
         Dialect::Emacs | Dialect::Basic | Dialect::Grep | Dialect::MinimalBasic
@@ -95,8 +118,18 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<String, Reg
     });
     let mut at = 0;
     let mut branch_start = true;
+    let mut can_repeat = false;
+    let mut atom_start = out.len();
+    let mut repeated = false;
+    let mut groups = Vec::new();
+    let mut group_count = 0;
+    let mut closed = [false; 9];
+    let mut has_reference = false;
     while let Some(&byte) = pattern.get(at) {
         if byte == b'[' {
+            atom_start = out.len();
+            can_repeat = true;
+            repeated = false;
             at = bracket(pattern, at, dialect, &mut out)?;
             branch_start = false;
             continue;
@@ -139,35 +172,108 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<String, Reg
             }
             _ => false,
         };
-        if escaped && byte.is_ascii_digit() && byte != b'0' && dialect != Dialect::Awk {
-            return Err(RegexError(
-                "backreferences are not supported by the find regex executor".into(),
-            ));
-        }
-        if operator && byte == b'{' {
-            let tail = &pattern[at + 1..];
-            let length = tail
-                .iter()
-                .take_while(|b| b.is_ascii_digit() || **b == b',')
-                .count();
-            let close: &[u8] = if basic { b"\\}" } else { b"}" };
-            if length > 0 && tail[length..].starts_with(close) {
-                out.push('{');
-                out.push_str(
-                    std::str::from_utf8(&tail[..length]).map_err(|e| RegexError(e.to_string()))?,
-                );
-                out.push('}');
-                at += length + close.len() + 1;
-                branch_start = false;
-                continue;
+        if escaped && matches!(byte, b'1'..=b'9') && dialect != Dialect::Awk {
+            if !closed[usize::from(byte - b'1')] {
+                return Err(RegexError("invalid backreference".into()));
             }
-            literal(&mut out, byte);
+            atom_start = out.len();
+            out.push('\\');
+            out.push(byte as char);
+            has_reference = true;
+            can_repeat = true;
+            repeated = false;
+        } else if operator && matches!(byte, b'*' | b'+' | b'?' | b'{') {
+            if !can_repeat {
+                if matches!(dialect, Dialect::Extended | Dialect::PosixAwk)
+                    || (byte == b'{' && dialect == Dialect::Basic)
+                {
+                    return Err(RegexError("invalid preceding regular expression".into()));
+                }
+                if dialect != Dialect::Egrep {
+                    atom_start = out.len();
+                    literal(&mut out, byte);
+                    can_repeat = true;
+                }
+                repeated = false;
+            } else {
+                let repetition = if byte == b'{' {
+                    interval(pattern, at, basic, dialect)?
+                } else {
+                    Some((String::from(byte as char), at + 1))
+                };
+                if let Some((repetition, next)) = repetition {
+                    if repeated && dialect == Dialect::Basic {
+                        return Err(RegexError("invalid preceding regular expression".into()));
+                    }
+                    // GNU repetition has no lazy/possessive suffixes. Nest
+                    // successive operators instead of leaking Rust's syntax.
+                    if repeated {
+                        out.insert_str(atom_start, "(?:");
+                        out.push(')');
+                    }
+                    out.push_str(&repetition);
+                    at = next;
+                    repeated = true;
+                    branch_start = false;
+                    continue;
+                }
+                atom_start = out.len();
+                literal(&mut out, byte);
+                repeated = false;
+            }
         } else if operator {
-            out.push(if byte == b'\n' { '|' } else { byte as char });
+            match byte {
+                b'(' => {
+                    group_count += 1;
+                    groups.push((group_count, out.len(), closed, [false; 9]));
+                    can_repeat = false;
+                }
+                b')' => {
+                    let (number, start, _, branches) = groups
+                        .pop()
+                        .ok_or_else(|| RegexError("unmatched group closer".into()))?;
+                    for (group, branch) in closed.iter_mut().zip(branches) {
+                        *group |= branch;
+                    }
+                    if number <= 9 {
+                        closed[number - 1] = true;
+                    }
+                    atom_start = start;
+                    can_repeat = true;
+                }
+                b'|' | b'\n' => {
+                    // References in a sibling branch cannot see captures
+                    // closed only in earlier branches. On closing a group,
+                    // their union becomes available to its continuation.
+                    if let Some((_, _, inherited, branches)) = groups.last_mut() {
+                        for (branch, group) in branches.iter_mut().zip(closed) {
+                            *branch |= group;
+                        }
+                        closed = *inherited;
+                    } else {
+                        closed = [false; 9];
+                    }
+                    can_repeat = false;
+                }
+                b'^' | b'$' => can_repeat = false,
+                _ => {
+                    atom_start = out.len();
+                    can_repeat = true;
+                }
+            }
+            repeated = false;
+            if byte == b'}' {
+                literal(&mut out, byte);
+            } else {
+                out.push(if byte == b'\n' { '|' } else { byte as char });
+            }
         } else if escaped
             && matches!(byte, b'w' | b'W' | b'b' | b'B')
             && !matches!(dialect, Dialect::Awk | Dialect::PosixAwk)
         {
+            atom_start = out.len();
+            can_repeat = matches!(byte, b'w' | b'W');
+            repeated = false;
             out.push('\\');
             out.push(byte as char);
         } else if escaped
@@ -178,13 +284,84 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<String, Reg
                 "GNU word-start/end assertions are not supported".into(),
             ));
         } else {
+            atom_start = out.len();
+            can_repeat = true;
+            repeated = false;
             literal(&mut out, byte);
         }
         branch_start = operator && matches!(byte, b'(' | b'|' | b'\n');
         at += 1;
     }
+    if !groups.is_empty() {
+        return Err(RegexError("unclosed group".into()));
+    }
     out.push_str(")\\z");
-    Ok(out)
+    Ok((out, has_reference))
+}
+
+// Malformed intervals are literal in the permissive extended dialects, but
+// reversed/oversized numeric bounds and an empty interval always diagnose.
+fn interval(
+    pattern: &[u8],
+    at: usize,
+    basic: bool,
+    dialect: Dialect,
+) -> Result<Option<(String, usize)>, RegexError> {
+    let close: &[u8] = if basic { b"\\}" } else { b"}" };
+    let tail = &pattern[at + 1..];
+    let strict = basic || dialect == Dialect::Extended;
+    let Some(end) = tail.windows(close.len()).position(|pair| pair == close) else {
+        return if strict {
+            Err(RegexError("unmatched interval opener".into()))
+        } else {
+            Ok(None)
+        };
+    };
+    let content = &tail[..end];
+    if content.is_empty() {
+        return Err(RegexError("empty interval".into()));
+    }
+    let fields: Vec<_> = content.split(|byte| *byte == b',').collect();
+    if fields.len() > 2
+        || fields
+            .iter()
+            .any(|field| field.iter().any(|byte| !byte.is_ascii_digit()))
+    {
+        return if strict {
+            Err(RegexError("invalid interval content".into()))
+        } else {
+            Ok(None)
+        };
+    }
+    let number = |field: &[u8]| -> Result<usize, RegexError> {
+        let value = field
+            .iter()
+            .try_fold(0usize, |value, byte| {
+                value.checked_mul(10)?.checked_add(usize::from(byte - b'0'))
+            })
+            .ok_or_else(|| RegexError("interval bound too large".into()))?;
+        if value > 32767 {
+            return Err(RegexError("interval bound too large".into()));
+        }
+        Ok(value)
+    };
+    let min = number(fields[0])?;
+    let max = if fields.len() == 1 {
+        Some(min)
+    } else if fields[1].is_empty() {
+        None
+    } else {
+        Some(number(fields[1])?)
+    };
+    if max.is_some_and(|max| max < min) {
+        return Err(RegexError("reversed interval bounds".into()));
+    }
+    let repetition = match max {
+        Some(max) if min == max => format!("{{{min}}}"),
+        Some(max) => format!("{{{min},{max}}}"),
+        None => format!("{{{min},}}"),
+    };
+    Ok(Some((repetition, at + end + close.len() + 1)))
 }
 
 fn bracket(
