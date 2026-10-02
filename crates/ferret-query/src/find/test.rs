@@ -145,7 +145,12 @@ impl Test {
         })
     }
 
-    pub(super) fn reference(primary: &[u8], path: PathBuf) -> Option<Self> {
+    pub(super) fn reference(primary: &[u8], path: PathBuf, follow: bool) -> Option<Self> {
+        let path = if follow {
+            fs::canonicalize(path).ok()?
+        } else {
+            path
+        };
         let entry = Entry::new(path, 0, FileKind::File);
         let stat = entry.metadata().ok()?;
         if primary == b"-samefile" {
@@ -167,7 +172,18 @@ impl Test {
         Some(Self::Newer { field, stamp })
     }
 
-    pub(super) fn newer_xy(x: u8, y: u8, path: PathBuf, now: SystemTime) -> Option<Self> {
+    pub(super) fn newer_xy(
+        x: u8,
+        y: u8,
+        path: PathBuf,
+        now: SystemTime,
+        follow: bool,
+    ) -> Option<Self> {
+        let path = if follow {
+            fs::canonicalize(path).ok()?
+        } else {
+            path
+        };
         let entry = Entry::new(path, 0, FileKind::File);
         let stat = entry.metadata().ok()?;
         let field = match x {
@@ -770,7 +786,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use std::fs::FileTimes;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     struct Fixture(PathBuf);
     impl Fixture {
@@ -1016,7 +1032,7 @@ mod tests {
             .unwrap()
             .set_times(FileTimes::new().set_modified(stamp + Duration::from_nanos(1)))
             .unwrap();
-        let reference = Test::reference(b"-newer", reference_path.clone()).unwrap();
+        let reference = Test::reference(b"-newer", reference_path.clone(), false).unwrap();
         assert!(
             !reference
                 .evaluate(&Entry::new(equal_path, 0, FileKind::File))
@@ -1027,9 +1043,30 @@ mod tests {
                 .evaluate(&Entry::new(newer_path.clone(), 0, FileKind::File))
                 .unwrap()
         );
-        let same = Test::reference(b"-samefile", newer_path.clone()).unwrap();
+        let same = Test::reference(b"-samefile", newer_path.clone(), false).unwrap();
         assert!(
             same.evaluate(&Entry::new(newer_path, 0, FileKind::File))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn reference_symlinks_are_followed_only_when_requested() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("target");
+        let link = fixture.0.join("link");
+        fs::write(&target, b"").unwrap();
+        symlink(&target, &link).unwrap();
+        let physical = Test::reference(b"-samefile", link.clone(), false).unwrap();
+        let followed = Test::reference(b"-samefile", link, true).unwrap();
+        assert!(
+            !physical
+                .evaluate(&Entry::new(target.clone(), 0, FileKind::File))
+                .unwrap()
+        );
+        assert!(
+            followed
+                .evaluate(&Entry::new(target, 0, FileKind::File))
                 .unwrap()
         );
     }

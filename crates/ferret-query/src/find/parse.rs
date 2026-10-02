@@ -63,14 +63,21 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         daystart: false,
         now: std::time::SystemTime::now(),
         permission_warning: false,
+        follow_references: false,
     };
     let mut no_ignore = false;
     let mut follow = None;
     while let Some(arg) = parser.peek() {
         match arg {
             b"-I" | b"--no-ignore" => no_ignore = true,
-            b"-P" => follow = None,
-            b"-H" | b"-L" => follow = Some(args[parser.at].clone()),
+            b"-P" => {
+                follow = None;
+                parser.follow_references = false;
+            }
+            b"-H" | b"-L" => {
+                follow = Some(args[parser.at].clone());
+                parser.follow_references = true;
+            }
             b"--" => {}
             b"-D" => {
                 parser.at += 1;
@@ -136,6 +143,7 @@ struct Parser<'a> {
     daystart: bool,
     now: std::time::SystemTime,
     permission_warning: bool,
+    follow_references: bool,
 }
 
 impl Parser<'_> {
@@ -373,10 +381,12 @@ impl Parser<'_> {
                 ))
             }
             b"-samefile" | b"-newer" | b"-anewer" | b"-cnewer" => {
+                let follow_references = self.follow_references;
                 let value = self.argument(&primary)?;
                 let test = super::test::Test::reference(
                     primary.as_bytes(),
                     std::path::PathBuf::from(value),
+                    follow_references,
                 );
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }
@@ -395,6 +405,7 @@ impl Parser<'_> {
                     return Err(ParseError::Unknown(primary));
                 }
                 let now = self.now;
+                let follow_references = self.follow_references;
                 let value = self.argument(&primary)?;
                 let x = bytes[6];
                 let y = bytes[7];
@@ -409,7 +420,13 @@ impl Parser<'_> {
                         stamp,
                     })
                 } else {
-                    super::test::Test::newer_xy(x, y, std::path::PathBuf::from(value), now)
+                    super::test::Test::newer_xy(
+                        x,
+                        y,
+                        std::path::PathBuf::from(value),
+                        now,
+                        follow_references,
+                    )
                 };
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }
