@@ -135,30 +135,33 @@ scan checks the same bound before indexing its pass bitset.
 
 ## Final search guard, resumed 2026-10-03
 
-After committing the search f/d/l compatibility guard in `e277011`, rebuilt the
-release benchmark and repeated baseline/final in pairs. Before **each**
-invocation, `pgrep -af 'ferret_timing|ferret find -I'` found no milestone 3b timing
-processes, and `uptime` recorded the load. No compilers ran during this series.
-The build/section comparison above still applies: the final guard only changes
-search, and the snapshot writer is unchanged. Warm medians of 7 and evicted
-medians of 3; all row counts match the baseline.
+Built the release benchmark from `a73937e`, with the search f/d/l compatibility
+guard after its existing path filters, and repeated baseline/final in pairs.
+Before **each** invocation, `pgrep -af 'ferret_timing|ferret find -I'` found no
+milestone 3b timing processes, and `uptime` recorded the load. No compilers ran
+during this series. The build/section comparison above still applies: the final
+guard only changes search, and the snapshot writer is unchanged. Warm medians
+of 7 and evicted medians of 3; all row counts match the baseline.
 
 | query | encoding | rows | warm first / all ms | evicted first / all ms | MB read | load start → finish |
 |---|---|---:|---:|---:|---:|---|
-| `flamegraph` | before | 115 | 263.39 / 269.46 | 350.07 / 355.91 | 300.3 | 1.23, 1.18, 1.09 → 1.21, 1.18, 1.09 |
-| `flamegraph` | final sentinel | 115 | 259.44 / 265.74 | 362.44 / 369.07 | 302.6 | 1.21, 1.18, 1.09 → 1.21, 1.18, 1.09 |
-| `test` | before | 162,219 | 241.34 / 301.87 | 347.78 / 408.16 | 300.3 | 1.21, 1.18, 1.09 → 1.27, 1.19, 1.10 |
-| `test` | final sentinel | 162,219 | 248.28 / 310.88 | 362.49 / 428.52 | 302.6 | 1.27, 1.19, 1.10 → 1.33, 1.20, 1.10 |
-| `ext:jpg` | before | 358,570 | 243.08 / 283.17 | 341.85 / 382.46 | 300.3 | 1.33, 1.20, 1.10 → 1.31, 1.20, 1.10 |
-| `ext:jpg` | final sentinel | 358,570 | 251.59 / 291.86 | 360.02 / 400.28 | 302.6 | 1.31, 1.20, 1.10 → 1.31, 1.20, 1.10 |
-| `*` | before | 10,405,729 | 246.77 / 1334.19 | 346.38 / 1446.76 | 300.3 | 1.31, 1.20, 1.10 → 1.69, 1.29, 1.13 |
-| `*` | final sentinel | 10,405,729 | 257.15 / 1393.87 | 370.98 / 1506.38 | 302.6 | 1.69, 1.29, 1.13 → 1.63, 1.30, 1.14 |
+| `flamegraph` | before | 115 | 269.17 / 275.11 | 353.78 / 359.89 | 300.3 | 1.41, 1.14, 1.08 → 1.37, 1.14, 1.08 |
+| `flamegraph` | final sentinel | 115 | 278.28 / 284.42 | 363.27 / 369.48 | 302.6 | 1.37, 1.14, 1.08 → 1.34, 1.13, 1.08 |
+| `test` | before | 162,219 | 246.16 / 307.56 | 342.43 / 402.32 | 300.3 | 1.34, 1.13, 1.08 → 1.34, 1.13, 1.08 |
+| `test` | final sentinel | 162,219 | 248.09 / 310.82 | 362.89 / 424.74 | 302.6 | 1.34, 1.13, 1.08 → 1.31, 1.13, 1.08 |
+| `ext:jpg` | before | 358,570 | 245.43 / 286.26 | 343.21 / 383.50 | 300.3 | 1.31, 1.13, 1.08 → 1.29, 1.13, 1.08 |
+| `ext:jpg` | final sentinel | 358,570 | 260.18 / 300.42 | 359.41 / 402.94 | 302.6 | 1.29, 1.13, 1.08 → 1.27, 1.13, 1.08 |
+| `*` | before | 10,405,729 | 257.83 / 1348.46 | 350.88 / 1434.65 | 300.3 | 1.27, 1.13, 1.08 → 1.28, 1.14, 1.09 |
+| `*` | final sentinel | 10,405,729 | 251.67 / 1365.20 | 367.59 / 1483.96 | 302.6 | 1.28, 1.14, 1.09 → 1.22, 1.13, 1.09 |
+| `path:deep` | before | 18,883 | 263.69 / 1012.59 | 348.04 / 1096.24 | 300.3 | 1.22, 1.13, 1.09 → 1.18, 1.12, 1.08 |
+| `path:deep` | final sentinel | 18,883 | 262.60 / 1016.16 | 369.71 / 1112.42 | 302.6 | 1.18, 1.12, 1.08 → 1.22, 1.13, 1.09 |
 
-Final warm full listing is 4.5% slower (1,334.19 → 1,393.87 ms), including
+Final warm full listing is 1.2% slower (1,348.46 → 1,365.20 ms), including
 validation of 2.3 MB more name data and the compatibility guards. Warm `test`
-is 3.0% slower, `ext:jpg` 3.1% slower, and rare `flamegraph` 1.4% faster. This
-repeat gives the current source's timings; the earlier series records the
-encoding experiment, under its higher load. It does not establish a zero-cost
+is 1.1% slower, `ext:jpg` 4.9% slower, rare `flamegraph` 3.4% slower, and
+`path:deep` 0.4% slower. This repeat gives the current source's timings; the
+earlier series records the encoding experiment, under its higher load. Small
+changes vary between series; these measurements do not establish a zero-cost
 format change.
 
 ## Reproduction and artifacts
@@ -175,7 +178,7 @@ it contains private HOME paths. Fixture SHA-256: `784a7abfb3bda8717250e638793f99
 /home/dave/w/super-ferret-wt/find-m4a/target/release/ferret-bench sections \
   /tmp/find-m4a-measure/new-catalog
 /home/dave/w/super-ferret-wt/find-m4a/target/release/ferret-bench query \
-  /tmp/find-m4a-measure/new-catalog flamegraph test ext:jpg '*'
+  /tmp/find-m4a-measure/new-catalog flamegraph test ext:jpg '*' path:deep
 ```
 
 The reproducible [adjacent-tag experiment patch](find-m4a-adjacent.patch) is
