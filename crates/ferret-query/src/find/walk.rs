@@ -60,6 +60,7 @@ pub struct Entry {
     root: PathBuf,
     follow: bool,
     directory: Option<Rc<File>>,
+    check_directory: bool,
     depth: usize,
     kind: Option<FileKind>,
     metadata: Rc<OnceCell<io::Result<Metadata>>>,
@@ -73,6 +74,7 @@ impl Entry {
             path,
             follow: false,
             directory: None,
+            check_directory: false,
             depth,
             kind: Some(kind),
             metadata: Rc::new(OnceCell::new()),
@@ -285,6 +287,17 @@ impl LiveWalk {
             if self.force_unknown {
                 child_entry.kind = None;
             }
+            // GNU observes the first child's directory metadata before a cwd
+            // batch flush, but later directories are checked when visited.
+            // Removed directories can therefore print and still fault at a
+            // depth limit; regular file metadata remains lazy.
+            if child_entry.kind == Some(FileKind::Directory) {
+                if children.is_empty() {
+                    let _ = child_entry.metadata();
+                } else {
+                    child_entry.check_directory = true;
+                }
+            }
             children.push(child_entry);
         }
         if !children.is_empty() {
@@ -332,7 +345,20 @@ impl LiveWalk {
                 }
             };
             match task {
-                Task::Visit(entry, root_dev) => {
+                Task::Visit(mut entry, root_dev) => {
+                    if entry.check_directory {
+                        entry.check_directory = false;
+                        if let Err(error) = entry.metadata() {
+                            let error = WalkError {
+                                path: entry.path.clone(),
+                                error: copy_error(error),
+                            };
+                            // GNU still evaluates cheap name/type fields after
+                            // this directory stat error, including at maxdepth.
+                            self.tasks.push(Task::Visit(entry, root_dev));
+                            return Some(Err(error));
+                        }
+                    }
                     let followed_kind = if entry.follow {
                         Some(entry.kind().map_err(|error| WalkError {
                             path: entry.path.clone(),

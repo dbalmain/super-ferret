@@ -228,3 +228,35 @@ fn exec_batch_sizes_against_pinned_gnu() {
         }
     }
 }
+
+#[test]
+fn interactive_commands_have_closed_stdin_after_the_answer() {
+    let tree = Tree::new("closed-stdin");
+    let mut child = tree
+        .command(&[
+            "-I",
+            "d",
+            "-maxdepth",
+            "0",
+            "-ok",
+            "cat",
+            ";",
+            "-o",
+            "-print",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"y\nremaining\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"d\n");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Bad file descriptor"));
+}

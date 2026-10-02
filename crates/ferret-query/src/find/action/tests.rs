@@ -669,6 +669,36 @@ fn differential_extra(tree: &Tree) -> usize {
     assert!(!output.bytes.is_empty());
     assert!(output.diagnostics.is_empty());
     count += 1;
+    let args = tree.args(&[
+        "-maxdepth",
+        "1",
+        "-execdir",
+        "sh",
+        "-c",
+        r#"rm -rf "$@""#,
+        "remove",
+        "{}",
+        "+",
+        "-print",
+    ]);
+    let expected = Command::new(GNU)
+        .args(&args[1..])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    let expected_tree = snapshot(&tree.0);
+    tree.reset();
+    let (outcome, output) = run(&args);
+    assert_eq!(
+        i32::from(outcome.errors != 0),
+        expected.status.code().unwrap()
+    );
+    assert_eq!(records(&output.bytes), records(&expected.stdout));
+    assert_eq!(output.diagnostics.is_empty(), expected.stderr.is_empty());
+    assert_eq!(snapshot(&tree.0), expected_tree);
+    tree.reset();
+    count += 1;
     count
 }
 
@@ -697,4 +727,26 @@ fn following_detects_stat_errors_even_when_the_expression_needs_no_metadata() {
         output.bytes,
         format!("{}/self\n", tree.0.display()).as_bytes()
     );
+}
+
+#[test]
+fn execdir_caches_names_before_a_batch_unlinks_its_directory() {
+    let tree = Tree::new();
+    let (outcome, output) = tree.run(&[
+        "-maxdepth",
+        "1",
+        "-execdir",
+        "sh",
+        "-c",
+        r#"rm -rf "$@""#,
+        "remove",
+        "{}",
+        "+",
+        "-print",
+    ]);
+    assert!(outcome.errors > 0);
+    assert!(!tree.0.exists());
+    assert!(output.bytes.windows(3).any(|bytes| bytes == b"/a\n"));
+    assert!(output.bytes.windows(3).any(|bytes| bytes == b"/b\n"));
+    assert_eq!(output.batches.len(), 2);
 }
