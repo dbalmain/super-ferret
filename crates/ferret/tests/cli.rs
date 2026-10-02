@@ -1079,9 +1079,13 @@ fn ignored_names_and_special_files_survive_index_search_and_stats() {
     let found = paths(&output);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(found.contains(&env.at("kept.txt")));
-    assert!(found.contains(&pipe));
-    assert!(found.contains(&env.at("socket")));
-    for missing in ["hidden.ignored", "build", "build/hidden.txt"] {
+    for missing in [
+        "pipe",
+        "socket",
+        "hidden.ignored",
+        "build",
+        "build/hidden.txt",
+    ] {
         assert!(!found.contains(&env.at(missing)), "{found:?}");
     }
     let stats = env.run(&[os("stats")]);

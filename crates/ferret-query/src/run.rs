@@ -237,6 +237,12 @@ impl<'c> Run<'_, 'c> {
         if structural || !names_pass {
             return Ok(ControlFlow::Continue(()));
         }
+        // Search keeps its existing file/directory/symlink result domain;
+        // the catalog's special entries are available to the find source.
+        let kind = kinds.kind(name.child);
+        if !matches!(kind, Kind::Dir | Kind::File | Kind::Symlink) {
+            return Ok(ControlFlow::Continue(()));
+        }
         if !tested && !self.query.meta.is_empty() {
             self.load_meta()?;
             if !self.meta_passes(name.child) {
@@ -252,7 +258,7 @@ impl<'c> Run<'_, 'c> {
             path: &self.path,
             name: id,
             inode: name.child,
-            kind: kinds.kind(name.child),
+            kind,
         }))
     }
 

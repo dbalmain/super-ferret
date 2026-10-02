@@ -10,7 +10,9 @@ the S1a synthetic driver. Baseline: 10,405,729 names, 10,405,730 inodes and
 8,495,924 documents. Both new encodings: 10,448,739 names, with **exactly the
 same inode/document counts**. The 43,010 additional names are ignored files or
 opaque directory markers, 0.41% of the new name count. The fixture has no
-visible special files; their stat/kind behavior is covered by real-crawler
+visible special files: the replay holds the original policy decisions fixed,
+including its eight skipped socket rows. This isolates the encoding comparison
+from the crawler's new special-file policy. Their stat/kind behavior is covered by real-crawler
 FIFO/socket tests and catalog tests for all seven types.
 
 The original dump omitted type data for stat-free Skip events. For this fixed
@@ -119,6 +121,10 @@ in total, with its time after the first row unchanged at 5.91 ms; section loadin
 accounts for that run's difference. Name sections grow from 300.3 to 302.6 MB.
 The evicted full-listing run is an outlier (first row 632 ms), so it is recorded
 rather than used to argue a storage/scanner effect.
+
+Special entries remain available to find's catalog reader, while search keeps
+its existing file/directory/symlink result domain. The crawler tests cover the
+new special-file policy separately from this fixed-decision replay.
 
 An early implementation obtained every kind from the mode dictionary. It
 loaded/validated another 6.5 MB and regressed the rare query by about 40 ms

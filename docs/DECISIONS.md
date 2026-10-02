@@ -2352,7 +2352,9 @@ implemented or measured here. There is no departure from the settled sentinel
 encoding. All seven ignored kinds have name-only rows; visible special kinds
 use a sparse 8-byte-per-row Specials section so name search loads no stat
 columns. Re-included ancestors are ordinary for find but keep the existing
-search-suppression bit to preserve search counts (D29 compatibility).
+search-suppression bit to preserve search counts (D29 compatibility). Visible
+special files are available to the find source but suppressed by search, which
+keeps its existing regular-file/directory/symlink result domain.
 
 ## D48 — The next move after S1
 

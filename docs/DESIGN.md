@@ -241,7 +241,9 @@ traversed bit still suppresses them in search to preserve existing result counts
 FIFOs, sockets and devices have ordinary names and stat rows, with Unindexed
 content and no document. A sparse `Specials` section holds `(InoId, kind)` pairs
 for those visible types, in inode order. `Links` loads this small table too, so
-kind lookup and name search need no mode-column load. EACCES while opening or
+kind lookup and name search need no mode-column load. Search continues to return
+only regular files, directories and symlinks; special entries are available to
+find through the catalog API. EACCES while opening or
 listing a directory retains its ordinary directory inode, no children and an
 unknown raw entry count. Other coverage faults still prevent publication.
 

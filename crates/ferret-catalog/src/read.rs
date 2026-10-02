@@ -1027,7 +1027,7 @@ pub struct Kinds<'c> {
 }
 
 impl Kinds<'_> {
-    /// Whether an inode is a directory, file or symlink.
+    /// An inode's file type, including FIFO, socket and device kinds.
     pub fn kind(&mut self, id: InoId) -> Kind {
         if id.0 < self.dirs {
             return Kind::Dir;

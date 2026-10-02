@@ -441,8 +441,9 @@ fn metadata_passes_over_many_runs_match_each_inode_tested_alone() {
 
 /// 4a: every candidate strategy must skip ignored child tags before looking
 /// up stat columns. A metadata scan previously indexed by every raw child id.
+/// Newly catalogued special files must also preserve search's existing counts.
 #[test]
-fn ignored_names_never_become_search_rows() {
+fn ignored_names_and_specials_never_become_search_rows() {
     let scratch = Scratch::new("ignored-search");
     let mut txn = Transaction::begin(&scratch.0, 1).unwrap();
     let mut batch = txn.batch();
@@ -450,6 +451,20 @@ fn ignored_names_never_become_search_rows() {
     batch.file(root, b"match.rs", file(2, 20, DAY), Content::Unindexed);
     batch.ignored(root, b"match.ignored.rs", Kind::File);
     batch.ignored(root, b"match.ignored", Kind::Dir);
+    for (ino, mode) in [
+        (4, 0o010_600),
+        (5, 0o140_600),
+        (6, 0o060_600),
+        (7, 0o020_600),
+    ] {
+        let name = format!("match.special{ino}.rs");
+        batch.file(
+            root,
+            name.as_bytes(),
+            stat(ino, mode, 20, DAY),
+            Content::Unindexed,
+        );
+    }
     let visible = batch.dir(root, b"only", dir(3));
     batch.ignored(visible, b"match.rs", Kind::File);
     txn.add(batch);
@@ -459,12 +474,13 @@ fn ignored_names_never_become_search_rows() {
         "ext:rs",
         "re:^match",
         "size:>0 type:file",
+        "size:>0",
         "type:file",
         "**/match*",
         "*",
     ] {
         let rows = paths(&catalog, query);
-        let expected = if query == "*" {
+        let expected = if matches!(query, "*" | "size:>0") {
             vec!["/r/match.rs", "/r/only"]
         } else {
             vec!["/r/match.rs"]
