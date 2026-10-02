@@ -367,6 +367,86 @@ fn a_directory_removed_after_its_visit_faults_without_losing_siblings() {
 }
 
 #[test]
+fn directories_removed_by_exec_rm_rf_mid_walk_match_observed_gnu() {
+    // Regression guard for the reused path buffer (m3b): a listed child whose
+    // directory vanished is reported once, post-order still yields the names
+    // already listed, and nothing is printed twice. Expectations are GNU
+    // 4.11.0's observed output on the same shapes.
+    let tree = Tree::new("rmrf");
+    let (outcome, output) = tree.run(&["-name", "dir", "-exec", "rm", "-rf", "{}", ";"]);
+    assert_eq!(outcome.errors, 1);
+    assert_eq!(output.errors, [tree.0.join("dir")]);
+    assert!(output.bytes.is_empty());
+    assert!(!tree.0.join("dir").exists());
+
+    let tree = Tree::new("rmrf-depth");
+    let (outcome, output) = tree.run(&["-depth", "-name", "dir", "-exec", "rm", "-rf", "{}", ";"]);
+    assert_eq!(outcome.errors, 0);
+    assert!(output.errors.is_empty());
+    assert!(!tree.0.join("dir").exists());
+
+    let tree = Tree::new("rmrf-ancestor");
+    let dir = tree.0.join("dir");
+    let dir = dir.to_str().unwrap();
+    let (outcome, output) = tree.run(&[
+        "-depth", "-name", "deep.c", "-exec", "rm", "-rf", dir, ";", "-o", "-path", "*/dir*",
+        "-print",
+    ]);
+    assert_eq!(outcome.errors, 0);
+    assert!(output.errors.is_empty());
+    assert_eq!(
+        records(&output.bytes, b'\n'),
+        paths(&tree, &["dir", "dir/file", "dir/sub"])
+    );
+}
+
+#[test]
+fn a_chain_past_path_max_spells_every_level_and_the_walk_continues() {
+    // Regression guard for the reused path buffer (m3b): each level is the
+    // exact join of its parent and the overlong directory is reported once.
+    // GNU walks past PATH_MAX; the live walk opens and lstats by path, so it
+    // stops at the first open that fails with ENAMETOOLONG.
+    let tree = Tree::new("pathmax");
+    let component = "d".repeat(200);
+    fs::create_dir(tree.0.join("chain")).unwrap();
+    let status = Command::new("sh")
+        .current_dir(tree.0.join("chain"))
+        .args([
+            "-c",
+            &format!("for i in $(seq 25); do mkdir {component} && cd {component} || exit 1; done"),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut level = tree.0.join("chain");
+    let mut levels = vec![level.as_os_str().as_bytes().to_vec()];
+    for _ in 0..25 {
+        level.push(&component);
+        levels.push(level.as_os_str().as_bytes().to_vec());
+    }
+
+    let (outcome, output) = tree.run(&[]);
+    let all = records(&output.bytes, b'\n');
+    let printed: Vec<_> = all
+        .iter()
+        .filter(|record| record.starts_with(&levels[0]))
+        .cloned()
+        .collect();
+    assert!(printed.len() > 10 && printed.len() < levels.len());
+    assert_eq!(printed, levels[..printed.len()]);
+    assert_eq!(outcome.errors, 1);
+    assert_eq!(
+        output.errors,
+        [PathBuf::from(OsString::from_vec(
+            printed[printed.len() - 1].clone()
+        ))]
+    );
+    for name in ["a.c", "dir/sub/deep.c", "empty"] {
+        assert!(all.contains(&tree.0.join(name).as_os_str().as_bytes().to_vec()));
+    }
+}
+
+#[test]
 fn metadata_observations_and_failures_are_cached_and_name_tests_are_lazy() {
     let tree = Tree::new("stat");
     let plan = Plan::parse(&tree.args(&["-name", "a.c"])).unwrap();
@@ -378,7 +458,7 @@ fn metadata_observations_and_failures_are_cached_and_name_tests_are_lazy() {
             assert!(
                 evaluate(
                     &plan.expression,
-                    &entry,
+                    entry,
                     &mut Output::default(),
                     &mut Control::default()
                 )

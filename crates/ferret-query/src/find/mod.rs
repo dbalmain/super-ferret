@@ -209,7 +209,7 @@ impl Plan {
                 outcome.errors += 1;
                 break;
             }
-            if let Err(error) = evaluate(&self.expression, &entry, effects, &mut control) {
+            if let Err(error) = evaluate(&self.expression, entry, effects, &mut control) {
                 let (error, stop) = match error {
                     EvaluationError::Metadata(error) => (error, false),
                     EvaluationError::Output(error) => (error, true),

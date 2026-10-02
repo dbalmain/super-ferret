@@ -76,6 +76,32 @@ fn process_stdout_is_interleaved_with_flushed_find_output() {
 }
 
 #[test]
+fn a_child_runs_after_every_earlier_record_even_past_the_stdout_buffer() {
+    // Regression guard for the 64 KiB stdout buffer (m3b): output is flushed
+    // before each child, so records and child lines strictly alternate even
+    // when the walk's output far exceeds the buffer.
+    let tree = Tree::new("alternate");
+    let name = "n".repeat(200);
+    for index in 0..1000 {
+        fs::write(tree.0.join("d").join(format!("{name}{index}")), b"").unwrap();
+    }
+    let output = tree.run(&[
+        "-I", "d", "-type", "f", "-print", "-exec", "echo", "child", ";",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let lines: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
+    assert_eq!(lines.len(), 2001);
+    for pair in lines[..2000].chunks(2) {
+        assert!(
+            pair[0].starts_with(b"d/n"),
+            "{:?}",
+            String::from_utf8_lossy(pair[0])
+        );
+        assert_eq!(pair[1], b"child");
+    }
+}
+
+#[test]
 fn ok_and_okdir_read_one_c_locale_answer_line() {
     let tree = Tree::new("ok");
     for primary in ["-ok", "-okdir"] {
