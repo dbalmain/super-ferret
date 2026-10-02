@@ -1,12 +1,20 @@
 //! Recursive descent in GNU precedence order: comma, OR, AND, negation.
 //! Global options affect traversal even in a branch that never evaluates.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::rc::Rc;
+
+use ferret_verify::{Dialect, FindRegex};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use super::{Expression, FileKind, Options};
+use super::action::{Action, Exec, Target};
+use super::printf::Format;
+use super::{Expression, FileKind, Follow, Options};
 
 /// A find command; unsupported features are retained after full parsing.
 #[derive(Debug)]
@@ -16,6 +24,8 @@ pub struct Plan {
     pub(super) options: Options,
     pub(super) no_ignore: bool,
     pub(super) unsupported: Option<OsString>,
+    pub(super) warnings: Vec<String>,
+    pub(super) message: Option<String>,
 }
 
 /// Invalid find syntax. The host maps every variant to exit status 1.
@@ -23,6 +33,9 @@ pub struct Plan {
 pub enum ParseError {
     /// A predicate GNU does not recognize.
     Unknown(OsString),
+    /// A recognized feature cannot be represented or an output file cannot
+    /// open.
+    Feature(String),
     /// A primary or leading option lacks its operand.
     Missing(OsString),
     /// A recognized primary has an invalid operand.
@@ -35,6 +48,7 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Feature(message) => f.write_str(message),
             Self::Unknown(primary) => write!(f, "unknown predicate {}", primary.to_string_lossy()),
             Self::Missing(primary) => {
                 write!(f, "missing argument to {}", primary.to_string_lossy())
@@ -59,19 +73,40 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         options: Options::default(),
         action: false,
         unsupported: None,
+        warnings: Vec::new(),
+        message: None,
+        dialect: Dialect::Emacs,
+        streams: HashMap::new(),
+        exec_id: 0,
+        delete: false,
+        prune: false,
+        explicit_depth: false,
     };
     let mut no_ignore = false;
-    let mut follow = None;
     while let Some(arg) = parser.peek() {
         match arg {
             b"-I" | b"--no-ignore" => no_ignore = true,
-            b"-P" => follow = None,
-            b"-H" | b"-L" => follow = Some(args[parser.at].clone()),
+            b"-P" => parser.options.follow = Follow::Physical,
+            b"-H" => parser.options.follow = Follow::Roots,
+            b"-L" => parser.options.follow = Follow::All,
             b"--" => {}
             b"-D" => {
                 parser.at += 1;
-                parser.argument(OsStr::new("-D"))?;
-                parser.unsupported(OsStr::new("-D"));
+                let value = parser.argument(OsStr::new("-D"))?.to_owned();
+                if value.is_empty() {
+                    return Err(invalid(OsStr::new("-D"), &value));
+                }
+                for flag in value.as_bytes().split(|&b| b == b',') {
+                    if flag == b"help" {
+                        parser.message = Some(
+                            "Debug options: exec opt rates search stat time tree all help\n".into(),
+                        );
+                    } else if flag != b"exec" && flag != b"stat" {
+                        parser
+                            .warnings
+                            .push(format!("debug flag {}", String::from_utf8_lossy(flag)));
+                    }
+                }
                 continue;
             }
             bytes if bytes.starts_with(b"-O") => {
@@ -86,9 +121,6 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         }
         parser.at += 1;
     }
-    if parser.unsupported.is_none() {
-        parser.unsupported = follow;
-    }
     let mut paths = Vec::new();
     while let Some(bytes) = parser.peek() {
         if bytes.starts_with(b"-") || bytes == b"(" || bytes == b"!" {
@@ -100,10 +132,17 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
     if paths.is_empty() {
         paths.push(PathBuf::from("."));
     }
-    let mut expression = if parser.at == args.len() {
+    let mut expression = if parser.at == args.len() || parser.message.is_some() {
+        parser.at = args.len();
         Expression::Constant(true)
     } else {
-        parser.comma()?
+        match parser.comma() {
+            _ if parser.message.is_some() => {
+                parser.at = args.len();
+                Expression::Constant(true)
+            }
+            result => result?,
+        }
     };
     if parser.at != args.len() {
         return Err(ParseError::Expression(Some(args[parser.at].clone())));
@@ -113,12 +152,19 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
     if !parser.action {
         expression = Expression::And(Box::new(expression), Box::new(Expression::Print(false)));
     }
+    if parser.delete && parser.prune && !parser.explicit_depth {
+        return Err(ParseError::Feature(
+            "-delete implies -depth; -prune requires an explicit -depth option".into(),
+        ));
+    }
     Ok(Plan {
         expression,
         paths,
         options: parser.options,
         no_ignore,
         unsupported: parser.unsupported,
+        warnings: parser.warnings,
+        message: parser.message,
     })
 }
 
@@ -128,6 +174,14 @@ struct Parser<'a> {
     options: Options,
     action: bool,
     unsupported: Option<OsString>,
+    warnings: Vec<String>,
+    message: Option<String>,
+    dialect: Dialect,
+    streams: HashMap<PathBuf, Rc<RefCell<File>>>,
+    exec_id: usize,
+    delete: bool,
+    prune: bool,
+    explicit_depth: bool,
 }
 
 impl Parser<'_> {
@@ -222,6 +276,7 @@ impl Parser<'_> {
                 constant
             }
             b"-depth" => {
+                self.explicit_depth = true;
                 self.options.depth_first = true;
                 constant
             }
@@ -231,34 +286,76 @@ impl Parser<'_> {
             }
             b"-true" => constant,
             b"-false" => Expression::Constant(false),
-            b"-prune" => Expression::Prune,
+            b"-prune" => {
+                self.prune = true;
+                Expression::Prune
+            }
             b"-quit" => Expression::Quit,
             b"-print" | b"-print0" => {
                 self.action = true;
                 Expression::Print(primary == "-print0")
             }
             b"-exec" | b"-execdir" | b"-ok" | b"-okdir" => {
-                self.exec(&primary)?;
+                let exec = self.exec(&primary)?;
                 self.action = true;
-                self.unsupported(&primary)
+                Expression::Action(Action::Exec(exec))
             }
-            b"-fprintf" => {
-                self.argument(&primary)?;
-                self.argument(&primary)?;
+            b"-fprintf" | b"-fprint" | b"-fprint0" | b"-fls" => {
+                let target = self.target(&primary)?;
                 self.action = true;
-                self.unsupported(&primary)
+                if primary == "-fls" {
+                    Expression::Action(Action::List(target))
+                } else {
+                    let format = if primary == "-fprintf" {
+                        self.format(&primary)?
+                    } else {
+                        Format::path(primary == "-fprint0")
+                    };
+                    Expression::Action(Action::Output(target, format))
+                }
             }
-            b"-fprint" | b"-fprint0" | b"-fls" | b"-printf" => {
-                self.argument(&primary)?;
+            b"-printf" => {
+                let format = self.format(&primary)?;
                 self.action = true;
-                self.unsupported(&primary)
+                Expression::Action(Action::Output(Target::Stdout, format))
             }
-            b"-ls" | b"-delete" => {
+            b"-ls" => {
                 self.action = true;
-                self.unsupported(&primary)
+                Expression::Action(Action::List(Target::Stdout))
             }
-            b"-follow"
-            | b"-daystart"
+            b"-delete" => {
+                self.action = true;
+                self.delete = true;
+                self.options.depth_first = true;
+                Expression::Action(Action::Delete)
+            }
+            b"-follow" => {
+                self.options.follow = Follow::All;
+                constant
+            }
+            b"-help" | b"--help" | b"-version" | b"--version" => {
+                self.at = self.args.len();
+                self.message = Some(if primary.as_bytes().ends_with(b"help") {
+                    "Usage: ferret find [-I] [-H|-L|-P] [paths] [expression]\n".into()
+                } else {
+                    "ferret find (GNU find compatible syntax)\n".into()
+                });
+                constant
+            }
+            b"-regex" | b"-iregex" => {
+                let value = self.argument(&primary)?.to_owned();
+                let regex = FindRegex::new(value.as_bytes(), self.dialect, primary == "-iregex")
+                    .map_err(|error| ParseError::Feature(error.to_string()))?;
+                Expression::Action(Action::Regex(regex))
+            }
+            b"-lname" | b"-ilname" => {
+                let value = self.argument(&primary)?;
+                Expression::Action(Action::Link(super::glob::Pattern::new(
+                    value.as_bytes(),
+                    primary == "-ilname",
+                )))
+            }
+            b"-daystart"
             | b"-noleaf"
             | b"-ignore_readdir_race"
             | b"-noignore_readdir_race"
@@ -269,43 +366,20 @@ impl Parser<'_> {
             | b"-writable"
             | b"-executable"
             | b"-nouser"
-            | b"-nogroup"
-            | b"-help"
-            | b"--help"
-            | b"-version"
-            | b"--version" => self.unsupported(&primary),
-            b"-lname" | b"-ilname" | b"-regex" | b"-iregex" | b"-fstype" | b"-context"
-            | b"-user" | b"-group" | b"-newer" | b"-anewer" | b"-cnewer" | b"-samefile"
-            | b"-files0-from" => {
+            | b"-nogroup" => self.unsupported(&primary),
+            b"-fstype" | b"-context" | b"-user" | b"-group" | b"-newer" | b"-anewer"
+            | b"-cnewer" | b"-samefile" | b"-files0-from" => {
                 self.argument(&primary)?;
                 self.unsupported(&primary)
             }
             b"-regextype" => {
-                let value = self.argument(&primary)?;
-                if ![
-                    b"findutils-default".as_slice(),
-                    b"awk",
-                    b"ed",
-                    b"egrep",
-                    b"emacs",
-                    b"gnu-awk",
-                    b"grep",
-                    b"posix-awk",
-                    b"posix-basic",
-                    b"posix-egrep",
-                    b"posix-extended",
-                    b"posix-minimal-basic",
-                    b"sed",
-                ]
-                .contains(&value.as_bytes())
-                {
-                    return Err(invalid(&primary, value));
-                }
-                self.unsupported(&primary)
+                let value = self.argument(&primary)?.to_owned();
+                self.dialect = Dialect::from_name(value.as_bytes())
+                    .ok_or_else(|| invalid(&primary, &value))?;
+                constant
             }
             b"-xtype" => {
-                kinds(&primary, self.argument(&primary)?)?;
-                self.unsupported(&primary)
+                Expression::Action(Action::Xtype(kinds(&primary, self.argument(&primary)?)?))
             }
             b"-perm" => {
                 let value = self.argument(&primary)?;
@@ -369,17 +443,46 @@ impl Parser<'_> {
         Expression::Constant(true)
     }
 
-    fn exec(&mut self, primary: &OsStr) -> Result<(), ParseError> {
+    fn target(&mut self, primary: &OsStr) -> Result<Target, ParseError> {
+        let path = PathBuf::from(self.argument(primary)?);
+        if path == std::path::Path::new("/dev/stdout") {
+            return Ok(Target::Stdout);
+        }
+        let file = match self.streams.get(&path) {
+            Some(file) => file.clone(),
+            None => {
+                let file = Rc::new(RefCell::new(File::create(&path).map_err(|error| {
+                    ParseError::Feature(format!("{}: {error}", path.display()))
+                })?));
+                self.streams.insert(path.clone(), file.clone());
+                file
+            }
+        };
+        Ok(Target::File(path, file))
+    }
+
+    fn format(&mut self, primary: &OsStr) -> Result<Format, ParseError> {
+        let value = self.argument(primary)?.to_owned();
+        Format::compile(value.as_bytes(), &mut self.warnings).map_err(ParseError::Feature)
+    }
+
+    fn exec(&mut self, primary: &OsStr) -> Result<Exec, ParseError> {
         let start = self.at;
         while let Some(arg) = self.args.get(self.at) {
             if arg == ";" {
                 if self.at == start {
                     return Err(ParseError::Missing(primary.to_owned()));
                 }
+                let args = self.args[start..self.at].to_vec();
                 self.at += 1;
-                return Ok(());
+                return self.exec_spec(primary, args, false);
             }
-            if arg == "+" && self.at > start && self.args[self.at - 1] == "{}" {
+            if arg == "+"
+                && self.at > start
+                && self.args[self.at - 1] == "{}"
+                && primary != "-ok"
+                && primary != "-okdir"
+            {
                 let count = self.args[start..self.at]
                     .iter()
                     .filter(|arg| arg.as_bytes().windows(2).any(|pair| pair == b"{}"))
@@ -387,12 +490,45 @@ impl Parser<'_> {
                 if count != 1 || primary == "-ok" || primary == "-okdir" {
                     return Err(invalid(primary, arg));
                 }
+                let args = self.args[start..self.at - 1].to_vec();
                 self.at += 1;
-                return Ok(());
+                if args.is_empty() {
+                    return Err(ParseError::Missing(primary.to_owned()));
+                }
+                return self.exec_spec(primary, args, true);
             }
             self.at += 1;
         }
         Err(ParseError::Missing(primary.to_owned()))
+    }
+
+    fn exec_spec(
+        &mut self,
+        primary: &OsStr,
+        args: Vec<OsString>,
+        batch: bool,
+    ) -> Result<Exec, ParseError> {
+        let directory = primary.as_bytes().ends_with(b"dir");
+        if directory
+            && std::env::var_os("PATH").is_some_and(|path| {
+                path.as_bytes()
+                    .split(|&b| b == b':')
+                    .any(|part| !part.starts_with(b"/"))
+            })
+        {
+            return Err(ParseError::Feature(
+                "relative or empty PATH entries are insecure with -execdir/-okdir".into(),
+            ));
+        }
+        let id = self.exec_id;
+        self.exec_id += 1;
+        Ok(Exec {
+            id,
+            args,
+            batch,
+            directory,
+            prompt: primary.as_bytes().starts_with(b"-ok"),
+        })
     }
 }
 

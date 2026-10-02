@@ -78,6 +78,20 @@ impl Effects for Output {
         Ok(())
     }
 
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn command(&mut self, command: &mut Command) -> io::Result<bool> {
+        let output = command.output()?;
+        self.bytes.extend_from_slice(&output.stdout);
+        if !output.stderr.is_empty() {
+            self.errors.push(PathBuf::from("child stderr"));
+        }
+        Ok(output.status.success())
+    }
+
     fn error(&mut self, error: &WalkError) {
         self.errors.push(error.path.clone());
     }
@@ -422,21 +436,12 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
         );
     }
     let cases: &[&[&str]] = &[
-        &["-exec", "echo", "{}", ";"],
-        &["-execdir", "echo", "{}", "+"],
-        &["-ok", "echo", "{}", ";"],
-        &["-fprintf", "out", "%p"],
-        &["-fprint", "out"],
-        &["-printf", "%p"],
-        &["-regextype", "posix-extended", "-regex", ".*"],
         &["-perm", "u=rw,g+r"],
         &["-size", "+1M"],
         &["-mtime", "-0.1"],
         &["-newermt", "yesterday"],
-        &["-xtype", "f,l"],
         &["-samefile", "ref"],
         &["-empty"],
-        &["-delete"],
     ];
     for args in cases {
         let plan = Plan::parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
@@ -497,6 +502,7 @@ fn differential_against_pinned_gnu() {
         &["-iname", "[[=a=]]*"],
         &["-iname", "[[.a.]-[.c.]]*"],
     ];
+    super::action::tests::differential();
     for expression in expressions {
         let gnu = Command::new(binary)
             .arg(&tree.0)
@@ -631,11 +637,10 @@ fn parser_precedence_and_implicit_action_are_visible_in_the_ast() {
 
 #[test]
 fn unsupported_plans_fail_before_the_source_or_effects_are_used() {
-    let plan =
-        Plan::parse(&["-I", "missing", "-printf", "%p", "-name", "x"].map(OsString::from)).unwrap();
+    let plan = Plan::parse(&["-I", "missing", "-empty", "-name", "x"].map(OsString::from)).unwrap();
     let mut output = Output::default();
     let error = plan.run(&mut plan.live_source(), &mut output).unwrap_err();
-    assert_eq!(error.feature, "-printf");
+    assert_eq!(error.feature, "-empty");
     assert!(output.errors.is_empty());
     assert!(output.bytes.is_empty());
 }

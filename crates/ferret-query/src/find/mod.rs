@@ -2,8 +2,10 @@
 //! source owns traversal; expressions own truth and control effects. Hosts own
 //! output and diagnostics, so the engine does not depend on the CLI or index.
 
+mod action;
 mod glob;
 mod parse;
+mod printf;
 mod walk;
 
 use std::ffi::OsString;
@@ -26,6 +28,7 @@ enum Expression {
     Print(bool),
     Prune,
     Quit,
+    Action(action::Action),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -34,6 +37,15 @@ pub(crate) struct Options {
     pub min_depth: usize,
     pub depth_first: bool,
     pub xdev: bool,
+    pub follow: Follow,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Follow {
+    #[default]
+    Physical,
+    Roots,
+    All,
 }
 
 /// The host supplies process output. A failed print stops the walk and is
@@ -43,6 +55,30 @@ pub trait Effects {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()>;
     /// Reports an I/O error. Execution continues after traversal errors.
     fn error(&mut self, error: &WalkError);
+    /// Writes formatted bytes without adding a record terminator.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        std::io::stdout().lock().write_all(bytes)
+    }
+    /// Flushes host output before a child inherits its descriptors.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    /// Executes a prepared command with inherited standard descriptors.
+    fn command(&mut self, command: &mut std::process::Command) -> io::Result<bool> {
+        Ok(command.status()?.success())
+    }
+    /// Prompts and reads one answer line. Only initial y/Y is yes in C locale.
+    fn confirm(&mut self, program: &std::ffi::OsStr, path: &Path) -> io::Result<bool> {
+        action::confirm(program, path)
+    }
+    /// Reports a parse-time warning without making execution fail.
+    fn warning(&mut self, message: &str) {
+        self.error(&WalkError {
+            path: std::path::PathBuf::new(),
+            error: io::Error::other(message.to_owned()),
+        });
+    }
 }
 
 /// A recognized feature that this evaluator does not implement yet.
@@ -81,12 +117,18 @@ enum EvaluationError {
 struct Control {
     prune: bool,
     quit: bool,
+    actions: action::State,
 }
 
 impl Plan {
     /// Parses a GNU find argument list, including leading ferret `-I`.
     pub fn parse(args: &[OsString]) -> Result<Self, ParseError> {
         parse::parse(args)
+    }
+
+    /// Whether this command prints help, version or debug-option help.
+    pub fn is_information(&self) -> bool {
+        self.message.is_some()
     }
 
     /// Whether `-I` / `--no-ignore` selected the live, GNU-compatible mode.
@@ -120,8 +162,24 @@ impl Plan {
             });
         }
         let mut outcome = Outcome::default();
+        for warning in &self.warnings {
+            effects.warning(warning);
+        }
+        if let Some(message) = &self.message {
+            if let Err(error) = effects.write(message.as_bytes()) {
+                effects.error(&WalkError {
+                    path: ".".into(),
+                    error,
+                });
+                outcome.errors += 1;
+            }
+            return Ok(outcome);
+        }
+        let mut control = Control::default();
         let mut descend = true;
-        while let Some(item) = source.next(descend) {
+        while let Some(item) =
+            source.next_with(descend, &mut || control.actions.flush(effects, true))
+        {
             descend = true;
             let entry = match item {
                 Ok(entry) => entry,
@@ -134,7 +192,16 @@ impl Plan {
             if entry.depth() < self.options.min_depth {
                 continue;
             }
-            let mut control = Control::default();
+            control.prune = false;
+            control.quit = false;
+            if let Err(error) = control.actions.change_directory(entry.path(), effects) {
+                effects.error(&WalkError {
+                    path: entry.path().to_owned(),
+                    error,
+                });
+                outcome.errors += 1;
+                break;
+            }
             if let Err(error) = evaluate(&self.expression, &entry, effects, &mut control) {
                 let (error, stop) = match error {
                     EvaluationError::Metadata(error) => (error, false),
@@ -156,6 +223,14 @@ impl Plan {
                 break;
             }
         }
+        if let Err(error) = control.actions.flush(effects, false) {
+            effects.error(&WalkError {
+                path: ".".into(),
+                error,
+            });
+            outcome.errors += 1;
+        }
+        outcome.errors += control.actions.errors;
         Ok(outcome)
     }
 }
@@ -199,6 +274,9 @@ fn evaluate(
         Expression::Prune => {
             control.prune = true;
             true
+        }
+        Expression::Action(action) => {
+            action::evaluate(action, entry, effects, &mut control.actions)?
         }
         Expression::Quit => {
             control.quit = true;

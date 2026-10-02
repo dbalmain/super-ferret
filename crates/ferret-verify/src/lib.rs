@@ -13,6 +13,7 @@
 //!
 //! Knows nothing about how candidates were found.
 
+mod dialect;
 pub mod matcher;
 pub mod scan;
 pub mod toolchain;
@@ -20,5 +21,6 @@ pub mod toolchain;
 #[cfg(test)]
 mod tests;
 
+pub use dialect::{Dialect, FindRegex};
 pub use matcher::{Matcher, Regex, RegexError};
 pub use scan::{Arm, Finder};

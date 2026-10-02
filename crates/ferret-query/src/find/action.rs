@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,6 +66,7 @@ pub(super) struct Exec {
 struct Batch {
     exec: Exec,
     directory: Option<PathBuf>,
+    handle: Option<Rc<File>>,
     paths: Vec<OsString>,
     bytes: usize,
 }
@@ -73,6 +75,7 @@ struct Batch {
 pub(super) struct State {
     batches: BTreeMap<usize, Batch>,
     buffer: Vec<u8>,
+    limit: Option<usize>,
     pub errors: u64,
 }
 
@@ -105,7 +108,12 @@ impl Batch {
         let mut args = self.exec.args.clone();
         args.extend(self.paths.drain(..));
         self.bytes = command_bytes(&self.exec.args);
-        spawn(&args, self.directory.as_deref(), effects)
+        spawn(
+            &args,
+            self.directory.as_deref(),
+            self.handle.as_deref(),
+            effects,
+        )
     }
 }
 
@@ -157,7 +165,10 @@ pub(super) fn evaluate(
             match result {
                 Ok(()) => Ok(true),
                 Err(error) => {
-                    effects.error(&WalkError { path: entry.path().to_owned(), error });
+                    effects.error(&WalkError {
+                        path: entry.path().to_owned(),
+                        error,
+                    });
                     state.errors += 1;
                     Ok(false)
                 }
@@ -165,14 +176,20 @@ pub(super) fn evaluate(
         }
         Action::Output(target, format) => {
             state.buffer.clear();
-            format.render(entry, &mut state.buffer).map_err(EvaluationError::Metadata)?;
-            target.write(&state.buffer, effects).map_err(EvaluationError::Output)?;
+            format
+                .render(entry, &mut state.buffer)
+                .map_err(EvaluationError::Metadata)?;
+            target
+                .write(&state.buffer, effects)
+                .map_err(EvaluationError::Output)?;
             Ok(true)
         }
         Action::List(target) => {
             state.buffer.clear();
             super::printf::list(entry, &mut state.buffer).map_err(EvaluationError::Metadata)?;
-            target.write(&state.buffer, effects).map_err(EvaluationError::Output)?;
+            target
+                .write(&state.buffer, effects)
+                .map_err(EvaluationError::Output)?;
             Ok(true)
         }
         Action::Regex(regex) => Ok(regex.is_match(entry.path().as_os_str().as_bytes())),
@@ -183,7 +200,9 @@ pub(super) fn evaluate(
             let target = fs::read_link(entry.path()).map_err(EvaluationError::Metadata)?;
             Ok(pattern.matches(target.as_os_str().as_bytes()))
         }
-        Action::Xtype(kinds) => Ok(kinds.contains(&entry.opposite_kind().map_err(EvaluationError::Metadata)?)),
+        Action::Xtype(kinds) => {
+            Ok(kinds.contains(&entry.opposite_kind().map_err(EvaluationError::Metadata)?))
+        }
     }
 }
 
@@ -191,22 +210,41 @@ fn metadata_error(error: &io::Error) -> EvaluationError {
     EvaluationError::Metadata(walk::copy_error(error))
 }
 
-fn execute(exec: &Exec, entry: &Entry, effects: &mut impl Effects, state: &mut State) -> io::Result<bool> {
+fn execute(
+    exec: &Exec,
+    entry: &Entry,
+    effects: &mut impl Effects,
+    state: &mut State,
+) -> io::Result<bool> {
     let (directory, path) = if exec.directory {
         let (directory, path) = exec_path(entry.path());
         (Some(directory), path)
     } else {
         (None, entry.path().as_os_str().to_owned())
     };
+    let handle = if exec.directory {
+        Some(match entry.directory_handle() {
+            Some(handle) => handle,
+            None => Rc::new(File::open(directory.as_deref().unwrap_or(Path::new(".")))?),
+        })
+    } else {
+        None
+    };
     if exec.batch {
+        let limit = *state.limit.get_or_insert_with(batch_limit);
         let batch = state.batches.entry(exec.id).or_insert_with(|| Batch {
-            exec: exec.clone(), directory: directory.clone(), paths: Vec::new(), bytes: command_bytes(&exec.args),
+            exec: exec.clone(),
+            directory: directory.clone(),
+            handle: handle.clone(),
+            paths: Vec::new(),
+            bytes: command_bytes(&exec.args),
         });
         let bytes = path.as_bytes().len() + 1;
-        if batch.directory != directory || batch.bytes + bytes > batch_limit() {
+        if batch.directory != directory || batch.bytes + bytes > limit {
             state.errors += u64::from(!batch.run(effects)?);
         }
         batch.directory = directory;
+        batch.handle = handle;
         batch.paths.push(path);
         batch.bytes += bytes;
         return Ok(true);
@@ -214,8 +252,12 @@ fn execute(exec: &Exec, entry: &Entry, effects: &mut impl Effects, state: &mut S
     if exec.prompt && !effects.confirm(&exec.args[0], entry.path())? {
         return Ok(false);
     }
-    let args = exec.args.iter().map(|arg| substitute(arg, &path)).collect::<Vec<_>>();
-    spawn(&args, directory.as_deref(), effects)
+    let args = exec
+        .args
+        .iter()
+        .map(|arg| substitute(arg, &path))
+        .collect::<Vec<_>>();
+    spawn(&args, directory.as_deref(), handle.as_deref(), effects)
 }
 
 fn substitute(arg: &OsStr, path: &OsStr) -> OsString {
@@ -232,26 +274,44 @@ fn substitute(arg: &OsStr, path: &OsStr) -> OsString {
 
 fn exec_path(path: &Path) -> (PathBuf, OsString) {
     let bytes = path.as_os_str().as_bytes();
-    let end = bytes.iter().rposition(|&b| b != b'/').map_or(0, |at| at + 1);
+    let end = bytes
+        .iter()
+        .rposition(|&b| b != b'/')
+        .map_or(0, |at| at + 1);
     let at = bytes[..end].iter().rposition(|&b| b == b'/');
     let (directory, name) = match at {
         Some(at) => (&bytes[..=at], &bytes[at + 1..]),
         None => (b".".as_slice(), bytes),
     };
-    (PathBuf::from(OsStr::from_bytes(directory)), OsString::from_vec([b"./", name].concat()))
+    (
+        PathBuf::from(OsStr::from_bytes(directory)),
+        OsString::from_vec([b"./", name].concat()),
+    )
 }
 
-fn spawn(args: &[OsString], directory: Option<&Path>, effects: &mut impl Effects) -> io::Result<bool> {
+fn spawn(
+    args: &[OsString],
+    directory: Option<&Path>,
+    handle: Option<&File>,
+    effects: &mut impl Effects,
+) -> io::Result<bool> {
     effects.flush()?;
     let mut command = Command::new(&args[0]);
     command.args(&args[1..]);
-    if let Some(directory) = directory {
+    if let Some(handle) = handle {
+        // CLOEXEC still allows the child to chdir through its inherited fd
+        // before exec. This also works after the directory has been unlinked.
+        command.current_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+    } else if let Some(directory) = directory {
         command.current_dir(directory);
     }
     match effects.command(&mut command) {
         Ok(success) => Ok(success),
         Err(error) => {
-            effects.error(&WalkError { path: PathBuf::from(&args[0]), error });
+            effects.error(&WalkError {
+                path: PathBuf::from(&args[0]),
+                error,
+            });
             Ok(false)
         }
     }
@@ -271,4 +331,4 @@ pub(super) fn confirm(program: &OsStr, path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

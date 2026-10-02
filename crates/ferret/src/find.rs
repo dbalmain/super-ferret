@@ -19,7 +19,7 @@ pub fn run(args: &[OsString]) -> Exit {
             return Exit::NoMatch;
         }
     };
-    if !plan.no_ignore() {
+    if !plan.no_ignore() && !plan.is_information() {
         cli::error(
             "find: ignore-respecting mode is not implemented yet; use -I for GNU find behaviour",
         );
@@ -59,6 +59,18 @@ impl<W: Write> Effects for Output<W> {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
         self.writer.write_all(path.as_os_str().as_bytes())?;
         self.writer.write_all(if nul { b"\0" } else { b"\n" })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.writer.write_all(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
+    fn warning(&mut self, message: &str) {
+        cli::error(&format!("find: {message}"));
     }
 
     fn error(&mut self, error: &WalkError) {
