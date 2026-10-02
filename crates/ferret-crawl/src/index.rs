@@ -163,6 +163,8 @@ pub struct Counts {
     pub files: u64,
     /// Symlinks catalogued.
     pub symlinks: u64,
+    /// Visible FIFOs, sockets and devices catalogued without content.
+    pub specials: u64,
     /// File names the policy sent to the index.
     pub indexed: u64,
     /// Of those, whose content came from the previous generation unread.
@@ -198,6 +200,7 @@ impl Counts {
             traversed,
             files,
             symlinks,
+            specials,
             indexed,
             carried,
             aliased,
@@ -215,6 +218,7 @@ impl Counts {
         self.traversed += traversed;
         self.files += files;
         self.symlinks += symlinks;
+        self.specials += specials;
         self.indexed += indexed;
         self.carried += carried;
         self.aliased += aliased;
@@ -468,7 +472,10 @@ pub(crate) fn content_faults(
     let mut buf = Vec::new();
     for id in (0..catalog.name_count()).map(NameId) {
         let name = catalog.name(id);
-        if !fault(name.child) || !refreshed.contains(&root_of(name.parent)) {
+        if matches!(name.target(), ferret_catalog::Target::Ignored(_))
+            || !fault(name.child)
+            || !refreshed.contains(&root_of(name.parent))
+        {
             continue;
         }
         buf.clear();
@@ -816,6 +823,12 @@ impl EventVisitor for Hasher<'_> {
     fn visit(&mut self, event: Event<'_, DirToken>) -> Option<DirToken> {
         match event {
             Event::Decided(decided) => {
+                if decided.decision == Decision::Skip {
+                    self.out
+                        .batch
+                        .ignored(decided.parent, decided.name.as_bytes(), decided.kind);
+                    return None;
+                }
                 let stat = decided.stat.as_ref().map(observe::from_walk)?;
                 let name = decided.name.as_bytes();
                 match decided.decision {
@@ -838,6 +851,13 @@ impl EventVisitor for Hasher<'_> {
                     }
                     Decision::Catalog(Reason::TooLarge) => {
                         self.out.counts.files += 1;
+                        self.out
+                            .batch
+                            .file(decided.parent, name, stat, Content::Unindexed);
+                        None
+                    }
+                    Decision::Catalog(Reason::Special) => {
+                        self.out.counts.specials += 1;
                         self.out
                             .batch
                             .file(decided.parent, name, stat, Content::Unindexed);

@@ -17,9 +17,9 @@ over-cap.txt    101     too-large
   | !big.log
 big.log         5000    too-large
 
-== symlinks are catalogued unless excluded; special files are always skipped
+== symlinks are catalogued unless excluded; special files are catalogued unless excluded
 .ferretignore           index
   | !fifo
 link@                   symlink
 result@                 skip
-fifo=                   skip
+fifo=                   special

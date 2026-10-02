@@ -438,3 +438,37 @@ fn metadata_passes_over_many_runs_match_each_inode_tested_alone() {
         assert_eq!(paths(&lazy(&scratch), text), expect(keep), "{text:?}");
     }
 }
+
+/// 4a: every candidate strategy must skip ignored child tags before looking
+/// up stat columns. A metadata scan previously indexed by every raw child id.
+#[test]
+fn ignored_names_never_become_search_rows() {
+    let scratch = Scratch::new("ignored-search");
+    let mut txn = Transaction::begin(&scratch.0, 1).unwrap();
+    let mut batch = txn.batch();
+    let root = batch.root(b"/r", dir(1));
+    batch.file(root, b"match.rs", file(2, 20, DAY), Content::Unindexed);
+    batch.ignored(root, b"match.ignored.rs", Kind::File);
+    batch.ignored(root, b"match.ignored", Kind::Dir);
+    let visible = batch.dir(root, b"only", dir(3));
+    batch.ignored(visible, b"match.rs", Kind::File);
+    txn.add(batch);
+    let catalog = txn.commit().unwrap();
+    for query in [
+        "match",
+        "ext:rs",
+        "re:^match",
+        "size:>0 type:file",
+        "type:file",
+        "**/match*",
+        "*",
+    ] {
+        let rows = paths(&catalog, query);
+        let expected = if query == "*" {
+            vec!["/r/match.rs", "/r/only"]
+        } else {
+            vec!["/r/match.rs"]
+        };
+        assert_eq!(rows, expected, "{query}");
+    }
+}

@@ -11,7 +11,7 @@
 //! where a bad one is a [`BuildError`](crate::BuildError).
 
 use crate::format::NONE;
-use crate::{ContentState, Hash};
+use crate::{ContentState, Hash, Kind};
 
 /// A directory, as minted by the batch that recorded it. Valid only within the
 /// transaction whose batch minted it. `Copy + Send`, for the walker's
@@ -140,6 +140,12 @@ pub(crate) struct FileEntry {
     pub(crate) name: Span,
 }
 
+pub(crate) struct IgnoredEntry {
+    pub(crate) parent: DirToken,
+    pub(crate) name: Span,
+    pub(crate) kind: Kind,
+}
+
 pub(crate) struct WorkTreeEntry {
     pub(crate) dir: DirToken,
     pub(crate) kind: WorkTreeKind,
@@ -162,6 +168,7 @@ pub struct Batch {
     pub(crate) dirs: Vec<DirEntry>,
     pub(crate) dir_stats: Vec<Stat>,
     pub(crate) files: Vec<FileEntry>,
+    pub(crate) ignored: Vec<IgnoredEntry>,
     pub(crate) file_stats: Vec<Stat>,
     pub(crate) contents: Vec<Content>,
     /// (file index, target in `strings`), in file order.
@@ -185,6 +192,7 @@ impl Batch {
             dirs: Vec::new(),
             dir_stats: Vec::new(),
             files: Vec::new(),
+            ignored: Vec::new(),
             file_stats: Vec::new(),
             contents: Vec::new(),
             targets: Vec::new(),
@@ -222,6 +230,13 @@ impl Batch {
         self.files.push(FileEntry { parent, name });
         self.file_stats.push(stat);
         self.contents.push(content);
+    }
+
+    /// Records an ignored name without stat or content. A directory is an
+    /// opaque marker: nothing below it is recorded.
+    pub fn ignored(&mut self, parent: DirToken, name: &[u8], kind: Kind) {
+        let name = push(&mut self.names, name, &mut self.overflow);
+        self.ignored.push(IgnoredEntry { parent, name, kind });
     }
 
     /// Records a symlink with its target as `readlink` returned it.
@@ -271,6 +286,7 @@ impl Batch {
     /// Drops what only the name sections need: every entry's parent and name.
     pub(crate) fn drop_structure(&mut self) {
         self.files = Vec::new();
+        self.ignored = Vec::new();
         self.names = Vec::new();
     }
 

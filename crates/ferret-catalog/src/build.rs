@@ -103,15 +103,20 @@ struct Index {
     file_base: Vec<usize>,
     dirs: usize,
     files: usize,
+    ignored_base: Vec<usize>,
+    ignored: usize,
 }
 
 impl Index {
     fn new(batches: &[Batch]) -> Self {
         let (mut dir_base, mut file_base) = (Vec::new(), Vec::new());
         let (mut dirs, mut files) = (0, 0);
+        let (mut ignored_base, mut ignored) = (Vec::new(), 0);
         for batch in batches {
             dir_base.push(dirs);
             file_base.push(files);
+            ignored_base.push(ignored);
+            ignored += batch.ignored.len();
             dirs += batch.dirs.len();
             files += batch.files.len();
         }
@@ -120,6 +125,8 @@ impl Index {
             file_base,
             dirs,
             files,
+            ignored_base,
+            ignored,
         }
     }
 
@@ -127,6 +134,11 @@ impl Index {
     fn dir(&self, g: usize) -> (usize, usize) {
         let b = self.dir_base.partition_point(|&start| start <= g) - 1;
         (b, g - self.dir_base[b])
+    }
+
+    fn ignored(&self, i: usize) -> (usize, usize) {
+        let b = self.ignored_base.partition_point(|&start| start <= i) - 1;
+        (b, i - self.ignored_base[b])
     }
 
     /// (batch position, index in its files) of file `f`, counted from 0.
@@ -175,6 +187,7 @@ pub(crate) struct Plan {
     strings: Vec<u8>,
     /// (symlink InoId, offset in strings), in inode order.
     links: Vec<(u32, u32)>,
+    specials: Vec<(u32, u32)>,
     /// (dir InoId, offset in strings, common id, kind), sorted by dir.
     work_trees: Vec<(u32, u32, (u64, u64), u8)>,
     /// (hash as big-endian halves, DocId), sorted by id.
@@ -187,18 +200,31 @@ impl Plan {
         if entry < self.index.dirs {
             let (b, d) = self.index.dir(entry);
             batches[b].dirs[d].name.of(&batches[b].names)
-        } else {
+        } else if entry < self.index.dirs + self.index.files {
             let (b, f) = self.index.file(entry - self.index.dirs);
             batches[b].files[f].name.of(&batches[b].names)
+        } else {
+            let (b, i) = self
+                .index
+                .ignored(entry - self.index.dirs - self.index.files);
+            batches[b].ignored[i].name.of(&batches[b].names)
         }
     }
 
     /// The inode an entry names.
-    fn child(&self, entry: u32) -> u32 {
+    fn child(&self, batches: &[Batch], entry: u32) -> u32 {
         let e = entry as usize;
-        match e < self.index.dirs {
-            true => self.dir_id[e],
-            false => self.inode_of_file[e - self.index.dirs],
+        if e < self.index.dirs {
+            if self.dir_id[e] == NONE {
+                crate::Kind::Dir.ignored_child()
+            } else {
+                self.dir_id[e]
+            }
+        } else if e < self.index.dirs + self.index.files {
+            self.inode_of_file[e - self.index.dirs]
+        } else {
+            let (b, i) = self.index.ignored(e - self.index.dirs - self.index.files);
+            batches[b].ignored[i].kind.ignored_child()
         }
     }
 
@@ -228,8 +254,14 @@ impl Plan {
     /// One pass over the inode rows finds every stat column's range, blocks
     /// and distinct values; the id columns are sized from the counts.
     fn head(&self, batches: &[Batch]) -> (Head, [Vec<u64>; COLUMNS.len()]) {
-        let dirs = self.index.dirs;
-        let (inodes, names) = (dirs + self.winner.len(), self.edges.len());
+        let dirs = self.order.len();
+        let (inodes, names) = (
+            dirs + self.winner.len(),
+            self.order
+                .iter()
+                .map(|&d| self.children(d).len())
+                .sum::<usize>(),
+        );
         let mut ranges = [Range::default(); COLUMNS.len()];
         let mut sets: [HashSet<u64>; COLUMNS.len()] = Default::default();
         let mut blocks: [BlockSizer; COLUMNS.len()] = Default::default();
@@ -266,7 +298,7 @@ impl Plan {
         for (id, &dir) in self.order.iter().enumerate() {
             for &entry in self.children(dir) {
                 parent.push(id as u64);
-                child.push(u64::from(self.child(entry)));
+                child.push(u64::from(self.child(batches, entry)));
             }
         }
         for (row, &(_, id)) in self.docs.iter().enumerate() {
@@ -302,6 +334,7 @@ impl Plan {
             (Section::Strings, self.strings.len()),
             (Section::States, inodes.div_ceil(4)),
             (Section::Links, self.links.len() * PAIR_ROW),
+            (Section::Specials, self.specials.len() * PAIR_ROW),
             (Section::WorkTrees, self.work_trees.len() * WORK_TREE_ROW),
             (Section::Docs, self.docs.len() * HASH_ROW),
         ] {
@@ -366,7 +399,7 @@ pub(crate) fn plan(
     }
     let index = Index::new(batches);
     let (dirs, files) = (index.dirs, index.files);
-    if dirs + files >= NONE as usize {
+    if dirs + files + index.ignored >= (NONE - 16) as usize {
         return Err(BuildError::TooLarge);
     }
     // Each batch's first directory number and its directories, by batch id.
@@ -385,7 +418,7 @@ pub(crate) fn plan(
     // Each entry's parent, then the entries grouped by parent: count, prefix
     // sum, scatter. Only each directory's own children are ever sorted.
     let mut roots = Vec::new();
-    let mut parent_of = vec![NONE; dirs + files];
+    let mut parent_of = vec![NONE; dirs + files + index.ignored];
     for (i, batch) in batches.iter().enumerate() {
         for (d, dir) in batch.dirs.iter().enumerate() {
             let g = index.dir_base[i] + d;
@@ -396,6 +429,9 @@ pub(crate) fn plan(
         }
         for (f, file) in batch.files.iter().enumerate() {
             parent_of[dirs + index.file_base[i] + f] = resolve(file.parent)? as u32;
+        }
+        for (j, ignored) in batch.ignored.iter().enumerate() {
+            parent_of[dirs + files + index.ignored_base[i] + j] = resolve(ignored.parent)? as u32;
         }
     }
     let mut edge_start = vec![0u32; dirs + 1];
@@ -415,7 +451,35 @@ pub(crate) fn plan(
             cursor[parent as usize] += 1;
         }
     }
-    drop((parent_of, cursor));
+    drop(cursor);
+    let mut reachable: Vec<u32> = roots.iter().map(|&(_, g)| g as u32).collect();
+    let mut next = 0;
+    while next < reachable.len() {
+        let d = reachable[next] as usize;
+        reachable.extend(
+            edges[edge_start[d] as usize..edge_start[d + 1] as usize]
+                .iter()
+                .copied()
+                .filter(|&e| (e as usize) < dirs),
+        );
+        next += 1;
+    }
+    if reachable.len() != dirs {
+        return Err(BuildError::Unreachable);
+    }
+    let mut visible = vec![false; dirs];
+    for &dir in reachable.iter().rev() {
+        let d = dir as usize;
+        let (b, i) = index.dir(d);
+        visible[d] |= !batches[b].dirs[i].traversed
+            || edges[edge_start[d] as usize..edge_start[d + 1] as usize]
+                .iter()
+                .any(|&e| (dirs..dirs + files).contains(&(e as usize)));
+        if visible[d] && parent_of[d] != NONE {
+            visible[parent_of[d] as usize] = true;
+        }
+    }
+    drop((parent_of, reachable));
 
     roots.sort_by(|a, b| a.0.cmp(b.0));
     if let Some(pair) = roots.windows(2).find(|w| w[0].0 == w[1].0) {
@@ -441,6 +505,7 @@ pub(crate) fn plan(
         roots: Vec::with_capacity(roots.len()),
         strings: Vec::new(),
         links: Vec::new(),
+        specials: Vec::new(),
         work_trees: Vec::new(),
         docs: Vec::new(),
     };
@@ -494,18 +559,17 @@ pub(crate) fn plan(
                 .ok_or(BuildError::TooLarge)?;
             let entry = entry as usize;
             if entry < dirs {
-                plan.dir_id[entry] = plan.order.len() as u32;
-                plan.order.push(entry as u32);
-                plan.name_of_dir[entry] = name_id as u32;
-            } else {
+                if visible[entry] {
+                    plan.dir_id[entry] = plan.order.len() as u32;
+                    plan.order.push(entry as u32);
+                    plan.name_of_dir[entry] = name_id as u32;
+                }
+            } else if entry < dirs + files {
                 file_pos[entry - dirs] = name_id as u32;
             }
             name_id += 1;
         }
         next += 1;
-    }
-    if plan.order.len() != dirs {
-        return Err(BuildError::Unreachable);
     }
     plan.offset_blocks = offsets.finish();
 
@@ -522,12 +586,20 @@ pub(crate) fn plan(
     // so the strings do not depend on which batch reported what.
     for k in 0..plan.winner.len() {
         let (b, f) = plan.index.file(plan.winner[k] as usize);
+        let kind = crate::Kind::from_mode(batches[b].file_stats[f].mode);
+        if matches!(
+            kind,
+            crate::Kind::Fifo | crate::Kind::Socket | crate::Kind::Block | crate::Kind::Character
+        ) {
+            plan.specials
+                .push(((plan.order.len() + k) as u32, kind as u32));
+        }
         if let Some(target) = batches[b].target(f) {
             if target.contains(&0) {
                 return Err(BuildError::BadPath(target.to_vec()));
             }
             let offset = push_string(&mut plan.strings, target)?;
-            plan.links.push(((dirs + k) as u32, offset));
+            plan.links.push(((plan.order.len() + k) as u32, offset));
         }
     }
     let mut work_trees = Vec::new();
@@ -567,6 +639,7 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
     let mut keys: Vec<(u64, u32, u32)> = file_pos
         .iter()
         .enumerate()
+        .filter(|&(_, &pos)| pos != NONE)
         .map(|(f, &pos)| {
             let (dev, ino) = identity(f as u32);
             (fingerprint(dev, ino), pos, f as u32)
@@ -628,9 +701,12 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
             let Some(file) = (entry as usize).checked_sub(dirs) else {
                 continue;
             };
+            if file >= index.files || group_of[file] == NONE {
+                continue;
+            }
             let group = group_of[file] as usize;
             if inode_of_group[group] == NONE {
-                let id = dirs + plan.winner.len();
+                let id = plan.order.len() + plan.winner.len();
                 if id >= NONE as usize {
                     return Err(BuildError::TooLarge);
                 }
@@ -642,7 +718,9 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
     }
     drop(groups);
     for group in &mut group_of {
-        *group = inode_of_group[*group as usize];
+        if *group != NONE {
+            *group = inode_of_group[*group as usize];
+        }
     }
     plan.inode_of_file = group_of;
     Ok(())
@@ -777,7 +855,7 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
     let mut offset = 0;
     for (id, &dir) in plan.order.iter().enumerate() {
         for &entry in plan.children(dir) {
-            let child = plan.child(entry);
+            let child = plan.child(&batches, entry);
             let name = plan.name(&batches, entry);
             parents.value(id as u64)?;
             children.value(u64::from(child))?;
@@ -801,9 +879,9 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
     let (mut dir_names, mut entries) = (column(Column::DirName)?, column(Column::Entries)?);
     let (mut traversed, mut bits) = (section(Section::Traversed), Bits::new(1));
     for &dir in &plan.order {
-        let (b, d) = plan.index.dir(dir as usize);
         dir_names.nullable(known(plan.name_of_dir[dir as usize]))?;
         entries.nullable(known(plan.entry_count[dir as usize]))?;
+        let (b, d) = plan.index.dir(dir as usize);
         bits.push(&mut traversed, u8::from(batches[b].dirs[d].traversed))?;
     }
     dir_names.finish()?;
@@ -866,6 +944,12 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
         format::put_work_tree(&mut work_trees, dir, offset, common_id, kind)?;
     }
     work_trees.finish()?;
+    let mut specials = section(Section::Specials);
+    for &(inode, kind) in &plan.specials {
+        specials.write_all(&inode.to_le_bytes())?;
+        specials.write_all(&kind.to_le_bytes())?;
+    }
+    specials.finish()?;
     let mut ids = column(Column::DocId)?;
     let mut hashes = At::new(out, (layout.range(Section::Docs).0 + layout.hashes) as u64);
     for &((hi, lo), id) in &plan.docs {

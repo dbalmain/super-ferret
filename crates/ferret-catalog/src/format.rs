@@ -116,7 +116,7 @@ use crate::packed::{self, Blocked, Packed, RUN};
 
 pub(crate) const MAGIC: [u8; 8] = *b"FERRETCT";
 /// 1: fixed-width rows (S1). 2: bit-packed columns (S1a).
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 /// "No id" in the builder's plan, and in the `u32` ids of fixed-width rows.
 pub(crate) const NONE: u32 = u32::MAX;
 
@@ -170,13 +170,15 @@ pub enum Section {
     States,
     /// Symlink targets.
     Links,
+    /// Visible FIFOs, sockets and devices: (inode, kind), sorted by inode.
+    Specials,
     /// Work-tree rows (D23).
     WorkTrees,
     /// Live documents and their hashes.
     Docs,
 }
 
-pub(crate) const SECTIONS: [Section; 22] = [
+pub(crate) const SECTIONS: [Section; 23] = [
     Section::Names,
     Section::NameHeap,
     Section::DirNames,
@@ -197,6 +199,7 @@ pub(crate) const SECTIONS: [Section; 22] = [
     Section::Doc,
     Section::States,
     Section::Links,
+    Section::Specials,
     Section::WorkTrees,
     Section::Docs,
 ];
@@ -937,6 +940,7 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     for (section, row) in [
         (Section::Roots, PAIR_ROW),
         (Section::Links, PAIR_ROW),
+        (Section::Specials, PAIR_ROW),
         (Section::WorkTrees, WORK_TREE_ROW),
     ] {
         if !len(section).is_multiple_of(row as u64) {
@@ -1047,6 +1051,7 @@ const CHECK_ORDER: [Section; SECTIONS.len()] = [
     Section::Doc,
     Section::States,
     Section::Links,
+    Section::Specials,
     Section::WorkTrees,
     Section::Docs,
 ];
@@ -1080,7 +1085,8 @@ impl Section {
             Section::Names => &[Section::NameHeap],
             Section::DirNames => &[Section::Names],
             Section::Roots => &[Section::DirNames, Section::Strings],
-            Section::Links | Section::WorkTrees => &[Section::Strings],
+            Section::Links => &[Section::Strings, Section::Specials],
+            Section::WorkTrees => &[Section::Strings],
             _ => &[],
         }
     }
@@ -1108,6 +1114,7 @@ impl Section {
             Section::Doc => "doc",
             Section::States => "states",
             Section::Links => "links",
+            Section::Specials => "specials",
             Section::WorkTrees => "work trees",
             Section::Docs => "docs",
         }
@@ -1184,11 +1191,30 @@ pub(crate) fn check<'a>(
                 return Err(DecodeError::Corrupt("roots"));
             }
         }
+        Section::Specials => {
+            let mut last = None;
+            for pair in get(Section::Specials).chunks_exact(PAIR_ROW) {
+                let (ino, kind) = (u32_at(pair, 0), u32_at(pair, 4));
+                if !(l.dirs..l.inodes).contains(&(ino as usize))
+                    || last.is_some_and(|last| ino <= last)
+                    || !(3..=6).contains(&kind)
+                {
+                    return Err(DecodeError::Corrupt("specials"));
+                }
+                last = Some(ino);
+            }
+        }
         Section::Links => {
+            let specials = get(Section::Specials);
+            let mut at = 0;
             let mut last = None;
             for pair in get(Section::Links).chunks_exact(PAIR_ROW) {
                 let (ino, offset) = (u32_at(pair, 0), u32_at(pair, 4) as usize);
-                let ok = (l.dirs..l.inodes).contains(&(ino as usize))
+                while at < specials.len() && u32_at(specials, at) < ino {
+                    at += PAIR_ROW;
+                }
+                let ok = (at == specials.len() || u32_at(specials, at) != ino)
+                    && (l.dirs..l.inodes).contains(&(ino as usize))
                     && last.is_none_or(|last| ino > last)
                     && offset < strings_len;
                 if !ok {
@@ -1302,7 +1328,9 @@ fn check_names(l: &Layout, rows: &[u8], heap: &[u8]) -> Result<usize, DecodeErro
         for j in 0..n {
             let (parent, child, offset) = (p[j], c[j], o[j]);
             let ok = parent < l.dirs as u64
-                && child < l.inodes as u64
+                && (child < l.inodes as u64
+                    || (child <= u64::from(NONE)
+                        && crate::Kind::from_ignored_child(child as u32).is_some()))
                 && parent >= last_parent
                 && offset >= next_offset
                 && (next_offset > 0 || offset == 0)

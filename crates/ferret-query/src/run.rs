@@ -176,7 +176,7 @@ impl<'c> Run<'_, 'c> {
         let (names, mut kinds) = (catalog.name_reader(), catalog.kinds());
         for (id, child) in names.children().enumerate() {
             let child = child.0;
-            if pass[child as usize / 64] >> (child % 64) & 1 == 1 {
+            if child < catalog.inode_count() && pass[child as usize / 64] >> (child % 64) & 1 == 1 {
                 self.stats.candidates += 1;
                 let id = NameId(id as u32);
                 if self
@@ -223,6 +223,9 @@ impl<'c> Run<'_, 'c> {
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> RunResult {
         let catalog = self.catalog;
+        if matches!(name.target(), ferret_catalog::Target::Ignored(_)) {
+            return Ok(ControlFlow::Continue(()));
+        }
         let structural = name.child.0 < catalog.dir_count() && catalog.is_traversed(name.child);
         let names_pass = self
             .query

@@ -127,7 +127,9 @@ fn listing(catalog: &Catalog) -> BTreeMap<PathBuf, Row> {
     for (id, _) in catalog.names() {
         path.clear();
         catalog.path(id, &mut path);
-        let ino = catalog.name(id).child;
+        let ferret_catalog::Target::Inode(ino) = catalog.name(id).target() else {
+            continue;
+        };
         let inode = catalog.inode(ino);
         let row = Row {
             ino,
@@ -148,7 +150,16 @@ fn published(tmp: &Tmp) -> (Catalog, BTreeMap<PathBuf, Row>) {
     let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
     catalog.load_all().unwrap();
     let rows = listing(&catalog);
-    assert_eq!(rows.len(), catalog.name_count() as usize);
+    let ignored = (0..catalog.name_count())
+        .map(NameId)
+        .filter(|&id| {
+            matches!(
+                catalog.name(id).target(),
+                ferret_catalog::Target::Ignored(_)
+            )
+        })
+        .count();
+    assert_eq!(rows.len() + ignored, catalog.name_count() as usize);
     (catalog, rows)
 }
 
@@ -1211,4 +1222,122 @@ fn a_kept_root_keeps_its_entry_and_link_counts() {
         "refreshed root"
     );
     assert_eq!(after.inode(rows[&f].ino).stat.nlink, 2, "kept file");
+}
+
+/// 4a: ignored rows must never acquire stat/content, and unsuccessful anchored
+/// traversal must collapse to one marker rather than leak its ignored children.
+#[test]
+fn ignored_names_opaque_directories_and_special_stats_round_trip() {
+    use ferret_catalog::{Contents, Target};
+    use std::os::unix::net::UnixListener;
+
+    for workers in [1, 4] {
+        let tmp = Tmp::new(&format!("ignored-specials-{workers}"));
+        tmp.write(
+            ".ferretignore",
+            b"*.ignored\ndrop/\nprobe/\n!/probe/missing.txt\nkeep/\n!/keep/deep/ok.txt\n",
+        );
+        tmp.write("regular.ignored", b"never read");
+        tmp.write("drop/hidden.txt", b"never read");
+        tmp.write("probe/hidden.ignored", b"never read");
+        tmp.write("keep/deep/ok.txt", b"visible");
+        tmp.write("keep/deep/no.ignored", b"never read");
+        tmp.write("only/child.ignored", b"never read");
+        fs::create_dir(tmp.at("dir.ignored")).unwrap();
+        std::os::unix::fs::symlink("missing", tmp.at("link.ignored")).unwrap();
+        super::mkfifo(&tmp.at("pipe.ignored"));
+        super::mkfifo(&tmp.at("pipe"));
+        let _ignored_socket = UnixListener::bind(tmp.at("socket.ignored")).unwrap();
+        let _socket = UnixListener::bind(tmp.at("socket")).unwrap();
+        tmp.write("unreadable/secret", b"never read");
+        chmod(&tmp.at("unreadable"), 0o000);
+        let report = run(&tmp, &[tmp.tree()], Refresh::All, workers);
+        assert_eq!(
+            report.counts.files_read, 2,
+            "only rules and re-included file read"
+        );
+        let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
+        catalog.load_all().unwrap();
+        let root = catalog.roots().next().unwrap().0;
+        let entries: BTreeMap<_, _> = catalog
+            .entries(root)
+            .map(|e| (e.bytes.to_vec(), e))
+            .collect();
+        for (name, kind) in [
+            ("regular.ignored", Kind::File),
+            ("dir.ignored", Kind::Dir),
+            ("link.ignored", Kind::Symlink),
+            ("pipe.ignored", Kind::Fifo),
+            ("socket.ignored", Kind::Socket),
+            ("drop", Kind::Dir),
+            ("probe", Kind::Dir),
+        ] {
+            let entry = entries[name.as_bytes()];
+            assert_eq!(entry.target, Target::Ignored(kind));
+            assert_eq!(entry.kind, kind);
+        }
+        assert_eq!(
+            catalog.contents(entries[b"drop".as_slice()].target),
+            Some(Contents::Ignored)
+        );
+        let path = tmp.at("drop/hidden.txt");
+        let resolved = catalog.resolve(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(resolved.target, Target::Ignored(Kind::Dir));
+        assert_eq!(resolved.remainder, b"hidden.txt");
+        let mut paths = Vec::new();
+        for (id, _) in catalog.names() {
+            let mut path = Vec::new();
+            catalog.path(id, &mut path);
+            paths.push(path);
+        }
+        for absent in [
+            "drop/hidden.txt",
+            "probe/hidden.ignored",
+            "unreadable/secret",
+        ] {
+            assert!(!paths.contains(&tmp.at(absent).as_os_str().as_bytes().to_vec()));
+        }
+        for dir in ["keep", "keep/deep"] {
+            let path = tmp.at(dir);
+            let resolved = catalog.resolve(path.as_os_str().as_bytes()).unwrap();
+            assert!(matches!(resolved.target, Target::Inode(_)));
+            assert_eq!(
+                catalog.contents(resolved.target),
+                Some(Contents::Catalogued)
+            );
+        }
+        let Target::Inode(only) = entries[b"only".as_slice()].target else {
+            panic!("visible dir");
+        };
+        assert_eq!(catalog.has_children(only), Some(true));
+        let child = catalog.entries(only).collect::<Vec<_>>();
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].target, Target::Ignored(Kind::File));
+        let Target::Inode(unreadable) = entries[b"unreadable".as_slice()].target else {
+            panic!("visible denied dir");
+        };
+        assert_eq!(
+            catalog.contents(Target::Inode(unreadable)),
+            Some(Contents::Unreadable)
+        );
+        assert_eq!(catalog.has_children(unreadable), None);
+        for (name, kind) in [("pipe", Kind::Fifo), ("socket", Kind::Socket)] {
+            let entry = entries[name.as_bytes()];
+            assert_eq!(entry.kind, kind);
+            let Target::Inode(inode) = entry.target else {
+                panic!("special stat row");
+            };
+            assert_eq!(Kind::from_mode(catalog.inode(inode).stat.mode), kind);
+            assert_eq!(catalog.state(inode), ContentState::Unindexed);
+            assert_eq!(catalog.doc(inode), None);
+        }
+        // Root keep must copy ignored rows without indexing their reserved
+        // child ids.
+        drop(catalog);
+        let before = fs::read(tmp.cat().join("catalog")).unwrap();
+        let mut txn = ferret_catalog::Transaction::begin(&tmp.cat(), 1).unwrap();
+        txn.keep(tmp.tree().as_os_str().as_bytes()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+    }
 }

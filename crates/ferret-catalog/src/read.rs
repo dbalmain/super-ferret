@@ -72,6 +72,85 @@ pub enum Kind {
     File,
     /// A symlink, never followed; see [`Catalog::link_target`].
     Symlink,
+    /// A named pipe; content is never read.
+    Fifo,
+    /// A Unix socket; content is never read.
+    Socket,
+    /// A block device; content is never read.
+    Block,
+    /// A character device; content is never read.
+    Character,
+}
+
+impl Kind {
+    /// The file type bits of `mode`, independent of permissions.
+    pub fn from_mode(mode: u32) -> Self {
+        match mode & 0o170_000 {
+            0o040_000 => Self::Dir,
+            0o120_000 => Self::Symlink,
+            0o010_000 => Self::Fifo,
+            0o140_000 => Self::Socket,
+            0o060_000 => Self::Block,
+            0o020_000 => Self::Character,
+            _ => Self::File,
+        }
+    }
+
+    pub(crate) fn ignored_child(self) -> u32 {
+        crate::format::NONE - 1 - self as u32
+    }
+
+    pub(crate) fn from_ignored_child(child: u32) -> Option<Self> {
+        match crate::format::NONE - child {
+            1 => Some(Self::Dir),
+            2 => Some(Self::File),
+            3 => Some(Self::Symlink),
+            4 => Some(Self::Fifo),
+            5 => Some(Self::Socket),
+            6 => Some(Self::Block),
+            7 => Some(Self::Character),
+            _ => None,
+        }
+    }
+}
+
+/// A name's target. Ignored targets have no stat row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// An ordinary catalogued inode.
+    Inode(InoId),
+    /// A name only; an ignored directory is opaque.
+    Ignored(Kind),
+}
+
+impl Target {
+    pub(crate) fn from_child(child: InoId) -> Self {
+        Kind::from_ignored_child(child.0).map_or(Self::Inode(child), Self::Ignored)
+    }
+}
+
+/// A directory's contents source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contents {
+    /// The directory was listed; children are in the catalog.
+    Catalogued,
+    /// Ignored directory; only its name and type are stored.
+    Ignored,
+    /// The directory could not be listed; walk live to report the error.
+    Unreadable,
+}
+
+/// One directory child, including ignored names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Entry<'a> {
+    /// Its name id in this generation.
+    pub name: NameId,
+    /// Raw basename bytes.
+    pub bytes: &'a [u8],
+    /// The d_type-equivalent, available even for ignored names.
+    pub kind: Kind,
+    /// Stat row or ignored type marker.
+    pub target: Target,
 }
 
 /// One name edge.
@@ -79,10 +158,30 @@ pub enum Kind {
 pub struct Name<'a> {
     /// The directory holding the name.
     pub parent: InoId,
-    /// The inode it names.
+    /// Raw child column. Use [`Name::target`] before reading stat columns:
+    /// ignored names hold reserved type values rather than inode ids.
     pub child: InoId,
     /// The name, as the kernel returned it; never contains NUL or `/`.
     pub bytes: &'a [u8],
+}
+
+impl Name<'_> {
+    /// A valid inode id, or an ignored type with no stat row.
+    pub fn target(&self) -> Target {
+        Target::from_child(self.child)
+    }
+}
+
+/// A path resolution, exact when `remainder` is empty. Otherwise the target
+/// is an opaque directory and the caller must walk the suffix live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resolved<'a> {
+    /// None for a configured root.
+    pub name: Option<NameId>,
+    /// Resolved inode or ignored marker.
+    pub target: Target,
+    /// Components below an opaque directory that the catalog cannot answer.
+    pub remainder: &'a [u8],
 }
 
 /// One inode row.
@@ -374,6 +473,109 @@ impl Catalog {
         (start as u32..end as u32).map(NameId)
     }
 
+    /// Children, visible and ignored, with raw names, kinds and optional stat
+    /// rows. Needs Names and Links. Ignored rows never load stat columns.
+    pub fn entries(&self, dir: InoId) -> impl Iterator<Item = Entry<'_>> {
+        self.children(dir).map(|id| self.entry(id))
+    }
+
+    /// One typed name row. Needs Names and Links for a visible non-directory.
+    pub fn entry(&self, id: NameId) -> Entry<'_> {
+        let name = self.name(id);
+        let target = name.target();
+        let kind = match target {
+            Target::Inode(inode) => self.kind(inode),
+            Target::Ignored(kind) => kind,
+        };
+        Entry {
+            name: id,
+            bytes: name.bytes,
+            kind,
+            target,
+        }
+    }
+
+    /// Where to read a directory's children. Needs Entries for an inode
+    /// target. Unknown counts designate unreadable directories.
+    pub fn contents(&self, target: Target) -> Option<Contents> {
+        match target {
+            Target::Ignored(Kind::Dir) => Some(Contents::Ignored),
+            Target::Inode(dir) if dir.0 < self.dir_count() => {
+                Some(if self.entry_count(dir).is_some() {
+                    Contents::Catalogued
+                } else {
+                    Contents::Unreadable
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a visible directory has a child on disk, ignored names
+    /// included. None means unreadable/unknown. Needs Entries.
+    pub fn has_children(&self, dir: InoId) -> Option<bool> {
+        self.entry_count(dir).map(|count| count != 0)
+    }
+
+    /// Resolves an absolute byte path in the innermost configured root.
+    /// Needs Roots and Names. Does not follow symlinks or `..`. A path below
+    /// an opaque marker returns that marker and its unresolved suffix.
+    pub fn resolve<'p>(&self, path: &'p [u8]) -> Option<Resolved<'p>> {
+        let (root, prefix) = self
+            .roots()
+            .filter(|&(_, prefix)| {
+                path == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| prefix == b"/" || rest.starts_with(b"/"))
+            })
+            .max_by_key(|&(_, prefix)| prefix.len())?;
+        let mut target = Target::Inode(root);
+        let mut name = None;
+        let mut rest = &path[prefix.len()..];
+        loop {
+            rest = rest.strip_prefix(b"/").unwrap_or(rest);
+            if rest.is_empty() {
+                return Some(Resolved {
+                    name,
+                    target,
+                    remainder: rest,
+                });
+            }
+            let end = rest
+                .iter()
+                .position(|&byte| byte == b'/')
+                .unwrap_or(rest.len());
+            let part = &rest[..end];
+            if part == b".." {
+                return None;
+            }
+            if part != b"." {
+                let Target::Inode(dir) = target else {
+                    return Some(Resolved {
+                        name,
+                        target,
+                        remainder: rest,
+                    });
+                };
+                if dir.0 >= self.dir_count() {
+                    return None;
+                }
+                if self.entry_count(dir).is_none() {
+                    return Some(Resolved {
+                        name,
+                        target,
+                        remainder: rest,
+                    });
+                }
+                let id = self.lookup(dir, part)?;
+                name = Some(id);
+                target = self.name(id).target();
+            }
+            rest = &rest[end..];
+        }
+    }
+
     fn child_range(&self, dir: InoId) -> (usize, usize) {
         let parents = self.blocked(Column::NameParent);
         let dir = u64::from(dir.0);
@@ -588,7 +790,7 @@ impl Catalog {
         } else if self.link_target(id).is_some() {
             Kind::Symlink
         } else {
-            Kind::File
+            special_kind(self.section(Section::Specials), id).unwrap_or(Kind::File)
         }
     }
 
@@ -599,6 +801,7 @@ impl Catalog {
         Kinds {
             dirs: self.dir_count(),
             links: self.section(Section::Links),
+            specials: self.section(Section::Specials),
             at: 0,
         }
     }
@@ -807,6 +1010,7 @@ impl<'c> Iterator for NameRuns<'c> {
 pub struct Kinds<'c> {
     dirs: u32,
     links: &'c [u8],
+    specials: &'c [u8],
     /// The first link row whose inode is at or past the last id asked for.
     at: usize,
 }
@@ -816,6 +1020,9 @@ impl Kinds<'_> {
     pub fn kind(&mut self, id: InoId) -> Kind {
         if id.0 < self.dirs {
             return Kind::Dir;
+        }
+        if let Some(kind) = special_kind(self.specials, id) {
+            return kind;
         }
         let links = self.links;
         let n = links.len() / PAIR_ROW;
@@ -860,4 +1067,13 @@ fn partition_point(n: usize, pred: impl Fn(usize) -> bool) -> usize {
         }
     }
     lo
+}
+
+fn special_kind(rows: &[u8], id: InoId) -> Option<Kind> {
+    let count = rows.len() / PAIR_ROW;
+    let at = partition_point(count, |i| u32_at(rows, i * PAIR_ROW) < id.0);
+    (at < count && u32_at(rows, at * PAIR_ROW) == id.0).then(|| {
+        Kind::from_ignored_child(crate::format::NONE - 1 - u32_at(rows, at * PAIR_ROW + 4))
+            .unwrap_or(Kind::File)
+    })
 }

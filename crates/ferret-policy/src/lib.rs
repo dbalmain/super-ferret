@@ -118,7 +118,7 @@ pub enum Entry {
     },
     /// A symbolic link. Catalogued, never followed.
     Symlink,
-    /// A socket, FIFO or device. Always skipped.
+    /// A socket, FIFO or device. Catalogued without content when included.
     Other,
 }
 
@@ -148,6 +148,8 @@ pub enum Reason {
     TooLarge,
     /// A symlink; its target is not followed.
     Symlink,
+    /// A FIFO, socket or device; never read as content.
+    Special,
 }
 
 /// What a file's head says about its content.

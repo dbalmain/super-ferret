@@ -258,7 +258,7 @@ impl DirRules {
             }
             Entry::File { .. } => Decision::Index,
             Entry::Symlink => Decision::Catalog(Reason::Symlink),
-            Entry::Other => Decision::Skip,
+            Entry::Other => Decision::Catalog(Reason::Special),
         }
     }
 }

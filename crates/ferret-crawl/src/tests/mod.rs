@@ -443,15 +443,18 @@ fn a_symlink_is_catalogued_and_not_followed() {
 }
 
 #[test]
-fn a_fifo_is_skipped_and_not_opened() {
+fn a_fifo_is_catalogued_and_not_opened() {
     let dir = Scratch::new("fifo");
     mkfifo(&dir.join("pipe"));
     write(&dir.join("note.txt"), "a");
 
     let walked = walked(dir.path.as_path(), None, Config::default());
     assert!(walked.io.is_empty(), "{:?}", walked.io);
-    assert_eq!(decision(&walked, "pipe"), Decision::Skip);
-    assert!(walked.rows.get(Path::new("pipe")).unwrap().stat.is_none());
+    assert_eq!(
+        decision(&walked, "pipe"),
+        Decision::Catalog(Reason::Special)
+    );
+    assert!(walked.rows.get(Path::new("pipe")).unwrap().stat.is_some());
     assert_eq!(decision(&walked, "note.txt"), Decision::Index);
 }
 

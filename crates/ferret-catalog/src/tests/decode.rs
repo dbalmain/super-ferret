@@ -973,3 +973,98 @@ fn every_accessor_needs_only_the_section_it_documents() {
         assert!(touched > 0, "{name}: the sample must exercise it");
     }
 }
+
+/// 4a changes the child interpretation and adds a section; v2 must be
+/// rejected by the version check before any old columns are decoded.
+#[test]
+fn the_previous_packed_format_requires_reindexing() {
+    let mut bytes = sample("decode-v2");
+    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    assert_eq!(
+        Catalog::from_bytes(bytes).err(),
+        Some(DecodeError::Version(2))
+    );
+}
+
+/// Reserved name tags are accepted only for the seven live file types. The
+/// future tombstone is reserved, but has no published read semantics yet.
+#[test]
+fn ignored_tags_and_special_rows_validate_before_access() {
+    use crate::{Kind, Target};
+    let scratch = Scratch::new("decode-ignored");
+    let catalog = commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        let root = w.root(b"/r", dir_stat(1));
+        w.entry_count(root, 8);
+        for (i, kind) in [
+            Kind::Dir,
+            Kind::File,
+            Kind::Symlink,
+            Kind::Fifo,
+            Kind::Socket,
+            Kind::Block,
+            Kind::Character,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            w.ignored(root, format!("ignored-{i}").as_bytes(), kind);
+        }
+        w.file(
+            root,
+            b"visible",
+            Stat {
+                mode: 0o010_600,
+                ..file_stat(2)
+            },
+            Content::Unindexed,
+        );
+        txn.add(w);
+    });
+    for (i, kind) in [
+        Kind::Dir,
+        Kind::File,
+        Kind::Symlink,
+        Kind::Fifo,
+        Kind::Socket,
+        Kind::Block,
+        Kind::Character,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            catalog.name(NameId(i as u32)).target(),
+            Target::Ignored(kind)
+        );
+    }
+    assert_eq!(catalog.inode_count(), 2);
+    assert_eq!(catalog.entry(NameId(7)).kind, Kind::Fifo);
+    let original = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let mut tombstone = original.clone();
+    // The mixed block spans a real id and high tags, so it has room for all
+    // u32 values; set_raw takes the value relative to that block's base.
+    let layout = format::decode_table(&tombstone, tombstone.len() as u64).unwrap();
+    let placed = layout.columns[Column::NameChild as usize];
+    let at = section_start(&tombstone, Section::Names) + placed.start;
+    let base = u64::from_le_bytes(tombstone[at..at + 8].try_into().unwrap());
+    set_raw(
+        &mut tombstone,
+        Column::NameChild,
+        0,
+        u64::from(format::NONE - 8) - base,
+    );
+    assert_eq!(
+        Catalog::from_bytes(tombstone).err(),
+        Some(DecodeError::Corrupt("names"))
+    );
+    for kind in [0u32, 2, 7, u32::MAX] {
+        let mut bad = original.clone();
+        let at = section_start(&bad, Section::Specials) + 4;
+        bad[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        assert_eq!(
+            Catalog::from_bytes(bad).err(),
+            Some(DecodeError::Corrupt("specials"))
+        );
+    }
+}
