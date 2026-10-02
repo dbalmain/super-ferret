@@ -442,8 +442,21 @@ is `ferret-query → rustix` for raw d_type access. The existing policy-driven
 parallel crawler stays separate.
 
 `ferret find -I` / `--no-ignore` uses this engine without opening an index,
-reading user config or writing a query log. Until milestone 4, the default
-ignore-respecting mode fails with status 1 and a not-implemented diagnostic.
+reading user config or writing a query log. Default mode loads the catalog's
+Names, Links, Roots and Entries sections, with no stat columns. `CatalogSource`
+shares the sequential traversal machinery with `LiveWalk`: kernel name listings
+supply readdir order, catalog entries supply visible names and kinds. Ignored
+children are skipped; explicit ignored starts and suffixes below opaque markers
+walk live without nested ignore rules. Unreadable opaque directories are opened
+live and report permission errors. Catalog entries cache lazy live lstat data;
+a failed stat drops the entry as a deletion during traversal. `-empty` uses the
+catalog's raw count (ignored children included); `-links` uses live lstat.
+Missing/incompatible catalogs, unresolved starts and newly observed uncatalogued
+names fail with status 1 and re-index/`-I` guidance (D47). Known deleted names
+are skipped; changed metadata is read live. Config at
+`$XDG_CONFIG_HOME/ferret/config` accepts `find_no_ignore = true` to make live
+mode the default. Explicit `-I` and informational commands bypass this file.
+Neither find mode writes a query log.
 Recognized but unevaluated primaries consume their complete operands and fail
 before traversal with the same diagnostic. Symlink following is deferred.
 `ferret search` retains the S1 atom grammar, flags, output and exit conventions.

@@ -70,8 +70,8 @@ usage:
   ferret roots remove DIR...    stop indexing DIR (roots inside it stay)
   ferret find [-I|--no-ignore] [-P] [PATH...] [EXPRESSION]
                                 GNU find syntax; -I walks without an index
-                                default ignore mode is not implemented yet
-                                -H/-L and later primaries parse but are deferred
+                                default uses catalog visibility and respects ignore rules
+                                pasted find ... -delete skips ignored files and still exits 0
   ferret search [--json] [--limit N] [--] ATOM...
                                 print each path that matches every ATOM
   ferret stats                  counts, sizes and a census of the index
@@ -107,6 +107,11 @@ output: one path per line, raw bytes, in index order (unsorted);
   and \"path_base64\" with the exact bytes when the path is not UTF-8.
 
 find exit status: 0 success, 1 error (including invalid syntax).
+  Default mode needs an index covering each start. Missing/incompatible indexes
+  and unresolved starts fail: re-index or use -I.
+  $XDG_CONFIG_HOME/ferret/config: find_no_ignore = true makes -I the default.
+  Pasted find ... -delete skips ignored files and still exits 0; a failed
+  deletion (for example a directory still holding ignored files) exits 1.
 
 search exit status: 0 success (search printed a row), 1 search matched nothing,
   2 usage error, 3 runtime error (no index, I/O, lock held, walk faults).
@@ -131,7 +136,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         }
     };
     match args.command {
-        Command::Find(ref args) => return crate::find::run(args),
+        Command::Find(ref find_args) => return crate::find::run(find_args, args.index.as_deref()),
         Command::Help => return print("usage", USAGE.as_bytes()),
         Command::Version => {
             let version = format!("ferret {}\n", env!("CARGO_PKG_VERSION"));

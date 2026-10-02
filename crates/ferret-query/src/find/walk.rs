@@ -10,6 +10,7 @@
 //! needs one.
 
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, FileType, Metadata};
 use std::io;
@@ -20,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rustix::fs::{FileType as RawType, Mode, OFlags, RawDir, open};
+
+use ferret_catalog::{Catalog, Contents, Kind, Target};
 
 use super::{Follow, Options};
 
@@ -75,6 +78,8 @@ pub struct Entry {
     depth: usize,
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
+    target: Option<Target>,
+    has_children: Option<bool>,
 }
 
 impl Entry {
@@ -90,6 +95,8 @@ impl Entry {
             depth,
             kind: Some(kind),
             metadata: OnceCell::new(),
+            target: None,
+            has_children: None,
         }
     }
 
@@ -130,6 +137,12 @@ impl Entry {
         self.metadata
             .get_or_init(|| metadata(self.path(), self.follow))
             .as_ref()
+    }
+    pub(super) fn vanished(&self) -> bool {
+        self.target.is_some() && self.metadata.get().is_some_and(Result::is_err)
+    }
+    pub(super) fn has_children(&self) -> Option<bool> {
+        self.has_children
     }
     pub(super) fn directory_handle(&self) -> Option<Rc<File>> {
         self.directory.clone()
@@ -205,6 +218,8 @@ struct Saved {
     depth: usize,
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
+    target: Option<Target>,
+    has_children: Option<bool>,
 }
 
 impl Saved {
@@ -215,6 +230,8 @@ impl Saved {
             depth: entry.depth,
             kind: entry.kind,
             metadata: std::mem::take(&mut entry.metadata),
+            target: entry.target,
+            has_children: entry.has_children,
         }
     }
 
@@ -225,6 +242,8 @@ impl Saved {
         entry.kind = self.kind;
         entry.check_directory = false;
         entry.metadata = self.metadata;
+        entry.target = self.target;
+        entry.has_children = self.has_children;
     }
 }
 
@@ -233,6 +252,7 @@ impl Saved {
 struct Child {
     name: (usize, usize),
     kind: Option<FileKind>,
+    target: Option<Target>,
 }
 
 /// An open directory. Its children occupy `start..end` of the walk's child
@@ -275,6 +295,7 @@ enum Loaded {
 /// It holds one directory handle per ancestor and never sorts child names.
 /// A descriptor exhaustion error is reported just like a listing failure.
 pub struct LiveWalk {
+    catalog: Option<Catalog>,
     paths: std::vec::IntoIter<PathBuf>,
     options: Options,
     entry: Entry,
@@ -291,6 +312,7 @@ pub struct LiveWalk {
 impl LiveWalk {
     pub(super) fn new(paths: Vec<PathBuf>, options: Options) -> Self {
         Self {
+            catalog: None,
             paths: paths.into_iter(),
             options,
             entry: Entry::new(PathBuf::new(), 0, FileKind::File),
@@ -351,6 +373,20 @@ impl LiveWalk {
         if self.buffer.is_empty() {
             self.buffer.resize(LISTING_BUFFER, MaybeUninit::uninit());
         }
+        // Catalog names are sorted; the kernel listing supplies only their
+        // observable traversal order. Opaque subtrees retain the live source.
+        let catalog_children = self.catalog.as_ref().and_then(|catalog| {
+            let target = entry.target?;
+            let Target::Inode(dir) = target else {
+                return None;
+            };
+            (catalog.contents(target) == Some(Contents::Catalogued)).then(|| {
+                catalog
+                    .entries(dir)
+                    .map(|child| (child.bytes, child))
+                    .collect::<HashMap<_, _>>()
+            })
+        });
         let mut reader = RawDir::new(&*handle, &mut self.buffer);
         while let Some(item) = reader.next() {
             let item = match item {
@@ -368,14 +404,43 @@ impl LiveWalk {
             if name == b"." || name == b".." {
                 continue;
             }
-            let kind = raw_kind(item.file_type());
+            let (name, kind, target) = if let Some(children) = &catalog_children {
+                if let Some(child) = children.get(name) {
+                    if matches!(child.target, Target::Ignored(_)) {
+                        continue;
+                    }
+                    (
+                        child.bytes,
+                        Some(catalog_kind(child.kind)),
+                        Some(child.target),
+                    )
+                } else if let Some((name, target)) = self.catalog.as_ref().and_then(|catalog| {
+                    (raw_kind(item.file_type()) == Some(FileKind::Directory))
+                        .then(|| root_child(catalog, entry.path(), name))
+                        .flatten()
+                }) {
+                    (name, Some(FileKind::Directory), Some(target))
+                } else {
+                    self.children.truncate(start);
+                    self.names.truncate(names_start);
+                    return Err(WalkError {
+                        path: entry.path().to_owned(),
+                        error: io::Error::other(
+                            "index is stale: a directory contains an uncatalogued name; re-index or use -I",
+                        ),
+                    });
+                }
+            } else {
+                (name, raw_kind(item.file_type()), None)
+            };
             #[cfg(test)]
             let kind = if self.force_unknown { None } else { kind };
             // GNU observes the first child's directory metadata before a cwd
             // batch flush, but later directories are checked when visited.
             // Removed directories can therefore print and still fault at a
             // depth limit; regular file metadata remains lazy.
-            if kind == Some(FileKind::Directory) && self.children.len() == start {
+            if target.is_none() && kind == Some(FileKind::Directory) && self.children.len() == start
+            {
                 if separator {
                     entry.path.push(b'/');
                 }
@@ -388,6 +453,7 @@ impl LiveWalk {
             self.children.push(Child {
                 name: (name_start, self.names.len()),
                 kind,
+                target,
             });
         }
         if self.children.len() > start
@@ -438,6 +504,38 @@ impl LiveWalk {
                 };
                 self.root_dev = stat.dev();
                 self.entry = Entry::new(path, 0, kind(stat.file_type()));
+                if let Some(catalog) = &self.catalog {
+                    let absolute = if self.entry.kind == Some(FileKind::Symlink) && !follow {
+                        let absolute = std::path::absolute(self.entry.path());
+                        absolute.and_then(|path| {
+                            let parent = path.parent().unwrap_or(Path::new("/"));
+                            Ok(fs::canonicalize(parent)?
+                                .join(path.file_name().unwrap_or(OsStr::new(""))))
+                        })
+                    } else {
+                        fs::canonicalize(self.entry.path())
+                    };
+                    let resolved = absolute
+                        .as_ref()
+                        .ok()
+                        .and_then(|path| catalog.resolve(path.as_os_str().as_bytes()));
+                    let Some(resolved) = resolved else {
+                        return Some(Err(self.entry.error(&io::Error::other(
+                            "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
+                        ))));
+                    };
+                    if resolved.remainder.is_empty() && matches!(resolved.target, Target::Inode(_))
+                    {
+                        self.entry.target = Some(resolved.target);
+                        if let Target::Inode(id) = resolved.target {
+                            self.entry.kind = Some(catalog_kind(catalog.kind(id)));
+                            self.entry.has_children = (self.entry.kind
+                                == Some(FileKind::Directory))
+                            .then(|| catalog.has_children(id))
+                            .flatten();
+                        }
+                    }
+                }
                 self.entry.follow = follow;
                 self.entry.metadata = OnceCell::from(Ok(stat));
                 return Some(Ok(Loaded::Entry));
@@ -459,7 +557,14 @@ impl LiveWalk {
             entry.kind = child.kind;
             entry.check_directory = false;
             entry.metadata = OnceCell::new();
-            if child.kind == Some(FileKind::Directory) {
+            entry.target = child.target;
+            entry.has_children = child.target.and_then(|target| match target {
+                Target::Inode(dir) if child.kind == Some(FileKind::Directory) => {
+                    self.catalog.as_ref()?.has_children(dir)
+                }
+                _ => None,
+            });
+            if child.target.is_none() && child.kind == Some(FileKind::Directory) {
                 match level.first.take() {
                     Some(stat) if index == level.start => entry.metadata = OnceCell::from(stat),
                     _ => entry.check_directory = true,
@@ -598,5 +703,59 @@ fn raw_kind(value: RawType) -> Option<FileKind> {
         RawType::BlockDevice => FileKind::Block,
         RawType::CharacterDevice => FileKind::Character,
         RawType::Unknown => return None,
+    })
+}
+
+/// Catalog visibility and kinds with the live walk's ordered traversal.
+/// Explicit ignored starts and unreadable opaque directories use live entries.
+/// The caller must load Names, Links, Roots and Entries before constructing it.
+pub struct CatalogSource {
+    walk: LiveWalk,
+}
+
+impl CatalogSource {
+    pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
+        let mut walk = LiveWalk::new(paths, options);
+        walk.catalog = Some(catalog);
+        Self { walk }
+    }
+}
+
+impl EntrySource for CatalogSource {
+    fn next(&mut self, descend: bool) -> Option<Result<&Entry, WalkError>> {
+        self.walk.next(descend)
+    }
+    fn next_with(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+    ) -> Option<Result<&Entry, WalkError>> {
+        self.walk.next_with(descend, before_directory)
+    }
+}
+
+fn catalog_kind(kind: Kind) -> FileKind {
+    match kind {
+        Kind::Dir => FileKind::Directory,
+        Kind::File => FileKind::File,
+        Kind::Symlink => FileKind::Symlink,
+        Kind::Fifo => FileKind::Fifo,
+        Kind::Socket => FileKind::Socket,
+        Kind::Block => FileKind::Block,
+        Kind::Character => FileKind::Character,
+    }
+}
+
+// The outer crawl stops before emitting an inner root's name (D34). Its
+// root record supplies that edge when find reaches it through recursion.
+fn root_child<'a>(catalog: &'a Catalog, parent: &Path, name: &[u8]) -> Option<(&'a [u8], Target)> {
+    let absolute = fs::canonicalize(parent).ok()?.join(OsStr::from_bytes(name));
+    catalog.roots().find_map(|(id, path)| {
+        (path == absolute.as_os_str().as_bytes()).then(|| {
+            (
+                path.rsplit(|&byte| byte == b'/').next().unwrap_or(path),
+                Target::Inode(id),
+            )
+        })
     })
 }

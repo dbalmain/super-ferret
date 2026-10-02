@@ -1040,7 +1040,7 @@ fn find_reports_usage_and_unsupported_features_with_status_one() {
     }
     let output = env.run(&[os("find"), tree.as_os_str(), os("-maxdepth"), os("0")]);
     assert_eq!(code(&output), 1);
-    assert!(stderr(&output).contains("not implemented yet"));
+    assert!(stderr(&output).contains("no index"));
     let output = env.run(&[
         os("find"),
         os("--no-ignore"),
@@ -1097,4 +1097,259 @@ fn ignored_names_and_special_files_survive_index_search_and_stats() {
     );
     assert!(text.contains("1 FIFO names, 1 socket names"), "{text}");
     assert!(text.contains("2 visible inodes"), "{text}");
+}
+
+mod find_expressions {
+    include!("../../ferret-query/src/find/tests/expressions.rs");
+}
+
+#[test]
+fn catalog_find_matches_live_across_the_differential_expressions_in_exact_order() {
+    // Regression guard for name-sorted catalog rows changing -quit and batches.
+    let env = Env::new("catalog-equivalence");
+    env.seed_ignore_file();
+    for name in [
+        "z.c",
+        "b.txt",
+        ".hidden",
+        "ABC",
+        "a1",
+        "[",
+        "dir/file",
+        "dir/sub/deep.c",
+        "back\\slash",
+        "reference",
+    ] {
+        env.write(name, b"contents");
+    }
+    fs::create_dir(env.at("empty")).unwrap();
+    env.write("only-empty", b"");
+    env.write("target/not-ignored", b"visible");
+    env.write(".gitignore", b"# no rules\n");
+    env.write(".ferretignore", b"# no rules\n");
+    env.write("nonutf8-placeholder", b"");
+    fs::rename(
+        env.at("nonutf8-placeholder"),
+        env.tree().join(OsStr::from_bytes(b"nonutf8-\xff")),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("dir", env.at("link")).unwrap();
+    std::os::unix::fs::symlink("missing", env.at("broken")).unwrap();
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    for start in [".", "./", "dir/", "dir/..", "link", "broken", "b.txt"] {
+        for template in find_expressions::EXPRESSIONS {
+            let reference = env.at("reference");
+            let expression: Vec<_> = template
+                .iter()
+                .map(|arg| {
+                    if *arg == "@REFERENCE@" {
+                        reference.as_os_str()
+                    } else {
+                        os(arg)
+                    }
+                })
+                .collect();
+            let mut args = vec![os("find"), os(start)];
+            args.extend(&expression);
+            let catalog = env.command(&args).current_dir(env.tree()).output().unwrap();
+            args.insert(1, os("-I"));
+            let live = env.command(&args).current_dir(env.tree()).output().unwrap();
+            assert_eq!(
+                code(&catalog),
+                code(&live),
+                "status {start} {template:?}: {}",
+                stderr(&catalog)
+            );
+            assert_eq!(catalog.stdout, live.stdout, "order {start} {template:?}");
+            assert_eq!(
+                catalog.stderr.is_empty(),
+                live.stderr.is_empty(),
+                "stderr {start} {template:?}: {}",
+                stderr(&catalog)
+            );
+        }
+    }
+    for expression in [
+        vec!["-type", "f", "-exec", "echo", "{}", "+"],
+        vec!["-type", "f", "-execdir", "echo", "{}", "+"],
+        vec!["-printf", "%H|%P|%p|%y|%s|%n\\n"],
+    ] {
+        let mut args = vec![os("find"), os(".")];
+        args.extend(expression.iter().map(os));
+        let catalog = env.command(&args).current_dir(env.tree()).output().unwrap();
+        args.insert(1, os("-I"));
+        let live = env.command(&args).current_dir(env.tree()).output().unwrap();
+        assert_eq!(
+            code(&catalog),
+            code(&live),
+            "{expression:?}: {}",
+            stderr(&catalog)
+        );
+        assert_eq!(catalog.stdout, live.stdout, "{expression:?}");
+        assert_eq!(catalog.stderr.is_empty(), live.stderr.is_empty());
+    }
+}
+
+#[test]
+fn catalog_find_skips_ignored_recursion_but_walks_explicit_starts_and_references() {
+    let env = Env::new("catalog-ignored");
+    env.seed_ignore_file();
+    env.write(
+        ".ferretignore",
+        b"*.tmp\nbuild/\nonly/hidden\ntarget/\n!/target/doc/**\n",
+    );
+    env.write("visible", b"v");
+    env.write("hidden.tmp", b"h");
+    env.write("build/nested/.ferretignore", b"*\n");
+    env.write("build/nested/result.tmp", b"h");
+    env.write("only/hidden", b"h");
+    env.write("target/doc/api.html", b"visible");
+    env.write("target/hidden.tmp", b"h");
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let run = |args: &[&str]| {
+        env.command(&args.iter().map(os).collect::<Vec<_>>())
+            .current_dir(env.tree())
+            .output()
+            .unwrap()
+    };
+    let output = run(&["find", "."]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("hidden"));
+    assert!(!text.contains("build"));
+    assert!(text.contains("./target\n"));
+    assert!(text.contains("./target/doc/api.html\n"));
+    for start in [
+        "build",
+        "build/nested",
+        "build/nested/result.tmp",
+        "hidden.tmp",
+        "only/hidden",
+    ] {
+        let catalog = run(&["find", start]);
+        let live = run(&["find", "-I", start]);
+        assert_eq!(code(&catalog), 0, "{start}: {}", stderr(&catalog));
+        assert_eq!(catalog.stdout, live.stdout, "{start}");
+    }
+    let output = run(&["find", "only", "-empty"]);
+    assert_eq!(code(&output), 0);
+    assert!(output.stdout.is_empty());
+    let output = run(&["find", ".", "-newer", "build/nested/result.tmp"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let output = run(&["find", ".", "-path", "./target", "-prune", "-o", "-print"]);
+    assert_eq!(code(&output), 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("target"));
+    let output = run(&["find", ".", "-name", "visible", "-delete"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(!env.at("visible").exists());
+    assert!(env.at("hidden.tmp").exists());
+}
+
+#[test]
+fn catalog_find_uses_live_stat_and_handles_deleted_names_and_unreadable_directories() {
+    let env = Env::new("catalog-stat");
+    env.seed_ignore_file();
+    env.write("changed", b"old");
+    env.write("deleted", b"old");
+    env.write("denied/file", b"contents");
+    fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o000)).unwrap();
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    env.write("changed", b"new size");
+    fs::remove_file(env.at("deleted")).unwrap();
+    let run = |args: &[&str]| {
+        env.command(&args.iter().map(os).collect::<Vec<_>>())
+            .current_dir(env.tree())
+            .output()
+            .unwrap()
+    };
+    fs::hard_link(env.at("changed"), env.base.join("alias")).unwrap();
+    let output = run(&["find", ".", "-name", "changed", "-links", "2"]);
+    assert_eq!(code(&output), 0);
+    assert_eq!(output.stdout, b"./changed\n");
+    let output = run(&["find", ".", "-name", "changed", "-size", "8c"]);
+    assert_eq!(code(&output), 0);
+    assert_eq!(output.stdout, b"./changed\n");
+    let output = run(&["find", ".", "-name", "deleted"]);
+    assert_eq!(code(&output), 0);
+    assert!(output.stdout.is_empty());
+    let output = run(&[
+        "find", ".", "-name", "changed", "-exec", "rm", "{}", ";", "-size", "8c",
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stdout.is_empty());
+    fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read_dir(env.at("denied")).is_ok();
+    let output = run(&["find", "."]);
+    fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o700)).unwrap();
+    // Privileged test runners can read mode 000 directories.
+    if !readable {
+        assert_eq!(code(&output), 1);
+        assert!(stderr(&output).contains("Permission denied"));
+    }
+}
+
+#[test]
+fn catalog_find_refuses_unresolved_starts_and_config_can_select_live_mode() {
+    let env = Env::new("catalog-config");
+    env.seed_ignore_file();
+    let run = |args: &[&str]| {
+        env.command(&args.iter().map(os).collect::<Vec<_>>())
+            .current_dir(env.tree())
+            .output()
+            .unwrap()
+    };
+    let output = run(&["find", "."]);
+    assert_eq!(code(&output), 1);
+    assert!(stderr(&output).contains("no index"));
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    fs::create_dir(env.base.join("outside")).unwrap();
+    env.write("new-after-index", b"contents");
+    for start in ["../outside", "new-after-index", "missing"] {
+        let output = run(&["find", start]);
+        assert_eq!(code(&output), 1, "{start}");
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+    let output = run(&["find", "."]);
+    assert_eq!(code(&output), 1);
+    assert!(stderr(&output).contains("index is stale"));
+    fs::write(
+        env.base.join("home/config/ferret/config"),
+        b"find_no_ignore = true\n",
+    )
+    .unwrap();
+    let configured = run(&["find", "../outside"]);
+    assert_eq!(code(&configured), 0, "{}", stderr(&configured));
+    assert_eq!(configured.stdout, run(&["find", "-I", "../outside"]).stdout);
+    fs::write(env.base.join("home/config/ferret/config"), b"invalid\n").unwrap();
+    assert_eq!(code(&run(&["find", "."])), 1);
+    assert_eq!(code(&run(&["find", "-I", "."])), 0);
+}
+
+#[test]
+fn catalog_find_crosses_nested_index_roots_and_honours_the_inner_policy() {
+    // D34 boundaries have a root record, but no child name in the outer crawl.
+    let env = Env::new("catalog-inner-root");
+    env.seed_ignore_file();
+    env.write("outer", b"visible");
+    env.write("nested/inner/.ferretignore", b"hidden\n");
+    env.write("nested/inner/visible", b"visible");
+    env.write("nested/inner/hidden", b"ignored");
+    let indexed = env.run(&[
+        os("index"),
+        env.tree().as_os_str(),
+        env.at("nested/inner").as_os_str(),
+    ]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let args = [os("find"), os(".")];
+    let output = env.command(&args).current_dir(env.tree()).output().unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("./nested/inner\n"));
+    assert!(text.contains("./nested/inner/visible\n"));
+    assert!(!text.contains("hidden"));
 }

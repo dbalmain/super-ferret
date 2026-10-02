@@ -2356,6 +2356,35 @@ search-suppression bit to preserve search counts (D29 compatibility). Visible
 special files are available to the find source but suppressed by search, which
 keeps its existing regular-file/directory/symlink result domain.
 
+**4b fallback and configuration (2026-10-03).** Default find needs an index
+covering each explicit start. Options: refuse with status 1; walk live with
+policy (a second policy crawl and changed costs); or walk as `-I` with a warning
+(scripted actions then reach ignored data). Chosen: **refuse** missing or
+incompatible catalogs, unresolved starts and new uncatalogued names observed
+while listing, with re-index/`-I` guidance. Deleted catalog names disappear
+from listings or are dropped when lazy lstat fails. Metadata changes are read
+live, not treated as index invalidation. A snapshot cannot detect changes inside
+ignored opaque subtrees, and does not watch for policy-file edits: re-index after
+changing ignore rules. This would change the recommendation: a policy-aware
+live source sharing the crawler's rules without duplicating traversal.
+
+Q4's setting is **`find_no_ignore = true`**, in
+`$XDG_CONFIG_HOME/ferret/config` (default `~/.config/ferret/config`). Its boolean
+name states the behavior directly and matches `--no-ignore`. The smallest
+shape is one `key = true|false` line, optional whitespace, blank lines and `#`
+comments; missing/empty means false. Unknown keys, duplicate keys and malformed
+values fail with status 1. No dependency or general-purpose format parser.
+Explicit `-I` bypasses both config and index; help/version bypass them too.
+
+The catalog's name order cannot reproduce readdir order. 4b retains live
+name listings solely for traversal order and intersects them with catalog
+entries. This preserves `-quit` and directory-local command batches without
+using stale stat columns. The cost is measured in [the 4b report](FIND-M4B.md).
+
+A pasted `find … -delete` skips ignored files and still exits 0 when the
+selected deletions succeed. Deleting a visible directory that still contains
+ignored files can fail with ENOTEMPTY and exit 1, as a live deletion does.
+
 ## D48 — The next move after S1
 
 **Question:** S1 is done. What comes next?

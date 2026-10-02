@@ -14,7 +14,7 @@ use std::io;
 use std::path::Path;
 
 pub use parse::{ParseError, Plan};
-pub use walk::{Entry, EntrySource, FileKind, LiveWalk, WalkError};
+pub use walk::{CatalogSource, Entry, EntrySource, FileKind, LiveWalk, WalkError};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Expression {
@@ -154,6 +154,12 @@ impl Plan {
         LiveWalk::new(self.paths.clone(), self.options)
     }
 
+    /// Creates the catalog source after the caller loads its name, kind,
+    /// root and raw entry-count sections. Stat columns are never used.
+    pub fn catalog_source(&self, catalog: ferret_catalog::Catalog) -> CatalogSource {
+        CatalogSource::new(catalog, self.paths.clone(), self.options)
+    }
+
     /// Evaluates this plan over a source configured for its traversal options.
     /// Unsupported features fail before the source is fetched. The source
     /// receives the previous entry's descent decision; `-quit` stops fetching
@@ -210,6 +216,10 @@ impl Plan {
                 break;
             }
             if let Err(error) = evaluate(&self.expression, entry, effects, &mut control) {
+                if matches!(error, EvaluationError::Metadata(_)) && entry.vanished() {
+                    descend = false;
+                    continue;
+                }
                 let (error, stop) = match error {
                     EvaluationError::Metadata(error) => (error, false),
                     EvaluationError::Output(error) => (error, true),

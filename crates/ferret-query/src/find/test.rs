@@ -317,7 +317,10 @@ impl Test {
                 .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?
             {
                 FileKind::File => stat.size() == 0,
-                FileKind::Directory => fs::read_dir(entry.path())?.next().transpose()?.is_none(),
+                FileKind::Directory => match entry.has_children() {
+                    Some(has_children) => !has_children,
+                    None => fs::read_dir(entry.path())?.next().transpose()?.is_none(),
+                },
                 _ => false,
             },
             Self::Access(access) => rustix::fs::access(entry.path(), *access).is_ok(),
