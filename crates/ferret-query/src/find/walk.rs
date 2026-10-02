@@ -1,6 +1,13 @@
 //! Sequential, prunable depth-first traversal in readdir order. Paths keep the
 //! spelling of each start operand. Raw d_type stays optional; an unknown type
 //! shares the entry's one lstat cache with metadata predicates.
+//!
+//! Speed (m3b): the walk lends one entry and allocates nothing per name. Its
+//! path buffer is truncated and extended per child, child names sit on one
+//! stack-shaped arena, and listings reuse one getdents buffer over the
+//! directory's own handle rather than a dup. What remains is kernel time: an
+//! lstat per directory (GNU's observable checks) and per entry wherever a test
+//! needs one.
 
 use std::cell::OnceCell;
 use std::ffi::OsStr;
