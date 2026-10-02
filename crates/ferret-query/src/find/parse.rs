@@ -4,13 +4,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::File;
+use std::io::BufWriter;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use ferret_verify::{Dialect, FindRegex};
-use std::fmt;
-use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
 
 use super::action::{Action, Exec, Target};
 use super::printf::Format;
@@ -101,7 +102,22 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
                         parser.message = Some(
                             "Debug options: exec opt rates search stat time tree all help\n".into(),
                         );
-                    } else if flag != b"exec" && flag != b"stat" {
+                    } else if flag != b"exec"
+                        && flag != b"stat"
+                        && (!value
+                            .as_bytes()
+                            .split(|&b| b == b',')
+                            .any(|part| part == b"help")
+                            || ![
+                                b"opt".as_slice(),
+                                b"rates",
+                                b"search",
+                                b"time",
+                                b"tree",
+                                b"all",
+                            ]
+                            .contains(&flag))
+                    {
                         parser
                             .warnings
                             .push(format!("debug flag {}", String::from_utf8_lossy(flag)));
@@ -177,7 +193,7 @@ struct Parser<'a> {
     warnings: Vec<String>,
     message: Option<String>,
     dialect: Dialect,
-    streams: HashMap<PathBuf, Rc<RefCell<File>>>,
+    streams: HashMap<PathBuf, Rc<RefCell<BufWriter<File>>>>,
     exec_id: usize,
     delete: bool,
     prune: bool,
@@ -451,9 +467,12 @@ impl Parser<'_> {
         let file = match self.streams.get(&path) {
             Some(file) => file.clone(),
             None => {
-                let file = Rc::new(RefCell::new(File::create(&path).map_err(|error| {
-                    ParseError::Feature(format!("{}: {error}", path.display()))
-                })?));
+                let file = Rc::new(RefCell::new(BufWriter::with_capacity(
+                    4096,
+                    File::create(&path).map_err(|error| {
+                        ParseError::Feature(format!("{}: {error}", path.display()))
+                    })?,
+                )));
                 self.streams.insert(path.clone(), file.clone());
                 file
             }

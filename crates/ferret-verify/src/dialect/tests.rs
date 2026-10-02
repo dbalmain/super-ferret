@@ -36,7 +36,10 @@ fn basic_plus_is_literal_and_intervals_are_escaped() {
 #[test]
 fn dots_match_slashes_newlines_and_nonutf8_bytes_in_c_locale() {
     let regex = FindRegex::new(b"...", Dialect::Emacs, false).unwrap();
-    assert!(regex.is_match(b"/\xff\n"));
+    assert!(regex.is_match(b"/\xffa"));
+    assert!(!regex.is_match(b"/\xff\n"));
+    let newline = FindRegex::new(b"...", Dialect::Extended, false).unwrap();
+    assert!(newline.is_match(b"/\xff\n"));
     assert!(!regex.is_match(b"abcd"));
     let regex = FindRegex::new(br".*/[[:alpha:]]+", Dialect::Extended, true).unwrap();
     assert!(regex.is_match(b"./Ab"));
@@ -66,4 +69,30 @@ fn bracket_backslashes_are_literal_in_emacs_and_basic() {
         assert!(regex.is_match(&[byte]));
     }
     assert!(!regex.is_match(b"c"));
+}
+
+#[test]
+fn c_locale_collating_and_equivalence_symbols_are_single_bytes() {
+    for pattern in [br"[[.a.]]".as_slice(), br"[[=a=]]".as_slice()] {
+        let regex = FindRegex::new(pattern, Dialect::Emacs, false).unwrap();
+        assert!(regex.is_match(b"a"));
+        assert!(!regex.is_match(b"b"));
+    }
+    let regex = FindRegex::new(br"[[.a.]-[.c.]]", Dialect::Extended, false).unwrap();
+    assert!(regex.is_match(b"b"));
+    assert!(!regex.is_match(b"d"));
+}
+
+#[test]
+fn awk_escapes_letters_literally_and_grep_pattern_newline_is_alternation() {
+    for dialect in [Dialect::Awk, Dialect::PosixAwk, Dialect::GnuAwk] {
+        let regex = FindRegex::new(br"./a\n", dialect, false).unwrap();
+        assert!(regex.is_match(b"./an"));
+        assert!(!regex.is_match(b"./a\n"));
+    }
+    for dialect in [Dialect::Grep, Dialect::Egrep] {
+        let regex = FindRegex::new(b".*a\n.*b", dialect, false).unwrap();
+        assert!(regex.is_match(b"./a"));
+        assert!(regex.is_match(b"./b"));
+    }
 }

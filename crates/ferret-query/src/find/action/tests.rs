@@ -404,7 +404,10 @@ pub(in crate::find) fn differential() {
             tree.reset();
         }
     }
-    eprintln!("lane A differential: {} expressions", expressions.len());
+    eprintln!(
+        "lane A differential: {} expressions",
+        expressions.len() + differential_extra(&tree)
+    );
 }
 
 fn snapshot(root: &Path) -> Vec<PathBuf> {
@@ -422,4 +425,276 @@ fn snapshot(root: &Path) -> Vec<PathBuf> {
     visit(root, root, &mut paths);
     paths.sort();
     paths
+}
+
+fn compare(tree: &Tree, args: &[OsString]) {
+    let expected = Command::new(GNU)
+        .args(&args[1..])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .unwrap();
+    let (outcome, output) = run(args);
+    assert_eq!(
+        i32::from(outcome.errors != 0),
+        expected.status.code().unwrap(),
+        "status {args:?}: {:?}",
+        output.diagnostics
+    );
+    assert_eq!(
+        records(&output.bytes),
+        records(&expected.stdout),
+        "stdout {args:?}"
+    );
+    assert_eq!(
+        output.diagnostics.is_empty(),
+        expected.stderr.is_empty(),
+        "stderr {args:?}"
+    );
+    assert!(tree.0.exists());
+}
+
+fn differential_extra(tree: &Tree) -> usize {
+    use std::fs::{File, FileTimes};
+    use std::process::Stdio;
+    use std::time::{Duration, UNIX_EPOCH};
+    let mut count = 0;
+    let names = [
+        "aa", "a+", "a?", "a{2}", "a^b", "a$b", "a(b)", "ab", "a|b", "an", "at", "a\\b", "\n",
+    ];
+    for name in names {
+        fs::write(tree.0.join(name), b"").unwrap();
+    }
+    let byte_name = OsStr::from_bytes(b"\xff");
+    fs::write(tree.0.join(byte_name), b"").unwrap();
+    for dialect in [
+        "emacs",
+        "posix-basic",
+        "grep",
+        "sed",
+        "posix-minimal-basic",
+        "posix-extended",
+        "posix-egrep",
+        "egrep",
+        "awk",
+        "posix-awk",
+        "gnu-awk",
+    ] {
+        for pattern in [
+            r".*/a+",
+            r".*/a\+",
+            r".*/a{2}",
+            r".*/a\{2\}",
+            r".*/a^b",
+            r".*/a$b",
+            r".*/\(a\|b\)",
+            r".*/(a|b)",
+            r".*/[[:alpha:]]+",
+            r".*/a\(b\)",
+            r".*/a\?",
+            r".*/a?",
+            r".*/[a\b]+",
+            r".*/a\w",
+            r".*/.",
+            r".*/a\n",
+            r".*/a\t",
+            r".*/[[.a.]-[.c.]]",
+        ] {
+            compare(
+                tree,
+                &tree.args(&["-regextype", dialect, "-regex", pattern]),
+            );
+            count += 1;
+        }
+    }
+    for name in names {
+        fs::remove_file(tree.0.join(name)).unwrap();
+    }
+    fs::remove_file(tree.0.join(byte_name)).unwrap();
+    compare(
+        tree,
+        &tree.args(&[
+            "-maxdepth",
+            "0",
+            "-printf",
+            "%#S|%.3S|%+d|% d|%010d|%10.3d|%#6.4m|%T%|%-10%|%T",
+        ]),
+    );
+    count += 1;
+    for primary in ["-ls", "-printf"] {
+        let mut args = vec!["-I".into(), "/dev/null".into(), primary.into()];
+        if primary == "-printf" {
+            args.push("%#S|%.3S|%+d|% d|%010d|%10.3d|%#6.4m\n".into());
+        }
+        compare(tree, &args);
+        count += 1;
+    }
+
+    for dialect in [
+        "posix-egrep",
+        "egrep",
+        "posix-awk",
+        "awk",
+        "sed",
+        "grep",
+        "posix-minimal-basic",
+        "gnu-awk",
+        "ed",
+    ] {
+        compare(
+            tree,
+            &tree.args(&["-regextype", dialect, "-regex", r".*/[[:alpha:]]+\..*"]),
+        );
+        count += 1;
+    }
+    for (flag, path) in [("-L", tree.0.clone()), ("-H", tree.0.join("link"))] {
+        let args = [
+            "-I".into(),
+            flag.into(),
+            path.into_os_string(),
+            "-printf".into(),
+            "%p %y %Y %l\n".into(),
+        ];
+        compare(tree, &args);
+        count += 1;
+    }
+    let time = UNIX_EPOCH + Duration::new(946684800, 123456789);
+    let path = tree.0.join("a");
+    File::open(&path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(time).set_accessed(time))
+        .unwrap();
+    let args=["-I".into(),path.into_os_string(),"-printf".into(),"%T@|%A@|%C@|%T+|%TS|%Ts|%CT|%TT|%a|%c|%t|%Tc|%Tb|%TY|%Tm|%Td|%TH|%TM|%TF|%Te|%Tz|%AY|%Am\n".into()];
+    compare(tree, &args);
+    count += 1;
+    for primary in ["-fprint", "-fprint0", "-fprintf", "-fls"] {
+        let path = tree.0.join("output");
+        fs::write(&path, b"old").unwrap();
+        let mut args = tree.args(&[primary]);
+        args.push(path.clone().into_os_string());
+        if primary == "-fprintf" {
+            args.push("%p %s\n".into());
+        }
+        let expected = Command::new(GNU)
+            .args(&args[1..])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .output()
+            .unwrap();
+        let file = fs::read(&path).unwrap();
+        fs::write(&path, b"old").unwrap();
+        let (outcome, output) = run(&args);
+        assert_eq!(
+            i32::from(outcome.errors != 0),
+            expected.status.code().unwrap(),
+            "{primary}"
+        );
+        assert_eq!(output.bytes, expected.stdout, "{primary}");
+        assert_eq!(
+            output.diagnostics.is_empty(),
+            expected.stderr.is_empty(),
+            "{primary}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), file, "output file {primary}");
+        fs::remove_file(&path).unwrap();
+        count += 1;
+    }
+    for primary in ["-ok", "-okdir"] {
+        for answer in [false, true] {
+            let path = tree.0.join("answer");
+            fs::write(
+                &path,
+                if answer {
+                    b"Yup\n".as_slice()
+                } else {
+                    b"no\n".as_slice()
+                },
+            )
+            .unwrap();
+            let args = tree.args(&["-maxdepth", "0", primary, "echo", "{}", ";", "-o", "-print"]);
+            let expected = Command::new(GNU)
+                .args(&args[1..])
+                .stdin(Stdio::from(File::open(&path).unwrap()))
+                .env("LC_ALL", "C")
+                .env("TZ", "UTC")
+                .output()
+                .unwrap();
+            let plan = Plan::parse(&args).unwrap();
+            let mut output = Output {
+                answer,
+                ..Output::default()
+            };
+            let outcome = plan.run(&mut plan.live_source(), &mut output).unwrap();
+            assert_eq!(
+                i32::from(outcome.errors != 0),
+                expected.status.code().unwrap()
+            );
+            assert_eq!(output.bytes, expected.stdout);
+            assert!(!expected.stderr.is_empty());
+            fs::remove_file(path).unwrap();
+            count += 1;
+        }
+    }
+    for flag in ["-help", "--help", "-version", "--version"] {
+        let args = tree.args(&[flag, "-unknown"]);
+        let expected = Command::new(GNU).args(&args[1..]).output().unwrap();
+        let (outcome, output) = run(&args);
+        assert_eq!(
+            i32::from(outcome.errors != 0),
+            expected.status.code().unwrap()
+        );
+        assert!(!output.bytes.is_empty());
+        assert!(!expected.stdout.is_empty());
+        assert!(output.diagnostics.is_empty());
+        assert!(expected.stderr.is_empty());
+        count += 1;
+    }
+    for flag in [
+        "exec", "opt", "rates", "search", "stat", "time", "tree", "all", "unknown",
+    ] {
+        let args = [
+            "-I".into(),
+            "-D".into(),
+            flag.into(),
+            tree.0.clone().into_os_string(),
+            "-maxdepth".into(),
+            "0".into(),
+        ];
+        compare(tree, &args);
+        count += 1;
+    }
+    let args = ["-I".into(), "-D".into(), "help".into()];
+    let (outcome, output) = run(&args);
+    assert_eq!(outcome.errors, 0);
+    assert!(!output.bytes.is_empty());
+    assert!(output.diagnostics.is_empty());
+    count += 1;
+    count
+}
+
+#[test]
+fn failed_unlink_is_false_and_does_not_stop_other_entries() {
+    let tree = Tree::new();
+    fs::set_permissions(&tree.0, fs::Permissions::from_mode(0o555)).unwrap();
+    let (outcome, output) = tree.run(&["-name", "a", "-delete", "-o", "-print"]);
+    fs::set_permissions(&tree.0, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(outcome.errors, 1);
+    assert!(tree.0.join("a").exists());
+    assert!(output.bytes.windows(3).any(|bytes| bytes == b"/a\n"));
+    assert!(output.bytes.windows(3).any(|bytes| bytes == b"/b\n"));
+}
+
+#[test]
+fn following_detects_stat_errors_even_when_the_expression_needs_no_metadata() {
+    let tree = Tree::new();
+    symlink("self", tree.0.join("self")).unwrap();
+    let (outcome, output) = tree.run(&["-follow", "-maxdepth", "1", "-name", "never"]);
+    assert_eq!(outcome.errors, 1);
+    assert!(output.bytes.is_empty());
+    let (outcome, output) = tree.run(&["-name", "self", "-xtype", "l"]);
+    assert_eq!(outcome.errors, 0);
+    assert_eq!(
+        output.bytes,
+        format!("{}/self\n", tree.0.display()).as_bytes()
+    );
 }

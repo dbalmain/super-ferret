@@ -1,6 +1,7 @@
 //! Parse-time compiled GNU printf directives and C-locale UTC formatting.
 //! Rendering reuses scratch storage; metadata comes solely through Entry.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -25,6 +26,7 @@ enum Directive {
         left: bool,
         zero: bool,
         alternate: bool,
+        sign: Option<u8>,
     },
 }
 
@@ -39,6 +41,7 @@ impl Format {
                 left: false,
                 zero: false,
                 alternate: false,
+                sign: None,
             },
             Directive::Literal(vec![if nul { 0 } else { b'\n' }]),
         ])
@@ -93,10 +96,14 @@ impl Format {
                     let mut left = false;
                     let mut zero = false;
                     let mut alternate = false;
+                    let mut sign = None;
                     while let Some(&flag) = bytes.get(at).filter(|b| b"-+ #0".contains(b)) {
                         left |= flag == b'-';
                         zero |= flag == b'0';
                         alternate |= flag == b'#';
+                        if flag == b'+' || (flag == b' ' && sign.is_none()) {
+                            sign = Some(flag);
+                        }
                         at += 1;
                     }
                     let width = number(bytes, &mut at)?;
@@ -112,12 +119,19 @@ impl Format {
                     at += 1;
                     if code == b'%' {
                         literal.push(b'%');
+                        literal.extend_from_slice(&bytes[start..at - 1]);
                         continue;
                     }
                     let time = if b"ABCT".contains(&code) {
-                        let value = *bytes
-                            .get(at)
-                            .ok_or_else(|| "missing time directive".to_owned())?;
+                        let Some(&value) = bytes.get(at) else {
+                            warnings.push(format!(
+                                "format directive %{} should be followed by another character",
+                                char::from(code)
+                            ));
+                            literal.push(b'%');
+                            literal.extend_from_slice(&bytes[start..at]);
+                            continue;
+                        };
                         at += 1;
                         Some(value)
                     } else {
@@ -143,6 +157,7 @@ impl Format {
                         left,
                         zero,
                         alternate,
+                        sign,
                     });
                 }
                 _ => literal.push(byte),
@@ -167,32 +182,44 @@ impl Format {
                     left,
                     zero,
                     alternate,
+                    sign,
                 } => {
                     scratch.clear();
-                    field(entry, *code, *time, &mut scratch)?;
-                    if *code == b'm' && *alternate && !scratch.starts_with(b"0") {
-                        scratch.insert(0, b'0');
-                    }
+                    field(entry, *code, *time, *precision, *alternate, &mut scratch)?;
+                    let integer = b"md".contains(code);
                     if let Some(precision) = precision {
-                        if *code == b'm' || *code == b'd' {
-                            let pad = precision.saturating_sub(scratch.len());
-                            output.extend(std::iter::repeat_n(b'0', pad));
-                        } else {
+                        if integer {
+                            if *precision == 0 && scratch == b"0" {
+                                scratch.clear();
+                            }
+                            let padding = precision.saturating_sub(scratch.len());
+                            scratch.splice(0..0, std::iter::repeat_n(b'0', padding));
+                        } else if *code != b'S' {
                             scratch.truncate(*precision);
                         }
                     }
-                    let padding = width.saturating_sub(scratch.len());
-                    if !left {
-                        output.extend(std::iter::repeat_n(
-                            if *zero && b"mdS".contains(code) {
-                                b'0'
-                            } else {
-                                b' '
-                            },
-                            padding,
-                        ));
+                    if *code == b'm' && *alternate && !scratch.starts_with(b"0") {
+                        scratch.insert(0, b'0');
                     }
-                    output.extend_from_slice(&scratch);
+                    let has_sign = b"dS".contains(code) && sign.is_some();
+                    if has_sign && let Some(sign) = sign {
+                        scratch.insert(0, *sign);
+                    }
+                    let padding = width.saturating_sub(scratch.len());
+                    let zero_pad =
+                        *zero && b"mdS".contains(code) && (!integer || precision.is_none());
+                    if !left && zero_pad {
+                        if has_sign {
+                            output.push(scratch[0]);
+                        }
+                        output.extend(std::iter::repeat_n(b'0', padding));
+                        output.extend_from_slice(&scratch[usize::from(has_sign)..]);
+                    } else {
+                        if !left {
+                            output.extend(std::iter::repeat_n(b' ', padding));
+                        }
+                        output.extend_from_slice(&scratch);
+                    }
                     if *left {
                         output.extend(std::iter::repeat_n(b' ', padding));
                     }
@@ -216,7 +243,14 @@ fn number(bytes: &[u8], at: &mut usize) -> Result<usize, String> {
     Ok(n)
 }
 
-fn field(entry: &Entry, code: u8, time: Option<u8>, out: &mut Vec<u8>) -> io::Result<()> {
+fn field(
+    entry: &Entry,
+    code: u8,
+    time: Option<u8>,
+    precision: Option<usize>,
+    alternate: bool,
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
     let path = entry.path().as_os_str().as_bytes();
     match code {
         b'p' => out.extend_from_slice(path),
@@ -297,16 +331,12 @@ fn field(entry: &Entry, code: u8, time: Option<u8>, out: &mut Vec<u8>) -> io::Re
                     } else {
                         stat.blocks() as f64 * 512.0 / stat.len() as f64
                     };
-                    general(ratio, out)?;
+                    general(ratio, precision.unwrap_or(6), alternate, out)?;
                 }
                 b'A' | b'a' => timestamp(stat.atime(), stat.atime_nsec(), time, out)?,
                 b'C' | b'c' => timestamp(stat.ctime(), stat.ctime_nsec(), time, out)?,
                 b'T' | b't' => timestamp(stat.mtime(), stat.mtime_nsec(), time, out)?,
-                b'B' => {
-                    if time == Some(b'@') {
-                        out.extend_from_slice(b"-1.-000000010");
-                    }
-                }
+                b'B' if time == Some(b'@') => out.extend_from_slice(b"-1.-000000010"),
                 _ => {}
             }
         }
@@ -326,30 +356,37 @@ pub(super) fn kind_letter(kind: FileKind) -> u8 {
     }
 }
 
-fn general(value: f64, out: &mut Vec<u8>) -> io::Result<()> {
-    let exponent = if value == 0.0 {
-        0
-    } else {
-        value.abs().log10().floor() as i32
-    };
-    if !(-4..6).contains(&exponent) {
-        let text = format!("{value:.5e}");
-        let (mantissa, exponent) = text.split_once('e').unwrap_or((&text, "0"));
-        let exponent = exponent.parse::<i32>().unwrap_or(0);
-        write!(
-            out,
-            "{}e{exponent:+03}",
-            mantissa.trim_end_matches('0').trim_end_matches('.')
-        )
-    } else {
-        let text = format!("{:.*}", (5 - exponent).max(0) as usize, value);
-        out.extend_from_slice(if text.contains('.') {
-            text.trim_end_matches('0').trim_end_matches('.').as_bytes()
+fn general(value: f64, precision: usize, alternate: bool, out: &mut Vec<u8>) -> io::Result<()> {
+    let precision = precision.max(1);
+    let scientific = format!("{:.*e}", precision - 1, value);
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent = exponent.parse::<i32>().unwrap_or(0);
+    let write_number = |text: &str, out: &mut Vec<u8>| {
+        if alternate {
+            out.extend_from_slice(text.as_bytes());
+            if !text.contains('.') {
+                out.push(b'.');
+            }
         } else {
-            text.as_bytes()
-        });
-        Ok(())
+            out.extend_from_slice(if text.contains('.') {
+                text.trim_end_matches('0').trim_end_matches('.').as_bytes()
+            } else {
+                text.as_bytes()
+            });
+        }
+    };
+    if exponent < -4 || exponent >= precision as i32 {
+        write_number(mantissa, out);
+        write!(out, "e{exponent:+03}")?;
+    } else {
+        let text = format!(
+            "{:.*}",
+            (precision as i32 - 1 - exponent).max(0) as usize,
+            value
+        );
+        write_number(&text, out);
     }
+    Ok(())
 }
 
 fn mode(value: u32, kind: u8) -> [u8; 10] {
@@ -372,7 +409,7 @@ fn mode(value: u32, kind: u8) -> [u8; 10] {
     result
 }
 
-fn owner(id: u32, group: bool) -> String {
+fn owner(id: u32, group: bool) -> Cow<'static, str> {
     static USERS: OnceLock<HashMap<u32, String>> = OnceLock::new();
     static GROUPS: OnceLock<HashMap<u32, String>> = OnceLock::new();
     let names = if group { &GROUPS } else { &USERS }.get_or_init(|| {
@@ -387,7 +424,10 @@ fn owner(id: u32, group: bool) -> String {
             })
             .collect()
     });
-    names.get(&id).cloned().unwrap_or_else(|| id.to_string())
+    names.get(&id).map_or_else(
+        || Cow::Owned(id.to_string()),
+        |name| Cow::Borrowed(name.as_str()),
+    )
 }
 
 pub(super) fn filesystem(path: &std::path::Path) -> io::Result<String> {
@@ -457,6 +497,34 @@ impl Date {
         }
     }
 }
+fn iso_week(d: &Date) -> (i64, i64) {
+    let weekday = ((d.weekday + 6) % 7 + 1) as i64;
+    let week = (d.ordinal + 10 - weekday) / 7;
+    let jan_weekday = (d.weekday as i64 - d.ordinal + 1).rem_euclid(7);
+    let leap = |year: i64| year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let weeks = |weekday: i64, year: i64| {
+        if weekday == 4 || (weekday == 3 && leap(year)) {
+            53
+        } else {
+            52
+        }
+    };
+    if week == 0 {
+        let previous = d.year - 1;
+        (
+            previous,
+            weeks(
+                (jan_weekday - if leap(previous) { 2 } else { 1 }).rem_euclid(7),
+                previous,
+            ),
+        )
+    } else if week > weeks(jan_weekday, d.year) {
+        (d.year + 1, 1)
+    } else {
+        (d.year, week)
+    }
+}
+
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
@@ -472,6 +540,7 @@ fn timestamp(seconds: i64, nanos: i64, directive: Option<u8>, out: &mut Vec<u8>)
             "{weekday} {month} {:2} {:02}:{:02}:{:02}.{nanos:09}0 {}",
             d.day, d.hour, d.minute, d.second, d.year
         )?,
+        Some(b'%') => out.push(b'%'),
         Some(b'@') => write!(out, "{seconds}.{nanos:09}0")?,
         Some(b'+') => write!(
             out,
@@ -560,6 +629,9 @@ fn timestamp(seconds: i64, nanos: i64, directive: Option<u8>, out: &mut Vec<u8>)
             "{:02}",
             (d.ordinal + 6 - ((d.weekday + 6) % 7) as i64) / 7
         )?,
+        Some(b'V') => write!(out, "{:02}", iso_week(&d).1)?,
+        Some(b'G') => write!(out, "{:04}", iso_week(&d).0)?,
+        Some(b'g') => write!(out, "{:02}", iso_week(&d).0.rem_euclid(100))?,
         Some(b'y') => write!(out, "{:02}", d.year.rem_euclid(100))?,
         Some(b'Y') => write!(out, "{:04}", d.year)?,
         Some(b'z') => out.extend_from_slice(b"+0000"),
@@ -599,16 +671,25 @@ pub(super) fn list(entry: &Entry, out: &mut Vec<u8>) -> io::Result<()> {
         )?;
     }
     let permissions = mode(stat.mode(), kind_letter(walk::kind(stat.file_type())));
+    let size = if permissions[0] == b'b' || permissions[0] == b'c' {
+        format!(
+            "{:3}, {:3}",
+            rustix::fs::major(stat.rdev()),
+            rustix::fs::minor(stat.rdev())
+        )
+    } else {
+        stat.len().to_string()
+    };
     write!(
         out,
-        "{:9} {:6} {} {:3} {:8} {:8} {:8} {} ",
+        "{:9} {:6} {} {:3} {:8} {:8} {:>8} {} ",
         stat.ino(),
         stat.blocks().div_ceil(2),
         String::from_utf8_lossy(&permissions),
         stat.nlink(),
         owner(stat.uid(), false),
         owner(stat.gid(), true),
-        stat.len(),
+        size,
         String::from_utf8_lossy(&date)
     )?;
     escaped(entry.path().as_os_str().as_bytes(), out)?;

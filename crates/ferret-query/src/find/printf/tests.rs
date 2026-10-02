@@ -66,3 +66,38 @@ fn list_escapes_spaces_and_uses_old_year_column() {
     );
     assert!(output.bytes.ends_with(b"/space\\ name\n"));
 }
+
+#[test]
+fn numeric_flags_and_incomplete_time_directives_follow_gnu() {
+    let tree = Tree::new();
+    let (_, output) = tree.run(&[
+        "-maxdepth",
+        "0",
+        "-printf",
+        "%#S|%.3S|%+d|% d|%010d|%10.3d|%#6.4m|%T%|%-10%|%T",
+    ]);
+    assert_eq!(
+        output.bytes,
+        b"1.00000|1|+0| 0|0000000000|       000|  0755|%|%-10|%T"
+    );
+    assert_eq!(output.diagnostics.len(), 1);
+}
+
+#[test]
+fn iso_week_year_uses_the_adjacent_year_at_new_year() {
+    let tree = Tree::new();
+    let path = tree.0.join("a");
+    let time = UNIX_EPOCH + Duration::from_secs(946684800);
+    File::open(&path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(time))
+        .unwrap();
+    let args = [
+        "-I".into(),
+        path.into_os_string(),
+        "-printf".into(),
+        "%TV|%TG|%Tg\n".into(),
+    ];
+    let (_, output) = crate::find::action::tests::run(&args);
+    assert_eq!(output.bytes, b"52|1999|99\n");
+}

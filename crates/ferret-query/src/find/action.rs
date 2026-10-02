@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ pub(super) enum Action {
 #[derive(Clone, Debug)]
 pub(super) enum Target {
     Stdout,
-    File(PathBuf, Rc<RefCell<File>>),
+    File(PathBuf, Rc<RefCell<BufWriter<File>>>),
 }
 
 impl PartialEq for Target {
@@ -76,11 +76,27 @@ pub(super) struct State {
     batches: BTreeMap<usize, Batch>,
     buffer: Vec<u8>,
     limit: Option<usize>,
+    files: Vec<Rc<RefCell<BufWriter<File>>>>,
     pub errors: u64,
 }
 
 impl State {
+    fn flush_files(&self) -> io::Result<()> {
+        for file in &self.files {
+            file.borrow_mut().flush()?;
+        }
+        Ok(())
+    }
+
     pub fn flush(&mut self, effects: &mut impl Effects, directories_only: bool) -> io::Result<()> {
+        if !directories_only
+            || self
+                .batches
+                .values()
+                .any(|batch| batch.exec.directory && !batch.paths.is_empty())
+        {
+            self.flush_files()?;
+        }
         for batch in self.batches.values_mut() {
             if !directories_only || batch.exec.directory {
                 self.errors += u64::from(!batch.run(effects)?);
@@ -91,6 +107,13 @@ impl State {
 
     pub fn change_directory(&mut self, path: &Path, effects: &mut impl Effects) -> io::Result<()> {
         let (directory, _) = exec_path(path);
+        if self.batches.values().any(|batch| {
+            batch.exec.directory
+                && !batch.paths.is_empty()
+                && batch.directory.as_deref() != Some(&directory)
+        }) {
+            self.flush_files()?;
+        }
         for batch in self.batches.values_mut() {
             if batch.exec.directory && batch.directory.as_deref() != Some(&directory) {
                 self.errors += u64::from(!batch.run(effects)?);
@@ -106,12 +129,13 @@ impl Batch {
             return Ok(true);
         }
         let mut args = self.exec.args.clone();
-        args.extend(self.paths.drain(..));
+        args.append(&mut self.paths);
         self.bytes = command_bytes(&self.exec.args);
         spawn(
             &args,
             self.directory.as_deref(),
             self.handle.as_deref(),
+            false,
             effects,
         )
     }
@@ -175,6 +199,7 @@ pub(super) fn evaluate(
             }
         }
         Action::Output(target, format) => {
+            register_file(state, target);
             state.buffer.clear();
             format
                 .render(entry, &mut state.buffer)
@@ -185,6 +210,7 @@ pub(super) fn evaluate(
             Ok(true)
         }
         Action::List(target) => {
+            register_file(state, target);
             state.buffer.clear();
             super::printf::list(entry, &mut state.buffer).map_err(EvaluationError::Metadata)?;
             target
@@ -203,6 +229,17 @@ pub(super) fn evaluate(
         Action::Xtype(kinds) => {
             Ok(kinds.contains(&entry.opposite_kind().map_err(EvaluationError::Metadata)?))
         }
+    }
+}
+
+fn register_file(state: &mut State, target: &Target) {
+    if let Target::File(_, file) = target
+        && !state
+            .files
+            .iter()
+            .any(|existing| Rc::ptr_eq(existing, file))
+    {
+        state.files.push(file.clone());
     }
 }
 
@@ -241,6 +278,9 @@ fn execute(
         });
         let bytes = path.as_bytes().len() + 1;
         if batch.directory != directory || batch.bytes + bytes > limit {
+            for file in &state.files {
+                file.borrow_mut().flush()?;
+            }
             state.errors += u64::from(!batch.run(effects)?);
         }
         batch.directory = directory;
@@ -249,6 +289,7 @@ fn execute(
         batch.bytes += bytes;
         return Ok(true);
     }
+    state.flush_files()?;
     if exec.prompt && !effects.confirm(&exec.args[0], entry.path())? {
         return Ok(false);
     }
@@ -257,7 +298,13 @@ fn execute(
         .iter()
         .map(|arg| substitute(arg, &path))
         .collect::<Vec<_>>();
-    spawn(&args, directory.as_deref(), handle.as_deref(), effects)
+    spawn(
+        &args,
+        directory.as_deref(),
+        handle.as_deref(),
+        exec.prompt,
+        effects,
+    )
 }
 
 fn substitute(arg: &OsStr, path: &OsStr) -> OsString {
@@ -278,6 +325,9 @@ fn exec_path(path: &Path) -> (PathBuf, OsString) {
         .iter()
         .rposition(|&b| b != b'/')
         .map_or(0, |at| at + 1);
+    if end == 0 {
+        return (PathBuf::from("/"), OsString::from("/"));
+    }
     let at = bytes[..end].iter().rposition(|&b| b == b'/');
     let (directory, name) = match at {
         Some(at) => (&bytes[..=at], &bytes[at + 1..]),
@@ -285,7 +335,18 @@ fn exec_path(path: &Path) -> (PathBuf, OsString) {
     };
     (
         PathBuf::from(OsStr::from_bytes(directory)),
-        OsString::from_vec([b"./", name].concat()),
+        OsString::from_vec(
+            [
+                b"./".as_slice(),
+                &name[..name.len() - (bytes.len() - end)],
+                if end < bytes.len() {
+                    b"/".as_slice()
+                } else {
+                    b"".as_slice()
+                },
+            ]
+            .concat(),
+        ),
     )
 }
 
@@ -293,11 +354,23 @@ fn spawn(
     args: &[OsString],
     directory: Option<&Path>,
     handle: Option<&File>,
+    close_stdin: bool,
     effects: &mut impl Effects,
 ) -> io::Result<bool> {
     effects.flush()?;
-    let mut command = Command::new(&args[0]);
-    command.args(&args[1..]);
+    // GNU closes fd 0 for interactive actions. A POSIX shell exec trampoline
+    // provides that child-only operation without unsafe pre_exec hooks.
+    let mut command = if close_stdin {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec \"$@\" <&-", "find-ok"])
+            .args(args);
+        command
+    } else {
+        let mut command = Command::new(&args[0]);
+        command.args(&args[1..]);
+        command
+    };
     if let Some(handle) = handle {
         // CLOEXEC still allows the child to chdir through its inherited fd
         // before exec. This also works after the directory has been unlinked.

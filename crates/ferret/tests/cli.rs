@@ -1003,12 +1003,9 @@ fn find_reports_usage_and_unsupported_features_with_status_one() {
         (&["-perm", "+066"], false),
         (&["(", ")"], false),
         (&["-perm", "0644"], true),
-        (&["-exec", "echo", "{}", "+"], true),
-        (&["-printf", "%p"], true),
-        (&["-fprintf", "out", "%p"], true),
-        (&["-regex", ".*"], true),
-        (&["-xtype", "l"], true),
-        (&["-delete"], true),
+        (&["-regex", r".*\(a\)\1"], false),
+        (&["-printf", "%"], false),
+        (&["-prune", "-delete"], false),
     ];
     for (expression, unsupported) in cases {
         let mut args = vec![os("find"), os("-I"), tree.as_os_str()];

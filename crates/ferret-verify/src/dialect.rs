@@ -12,14 +12,20 @@ pub enum Dialect {
     Emacs,
     /// POSIX basic, grep, sed and ed.
     Basic,
+    /// Grep basic (a pattern newline is alternation).
+    Grep,
     /// POSIX minimal basic (no escaped +, ? or alternation).
     MinimalBasic,
     /// POSIX extended, egrep and posix-egrep.
     Extended,
+    /// Egrep and POSIX egrep (a pattern newline is alternation).
+    Egrep,
     /// Historical awk (intervals are literals).
     Awk,
-    /// POSIX awk and GNU awk (interval operators).
+    /// POSIX awk (interval operators, no GNU word assertions).
     PosixAwk,
+    /// GNU awk (intervals and GNU word assertions).
+    GnuAwk,
 }
 
 impl Dialect {
@@ -27,11 +33,14 @@ impl Dialect {
     pub fn from_name(name: &[u8]) -> Option<Self> {
         Some(match name {
             b"emacs" | b"findutils-default" => Self::Emacs,
-            b"posix-basic" | b"grep" | b"sed" | b"ed" => Self::Basic,
+            b"posix-basic" | b"sed" | b"ed" => Self::Basic,
+            b"grep" => Self::Grep,
+            b"egrep" | b"posix-egrep" => Self::Egrep,
             b"posix-minimal-basic" => Self::MinimalBasic,
-            b"posix-extended" | b"posix-egrep" | b"egrep" => Self::Extended,
+            b"posix-extended" => Self::Extended,
             b"awk" => Self::Awk,
-            b"posix-awk" | b"gnu-awk" => Self::PosixAwk,
+            b"posix-awk" => Self::PosixAwk,
+            b"gnu-awk" => Self::GnuAwk,
             _ => return None,
         })
     }
@@ -76,12 +85,13 @@ fn literal(out: &mut String, byte: u8) {
 fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<String, RegexError> {
     let basic = matches!(
         dialect,
-        Dialect::Emacs | Dialect::Basic | Dialect::MinimalBasic
+        Dialect::Emacs | Dialect::Basic | Dialect::Grep | Dialect::MinimalBasic
     );
-    let mut out = String::from(if fold {
-        "(?is-u)\\A(?:"
-    } else {
-        "(?s-u)\\A(?:"
+    let mut out = String::from(match (fold, dialect == Dialect::Emacs) {
+        (true, true) => "(?i-u)\\A(?:",
+        (false, true) => "(?-u)\\A(?:",
+        (true, false) => "(?is-u)\\A(?:",
+        (false, false) => "(?s-u)\\A(?:",
     });
     let mut at = 0;
     let mut branch_start = true;
@@ -101,6 +111,7 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<String, Reg
             byte
         };
         let operator = match byte {
+            b'\n' => matches!(dialect, Dialect::Grep | Dialect::Egrep),
             b'(' | b')' => escaped == basic,
             b'|' => {
                 if basic {
@@ -152,7 +163,7 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<String, Reg
             }
             literal(&mut out, byte);
         } else if operator {
-            out.push(byte as char);
+            out.push(if byte == b'\n' { '|' } else { byte as char });
         } else if escaped
             && matches!(byte, b'w' | b'W' | b'b' | b'B')
             && !matches!(dialect, Dialect::Awk | Dialect::PosixAwk)
@@ -166,26 +177,10 @@ fn translate(pattern: &[u8], dialect: Dialect, fold: bool) -> Result<String, Reg
             return Err(RegexError(
                 "GNU word-start/end assertions are not supported".into(),
             ));
-        } else if escaped
-            && matches!(dialect, Dialect::Awk | Dialect::PosixAwk)
-            && b"abfnrtv".contains(&byte)
-        {
-            literal(
-                &mut out,
-                match byte {
-                    b'a' => 7,
-                    b'b' => 8,
-                    b'f' => 12,
-                    b'n' => 10,
-                    b'r' => 13,
-                    b't' => 9,
-                    _ => 11,
-                },
-            );
         } else {
             literal(&mut out, byte);
         }
-        branch_start = operator && matches!(byte, b'(' | b'|');
+        branch_start = operator && matches!(byte, b'(' | b'|' | b'\n');
         at += 1;
     }
     out.push_str(")\\z");
@@ -213,6 +208,24 @@ fn bracket(
             out.push(']');
             return Ok(at + 1);
         }
+        if byte == b'[' && pattern.get(at + 1).is_some_and(|byte| b".=".contains(byte)) {
+            let delimiter = pattern[at + 1];
+            let end = pattern[at + 2..]
+                .windows(2)
+                .position(|pair| pair == [delimiter, b']'])
+                .ok_or_else(|| RegexError("unclosed collating symbol".into()))?
+                + at
+                + 2;
+            let symbol = &pattern[at + 2..end];
+            if symbol.len() != 1 || !symbol[0].is_ascii() {
+                return Err(RegexError(
+                    "only single-byte C-locale collating symbols are supported".into(),
+                ));
+            }
+            literal(out, symbol[0]);
+            at = end + 2;
+            continue;
+        }
         if byte == b'[' && pattern.get(at + 1) == Some(&b':') {
             let end = pattern[at + 2..]
                 .windows(2)
@@ -227,7 +240,7 @@ fn bracket(
             at = end;
             continue;
         }
-        if byte == b'\\' && matches!(dialect, Dialect::Awk | Dialect::PosixAwk) {
+        if byte == b'\\' && matches!(dialect, Dialect::Awk | Dialect::PosixAwk | Dialect::GnuAwk) {
             at += 1;
             let byte = *pattern
                 .get(at)

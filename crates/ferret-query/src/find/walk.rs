@@ -122,7 +122,15 @@ impl Entry {
     }
 
     pub(super) fn opposite_kind(&self) -> io::Result<FileKind> {
-        metadata(&self.path, !self.follow).map(|stat| kind(stat.file_type()))
+        metadata(&self.path, !self.follow)
+            .or_else(|error| {
+                if error.raw_os_error() == Some(40) {
+                    fs::symlink_metadata(&self.path)
+                } else {
+                    Err(error)
+                }
+            })
+            .map(|stat| kind(stat.file_type()))
     }
 }
 
@@ -325,7 +333,18 @@ impl LiveWalk {
             };
             match task {
                 Task::Visit(entry, root_dev) => {
-                    if entry.follow && entry.kind().is_ok_and(|kind| kind == FileKind::Directory) {
+                    let followed_kind = if entry.follow {
+                        Some(entry.kind().map_err(|error| WalkError {
+                            path: entry.path.clone(),
+                            error: copy_error(error),
+                        }))
+                    } else {
+                        None
+                    };
+                    if let Some(Err(error)) = followed_kind {
+                        return Some(Err(error));
+                    }
+                    if matches!(followed_kind, Some(Ok(FileKind::Directory))) {
                         let stat = match entry.metadata() {
                             Ok(stat) => stat,
                             Err(error) => {
