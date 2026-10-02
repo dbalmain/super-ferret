@@ -25,8 +25,9 @@ A pasted `find … -delete` skips ignored files and still exits 0. Failed select
 deletions still exit 1: for example, removing a visible directory containing
 ignored files fails because it is not empty. Default mode exits 1 with guidance
 to re-index or use `-I` if its index is missing/incompatible, a start cannot be
-resolved, or traversal finds a new uncatalogued name. Re-index after changing
-ignore rules. Both find modes exit 0 for no matches and 1 for errors.
+resolved. New names discovered during traversal are visible and walked live;
+even names that match ignore rules appear until the next index. Re-index after
+changing ignore rules. Both find modes exit 0 for no matches and 1 for errors.
 
 Related repositories:
 

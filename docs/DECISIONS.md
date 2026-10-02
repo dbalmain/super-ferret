@@ -2360,13 +2360,28 @@ keeps its existing regular-file/directory/symlink result domain.
 covering each explicit start. Options: refuse with status 1; walk live with
 policy (a second policy crawl and changed costs); or walk as `-I` with a warning
 (scripted actions then reach ignored data). Chosen: **refuse** missing or
-incompatible catalogs, unresolved starts and new uncatalogued names observed
-while listing, with re-index/`-I` guidance. Deleted catalog names disappear
-from listings or are dropped when lazy lstat fails. Metadata changes are read
-live, not treated as index invalidation. A snapshot cannot detect changes inside
-ignored opaque subtrees, and does not watch for policy-file edits: re-index after
-changing ignore rules. This would change the recommendation: a policy-aware
-live source sharing the crawler's rules without duplicating traversal.
+incompatible catalogs and unresolved explicit starts, with re-index/`-I`
+guidance. **New names observed while listing are visible**, using live kinds
+and lstat; an uncatalogued directory walks live as visible, without nested
+ignore rules. This replaces 4b's initial refusal of new names: actions such as
+`-exec touch {}/new \;` must not invalidate their own walk. Dave selected this
+behavior after the full-corpus run. The tradeoff is that a name created after
+indexing that the ignore rules would hide shows up until the next index.
+Deleted catalog names disappear from listings or are dropped when live lstat
+fails. Metadata changes are read live, not treated as index invalidation. A
+snapshot cannot detect changes inside ignored opaque subtrees, and does not
+watch for policy-file edits: re-index after changing ignore rules. A policy-aware
+live source sharing the crawler's rules could remove the new-name tradeoff
+without duplicating traversal.
+
+Directories cache their live stat observation before descending, including in
+`-depth` and implicit depth from `-delete`; child actions must not change the
+mtime seen by the directory's later predicates. Regular-file metadata stays
+lazy. `-empty` checks current on-disk contents, including ignored entries,
+rather than the catalog's snapshot child count: deleting visible children may
+make the directory empty during the walk, while ignored children still prevent
+emptiness. Real CatalogSource regressions cover both timings and new names
+created by directory `-exec` actions.
 
 Q4's setting is **`find_no_ignore = true`**, in
 `$XDG_CONFIG_HOME/ferret/config` (default `~/.config/ferret/config`). Its boolean

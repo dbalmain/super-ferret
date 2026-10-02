@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// A temp directory holding `tree/` (what is indexed), `index/`, and the
 /// XDG homes under `home/`.
@@ -1330,8 +1330,9 @@ fn catalog_find_refuses_unresolved_starts_and_config_can_select_live_mode() {
         assert!(!output.stderr.is_empty());
     }
     let output = run(&["find", "."]);
-    assert_eq!(code(&output), 1);
-    assert!(stderr(&output).contains("index is stale"));
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    assert!(paths(&output).contains(&PathBuf::from("./new-after-index")));
     fs::write(
         env.base.join("home/config/ferret/config"),
         b"find_no_ignore = true\n",
@@ -1376,4 +1377,170 @@ fn catalog_find_crosses_nested_index_roots_and_honours_the_inner_policy() {
     assert!(text.contains("./nested/inner\n"));
     assert!(text.contains("./nested/inner/visible\n"));
     assert!(!text.contains("hidden"));
+}
+
+fn catalog_delete_tree(name: &str) -> Env {
+    let env = Env::new(name);
+    env.seed_ignore_file();
+    env.write(
+        ".ferretignore",
+        b"target/\n!/target/doc/**\n!/target/visible\nnode_modules/\n!/node_modules/visible\n",
+    );
+    for path in [
+        "sub/visible",
+        "node_modules/visible",
+        "target/doc/visible",
+        "target/visible",
+        "target/hidden",
+    ] {
+        env.write(path, b"contents");
+    }
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    // Stamp after indexing so using stale catalog metadata cannot pass this
+    // regression for post-order stat timing after -delete changes parent
+    // mtimes.
+    let old = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+    for path in [
+        ".ferretignore",
+        "sub/visible",
+        "node_modules/visible",
+        "target/doc/visible",
+        "target/visible",
+        "target/hidden",
+        "sub",
+        "node_modules",
+        "target/doc",
+        "target",
+        ".",
+    ] {
+        File::open(env.at(path))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+    env
+}
+
+#[test]
+fn catalog_find_observes_directory_mtime_before_deleting_its_children() {
+    let env = catalog_delete_tree("catalog-delete-mtime");
+    let output = env
+        .command(&[os("find"), os("."), os("-mmin"), os("+720"), os("-delete")])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("Directory not empty"),
+        "{}",
+        stderr(&output)
+    );
+    for dir in ["sub", "node_modules", "target/doc"] {
+        assert!(!env.at(dir).exists(), "{dir} was not deleted");
+    }
+    assert!(env.at("target/hidden").exists());
+    assert!(env.tree().exists());
+}
+
+#[test]
+fn catalog_find_checks_live_emptiness_after_deleting_children_in_depth_order() {
+    // The original raw count includes children that -delete has now removed.
+    let env = catalog_delete_tree("catalog-delete-empty");
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-depth"),
+            os("("),
+            os("-type"),
+            os("f"),
+            os("-name"),
+            os("visible"),
+            os("-or"),
+            os("-type"),
+            os("d"),
+            os("-empty"),
+            os(")"),
+            os("-delete"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    for dir in ["sub", "node_modules", "target/doc"] {
+        assert!(!env.at(dir).exists(), "{dir} was not deleted");
+    }
+    assert!(env.at("target/hidden").exists());
+}
+
+#[test]
+fn catalog_find_evaluates_names_created_by_exec_as_visible() {
+    // A directory's pre-order -exec creates a name before its listing.
+    let env = Env::new("catalog-exec-touch-new");
+    env.seed_ignore_file();
+    env.write(".ferretignore", b"*.tmp\n");
+    env.write("parent/child/original", b"contents");
+    env.write("old.tmp", b"ignored");
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-type"),
+            os("d"),
+            os("-exec"),
+            os("touch"),
+            os("{}/new.tmp"),
+            os(";"),
+            os("-o"),
+            os("-type"),
+            os("f"),
+            os("-name"),
+            os("*.tmp"),
+            os("-print"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    let found = paths(&output);
+    for (printed, path) in [
+        ("./new.tmp", "new.tmp"),
+        ("./parent/new.tmp", "parent/new.tmp"),
+        ("./parent/child/new.tmp", "parent/child/new.tmp"),
+    ] {
+        assert!(found.contains(&PathBuf::from(printed)), "{found:?}");
+        assert!(env.at(path).exists());
+    }
+    assert_eq!(found.len(), 3, "{found:?}");
+}
+
+#[test]
+fn catalog_find_walks_uncatalogued_directories_live_as_visible() {
+    let env = Env::new("catalog-new-directory");
+    env.seed_ignore_file();
+    env.write(".ferretignore", b"*.tmp\n");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    env.write("new-dir/nested/new.tmp", b"contents");
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-type"),
+            os("f"),
+            os("-name"),
+            os("*.tmp"),
+            os("-size"),
+            os("8c"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"./new-dir/nested/new.tmp\n");
 }

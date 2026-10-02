@@ -79,7 +79,6 @@ pub struct Entry {
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
     target: Option<Target>,
-    has_children: Option<bool>,
 }
 
 impl Entry {
@@ -96,7 +95,6 @@ impl Entry {
             kind: Some(kind),
             metadata: OnceCell::new(),
             target: None,
-            has_children: None,
         }
     }
 
@@ -140,9 +138,6 @@ impl Entry {
     }
     pub(super) fn vanished(&self) -> bool {
         self.target.is_some() && self.metadata.get().is_some_and(Result::is_err)
-    }
-    pub(super) fn has_children(&self) -> Option<bool> {
-        self.has_children
     }
     pub(super) fn directory_handle(&self) -> Option<Rc<File>> {
         self.directory.clone()
@@ -219,7 +214,6 @@ struct Saved {
     kind: Option<FileKind>,
     metadata: OnceCell<io::Result<Metadata>>,
     target: Option<Target>,
-    has_children: Option<bool>,
 }
 
 impl Saved {
@@ -231,7 +225,6 @@ impl Saved {
             kind: entry.kind,
             metadata: std::mem::take(&mut entry.metadata),
             target: entry.target,
-            has_children: entry.has_children,
         }
     }
 
@@ -243,7 +236,6 @@ impl Saved {
         entry.check_directory = false;
         entry.metadata = self.metadata;
         entry.target = self.target;
-        entry.has_children = self.has_children;
     }
 }
 
@@ -339,6 +331,12 @@ impl LiveWalk {
         if entry.kind().map_err(|error| entry.error(error))? != FileKind::Directory {
             return Ok(());
         }
+        // Preserve the directory observation before child actions change its
+        // timestamps. Saved carries it through post-order evaluation; regular
+        // files still obtain metadata only when a predicate needs it.
+        if entry.target.is_some() {
+            entry.metadata().map_err(|error| entry.error(error))?;
+        }
         if self.options.xdev {
             match entry.metadata() {
                 Ok(stat) if stat.dev() != self.root_dev => return Ok(()),
@@ -421,14 +419,9 @@ impl LiveWalk {
                 }) {
                     (name, Some(FileKind::Directory), Some(target))
                 } else {
-                    self.children.truncate(start);
-                    self.names.truncate(names_start);
-                    return Err(WalkError {
-                        path: entry.path().to_owned(),
-                        error: io::Error::other(
-                            "index is stale: a directory contains an uncatalogued name; re-index or use -I",
-                        ),
-                    });
+                    // New names are visible until the next index. A new
+                    // directory has no catalog target, so its subtree is live.
+                    (name, raw_kind(item.file_type()), None)
                 }
             } else {
                 (name, raw_kind(item.file_type()), None)
@@ -529,10 +522,6 @@ impl LiveWalk {
                         self.entry.target = Some(resolved.target);
                         if let Target::Inode(id) = resolved.target {
                             self.entry.kind = Some(catalog_kind(catalog.kind(id)));
-                            self.entry.has_children = (self.entry.kind
-                                == Some(FileKind::Directory))
-                            .then(|| catalog.has_children(id))
-                            .flatten();
                         }
                     }
                 }
@@ -558,12 +547,6 @@ impl LiveWalk {
             entry.check_directory = false;
             entry.metadata = OnceCell::new();
             entry.target = child.target;
-            entry.has_children = child.target.and_then(|target| match target {
-                Target::Inode(dir) if child.kind == Some(FileKind::Directory) => {
-                    self.catalog.as_ref()?.has_children(dir)
-                }
-                _ => None,
-            });
             if child.target.is_none() && child.kind == Some(FileKind::Directory) {
                 match level.first.take() {
                     Some(stat) if index == level.start => entry.metadata = OnceCell::from(stat),

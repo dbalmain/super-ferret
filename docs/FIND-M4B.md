@@ -1,17 +1,22 @@
 # Default find: correctness and performance
 
-The default source uses catalog visibility and kinds and lazy live stat. It
+The default source uses catalog visibility and kinds and cached live stat. It
 shares ordered traversal with the unrestricted source. Kernel name listings
 retain live readdir order; catalog name rows are sorted and cannot supply it.
 Explicit ignored starts/suffixes walk live, ignoring nested rules. Unreadable
 opaque directories also walk live. Nested roots supply an edge from their root
 record where the outer crawl stops (D34). Ignored recursive children never emit.
 
-Missing/incompatible indexes, unresolved starts and new uncatalogued names
-observed in listings fail with status 1, with re-index/`-I` guidance. Deleted
-names are skipped. Changes to metadata are read live. Changing ignore policy
-requires re-indexing. `-empty` uses raw child counts, including ignored names;
-`-links` uses live lstat.
+Missing/incompatible indexes and unresolved explicit starts fail with status 1,
+with re-index/`-I` guidance. New names observed in listings are visible with live
+kinds and lstat; new directories walk live without nested ignore rules. A name
+created after indexing that matches ignore rules shows up until the next index.
+Deleted names are skipped. Directories retain their live stat observation from
+before descent through post-order evaluation, so child deletion does not change
+the mtime tested on the directory. Regular-file metadata remains lazy. Changing
+ignore policy requires re-indexing. `-empty` reads current on-disk contents,
+including ignored names, rather than snapshot child counts; `-links` uses live
+lstat.
 
 Config: `$XDG_CONFIG_HOME/ferret/config`, default `~/.config/ferret/config`,
 contains `find_no_ignore = true|false`. Missing/empty means false; blank lines
@@ -51,12 +56,16 @@ Artifacts: `/home/dave/w/find-compat/.scratch/ferret-impl/m4b/`:
 `seed-progress-final-*.jsonl`, `seed-summary.json`, `seed-final.log` (final
 release; same counts as the initial run).
 The runner wrapper only redirects temporary/output directories into this slice.
-The full corpus remains Dave's acceptance run; its old unrestricted baseline
-67,394 agree / 20 differ / 6 harness-failure was not re-run here.
+Dave subsequently ran the full corpus: unrestricted remains 67,394 agree /
+20 differ / 6 known harness failures; default was 52,858 agree / 79 differ /
+3 harness failures. Besides harness artifacts, this found the two classes
+addressed in the follow-up below. The next full-corpus run remains Dave's.
 
 ## Serial timing on the 300k tree
 
-Initial median of 7 warm repeats, each preceded by a counting/warmup run.
+These measurements precede the full-corpus correctness fixes below; they were
+not repeated for that follow-up. Initial median of 7 warm repeats, each preceded
+by a counting/warmup run.
 No competing `ferret_timing|synthetic|ferret-bench` process. Start load:
 1.32 / 1.54 / 1.36. No compilation ran during measurements. Each cell gives
 milliseconds and the median sample's starting 1/5/15-minute load; every
@@ -108,7 +117,7 @@ paths. Its stdout byte counts differ accordingly. Warm median of 9:
 - `search mtime:<1d`: 21.49 ms, load 1.85/1.55/1.52.
 
 Trial code is [find-m4b-stored-stat.patch](find-m4b-stored-stat.patch), preserved
-but **unapplied**. Trial/live binaries and formatted source copies are in
+but **unapplied**, against the initial 4b source at `92077ee`. Trial/live binaries and formatted source copies are in
 `/tmp/find-m4b-measure/`. The patch changes only the measured size/mtime subset;
 it is not a complete or production-ready alternate metadata policy.
 
@@ -142,7 +151,46 @@ the speed gate; the report records the measured constraint and proposed shapes.
 ## Final validation
 
 Pinned `nix run .#fmt`, workspace clippy with `-D warnings`, and workspace tests
-pass with zero compiler warnings. 371 tests pass, 4 pre-existing tests are
-ignored; the two layering tests pass. No manifests or lockfile changed. The
+passed with zero compiler warnings before the follow-up: 371 tests passed,
+4 pre-existing tests were ignored; the two layering tests passed. No manifests or lockfile changed. The
 final seed release gives the same counts above. Release binary:
 `/home/dave/w/super-ferret-wt/find-m4b/target/release/ferret`.
+
+## Full-corpus correctness follow-up
+
+Requested `git merge wt/find` was already up to date: both refs in this checkout
+were `92077ee`, without a new merge commit to import.
+
+Four real CLI/CatalogSource regressions failed before the fixes:
+
+- old directory mtimes with `-mmin +720 -delete`: exit 0 instead of ENOTEMPTY
+  status 1, with emptied visible directories left behind;
+- `-depth ( -type f -name visible -or -type d -empty ) -delete`: emptied
+  visible directories left behind because snapshot counts were nonzero;
+- directory `-exec touch {}/new.tmp \;`: stale-index status 1 instead of 0;
+- newly created directories: stale-index status 1 instead of live recursion.
+
+The mtime fixture stamps files and directories two days old **after indexing**,
+so a stale catalog stat cannot satisfy it. The touch fixture creates ignored-
+pattern names and verifies they are visible while the pre-index ignored file
+stays hidden. The new-directory fixture also checks live `-size` below it.
+Missing-index and unresolved-start refusal remain tested.
+
+After the fixes, all nine catalog CLI tests pass, including the exact-order
+comparison with unrestricted find over all 105 differential expressions.
+Before/after logs are preserved in m4b scratch as `fix-*-before.log` and
+`fix-catalog-tests.log`.
+
+Pinned formatting, workspace clippy with `-D warnings`, and workspace tests
+pass with zero compiler warnings: **375 passed, 4 pre-existing ignored**;
+both layering tests pass. No manifest, lockfile or crate-edge changes.
+`cargo build --release -p ferret` passes. The binary path is unchanged; SHA-256
+`b430679625f8f157e6c53575e91f1e4291a0cf64fd953398d86c9ebb795d384a`.
+Gate/build logs are `fix-{fmt,clippy,tests,release}.log` in m4b scratch.
+
+The fixed release seed run gives the same counts as above: default 243 agree /
+9 skipped / 4 oracle allowlist artifacts, unrestricted 315 agree / 5 skipped;
+zero errors. Artifacts: `seed-progress-fix-*.jsonl`, `seed-summary-fix.json`,
+`seed-fix.log`. All four reported differences remain `ec752f4d3d48` against
+an oracle skipped result. The full corpus was not repeated here; Dave will run
+it. This follow-up does not remeasure or resolve the earlier speed-gate miss.
