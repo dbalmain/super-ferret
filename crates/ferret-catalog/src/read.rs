@@ -366,7 +366,7 @@ impl Catalog {
         self.layout.dirs as u32
     }
 
-    /// All inode rows: directories, then files and symlinks.
+    /// All inode rows: directories, then non-directory entries.
     pub fn inode_count(&self) -> u32 {
         self.layout.inodes as u32
     }

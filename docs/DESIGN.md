@@ -265,7 +265,8 @@ Measured at 10M (D40/D43): v2 592.6 MB, v3 594.8 MB for 43,010 additional
 ignored names, with identical inode/document counts and stat-column sizes;
 peak build RSS 1,630 → 1,641 MiB. The high-sentinel encoding is retained after
 measuring an adjacent tag range that saved 1.18 MB (0.20% of the snapshot).
-Name-search row counts stay identical; the warm full listing costs 2.2% more.
+Name-search row counts stay identical; the final warm full listing costs 4.5%
+more in the resumed baseline/final series.
 See [the 4a report](FIND-M4A.md) for per-section bytes, build time, load averages,
 query timings and the encoding comparison.
 

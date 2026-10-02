@@ -234,7 +234,7 @@ impl Plan {
     }
 
     /// Each inode row's stat, `DocId` (or NONE) and content state, in inode
-    /// order: directories, then files and symlinks.
+    /// order: directories, then non-directory entries.
     fn inode_rows<'a>(
         &'a self,
         batches: &'a [Batch],

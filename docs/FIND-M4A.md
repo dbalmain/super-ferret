@@ -133,6 +133,34 @@ table: plain name search again reads no inode columns. Ignored-row suppression
 is one comparison against inode_count before any stat access; a metadata-first
 scan checks the same bound before indexing its pass bitset.
 
+## Final search guard, resumed 2026-10-03
+
+After committing the search f/d/l compatibility guard in `e277011`, rebuilt the
+release benchmark and repeated baseline/final in pairs. Before **each**
+invocation, `pgrep -af 'ferret_timing|ferret find -I'` found no milestone 3b timing
+processes, and `uptime` recorded the load. No compilers ran during this series.
+The build/section comparison above still applies: the final guard only changes
+search, and the snapshot writer is unchanged. Warm medians of 7 and evicted
+medians of 3; all row counts match the baseline.
+
+| query | encoding | rows | warm first / all ms | evicted first / all ms | MB read | load start → finish |
+|---|---|---:|---:|---:|---:|---|
+| `flamegraph` | before | 115 | 263.39 / 269.46 | 350.07 / 355.91 | 300.3 | 1.23, 1.18, 1.09 → 1.21, 1.18, 1.09 |
+| `flamegraph` | final sentinel | 115 | 259.44 / 265.74 | 362.44 / 369.07 | 302.6 | 1.21, 1.18, 1.09 → 1.21, 1.18, 1.09 |
+| `test` | before | 162,219 | 241.34 / 301.87 | 347.78 / 408.16 | 300.3 | 1.21, 1.18, 1.09 → 1.27, 1.19, 1.10 |
+| `test` | final sentinel | 162,219 | 248.28 / 310.88 | 362.49 / 428.52 | 302.6 | 1.27, 1.19, 1.10 → 1.33, 1.20, 1.10 |
+| `ext:jpg` | before | 358,570 | 243.08 / 283.17 | 341.85 / 382.46 | 300.3 | 1.33, 1.20, 1.10 → 1.31, 1.20, 1.10 |
+| `ext:jpg` | final sentinel | 358,570 | 251.59 / 291.86 | 360.02 / 400.28 | 302.6 | 1.31, 1.20, 1.10 → 1.31, 1.20, 1.10 |
+| `*` | before | 10,405,729 | 246.77 / 1334.19 | 346.38 / 1446.76 | 300.3 | 1.31, 1.20, 1.10 → 1.69, 1.29, 1.13 |
+| `*` | final sentinel | 10,405,729 | 257.15 / 1393.87 | 370.98 / 1506.38 | 302.6 | 1.69, 1.29, 1.13 → 1.63, 1.30, 1.14 |
+
+Final warm full listing is 4.5% slower (1,334.19 → 1,393.87 ms), including
+validation of 2.3 MB more name data and the compatibility guards. Warm `test`
+is 3.0% slower, `ext:jpg` 3.1% slower, and rare `flamegraph` 1.4% faster. This
+repeat gives the current source's timings; the earlier series records the
+encoding experiment, under its higher load. It does not establish a zero-cost
+format change.
+
 ## Reproduction and artifacts
 
 All repo work stayed in `/home/dave/w/super-ferret-wt/find-m4a`. The existing S1a
@@ -150,5 +178,8 @@ it contains private HOME paths. Fixture SHA-256: `784a7abfb3bda8717250e638793f99
   /tmp/find-m4a-measure/new-catalog flamegraph test ext:jpg '*'
 ```
 
-The experiment patch and raw aggregate logs are referenced by the external
-find-m4a done-note. No snapshot, HOME dump or protected writer path is committed.
+The reproducible [adjacent-tag experiment patch](find-m4a-adjacent.patch) is
+committed as an artifact; it is not applied to the selected writer. Apply it
+with `git apply` to an isolated checkout of `e277011` to reproduce B. The raw
+aggregate logs are referenced by the external find-m4a done-note. No snapshot,
+HOME dump or protected writer path is committed.
