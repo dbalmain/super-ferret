@@ -106,6 +106,11 @@ impl State {
     }
 
     pub fn change_directory(&mut self, path: &Path, effects: &mut impl Effects) -> io::Result<()> {
+        // Called for every entry; without an -execdir batch there is nothing
+        // to flush, so skip splitting the path.
+        if !self.batches.values().any(|batch| batch.exec.directory) {
+            return Ok(());
+        }
         let (directory, _) = exec_path(path);
         if self.batches.values().any(|batch| {
             batch.exec.directory
