@@ -321,7 +321,9 @@ impl Test {
                 _ => false,
             },
             Self::Access(access) => rustix::fs::access(entry.path(), *access).is_ok(),
-            Self::FsType(wanted) => filesystem_type(entry.path()).as_deref() == Some(wanted),
+            Self::FsType(wanted) => entry
+                .metadata()
+                .is_ok_and(|stat| filesystem_type(stat.dev()) == Some(wanted.as_str())),
         })
     }
 }
@@ -736,33 +738,33 @@ fn civil_date(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
-fn filesystem_type(path: &std::path::Path) -> Option<String> {
-    let target = fs::canonicalize(path).ok()?;
-    static MOUNTS: std::sync::OnceLock<Vec<(PathBuf, String)>> = std::sync::OnceLock::new();
+/// The type of the filesystem holding a device, from the mount whose
+/// `major:minor` (mountinfo field 3) is the entry's own `st_dev`. Matching on
+/// the device rather than the path means a symlink is typed where it lives, not
+/// where it points, and costs no path resolution per entry.
+fn filesystem_type(dev: u64) -> Option<&'static str> {
+    static MOUNTS: std::sync::OnceLock<Vec<(u64, String)>> = std::sync::OnceLock::new();
     let mounts = MOUNTS.get_or_init(|| {
         fs::read_to_string("/proc/self/mountinfo")
             .unwrap_or_default()
             .lines()
             .filter_map(|line| {
                 let (left, right) = line.split_once(" - ")?;
-                let raw = left.split_whitespace().nth(4)?;
-                let mountpoint = raw
-                    .replace("\\040", " ")
-                    .replace("\\011", "\t")
-                    .replace("\\012", "\n")
-                    .replace("\\134", "\\");
-                Some((
-                    PathBuf::from(mountpoint),
-                    right.split_whitespace().next()?.to_owned(),
-                ))
+                let (major, minor) = left.split_whitespace().nth(2)?.split_once(':')?;
+                let dev = device(major.parse().ok()?, minor.parse().ok()?);
+                Some((dev, right.split_whitespace().next()?.to_owned()))
             })
             .collect()
     });
     mounts
         .iter()
-        .filter(|(mount, _)| target.starts_with(mount))
-        .max_by_key(|(mount, _)| mount.components().count())
-        .map(|(_, kind)| kind.clone())
+        .find(|(mount, _)| *mount == dev)
+        .map(|(_, kind)| kind.as_str())
+}
+
+/// Linux's `makedev`: the `dev_t` encoding of a major and minor number.
+fn device(major: u64, minor: u64) -> u64 {
+    (major & 0xfff) << 8 | (major & !0xfff) << 32 | (minor & 0xff) | (minor & !0xff) << 12
 }
 
 #[cfg(test)]
@@ -812,6 +814,27 @@ mod tests {
             assert!(parse_number(value, false).is_none(), "{value:?}");
         }
         assert!(parse_number(b"18446744073709551616", false).is_some());
+    }
+
+    #[test]
+    fn fstype_types_a_symlink_where_it_lives_not_where_it_points() {
+        let fixture = Fixture::new();
+        let link = fixture.0.join("into-proc");
+        symlink("/proc/self", &link).unwrap();
+        let proc = Test::FsType("proc".to_owned());
+        assert!(
+            proc.evaluate(&Entry::new(
+                PathBuf::from("/proc/self"),
+                0,
+                FileKind::Symlink
+            ))
+            .unwrap()
+        );
+        assert!(
+            !proc
+                .evaluate(&Entry::new(link, 0, FileKind::Symlink))
+                .unwrap()
+        ); // Resolving the path would say proc.
     }
 
     #[test]
