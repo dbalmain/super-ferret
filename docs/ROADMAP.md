@@ -94,7 +94,7 @@ one engine hosted by `ferretd` or by an in-process batch run; `ferret find`
 takes find(1) syntax (D47); compaction comes first (D48). The order below runs
 through complete `find` support before S2.
 
-## S1a — Catalog compaction
+## S1a — Catalog compaction (done 2026-09-30)
 
 Bit-packed fixed-width columns sized from the catalog, per-catalog dictionaries
 for dev, mode and (uid, gid), then names (D43, D48). The row gains nlink and
