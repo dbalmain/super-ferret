@@ -180,6 +180,10 @@ fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
         Kind::Dir => "dir",
         Kind::File => "file",
         Kind::Symlink => "symlink",
+        Kind::Fifo => "fifo",
+        Kind::Socket => "socket",
+        Kind::Block => "block",
+        Kind::Character => "character",
     };
     let mut object = Object::new(out);
     object

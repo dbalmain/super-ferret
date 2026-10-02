@@ -2328,6 +2328,34 @@ that milestone must explain that a pasted `find ... -delete` skips ignored
 files and still exits 0. Milestone 1 builds the live engine and rejects default
 mode until those catalog and policy changes land.
 
+**4a encoding brief (2026-10-02, D40/D43).** The handoff's fixed-width
+12-byte name row predates S1a: child is now blocked frame-of-reference, 128 rows
+per block. Does its high type sentinel justify a different physical encoding?
+
+- **A, fixed high sentinels (retained):** seven values below NONE, one reserved
+  tombstone, no inode for an ignored name. Mixed blocks widen to 32 bits.
+  10.449M names: 594,837,226 B, 10.71 s build wall, 1,641 MiB peak RSS.
+  Build load 7.86/4.22/3.22. Tags stay fixed when stable inode ids are added.
+- **B, tags adjacent to inode_count (measured trial):** keep real ids unchanged,
+  put seven type codes immediately after them, translate in the reader. Same
+  names/inodes/docs: 593,660,890 B, 10.69 s wall, 1,639 MiB peak RSS.
+  Build load 9.98/7.00/4.56. Saves 1,176,336 B (0.20%), but tags move as the
+  inode count changes, complicating the future incremental writer.
+
+**Recommendation: A.** The size difference is small and B has no consistent
+query win. Full listing, warm: A 1,369 ms vs B 1,354 ms; baseline 1,340 ms.
+Their recorded loads and all query/section numbers are in
+[the measurement report](FIND-M4A.md). The fact that would change it: a much
+more ignored-heavy 10M fixture where nullable child/type or a separate ignored
+range saves materially more space or query time. Those two options were not
+implemented or measured here. There is no departure from the settled sentinel
+encoding. All seven ignored kinds have name-only rows; visible special kinds
+use a sparse 8-byte-per-row Specials section so name search loads no stat
+columns. Re-included ancestors are ordinary for find but keep the existing
+search-suppression bit to preserve search counts (D29 compatibility). Visible
+special files are available to the find source but suppressed by search, which
+keeps its existing regular-file/directory/symlink result domain.
+
 ## D48 — The next move after S1
 
 **Question:** S1 is done. What comes next?

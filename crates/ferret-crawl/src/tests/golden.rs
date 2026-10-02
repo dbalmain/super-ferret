@@ -128,6 +128,7 @@ fn label(decision: Decision) -> &'static str {
         Decision::Index => "index",
         Decision::Catalog(Reason::TooLarge) => "too-large",
         Decision::Catalog(Reason::Symlink) => "symlink",
+        Decision::Catalog(Reason::Special) => "special",
     }
 }
 

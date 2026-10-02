@@ -36,7 +36,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ferret_catalog::{Content, DirToken, Hash, Stat, Transaction};
+use ferret_catalog::{Content, DirToken, Hash, Kind, Stat, Transaction};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -253,12 +253,11 @@ fn run(
         };
         let stat = parse_stat(&columns, fields, plain_stat(mode))?;
         match decision {
-            b"Descend" => dirs.push(Item {
+            b"Descend" | b"Traverse" => dirs.push(Item {
                 path,
                 decision,
                 stat,
             }),
-            b"Skip" => {}
             _ => entries.push(Item {
                 path,
                 decision,
@@ -298,6 +297,7 @@ fn run(
     let mut batches: Vec<_> = (0..BATCHES).map(|_| txn.batch()).collect();
     // The root takes the last stride, after every copy's.
     let root = batches[0].root(b"/synthetic", moved(&root_stat, copies));
+    batches[0].entry_count(root, copies as u32);
     let (mut carried, mut total) = (0u64, 0u64);
     let mut tokens: HashMap<&[u8], DirToken> = HashMap::with_capacity(dirs.len());
     for copy in 0..copies {
@@ -315,7 +315,12 @@ fn run(
         for dir in &dirs {
             let (parent, name) = split(dir.path);
             let stat = moved(&dir.stat, copy);
-            let token = batch.dir(parent_of(&tokens, parent)?, name, stat);
+            let parent = parent_of(&tokens, parent)?;
+            let token = if dir.decision == b"Traverse" {
+                batch.traversed_dir(parent, name, stat)
+            } else {
+                batch.dir(parent, name, stat)
+            };
             batch.entry_count(
                 token,
                 child_counts.get(&Some(dir.path)).copied().unwrap_or(0),
@@ -329,6 +334,7 @@ fn run(
             let ino = s.ino;
             total += 1;
             match entry.decision {
+                b"Skip" => batch.ignored(parent, name, Kind::from_mode(s.mode)),
                 b"Index" => {
                     let content = match rerun.then(|| txn.carry(&s)).flatten() {
                         Some(content) => {

@@ -1,7 +1,8 @@
 //! Names, inodes and documents: the only mutable state in Super Ferret.
 //!
 //! `(parent inode, name) → inode → document → content hash`, with dense ids
-//! assigned here (DECISIONS.md D4, D5). A rename, move or duplicate changes
+//! assigned here (DECISIONS.md D4, D5). Ignored names carry type tags and have
+//! no inode row. A rename, move or duplicate changes
 //! this crate's tables and nothing else. Also owns the contiguous name heap
 //! that filename search scans (D14), and document liveness.
 //!
@@ -27,7 +28,10 @@ mod tests;
 pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
 pub use build::BuildError;
 pub use format::{DecodeError, Section};
-pub use read::{Catalog, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN, WorkTree};
+pub use read::{
+    Catalog, Contents, Entry, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN,
+    Resolved, Target, WorkTree,
+};
 pub use transaction::{BeginError, CommitError, KeepError, Transaction};
 
 /// A content hash: the first 128 bits of BLAKE3, computed by the crawler.

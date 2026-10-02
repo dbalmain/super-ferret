@@ -109,6 +109,8 @@ pub struct Decided<'a, D> {
     pub path: &'a Path,
     /// What the policy said to do with `path`.
     pub decision: Decision,
+    /// File type, including for ignored names without stat data.
+    pub kind: ferret_catalog::Kind,
     /// `lstat` of `path`. Present for every decision other than
     /// [`Decision::Skip`].
     pub stat: Option<Stat<'a>>,
@@ -1017,6 +1019,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         name: &OsStr,
         decision: Decision,
         stat: Option<Stat<'_>>,
+        kind: FileType,
     ) -> Option<V::Dir> {
         self.visit.visit(Event::Decided(Decided {
             parent: here.token,
@@ -1025,11 +1028,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             path: bytes_path(&self.rel),
             decision,
             stat,
+            kind: catalog_kind(kind),
         }))
     }
 
-    fn emit_skip(&mut self, here: &Here<'_, V::Dir>, name: &OsStr) {
-        self.emit(here, name, Decision::Skip, None);
+    fn emit_skip(&mut self, here: &Here<'_, V::Dir>, name: &OsStr, kind: FileType) {
+        self.emit(here, name, Decision::Skip, None, kind);
     }
 
     fn emit_stat(
@@ -1040,7 +1044,13 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         stat: &rustix::fs::Stat,
         target: Option<&OsStr>,
     ) -> Option<V::Dir> {
-        self.emit(here, name, decision, Some(public_stat(stat, target)))
+        self.emit(
+            here,
+            name,
+            decision,
+            Some(public_stat(stat, target)),
+            file_type(stat),
+        )
     }
 
     /// Lists `dir` into the worker's `getdents` buffer. The listing stops at
@@ -1202,7 +1212,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             FileType::Symlink => {
                 let decision = here.rules.decide(bytes_path(&self.rel), Entry::Symlink);
                 if decision == Decision::Skip {
-                    self.emit_skip(here, name);
+                    self.emit_skip(here, name, kind);
                     return None;
                 }
                 self.finish_link(here, name, decision)
@@ -1210,7 +1220,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             FileType::Directory => self.consider_dir(here, name),
             _ => {
                 if here.rules.decide(bytes_path(&self.rel), Entry::Other) == Decision::Skip {
-                    self.emit_skip(here, name);
+                    self.emit_skip(here, name, kind);
                     return None;
                 }
                 let stat = self.stat_child(here, name)?;
@@ -1225,7 +1235,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         // owns it (D34). Only a name that could be one is statted when
         // skipped.
         if decision == Decision::Skip && !self.may_be_boundary() {
-            self.emit_skip(here, name);
+            self.emit_skip(here, name, FileType::Directory);
             return None;
         }
         let stat = self.stat_child(here, name)?;
@@ -1233,14 +1243,14 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             return None;
         }
         if decision == Decision::Skip {
-            self.emit_skip(here, name);
+            self.emit_skip(here, name, file_type(&stat));
             return None;
         }
         let seen = entry_from_stat(&stat);
         if seen != Entry::Dir {
             decision = here.rules.decide(bytes_path(&self.rel), seen);
             if decision == Decision::Skip {
-                self.emit_skip(here, name);
+                self.emit_skip(here, name, file_type(&stat));
                 return None;
             }
             if seen == Entry::Symlink {
@@ -1266,7 +1276,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         let entry = entry_from_stat(&stat);
         let decision = here.rules.decide(bytes_path(&self.rel), entry);
         if decision == Decision::Skip {
-            self.emit_skip(here, name);
+            self.emit_skip(here, name, file_type(&stat));
             return None;
         }
         if entry == Entry::Symlink {
@@ -1298,7 +1308,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             }
             let decision = here.rules.decide(bytes_path(&self.rel), seen);
             if decision == Decision::Skip {
-                self.emit_skip(here, name);
+                self.emit_skip(here, name, file_type(&stat));
                 return None;
             }
             let token = self.emit_stat(here, name, decision, &stat, None);
@@ -1958,4 +1968,16 @@ fn public_stat<'a>(stat: &rustix::fs::Stat, target: Option<&'a OsStr>) -> Stat<'
 fn decode_lossy(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes)
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+}
+
+fn catalog_kind(kind: FileType) -> ferret_catalog::Kind {
+    match kind {
+        FileType::Directory => ferret_catalog::Kind::Dir,
+        FileType::Symlink => ferret_catalog::Kind::Symlink,
+        FileType::Fifo => ferret_catalog::Kind::Fifo,
+        FileType::Socket => ferret_catalog::Kind::Socket,
+        FileType::BlockDevice => ferret_catalog::Kind::Block,
+        FileType::CharacterDevice => ferret_catalog::Kind::Character,
+        _ => ferret_catalog::Kind::File,
+    }
 }

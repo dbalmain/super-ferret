@@ -176,7 +176,7 @@ impl<'c> Run<'_, 'c> {
         let (names, mut kinds) = (catalog.name_reader(), catalog.kinds());
         for (id, child) in names.children().enumerate() {
             let child = child.0;
-            if pass[child as usize / 64] >> (child % 64) & 1 == 1 {
+            if child < catalog.inode_count() && pass[child as usize / 64] >> (child % 64) & 1 == 1 {
                 self.stats.candidates += 1;
                 let id = NameId(id as u32);
                 if self
@@ -223,6 +223,10 @@ impl<'c> Run<'_, 'c> {
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> RunResult {
         let catalog = self.catalog;
+        // Validated children are either real inode ids or ignored type tags.
+        if name.child.0 >= catalog.inode_count() {
+            return Ok(ControlFlow::Continue(()));
+        }
         let structural = name.child.0 < catalog.dir_count() && catalog.is_traversed(name.child);
         let names_pass = self
             .query
@@ -243,12 +247,18 @@ impl<'c> Run<'_, 'c> {
         if !self.query.paths.iter().all(|t| t.matches(&self.path)) {
             return Ok(ControlFlow::Continue(()));
         }
+        // Search keeps its existing file/directory/symlink result domain;
+        // the catalog's special entries are available to the find source.
+        let kind = kinds.kind(name.child);
+        if !matches!(kind, Kind::Dir | Kind::File | Kind::Symlink) {
+            return Ok(ControlFlow::Continue(()));
+        }
         self.stats.rows += 1;
         Ok(emit(&Row {
             path: &self.path,
             name: id,
             inode: name.child,
-            kind: kinds.kind(name.child),
+            kind,
         }))
     }
 

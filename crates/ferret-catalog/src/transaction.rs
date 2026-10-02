@@ -292,6 +292,10 @@ impl Transaction {
             }
             for name_id in old.children(dir) {
                 let name = old.name(name_id);
+                if let crate::Target::Ignored(kind) = name.target() {
+                    batch.ignored(token, name.bytes, kind);
+                    continue;
+                }
                 let inode = old.inode(name.child);
                 match old.kind(name.child) {
                     Kind::Dir if old.is_traversed(name.child) => {
@@ -305,7 +309,7 @@ impl Transaction {
                         let target = old.link_target(name.child).unwrap_or_default();
                         batch.symlink(token, name.bytes, inode.stat, target);
                     }
-                    Kind::File => {
+                    Kind::File | Kind::Fifo | Kind::Socket | Kind::Block | Kind::Character => {
                         let content = match inode.state {
                             ContentState::Unindexed => Content::Unindexed,
                             ContentState::Binary => Content::Binary,
