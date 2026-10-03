@@ -2347,8 +2347,8 @@ per block. Does its high type sentinel justify a different physical encoding?
 query win. Full listing, warm: A 1,369 ms vs B 1,354 ms; baseline 1,340 ms.
 ROADMAP § S1c summarises the section and query numbers; the full tables, with
 their loads, are in git history as `docs/FIND-M4A.md`. The fact that would
-change it: a much more ignored-heavy 10M fixture where nullable child/type or a separate ignored
-range saves materially more space or query time. Those two options were not
+change it: a much more ignored-heavy 10M fixture where nullable child/type or a
+separate ignored range saves materially more space or query time. Those two options were not
 implemented or measured here. There is no departure from the settled sentinel
 encoding. All seven ignored kinds have name-only rows; visible special kinds
 use a sparse 8-byte-per-row Specials section so name search loads no stat
@@ -2506,8 +2506,8 @@ and default 52,909 / 28 / 3, and every one of those rows was F1, F2 or F9.
 `/ferret`, giving `/` one more link, so `ls -la` of the start's parent differs
 (20 rows). How should the harness stop that?
 
-- A. An empty `/ferret` in every target's sandbox: one line, identical sandboxes;
-  older bfs/busybox/fd results stop being comparable on those rows.
+- A. An empty `/ferret` in every target's sandbox: one line, identical
+  sandboxes; older bfs/busybox/fd results stop being comparable on those rows.
 - B. Bind ferret's directories under a directory that already exists: no new
   root entry, but the harness paths change and a safe directory must exist.
 - C. Leave it and record a known artefact: every run report carries the list.
@@ -2623,9 +2623,9 @@ allowlisted" for the ferret oracle while ferret ran them, and scored as differ.
 How should the harness score them?
 
 The cause was found in the harness: its allowlist rewrite was not idempotent, so
-the oracle's second pass rejected its own output. B was to fix the rewrite (about
-three lines) and test that it is idempotent. The page did not preserve the other
-option's text.
+the oracle's second pass rejected its own output. B was to fix the rewrite
+(about three lines) and test that it is idempotent. The page did not preserve
+the other option's text.
 
 **Answer: B.** "It is a small change."
 
@@ -2764,8 +2764,9 @@ merges at 32 paths or 4 KiB; only the shared batch fills/partitions argv. Partia
 stages merge even after quit, before shared exit flush. Staging recovers M5b
 throughput. A cheap narrow-root donation guard made effectful starts slower
 (148.730 versus 135.290 ms live), so it was removed. The pool already persists
-across starts; no new scheduler policy is kept. ROADMAP § S1c records the measurements;
-per-cell loads and the syscall profile are in find-compat's m5c scratch.
+across starts; no new scheduler policy is kept. ROADMAP § S1c records the
+measurements; per-cell loads and the syscall profile are in find-compat's m5c
+scratch.
 
 The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap
 in overlapping read-only starts: with `-quit`, a later missing start reported
