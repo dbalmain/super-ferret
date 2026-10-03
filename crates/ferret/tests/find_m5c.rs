@@ -3,10 +3,14 @@
 
 #[path = "../../../tests/support/gnu_find.rs"]
 mod gnu;
+mod support {
+    #![allow(dead_code)] // This binary only uses `command`, not `bounded_command`.
+    pub mod fixture;
+}
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Output;
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
 
@@ -31,26 +35,19 @@ impl Tree {
         tree
     }
     fn index(&self) {
-        let output = Command::new(FERRET)
+        let output = support::fixture::command(FERRET, &self.0)
             .args(["index", "root"])
-            .current_dir(&self.0)
-            .env("FERRET_INDEX", self.0.join("index"))
             .output()
             .unwrap();
         assert!(output.status.success(), "{:?}", output);
     }
     fn run(&self, live: bool, args: &[&str]) -> Output {
-        let mut command = Command::new(FERRET);
+        let mut command = support::fixture::command(FERRET, &self.0);
         command.arg("find");
         if live {
             command.arg("-I");
         }
-        let output = command
-            .args(args)
-            .current_dir(&self.0)
-            .env("FERRET_INDEX", self.0.join("index"))
-            .output()
-            .unwrap();
+        let output = command.args(args).output().unwrap();
         assert!(output.status.success(), "{:?}", output);
         assert!(output.stderr.is_empty(), "{:?}", output);
         output
