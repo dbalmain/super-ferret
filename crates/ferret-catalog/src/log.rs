@@ -4,7 +4,7 @@ mod records;
 pub use records::Record;
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,7 @@ pub struct Log {
     transactions: Vec<Envelope>,
     end: u64,
     read: AtomicU64,
+    checkpoint: u64,
 }
 
 /// A pinned manifest, checkpoint descriptor and log descriptor. Opening reads
@@ -96,6 +97,10 @@ impl Published {
             let Some(manifest) = crate::read::read_manifest(dir)? else {
                 return Ok(None);
             };
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_PAIR.with_borrow_mut(Option::take) {
+                hook(dir);
+            }
             let pair = (|| {
                 let snapshot =
                     File::open(dir.join(format!("snapshot.{}", manifest.generation.checkpoint)))
@@ -109,7 +114,14 @@ impl Published {
                     )
                 };
                 let checkpoint = Catalog::open_checkpoint(snapshot, &manifest)?;
-                let log = Log::open(file, &manifest, checkpoint.manifest().counters)?;
+                let log = Log::open(file, &manifest, checkpoint.manifest().counters).map_err(
+                    |cause| OpenError::Log {
+                        checkpoint: manifest.generation.checkpoint,
+                        sequence: None,
+                        family: None,
+                        cause: Box::new(cause),
+                    },
+                )?;
                 Ok(Self {
                     manifest: manifest.clone(),
                     checkpoint,
@@ -164,6 +176,7 @@ impl Log {
                 transactions: Vec::new(),
                 end: 0,
                 read: AtomicU64::new(0),
+                checkpoint: m.generation.checkpoint,
             });
         };
         if m.log_end < HEADER || file.metadata().map_err(io_error)?.len() < m.log_end {
@@ -284,6 +297,7 @@ impl Log {
             transactions,
             end: m.log_end,
             read: AtomicU64::new(read),
+            checkpoint: m.generation.checkpoint,
         })
     }
     pub fn transaction_count(&self) -> usize {
@@ -307,13 +321,21 @@ impl Log {
                 let Some(file) = &self.file else {
                     return Err(corrupt("missing log descriptor"));
                 };
-                file.read_exact_at(&mut bytes, b.offset).map_err(io_error)?;
-                self.read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                if checksum(&bytes) != b.digest {
-                    return Err(corrupt("log payload checksum"));
-                }
-                let records = records::decode(&bytes, b.count, family, t.counters, t.sequence)
-                    .map_err(OpenError::Decode)?;
+                let checked = (|| {
+                    file.read_exact_at(&mut bytes, b.offset).map_err(io_error)?;
+                    self.read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    if checksum(&bytes) != b.digest {
+                        return Err(corrupt("log payload checksum"));
+                    }
+                    records::decode(&bytes, b.count, family, t.counters, t.sequence)
+                        .map_err(OpenError::Decode)
+                })();
+                let records = checked.map_err(|cause| OpenError::Log {
+                    checkpoint: self.checkpoint,
+                    sequence: Some(t.sequence),
+                    family: Some(family),
+                    cause: Box::new(cause),
+                })?;
                 let _ = b.records.set(records);
             }
         }
@@ -331,11 +353,10 @@ impl Log {
                 .iter()
                 .filter(move |b| b.family == family)
                 .flat_map(move |b| {
-                    b.records
-                        .get()
-                        .into_iter()
-                        .flatten()
-                        .map(move |r| (t.sequence, r))
+                    let Some(records) = b.records.get() else {
+                        panic!("log family {family:?} was not loaded");
+                    };
+                    records.iter().map(move |r| (t.sequence, r))
                 })
         })
     }
@@ -345,7 +366,7 @@ impl Log {
 /// validate the published payloads and truncate/sync an unpublished suffix.
 pub struct Writer {
     dir: PathBuf,
-    lock: File,
+    _lock: crate::lock::Lock,
     log: File,
     manifest: Manifest,
     poisoned: bool,
@@ -386,22 +407,15 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 impl Writer {
     pub fn open(dir: &Path) -> Result<Self, Error> {
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("lock"))
-            .map_err(Error::Io)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(Error::Locked),
-            Err(TryLockError::Error(e)) => return Err(Error::Io(e)),
-        }
-        let result = (|| {
+        let lock = crate::lock::Lock::open(dir).map_err(|e| match e {
+            crate::lock::Error::Locked => Error::Locked,
+            crate::lock::Error::Io(e) => Error::Io(e),
+        })?;
+        let result: Result<(File, Manifest), Error> = (|| {
             let pinned = Published::open(dir)
                 .map_err(Error::Previous)?
                 .ok_or(Error::MissingCheckpoint)?;
-            pinned.log.load_all().map_err(Error::Previous)?;
+            recover(dir, &pinned).map_err(Error::Previous)?;
             let mut manifest = pinned.manifest;
             let path = dir.join(format!("changes.{}", manifest.generation.checkpoint));
             if manifest.log_end == 0 {
@@ -425,26 +439,16 @@ impl Writer {
                 .write(true)
                 .open(path)
                 .map_err(Error::Io)?;
-            if log.metadata().map_err(Error::Io)?.len() > manifest.log_end {
-                log.set_len(manifest.log_end).map_err(Error::Io)?;
-                publication::sync(&log, Point::RecoverySync).map_err(Error::Io)?;
-            }
-            cleanup(dir, manifest.generation.checkpoint).map_err(Error::Io)?;
             Ok((log, manifest))
         })();
-        match result {
-            Ok((log, manifest)) => Ok(Self {
-                dir: dir.to_owned(),
-                lock,
-                log,
-                manifest,
-                poisoned: false,
-            }),
-            Err(e) => {
-                let _ = lock.unlock();
-                Err(e)
-            }
-        }
+        let (log, manifest) = result?;
+        Ok(Self {
+            dir: dir.to_owned(),
+            _lock: lock,
+            log,
+            manifest,
+            poisoned: false,
+        })
     }
     pub fn generation(&self) -> Generation {
         self.manifest.generation
@@ -497,20 +501,12 @@ impl Writer {
             .checked_add(bytes.len() as u64)
             .ok_or(Error::Invalid(DecodeError::Corrupt("log exhausted")))?;
         self.poisoned = true;
-        self.log
-            .write_all_at(&bytes, self.manifest.log_end)
-            .map_err(Error::Io)?;
-        publication::hit(Point::LogWrite).map_err(Error::Io)?;
+        publication::append(&self.log, &bytes, self.manifest.log_end).map_err(Error::Io)?;
         publication::sync(&self.log, Point::LogSync).map_err(Error::Io)?;
         publish_manifest(&self.dir, &next)?;
         self.manifest = next;
         self.poisoned = false;
         Ok(self.manifest.generation)
-    }
-}
-impl Drop for Writer {
-    fn drop(&mut self) {
-        let _ = self.lock.unlock();
     }
 }
 
@@ -578,7 +574,25 @@ fn publish_manifest(dir: &Path, m: &Manifest) -> Result<(), Error> {
     .map_err(Error::Undurable)
 }
 
+/// Caller holds the common writer lock. Validate published payloads before
+/// modifying any suffix or clearing private/orphan files.
+pub(crate) fn recover(dir: &Path, pinned: &Published) -> Result<(), OpenError> {
+    pinned.log.load_all()?;
+    if pinned.manifest.log_end != 0 {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(dir.join(format!("changes.{}", pinned.manifest.generation.checkpoint)))
+            .map_err(io_error)?;
+        if file.metadata().map_err(io_error)?.len() > pinned.manifest.log_end {
+            file.set_len(pinned.manifest.log_end).map_err(io_error)?;
+            publication::sync(&file, Point::RecoverySync).map_err(io_error)?;
+        }
+    }
+    cleanup(dir, pinned.manifest.generation.checkpoint).map_err(io_error)
+}
+
 fn cleanup(dir: &Path, checkpoint: u64) -> io::Result<()> {
+    let mut obsolete = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -588,11 +602,28 @@ fn cleanup(dir: &Path, checkpoint: u64) -> io::Result<()> {
         let orphan = ["snapshot.", "changes."].into_iter().any(|prefix| {
             name.strip_prefix(prefix)
                 .and_then(|n| n.parse::<u64>().ok())
-                .is_some_and(|n| n != checkpoint)
+                .is_some()
+                && name != format!("{prefix}{checkpoint}")
         });
         if orphan || matches!(name, "catalog.tmp" | "changes.tmp" | "current.tmp") {
-            fs::remove_file(entry.path())?;
+            obsolete.push(entry.path());
+        }
+    }
+    if !obsolete.is_empty() {
+        // A prior writer may have returned Undurable without a process/OS
+        // restart. Make current's selected pair durable before retiring any
+        // alternative pair. File contents were synced before its rename.
+        publication::sync(&File::open(dir)?, Point::RecoveryDirectorySync)?;
+        for path in obsolete {
+            fs::remove_file(path)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+type OpenHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_PAIR: std::cell::RefCell<Option<OpenHook>> = const { std::cell::RefCell::new(None) };
 }

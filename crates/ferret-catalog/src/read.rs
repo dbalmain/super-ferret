@@ -55,6 +55,13 @@ pub enum OpenError {
     Decode(DecodeError),
     /// M2 pins log records; M3 will provide their effective query view.
     OverlayRequired(Generation),
+    /// Damaged framing or payload, with the file and block to re-index.
+    Log {
+        checkpoint: u64,
+        sequence: Option<u64>,
+        family: Option<crate::log::Family>,
+        cause: Box<OpenError>,
+    },
 }
 
 impl fmt::Display for OpenError {
@@ -62,6 +69,15 @@ impl fmt::Display for OpenError {
         match self {
             Self::Io(e) => write!(f, "reading the catalog: {e}"),
             Self::Decode(e) => e.fmt(f),
+            Self::Log {
+                checkpoint,
+                sequence,
+                family,
+                cause,
+            } => write!(
+                f,
+                "changes.{checkpoint}, sequence {sequence:?}, family {family:?}: {cause}"
+            ),
             Self::OverlayRequired(g) => {
                 write!(f, "generation {g:?} requires the log overlay reader")
             }

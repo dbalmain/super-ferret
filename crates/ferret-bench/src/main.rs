@@ -76,6 +76,9 @@ fn main() -> ExitCode {
             ("open", [dir]) => open(Path::new(dir)),
             ("open-once", [dir, set]) => open_once(Path::new(dir), set),
             ("checksum", [dir]) => checksum(Path::new(dir)),
+            ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
+            ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
+            ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
             ("sections", [dir]) => sections(Path::new(dir)),
             ("query", [dir, queries @ ..]) => query(Path::new(dir), queries),
             _ => return usage(),
@@ -95,7 +98,10 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: ferret-bench scan <catalog-dir> [needle...]\n       \
          ferret-bench open <catalog-dir>\n       \
-         ferret-bench open-once <catalog-dir> names|metadata|full\n       \
+         ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \
+         ferret-bench log-fill <catalog-dir> <transactions> <records>\n       \
+         ferret-bench log-append-once <catalog-dir> <records>\n       \
+         ferret-bench log-open-once <catalog-dir>\n       \
          ferret-bench checksum <catalog-dir>\n       \
          ferret-bench sections <catalog-dir>\n       \
          ferret-bench query <catalog-dir> [query...]"
@@ -255,6 +261,13 @@ fn open_once(dir: &Path, set: &str) -> Result<()> {
             catalog.load(&Section::INODE)?;
         }
         "full" => catalog.load_all()?,
+        "legacy-full" => catalog.load(
+            &catalog
+                .section_sizes()
+                .map(|(s, _)| s)
+                .filter(|s| !matches!(s, Section::DocRefs | Section::RetainedAt | Section::Policy))
+                .collect::<Vec<_>>(),
+        )?,
         _ => return Err(format!("unknown open section set {set}").into()),
     }
     let elapsed = start.elapsed();
@@ -464,4 +477,88 @@ fn run_query(dir: &Path, text: &str, now: SystemTime) -> Result<Timed> {
         rows: stats.rows,
         read: catalog.bytes_read(),
     })
+}
+
+// Log benchmarks use real metadata replacements, preserving document bindings.
+// Preparing rows and locked recovery are outside the append timer.
+fn log_changes(
+    p: &ferret_catalog::log::Published,
+    rows: usize,
+) -> Result<ferret_catalog::log::ChangeSet> {
+    use ferret_catalog::log::{ChangeSet, Record};
+    let base = p.checkpoint();
+    base.load(&Section::INODE)?;
+    if rows > (base.inode_count() - base.dir_count()) as usize {
+        return Err("not enough file rows".into());
+    }
+    let mut records = Vec::new();
+    for id in base.dir_count()..base.dir_count() + rows as u32 {
+        let inode = base.inode(ferret_catalog::InoId(id));
+        let mut stat = inode.stat;
+        stat.mode ^= 0o100;
+        records.push(Record::InodePut {
+            id,
+            kind: ferret_catalog::Kind::from_mode(stat.mode),
+            state: inode.state,
+            doc: inode.doc.map(|d| d.0),
+            stat,
+        });
+    }
+    Ok(ChangeSet {
+        records,
+        counters: p.counters(),
+        counts: p.counts(),
+    })
+}
+fn log_fill(dir: &Path, transactions: &str, rows: &str) -> Result<()> {
+    let count: usize = transactions.parse()?;
+    let rows: usize = rows.parse()?;
+    let mut writer = ferret_catalog::log::Writer::open(dir)?;
+    let p = ferret_catalog::log::Published::open(dir)?.ok_or("no checkpoint")?;
+    let changes = log_changes(&p, rows)?;
+    for _ in 0..count {
+        writer.commit(writer.generation(), &changes)?;
+    }
+    println!(
+        "filled {count} transactions of {rows} records, sequence {}",
+        writer.generation().sequence
+    );
+    Ok(())
+}
+fn log_append_once(dir: &Path, rows: &str) -> Result<()> {
+    let rows: usize = rows.parse()?;
+    let mut writer = ferret_catalog::log::Writer::open(dir)?;
+    let p = ferret_catalog::log::Published::open(dir)?.ok_or("no checkpoint")?;
+    let changes = log_changes(&p, rows)?;
+    let path = dir.join(format!("changes.{}", p.generation().checkpoint));
+    let before = std::fs::metadata(&path)?.len();
+    let start = Instant::now();
+    writer.commit(writer.generation(), &changes)?;
+    let elapsed = start.elapsed();
+    let bytes = std::fs::metadata(path)?.len() - before;
+    println!(
+        "log-append: {rows} records, {bytes} log bytes + {} manifest bytes, {:.3} ms",
+        if rows == 0 { 0 } else { 128 },
+        elapsed.as_secs_f64() * 1e3
+    );
+    Ok(())
+}
+fn log_open_once(dir: &Path) -> Result<()> {
+    let start = Instant::now();
+    let p = ferret_catalog::log::Published::open(dir)?.ok_or("no checkpoint")?;
+    let elapsed = start.elapsed();
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let rss = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .ok_or("no VmHWM")?
+        .trim();
+    println!(
+        "log-open: {} transactions, {:.3} ms, {} checkpoint + {} log bytes read, RSS {rss}",
+        p.log().transaction_count(),
+        elapsed.as_secs_f64() * 1e3,
+        p.checkpoint().bytes_read(),
+        p.log().bytes_read()
+    );
+    Ok(())
 }

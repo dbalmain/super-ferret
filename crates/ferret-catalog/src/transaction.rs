@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -42,7 +42,6 @@ use crate::read::{self, Catalog, Kind, OpenError};
 use crate::{ContentState, DecodeError, Generation, Hash, InoId};
 
 const TEMP: &str = "catalog.tmp";
-const LOCK: &str = "lock";
 
 /// Why [`Transaction::begin`] failed.
 #[derive(Debug)]
@@ -145,9 +144,8 @@ impl std::error::Error for CommitError {}
 /// dropped; dropping it publishes nothing.
 pub struct Transaction {
     dir: PathBuf,
-    /// Held for the transaction's life and released explicitly on drop; see
-    /// the `Drop` impl.
-    lock: File,
+    /// Held for the transaction's life; the guard explicitly unlocks on drop.
+    _lock: crate::lock::Lock,
     sniffer: u32,
     policy: Hash,
     previous: Option<Catalog>,
@@ -179,23 +177,22 @@ impl Transaction {
     /// is carried or kept, and the commit replaces it.
     pub fn begin(dir: &Path, sniffer: u32) -> Result<Transaction, BeginError> {
         fs::create_dir_all(dir).map_err(BeginError::Io)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(LOCK))
-            .map_err(BeginError::Io)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(BeginError::Locked),
-            Err(TryLockError::Error(e)) => return Err(BeginError::Io(e)),
-        }
-        remove_temp(dir).map_err(BeginError::Io)?;
-        let previous = match Catalog::open(dir) {
-            // Another format: nothing can be carried, and the commit
-            // replaces it (S1a). Re-hashing once is the migration.
+        let lock = crate::lock::Lock::open(dir).map_err(|e| match e {
+            crate::lock::Error::Locked => BeginError::Locked,
+            crate::lock::Error::Io(e) => BeginError::Io(e),
+        })?;
+        let previous = match crate::log::Published::open(dir) {
+            // Another format: nothing can be carried; indexing replaces it.
             Err(OpenError::Decode(DecodeError::Version(_))) => None,
-            other => other.map_err(BeginError::Previous)?,
+            Ok(Some(pinned)) => {
+                crate::log::recover(dir, &pinned).map_err(BeginError::Previous)?;
+                Some(pinned.into_checkpoint().map_err(BeginError::Previous)?)
+            }
+            other => {
+                other.map_err(BeginError::Previous)?;
+                remove_temp(dir).map_err(BeginError::Io)?;
+                None
+            }
         };
         if previous.is_none() {
             sync_ancestors(dir).map_err(BeginError::Io)?;
@@ -217,7 +214,7 @@ impl Transaction {
         }
         Ok(Transaction {
             dir: dir.to_owned(),
-            lock,
+            _lock: lock,
             sniffer,
             policy: previous.as_ref().map_or([0; 16], Catalog::policy),
             previous,
@@ -369,10 +366,10 @@ impl Transaction {
         }
         let bytes = fs::read(dir.join(read::FILE)).map_err(CommitError::Write)?;
         let mut generation = Generation::fresh().map_err(CommitError::Write)?;
-        while dir
-            .join(format!("snapshot.{}", generation.checkpoint))
-            .exists()
-        {
+        while ["snapshot", "changes"].iter().any(|prefix| {
+            dir.join(format!("{prefix}.{}", generation.checkpoint))
+                .exists()
+        }) {
             generation.checkpoint = generation
                 .checkpoint
                 .checked_add(1)
@@ -422,11 +419,11 @@ impl Transaction {
             None => Generation::fresh().map_err(CommitError::Write)?,
         };
         // An abandoned checkpoint is never adopted or overwritten.
-        while self
-            .dir
-            .join(format!("snapshot.{}", generation.checkpoint))
-            .exists()
-        {
+        while ["snapshot", "changes"].iter().any(|prefix| {
+            self.dir
+                .join(format!("{prefix}.{}", generation.checkpoint))
+                .exists()
+        }) {
             generation.checkpoint = generation
                 .checkpoint
                 .checked_add(1)
@@ -487,25 +484,12 @@ impl Transaction {
     }
 }
 
-/// Releases the lock with `LOCK_UN` rather than by closing the file. `flock`
-/// belongs to the open file description, which a child forked by any thread
-/// shares until it execs; closing only this process's descriptor then leaves
-/// the lock held, and the next `begin` sees `Locked`. Seen in the crawl tests,
-/// where other tests spawn `git` and `chmod` (slice 4). Unlocking releases it
-/// for every copy.
-impl Drop for Transaction {
-    fn drop(&mut self) {
-        // Nothing to do if it fails: closing the file is the fallback.
-        let _ = self.lock.unlock();
-    }
-}
-
 #[cfg(test)]
 impl Transaction {
     /// Test seam: a second descriptor for the lock's open file description,
     /// as a forked child would hold.
     pub(crate) fn lock_copy(&self) -> File {
-        self.lock.try_clone().expect("dup the lock descriptor")
+        self._lock.copy().expect("dup the lock descriptor")
     }
 }
 

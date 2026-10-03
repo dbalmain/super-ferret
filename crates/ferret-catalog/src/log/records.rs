@@ -307,7 +307,11 @@ pub(super) fn decode(
         let record = match b[0] {
             1 => {
                 exact(24)?;
-                if b[14..16] != [0; 2] || b[20..24] != [0; 4] || b[13] != 0 || u32_at(b, 16) == 0 {
+                if b[14..16] != [0; 2]
+                    || b[20..24] != [0; 4]
+                    || b[13] != 0
+                    || (u32_at(b, 16) == 0 && kind(b[12])? != Kind::Dir)
+                {
                     return Err(bad());
                 }
                 Record::LifePut {

@@ -13,12 +13,14 @@
 //! - `build`: merges batches and carried roots into tables (D29, D30, D31).
 //! - `format`: the snapshot file, its encoder and its validating decoder.
 //! - [`read`]: [`Catalog`], one opened generation, and its accessors.
-//! - [`transaction`]: the single writer: lock, carry-over, commit (D26, D32).
+//! - [`transaction`]: checkpoint writer: lock, carry-over, commit (D26, D32).
+//! - [`log`]: durable changes, published prefixes and lazy family checks.
 
 pub mod batch;
 mod build;
 mod format;
 mod generation;
+mod lock;
 pub mod log;
 mod migrate;
 mod packed;

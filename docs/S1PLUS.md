@@ -216,7 +216,8 @@ count at 32 and bytes at 36 (`align8(36 + L + 1)`). Their deletes are
 16 B id/reserved records. PolicyPut is 24 B, its hash at 8..24.
 DirPut flags use bits 0..3 for traversed, search suppressed, complete,
 retained fault; retained-at is u64::MAX for none. LifePut flags are currently
-zero; kind uses the `Kind` discriminants 0..6. All other flags are zero.
+zero; a root directory may have zero indexed names, while other inode births
+require at least one. Kind uses the `Kind` discriminants 0..6. All other flags are zero.
 The log header is magic `FERRETCL` at 0, version at 8, zeros at 12..16,
 incarnation at 16, checkpoint at 32, checkpoint sequence at 40 and checksum
 of 0..48 at 48. Transaction magic is `FERRETTX`.
@@ -299,6 +300,9 @@ One slow reader can pin one old checkpoint, so disk/RSS reporting includes
 retired-but-open generations. Directory creation keeps today's ancestor-sync
 discipline. Recovery removes abandoned temp/orphan checkpoint files under the
 writer lock after establishing the manifest's pair; it never adopts them.
+If obsolete files exist, recovery first syncs the directory containing the
+selected manifest: a prior `Undurable` writer may have stopped without an OS
+restart, so a readable rename alone is not permission to retire its old pair.
 No live or retired snapshot is truncated or rewritten.
 
 ## Epoch-scoped ids
