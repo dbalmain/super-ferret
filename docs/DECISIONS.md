@@ -65,6 +65,7 @@ Predecessors, carried forward where still open:
 | D47 | `ferret find` as a drop-in for find(1)                   | answered       | C: find semantics except ignore rules                                                                          |
 | D48 | The next move after S1                                   | answered       | A: compaction; name index only if 10M misses 1 GB                                                              |
 | D49 | A one-shot query with no daemon running                  | answered       | A: spawn on first use, in-process fallback                                                                     |
+| D50 | `ferret find` stretch calls F1–F13                       | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                     |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2426,6 +2427,13 @@ relaxation is selected. The fact that changes it: Dave accepting catalog order
 for those plans, or evidence that persisted order can stay current cheaply.
 The functional implementation therefore does not complete the speed gate.
 
+**Superseded in part (2026-10-03, D50).** F7, F8, F10 and F12 replace 4b's
+live listing order, its new-name visibility, its live stat and its live
+`-empty`: default mode is now a pure index query in catalog order, with stored
+metadata, and `-empty` subtracts the walk's own `-delete` removals. The config
+key and the refusal without a covering index stand. [FIND.md](FIND.md) is the
+current contract.
+
 ## D48 — The next move after S1
 
 **Question:** S1 is done. What comes next?
@@ -2478,7 +2486,238 @@ explicit `ferretd` is the whole design.
 **Answer (2026-09-30): A.** Start the daemon on first use; build the engine in
 process when a background process is not allowed or `FERRET_NO_DAEMON` is set.
 
-## Find M5b — quit while an action is running (answered)
+## D50 — The `ferret find` stretch's calls (answered 2026-10-03, on the decisions page)
+
+The find stretch (ROADMAP § S1c, milestones M1–M5c) asked its questions on an
+HTML decisions page rather than here, numbered F1–F13. Each is recorded below
+with its options, Dave's answer and the reason. The contract they produced is
+[FIND.md](FIND.md). Dave's standing rule for the stretch (2026-10-03): take the
+fastest answer and the simplest to maintain over time; more work now, and
+harness changes, are fine; discuss only where fastest and simplest disagree.
+
+F1, F2, F6 and F9 are changes to the private find-compat harness, not to
+ferret. They are recorded because they decide what "zero differ" means. After
+M4 the full corpus stood at `-I` 67,394 agree / 20 differ / 6 harness failures
+and default 52,909 / 28 / 3, and every one of those rows was F1, F2 or F9.
+
+### F1 — The sandbox root's link count
+
+**Question:** ferret's sandbox binds its XDG and index directories under
+`/ferret`, giving `/` one more link, so `ls -la` of the start's parent differs
+(20 rows). How should the harness stop that?
+
+- A. An empty `/ferret` in every target's sandbox: one line, identical sandboxes;
+  older bfs/busybox/fd results stop being comparable on those rows.
+- B. Bind ferret's directories under a directory that already exists: no new
+  root entry, but the harness paths change and a safe directory must exist.
+- C. Leave it and record a known artefact: every run report carries the list.
+
+**Answer: A** (harness change). Smallest change, identical sandboxes, no
+exception list.
+
+### F2 — Commands that hang on the tree's FIFO
+
+**Question:** Three commands `cat` or `grep` every entry and block on the FIFO
+in two trees, so both GNU and ferret time out (6 rows). How should such a row
+score?
+
+- A. A separate status, outside both differ and error, listed beside the gate.
+- B. Score a both-sides timeout as agree: one clean number, but it calls two
+  outputs equal without comparing them.
+- C. Remove the FIFO: loses the coverage that FIFOs are catalogued.
+
+**Answer: A** (harness change, the `both-timeout` status). A timed-out run's
+partial stdout depends on scheduling, so B would be a claim the harness cannot
+make.
+
+### F3 — Parallelism in the live walk
+
+**Question:** Should `ferret find -I` walk directories in parallel, given that
+its output order would then stop matching GNU's? After M3b, single-threaded
+`-I` beat GNU on every timing row and was at or below `bfs -j1` on all but
+`-maxdepth 2`; the gap to default bfs and to fd was threads.
+
+- A. Keep `-I` sequential; parallelise only default mode's live fallback.
+- B. `-I` goes parallel when the expression does not depend on order, which
+  needs a classifier for order-sensitive expressions.
+- C. Parallel only behind a flag or config key.
+
+**Answer: superseded by F10 B.** The live walk is parallel in every mode, with
+no order classifier; F11 settles actions.
+
+### F4 — A stray file in the repository root
+
+**Question:** May the untracked, empty `1T`, apparently a stray shell redirect,
+be deleted? A: delete it. B: leave it in `git status`.
+
+**Answer: A.** Deleted.
+
+### F5 — Walking relative to each directory's fd
+
+**Question:** Should `-I` open and stat entries relative to the parent
+directory's fd, as GNU does, instead of by full path? Two shapes outside the
+corpus differ: a tree deeper than PATH_MAX, and an ancestor renamed mid-walk.
+
+- A. Stay path-based: no cost; those two shapes stay wrong.
+- B. Go fd-relative: a medium slice touching every metadata call site, with no
+  measured speed gain.
+
+**Answer: A.** Same speed and less code. FIND.md lists both shapes as known
+differences.
+
+### F6 — The harness's catalogue listing used a retired command
+
+**Question:** find-compat's control 3 listed the catalogue with
+`ferret find --json -- '*'`, the atom grammar that moved to `ferret search`.
+What should it run?
+
+- A. `ferret search --json -- '*'`: one word, but search keeps its old
+  file/directory/symlink domain, so special files never appear.
+- B. Default-mode `ferret find / -print` once M4b landed: lists everything the
+  find source sees, special files included.
+
+**Answer: B** (harness change). Control 3 then passes for the right reason.
+
+### F7 — Output order in default mode
+
+**Question:** M4b listed each visible directory live to keep GNU's order, which
+made default mode as slow as the live walk: `-name '*.c'` took 185 ms against
+fd's 25 ms, while catalog-only search answered in 12 ms. May default mode print
+in catalog order?
+
+- A. Catalog order whenever the plan cannot observe order.
+- B. Persist readdir order in the catalog: exact and fast, but a permutation
+  column, crawl work, and staleness on every create and rename.
+- C. Keep the live listing: exact, and 4–7 times behind fd.
+
+**Answer: A, unconditionally** (under F10 B). Default mode prints in catalog
+order for every expression, `-quit` included; live listing is used only below
+opaque markers. It was the only option that met the speed goal without daemon
+work.
+
+### F8 — Where default mode gets stat data
+
+**Question:** Should default mode answer `-size`, `-mtime` and the other stat
+tests from stored columns instead of a live lstat? In M4b's ordered source,
+`-size +1024c` took 443 ms with live stat and 170 ms with stored columns; fd
+took 51 ms.
+
+- A. Live lstat, in parallel: current metadata; new code, speed unmeasured.
+- B. Stored columns: well below fd, with the index's freshness, like `locate`.
+- C. Stored columns only inside a daemon-watched set: fast and current, but
+  waits for the daemon.
+
+The recommendation was A now, C with the daemon.
+
+**Answer: B.** Default mode is a pure index query: catalog order, stored
+metadata, and a live walk only below opaque markers. It will not be advertised
+until the daemon keeps the index current; C follows with the daemon. Cold reads
+get less weight in performance work, since the daemon is the normal mode (D46,
+D49); D30 is amended to match. This replaces D47's 4b freshness brief, which
+retained live lstat.
+
+### F9 — Oracle skips that scored as differences
+
+**Question:** In default mode, 12 rows came out as "skipped: command not
+allowlisted" for the ferret oracle while ferret ran them, and scored as differ.
+How should the harness score them?
+
+The cause was found in the harness: its allowlist rewrite was not idempotent, so
+the oracle's second pass rejected its own output. B was to fix the rewrite (about
+three lines) and test that it is idempotent. The page did not preserve the other
+option's text.
+
+**Answer: B.** "It is a small change."
+
+### F10 — What order `ferret find` promises
+
+**Question:** When an expression can observe walk order, which order must
+`ferret find` produce? GNU's sibling order is readdir order, which on ext4 is
+hash order: arbitrary, and changed by copying the tree. fd and bfs do not keep
+it. The harness sorts line output, but order still shows in `-quit` (829 corpus
+commands), in `-printf` with no separator, and in `-exec +` argument order.
+
+- A. Free order unless the expression can observe it: zero differ stays
+  reachable, but a classifier must recognise every order-sensitive shape.
+- B. Free order everywhere, with only the structural rules: the simplest code,
+  fastest on `-quit` too; about 70 harness rows differ on order alone, and the
+  harness must learn to classify them.
+- C. GNU order always: no classifier; `-I` stays 3–5 times behind fd, and
+  default mode needs F7 B.
+
+**Answer: B.** Free order everywhere; the harness learns to classify order-only
+rows. The structural rules are a parent before its children, children first
+under `-depth` and `-delete`, and `-prune` stopping descent.
+
+### F11 — Actions under a parallel walk
+
+**Question:** When the walk is parallel, may `-exec`, `-execdir` and `-delete`
+run concurrently? `-exec` is a test, so a worker would otherwise wait on a
+single action thread for its exit status.
+
+- A. Concurrent actions, fd's model: workers run commands themselves; each
+  child's stdout is buffered and written whole; `-ok` prompts take a lock.
+  Commands with clashing side effects can leave a different tree from run to
+  run.
+- B. Serial actions: a deterministic tree for a given order, but workers stall
+  on every `-exec` used as a test, and a hand-off channel is more code.
+
+**Answer: A.** Both of Dave's criteria point at it. H1, on find-compat's
+`ferret-harness` branch, takes F1, F2, F6, F9 and order-only rows; M5a makes
+default mode a pure index query; M5b, the parallel walk, follows.
+
+### F12 — Index answers inside commands that change the tree
+
+**Question:** M5a's full corpus found 85 rows where actions went wrong. Opening
+directories and dropping vanished children, only when the expression has an
+action, fixed 77. The other 8 were `-depth … -type d -empty -delete`: the index
+still says a directory has children after the walk deleted them. Should
+effectful expressions read the disk?
+
+- A. Expressions with actions read stat live: one rule, which also stops a stale
+  `-mtime` deciding what `-delete` removes.
+- B. Live `-empty` only, when the expression has actions.
+- C. Index answers everywhere: accepts the 8 rows.
+- D. The walk counts the children it deleted itself: `-empty` is the indexed
+  count minus this walk's own `-delete` removals; no live reads, and it cannot
+  see `-exec rm` or `-exec rmdir`.
+
+A was recommended. A current daemon would not fix the 8 rows, because the walk
+reads index state before it starts and the daemon's updates arrive
+asynchronously; 91 of the corpus's 163 `-empty` commands also delete.
+
+**Answer: D.** `find . -depth -type d -empty -exec rmdir {} \;` leaving an
+emptied parent in default mode is accepted: use `-delete`, or `-I`. Revisit only
+if a user brings a case that neither solves.
+
+### F13 — Stat fields the catalog does not store
+
+**Question:** Should the catalog add atime and allocated-block columns, so that
+`-atime`, `-amin`, `-used`, `%a`, `%b`, `%k` and `-ls` stop doing a live lstat?
+Over 300k entries the fallback cost about 350 ms against about 40 ms stored. At
+10M: atime 31.1 MB on this fixture (up to about 77 MB with fully varying
+times) and blocks 6.1 MB, against 553 MB of sections.
+
+- A. Keep the lazy fallback: no format change; these primaries run at `-I`
+  speed; a stored atime is usually stale, since reading a file changes it.
+- B. Add both columns: index speed; about 37 MB at 10M and a migration.
+- C. Blocks only: 6 MB for index-speed `-ls` and `%k`.
+
+**Answer: A.** Atime, allocated blocks, birth time and device numbers stay
+lazy. The fact that would change it: query logs showing `-ls` or `%k` in normal
+use (then C).
+
+### M4b's own calls, recorded in D47
+
+The config key `find_no_ignore = true`, and refusing default mode without a
+covering index, were decided inside M4b and are recorded under D47 (4b
+fallback and configuration). The page asked Dave to say if either should
+change; no change is recorded.
+
+The two follow-ups below were asked and answered during M5b and M5c, in this
+file, and refine F11.
+
+### Find M5b — quit while an action is running (answered)
 
 **Question.** Does F11's “stops every worker promptly” require terminating
 a command or interactive prompt already started on another worker, or
@@ -2498,7 +2737,7 @@ entries finishing later discard their buffered output. Side effects already
 performed remain. Collected batches flush at exit. This accepts exit latency
 from a slow command or unanswered prompt and avoids cancellation machinery.
 
-## Find M5c — measured batching and many-start costs (answered)
+### Find M5c — measured batching and many-start costs (answered)
 
 **Question.** The initial implementation sequences all starts and runs full
 shared batches while holding their mutex. Fifteen warm samples on the 300k tree
@@ -2525,14 +2764,10 @@ merges at 32 paths or 4 KiB; only the shared batch fills/partitions argv. Partia
 stages merge even after quit, before shared exit flush. Staging recovers M5b
 throughput. A cheap narrow-root donation guard made effectful starts slower
 (148.730 versus 135.290 ms live), so it was removed. The pool already persists
-across starts; no new scheduler policy is kept. ROADMAP § S1c records measurements,
-loads, syscall evidence and final validation.
+across starts; no new scheduler policy is kept. ROADMAP § S1c records the measurements;
+per-cell loads and the syscall profile are in find-compat's m5c scratch.
 
 The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap
 in overlapping read-only starts: with `-quit`, a later missing start reported
 ENOENT and exit 1 before the first start quit, where GNU exits 0 silently.
 Starts now also sequence when the expression contains `-quit`.
-
-## D50 — The `ferret find` stretch's calls (answered 2026-10-03, on the decisions page)
-
-(to fill: F1–F13.)
