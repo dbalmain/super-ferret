@@ -183,15 +183,15 @@ pub trait Effects {
         Ok(())
     }
     /// Writes an output-file record through the evaluator's entry adapter.
-    fn file(
-        &mut self,
-        file: &std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
-        bytes: &[u8],
-    ) -> io::Result<()> {
+    fn file(&mut self, file: &action::SharedFile, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        file.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_all(bytes)
+        let mut guard = file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer = guard.as_mut().ok_or_else(|| {
+            io::Error::other("output file target was not opened during preparation")
+        })?;
+        writer.write_all(bytes)
     }
     /// Prompts and reads one answer line. Only initial y/Y is yes in C locale.
     fn confirm(&mut self, program: &std::ffi::OsStr, path: &Path) -> io::Result<bool> {
@@ -346,7 +346,7 @@ impl Plan {
             return Ok(None);
         }
         let mut expression = self.expression.clone();
-        if let Err(error) = resolve_references(&mut expression, source.catalog()) {
+        if let Err(error) = prepare_expression(&mut expression, source.catalog()) {
             effects.error(&WalkError {
                 path: ".".into(),
                 error,
@@ -440,12 +440,22 @@ fn expression_sections(expression: &Expression, out: &mut Vec<ferret_catalog::Se
     });
 }
 
-fn resolve_references(
+/// One ordered pass over the expression, left to right, that does the two
+/// things parsing could not: observe `-newer`-style references against the
+/// live catalog, and open (truncating) each `-fprint`/`-fprintf` output
+/// file. Both must happen in the expression's written order - `-newer ref
+/// -fprint ref` must read `ref`'s mtime before `-fprint ref` truncates it,
+/// and `-fprint ref -newer ref` must truncate first (#6) - so one function
+/// does both rather than two passes racing on order.
+fn prepare_expression(
     expression: &mut Expression,
     catalog: Option<&ferret_catalog::Catalog>,
 ) -> io::Result<()> {
     expression.try_visit_mut(&mut |leaf| match leaf {
         Expression::Test(test) => test.resolve_reference(catalog),
+        Expression::Action(action::Action::Output(target, _) | action::Action::List(target)) => {
+            target.open()
+        }
         _ => Ok(()),
     })
 }

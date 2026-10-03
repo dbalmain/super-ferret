@@ -252,7 +252,14 @@ fn symlink_following_and_cycles_go_through_entry_metadata() {
 }
 
 #[test]
-fn output_files_open_at_parse_time_and_same_name_shares_one_stream() {
+fn output_files_open_during_prepare_and_same_name_shares_one_stream() {
+    // #6: files used to open (and truncate) at parse time, before any
+    // `-newer`-style reference sharing the same path could observe it.
+    // They now open during `prepare`'s ordered pass instead - still
+    // unconditionally (even behind a leading `-false`, since `prepare`
+    // visits every leaf regardless of runtime truthiness), but late enough
+    // that a reference test earlier in the expression sees the file before
+    // it is truncated.
     let tree = Tree::new();
     let path = tree.0.join("output");
     fs::write(&path, b"old").unwrap();
@@ -264,8 +271,15 @@ fn output_files_open_at_parse_time_and_same_name_shares_one_stream() {
         path.clone().into_os_string(),
     ];
     let plan = Plan::parse(&args).unwrap();
-    assert_eq!(fs::read(&path).unwrap(), b"");
+    assert_eq!(fs::read(&path).unwrap(), b"old", "parsing must not open it");
     drop(plan);
+    run(&args);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"",
+        "prepare opens it even though -false means -fprint never runs"
+    );
+    fs::write(&path, b"old").unwrap();
     let args = [
         "-I".into(),
         tree.0.clone().into_os_string(),

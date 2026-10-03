@@ -260,3 +260,57 @@ fn followed_dangling_reference_uses_the_link_itself() {
     assert!(actual.stderr.is_empty(), "{actual:?}");
     assert_eq!(actual.stdout, expected.stdout, "catalog mode: {actual:?}");
 }
+
+#[test]
+fn reference_observation_and_output_truncation_run_in_expression_order() {
+    // #6: `-fprint`/`-fprintf` used to open (and truncate) their target at
+    // parse time, unconditionally before any `-newer`-style reference test
+    // observed its mtime - regardless of which came first in the
+    // expression. `reference` and `-fprint reference` name the same file;
+    // whether `-newer reference`'s observation sees its original mtime
+    // (1000s) or the fresh mtime truncation gives it depends only on
+    // expression order now.
+    // `reference` starts far in the past; `candidate` is a few seconds
+    // old - newer than the original `reference`, but older than "now",
+    // which is what `reference` becomes the instant `-fprint` truncates
+    // it. That is exactly what should flip `-newer reference`'s answer
+    // depending on which runs first.
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    let new = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+    let seed = |tree: &Tree| {
+        fs::write(tree.0.join("reference"), b"ref").unwrap();
+        fs::write(tree.0.join("candidate"), b"cand").unwrap();
+        fs::File::open(tree.0.join("reference"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        fs::File::open(tree.0.join("candidate"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(new))
+            .unwrap();
+    };
+
+    for (at, args) in [
+        vec!["candidate", "-newer", "reference", "-fprint", "reference"],
+        vec!["candidate", "-fprint", "reference", "-newer", "reference"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let gnu_tree = Tree::new(&format!("reference-output-order-gnu-{at}"));
+        seed(&gnu_tree);
+        let expected = gnu_tree.run(true, &args);
+        assert!(expected.status.success(), "{expected:?}");
+
+        let ferret_tree = Tree::new(&format!("reference-output-order-ferret-{at}"));
+        seed(&ferret_tree);
+        let actual = ferret_tree.run(false, &args);
+        assert!(actual.status.success(), "{actual:?}");
+        assert_eq!(actual.stdout, expected.stdout, "args={args:?}: {actual:?}");
+        assert_eq!(
+            fs::read(ferret_tree.0.join("reference")).unwrap(),
+            fs::read(gnu_tree.0.join("reference")).unwrap(),
+            "args={args:?}: ferret's reference content must match GNU's"
+        );
+    }
+}

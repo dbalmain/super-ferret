@@ -4,8 +4,6 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::File;
-use std::io::BufWriter;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -198,7 +196,7 @@ struct Parser<'a> {
     warnings: Vec<String>,
     message: Option<String>,
     dialect: Dialect,
-    streams: HashMap<PathBuf, Arc<Mutex<BufWriter<File>>>>,
+    streams: HashMap<PathBuf, super::action::SharedFile>,
     exec_id: usize,
     delete: bool,
     prune: bool,
@@ -555,15 +553,15 @@ impl Parser<'_> {
         if path == std::path::Path::new("/dev/stdout") {
             return Ok(Target::Stdout);
         }
+        // The file itself opens (and truncates) later, during `prepare`'s
+        // single ordered pass over the expression - in step with any
+        // `-newer`-style reference observation, not here at parse time
+        // (#6). Parsing only reserves the shared, as-yet-unopened cell,
+        // deduplicated by path so repeated targets share one open.
         let file = match self.streams.get(&path) {
             Some(file) => file.clone(),
             None => {
-                let file = Arc::new(Mutex::new(BufWriter::with_capacity(
-                    4096,
-                    File::create(&path).map_err(|error| {
-                        ParseError::Feature(format!("{}: {error}", path.display()))
-                    })?,
-                )));
+                let file = Arc::new(Mutex::new(None));
                 self.streams.insert(path.clone(), file.clone());
                 file
             }

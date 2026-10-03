@@ -102,7 +102,7 @@ impl OutputBuffer {
 #[derive(Default)]
 pub(super) struct Record {
     stdout: OutputBuffer,
-    files: Vec<(Arc<Mutex<io::BufWriter<File>>>, OutputBuffer)>,
+    files: Vec<(super::action::SharedFile, OutputBuffer)>,
 }
 
 pub(super) struct EntryEffects<'a, E> {
@@ -138,9 +138,12 @@ impl<E: Effects> EntryEffects<'_, E> {
                 .emit(|bytes| self.host.write(bytes))
                 .and_then(|()| {
                     for (file, spool) in &mut self.record.files {
-                        let mut file = file
+                        let mut guard = file
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let file = guard.as_mut().ok_or_else(|| {
+                            io::Error::other("output file target was not opened during preparation")
+                        })?;
                         spool.emit(|bytes| file.write_all(bytes))?;
                         file.flush()?;
                     }
@@ -167,11 +170,7 @@ impl<E: Effects> Effects for EntryEffects<'_, E> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.record.stdout.write_all(bytes)
     }
-    fn file(
-        &mut self,
-        file: &std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
-        bytes: &[u8],
-    ) -> io::Result<()> {
+    fn file(&mut self, file: &super::action::SharedFile, bytes: &[u8]) -> io::Result<()> {
         let index = match self
             .record
             .files

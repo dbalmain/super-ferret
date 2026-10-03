@@ -1,7 +1,9 @@
 //! Process, deletion and output primaries. Compiled actions are immutable;
 //! pending exec batches belong to one run. Workers stage bounded chunks; only
 //! the shared batch partitions ordinary exec argv. Output files open during
-//! parsing.
+//! `prepare`'s ordered pass over the expression, not at parse time, so they
+//! land in expression order relative to any reference observation sharing
+//! the same path (#6).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -26,10 +28,14 @@ pub(super) enum Action {
     List(Target),
 }
 
+/// A shared, lazily-opened output file. `None` until `Target::open` runs
+/// during `prepare`'s ordered pass (#6).
+pub(super) type SharedFile = Arc<Mutex<Option<BufWriter<File>>>>;
+
 #[derive(Clone, Debug)]
 pub(super) enum Target {
     Stdout,
-    File(PathBuf, Arc<Mutex<BufWriter<File>>>),
+    File(PathBuf, SharedFile),
 }
 
 impl PartialEq for Target {
@@ -49,6 +55,26 @@ impl Target {
             Self::Stdout => effects.write(bytes),
             Self::File(_, file) => effects.file(file, bytes),
         }
+    }
+
+    /// Opens (truncating) a file target in place, if it was not already
+    /// opened by an earlier appearance of the same target. Called once, in
+    /// expression order, during `prepare` (#6) - never at parse time, so
+    /// expression order (not argument-parse order) decides its position
+    /// relative to any reference observation sharing the same path.
+    pub(super) fn open(&mut self) -> io::Result<()> {
+        let Self::File(path, file) = self else {
+            return Ok(());
+        };
+        let mut guard = file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_some() {
+            return Ok(());
+        }
+        let opened = File::create(path)?;
+        *guard = Some(BufWriter::with_capacity(4096, opened));
+        Ok(())
     }
 }
 
@@ -76,7 +102,7 @@ pub(super) struct State {
     pub shared: Arc<Mutex<BTreeMap<usize, Batch>>>,
     buffer: Vec<u8>,
     limit: Option<Budget>,
-    files: Vec<Arc<Mutex<BufWriter<File>>>>,
+    files: Vec<SharedFile>,
     pub errors: u64,
     // Batch commits share the entry record's gate, so a batch's output can
     // never split an entry's and vice versa. Set once per task, including
@@ -85,14 +111,25 @@ pub(super) struct State {
     pub quit: Arc<AtomicBool>,
 }
 
+fn flush_files(files: &[SharedFile]) -> io::Result<()> {
+    for file in files {
+        // `None` here means this target's `prepare`-time open is the one
+        // still pending (or failed and already reported); either way there
+        // is nothing committed yet to flush.
+        if let Some(writer) = file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            writer.flush()?;
+        }
+    }
+    Ok(())
+}
+
 impl State {
     pub(super) fn flush_files(&self) -> io::Result<()> {
-        for file in &self.files {
-            file.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .flush()?;
-        }
-        Ok(())
+        flush_files(&self.files)
     }
 
     pub fn flush(&mut self, effects: &mut impl Effects, directories_only: bool) -> io::Result<()> {
@@ -438,11 +475,7 @@ fn execute(
             // Bound worker staging by count and bytes. A single oversized path
             // is immediately collected; only the shared batch partitions argv.
             if batch.paths.len() >= 32 || batch.bytes - command_bytes(&exec.args) >= 4096 {
-                for file in &state.files {
-                    file.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .flush()?;
-                }
+                flush_files(&state.files)?;
                 state.errors +=
                     batch.collect(&state.shared, limit, effects, &state.gate, &state.quit)?;
             }
@@ -454,11 +487,7 @@ fn execute(
             .or_insert_with(|| Batch::new(exec, directory.clone(), handle.clone()));
         let bytes = path.as_bytes().len() + 1;
         if batch.directory != directory || batch.full(bytes, limit) {
-            for file in &state.files {
-                file.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .flush()?;
-            }
+            flush_files(&state.files)?;
             state.errors += u64::from(!batch.run(effects, &state.gate, &state.quit)?);
         }
         batch.directory = directory;
