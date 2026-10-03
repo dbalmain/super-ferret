@@ -640,7 +640,7 @@ included rather than treating the three final states as identical.
 
 | Query | Median ms, 0 / 1 / 2% | Current RSS MiB, 0 / 1 / 2% | Peak MiB, 0 / 1 / 2% | Source command | Commit | Load ranges (1 / 5 / 15 min) |
 | --- | ---: | ---: | ---: | --- | --- | --- |
-| `` (all names) | 526.60 / 765.02 / 801.03 | 603.48 / 699.64 / 796.30 | 634.27 / 729.99 / 823.63 | `$B resident-once "$I" ""` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
+| `""` (all names) | 526.60 / 765.02 / 801.03 | 603.48 / 699.64 / 796.30 | 634.27 / 729.99 / 823.63 | `$B resident-once "$I" ""` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
 | `case:Flamegraph` | 8.63 / 9.43 / 9.21 | 603.34 / 699.64 / 796.29 | 635.04 / 729.04 / 823.24 | `$B resident-once "$I" "case:Flamegraph"` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
 | `test` | 67.42 / 106.70 / 117.69 | 603.41 / 699.63 / 796.34 | 634.54 / 729.78 / 823.76 | `$B resident-once "$I" "test"` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
 | `size:>100M` | 191.81 / 213.70 / 227.75 | 605.96 / 700.70 / 796.28 | 634.77 / 729.51 / 823.79 | `$B resident-once "$I" "size:>100M"` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
@@ -672,6 +672,31 @@ policy. Do not add a second persistent tree to hide this representation cost.
 The 5.10 ms large carry is occasional CPU merge latency, not a durability or
 end-to-end scoped-update measurement. Full recrawl diff and durable update
 costs belong to M4; repeated churn/compaction and retained-reader budgets to M7.
+
+
+The namespace generation has a separate cost: immutable **record runs** merge
+geometrically, but a changed namespace rematerialises its sparse latest-name heap
+and base-id suppression stream. Metadata-only generations share those buffers.
+To avoid hiding this cost under the metadata carry result, one real NamePut at the
+first live edge was advanced and then published at 0/1/2% existing overlays.
+Source **`4f87e00`** adds only this bench command and documentation to the same
+reader implementation as `2e12d7b`. Writer open, inverse reference preparation,
+record creation and durable I/O are outside the timer. One warm-up and seven
+samples per fixture, reversing fixture order each round, fresh process/log reset.
+All usual uptime/pgrep and XDG/index isolation checks apply.
+
+| Existing overlay | Namespace advance median (range), ms | Runs before → after | RSS / peak MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | --- | ---: | --- | --- | --- |
+| 0% | 0.05 (0.05–0.06) | 0 → 1 | 643.09 / 643.09 | `$B overlay-rename-once /tmp/s1plus-m3-overlays/rename` | `4f87e00` | 2.34–2.50 / 2.56–2.60 / 2.53–2.54 |
+| 1% | 15.41 (15.03–15.94) | 2 → 3 | 752.31 / 752.31 | `$B overlay-rename-once /tmp/s1plus-m3-overlays/rename` | `4f87e00` | 2.34–2.50 / 2.56–2.60 / 2.53–2.54 |
+| 2% | 31.47 (30.45–32.36) | 2 → 3 | 858.09 / 858.09 | `$B overlay-rename-once /tmp/s1plus-m3-overlays/rename` | `4f87e00` | 2.34–2.50 / 2.56–2.60 / 2.53–2.54 |
+
+These updates do **not** carry the large record run. The 1/2% cost is derived
+namespace materialisation, O(dirty names), not the 1–10 ms metadata-only model.
+M4 must batch name changes; M6 must account for this in namespace burst latency.
+A heap per immutable run would avoid this generation-wide sparse copy but adds
+multiple-heap span/ownership handling and query merging. It is a possible later
+optimisation, not part of this measured implementation. No base heap is copied.
 
 ## S1b — The engine, batch mode and the daemon
 

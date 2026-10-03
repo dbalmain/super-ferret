@@ -474,8 +474,13 @@ one whole family instead. Range iteration merges sorted runs, while sparse
 lookup searches newest applicable runs before the base. Build the suppression
 stream in **base-id order** for base scans; do not hash-probe every
 one of 10M names. Scan delta name bytes in a contiguous heap of latest live
-delta names, built when Names loads or its run set merges. This never recopies
-the base heap. A namespace rename into an old directory replaces its lookup
+delta names. In M3, Names load or a namespace change rematerialises this sparse
+latest-name heap and its suppression stream; metadata-only generations share
+both. Record runs carry geometrically, but this derived namespace work is
+O(dirty names): one rename measured about 15/32 ms at 1/2% mixed overlays
+(ROADMAP S1+). It never recopies the base heap. M4 batches namespace changes;
+M6 accounts for their burst cost. A heap per immutable run is a possible later
+optimisation requiring multiple-heap span/ownership and query merging. A namespace rename into an old directory replaces its lookup
 key and heap span, so both stale base hits and stale keys must be suppressed.
 
 This has occasional merge latency, rather than a worst-case constant update
