@@ -694,3 +694,66 @@ fn cli_bounds_parenthesis_and_negation_nesting_before_descent() {
         );
     }
 }
+
+#[test]
+fn live_empty_and_access_tests_use_an_already_retained_parent() {
+    // R2 pattern section: these adjacent live lookups also redirected after
+    // replacement, even though execdir had retained the observed parent.
+    use std::os::unix::fs::PermissionsExt;
+    for empty in [true, false] {
+        let tree = Tree::new(&format!("observed-live-test-{empty}"));
+        for parent in ["tree", "outside"] {
+            fs::create_dir(tree.0.join(parent)).unwrap();
+        }
+        if empty {
+            fs::create_dir(tree.0.join("tree/victim")).unwrap();
+            fs::create_dir(tree.0.join("outside/victim")).unwrap();
+            fs::write(tree.0.join("outside/victim/child"), b"").unwrap();
+        } else {
+            fs::write(tree.0.join("tree/victim"), b"").unwrap();
+            fs::write(tree.0.join("outside/victim"), b"").unwrap();
+            fs::set_permissions(tree.0.join("tree/victim"), fs::Permissions::from_mode(0)).unwrap();
+        }
+        let output = tree.run(
+            false,
+            &[
+                "tree/victim",
+                "-maxdepth",
+                "0",
+                "-exec",
+                "sh",
+                "-c",
+                "mv tree tree.old; ln -s outside tree",
+                ";",
+                "-execdir",
+                "true",
+                ";",
+                if empty { "-empty" } else { "-readable" },
+                "-print",
+            ],
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            if empty {
+                b"tree/victim\n".as_slice()
+            } else {
+                b""
+            },
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn deleting_an_explicit_ignored_start_counts_against_its_stored_parent() {
+    // R2 resolver/accounting pattern: an opaque start resolves live, but its
+    // parent still has a stored raw count including that ignored child.
+    let tree = Tree::new("ignored-start-deletion-count");
+    fs::create_dir_all(tree.0.join("tree/parent/child")).unwrap();
+    fs::write(tree.0.join("tree/.ferretignore"), b"parent/child\n").unwrap();
+    tree.index(&["tree"]);
+    let output = tree.catalog(&["tree/parent/child", "tree/parent", "-empty", "-delete"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!tree.0.join("tree/parent").exists(), "{output:?}");
+}

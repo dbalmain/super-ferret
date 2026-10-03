@@ -397,7 +397,7 @@ impl Test {
             Self::NoGroup => !group_exists(entry.stat()?.gid()),
             Self::Newer { field, stamp } => {
                 let actual = if *field == TimeField::Birth {
-                    birth_stamp(entry.path()).ok_or_else(|| {
+                    entry.with_observed_path(birth_stamp).ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::Unsupported,
                             "birth time unavailable",
@@ -418,11 +418,17 @@ impl Test {
                 // directories have no count and use their live listing.
                 FileKind::Directory => match entry.has_children() {
                     Some(has_children) => !has_children,
-                    None => fs::read_dir(entry.path())?.next().transpose()?.is_none(),
+                    None => entry
+                        .with_observed_path(|path| fs::read_dir(path))?
+                        .next()
+                        .transpose()?
+                        .is_none(),
                 },
                 _ => false,
             },
-            Self::Access(access) => rustix::fs::access(entry.path(), *access).is_ok(),
+            Self::Access(access) => entry
+                .with_observed_path(|path| rustix::fs::access(path, *access))
+                .is_ok(),
             Self::FsType(wanted) => filesystem_type(entry.stat()?.dev()) == Some(wanted.as_str()),
         })
     }

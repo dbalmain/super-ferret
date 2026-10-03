@@ -216,12 +216,13 @@ Beyond the order rules:
   directory handle, including for explicit starts, so replacing an ancestor
   cannot redirect deletion outside that directory. `-execdir`/`-okdir` and
   live symlink reads (`%l`, `%Y`, `-lname`, `-ilname`, `-xtype`) use the same
-  observed parent. Explicit parents require search permission, without read
-  permission. Under `-P`, descent does
+  observed parent. When a parent is retained, live metadata, access and
+  `-empty` lookups use it too. Explicit parents require search permission,
+  without read permission. Under `-P`, descent does
   not follow a replacement symlink; an explicit trailing slash still follows
-  the operand's link. A tree deeper than PATH_MAX stops at the
-  first path that is too long, and an ancestor renamed mid-walk reports ENOENT;
-  both exit 1 where GNU carries on.
+  the operand's link. A full-path lookup beyond PATH_MAX reports
+  ENAMETOOLONG; walks without retained directory capabilities can report ENOENT
+  after an ancestor rename. Both errors exit 1.
 - **Not implemented**, failing with exit 1: `-context`, `-files0-from`,
   `-printf %Z`, the GNU regex word assertions `\<` and `\>`, and multi-byte
   collating symbols.
@@ -241,7 +242,7 @@ Freshness checks and file output alone retain no directory descriptors across
 ancestor levels. Actions or live link reads needing an observed parent retain
 one descriptor per active ancestor, plus active command batches; such walks
 can reach the process's descriptor limit and report EMFILE. Increase that limit
-for deep `-delete`/`-execdir` walks. Path length remains limited by PATH_MAX.
+for deep `-delete`/`-execdir` walks. Full-path lookups remain limited by PATH_MAX.
 
 Expressions accept at most 2,000 explicit or implicit `-a`, `-o`, `-not` and
 comma operators, and at most 128 nested parentheses or negations in total.

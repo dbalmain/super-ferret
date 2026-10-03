@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 use ferret_catalog::Catalog;
@@ -92,9 +93,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
             "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form",
         );
     }
-    let mut effects = Output {
-        writer: Arc::new(Mutex::new(io::stdout())),
-    };
+    let mut effects = Output::Stdout;
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
         Some(catalog) => plan.run_parallel(
@@ -126,46 +125,54 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     }
 }
 
-struct Output<W: Write = io::Stdout> {
-    writer: Arc<Mutex<W>>,
+#[derive(Clone)]
+enum Output {
+    Stdout,
+    #[cfg(test)]
+    Test(Arc<Mutex<Box<dyn Write + Send>>>),
 }
 
-impl<W: Write> Clone for Output<W> {
-    fn clone(&self) -> Self {
-        Self {
-            writer: self.writer.clone(),
+impl Output {
+    // The engine holds its transaction gate. Stdout's own lock covers the
+    // destination, including its internal line buffer, without another mutex.
+    fn with_writer(
+        &mut self,
+        write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self {
+            Self::Stdout => write(&mut io::stdout().lock()),
+            #[cfg(test)]
+            Self::Test(writer) => write(
+                &mut **writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
         }
     }
+    #[cfg(test)]
+    fn test(writer: impl Write + Send + 'static) -> Self {
+        Self::Test(Arc::new(Mutex::new(Box::new(writer))))
+    }
 }
 
-impl<W: Write> Effects for Output<W> {
+impl Effects for Output {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
-        self.write(path.as_os_str().as_bytes())?;
-        self.write(if nul { b"\0" } else { b"\n" })
+        self.with_writer(|writer| {
+            writer.write_all(path.as_os_str().as_bytes())?;
+            writer.write_all(if nul { b"\0" } else { b"\n" })
+        })
     }
-
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_all(bytes)
+        self.with_writer(|writer| writer.write_all(bytes))
     }
-
     fn flush(&mut self) -> io::Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer.flush()
+        self.with_writer(|writer| writer.flush())
     }
-
     fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        buffer.write_to(&mut *writer)?;
-        writer.flush()
+        self.with_writer(|writer| {
+            buffer.write_to(writer)?;
+            writer.flush()
+        })
     }
 
     fn warning(&mut self, message: &str) {
@@ -246,7 +253,7 @@ mod tests {
         struct Interleave {
             entry: Entry,
             yielded: bool,
-            other: Option<(Plan, LiveWalk, Output<Vec<u8>>)>,
+            other: Option<(Plan, LiveWalk, Output)>,
         }
         impl EntrySource for Interleave {
             fn next(&mut self, _: bool) -> Option<Result<&Entry, WalkError>> {
@@ -278,9 +285,18 @@ mod tests {
         };
         let plan = make_plan(&long);
         let other = make_plan(&short);
-        let mut host = Output {
-            writer: Arc::new(Mutex::new(Vec::new())),
-        };
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut host = Output::test(Sink(bytes.clone()));
         let mut source = Interleave {
             entry: Entry::new(long, 0, FileKind::Symlink),
             yielded: false,
@@ -288,7 +304,7 @@ mod tests {
         };
         let result = plan.run(&mut source, &mut host).unwrap();
         host.flush().unwrap();
-        let shared = host.writer.lock().unwrap();
+        let shared = bytes.lock().unwrap();
         let records: Vec<_> = shared.split(|&byte| byte == b'\n').collect();
         std::fs::remove_dir_all(directory).unwrap();
         assert_eq!(result.errors, 0);
@@ -323,7 +339,7 @@ mod tests {
                 }
             }
         }
-        fn short_record(plan: &Plan, path: &Path, mut host: Output<Vec<u8>>) {
+        fn short_record(plan: &Plan, path: &Path, mut host: Output) {
             let mut source = One {
                 entry: Entry::new(path.to_owned(), 0, FileKind::Symlink),
                 yielded: false,
@@ -331,7 +347,7 @@ mod tests {
             assert_eq!(plan.run(&mut source, &mut host).unwrap().errors, 0);
         }
         struct Host {
-            cli: Output<Vec<u8>>,
+            cli: Output,
             plan: Arc<Plan>,
             short: PathBuf,
             emitted: Arc<AtomicBool>,
@@ -365,7 +381,7 @@ mod tests {
             first: One,
             plan: Arc<Plan>,
             short: PathBuf,
-            cli: Output<Vec<u8>>,
+            cli: Output,
             emitted: Arc<AtomicBool>,
         }
         impl EntrySource for Source {
@@ -397,9 +413,7 @@ mod tests {
             ])
             .unwrap(),
         );
-        let cli = Output {
-            writer: Arc::new(Mutex::new(Vec::new())),
-        };
+        let cli = Output::test(Vec::new());
         let emitted = Arc::new(AtomicBool::new(false));
         let mut host = Host {
             cli: cli.clone(),
@@ -474,9 +488,7 @@ mod tests {
         ];
         let plan = Plan::parse(&args).unwrap();
         let (sent, received) = mpsc::channel();
-        let effects = Output {
-            writer: Arc::new(Mutex::new(Sink(sent))),
-        };
+        let effects = Output::test(Sink(sent));
         let slow = effects.clone();
         let batch =
             std::thread::spawn(move || plan.run_parallel(plan.live_source(), slow, 1).unwrap());

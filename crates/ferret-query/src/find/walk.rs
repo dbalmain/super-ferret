@@ -9,7 +9,6 @@
 //! open it for descent errors and execdir; read-only stored-field queries do
 //! neither.
 
-use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -162,7 +161,9 @@ impl Entry {
     pub fn metadata(&self) -> io::Result<&Metadata> {
         self.state
             .metadata
-            .get_or_init(|| cached_metadata(&self.observed_path(), self.state.follow))
+            .get_or_init(|| {
+                self.with_observed_path(|path| cached_metadata(path, self.state.follow))
+            })
             .as_ref()
             .map_err(|error| {
                 error.raw_os_error().map_or_else(
@@ -212,22 +213,21 @@ impl Entry {
         if let (Some(catalog), Some(Target::Inode(id))) = (&self.state.catalog, self.state.target) {
             return Ok(catalog.link_target(id).unwrap_or_default().to_vec());
         }
-        Ok(fs::read_link(self.observed_path())?
+        Ok(self
+            .with_observed_path(|path| fs::read_link(path))?
             .into_os_string()
             .into_vec())
     }
     // A retained parent is the capability for every live re-resolution of
     // this observed name. /proc exposes it to std APIs without unsafe code.
-    pub(super) fn observed_path(&self) -> Cow<'_, Path> {
-        self.state.directory.as_ref().map_or_else(
-            || Cow::Borrowed(self.path()),
-            |parent| {
-                Cow::Owned(
-                    PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
-                        .join(OsStr::from_bytes(self.name())),
-                )
-            },
-        )
+    pub(super) fn with_observed_path<T>(&self, lookup: impl FnOnce(&Path) -> T) -> T {
+        if let Some(parent) = &self.state.directory {
+            let path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+                .join(OsStr::from_bytes(self.name()));
+            lookup(&path)
+        } else {
+            lookup(self.path())
+        }
     }
 
     pub(super) fn directory_handle(&self) -> Option<Arc<File>> {
@@ -241,8 +241,8 @@ impl Entry {
         let Some(catalog) = &self.state.catalog else {
             return Ok(());
         };
-        if let Some((Target::Inode(id), false)) =
-            resolve_observed(catalog, self.path(), true, &self.observed_path())?
+        if let Some((Target::Inode(id), false)) = self
+            .with_observed_path(|observed| resolve_observed(catalog, self.path(), true, observed))?
         {
             if catalog.kind(id) == Kind::Symlink {
                 return Ok(());
@@ -273,7 +273,8 @@ impl Entry {
                 return entry.kind();
             }
         }
-        fs::metadata(self.observed_path()).map(|stat| kind(stat.file_type()))
+        self.with_observed_path(|path| fs::metadata(path))
+            .map(|stat| kind(stat.file_type()))
     }
 
     pub(super) fn opposite_kind(&self) -> io::Result<FileKind> {
@@ -294,15 +295,16 @@ impl Entry {
                 }
             });
         }
-        metadata(&self.observed_path(), !self.state.follow)
-            .or_else(|error| {
+        self.with_observed_path(|path| {
+            metadata(path, !self.state.follow).or_else(|error| {
                 if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
-                    fs::symlink_metadata(self.observed_path())
+                    fs::symlink_metadata(path)
                 } else {
                     Err(error)
                 }
             })
-            .map(|stat| kind(stat.file_type()))
+        })
+        .map(|stat| kind(stat.file_type()))
     }
 
     fn error(&self, error: io::Error) -> WalkError {
@@ -940,6 +942,17 @@ impl LiveWalk {
                     }
                 }
                 if let Some(catalog) = &self.catalog {
+                    if self.options.delete {
+                        self.entry.state.parent = std::path::absolute(self.entry.path())
+                            .ok()
+                            .as_deref()
+                            .and_then(Path::parent)
+                            .and_then(|parent| resolve(catalog, parent, true).ok().flatten())
+                            .and_then(|(target, remainder)| match target {
+                                Target::Inode(id) if !remainder => Some(id),
+                                _ => None,
+                            });
+                    }
                     let resolved = match resolve(catalog, self.entry.path(), follow || self.entry.path.ends_with(b"/")) {
                         Ok(Some(resolved)) => resolved,
                         Ok(None) => return Some(Err(self.entry.error(io::Error::other(
@@ -954,15 +967,6 @@ impl LiveWalk {
                         self.entry.state.catalog = Some(catalog.clone());
                         self.entry.state.kind = Some(catalog_kind(catalog.kind(id)));
                         self.entry.state.follow = follow || self.entry.path.ends_with(b"/");
-                        self.entry.state.parent = std::path::absolute(self.entry.path())
-                            .ok()
-                            .as_deref()
-                            .and_then(Path::parent)
-                            .and_then(|parent| resolve(catalog, parent, true).ok().flatten())
-                            .and_then(|(target, remainder)| match target {
-                                Target::Inode(id) if !remainder => Some(id),
-                                _ => None,
-                            });
                         self.entry.state.followed_symlink =
                             resolve(catalog, self.entry.path(), false)
                                 .ok()
@@ -989,7 +993,7 @@ impl LiveWalk {
                     }
                 }
                 let follow = follow || self.entry.path.ends_with(b"/");
-                let stat = match metadata(&self.entry.observed_path(), follow) {
+                let stat = match self.entry.with_observed_path(|path| metadata(path, follow)) {
                     Ok(stat) => stat,
                     Err(error) => return Some(Err(self.entry.error(error))),
                 };
@@ -1205,7 +1209,10 @@ pub struct CatalogSource {
 impl CatalogSource {
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
         let mut walk = LiveWalk::new(paths, options);
-        walk.removed_children = Some(Arc::new(Mutex::new(Removals::default())));
+        walk.removed_children = walk
+            .options
+            .delete
+            .then(|| Arc::new(Mutex::new(Removals::default())));
         for (id, path) in catalog.roots() {
             let path = Path::new(OsStr::from_bytes(path));
             if let Some(parent) = path.parent()
@@ -1274,11 +1281,9 @@ fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
     } else {
         flags | OFlags::NOFOLLOW
     };
-    Ok(Arc::new(File::from(open(
-        &*entry.observed_path(),
-        flags,
-        Mode::empty(),
-    )?)))
+    Ok(Arc::new(File::from(entry.with_observed_path(|path| {
+        open(path, flags, Mode::empty())
+    })?)))
 }
 
 // Resolve links from the snapshot, including intermediate components. A ..

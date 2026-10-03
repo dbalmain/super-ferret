@@ -360,7 +360,7 @@ fn field(
                     .ok_or_else(|| io::Error::other("indexed filesystem is no longer mounted"))?;
                 out.extend_from_slice(name.as_bytes());
             } else {
-                out.extend_from_slice(filesystem(entry.path())?.as_bytes());
+                out.extend_from_slice(entry.with_observed_path(filesystem)?.as_bytes());
             }
         }
         b'Z' => {

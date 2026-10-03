@@ -177,6 +177,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         ));
     }
     parser.options.retain_parent = parser.delete;
+    parser.options.delete = parser.delete;
     Ok(Plan {
         expression,
         paths,
