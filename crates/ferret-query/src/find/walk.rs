@@ -241,7 +241,9 @@ impl Entry {
         let Some(catalog) = &self.state.catalog else {
             return Ok(());
         };
-        if let Some((Target::Inode(id), false)) = resolve(catalog, self.path(), true)? {
+        if let Some((Target::Inode(id), false)) =
+            resolve_observed(catalog, self.path(), true, &self.observed_path())?
+        {
             if catalog.kind(id) == Kind::Symlink {
                 return Ok(());
             }
@@ -932,27 +934,17 @@ impl LiveWalk {
                 if self.options.retain_parent
                     && (self.catalog.is_none() || self.options.live_checks)
                 {
-                    let (parent, _) = super::action::exec_path(self.entry.path());
-                    match open(
-                        &parent,
-                        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    ) {
-                        Ok(handle) => {
-                            self.entry.state.directory = Some(Arc::new(File::from(handle)))
-                        }
-                        Err(error) => return Some(Err(self.entry.error(error.into()))),
+                    match parent_handle(&self.entry) {
+                        Ok(handle) => self.entry.state.directory = Some(handle),
+                        Err(error) => return Some(Err(self.entry.error(error))),
                     }
                 }
                 if let Some(catalog) = &self.catalog {
                     let resolved = match resolve(catalog, self.entry.path(), follow || self.entry.path.ends_with(b"/")) {
                         Ok(Some(resolved)) => resolved,
-                        Ok(None) => match resolve(catalog, self.entry.path(), false) {
-                            Ok(Some(resolved)) => resolved,
-                            _ => return Some(Err(self.entry.error(io::Error::other(
-                                "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
-                            )))),
-                        },
+                        Ok(None) => return Some(Err(self.entry.error(io::Error::other(
+                            "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
+                        )))),
                         Err(error) => return Some(Err(self.entry.error(error))),
                     };
                     if !resolved.1
@@ -991,16 +983,9 @@ impl LiveWalk {
                     }
                 }
                 if self.options.retain_parent && self.entry.state.directory.is_none() {
-                    let (parent, _) = super::action::exec_path(self.entry.path());
-                    match open(
-                        &parent,
-                        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                        Mode::empty(),
-                    ) {
-                        Ok(handle) => {
-                            self.entry.state.directory = Some(Arc::new(File::from(handle)))
-                        }
-                        Err(error) => return Some(Err(self.entry.error(error.into()))),
+                    match parent_handle(&self.entry) {
+                        Ok(handle) => self.entry.state.directory = Some(handle),
+                        Err(error) => return Some(Err(self.entry.error(error))),
                     }
                 }
                 let follow = follow || self.entry.path.ends_with(b"/");
@@ -1273,6 +1258,15 @@ fn catalog_kind(kind: Kind) -> FileKind {
     }
 }
 
+fn parent_handle(entry: &Entry) -> io::Result<Arc<File>> {
+    let (parent, _) = super::action::exec_path(entry.path());
+    Ok(Arc::new(File::from(open(
+        &parent,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)))
+}
+
 fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     let flags = if entry.state.follow {
@@ -1304,6 +1298,15 @@ pub(super) fn resolve(
     path: &Path,
     follow: bool,
 ) -> io::Result<Option<(Target, bool)>> {
+    resolve_observed(catalog, path, follow, path)
+}
+
+fn resolve_observed(
+    catalog: &Catalog,
+    path: &Path,
+    follow: bool,
+    observed: &Path,
+) -> io::Result<Option<(Target, bool)>> {
     let resolved = match resolve_catalog(catalog, path, follow) {
         Err(error) if follow && error.kind() == io::ErrorKind::NotFound => None,
         result => result?,
@@ -1315,7 +1318,7 @@ pub(super) fn resolve(
     let Some((target, remainder)) = physical else {
         return Ok(None);
     };
-    match fs::metadata(path) {
+    match fs::metadata(observed) {
         Ok(_) => Ok(Some((target, true))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some((target, remainder))),
         Err(error) => Err(error),

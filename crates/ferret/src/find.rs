@@ -5,18 +5,17 @@ use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use ferret_catalog::Catalog;
 
-use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError, mark_output_failure};
+use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
 
 use crate::cli::{self, Exit};
 use crate::xdg::Dirs;
 
-/// Stdout buffer. The engine flushes it before every child process, so a
-/// larger buffer changes only how often a plain walk writes.
+/// Destination buffer. The engine batches complete records and holds its
+/// commit gate until this buffer is flushed.
 const OUTPUT_BUFFER: usize = 64 * 1024;
 
 /// Runs a find command. Find errors and usage errors both exit 1; no matches
@@ -176,19 +175,6 @@ impl<W: Write> Effects for Output<W> {
         writer.flush()
     }
 
-    fn command(&mut self, command: &mut Command) -> io::Result<bool> {
-        self.flush()?;
-        let mut output = OutputBuffer::default();
-        let success = self.capture(command, &mut output)?;
-        let shared = self.writer.clone();
-        let mut writer = shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        output.write_to(&mut *writer).map_err(mark_output_failure)?;
-        writer.flush().map_err(mark_output_failure)?;
-        Ok(success)
-    }
-
     fn warning(&mut self, message: &str) {
         cli::error(&format!("find: {message}"));
     }
@@ -254,6 +240,69 @@ mod tests {
         ] {
             assert!(parse_config(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn spilled_record_reaches_the_cli_destination_before_another_worker_flushes() {
+        // R2 #4: force the next worker's complete short record between the
+        // first worker's evaluation and completion flush, without scheduling
+        // or sleeps. This drives the real evaluator and CLI Output host.
+        use ferret_query::find::{Entry, EntrySource, FileKind, LiveWalk};
+        struct Interleave {
+            entry: Entry,
+            yielded: bool,
+            other: Option<(Plan, LiveWalk, Output<Vec<u8>>)>,
+        }
+        impl EntrySource for Interleave {
+            fn next(&mut self, _: bool) -> Option<Result<&Entry, WalkError>> {
+                if !self.yielded {
+                    self.yielded = true;
+                    return Some(Ok(&self.entry));
+                }
+                if let Some((plan, mut walk, mut host)) = self.other.take() {
+                    assert_eq!(plan.run(&mut walk, &mut host).unwrap().errors, 0);
+                }
+                None
+            }
+        }
+        let directory = std::env::temp_dir().join(format!("ferret-r2-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let long = directory.join("long");
+        let short = directory.join("short");
+        std::os::unix::fs::symlink("L".repeat(2000), &long).unwrap();
+        std::os::unix::fs::symlink("S", &short).unwrap();
+        let format = OsString::from(format!("{}\\n", "%l".repeat(100)));
+        let make_plan = |path: &Path| {
+            Plan::parse(&[
+                "-I".into(),
+                path.as_os_str().to_owned(),
+                "-printf".into(),
+                format.clone(),
+            ])
+            .unwrap()
+        };
+        let plan = make_plan(&long);
+        let other = make_plan(&short);
+        let mut host = Output {
+            writer: Arc::new(Mutex::new(BufWriter::new(Vec::new()))),
+        };
+        let mut source = Interleave {
+            entry: Entry::new(long, 0, FileKind::Symlink),
+            yielded: false,
+            other: Some((other, make_plan(&short).live_source(), host.clone())),
+        };
+        let result = plan.run(&mut source, &mut host).unwrap();
+        host.flush().unwrap();
+        let shared = host.writer.lock().unwrap();
+        let records: Vec<_> = shared.get_ref().split(|&byte| byte == b'\n').collect();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(result.errors, 0);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].len(), 200_000);
+        assert!(records[0].iter().all(|&byte| byte == b'L'));
+        assert_eq!(records[1].len(), 100);
+        assert!(records[1].iter().all(|&byte| byte == b'S'));
+        assert!(records[2].is_empty());
     }
 
     #[test]

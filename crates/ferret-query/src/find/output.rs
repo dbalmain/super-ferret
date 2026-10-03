@@ -20,9 +20,14 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 #[derive(Default)]
 pub struct OutputBuffer {
     bytes: Vec<u8>,
-    file: Option<File>,
-    path: Option<PathBuf>,
+    file: Option<Spill>,
     len: u64,
+    checkpoint: u64,
+}
+
+struct Spill {
+    file: File,
+    path: PathBuf,
 }
 
 impl Write for OutputBuffer {
@@ -47,8 +52,7 @@ impl Write for OutputBuffer {
                         file.write_all(&self.bytes)
                             .map_err(|error| spill_error("write", &path, error))?;
                         self.bytes.clear();
-                        self.path = Some(path);
-                        self.file = Some(file);
+                        self.file = Some(Spill { file, path });
                         break;
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -56,14 +60,11 @@ impl Write for OutputBuffer {
                 }
             }
         }
-        if let Some(file) = &mut self.file {
-            file.write_all(bytes).map_err(|error| {
-                spill_error(
-                    "write",
-                    self.path.as_deref().unwrap_or(Path::new("")),
-                    error,
-                )
-            })?;
+        if let Some(spill) = &mut self.file {
+            spill
+                .file
+                .write_all(bytes)
+                .map_err(|error| spill_error("write", &spill.path, error))?;
         } else {
             self.bytes.extend_from_slice(bytes);
         }
@@ -76,25 +77,36 @@ impl Write for OutputBuffer {
 }
 
 impl OutputBuffer {
+    fn record(&mut self, bytes: &[u8], terminator: &[u8]) -> io::Result<()> {
+        let len = bytes.len() + terminator.len();
+        if self.file.is_none() && self.bytes.len() + len <= MEMORY_LIMIT {
+            self.bytes.extend_from_slice(bytes);
+            self.bytes.extend_from_slice(terminator);
+            self.len += len as u64;
+            Ok(())
+        } else {
+            self.write_all(bytes)?;
+            self.write_all(terminator)
+        }
+    }
+
     /// Writes all captured bytes to the destination, preserving their order.
     pub fn write_to(&mut self, writer: &mut dyn Write) -> io::Result<()> {
         self.emit(|bytes| writer.write_all(bytes))
     }
 
     fn emit(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
-        if let Some(file) = &mut self.file {
-            file.rewind().map_err(|error| {
-                spill_error(
-                    "rewind",
-                    self.path.as_deref().unwrap_or(Path::new("")),
-                    error,
-                )
-            })?;
+        if let Some(spill) = &mut self.file {
+            spill
+                .file
+                .rewind()
+                .map_err(|error| spill_error("rewind", &spill.path, error))?;
             let mut bytes = [0; MEMORY_LIMIT];
             loop {
-                let count = file.read(&mut bytes).map_err(|error| {
-                    spill_error("read", self.path.as_deref().unwrap_or(Path::new("")), error)
-                })?;
+                let count = spill
+                    .file
+                    .read(&mut bytes)
+                    .map_err(|error| spill_error("read", &spill.path, error))?;
                 if count == 0 {
                     break;
                 }
@@ -106,9 +118,15 @@ impl OutputBuffer {
         Ok(())
     }
     fn truncate(&mut self, len: u64) -> io::Result<()> {
-        if let Some(file) = &mut self.file {
-            file.set_len(len)?;
-            file.seek(SeekFrom::Start(len))?;
+        if let Some(spill) = &mut self.file {
+            spill
+                .file
+                .set_len(len)
+                .map_err(|error| spill_error("truncate", &spill.path, error))?;
+            spill
+                .file
+                .seek(SeekFrom::Start(len))
+                .map_err(|error| spill_error("seek", &spill.path, error))?;
         } else {
             self.bytes.truncate(len as usize);
         }
@@ -118,7 +136,6 @@ impl OutputBuffer {
     fn clear(&mut self) {
         self.bytes.clear();
         self.file = None;
-        self.path = None;
         self.len = 0;
     }
 }
@@ -168,21 +185,24 @@ pub(super) fn error_path(error: &io::Error) -> Option<&Path> {
 
 pub(super) struct Checkpoint {
     stdout: u64,
-    files: Vec<u64>,
+    files: usize,
 }
 
 impl Record {
-    pub fn checkpoint(&self) -> Checkpoint {
+    pub fn checkpoint(&mut self) -> Checkpoint {
+        for (_, spool) in &mut self.files {
+            spool.checkpoint = spool.len;
+        }
         Checkpoint {
             stdout: self.stdout.len,
-            files: self.files.iter().map(|(_, spool)| spool.len).collect(),
+            files: self.files.len(),
         }
     }
     pub fn rollback(&mut self, checkpoint: Checkpoint) -> io::Result<()> {
         self.stdout.truncate(checkpoint.stdout)?;
-        self.files.truncate(checkpoint.files.len());
-        for ((_, spool), len) in self.files.iter_mut().zip(checkpoint.files) {
-            spool.truncate(len)?;
+        self.files.truncate(checkpoint.files);
+        for (_, spool) in &mut self.files {
+            spool.truncate(spool.checkpoint)?;
         }
         Ok(())
     }
@@ -193,13 +213,15 @@ impl Record {
             spool.clear();
         }
     }
+    // Leave room for another ordinary PATH_MAX-sized print without spilling
+    // a batch of otherwise small records.
     pub fn full(&self) -> bool {
         self.stdout.file.is_some()
-            || self.stdout.bytes.len() >= MEMORY_LIMIT / 2
+            || self.stdout.bytes.len() >= MEMORY_LIMIT - 4096
             || self
                 .files
                 .iter()
-                .any(|(_, spool)| spool.file.is_some() || spool.bytes.len() >= MEMORY_LIMIT / 2)
+                .any(|(_, spool)| spool.file.is_some() || spool.bytes.len() >= MEMORY_LIMIT - 4096)
     }
 }
 
@@ -255,7 +277,7 @@ impl<E: Effects> EntryEffects<'_, E> {
                         spool.emit(|bytes| file.write_all(bytes))?;
                         file.flush()?;
                     }
-                    self.host.flush()
+                    Ok(())
                 });
                 if quit {
                     self.quit.store(true, Ordering::Release);
@@ -270,8 +292,9 @@ impl<E: Effects> EntryEffects<'_, E> {
 
 impl<E: Effects> Effects for EntryEffects<'_, E> {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
-        self.write(path.as_os_str().as_bytes())?;
-        self.write(if nul { b"\0" } else { b"\n" })
+        self.record
+            .stdout
+            .record(path.as_os_str().as_bytes(), if nul { b"\0" } else { b"\n" })
     }
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.record.stdout.write_all(bytes)

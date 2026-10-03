@@ -469,12 +469,19 @@ fn rendering_spill_failure_discards_output_and_stops_before_the_next_start() {
 fn explicit_delete_needs_search_and_write_but_no_parent_read_permission() {
     // R2 #1: RDONLY parent retention made a searchable 0333 parent fail.
     use std::os::unix::fs::PermissionsExt;
-    for oracle in [true, false] {
-        let tree = Tree::new(&format!("delete-permission-{oracle}"));
+    for (oracle, catalog) in [(true, false), (false, false), (false, true)] {
+        let tree = Tree::new(&format!("delete-permission-{oracle}-{catalog}"));
         fs::create_dir(tree.0.join("parent")).unwrap();
         fs::write(tree.0.join("parent/victim"), b"").unwrap();
+        if catalog {
+            tree.index(&["parent"]);
+        }
         fs::set_permissions(tree.0.join("parent"), fs::Permissions::from_mode(0o333)).unwrap();
-        let output = tree.run(oracle, &["parent/victim", "-delete"]);
+        let output = if catalog {
+            tree.catalog(&["parent/victim", "-delete"])
+        } else {
+            tree.run(oracle, &["parent/victim", "-delete"])
+        };
         fs::set_permissions(tree.0.join("parent"), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(!tree.0.join("parent/victim").exists());
@@ -492,17 +499,14 @@ fn file_output_does_not_retain_one_directory_descriptor_per_ancestor() {
         fs::create_dir(&path).unwrap();
     }
     fs::write(path.join("leaf"), b"").unwrap();
-    let output = support::fixture::bounded_command("sh", &tree.0)
-        .args([
-            "-c",
-            "ulimit -n 64; exec \"$1\" find -I chain -name leaf -fprint out",
-            "sh",
-            FERRET,
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert!(fs::read(tree.0.join("out")).unwrap().ends_with(b"/leaf\n"));
+    tree.index(&["chain"]);
+    for mode in ["live", "catalog"] {
+        let output = support::fixture::bounded_command("sh", &tree.0)
+            .args(["-c", "ulimit -n 64; if test \"$2\" = live; then exec \"$1\" find -I chain -name leaf -fprint out; else exec \"$1\" find chain -name leaf -fprint out; fi", "sh", FERRET, mode])
+            .output().unwrap();
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert!(fs::read(tree.0.join("out")).unwrap().ends_with(b"/leaf\n"));
+    }
 }
 
 #[test]
@@ -510,41 +514,32 @@ fn explicit_execdir_and_link_reads_use_the_observed_parent() {
     // R2 pattern: replacing an explicit start's parent must not redirect
     // execdir's cwd or live %l/%Y reads. Mutation completes in the first exec.
     use std::os::unix::fs::symlink;
-    for catalog in [false, true] {
-        let tree = Tree::new(&format!("observed-link-parent-{catalog}"));
+    for (catalog, execdir) in [(false, false), (false, true), (true, false), (true, true)] {
+        let tree = Tree::new(&format!("observed-link-parent-{catalog}-{execdir}"));
         for parent in ["tree", "outside"] {
             fs::create_dir(tree.0.join(parent)).unwrap();
         }
         fs::write(tree.0.join("tree/target"), b"").unwrap();
         fs::create_dir(tree.0.join("outside/target")).unwrap();
-        symlink("target", tree.0.join("tree/link")).unwrap();
+        fs::write(tree.0.join("original"), b"").unwrap();
+        symlink("../original", tree.0.join("tree/link")).unwrap();
         symlink("other", tree.0.join("outside/link")).unwrap();
         let script = "mv tree tree.old; ln -s outside tree";
         if catalog {
             tree.index(&["tree"]);
         }
-        let args = [
-            "tree/link",
-            "-exec",
-            "sh",
-            "-c",
-            script,
-            ";",
-            "-execdir",
-            "sh",
-            "-c",
-            "test -f target",
-            ";",
-            "-printf",
-            "%l %Y\\n",
-        ];
+        let mut args = vec!["tree/link", "-exec", "sh", "-c", script, ";"];
+        if execdir {
+            args.extend(["-execdir", "sh", "-c", "test -f target", ";"]);
+        }
+        args.extend(["-printf", "%l %Y\\n"]);
         let output = if catalog {
             tree.catalog(&args)
         } else {
             tree.run(false, &args)
         };
         assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, b"target f\n", "{output:?}");
+        assert_eq!(output.stdout, b"../original f\n", "{output:?}");
     }
 }
 
@@ -664,6 +659,14 @@ fn cli_bounds_parenthesis_and_negation_nesting_before_descent() {
     // R2 #11: parentheses bypassed the AST operator limit and aborted.
     let tree = Tree::new("parser-nesting");
     for token in ["(", "-not"] {
+        let mut boundary = vec!["/dev/null"];
+        boundary.extend(std::iter::repeat_n(token, 128));
+        boundary.push("-true");
+        if token == "(" {
+            boundary.extend(std::iter::repeat_n(")", 128));
+        }
+        let output = tree.run(false, &boundary);
+        assert!(output.status.success(), "128 nested {token}: {output:?}");
         let mut args = vec!["/dev/null"; 1];
         args.extend(std::iter::repeat_n(token, 20_000));
         args.push("-true");

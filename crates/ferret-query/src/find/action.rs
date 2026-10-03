@@ -420,10 +420,11 @@ fn execute(
         (None, entry.path().as_os_str().to_owned())
     };
     let handle = if exec.directory {
-        Some(match entry.directory_handle() {
-            Some(handle) => handle,
-            None => Arc::new(File::open(directory.as_deref().unwrap_or(Path::new(".")))?),
-        })
+        Some(
+            entry
+                .directory_handle()
+                .ok_or_else(|| io::Error::other("missing execution directory handle"))?,
+        )
     } else {
         None
     };

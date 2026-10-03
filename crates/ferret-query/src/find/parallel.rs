@@ -142,9 +142,9 @@ impl<W: EntrySource> Task<W> {
         }
     }
 
-    fn finish(mut self, effects: &mut impl Effects) -> u64 {
+    fn finish(&mut self, effects: &mut impl Effects) -> u64 {
         self.flush(effects);
-        if let Some(completion) = self.completion {
+        if let Some(completion) = self.completion.take() {
             completion.fetch_sub(1, Ordering::Release);
         }
         self.errors + self.control.actions.errors
@@ -213,6 +213,9 @@ struct Pool {
 impl Pool {
     fn worker(&self, plan: &Plan, expression: &Expression, mut effects: impl Effects) -> u64 {
         let mut errors = 0;
+        // Keep allocation capacity with the worker when a task completes or
+        // suspends. Queued tasks have already flushed their transactions.
+        let mut record = super::output::Record::default();
         let immediate = super::output::immediate(expression);
         let sequential = super::sequential_starts(expression);
         loop {
@@ -237,6 +240,7 @@ impl Pool {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             };
             drop(queue);
+            std::mem::swap(&mut record, &mut task.record);
             let mut steps = 0usize;
             while !self.quit.load(Ordering::Acquire)
                 && task.step(plan, expression, &mut effects, immediate)
@@ -287,9 +291,11 @@ impl Pool {
             let waiting = task.walk.suspended() && !self.quit.load(Ordering::Acquire);
             let suspended = if waiting {
                 task.flush(&mut effects);
+                std::mem::swap(&mut record, &mut task.record);
                 Some(task)
             } else {
                 errors += task.finish(&mut effects);
+                std::mem::swap(&mut record, &mut task.record);
                 None
             };
             let mut queue = self
@@ -405,7 +411,7 @@ impl Plan {
                     + queue
                         .tasks
                         .into_iter()
-                        .map(|task| task.finish(&mut effects))
+                        .map(|mut task| task.finish(&mut effects))
                         .sum::<u64>();
                 let errors = errors
                     + super::action::flush_shared(&shared, &mut effects, &gate, &pool.quit)

@@ -165,9 +165,7 @@ pub trait Effects {
     fn command(&mut self, command: &mut std::process::Command) -> io::Result<bool> {
         let mut output = OutputBuffer::default();
         let success = self.capture(command, &mut output)?;
-        output
-            .write_to(&mut io::stdout().lock())
-            .map_err(mark_output_failure)?;
+        self.output(&mut output).map_err(mark_output_failure)?;
         Ok(success)
     }
     /// Drains a child's stdout into the entry buffer while it runs. Stderr and
