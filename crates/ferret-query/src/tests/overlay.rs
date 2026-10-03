@@ -494,6 +494,9 @@ fn find_paths(c: &Catalog, args: &[&str]) -> Vec<Vec<u8>> {
     out.paths
 }
 fn oracle(state: &State, effective: &Catalog, scratch: &Scratch, label: &str) {
+    if scratch.0.exists() {
+        std::fs::remove_dir_all(&scratch.0).unwrap();
+    }
     let checkpoint = state.materialise(&scratch.0);
     assert_eq!(
         listings(effective),

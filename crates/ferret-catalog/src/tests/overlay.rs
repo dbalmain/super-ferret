@@ -273,3 +273,83 @@ fn pinned_effective_views_and_keep_survive_later_append_and_epoch_unlink() {
     assert_eq!(new.name(NameId(0)).bytes, b"second");
     assert_ne!(old.generation().checkpoint, new.generation().checkpoint);
 }
+
+#[test]
+fn incremental_orphan_and_type_damage_is_rejected_after_a_checked_predecessor() {
+    for case in 0..2 {
+        let s = fixture(&format!("overlay-incremental-damage-{case}"));
+        let mut w = Writer::open(&s.path).unwrap();
+        let first = changes(
+            &s,
+            vec![Record::NamePut {
+                id: 0,
+                parent: 0,
+                child: 1,
+                name: b"first".to_vec(),
+            }],
+        );
+        w.commit(w.generation(), &first).unwrap();
+        let mut bad = changes(
+            &s,
+            if case == 0 {
+                vec![Record::NameDelete { id: 0 }]
+            } else {
+                vec![
+                    Record::InodePut {
+                        id: 1,
+                        kind: Kind::Symlink,
+                        state: ContentState::Unindexed,
+                        doc: None,
+                        stat: crate::Stat {
+                            mode: 0o120777,
+                            ..file_stat(2)
+                        },
+                    },
+                    Record::DocDelete { id: 0 },
+                ]
+            },
+        );
+        if case == 0 {
+            bad.counts[1] -= 1;
+        } else {
+            bad.counts[3] -= 1;
+        }
+        let before = fs::read(s.path.join("current")).unwrap();
+        assert!(
+            w.commit(w.generation(), &bad).is_err(),
+            "writer case {case}"
+        );
+        assert_eq!(fs::read(s.path.join("current")).unwrap(), before);
+        drop(w);
+        signed(&s, &bad);
+        let view = Catalog::open(&s.path).unwrap().unwrap();
+        assert!(view.load_all().is_err(), "reader case {case}");
+    }
+}
+#[test]
+fn same_sequence_key_removals_and_additions_form_one_run() {
+    let s = fixture("overlay-same-sequence-keys");
+    let mut w = Writer::open(&s.path).unwrap();
+    // Two old keys and one addition occupy different geometric levels if
+    // inserted separately. Their equal sequences must still retain the put.
+    let mut c = changes(
+        &s,
+        vec![
+            Record::NamePut {
+                id: 0,
+                parent: 0,
+                child: 1,
+                name: b"old".to_vec(),
+            },
+            Record::NameDelete { id: 1 },
+        ],
+    );
+    c.counts[1] -= 1;
+    w.commit(w.generation(), &c).unwrap();
+    for view in [w.view(), Catalog::open(&s.path).unwrap().unwrap()] {
+        view.load_all().unwrap();
+        assert_eq!(view.lookup(InoId(0), b"old"), Some(NameId(0)));
+        assert_eq!(view.children(InoId(0)).collect::<Vec<_>>(), vec![NameId(0)]);
+        assert_eq!(view.lookup(InoId(0), b"zz-ignored"), None);
+    }
+}

@@ -420,7 +420,7 @@ edges keep epoch NameIds too.
 | Find's `CatalogSource` gets `entries`, `contents`, counts and `resolve`; DFS frames establish order | These consume the effective view. Parent-before-child, reverse order for depth/delete and prune follow graph traversal, not ids. Sibling order remains free under D50 F10. The per-query delete-count map uses epoch parent ids in its pinned generation. |
 | Nested roots are sorted by parent id in `find/walk.rs` | Sort their derived attachment list by epoch parent and binary-search equality as today; no assumption that the parent was allocated first. |
 | `stats.rs` computes depths in one numeric-id pass and loops over dense names/files | Use an explicit root traversal for depth and live row iterators for census/refcounts. Numeric-id topological order is removed. |
-| `ferret-crawl/src/index.rs::content_faults` and `Transaction::begin/keep` loop over dense ranges | Live iterators and effective graph traversal replace these loops. Kept roots produce no copied batches and no sweep. |
+| `ferret-crawl/src/index.rs::content_faults` and `Transaction::begin/keep` loop over dense ranges | Live iterators and effective graph traversal replace these loops. The full-checkpoint `Transaction::keep` still copies a kept root into its output batch; M4's diff producer leaves untouched roots in the effective view without copying or sweeping them. |
 | Cached ids and writer request scopes | Pin the source generation or carry its epoch. Compaction changes the generation even at the same sequence; mismatches retry before dereference. DocId candidates alone remain valid across epochs, subject to current liveness. |
 
 Directory coverage must be distinct from raw counts: a retained-fault directory

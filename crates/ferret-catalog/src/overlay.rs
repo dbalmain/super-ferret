@@ -95,6 +95,8 @@ pub(crate) struct Overlay {
     namespace: OnceLock<Arc<Namespace>>,
     checked: OnceLock<()>,
     fields_checked: OnceLock<()>,
+    aux_checked: OnceLock<()>,
+    kinds_checked: OnceLock<()>,
 }
 pub(crate) struct Namespace {
     pub(crate) rows: Projection,
@@ -117,6 +119,8 @@ impl Overlay {
             namespace: OnceLock::new(),
             checked: OnceLock::new(),
             fields_checked: OnceLock::new(),
+            aux_checked: OnceLock::new(),
+            kinds_checked: OnceLock::new(),
         }
     }
     pub(crate) fn new(base: Catalog, manifest: Manifest, log: Log) -> Self {
@@ -130,6 +134,8 @@ impl Overlay {
             namespace: OnceLock::new(),
             checked: OnceLock::new(),
             fields_checked: OnceLock::new(),
+            aux_checked: OnceLock::new(),
+            kinds_checked: OnceLock::new(),
         }
     }
     pub(crate) fn advance(
@@ -148,6 +154,8 @@ impl Overlay {
             namespace: OnceLock::new(),
             checked: OnceLock::new(),
             fields_checked: OnceLock::new(),
+            aux_checked: OnceLock::new(),
+            kinds_checked: OnceLock::new(),
         }
     }
     fn transactions(&self, family: Family) -> Vec<(u64, [u32; 3], Vec<Arc<Record>>)> {
@@ -331,21 +339,64 @@ impl Overlay {
     }
     pub(crate) fn check_aux(&self) -> Result<(), OpenError> {
         self.base.load(&[Section::Links])?;
-        for r in self.projection(Family::Namespace).records(LIFE) {
-            if let Record::LifePut { id, kind, .. } = r
-                && *id < self.base.base_inode_count()
-                && self.base.kind(InoId(*id)) != *kind
+        if self.aux_checked.get().is_none() {
+            // A checked predecessor proves the inherited rows; validate only
+            // current changes. Disk replay has no predecessor proof.
+            let rows: Vec<_> = if self
+                .parent
+                .as_ref()
+                .is_some_and(|p| p.checked.get().is_some())
             {
-                return Err(bad("base inode lifetime type changed"));
+                self.delta.iter().map(Arc::as_ref).collect()
+            } else {
+                self.projection(Family::Namespace)
+                    .records(LIFE)
+                    .chain(self.projection(Family::Aux).records(LINK))
+                    .collect()
+            };
+            for r in rows {
+                match r {
+                    Record::LifePut { id, kind, .. }
+                        if *id < self.base.base_inode_count()
+                            && self.base.kind(InoId(*id)) != *kind =>
+                    {
+                        return Err(bad("base inode lifetime type changed"));
+                    }
+                    Record::LinkPut { id, .. }
+                        if self.live_inode(*id)
+                            && self.kind(*id).unwrap_or_else(|| self.base.kind(InoId(*id)))
+                                != Kind::Symlink =>
+                    {
+                        return Err(bad("link target on non-symlink"));
+                    }
+                    _ => {}
+                }
             }
+            let _ = self.aux_checked.set(());
         }
-        for r in self.projection(Family::Aux).records(LINK) {
-            if let Record::LinkPut { id, .. } = r
-                && self.live_inode(*id)
-                && self.kind(*id).unwrap_or_else(|| self.base.kind(InoId(*id))) != Kind::Symlink
+        if self.kinds_checked.get().is_none()
+            && let Some(fields) = self.families[Family::Inodes as usize].get()
+        {
+            let rows: Vec<_> = if self
+                .parent
+                .as_ref()
+                .is_some_and(|p| p.checked.get().is_some())
             {
-                return Err(bad("link target on non-symlink"));
+                self.delta.iter().map(Arc::as_ref).collect()
+            } else {
+                fields.records(INODE).collect()
+            };
+            for r in rows {
+                if let Record::InodePut { id, kind, .. } = r
+                    && self.live_inode(*id)
+                {
+                    let actual = self.kind(*id).unwrap_or_else(|| self.base.kind(InoId(*id)));
+                    if *kind != actual {
+                        return Err(bad("inode/life kind mismatch"));
+                    }
+                }
             }
+            let _ = self.kinds_checked.set(());
         }
         Ok(())
     }
@@ -400,6 +451,9 @@ impl Overlay {
             {
                 return Err(bad("new inode has no fields"));
             }
+        }
+        if self.families[Family::Aux as usize].get().is_some() {
+            self.check_aux()?;
         }
         let _ = self.fields_checked.set(());
         Ok(())
@@ -675,6 +729,8 @@ impl Overlay {
                 final_rows.insert(record_key(&r), r);
             }
             let mut key_rows = Vec::new();
+            let mut old_dirs = BTreeSet::new();
+            let mut ref_changes = BTreeMap::<u32, i64>::new();
             let mut births = BTreeSet::new();
             for r in final_rows.values() {
                 let id = match r.as_ref() {
@@ -692,6 +748,10 @@ impl Overlay {
                         name(&self.base, &rows, id).ok_or_else(|| bad("retired name reused"))?;
                     if let Target::Inode(child) = old.target() {
                         *references.entry(child.0).or_default() -= 1;
+                        *ref_changes.entry(child.0).or_default() -= 1;
+                        if kind(&self.base, &rows, child.0) == Some(Kind::Dir) {
+                            old_dirs.insert(child.0);
+                        }
                     }
                     key_rows.push(Row {
                         key: (old.parent.0, old.bytes.to_vec()),
@@ -713,11 +773,13 @@ impl Overlay {
                     && Kind::from_ignored_child(*child).is_none()
                 {
                     *references.entry(*child).or_default() += 1;
+                    *ref_changes.entry(*child).or_default() += 1;
                 }
             }
             let changed: Vec<_> = final_rows.into_values().collect();
             rows.apply(seq, changed.iter().cloned());
-            keys.insert(key_rows);
+            let mut removed = keys.clone();
+            removed.insert(key_rows.clone());
             let mut additions = Vec::new();
             for r in &changed {
                 if let Record::NamePut {
@@ -736,7 +798,7 @@ impl Overlay {
                     }
                     // Changed names are checked against the final transaction,
                     // including removals of overwritten destinations.
-                    if let Some(other) = lookup(&self.base, &rows, &keys, *parent, bytes)
+                    if let Some(other) = lookup(&self.base, &rows, &removed, *parent, bytes)
                         && other != *id
                     {
                         return Err(bad("duplicate child key"));
@@ -759,37 +821,59 @@ impl Overlay {
             if additions.windows(2).any(|w| w[0].key == w[1].key) {
                 return Err(bad("duplicate changed child key"));
             }
-            keys.insert(additions);
-            validate_graph(&self.base, &rows, &changed)?;
-            if changed.iter().any(|r| {
-                matches!(
-                    r.as_ref(),
-                    Record::LifePut { .. } | Record::InodeDelete { .. }
-                )
-            }) {
-                let base_refs = self.base.name_references();
-                for r in &changed {
-                    let (id, count) = match r.as_ref() {
-                        Record::LifePut { id, names, .. } => (*id, *names),
-                        Record::InodeDelete { id } => (*id, 0),
-                        _ => continue,
-                    };
+            // Coalesce one transaction into one run: removals and additions
+            // have the same sequence, so separate runs cannot order them.
+            key_rows.extend(additions);
+            keys.insert(key_rows);
+            validate_graph(&self.base, &rows, &changed, old_dirs)?;
+            let mut affected: BTreeSet<_> = ref_changes
+                .into_iter()
+                .filter(|(_, delta)| *delta != 0)
+                .map(|(id, _)| id)
+                .collect();
+            for r in &changed {
+                if let Record::LifePut { id, .. } | Record::InodeDelete { id } = r.as_ref() {
+                    affected.insert(*id);
+                }
+            }
+            if !affected.is_empty() {
+                let base_refs = if affected.iter().any(|&id| id < self.base.base_inode_count()) {
+                    self.base.name_references()
+                } else {
+                    &[]
+                };
+                for id in affected {
                     let actual = i64::from(base_refs.get(id as usize).copied().unwrap_or(0))
                         + references.get(&id).copied().unwrap_or(0);
-                    if actual != i64::from(count) {
+                    let declared = match rows.get(LIFE, id) {
+                        Some(Record::LifePut { names, .. }) => Some(i64::from(*names)),
+                        Some(Record::InodeDelete { .. }) => Some(0),
+                        _ => None,
+                    };
+                    if actual < 0
+                        || declared.is_some_and(|n| n != actual)
+                        || (!live(&self.base, &rows, id) && actual != 0)
+                        || (live(&self.base, &rows, id)
+                            && kind(&self.base, &rows, id) != Some(Kind::Dir)
+                            && actual == 0)
+                    {
                         return Err(bad("namespace inode reference count"));
                     }
-                    if !live(&self.base, &rows, id) && id < self.base.base_dir_count() {
-                        let children = self
-                            .base
-                            .children(InoId(id))
-                            .filter(|n| rows.get(NAME, n.0).is_none())
-                            .count()
-                            + rows
-                                .records(NAME)
-                                .filter(|r| matches!(r,Record::NamePut{parent,..} if *parent==id))
-                                .count();
-                        if children != 0 {
+                    if !live(&self.base, &rows, id) {
+                        let base_children = if id < self.base.base_inode_count() {
+                            self.base
+                                .children(InoId(id))
+                                .filter(|n| rows.get(NAME, n.0).is_none())
+                                .count()
+                        } else {
+                            0
+                        };
+                        let delta_children = keys
+                            .latest_range((id, Vec::new()), (id + 1, Vec::new()))
+                            .into_iter()
+                            .filter(|r| r.value.is_some())
+                            .count();
+                        if base_children + delta_children != 0 {
                             return Err(bad("deleted directory retains children"));
                         }
                     }
@@ -916,6 +1000,7 @@ fn validate_graph(
     base: &Catalog,
     rows: &Projection,
     changed: &[Arc<Record>],
+    old_dirs: BTreeSet<u32>,
 ) -> Result<(), OpenError> {
     let mut paths = BTreeSet::new();
     let roots = base
@@ -934,7 +1019,10 @@ fn validate_graph(
             return Err(bad("root liveness/incoming edge/duplicate path"));
         }
     }
-    let mut dirs = BTreeSet::new();
+    let mut dirs: BTreeSet<_> = old_dirs
+        .into_iter()
+        .filter(|&id| live(base, rows, id))
+        .collect();
     for r in changed.iter().map(Arc::as_ref) {
         if let Record::NamePut { parent, child, .. } = r {
             dirs.insert(*parent);
