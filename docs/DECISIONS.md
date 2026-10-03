@@ -2346,8 +2346,8 @@ per block. Does its high type sentinel justify a different physical encoding?
 **Recommendation: A.** The size difference is small and B has no consistent
 query win. Full listing, warm: A 1,369 ms vs B 1,354 ms; baseline 1,340 ms.
 ROADMAP § S1c summarises the section and query numbers; the full tables, with
-their loads, are in git history as `docs/FIND-M4A.md`. The fact that would change it: a much
-more ignored-heavy 10M fixture where nullable child/type or a separate ignored
+their loads, are in git history as `docs/FIND-M4A.md`. The fact that would
+change it: a much more ignored-heavy 10M fixture where nullable child/type or a separate ignored
 range saves materially more space or query time. Those two options were not
 implemented or measured here. There is no departure from the settled sentinel
 encoding. All seven ignored kinds have name-only rows; visible special kinds
