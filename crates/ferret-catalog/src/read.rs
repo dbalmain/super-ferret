@@ -585,14 +585,23 @@ impl Catalog {
                         o.load(Family::Aux)?;
                         o.check_aux()?;
                     }
-                    Section::WorkTrees => o.load(Family::Aux)?,
-                    Section::Docs | Section::DocRefs => o.load(Family::Docs)?,
+                    Section::WorkTrees => {
+                        o.load(Family::Aux)?;
+                        o.check_aux()?;
+                    }
+                    Section::Docs => o.load(Family::Docs)?,
+                    Section::DocRefs => {
+                        o.load(Family::Inodes)?;
+                        o.check_fields()?;
+                        o.load(Family::Docs)?;
+                    }
                     Section::Strings | Section::Policy => {}
                     _ => {
                         o.load(Family::Inodes)?;
                         o.check_fields()?;
                     }
                 }
+                o.check_documents(self)?;
             }
         }
         Ok(())

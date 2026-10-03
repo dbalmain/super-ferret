@@ -387,3 +387,50 @@ fn removing_a_directory_incoming_edge_requires_retiring_or_reparenting_it() {
     let view = Catalog::open(&s.path).unwrap().unwrap();
     assert!(view.load(&[Section::Roots]).is_err());
 }
+
+#[test]
+fn document_reference_dependencies_load_effective_fields_and_check_bindings() {
+    for bad_refs in [false, true] {
+        let s = fixture(&format!("overlay-partial-docs-{bad_refs}"));
+        let c = changes(
+            &s,
+            vec![
+                Record::DocPut {
+                    id: 0,
+                    references: if bad_refs { 2 } else { 1 },
+                    hash: hash(1),
+                },
+                Record::InodePut {
+                    id: 1,
+                    kind: Kind::File,
+                    state: ContentState::Hashed,
+                    doc: Some(0),
+                    stat: file_stat(2),
+                },
+            ],
+        );
+        if bad_refs {
+            signed(&s, &c);
+        } else {
+            let mut w = Writer::open(&s.path).unwrap();
+            w.commit(w.generation(), &c).unwrap();
+        }
+        for sections in [
+            &[Section::DocRefs][..],
+            &[Section::Size, Section::Docs],
+            &[Section::Docs, Section::Size],
+        ] {
+            let view = Catalog::open(&s.path).unwrap().unwrap();
+            let result = view.load(sections);
+            if bad_refs {
+                assert!(result.is_err(), "{sections:?}");
+                assert!(!view.is_loaded(Section::DocRefs));
+            } else {
+                result.unwrap();
+                assert_eq!(view.doc(InoId(1)), Some(crate::DocId(0)));
+                assert_eq!(view.doc_references(crate::DocId(0)), Some(1));
+                assert!(!view.is_loaded(Section::Names));
+            }
+        }
+    }
+}

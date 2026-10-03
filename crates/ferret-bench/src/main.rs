@@ -8,6 +8,7 @@
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
 //! ferret-bench overlay-carry <catalog-dir> <count> one-inode geometric carries
+//! ferret-bench overlay-carry-boundary <catalog-dir> <rows> a large carry
 //! ```
 //!
 //! Build it in release (`cargo build --release -p ferret-bench`). Every
@@ -85,6 +86,7 @@ fn main() -> ExitCode {
             ("overlay-fill", [dir, rows]) => overlay_fill(Path::new(dir), rows),
             ("resident-once", [dir, text]) => resident_once(Path::new(dir), text),
             ("overlay-carry", [dir, count]) => overlay_carry(Path::new(dir), count),
+            ("overlay-carry-boundary", [dir, rows]) => overlay_carry_boundary(Path::new(dir), rows),
             ("sections", [dir]) => sections(Path::new(dir)),
             ("query", [dir, queries @ ..]) => query(Path::new(dir), queries),
             _ => return usage(),
@@ -111,6 +113,7 @@ fn usage() -> ExitCode {
          ferret-bench overlay-fill <catalog-dir> <rows>\n       \
          ferret-bench resident-once <catalog-dir> <query>\n       \
          ferret-bench overlay-carry <catalog-dir> <count>\n       \
+         ferret-bench overlay-carry-boundary <catalog-dir> <rows>\n       \
          ferret-bench checksum <catalog-dir>\n       \
          ferret-bench sections <catalog-dir>\n       \
          ferret-bench query <catalog-dir> [query...]"
@@ -706,5 +709,76 @@ fn overlay_carry(dir: &Path, count: &str) -> Result<()> {
     }
     let (rss, peak) = memory()?;
     println!("carry {:?}; RSS {rss}, peak {peak}", times);
+    Ok(())
+}
+
+/// Seed geometric runs in bursts, then time the individual updates on both
+/// sides of a large carry. Every burst and timed update is also published by
+/// the real writer; durable I/O is outside the resident advance timer.
+fn overlay_carry_boundary(dir: &Path, rows: &str) -> Result<()> {
+    use ferret_catalog::{
+        InoId,
+        log::{ChangeSet, Record, Writer},
+    };
+    let rows: u32 = rows.parse()?;
+    let mut writer = Writer::open(dir)?;
+    let mut view = writer.view();
+    if !rows.is_power_of_two()
+        || rows < 4
+        || rows + 1 > view.base_inode_count() - view.base_dir_count()
+    {
+        return Err("rows must be a power of two within the base file count".into());
+    }
+    let changes = |view: &Catalog, offset: u32, count: u32| {
+        let records = (offset..offset + count)
+            .map(|offset| {
+                let id = view.base_dir_count() + offset;
+                let inode = view.inode(InoId(id));
+                let mut stat = inode.stat;
+                stat.size = stat.size.saturating_add(7);
+                Record::InodePut {
+                    id,
+                    kind: view.kind(InoId(id)),
+                    state: inode.state,
+                    doc: inode.doc.map(|d| d.0),
+                    stat,
+                }
+            })
+            .collect();
+        ChangeSet {
+            records,
+            counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+            counts: [
+                view.inode_count(),
+                view.name_count(),
+                view.dir_count(),
+                view.doc_count(),
+            ],
+        }
+    };
+    let mut offset = 0;
+    let mut burst = rows / 2;
+    while burst >= 2 {
+        let c = changes(&view, offset, burst);
+        writer.commit(writer.generation(), &c)?;
+        view = writer.view();
+        offset += burst;
+        burst /= 2;
+    }
+    let mut times = Vec::new();
+    for _ in 0..3 {
+        let c = changes(&view, offset, 1);
+        let before = view.overlay_run_count();
+        let start = Instant::now();
+        let candidate = view.advance(view.generation(), &c)?;
+        let elapsed = ms(start.elapsed());
+        let after = candidate.overlay_run_count();
+        writer.commit(writer.generation(), &c)?;
+        view = writer.view();
+        offset += 1;
+        times.push((offset, before, after, elapsed));
+    }
+    let (rss, peak) = memory()?;
+    println!("boundary {:?}; RSS {rss}, peak {peak}", times);
     Ok(())
 }
