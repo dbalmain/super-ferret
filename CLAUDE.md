@@ -29,19 +29,19 @@ Style: `~/style-guide/rust.md` and `~/style-guide/common.md`
 
 ## Where things go
 
-| Change                                         | Crate            |
-| ---------------------------------------------- | ---------------- |
-| ignore rules, size cap, binary check           | `ferret-policy`  |
-| walking roots, change detection, hashing       | `ferret-crawl`   |
-| names, inodes, documents, name search, storage | `ferret-catalog` |
-| what a token is                                | `ferret-text`    |
-| a new index structure                          | `ferret-index`   |
-| matching a candidate's bytes                   | `ferret-verify`  |
-| query syntax, planning, result rows            | `ferret-query`   |
-| find: parser, evaluator, walk, actions         | `ferret-query` `src/find/` |
-| GNU regex dialect for `-regex`                 | `ferret-verify` `src/dialect*` |
-| CLI flags, output, config, query log           | `ferret`         |
-| find's CLI host                                | `ferret` `src/find.rs` |
+| Change                                                 | Crate                           |
+| ------------------------------------------------------ | ------------------------------- |
+| ignore rules, size cap, binary check                   | `ferret-policy`                 |
+| walking roots, change detection, hashing               | `ferret-crawl`                  |
+| names, inodes, documents, name search, storage         | `ferret-catalog`                |
+| what a token is                                        | `ferret-text`                   |
+| a new index structure                                  | `ferret-index`                  |
+| matching a candidate's bytes                           | `ferret-verify`                 |
+| GNU regex dialects for `-regex`; the only `regex` user | `ferret-verify`, `src/dialect*` |
+| query syntax, planning, result rows                    | `ferret-query`                  |
+| `find`: parser, evaluator, walk, actions               | `ferret-query`, `src/find/`     |
+| CLI flags, output, config, query log                   | `ferret`                        |
+| `find`'s CLI host                                      | `ferret`, `src/find.rs`         |
 
 The crate graph is enforced: `crates/ferret/tests/layering.rs` fails if any
 crate's `[dependencies]` differ from the graph in DESIGN.md § Crates. To add a

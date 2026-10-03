@@ -20,8 +20,8 @@ Default mode opens the index named by `ferret --index DIR find …`, else
 `$FERRET_INDEX`, else `$XDG_DATA_HOME/ferret` (default `~/.local/share/ferret`),
 and reads only the index sections the expression needs.
 
-Live mode opens no index and reads no configuration. It matches GNU exactly,
-apart from the order and concurrency rules below. Help and version requests also
+Live mode opens no index and reads no configuration. It matches GNU apart from
+the order and concurrency rules and the known differences below. Help and version requests also
 skip the index and the configuration. Neither mode writes a query log.
 
 Both modes run the same parser and evaluator over the same depth-first walk;
