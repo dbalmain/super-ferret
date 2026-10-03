@@ -10,12 +10,13 @@ use crate::{
 #[test]
 fn stale_handles_fail_before_even_an_out_of_range_id_is_interpreted() {
     let scratch = Scratch::new("epoch-handles");
-    let first = commit(&scratch.path, |txn| {
+    commit(&scratch.path, |txn| {
         let mut batch = txn.batch();
         let root = batch.root(b"/root", dir_stat(1));
         batch.file(root, b"a", file_stat(2), Content::Hashed(hash(1)));
         txn.add(batch);
     });
+    let first = Catalog::open(&scratch.path).unwrap().unwrap();
     let current = first.generation();
     assert_eq!(
         first.checked_name(Handle {
@@ -263,4 +264,49 @@ fn reserved_and_future_retention_sequences_fail_before_publication() {
         );
         assert!(Catalog::open(&scratch.path).unwrap().is_none());
     }
+}
+
+#[test]
+fn allocation_boundaries_and_exhausted_documents_drive_the_real_codec_and_writer() {
+    let scratch = Scratch::new("epoch-allocation-boundaries");
+    std::fs::create_dir_all(&scratch.path).unwrap();
+    let mut legacy = include_bytes!("v3.catalog").to_vec();
+    legacy[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(scratch.path.join("catalog"), legacy).unwrap();
+    let catalog = Transaction::import_v3(&scratch.path, hash(0)).unwrap();
+    let original = catalog.manifest();
+    for (counter, value, accepted) in [
+        (0, u32::MAX - 16, true),
+        (0, u32::MAX - 15, false),
+        (1, u32::MAX - 1, true),
+        (1, u32::MAX, false),
+        (2, u32::MAX, true),
+    ] {
+        let mut manifest = catalog.manifest();
+        manifest.counters[counter] = value;
+        assert_eq!(
+            Manifest::decode(&manifest.encode()).is_ok(),
+            accepted,
+            "counter {counter}, high water {value}"
+        );
+    }
+    let mut zero_incarnation = catalog.manifest();
+    zero_incarnation.generation.incarnation = [0; 16];
+    assert!(Manifest::decode(&zero_incarnation.encode()).is_err());
+
+    // A high water equal to DocId's sentinel records an exhausted allocator,
+    // but existing sparse live ids remain valid. Only a new allocation fails.
+    assert_eq!(catalog.next_doc().0, u32::MAX);
+    let mut txn = Transaction::begin(&scratch.path, 1).unwrap();
+    txn.keep(b"/alpha").unwrap();
+    txn.keep(b"/beta").unwrap();
+    let mut batch = txn.batch();
+    let root = batch.root(b"/new", dir_stat(99));
+    batch.file(root, b"new", file_stat(100), Content::Hashed(hash(9)));
+    txn.add(batch);
+    assert!(matches!(
+        txn.commit(),
+        Err(crate::CommitError::Build(crate::BuildError::TooLarge))
+    ));
+    assert_eq!(reopen(&scratch.path).generation(), original.generation);
 }

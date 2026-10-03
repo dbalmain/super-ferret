@@ -204,7 +204,8 @@ RootPut/RootDelete key by root InoId and include the configured absolute path
 for a put. LinkPut/LinkDelete key by InoId, with target bytes for a put.
 WorkTreePut/WorkTreeDelete key by directory InoId, with kind, common identity
 and path for a put. These use the same record header and counted-string rule.
-M1 fixes their offsets and lengths alongside the fixed records above.
+M2 fixes their offsets and lengths alongside the fixed records above; M1
+contains no log records.
 LifePut carries kind without loading stat columns and counts **indexed names**,
 not `st_nlink`; ignored names have no LifePut. Directory flags include
 traversed/search-suppressed and complete/retained-fault coverage.
@@ -344,8 +345,12 @@ the old view. Watch descriptors need not be recreated just because catalog
 ids changed. The commit result distinguishes a checkpoint view from a
 same-epoch delta so a host cannot apply renumbered ids as ordinary replacements.
 
-Before an epoch counter reaches the reserved top 16 inode values or the name
-limit, checkpoint. If the live checkpoint plus proposed births cannot fit,
+Before an epoch counter exceeds the inode limit `u32::MAX - 16`, or reaches
+NameId's `u32::MAX` sentinel, checkpoint. This retains the existing v3 reader's
+conservative bound: since the counter is a count rather than the last id,
+**17** top inode values are unavailable, including none and ignored type tags.
+The earlier “top 16” wording confused those two quantities. If the live
+checkpoint plus proposed births cannot fit,
 fail before publication; no wrap. Historical inode/name allocation exhaustion
 is no longer a format concern. Live-count limits still exist, and DocId and
 sequence/checkpoint counters retain their independent exhaustion checks.

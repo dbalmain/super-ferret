@@ -12,13 +12,15 @@ use crate::{
 
 /// A small snapshot with every section non-empty and every column wider
 /// than 0 bits, built in its own scratch directory `name`. Dev and mode have
-/// three values, so their dictionary checks read every index; owner has two,
-/// so its check reads none.
+/// three and five values, so their dictionary checks read every index; owner
+/// has two, so its check reads none.
 fn sample(name: &str) -> Vec<u8> {
     let scratch = Scratch::new(name);
     commit(&scratch.path, |txn| {
+        txn.set_policy(hash(9));
         let mut w = txn.batch();
         let root = w.root(b"/s", dir_stat(1));
+        w.retained_at(root, Some(0));
         let sub = w.dir(root, b"sub", dir_stat(2));
         let skip = w.traversed_dir(sub, b"skip", dir_stat(3));
         w.file(sub, b"a.rs", file_stat(10), Content::Hashed(hash(1)));
@@ -49,6 +51,15 @@ fn sample(name: &str) -> Vec<u8> {
             Stat {
                 mode: 0o010_600,
                 ..file_stat(15)
+            },
+            Content::Unindexed,
+        );
+        w.file(
+            other,
+            b"z-mode",
+            Stat {
+                mode: 0o100_600,
+                ..file_stat(16)
             },
             Content::Unindexed,
         );
@@ -350,6 +361,28 @@ fn every_single_bit_flip_is_refused_when_its_section_loads() {
             flipped[at] ^= 1 << bit;
             let context = format!("flip at {at} bit {bit}");
             write_catalog(&scratch.path, &flipped);
+            if at < TABLE_END {
+                assert!(
+                    Catalog::open(&scratch.path).is_err(),
+                    "{context}: corrupt head opened"
+                );
+            } else {
+                let layout = format::decode_table(&bytes, bytes.len() as u64).unwrap();
+                let damaged = SECTIONS
+                    .into_iter()
+                    .find(|&section| {
+                        let (start, end) = layout.range(section);
+                        (start..end).contains(&at)
+                    })
+                    .unwrap();
+                let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+                assert!(
+                    matches!(catalog.load(&[damaged]),
+                    Err(OpenError::Decode(DecodeError::Corrupt(label))) if label == damaged.label()),
+                    "{context}: {damaged:?} did not reject its changed byte"
+                );
+                assert!(!catalog.is_loaded(damaged));
+            }
             // Loading any one section (with what it needs) either fails or
             // leaves every accessor it enables safe.
             for section in SECTIONS {
@@ -786,11 +819,11 @@ fn a_dictionary_on_a_column_that_has_none_is_rejected() {
 
 #[test]
 fn a_dictionary_index_past_the_end_is_rejected_on_load() {
-    // Mode has three values in two bits, so index 3 fits the width and
+    // Mode has five values in three bits, so index 7 fits the width and
     // misses the dictionary.
     let bytes = sample("decode-dict-index");
     let mut bad = bytes.clone();
-    set_raw(&mut bad, Column::Mode, 0, 3);
+    set_raw(&mut bad, Column::Mode, 0, 7);
     let scratch = Scratch::new("decode-dict-index-lazy");
     write_catalog(&scratch.path, &resigned(bad.clone()));
     let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
@@ -879,6 +912,8 @@ const ACCESSORS: &[Accessor] = {
         (&[], "counts", |c| {
             (c.dir_count() + c.inode_count() + c.name_count() + c.doc_count()) as usize
                 + c.next_doc().0 as usize
+                + c.next_inode().0 as usize
+                + c.next_name().0 as usize
                 + c.sniffer_version() as usize
                 + c.head_len() as usize
                 + c.section_sizes()
@@ -978,6 +1013,18 @@ const ACCESSORS: &[Accessor] = {
         }),
         (&[WorkTrees], "work_tree", |c| {
             dirs(c).filter_map(|d| c.work_tree(d)).count()
+        }),
+        (&[RetainedAt], "retained_at", |c| {
+            dirs(c).filter_map(|d| c.retained_at(d)).count()
+        }),
+        (&[Policy], "policy", |c| {
+            c.policy().into_iter().map(usize::from).sum()
+        }),
+        (&[DocRefs], "doc_references", |c| {
+            c.docs()
+                .filter_map(|(id, _)| c.doc_references(id))
+                .map(|n| n as usize)
+                .sum()
         }),
         (&[Docs], "docs", |c| c.docs().count()),
         (&[Docs], "doc_hash", |c| {

@@ -345,6 +345,107 @@ the change and not the catalog. The daemon's small inotify bursts need it.
 
 **Measure:** bytes written and time for a one-file change at 10M entries.
 
+**M1 measured** (2026-10-04 local time, production code `13051e5`, release
+build via `nix develop --command cargo build --release -p ferret -p ferret-bench`).
+Machine: AMD Ryzen 9 9955HX, 32 logical CPUs, ext4.
+The original 10M synthetic v3 fixture is actually **10,448,739 names**,
+10,405,730 inodes, 1,800,947 directories and 8,495,924 documents:
+`/tmp/find-m4a-measure/sentinel-final/catalog`. It was copied into an isolated
+index and migrated with the real `ferret import-v3`; the packed v3 sections are
+byte-preserved. No log or overlay exists. The final follow-up changes tests
+and documentation only, so `13051e5` identifies the measured production code.
+
+All manual runs used:
+
+```sh
+export XDG_CONFIG_HOME=/tmp/s1plus-m1-measure/config
+export XDG_DATA_HOME=/tmp/s1plus-m1-measure/data
+export XDG_STATE_HOME=/tmp/s1plus-m1-measure/state
+export XDG_CACHE_HOME=/tmp/s1plus-m1-measure/cache
+export FERRET_INDEX=/tmp/s1plus-m1-measure/index
+```
+
+Source commands below abbreviate
+`B=/home/dave/w/super-ferret-wt/s1plus/target/release/ferret-bench` and
+`I=/tmp/s1plus-m1-measure/index`. The runner
+`/home/dave/w/super-ferret/.ai/s1plus-m1-measurements/run.py` checks `uptime` and
+`pgrep -af 'harness.run|ferret_timing|ignore_timing|synthetic|ferret-bench'`
+before **every** invocation; no competing timing process was present. The
+runner excludes itself and its ancestors from pgrep's matches. Raw commands,
+loads and outputs are preserved beside that runner in `sections.json` and
+`timings.json`. One benchmark ran at a time, with no concurrent compilation.
+
+Section bytes are exact. **Every snapshot row** below comes from
+`$B sections "$I"`, at `13051e5`, load averages **1.84 / 2.09 / 1.81**.
+The 128 B `current` manifest is separate from the snapshot total, measured
+with `stat --format=%s "$I/current"` at `13051e5`, load **2.64 / 2.46 / 2.09**.
+
+| Section | Bytes | B/name |
+| --- | ---: | ---: |
+| Names | 44,348,882 | 4.2444 |
+| NameHeap | 252,108,533 | 24.1281 |
+| DirNames | 5,402,849 | 0.5171 |
+| Entries | 1,040,735 | 0.0996 |
+| Traversed | 225,119 | 0.0215 |
+| Roots | 8 | 0.0000 |
+| Strings | 238,130 | 0.0228 |
+| Dev | 2,601,473 | 0.2490 |
+| Ino | 19,022,579 | 1.8206 |
+| Size | 19,181,044 | 1.8357 |
+| Mtime | 15,963,579 | 1.5278 |
+| MtimeNs | 28,287,944 | 2.7073 |
+| Ctime | 12,993,698 | 1.2436 |
+| CtimeNs | 36,199,331 | 3.4645 |
+| Mode | 6,503,758 | 0.6224 |
+| Owner | 1,300,741 | 0.1245 |
+| Nlink | 1,790,376 | 0.1713 |
+| Doc | 8,819,406 | 0.8441 |
+| States | 2,601,433 | 0.2490 |
+| Links | 272,136 | 0.0260 |
+| Specials | 0 | 0.0000 |
+| WorkTrees | 0 | 0.0000 |
+| Docs | 135,934,792 | 13.0097 |
+| DocRefs | 33,983,696 | 3.2524 |
+| RetainedAt | 225,128 | 0.0215 |
+| Policy | 16 | 0.0000 |
+| **Snapshot total** | **629,046,618** | **60.2031** |
+| `current` manifest | 128 | <0.0001 |
+
+Normalizing the snapshot to exactly 10M names gives **602.031 MB**, against
+M0's **602.0 MB estimate**. The unchanged v3 packed payload contributes
+594,836,546 B; DocRefs adds 33,983,696 B, all-none RetainedAt 225,128 B,
+Policy 16 B and the checked head 1,232 B. This is a measured artifact-size
+comparison; the 10M normalization remains a projection, not another fixture.
+
+Warm timings use the S1a/S1c median method: one unreported warm-up then seven
+fresh-process runs, with the fixture resident in the page cache. Open times
+include manifest/head I/O, section reads, checksum verification and structural
+validation. Snapshot bytes read exclude the manifest's additional 128 B.
+RSS is Linux `VmHWM` in KiB converted to MiB, per fresh benchmark process;
+there is no Python parent-process RSS floor in this figure.
+
+| Measurement | Warm median | Snapshot bytes read | Peak RSS, median (range), MiB | Source command | Commit | Load averages, ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Name open | 307.54 ms | 302,596,889 | 291.70 (291.61–291.73) | `$B open-once "$I" names` | `13051e5` | 1.69 / 2.06 / 1.80 |
+| Name + inode metadata open | 421.10 ms | 457,862,251 | 439.80 (439.71–439.85) | `$B open-once "$I" metadata` | `13051e5` | 1.64 / 2.04 / 1.79 |
+| Full open | 638.93 ms | 629,046,618 | 634.41 (633.91–634.96) | `$B open-once "$I" full` | `13051e5` | 1.64–1.91 / 2.04–2.09 / 1.79–1.81 |
+| All-section checksum throughput | 5.273 GB/s; 119.29 ms | 629,045,386 bytes hashed | — | `$B checksum "$I"` | `13051e5` | 1.91–2.00 / 2.09–2.10 / 1.81–1.82 |
+
+The name set is Names/NameHeap/DirNames/Roots/Strings/Traversed/Links/Specials;
+metadata adds the twelve inode sections. Entries is absent from this name
+load, while M0's conservative name-set estimate included it. Full open also
+loads Entries, Docs, DocRefs, RetainedAt and Policy; its peak includes the
+32.4 MiB temporary reference-count array used for DocRefs validation, which
+is freed after checking. The checksum measurement calls the same BLAKE3-128
+primitive as the decoder over each persisted section, with file reads and
+warming outside the timed interval; it measures resident hashing rather than
+I/O or validation throughput. The seven measured checksum runs span
+118.35–121.95 ms (5.158–5.315 GB/s).
+
+M1 keeps the existing full-checkpoint writer: an unchanged recrawl still
+publishes a new epoch. The zero-write unchanged pass, tiny log commits and
+incremental timings remain M2–M7 work.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes

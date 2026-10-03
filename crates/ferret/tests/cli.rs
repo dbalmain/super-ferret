@@ -2002,3 +2002,36 @@ fn catalog_find_candidate_guards_preserve_earlier_effects_and_followed_directory
         assert_eq!(catalog.stderr.is_empty(), live.stderr.is_empty());
     }
 }
+
+#[test]
+fn search_checks_only_the_sections_its_query_loads() {
+    // Value/padding corruption in an unloaded stat column must not make a
+    // name query fail. The first metadata load must reject the same file.
+    let env = Env::new("lazy-checksum-query");
+    env.write("checked.txt", b"content\n");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let before = env.run(&[os("search"), os("checked")]);
+    assert_eq!(code(&before), 0);
+    let catalog = ferret_catalog::Catalog::open(&env.index())
+        .unwrap()
+        .unwrap();
+    let mut offset = catalog.head_len() as usize;
+    for (section, len) in catalog.section_sizes() {
+        if section == ferret_catalog::Section::Size {
+            break;
+        }
+        offset += len as usize;
+    }
+    let path = ferret_catalog::Catalog::snapshot_path(&env.index())
+        .unwrap()
+        .unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[offset] ^= 1;
+    fs::write(path, bytes).unwrap();
+    let names = env.run(&[os("search"), os("checked")]);
+    assert_eq!(code(&names), 0, "{}", stderr(&names));
+    assert_eq!(names.stdout, before.stdout);
+    let metadata = env.run(&[os("search"), os("checked"), os("size:>0")]);
+    assert_eq!(code(&metadata), 3, "{}", stderr(&metadata));
+    assert!(stderr(&metadata).contains("corrupt: size"));
+}
