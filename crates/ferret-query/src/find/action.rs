@@ -1,7 +1,9 @@
 //! Process, deletion and output primaries. Compiled actions are immutable;
 //! pending exec batches belong to one run. Workers stage bounded chunks; only
 //! the shared batch partitions ordinary exec argv. Output files open during
-//! parsing.
+//! `prepare`'s ordered pass over the expression, not at parse time, so they
+//! land in expression order relative to any reference observation sharing
+//! the same path (#6).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -11,8 +13,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use super::output::OutputBuffer;
 use super::printf::Format;
 use super::{Effects, Entry, EvaluationError, FileKind, WalkError};
 
@@ -24,10 +28,14 @@ pub(super) enum Action {
     List(Target),
 }
 
+/// A shared, lazily-opened output file. `None` until `Target::open` runs
+/// during `prepare`'s ordered pass (#6).
+pub(super) type SharedFile = Arc<Mutex<Option<BufWriter<File>>>>;
+
 #[derive(Clone, Debug)]
 pub(super) enum Target {
     Stdout,
-    File(PathBuf, Arc<Mutex<BufWriter<File>>>),
+    File(PathBuf, SharedFile),
 }
 
 impl PartialEq for Target {
@@ -47,6 +55,26 @@ impl Target {
             Self::Stdout => effects.write(bytes),
             Self::File(_, file) => effects.file(file, bytes),
         }
+    }
+
+    /// Opens (truncating) a file target in place, if it was not already
+    /// opened by an earlier appearance of the same target. Called once, in
+    /// expression order, during `prepare` (#6) - never at parse time, so
+    /// expression order (not argument-parse order) decides its position
+    /// relative to any reference observation sharing the same path.
+    pub(super) fn open(&mut self) -> io::Result<()> {
+        let Self::File(path, file) = self else {
+            return Ok(());
+        };
+        let mut guard = file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_some() {
+            return Ok(());
+        }
+        let opened = File::create(path)?;
+        *guard = Some(BufWriter::with_capacity(4096, opened));
+        Ok(())
     }
 }
 
@@ -74,18 +102,34 @@ pub(super) struct State {
     pub shared: Arc<Mutex<BTreeMap<usize, Batch>>>,
     buffer: Vec<u8>,
     limit: Option<Budget>,
-    files: Vec<Arc<Mutex<BufWriter<File>>>>,
+    files: Vec<SharedFile>,
     pub errors: u64,
+    // Batch commits share the entry record's gate, so a batch's output can
+    // never split an entry's and vice versa. Set once per task, including
+    // donated ones.
+    pub gate: Arc<Mutex<()>>,
+    pub quit: Arc<AtomicBool>,
+}
+
+fn flush_files(files: &[SharedFile]) -> io::Result<()> {
+    for file in files {
+        // `None` here means this target's `prepare`-time open is the one
+        // still pending (or failed and already reported); either way there
+        // is nothing committed yet to flush.
+        if let Some(writer) = file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            writer.flush()?;
+        }
+    }
+    Ok(())
 }
 
 impl State {
     pub(super) fn flush_files(&self) -> io::Result<()> {
-        for file in &self.files {
-            file.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .flush()?;
-        }
-        Ok(())
+        flush_files(&self.files)
     }
 
     pub fn flush(&mut self, effects: &mut impl Effects, directories_only: bool) -> io::Result<()> {
@@ -100,12 +144,13 @@ impl State {
         if !directories_only && !self.staged.is_empty() {
             let limit = *self.limit.get_or_insert_with(batch_limit);
             for batch in self.staged.values_mut() {
-                self.errors += batch.collect(&self.shared, limit, effects)?;
+                self.errors +=
+                    batch.collect(&self.shared, limit, effects, &self.gate, &self.quit)?;
             }
         }
         for batch in self.batches.values_mut() {
             if !directories_only || batch.exec.directory {
-                self.errors += u64::from(!batch.run(effects)?);
+                self.errors += u64::from(!batch.run(effects, &self.gate, &self.quit)?);
             }
         }
         Ok(())
@@ -127,7 +172,7 @@ impl State {
         }
         for batch in self.batches.values_mut() {
             if batch.exec.directory && batch.directory.as_deref() != Some(&directory) {
-                self.errors += u64::from(!batch.run(effects)?);
+                self.errors += u64::from(!batch.run(effects, &self.gate, &self.quit)?);
             }
         }
         Ok(())
@@ -137,6 +182,8 @@ impl State {
 pub(super) fn flush_shared(
     shared: &Mutex<BTreeMap<usize, Batch>>,
     effects: &mut impl Effects,
+    gate: &Mutex<()>,
+    quit: &AtomicBool,
 ) -> io::Result<u64> {
     let mut errors = 0;
     let mut batches = std::mem::take(
@@ -145,7 +192,7 @@ pub(super) fn flush_shared(
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     for batch in batches.values_mut() {
-        errors += u64::from(!batch.run(effects)?);
+        errors += u64::from(!batch.run(effects, gate, quit)?);
     }
     Ok(errors)
 }
@@ -172,6 +219,8 @@ impl Batch {
         shared: &Mutex<BTreeMap<usize, Self>>,
         limit: Budget,
         effects: &mut impl Effects,
+        gate: &Mutex<()>,
+        quit: &AtomicBool,
     ) -> io::Result<u64> {
         if self.paths.is_empty() {
             return Ok(0);
@@ -197,24 +246,30 @@ impl Batch {
         // Workers append to a fresh batch while detached full batches run.
         let mut errors = 0;
         for batch in &mut ready {
-            errors += u64::from(!batch.run(effects)?);
+            errors += u64::from(!batch.run(effects, gate, quit)?);
         }
         Ok(errors)
     }
 
-    fn run(&mut self, effects: &mut impl Effects) -> io::Result<bool> {
+    fn run(
+        &mut self,
+        effects: &mut impl Effects,
+        gate: &Mutex<()>,
+        quit: &AtomicBool,
+    ) -> io::Result<bool> {
         if self.paths.is_empty() {
             return Ok(true);
         }
         let mut args = self.exec.args.clone();
         args.append(&mut self.paths);
         self.bytes = command_bytes(&self.exec.args);
-        spawn(
+        spawn_batch(
             &args,
             self.directory.as_deref(),
             self.handle.as_deref(),
-            false,
             effects,
+            gate,
+            quit,
         )
     }
 }
@@ -268,12 +323,23 @@ pub(super) fn evaluate(
     match action {
         Action::Exec(exec) => execute(exec, entry, effects, state).map_err(EvaluationError::Output),
         Action::Delete => {
-            let result = if entry.name() == b"." {
-                Ok(())
-            } else if entry.kind().map_err(EvaluationError::Metadata)? == FileKind::Directory {
-                fs::remove_dir(entry.path())
-            } else {
-                fs::remove_file(entry.path())
+            if entry.name() == b"." {
+                return Ok(true);
+            }
+            let result = {
+                let flags =
+                    if entry.kind().map_err(EvaluationError::Metadata)? == FileKind::Directory {
+                        rustix::fs::AtFlags::REMOVEDIR
+                    } else {
+                        rustix::fs::AtFlags::empty()
+                    };
+                entry
+                    .directory_handle()
+                    .ok_or_else(|| io::Error::other("missing deletion parent handle"))
+                    .and_then(|parent| {
+                        rustix::fs::unlinkat(&*parent, OsStr::from_bytes(entry.name()), flags)
+                            .map_err(Into::into)
+                    })
             };
             match result {
                 Ok(()) => {
@@ -292,13 +358,30 @@ pub(super) fn evaluate(
         }
         Action::Output(target, format) => {
             register_file(state, target);
-            state.buffer.clear();
+            struct Sink<'a, E> {
+                target: &'a Target,
+                effects: &'a mut E,
+            }
+            impl<E: Effects> Write for Sink<'_, E> {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.target
+                        .write(bytes, self.effects)
+                        .map_err(super::mark_output_failure)?;
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
             format
-                .render(entry, &mut state.buffer)
-                .map_err(EvaluationError::Metadata)?;
-            target
-                .write(&state.buffer, effects)
-                .map_err(EvaluationError::Output)?;
+                .render(entry, &mut Sink { target, effects })
+                .map_err(|error| {
+                    if super::is_output_failure(&error) {
+                        EvaluationError::Output(super::unmark_output_failure(error))
+                    } else {
+                        EvaluationError::Metadata(error)
+                    }
+                })?;
             Ok(true)
         }
         Action::List(target) => {
@@ -337,10 +420,11 @@ fn execute(
         (None, entry.path().as_os_str().to_owned())
     };
     let handle = if exec.directory {
-        Some(match entry.directory_handle() {
-            Some(handle) => handle,
-            None => Arc::new(File::open(directory.as_deref().unwrap_or(Path::new(".")))?),
-        })
+        Some(
+            entry
+                .directory_handle()
+                .ok_or_else(|| io::Error::other("missing execution directory handle"))?,
+        )
     } else {
         None
     };
@@ -356,12 +440,9 @@ fn execute(
             // Bound worker staging by count and bytes. A single oversized path
             // is immediately collected; only the shared batch partitions argv.
             if batch.paths.len() >= 32 || batch.bytes - command_bytes(&exec.args) >= 4096 {
-                for file in &state.files {
-                    file.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .flush()?;
-                }
-                state.errors += batch.collect(&state.shared, limit, effects)?;
+                flush_files(&state.files)?;
+                state.errors +=
+                    batch.collect(&state.shared, limit, effects, &state.gate, &state.quit)?;
             }
             return Ok(true);
         }
@@ -371,12 +452,8 @@ fn execute(
             .or_insert_with(|| Batch::new(exec, directory.clone(), handle.clone()));
         let bytes = path.as_bytes().len() + 1;
         if batch.directory != directory || batch.full(bytes, limit) {
-            for file in &state.files {
-                file.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .flush()?;
-            }
-            state.errors += u64::from(!batch.run(effects)?);
+            flush_files(&state.files)?;
+            state.errors += u64::from(!batch.run(effects, &state.gate, &state.quit)?);
         }
         batch.directory = directory;
         batch.handle = handle;
@@ -414,7 +491,7 @@ fn substitute(arg: &OsStr, path: &OsStr) -> OsString {
     OsString::from_vec(result)
 }
 
-fn exec_path(path: &Path) -> (PathBuf, OsString) {
+pub(super) fn exec_path(path: &Path) -> (PathBuf, OsString) {
     let bytes = path.as_os_str().as_bytes();
     let end = bytes
         .iter()
@@ -453,19 +530,35 @@ fn spawn(
     effects: &mut impl Effects,
 ) -> io::Result<bool> {
     effects.flush()?;
-    // GNU closes fd 0 for interactive actions. A POSIX shell exec trampoline
-    // provides that child-only operation without unsafe pre_exec hooks.
     let mut command = if close_stdin {
+        // GNU closes fd 0 for interactive actions. A POSIX shell exec
+        // trampoline provides that child-only operation without unsafe
+        // pre_exec hooks.
         let mut command = Command::new("sh");
         command
             .args(["-c", "exec \"$@\" <&-", "find-ok"])
             .args(args);
+        if let Some(handle) = handle {
+            command.current_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        } else if let Some(directory) = directory {
+            command.current_dir(directory);
+        }
         command
     } else {
-        let mut command = Command::new(&args[0]);
-        command.args(&args[1..]);
-        command
+        prepare(args, directory, handle)
     };
+    match effects.command(&mut command) {
+        Ok(success) => Ok(success),
+        Err(error) if super::is_output_failure(&error) => Err(super::unmark_output_failure(error)),
+        Err(error) => probe_launch_failure(error, args, handle, effects),
+    }
+}
+
+/// Builds the directory/handle-relative command common to both single and
+/// batched exec, without running it.
+fn prepare(args: &[OsString], directory: Option<&Path>, handle: Option<&File>) -> Command {
+    let mut command = Command::new(&args[0]);
+    command.args(&args[1..]);
     if let Some(handle) = handle {
         // CLOEXEC still allows the child to chdir through its inherited fd
         // before exec. This also works after the directory has been unlinked.
@@ -473,26 +566,59 @@ fn spawn(
     } else if let Some(directory) = directory {
         command.current_dir(directory);
     }
-    match effects.command(&mut command) {
-        Ok(success) => Ok(success),
-        Err(error) => {
-            if let Some(handle) = handle {
-                // GNU stops for an inaccessible batch cwd, but an executable
-                // launch failure is only false. Probe only failed commands,
-                // through the retained handle so renamed directories work.
-                rustix::fs::accessat(
-                    handle,
-                    ".",
-                    rustix::fs::Access::EXEC_OK,
-                    rustix::fs::AtFlags::EACCESS,
-                )?;
-            }
-            effects.error(&WalkError {
-                path: PathBuf::from(&args[0]),
-                error,
-            });
-            Ok(false)
+    command
+}
+
+fn probe_launch_failure(
+    error: io::Error,
+    args: &[OsString],
+    handle: Option<&File>,
+    effects: &mut impl Effects,
+) -> io::Result<bool> {
+    if let Some(handle) = handle {
+        // GNU stops for an inaccessible batch cwd, but an executable
+        // launch failure is only false. Probe only failed commands,
+        // through the retained handle so renamed directories work.
+        rustix::fs::accessat(
+            handle,
+            ".",
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )?;
+    }
+    effects.error(&WalkError {
+        path: PathBuf::from(&args[0]),
+        error,
+    });
+    Ok(false)
+}
+
+/// Runs a batch's command and commits its captured stdout through the same
+/// gate an entry's own output commits through (#4): capture happens before
+/// the lock is taken, so a slow child cannot hold up other workers, and the
+/// write happens atomically against entry commits so no record can split
+/// another's.
+fn spawn_batch(
+    args: &[OsString],
+    directory: Option<&Path>,
+    handle: Option<&File>,
+    effects: &mut impl Effects,
+    gate: &Mutex<()>,
+    _quit: &AtomicBool,
+) -> io::Result<bool> {
+    effects.flush()?;
+    let mut command = prepare(args, directory, handle);
+    let mut buffer = OutputBuffer::default();
+    match effects.capture(&mut command, &mut buffer) {
+        Ok(success) => {
+            // Unlike an entry's own record, a batch's already-collected
+            // arguments must still flush after `-quit`: GNU runs any
+            // pending `+` batch at the end regardless.
+            super::output::commit_stdout(effects, &mut buffer, gate)?;
+            Ok(success)
         }
+        Err(error) if super::is_output_failure(&error) => Err(super::unmark_output_failure(error)),
+        Err(error) => probe_launch_failure(error, args, handle, effects),
     }
 }
 

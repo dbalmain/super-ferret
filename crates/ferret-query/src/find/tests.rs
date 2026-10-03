@@ -65,17 +65,12 @@ impl Drop for Tree {
 struct Output {
     bytes: Vec<u8>,
     errors: Vec<PathBuf>,
-    remove: Option<PathBuf>,
 }
 
 impl Effects for Output {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
         self.bytes.extend_from_slice(path.as_os_str().as_bytes());
         self.bytes.push(if nul { 0 } else { b'\n' });
-        if self.remove.as_deref() == Some(path) {
-            fs::remove_dir_all(path)?;
-            self.remove = None;
-        }
         Ok(())
     }
 
@@ -376,11 +371,20 @@ fn errors_continue_across_starts_and_missing_matches_succeed() {
 #[test]
 fn a_directory_removed_after_its_visit_faults_without_losing_siblings() {
     let tree = Tree::new("vanish");
-    let plan = Plan::parse(&tree.args(&["-print"])).unwrap();
-    let mut output = Output {
-        remove: Some(tree.0.join("dir")),
-        ..Output::default()
-    };
+    // Printing is captured now; mutate through a real synchronous command
+    // after observing the directory, before attempting its descent.
+    let plan = Plan::parse(&tree.args(&[
+        "-exec",
+        "sh",
+        "-c",
+        "case \"$1\" in */dir) rm -rf \"$1\";; esac",
+        "sh",
+        "{}",
+        ";",
+        "-print",
+    ]))
+    .unwrap();
+    let mut output = Output::default();
     let outcome = plan.run(&mut plan.live_source(), &mut output).unwrap();
     assert_eq!(outcome.errors, 1);
     assert_eq!(output.errors, [tree.0.join("dir")]);
@@ -502,6 +506,26 @@ fn metadata_observations_and_failures_are_cached_and_name_tests_are_lazy() {
     assert!(entry.metadata().is_err());
     fs::write(entry.path(), b"later").unwrap();
     assert!(entry.metadata().is_err());
+}
+
+#[test]
+fn parser_rejects_a_combinator_chain_deep_enough_to_overflow_the_stack() {
+    // #11: evaluate(), visit() and friends recurse once per AST level, and
+    // a long implicit-`-a` chain builds one level per joined primary. 50,000
+    // `-true`s reliably aborted with a stack overflow before this fix,
+    // because nothing stopped the chain from growing past what a recursive
+    // evaluation pass can walk. The parser now refuses past a limit far
+    // below any observed crash and far above any real command line,
+    // turning the abort into an ordinary parse error.
+    let mut args: Vec<OsString> = vec!["-I".into(), ".".into()];
+    args.extend(std::iter::repeat_n(OsString::from("-true"), 50_000));
+    assert!(Plan::parse(&args).is_err());
+
+    // A chain well under the limit still parses and evaluates normally.
+    let mut args: Vec<OsString> = vec!["-I".into(), ".".into()];
+    args.extend(std::iter::repeat_n(OsString::from("-true"), 100));
+    args.push("-print".into());
+    Plan::parse(&args).unwrap();
 }
 
 #[test]

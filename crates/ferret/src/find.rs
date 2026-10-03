@@ -2,10 +2,10 @@
 //! source.
 
 use std::ffi::OsString;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 use ferret_catalog::Catalog;
@@ -14,10 +14,6 @@ use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
 
 use crate::cli::{self, Exit};
 use crate::xdg::Dirs;
-
-/// Stdout buffer. The engine flushes it before every child process, so a
-/// larger buffer changes only how often a plain walk writes.
-const OUTPUT_BUFFER: usize = 64 * 1024;
 
 /// Runs a find command. Find errors and usage errors both exit 1; no matches
 /// is success. Explicit -I never reads config or opens an index; neither mode
@@ -97,13 +93,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
             "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form",
         );
     }
-    let mut effects = Output {
-        writer: Arc::new(Mutex::new(BufWriter::with_capacity(
-            OUTPUT_BUFFER,
-            io::stdout(),
-        ))),
-        buffer: Vec::with_capacity(OUTPUT_BUFFER),
-    };
+    let mut effects = Output::Stdout;
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
         Some(catalog) => plan.run_parallel(
@@ -135,61 +125,54 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     }
 }
 
-struct Output<W: Write = io::Stdout> {
-    writer: Arc<Mutex<BufWriter<W>>>,
-    buffer: Vec<u8>,
+#[derive(Clone)]
+enum Output {
+    Stdout,
+    #[cfg(test)]
+    Test(Arc<Mutex<Box<dyn Write + Send>>>),
 }
 
-impl<W: Write> Clone for Output<W> {
-    fn clone(&self) -> Self {
-        Self {
-            writer: self.writer.clone(),
-            buffer: Vec::with_capacity(OUTPUT_BUFFER),
+impl Output {
+    // The engine holds its transaction gate. Stdout's own lock covers the
+    // destination, including its internal line buffer, without another mutex.
+    fn with_writer(
+        &mut self,
+        write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match self {
+            Self::Stdout => write(&mut io::stdout().lock()),
+            #[cfg(test)]
+            Self::Test(writer) => write(
+                &mut **writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
         }
+    }
+    #[cfg(test)]
+    fn test(writer: impl Write + Send + 'static) -> Self {
+        Self::Test(Arc::new(Mutex::new(Box::new(writer))))
     }
 }
 
-impl<W: Write> Output<W> {
-    fn record(&mut self, bytes: &[u8], terminator: &[u8]) -> io::Result<()> {
-        if self.buffer.len() + bytes.len() + terminator.len() > OUTPUT_BUFFER {
-            self.flush()?;
-        }
-        self.buffer.extend_from_slice(bytes);
-        self.buffer.extend_from_slice(terminator);
-        Ok(())
-    }
-}
-
-impl<W: Write> Effects for Output<W> {
+impl Effects for Output {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
-        self.record(path.as_os_str().as_bytes(), if nul { b"\0" } else { b"\n" })
+        self.with_writer(|writer| {
+            writer.write_all(path.as_os_str().as_bytes())?;
+            writer.write_all(if nul { b"\0" } else { b"\n" })
+        })
     }
-
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.record(bytes, b"")
+        self.with_writer(|writer| writer.write_all(bytes))
     }
-
     fn flush(&mut self) -> io::Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer.write_all(&self.buffer)?;
-        self.buffer.clear();
-        writer.flush()
+        self.with_writer(|writer| writer.flush())
     }
-
-    fn command(&mut self, command: &mut Command) -> io::Result<bool> {
-        self.flush()?;
-        let mut output = OutputBuffer::default();
-        let success = self.capture(command, &mut output)?;
-        let shared = self.writer.clone();
-        let mut writer = shared
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        output.write_to(&mut *writer)?;
-        writer.flush()?;
-        Ok(success)
+    fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
+        self.with_writer(|writer| {
+            buffer.write_to(writer)?;
+            writer.flush()
+        })
     }
 
     fn warning(&mut self, message: &str) {
@@ -243,6 +226,8 @@ fn parse_config(text: &str) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::BufWriter;
+
     use super::*;
 
     #[test]
@@ -257,6 +242,205 @@ mod tests {
         ] {
             assert!(parse_config(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn spilled_record_reaches_the_cli_destination_before_another_worker_flushes() {
+        // R2 #4: force the next worker's complete short record between the
+        // first worker's evaluation and completion flush, without scheduling
+        // or sleeps. This drives the real evaluator and CLI Output host.
+        use ferret_query::find::{Entry, EntrySource, FileKind, LiveWalk};
+        struct Interleave {
+            entry: Entry,
+            yielded: bool,
+            other: Option<(Plan, LiveWalk, Output)>,
+        }
+        impl EntrySource for Interleave {
+            fn next(&mut self, _: bool) -> Option<Result<&Entry, WalkError>> {
+                if !self.yielded {
+                    self.yielded = true;
+                    return Some(Ok(&self.entry));
+                }
+                if let Some((plan, mut walk, mut host)) = self.other.take() {
+                    assert_eq!(plan.run(&mut walk, &mut host).unwrap().errors, 0);
+                }
+                None
+            }
+        }
+        let directory = std::env::temp_dir().join(format!("ferret-r2-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let long = directory.join("long");
+        let short = directory.join("short");
+        std::os::unix::fs::symlink("L".repeat(2000), &long).unwrap();
+        std::os::unix::fs::symlink("S", &short).unwrap();
+        let format = OsString::from(format!("{}\\n", "%l".repeat(100)));
+        let make_plan = |path: &Path| {
+            Plan::parse(&[
+                "-I".into(),
+                path.as_os_str().to_owned(),
+                "-printf".into(),
+                format.clone(),
+            ])
+            .unwrap()
+        };
+        let plan = make_plan(&long);
+        let other = make_plan(&short);
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let mut host = Output::test(Sink(bytes.clone()));
+        let mut source = Interleave {
+            entry: Entry::new(long, 0, FileKind::Symlink),
+            yielded: false,
+            other: Some((other, make_plan(&short).live_source(), host.clone())),
+        };
+        let result = plan.run(&mut source, &mut host).unwrap();
+        host.flush().unwrap();
+        let shared = bytes.lock().unwrap();
+        let records: Vec<_> = shared.split(|&byte| byte == b'\n').collect();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(result.errors, 0);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].len(), 200_000);
+        assert!(records[0].iter().all(|&byte| byte == b'L'));
+        assert_eq!(records[1].len(), 100);
+        assert!(records[1].iter().all(|&byte| byte == b'S'));
+        assert!(records[2].is_empty());
+    }
+
+    #[test]
+    fn spilled_file_record_excludes_a_short_record_between_destination_writes() {
+        // R2 #4: interpose after the first actual file-destination write.
+        // The old single-action path allowed a second invocation of the same
+        // prepared plan to insert a short record there. Whole transactions
+        // bypass that byte-write seam; the source then runs the short record
+        // after the long evaluation. No thread scheduling or sleeps are used.
+        use ferret_query::find::{Entry, EntrySource, FileKind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct One {
+            entry: Entry,
+            yielded: bool,
+        }
+        impl EntrySource for One {
+            fn next(&mut self, _: bool) -> Option<Result<&Entry, WalkError>> {
+                if self.yielded {
+                    None
+                } else {
+                    self.yielded = true;
+                    Some(Ok(&self.entry))
+                }
+            }
+        }
+        fn short_record(plan: &Plan, path: &Path, mut host: Output) {
+            let mut source = One {
+                entry: Entry::new(path.to_owned(), 0, FileKind::Symlink),
+                yielded: false,
+            };
+            assert_eq!(plan.run(&mut source, &mut host).unwrap().errors, 0);
+        }
+        struct Host {
+            cli: Output,
+            plan: Arc<Plan>,
+            short: PathBuf,
+            emitted: Arc<AtomicBool>,
+        }
+        impl Effects for Host {
+            fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
+                self.cli.print(path, nul)
+            }
+            fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+                self.cli.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.cli.flush()
+            }
+            fn error(&mut self, error: &WalkError) {
+                panic!("{error:?}");
+            }
+            fn file(
+                &mut self,
+                file: &Arc<Mutex<Option<BufWriter<std::fs::File>>>>,
+                bytes: &[u8],
+            ) -> io::Result<()> {
+                self.cli.file(file, bytes)?;
+                if !self.emitted.swap(true, Ordering::SeqCst) {
+                    short_record(&self.plan, &self.short, self.cli.clone());
+                }
+                Ok(())
+            }
+        }
+        struct Source {
+            first: One,
+            plan: Arc<Plan>,
+            short: PathBuf,
+            cli: Output,
+            emitted: Arc<AtomicBool>,
+        }
+        impl EntrySource for Source {
+            fn next(&mut self, _: bool) -> Option<Result<&Entry, WalkError>> {
+                if !self.first.yielded {
+                    return self.first.next(true);
+                }
+                if !self.emitted.swap(true, Ordering::SeqCst) {
+                    short_record(&self.plan, &self.short, self.cli.clone());
+                }
+                None
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("ferret-r2-cli-file-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let long = directory.join("long");
+        let short = directory.join("short");
+        let destination = directory.join("out");
+        std::os::unix::fs::symlink("L".repeat(2000), &long).unwrap();
+        std::os::unix::fs::symlink("S", &short).unwrap();
+        let plan = Arc::new(
+            Plan::parse(&[
+                "-I".into(),
+                long.as_os_str().to_owned(),
+                "-fprintf".into(),
+                destination.as_os_str().to_owned(),
+                format!("{}\\n", "%l".repeat(100)).into(),
+            ])
+            .unwrap(),
+        );
+        let cli = Output::test(Vec::new());
+        let emitted = Arc::new(AtomicBool::new(false));
+        let mut host = Host {
+            cli: cli.clone(),
+            plan: plan.clone(),
+            short: short.clone(),
+            emitted: emitted.clone(),
+        };
+        let mut source = Source {
+            first: One {
+                entry: Entry::new(long, 0, FileKind::Symlink),
+                yielded: false,
+            },
+            plan: plan.clone(),
+            short,
+            cli,
+            emitted,
+        };
+        assert_eq!(plan.run(&mut source, &mut host).unwrap().errors, 0);
+        let bytes = std::fs::read(&destination).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        let records: Vec<_> = bytes.split(|&byte| byte == b'\n').collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].len(), 200_000);
+        assert!(records[0].iter().all(|&byte| byte == b'L'));
+        assert_eq!(records[1].len(), 100);
+        assert!(records[1].iter().all(|&byte| byte == b'S'));
+        assert!(records[2].is_empty());
     }
 
     #[test]
@@ -304,10 +488,7 @@ mod tests {
         ];
         let plan = Plan::parse(&args).unwrap();
         let (sent, received) = mpsc::channel();
-        let effects = Output {
-            writer: Arc::new(Mutex::new(BufWriter::new(Sink(sent)))),
-            buffer: Vec::new(),
-        };
+        let effects = Output::test(Sink(sent));
         let slow = effects.clone();
         let batch =
             std::thread::spawn(move || plan.run_parallel(plan.live_source(), slow, 1).unwrap());

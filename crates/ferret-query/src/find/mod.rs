@@ -73,6 +73,8 @@ pub(crate) struct Options {
     pub xdev: bool,
     pub follow: Follow,
     pub live_checks: bool,
+    pub retain_parent: bool,
+    pub delete: bool,
     guard: Option<CandidateGuard>,
 }
 
@@ -82,6 +84,48 @@ pub(crate) enum Follow {
     Physical,
     Roots,
     All,
+}
+
+/// Marks an `io::Error` as happening after a child was successfully
+/// launched (capture, wait, or writing the captured bytes to their
+/// destination), rather than as a failure to launch it. `-exec`'s result is
+/// only ever false for a launch failure; anything marked here is a fatal
+/// output error instead (#3).
+#[derive(Debug)]
+struct OutputFailure(io::Error);
+
+impl std::fmt::Display for OutputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for OutputFailure {}
+
+/// Marks a captured command's output error so a caller's own `command`
+/// override is held to the same contract as the default: a failure writing
+/// out already-captured bytes is fatal, never a false `-exec` result.
+pub fn mark_output_failure(error: io::Error) -> io::Error {
+    io::Error::other(OutputFailure(error))
+}
+
+pub(super) fn is_output_failure(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<OutputFailure>().is_some())
+}
+
+/// Unwraps a marked error back to its original kind and message, for
+/// display; a plain error passes through unchanged.
+pub(super) fn unmark_output_failure(error: io::Error) -> io::Error {
+    let kind = error.kind();
+    match error.into_inner() {
+        Some(inner) => match inner.downcast::<OutputFailure>() {
+            Ok(marked) => marked.0,
+            Err(inner) => io::Error::new(kind, inner),
+        },
+        None => io::Error::from(kind),
+    }
 }
 
 /// The host supplies process output. A failed print stops the walk and is
@@ -100,16 +144,36 @@ pub trait Effects {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// Writes a complete captured transaction and flushes all host buffering.
+    /// Called with the run's commit gate held. Adapters forward this operation
+    /// to the destination rather than recapturing it.
+    fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
+        struct Host<'a, E: ?Sized>(&'a mut E);
+        impl<E: Effects + ?Sized> std::io::Write for Host<'_, E> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.write(bytes)?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        buffer.write_to(&mut Host(self))?;
+        self.flush()
+    }
     /// Executes a prepared command, draining stdout through the host capture
     /// hook.
     fn command(&mut self, command: &mut std::process::Command) -> io::Result<bool> {
         let mut output = OutputBuffer::default();
         let success = self.capture(command, &mut output)?;
-        output.write_to(&mut io::stdout().lock())?;
+        self.output(&mut output).map_err(mark_output_failure)?;
         Ok(success)
     }
     /// Drains a child's stdout into the entry buffer while it runs. Stderr and
-    /// stdin retain the host's normal process policy.
+    /// stdin retain the host's normal process policy. Only the initial spawn
+    /// can be a launch failure; a failure draining, waiting for, or writing
+    /// the child's output is fatal and must never read as the command simply
+    /// having failed (#3).
     fn capture(
         &mut self,
         command: &mut std::process::Command,
@@ -125,9 +189,9 @@ pub trait Effects {
             Some(mut stdout) => io::copy(&mut stdout, output).map(|_| ()),
             None => Ok(()),
         };
-        let status = child.wait();
-        copied?;
-        Ok(status?.success())
+        let status = child.wait().map_err(mark_output_failure)?;
+        copied.map_err(mark_output_failure)?;
+        Ok(status.success())
     }
     /// Commits this entry and latches cancellation. Hosts normally use the
     /// evaluator's entry adapter rather than overriding this hook.
@@ -135,15 +199,15 @@ pub trait Effects {
         Ok(())
     }
     /// Writes an output-file record through the evaluator's entry adapter.
-    fn file(
-        &mut self,
-        file: &std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
-        bytes: &[u8],
-    ) -> io::Result<()> {
+    fn file(&mut self, file: &action::SharedFile, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        file.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .write_all(bytes)
+        let mut guard = file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer = guard.as_mut().ok_or_else(|| {
+            io::Error::other("output file target was not opened during preparation")
+        })?;
+        writer.write_all(bytes)
     }
     /// Prompts and reads one answer line. Only initial y/Y is yes in C locale.
     fn confirm(&mut self, program: &std::ffi::OsStr, path: &Path) -> io::Result<bool> {
@@ -201,7 +265,16 @@ struct Control {
 impl Plan {
     /// Parses a GNU find argument list, including leading ferret `-I`.
     pub fn parse(args: &[OsString]) -> Result<Self, ParseError> {
-        parse::parse(args)
+        let mut plan = parse::parse(args)?;
+        plan.options.live_checks = has_actions(&plan.expression);
+        plan.expression.visit(&mut |leaf| {
+            plan.options.retain_parent |= matches!(leaf,
+                Expression::Action(action::Action::Delete)
+                | Expression::Action(action::Action::Exec(action::Exec { directory: true, .. }))
+                | Expression::Test(test::Test::Link(_) | test::Test::Xtype(_))
+            ) || matches!(leaf, Expression::Action(action::Action::Output(_, format)) if format.needs_directory());
+        });
+        Ok(plan)
     }
 
     /// Whether this command prints help, version or debug-option help.
@@ -256,7 +329,6 @@ impl Plan {
     /// Creates a catalog walk. Load `catalog_sections()` before construction.
     pub fn catalog_source(&self, catalog: ferret_catalog::Catalog) -> CatalogSource {
         let mut options = self.options.clone();
-        options.live_checks = has_actions(&self.expression);
         options.guard = leading_guard(&self.expression);
         CatalogSource::new(catalog, self.paths.clone(), options)
     }
@@ -298,7 +370,7 @@ impl Plan {
             return Ok(None);
         }
         let mut expression = self.expression.clone();
-        if let Err(error) = resolve_references(&mut expression, source.catalog()) {
+        if let Err(error) = prepare_expression(&mut expression, source.catalog()) {
             effects.error(&WalkError {
                 path: ".".into(),
                 error,
@@ -392,12 +464,22 @@ fn expression_sections(expression: &Expression, out: &mut Vec<ferret_catalog::Se
     });
 }
 
-fn resolve_references(
+/// One ordered pass over the expression, left to right, that does the two
+/// things parsing could not: observe `-newer`-style references against the
+/// live catalog, and open (truncating) each `-fprint`/`-fprintf` output
+/// file. Both must happen in the expression's written order - `-newer ref
+/// -fprint ref` must read `ref`'s mtime before `-fprint ref` truncates it,
+/// and `-fprint ref -newer ref` must truncate first (#6) - so one function
+/// does both rather than two passes racing on order.
+fn prepare_expression(
     expression: &mut Expression,
     catalog: Option<&ferret_catalog::Catalog>,
 ) -> io::Result<()> {
     expression.try_visit_mut(&mut |leaf| match leaf {
         Expression::Test(test) => test.resolve_reference(catalog),
+        Expression::Action(action::Action::Output(target, _) | action::Action::List(target)) => {
+            target.open()
+        }
         _ => Ok(()),
     })
 }

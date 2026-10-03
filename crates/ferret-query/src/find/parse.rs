@@ -4,8 +4,6 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::File;
-use std::io::BufWriter;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -85,6 +83,8 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         daystart: false,
         now: std::time::SystemTime::now(),
         permission_warning: false,
+        combinators: 0,
+        nesting: 0,
     };
     let mut no_ignore = false;
     while let Some(arg) = parser.peek() {
@@ -176,6 +176,8 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
             "-delete implies -depth; -prune requires an explicit -depth option".into(),
         ));
     }
+    parser.options.retain_parent = parser.delete;
+    parser.options.delete = parser.delete;
     Ok(Plan {
         expression,
         paths,
@@ -197,7 +199,7 @@ struct Parser<'a> {
     warnings: Vec<String>,
     message: Option<String>,
     dialect: Dialect,
-    streams: HashMap<PathBuf, Arc<Mutex<BufWriter<File>>>>,
+    streams: HashMap<PathBuf, super::action::SharedFile>,
     exec_id: usize,
     delete: bool,
     prune: bool,
@@ -205,9 +207,45 @@ struct Parser<'a> {
     daystart: bool,
     now: std::time::SystemTime,
     permission_warning: bool,
+    combinators: usize,
+    nesting: usize,
 }
 
+/// A chain this long would build an AST deep enough to overflow the stack in
+/// every recursive pass over it - evaluation foremost, since it runs per
+/// entry and can't be rewritten iteratively without an explicit
+/// continuation stack for `&&`/`||` short-circuiting. 50,000 `-true`s
+/// joined by an implicit `-a` reliably aborted at this depth (#11); this
+/// limit sits an order of magnitude below the lowest observed crash
+/// (10,000-20,000, debug build, default 8 MiB stack) with headroom for
+/// release builds' smaller frames and tighter stacks alike. No real find
+/// command line approaches it.
+const MAX_COMBINATORS: usize = 2000;
+// Parentheses add parser frames even when they add no AST nodes. Negations
+// share this budget so alternating parentheses and negations cannot evade it.
+const MAX_NESTING: usize = 128;
+
 impl Parser<'_> {
+    fn nest(&mut self) -> Result<(), ParseError> {
+        self.nesting += 1;
+        if self.nesting > MAX_NESTING {
+            return Err(ParseError::Feature(format!(
+                "expression nesting exceeds {MAX_NESTING} parentheses/negations; split it up"
+            )));
+        }
+        Ok(())
+    }
+
+    fn combine(&mut self) -> Result<(), ParseError> {
+        self.combinators += 1;
+        if self.combinators > MAX_COMBINATORS {
+            return Err(ParseError::Feature(format!(
+                "expression has more than {MAX_COMBINATORS} -a/-o/-not/, operators; split it up"
+            )));
+        }
+        Ok(())
+    }
+
     fn peek(&self) -> Option<&[u8]> {
         self.args.get(self.at).map(|arg| arg.as_bytes())
     }
@@ -224,6 +262,7 @@ impl Parser<'_> {
     fn comma(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.or()?;
         while self.consume(&[b","]) {
+            self.combine()?;
             left = Expression::Comma(Box::new(left), Box::new(self.or()?));
         }
         Ok(left)
@@ -232,6 +271,7 @@ impl Parser<'_> {
     fn or(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.and()?;
         while self.consume(&[b"-o", b"-or"]) {
+            self.combine()?;
             left = Expression::Or(Box::new(left), Box::new(self.and()?));
         }
         Ok(left)
@@ -241,6 +281,7 @@ impl Parser<'_> {
         let mut left = self.unary()?;
         loop {
             if self.consume(&[b"-a", b"-and"]) {
+                self.combine()?;
                 left = Expression::And(Box::new(left), Box::new(self.unary()?));
             } else if self
                 .peek()
@@ -248,6 +289,7 @@ impl Parser<'_> {
             {
                 break;
             } else {
+                self.combine()?;
                 left = Expression::And(Box::new(left), Box::new(self.unary()?));
             }
         }
@@ -256,10 +298,17 @@ impl Parser<'_> {
 
     fn unary(&mut self) -> Result<Expression, ParseError> {
         if self.consume(&[b"!", b"-not"]) {
-            return Ok(Expression::Not(Box::new(self.unary()?)));
+            self.combine()?;
+            self.nest()?;
+            let inner = self.unary();
+            self.nesting -= 1;
+            return inner.map(|inner| Expression::Not(Box::new(inner)));
         }
         if self.consume(&[b"("]) {
-            let inner = self.comma()?;
+            self.nest()?;
+            let inner = self.comma();
+            self.nesting -= 1;
+            let inner = inner?;
             if !self.consume(&[b")"]) {
                 return Err(ParseError::Expression(self.args.get(self.at).cloned()));
             }
@@ -554,15 +603,15 @@ impl Parser<'_> {
         if path == std::path::Path::new("/dev/stdout") {
             return Ok(Target::Stdout);
         }
+        // The file itself opens (and truncates) later, during `prepare`'s
+        // single ordered pass over the expression - in step with any
+        // `-newer`-style reference observation, not here at parse time
+        // (#6). Parsing only reserves the shared, as-yet-unopened cell,
+        // deduplicated by path so repeated targets share one open.
         let file = match self.streams.get(&path) {
             Some(file) => file.clone(),
             None => {
-                let file = Arc::new(Mutex::new(BufWriter::with_capacity(
-                    4096,
-                    File::create(&path).map_err(|error| {
-                        ParseError::Feature(format!("{}: {error}", path.display()))
-                    })?,
-                )));
+                let file = Arc::new(Mutex::new(None));
                 self.streams.insert(path.clone(), file.clone());
                 file
             }

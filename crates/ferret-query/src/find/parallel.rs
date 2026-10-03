@@ -25,17 +25,21 @@ struct Task<W = LiveWalk> {
 
 impl<W: EntrySource> Task<W> {
     fn new(walk: W, completion: Option<Arc<AtomicUsize>>, quit: &Arc<AtomicBool>) -> Self {
+        let gate = Arc::new(Mutex::new(()));
+        let mut control = Control {
+            cancelled: Some(quit.clone()),
+            ..Control::default()
+        };
+        control.actions.gate = gate.clone();
+        control.actions.quit = quit.clone();
         Self {
             walk,
-            control: Control {
-                cancelled: Some(quit.clone()),
-                ..Control::default()
-            },
+            control,
             descend: true,
             completion,
             errors: 0,
             record: super::output::Record::default(),
-            gate: Arc::new(Mutex::new(())),
+            gate,
             quit: quit.clone(),
         }
     }
@@ -45,7 +49,7 @@ impl<W: EntrySource> Task<W> {
         plan: &Plan,
         expression: &Expression,
         effects: &mut impl Effects,
-        buffered: bool,
+        policy: super::output::Policy,
     ) -> bool {
         let Some(item) = self.walk.next_with(self.descend, &mut || {
             self.control.actions.flush(effects, true).inspect_err(|_| {
@@ -76,20 +80,25 @@ impl<W: EntrySource> Task<W> {
             self.control.quit = true;
             return false;
         }
-        let result = if buffered {
+        let checkpoint = policy.checkpoint.then(|| self.record.checkpoint());
+        let result = {
             let mut output = super::output::EntryEffects {
                 host: effects,
                 record: &mut self.record,
                 gate: &self.gate,
                 quit: &self.quit,
             };
-            let result = evaluate(expression, entry, &mut output, &mut self.control);
-            let committed = output.commit(false);
-            committed
-                .map_err(EvaluationError::Output)
-                .and(result.map(|_| ()))
-        } else {
-            evaluate(expression, entry, effects, &mut self.control).map(|_| ())
+            match evaluate(expression, entry, &mut output, &mut self.control) {
+                Ok(_) if policy.immediate || output.record.full() => {
+                    output.commit(false).map_err(EvaluationError::Output)
+                }
+                Ok(_) => Ok(()),
+                Err(error) => checkpoint
+                    .map_or(Ok(()), |checkpoint| output.record.rollback(checkpoint))
+                    .and_then(|()| output.commit(false))
+                    .map_err(EvaluationError::Output)
+                    .and(Err(error)),
+            }
         };
         if let Err(error) = result {
             let (error, stop) = match error {
@@ -97,7 +106,9 @@ impl<W: EntrySource> Task<W> {
                 EvaluationError::Output(error) => (error, true),
             };
             effects.error(&WalkError {
-                path: entry.path().to_owned(),
+                path: super::output::error_path(&error)
+                    .unwrap_or(entry.path())
+                    .to_owned(),
                 error,
             });
             self.errors += 1;
@@ -110,10 +121,15 @@ impl<W: EntrySource> Task<W> {
     }
 
     fn flush(&mut self, effects: &mut impl Effects) {
-        if let Err(error) = self
-            .control
-            .actions
-            .flush(effects, false)
+        let committed = super::output::EntryEffects {
+            host: effects,
+            record: &mut self.record,
+            gate: &self.gate,
+            quit: &self.quit,
+        }
+        .commit(false);
+        if let Err(error) = committed
+            .and_then(|()| self.control.actions.flush(effects, false))
             .and_then(|()| effects.flush())
         {
             effects.error(&WalkError {
@@ -125,9 +141,9 @@ impl<W: EntrySource> Task<W> {
         }
     }
 
-    fn finish(mut self, effects: &mut impl Effects) -> u64 {
+    fn finish(&mut self, effects: &mut impl Effects) -> u64 {
         self.flush(effects);
-        if let Some(completion) = self.completion {
+        if let Some(completion) = self.completion.take() {
             completion.fetch_sub(1, Ordering::Release);
         }
         self.errors + self.control.actions.errors
@@ -144,6 +160,7 @@ impl Task {
         };
         let mut task = Self::new(walk, completion, quit);
         task.gate = self.gate.clone();
+        task.control.actions.gate = self.gate.clone();
         task.control.actions.shared = self.control.actions.shared.clone();
         Some(task)
     }
@@ -161,15 +178,16 @@ pub(super) fn run(
     let quit = Arc::new(AtomicBool::new(false));
     let mut task = Task::new(source, None, &quit);
     task.control.cancelled = None;
-    let buffered = super::output::needs_record(&expression);
+    let policy = super::output::policy(&expression);
     let shared = task.control.actions.shared.clone();
-    while !quit.load(Ordering::Acquire) && task.step(plan, &expression, effects, buffered) {
+    let gate = task.gate.clone();
+    while !quit.load(Ordering::Acquire) && task.step(plan, &expression, effects, policy) {
         if task.control.quit {
             break;
         }
     }
     outcome.errors += task.finish(effects)
-        + super::action::flush_shared(&shared, effects).unwrap_or_else(|error| {
+        + super::action::flush_shared(&shared, effects, &gate, &quit).unwrap_or_else(|error| {
             effects.error(&WalkError {
                 path: ".".into(),
                 error,
@@ -194,7 +212,10 @@ struct Pool {
 impl Pool {
     fn worker(&self, plan: &Plan, expression: &Expression, mut effects: impl Effects) -> u64 {
         let mut errors = 0;
-        let buffered = super::output::needs_record(expression);
+        // Keep allocation capacity with the worker when a task completes or
+        // suspends. Queued tasks have already flushed their transactions.
+        let mut record = super::output::Record::default();
+        let policy = super::output::policy(expression);
         let sequential = super::sequential_starts(expression);
         loop {
             let mut queue = self
@@ -218,9 +239,10 @@ impl Pool {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             };
             drop(queue);
+            std::mem::swap(&mut record, &mut task.record);
             let mut steps = 0usize;
             while !self.quit.load(Ordering::Acquire)
-                && task.step(plan, expression, &mut effects, buffered)
+                && task.step(plan, expression, &mut effects, policy)
             {
                 if task.control.quit {
                     self.quit.store(true, Ordering::Release);
@@ -236,11 +258,15 @@ impl Pool {
                     {
                         // Publish earlier records before children can
                         // evaluate.
-                        if let Err(error) = task
-                            .control
-                            .actions
-                            .flush_files()
-                            .and_then(|()| effects.flush())
+                        if let Err(error) = (super::output::EntryEffects {
+                            host: &mut effects,
+                            record: &mut task.record,
+                            gate: &task.gate,
+                            quit: &task.quit,
+                        })
+                        .commit(false)
+                        .and_then(|()| task.control.actions.flush_files())
+                        .and_then(|()| effects.flush())
                         {
                             effects.error(&WalkError {
                                 path: ".".into(),
@@ -264,9 +290,11 @@ impl Pool {
             let waiting = task.walk.suspended() && !self.quit.load(Ordering::Acquire);
             let suspended = if waiting {
                 task.flush(&mut effects);
+                std::mem::swap(&mut record, &mut task.record);
                 Some(task)
             } else {
                 errors += task.finish(&mut effects);
+                std::mem::swap(&mut record, &mut task.record);
                 None
             };
             let mut queue = self
@@ -315,11 +343,11 @@ impl Plan {
         let quit = Arc::new(AtomicBool::new(false));
         let mut task = Task::new(source, None, &quit);
         task.control.cancelled = None;
-        let buffered = super::output::needs_record(&expression);
+        let policy = super::output::policy(&expression);
         let sequential = super::sequential_starts(&expression);
         let shared = task.control.actions.shared.clone();
-        while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects, buffered)
-        {
+        let gate = task.gate.clone();
+        while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects, policy) {
             if task.control.quit {
                 break;
             }
@@ -330,11 +358,15 @@ impl Plan {
                 && let Some(donated) = task.donate(&quit, sequential)
             {
                 task.control.cancelled = Some(quit.clone());
-                if let Err(error) = task
-                    .control
-                    .actions
-                    .flush_files()
-                    .and_then(|()| effects.flush())
+                if let Err(error) = (super::output::EntryEffects {
+                    host: &mut effects,
+                    record: &mut task.record,
+                    gate: &task.gate,
+                    quit: &task.quit,
+                })
+                .commit(false)
+                .and_then(|()| task.control.actions.flush_files())
+                .and_then(|()| effects.flush())
                 {
                     effects.error(&WalkError {
                         path: ".".into(),
@@ -377,27 +409,30 @@ impl Plan {
                     + queue
                         .tasks
                         .into_iter()
-                        .map(|task| task.finish(&mut effects))
+                        .map(|mut task| task.finish(&mut effects))
                         .sum::<u64>();
                 let errors = errors
-                    + super::action::flush_shared(&shared, &mut effects).unwrap_or_else(|error| {
-                        effects.error(&WalkError {
-                            path: ".".into(),
-                            error,
+                    + super::action::flush_shared(&shared, &mut effects, &gate, &pool.quit)
+                        .unwrap_or_else(|error| {
+                            effects.error(&WalkError {
+                                path: ".".into(),
+                                error,
+                            });
+                            1
                         });
-                        1
-                    });
                 return Ok(Outcome { errors });
             }
         }
         let errors = task.finish(&mut effects)
-            + super::action::flush_shared(&shared, &mut effects).unwrap_or_else(|error| {
-                effects.error(&WalkError {
-                    path: ".".into(),
-                    error,
-                });
-                1
-            });
+            + super::action::flush_shared(&shared, &mut effects, &gate, &quit).unwrap_or_else(
+                |error| {
+                    effects.error(&WalkError {
+                        path: ".".into(),
+                        error,
+                    });
+                    1
+                },
+            );
         Ok(Outcome { errors })
     }
 }

@@ -248,7 +248,7 @@ impl Test {
         else {
             return Ok(());
         };
-        let mut entry = Entry::new(path.clone(), 0, FileKind::File);
+        let entry = Entry::new(path.clone(), 0, FileKind::File);
         if let Some(catalog) = catalog {
             let resolved = super::walk::resolve(catalog, path, *follow)?.ok_or_else(|| {
                 std::io::Error::other(
@@ -264,11 +264,7 @@ impl Test {
                         TimeField::Modify => timestamp(catalog.mtime(id), catalog.mtime_nsec(id)),
                         TimeField::Change => timestamp(catalog.ctime(id), catalog.ctime_nsec(id)),
                         TimeField::Access => {
-                            let stat = if *follow {
-                                fs::metadata(&*path)?
-                            } else {
-                                fs::symlink_metadata(&*path)?
-                            };
+                            let stat = super::walk::metadata(path, *follow)?;
                             stat_stamp(&stat, TimeField::Access)
                         }
                         TimeField::Birth => birth_stamp(entry.path())
@@ -282,10 +278,7 @@ impl Test {
                 return Ok(());
             }
         }
-        if *follow {
-            entry = Entry::new(fs::canonicalize(&*path)?, 0, FileKind::File);
-        }
-        let stat = entry.metadata()?;
+        let stat = super::walk::metadata(path, *follow)?;
         *self = if *same_file {
             Self::SameFile {
                 dev: stat.dev(),
@@ -298,7 +291,7 @@ impl Test {
                     birth_stamp(entry.path())
                         .ok_or_else(|| std::io::Error::other("birth time unavailable"))?
                 } else {
-                    stat_stamp(stat, *reference_field)
+                    stat_stamp(&stat, *reference_field)
                 },
             }
         };
@@ -404,7 +397,7 @@ impl Test {
             Self::NoGroup => !group_exists(entry.stat()?.gid()),
             Self::Newer { field, stamp } => {
                 let actual = if *field == TimeField::Birth {
-                    birth_stamp(entry.path()).ok_or_else(|| {
+                    entry.with_observed_path(birth_stamp).ok_or_else(|| {
                         std::io::Error::new(
                             std::io::ErrorKind::Unsupported,
                             "birth time unavailable",
@@ -425,11 +418,17 @@ impl Test {
                 // directories have no count and use their live listing.
                 FileKind::Directory => match entry.has_children() {
                     Some(has_children) => !has_children,
-                    None => fs::read_dir(entry.path())?.next().transpose()?.is_none(),
+                    None => entry
+                        .with_observed_path(|path| fs::read_dir(path))?
+                        .next()
+                        .transpose()?
+                        .is_none(),
                 },
                 _ => false,
             },
-            Self::Access(access) => rustix::fs::access(entry.path(), *access).is_ok(),
+            Self::Access(access) => entry
+                .with_observed_path(|path| rustix::fs::access(path, *access))
+                .is_ok(),
             Self::FsType(wanted) => filesystem_type(entry.stat()?.dev()) == Some(wanted.as_str()),
         })
     }
