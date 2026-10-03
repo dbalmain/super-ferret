@@ -533,3 +533,7 @@ fn evaluate(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../../tests/support/gnu_find.rs"]
+mod gnu;

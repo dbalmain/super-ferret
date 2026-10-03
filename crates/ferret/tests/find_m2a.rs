@@ -2,12 +2,14 @@
 //! GNU's observable batching. The engine oracle remains in ferret-query.
 #![allow(clippy::unwrap_used)] // Fixture/process setup failures are test failures.
 
+#[path = "../../../tests/support/gnu_find.rs"]
+mod gnu;
+
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
-const GNU: &str = "/nix/store/i9wgqa0l88aprvpwfaq5hkfa6pklhlv0-findutils-4.11.0/bin/find";
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
 
 struct Tree(PathBuf);
@@ -203,11 +205,8 @@ fn execdir_root_spelling_and_delete_dot_match_observed_gnu_rules() {
 }
 
 #[test]
-#[ignore = "development oracle uses the machine-specific pinned GNU binary"]
+#[ignore = "extended development differential"]
 fn exec_batch_sizes_against_pinned_gnu() {
-    if !Path::new(GNU).exists() {
-        return;
-    }
     let tree = Tree::new("batches");
     for i in 0..1300 {
         fs::write(
@@ -247,7 +246,7 @@ fn exec_batch_sizes_against_pinned_gnu() {
                     .env("PAD", "x".repeat(pad));
                 command.output().unwrap()
             };
-            let expected = execute(GNU, &[]);
+            let expected = execute(gnu::binary().to_str().unwrap(), &[]);
             let actual = execute(FERRET, &["find", "-I"]);
             assert_eq!(
                 actual.status.code(),
@@ -326,13 +325,10 @@ mod regex_cases {
 }
 
 #[test]
-#[ignore = "development oracle uses the machine-specific pinned GNU binary"]
+#[ignore = "extended development differential"]
 fn regex_dialects_against_pinned_gnu() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
-    if !Path::new(GNU).exists() {
-        return;
-    }
     let tree = Tree::new("regex-m3a");
     for name in regex_cases::NAMES {
         fs::write(tree.0.join(name), b"").unwrap();
@@ -359,12 +355,12 @@ fn regex_dialects_against_pinned_gnu() {
             pattern,
             "-print0",
         ];
-        let expected = Command::new(GNU)
-            .args(args)
-            .current_dir(&tree.0)
-            .env("LC_ALL", "C")
-            .output()
-            .unwrap();
+        let expected = gnu::output(
+            gnu::command()
+                .args(args)
+                .current_dir(&tree.0)
+                .env("LC_ALL", "C"),
+        );
         let actual = tree.command(&["-I"]).args(args).output().unwrap();
         assert_eq!(
             actual.status.code(),

@@ -1,12 +1,14 @@
 //! Common find idioms through the CLI and both real parallel entry sources.
 #![allow(clippy::unwrap_used)] // Fixture and subprocess failures identify setup.
 
+#[path = "../../../tests/support/gnu_find.rs"]
+mod gnu;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
-const GNU: &str = "/nix/store/i9wgqa0l88aprvpwfaq5hkfa6pklhlv0-findutils-4.11.0/bin/find";
 
 struct Tree(PathBuf);
 impl Tree {
@@ -124,11 +126,7 @@ fn overlapping_starts_delete_with_gnus_status_and_empty_stderr() {
     for live in [false, true] {
         let tree = Tree::new(if live { "delete-live" } else { "delete-index" });
         let args = ["root", "root/b0", "-type", "f", "-delete"];
-        let expected = Command::new(GNU)
-            .args(args)
-            .current_dir(&tree.0)
-            .output()
-            .unwrap();
+        let expected = gnu::output(gnu::command().args(args).current_dir(&tree.0));
         for branch in 0..32 {
             for file in 0..4 {
                 fs::write(tree.0.join(format!("root/b{branch}/f{file}")), b"x").unwrap();
@@ -154,11 +152,7 @@ fn quit_in_an_early_start_never_reports_a_later_missing_start() {
     // start would report ENOENT and exit 1 before the quit.
     let tree = Tree::new("quit-starts");
     let args = ["root", "missing", "-type", "f", "-print", "-quit"];
-    let expected = Command::new(GNU)
-        .args(args)
-        .current_dir(&tree.0)
-        .output()
-        .unwrap();
+    let expected = gnu::output(gnu::command().args(args).current_dir(&tree.0));
     assert!(expected.status.success(), "{:?}", expected);
     assert!(expected.stderr.is_empty(), "{:?}", expected);
     for live in [false, true] {
@@ -260,11 +254,7 @@ fn quit_keeps_file_output_for_the_same_winning_entry() {
 fn read_only_overlapping_and_repeated_starts_keep_gnus_duplicates() {
     let tree = Tree::new("duplicates");
     let args = ["root", "root/b0", "root/b0", "-type", "f", "-print"];
-    let expected = Command::new(GNU)
-        .args(args)
-        .current_dir(&tree.0)
-        .output()
-        .unwrap();
+    let expected = gnu::output(gnu::command().args(args).current_dir(&tree.0));
     assert!(expected.status.success());
     let mut expected: Vec<_> = expected.stdout.split(|&b| b == b'\n').collect();
     expected.sort();
@@ -304,11 +294,7 @@ fn staged_arguments_fill_shared_batches_and_flush_the_final_remainder() {
         "{}",
         "+",
     ];
-    let expected = Command::new(GNU)
-        .args(args)
-        .current_dir(&tree.0)
-        .output()
-        .unwrap();
+    let expected = gnu::output(gnu::command().args(args).current_dir(&tree.0));
     assert!(expected.status.success(), "{expected:?}");
     let expected = String::from_utf8(expected.stdout).unwrap();
     let expected_batches = expected.lines().filter(|&line| line == "batch").count();

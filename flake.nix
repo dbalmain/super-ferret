@@ -16,6 +16,7 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
+      findutils = assert pkgs.findutils.version == "4.11.0"; pkgs.findutils;
       rustfmt = fenix.packages.${system}.default.rustfmt;
       fmt = pkgs.writeShellApplication {
         name = "fmt";
@@ -25,7 +26,11 @@
         '';
       };
     in {
-      packages.${system} = { inherit rustfmt fmt; };
+      packages.${system} = { inherit rustfmt fmt findutils; };
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [ findutils ];
+        FERRET_GNU_FIND = "${findutils}/bin/find";
+      };
       apps.${system}.fmt = { type = "app"; program = "${fmt}/bin/fmt"; };
     };
 }

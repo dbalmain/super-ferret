@@ -10,9 +10,12 @@ All green with zero warnings before a change is done:
 
 ```sh
 nix run .#fmt        # cargo fmt --all with the pinned nightly rustfmt
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+nix develop --command cargo test --workspace
 ```
+
+The dev shell supplies the pinned GNU findutils 4.11.0 differential oracle via
+`FERRET_GNU_FIND`. Missing or different oracle versions fail the tests.
 
 Formatting needs nightly rustfmt because `rustfmt.toml` wraps comments; the
 flake pins it, and the build stays on stable. Plain `cargo fmt` with stable

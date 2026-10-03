@@ -9,9 +9,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
-use crate::find::{Outcome, Plan};
+use crate::find::{Outcome, Plan, gnu};
 
-const GNU: &str = "/nix/store/i9wgqa0l88aprvpwfaq5hkfa6pklhlv0-findutils-4.11.0/bin/find";
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub(in crate::find) struct Tree(pub PathBuf);
@@ -335,9 +334,6 @@ fn records(bytes: &[u8]) -> Vec<Vec<u8>> {
 }
 
 pub(in crate::find) fn differential() {
-    if !Path::new(GNU).exists() {
-        return;
-    }
     let tree = Tree::new();
     let expressions: &[&[&str]] = &[
         &["-exec", "echo", "x{}y", ";"],
@@ -374,13 +370,13 @@ pub(in crate::find) fn differential() {
     ];
     for expression in expressions {
         // Nonmutating expressions share the actual inodes and times.
-        let mut gnu = Command::new(GNU);
+        let mut gnu = gnu::command();
         gnu.arg(&tree.0)
             .args(*expression)
             .env("LC_ALL", "C")
             .env("TZ", "UTC");
         let destructive = expression.contains(&"-delete") || expression.contains(&"rm");
-        let output = gnu.output().unwrap();
+        let output = gnu::output(&mut gnu);
         let expected_tree = if destructive {
             Some(snapshot(&tree.0))
         } else {
@@ -434,12 +430,12 @@ fn snapshot(root: &Path) -> Vec<PathBuf> {
 }
 
 fn compare(tree: &Tree, args: &[OsString]) {
-    let expected = Command::new(GNU)
-        .args(&args[1..])
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .output()
-        .unwrap();
+    let expected = gnu::output(
+        gnu::command()
+            .args(&args[1..])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC"),
+    );
     let Ok(plan) = Plan::parse(args) else {
         assert_eq!(expected.status.code(), Some(1), "status {args:?}");
         assert!(expected.stdout.is_empty(), "stdout {args:?}");
@@ -588,12 +584,12 @@ fn differential_extra(tree: &Tree) -> usize {
         if primary == "-fprintf" {
             args.push("%p %s\n".into());
         }
-        let expected = Command::new(GNU)
-            .args(&args[1..])
-            .env("LC_ALL", "C")
-            .env("TZ", "UTC")
-            .output()
-            .unwrap();
+        let expected = gnu::output(
+            gnu::command()
+                .args(&args[1..])
+                .env("LC_ALL", "C")
+                .env("TZ", "UTC"),
+        );
         let file = fs::read(&path).unwrap();
         fs::write(&path, b"old").unwrap();
         let (outcome, output) = run(&args);
@@ -625,13 +621,13 @@ fn differential_extra(tree: &Tree) -> usize {
             )
             .unwrap();
             let args = tree.args(&["-maxdepth", "0", primary, "echo", "{}", ";", "-o", "-print"]);
-            let expected = Command::new(GNU)
-                .args(&args[1..])
-                .stdin(Stdio::from(File::open(&path).unwrap()))
-                .env("LC_ALL", "C")
-                .env("TZ", "UTC")
-                .output()
-                .unwrap();
+            let expected = gnu::output(
+                gnu::command()
+                    .args(&args[1..])
+                    .stdin(Stdio::from(File::open(&path).unwrap()))
+                    .env("LC_ALL", "C")
+                    .env("TZ", "UTC"),
+            );
             let plan = Plan::parse(&args).unwrap();
             let mut output = Output {
                 answer,
@@ -650,7 +646,7 @@ fn differential_extra(tree: &Tree) -> usize {
     }
     for flag in ["-help", "--help", "-version", "--version"] {
         let args = tree.args(&[flag, "-unknown"]);
-        let expected = Command::new(GNU).args(&args[1..]).output().unwrap();
+        let expected = gnu::output(gnu::command().args(&args[1..]));
         let (outcome, output) = run(&args);
         assert_eq!(
             i32::from(outcome.errors != 0),
@@ -694,12 +690,12 @@ fn differential_extra(tree: &Tree) -> usize {
         "+",
         "-print",
     ]);
-    let expected = Command::new(GNU)
-        .args(&args[1..])
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .output()
-        .unwrap();
+    let expected = gnu::output(
+        gnu::command()
+            .args(&args[1..])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC"),
+    );
     let expected_tree = snapshot(&tree.0);
     tree.reset();
     let (outcome, output) = run(&args);

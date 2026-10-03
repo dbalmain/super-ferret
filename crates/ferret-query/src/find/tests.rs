@@ -567,12 +567,8 @@ fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
 }
 
 #[test]
-#[ignore = "development oracle uses the machine-specific pinned GNU binary"]
+#[ignore = "extended development differential"]
 fn differential_against_pinned_gnu() {
-    let binary = Path::new("/nix/store/i9wgqa0l88aprvpwfaq5hkfa6pklhlv0-findutils-4.11.0/bin/find");
-    if !binary.exists() {
-        return;
-    }
     let tree = Tree::new("oracle");
     fs::write(tree.0.join("reference"), b"ref").unwrap();
     fs::create_dir(tree.0.join("denied")).unwrap();
@@ -597,13 +593,13 @@ fn differential_against_pinned_gnu() {
             fs::Permissions::from_mode(if quitting { 0o700 } else { 0o000 }),
         )
         .unwrap();
-        let gnu = Command::new(binary)
-            .arg(&tree.0)
-            .args(&expression)
-            .env("LC_ALL", "C")
-            .env("TZ", "UTC")
-            .output()
-            .unwrap();
+        let gnu = gnu::output(
+            gnu::command()
+                .arg(&tree.0)
+                .args(&expression)
+                .env("LC_ALL", "C")
+                .env("TZ", "UTC"),
+        );
         let args: Vec<_> = [OsString::from("-I"), tree.0.clone().into_os_string()]
             .into_iter()
             .chain(expression.iter().cloned())
@@ -622,11 +618,7 @@ fn differential_against_pinned_gnu() {
         );
         if quitting {
             let all: Vec<_> = expression.iter().filter(|arg| *arg != "-quit").collect();
-            let all = Command::new(binary)
-                .arg(&tree.0)
-                .args(all)
-                .output()
-                .unwrap();
+            let all = gnu::output(gnu::command().arg(&tree.0).args(all));
             let candidates = records(&all.stdout, delimiter);
             for record in records(&output.bytes, delimiter) {
                 assert!(candidates.contains(&record));
