@@ -33,6 +33,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::batch::{Batch, Content, Stat};
@@ -152,10 +153,7 @@ pub struct Transaction {
     /// Old file and symlink rows sorted by `(dev, ino)`, for carry-over:
     /// 4 B per inode where a map measured 40 (D40). Empty when the sniffer
     /// changed, since old classifications no longer hold.
-    by_identity: Vec<u32>,
-    /// Old live documents as `(hash, DocId)` sorted by hash, so known content
-    /// keeps its `DocId`.
-    docs: Vec<(Hash, u32)>,
+    by_identity: OnceLock<Vec<u32>>,
     next_batch: AtomicU32,
     batches: Vec<Batch>,
     /// Paths passed to [`Transaction::keep`], checked against the root
@@ -201,33 +199,26 @@ impl Transaction {
             old.load_all().map_err(BeginError::Previous)?;
         }
 
-        let mut by_identity = Vec::new();
-        let mut docs = Vec::new();
-        if let Some(old) = &previous {
-            if old.sniffer_version() == sniffer {
-                by_identity.extend(
-                    old.inode_ids()
-                        .filter(|&id| !old.is_directory(id))
-                        .map(|id| id.0),
-                );
-                by_identity.sort_unstable_by_key(|&id| identity(old, id));
-            }
-            docs.reserve(old.doc_count() as usize);
-            docs.extend(old.docs().map(|(doc, hash)| (hash, doc.0)));
-            docs.sort_unstable();
-        }
-        Ok(Transaction {
-            dir: dir.to_owned(),
+        Ok(Self::from_locked(dir.to_owned(), lock, previous, sniffer))
+    }
+
+    pub(crate) fn from_locked(
+        dir: PathBuf,
+        lock: crate::lock::Lock,
+        previous: Option<Catalog>,
+        sniffer: u32,
+    ) -> Self {
+        Self {
+            dir,
             _lock: lock,
             sniffer,
             policy: previous.as_ref().map_or([0; 16], Catalog::policy),
             previous,
-            by_identity,
-            docs,
+            by_identity: OnceLock::new(),
             next_batch: AtomicU32::new(0),
             batches: Vec::new(),
             kept: Vec::new(),
-        })
+        }
     }
 
     /// The generation this transaction replaces, if any: its roots, and
@@ -250,11 +241,22 @@ impl Transaction {
     /// file the policy now sends to the index must be read (D37).
     pub fn carry(&self, stat: &Stat) -> Option<Content> {
         let old = self.previous.as_ref()?;
-        let at = self
-            .by_identity
+        if old.sniffer_version() != self.sniffer {
+            return None;
+        }
+        let by_identity = self.by_identity.get_or_init(|| {
+            let mut ids: Vec<_> = old
+                .inode_ids()
+                .filter(|&id| !old.is_directory(id))
+                .map(|id| id.0)
+                .collect();
+            ids.sort_unstable_by_key(|&id| identity(old, id));
+            ids
+        });
+        let at = by_identity
             .binary_search_by_key(&(stat.dev, stat.ino), |&id| identity(old, id))
             .ok()?;
-        let inode = old.inode(InoId(self.by_identity[at]));
+        let inode = old.inode(InoId(by_identity[at]));
         if !inode.stat.same_version(stat) {
             return None;
         }
@@ -448,16 +450,21 @@ impl Transaction {
                 sequence: generation.sequence,
             }));
         }
-        let next_doc = self.previous.take().map_or(0, |old| old.next_doc().0);
-        self.by_identity = Vec::new();
+        let mut docs = Vec::new();
+        let next_doc = self.previous.take().map_or(0, |old| {
+            docs.extend(old.docs().map(|(doc, hash)| (hash, doc.0)));
+            old.next_doc().0
+        });
+        docs.sort_unstable();
+        self.by_identity = OnceLock::new();
         let known = Known {
-            docs: &self.docs,
+            docs: &docs,
             next_doc,
         };
         let plan =
             build::plan(&mut self.batches, self.sniffer, known).map_err(CommitError::Build)?;
         let batches = std::mem::take(&mut self.batches);
-        self.docs = Vec::new();
+        drop(docs);
 
         let temp = self.dir.join(TEMP);
         let checked = write_synced(&temp, |out| {

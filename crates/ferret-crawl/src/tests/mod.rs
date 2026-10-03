@@ -4,6 +4,7 @@ mod index;
 mod lifecycle;
 mod parallel;
 mod race;
+mod reconcile;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

@@ -196,7 +196,7 @@ impl Manifest {
         if self.generation.incarnation != l.generation.incarnation
             || self.generation.checkpoint != l.generation.checkpoint
             || self.checkpoint_sequence != l.generation.sequence
-            || self.sniffer != l.sniffer
+            || (self.generation.sequence == self.checkpoint_sequence && self.sniffer != l.sniffer)
             || self
                 .counters
                 .iter()

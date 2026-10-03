@@ -16,7 +16,7 @@ use crate::{ContentState, Hash, Kind};
 /// A directory, as minted by the batch that recorded it. Valid only within the
 /// transaction whose batch minted it. `Copy + Send`, for the walker's
 /// `EventVisitor::Dir`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DirToken {
     pub(crate) batch: u32,
     pub(crate) index: u32,
@@ -335,5 +335,83 @@ fn push(buffer: &mut Vec<u8>, bytes: &[u8], overflow: &mut bool) -> Span {
             *overflow = true;
             Span::default()
         }
+    }
+}
+
+/// Borrowed directory observation. Tokens remain local to the producing run.
+#[derive(Clone, Copy)]
+pub struct DirectoryObservation<'a> {
+    pub token: DirToken,
+    pub parent: Option<DirToken>,
+    pub name: &'a [u8],
+    pub stat: Stat,
+    pub traversed: bool,
+    pub retained_at: Option<u64>,
+}
+
+/// Borrowed file observation, including symlinks and special files.
+#[derive(Clone, Copy)]
+pub struct FileObservation<'a> {
+    pub parent: DirToken,
+    pub name: &'a [u8],
+    pub stat: Stat,
+    pub content: Content,
+    pub target: Option<&'a [u8]>,
+}
+
+impl Batch {
+    /// Directory observations, without copying their strings or stat columns.
+    pub fn directories(&self) -> impl Iterator<Item = DirectoryObservation<'_>> {
+        self.dirs
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| DirectoryObservation {
+                token: DirToken {
+                    batch: self.id,
+                    index: i as u32,
+                },
+                parent: dir.parent,
+                name: dir.name.of(&self.names),
+                stat: self.dir_stats[i],
+                traversed: dir.traversed,
+                retained_at: dir.retained_at,
+            })
+    }
+    /// Number of file observations in this batch.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+    /// Borrows one file observation; `index` must be below `file_count`.
+    pub fn file_observation(&self, index: usize) -> FileObservation<'_> {
+        let file = &self.files[index];
+        FileObservation {
+            parent: file.parent,
+            name: file.name.of(&self.names),
+            stat: self.file_stats[index],
+            content: self.contents[index],
+            target: self.target(index),
+        }
+    }
+    /// Opaque ignored edges, without allocating inode observations.
+    pub fn ignored_entries(&self) -> impl Iterator<Item = (DirToken, &[u8], Kind)> {
+        self.ignored
+            .iter()
+            .map(|e| (e.parent, e.name.of(&self.names), e.kind))
+    }
+    /// Raw listing counts; a token without a count has incomplete coverage.
+    pub fn entry_counts(&self) -> impl Iterator<Item = (DirToken, u32)> + '_ {
+        self.entry_counts.iter().copied()
+    }
+    /// Work-tree observations, borrowing repository paths.
+    pub fn work_tree_observations(
+        &self,
+    ) -> impl Iterator<Item = (DirToken, WorkTreeKind, &[u8], (u64, u64))> {
+        self.work_trees
+            .iter()
+            .map(|w| (w.dir, w.kind, w.common_dir.of(&self.strings), w.common_id))
+    }
+    /// Whether an observation buffer exceeded the wire-format span limit.
+    pub fn overflowed(&self) -> bool {
+        self.overflow
     }
 }

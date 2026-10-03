@@ -455,6 +455,9 @@ impl Writer {
             current,
         })
     }
+    pub(crate) fn into_checkpoint(self, sniffer: u32) -> crate::Transaction {
+        crate::Transaction::from_locked(self.dir, self._lock, Some(self.current), sniffer)
+    }
     pub fn generation(&self) -> Generation {
         self.manifest.generation
     }
@@ -467,6 +470,18 @@ impl Writer {
         expected: Generation,
         changes: &ChangeSet,
     ) -> Result<Generation, Error> {
+        self.commit_with_sniffer(expected, changes, self.manifest.sniffer)
+    }
+    /// Publishes observations made under a completely refreshed sniffer
+    /// version. A transition requires a nonempty change set, even when
+    /// classifications remain equal; callers include their policy record in
+    /// that case.
+    pub fn commit_with_sniffer(
+        &mut self,
+        expected: Generation,
+        changes: &ChangeSet,
+        sniffer: u32,
+    ) -> Result<Generation, Error> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
@@ -475,7 +490,9 @@ impl Writer {
             .check(expected)
             .map_err(Error::Stale)?;
         if changes.records.is_empty() {
-            if changes.counters != self.manifest.counters || changes.counts != self.manifest.counts
+            if changes.counters != self.manifest.counters
+                || changes.counts != self.manifest.counts
+                || sniffer != self.manifest.sniffer
             {
                 return Err(Error::Invalid(DecodeError::Corrupt(
                     "empty change set counters",
@@ -489,6 +506,7 @@ impl Writer {
             .checked_add(1)
             .filter(|&n| n != u64::MAX)
             .ok_or(Error::Invalid(DecodeError::Corrupt("sequence exhausted")))?;
+        next.sniffer = sniffer;
         next.counters = changes.counters;
         next.counts = changes.counts;
         Manifest::decode(&next.encode()).map_err(Error::Invalid)?;
@@ -511,7 +529,7 @@ impl Writer {
             .ok_or(Error::Invalid(DecodeError::Corrupt("log exhausted")))?;
         let current = self
             .current
-            .advance(expected, changes)
+            .advance_with_sniffer(expected, changes, sniffer)
             .map_err(|e| match e {
                 Error::Previous(OpenError::Decode(e)) => Error::Invalid(e),
                 other => other,

@@ -286,7 +286,11 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
             print_content_faults(report);
             (
                 print("the report", report_text(report).as_bytes()),
-                "published",
+                if report.published.is_some() {
+                    "published"
+                } else {
+                    "unchanged"
+                },
             )
         }
         Err(IndexError::Coverage { faults, report }) => {
@@ -310,6 +314,10 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
             }
             note(&text);
             (Exit::Error, "coverage")
+        }
+        Err(IndexError::Update(e)) if e.published() => {
+            warn(&e.to_string());
+            (Exit::Ok, "undurable")
         }
         Err(IndexError::Commit(e)) if e.published() => {
             warn(&e.to_string());

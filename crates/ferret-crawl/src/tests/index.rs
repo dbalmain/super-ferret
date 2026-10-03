@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind, NameId};
+use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind};
 use ferret_policy::Config;
 
 use crate::index::{DRAIN_MIN, Deferred, Hasher, PROBES, Probe, content_faults};
@@ -23,13 +23,13 @@ use crate::{
 /// (`cat/`), outside the tree. Cleanup is pure Rust: a spawned `chmod` would
 /// inherit a catalog lock descriptor between fork and exec, and another test's
 /// `begin` would see `Locked`.
-struct Tmp {
-    base: PathBuf,
+pub(super) struct Tmp {
+    pub(super) base: PathBuf,
     _fds: std::sync::RwLockReadGuard<'static, ()>,
 }
 
 impl Tmp {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let base = std::env::temp_dir().join(format!("ferret-index-{}-{name}", std::process::id()));
         unlock(&base);
         let _ = fs::remove_dir_all(&base);
@@ -38,19 +38,19 @@ impl Tmp {
         Self { base, _fds: fds }
     }
 
-    fn tree(&self) -> PathBuf {
+    pub(super) fn tree(&self) -> PathBuf {
         self.base.join("tree")
     }
 
-    fn at(&self, rel: &str) -> PathBuf {
+    pub(super) fn at(&self, rel: &str) -> PathBuf {
         self.tree().join(rel)
     }
 
-    fn cat(&self) -> PathBuf {
+    pub(super) fn cat(&self) -> PathBuf {
         self.base.join("cat")
     }
 
-    fn write(&self, rel: &str, bytes: &[u8]) -> PathBuf {
+    pub(super) fn write(&self, rel: &str, bytes: &[u8]) -> PathBuf {
         let path = self.at(rel);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, bytes).unwrap();
@@ -150,8 +150,9 @@ fn published(tmp: &Tmp) -> (Catalog, BTreeMap<PathBuf, Row>) {
     let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
     catalog.load_all().unwrap();
     let rows = listing(&catalog);
-    let ignored = (0..catalog.name_count())
-        .map(NameId)
+    let ignored = catalog
+        .names()
+        .map(|(id, _)| id)
         .filter(|&id| {
             matches!(
                 catalog.name(id).target(),
@@ -556,8 +557,9 @@ fn an_unreadable_directory_publishes_but_other_listing_faults_do_not() {
     assert!(!rows.contains_key(&tmp.at("shut/b.txt")));
     let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
     catalog.load_all().unwrap();
-    let dir = (0..catalog.name_count())
-        .map(NameId)
+    let dir = catalog
+        .names()
+        .map(|(id, _)| id)
         .find_map(|id| {
             let mut path = Vec::new();
             catalog.path(id, &mut path);

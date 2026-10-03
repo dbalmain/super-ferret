@@ -56,6 +56,12 @@ These are constraints found in the code, rather than inferred from DESIGN:
   stat rows and a sparse kind table. Directory entry counts include ignored
   children and are distinct from the indexed child count.
 
+M4 implements the recrawl producer and resident `WriterSession`. The batch CLI
+uses log transactions for completely covered recrawls, initial indexing uses a
+checkpoint, and incomplete EACCES observations transfer the held lock to the
+existing checkpoint fallback. The resident `recrawl` API blocks those incomplete
+observations until M5 supplies protected fault scopes.
+
 The proposed fault reconciliation replaces the last two coverage rules only
 in its own slice. Until that slice lands, keep the current amended A′ rule.
 Do not temporarily treat an unclassified fault as a deletion.
@@ -199,6 +205,13 @@ to the same row into its final value.
 | DirPut | id, own NameId or none, raw entry count or unknown, flags u32; retained-at sequence u64 | 32 |
 | DocPut | DocId u32; indexed-inode references u32; hash 16 B | 32 |
 | DocDelete | DocId u32; reserved u32 | 16 |
+
+A completely covered sniffer transition updates the manifest's sniffer version
+in the same transaction, including a PolicyPut when all entry rows are equal.
+The snapshot retains the sniffer under which it was built; after a nonempty log,
+the effective reader uses the published manifest version. Requiring those two
+versions to remain equal would force an unnecessary checkpoint on every sniffer
+transition.
 
 RootPut/RootDelete key by root InoId and include the configured absolute path
 for a put. LinkPut/LinkDelete key by InoId, with target bytes for a put.
@@ -395,8 +408,9 @@ revalidates content. A directory is keyed by its rooted namespace occurrence,
 as today; bind-mounted occurrences are not collapsed into one tree.
 
 Within an epoch a NameId identifies an edge lifetime. Preserve it for an
-unchanged `(parent id, raw basename)`, including an inode replacement at that
-name. A proved rename transfers it to the new edge. A recrawl infers a rename
+unchanged `(parent id, raw basename, child lifetime)`. An inode replacement at
+that name retires the edge and allocates a new NameId, matching M4's explicit
+delete/recreate contract. A proved rename transfers it to the new edge. A recrawl infers a rename
 only for an unambiguous old/new singleton within a continuing inode; otherwise
 delete and allocate edges while preserving the inode and content ids. An
 overwritten destination retires its old edge id. An observed delete followed

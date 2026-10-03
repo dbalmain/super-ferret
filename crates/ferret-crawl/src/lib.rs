@@ -14,11 +14,12 @@
 
 mod index;
 mod observe;
+pub mod reconcile;
 mod walk;
 
 pub use index::{
     Counts, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report, RootChange, index,
-    index_change,
+    index_change, recrawl,
 };
 pub use observe::ContentFault;
 

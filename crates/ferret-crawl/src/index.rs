@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use ferret_catalog::{
     BeginError, Catalog, CommitError, Content, ContentState, DirToken, InoId, KeepError, Stat,
-    Transaction,
+    Transaction, WriterSession,
 };
 use ferret_policy::{Config, Decision, Reason};
 
@@ -125,6 +125,9 @@ pub enum IndexError {
     /// Commit failed. [`CommitError::published`] says whether the new
     /// generation is visible anyway.
     Commit(CommitError),
+    /// Incremental reconciliation or publication failed. An incomplete resident
+    /// recrawl is blocked until M5 can represent protected fault scopes.
+    Update(ferret_catalog::log::Error),
 }
 
 impl fmt::Display for IndexError {
@@ -146,6 +149,7 @@ impl fmt::Display for IndexError {
                 Ok(())
             }
             Self::Commit(e) => write!(f, "{e}"),
+            Self::Update(e) => write!(f, "{e}"),
         }
     }
 }
@@ -368,19 +372,179 @@ fn run(
     refresh: Refresh<'_>,
     options: &IndexOptions,
 ) -> Result<Report, IndexError> {
-    let mut txn = Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
-    let roots = roots(txn.previous())?;
-    let plan = Plan::new(txn.previous(), &roots, refresh, options.sniffer)?;
+    let session = WriterSession::open(catalog_dir);
+    match session {
+        Ok(mut session) => {
+            let previous = session.view();
+            let roots = roots(Some(&previous))?;
+            let plan = Plan::new(
+                Some(&previous),
+                &roots,
+                refresh,
+                options.sniffer,
+                fingerprint(options),
+            )?;
+            let (batches, mut report) =
+                observe(Source::Session(&session, options.sniffer), &plan, options)?;
+            let started = Instant::now();
+            let changes = crate::reconcile::changes(
+                &session,
+                &batches,
+                &plan.refresh,
+                &plan.dropped,
+                fingerprint(options),
+                options.sniffer,
+            )
+            .map_err(IndexError::Update)?;
+            let (catalog, changed) = match changes {
+                Some(changes) => {
+                    let changed = !changes.records.is_empty();
+                    let catalog = session
+                        .commit(&changes, options.sniffer)
+                        .map_err(IndexError::Update)?;
+                    (catalog, changed)
+                }
+                None => {
+                    let mut txn = session.into_checkpoint(options.sniffer);
+                    txn.set_policy(fingerprint(options));
+                    for batch in batches {
+                        txn.add(batch);
+                    }
+                    for root in &plan.keep {
+                        txn.keep(root.as_os_str().as_bytes())
+                            .map_err(IndexError::Keep)?;
+                    }
+                    (txn.commit().map_err(IndexError::Commit)?, true)
+                }
+            };
+            report.commit_time = started.elapsed();
+            finish_report(&mut report, &catalog, &plan, changed);
+            Ok(report)
+        }
+        Err(ferret_catalog::log::Error::MissingCheckpoint)
+        | Err(ferret_catalog::log::Error::Previous(ferret_catalog::OpenError::Decode(
+            ferret_catalog::DecodeError::Version(_),
+        ))) => {
+            let mut txn =
+                Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
+            let roots = roots(txn.previous())?;
+            let plan = Plan::new(
+                txn.previous(),
+                &roots,
+                refresh,
+                options.sniffer,
+                fingerprint(options),
+            )?;
+            let (batches, mut report) = observe(Source::Checkpoint(&txn), &plan, options)?;
+            let started = Instant::now();
+            txn.set_policy(fingerprint(options));
+            for batch in batches {
+                txn.add(batch);
+            }
+            for root in &plan.keep {
+                txn.keep(root.as_os_str().as_bytes())
+                    .map_err(IndexError::Keep)?;
+            }
+            let catalog = txn.commit().map_err(IndexError::Commit)?;
+            report.commit_time = started.elapsed();
+            finish_report(&mut report, &catalog, &plan, true);
+            Ok(report)
+        }
+        Err(ferret_catalog::log::Error::Locked) => Err(IndexError::Begin(BeginError::Locked)),
+        Err(error) => Err(IndexError::Update(error)),
+    }
+}
+
+/// Recrawls using a resident session, retaining its lookups and writer lock.
+/// The complete configured root set and D34 widening have the same contract as
+/// `index`. Incomplete EACCES coverage blocks this resident API in M4; the
+/// batch CLI can transfer its owned session to the amended A′ checkpoint
+/// fallback.
+pub fn recrawl(
+    session: &mut WriterSession,
+    roots: &[PathBuf],
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+) -> Result<Report, IndexError> {
+    let previous = session.view();
+    let plan = Plan::new(
+        Some(&previous),
+        roots,
+        refresh,
+        options.sniffer,
+        fingerprint(options),
+    )?;
+    let (batches, mut report) = observe(Source::Session(session, options.sniffer), &plan, options)?;
+    let started = Instant::now();
+    let changes = crate::reconcile::changes(
+        session,
+        &batches,
+        &plan.refresh,
+        &plan.dropped,
+        fingerprint(options),
+        options.sniffer,
+    )
+    .map_err(IndexError::Update)?
+    .ok_or_else(|| {
+        IndexError::Update(ferret_catalog::log::Error::Invalid(
+            ferret_catalog::DecodeError::Corrupt("incomplete resident recrawl requires checkpoint"),
+        ))
+    })?;
+    let changed = !changes.records.is_empty();
+    let catalog = session
+        .commit(&changes, options.sniffer)
+        .map_err(IndexError::Update)?;
+    report.commit_time = started.elapsed();
+    finish_report(&mut report, &catalog, &plan, changed);
+    Ok(report)
+}
+
+fn fingerprint(options: &IndexOptions) -> ferret_catalog::Hash {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"ferret-policy-v1\0");
+    hash.update(&options.config.size_cap.to_le_bytes());
+    hash.update(&[u8::from(options.global.is_some())]);
+    hash.update(options.global.as_deref().unwrap_or_default().as_bytes());
+    let mut fingerprint = [0; 16];
+    fingerprint.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+    fingerprint
+}
+
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Checkpoint(&'a Transaction),
+    Session(&'a WriterSession, u32),
+}
+impl Source<'_> {
+    fn batch(self) -> ferret_catalog::Batch {
+        match self {
+            Self::Checkpoint(txn) => txn.batch(),
+            Self::Session(session, _) => session.batch(),
+        }
+    }
+    fn carry(self, stat: &Stat) -> Option<Content> {
+        match self {
+            Self::Checkpoint(txn) => txn.carry(stat),
+            Self::Session(session, sniffer) => session.carry(stat, sniffer),
+        }
+    }
+}
+
+fn observe(
+    source: Source<'_>,
+    plan: &Plan,
+    options: &IndexOptions,
+) -> Result<(Vec<ferret_catalog::Batch>, Report), IndexError> {
     let mut report = Report {
         refreshed: plan.refresh.clone(),
         kept: plan.keep.clone(),
         dropped: plan.dropped.clone(),
         ..Report::default()
     };
-
     let started = Instant::now();
     let cache = Cache::new();
     let mut faults = Vec::new();
+    let mut batches = Vec::new();
     for root in &plan.refresh {
         let walk_options = WalkOptions {
             workers: options.workers,
@@ -391,52 +555,42 @@ fn run(
             options.global.as_deref(),
             options.config,
             &walk_options,
-            || Hasher::new(&txn, &cache, root),
+            || Hasher::with_source(source, &cache, root),
         );
         let outputs: Vec<Output> = visitors
             .into_iter()
             .map(|v| v.finish(&mut faults))
             .collect();
-        // Every inode this root's workers claimed is finished now (roots are
-        // walked one at a time), so its deferred aliases resolve here rather
-        // than riding along through later roots.
         for mut output in outputs {
             output.resolve(&cache);
             report.counts.add(&output.counts);
             report.hash_time += output.read_time;
             report.content_faults.append(&mut output.content_faults);
             report.pattern_errors.append(&mut output.pattern_errors);
-            txn.add(output.batch);
+            batches.push(output.batch);
         }
     }
     report.counts.cached_inodes = cache.len() as u64;
     report.counts.deferred_peak = cache.deferred_peak();
-    drop(cache);
     report.content_faults.sort_by(|a, b| a.0.cmp(&b.0));
     report.counts.content_faults = report.content_faults.len() as u64;
     report.walk_time = started.elapsed();
-
     if !faults.is_empty() {
         return Err(IndexError::Coverage {
             faults,
             report: Box::new(report),
         });
     }
+    Ok((batches, report))
+}
 
-    let started = Instant::now();
-    for root in &plan.keep {
-        txn.keep(root.as_os_str().as_bytes())
-            .map_err(IndexError::Keep)?;
-    }
-    let catalog = txn.commit().map_err(IndexError::Commit)?;
-    report.commit_time = started.elapsed();
+fn finish_report(report: &mut Report, catalog: &Catalog, plan: &Plan, changed: bool) {
     let started = Instant::now();
     let seen = std::mem::take(&mut report.content_faults);
-    report.content_faults = content_faults(&catalog, &plan.refresh, seen);
+    report.content_faults = content_faults(catalog, &plan.refresh, seen);
     report.counts.content_faults = report.content_faults.len() as u64;
     report.fault_time = started.elapsed();
-    report.published = Some(Published::of(&catalog));
-    Ok(report)
+    report.published = changed.then(|| Published::of(catalog));
 }
 
 /// Every name under a refreshed root whose inode the catalog published as
@@ -505,6 +659,7 @@ impl Plan {
         roots: &[PathBuf],
         refresh: Refresh<'_>,
         sniffer: u32,
+        policy: ferret_catalog::Hash,
     ) -> Result<Plan, IndexError> {
         let mut configured = roots
             .iter()
@@ -520,7 +675,7 @@ impl Plan {
             })
             .unwrap_or_default();
         let everything = matches!(refresh, Refresh::All)
-            || previous.is_some_and(|p| p.sniffer_version() != sniffer);
+            || previous.is_some_and(|p| p.sniffer_version() != sniffer || p.policy() != policy);
         let named = match refresh {
             Refresh::All => Vec::new(),
             Refresh::Only(paths) => {
@@ -609,7 +764,7 @@ pub(crate) struct Deferred {
 
 /// The per-worker visitor: fills one batch and reads the files it must.
 pub(crate) struct Hasher<'a> {
-    txn: &'a Transaction,
+    txn: Source<'a>,
     cache: &'a Cache,
     root: &'a Path,
     pub(crate) out: Output,
@@ -635,7 +790,11 @@ pub(crate) struct Output {
 pub(crate) const DRAIN_MIN: usize = 64;
 
 impl<'a> Hasher<'a> {
+    #[cfg(test)]
     pub(crate) fn new(txn: &'a Transaction, cache: &'a Cache, root: &'a Path) -> Self {
+        Self::with_source(Source::Checkpoint(txn), cache, root)
+    }
+    fn with_source(txn: Source<'a>, cache: &'a Cache, root: &'a Path) -> Self {
         Self {
             txn,
             cache,

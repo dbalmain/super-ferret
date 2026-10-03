@@ -336,6 +336,14 @@ impl Catalog {
         expected: Generation,
         changes: &crate::log::ChangeSet,
     ) -> Result<Self, crate::log::Error> {
+        self.advance_with_sniffer(expected, changes, self.sniffer_version())
+    }
+    pub(crate) fn advance_with_sniffer(
+        &self,
+        expected: Generation,
+        changes: &crate::log::ChangeSet,
+        sniffer: u32,
+    ) -> Result<Self, crate::log::Error> {
         use crate::log::Error;
         self.generation().check(expected).map_err(Error::Stale)?;
         self.load_all().map_err(Error::Previous)?;
@@ -366,6 +374,7 @@ impl Catalog {
                 "allocation counters decreased",
             )));
         }
+        manifest.sniffer = sniffer;
         manifest.counters = changes.counters;
         manifest.counts = changes.counts;
         Manifest::decode(&manifest.encode()).map_err(Error::Invalid)?;
@@ -702,7 +711,9 @@ impl Catalog {
     /// The sniffer version this generation's content states were found with
     /// (D37).
     pub fn sniffer_version(&self) -> u32 {
-        self.layout.sniffer
+        self.overlay
+            .as_ref()
+            .map_or(self.layout.sniffer, |o| o.manifest.sniffer)
     }
 
     /// The next `DocId` a new document will get. Never decreases (D36 B).

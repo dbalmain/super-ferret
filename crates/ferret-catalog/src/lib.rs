@@ -27,6 +27,7 @@ mod overlay;
 mod packed;
 mod publication;
 pub mod read;
+mod session;
 pub mod transaction;
 
 #[cfg(test)]
@@ -40,6 +41,7 @@ pub use read::{
     Catalog, Contents, Entry, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN,
     Resolved, Target, WorkTree,
 };
+pub use session::WriterSession;
 pub use transaction::{BeginError, CommitError, KeepError, Transaction};
 
 /// A content hash: the first 128 bits of BLAKE3, computed by the crawler.
