@@ -155,7 +155,7 @@ pub(super) fn run(
     effects: &mut impl Effects,
 ) -> Result<Outcome, Unsupported> {
     let mut outcome = Outcome::default();
-    let Some(expression) = plan.prepare(source.catalog(), effects, &mut outcome)? else {
+    let Some(expression) = plan.prepare(source, effects, &mut outcome)? else {
         return Ok(outcome);
     };
     let quit = Arc::new(AtomicBool::new(false));
@@ -300,7 +300,7 @@ impl Plan {
             source.worker_limit(workers)
         };
         let mut outcome = Outcome::default();
-        let Some(expression) = self.prepare(source.catalog(), &mut effects, &mut outcome)? else {
+        let Some(expression) = self.prepare(&source, &mut effects, &mut outcome)? else {
             if let Err(error) = effects.flush() {
                 effects.error(&WalkError {
                     path: ".".into(),

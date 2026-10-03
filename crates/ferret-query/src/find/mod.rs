@@ -103,7 +103,10 @@ pub trait Effects {
     /// Executes a prepared command, draining stdout through the host capture
     /// hook.
     fn command(&mut self, command: &mut std::process::Command) -> io::Result<bool> {
-        self.capture(command, &mut io::stdout().lock())
+        let mut output = OutputBuffer::default();
+        let success = self.capture(command, &mut output)?;
+        output.write_to(&mut io::stdout().lock())?;
+        Ok(success)
     }
     /// Drains a child's stdout into the entry buffer while it runs. Stderr and
     /// stdin retain the host's normal process policy.
@@ -272,7 +275,7 @@ impl Plan {
 
     fn prepare(
         &self,
-        catalog: Option<&ferret_catalog::Catalog>,
+        source: &impl EntrySource,
         effects: &mut impl Effects,
         outcome: &mut Outcome,
     ) -> Result<Option<Expression>, Unsupported> {
@@ -295,7 +298,7 @@ impl Plan {
             return Ok(None);
         }
         let mut expression = self.expression.clone();
-        if let Err(error) = resolve_references(&mut expression, catalog) {
+        if let Err(error) = resolve_references(&mut expression, source.catalog()) {
             effects.error(&WalkError {
                 path: ".".into(),
                 error,

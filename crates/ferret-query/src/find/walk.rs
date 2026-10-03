@@ -155,7 +155,12 @@ impl Entry {
             .metadata
             .get_or_init(|| cached_metadata(self.path(), self.state.follow))
             .as_ref()
-            .map_err(|&errno| io::Error::from_raw_os_error(errno))
+            .map_err(|error| {
+                error.raw_os_error().map_or_else(
+                    || io::Error::new(error.kind(), error.to_string()),
+                    io::Error::from_raw_os_error,
+                )
+            })
     }
     pub(super) fn catalog(&self) -> Option<&Catalog> {
         self.state.catalog.as_deref()
@@ -358,12 +363,8 @@ fn metadata(path: &Path, follow: bool) -> io::Result<Metadata> {
     }
 }
 
-fn cached_metadata(path: &Path, follow: bool) -> Result<Metadata, i32> {
-    metadata(path, follow).map_err(|error| {
-        error
-            .raw_os_error()
-            .unwrap_or(rustix::io::Errno::IO.raw_os_error())
-    })
+fn cached_metadata(path: &Path, follow: bool) -> Result<Metadata, Arc<io::Error>> {
+    metadata(path, follow).map_err(Arc::new)
 }
 
 /// An I/O error with its path. The evaluator reports it and keeps walking.
@@ -425,7 +426,7 @@ struct Saved {
     directory: Option<Arc<File>>,
     depth: usize,
     kind: Option<FileKind>,
-    metadata: OnceCell<Result<Metadata, i32>>,
+    metadata: OnceCell<Result<Metadata, Arc<io::Error>>>,
     target: Option<Target>,
     parent: Option<InoId>,
     catalog: Option<Arc<Catalog>>,
@@ -467,7 +468,7 @@ struct Level {
     names_start: usize,
     /// The first child's metadata, observed while listing when it is a
     /// directory.
-    first: Option<Result<Metadata, i32>>,
+    first: Option<Result<Metadata, Arc<io::Error>>>,
     own: Saved,
 }
 
@@ -936,7 +937,8 @@ impl LiveWalk {
             entry.state.metadata = OnceCell::new();
             entry.state.target = child.target;
             entry.state.parent = child.parent;
-            entry.removed_children = self.removed_children.clone();
+            // Deletion accounting is walk-wide and stays in the reusable entry;
+            // re-cloning its shared counter here contends across workers.
             if child.target.is_some() {
                 if entry.state.catalog.is_none() {
                     entry.state.catalog = self.catalog.clone();
@@ -1246,22 +1248,54 @@ mod tests {
     fn access_tests_leave_the_metadata_cache_unobserved() {
         // Access predicates once performed an extra lstat before access(2).
         // A missing path is a false access test, not a metadata error.
-        let entry = Entry::new(
-            PathBuf::from("/ferret-r1-missing-access-entry"),
-            0,
-            FileKind::File,
-        );
-        for access in [
-            rustix::fs::Access::READ_OK,
-            rustix::fs::Access::WRITE_OK,
-            rustix::fs::Access::EXEC_OK,
+        let entries = [
+            (
+                Entry::new(
+                    PathBuf::from("/ferret-r1-missing-access-entry"),
+                    0,
+                    FileKind::File,
+                ),
+                false,
+            ),
+            (
+                Entry::new(std::env::current_exe().unwrap(), 0, FileKind::File),
+                true,
+            ),
+        ];
+        for (entry, expected) in entries {
+            for access in [
+                rustix::fs::Access::READ_OK,
+                rustix::fs::Access::WRITE_OK,
+                rustix::fs::Access::EXEC_OK,
+            ] {
+                assert_eq!(
+                    crate::find::test::Test::Access(access)
+                        .evaluate(&entry)
+                        .unwrap(),
+                    expected
+                );
+                assert!(entry.state.metadata.get().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn cloning_an_entry_preserves_cached_os_and_non_os_metadata_errors() {
+        // Caching only errno turned std's NUL-path InvalidInput into EIO.
+        for path in [
+            PathBuf::from("/ferret-r1-missing-metadata-entry"),
+            PathBuf::from(OsStr::from_bytes(b"bad\0path")),
         ] {
-            assert!(
-                !crate::find::test::Test::Access(access)
-                    .evaluate(&entry)
-                    .unwrap()
-            );
-            assert!(entry.state.metadata.get().is_none());
+            let expected = fs::symlink_metadata(&path).unwrap_err();
+            let entry = Entry::new(path, 0, FileKind::File);
+            let observed = entry.metadata().unwrap_err();
+            let copied = entry.clone();
+            let cached = copied.metadata().unwrap_err();
+            for error in [observed, cached] {
+                assert_eq!(error.raw_os_error(), expected.raw_os_error());
+                assert_eq!(error.kind(), expected.kind());
+                assert_eq!(error.to_string(), expected.to_string());
+            }
         }
     }
 }

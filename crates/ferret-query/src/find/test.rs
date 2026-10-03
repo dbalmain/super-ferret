@@ -1,4 +1,4 @@
-//! Stat and system-name tests used by GNU find expressions.
+//! Path, metadata and system-name predicates used by GNU find expressions.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -24,7 +24,7 @@ pub(super) struct Number {
     value: f64,
 }
 
-/// One parsed metadata predicate. References resolve once against the selected
+/// One parsed predicate. References resolve once against the selected
 /// source before execution.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Test {
@@ -883,7 +883,6 @@ fn device(major: u64, minor: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use std::fs::FileTimes;
     use std::os::unix::fs::{PermissionsExt, symlink};

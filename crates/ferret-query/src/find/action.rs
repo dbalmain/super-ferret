@@ -270,7 +270,7 @@ pub(super) fn evaluate(
         Action::Delete => {
             let result = if entry.name() == b"." {
                 Ok(())
-            } else if entry.kind().map_err(metadata_error)? == FileKind::Directory {
+            } else if entry.kind().map_err(EvaluationError::Metadata)? == FileKind::Directory {
                 fs::remove_dir(entry.path())
             } else {
                 fs::remove_file(entry.path())
@@ -322,10 +322,6 @@ fn register_file(state: &mut State, target: &Target) {
     {
         state.files.push(file.clone());
     }
-}
-
-fn metadata_error(error: io::Error) -> EvaluationError {
-    EvaluationError::Metadata(error)
 }
 
 fn execute(
@@ -471,15 +467,6 @@ fn spawn(
         command
     };
     if let Some(handle) = handle {
-        // A failed batch cwd stops GNU's walk; an executable launch failure
-        // is only false. Check search permission through the retained handle
-        // so renamed or unlinked directories remain usable.
-        rustix::fs::accessat(
-            handle,
-            ".",
-            rustix::fs::Access::EXEC_OK,
-            rustix::fs::AtFlags::EACCESS,
-        )?;
         // CLOEXEC still allows the child to chdir through its inherited fd
         // before exec. This also works after the directory has been unlinked.
         command.current_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()));
@@ -489,6 +476,17 @@ fn spawn(
     match effects.command(&mut command) {
         Ok(success) => Ok(success),
         Err(error) => {
+            if let Some(handle) = handle {
+                // GNU stops for an inaccessible batch cwd, but an executable
+                // launch failure is only false. Probe only failed commands,
+                // through the retained handle so renamed directories work.
+                rustix::fs::accessat(
+                    handle,
+                    ".",
+                    rustix::fs::Access::EXEC_OK,
+                    rustix::fs::AtFlags::EACCESS,
+                )?;
+            }
             effects.error(&WalkError {
                 path: PathBuf::from(&args[0]),
                 error,

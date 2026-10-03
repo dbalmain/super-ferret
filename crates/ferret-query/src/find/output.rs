@@ -1,4 +1,4 @@
-//! Entry output transactions. Memory is capped per stream; larger output spills
+//! Bounded captures and entry output transactions. Larger output spills
 //! to an unlinked file. Commit and quit share a lock across all worker tasks.
 
 use std::fs::{File, OpenOptions};

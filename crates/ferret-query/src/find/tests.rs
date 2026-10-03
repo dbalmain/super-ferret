@@ -742,8 +742,17 @@ fn parser_precedence_and_implicit_action_are_visible_in_the_ast() {
 fn unsupported_plans_fail_before_the_source_or_effects_are_used() {
     let plan =
         Plan::parse(&["-I", "missing", "-context", "x", "-name", "x"].map(OsString::from)).unwrap();
+    struct UnusedSource;
+    impl EntrySource for UnusedSource {
+        fn catalog(&self) -> Option<&ferret_catalog::Catalog> {
+            panic!("unsupported plans must not inspect the source");
+        }
+        fn next(&mut self, _: bool) -> Option<Result<&Entry, WalkError>> {
+            panic!("unsupported plans must not fetch entries");
+        }
+    }
     let mut output = Output::default();
-    let error = plan.run(&mut plan.live_source(), &mut output).unwrap_err();
+    let error = plan.run(&mut UnusedSource, &mut output).unwrap_err();
     assert_eq!(error.feature, "-context");
     assert!(output.errors.is_empty());
     assert!(output.bytes.is_empty());
