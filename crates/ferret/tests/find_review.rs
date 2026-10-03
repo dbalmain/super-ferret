@@ -180,3 +180,29 @@ fn catalog_delete_retains_the_parent_for_explicit_directory_starts() {
         assert!(!tree.0.join("tree.old/victim").exists());
     }
 }
+
+#[test]
+fn failed_child_capture_is_an_output_error_and_reaps_the_child() {
+    // #3: spill creation used to masquerade as ENOENT launching head, exit 0.
+    let tree = Tree::new("capture-error");
+    let output = tree
+        .command(false)
+        .env("TMPDIR", tree.0.join("nonexistent"))
+        .args([
+            "/dev/null",
+            "-maxdepth",
+            "0",
+            "-exec",
+            "head",
+            "-c",
+            "131072",
+            "/dev/zero",
+            ";",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("/dev/null"), "{error}");
+    assert!(!error.contains("find: head:"), "{error}");
+}

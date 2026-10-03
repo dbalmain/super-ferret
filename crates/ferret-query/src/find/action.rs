@@ -11,8 +11,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use super::output::OutputBuffer;
 use super::printf::Format;
 use super::{Effects, Entry, EvaluationError, FileKind, WalkError};
 
@@ -76,6 +78,11 @@ pub(super) struct State {
     limit: Option<Budget>,
     files: Vec<Arc<Mutex<BufWriter<File>>>>,
     pub errors: u64,
+    // Batch commits share the entry record's gate, so a batch's output can
+    // never split an entry's and vice versa. Set once per task, including
+    // donated ones.
+    pub gate: Arc<Mutex<()>>,
+    pub quit: Arc<AtomicBool>,
 }
 
 impl State {
@@ -100,12 +107,13 @@ impl State {
         if !directories_only && !self.staged.is_empty() {
             let limit = *self.limit.get_or_insert_with(batch_limit);
             for batch in self.staged.values_mut() {
-                self.errors += batch.collect(&self.shared, limit, effects)?;
+                self.errors +=
+                    batch.collect(&self.shared, limit, effects, &self.gate, &self.quit)?;
             }
         }
         for batch in self.batches.values_mut() {
             if !directories_only || batch.exec.directory {
-                self.errors += u64::from(!batch.run(effects)?);
+                self.errors += u64::from(!batch.run(effects, &self.gate, &self.quit)?);
             }
         }
         Ok(())
@@ -127,7 +135,7 @@ impl State {
         }
         for batch in self.batches.values_mut() {
             if batch.exec.directory && batch.directory.as_deref() != Some(&directory) {
-                self.errors += u64::from(!batch.run(effects)?);
+                self.errors += u64::from(!batch.run(effects, &self.gate, &self.quit)?);
             }
         }
         Ok(())
@@ -137,6 +145,8 @@ impl State {
 pub(super) fn flush_shared(
     shared: &Mutex<BTreeMap<usize, Batch>>,
     effects: &mut impl Effects,
+    gate: &Mutex<()>,
+    quit: &AtomicBool,
 ) -> io::Result<u64> {
     let mut errors = 0;
     let mut batches = std::mem::take(
@@ -145,7 +155,7 @@ pub(super) fn flush_shared(
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     for batch in batches.values_mut() {
-        errors += u64::from(!batch.run(effects)?);
+        errors += u64::from(!batch.run(effects, gate, quit)?);
     }
     Ok(errors)
 }
@@ -172,6 +182,8 @@ impl Batch {
         shared: &Mutex<BTreeMap<usize, Self>>,
         limit: Budget,
         effects: &mut impl Effects,
+        gate: &Mutex<()>,
+        quit: &AtomicBool,
     ) -> io::Result<u64> {
         if self.paths.is_empty() {
             return Ok(0);
@@ -197,24 +209,30 @@ impl Batch {
         // Workers append to a fresh batch while detached full batches run.
         let mut errors = 0;
         for batch in &mut ready {
-            errors += u64::from(!batch.run(effects)?);
+            errors += u64::from(!batch.run(effects, gate, quit)?);
         }
         Ok(errors)
     }
 
-    fn run(&mut self, effects: &mut impl Effects) -> io::Result<bool> {
+    fn run(
+        &mut self,
+        effects: &mut impl Effects,
+        gate: &Mutex<()>,
+        quit: &AtomicBool,
+    ) -> io::Result<bool> {
         if self.paths.is_empty() {
             return Ok(true);
         }
         let mut args = self.exec.args.clone();
         args.append(&mut self.paths);
         self.bytes = command_bytes(&self.exec.args);
-        spawn(
+        spawn_batch(
             &args,
             self.directory.as_deref(),
             self.handle.as_deref(),
-            false,
             effects,
+            gate,
+            quit,
         )
     }
 }
@@ -371,7 +389,8 @@ fn execute(
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .flush()?;
                 }
-                state.errors += batch.collect(&state.shared, limit, effects)?;
+                state.errors +=
+                    batch.collect(&state.shared, limit, effects, &state.gate, &state.quit)?;
             }
             return Ok(true);
         }
@@ -386,7 +405,7 @@ fn execute(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .flush()?;
             }
-            state.errors += u64::from(!batch.run(effects)?);
+            state.errors += u64::from(!batch.run(effects, &state.gate, &state.quit)?);
         }
         batch.directory = directory;
         batch.handle = handle;
@@ -463,19 +482,35 @@ fn spawn(
     effects: &mut impl Effects,
 ) -> io::Result<bool> {
     effects.flush()?;
-    // GNU closes fd 0 for interactive actions. A POSIX shell exec trampoline
-    // provides that child-only operation without unsafe pre_exec hooks.
     let mut command = if close_stdin {
+        // GNU closes fd 0 for interactive actions. A POSIX shell exec
+        // trampoline provides that child-only operation without unsafe
+        // pre_exec hooks.
         let mut command = Command::new("sh");
         command
             .args(["-c", "exec \"$@\" <&-", "find-ok"])
             .args(args);
+        if let Some(handle) = handle {
+            command.current_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()));
+        } else if let Some(directory) = directory {
+            command.current_dir(directory);
+        }
         command
     } else {
-        let mut command = Command::new(&args[0]);
-        command.args(&args[1..]);
-        command
+        prepare(args, directory, handle)
     };
+    match effects.command(&mut command) {
+        Ok(success) => Ok(success),
+        Err(error) if super::is_output_failure(&error) => Err(super::unmark_output_failure(error)),
+        Err(error) => probe_launch_failure(error, args, handle, effects),
+    }
+}
+
+/// Builds the directory/handle-relative command common to both single and
+/// batched exec, without running it.
+fn prepare(args: &[OsString], directory: Option<&Path>, handle: Option<&File>) -> Command {
+    let mut command = Command::new(&args[0]);
+    command.args(&args[1..]);
     if let Some(handle) = handle {
         // CLOEXEC still allows the child to chdir through its inherited fd
         // before exec. This also works after the directory has been unlinked.
@@ -483,26 +518,73 @@ fn spawn(
     } else if let Some(directory) = directory {
         command.current_dir(directory);
     }
-    match effects.command(&mut command) {
-        Ok(success) => Ok(success),
-        Err(error) => {
-            if let Some(handle) = handle {
-                // GNU stops for an inaccessible batch cwd, but an executable
-                // launch failure is only false. Probe only failed commands,
-                // through the retained handle so renamed directories work.
-                rustix::fs::accessat(
-                    handle,
-                    ".",
-                    rustix::fs::Access::EXEC_OK,
-                    rustix::fs::AtFlags::EACCESS,
-                )?;
+    command
+}
+
+fn probe_launch_failure(
+    error: io::Error,
+    args: &[OsString],
+    handle: Option<&File>,
+    effects: &mut impl Effects,
+) -> io::Result<bool> {
+    if let Some(handle) = handle {
+        // GNU stops for an inaccessible batch cwd, but an executable
+        // launch failure is only false. Probe only failed commands,
+        // through the retained handle so renamed directories work.
+        rustix::fs::accessat(
+            handle,
+            ".",
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )?;
+    }
+    effects.error(&WalkError {
+        path: PathBuf::from(&args[0]),
+        error,
+    });
+    Ok(false)
+}
+
+/// Runs a batch's command and commits its captured stdout through the same
+/// gate an entry's own output commits through (#4): capture happens before
+/// the lock is taken, so a slow child cannot hold up other workers, and the
+/// write happens atomically against entry commits so no record can split
+/// another's.
+fn spawn_batch(
+    args: &[OsString],
+    directory: Option<&Path>,
+    handle: Option<&File>,
+    effects: &mut impl Effects,
+    gate: &Mutex<()>,
+    _quit: &AtomicBool,
+) -> io::Result<bool> {
+    effects.flush()?;
+    let mut command = prepare(args, directory, handle);
+    let mut buffer = OutputBuffer::default();
+    match effects.capture(&mut command, &mut buffer) {
+        Ok(success) => {
+            // Unlike an entry's own record, a batch's already-collected
+            // arguments must still flush after `-quit`: GNU runs any
+            // pending `+` batch at the end regardless.
+            let _gate = gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            struct Host<'a, E>(&'a mut E);
+            impl<E: Effects> Write for Host<'_, E> {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.0.write(bytes)?;
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    self.0.flush()
+                }
             }
-            effects.error(&WalkError {
-                path: PathBuf::from(&args[0]),
-                error,
-            });
-            Ok(false)
+            buffer.write_to(&mut Host(effects))?;
+            effects.flush()?;
+            Ok(success)
         }
+        Err(error) if super::is_output_failure(&error) => Err(super::unmark_output_failure(error)),
+        Err(error) => probe_launch_failure(error, args, handle, effects),
     }
 }
 

@@ -25,17 +25,21 @@ struct Task<W = LiveWalk> {
 
 impl<W: EntrySource> Task<W> {
     fn new(walk: W, completion: Option<Arc<AtomicUsize>>, quit: &Arc<AtomicBool>) -> Self {
+        let gate = Arc::new(Mutex::new(()));
+        let mut control = Control {
+            cancelled: Some(quit.clone()),
+            ..Control::default()
+        };
+        control.actions.gate = gate.clone();
+        control.actions.quit = quit.clone();
         Self {
             walk,
-            control: Control {
-                cancelled: Some(quit.clone()),
-                ..Control::default()
-            },
+            control,
             descend: true,
             completion,
             errors: 0,
             record: super::output::Record::default(),
-            gate: Arc::new(Mutex::new(())),
+            gate,
             quit: quit.clone(),
         }
     }
@@ -144,6 +148,7 @@ impl Task {
         };
         let mut task = Self::new(walk, completion, quit);
         task.gate = self.gate.clone();
+        task.control.actions.gate = self.gate.clone();
         task.control.actions.shared = self.control.actions.shared.clone();
         Some(task)
     }
@@ -163,13 +168,14 @@ pub(super) fn run(
     task.control.cancelled = None;
     let buffered = super::output::needs_record(&expression);
     let shared = task.control.actions.shared.clone();
+    let gate = task.gate.clone();
     while !quit.load(Ordering::Acquire) && task.step(plan, &expression, effects, buffered) {
         if task.control.quit {
             break;
         }
     }
     outcome.errors += task.finish(effects)
-        + super::action::flush_shared(&shared, effects).unwrap_or_else(|error| {
+        + super::action::flush_shared(&shared, effects, &gate, &quit).unwrap_or_else(|error| {
             effects.error(&WalkError {
                 path: ".".into(),
                 error,
@@ -318,6 +324,7 @@ impl Plan {
         let buffered = super::output::needs_record(&expression);
         let sequential = super::sequential_starts(&expression);
         let shared = task.control.actions.shared.clone();
+        let gate = task.gate.clone();
         while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects, buffered)
         {
             if task.control.quit {
@@ -380,24 +387,27 @@ impl Plan {
                         .map(|task| task.finish(&mut effects))
                         .sum::<u64>();
                 let errors = errors
-                    + super::action::flush_shared(&shared, &mut effects).unwrap_or_else(|error| {
-                        effects.error(&WalkError {
-                            path: ".".into(),
-                            error,
+                    + super::action::flush_shared(&shared, &mut effects, &gate, &pool.quit)
+                        .unwrap_or_else(|error| {
+                            effects.error(&WalkError {
+                                path: ".".into(),
+                                error,
+                            });
+                            1
                         });
-                        1
-                    });
                 return Ok(Outcome { errors });
             }
         }
         let errors = task.finish(&mut effects)
-            + super::action::flush_shared(&shared, &mut effects).unwrap_or_else(|error| {
-                effects.error(&WalkError {
-                    path: ".".into(),
-                    error,
-                });
-                1
-            });
+            + super::action::flush_shared(&shared, &mut effects, &gate, &quit).unwrap_or_else(
+                |error| {
+                    effects.error(&WalkError {
+                        path: ".".into(),
+                        error,
+                    });
+                    1
+                },
+            );
         Ok(Outcome { errors })
     }
 }

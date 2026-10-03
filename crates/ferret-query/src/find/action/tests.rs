@@ -809,14 +809,14 @@ fn full_batch_releases_collection_lock_before_running_child() {
         fn error(&mut self, error: &WalkError) {
             self.output.error(error);
         }
-        fn command(&mut self, command: &mut Command) -> io::Result<bool> {
+        fn capture(&mut self, command: &mut Command, sink: &mut dyn Write) -> io::Result<bool> {
             // This would fail immediately if child execution retained the lock.
             assert!(self.state.shared.try_lock().is_ok());
             if let Some(next) = self.next.take() {
                 execute(&self.exec, &next, &mut self.output, &mut self.state)?;
                 self.state.flush(&mut self.output, false)?;
             }
-            self.output.command(command)
+            self.output.capture(command, sink)
         }
     }
     let tree = Tree::new();
@@ -856,7 +856,10 @@ fn full_batch_releases_collection_lock_before_running_child() {
         .unwrap();
     }
     state.flush(&mut effects, false).unwrap();
-    assert_eq!(flush_shared(&state.shared, &mut effects).unwrap(), 0);
+    assert_eq!(
+        flush_shared(&state.shared, &mut effects, &state.gate, &state.quit).unwrap(),
+        0
+    );
     assert_eq!(
         effects.output.batches,
         vec![
@@ -871,4 +874,102 @@ fn full_batch_releases_collection_lock_before_running_child() {
         ]
     );
     assert_eq!(state.errors + effects.state.errors, 0);
+}
+
+#[test]
+fn batch_commit_shares_the_entry_record_gate() {
+    // #4: an entry's buffered record and a batch's output used to commit
+    // through separate mechanisms, so one worker's batch write could land in
+    // the middle of another worker's entry record. Drive both sides by hand
+    // through a deterministic handshake (no sleeps) and check that the
+    // batch's write cannot land until the entry's commit has released the
+    // gate, even though the batch finishes capturing its own output first.
+    use crate::find::output::{EntryEffects, Record};
+    use std::sync::atomic::AtomicBool as StdAtomicBool;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct Handshake {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        entry_started: std::sync::mpsc::SyncSender<()>,
+        await_entry_started: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+        release_entry: std::sync::mpsc::SyncSender<()>,
+        await_release_entry: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+        triggered: Arc<StdAtomicBool>,
+    }
+    impl Effects for Handshake {
+        fn print(&mut self, _: &Path, _: bool) -> io::Result<()> {
+            Ok(())
+        }
+        fn error(&mut self, error: &WalkError) {
+            panic!("{error:?}");
+        }
+        fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if bytes.first() == Some(&b'A') && !self.triggered.swap(true, Ordering::SeqCst) {
+                self.entry_started.send(()).map_err(io::Error::other)?;
+                self.await_release_entry
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+        fn capture(&mut self, _: &mut Command, sink: &mut dyn Write) -> io::Result<bool> {
+            // The batch captures its own output, and only afterwards tries to
+            // commit it - proving capture happens before the gate is taken.
+            self.await_entry_started
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            sink.write_all(b"B")?;
+            self.release_entry.send(()).map_err(io::Error::other)?;
+            Ok(true)
+        }
+    }
+
+    let gate = Arc::new(Mutex::new(()));
+    let quit = Arc::new(StdAtomicBool::new(false));
+    let (entry_started, await_entry_started) = sync_channel(1);
+    let (release_entry, await_release_entry) = sync_channel(1);
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let host = Handshake {
+        bytes: bytes.clone(),
+        entry_started,
+        await_entry_started: Arc::new(Mutex::new(await_entry_started)),
+        release_entry,
+        await_release_entry: Arc::new(Mutex::new(await_release_entry)),
+        triggered: Arc::default(),
+    };
+    let a_len = 200 * 1024; // exceeds OutputBuffer's 64 KiB memory limit
+
+    std::thread::scope(|scope| {
+        let (gate1, quit1, mut host1) = (gate.clone(), quit.clone(), host.clone());
+        let entry = scope.spawn(move || {
+            let mut record = Record::default();
+            let mut output = EntryEffects {
+                host: &mut host1,
+                record: &mut record,
+                gate: &gate1,
+                quit: &quit1,
+            };
+            Effects::write(&mut output, &vec![b'A'; a_len]).unwrap();
+            output.commit(false).unwrap();
+        });
+        let (gate2, quit2, mut host2) = (gate.clone(), quit.clone(), host.clone());
+        let batch = scope.spawn(move || {
+            let args = [OsString::from("batch-output")];
+            spawn_batch(&args, None, None, &mut host2, &gate2, &quit2).unwrap()
+        });
+        entry.join().unwrap();
+        assert!(batch.join().unwrap());
+    });
+
+    let bytes = bytes.lock().unwrap();
+    let at = bytes.iter().position(|&b| b == b'B').unwrap();
+    assert_eq!(at, a_len, "the batch's write split the entry's record");
+    assert_eq!(bytes.len(), at + 1);
 }

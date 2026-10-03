@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use ferret_catalog::Catalog;
 
-use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
+use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError, mark_output_failure};
 
 use crate::cli::{self, Exit};
 use crate::xdg::Dirs;
@@ -187,8 +187,8 @@ impl<W: Write> Effects for Output<W> {
         let mut writer = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        output.write_to(&mut *writer)?;
-        writer.flush()?;
+        output.write_to(&mut *writer).map_err(mark_output_failure)?;
+        writer.flush().map_err(mark_output_failure)?;
         Ok(success)
     }
 
