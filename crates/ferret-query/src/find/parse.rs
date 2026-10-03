@@ -83,6 +83,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         daystart: false,
         now: std::time::SystemTime::now(),
         permission_warning: false,
+        combinators: 0,
     };
     let mut no_ignore = false;
     while let Some(arg) = parser.peek() {
@@ -204,9 +205,31 @@ struct Parser<'a> {
     daystart: bool,
     now: std::time::SystemTime,
     permission_warning: bool,
+    combinators: usize,
 }
 
+/// A chain this long would build an AST deep enough to overflow the stack in
+/// every recursive pass over it - evaluation foremost, since it runs per
+/// entry and can't be rewritten iteratively without an explicit
+/// continuation stack for `&&`/`||` short-circuiting. 50,000 `-true`s
+/// joined by an implicit `-a` reliably aborted at this depth (#11); this
+/// limit sits an order of magnitude below the lowest observed crash
+/// (10,000-20,000, debug build, default 8 MiB stack) with headroom for
+/// release builds' smaller frames and tighter stacks alike. No real find
+/// command line approaches it.
+const MAX_COMBINATORS: usize = 2000;
+
 impl Parser<'_> {
+    fn combine(&mut self) -> Result<(), ParseError> {
+        self.combinators += 1;
+        if self.combinators > MAX_COMBINATORS {
+            return Err(ParseError::Feature(format!(
+                "expression has more than {MAX_COMBINATORS} -a/-o/-not/, operators; split it up"
+            )));
+        }
+        Ok(())
+    }
+
     fn peek(&self) -> Option<&[u8]> {
         self.args.get(self.at).map(|arg| arg.as_bytes())
     }
@@ -223,6 +246,7 @@ impl Parser<'_> {
     fn comma(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.or()?;
         while self.consume(&[b","]) {
+            self.combine()?;
             left = Expression::Comma(Box::new(left), Box::new(self.or()?));
         }
         Ok(left)
@@ -231,6 +255,7 @@ impl Parser<'_> {
     fn or(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.and()?;
         while self.consume(&[b"-o", b"-or"]) {
+            self.combine()?;
             left = Expression::Or(Box::new(left), Box::new(self.and()?));
         }
         Ok(left)
@@ -240,6 +265,7 @@ impl Parser<'_> {
         let mut left = self.unary()?;
         loop {
             if self.consume(&[b"-a", b"-and"]) {
+                self.combine()?;
                 left = Expression::And(Box::new(left), Box::new(self.unary()?));
             } else if self
                 .peek()
@@ -247,6 +273,7 @@ impl Parser<'_> {
             {
                 break;
             } else {
+                self.combine()?;
                 left = Expression::And(Box::new(left), Box::new(self.unary()?));
             }
         }
@@ -255,6 +282,7 @@ impl Parser<'_> {
 
     fn unary(&mut self) -> Result<Expression, ParseError> {
         if self.consume(&[b"!", b"-not"]) {
+            self.combine()?;
             return Ok(Expression::Not(Box::new(self.unary()?)));
         }
         if self.consume(&[b"("]) {

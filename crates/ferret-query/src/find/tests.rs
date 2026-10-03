@@ -505,6 +505,26 @@ fn metadata_observations_and_failures_are_cached_and_name_tests_are_lazy() {
 }
 
 #[test]
+fn parser_rejects_a_combinator_chain_deep_enough_to_overflow_the_stack() {
+    // #11: evaluate(), visit() and friends recurse once per AST level, and
+    // a long implicit-`-a` chain builds one level per joined primary. 50,000
+    // `-true`s reliably aborted with a stack overflow before this fix,
+    // because nothing stopped the chain from growing past what a recursive
+    // evaluation pass can walk. The parser now refuses past a limit far
+    // below any observed crash and far above any real command line,
+    // turning the abort into an ordinary parse error.
+    let mut args: Vec<OsString> = vec!["-I".into(), ".".into()];
+    args.extend(std::iter::repeat_n(OsString::from("-true"), 50_000));
+    assert!(Plan::parse(&args).is_err());
+
+    // A chain well under the limit still parses and evaluates normally.
+    let mut args: Vec<OsString> = vec!["-I".into(), ".".into()];
+    args.extend(std::iter::repeat_n(OsString::from("-true"), 100));
+    args.push("-print".into());
+    Plan::parse(&args).unwrap();
+}
+
+#[test]
 fn parser_rejects_bad_syntax_and_retains_every_unsupported_operand() {
     let warning = Plan::parse(&["-I", ".", "-perm", "/000"].map(OsString::from)).unwrap();
     assert!(warning.permission_warning());

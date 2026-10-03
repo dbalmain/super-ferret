@@ -828,10 +828,22 @@ impl LiveWalk {
             });
         }
         let own = Saved::take(entry);
+        // A pure, action-free walk never needs this directory open past its
+        // own listing - no -delete/-execdir will ask a child for its
+        // parent's fd. Dropping it here, rather than carrying it for the
+        // whole subtree the way an effectful walk must, bounds live fd use
+        // by width instead of depth (#10): a 100-level chain under a tight
+        // RLIMIT_NOFILE no longer exhausts descriptors one per ancestor.
+        let handle = if self.options.live_checks {
+            Some(handle)
+        } else {
+            drop(handle);
+            None
+        };
         self.levels.push(Level {
             catalogued: false,
             pending: None,
-            handle: Some(handle),
+            handle,
             path_len,
             separator,
             start,

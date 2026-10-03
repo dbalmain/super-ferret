@@ -249,7 +249,15 @@ struct Control {
 impl Plan {
     /// Parses a GNU find argument list, including leading ferret `-I`.
     pub fn parse(args: &[OsString]) -> Result<Self, ParseError> {
-        parse::parse(args)
+        let mut plan = parse::parse(args)?;
+        // Whether an action needs a live filesystem check or a kept
+        // directory handle (a cataloged child another start deleted earlier
+        // in the same walk, or a parent fd for -delete/-execdir) - true for
+        // either source, not only the catalog one, which is why this is set
+        // once here rather than only inside `catalog_source` (#10: a live
+        // -I walk needs it exactly as much as a catalog walk does).
+        plan.options.live_checks = has_actions(&plan.expression);
+        Ok(plan)
     }
 
     /// Whether this command prints help, version or debug-option help.
@@ -304,7 +312,6 @@ impl Plan {
     /// Creates a catalog walk. Load `catalog_sections()` before construction.
     pub fn catalog_source(&self, catalog: ferret_catalog::Catalog) -> CatalogSource {
         let mut options = self.options.clone();
-        options.live_checks = has_actions(&self.expression);
         options.guard = leading_guard(&self.expression);
         CatalogSource::new(catalog, self.paths.clone(), options)
     }

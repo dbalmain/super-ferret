@@ -299,6 +299,41 @@ fn deleting_an_explicit_start_counts_against_its_catalog_parent() {
 }
 
 #[test]
+fn live_descent_does_not_hold_one_fd_per_ancestor() {
+    // #10: a live (non-catalog) directory listing kept its open fd in the
+    // traversal's `Level` for the whole subtree beneath it - not just for
+    // the listing itself - so a pure query's fd use grew with *depth*
+    // rather than staying bounded by its own level. Under a 100-level
+    // chain and RLIMIT_NOFILE=64, that aborted with EMFILE partway down,
+    // before reaching `leaf`. A plain query (no -delete/-execdir) never
+    // asks a child for its parent's fd, so the listing handle can close
+    // once its own getdents pass finishes, the same way catalog mode
+    // already never opens one at all for a pure query.
+    let tree = Tree::new("fd-per-ancestor");
+    let mut dir = tree.0.join("chain");
+    fs::create_dir(&dir).unwrap();
+    for _ in 0..100 {
+        dir.push("x");
+        fs::create_dir(&dir).unwrap();
+    }
+    fs::write(dir.join("leaf"), b"").unwrap();
+
+    let output = support::fixture::command("sh", &tree.0)
+        .arg("-c")
+        .arg(r#"ulimit -n 64 && exec "$0" find -I chain -name leaf"#)
+        .arg(FERRET)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .ends_with("leaf"),
+        "{output:?}"
+    );
+}
+
+#[test]
 fn reference_observation_and_output_truncation_run_in_expression_order() {
     // #6: `-fprint`/`-fprintf` used to open (and truncate) their target at
     // parse time, unconditionally before any `-newer`-style reference test
