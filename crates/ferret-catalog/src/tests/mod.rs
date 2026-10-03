@@ -6,6 +6,7 @@ mod commit;
 mod decode;
 mod epoch;
 mod log;
+mod overlay;
 mod roots;
 mod round_trip;
 

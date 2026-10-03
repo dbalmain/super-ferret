@@ -79,6 +79,9 @@ fn main() -> ExitCode {
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
+            ("overlay-fill", [dir, rows]) => overlay_fill(Path::new(dir), rows),
+            ("resident-once", [dir, text]) => resident_once(Path::new(dir), text),
+            ("overlay-carry", [dir, count]) => overlay_carry(Path::new(dir), count),
             ("sections", [dir]) => sections(Path::new(dir)),
             ("query", [dir, queries @ ..]) => query(Path::new(dir), queries),
             _ => return usage(),
@@ -560,5 +563,142 @@ fn log_open_once(dir: &Path) -> Result<()> {
         p.checkpoint().bytes_read(),
         p.log().bytes_read()
     );
+    Ok(())
+}
+
+// M3 uses the product writer and effective reader, with fixture preparation
+// outside query timers. Both names and inode fields change at the stated rate.
+fn overlay_fill(dir: &Path, rows: &str) -> Result<()> {
+    use ferret_catalog::log::{ChangeSet, Record, Writer};
+    use ferret_catalog::{InoId, NameId};
+    let rows: u32 = rows.parse()?;
+    let mut writer = Writer::open(dir)?;
+    let view = writer.view();
+    if rows > view.base_name_count() || rows > view.base_inode_count() - view.base_dir_count() {
+        return Err("overlay exceeds fixture".into());
+    }
+    let mut records = Vec::new();
+    for id in 0..rows {
+        let n = view.name(NameId(id));
+        let mut name = n.bytes.to_vec();
+        name.extend_from_slice(b".m3");
+        records.push(Record::NamePut {
+            id,
+            parent: n.parent.0,
+            child: n.child.0,
+            name,
+        });
+    }
+    for id in view.base_dir_count()..view.base_dir_count() + rows {
+        let inode = view.inode(InoId(id));
+        let mut stat = inode.stat;
+        stat.size = stat.size.saturating_add(1);
+        stat.mode ^= 0o100;
+        records.push(Record::InodePut {
+            id,
+            kind: view.kind(InoId(id)),
+            state: inode.state,
+            doc: inode.doc.map(|d| d.0),
+            stat,
+        });
+    }
+    let changes = ChangeSet {
+        records,
+        counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+        counts: [
+            view.inode_count(),
+            view.name_count(),
+            view.dir_count(),
+            view.doc_count(),
+        ],
+    };
+    writer.commit(writer.generation(), &changes)?;
+    println!(
+        "overlay {rows} names + {rows} inode fields; sequence {}",
+        writer.generation().sequence
+    );
+    Ok(())
+}
+fn memory() -> Result<(String, String)> {
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(str::trim)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("no {name}"))
+    };
+    Ok((field("VmRSS:")?, field("VmHWM:")?))
+}
+fn resident_once(dir: &Path, text: &str) -> Result<()> {
+    let catalog = open_catalog(dir)?;
+    catalog.load_all()?;
+    let query = Query::parse(text, SystemTime::now())?;
+    let mut samples = Vec::new();
+    let mut count = 0;
+    for _ in 0..14 {
+        let mut sink = 0usize;
+        let start = Instant::now();
+        let stats = query.run(&catalog, |row| {
+            sink = sink.wrapping_add(row.path.len()) ^ row.inode.0 as usize;
+            ControlFlow::Continue(())
+        })?;
+        let time = start.elapsed();
+        black_box(sink);
+        count = stats.rows;
+        samples.push(ms(time));
+    }
+    samples.remove(0);
+    let (rss, peak) = memory()?;
+    println!(
+        "resident {:?}: rows {count}, samples {:?} ms, RSS {rss}, peak {peak}, runs {}",
+        text,
+        samples,
+        catalog.overlay_run_count()
+    );
+    Ok(())
+}
+fn overlay_carry(dir: &Path, count: &str) -> Result<()> {
+    use ferret_catalog::{
+        InoId,
+        log::{ChangeSet, Record, Writer},
+    };
+    let count: u32 = count.parse()?;
+    let mut writer = Writer::open(dir)?;
+    let mut view = writer.view();
+    let mut times = Vec::new();
+    for step in 0..count {
+        let id = view.base_dir_count() + step;
+        let inode = view.inode(InoId(id));
+        let mut stat = inode.stat;
+        stat.size = stat.size.saturating_add(7);
+        let changes = ChangeSet {
+            records: vec![Record::InodePut {
+                id,
+                kind: view.kind(InoId(id)),
+                state: inode.state,
+                doc: inode.doc.map(|d| d.0),
+                stat,
+            }],
+            counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+            counts: [
+                view.inode_count(),
+                view.name_count(),
+                view.dir_count(),
+                view.doc_count(),
+            ],
+        };
+        let before = view.overlay_run_count();
+        let start = Instant::now();
+        let candidate = view.advance(view.generation(), &changes)?;
+        let elapsed = ms(start.elapsed());
+        let after = candidate.overlay_run_count();
+        writer.commit(writer.generation(), &changes)?;
+        view = writer.view();
+        times.push((step + 1, before, after, elapsed));
+    }
+    let (rss, peak) = memory()?;
+    println!("carry {:?}; RSS {rss}, peak {peak}", times);
     Ok(())
 }

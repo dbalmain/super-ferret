@@ -40,9 +40,13 @@ fn bad(label: &'static str) -> OpenError {
 #[derive(Clone, Default)]
 pub(crate) struct Projection {
     rows: Runs<u64, Arc<Record>>,
+    categories: u16,
 }
 impl Projection {
     pub(crate) fn get(&self, category: u64, id: u32) -> Option<&Record> {
+        if self.categories & (1 << category) == 0 {
+            return None;
+        }
         self.rows.get(&key(category, id)).map(Arc::as_ref)
     }
     pub(crate) fn records(&self, category: u64) -> impl Iterator<Item = &Record> {
@@ -68,10 +72,13 @@ impl Projection {
     fn apply(&mut self, sequence: u64, records: impl Iterator<Item = Arc<Record>>) {
         self.rows.insert(
             records
-                .map(|r| Row {
-                    key: record_key(&r),
-                    sequence,
-                    value: r,
+                .map(|r| {
+                    self.categories |= 1 << (record_key(&r) >> 32);
+                    Row {
+                        key: record_key(&r),
+                        sequence,
+                        value: r,
+                    }
                 })
                 .collect(),
         );
@@ -85,7 +92,9 @@ pub(crate) struct Overlay {
     parent: Option<Arc<Overlay>>,
     delta: Vec<Arc<Record>>,
     families: [OnceLock<Projection>; 4],
-    namespace: OnceLock<Namespace>,
+    namespace: OnceLock<Arc<Namespace>>,
+    checked: OnceLock<()>,
+    fields_checked: OnceLock<()>,
 }
 pub(crate) struct Namespace {
     pub(crate) rows: Projection,
@@ -106,6 +115,8 @@ impl Overlay {
             delta: Vec::new(),
             families: Default::default(),
             namespace: OnceLock::new(),
+            checked: OnceLock::new(),
+            fields_checked: OnceLock::new(),
         }
     }
     pub(crate) fn new(base: Catalog, manifest: Manifest, log: Log) -> Self {
@@ -117,6 +128,8 @@ impl Overlay {
             delta: Vec::new(),
             families: Default::default(),
             namespace: OnceLock::new(),
+            checked: OnceLock::new(),
+            fields_checked: OnceLock::new(),
         }
     }
     pub(crate) fn advance(
@@ -133,6 +146,8 @@ impl Overlay {
             delta: records.iter().cloned().map(Arc::new).collect(),
             families: Default::default(),
             namespace: OnceLock::new(),
+            checked: OnceLock::new(),
+            fields_checked: OnceLock::new(),
         }
     }
     fn transactions(&self, family: Family) -> Vec<(u64, [u32; 3], Vec<Arc<Record>>)> {
@@ -229,6 +244,55 @@ impl Overlay {
                     return Err(bad("inode allocation gaps"));
                 }
             }
+            if family == Family::Docs {
+                self.base.load(&[Section::Docs])?;
+                let mut final_rows = BTreeMap::new();
+                for r in &records {
+                    final_rows.insert(record_key(r), r.as_ref());
+                }
+                let mut births = BTreeSet::new();
+                for r in final_rows.values() {
+                    match r {
+                        Record::DocPut { id, hash, .. } => {
+                            let previous = match p.get(DOC, *id) {
+                                Some(Record::DocPut { hash, .. }) => Some(*hash),
+                                Some(Record::DocDelete { .. }) => {
+                                    return Err(bad("retired document reused"));
+                                }
+                                _ => self.base.doc_hash(crate::DocId(*id)),
+                            };
+                            if *id >= counters[2] {
+                                births.insert(*id);
+                                counts[3] += 1;
+                            } else if previous.is_none() {
+                                return Err(bad("unassigned/retired document reused"));
+                            }
+                            if previous.is_some_and(|old| old != *hash) {
+                                return Err(bad("document hash changed"));
+                            }
+                        }
+                        Record::DocDelete { id } => {
+                            let existed = match p.get(DOC, *id) {
+                                Some(Record::DocPut { .. }) => true,
+                                Some(Record::DocDelete { .. }) => false,
+                                _ => self.base.doc_hash(crate::DocId(*id)).is_some(),
+                            };
+                            if !existed {
+                                return Err(bad("delete absent document"));
+                            }
+                            counts[3] = counts[3]
+                                .checked_sub(1)
+                                .ok_or_else(|| bad("document counts"))?;
+                        }
+                        _ => {}
+                    }
+                }
+                if births.len() as u64 != u64::from(next[2] - counters[2])
+                    || births.iter().copied().ne(counters[2]..next[2])
+                {
+                    return Err(bad("document allocation gaps"));
+                }
+            }
             p.apply(seq, records.into_iter());
             counters = next;
         }
@@ -237,16 +301,67 @@ impl Overlay {
         {
             return Err(bad("live inode/directory counts"));
         }
+        if family == Family::Docs && counts[3] != self.manifest.counts[3] {
+            return Err(bad("live document count"));
+        }
         let _ = self.families[family as usize].set(p);
         Ok(())
     }
+    pub(crate) fn loaded(&self, section: Section) -> bool {
+        if self.families[Family::Namespace as usize].get().is_none() {
+            return false;
+        }
+        match section {
+            Section::Names
+            | Section::NameHeap
+            | Section::DirNames
+            | Section::Roots
+            | Section::Entries
+            | Section::Traversed
+            | Section::RetainedAt => self.namespace.get().is_some(),
+            Section::Links | Section::Specials | Section::WorkTrees => {
+                self.families[Family::Aux as usize].get().is_some()
+            }
+            Section::Docs | Section::DocRefs => {
+                self.families[Family::Docs as usize].get().is_some()
+            }
+            Section::Strings | Section::Policy => true,
+            _ => self.fields_checked.get().is_some(),
+        }
+    }
+    pub(crate) fn check_aux(&self) -> Result<(), OpenError> {
+        self.base.load(&[Section::Links])?;
+        for r in self.projection(Family::Namespace).records(LIFE) {
+            if let Record::LifePut { id, kind, .. } = r
+                && *id < self.base.base_inode_count()
+                && self.base.kind(InoId(*id)) != *kind
+            {
+                return Err(bad("base inode lifetime type changed"));
+            }
+        }
+        for r in self.projection(Family::Aux).records(LINK) {
+            if let Record::LinkPut { id, .. } = r
+                && self.live_inode(*id)
+                && self.kind(*id).unwrap_or_else(|| self.base.kind(InoId(*id))) != Kind::Symlink
+            {
+                return Err(bad("link target on non-symlink"));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn projection(&self, family: Family) -> &Projection {
-        self.families[family as usize]
-            .get()
-            .expect("overlay family not loaded")
+        let Some(rows) = self.families[family as usize].get() else {
+            panic!("overlay family {family:?} not loaded")
+        };
+        rows
     }
     pub(crate) fn namespace(&self) -> &Namespace {
-        self.namespace.get().expect("namespace not loaded")
+        {
+            let Some(ns) = self.namespace.get() else {
+                panic!("namespace not loaded")
+            };
+            ns
+        }
     }
     pub(crate) fn life(&self, id: u32) -> Option<&Record> {
         self.projection(Family::Namespace).get(LIFE, id)
@@ -274,6 +389,9 @@ impl Overlay {
         self.delta.clear();
     }
     pub(crate) fn check_fields(&self) -> Result<(), OpenError> {
+        if self.fields_checked.get().is_some() {
+            return Ok(());
+        }
         let rows = self.projection(Family::Inodes);
         for r in self.projection(Family::Namespace).records(LIFE) {
             if let Record::LifePut { id, .. } = r
@@ -283,10 +401,21 @@ impl Overlay {
                 return Err(bad("new inode has no fields"));
             }
         }
+        let _ = self.fields_checked.set(());
         Ok(())
     }
     pub(crate) fn validate_all(&self, view: &Catalog) -> Result<(), OpenError> {
+        if self.checked.get().is_some() {
+            return Ok(());
+        }
         self.check_fields()?;
+        if let Some(parent) = &self.parent
+            && parent.checked.get().is_some()
+        {
+            self.validate_delta(view, parent)?;
+            let _ = self.checked.set(());
+            return Ok(());
+        }
         let ns = self.namespace();
         let needs_refs = ns.references.values().any(|&d| d != 0)
             || self
@@ -405,6 +534,95 @@ impl Overlay {
                 return Err(bad("work tree on absent/non-directory inode"));
             }
         }
+        let _ = self.checked.set(());
+        Ok(())
+    }
+    fn validate_delta(&self, view: &Catalog, parent: &Overlay) -> Result<(), OpenError> {
+        let mut docs = BTreeMap::<u32, i64>::new();
+        let mut changed = BTreeSet::new();
+        for r in &self.delta {
+            match r.as_ref() {
+                Record::InodePut { id, .. } | Record::InodeDelete { id } => {
+                    changed.insert(*id);
+                }
+                Record::DocPut { id, .. } | Record::DocDelete { id } => {
+                    docs.entry(*id).or_default();
+                }
+                Record::LinkPut { id, .. }
+                    if self.live_inode(*id) && view.kind(InoId(*id)) != Kind::Symlink =>
+                {
+                    return Err(bad("link target on non-symlink"));
+                }
+                Record::WorkTreePut { id, .. }
+                    if !self.live_inode(*id) || !view.is_directory(InoId(*id)) =>
+                {
+                    return Err(bad("work tree on absent/non-directory inode"));
+                }
+                _ => {}
+            }
+        }
+        for id in changed {
+            let old = parent
+                .inode(id)
+                .map(|r| match r {
+                    Record::InodePut { doc, .. } => *doc,
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    (id < self.base.base_inode_count())
+                        .then(|| self.base.doc(InoId(id)).map(|d| d.0))
+                        .flatten()
+                });
+            if parent.live_inode(id)
+                && let Some(doc) = old
+            {
+                *docs.entry(doc).or_default() -= 1;
+            }
+            if self.live_inode(id) {
+                if let Some(Record::InodePut { kind, .. }) = self.inode(id)
+                    && *kind != view.kind(InoId(id))
+                {
+                    return Err(bad("inode/life kind mismatch"));
+                }
+                if let Some(doc) = view.doc(InoId(id)) {
+                    *docs.entry(doc.0).or_default() += 1;
+                }
+            }
+        }
+        let mut count = i64::from(parent.manifest.counts[3]);
+        for (id, delta) in docs {
+            let prior = match parent.projection(Family::Docs).get(DOC, id) {
+                Some(Record::DocPut { references, .. }) => Some(*references),
+                Some(Record::DocDelete { .. }) => None,
+                _ => self.base.doc_references(crate::DocId(id)),
+            };
+            let now = view.doc_references(crate::DocId(id));
+            if i64::from(prior.unwrap_or(0)) + delta != i64::from(now.unwrap_or(0)) {
+                return Err(bad("document reference count"));
+            }
+            if prior.is_none() && now.is_some() {
+                if id < parent.manifest.counters[2] {
+                    return Err(bad("retired document reused"));
+                }
+                count += 1;
+            }
+            if prior.is_some() && now.is_none() {
+                count -= 1;
+            }
+            let old_hash = match parent.projection(Family::Docs).get(DOC, id) {
+                Some(Record::DocPut { hash, .. }) => Some(*hash),
+                Some(Record::DocDelete { .. }) => None,
+                _ => self.base.doc_hash(crate::DocId(id)),
+            };
+            if let (Some(a), Some(b)) = (old_hash, view.doc_hash(crate::DocId(id)))
+                && a != b
+            {
+                return Err(bad("document hash changed"));
+            }
+        }
+        if count != i64::from(self.manifest.counts[3]) {
+            return Err(bad("live document count"));
+        }
         Ok(())
     }
     pub(crate) fn bytes_read(&self) -> u64 {
@@ -413,6 +631,16 @@ impl Overlay {
     }
     pub(crate) fn load_namespace(&self) -> Result<(), OpenError> {
         if self.namespace.get().is_some() {
+            return Ok(());
+        }
+        if let Some(parent) = &self.parent
+            && !self.delta.iter().any(|r| r.family() == Family::Namespace)
+        {
+            parent.load_namespace()?;
+            let Some(ns) = parent.namespace.get() else {
+                unreachable!("loaded predecessor namespace")
+            };
+            let _ = self.namespace.set(ns.clone());
             return Ok(());
         }
         self.load(Family::Namespace)?;
@@ -533,6 +761,40 @@ impl Overlay {
             }
             keys.insert(additions);
             validate_graph(&self.base, &rows, &changed)?;
+            if changed.iter().any(|r| {
+                matches!(
+                    r.as_ref(),
+                    Record::LifePut { .. } | Record::InodeDelete { .. }
+                )
+            }) {
+                let base_refs = self.base.name_references();
+                for r in &changed {
+                    let (id, count) = match r.as_ref() {
+                        Record::LifePut { id, names, .. } => (*id, *names),
+                        Record::InodeDelete { id } => (*id, 0),
+                        _ => continue,
+                    };
+                    let actual = i64::from(base_refs.get(id as usize).copied().unwrap_or(0))
+                        + references.get(&id).copied().unwrap_or(0);
+                    if actual != i64::from(count) {
+                        return Err(bad("namespace inode reference count"));
+                    }
+                    if !live(&self.base, &rows, id) && id < self.base.base_dir_count() {
+                        let children = self
+                            .base
+                            .children(InoId(id))
+                            .filter(|n| rows.get(NAME, n.0).is_none())
+                            .count()
+                            + rows
+                                .records(NAME)
+                                .filter(|r| matches!(r,Record::NamePut{parent,..} if *parent==id))
+                                .count();
+                        if children != 0 {
+                            return Err(bad("deleted directory retains children"));
+                        }
+                    }
+                }
+            }
             references.retain(|_, delta| *delta != 0);
             counter = next[1];
         }
@@ -561,7 +823,7 @@ impl Overlay {
                 heap.push(0);
             }
         }
-        let _ = self.namespace.set(Namespace {
+        let _ = self.namespace.set(Arc::new(Namespace {
             rows,
             keys,
             suppressed,
@@ -569,7 +831,7 @@ impl Overlay {
             heap,
             spans,
             references,
-        });
+        }));
         Ok(())
     }
 }
@@ -655,6 +917,23 @@ fn validate_graph(
     rows: &Projection,
     changed: &[Arc<Record>],
 ) -> Result<(), OpenError> {
+    let mut paths = BTreeSet::new();
+    let roots = base
+        .roots()
+        .filter(|(id, _)| rows.get(ROOT, id.0).is_none())
+        .chain(rows.records(ROOT).filter_map(|r| match r {
+            Record::RootPut { id, path } => Some((InoId(*id), path.as_slice())),
+            _ => None,
+        }));
+    for (id, path) in roots {
+        if !live(base, rows, id.0)
+            || kind(base, rows, id.0) != Some(Kind::Dir)
+            || own(base, rows, id.0).is_some()
+            || !paths.insert(path)
+        {
+            return Err(bad("root liveness/incoming edge/duplicate path"));
+        }
+    }
     let mut dirs = BTreeSet::new();
     for r in changed.iter().map(Arc::as_ref) {
         if let Record::NamePut { parent, child, .. } = r {
@@ -674,10 +953,10 @@ fn validate_graph(
                 }
                 | Record::DirPut { id, .. }
                 | Record::RootPut { id, .. }
-                | Record::RootDelete { id } => {
-                    if live(base, rows, *id) {
-                        dirs.insert(*id);
-                    }
+                | Record::RootDelete { id }
+                    if live(base, rows, *id) =>
+                {
+                    dirs.insert(*id);
                 }
                 _ => {}
             }

@@ -90,6 +90,11 @@ impl<K: Ord + Clone, V: Clone> Runs<K, V> {
             .iter()
             .flatten()
             .filter_map(|run| {
+                if run.rows.first().is_none_or(|r| *key < r.key)
+                    || run.rows.last().is_none_or(|r| *key > r.key)
+                {
+                    return None;
+                }
                 run.rows
                     .binary_search_by(|r| r.key.cmp(key))
                     .ok()

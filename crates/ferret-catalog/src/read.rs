@@ -338,6 +338,7 @@ impl Catalog {
     ) -> Result<Self, crate::log::Error> {
         use crate::log::Error;
         self.generation().check(expected).map_err(Error::Stale)?;
+        self.load_all().map_err(Error::Previous)?;
         let mut manifest = self
             .overlay
             .as_ref()
@@ -381,9 +382,11 @@ impl Catalog {
             &changes.records,
         )));
         view.load_all().map_err(Error::Previous)?;
-        Arc::get_mut(view.overlay.as_mut().expect("new overlay"))
-            .expect("unshared new overlay")
-            .detach();
+        if let Some(overlay) = view.overlay.as_mut().and_then(Arc::get_mut) {
+            overlay.detach();
+        } else {
+            unreachable!("new view has an unshared overlay");
+        }
         Ok(view)
     }
     /// Number of immutable replacement runs, for carry measurements.
@@ -578,9 +581,11 @@ impl Catalog {
                     | Section::Entries
                     | Section::Traversed
                     | Section::RetainedAt => o.load_namespace()?,
-                    Section::Links | Section::Specials | Section::WorkTrees => {
-                        o.load(Family::Aux)?
+                    Section::Links | Section::Specials => {
+                        o.load(Family::Aux)?;
+                        o.check_aux()?;
                     }
+                    Section::WorkTrees => o.load(Family::Aux)?,
                     Section::Docs | Section::DocRefs => o.load(Family::Docs)?,
                     Section::Strings | Section::Policy => {}
                     _ => {
@@ -649,10 +654,11 @@ impl Catalog {
     /// Whether `section` is loaded. A reader from [`Catalog::from_bytes`]
     /// has every section.
     pub fn is_loaded(&self, section: Section) -> bool {
-        match self.source.as_ref() {
+        let base = match self.source.as_ref() {
             Source::Whole(_) => true,
             Source::File { sections, .. } => sections[section as usize].get().is_some(),
-        }
+        };
+        base && self.overlay.as_ref().is_none_or(|o| o.loaded(section))
     }
 
     /// Bytes read from the file so far: the head of the file and each loaded
@@ -1135,10 +1141,10 @@ impl Catalog {
                 (run * RUN) as u32,
                 ((run + 1) * RUN) as u32,
             ) {
-                if let Record::InodePut { id, stat, .. } = r {
-                    if let Some(value) = out.get_mut((*id as usize).wrapping_sub(run * RUN)) {
-                        *value = stat.size;
-                    }
+                if let Record::InodePut { id, stat, .. } = r
+                    && let Some(value) = out.get_mut((*id as usize).wrapping_sub(run * RUN))
+                {
+                    *value = stat.size;
                 }
             }
         }
@@ -1161,12 +1167,11 @@ impl Catalog {
                 (run * RUN) as u32,
                 ((run + 1) * RUN) as u32,
             ) {
-                if let Record::InodePut { id, stat, .. } = r {
-                    if let Some(value) =
+                if let Record::InodePut { id, stat, .. } = r
+                    && let Some(value) =
                         out[..raw.len()].get_mut((*id as usize).wrapping_sub(run * RUN))
-                    {
-                        *value = stat.mtime_sec;
-                    }
+                {
+                    *value = stat.mtime_sec;
                 }
             }
         }
@@ -1446,7 +1451,10 @@ impl<'c> NameReader<'c> {
     /// One name edge, read by itself: for a sparse hit.
     pub fn get(&self, id: NameId) -> Name<'c> {
         if let Some((ns, base)) = self.overlay {
-            return ns.name(base, id.0).expect("dead name");
+            let Some(name) = ns.name(base, id.0) else {
+                panic!("dead name {}", id.0)
+            };
+            return name;
         }
         let (parent, bytes) = self.edge(id);
         Name {
@@ -1518,7 +1526,9 @@ impl<'c> NameReader<'c> {
             .flatten();
         let delta = overlay.into_iter().flat_map(|(ns, base)| {
             ns.names.iter().map(move |&id| {
-                let n = ns.name(base, id).expect("live delta name");
+                let Some(n) = ns.name(base, id) else {
+                    unreachable!("live delta name")
+                };
                 (NameId(id), n.child)
             })
         });
