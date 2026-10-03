@@ -98,8 +98,8 @@ impl<K: Ord + Clone, V: Clone> Runs<K, V> {
             .max_by_key(|r| r.sequence)
             .map(|r| &r.value)
     }
-    pub(super) fn latest(&self) -> Vec<&Row<K, V>> {
-        let mut rows: Vec<_> = self.levels.iter().flatten().flat_map(|r| &r.rows).collect();
+    pub(super) fn latest_range(&self, start: K, end: K) -> Vec<&Row<K, V>> {
+        let mut rows: Vec<_> = self.range(start, end).collect();
         rows.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| b.sequence.cmp(&a.sequence)));
         rows.dedup_by(|a, b| a.key == b.key);
         rows

@@ -55,8 +55,6 @@ pub enum OpenError {
     Io(io::Error),
     /// The file is not a valid catalog.
     Decode(DecodeError),
-    /// M2 pins log records; M3 will provide their effective query view.
-    OverlayRequired(Generation),
     /// Damaged framing or payload, with the file and block to re-index.
     Log {
         checkpoint: u64,
@@ -80,9 +78,6 @@ impl fmt::Display for OpenError {
                 f,
                 "changes.{checkpoint}, sequence {sequence:?}, family {family:?}: {cause}"
             ),
-            Self::OverlayRequired(g) => {
-                write!(f, "generation {g:?} requires the log overlay reader")
-            }
         }
     }
 }
@@ -92,7 +87,7 @@ impl std::error::Error for OpenError {}
 /// What an inode row is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A directory; `InoId < dir_count()`.
+    /// A directory; only checkpoint base directories form an id prefix.
     Dir,
     /// A regular file.
     File,
@@ -244,6 +239,7 @@ pub struct Catalog {
     layout: Layout,
     source: Arc<Source>,
     overlay: Option<Arc<Overlay>>,
+    name_references: Arc<OnceLock<Vec<u32>>>,
 }
 
 enum Source {
@@ -306,6 +302,7 @@ impl Catalog {
         Ok(Catalog {
             layout,
             overlay: None,
+            name_references: Default::default(),
             source: Arc::new(Source::File {
                 file,
                 sections: Default::default(),
@@ -315,6 +312,17 @@ impl Catalog {
         })
     }
 
+    pub(crate) fn name_references(&self) -> &[u32] {
+        self.name_references.get_or_init(|| {
+            let mut refs = vec![0u32; self.base_inode_count() as usize];
+            for (_, child) in self.name_reader().child_ids() {
+                if let Some(n) = refs.get_mut(child.0 as usize) {
+                    *n += 1;
+                }
+            }
+            refs
+        })
+    }
     pub(crate) fn with_log(mut self, manifest: Manifest, log: crate::log::Log) -> Self {
         if log.transaction_count() != 0 {
             self.overlay = Some(Arc::new(Overlay::new(self.clone(), manifest, log)));
@@ -373,6 +381,9 @@ impl Catalog {
             &changes.records,
         )));
         view.load_all().map_err(Error::Previous)?;
+        Arc::get_mut(view.overlay.as_mut().expect("new overlay"))
+            .expect("unshared new overlay")
+            .detach();
         Ok(view)
     }
     /// Number of immutable replacement runs, for carry measurements.
@@ -416,6 +427,16 @@ impl Catalog {
             .as_ref()
             .map_or(id.0 < self.base_inode_count(), |o| o.live_inode(id.0))
     }
+    /// Base deaths, in id order; requires Life. Used to clear base bitsets.
+    pub fn deleted_base_inodes(&self) -> impl Iterator<Item = InoId> + '_ {
+        self.overlay
+            .iter()
+            .flat_map(|o| o.projection(Family::Namespace).records(overlay::LIFE))
+            .filter_map(|r| match r {
+                Record::InodeDelete { id } if *id < self.base_inode_count() => Some(InoId(*id)),
+                _ => None,
+            })
+    }
     /// Directory membership, independent of live counts and allocation order.
     pub fn is_directory(&self, id: InoId) -> bool {
         self.overlay
@@ -438,7 +459,7 @@ impl Catalog {
             (&o.namespace().heap, &o.namespace().spans)
         })
     }
-    /// Dense checkpoint allocation high water for inodes (no log in M1).
+    /// Next epoch inode id; deleted ids are never reused.
     pub fn next_inode(&self) -> InoId {
         InoId(
             self.overlay
@@ -447,7 +468,7 @@ impl Catalog {
         )
     }
 
-    /// Dense checkpoint allocation high water for names (no log in M1).
+    /// Next epoch name id; deleted edges leave holes.
     pub fn next_name(&self) -> NameId {
         NameId(
             self.overlay
@@ -535,6 +556,7 @@ impl Catalog {
         Ok(Catalog {
             layout,
             overlay: None,
+            name_references: Default::default(),
             source: Arc::new(Source::Whole(bytes)),
         })
     }
@@ -561,7 +583,10 @@ impl Catalog {
                     }
                     Section::Docs | Section::DocRefs => o.load(Family::Docs)?,
                     Section::Strings | Section::Policy => {}
-                    _ => o.load(Family::Inodes)?,
+                    _ => {
+                        o.load(Family::Inodes)?;
+                        o.check_fields()?;
+                    }
                 }
             }
         }
@@ -579,7 +604,11 @@ impl Catalog {
     /// Loads every section: what a caller that reads the whole generation
     /// (the writer's previous generation, a test) needs.
     pub fn load_all(&self) -> Result<(), OpenError> {
-        self.load(&SECTIONS)
+        self.load(&SECTIONS)?;
+        if let Some(o) = &self.overlay {
+            o.validate_all(self)?;
+        }
+        Ok(())
     }
 
     fn load_one(&self, section: Section) -> Result<(), OpenError> {
@@ -670,14 +699,14 @@ impl Catalog {
         )
     }
 
-    /// Directories, which are inodes `0..dir_count()`.
+    /// Live directories; enumerate with `dir_ids`, not this count.
     pub fn dir_count(&self) -> u32 {
         self.overlay
             .as_ref()
             .map_or(self.layout.dirs as u32, |o| o.manifest.counts[2])
     }
 
-    /// All inode rows: directories, then non-directory entries.
+    /// Live inode rows; physical scan bounds are `base_inode_count`.
     pub fn inode_count(&self) -> u32 {
         self.overlay
             .as_ref()
@@ -794,14 +823,7 @@ impl Catalog {
             .filter(|&id| self.base_name_live(id))
             .collect();
         if let Some(o) = &self.overlay {
-            ids.extend(
-                o.namespace()
-                    .names
-                    .iter()
-                    .copied()
-                    .filter(|&id| self.name(NameId(id)).parent == dir)
-                    .map(NameId),
-            );
+            ids.extend(o.namespace().children(dir.0).map(NameId));
         }
         ids.sort_unstable_by(|&a, &b| self.name(a).bytes.cmp(self.name(b).bytes));
         ids.into_iter()
@@ -963,12 +985,20 @@ impl Catalog {
     /// [`Section::Traversed`].
     pub fn is_traversed(&self, dir: InoId) -> bool {
         if let Some(Record::DirPut { flags, .. }) = self.ns_record(overlay::DIR, dir.0) {
-            return flags & 2 != 0;
+            return flags & 1 != 0;
         }
         let bits = self.section(Section::Traversed);
         bits[dir.0 as usize / 8] >> (dir.0 % 8) & 1 == 1
     }
 
+    /// Search suppression is independent of traversal and retained coverage.
+    /// Requires Traversed (which loads namespace flags).
+    pub fn is_search_suppressed(&self, dir: InoId) -> bool {
+        if let Some(Record::DirPut { flags, .. }) = self.ns_record(overlay::DIR, dir.0) {
+            return flags & 2 != 0;
+        }
+        self.is_traversed(dir)
+    }
     // ── paths ──
 
     /// Appends the path of the entry `name` names: its root's path, then each
@@ -1242,6 +1272,9 @@ impl Catalog {
         if let Some(kind) = self.overlay.as_ref().and_then(|o| o.kind(id.0)) {
             return kind;
         }
+        if let Some(o) = &self.overlay {
+            return o.base.kind(id);
+        }
         if id.0 < self.base_dir_count() {
             Kind::Dir
         } else if self.link_target(id).is_some() {
@@ -1461,9 +1494,35 @@ impl<'c> NameReader<'c> {
     /// Every name's child, in name order: a pass over the child column
     /// alone.
     pub fn children(&self) -> impl Iterator<Item = InoId> + 'c {
+        self.child_ids().map(|(_, child)| child)
+    }
+    /// Live epoch NameIds and their targets, decoding only the base child
+    /// column.
+    pub fn child_ids(&self) -> impl Iterator<Item = (NameId, InoId)> + 'c {
         let children = self.children;
-        packed::runs(self.count, move |first, out| children.decode(first, out))
-            .map(|child| InoId(child as u32))
+        let overlay = self.overlay;
+        let base = packed::runs(self.count, move |first, out| children.decode(first, out))
+            .enumerate()
+            .scan(0usize, move |at, (id, child)| {
+                if let Some((ns, _)) = overlay {
+                    while *at < ns.suppressed.len() && ns.suppressed[*at] < id as u32 {
+                        *at += 1;
+                    }
+                    if ns.suppressed.get(*at) == Some(&(id as u32)) {
+                        *at += 1;
+                        return Some(None);
+                    }
+                }
+                Some(Some((NameId(id as u32), InoId(child as u32))))
+            })
+            .flatten();
+        let delta = overlay.into_iter().flat_map(|(ns, base)| {
+            ns.names.iter().map(move |&id| {
+                let n = ns.name(base, id).expect("live delta name");
+                (NameId(id), n.child)
+            })
+        });
+        base.chain(delta)
     }
 }
 

@@ -1397,7 +1397,7 @@ fn resolve_catalog(
                 redirected = Some(std::path::absolute(next)?);
                 break;
             }
-            exact = matches!(resolved.target, Target::Inode(dir) if dir.0 < catalog.dir_count());
+            exact = matches!(resolved.target, Target::Inode(dir) if catalog.is_directory(dir));
             opaque = Some(resolved.target);
         }
         match redirected {

@@ -186,7 +186,7 @@ impl Transaction {
             Err(OpenError::Decode(DecodeError::Version(_))) => None,
             Ok(Some(pinned)) => {
                 crate::log::recover(dir, &pinned).map_err(BeginError::Previous)?;
-                Some(pinned.into_checkpoint().map_err(BeginError::Previous)?)
+                Some(pinned.into_catalog())
             }
             other => {
                 other.map_err(BeginError::Previous)?;
@@ -205,7 +205,11 @@ impl Transaction {
         let mut docs = Vec::new();
         if let Some(old) = &previous {
             if old.sniffer_version() == sniffer {
-                by_identity.extend(old.dir_count()..old.inode_count());
+                by_identity.extend(
+                    old.inode_ids()
+                        .filter(|&id| !old.is_directory(id))
+                        .map(|id| id.0),
+                );
                 by_identity.sort_unstable_by_key(|&id| identity(old, id));
             }
             docs.reserve(old.doc_count() as usize);

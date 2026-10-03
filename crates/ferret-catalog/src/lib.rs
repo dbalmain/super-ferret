@@ -47,8 +47,8 @@ pub type Hash = [u8; 16];
 
 /// An inode row in a checkpoint epoch. Dense at its base, renumbered by
 /// checkpoint publication (D52). Retained references use [`Handle`].
-/// Directories come first, so `0..Catalog::dir_count()` are exactly the
-/// directories (D30).
+/// Base directories form a prefix; log-created directories can follow files.
+/// Use the effective live iterators and kind checks (D52).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InoId(pub u32);
 

@@ -227,8 +227,8 @@ only checkpoint sequence equal to published sequence is legal in that case.
 M2 checkpoints create the header and publish end 64. A log writer upgrades
 an M1 empty prefix under the writer lock before appending. `Published::open`
 pins the checked pair and provides explicit base checkpoint and lazy log
-family access. Until M3 provides an effective overlay, ordinary `Catalog::open`
-refuses a nonempty log with `OverlayRequired`, avoiding stale query answers.
+family access. M3 supplies the effective view through ordinary `Catalog::open`; M2 initially
+refused a nonempty log with `OverlayRequired`, avoiding stale query answers.
 Live-count cross-checking needs overlay liveness and is therefore M3 work;
 M2 checks counter limits/monotonicity and the final envelope counters against
 current, plus each loaded record's wire invariants and references' bounds.
@@ -420,7 +420,7 @@ edges keep epoch NameIds too.
 | Find's `CatalogSource` gets `entries`, `contents`, counts and `resolve`; DFS frames establish order | These consume the effective view. Parent-before-child, reverse order for depth/delete and prune follow graph traversal, not ids. Sibling order remains free under D50 F10. The per-query delete-count map uses epoch parent ids in its pinned generation. |
 | Nested roots are sorted by parent id in `find/walk.rs` | Sort their derived attachment list by epoch parent and binary-search equality as today; no assumption that the parent was allocated first. |
 | `stats.rs` computes depths in one numeric-id pass and loops over dense names/files | Use an explicit root traversal for depth and live row iterators for census/refcounts. Numeric-id topological order is removed. |
-| `index.rs::content_faults` and `Transaction::begin/keep` loop over dense ranges | Live iterators and effective graph traversal replace these loops. Kept roots produce no copied batches and no sweep. |
+| `ferret-crawl/src/index.rs::content_faults` and `Transaction::begin/keep` loop over dense ranges | Live iterators and effective graph traversal replace these loops. Kept roots produce no copied batches and no sweep. |
 | Cached ids and writer request scopes | Pin the source generation or carry its epoch. Compaction changes the generation even at the same sequence; mismatches retry before dereference. DocId candidates alone remain valid across epochs, subject to current liveness. |
 
 Directory coverage must be distinct from raw counts: a retained-fault directory

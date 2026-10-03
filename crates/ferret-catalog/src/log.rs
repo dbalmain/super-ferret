@@ -160,12 +160,6 @@ impl Published {
     pub(crate) fn into_catalog(self) -> Catalog {
         self.checkpoint.with_log(self.manifest, self.log)
     }
-    pub(crate) fn into_checkpoint(self) -> Result<Catalog, OpenError> {
-        if self.log.transaction_count() != 0 {
-            return Err(OpenError::OverlayRequired(self.manifest.generation));
-        }
-        Ok(self.checkpoint)
-    }
 }
 
 impl Log {
@@ -376,6 +370,7 @@ pub struct Writer {
     log: File,
     manifest: Manifest,
     poisoned: bool,
+    current: Catalog,
 }
 
 #[derive(Debug)]
@@ -417,12 +412,15 @@ impl Writer {
             crate::lock::Error::Locked => Error::Locked,
             crate::lock::Error::Io(e) => Error::Io(e),
         })?;
-        let result: Result<(File, Manifest), Error> = (|| {
+        let result: Result<(File, Manifest, Catalog), Error> = (|| {
             let pinned = Published::open(dir)
                 .map_err(Error::Previous)?
                 .ok_or(Error::MissingCheckpoint)?;
             recover(dir, &pinned).map_err(Error::Previous)?;
-            let mut manifest = pinned.manifest;
+            let mut manifest = pinned.manifest.clone();
+            let current = pinned.into_catalog();
+            current.load_all().map_err(Error::Previous)?;
+            current.name_references();
             let path = dir.join(format!("changes.{}", manifest.generation.checkpoint));
             if manifest.log_end == 0 {
                 let file = OpenOptions::new()
@@ -445,19 +443,24 @@ impl Writer {
                 .write(true)
                 .open(path)
                 .map_err(Error::Io)?;
-            Ok((log, manifest))
+            Ok((log, manifest, current))
         })();
-        let (log, manifest) = result?;
+        let (log, manifest, current) = result?;
         Ok(Self {
             dir: dir.to_owned(),
             _lock: lock,
             log,
             manifest,
             poisoned: false,
+            current,
         })
     }
     pub fn generation(&self) -> Generation {
         self.manifest.generation
+    }
+    /// Shares the writer's current checked view; old clones remain pinned.
+    pub fn view(&self) -> Catalog {
+        self.current.clone()
     }
     pub fn commit(
         &mut self,
@@ -506,11 +509,19 @@ impl Writer {
             .log_end
             .checked_add(bytes.len() as u64)
             .ok_or(Error::Invalid(DecodeError::Corrupt("log exhausted")))?;
+        let current = self
+            .current
+            .advance(expected, changes)
+            .map_err(|e| match e {
+                Error::Previous(OpenError::Decode(e)) => Error::Invalid(e),
+                other => other,
+            })?;
         self.poisoned = true;
         publication::append(&self.log, &bytes, self.manifest.log_end).map_err(Error::Io)?;
         publication::sync(&self.log, Point::LogSync).map_err(Error::Io)?;
         publish_manifest(&self.dir, &next)?;
         self.manifest = next;
+        self.current = current;
         self.poisoned = false;
         Ok(self.manifest.generation)
     }

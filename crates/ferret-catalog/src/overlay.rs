@@ -47,7 +47,7 @@ impl Projection {
     }
     pub(crate) fn records(&self, category: u64) -> impl Iterator<Item = &Record> {
         self.rows
-            .latest()
+            .latest_range(key(category, 0), key(category + 1, 0))
             .into_iter()
             .filter(move |r| r.key >> 32 == category)
             .map(|r| r.value.as_ref())
@@ -94,6 +94,7 @@ pub(crate) struct Namespace {
     pub(crate) names: Vec<u32>,
     pub(crate) heap: Vec<u8>,
     pub(crate) spans: Vec<(usize, u32)>,
+    pub(crate) references: BTreeMap<u32, i64>,
 }
 impl Overlay {
     pub(crate) fn empty(base: Catalog, manifest: Manifest) -> Self {
@@ -268,6 +269,144 @@ impl Overlay {
     pub(crate) fn inode(&self, id: u32) -> Option<&Record> {
         self.projection(Family::Inodes).get(INODE, id)
     }
+    pub(crate) fn detach(&mut self) {
+        self.parent = None;
+        self.delta.clear();
+    }
+    pub(crate) fn check_fields(&self) -> Result<(), OpenError> {
+        let rows = self.projection(Family::Inodes);
+        for r in self.projection(Family::Namespace).records(LIFE) {
+            if let Record::LifePut { id, .. } = r
+                && *id >= self.base.base_inode_count()
+                && rows.get(INODE, *id).is_none()
+            {
+                return Err(bad("new inode has no fields"));
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_all(&self, view: &Catalog) -> Result<(), OpenError> {
+        self.check_fields()?;
+        let ns = self.namespace();
+        let needs_refs = ns.references.values().any(|&d| d != 0)
+            || self
+                .projection(Family::Namespace)
+                .records(LIFE)
+                .next()
+                .is_some();
+        let refs = if needs_refs {
+            self.base.name_references()
+        } else {
+            &[]
+        };
+        for r in self.projection(Family::Namespace).records(LIFE) {
+            let (id, expected) = match r {
+                Record::LifePut { id, names, .. } => (*id, i64::from(*names)),
+                Record::InodeDelete { id } => (*id, 0),
+                _ => continue,
+            };
+            let actual = i64::from(refs.get(id as usize).copied().unwrap_or(0))
+                + ns.references.get(&id).copied().unwrap_or(0);
+            if actual != expected {
+                return Err(bad("inode name reference count"));
+            }
+        }
+        for (&id, &delta) in &ns.references {
+            let actual = i64::from(refs.get(id as usize).copied().unwrap_or(0)) + delta;
+            if actual < 0
+                || (!self.live_inode(id) && actual != 0)
+                || (self.live_inode(id) && !view.is_directory(InoId(id)) && actual == 0)
+            {
+                return Err(bad("dangling name/inode reference"));
+            }
+        }
+        let mut doc_delta = BTreeMap::<u32, i64>::new();
+        let mut changed = BTreeSet::new();
+        for r in self.projection(Family::Inodes).records(INODE) {
+            if let Record::InodePut { id, .. } = r {
+                changed.insert(*id);
+            }
+        }
+        for r in self.projection(Family::Namespace).records(LIFE) {
+            if let Record::InodeDelete { id } = r {
+                changed.insert(*id);
+            }
+        }
+        for id in changed {
+            if id < self.base.base_inode_count()
+                && let Some(doc) = self.base.doc(InoId(id))
+            {
+                *doc_delta.entry(doc.0).or_default() -= 1;
+            }
+            if self.live_inode(id) {
+                let kind = view.kind(InoId(id));
+                if let Some(Record::InodePut { kind: declared, .. }) = self.inode(id)
+                    && *declared != kind
+                {
+                    return Err(bad("inode/life kind mismatch"));
+                }
+                if let Some(doc) = view.doc(InoId(id)) {
+                    if view.doc_hash(doc).is_none() {
+                        return Err(bad("inode names absent document"));
+                    }
+                    *doc_delta.entry(doc.0).or_default() += 1;
+                }
+            }
+        }
+        let mut affected: BTreeSet<_> = doc_delta.keys().copied().collect();
+        let mut live_docs = i64::from(self.base.doc_count());
+        for r in self.projection(Family::Docs).records(DOC) {
+            match r {
+                Record::DocPut { id, hash, .. } => {
+                    if let Some(old) = self.base.doc_hash(crate::DocId(*id)) {
+                        if old != *hash {
+                            return Err(bad("document hash changed"));
+                        }
+                    } else {
+                        if *id < self.base.next_doc().0 {
+                            return Err(bad("retired document reused"));
+                        }
+                        live_docs += 1;
+                    }
+                    affected.insert(*id);
+                }
+                Record::DocDelete { id } => {
+                    if self.base.doc_hash(crate::DocId(*id)).is_some() {
+                        live_docs -= 1;
+                    }
+                    affected.insert(*id);
+                }
+                _ => {}
+            }
+        }
+        if live_docs != i64::from(self.manifest.counts[3]) {
+            return Err(bad("live document count"));
+        }
+        for id in affected {
+            let actual = i64::from(self.base.doc_references(crate::DocId(id)).unwrap_or(0))
+                + doc_delta.get(&id).copied().unwrap_or(0);
+            let declared = i64::from(view.doc_references(crate::DocId(id)).unwrap_or(0));
+            if actual != declared {
+                return Err(bad("document reference count"));
+            }
+        }
+        for r in self.projection(Family::Aux).records(LINK) {
+            if let Record::LinkPut { id, .. } = r
+                && self.live_inode(*id)
+                && view.kind(InoId(*id)) != Kind::Symlink
+            {
+                return Err(bad("link target on non-symlink"));
+            }
+        }
+        for r in self.projection(Family::Aux).records(WORKTREE) {
+            if let Record::WorkTreePut { id, .. } = r
+                && (!self.live_inode(*id) || !view.is_directory(InoId(*id)))
+            {
+                return Err(bad("work tree on absent/non-directory inode"));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn bytes_read(&self) -> u64 {
         self.log.as_ref().map_or(0, |l| l.bytes_read())
             + self.parent.as_ref().map_or(0, |p| p.bytes_read())
@@ -290,6 +429,10 @@ impl Overlay {
         } else {
             Runs::default()
         };
+        let mut references = self
+            .parent
+            .as_ref()
+            .map_or_else(BTreeMap::new, |p| p.namespace().references.clone());
         let mut counter = self
             .parent
             .as_ref()
@@ -319,6 +462,9 @@ impl Overlay {
                 } else {
                     let old =
                         name(&self.base, &rows, id).ok_or_else(|| bad("retired name reused"))?;
+                    if let Target::Inode(child) = old.target() {
+                        *references.entry(child.0).or_default() -= 1;
+                    }
                     key_rows.push(Row {
                         key: (old.parent.0, old.bytes.to_vec()),
                         sequence: seq,
@@ -334,16 +480,24 @@ impl Overlay {
             {
                 return Err(bad("name allocation gaps"));
             }
-            rows.apply(seq, final_rows.into_values());
+            for r in final_rows.values() {
+                if let Record::NamePut { child, .. } = r.as_ref()
+                    && Kind::from_ignored_child(*child).is_none()
+                {
+                    *references.entry(*child).or_default() += 1;
+                }
+            }
+            let changed: Vec<_> = final_rows.into_values().collect();
+            rows.apply(seq, changed.iter().cloned());
             keys.insert(key_rows);
             let mut additions = Vec::new();
-            for r in rows.records(NAME) {
+            for r in &changed {
                 if let Record::NamePut {
                     id,
                     parent,
                     child,
                     name: bytes,
-                } = r
+                } = r.as_ref()
                 {
                     if !live(&self.base, &rows, *parent)
                         || kind(&self.base, &rows, *parent) != Some(Kind::Dir)
@@ -359,6 +513,12 @@ impl Overlay {
                     {
                         return Err(bad("duplicate child key"));
                     }
+                    if kind(&self.base, &rows, *child) == Some(Kind::Dir)
+                        && (own(&self.base, &rows, *child) != Some(*id)
+                            || root(&self.base, &rows, *child))
+                    {
+                        return Err(bad("directory has multiple incoming edges"));
+                    }
                     additions.push(Row {
                         key: (*parent, bytes.clone()),
                         sequence: seq,
@@ -372,7 +532,8 @@ impl Overlay {
                 return Err(bad("duplicate changed child key"));
             }
             keys.insert(additions);
-            validate_graph(&self.base, &rows)?;
+            validate_graph(&self.base, &rows, &changed)?;
+            references.retain(|_, delta| *delta != 0);
             counter = next[1];
         }
         if count != self.manifest.counts[1] {
@@ -407,6 +568,7 @@ impl Overlay {
             names,
             heap,
             spans,
+            references,
         });
         Ok(())
     }
@@ -417,6 +579,12 @@ impl Namespace {
     }
     pub(crate) fn lookup(&self, base: &Catalog, parent: u32, bytes: &[u8]) -> Option<u32> {
         lookup(base, &self.rows, &self.keys, parent, bytes)
+    }
+    pub(crate) fn children(&self, parent: u32) -> impl Iterator<Item = u32> {
+        self.keys
+            .latest_range((parent, Vec::new()), (parent + 1, Vec::new()))
+            .into_iter()
+            .filter_map(|r| r.value)
     }
     pub(crate) fn suppresses(&self, id: u32) -> bool {
         self.suppressed.binary_search(&id).is_ok()
@@ -482,9 +650,13 @@ fn root(base: &Catalog, rows: &Projection, id: u32) -> bool {
         _ => base.roots().any(|(i, _)| i.0 == id),
     }
 }
-fn validate_graph(base: &Catalog, rows: &Projection) -> Result<(), OpenError> {
+fn validate_graph(
+    base: &Catalog,
+    rows: &Projection,
+    changed: &[Arc<Record>],
+) -> Result<(), OpenError> {
     let mut dirs = BTreeSet::new();
-    for r in rows.records(NAME) {
+    for r in changed.iter().map(Arc::as_ref) {
         if let Record::NamePut { parent, child, .. } = r {
             dirs.insert(*parent);
             if kind(base, rows, *child) == Some(Kind::Dir) {
@@ -492,8 +664,8 @@ fn validate_graph(base: &Catalog, rows: &Projection) -> Result<(), OpenError> {
             }
         }
     }
-    for category in [LIFE, DIR, ROOT] {
-        for r in rows.records(category) {
+    {
+        for r in changed.iter().map(Arc::as_ref) {
             match r {
                 Record::LifePut {
                     id,
@@ -501,8 +673,11 @@ fn validate_graph(base: &Catalog, rows: &Projection) -> Result<(), OpenError> {
                     ..
                 }
                 | Record::DirPut { id, .. }
-                | Record::RootPut { id, .. } => {
-                    dirs.insert(*id);
+                | Record::RootPut { id, .. }
+                | Record::RootDelete { id } => {
+                    if live(base, rows, *id) {
+                        dirs.insert(*id);
+                    }
                 }
                 _ => {}
             }

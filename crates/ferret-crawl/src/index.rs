@@ -30,8 +30,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ferret_catalog::{
-    BeginError, Catalog, CommitError, Content, ContentState, DirToken, InoId, KeepError, NameId,
-    Stat, Transaction,
+    BeginError, Catalog, CommitError, Content, ContentState, DirToken, InoId, KeepError, Stat,
+    Transaction,
 };
 use ferret_policy::{Config, Decision, Reason};
 
@@ -455,7 +455,11 @@ pub(crate) fn content_faults(
 ) -> Vec<(PathBuf, ContentFault)> {
     let fault = |id: InoId| catalog.state(id) == ContentState::Fault;
     let mut listed: BTreeMap<PathBuf, ContentFault> = seen.into_iter().collect();
-    if !(catalog.dir_count()..catalog.inode_count()).any(|i| fault(InoId(i))) {
+    if !catalog
+        .inode_ids()
+        .filter(|&id| !catalog.is_directory(id))
+        .any(fault)
+    {
         return listed.into_iter().collect();
     }
     let refreshed: Vec<InoId> = catalog
@@ -470,7 +474,7 @@ pub(crate) fn content_faults(
         dir
     };
     let mut buf = Vec::new();
-    for id in (0..catalog.name_count()).map(NameId) {
+    for (id, _) in catalog.names() {
         let name = catalog.name(id);
         if matches!(name.target(), ferret_catalog::Target::Ignored(_))
             || !fault(name.child)

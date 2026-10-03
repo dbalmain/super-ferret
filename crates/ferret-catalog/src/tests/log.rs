@@ -39,14 +39,16 @@ fn changes(p: &Published) -> ChangeSet {
                 doc: Some(0),
                 stat: file_stat(2),
             },
-            Record::LinkPut {
-                id: 1,
-                target: b"target".to_vec(),
+            Record::WorkTreePut {
+                id: 0,
+                kind: crate::WorkTreeKind::Main,
+                common_id: (7, 8),
+                path: b"/git".to_vec(),
             },
             Record::DocPut {
                 id: 0,
                 references: 1,
-                hash: hash(2),
+                hash: hash(1),
             },
         ],
     }
@@ -59,7 +61,14 @@ fn publish(s: &Scratch) -> (crate::Generation, ChangeSet) {
     (g, changes)
 }
 fn log_path(s: &Scratch) -> std::path::PathBuf {
-    s.path.join("changes.0")
+    s.path.join(format!(
+        "changes.{}",
+        crate::read::read_manifest(&s.path)
+            .unwrap()
+            .unwrap()
+            .generation
+            .checkpoint
+    ))
 }
 
 #[test]
@@ -92,10 +101,12 @@ fn framing_open_is_header_only_and_families_load_once() {
         p.log().bytes_read(),
         fs::metadata(log_path(&s)).unwrap().len()
     );
-    assert!(matches!(
-        Catalog::open(&s.path),
-        Err(OpenError::OverlayRequired(_))
-    ));
+    let effective = Catalog::open(&s.path).unwrap().unwrap();
+    assert_eq!(effective.generation(), g);
+    assert_eq!(
+        effective.bytes_read(),
+        crate::format::TABLE_END as u64 + 64 + 64 + 4 * 48 + 32
+    );
 }
 
 #[test]
@@ -420,6 +431,15 @@ fn opening_retries_only_when_unlink_races_a_changed_manifest() {
 #[test]
 fn all_record_shapes_round_trip_and_invalid_records_publish_nothing() {
     let s = fixture("log-records");
+    commit(&s.path, |txn| {
+        let mut b = txn.batch();
+        let root = b.root(b"/root", dir_stat(1));
+        b.file(root, b"file", file_stat(2), Content::Hashed(hash(1)));
+        let mut st = file_stat(3);
+        st.mode = 0o120777;
+        b.symlink(root, b"symlink", st, b"target");
+        txn.add(b);
+    });
     let p = Published::open(&s.path).unwrap().unwrap();
     let mut c = changes(&p);
     c.records.extend([
@@ -452,6 +472,31 @@ fn all_record_shapes_round_trip_and_invalid_records_publish_nothing() {
             kind: Kind::Dir,
             flags: 0,
             names: 0,
+        },
+        Record::LifePut {
+            id: 1,
+            kind: Kind::File,
+            flags: 0,
+            names: 1,
+        },
+        Record::NamePut {
+            id: 0,
+            parent: 0,
+            child: 1,
+            name: b"new".to_vec(),
+        },
+        Record::RootPut {
+            id: 0,
+            path: b"/root".to_vec(),
+        },
+        Record::DocPut {
+            id: 0,
+            references: 1,
+            hash: hash(1),
+        },
+        Record::LinkPut {
+            id: 2,
+            target: b"new target".to_vec(),
         },
     ]);
     let mut w = Writer::open(&s.path).unwrap();

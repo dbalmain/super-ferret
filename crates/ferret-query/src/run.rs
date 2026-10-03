@@ -137,7 +137,7 @@ impl<'c> Run<'_, 'c> {
         catalog.load(&ROW_SECTIONS)?;
         let (heap, names, mut kinds) =
             (catalog.name_heap(), catalog.name_reader(), catalog.kinds());
-        let count = catalog.name_count();
+        let count = catalog.base_name_count();
         let skip = matches!(query.names.get(driver.from), Some(NameTest::Substring(_)))
             .then_some(driver.from);
         let (mut from, mut next) = (0, 0);
@@ -150,10 +150,27 @@ impl<'c> Run<'_, 'c> {
             } else {
                 heap.len()
             };
+            if !catalog.base_name_live(id) {
+                continue;
+            }
             self.stats.candidates += 1;
             let name = names.get(id);
             if self
                 .consider(&mut kinds, id, name, skip, false, emit)?
+                .is_break()
+            {
+                return Ok(());
+            }
+        }
+        let (heap, spans) = catalog.delta_names();
+        let mut from = 0;
+        while let Some(hit) = driver.finder.find_from(heap, from) {
+            let at = spans.partition_point(|&(offset, _)| offset <= hit) - 1;
+            let id = NameId(spans[at].1);
+            from = spans.get(at + 1).map_or(heap.len(), |&(offset, _)| offset);
+            self.stats.candidates += 1;
+            if self
+                .consider(&mut kinds, id, names.get(id), skip, false, emit)?
                 .is_break()
             {
                 break;
@@ -167,18 +184,20 @@ impl<'c> Run<'_, 'c> {
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<(), RunError> {
         let catalog = self.catalog;
-        let pass = self.meta_pass()?;
+        let (pass, new) = self.meta_pass()?;
         // Nothing passed: no name can, so the name sections stay on disk.
-        if pass.iter().all(|&word| word == 0) {
+        if pass.iter().all(|&word| word == 0) && new.is_empty() {
             return Ok(());
         }
         catalog.load(&ROW_SECTIONS)?;
         let (names, mut kinds) = (catalog.name_reader(), catalog.kinds());
-        for (id, child) in names.children().enumerate() {
+        for (id, child) in names.child_ids() {
             let child = child.0;
-            if child < catalog.inode_count() && pass[child as usize / 64] >> (child % 64) & 1 == 1 {
+            if (child < catalog.base_inode_count()
+                && pass[child as usize / 64] >> (child % 64) & 1 == 1)
+                || new.binary_search(&child).is_ok()
+            {
                 self.stats.candidates += 1;
-                let id = NameId(id as u32);
                 if self
                     .consider(&mut kinds, id, names.get(id), None, true, emit)?
                     .is_break()
@@ -224,10 +243,11 @@ impl<'c> Run<'_, 'c> {
     ) -> RunResult {
         let catalog = self.catalog;
         // Validated children are either real inode ids or ignored type tags.
-        if name.child.0 >= catalog.inode_count() {
+        if !catalog.is_live_inode(name.child) {
             return Ok(ControlFlow::Continue(()));
         }
-        let structural = name.child.0 < catalog.dir_count() && catalog.is_traversed(name.child);
+        let structural =
+            catalog.is_directory(name.child) && catalog.is_search_suppressed(name.child);
         let names_pass = self
             .query
             .names
@@ -278,9 +298,10 @@ impl<'c> Run<'_, 'c> {
     /// and decoding only the runs of 64 inodes that still have a bit set; a
     /// pass that clears every bit ends the conjunction, so a later test's
     /// sections stay on disk.
-    fn meta_pass(&self) -> Result<Vec<u64>, OpenError> {
+    fn meta_pass(&self) -> Result<(Vec<u64>, Vec<u32>), OpenError> {
         let catalog = self.catalog;
-        let n = catalog.inode_count() as usize;
+        let n = catalog.base_inode_count() as usize;
+        let mut new: Vec<_> = (catalog.base_inode_count()..catalog.next_inode().0).collect();
         let mut pass = vec![!0; n.div_ceil(64)];
         if let Some(last) = pass.last_mut()
             && !n.is_multiple_of(64)
@@ -289,10 +310,25 @@ impl<'c> Run<'_, 'c> {
         }
         let (mut sizes, mut times) = ([0; RUN], [0; RUN]);
         for test in &self.query.meta {
-            if pass.iter().all(|&word| word == 0) {
+            if pass.iter().all(|&word| word == 0) && new.is_empty() {
                 break;
             }
             catalog.load(test.sections())?;
+            // Deaths never enter a stat pass, even though their physical row
+            // remains.
+            for id in catalog.deleted_base_inodes() {
+                pass[id.0 as usize / 64] &= !(1 << (id.0 % 64));
+            }
+            new.retain(|&id| {
+                catalog.is_live_inode(InoId(id))
+                    && match *test {
+                        MetaTest::Size(cmp, n) => cmp.holds(catalog.size(InoId(id)), n),
+                        MetaTest::Age(cmp, secs) => {
+                            self.age_holds(cmp, secs, catalog.mtime(InoId(id)))
+                        }
+                        MetaTest::Type(kind) => catalog.kind(InoId(id)) == kind,
+                    }
+            });
             match *test {
                 MetaTest::Size(cmp, v) => and_runs(&mut pass, |run, _| {
                     word(
@@ -322,7 +358,7 @@ impl<'c> Run<'_, 'c> {
                 }
             }
         }
-        Ok(pass)
+        Ok((pass, new))
     }
 
     /// Whether a file modified at `mtime` is `cmp` `secs` old. Widened: mtime
@@ -426,7 +462,7 @@ fn word(bits: impl Iterator<Item = bool>) -> u64 {
 /// hits arrive in heap order, so a gallop from the last hit's successor
 /// costs O(log gap) rather than a binary search over every name.
 fn locate(catalog: &Catalog, hit: usize, from: u32) -> NameId {
-    let count = catalog.name_count();
+    let count = catalog.base_name_count();
     let starts_by = |id: u32| catalog.name_start(NameId(id)) <= hit;
     // Invariant: `lo` starts at or before `hit`; `hi` is past it or `count`.
     let (mut lo, mut step) = (from, 1);
