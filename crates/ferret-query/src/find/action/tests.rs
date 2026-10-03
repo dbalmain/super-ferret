@@ -973,3 +973,121 @@ fn batch_commit_shares_the_entry_record_gate() {
     assert_eq!(at, a_len, "the batch's write split the entry's record");
     assert_eq!(bytes.len(), at + 1);
 }
+
+#[test]
+fn spilled_printf_record_shares_the_entry_record_gate() {
+    // Residual gap left by #9/#4: a lone `-printf`/`-fprintf` (no
+    // `-print`/`-exec` beside it) isn't wrapped by `EntryEffects`, so its
+    // record used to commit straight to the host with no gate at all. A
+    // record that fits in memory still committed in one `write_to` call and
+    // was atomic by accident; a record that spills past the 64 KiB memory
+    // cap commits in several chunks, and nothing stopped another worker's
+    // batch output from landing between them. Drive a spilled `-printf`
+    // record and a concurrent batch through a deterministic handshake (no
+    // sleeps) and check the batch's write cannot land until every chunk of
+    // the printf record has been written.
+    use crate::find::printf::Format;
+    use std::sync::atomic::AtomicBool as StdAtomicBool;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct Handshake {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        output_started: std::sync::mpsc::SyncSender<()>,
+        await_output_started: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+        release_output: std::sync::mpsc::SyncSender<()>,
+        await_release_output: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+        triggered: Arc<StdAtomicBool>,
+    }
+    impl Effects for Handshake {
+        fn print(&mut self, _: &Path, _: bool) -> io::Result<()> {
+            Ok(())
+        }
+        fn error(&mut self, error: &WalkError) {
+            panic!("{error:?}");
+        }
+        fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            // Every call to `write` here is a chunk of the spilled printf
+            // record; the batch's own output goes through `capture`, never
+            // `write`, until its single final commit. Pause on the very
+            // first chunk so the batch can run concurrently while the
+            // printf record still holds the gate.
+            if !self.triggered.swap(true, Ordering::SeqCst) {
+                self.output_started.send(()).map_err(io::Error::other)?;
+                self.await_release_output
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(io::Error::other)?;
+            }
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+        fn capture(&mut self, _: &mut Command, sink: &mut dyn Write) -> io::Result<bool> {
+            // The batch captures its own output, and only afterwards tries
+            // to commit it against the shared gate - proving capture still
+            // happens before the gate is taken.
+            self.await_output_started
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            sink.write_all(b"B")?;
+            self.release_output.send(()).map_err(io::Error::other)?;
+            Ok(true)
+        }
+    }
+
+    let gate = Arc::new(Mutex::new(()));
+    let quit = Arc::new(StdAtomicBool::new(false));
+    let (output_started, await_output_started) = sync_channel(1);
+    let (release_output, await_release_output) = sync_channel(1);
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let host = Handshake {
+        bytes: bytes.clone(),
+        output_started,
+        await_output_started: Arc::new(Mutex::new(await_output_started)),
+        release_output,
+        await_release_output: Arc::new(Mutex::new(await_release_output)),
+        triggered: Arc::default(),
+    };
+
+    // A width-padded `%p` well past the 64 KiB in-memory cap forces the
+    // record to spill, so `write_to` makes several `write` calls instead of
+    // one.
+    let width = 200_000;
+    let mut warnings = Vec::new();
+    let format = Format::compile(format!("%{width}p").as_bytes(), &mut warnings).unwrap();
+    assert!(warnings.is_empty());
+    let entry = Entry::new(PathBuf::from("/x"), 0, FileKind::File);
+    let action = Action::Output(Target::Stdout, format);
+    let record_len = width.max(2); // padded width, or the path if wider
+
+    std::thread::scope(|scope| {
+        let (gate1, quit1, mut host1) = (gate.clone(), quit.clone(), host.clone());
+        let printf = scope.spawn(move || {
+            let mut state = State {
+                gate: gate1,
+                quit: quit1,
+                ..State::default()
+            };
+            evaluate(&action, &entry, &mut host1, &mut state).unwrap();
+        });
+        let (gate2, quit2, mut host2) = (gate.clone(), quit.clone(), host.clone());
+        let batch = scope.spawn(move || {
+            let args = [OsString::from("batch-output")];
+            spawn_batch(&args, None, None, &mut host2, &gate2, &quit2).unwrap()
+        });
+        printf.join().unwrap();
+        assert!(batch.join().unwrap());
+    });
+
+    let bytes = bytes.lock().unwrap();
+    let at = bytes.iter().position(|&b| b == b'B').unwrap();
+    assert_eq!(
+        at, record_len,
+        "the batch's write split the spilled printf record"
+    );
+    assert_eq!(bytes.len(), at + 1);
+}

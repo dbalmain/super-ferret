@@ -69,6 +69,14 @@ impl OutputBuffer {
         self.emit(|bytes| writer.write_all(bytes))
     }
 
+    /// Whether the buffer spilled to disk, i.e. whether `write_to` will make
+    /// more than one write call. A caller that only needs atomicity when a
+    /// record might otherwise split across calls can use this to skip
+    /// locking in the common, single-call case.
+    pub fn is_spilled(&self) -> bool {
+        self.file.is_some()
+    }
+
     fn emit(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
         if let Some(file) = &mut self.file {
             file.rewind()?;
