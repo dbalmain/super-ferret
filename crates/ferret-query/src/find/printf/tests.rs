@@ -2,6 +2,7 @@
 //! evaluator; fractions and width rules differ from plausible Rust defaults.
 
 use std::fs::{File, FileTimes};
+use std::path::PathBuf;
 use std::time::{Duration, UNIX_EPOCH};
 
 use super::*;
@@ -99,4 +100,48 @@ fn iso_week_year_uses_the_adjacent_year_at_new_year() {
     ];
     let (_, output) = crate::find::action::tests::run(&args);
     assert_eq!(output.bytes, b"52|1999|99\n");
+}
+
+#[test]
+fn render_writes_wide_padding_in_bounded_chunks() {
+    // #9: a record's total size is unbounded (repeated wide directives are
+    // legal GNU syntax), so render must never materialize the whole record,
+    // or even one directive's padding, as a single allocation. A sink that
+    // panics on an over-large write call, run against a width far larger
+    // than any reasonable chunk, proves render stays bounded rather than
+    // merely checking the final bytes (which a buffering implementation
+    // would also get right).
+    struct Bounded {
+        bytes: Vec<u8>,
+        max_write: usize,
+    }
+    impl std::io::Write for Bounded {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            assert!(
+                buf.len() <= self.max_write,
+                "single write of {} bytes exceeds the {} byte bound",
+                buf.len(),
+                self.max_write
+            );
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let width = 500_000;
+    let mut warnings = Vec::new();
+    let format = Format::compile(format!("%{width}p").as_bytes(), &mut warnings).unwrap();
+    assert!(warnings.is_empty());
+    let entry = Entry::new(PathBuf::from("/x"), 0, FileKind::File);
+    let mut sink = Bounded {
+        bytes: Vec::new(),
+        max_write: 16 * 1024,
+    };
+    format.render(&entry, &mut sink).unwrap();
+    assert_eq!(sink.bytes.len(), width);
+    assert_eq!(sink.bytes[..width - 2], vec![b' '; width - 2]);
+    assert_eq!(&sink.bytes[width - 2..], b"/x");
 }

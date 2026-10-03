@@ -187,11 +187,17 @@ impl Format {
         }
     }
 
-    pub fn render(&self, entry: &Entry, output: &mut Vec<u8>) -> io::Result<()> {
+    /// Renders directly into a bounded/spillable sink: a record's total
+    /// size is unlimited (`%1000000p` repeated many times is legal GNU
+    /// syntax), so nothing here may build the whole record in memory first
+    /// (#9). Padding, which can itself be up to `number()`'s one-million-byte
+    /// cap per directive, is written in bounded chunks rather than
+    /// materialized as one allocation.
+    pub fn render(&self, entry: &Entry, output: &mut dyn Write) -> io::Result<()> {
         let mut scratch = Vec::with_capacity(64);
         for directive in &self.0 {
             match directive {
-                Directive::Literal(bytes) => output.extend_from_slice(bytes),
+                Directive::Literal(bytes) => output.write_all(bytes)?,
                 Directive::Field {
                     code,
                     time,
@@ -228,24 +234,37 @@ impl Format {
                         *zero && b"mdS".contains(code) && (!integer || precision.is_none());
                     if !left && zero_pad {
                         if has_sign {
-                            output.push(scratch[0]);
+                            output.write_all(&scratch[..1])?;
                         }
-                        output.extend(std::iter::repeat_n(b'0', padding));
-                        output.extend_from_slice(&scratch[usize::from(has_sign)..]);
+                        write_padding(output, b'0', padding)?;
+                        output.write_all(&scratch[usize::from(has_sign)..])?;
                     } else {
                         if !left {
-                            output.extend(std::iter::repeat_n(b' ', padding));
+                            write_padding(output, b' ', padding)?;
                         }
-                        output.extend_from_slice(&scratch);
+                        output.write_all(&scratch)?;
                     }
                     if *left {
-                        output.extend(std::iter::repeat_n(b' ', padding));
+                        write_padding(output, b' ', padding)?;
                     }
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Writes `count` copies of `byte` in bounded chunks, never allocating more
+/// than one chunk regardless of how large `count` is.
+fn write_padding(output: &mut dyn Write, byte: u8, mut count: usize) -> io::Result<()> {
+    const CHUNK: usize = 8192;
+    let chunk = [byte; CHUNK];
+    while count > 0 {
+        let n = count.min(CHUNK);
+        output.write_all(&chunk[..n])?;
+        count -= n;
+    }
+    Ok(())
 }
 
 fn number(bytes: &[u8], at: &mut usize) -> Result<usize, String> {

@@ -320,14 +320,52 @@ pub(super) fn evaluate(
         }
         Action::Output(target, format) => {
             register_file(state, target);
-            state.buffer.clear();
-            format
-                .render(entry, &mut state.buffer)
-                .map_err(EvaluationError::Metadata)?;
-            target
-                .write(&state.buffer, effects)
-                .map_err(EvaluationError::Output)?;
-            Ok(true)
+            // Render into a local, bounded buffer rather than a plain Vec
+            // (#9): a record's total size is unbounded, so nothing may
+            // require the whole thing resident as one allocation. Spilling
+            // past the in-memory cap keeps this bounded exactly like a
+            // batch's captured output.
+            //
+            // The buffer also restores what a single `target.write` call
+            // used to give for free: when a lone `-printf`/`-fprintf` is the
+            // only action on an entry, it runs unbuffered (not behind
+            // `EntryEffects`; see `needs_record`), so the destination is the
+            // raw, possibly multi-worker-shared host. Rendering straight
+            // into that host let the host's own internal buffer flush
+            // mid-record whenever a directive boundary happened to cross
+            // its threshold, splicing one worker's record into another's
+            // output. Buffering a whole record first and committing it in
+            // one `write_to` call (one underlying write for anything that
+            // fits in memory) restores that atomicity for the common case;
+            // only a spilled, pathologically wide record still commits in
+            // chunks.
+            let mut buffer = OutputBuffer::default();
+            if let Err(error) = format.render(entry, &mut buffer) {
+                return Err(EvaluationError::Metadata(error));
+            }
+            struct Sink<'a, E> {
+                target: &'a Target,
+                effects: &'a mut E,
+            }
+            impl<E: Effects> Write for Sink<'_, E> {
+                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                    self.target
+                        .write(bytes, self.effects)
+                        .map_err(super::mark_output_failure)?;
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut sink = Sink { target, effects };
+            match buffer.write_to(&mut sink) {
+                Ok(()) => Ok(true),
+                Err(error) if super::is_output_failure(&error) => {
+                    Err(EvaluationError::Output(super::unmark_output_failure(error)))
+                }
+                Err(error) => Err(EvaluationError::Metadata(error)),
+            }
         }
         Action::List(target) => {
             register_file(state, target);
