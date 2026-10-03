@@ -819,6 +819,7 @@ fn full_batch_releases_collection_lock_before_running_child() {
             assert!(self.state.shared.try_lock().is_ok());
             if let Some(next) = self.next.take() {
                 execute(&self.exec, &next, &mut self.output, &mut self.state)?;
+                self.state.flush(&mut self.output, false)?;
             }
             self.output.command(command)
         }
@@ -859,6 +860,7 @@ fn full_batch_releases_collection_lock_before_running_child() {
         )
         .unwrap();
     }
+    state.flush(&mut effects, false).unwrap();
     assert_eq!(flush_shared(&state.shared, &mut effects).unwrap(), 0);
     assert_eq!(
         effects.output.batches,

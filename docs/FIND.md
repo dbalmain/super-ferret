@@ -23,7 +23,9 @@ stays bounded per stream and worker. Interactive prompts are serialized.
 Each ordinary `-exec … {} +` action has one shared batch across workers and
 starts, flushed at the argument limit and once at exit. Full batches are taken
 under the lock, then run outside it while workers collect the next batch.
-Argument order is free;
+Workers stage at most 32 paths, merging at 4 KiB of path bytes (an oversized
+path merges immediately). Staged arguments merge on task completion, including
+quit. Only the shared batch partitions arguments. Argument order is free;
 `-execdir` retains directory-local boundaries. `-quit` commits the winning entry
 under the output lock and discards entries finishing later. Collected batches
 still flush at exit. Started commands and prompts finish and are awaited

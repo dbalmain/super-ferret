@@ -1,5 +1,7 @@
 //! Process, deletion and output primaries. Compiled actions are immutable;
-//! pending exec batches belong to one run. Output files open during parsing.
+//! pending exec batches belong to one run. Workers stage bounded chunks; only
+//! the shared batch partitions ordinary exec argv. Output files open during
+//! parsing.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -73,6 +75,7 @@ pub(super) struct Batch {
 #[derive(Default)]
 pub(super) struct State {
     batches: BTreeMap<usize, Batch>,
+    staged: BTreeMap<usize, Batch>,
     pub shared: Arc<Mutex<BTreeMap<usize, Batch>>>,
     buffer: Vec<u8>,
     limit: Option<Budget>,
@@ -98,6 +101,12 @@ impl State {
                 .any(|batch| batch.exec.directory && !batch.paths.is_empty())
         {
             self.flush_files()?;
+        }
+        if !directories_only && !self.staged.is_empty() {
+            let limit = *self.limit.get_or_insert_with(batch_limit);
+            for batch in self.staged.values_mut() {
+                self.errors += batch.collect(&self.shared, limit, effects)?;
+            }
         }
         for batch in self.batches.values_mut() {
             if !directories_only || batch.exec.directory {
@@ -147,6 +156,57 @@ pub(super) fn flush_shared(
 }
 
 impl Batch {
+    fn new(exec: &Exec, directory: Option<PathBuf>, handle: Option<Arc<File>>) -> Self {
+        Self {
+            exec: exec.clone(),
+            directory,
+            handle,
+            paths: Vec::new(),
+            bytes: command_bytes(&exec.args),
+        }
+    }
+
+    fn full(&self, bytes: usize, limit: Budget) -> bool {
+        // Linux counts argv pointers as well as strings against ARG_MAX.
+        let pointers = (self.exec.args.len() + self.paths.len() + 2) * std::mem::size_of::<usize>();
+        self.bytes + bytes > limit.strings || self.bytes + bytes + pointers > limit.kernel
+    }
+
+    fn collect(
+        &mut self,
+        shared: &Mutex<BTreeMap<usize, Self>>,
+        limit: Budget,
+        effects: &mut impl Effects,
+    ) -> io::Result<u64> {
+        if self.paths.is_empty() {
+            return Ok(0);
+        }
+        let mut ready = Vec::new();
+        {
+            let mut batches = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch = batches
+                .entry(self.exec.id)
+                .or_insert_with(|| Self::new(&self.exec, None, None));
+            for path in self.paths.drain(..) {
+                let bytes = path.as_bytes().len() + 1;
+                if batch.full(bytes, limit) {
+                    ready.push(std::mem::replace(batch, Self::new(&self.exec, None, None)));
+                }
+                batch.paths.push(path);
+                batch.bytes += bytes;
+            }
+        }
+        self.bytes = command_bytes(&self.exec.args);
+        // Workers append to a fresh batch while detached full batches run.
+        let mut errors = 0;
+        for batch in &mut ready {
+            errors += u64::from(!batch.run(effects)?);
+        }
+        Ok(errors)
+    }
+
     fn run(&mut self, effects: &mut impl Effects) -> io::Result<bool> {
         if self.paths.is_empty() {
             return Ok(true);
@@ -308,56 +368,42 @@ fn execute(
     };
     if exec.batch {
         let limit = *state.limit.get_or_insert_with(batch_limit);
-        let mut shared = None;
-        let batches = if exec.directory {
-            &mut state.batches
-        } else {
-            shared = Some(
-                state
-                    .shared
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-            shared.as_mut().unwrap()
-        };
-        let batch = batches.entry(exec.id).or_insert_with(|| Batch {
-            exec: exec.clone(),
-            directory: directory.clone(),
-            handle: handle.clone(),
-            paths: Vec::new(),
-            bytes: command_bytes(&exec.args),
-        });
+        if !exec.directory {
+            let batch = state
+                .staged
+                .entry(exec.id)
+                .or_insert_with(|| Batch::new(exec, None, None));
+            batch.bytes += path.as_bytes().len() + 1;
+            batch.paths.push(path);
+            // Bound worker staging by count and bytes. A single oversized path
+            // is immediately collected; only the shared batch partitions argv.
+            if batch.paths.len() >= 32 || batch.bytes - command_bytes(&exec.args) >= 4096 {
+                for file in &state.files {
+                    file.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .flush()?;
+                }
+                state.errors += batch.collect(&state.shared, limit, effects)?;
+            }
+            return Ok(true);
+        }
+        let batch = state
+            .batches
+            .entry(exec.id)
+            .or_insert_with(|| Batch::new(exec, directory.clone(), handle.clone()));
         let bytes = path.as_bytes().len() + 1;
-        // Linux counts argv pointers as well as strings against ARG_MAX.
-        // Shared batches can reach this limit even at a 256 KiB stack; the
-        // old worker-local partitions happened to hide that accounting gap.
-        let pointers = (exec.args.len() + batch.paths.len() + 2) * std::mem::size_of::<usize>();
-        let full = batch.directory != directory
-            || batch.bytes + bytes > limit.strings
-            || batch.bytes + bytes + pointers > limit.kernel;
-        let mut ready = full.then(|| {
-            std::mem::replace(
-                batch,
-                Batch {
-                    exec: exec.clone(),
-                    directory: directory.clone(),
-                    handle: handle.clone(),
-                    paths: Vec::new(),
-                    bytes: command_bytes(&exec.args),
-                },
-            )
-        });
+        if batch.directory != directory || batch.full(bytes, limit) {
+            for file in &state.files {
+                file.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .flush()?;
+            }
+            state.errors += u64::from(!batch.run(effects)?);
+        }
         batch.directory = directory;
         batch.handle = handle;
         batch.paths.push(path);
         batch.bytes += bytes;
-        // Collect into the replacement while the full batch runs. Only append
-        // and partitioning hold the shared lock; child execution never does.
-        drop(shared);
-        if let Some(batch) = &mut ready {
-            state.flush_files()?;
-            state.errors += u64::from(!batch.run(effects)?);
-        }
         return Ok(true);
     }
     state.flush_files()?;

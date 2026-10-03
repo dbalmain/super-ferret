@@ -234,3 +234,75 @@ fn quit_keeps_file_output_for_the_same_winning_entry() {
         }
     }
 }
+
+#[test]
+fn read_only_overlapping_and_repeated_starts_keep_gnus_duplicates() {
+    let tree = Tree::new("duplicates");
+    let args = ["root", "root/b0", "root/b0", "-type", "f", "-print"];
+    let expected = Command::new(GNU)
+        .args(args)
+        .current_dir(&tree.0)
+        .output()
+        .unwrap();
+    assert!(expected.status.success());
+    let mut expected: Vec<_> = expected.stdout.split(|&b| b == b'\n').collect();
+    expected.sort();
+    for live in [false, true] {
+        for _ in 0..8 {
+            let output = tree.run(live, &args);
+            let mut actual: Vec<_> = output.stdout.split(|&b| b == b'\n').collect();
+            actual.sort();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn staged_arguments_fill_shared_batches_and_flush_the_final_remainder() {
+    let tree = Tree::new("large-batch");
+    for branch in 0..32 {
+        for file in 0..32 {
+            fs::write(
+                tree.0
+                    .join(format!("root/b{branch}/large{file:02}{}", "x".repeat(210))),
+                b"x\n",
+            )
+            .unwrap();
+        }
+    }
+    tree.index();
+    let args = [
+        "root",
+        "-name",
+        "large*",
+        "-exec",
+        "sh",
+        "-c",
+        "printf 'batch\n'; printf '%s\n' \"$@\"",
+        "sh",
+        "{}",
+        "+",
+    ];
+    let expected = Command::new(GNU)
+        .args(args)
+        .current_dir(&tree.0)
+        .output()
+        .unwrap();
+    assert!(expected.status.success(), "{expected:?}");
+    let expected = String::from_utf8(expected.stdout).unwrap();
+    let expected_batches = expected.lines().filter(|&line| line == "batch").count();
+    assert_eq!(expected_batches, 2);
+    let mut expected_paths: Vec<_> = expected.lines().filter(|&line| line != "batch").collect();
+    expected_paths.sort();
+    for live in [false, true] {
+        let output = tree.run(live, &args);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            text.lines().filter(|&line| line == "batch").count(),
+            expected_batches
+        );
+        let mut actual_paths: Vec<_> = text.lines().filter(|&line| line != "batch").collect();
+        actual_paths.sort();
+        assert_eq!(actual_paths, expected_paths);
+    }
+}

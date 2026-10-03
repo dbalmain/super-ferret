@@ -2500,38 +2500,30 @@ from a slow command or unanswered prompt and avoids cancellation machinery.
 
 ## Find M5c — measured batching and many-start costs (answered)
 
-Fifteen warm samples, one benchmark at a time, same 300k timing tree and index.
-The fixture has 368 directory start operands. Median-sample load was
-2.30/2.39/2.55 for M5b many starts and 2.20/2.36/2.54 for M5c live starts.
-`find $(ls) -name x`: M5b default/live 17.261/26.694 ms; M5c 21.565/130.593 ms.
-Sequential starts retain the required semantics but repeatedly drain sibling
-work before admitting the next root. This is a real cost on many small roots.
-
-Shared `-type f -exec true {} +` batches: M5b default/live 76.342/48.539 ms;
-M5c 189.923/243.461 ms. Median-sample load 2.74/2.47/2.58. Name-selected batches:
-24.052/39.964 ms versus 32.289/58.118 ms, load 2.20/2.36/2.54. The command uses
-the pinned absolute coreutils true binary. Raw samples are in
-`/home/dave/w/find-compat/.scratch/ferret-impl/m5c/probes.json`.
+**Question.** The initial implementation sequences all starts and runs full
+shared batches while holding their mutex. Fifteen warm samples on the 300k tree
+showed many-starts default/live 21.565/130.593 ms versus M5b 17.261/26.694 ms;
+batch-all 189.923/243.461 ms versus 76.342/48.539 ms. The original brief attributed
+too much of this to append contention and treated read-only starts as effectful.
 
 | Option | Benefit | Cost |
 | --- | --- | --- |
-| A. Keep the shared mutex | Smallest implementation; one minimal batch partition | Every selected entry contends on the batch lock; full-batch processes hold it while running |
-| B. Stage small worker chunks, append to the shared batch | Amortizes lock acquisitions while keeping one spawning batch per action | Adds bounded path staging and a final merge before shared exit flush; quit must retain staged arguments |
-| C. Change start scheduling without overlapping roots | Try fewer workers or caller-thread traversal for narrow roots | Requires additional measurements and a scheduler policy; cannot recover concurrency between independent small starts |
+| A. Shared batch, execute outside its mutex | Minimal partition; collect while full batches run | Selected entries still synchronize on append |
+| B. Bounded worker staging into that shared batch | Amortize append synchronization | Partial stages must merge at task completion and quit; shared batch remains the sole partitioner |
+| C. Special scheduling for narrow effectful roots | Reduce short-task barriers | New scheduler policy must earn its cost in measurements |
 
-Recommendation: B is the cheapest batching improvement. Keep start sequencing;
-measure C before adopting any heuristic. Reverting to independent start walks
-would reintroduce the overlapping-delete errors that M5c must fix. Dave asked
-for a write-up before accepting real speed or complexity costs; these timings
-are reported rather than silently expanding the implementation.
+**Answer (2026-10-03): A, then measured B; overlap read-only starts.** Dave requires
+full batches to detach under the lock, then spawn and wait outside it. Concurrent
+full-batch commands are allowed by F11 A. Reuse M5a's `has_actions` for scheduling,
+extending it to all file-output actions as well as exec variants and delete.
+Only effectful starts sequence. Dave accepts 0.4–2.3% default-mode timing
+regressions as noise.
 
-**Answer (2026-10-03): detach full batches and overlap read-only starts.**
-Dave corrected A's cost: holding the mutex during process execution dominates
-that measurement. Take a full batch under the lock and spawn/wait outside it;
-other workers collect a fresh batch. Concurrent full-batch commands are allowed
-by F11 A. Reuse M5a's `has_actions` for start scheduling, extending it to all
-file-output actions as well as exec variants and delete. Sequence only effectful
-starts. Measure the append path after this correction, and add B's bounded
-staging only if contention remains. Investigate narrow effectful starts before
-adding scheduling complexity. The measured 0.4–2.3% default-mode differences
-are accepted as noise. Revised measurements and final corpus follow in FIND-M5C.
+After A, append contention remains on batch-all (144.411/188.290 ms versus paired
+M5b 75.811/49.490 ms), so Dave's conditional authorization for B applies. Staging
+merges at 32 paths or 4 KiB; only the shared batch fills/partitions argv. Partial
+stages merge even after quit, before shared exit flush. Staging recovers M5b
+throughput. A cheap narrow-root donation guard made effectful starts slower
+(148.730 versus 135.290 ms live), so it was removed. The pool already persists
+across starts; no new scheduler policy is kept. FIND-M5C records measurements,
+loads, syscall evidence and final validation.
