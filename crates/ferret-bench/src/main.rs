@@ -85,6 +85,7 @@ fn main() -> ExitCode {
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
             ("overlay-fill", [dir, rows]) => overlay_fill(Path::new(dir), rows),
             ("resident-once", [dir, text]) => resident_once(Path::new(dir), text),
+            ("overlay-rename-once", [dir]) => overlay_rename_once(Path::new(dir)),
             ("overlay-carry", [dir, count]) => overlay_carry(Path::new(dir), count),
             ("overlay-carry-boundary", [dir, rows]) => overlay_carry_boundary(Path::new(dir), rows),
             ("sections", [dir]) => sections(Path::new(dir)),
@@ -112,6 +113,7 @@ fn usage() -> ExitCode {
          ferret-bench log-open-once <catalog-dir>\n       \
          ferret-bench overlay-fill <catalog-dir> <rows>\n       \
          ferret-bench resident-once <catalog-dir> <query>\n       \
+         ferret-bench overlay-rename-once <catalog-dir>\n       \
          ferret-bench overlay-carry <catalog-dir> <count>\n       \
          ferret-bench overlay-carry-boundary <catalog-dir> <rows>\n       \
          ferret-bench checksum <catalog-dir>\n       \
@@ -780,5 +782,41 @@ fn overlay_carry_boundary(dir: &Path, rows: &str) -> Result<()> {
     }
     let (rss, peak) = memory()?;
     println!("boundary {:?}; RSS {rss}, peak {peak}", times);
+    Ok(())
+}
+
+/// Namespace publication also builds a latest-name heap and suppression
+/// stream. Measure that sparse work separately from metadata run carries.
+fn overlay_rename_once(dir: &Path) -> Result<()> {
+    use ferret_catalog::log::{ChangeSet, Record, Writer};
+    let mut writer = Writer::open(dir)?;
+    let view = writer.view();
+    let (id, _) = view.names().next().ok_or("empty namespace")?;
+    let old = view.name(id);
+    let mut name = old.bytes.to_vec();
+    name.extend_from_slice(b".next");
+    let c = ChangeSet {
+        records: vec![Record::NamePut {
+            id: id.0,
+            parent: old.parent.0,
+            child: old.child.0,
+            name,
+        }],
+        counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+        counts: [
+            view.inode_count(),
+            view.name_count(),
+            view.dir_count(),
+            view.doc_count(),
+        ],
+    };
+    let before = view.overlay_run_count();
+    let start = Instant::now();
+    let candidate = view.advance(view.generation(), &c)?;
+    let elapsed = ms(start.elapsed());
+    let after = candidate.overlay_run_count();
+    writer.commit(writer.generation(), &c)?;
+    let (rss, peak) = memory()?;
+    println!("rename {elapsed} ms; runs {before} -> {after}; RSS {rss}, peak {peak}");
     Ok(())
 }

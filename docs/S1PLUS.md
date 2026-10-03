@@ -776,14 +776,19 @@ the small commit; it is not the 1–10 ms scoped-update row. M4 measures both.
 ### Compaction and open
 
 Request a checkpoint at the first of: **64 MB log**, **500k log records**,
-**2% distinct new or overwritten rows** in either names or inodes, or
+**1% distinct new or overwritten rows** in either names or inodes, or
 **5% dead base rows**. These are initial measured-work targets, not format constants.
 Repeated updates of one file hit log/record limits even with only one dirty
 row. New/overwritten and dead fractions use checkpoint live counts, not
 lifetime high water; a deleted row is in the dead fraction, not both.
-At the 2% limit, an inode/doc overlay is roughly tens of MB on disk and
-20–80 MB resident (estimate, representation dependent). Geometric runs and
-queries retaining old runs can increase that; report it.
+The initial 2% dirty-row target was reduced to 1% after M3: mixed 100k/200k
+name and inode-field replacements on the 10M fixture increased broad-query
+resident RSS from 603.48 to 699.64/796.30 MiB, and full-open peak from 634.57
+to 729.37/823.96 MiB (ROADMAP S1+). This leaves more room for pinned generations
+and transient carries. M7 implements and tunes the trigger; it is not a format
+limit, and the reader still accepts larger overlays. The earlier 20–80 MB
+inode/doc-only estimate did not include this mixed namespace representation.
+Geometric runs and queries retaining old runs can increase that; measure them.
 
 Preflight the final transaction against these bounds and epoch id limits.
 If a burst crosses a bound, or the incoming diff itself exceeds it, build the

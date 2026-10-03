@@ -596,6 +596,83 @@ be applied to the recorded baseline to reproduce the parallel arm. A dominant
 NameHeap section limits concurrency between sections; recovering the remaining
 cost needs work beyond this requested small experiment.
 
+
+### S1+ M3 — Effective reader and resident overlays (2026-10-04)
+
+Measured source **`2e12d7b`**, release `ferret-bench`, same Ryzen 9 9955HX,
+Linux 6.18.43/ext4/NVMe and imported v4 10,448,739-name checkpoint as M1/M2.
+No competing timing was found: before **every invocation**, the host runner
+checked `uptime` and `pgrep -af 'harness.run|ferret_timing|ignore_timing|synthetic|ferret-bench'`.
+All four XDG directories and `FERRET_INDEX` were isolated under
+`/tmp/s1plus-m3-overlays`. Full command/env/load records, binary SHA256, raw samples,
+summary and runner are in `/home/dave/w/super-ferret/.ai/s1plus-m3-measurements/`.
+The interrupted 8e95513 preparation and superseded ebeda64 runs are archived;
+none of their figures enter the tables below.
+
+Here `B=/home/dave/w/super-ferret-wt/s1plus/target/release/ferret-bench` and
+`I=/tmp/s1plus-m3-overlays/p{0,1,2}` denotes a **separate invocation per fixture**.
+The 1/2% labels mean 100k/200k distinct names **and** 100k/200k distinct inode
+field replacements per nominal 10M entries. One transaction appends `.m3` to
+the first BFS name rows (including directory basenames) and changes size/mode
+on the first non-directory inode rows, preserving identity and document bindings.
+Moving those directory spellings affects descendant paths; this is a mixed
+namespace/metadata stress case. Exact payload sizes depend on actual basenames.
+Preparation command: `$B overlay-fill "$I" {100000,200000}` (one count per fixture),
+source `2e12d7b`, loads 2.55–2.60 / 2.71–2.72 / 2.76–2.77.
+The 0/1/2% log files are 64 / 14,353,544 / 28,331,456 B; the checkpoint is shared unchanged.
+
+Warm opens have one warm-up per case/fixture, then seven fresh-process samples,
+rotating 0/1/2 and reversing each round. RSS here is **VmHWM**, not current RSS.
+
+| Overlay | Names median (range), ms | Full median (range), ms | Names / full peak MiB | Source commands | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| 0% | 330.46 (318.25–347.78) | 709.28 (688.43–752.65) | 291.96 / 634.57 | `$B open-once "$I" names`; `$B open-once "$I" full` | `2e12d7b` | 2.36–2.65 / 2.65–2.71 / 2.74–2.76 |
+| 1% | 557.88 (548.17–573.75) | 1011.98 (995.73–1020.87) | 379.06 / 729.37 | `$B open-once "$I" names`; `$B open-once "$I" full` | `2e12d7b` | 2.36–2.65 / 2.65–2.71 / 2.74–2.76 |
+| 2% | 816.45 (799.78–823.48) | 1351.19 (1329.92–1366.45) | 461.57 / 823.96 | `$B open-once "$I" names`; `$B open-once "$I" full` | `2e12d7b` | 2.36–2.65 / 2.65–2.71 / 2.74–2.76 |
+
+Resident runs load all sections before timing, parse once, discard one warm-up,
+then execute 13 queries through the real query reader, touching each emitted
+path/id. Each query/fixture is one process; current **VmRSS** and peak **VmHWM**
+are read after the samples. The broad query emits 10,405,729 rows; rare name 92,
+common name 162,219, size 20,010. Extension+size emits 133,538 / 133,426 / 133,286
+because the rename suffix changes extensions. The differing result count is
+included rather than treating the three final states as identical.
+
+| Query | Median ms, 0 / 1 / 2% | Current RSS MiB, 0 / 1 / 2% | Peak MiB, 0 / 1 / 2% | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| `` (all names) | 526.60 / 765.02 / 801.03 | 603.48 / 699.64 / 796.30 | 634.27 / 729.99 / 823.63 | `$B resident-once "$I" ""` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
+| `case:Flamegraph` | 8.63 / 9.43 / 9.21 | 603.34 / 699.64 / 796.29 | 635.04 / 729.04 / 823.24 | `$B resident-once "$I" "case:Flamegraph"` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
+| `test` | 67.42 / 106.70 / 117.69 | 603.41 / 699.63 / 796.34 | 634.54 / 729.78 / 823.76 | `$B resident-once "$I" "test"` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
+| `size:>100M` | 191.81 / 213.70 / 227.75 | 605.96 / 700.70 / 796.28 | 634.77 / 729.51 / 823.79 | `$B resident-once "$I" "size:>100M"` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
+| `ext:rs size:>10k` | 81.88 / 134.58 / 140.26 | 603.48 / 699.57 / 796.34 | 634.84 / 728.71 / 823.66 | `$B resident-once "$I" "ext:rs size:>10k"` | `2e12d7b` | 2.40–2.76 / 2.64–2.72 / 2.73–2.76 |
+
+Geometric carry measurements use real writer transactions and `Catalog::advance`;
+only the resident advance is timed, excluding record construction, writer setup
+and durable publication. Each candidate is also committed through the writer.
+The small sequence publishes 1,024 distinct one-inode updates. For the large
+boundary, bursts seed 131,070 distinct fields in geometric runs, then three
+one-inode updates straddle the 131,072-row carry. One warm-up process and 13
+fresh-process samples, resetting the log each time. Times are printed to 0.01 ms;
+`0.00` is below that display resolution, not zero work.
+
+| Update / carry | Runs before → after | Median (range), ms | RSS / peak MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| 1,024-update sequence | at most 10; final 10 → 1 | 0.01 (0.00–0.06); final carry 0.06 | 643.36 / 643.36 | `$B overlay-carry /tmp/s1plus-m3-overlays/carry 1024` | `2e12d7b` | 2.70 / 2.69 / 2.75 |
+| 131,072 boundary, before | 16 → 17 | 0.01 (0.01–0.02) | 670.41 / 670.41 | `$B overlay-carry-boundary /tmp/s1plus-m3-overlays/boundary 131072` | `2e12d7b` | 2.70–2.82 / 2.69–2.72 / 2.75 |
+| 131,072 boundary, carry | 17 → 1 | 5.10 (4.96–6.20) | 670.41 / 670.41 | `$B overlay-carry-boundary /tmp/s1plus-m3-overlays/boundary 131072` | `2e12d7b` | 2.70–2.82 / 2.69–2.72 / 2.75 |
+| 131,072 boundary, after | 1 → 2 | 0.02 (0.01–0.03) | 670.41 / 670.41 | `$B overlay-carry-boundary /tmp/s1plus-m3-overlays/boundary 131072` | `2e12d7b` | 2.70–2.82 / 2.69–2.72 / 2.75 |
+
+The mixed 2% overlay adds **192.82 MiB (202.19 MB)** current RSS for the broad
+query and **189.39 MiB** peak on full open. This exceeds the design's 20–80 MB
+inode/doc-only estimate, although the measured workload also replaces names
+and directory paths. It stays below D48's 1 GB resident line, but broad-query
+latency rises **52.1%** and full-open time **90.5%**. Start with a **1% dirty-row
+checkpoint target**, lowered from 2% for headroom; M7 implements and tunes that
+policy. Do not add a second persistent tree to hide this representation cost.
+The 5.10 ms large carry is occasional CPU merge latency, not a durability or
+end-to-end scoped-update measurement. Full recrawl diff and durable update
+costs belong to M4; repeated churn/compaction and retained-reader budgets to M7.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes
