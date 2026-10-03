@@ -204,12 +204,12 @@ fn v3_import_preserves_roots_sparse_doc_ids_and_dense_base_rows() {
             .docs()
             .map(|(id, hash)| (id.0, hash))
             .collect::<Vec<_>>(),
-        [(1, hash(2)), (2, hash(3))]
+        [(1, hash(3)), (2, hash(2))]
     );
     assert_eq!(imported.next_doc().0, 3);
     assert_eq!(imported.policy(), hash(9));
-    assert_eq!(imported.doc_references(crate::DocId(1)), Some(2));
-    assert_eq!(imported.doc_references(crate::DocId(2)), Some(1));
+    assert_eq!(imported.doc_references(crate::DocId(1)), Some(1));
+    assert_eq!(imported.doc_references(crate::DocId(2)), Some(2));
     assert_eq!(imported.next_inode().0, imported.inode_count());
     assert_eq!(imported.next_name().0, imported.name_count());
     let rows = paths(&imported);
@@ -247,4 +247,20 @@ fn coverage_policy_and_inode_reference_counts_survive_checkpoint_and_keep() {
     assert!(!lazy.is_loaded(Section::RetainedAt));
     assert!(!lazy.is_loaded(Section::Policy));
     assert!(Manifest::decode(&std::fs::read(scratch.path.join("current")).unwrap()).is_ok());
+}
+
+#[test]
+fn reserved_and_future_retention_sequences_fail_before_publication() {
+    for sequence in [1, u64::MAX] {
+        let scratch = Scratch::new(&format!("epoch-retention-{sequence}"));
+        let mut txn = Transaction::begin(&scratch.path, 1).unwrap();
+        let mut batch = txn.batch();
+        let root = batch.root(b"/root", dir_stat(1));
+        batch.retained_at(root, Some(sequence));
+        txn.add(batch);
+        assert!(
+            matches!(txn.commit(), Err(crate::CommitError::Build(crate::BuildError::FutureRetention { retained_at, .. })) if retained_at == sequence)
+        );
+        assert!(Catalog::open(&scratch.path).unwrap().is_none());
+    }
 }

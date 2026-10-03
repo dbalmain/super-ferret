@@ -74,6 +74,8 @@ fn main() -> ExitCode {
         Some((command, rest)) => match (command.as_str(), rest) {
             ("scan", [dir, needles @ ..]) => scan(Path::new(dir), needles),
             ("open", [dir]) => open(Path::new(dir)),
+            ("open-once", [dir, set]) => open_once(Path::new(dir), set),
+            ("checksum", [dir]) => checksum(Path::new(dir)),
             ("sections", [dir]) => sections(Path::new(dir)),
             ("query", [dir, queries @ ..]) => query(Path::new(dir), queries),
             _ => return usage(),
@@ -93,6 +95,8 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: ferret-bench scan <catalog-dir> [needle...]\n       \
          ferret-bench open <catalog-dir>\n       \
+         ferret-bench open-once <catalog-dir> names|metadata|full\n       \
+         ferret-bench checksum <catalog-dir>\n       \
          ferret-bench sections <catalog-dir>\n       \
          ferret-bench query <catalog-dir> [query...]"
     );
@@ -232,6 +236,66 @@ fn sections(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One fresh process for warm load/RSS measurement, using the same section
+/// sets as `open`. RSS is the process high-water mark, in KiB, on Linux.
+fn open_once(dir: &Path, set: &str) -> Result<()> {
+    let start = Instant::now();
+    let catalog = open_catalog(dir)?;
+    let names = [
+        Section::Names,
+        Section::DirNames,
+        Section::Roots,
+        Section::Traversed,
+        Section::Links,
+    ];
+    match set {
+        "names" => catalog.load(&names)?,
+        "metadata" => {
+            catalog.load(&names)?;
+            catalog.load(&Section::INODE)?;
+        }
+        "full" => catalog.load_all()?,
+        _ => return Err(format!("unknown open section set {set}").into()),
+    }
+    let elapsed = start.elapsed();
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let rss = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .ok_or("no VmHWM")?
+        .trim();
+    println!(
+        "{set}: {} ms, {} bytes read, RSS {rss}",
+        ms(elapsed),
+        catalog.bytes_read()
+    );
+    Ok(())
+}
+
+/// Hashes every persisted section through the catalog's real checksum
+/// primitive. Reading/warming is outside the timed interval.
+fn checksum(dir: &Path) -> Result<()> {
+    let catalog = open_catalog(dir)?;
+    let bytes = std::fs::read(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?;
+    let mut start = catalog.head_len() as usize;
+    let mut total = 0;
+    let before = Instant::now();
+    for (_, len) in catalog.section_sizes() {
+        let end = start + len as usize;
+        std::hint::black_box(ferret_catalog::checkpoint_checksum(&bytes[start..end]));
+        total += len;
+        start = end;
+    }
+    let elapsed = before.elapsed();
+    println!(
+        "checksum: {} bytes, {} ms, {:.3} GB/s",
+        total,
+        ms(elapsed),
+        total as f64 / elapsed.as_secs_f64() / 1e9
+    );
+    Ok(())
+}
+
 // ── open ──
 
 fn open(dir: &Path) -> Result<()> {
@@ -246,16 +310,19 @@ fn open(dir: &Path) -> Result<()> {
     ];
     println!("\n| open | cache | ms | bytes read |");
     println!("|---|---|---:|---:|");
-    let cases: [(&str, &[Section]); 3] = [
+    let mut metadata_sections = name_sections.to_vec();
+    metadata_sections.extend(Section::INODE);
+    let cases: [(&str, &[Section]); 4] = [
         ("header and table", &[]),
         ("name sections (a name query's load)", &name_sections),
+        ("name and inode metadata", &metadata_sections),
         ("every section", &[]),
     ];
     for (i, (label, sections)) in cases.into_iter().enumerate() {
         let run = || -> Result<(Duration, u64)> {
             let start = Instant::now();
             let catalog = open_catalog(dir)?;
-            if i == 2 {
+            if i == 3 {
                 catalog.load_all()?;
             } else {
                 catalog.load(sections)?;

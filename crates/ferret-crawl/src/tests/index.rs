@@ -1347,6 +1347,7 @@ fn ignored_names_opaque_directories_and_special_stats_round_trip() {
         }
         // Root keep must copy ignored rows without indexing their reserved
         // child ids.
+        let head = catalog.head_len() as usize;
         drop(catalog);
         let before = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
         // An ignored file's content, size and timestamps have no snapshot
@@ -1355,16 +1356,12 @@ fn ignored_names_opaque_directories_and_special_stats_round_trip() {
         tmp.write("regular.ignored", b"changed ignored content and size");
         let report = run(&tmp, &[tmp.tree()], Refresh::All, workers);
         assert_eq!(report.counts.files_read, 0);
-        assert_eq!(
-            fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
-            before
-        );
+        let after = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
+        assert_eq!(&after[head..], &before[head..]);
         let mut txn = ferret_catalog::Transaction::begin(&tmp.cat(), 1).unwrap();
         txn.keep(tmp.tree().as_os_str().as_bytes()).unwrap();
         txn.commit().unwrap();
-        assert_eq!(
-            fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
-            before
-        );
+        let after = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
+        assert_eq!(&after[head..], &before[head..]);
     }
 }

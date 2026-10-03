@@ -43,6 +43,15 @@ fn sample(name: &str) -> Vec<u8> {
             },
         );
         w.file(other, b"e", file_stat(14), Content::Fault);
+        w.file(
+            other,
+            b"pipe",
+            Stat {
+                mode: 0o010_600,
+                ..file_stat(15)
+            },
+            Content::Unindexed,
+        );
         txn.add(w);
     });
     std::fs::read(super::snapshot(&scratch.path)).unwrap()

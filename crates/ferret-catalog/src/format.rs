@@ -1,13 +1,12 @@
 //! The snapshot file: one generation of the catalog.
 //!
 //! ```text
-//! header       magic "FERRETCT" | version u32 | sniffer u32 | next_doc u32 |
-//!              section count u32 | dirs u32 | inodes u32 | names u32 |
-//!              docs u32                                               (40 B)
-//! table        (offset u64, length u64) per section, in SECTIONS order (368 B)
-//! descriptors  (base u64, width u32, dictionary length u32) per column, in
-//!              COLUMNS order                                         (272 B)
-//! sections     contiguous from byte 680 to the end of the file, in order
+//! header       v3's 40 B fields, incarnation 16 B, checkpoint/sequence u64,
+//!              next inode/name u32, reserved zeros 16 B                 (96 B)
+//! table        (offset u64, length u64, checksum 16 B) per section      (832 B)
+//! descriptors  (base u64, width u32, dictionary length u32) per column (288 B)
+//! head digest  BLAKE3-128 of every preceding head byte                  (16 B)
+//! sections     contiguous from byte 1232 to the end, in SECTIONS order
 //! ```
 //!
 //! All integers are little-endian. The sections a name query reads come
@@ -44,12 +43,15 @@
 //!             dev, common ino, kind u8, 7 B zero
 //! docs        column per document: its DocId (sequence), then 16 B rows:
 //!             its hash; sorted by id, live documents only (D36 B)
+//! doc refs    u32 indexed-inode count per live document, in Docs order
+//! retained at nullable blocked u64 last trustworthy sequence per directory
+//! policy      BLAKE3-128 fingerprint of global rules and eligibility
 //! ```
 //!
 //! A column is its dictionary (`u64` values, present only in a dictionary
 //! column) and then one value per row of its table, bit-packed at the
 //! descriptor's width (`packed`), then 8 bytes of padding (written as zeros,
-//! not checked: reads never depend on it). Each column is sized to this
+//! checksummed along with all section bytes). Each column is sized to this
 //! catalog's values (D43), in one of five codings, each built on a frame of
 //! reference: a value is `base + packed`, and the width is that of the largest
 //! value less the smallest, which is the base. Signed times are stored with
@@ -98,8 +100,8 @@
 //! directory is the child of exactly its recorded name edge, so walking down
 //! from a root ends too. Field values that index nothing (times, sizes,
 //! nlink, entry counts, dictionary values, an inode's `DocId`) are not
-//! checked; a flipped bit there reads back as a different value, truncated to
-//! the field's type.
+//! structurally constrained; every byte is protected by a section checksum
+//! verified before any column is interpreted.
 //!
 //! Validation is split so that it can run per section: [`decode_table`]
 //! checks the header, the table, the descriptors and every count and length
@@ -119,6 +121,7 @@ use crate::packed::{self, Blocked, Packed, RUN};
 pub(crate) const MAGIC: [u8; 8] = *b"FERRETCT";
 /// 1: fixed-width rows (S1). 2: bit-packed columns (S1a).
 /// 3: ignored type tags, collapsed opaque directories and visible specials.
+/// 4: checked checkpoint, incarnation, allocation counters and writer sections.
 pub(crate) const VERSION: u32 = 4;
 /// "No id" in the builder's plan, and in the `u32` ids of fixed-width rows.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -830,6 +833,30 @@ impl<'a> View<'a> {
         self.get(row).wrapping_add(row as u64)
     }
 
+    /// Finds a live sequence id, including sparse historical DocIds. The
+    /// zero-width representation permits subtraction instead of searching.
+    pub(crate) fn sequence_row(self, id: u64, count: usize) -> Option<usize> {
+        let at = match self.dense() {
+            Some(first) => id
+                .checked_sub(first)
+                .map_or(count, |row| row.min(count as u64) as usize),
+            None => {
+                let mut low = 0;
+                let mut high = count;
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    if self.sequence(mid) < id {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
+                    }
+                }
+                low
+            }
+        };
+        (at < count && self.sequence(at) == id).then_some(at)
+    }
+
     /// For a sequence column that is `base + row` throughout, `base`: its
     /// row for a value is found by subtraction.
     pub(crate) fn dense(&self) -> Option<u64> {
@@ -1343,30 +1370,7 @@ pub(crate) fn check<'a>(
             }
         }
         Section::DocRefs => {
-            let ids = l.view(Column::DocId, get(Section::Docs));
-            let mut counts = vec![0u32; l.docs];
-            let docs = l.blocked(Column::Doc, get(Section::Doc));
-            for row in 0..l.inodes {
-                let Some(id) = docs.nullable(row) else {
-                    continue;
-                };
-                let mut low = 0;
-                let mut high = l.docs;
-                while low < high {
-                    let mid = low + (high - low) / 2;
-                    if ids.sequence(mid) < id {
-                        low = mid + 1;
-                    } else {
-                        high = mid;
-                    }
-                }
-                if low == l.docs || ids.sequence(low) != id {
-                    return Err(DecodeError::Corrupt("document references"));
-                }
-                counts[low] = counts[low]
-                    .checked_add(1)
-                    .ok_or(DecodeError::Corrupt("document references"))?;
-            }
+            let counts = document_references(l, get(Section::Docs), get(Section::Doc))?;
             for (row, count) in counts.into_iter().enumerate() {
                 if count == 0 || count != u32_at(get(section), row * 4) {
                     return Err(DecodeError::Corrupt("document references"));
@@ -1397,6 +1401,30 @@ pub(crate) fn check<'a>(
         | Section::States => {}
     }
     Ok(())
+}
+
+/// Counts indexed inode bindings in live document row order. Used by import
+/// and by the lazy DocRefs validator; hard-link name edges are never counted.
+pub(crate) fn document_references(
+    l: &Layout,
+    docs: &[u8],
+    bindings: &[u8],
+) -> Result<Vec<u32>, DecodeError> {
+    let ids = l.view(Column::DocId, docs);
+    let bindings = l.blocked(Column::Doc, bindings);
+    let mut counts = vec![0u32; l.docs];
+    for row in 0..l.inodes {
+        let Some(id) = bindings.nullable(row) else {
+            continue;
+        };
+        let at = ids
+            .sequence_row(id, l.docs)
+            .ok_or(DecodeError::Corrupt("document references"))?;
+        counts[at] = counts[at]
+            .checked_add(1)
+            .ok_or(DecodeError::Corrupt("document references"))?;
+    }
+    Ok(counts)
 }
 
 /// Every inode's dictionary index is inside the dictionary. Nothing is read

@@ -8,9 +8,9 @@
 //! carry(stat)  the old content of an unchanged inode; any thread
 //! add(batch)   hand a filled batch back
 //! keep(root)   copy an old root forward unchanged
-//! commit()     plan, stream dir/catalog.tmp, fsync, read it back and
-//!              self-check, rename over dir/catalog, fsync dir, release the
-//!              lock
+//! commit()     plan, stream private snapshot, checksum/fsync/self-check,
+//!              rename to snapshot.<n> and sync its directory entry, publish
+//!              checked current manifest, retire old snapshot, release lock
 //! ```
 //!
 //! Roots are refreshed by adding batches that record them, and kept with
@@ -25,8 +25,8 @@
 //! inside a kept one would duplicate or lose that subtree, so commit refuses
 //! it; the outer root must be refreshed in the same transaction.
 //!
-//! Readers never lock: they read whichever file `dir/catalog` names when they
-//! open it, and the rename is atomic (D32).
+//! Readers never lock: they pin `current` and its snapshot descriptor (D32).
+//! The manifest identity must match before any section or id is interpreted.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -433,6 +433,18 @@ impl Transaction {
                 .ok_or(CommitError::Encode(DecodeError::Corrupt(
                     "checkpoint exhausted",
                 )))?;
+        }
+        if let Some(retained_at) = self
+            .batches
+            .iter()
+            .flat_map(|batch| &batch.dirs)
+            .filter_map(|dir| dir.retained_at)
+            .find(|&n| n > generation.sequence)
+        {
+            return Err(CommitError::Build(BuildError::FutureRetention {
+                retained_at,
+                sequence: generation.sequence,
+            }));
         }
         let next_doc = self.previous.take().map_or(0, |old| old.next_doc().0);
         self.by_identity = Vec::new();

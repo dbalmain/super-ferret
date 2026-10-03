@@ -65,6 +65,8 @@ pub enum BuildError {
     Unreachable,
     /// Two work-tree records for one directory.
     DuplicateWorkTree,
+    /// Retained coverage cannot refer to a future or reserved sequence.
+    FutureRetention { retained_at: u64, sequence: u64 },
     /// More rows, documents or heap bytes than 32-bit ids can address.
     TooLarge,
 }
@@ -80,6 +82,13 @@ impl fmt::Display for BuildError {
             Self::BadPath(p) => write!(f, "invalid path {:?}", show(p)),
             Self::Unreachable => write!(f, "directories not connected to any root"),
             Self::DuplicateWorkTree => write!(f, "two work-tree records for one directory"),
+            Self::FutureRetention {
+                retained_at,
+                sequence,
+            } => write!(
+                f,
+                "retained sequence {retained_at} exceeds checkpoint sequence {sequence}"
+            ),
             Self::TooLarge => write!(f, "catalog too large for 32-bit ids"),
         }
     }

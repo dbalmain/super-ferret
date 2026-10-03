@@ -240,10 +240,14 @@ fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // Legacy snapshots remain explicitly refused; only import reads v3.
-            if let Ok(file) = File::open(dir.join(FILE)) {
-                let mut head = [0; 12];
-                file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
-                return Err(OpenError::Decode(DecodeError::Version(u32_at(&head, 8))));
+            match File::open(dir.join(FILE)) {
+                Ok(file) => {
+                    let mut head = [0; 12];
+                    file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
+                    return Err(OpenError::Decode(DecodeError::Version(u32_at(&head, 8))));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(OpenError::Io(e)),
             }
             return Ok(None);
         }
@@ -364,10 +368,9 @@ impl Catalog {
     /// Indexed inode reference count for a live document. Requires DocRefs
     /// (which loads Docs and Doc for validation).
     pub fn doc_references(&self, id: DocId) -> Option<u32> {
-        self.docs()
-            .enumerate()
-            .find(|(_, (doc, _))| *doc == id)
-            .map(|(row, _)| u32_at(self.section(Section::DocRefs), row * 4))
+        self.column(Column::DocId)
+            .sequence_row(u64::from(id.0), self.layout.docs)
+            .map(|row| u32_at(self.section(Section::DocRefs), row * 4))
     }
 
     pub(crate) fn manifest(&self) -> Manifest {
@@ -1001,18 +1004,9 @@ impl Catalog {
     /// Needs [`Section::Docs`]. Where the generation's ids have no holes, the
     /// row is the id less the first; otherwise a binary search.
     pub fn doc_hash(&self, doc: DocId) -> Option<Hash> {
-        let (ids, n, doc) = (
-            self.column(Column::DocId),
-            self.layout.docs,
-            u64::from(doc.0),
-        );
-        let at = match ids.dense() {
-            Some(first) => doc
-                .checked_sub(first)
-                .map_or(n, |row| row.min(n as u64) as usize),
-            None => partition_point(n, |i| ids.sequence(i) < doc),
-        };
-        (at < n && ids.sequence(at) == doc).then(|| self.hash(at))
+        self.column(Column::DocId)
+            .sequence_row(u64::from(doc.0), self.layout.docs)
+            .map(|row| self.hash(row))
     }
 
     /// Document row `row`'s hash.

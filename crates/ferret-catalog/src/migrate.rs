@@ -50,11 +50,8 @@ pub(crate) fn write(
     {
         return Err(fail());
     }
-    let mut nulls = packed::BlockSizer::default();
-    for _ in 0..dirs {
-        nulls.push_null();
-    }
-    columns[Column::RetainedAt as usize] = Descriptor::blocked(nulls.finish());
+    // All-none blocks have zero value bytes and width, regardless of row count.
+    columns[Column::RetainedAt as usize] = Descriptor::blocked((0, 0));
     let mut head = Head {
         generation,
         sniffer: u32_at(bytes, 12),
@@ -111,42 +108,25 @@ pub(crate) fn write(
     let mut converted = vec![0; len as usize];
     out.read_exact_at(&mut converted, 0)
         .map_err(crate::CommitError::Write)?;
+    let checked_layout =
+        format::decode_table(&converted, len).map_err(crate::CommitError::Encode)?;
     let facts = format::Facts::default();
     for section in SECTIONS.into_iter().filter(|&s| s != Section::DocRefs) {
-        format::check(
-            section,
-            &format::decode_table(&converted, len).map_err(crate::CommitError::Encode)?,
-            &facts,
-            |s| layout.section(&converted, s),
-        )
+        format::check(section, &checked_layout, &facts, |s| {
+            layout.section(&converted, s)
+        })
         .map_err(crate::CommitError::Encode)?;
     }
-    let ids = layout.view(Column::DocId, layout.section(&converted, Section::Docs));
-    let docs = layout.blocked(Column::Doc, layout.section(&converted, Section::Doc));
-    let mut refs = vec![0u32; layout.docs];
-    for row in 0..layout.inodes {
-        let Some(id) = docs.nullable(row) else {
-            continue;
-        };
-        let mut low = 0;
-        let mut high = layout.docs;
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if ids.sequence(mid) < id {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        if low == layout.docs || ids.sequence(low) != id {
-            return Err(fail());
-        }
-        refs[low] = refs[low].checked_add(1).ok_or_else(fail)?;
+    let refs = format::document_references(
+        &layout,
+        layout.section(&converted, Section::Docs),
+        layout.section(&converted, Section::Doc),
+    )
+    .map_err(crate::CommitError::Encode)?;
+    let mut references = format::At::new(out, layout.range(Section::DocRefs).0 as u64);
+    for count in refs {
+        format::put_u32(&mut references, count).map_err(crate::CommitError::Write)?;
     }
-    let start = layout.range(Section::DocRefs).0;
-    for (row, count) in refs.into_iter().enumerate() {
-        out.write_all_at(&count.to_le_bytes(), (start + row * 4) as u64)
-            .map_err(crate::CommitError::Write)?;
-    }
+    references.finish().map_err(crate::CommitError::Write)?;
     format::seal(out).map_err(crate::CommitError::Write)
 }
