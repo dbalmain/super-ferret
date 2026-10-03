@@ -5,6 +5,9 @@
 //! ferret-bench open  <catalog-dir>               open and load, by section set
 //! ferret-bench sections <catalog-dir>            bytes per name, per section
 //! ferret-bench query <catalog-dir> [query...]    the D40 query mix
+//! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
+//! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
+//! ferret-bench overlay-carry <catalog-dir> <count> one-inode geometric carries
 //! ```
 //!
 //! Build it in release (`cargo build --release -p ferret-bench`). Every
@@ -105,6 +108,9 @@ fn usage() -> ExitCode {
          ferret-bench log-fill <catalog-dir> <transactions> <records>\n       \
          ferret-bench log-append-once <catalog-dir> <records>\n       \
          ferret-bench log-open-once <catalog-dir>\n       \
+         ferret-bench overlay-fill <catalog-dir> <rows>\n       \
+         ferret-bench resident-once <catalog-dir> <query>\n       \
+         ferret-bench overlay-carry <catalog-dir> <count>\n       \
          ferret-bench checksum <catalog-dir>\n       \
          ferret-bench sections <catalog-dir>\n       \
          ferret-bench query <catalog-dir> [query...]"

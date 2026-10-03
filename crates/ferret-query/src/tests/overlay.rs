@@ -797,3 +797,101 @@ fn generated_change_sequences_match_real_materialised_checkpoint_oracle() {
         }
     }
 }
+
+#[test]
+fn shared_documents_hard_links_and_root_retirement_match_fresh_checkpoint() {
+    let (_s, mut state, mut w) = setup("overlay-shared-docs-roots");
+    let fresh = Scratch::new("oracle-shared-docs-roots");
+    let old = state.clone();
+    let root = *state
+        .nodes
+        .iter()
+        .find(|(_, n)| n.root.as_deref() == Some(b"/r"))
+        .unwrap()
+        .0;
+    let original = *state
+        .nodes
+        .iter()
+        .find(|(_, n)| n.kind == Kind::File)
+        .unwrap()
+        .0;
+    let hash = state.nodes[&original].hash;
+    let duplicate = state.create(root, b"duplicate.rs", Kind::File);
+    state.nodes.get_mut(&duplicate).unwrap().hash = hash;
+    state.edge(root, original, b"hardlink.rs");
+    let view = publish(&mut state, &old, &mut w);
+    oracle(
+        &state,
+        &view,
+        &fresh,
+        "distinct inodes share one document; hard link does not add a doc reference",
+    );
+    let old = state.clone();
+    let retired = *state
+        .nodes
+        .iter()
+        .find(|(_, n)| n.root.as_deref() == Some(b"/t"))
+        .unwrap()
+        .0;
+    let edges: Vec<_> = state
+        .edges
+        .iter()
+        .filter(|(_, e)| e.parent == retired)
+        .map(|(&id, _)| id)
+        .collect();
+    for edge in edges {
+        state.remove(edge);
+    }
+    state.nodes.remove(&retired);
+    let view = publish(&mut state, &old, &mut w);
+    oracle(&state, &view, &fresh, "root and its symlink retired");
+}
+#[test]
+fn effective_find_delete_traverses_moved_directory_before_its_later_parent() {
+    let live = Scratch::new("overlay-delete-live");
+    let source = Scratch::new("overlay-delete-source");
+    let fresh = Scratch::new("oracle-delete-source");
+    let mut state = State {
+        nodes: BTreeMap::new(),
+        edges: BTreeMap::new(),
+        next_ino: 0,
+        next_name: 0,
+        next_doc: 0,
+        docs: BTreeMap::new(),
+    };
+    let root = state.root(live.0.as_os_str().as_bytes());
+    let a = state.create(root, b"a", Kind::Dir);
+    state.create(a, b"child", Kind::File);
+    let base = state.materialise(&source.0);
+    state.adopt_epoch(&base);
+    let mut w = Writer::open(&source.0).unwrap();
+    let old = state.clone();
+    let root = *state
+        .nodes
+        .iter()
+        .find(|(_, n)| n.root.is_some())
+        .unwrap()
+        .0;
+    let a = state
+        .edges
+        .iter()
+        .find(|(_, e)| e.name == b"a")
+        .unwrap()
+        .1
+        .child;
+    let later = state.create(root, b"later", Kind::Dir);
+    assert!(later > a);
+    state.rename(state.own(a).unwrap(), later, b"moved");
+    let effective = publish(&mut state, &old, &mut w);
+    let checkpoint = state.materialise(&fresh.0);
+    for c in [&effective, &checkpoint] {
+        std::fs::create_dir_all(live.0.join("later/moved")).unwrap();
+        std::fs::write(live.0.join("later/moved/child"), b"data").unwrap();
+        let paths = find_paths(c, &["-delete", "-print"]);
+        assert_eq!(paths.len(), 4);
+        assert!(
+            !live.0.exists(),
+            "real unlinkat removed every descendant and root"
+        );
+    }
+}

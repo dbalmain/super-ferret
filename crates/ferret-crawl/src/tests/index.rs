@@ -1365,3 +1365,113 @@ fn ignored_names_opaque_directories_and_special_stats_round_trip() {
         assert_eq!(&after[head..], &before[head..]);
     }
 }
+
+#[test]
+fn effective_content_faults_use_live_names_and_graph_roots() {
+    use ferret_catalog::log::{ChangeSet, Published, Record, Writer};
+    use ferret_catalog::{Content, Stat, Transaction};
+    let tmp = Tmp::new("fault-overlay-graph");
+    let st = |ino, mode| Stat {
+        dev: 1,
+        ino,
+        mode,
+        nlink: 1,
+        ..Stat::default()
+    };
+    let mut tx = Transaction::begin(&tmp.cat(), 1).unwrap();
+    let mut b = tx.batch();
+    let r = b.root(b"/r", st(1, 0o040755));
+    b.entry_count(r, 1);
+    let a = b.dir(r, b"a", st(2, 0o040755));
+    b.entry_count(a, 1);
+    b.file(a, b"old", st(3, 0o100644), Content::Fault);
+    tx.add(b);
+    tx.commit().unwrap();
+    let mut w = Writer::open(&tmp.cat()).unwrap();
+    let c = w.view();
+    let r = c.roots().next().unwrap().0;
+    let own = c.lookup(r, b"a").unwrap();
+    let a = c.name(own).child;
+    let file = c.lookup(a, b"old").unwrap();
+    let child = c.name(file).child;
+    let id = c.next_inode().0;
+    let edge = c.next_name().0;
+    let p = Published::open(&tmp.cat()).unwrap().unwrap();
+    let mut counters = p.counters();
+    let mut counts = p.counts();
+    counters[0] += 1;
+    counters[1] += 1;
+    counts[0] += 1;
+    counts[1] += 1;
+    counts[2] += 1;
+    w.commit(
+        w.generation(),
+        &ChangeSet {
+            counters,
+            counts,
+            records: vec![
+                Record::LifePut {
+                    id,
+                    kind: Kind::Dir,
+                    flags: 0,
+                    names: 1,
+                },
+                Record::InodePut {
+                    id,
+                    kind: Kind::Dir,
+                    state: ContentState::Unindexed,
+                    doc: None,
+                    stat: st(4, 0o040755),
+                },
+                Record::NamePut {
+                    id: edge,
+                    parent: r.0,
+                    child: id,
+                    name: b"later".to_vec(),
+                },
+                Record::DirPut {
+                    id,
+                    name: Some(edge),
+                    entries: Some(1),
+                    flags: 4,
+                    retained_at: None,
+                },
+                Record::NamePut {
+                    id: own.0,
+                    parent: id,
+                    child: a.0,
+                    name: b"a".to_vec(),
+                },
+                Record::NamePut {
+                    id: file.0,
+                    parent: a.0,
+                    child: child.0,
+                    name: b"renamed".to_vec(),
+                },
+            ],
+        },
+    )
+    .unwrap();
+    let effective = w.view();
+    let oracle = tmp.base.join("oracle");
+    let mut tx = Transaction::begin(&oracle, 1).unwrap();
+    let mut b = tx.batch();
+    let r = b.root(b"/r", st(1, 0o040755));
+    b.entry_count(r, 1);
+    let d = b.dir(r, b"later", st(4, 0o040755));
+    b.entry_count(d, 1);
+    let a = b.dir(d, b"a", st(2, 0o040755));
+    b.entry_count(a, 1);
+    b.file(a, b"renamed", st(3, 0o100644), Content::Fault);
+    tx.add(b);
+    let materialised = tx.commit().unwrap();
+    for roots in [vec![PathBuf::from("/r")], vec![PathBuf::from("/other")]] {
+        let actual = content_faults(&effective, &roots, Vec::new());
+        let expected = content_faults(&materialised, &roots, Vec::new());
+        assert_eq!(
+            actual.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            expected.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        assert!(actual.iter().all(|(_, f)| matches!(f, ContentFault::Alias)));
+    }
+}

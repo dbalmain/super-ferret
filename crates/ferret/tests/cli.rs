@@ -2035,3 +2035,116 @@ fn search_checks_only_the_sections_its_query_loads() {
     assert_eq!(code(&metadata), 3, "{}", stderr(&metadata));
     assert!(stderr(&metadata).contains("corrupt: size"));
 }
+
+#[test]
+fn stats_effective_depth_census_matches_a_fresh_checkpoint() {
+    use ferret_catalog::log::{ChangeSet, Record, Writer};
+    use ferret_catalog::{Catalog, Content, Kind, Stat, Transaction};
+    let env = Env::new("stats-overlay-depth");
+    let oracle = Env::new("stats-oracle-depth");
+    let st = |ino, mode| Stat {
+        dev: 1,
+        ino,
+        mode,
+        nlink: 1,
+        size: 17,
+        ..Stat::default()
+    };
+    for (index, moved) in [(env.index(), false), (oracle.index(), true)] {
+        let mut tx = Transaction::begin(&index, 1).unwrap();
+        let mut b = tx.batch();
+        let r = b.root(b"/r", st(1, 0o040755));
+        b.entry_count(r, 1);
+        let parent = if moved {
+            let d = b.dir(r, b"later", st(4, 0o040755));
+            b.entry_count(d, 1);
+            d
+        } else {
+            r
+        };
+        let a = b.dir(parent, b"a", st(2, 0o040755));
+        b.entry_count(a, 1);
+        b.file(a, b"file.rs", st(3, 0o100644), Content::Hashed([1; 16]));
+        tx.add(b);
+        tx.commit().unwrap();
+    }
+    let c = Catalog::open(&env.index()).unwrap().unwrap();
+    c.load_all().unwrap();
+    let r = c.roots().next().unwrap().0;
+    let name = c.lookup(r, b"a").unwrap();
+    let a = c.name(name).child;
+    let id = c.next_inode().0;
+    let edge = c.next_name().0;
+    assert!(id > a.0);
+    let mut w = Writer::open(&env.index()).unwrap();
+    let p = ferret_catalog::log::Published::open(&env.index())
+        .unwrap()
+        .unwrap();
+    let mut counters = p.counters();
+    let mut counts = p.counts();
+    counters[0] += 1;
+    counters[1] += 1;
+    counts[0] += 1;
+    counts[1] += 1;
+    counts[2] += 1;
+    w.commit(
+        w.generation(),
+        &ChangeSet {
+            counters,
+            counts,
+            records: vec![
+                Record::LifePut {
+                    id,
+                    kind: Kind::Dir,
+                    flags: 0,
+                    names: 1,
+                },
+                Record::InodePut {
+                    id,
+                    kind: Kind::Dir,
+                    state: ferret_catalog::ContentState::Unindexed,
+                    doc: None,
+                    stat: st(4, 0o040755),
+                },
+                Record::NamePut {
+                    id: edge,
+                    parent: r.0,
+                    child: id,
+                    name: b"later".to_vec(),
+                },
+                Record::DirPut {
+                    id,
+                    name: Some(edge),
+                    entries: Some(1),
+                    flags: 4,
+                    retained_at: None,
+                },
+                Record::NamePut {
+                    id: name.0,
+                    parent: id,
+                    child: a.0,
+                    name: b"a".to_vec(),
+                },
+            ],
+        },
+    )
+    .unwrap();
+    drop(w);
+    let outputs = [env.run(&[os("stats")]), oracle.run(&[os("stats")])];
+    for output in &outputs {
+        assert_eq!(
+            code(output),
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let text: Vec<_> = outputs
+        .iter()
+        .map(|o| String::from_utf8(o.stdout.clone()).unwrap())
+        .collect();
+    assert_eq!(
+        text[0].split_once("\ncontent (file inodes)").unwrap().1,
+        text[1].split_once("\ncontent (file inodes)").unwrap().1
+    );
+}

@@ -199,6 +199,12 @@ fn unused_payload_damage_does_not_fail_a_name_or_metadata_query() {
                 references: 1,
                 hash: hash(1),
             },
+            Record::WorkTreePut {
+                id: 0,
+                kind: crate::WorkTreeKind::Main,
+                common_id: (1, 2),
+                path: b"/git".to_vec(),
+            },
         ],
     );
     w.commit(w.generation(), &c).unwrap();
@@ -207,7 +213,7 @@ fn unused_payload_damage_does_not_fail_a_name_or_metadata_query() {
     let original = fs::read(&path).unwrap();
     let tx = 64;
     let count = crate::format::u32_at(&original, tx + 12) as usize;
-    for family in [Family::Inodes, Family::Docs] {
+    for family in [Family::Namespace, Family::Inodes, Family::Docs, Family::Aux] {
         let mut bad = original.clone();
         let d = (0..count)
             .map(|i| tx + 64 + i * 48)
@@ -217,6 +223,10 @@ fn unused_payload_damage_does_not_fail_a_name_or_metadata_query() {
         bad[offset] ^= 1;
         fs::write(&path, bad).unwrap();
         let names = Catalog::open(&s.path).unwrap().unwrap();
+        if family == Family::Namespace {
+            assert!(names.load(&[Section::Roots]).is_err());
+            continue;
+        }
         names.load(&[Section::Roots]).unwrap();
         assert_eq!(names.name(NameId(0)).bytes, b"renamed");
         assert!(!names.is_loaded(Section::Size));
@@ -224,12 +234,14 @@ fn unused_payload_damage_does_not_fail_a_name_or_metadata_query() {
             names
                 .load(&[if family == Family::Inodes {
                     Section::Size
-                } else {
+                } else if family == Family::Docs {
                     Section::Docs
+                } else {
+                    Section::WorkTrees
                 }])
                 .is_err()
         );
-        if family == Family::Docs {
+        if matches!(family, Family::Docs | Family::Aux) {
             let meta = Catalog::open(&s.path).unwrap().unwrap();
             meta.load(&[Section::Size]).unwrap();
             assert_eq!(meta.size(InoId(1)), file_stat(2).size);
@@ -352,4 +364,26 @@ fn same_sequence_key_removals_and_additions_form_one_run() {
         assert_eq!(view.children(InoId(0)).collect::<Vec<_>>(), vec![NameId(0)]);
         assert_eq!(view.lookup(InoId(0), b"zz-ignored"), None);
     }
+}
+
+#[test]
+fn removing_a_directory_incoming_edge_requires_retiring_or_reparenting_it() {
+    let s = Scratch::new("overlay-dir-orphan");
+    commit(&s.path, |tx| {
+        let mut b = tx.batch();
+        let r = b.root(b"/r", dir_stat(1));
+        let d = b.dir(r, b"dir", dir_stat(2));
+        b.entry_count(r, 1);
+        b.entry_count(d, 0);
+        tx.add(b);
+    });
+    let mut w = Writer::open(&s.path).unwrap();
+    let name = w.view().lookup(InoId(0), b"dir").unwrap();
+    let mut c = changes(&s, vec![Record::NameDelete { id: name.0 }]);
+    c.counts[1] -= 1;
+    assert!(w.commit(w.generation(), &c).is_err());
+    drop(w);
+    signed(&s, &c);
+    let view = Catalog::open(&s.path).unwrap().unwrap();
+    assert!(view.load(&[Section::Roots]).is_err());
 }
