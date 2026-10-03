@@ -595,6 +595,10 @@ impl LiveWalk {
         }
     }
 
+    pub(super) fn has_starts(&self) -> bool {
+        !self.paths.as_slice().is_empty()
+    }
+
     pub(super) fn in_live_directory(&self) -> bool {
         self.levels.last().is_some_and(|level| !level.catalogued)
     }
@@ -612,6 +616,17 @@ impl LiveWalk {
                         .as_ref()
                         .is_some_and(|pending| pending.load(Ordering::Acquire) != 0)
             })
+    }
+
+    // Read-only starts may overlap. Effectful starts stay in the donor and
+    // advance only after all donated descendants have completed.
+    pub(super) fn split_start(&mut self) -> Option<Self> {
+        let path = self.paths.next()?;
+        let mut walk = Self::new(vec![path], self.options.clone());
+        walk.catalog = self.catalog.clone();
+        walk.removed_children = self.removed_children.clone();
+        walk.nested_roots = self.nested_roots.clone();
+        Some(walk)
     }
 
     // Donate siblings already observed by readdir. Ancestor levels remain in

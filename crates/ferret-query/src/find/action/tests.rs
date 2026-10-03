@@ -798,3 +798,80 @@ fn differential_regex() -> usize {
     );
     cases.len()
 }
+
+#[test]
+fn full_batch_releases_collection_lock_before_running_child() {
+    struct CollectWhileRunning {
+        state: State,
+        exec: Exec,
+        next: Option<Entry>,
+        output: Output,
+    }
+    impl Effects for CollectWhileRunning {
+        fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
+            self.output.print(path, nul)
+        }
+        fn error(&mut self, error: &WalkError) {
+            self.output.error(error);
+        }
+        fn command(&mut self, command: &mut Command) -> io::Result<bool> {
+            // This would fail immediately if child execution retained the lock.
+            assert!(self.state.shared.try_lock().is_ok());
+            if let Some(next) = self.next.take() {
+                execute(&self.exec, &next, &mut self.output, &mut self.state)?;
+            }
+            self.output.command(command)
+        }
+    }
+    let tree = Tree::new();
+    let exec = Exec {
+        id: 0,
+        args: vec!["true".into()],
+        batch: true,
+        directory: false,
+        prompt: false,
+    };
+    let paths: Vec<_> = ["a", "b", "c", "d"].map(|name| tree.0.join(name)).into();
+    let limit = Budget {
+        strings: command_bytes(&exec.args) + 2 * (paths[0].as_os_str().len() + 1),
+        kernel: usize::MAX,
+    };
+    let mut state = State {
+        limit: Some(limit),
+        ..State::default()
+    };
+    let mut effects = CollectWhileRunning {
+        state: State {
+            shared: state.shared.clone(),
+            limit: Some(limit),
+            ..State::default()
+        },
+        exec: exec.clone(),
+        next: Some(Entry::new(paths[3].clone(), 0, FileKind::File)),
+        output: Output::default(),
+    };
+    for path in &paths[..3] {
+        execute(
+            &exec,
+            &Entry::new(path.clone(), 0, FileKind::File),
+            &mut effects,
+            &mut state,
+        )
+        .unwrap();
+    }
+    assert_eq!(flush_shared(&state.shared, &mut effects).unwrap(), 0);
+    assert_eq!(
+        effects.output.batches,
+        vec![
+            paths[..2]
+                .iter()
+                .map(|p| p.as_os_str().to_owned())
+                .collect::<Vec<_>>(),
+            paths[2..]
+                .iter()
+                .map(|p| p.as_os_str().to_owned())
+                .collect::<Vec<_>>(),
+        ]
+    );
+    assert_eq!(state.errors + effects.state.errors, 0);
+}

@@ -6,10 +6,10 @@ nanoseconds) describe the last indexing observation. New names are absent;
 deleted names and old metadata remain queryable until re-indexing. Re-index
 when changing ignore policy. The daemon will maintain freshness in a later slice.
 
-Start operands run one after another; siblings within each start may interleave.
+Read-only start operands may overlap. Effectful starts run one after another;
+siblings within each start may interleave.
 A parent's expression completes before its children start; `-depth` and
-`-delete` complete children first. `-prune` stops descent. There is no
-order-sensitive plan class. Live traversal, including default-mode live
+`-delete` complete children first. `-prune` stops descent. Start scheduling reuses the effectful-plan flag. Live traversal, including default-mode live
 fallbacks, uses a bounded worker pool. Catalog work also uses workers where
 measurements show a gain; shallow catalog walks stay on the caller thread.
 
@@ -21,7 +21,9 @@ command runs; output above 64 KiB per stream spills to a private, unlinked
 temporary file. Temporary storage grows with the entry's output, while memory
 stays bounded per stream and worker. Interactive prompts are serialized.
 Each ordinary `-exec … {} +` action has one shared batch across workers and
-starts, flushed at the argument limit and once at exit. Argument order is free;
+starts, flushed at the argument limit and once at exit. Full batches are taken
+under the lock, then run outside it while workers collect the next batch.
+Argument order is free;
 `-execdir` retains directory-local boundaries. `-quit` commits the winning entry
 under the output lock and discards entries finishing later. Collected batches
 still flush at exit. Started commands and prompts finish and are awaited
@@ -55,7 +57,8 @@ and re-index/`-I` guidance. Successful selected deletions exit 0, including when
 ignored files were skipped. A visible directory containing ignored files can
 fail with ENOTEMPTY and exit 1.
 
-Effectful plans (`-exec`, `-execdir`, `-ok`, `-delete`) validate live starts,
+Effectful plans (`-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`,
+`-fprint`, `-fprint0`, `-fprintf`, `-fls`) validate live starts,
 observe which catalog names still exist when entering each directory, and open
 directories for descent errors and execdir handles. A later sibling removal
 does not hide a name already observed; a removed directory fails descent.

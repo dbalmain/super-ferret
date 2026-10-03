@@ -403,7 +403,12 @@ fn has_actions(expression: &Expression) -> bool {
             has_actions(a) || has_actions(b)
         }
         Expression::Not(inner) => has_actions(inner),
-        Expression::Action(action::Action::Exec(_) | action::Action::Delete) => true,
+        Expression::Action(
+            action::Action::Exec(_)
+            | action::Action::Delete
+            | action::Action::Output(action::Target::File(..), _)
+            | action::Action::List(action::Target::File(..)),
+        ) => true,
         _ => false,
     }
 }

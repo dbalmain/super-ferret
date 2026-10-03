@@ -251,3 +251,49 @@ fn parallel_delete_waits_for_every_descendant() {
     assert_eq!(outcome.errors, 0, "{:?}", output.errors);
     assert!(!tree.0.exists());
 }
+
+#[test]
+fn start_donation_uses_existing_effectful_plan_for_every_action_variant() {
+    let tree = Tree::new();
+    let file = tree.0.join("records");
+    let file = file.to_str().unwrap();
+    let expressions = [
+        (vec!["-print"], false),
+        (vec!["-printf", "%p"], false),
+        (vec!["-ls"], false),
+        (vec!["-print", "-quit"], false),
+        (vec!["-delete"], true),
+        (vec!["-exec", "true", "{}", ";"], true),
+        (vec!["-execdir", "true", "{}", ";"], true),
+        (vec!["-ok", "true", "{}", ";"], true),
+        (vec!["-okdir", "true", "{}", ";"], true),
+        (vec!["-fprint", file], true),
+        (vec!["-fprint0", file], true),
+        (vec!["-fprintf", file, "%p"], true),
+        (vec!["-fls", file], true),
+    ];
+    for (expression, effectful) in expressions {
+        let mut args = vec![
+            OsString::from("-I"),
+            tree.0.clone().into_os_string(),
+            tree.0.join("b0").into_os_string(),
+        ];
+        args.extend(expression.iter().map(OsString::from));
+        let plan = Plan::parse(&args).unwrap();
+        assert_eq!(
+            super::super::has_actions(&plan.expression),
+            effectful,
+            "{expression:?}"
+        );
+        let quit = Arc::new(super::AtomicBool::new(false));
+        let mut task = super::Task::new(plan.live_source(), None, &quit);
+        assert!(super::super::EntrySource::next(&mut task.walk, true).is_some());
+        // Starts can be donated before descending into any sibling range.
+        assert_eq!(
+            task.donate(&quit, effectful)
+                .is_some_and(|donated| donated.completion.is_none()),
+            !effectful,
+            "{expression:?}"
+        );
+    }
+}

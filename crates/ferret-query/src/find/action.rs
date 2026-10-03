@@ -135,11 +135,12 @@ pub(super) fn flush_shared(
     effects: &mut impl Effects,
 ) -> io::Result<u64> {
     let mut errors = 0;
-    for batch in shared
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values_mut()
-    {
+    let mut batches = std::mem::take(
+        &mut *shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for batch in batches.values_mut() {
         errors += u64::from(!batch.run(effects)?);
     }
     Ok(errors)
@@ -307,15 +308,17 @@ fn execute(
     };
     if exec.batch {
         let limit = *state.limit.get_or_insert_with(batch_limit);
-        let mut shared;
+        let mut shared = None;
         let batches = if exec.directory {
             &mut state.batches
         } else {
-            shared = state
-                .shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            &mut *shared
+            shared = Some(
+                state
+                    .shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            shared.as_mut().unwrap()
         };
         let batch = batches.entry(exec.id).or_insert_with(|| Batch {
             exec: exec.clone(),
@@ -329,21 +332,32 @@ fn execute(
         // Shared batches can reach this limit even at a 256 KiB stack; the
         // old worker-local partitions happened to hide that accounting gap.
         let pointers = (exec.args.len() + batch.paths.len() + 2) * std::mem::size_of::<usize>();
-        if batch.directory != directory
+        let full = batch.directory != directory
             || batch.bytes + bytes > limit.strings
-            || batch.bytes + bytes + pointers > limit.kernel
-        {
-            for file in &state.files {
-                file.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .flush()?;
-            }
-            state.errors += u64::from(!batch.run(effects)?);
-        }
+            || batch.bytes + bytes + pointers > limit.kernel;
+        let mut ready = full.then(|| {
+            std::mem::replace(
+                batch,
+                Batch {
+                    exec: exec.clone(),
+                    directory: directory.clone(),
+                    handle: handle.clone(),
+                    paths: Vec::new(),
+                    bytes: command_bytes(&exec.args),
+                },
+            )
+        });
         batch.directory = directory;
         batch.handle = handle;
         batch.paths.push(path);
         batch.bytes += bytes;
+        // Collect into the replacement while the full batch runs. Only append
+        // and partitioning hold the shared lock; child execution never does.
+        drop(shared);
+        if let Some(batch) = &mut ready {
+            state.flush_files()?;
+            state.errors += u64::from(!batch.run(effects)?);
+        }
         return Ok(true);
     }
     state.flush_files()?;

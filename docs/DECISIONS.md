@@ -2484,7 +2484,7 @@ process when a background process is not allowed or `FERRET_NO_DAEMON` is set.
 a command or interactive prompt already started on another worker, or
 only cancelling further traversal and expression evaluation? The M5b
 implementation does the latter, flushes collected batches, and reaps children.
-An asynchronous clarification was sent; no answer has been received.
+Dave answered the clarification in M5c, as recorded below.
 
 | Option | Behavior | Tradeoff |
 | --- | --- | --- |
@@ -2498,7 +2498,7 @@ entries finishing later discard their buffered output. Side effects already
 performed remain. Collected batches flush at exit. This accepts exit latency
 from a slow command or unanswered prompt and avoids cancellation machinery.
 
-## Find M5c — measured batching and many-start costs (open)
+## Find M5c — measured batching and many-start costs (answered)
 
 Fifteen warm samples, one benchmark at a time, same 300k timing tree and index.
 The fixture has 368 directory start operands. Median-sample load was
@@ -2524,3 +2524,14 @@ measure C before adopting any heuristic. Reverting to independent start walks
 would reintroduce the overlapping-delete errors that M5c must fix. Dave asked
 for a write-up before accepting real speed or complexity costs; these timings
 are reported rather than silently expanding the implementation.
+
+**Answer (2026-10-03): detach full batches and overlap read-only starts.**
+Dave corrected A's cost: holding the mutex during process execution dominates
+that measurement. Take a full batch under the lock and spawn/wait outside it;
+other workers collect a fresh batch. Concurrent full-batch commands are allowed
+by F11 A. Reuse M5a's `has_actions` for start scheduling, extending it to all
+file-output actions as well as exec variants and delete. Sequence only effectful
+starts. Measure the append path after this correction, and add B's bounded
+staging only if contention remains. Investigate narrow effectful starts before
+adding scheduling complexity. The measured 0.4–2.3% default-mode differences
+are accepted as noise. Revised measurements and final corpus follow in FIND-M5C.

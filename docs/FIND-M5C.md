@@ -1,9 +1,10 @@
 # Parallel find idioms
 
 M5c keeps sibling order free and concurrent `-exec … ;`, while making each
-start operand complete before the next begins. Each ordinary `-exec … {} +`
+effectful start complete before the next begins. Read-only starts may overlap. Each ordinary `-exec … {} +`
 action owns one shared argument batch for the run. Directory-local batches
-retain their directory boundary semantics.
+retain their directory boundary semantics. Full shared batches detach under
+the lock and run outside it; collection proceeds while commands run.
 
 An entry commits all its output together. Child stdout is drained while the
 command runs; large records spill to an unlinked temporary file rather than
@@ -80,3 +81,11 @@ The four functional fixes are checked. Speed completion remains open under the
 measured-cost brief; this milestone is not claimed fully complete. All gates
 pass, 397 tests pass and four pre-existing tests remain ignored. Binary SHA256:
 `b75f73d455f816a42d04e66e8a9353d63af07a7f16e2a82eaba78744c4230a5a`.
+
+## Revised follow-up in progress
+
+Dave accepted the read-only timing noise and corrected the measured-cost brief:
+full shared batches must run outside the lock, and only effectful starts need
+sequencing. Both corrections are implemented with targeted tests. The existing
+effectful classifier now includes all file outputs. New measurements, seed and
+one fresh full corpus will replace the initial candidate's results above.

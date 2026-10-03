@@ -17,8 +17,8 @@ its code.
 then uses GNU find syntax over catalog visibility, respecting ignore rules.
 It uses parallel tree traversal and stored metadata: changes appear after
 re-indexing. Parents precede children; `-depth` and `-delete` reverse that
-relationship, and `-prune` stops descent. Starts run in operand order; sibling
-order need not match GNU find. Each entry's output stays together, including
+relationship, and `-prune` stops descent. Read-only starts may overlap; effectful
+starts run in operand order. Sibling order need not match GNU find. Each entry's output stays together, including
 its commands' stdout. Ordinary `-exec … {} +` batches are shared across workers.
 `-quit` commits one winning entry and waits for commands already running.
 An explicitly named ignored start is walked live, with no nested ignore rules.

@@ -95,8 +95,8 @@ pre-existing tests remain ignored. No manifest/lockfile changes or push.
 ## M5c contract update
 
 FIND-M5C.md supersedes M5b's independent concurrent starts, worker-local ordinary
-batches, action-level output records and open quit policy. Starts now run in
-sequence, ordinary batches are shared, entry output is committed as one unit
+batches, action-level output records and open quit policy. Effectful starts now run in
+sequence; read-only starts may overlap. Ordinary batches are shared, entry output is committed as one unit
 with bounded-memory spill, and quit uses an output latch while finishing
 started commands (option A). Sibling order and concurrent semicolon commands
 remain as measured in M5b.
