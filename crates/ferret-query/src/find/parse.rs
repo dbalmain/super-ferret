@@ -176,6 +176,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
             "-delete implies -depth; -prune requires an explicit -depth option".into(),
         ));
     }
+    parser.options.retain_parent = parser.delete;
     Ok(Plan {
         expression,
         paths,

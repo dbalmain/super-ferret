@@ -209,7 +209,11 @@ Beyond the order rules:
   send concurrent `rm` commands at the same files, and the outcome varies from
   run to run.
 - **Command stdout is a pipe**, not the terminal, because it is captured.
-- **The walk is path-based** (F5 A). A tree deeper than PATH_MAX stops at the
+- **The walk is path-based** (F5 A). Deletion uses the observed parent
+  directory handle, including for explicit starts, so replacing an ancestor
+  cannot redirect deletion outside that directory. Under `-P`, descent does
+  not follow a replacement symlink; an explicit trailing slash still follows
+  the operand's link. A tree deeper than PATH_MAX stops at the
   first path that is too long, and an ancestor renamed mid-walk reports ENOENT;
   both exit 1 where GNU carries on.
 - **Not implemented**, failing with exit 1: `-context`, `-files0-from`,

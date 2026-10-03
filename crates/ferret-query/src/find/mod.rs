@@ -73,6 +73,7 @@ pub(crate) struct Options {
     pub xdev: bool,
     pub follow: Follow,
     pub live_checks: bool,
+    pub retain_parent: bool,
     guard: Option<CandidateGuard>,
 }
 

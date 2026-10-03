@@ -871,6 +871,19 @@ impl LiveWalk {
                 let follow = self.options.follow != Follow::Physical;
                 self.entry = Entry::new(path, 0, FileKind::File);
                 self.entry.removed_children = self.removed_children.clone();
+                if self.options.retain_parent {
+                    let (parent, _) = super::action::exec_path(self.entry.path());
+                    match open(
+                        &parent,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(handle) => {
+                            self.entry.state.directory = Some(Arc::new(File::from(handle)))
+                        }
+                        Err(error) => return Some(Err(self.entry.error(error.into()))),
+                    }
+                }
                 if let Some(catalog) = &self.catalog {
                     let resolved = match resolve(catalog, self.entry.path(), follow || self.entry.path.ends_with(b"/")) {
                         Ok(Some(resolved)) => resolved,
@@ -908,6 +921,7 @@ impl LiveWalk {
                         return Some(Ok(Loaded::Entry));
                     }
                 }
+                let follow = follow || self.entry.path.ends_with(b"/");
                 let stat = match metadata(self.entry.path(), follow) {
                     Ok(stat) => stat,
                     Err(error) => return Some(Err(self.entry.error(error))),
@@ -1179,7 +1193,7 @@ fn catalog_kind(kind: Kind) -> FileKind {
 
 fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let flags = if entry.state.depth == 0 || entry.state.follow {
+    let flags = if entry.state.follow {
         flags
     } else {
         flags | OFlags::NOFOLLOW

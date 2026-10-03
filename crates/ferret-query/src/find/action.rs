@@ -270,10 +270,20 @@ pub(super) fn evaluate(
         Action::Delete => {
             let result = if entry.name() == b"." {
                 Ok(())
-            } else if entry.kind().map_err(EvaluationError::Metadata)? == FileKind::Directory {
-                fs::remove_dir(entry.path())
             } else {
-                fs::remove_file(entry.path())
+                let flags =
+                    if entry.kind().map_err(EvaluationError::Metadata)? == FileKind::Directory {
+                        rustix::fs::AtFlags::REMOVEDIR
+                    } else {
+                        rustix::fs::AtFlags::empty()
+                    };
+                entry
+                    .directory_handle()
+                    .ok_or_else(|| io::Error::other("missing deletion parent handle"))
+                    .and_then(|parent| {
+                        rustix::fs::unlinkat(&*parent, OsStr::from_bytes(entry.name()), flags)
+                            .map_err(Into::into)
+                    })
             };
             match result {
                 Ok(()) => {
@@ -414,7 +424,7 @@ fn substitute(arg: &OsStr, path: &OsStr) -> OsString {
     OsString::from_vec(result)
 }
 
-fn exec_path(path: &Path) -> (PathBuf, OsString) {
+pub(super) fn exec_path(path: &Path) -> (PathBuf, OsString) {
     let bytes = path.as_os_str().as_bytes();
     let end = bytes
         .iter()
