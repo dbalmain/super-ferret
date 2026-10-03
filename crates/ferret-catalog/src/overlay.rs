@@ -993,7 +993,7 @@ fn lookup(
     parent: u32,
     bytes: &[u8],
 ) -> Option<u32> {
-    if let Some(value) = keys.get(&(parent, bytes.to_vec())) {
+    if let Some(value) = keys.get_by(|k| k.0.cmp(&parent).then_with(|| k.1.as_slice().cmp(bytes))) {
         return *value;
     }
     base.lookup(InoId(parent), bytes)

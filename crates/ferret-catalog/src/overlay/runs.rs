@@ -86,17 +86,25 @@ impl<K: Ord + Clone, V: Clone> Runs<K, V> {
         }
     }
     pub(super) fn get(&self, key: &K) -> Option<&V> {
+        self.get_by(|k| k.cmp(key))
+    }
+    /// Looks a row up by a comparator against the key, rather than an owned
+    /// `K` compared with `Ord`. Lets a caller probe with a borrowed or
+    /// composite key (e.g. `(u32, &[u8])` against a stored `(u32, Vec<u8>)`)
+    /// without allocating one just to call [`Runs::get`]. `cmp(k)` must agree
+    /// with the ordering `K: Ord` would give for the key being searched for.
+    pub(super) fn get_by(&self, cmp: impl Fn(&K) -> std::cmp::Ordering) -> Option<&V> {
         self.levels
             .iter()
             .flatten()
             .filter_map(|run| {
-                if run.rows.first().is_none_or(|r| *key < r.key)
-                    || run.rows.last().is_none_or(|r| *key > r.key)
+                if run.rows.first().is_none_or(|r| cmp(&r.key).is_gt())
+                    || run.rows.last().is_none_or(|r| cmp(&r.key).is_lt())
                 {
                     return None;
                 }
                 run.rows
-                    .binary_search_by(|r| r.key.cmp(key))
+                    .binary_search_by(|r| cmp(&r.key))
                     .ok()
                     .map(|i| &run.rows[i])
             })
