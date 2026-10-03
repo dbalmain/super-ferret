@@ -143,6 +143,23 @@ pub trait Effects {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+    /// Writes a complete captured transaction and flushes all host buffering.
+    /// Called with the run's commit gate held. Adapters forward this operation
+    /// to the destination rather than recapturing it.
+    fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
+        struct Host<'a, E: ?Sized>(&'a mut E);
+        impl<E: Effects + ?Sized> std::io::Write for Host<'_, E> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.write(bytes)?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        buffer.write_to(&mut Host(self))?;
+        self.flush()
+    }
     /// Executes a prepared command, draining stdout through the host capture
     /// hook.
     fn command(&mut self, command: &mut std::process::Command) -> io::Result<bool> {
@@ -250,13 +267,14 @@ impl Plan {
     /// Parses a GNU find argument list, including leading ferret `-I`.
     pub fn parse(args: &[OsString]) -> Result<Self, ParseError> {
         let mut plan = parse::parse(args)?;
-        // Whether an action needs a live filesystem check or a kept
-        // directory handle (a cataloged child another start deleted earlier
-        // in the same walk, or a parent fd for -delete/-execdir) - true for
-        // either source, not only the catalog one, which is why this is set
-        // once here rather than only inside `catalog_source` (#10: a live
-        // -I walk needs it exactly as much as a catalog walk does).
         plan.options.live_checks = has_actions(&plan.expression);
+        plan.expression.visit(&mut |leaf| {
+            plan.options.retain_parent |= matches!(leaf,
+                Expression::Action(action::Action::Delete)
+                | Expression::Action(action::Action::Exec(action::Exec { directory: true, .. }))
+                | Expression::Test(test::Test::Link(_) | test::Test::Xtype(_))
+            ) || matches!(leaf, Expression::Action(action::Action::Output(_, format)) if format.needs_directory());
+        });
         Ok(plan)
     }
 

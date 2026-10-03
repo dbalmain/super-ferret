@@ -169,6 +169,18 @@ impl Format {
         Ok(Self(directives))
     }
 
+    pub(super) fn needs_directory(&self) -> bool {
+        self.0.iter().any(|directive| {
+            matches!(
+                directive,
+                Directive::Field {
+                    code: b'l' | b'Y',
+                    ..
+                }
+            )
+        })
+    }
+
     pub(super) fn sections(&self, out: &mut Vec<ferret_catalog::Section>) {
         use ferret_catalog::Section::*;
         for directive in &self.0 {

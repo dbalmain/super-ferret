@@ -248,29 +248,13 @@ impl Test {
         else {
             return Ok(());
         };
-        let mut entry = Entry::new(path.clone(), 0, FileKind::File);
+        let entry = Entry::new(path.clone(), 0, FileKind::File);
         if let Some(catalog) = catalog {
-            // A followed reference that resolves to nothing (a dangling
-            // link) falls back to the link's own identity, the same
-            // fallback `Entry::follow_catalog` uses for a dangling link met
-            // during traversal (#8): one resolver, one dangling-link
-            // policy, rather than this reference path treating it as an
-            // error the traversal path already knows how to recover from.
-            let resolved = match super::walk::resolve(catalog, path, *follow)? {
-                Some(resolved) => resolved,
-                None if *follow => super::walk::resolve(catalog, path, false)?.ok_or_else(
-                    || {
-                        std::io::Error::other(
-                            "reference is outside the catalog or the index is stale; re-index or use -I",
-                        )
-                    },
-                )?,
-                None => {
-                    return Err(std::io::Error::other(
-                        "reference is outside the catalog or the index is stale; re-index or use -I",
-                    ));
-                }
-            };
+            let resolved = super::walk::resolve(catalog, path, *follow)?.ok_or_else(|| {
+                std::io::Error::other(
+                    "reference is outside the catalog or the index is stale; re-index or use -I",
+                )
+            })?;
             if let (ferret_catalog::Target::Inode(id), false) = resolved {
                 *self = if *same_file {
                     let (dev, ino) = catalog.identity(id);
@@ -280,11 +264,7 @@ impl Test {
                         TimeField::Modify => timestamp(catalog.mtime(id), catalog.mtime_nsec(id)),
                         TimeField::Change => timestamp(catalog.ctime(id), catalog.ctime_nsec(id)),
                         TimeField::Access => {
-                            let stat = if *follow {
-                                fs::metadata(&*path)?
-                            } else {
-                                fs::symlink_metadata(&*path)?
-                            };
+                            let stat = super::walk::metadata(path, *follow)?;
                             stat_stamp(&stat, TimeField::Access)
                         }
                         TimeField::Birth => birth_stamp(entry.path())
@@ -298,10 +278,7 @@ impl Test {
                 return Ok(());
             }
         }
-        if *follow {
-            entry = Entry::new(fs::canonicalize(&*path)?, 0, FileKind::File);
-        }
-        let stat = entry.metadata()?;
+        let stat = super::walk::metadata(path, *follow)?;
         *self = if *same_file {
             Self::SameFile {
                 dev: stat.dev(),
@@ -314,7 +291,7 @@ impl Test {
                     birth_stamp(entry.path())
                         .ok_or_else(|| std::io::Error::other("birth time unavailable"))?
                 } else {
-                    stat_stamp(stat, *reference_field)
+                    stat_stamp(&stat, *reference_field)
                 },
             }
         };

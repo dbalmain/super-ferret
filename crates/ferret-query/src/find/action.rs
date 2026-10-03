@@ -323,9 +323,10 @@ pub(super) fn evaluate(
     match action {
         Action::Exec(exec) => execute(exec, entry, effects, state).map_err(EvaluationError::Output),
         Action::Delete => {
-            let result = if entry.name() == b"." {
-                Ok(())
-            } else {
+            if entry.name() == b"." {
+                return Ok(true);
+            }
+            let result = {
                 let flags =
                     if entry.kind().map_err(EvaluationError::Metadata)? == FileKind::Directory {
                         rustix::fs::AtFlags::REMOVEDIR
@@ -357,34 +358,6 @@ pub(super) fn evaluate(
         }
         Action::Output(target, format) => {
             register_file(state, target);
-            // Render into a local, bounded buffer rather than a plain Vec
-            // (#9): a record's total size is unbounded, so nothing may
-            // require the whole thing resident as one allocation. Spilling
-            // past the in-memory cap keeps this bounded exactly like a
-            // batch's captured output.
-            //
-            // The buffer also restores what a single `target.write` call
-            // used to give for free: when a lone `-printf`/`-fprintf` is the
-            // only action on an entry, it runs unbuffered (not behind
-            // `EntryEffects`; see `needs_record`), so the destination is the
-            // raw, possibly multi-worker-shared host. Rendering straight
-            // into that host let the host's own internal buffer flush
-            // mid-record whenever a directive boundary happened to cross
-            // its threshold, splicing one worker's record into another's
-            // output. Buffering a whole record first and committing it in
-            // one `write_to` call (one underlying write for anything that
-            // fits in memory) restores that atomicity for the common case.
-            // A spilled, pathologically wide record still commits in
-            // several chunks; those chunks are made atomic against other
-            // workers (entries, batches, and other spilled records alike)
-            // by taking the same gate a batch commits through (#4's
-            // mechanism) around the whole `write_to` call. The gate is
-            // only taken when the buffer actually spilled, so the common
-            // single-write case pays no lock cost.
-            let mut buffer = OutputBuffer::default();
-            if let Err(error) = format.render(entry, &mut buffer) {
-                return Err(EvaluationError::Metadata(error));
-            }
             struct Sink<'a, E> {
                 target: &'a Target,
                 effects: &'a mut E,
@@ -400,25 +373,16 @@ pub(super) fn evaluate(
                     Ok(())
                 }
             }
-            let spilled = buffer.is_spilled();
-            let result = if spilled {
-                let _gate = state
-                    .gate
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut sink = Sink { target, effects };
-                buffer.write_to(&mut sink)
-            } else {
-                let mut sink = Sink { target, effects };
-                buffer.write_to(&mut sink)
-            };
-            match result {
-                Ok(()) => Ok(true),
-                Err(error) if super::is_output_failure(&error) => {
-                    Err(EvaluationError::Output(super::unmark_output_failure(error)))
-                }
-                Err(error) => Err(EvaluationError::Metadata(error)),
-            }
+            format
+                .render(entry, &mut Sink { target, effects })
+                .map_err(|error| {
+                    if super::is_output_failure(&error) {
+                        EvaluationError::Output(super::unmark_output_failure(error))
+                    } else {
+                        EvaluationError::Metadata(error)
+                    }
+                })?;
+            Ok(true)
         }
         Action::List(target) => {
             register_file(state, target);
@@ -649,21 +613,7 @@ fn spawn_batch(
             // Unlike an entry's own record, a batch's already-collected
             // arguments must still flush after `-quit`: GNU runs any
             // pending `+` batch at the end regardless.
-            let _gate = gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            struct Host<'a, E>(&'a mut E);
-            impl<E: Effects> Write for Host<'_, E> {
-                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                    self.0.write(bytes)?;
-                    Ok(bytes.len())
-                }
-                fn flush(&mut self) -> io::Result<()> {
-                    self.0.flush()
-                }
-            }
-            buffer.write_to(&mut Host(effects))?;
-            effects.flush()?;
+            super::output::commit_stdout(effects, &mut buffer, gate)?;
             Ok(success)
         }
         Err(error) if super::is_output_failure(&error) => Err(super::unmark_output_failure(error)),

@@ -9,12 +9,14 @@
 //! open it for descent errors and execdir; read-only stored-field queries do
 //! neither.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, FileType, Metadata};
 use std::io;
 use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -64,6 +66,12 @@ pub(super) fn kind(value: FileType) -> FileKind {
     }
 }
 
+#[derive(Default)]
+struct Removals {
+    children: BTreeMap<InoId, u32>,
+    entries: BTreeSet<InoId>,
+}
+
 /// An entry's cheap fields and one lazy lstat observation. Metadata failures
 /// are cached too, so repeated predicates never retry a vanished name. The live
 /// source lends one entry at a time and reuses its path buffer, so a borrowed
@@ -76,7 +84,7 @@ pub struct Entry {
     root_len: usize,
     check_directory: bool,
     /// Shared across a walk so action workers can update counts safely.
-    removed_children: Option<Arc<Mutex<BTreeMap<InoId, u32>>>>,
+    removed_children: Option<Arc<Mutex<Removals>>>,
     state: Saved,
 }
 
@@ -154,7 +162,7 @@ impl Entry {
     pub fn metadata(&self) -> io::Result<&Metadata> {
         self.state
             .metadata
-            .get_or_init(|| cached_metadata(self.path(), self.state.follow))
+            .get_or_init(|| cached_metadata(&self.observed_path(), self.state.follow))
             .as_ref()
             .map_err(|error| {
                 error.raw_os_error().map_or_else(
@@ -181,6 +189,7 @@ impl Entry {
             children
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .children
                 .get(&id)
                 .copied()
                 .unwrap_or(0)
@@ -192,7 +201,10 @@ impl Entry {
             let mut removed = children
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let count = removed.entry(parent).or_default();
+            if let Some(Target::Inode(id)) = self.state.target {
+                removed.entries.insert(id);
+            }
+            let count = removed.children.entry(parent).or_default();
             *count = count.saturating_add(1);
         }
     }
@@ -200,8 +212,24 @@ impl Entry {
         if let (Some(catalog), Some(Target::Inode(id))) = (&self.state.catalog, self.state.target) {
             return Ok(catalog.link_target(id).unwrap_or_default().to_vec());
         }
-        Ok(fs::read_link(self.path())?.into_os_string().into_vec())
+        Ok(fs::read_link(self.observed_path())?
+            .into_os_string()
+            .into_vec())
     }
+    // A retained parent is the capability for every live re-resolution of
+    // this observed name. /proc exposes it to std APIs without unsafe code.
+    pub(super) fn observed_path(&self) -> Cow<'_, Path> {
+        self.state.directory.as_ref().map_or_else(
+            || Cow::Borrowed(self.path()),
+            |parent| {
+                Cow::Owned(
+                    PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
+                        .join(OsStr::from_bytes(self.name())),
+                )
+            },
+        )
+    }
+
     pub(super) fn directory_handle(&self) -> Option<Arc<File>> {
         self.state.directory.clone()
     }
@@ -214,6 +242,9 @@ impl Entry {
             return Ok(());
         };
         if let Some((Target::Inode(id), false)) = resolve(catalog, self.path(), true)? {
+            if catalog.kind(id) == Kind::Symlink {
+                return Ok(());
+            }
             self.state.followed_symlink = true;
             self.state.target = Some(Target::Inode(id));
             self.state.kind = Some(catalog_kind(catalog.kind(id)));
@@ -232,14 +263,15 @@ impl Entry {
             }
             let mut entry = Entry::new(self.path().to_owned(), self.state.depth, FileKind::Symlink);
             entry.state.catalog = self.state.catalog.clone();
+            entry.state.directory = self.state.directory.clone();
             entry.state.target = self.state.target;
             entry.state.follow = true;
             entry.follow_catalog()?;
-            if entry.state.catalog.is_some() {
+            if entry.state.catalog.is_some() && entry.state.kind != Some(FileKind::Symlink) {
                 return entry.kind();
             }
         }
-        fs::metadata(self.path()).map(|stat| kind(stat.file_type()))
+        fs::metadata(self.observed_path()).map(|stat| kind(stat.file_type()))
     }
 
     pub(super) fn opposite_kind(&self) -> io::Result<FileKind> {
@@ -260,10 +292,10 @@ impl Entry {
                 }
             });
         }
-        metadata(self.path(), !self.state.follow)
+        metadata(&self.observed_path(), !self.state.follow)
             .or_else(|error| {
                 if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
-                    fs::symlink_metadata(self.path())
+                    fs::symlink_metadata(self.observed_path())
                 } else {
                     Err(error)
                 }
@@ -353,7 +385,7 @@ impl Stat<'_> {
     }
 }
 
-fn metadata(path: &Path, follow: bool) -> io::Result<Metadata> {
+pub(super) fn metadata(path: &Path, follow: bool) -> io::Result<Metadata> {
     if follow {
         match fs::metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => fs::symlink_metadata(path),
@@ -498,7 +530,7 @@ enum Loaded {
 pub struct LiveWalk {
     catalog: Option<Arc<Catalog>>,
     /// Counts only successful catalog-child removals made by this walk.
-    removed_children: Option<Arc<Mutex<BTreeMap<InoId, u32>>>>,
+    removed_children: Option<Arc<Mutex<Removals>>>,
     nested_roots: Vec<(InoId, InoId, Vec<u8>)>,
     paths: std::vec::IntoIter<PathBuf>,
     options: Options,
@@ -695,10 +727,15 @@ impl LiveWalk {
                         entry.path.push(b'/');
                     }
                     entry.path.extend_from_slice(child.bytes);
-                    let missing = fs::symlink_metadata(entry.path())
+                    let observed = handle.as_ref().map(|directory| {
+                        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+                            .join(OsStr::from_bytes(child.bytes))
+                    });
+                    let missing = fs::symlink_metadata(observed.as_deref().unwrap_or(entry.path()))
                         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
                     entry.path.truncate(own_len);
-                    if missing {
+                    let removed_here = matches!(child.target, Target::Inode(id) if self.removed_children.as_ref().is_some_and(|removed| removed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.contains(&id)));
+                    if missing && (child.kind != Kind::Dir || removed_here) {
                         continue;
                     }
                 }
@@ -744,7 +781,11 @@ impl LiveWalk {
             self.levels.push(Level {
                 catalogued: true,
                 pending: None,
-                handle,
+                handle: if self.options.retain_parent {
+                    handle
+                } else {
+                    None
+                },
                 path_len,
                 separator,
                 start,
@@ -834,7 +875,7 @@ impl LiveWalk {
         // whole subtree the way an effectful walk must, bounds live fd use
         // by width instead of depth (#10): a 100-level chain under a tight
         // RLIMIT_NOFILE no longer exhausts descriptors one per ancestor.
-        let handle = if self.options.live_checks {
+        let handle = if self.options.retain_parent {
             Some(handle)
         } else {
             drop(handle);
@@ -888,11 +929,13 @@ impl LiveWalk {
                 let follow = self.options.follow != Follow::Physical;
                 self.entry = Entry::new(path, 0, FileKind::File);
                 self.entry.removed_children = self.removed_children.clone();
-                if self.options.retain_parent {
+                if self.options.retain_parent
+                    && (self.catalog.is_none() || self.options.live_checks)
+                {
                     let (parent, _) = super::action::exec_path(self.entry.path());
                     match open(
                         &parent,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
                         Mode::empty(),
                     ) {
                         Ok(handle) => {
@@ -919,25 +962,14 @@ impl LiveWalk {
                         self.entry.state.catalog = Some(catalog.clone());
                         self.entry.state.kind = Some(catalog_kind(catalog.kind(id)));
                         self.entry.state.follow = follow || self.entry.path.ends_with(b"/");
-                        // An explicit start's deletion must still count against
-                        // its catalog parent's -empty bookkeeping (#7), the
-                        // same as a child reached by descent. Resolve the
-                        // parent directory's own inode, independent of
-                        // `follow`: this identifies where the start itself
-                        // lives, not a symlink's target.
                         self.entry.state.parent = std::path::absolute(self.entry.path())
                             .ok()
                             .as_deref()
                             .and_then(Path::parent)
-                            .and_then(|parent| {
-                                let resolved = catalog.resolve(parent.as_os_str().as_bytes())?;
-                                if resolved.remainder.is_empty()
-                                    && let Target::Inode(parent_id) = resolved.target
-                                {
-                                    Some(parent_id)
-                                } else {
-                                    None
-                                }
+                            .and_then(|parent| resolve(catalog, parent, true).ok().flatten())
+                            .and_then(|(target, remainder)| match target {
+                                Target::Inode(id) if !remainder => Some(id),
+                                _ => None,
                             });
                         self.entry.state.followed_symlink =
                             resolve(catalog, self.entry.path(), false)
@@ -958,8 +990,21 @@ impl LiveWalk {
                         return Some(Ok(Loaded::Entry));
                     }
                 }
+                if self.options.retain_parent && self.entry.state.directory.is_none() {
+                    let (parent, _) = super::action::exec_path(self.entry.path());
+                    match open(
+                        &parent,
+                        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(handle) => {
+                            self.entry.state.directory = Some(Arc::new(File::from(handle)))
+                        }
+                        Err(error) => return Some(Err(self.entry.error(error.into()))),
+                    }
+                }
                 let follow = follow || self.entry.path.ends_with(b"/");
-                let stat = match metadata(self.entry.path(), follow) {
+                let stat = match metadata(&self.entry.observed_path(), follow) {
                     Ok(stat) => stat,
                     Err(error) => return Some(Err(self.entry.error(error))),
                 };
@@ -1175,7 +1220,7 @@ pub struct CatalogSource {
 impl CatalogSource {
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
         let mut walk = LiveWalk::new(paths, options);
-        walk.removed_children = Some(Arc::new(Mutex::new(BTreeMap::new())));
+        walk.removed_children = Some(Arc::new(Mutex::new(Removals::default())));
         for (id, path) in catalog.roots() {
             let path = Path::new(OsStr::from_bytes(path));
             if let Some(parent) = path.parent()
@@ -1236,7 +1281,7 @@ fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
         flags | OFlags::NOFOLLOW
     };
     Ok(Arc::new(File::from(open(
-        entry.path(),
+        &*entry.observed_path(),
         flags,
         Mode::empty(),
     )?)))
@@ -1259,6 +1304,29 @@ pub(super) fn resolve(
     path: &Path,
     follow: bool,
 ) -> io::Result<Option<(Target, bool)>> {
+    let resolved = match resolve_catalog(catalog, path, follow) {
+        Err(error) if follow && error.kind() == io::ErrorKind::NotFound => None,
+        result => result?,
+    };
+    if resolved.is_some() || !follow {
+        return Ok(resolved);
+    }
+    let physical = resolve_catalog(catalog, path, false)?;
+    let Some((target, remainder)) = physical else {
+        return Ok(None);
+    };
+    match fs::metadata(path) {
+        Ok(_) => Ok(Some((target, true))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some((target, remainder))),
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_catalog(
+    catalog: &Catalog,
+    path: &Path,
+    follow: bool,
+) -> io::Result<Option<(Target, bool)>> {
     let mut pending = std::path::absolute(path)?;
     for _ in 0..40 {
         let mut prefix = PathBuf::new();
@@ -1268,6 +1336,7 @@ pub(super) fn resolve(
         // to pop a later `..` against lexically.
         let mut exact = true;
         let mut opaque = None;
+        let mut inside = false;
         for (at, part) in parts.iter().enumerate() {
             match part {
                 std::path::Component::ParentDir => {
@@ -1280,12 +1349,12 @@ pub(super) fn resolve(
                 part => prefix.push(part.as_os_str()),
             }
             let Some(resolved) = catalog.resolve(prefix.as_os_str().as_bytes()) else {
-                // No root matches this prefix yet (e.g. a bare "/" before
-                // the index root is reached) - inconclusive, not a
-                // boundary; keep lexically collapsing until something
-                // resolves.
+                if inside {
+                    return Err(rustix::io::Errno::NOENT.into());
+                }
                 continue;
             };
+            inside = true;
             if !resolved.remainder.is_empty() {
                 exact = false;
                 opaque = Some(resolved.target);

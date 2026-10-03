@@ -84,6 +84,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         now: std::time::SystemTime::now(),
         permission_warning: false,
         combinators: 0,
+        nesting: 0,
     };
     let mut no_ignore = false;
     while let Some(arg) = parser.peek() {
@@ -206,6 +207,7 @@ struct Parser<'a> {
     now: std::time::SystemTime,
     permission_warning: bool,
     combinators: usize,
+    nesting: usize,
 }
 
 /// A chain this long would build an AST deep enough to overflow the stack in
@@ -218,8 +220,21 @@ struct Parser<'a> {
 /// release builds' smaller frames and tighter stacks alike. No real find
 /// command line approaches it.
 const MAX_COMBINATORS: usize = 2000;
+// Parentheses add parser frames even when they add no AST nodes. Negations
+// share this budget so alternating parentheses and negations cannot evade it.
+const MAX_NESTING: usize = 128;
 
 impl Parser<'_> {
+    fn nest(&mut self) -> Result<(), ParseError> {
+        self.nesting += 1;
+        if self.nesting > MAX_NESTING {
+            return Err(ParseError::Feature(format!(
+                "expression nesting exceeds {MAX_NESTING} parentheses/negations; split it up"
+            )));
+        }
+        Ok(())
+    }
+
     fn combine(&mut self) -> Result<(), ParseError> {
         self.combinators += 1;
         if self.combinators > MAX_COMBINATORS {
@@ -283,10 +298,16 @@ impl Parser<'_> {
     fn unary(&mut self) -> Result<Expression, ParseError> {
         if self.consume(&[b"!", b"-not"]) {
             self.combine()?;
-            return Ok(Expression::Not(Box::new(self.unary()?)));
+            self.nest()?;
+            let inner = self.unary();
+            self.nesting -= 1;
+            return inner.map(|inner| Expression::Not(Box::new(inner)));
         }
         if self.consume(&[b"("]) {
-            let inner = self.comma()?;
+            self.nest()?;
+            let inner = self.comma();
+            self.nesting -= 1;
+            let inner = inner?;
             if !self.consume(&[b")"]) {
                 return Err(ParseError::Expression(self.args.get(self.at).cloned()));
             }

@@ -1081,12 +1081,23 @@ fn spilled_printf_record_shares_the_entry_record_gate() {
     std::thread::scope(|scope| {
         let (gate1, quit1, mut host1) = (gate.clone(), quit.clone(), host.clone());
         let printf = scope.spawn(move || {
-            let mut state = State {
+            let state = State {
                 gate: gate1,
                 quit: quit1,
                 ..State::default()
             };
-            evaluate(&action, &entry, &mut host1, &mut state).unwrap();
+            let mut record = crate::find::output::Record::default();
+            let mut output = crate::find::output::EntryEffects {
+                host: &mut host1,
+                record: &mut record,
+                gate: &state.gate,
+                quit: &state.quit,
+            };
+            // The evaluator always captures before committing, including a
+            // single output primary.
+            let mut evaluation_state = State::default();
+            evaluate(&action, &entry, &mut output, &mut evaluation_state).unwrap();
+            output.commit(false).unwrap();
         });
         let (gate2, quit2, mut host2) = (gate.clone(), quit.clone(), host.clone());
         let batch = scope.spawn(move || {

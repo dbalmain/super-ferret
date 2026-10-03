@@ -102,7 +102,6 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
             OUTPUT_BUFFER,
             io::stdout(),
         ))),
-        buffer: Vec::with_capacity(OUTPUT_BUFFER),
     };
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
@@ -137,36 +136,27 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
 
 struct Output<W: Write = io::Stdout> {
     writer: Arc<Mutex<BufWriter<W>>>,
-    buffer: Vec<u8>,
 }
 
 impl<W: Write> Clone for Output<W> {
     fn clone(&self) -> Self {
         Self {
             writer: self.writer.clone(),
-            buffer: Vec::with_capacity(OUTPUT_BUFFER),
         }
-    }
-}
-
-impl<W: Write> Output<W> {
-    fn record(&mut self, bytes: &[u8], terminator: &[u8]) -> io::Result<()> {
-        if self.buffer.len() + bytes.len() + terminator.len() > OUTPUT_BUFFER {
-            self.flush()?;
-        }
-        self.buffer.extend_from_slice(bytes);
-        self.buffer.extend_from_slice(terminator);
-        Ok(())
     }
 }
 
 impl<W: Write> Effects for Output<W> {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
-        self.record(path.as_os_str().as_bytes(), if nul { b"\0" } else { b"\n" })
+        self.write(path.as_os_str().as_bytes())?;
+        self.write(if nul { b"\0" } else { b"\n" })
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.record(bytes, b"")
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_all(bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -174,8 +164,15 @@ impl<W: Write> Effects for Output<W> {
             .writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writer.write_all(&self.buffer)?;
-        self.buffer.clear();
+        writer.flush()
+    }
+
+    fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        buffer.write_to(&mut *writer)?;
         writer.flush()
     }
 
@@ -306,7 +303,6 @@ mod tests {
         let (sent, received) = mpsc::channel();
         let effects = Output {
             writer: Arc::new(Mutex::new(BufWriter::new(Sink(sent)))),
-            buffer: Vec::new(),
         };
         let slow = effects.clone();
         let batch =

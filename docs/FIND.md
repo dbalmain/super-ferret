@@ -42,8 +42,9 @@ An expression with an effect on the tree or on files checks that names still
 exist. The effects are every form of `-exec`, `-execdir`, `-ok` and `-okdir`,
 `-delete`, and the file outputs `-fprint`, `-fprint0`, `-fprintf` and `-fls`.
 Such an expression lstats each start operand. On entering a directory it opens
-it and lstats each non-directory child, dropping the ones that have gone. A
-directory removed before the walk reaches it fails descent. A later sibling's
+it and lstats each child. Non-directory names that have gone are dropped.
+Directories removed by this invocation's own `-delete` are also dropped;
+externally removed directories still report ENOENT. A later sibling's
 removal does not hide a name already observed. Stored predicates such as
 `-mtime` and `-size` still answer from the index.
 
@@ -145,8 +146,10 @@ run.
 
 **An entry's output commits whole.** Everything one entry writes — its prints,
 `-printf` and `-ls` records, its commands' stdout, and its records for `-fprint`
-files — is written together when its expression ends, and never interleaves with
-another entry's. A command's stdout is a pipe, drained while it runs. Up to 64
+files — commits whole and never interleaves with another entry's. Completed
+records may stage together in a bounded transaction; commands and `-quit`
+commit immediately. The commit lock covers destination buffers and their final
+flush. A failed capture or rendering discards that entry's record. A command's stdout is a pipe, drained while it runs. Up to 64
 KiB per stream is held in memory; beyond that the stream spills to a private,
 unlinked file in `$TMPDIR`, so memory stays bounded while temporary storage
 grows with the entry's output. A command's stderr and stdin are inherited, not
@@ -211,7 +214,10 @@ Beyond the order rules:
 - **Command stdout is a pipe**, not the terminal, because it is captured.
 - **The walk is path-based** (F5 A). Deletion uses the observed parent
   directory handle, including for explicit starts, so replacing an ancestor
-  cannot redirect deletion outside that directory. Under `-P`, descent does
+  cannot redirect deletion outside that directory. `-execdir`/`-okdir` and
+  live symlink reads (`%l`, `%Y`, `-lname`, `-ilname`, `-xtype`) use the same
+  observed parent. Explicit parents require search permission, without read
+  permission. Under `-P`, descent does
   not follow a replacement symlink; an explicit trailing slash still follows
   the operand's link. A tree deeper than PATH_MAX stops at the
   first path that is too long, and an ancestor renamed mid-walk reports ENOENT;
@@ -224,3 +230,19 @@ Beyond the order rules:
 - **Dates and names:** `-printf` and `-ls` format times in UTC, whatever `TZ`
   says, in the C locale. User and group names come from `/etc/passwd` and
   `/etc/group` only.
+
+## Resource and expression limits
+
+Output keeps at most 64 KiB per captured stream in memory, then uses temporary
+storage. Spill creation, writes and reads report the operation and temporary
+path; an output failure stops the walk.
+
+Freshness checks and file output alone retain no directory descriptors across
+ancestor levels. Actions or live link reads needing an observed parent retain
+one descriptor per active ancestor, plus active command batches; such walks
+can reach the process's descriptor limit and report EMFILE. Increase that limit
+for deep `-delete`/`-execdir` walks. Path length remains limited by PATH_MAX.
+
+Expressions accept at most 2,000 explicit or implicit `-a`, `-o`, `-not` and
+comma operators, and at most 128 nested parentheses or negations in total.
+Exceeding either limit gives a parse error with exit 1, before evaluation.
