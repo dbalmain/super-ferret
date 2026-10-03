@@ -712,7 +712,11 @@ fn live_empty_and_access_tests_use_an_already_retained_parent() {
         } else {
             fs::write(tree.0.join("tree/victim"), b"").unwrap();
             fs::write(tree.0.join("outside/victim"), b"").unwrap();
-            fs::set_permissions(tree.0.join("tree/victim"), fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(
+                tree.0.join("tree/victim"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
         }
         let output = tree.run(
             false,
