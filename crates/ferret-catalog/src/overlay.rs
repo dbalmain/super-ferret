@@ -206,9 +206,15 @@ impl Overlay {
             .map_or(self.base.manifest().counts, |p| p.manifest.counts);
         for (seq, next, records) in self.transactions(family) {
             if family == Family::Namespace {
-                let mut final_rows: BTreeMap<u64, &Record> = BTreeMap::new();
+                // Only LifePut/InodeDelete affect liveness and counts below;
+                // most touched Namespace records are NamePut/DirPut and
+                // never match. Key the last-wins map on id alone instead of
+                // building a generic map over every touched record.
+                let mut final_rows: BTreeMap<u32, &Record> = BTreeMap::new();
                 for r in &records {
-                    final_rows.insert(record_key(r), r);
+                    if let Record::LifePut { id, .. } | Record::InodeDelete { id } = r.as_ref() {
+                        final_rows.insert(*id, r.as_ref());
+                    }
                 }
                 let mut births = BTreeSet::new();
                 for r in final_rows.values() {
