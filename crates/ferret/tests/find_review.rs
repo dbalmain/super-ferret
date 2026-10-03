@@ -262,6 +262,43 @@ fn followed_dangling_reference_uses_the_link_itself() {
 }
 
 #[test]
+fn deleting_an_explicit_start_counts_against_its_catalog_parent() {
+    // #7: an explicit start operand's `Entry` retained `parent: None`, so
+    // deleting it never incremented its catalog parent's removed-children
+    // count - the same walk's own later `-empty` check on that parent
+    // therefore disagreed with the deletion it had just performed.
+    // `parent/child` is empty; deleting it as an explicit start should make
+    // `parent` empty too, in the same `find` invocation.
+    let tree = Tree::new("explicit-start-empty-accounting");
+    fs::create_dir_all(tree.0.join("parent/child")).unwrap();
+    tree.index(&["."]);
+
+    let args = ["parent/child", "parent", "-empty", "-delete"];
+    let expected = tree.run(true, &args);
+    assert!(expected.status.success(), "{expected:?}");
+    assert!(
+        !tree.0.join("parent/child").exists(),
+        "GNU oracle: {expected:?}"
+    );
+    assert!(!tree.0.join("parent").exists(), "GNU oracle: {expected:?}");
+
+    let tree = Tree::new("explicit-start-empty-accounting-ferret");
+    fs::create_dir_all(tree.0.join("parent/child")).unwrap();
+    tree.index(&["."]);
+
+    let actual = tree.catalog(&args);
+    assert!(actual.status.success(), "{actual:?}");
+    assert!(
+        !tree.0.join("parent/child").exists(),
+        "catalog mode: {actual:?}"
+    );
+    assert!(
+        !tree.0.join("parent").exists(),
+        "catalog mode must also remove the now-empty parent: {actual:?}"
+    );
+}
+
+#[test]
 fn reference_observation_and_output_truncation_run_in_expression_order() {
     // #6: `-fprint`/`-fprintf` used to open (and truncate) their target at
     // parse time, unconditionally before any `-newer`-style reference test

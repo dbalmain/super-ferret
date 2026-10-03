@@ -683,8 +683,13 @@ impl LiveWalk {
                     continue;
                 }
                 // Test membership before child actions. A later sibling
-                // removal must not erase a name already observed here.
-                if self.options.live_checks && child.kind != Kind::Dir {
+                // removal must not erase a name already observed here. This
+                // applies to a cataloged directory child too (#7's repro):
+                // an earlier explicit start's own `-delete` can remove a
+                // directory another start is about to descend into, and the
+                // catalog's stored listing has no way to know that already
+                // happened - GNU's live readdir simply never lists it.
+                if self.options.live_checks {
                     let own_len = entry.path.len();
                     if !entry.path.ends_with(b"/") {
                         entry.path.push(b'/');
@@ -902,6 +907,26 @@ impl LiveWalk {
                         self.entry.state.catalog = Some(catalog.clone());
                         self.entry.state.kind = Some(catalog_kind(catalog.kind(id)));
                         self.entry.state.follow = follow || self.entry.path.ends_with(b"/");
+                        // An explicit start's deletion must still count against
+                        // its catalog parent's -empty bookkeeping (#7), the
+                        // same as a child reached by descent. Resolve the
+                        // parent directory's own inode, independent of
+                        // `follow`: this identifies where the start itself
+                        // lives, not a symlink's target.
+                        self.entry.state.parent = std::path::absolute(self.entry.path())
+                            .ok()
+                            .as_deref()
+                            .and_then(Path::parent)
+                            .and_then(|parent| {
+                                let resolved = catalog.resolve(parent.as_os_str().as_bytes())?;
+                                if resolved.remainder.is_empty()
+                                    && let Target::Inode(parent_id) = resolved.target
+                                {
+                                    Some(parent_id)
+                                } else {
+                                    None
+                                }
+                            });
                         self.entry.state.followed_symlink =
                             resolve(catalog, self.entry.path(), false)
                                 .ok()
