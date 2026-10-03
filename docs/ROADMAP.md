@@ -446,6 +446,124 @@ M1 keeps the existing full-checkpoint writer: an unchanged recrawl still
 publishes a new epoch. The zero-write unchanged pass, tiny log commits and
 incremental timings remain M2–M7 work.
 
+### S1+ M2 — Durable log transactions (2026-10-04)
+
+M2 adds checked `changes.<checkpoint>` headers, complete transaction envelopes,
+three-barrier append publication, locked prefix recovery, and pinned lazy family
+loads. Checkpoint publication now syncs the snapshot/log pair before publishing
+`current`. Recovery refuses damaged published payloads, discards every unpublished
+suffix, and syncs the selected manifest's directory entry before retiring obsolete
+pairs after an `Undurable` result. Ordinary queries preserve their no-log behavior;
+until M3 supplies the overlay they explicitly refuse a nonempty log. Tests drive
+actual writers/readers at every sync/rename boundary, including every ancestor on
+first publication, partial writes, signed malformed records, every log truncation
+and single-bit flip, lock/open races, and lazy loads after unlink.
+
+Measurements use production commit **`8baafd4`**, release builds with the same
+compiler/environment on the Ryzen 9 9955HX (32 logical CPUs), Linux 6.18.43,
+ext4/NVMe. Later edits add reserved-option/reference bounds and tests; the measured
+valid record paths and checkpoint loads otherwise remain the same. No dependencies
+or manifests changed. The 10,448,739-name fixture is M1's v3 import; the entire old
+packed payload was verified byte-for-byte identical across v3/v4 (594,836,546 B).
+Fixtures and all four XDG directories are isolated under
+`/tmp/s1plus-m2-measure`; `FERRET_INDEX` is set for each invocation. Before **every**
+run the host runner checks `uptime` and
+`pgrep -af 'harness.run|ferret_timing|ignore_timing|synthetic|ferret-bench'`;
+no competing timing was found. Runs are serial.
+
+**Baseline correction:** `main` at `9d04f1f` is format **v2**, and refused the v3
+fixture. The actual v3 comparison uses pre-M1 **`db80b2f`**, rather than presenting
+v2 as v3. Only identical fresh-process `open-once` timing/RSS instrumentation was
+added to that isolated baseline's benchmark driver; its catalog code is unchanged.
+The patch, fixture SHA256s, complete commands, load checks, raw samples and traces
+are preserved in `/home/dave/w/super-ferret/.ai/s1plus-m2-measurements/`.
+
+Warm opens have one unreported warm-up and **13 samples per version/set**. Each
+v3/v4 pair alternates its ordering (AB/BA) to balance drift; the matched-section
+v4 full load follows each full pair. RSS is fresh-process Linux `VmHWM` in MiB.
+`B3=/tmp/s1plus-m2-v3/target/release/ferret-bench`,
+`B4=/home/dave/w/super-ferret-wt/s1plus/target/release/ferret-bench`, and
+`I=/tmp/s1plus-m2-measure` in the commands below.
+
+| Open | Warm median (range), ms | Snapshot bytes read | Peak RSS median, MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| v3 names | 269.11 (258.90–294.48) | 302,596,337 | 291.59 | `$B3 open-once "$I/v3" names` | `db80b2f` + driver patch | 1.89–2.30 / 1.98–2.08 / 3.02–3.06 |
+| v4 names | 317.05 (301.63–334.92) | 302,596,889 | 291.80 | `$B4 open-once "$I/v4" names` | `8baafd4` | same paired load range |
+| v3 full | 466.23 (459.15–514.84) | 594,837,226 | 570.33 | `$B3 open-once "$I/v3" full` | `db80b2f` + driver patch | same paired load range |
+| v4 matched v3 sections | 552.98 (537.58–580.11) | 594,837,778 | 570.54 | `$B4 open-once "$I/v4" legacy-full` | `8baafd4` | same paired load range |
+| v4 full | 643.27 (624.57–684.35) | 629,046,618 | 634.46 | `$B4 open-once "$I/v4" full` | `8baafd4` | same paired load range |
+
+Name open adds **47.94 ms / 17.8%**, exceeding the approximate 15% question.
+Matched-section full open adds **86.75 ms / 18.6%**. These isolate the checked
+format's first-load overhead on identical payloads and nearly identical validation;
+they are an A/B of formats, not a hash-only profiler. Actual full open adds
+177.04 ms / 38.0%; that also pays for the new sections and DocRefs validation,
+including its temporary refcount array. Snapshot byte counts omit v4's additional
+128 B manifest and 64 B empty log header. The 552 B head difference is included.
+
+**Per-block verification assessment (not implemented):** Simply moving the
+checksum into block access would not recover this measured name open: today's
+`check_names` validates every row and basename, so it would touch/check the entire
+set anyway. Recovering most of the 48 ms at open would require deferring structural
+validation too, with fallible block loads and integrity state checked before each
+access. Sparse path/metadata queries could then avoid untouched blocks. A complete
+name search still scans the heap and must pay its verification cost somewhere;
+this shifts work and can improve first-row latency, not remove full-scan hashing.
+At illustrative 64 KiB byte blocks, digests alone add about 0.154 MB per snapshot
+(0.074 MB for this name set), plus small validity bitsets. The maintenance cost is
+larger: a new wire table and writer sealing/import paths, checked block caches,
+strings/packed rows crossing byte blocks, validation across adjacent blocks and
+references, fallible query access, concurrent first-use handling, and a revised
+corruption matrix. Keep section checks for now; revisit only with sparse-query or
+first-row measurements that justify that complexity.
+
+Durable append times exclude writer-open recovery and preparation of replacement
+rows. Each replacement preserves the real inode's content state and DocId; only
+permissions change. Thirteen samples follow one warm-up per case. Sync calls batch
+all records in the transaction. Load was **1.96–1.97 / 2.05 / 3.27–3.29** for every
+append/trace row below; source commit is **`8baafd4`** throughout.
+
+| Write / barrier | Bytes | Median (range), ms | Source command |
+| --- | ---: | ---: | --- |
+| Empty change set | 0 | 0.001 (0.001–0.001) | `$B4 log-append-once "$I/tiny" 0` |
+| One inode observation | 232 log + 128 manifest = **360** | 8.998 (4.278–18.811) | `$B4 log-append-once "$I/tiny" 1` |
+| 1,000 inode observations | 88,144 log + 128 manifest = **88,272** | 11.801 (5.278–16.174) | `$B4 log-append-once "$I/batched" 1000` |
+| Log fsync, traced | — | 3.802 (1.130–21.460) | `strace -T -yy -e trace=fsync,rename,renameat,renameat2,pwrite64 -o trace.txt $B4 log-append-once "$I/tiny" 1` |
+| Manifest fsync, traced | — | 2.190 (0.808–14.159) | same command, 11 trace samples |
+| Directory fsync, traced | — | 1.533 (0.464–8.171) | same command, 11 trace samples |
+
+Every trace shows `pwrite64(log) → fsync(log) → fsync(current.tmp) →
+rename(current.tmp,current) → fsync(directory)`. Traced barrier distributions are
+reported separately from untraced commit latency; their medians are not additive.
+The empty API result reports microsecond timer resolution; tests verify literally
+zero writes and syncs. Fsync variation dominates a tiny commit on this device.
+
+Header-only opens below use the same 10M checkpoint, one Inodes block per
+transaction, warm-up plus 13 samples. `N` is total log records. Setup uses the real
+writer (`$B4 log-fill "$I/header-<records-per-tx>" <added-transactions>
+<records-per-tx>`). Every timing row's command is
+`$B4 log-open-once "$I/header-<records-per-tx>"`, commit **`8baafd4`**, load ranges
+**1.31–1.49 / 1.86–1.88 / 2.90–2.91**.
+
+| Records/transaction | T | N | Median (range), ms | Log bytes read | Peak RSS median, MiB |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0 | 0 | 0.037 (0.029–0.072) | 64 | 3.09 |
+| 1 | 1 | 1 | 0.043 (0.037–0.065) | 208 | 3.13 |
+| 1 | 100 | 100 | 0.161 (0.151–0.320) | 14,464 | 3.16 |
+| 1 | 1,000 | 1,000 | 1.219 (1.194–1.359) | 144,064 | 3.44 |
+| 1,000 | 0 | 0 | 0.031 (0.026–0.066) | 64 | 3.09 |
+| 1,000 | 1 | 1,000 | 0.041 (0.029–0.046) | 208 | 3.14 |
+| 1,000 | 100 | 100,000 | 0.200 (0.159–0.291) | 14,464 | 3.14 |
+| 1,000 | 1,000 | 1,000,000 | 1.412 (1.285–1.863) | 144,064 | 3.47 |
+
+Every row also reads the 1,232 B checkpoint head and 128 B manifest, and **zero
+section or log payload bytes**. Log disk size at T=1,000 is 232,064 B for one-row
+transactions versus 88,144,064 B for 1,000-row transactions. Read volume follows
+`64 + 144*T` for this one-family shape, independent of N; the runtime/RSS likewise
+track transaction framing rather than replay. Recovery deliberately loads all
+published payloads before allowing a writer to append; that is not header-only
+query opening. Overlay construction/replay and crawl production remain M3/M4.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes

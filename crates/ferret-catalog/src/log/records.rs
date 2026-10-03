@@ -88,6 +88,20 @@ impl Record {
     }
 
     pub(super) fn encode(&self, out: &mut Vec<u8>) -> Result<(), DecodeError> {
+        // Some(reserved sentinel) must never silently become None on wire.
+        let reserved = match self {
+            Self::DirPut {
+                name,
+                entries,
+                retained_at,
+                ..
+            } => *name == Some(NONE) || *entries == Some(NONE) || *retained_at == Some(u64::MAX),
+            Self::InodePut { doc, .. } => *doc == Some(NONE),
+            _ => false,
+        };
+        if reserved {
+            return Err(bad());
+        }
         let start = out.len();
         out.extend_from_slice(&[0; 8]);
         let op = match self {
@@ -310,6 +324,7 @@ pub(super) fn decode(
                 if b[14..16] != [0; 2]
                     || b[20..24] != [0; 4]
                     || b[13] != 0
+                    || u32_at(b, 16) > counters[1]
                     || (u32_at(b, 16) == 0 && kind(b[12])? != Kind::Dir)
                 {
                     return Err(bad());
@@ -456,7 +471,7 @@ pub(super) fn decode(
             14 => {
                 exact(32)?;
                 let references = u32_at(b, 12);
-                if references == 0 {
+                if references == 0 || references > counters[0] {
                     return Err(bad());
                 }
                 let mut hash = [0; 16];

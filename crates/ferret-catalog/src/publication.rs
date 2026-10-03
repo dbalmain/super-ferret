@@ -25,8 +25,11 @@ pub(crate) enum Point {
 pub(crate) fn hit(point: Point) -> io::Result<()> {
     #[cfg(test)]
     {
-        VISITED.with_borrow_mut(|points| points.push(point));
-        if FAIL.get() == Some(point) {
+        let count = VISITED.with_borrow_mut(|points| {
+            points.push(point);
+            points.len()
+        });
+        if FAIL.get() == Some(point) || STOP_AFTER.get() == Some(count) {
             return Err(io::Error::other(format!("injected stop after {point:?}")));
         }
     }
@@ -47,6 +50,8 @@ pub(crate) fn rename(from: &Path, to: &Path, point: Point) -> io::Result<()> {
 
 #[cfg(test)]
 thread_local! {
+    /// An ordinal also distinguishes repeated ancestor directory syncs.
+    pub(crate) static STOP_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     pub(crate) static FAIL: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
     pub(crate) static VISITED: std::cell::RefCell<Vec<Point>> = const { std::cell::RefCell::new(Vec::new()) };
 }

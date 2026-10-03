@@ -743,3 +743,112 @@ fn recovery_makes_an_undurable_selection_durable_before_retiring_its_old_pair() 
     old.checkpoint().load_all().unwrap();
     old.log().load_all().unwrap();
 }
+
+#[test]
+fn every_first_publication_barrier_including_each_ancestor_can_stop() {
+    let baseline = Scratch::new("log-first-barriers");
+    let dir = baseline.path.join("a/b");
+    VISITED.with_borrow_mut(Vec::clear);
+    commit(&dir, |txn| {
+        let mut b = txn.batch();
+        b.root(b"/root", dir_stat(1));
+        txn.add(b);
+    });
+    let points = VISITED.with_borrow(Clone::clone);
+    let rename = points
+        .iter()
+        .position(|&p| p == Point::ManifestRename)
+        .unwrap();
+    assert!(
+        points[..rename]
+            .iter()
+            .filter(|&&p| p == Point::DirectorySync)
+            .count()
+            > 1,
+        "nested index syncs each ancestor"
+    );
+    for (index, point) in points.iter().enumerate() {
+        let s = Scratch::new(&format!("log-first-stop-{index}"));
+        let dir = s.path.join("a/b");
+        VISITED.with_borrow_mut(Vec::clear);
+        crate::publication::STOP_AFTER.set(Some(index + 1));
+        let result = Transaction::begin(&dir, SNIFFER)
+            .map_err(|e| e.to_string())
+            .and_then(|mut txn| {
+                let mut b = txn.batch();
+                b.root(b"/root", dir_stat(1));
+                txn.add(b);
+                txn.commit().map(|_| ()).map_err(|e| e.to_string())
+            });
+        crate::publication::STOP_AFTER.set(None);
+        assert!(result.is_err(), "stop {index}");
+        let p = Published::open(&dir).unwrap();
+        assert_eq!(p.is_some(), index >= rename, "stop {index} {:?}", point);
+        if let Some(p) = p {
+            p.checkpoint().load_all().unwrap();
+            p.log().load_all().unwrap();
+        }
+        // The real next writer succeeds even after begin's ancestor failure.
+        drop(Transaction::begin(&dir, SNIFFER).unwrap());
+    }
+}
+
+#[test]
+fn optional_reserved_sentinels_and_impossible_reference_counts_are_rejected() {
+    let s = fixture("log-option-limits");
+    let p = Published::open(&s.path).unwrap().unwrap();
+    let mut c = changes(&p);
+    let mut w = Writer::open(&s.path).unwrap();
+    for record in [
+        Record::DirPut {
+            id: 0,
+            name: Some(u32::MAX),
+            entries: None,
+            flags: 0,
+            retained_at: None,
+        },
+        Record::DirPut {
+            id: 0,
+            name: None,
+            entries: Some(u32::MAX),
+            flags: 0,
+            retained_at: None,
+        },
+        Record::DirPut {
+            id: 0,
+            name: None,
+            entries: None,
+            flags: 0,
+            retained_at: Some(u64::MAX),
+        },
+        Record::InodePut {
+            id: 1,
+            kind: Kind::File,
+            state: ContentState::Unindexed,
+            doc: Some(u32::MAX),
+            stat: file_stat(2),
+        },
+        Record::LifePut {
+            id: 1,
+            kind: Kind::File,
+            flags: 0,
+            names: u32::MAX,
+        },
+        Record::DocPut {
+            id: 0,
+            references: u32::MAX,
+            hash: hash(1),
+        },
+    ] {
+        c.records = vec![record];
+        assert!(matches!(
+            w.commit(p.generation(), &c),
+            Err(Error::Invalid(_))
+        ));
+    }
+    assert_eq!(fs::metadata(log_path(&s)).unwrap().len(), 64);
+    assert_eq!(
+        Published::open(&s.path).unwrap().unwrap().generation(),
+        p.generation()
+    );
+}
