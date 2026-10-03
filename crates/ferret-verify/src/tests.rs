@@ -3,7 +3,6 @@
 //! [`reference`] is the one place a second implementation is right: it is
 //! the oracle the fast arms are checked against, and it is written to be
 //! obviously correct rather than fast.
-#![allow(clippy::unwrap_used)]
 
 use crate::{Arm, Finder, Matcher, Regex};
 

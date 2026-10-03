@@ -2,7 +2,6 @@
 //! ignored oracle suite is clean-room: only the pinned binary is consulted.
 
 // Helpers build real fixtures; a setup failure should panic with its location.
-#![allow(clippy::unwrap_used)]
 
 use std::ffi::{OsStr, OsString};
 use std::fs;

@@ -9,11 +9,11 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use super::{
     Control, Effects, EntrySource, EvaluationError, Expression, LiveWalk, Outcome, Plan,
-    Unsupported, WalkError, evaluate, resolve_references,
+    Unsupported, WalkError, evaluate,
 };
 
-struct Task {
-    walk: LiveWalk,
+struct Task<W = LiveWalk> {
+    walk: W,
     control: Control,
     descend: bool,
     completion: Option<Arc<AtomicUsize>>,
@@ -23,8 +23,8 @@ struct Task {
     quit: Arc<AtomicBool>,
 }
 
-impl Task {
-    fn new(walk: LiveWalk, completion: Option<Arc<AtomicUsize>>, quit: &Arc<AtomicBool>) -> Self {
+impl<W: EntrySource> Task<W> {
+    fn new(walk: W, completion: Option<Arc<AtomicUsize>>, quit: &Arc<AtomicBool>) -> Self {
         Self {
             walk,
             control: Control {
@@ -48,7 +48,9 @@ impl Task {
         buffered: bool,
     ) -> bool {
         let Some(item) = self.walk.next_with(self.descend, &mut || {
-            self.control.actions.flush(effects, true)
+            self.control.actions.flush(effects, true).inspect_err(|_| {
+                self.control.quit = true;
+            })
         }) else {
             return false;
         };
@@ -58,7 +60,7 @@ impl Task {
             Err(error) => {
                 effects.error(&error);
                 self.errors += 1;
-                return true;
+                return !self.control.quit;
             }
         };
         if entry.depth() < plan.options.min_depth {
@@ -107,19 +109,6 @@ impl Task {
         true
     }
 
-    fn donate(&mut self, quit: &Arc<AtomicBool>, sequential: bool) -> Option<Self> {
-        let (walk, completion) = if !sequential && let Some(walk) = self.walk.split_start() {
-            (walk, None)
-        } else {
-            let (walk, completion) = self.walk.split()?;
-            (walk, Some(completion))
-        };
-        let mut task = Self::new(walk, completion, quit);
-        task.gate = self.gate.clone();
-        task.control.actions.shared = self.control.actions.shared.clone();
-        Some(task)
-    }
-
     fn flush(&mut self, effects: &mut impl Effects) {
         if let Err(error) = self
             .control
@@ -132,6 +121,7 @@ impl Task {
                 error,
             });
             self.errors += 1;
+            self.quit.store(true, Ordering::Release);
         }
     }
 
@@ -142,6 +132,51 @@ impl Task {
         }
         self.errors + self.control.actions.errors
     }
+}
+
+impl Task {
+    fn donate(&mut self, quit: &Arc<AtomicBool>, sequential: bool) -> Option<Self> {
+        let (walk, completion) = if !sequential && let Some(walk) = self.walk.split_start() {
+            (walk, None)
+        } else {
+            let (walk, completion) = self.walk.split()?;
+            (walk, Some(completion))
+        };
+        let mut task = Self::new(walk, completion, quit);
+        task.gate = self.gate.clone();
+        task.control.actions.shared = self.control.actions.shared.clone();
+        Some(task)
+    }
+}
+
+pub(super) fn run(
+    plan: &Plan,
+    source: &mut impl EntrySource,
+    effects: &mut impl Effects,
+) -> Result<Outcome, Unsupported> {
+    let mut outcome = Outcome::default();
+    let Some(expression) = plan.prepare(source.catalog(), effects, &mut outcome)? else {
+        return Ok(outcome);
+    };
+    let quit = Arc::new(AtomicBool::new(false));
+    let mut task = Task::new(source, None, &quit);
+    task.control.cancelled = None;
+    let buffered = super::output::needs_record(&expression);
+    let shared = task.control.actions.shared.clone();
+    while !quit.load(Ordering::Acquire) && task.step(plan, &expression, effects, buffered) {
+        if task.control.quit {
+            break;
+        }
+    }
+    outcome.errors += task.finish(effects)
+        + super::action::flush_shared(&shared, effects).unwrap_or_else(|error| {
+            effects.error(&WalkError {
+                path: ".".into(),
+                error,
+            });
+            1
+        });
+    Ok(outcome)
 }
 
 struct Queue {
@@ -220,6 +255,9 @@ impl Pool {
                 }
                 steps += 1;
             }
+            if task.control.quit {
+                self.quit.store(true, Ordering::Release);
+            }
             // Completion can race with the None returned for suspension. Use
             // the recorded reason, not a second counter read, to
             // retain the task.
@@ -252,13 +290,17 @@ impl Plan {
     /// may overlap unless the expression has effects on the tree or files.
     pub fn run_parallel<E: Effects + Clone + Send>(
         &self,
-        mut source: LiveWalk,
+        source: LiveWalk,
         mut effects: E,
         workers: usize,
     ) -> Result<Outcome, Unsupported> {
-        let workers = source.worker_limit(workers);
-        if workers <= 1 || self.options.max_depth == Some(0) || self.is_information() {
-            let mut outcome = self.run(&mut source, &mut effects)?;
+        let workers = if self.options.max_depth == Some(0) || self.is_information() {
+            1
+        } else {
+            source.worker_limit(workers)
+        };
+        let mut outcome = Outcome::default();
+        let Some(expression) = self.prepare(source.catalog(), &mut effects, &mut outcome)? else {
             if let Err(error) = effects.flush() {
                 effects.error(&WalkError {
                     path: ".".into(),
@@ -267,23 +309,7 @@ impl Plan {
                 outcome.errors += 1;
             }
             return Ok(outcome);
-        }
-        if let Some(feature) = &self.unsupported {
-            return Err(Unsupported {
-                feature: feature.clone(),
-            });
-        }
-        for warning in &self.warnings {
-            effects.warning(warning);
-        }
-        let mut expression = self.expression.clone();
-        if let Err(error) = resolve_references(&mut expression, source.catalog()) {
-            effects.error(&WalkError {
-                path: ".".into(),
-                error,
-            });
-            return Ok(Outcome { errors: 1 });
-        }
+        };
         let shallow_catalog =
             source.catalog().is_some() && self.options.max_depth.is_some_and(|depth| depth <= 2);
         let quit = Arc::new(AtomicBool::new(false));
@@ -297,9 +323,10 @@ impl Plan {
             if task.control.quit {
                 break;
             }
-            if (!shallow_catalog
-                || task.walk.in_live_directory()
-                || !sequential && task.walk.has_starts())
+            if workers > 1
+                && (!shallow_catalog
+                    || task.walk.in_live_directory()
+                    || !sequential && task.walk.has_starts())
                 && let Some(donated) = task.donate(&quit, sequential)
             {
                 task.control.cancelled = Some(quit.clone());

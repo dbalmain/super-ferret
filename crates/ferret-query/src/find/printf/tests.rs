@@ -1,6 +1,5 @@
 //! Fixed timestamp fixtures exercise the actual directive compiler and live
 //! evaluator; fractions and width rules differ from plausible Rust defaults.
-#![allow(clippy::unwrap_used)] // Fixture setup/formatting failures identify the test.
 
 use std::fs::{File, FileTimes};
 use std::time::{Duration, UNIX_EPOCH};

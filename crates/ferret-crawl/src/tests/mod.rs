@@ -1,5 +1,3 @@
-#![allow(clippy::unwrap_used)]
-
 mod gitfile;
 mod golden;
 mod index;

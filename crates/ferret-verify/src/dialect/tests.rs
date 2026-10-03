@@ -1,6 +1,5 @@
 //! Pure translator regressions include the default dialect's easy-to-miss
 //! unescaped ? and escaped alternation, and basic's literal +.
-#![allow(clippy::unwrap_used)] // Failed regex compilation is a test failure.
 
 use super::*;
 

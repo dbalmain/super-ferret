@@ -13,10 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use ferret_verify::FindRegex;
-
 use super::printf::Format;
-use super::{Effects, Entry, EvaluationError, FileKind, WalkError, glob, walk};
+use super::{Effects, Entry, EvaluationError, FileKind, WalkError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Action {
@@ -24,9 +22,6 @@ pub(super) enum Action {
     Delete,
     Output(Target, Format),
     List(Target),
-    Regex(FindRegex),
-    Link(glob::Pattern),
-    Xtype(Vec<FileKind>),
 }
 
 #[derive(Clone, Debug)]
@@ -315,19 +310,6 @@ pub(super) fn evaluate(
                 .map_err(EvaluationError::Output)?;
             Ok(true)
         }
-        Action::Regex(regex) => regex
-            .try_is_match(entry.path().as_os_str().as_bytes())
-            .map_err(|error| EvaluationError::Metadata(io::Error::other(error))),
-        Action::Link(pattern) => {
-            if entry.kind().map_err(metadata_error)? != FileKind::Symlink {
-                return Ok(false);
-            }
-            let target = entry.link_target().map_err(EvaluationError::Metadata)?;
-            Ok(pattern.matches(&target))
-        }
-        Action::Xtype(kinds) => {
-            Ok(kinds.contains(&entry.opposite_kind().map_err(EvaluationError::Metadata)?))
-        }
     }
 }
 
@@ -342,8 +324,8 @@ fn register_file(state: &mut State, target: &Target) {
     }
 }
 
-fn metadata_error(error: &io::Error) -> EvaluationError {
-    EvaluationError::Metadata(walk::copy_error(error))
+fn metadata_error(error: io::Error) -> EvaluationError {
+    EvaluationError::Metadata(error)
 }
 
 fn execute(
@@ -489,6 +471,15 @@ fn spawn(
         command
     };
     if let Some(handle) = handle {
+        // A failed batch cwd stops GNU's walk; an executable launch failure
+        // is only false. Check search permission through the retained handle
+        // so renamed or unlinked directories remain usable.
+        rustix::fs::accessat(
+            handle,
+            ".",
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )?;
         // CLOEXEC still allows the child to chdir through its inherited fd
         // before exec. This also works after the directory has been unlinked.
         command.current_dir(format!("/proc/self/fd/{}", handle.as_raw_fd()));

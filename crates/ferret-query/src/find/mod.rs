@@ -15,6 +15,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 
+pub use output::OutputBuffer;
 pub use parse::{ParseError, Plan};
 pub use walk::{CatalogSource, Entry, EntrySource, FileKind, LiveWalk, WalkError};
 
@@ -33,6 +34,35 @@ enum Expression {
     Quit,
     Action(action::Action),
     Test(test::Test),
+}
+
+impl Expression {
+    /// Visits every leaf in expression order, independently of its truth value.
+    fn visit(&self, visitor: &mut impl FnMut(&Self)) {
+        match self {
+            Self::And(left, right) | Self::Or(left, right) | Self::Comma(left, right) => {
+                left.visit(visitor);
+                right.visit(visitor);
+            }
+            Self::Not(inner) => inner.visit(visitor),
+            leaf => visitor(leaf),
+        }
+    }
+
+    /// The mutable counterpart for preparation, stopping at the first error.
+    fn try_visit_mut<E>(
+        &mut self,
+        visitor: &mut impl FnMut(&mut Self) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::And(left, right) | Self::Or(left, right) | Self::Comma(left, right) => {
+                left.try_visit_mut(visitor)?;
+                right.try_visit_mut(visitor)
+            }
+            Self::Not(inner) => inner.try_visit_mut(visitor),
+            leaf => visitor(leaf),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -237,12 +267,20 @@ impl Plan {
         source: &mut impl EntrySource,
         effects: &mut impl Effects,
     ) -> Result<Outcome, Unsupported> {
+        parallel::run(self, source, effects)
+    }
+
+    fn prepare(
+        &self,
+        catalog: Option<&ferret_catalog::Catalog>,
+        effects: &mut impl Effects,
+        outcome: &mut Outcome,
+    ) -> Result<Option<Expression>, Unsupported> {
         if let Some(feature) = &self.unsupported {
             return Err(Unsupported {
                 feature: feature.clone(),
             });
         }
-        let mut outcome = Outcome::default();
         for warning in &self.warnings {
             effects.warning(warning);
         }
@@ -254,106 +292,18 @@ impl Plan {
                 });
                 outcome.errors += 1;
             }
-            return Ok(outcome);
+            return Ok(None);
         }
         let mut expression = self.expression.clone();
-        if let Err(error) = resolve_references(&mut expression, source.catalog()) {
+        if let Err(error) = resolve_references(&mut expression, catalog) {
             effects.error(&WalkError {
                 path: ".".into(),
                 error,
             });
             outcome.errors += 1;
-            return Ok(outcome);
+            return Ok(None);
         }
-        let mut control = Control::default();
-        let mut descend = true;
-        let buffered = output::needs_record(&expression);
-        let mut record = output::Record::default();
-        let gate = std::sync::Mutex::new(());
-        let quit = std::sync::atomic::AtomicBool::new(false);
-        while let Some(item) =
-            source.next_with(descend, &mut || control.actions.flush(effects, true))
-        {
-            descend = true;
-            let entry = match item {
-                Ok(entry) => entry,
-                Err(error) => {
-                    effects.error(&error);
-                    outcome.errors += 1;
-                    continue;
-                }
-            };
-            if entry.depth() < self.options.min_depth {
-                continue;
-            }
-            control.prune = false;
-            control.quit = false;
-            if let Err(error) = control.actions.change_directory(entry.path(), effects) {
-                effects.error(&WalkError {
-                    path: entry.path().to_owned(),
-                    error,
-                });
-                outcome.errors += 1;
-                break;
-            }
-            let result = if buffered {
-                let mut output = output::EntryEffects {
-                    host: effects,
-                    record: &mut record,
-                    gate: &gate,
-                    quit: &quit,
-                };
-                let result = evaluate(&expression, entry, &mut output, &mut control);
-                let committed = output.commit(false);
-                committed
-                    .map_err(EvaluationError::Output)
-                    .and(result.map(|_| ()))
-            } else {
-                evaluate(&expression, entry, effects, &mut control).map(|_| ())
-            };
-            if let Err(error) = result {
-                let (error, stop) = match error {
-                    EvaluationError::Metadata(error) => (error, false),
-                    EvaluationError::Output(error) => (error, true),
-                };
-                effects.error(&WalkError {
-                    path: entry.path().to_owned(),
-                    error,
-                });
-                outcome.errors += 1;
-                descend = false;
-                if stop {
-                    break;
-                }
-                continue;
-            }
-            descend = !control.prune;
-            if control.quit
-                || control
-                    .cancelled
-                    .as_ref()
-                    .is_some_and(|quit| quit.load(std::sync::atomic::Ordering::Acquire))
-            {
-                break;
-            }
-        }
-        if let Err(error) = control.actions.flush(effects, false) {
-            effects.error(&WalkError {
-                path: ".".into(),
-                error,
-            });
-            outcome.errors += 1;
-        }
-        outcome.errors +=
-            action::flush_shared(&control.actions.shared, effects).unwrap_or_else(|error| {
-                effects.error(&WalkError {
-                    path: ".".into(),
-                    error,
-                });
-                1
-            });
-        outcome.errors += control.actions.errors;
-        Ok(outcome)
+        Ok(Some(expression))
     }
 }
 
@@ -398,45 +348,32 @@ fn leading_guard(expression: &Expression) -> Option<CandidateGuard> {
 }
 
 fn has_actions(expression: &Expression) -> bool {
-    match expression {
-        Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
-            has_actions(a) || has_actions(b)
-        }
-        Expression::Not(inner) => has_actions(inner),
-        Expression::Action(
-            action::Action::Exec(_)
-            | action::Action::Delete
-            | action::Action::Output(action::Target::File(..), _)
-            | action::Action::List(action::Target::File(..)),
-        ) => true,
-        _ => false,
-    }
+    let mut found = false;
+    expression.visit(&mut |leaf| found |= effectful(leaf));
+    found
 }
 
-/// Whether start operands run one after another. Actions can change what a
-/// later start sees, and `-quit` must stop at the first start that reaches it
-/// before a later start can report a missing path.
+fn effectful(leaf: &Expression) -> bool {
+    matches!(
+        leaf,
+        Expression::Action(
+            action::Action::Exec(_)
+                | action::Action::Delete
+                | action::Action::Output(action::Target::File(..), _)
+                | action::Action::List(action::Target::File(..))
+        )
+    )
+}
+
+/// Actions can change later starts; quit must precede a later missing start.
 fn sequential_starts(expression: &Expression) -> bool {
-    fn has_quit(expression: &Expression) -> bool {
-        match expression {
-            Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
-                has_quit(a) || has_quit(b)
-            }
-            Expression::Not(inner) => has_quit(inner),
-            Expression::Quit => true,
-            _ => false,
-        }
-    }
-    has_actions(expression) || has_quit(expression)
+    let mut sequential = false;
+    expression.visit(&mut |leaf| sequential |= effectful(leaf) || matches!(leaf, Expression::Quit));
+    sequential
 }
 
 fn expression_sections(expression: &Expression, out: &mut Vec<ferret_catalog::Section>) {
-    match expression {
-        Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
-            expression_sections(a, out);
-            expression_sections(b, out);
-        }
-        Expression::Not(inner) => expression_sections(inner, out),
+    expression.visit(&mut |leaf| match leaf {
         Expression::Test(test) => test.sections(out),
         Expression::Action(action::Action::Output(_, format)) => format.sections(out),
         Expression::Action(action::Action::List(_)) => out.extend([
@@ -449,22 +386,17 @@ fn expression_sections(expression: &Expression, out: &mut Vec<ferret_catalog::Se
             ferret_catalog::Section::Mtime,
         ]),
         _ => {}
-    }
+    });
 }
 
 fn resolve_references(
     expression: &mut Expression,
     catalog: Option<&ferret_catalog::Catalog>,
 ) -> io::Result<()> {
-    match expression {
-        Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
-            resolve_references(a, catalog)?;
-            resolve_references(b, catalog)
-        }
-        Expression::Not(inner) => resolve_references(inner, catalog),
+    expression.try_visit_mut(&mut |leaf| match leaf {
         Expression::Test(test) => test.resolve_reference(catalog),
         _ => Ok(()),
-    }
+    })
 }
 
 fn evaluate(
@@ -496,11 +428,9 @@ fn evaluate(
         Expression::Not(inner) => !evaluate(inner, entry, effects, control)?,
         Expression::Name(pattern) => pattern.matches(entry.name()),
         Expression::Path(pattern) => pattern.matches(entry.path().as_os_str().as_bytes()),
-        Expression::Type(kinds) => kinds.contains(
-            &entry
-                .kind()
-                .map_err(|error| EvaluationError::Metadata(walk::copy_error(error)))?,
-        ),
+        Expression::Type(kinds) => {
+            kinds.contains(&entry.kind().map_err(EvaluationError::Metadata)?)
+        }
         Expression::Constant(value) => *value,
         Expression::Print(nul) => {
             effects
@@ -511,10 +441,8 @@ fn evaluate(
         Expression::Prune => {
             // GNU needs the stat of anything but a directory here: a file an
             // earlier -exec removed makes `-prune` report it and exit 1.
-            if entry.catalog.is_none() && !matches!(entry.kind(), Ok(FileKind::Directory)) {
-                entry
-                    .metadata()
-                    .map_err(|error| EvaluationError::Metadata(walk::copy_error(error)))?;
+            if entry.catalog().is_none() && !matches!(entry.kind(), Ok(FileKind::Directory)) {
+                entry.metadata().map_err(EvaluationError::Metadata)?;
             }
             control.prune = true;
             true

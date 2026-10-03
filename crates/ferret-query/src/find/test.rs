@@ -7,7 +7,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{Entry, FileKind};
+use ferret_verify::FindRegex;
+
+use super::{Entry, FileKind, glob};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Order {
@@ -26,6 +28,9 @@ pub(super) struct Number {
 /// source before execution.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Test {
+    Regex(FindRegex),
+    Link(glob::Pattern),
+    Xtype(Vec<FileKind>),
     Reference {
         path: PathBuf,
         follow: bool,
@@ -117,7 +122,7 @@ impl Test {
             | Self::NoUser
             | Self::NoGroup => vec![Owner],
             Self::SameFile { .. } | Self::FsType(_) => vec![Dev, Ino],
-            Self::Access(_) => vec![],
+            Self::Access(_) | Self::Regex(_) | Self::Link(_) | Self::Xtype(_) => vec![],
         });
     }
 
@@ -280,7 +285,7 @@ impl Test {
         if *follow {
             entry = Entry::new(fs::canonicalize(&*path)?, 0, FileKind::File);
         }
-        let stat = entry.metadata().map_err(super::walk::copy_error)?;
+        let stat = entry.metadata()?;
         *self = if *same_file {
             Self::SameFile {
                 dev: stat.dev(),
@@ -301,8 +306,14 @@ impl Test {
     }
 
     pub(super) fn evaluate(&self, entry: &Entry) -> std::io::Result<bool> {
-        let stat = entry.stat()?;
         Ok(match self {
+            Self::Regex(regex) => regex
+                .try_is_match(entry.path().as_os_str().as_bytes())
+                .map_err(std::io::Error::other)?,
+            Self::Link(pattern) => {
+                entry.kind()? == FileKind::Symlink && pattern.matches(&entry.link_target()?)
+            }
+            Self::Xtype(kinds) => kinds.contains(&entry.opposite_kind()?),
             Self::Reference { .. } => {
                 let mut test = self.clone();
                 test.resolve_reference(None)?;
@@ -313,13 +324,8 @@ impl Test {
                 conditional,
                 order,
             } => {
-                let actual = stat.mode() & 0o7777;
-                let conditional = if *conditional != 0
-                    && entry
-                        .kind()
-                        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?
-                        == FileKind::Directory
-                {
+                let actual = entry.stat()?.mode() & 0o7777;
+                let conditional = if *conditional != 0 && entry.kind()? == FileKind::Directory {
                     *conditional
                 } else {
                     0
@@ -332,7 +338,7 @@ impl Test {
                 }
             }
             Self::Size { units, bytes } => {
-                let size = stat.size().div_ceil(*bytes);
+                let size = entry.stat()?.size().div_ceil(*bytes);
                 compare(size, units.value as u64, units.order)
             }
             Self::Time {
@@ -388,14 +394,14 @@ impl Test {
                     }
                 }
             }
-            Self::Links(n) => compare(stat.nlink(), n.value as u64, n.order),
-            Self::Inum(n) => compare(stat.ino(), n.value as u64, n.order),
-            Self::Uid(n) => compare(stat.uid() as u64, n.value as u64, n.order),
-            Self::Gid(n) => compare(stat.gid() as u64, n.value as u64, n.order),
-            Self::User(uid) => stat.uid() == *uid,
-            Self::Group(gid) => stat.gid() == *gid,
-            Self::NoUser => !user_exists(stat.uid()),
-            Self::NoGroup => !group_exists(stat.gid()),
+            Self::Links(n) => compare(entry.stat()?.nlink(), n.value as u64, n.order),
+            Self::Inum(n) => compare(entry.stat()?.ino(), n.value as u64, n.order),
+            Self::Uid(n) => compare(entry.stat()?.uid() as u64, n.value as u64, n.order),
+            Self::Gid(n) => compare(entry.stat()?.gid() as u64, n.value as u64, n.order),
+            Self::User(uid) => entry.stat()?.uid() == *uid,
+            Self::Group(gid) => entry.stat()?.gid() == *gid,
+            Self::NoUser => !user_exists(entry.stat()?.uid()),
+            Self::NoGroup => !group_exists(entry.stat()?.gid()),
             Self::Newer { field, stamp } => {
                 let actual = if *field == TimeField::Birth {
                     birth_stamp(entry.path()).ok_or_else(|| {
@@ -409,12 +415,12 @@ impl Test {
                 };
                 actual > *stamp
             }
-            Self::SameFile { dev, ino } => stat.dev() == *dev && stat.ino() == *ino,
-            Self::Empty => match entry
-                .kind()
-                .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?
-            {
-                FileKind::File => stat.size() == 0,
+            Self::SameFile { dev, ino } => {
+                let stat = entry.stat()?;
+                stat.dev() == *dev && stat.ino() == *ino
+            }
+            Self::Empty => match entry.kind()? {
+                FileKind::File => entry.stat()?.size() == 0,
                 // Raw indexed counts include ignored names. Opaque/live
                 // directories have no count and use their live listing.
                 FileKind::Directory => match entry.has_children() {
@@ -424,7 +430,7 @@ impl Test {
                 _ => false,
             },
             Self::Access(access) => rustix::fs::access(entry.path(), *access).is_ok(),
-            Self::FsType(wanted) => filesystem_type(stat.dev()) == Some(wanted.as_str()),
+            Self::FsType(wanted) => filesystem_type(entry.stat()?.dev()) == Some(wanted.as_str()),
         })
     }
 }
@@ -555,7 +561,7 @@ fn entry_stamp(entry: &Entry, field: TimeField) -> std::io::Result<i128> {
     let stat = entry.stat()?;
     Ok(match field {
         TimeField::Access => {
-            let live = entry.metadata().map_err(super::walk::copy_error)?;
+            let live = entry.metadata()?;
             timestamp(live.atime(), live.atime_nsec())
         }
         TimeField::Change => timestamp(stat.ctime(), stat.ctime_nsec()),
@@ -877,7 +883,7 @@ fn device(major: u64, minor: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+
     use super::*;
     use std::fs::FileTimes;
     use std::os::unix::fs::{PermissionsExt, symlink};

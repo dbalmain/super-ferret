@@ -1395,7 +1395,6 @@ fn check_dir_names(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
 
     use std::io::Write;
 

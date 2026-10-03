@@ -378,11 +378,11 @@ impl Parser<'_> {
                 let value = self.argument(&primary)?.to_owned();
                 let regex = FindRegex::new(value.as_bytes(), self.dialect, primary == "-iregex")
                     .map_err(|error| ParseError::Feature(error.to_string()))?;
-                Expression::Action(Action::Regex(regex))
+                Expression::Test(super::test::Test::Regex(regex))
             }
             b"-lname" | b"-ilname" => {
                 let value = self.argument(&primary)?;
-                Expression::Action(Action::Link(super::glob::Pattern::new(
+                Expression::Test(super::test::Test::Link(super::glob::Pattern::new(
                     value.as_bytes(),
                     primary == "-ilname",
                 )))
@@ -406,9 +406,10 @@ impl Parser<'_> {
                     .ok_or_else(|| invalid(&primary, &value))?;
                 constant
             }
-            b"-xtype" => {
-                Expression::Action(Action::Xtype(kinds(&primary, self.argument(&primary)?)?))
-            }
+            b"-xtype" => Expression::Test(super::test::Test::Xtype(kinds(
+                &primary,
+                self.argument(&primary)?,
+            )?)),
             b"-perm" => {
                 let value = self.argument(&primary)?;
                 if value.as_bytes().starts_with(b"+") || !valid_mode(value.as_bytes()) {

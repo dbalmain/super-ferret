@@ -14,13 +14,16 @@ use super::{Effects, WalkError};
 const MEMORY_LIMIT: usize = 64 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// Bounded output capture. Up to 64 KiB stays in memory; larger streams spill
+/// to a private, unlinked temporary file. Capture before locking the
+/// destination, then write the complete stream while holding that lock.
 #[derive(Default)]
-struct Spool {
+pub struct OutputBuffer {
     bytes: Vec<u8>,
     file: Option<File>,
 }
 
-impl Write for Spool {
+impl Write for OutputBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if self.file.is_none() && self.bytes.len() + bytes.len() > MEMORY_LIMIT {
             loop {
@@ -60,7 +63,12 @@ impl Write for Spool {
     }
 }
 
-impl Spool {
+impl OutputBuffer {
+    /// Writes all captured bytes to the destination, preserving their order.
+    pub fn write_to(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        self.emit(|bytes| writer.write_all(bytes))
+    }
+
     fn emit(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
         if let Some(file) = &mut self.file {
             file.rewind()?;
@@ -85,8 +93,8 @@ impl Spool {
 
 #[derive(Default)]
 pub(super) struct Record {
-    stdout: Spool,
-    files: Vec<(Arc<Mutex<io::BufWriter<File>>>, Spool)>,
+    stdout: OutputBuffer,
+    files: Vec<(Arc<Mutex<io::BufWriter<File>>>, OutputBuffer)>,
 }
 
 pub(super) struct EntryEffects<'a, E> {
@@ -164,7 +172,9 @@ impl<E: Effects> Effects for EntryEffects<'_, E> {
         {
             Some(index) => index,
             None => {
-                self.record.files.push((file.clone(), Spool::default()));
+                self.record
+                    .files
+                    .push((file.clone(), OutputBuffer::default()));
                 self.record.files.len() - 1
             }
         };
@@ -197,20 +207,17 @@ impl<E: Effects> Effects for EntryEffects<'_, E> {
 // A single output primary is already a whole entry record. Preserve that
 // common path's worker buffer without adding a lock for every selected file.
 pub(super) fn needs_record(expression: &super::Expression) -> bool {
-    fn count(expression: &super::Expression) -> usize {
-        use super::Expression;
-        match expression {
-            Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
-                count(a).saturating_add(count(b))
-            }
-            Expression::Not(inner) => count(inner),
+    use super::Expression;
+    let mut count = 0usize;
+    expression.visit(&mut |leaf| {
+        count = count.saturating_add(match leaf {
             Expression::Quit | Expression::Action(super::action::Action::Exec(_)) => 2,
             Expression::Print(_)
             | Expression::Action(
                 super::action::Action::Output(..) | super::action::Action::List(_),
             ) => 1,
             _ => 0,
-        }
-    }
-    count(expression) > 1
+        });
+    });
+    count > 1
 }

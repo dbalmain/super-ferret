@@ -10,7 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{Entry, FileKind, walk};
+use super::{Entry, FileKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Format(Vec<Directive>);
@@ -303,23 +303,27 @@ fn field(
             None => out.push(b'.'),
         },
         b'd' => write!(out, "{}", entry.depth())?,
-        b'y' => out.push(kind_letter(entry.kind().map_err(walk::copy_error)?)),
+        b'y' => out.push(kind_letter(entry.kind()?)),
         b'Y' => {
             let kind = match entry.referenced_kind() {
                 Ok(kind) => kind_letter(kind),
-                Err(error) if error.raw_os_error() == Some(40) => b'L',
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) =>
+                {
+                    b'L'
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => b'N',
                 Err(_) => b'?',
             };
             out.push(kind);
         }
         b'l' => {
-            if entry.kind().map_err(walk::copy_error)? == FileKind::Symlink {
+            if entry.kind()? == FileKind::Symlink {
                 out.extend_from_slice(&entry.link_target()?);
             }
         }
         b'F' => {
-            if entry.catalog.is_some() {
+            if entry.catalog().is_some() {
                 let dev = entry.stat()?.dev();
                 let name = super::test::filesystem_type(dev)
                     .ok_or_else(|| io::Error::other("indexed filesystem is no longer mounted"))?;
@@ -342,40 +346,24 @@ fn field(
                 b'D' => write!(out, "{}", stat.dev())?,
                 b'n' => write!(out, "{}", stat.nlink())?,
                 b'm' => write!(out, "{:o}", stat.mode() & 0o7777)?,
-                b'M' => out.extend_from_slice(&mode(
-                    stat.mode(),
-                    kind_letter(entry.kind().map_err(walk::copy_error)?),
-                )),
+                b'M' => out.extend_from_slice(&mode(stat.mode(), kind_letter(entry.kind()?))),
                 b'U' => write!(out, "{}", stat.uid())?,
                 b'G' => write!(out, "{}", stat.gid())?,
                 b'u' => out.extend_from_slice(owner(stat.uid(), false).as_bytes()),
                 b'g' => out.extend_from_slice(owner(stat.gid(), true).as_bytes()),
-                b'b' => write!(
-                    out,
-                    "{}",
-                    entry.metadata().map_err(walk::copy_error)?.blocks()
-                )?,
-                b'k' => write!(
-                    out,
-                    "{}",
-                    entry
-                        .metadata()
-                        .map_err(walk::copy_error)?
-                        .blocks()
-                        .div_ceil(2)
-                )?,
+                b'b' => write!(out, "{}", entry.metadata()?.blocks())?,
+                b'k' => write!(out, "{}", entry.metadata()?.blocks().div_ceil(2))?,
                 b'S' => {
                     let ratio = if stat.size() == 0 {
                         1.0
                     } else {
-                        entry.metadata().map_err(walk::copy_error)?.blocks() as f64 * 512.0
-                            / stat.size() as f64
+                        entry.metadata()?.blocks() as f64 * 512.0 / stat.size() as f64
                     };
                     general(ratio, precision.unwrap_or(6), alternate, out)?;
                 }
                 b'A' | b'a' => timestamp(
-                    entry.metadata().map_err(walk::copy_error)?.atime(),
-                    entry.metadata().map_err(walk::copy_error)?.atime_nsec(),
+                    entry.metadata()?.atime(),
+                    entry.metadata()?.atime_nsec(),
                     time,
                     out,
                 )?,
@@ -715,15 +703,12 @@ pub(super) fn list(entry: &Entry, out: &mut Vec<u8>) -> io::Result<()> {
             d.minute
         )?;
     }
-    let permissions = mode(
-        stat.mode(),
-        kind_letter(entry.kind().map_err(walk::copy_error)?),
-    );
+    let permissions = mode(stat.mode(), kind_letter(entry.kind()?));
     let size = if permissions[0] == b'b' || permissions[0] == b'c' {
         format!(
             "{:3}, {:3}",
-            rustix::fs::major(entry.metadata().map_err(walk::copy_error)?.rdev()),
-            rustix::fs::minor(entry.metadata().map_err(walk::copy_error)?.rdev())
+            rustix::fs::major(entry.metadata()?.rdev()),
+            rustix::fs::minor(entry.metadata()?.rdev())
         )
     } else {
         stat.size().to_string()
@@ -732,11 +717,7 @@ pub(super) fn list(entry: &Entry, out: &mut Vec<u8>) -> io::Result<()> {
         out,
         "{:9} {:6} {} {:3} {:8} {:8} {:>8} {} ",
         stat.ino(),
-        entry
-            .metadata()
-            .map_err(walk::copy_error)?
-            .blocks()
-            .div_ceil(2),
+        entry.metadata()?.blocks().div_ceil(2),
         String::from_utf8_lossy(&permissions),
         stat.nlink(),
         owner(stat.uid(), false),
@@ -745,7 +726,7 @@ pub(super) fn list(entry: &Entry, out: &mut Vec<u8>) -> io::Result<()> {
         String::from_utf8_lossy(&date)
     )?;
     escaped(entry.path().as_os_str().as_bytes(), out)?;
-    if entry.kind().map_err(walk::copy_error)? == FileKind::Symlink {
+    if entry.kind()? == FileKind::Symlink {
         out.extend_from_slice(b" -> ");
         escaped(&entry.link_target()?, out)?;
     }

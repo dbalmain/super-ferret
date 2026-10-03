@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use ferret_catalog::Catalog;
 
-use ferret_query::find::{Effects, Plan, WalkError};
+use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
 
 use crate::cli::{self, Exit};
 use crate::xdg::Dirs;
@@ -135,12 +135,12 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     }
 }
 
-struct Output {
-    writer: Arc<Mutex<BufWriter<io::Stdout>>>,
+struct Output<W: Write = io::Stdout> {
+    writer: Arc<Mutex<BufWriter<W>>>,
     buffer: Vec<u8>,
 }
 
-impl Clone for Output {
+impl<W: Write> Clone for Output<W> {
     fn clone(&self) -> Self {
         Self {
             writer: self.writer.clone(),
@@ -149,7 +149,7 @@ impl Clone for Output {
     }
 }
 
-impl Output {
+impl<W: Write> Output<W> {
     fn record(&mut self, bytes: &[u8], terminator: &[u8]) -> io::Result<()> {
         if self.buffer.len() + bytes.len() + terminator.len() > OUTPUT_BUFFER {
             self.flush()?;
@@ -160,7 +160,7 @@ impl Output {
     }
 }
 
-impl Effects for Output {
+impl<W: Write> Effects for Output<W> {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
         self.record(path.as_os_str().as_bytes(), if nul { b"\0" } else { b"\n" })
     }
@@ -181,11 +181,13 @@ impl Effects for Output {
 
     fn command(&mut self, command: &mut Command) -> io::Result<bool> {
         self.flush()?;
+        let mut output = OutputBuffer::default();
+        let success = self.capture(command, &mut output)?;
         let shared = self.writer.clone();
         let mut writer = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let success = self.capture(command, &mut *writer)?;
+        output.write_to(&mut *writer)?;
         writer.flush()?;
         Ok(success)
     }
@@ -241,7 +243,7 @@ fn parse_config(text: &str) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_config;
+    use super::*;
 
     #[test]
     fn config_accepts_one_boolean_and_rejects_ambiguous_settings() {
@@ -255,5 +257,99 @@ mod tests {
         ] {
             assert!(parse_config(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn a_batch_child_does_not_hold_back_another_workers_output() {
+        // Two executor workers share the real CLI writer. A final execdir
+        // batch waits for the other worker's committed output before exiting;
+        // capturing under the writer lock used to make that wait time out.
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        struct Sink(mpsc::Sender<Vec<u8>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.send(bytes.to_vec()).map_err(io::Error::other)?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("ferret-r1-output-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let entry = directory.join("entry");
+        std::fs::write(&entry, b"").unwrap();
+        let started = directory.join("started");
+        let release = directory.join("release");
+        let args = vec![
+            OsString::from("-I"),
+            entry.clone().into_os_string(),
+            "-maxdepth".into(),
+            "0".into(),
+            "-execdir".into(),
+            "timeout".into(),
+            "8".into(),
+            "sh".into(),
+            "-c".into(),
+            ": > \"$1\"; while ! test -e \"$2\"; do sleep 0.01; done; head -c 70000 /dev/zero"
+                .into(),
+            "sh".into(),
+            started.clone().into_os_string(),
+            release.clone().into_os_string(),
+            "{}".into(),
+            "+".into(),
+        ];
+        let plan = Plan::parse(&args).unwrap();
+        let (sent, received) = mpsc::channel();
+        let effects = Output {
+            writer: Arc::new(Mutex::new(BufWriter::new(Sink(sent)))),
+            buffer: Vec::new(),
+        };
+        let slow = effects.clone();
+        let batch =
+            std::thread::spawn(move || plan.run_parallel(plan.live_source(), slow, 1).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !started.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_started = started.exists();
+        let fast = effects.clone();
+        let fast_plan = Plan::parse(&[
+            OsString::from("-I"),
+            entry.into_os_string(),
+            "-maxdepth".into(),
+            "0".into(),
+            "-printf".into(),
+            "fast\n".into(),
+        ])
+        .unwrap();
+        let other = std::thread::spawn(move || {
+            fast_plan
+                .run_parallel(fast_plan.live_source(), fast, 1)
+                .unwrap()
+        });
+        let first = received.recv_timeout(Duration::from_secs(2));
+        // Release and await both children before asserting, including failures.
+        std::fs::write(&release, b"").unwrap();
+        let batch = batch.join().unwrap();
+        let other = other.join().unwrap();
+        let mut bytes = Vec::new();
+        if let Ok(first) = &first {
+            bytes.extend_from_slice(first);
+        }
+        bytes.extend(received.try_iter().flatten());
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(child_started, "batch child did not start within 3 seconds");
+        assert_eq!(
+            first.unwrap(),
+            b"fast\n",
+            "another worker's output was held back"
+        );
+        assert_eq!(batch.errors + other.errors, 0);
+        assert_eq!(bytes.len(), 5 + 70000);
+        assert!(bytes[5..].iter().all(|byte| *byte == 0));
     }
 }

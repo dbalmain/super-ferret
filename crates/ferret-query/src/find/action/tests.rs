@@ -1,6 +1,5 @@
 //! Real effects and filesystem fixtures; the ignored differential extension
 //! compares the same tree, including tree mutations and output-file contents.
-#![allow(clippy::unwrap_used)] // Test setup failures should point at the fixture.
 
 use std::fs;
 use std::io;
@@ -134,7 +133,7 @@ fn exec_substitution_truth_and_spawn_errors_use_the_real_process_path() {
     assert_eq!(outcome.errors, 0);
     let path = tree.0.to_string_lossy();
     assert_eq!(output.bytes, format!("x{path}y:{path}{path}\n").as_bytes());
-    assert_eq!(output.flushes, 2); // Before spawning, then while committing the entry.
+    assert_eq!(output.flushes, 3); // Spawn, entry commit, and task completion.
     let (outcome, output) = tree.run(&["-maxdepth", "0", "-exec", "false", ";", "-o", "-print"]);
     assert_eq!(outcome.errors, 0);
     assert!(!output.bytes.is_empty());
