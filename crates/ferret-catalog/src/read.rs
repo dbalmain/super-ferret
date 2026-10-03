@@ -24,8 +24,8 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::batch::{Stat, WorkTreeKind};
 use crate::format::{
@@ -235,10 +235,12 @@ pub struct WorkTree<'a> {
 
 /// One generation of the catalog. It stays valid however many commits
 /// follow: an opened catalog holds its file, not its path, so a generation
-/// replaced mid-query stays readable (D32).
+/// replaced mid-query stays readable (D32). Cloning shares the descriptor and
+/// checked buffers; it never copies checkpoint payloads.
+#[derive(Clone)]
 pub struct Catalog {
     layout: Layout,
-    source: Source,
+    source: Arc<Source>,
 }
 
 enum Source {
@@ -302,12 +304,12 @@ impl Catalog {
         manifest.check(&layout).map_err(OpenError::Decode)?;
         Ok(Catalog {
             layout,
-            source: Source::File {
+            source: Arc::new(Source::File {
                 file,
                 sections: Default::default(),
                 read: AtomicU64::new(head.len() as u64),
                 facts: Facts::default(),
-            },
+            }),
         })
     }
 
@@ -386,7 +388,7 @@ impl Catalog {
         let layout = format::decode(&bytes)?;
         Ok(Catalog {
             layout,
-            source: Source::Whole(bytes),
+            source: Arc::new(Source::Whole(bytes)),
         })
     }
 
@@ -410,7 +412,7 @@ impl Catalog {
             sections,
             read,
             facts,
-        } = &self.source
+        } = self.source.as_ref()
         else {
             return Ok(());
         };
@@ -440,7 +442,7 @@ impl Catalog {
     /// Whether `section` is loaded. A reader from [`Catalog::from_bytes`]
     /// has every section.
     pub fn is_loaded(&self, section: Section) -> bool {
-        match &self.source {
+        match self.source.as_ref() {
             Source::Whole(_) => true,
             Source::File { sections, .. } => sections[section as usize].get().is_some(),
         }
@@ -449,7 +451,7 @@ impl Catalog {
     /// Bytes read from the file so far: the head of the file and each loaded
     /// section. For a reader from [`Catalog::from_bytes`], the whole file.
     pub fn bytes_read(&self) -> u64 {
-        match &self.source {
+        match self.source.as_ref() {
             Source::Whole(bytes) => bytes.len() as u64,
             Source::File { read, .. } => read.load(Ordering::Relaxed),
         }
@@ -464,7 +466,7 @@ impl Catalog {
     }
 
     fn section(&self, section: Section) -> &[u8] {
-        match &self.source {
+        match self.source.as_ref() {
             Source::Whole(bytes) => self.layout.section(bytes, section),
             Source::File { sections, .. } => sections[section as usize]
                 .get()

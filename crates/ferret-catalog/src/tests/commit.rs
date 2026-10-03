@@ -242,3 +242,21 @@ fn a_first_publication_syncs_every_ancestor_of_the_index_directory() {
     // Later generations sync only the index directory, after the rename.
     assert_eq!(synced_during(publish), [dir]);
 }
+
+#[test]
+fn catalog_clones_share_lazy_checked_buffers_after_checkpoint_retirement() {
+    let scratch = Scratch::new("shared-reader");
+    commit(&scratch.path, |txn| fill(txn, &["old"]));
+    let reader = Catalog::open(&scratch.path).unwrap().unwrap();
+    let shared = reader.clone();
+    commit(&scratch.path, |txn| fill(txn, &["new"]));
+    shared.load(&[crate::Section::Names]).unwrap();
+    assert!(reader.is_loaded(crate::Section::Names));
+    let bytes = reader.bytes_read();
+    reader.load(&[crate::Section::Names]).unwrap();
+    assert_eq!(reader.bytes_read(), bytes);
+    assert_eq!(reader.name_heap().as_ptr(), shared.name_heap().as_ptr());
+    assert_eq!(reader.generation(), shared.generation());
+    reader.load_all().unwrap();
+    assert_eq!(names(&reader), ["/g/old"]);
+}

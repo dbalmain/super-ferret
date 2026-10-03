@@ -564,6 +564,38 @@ track transaction framing rather than replay. Recovery deliberately loads all
 published payloads before allowing a writer to append; that is not header-only
 query opening. Overlay construction/replay and crawl production remain M3/M4.
 
+### S1+ M3 — Scoped section verification experiment (2026-10-04)
+
+The separable M3 startup experiment was **reverted**: scoped concurrent section
+reads/BLAKE3 checks recovered 23.03 ms (48.0% of M2's 47.94 ms name-open cost),
+rather than most of it, and the prototype added 88 lines. Structural checks
+remained serial in dependency order after digests passed; only requested sections
+and their dependencies were fetched. Section-level integrity stays as accepted.
+The larger full-open gain below is recorded without changing the requested keep
+criterion.
+
+The actual merged serial baseline is `a979412`; the parallel arm is that source
+plus the preserved prototype patch, with **no catalog format or dependency
+change**. Release builds used the same compiler on the Ryzen 9 9955HX, Linux
+6.18.43/ext4/NVMe. The no-log 10,448,739-name v4 fixture is the same imported
+checkpoint as M1/M2. One warm-up then 13 fresh-process samples per arm/set,
+paired **AB/BA**. Before every invocation the host runner checked uptime and the
+required pgrep; no competing timing was found. All four XDG paths and FERRET_INDEX
+were isolated under `/tmp/s1plus-m3-measure`.
+
+| Open | Serial median, ms | Scoped median, ms | Saved | Source command | Source | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Names | 308.68 | 285.65 | 23.03 ms / 7.5% | `{serial,parallel}-bench open-once "$I" names` | `a979412`, parallel + archived patch | 1.94–3.34 / 2.32–2.61 / 2.18–2.28 |
+| Full | 635.54 | 477.80 | 157.74 ms / 24.8% | `{serial,parallel}-bench open-once "$I" full` | same | same |
+
+Binaries were `/tmp/s1plus-m3-{serial,parallel}-bench`,
+`I=/tmp/s1plus-m3-measure/index`; complete commands, individual load checks,
+raw samples/RSS, compiler and binary/patch SHA256s are preserved in
+`/home/dave/w/super-ferret/.ai/s1plus-m3-measurements/`. The saved prototype can
+be applied to the recorded baseline to reproduce the parallel arm. A dominant
+NameHeap section limits concurrency between sections; recovering the remaining
+cost needs work beyond this requested small experiment.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes
