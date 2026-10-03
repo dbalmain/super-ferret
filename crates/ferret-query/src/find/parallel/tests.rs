@@ -299,7 +299,7 @@ fn start_donation_uses_existing_effectful_plan_for_every_action_variant() {
 
 #[test]
 fn a_batch_boundary_output_failure_cancels_queued_workers() {
-    // change_directory can propagate host flush errors, not child chdir errors.
+    // Inject a host flush error at a batch directory boundary.
     // Task::step once returned false with quit set, bypassing Pool's latch and
     // allowing another queued task to evaluate after sequential execution
     // stopped.

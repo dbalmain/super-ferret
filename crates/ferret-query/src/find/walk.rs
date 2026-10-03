@@ -67,7 +67,8 @@ pub(super) fn kind(value: FileType) -> FileKind {
 /// An entry's cheap fields and one lazy lstat observation. Metadata failures
 /// are cached too, so repeated predicates never retry a vanished name. The live
 /// source lends one entry at a time and reuses its path buffer, so a borrowed
-/// entry is gone at the next fetch; nothing in an entry allocates per name.
+/// entry is gone at the next fetch. Successful metadata observations need no
+/// per-name allocation; cached failures share an owned error.
 #[derive(Clone)]
 pub struct Entry {
     path: Vec<u8>,
