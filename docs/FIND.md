@@ -21,8 +21,9 @@ Default mode opens the index named by `ferret --index DIR find …`, else
 and reads only the index sections the expression needs.
 
 Live mode opens no index and reads no configuration. It matches GNU apart from
-the order and concurrency rules and the known differences below. Help and version requests also
-skip the index and the configuration. Neither mode writes a query log.
+the order and concurrency rules and the known differences below. Help and
+version requests also skip the index and the configuration. Neither mode writes
+a query log.
 
 Both modes run the same parser and evaluator over the same depth-first walk;
 only the source of names and metadata differs.
