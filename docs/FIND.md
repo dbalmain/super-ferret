@@ -1,81 +1,222 @@
-# Find sources and freshness
+# `ferret find`
 
-`ferret find` answers from the index. Names, kinds, visibility, size, permissions,
-ownership, link counts, inode/device identity, mtime and ctime (including
-nanoseconds) describe the last indexing observation. New names are absent;
-deleted names and old metadata remain queryable until re-indexing. Re-index
-when changing ignore policy. The daemon will maintain freshness in a later slice.
+The contract for `ferret find [-I] [-H|-L|-P] [PATH...] [EXPRESSION]`: GNU find
+syntax, answered from the index by default. Anything this page does not promise
+is not promised. Why each choice was made is in [DECISIONS.md](DECISIONS.md)
+(D47 and D50); what was built when, and what it measured, is in
+[ROADMAP.md § S1c](ROADMAP.md#s1c--ferret-find-in-find1-syntax).
 
-Read-only start operands may overlap. Starts run one after another when the
-expression has an action or `-quit`;
-siblings within each start may interleave.
-A parent's expression completes before its children start; `-depth` and
-`-delete` complete children first. `-prune` stops descent. Live traversal, including default-mode live
-fallbacks, uses a bounded worker pool. Catalog work also uses workers where
-measurements show a gain; shallow catalog walks stay on the caller thread.
+"GNU" throughout means GNU findutils 4.11.0, which the differential tests run
+against.
 
-Workers evaluate whole expressions and run actions concurrently. `-exec`'s
-exit status gates its remaining expression. Everything one entry produces,
-including child stdout and output-file records,
-commits together when its expression ends. Child stdout is drained while the
-command runs; output above 64 KiB per stream spills to a private, unlinked
-temporary file. Temporary storage grows with the entry's output, while memory
-stays bounded per stream and worker. Interactive prompts are serialized.
-Each ordinary `-exec … {} +` action has one shared batch across workers and
-starts, flushed at the argument limit and once at exit. Full batches are taken
-under the lock, then run outside it while workers collect the next batch.
-Workers stage at most 32 paths, merging at 4 KiB of path bytes (an oversized
-path merges immediately). Staged arguments merge on task completion, including
-quit. Only the shared batch partitions arguments. Argument order is free;
-`-execdir` retains directory-local boundaries. `-quit` commits the winning entry
-under the output lock and discards entries finishing later. Collected batches
-still flush at exit. Started commands and prompts finish and are awaited
-(DECISIONS option A). Errors are reported on stderr and set exit status 1,
-except that GNU treats a failed `-exec … ;` launch as
-a false test without changing exit status.
+## Modes
 
-The catalog's raw directory entry count includes ignored names, so `-empty`
-answers exact **indexed** emptiness. Successful `-delete` actions subtract this walk's removals from
-that observation, including across worker tasks. Nested indexed roots supply their missing boundary edges from
-root records. Re-included ancestors are ordinary visible directories.
+| Mode    | Selected by                                      | Answers from                                                     |
+| ------- | ------------------------------------------------ | ---------------------------------------------------------------- |
+| default | nothing                                          | the index: names, kinds, visibility and metadata as last indexed |
+| live    | leading `-I` or `--no-ignore`, or the config key | the disk, now, with no ignore rules                              |
 
-Explicit ignored starts, suffixes below opaque markers, and unreadable opaque
-directories walk live without nested ignore rules. Ignored reference operands
-use live metadata; indexed references use stored metadata. Fields not stored
-(access time, birth time, allocated blocks, and device major/minor numbers) need
-live observations only when the corresponding primary or format asks for them.
-Atime and block-column measurements are complete; their storage/fallback
-tradeoff remains open under milestone 5a's decision rule. Logical symlink
-following uses stored targets where indexed and live targets where no row
-exists.
+Default mode opens the index named by `ferret --index DIR find …`, else
+`$FERRET_INDEX`, else `$XDG_DATA_HOME/ferret` (default `~/.local/share/ferret`),
+and reads only the index sections the expression needs.
 
-`ferret find -I` / `--no-ignore` is the unrestricted live mode. It opens no index
-and reads no configuration. Set `find_no_ignore = true` in
-`$XDG_CONFIG_HOME/ferret/config` (default `~/.config/ferret/config`) to use it by
-default. Missing/empty config means false; comments and blank lines are accepted;
-unknown, duplicate or malformed settings fail. Neither mode logs queries.
+Live mode opens no index and reads no configuration. It matches GNU apart from
+the order and concurrency rules and the known differences below. Help and
+version requests also skip the index and the configuration. Neither mode writes
+a query log.
 
-Missing/incompatible indexes and unresolved explicit starts fail with status 1
-and re-index/`-I` guidance. Successful selected deletions exit 0, including when
-ignored files were skipped. A visible directory containing ignored files can
-fail with ENOTEMPTY and exit 1.
+Both modes run the same parser and evaluator over the same depth-first walk;
+only the source of names and metadata differs.
 
-Effectful plans (`-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`,
-`-fprint`, `-fprint0`, `-fprintf`, `-fls`) validate live starts,
-observe which catalog names still exist when entering each directory, and open
-directories for descent errors and execdir handles. A later sibling removal
-does not hide a name already observed; a removed directory fails descent.
-Names created by actions remain absent from the snapshot. Stored predicates
-retain their indexed values. In default mode, `-empty` starts with the raw
-indexed child count, including ignored children, and subtracts successful
-removals made by this walk's `-delete`. It does not see removals made by
-`-exec` commands. Use `-delete` for this accounting or `-I` for live emptiness.
+## Freshness (default mode)
 
-Validation, full-corpus classification, missing-field costs and the complete
-warm timing table are recorded in
-`/home/dave/w/super-ferret/.ai/find-m5a-done.md`. The checked checkpoint passes
-all workspace gates and all eight fd-comparable timing rows. Milestone 5a is
-not complete until its two decision conflicts above are resolved.
+Default mode is an index query, like `locate`. Names, kinds, visibility and
+stored metadata describe the last `ferret index` run:
 
-M5c's parallel-idiom contract and validation are recorded in FIND-M5C.md and
-`/home/dave/w/super-ferret/.ai/find-m5c-done.md`.
+- a name created since then is absent, including one created by the command's
+  own actions;
+- a name deleted since then is still listed, and changed metadata still answers
+  with its old value, until the next index run.
+
+An expression with an effect on the tree or on files checks that names still
+exist. The effects are every form of `-exec`, `-execdir`, `-ok` and `-okdir`,
+`-delete`, and the file outputs `-fprint`, `-fprint0`, `-fprintf` and `-fls`.
+Such an expression lstats each start operand. On entering a directory it opens
+it and lstats each non-directory child, dropping the ones that have gone. A
+directory removed before the walk reaches it fails descent. A later sibling's
+removal does not hide a name already observed. Stored predicates such as
+`-mtime` and `-size` still answer from the index.
+
+Re-index after changing ignore rules: the index does not watch policy files, or
+anything inside an ignored tree. The daemon (S1b) will keep the index current;
+until then, `-I` asks about the disk as it is now.
+
+## Ignore rules (default mode)
+
+Paths excluded by the ignore rules (D13: the global rules, `.gitignore` and
+`.ferretignore`) do not exist to default mode, with these exceptions:
+
+- A start operand that names an ignored path, or a path beneath an ignored
+  directory, is walked live, without nested ignore rules. So is an indexed
+  directory that could not be read when it was indexed.
+- A re-included path's ancestors are ordinary visible directories.
+- An ignored reference operand (`-newer REF`, `-samefile REF` and the like)
+  resolves from the disk.
+- A directory's `-links`, `-size` and `-empty` count its ignored children, as
+  GNU sees them.
+
+A start or reference operand outside every indexed root fails, exit 1, with
+advice to re-index or use `-I`.
+
+A pasted `find … -delete` skips ignored files, and exits 0 when the deletions it
+selected succeed. Deleting a visible directory that still holds ignored files
+fails with ENOTEMPTY and exits 1, as a live `rmdir` would.
+
+## Stored and live metadata (default mode)
+
+The index stores, and default mode answers from: kind, size, mode, owner and
+group ids, link count, device and inode numbers, mtime and ctime with
+nanoseconds, symlink targets, and each directory's raw entry count, ignored
+entries included (F8 B).
+
+These are not stored (F13 A). They are read from the disk only when the
+expression asks for them:
+
+| Field                  | Asked for by                                                  |
+| ---------------------- | ------------------------------------------------------------- |
+| access time            | `-atime`, `-amin`, `-anewer`, `-used`, `-newera*`, `%a`, `%A` |
+| allocated blocks       | `-ls`, `%b`, `%k`                                             |
+| birth time             | `-newerB*`, `%B`                                              |
+| device major and minor | `-ls` on a device                                             |
+| access permission      | `-readable`, `-writable`, `-executable`                       |
+| filesystem type        | `-fstype` (the mount table, against the stored device)        |
+
+Entries walked live, under an ignored start or an unreadable directory, read
+everything from the disk. With `-H` or `-L`, a symlink is followed through the
+index when its target is indexed, and through the disk when it is not.
+
+## `-empty` (default mode)
+
+A file is empty when its stored size is zero. A directory is empty when its
+stored raw entry count, ignored entries included, minus the children this walk's
+own `-delete` has removed, is zero (F12 D). A directory walked live reads its
+listing.
+
+So `find . -depth -type d -empty -delete` removes the directories it empties, as
+GNU does. Removals made by a command are not seen: `-exec rmdir {} \;` leaves an
+emptied parent behind in default mode. Use `-delete`, or `-I`.
+
+## Order
+
+Three rules, in both modes:
+
+- a parent's expression completes before its children start;
+- under `-depth` or `-delete`, children complete before their parent;
+- `-prune` stops descent below the entry it is true for.
+
+No other order is promised (F10 B): not sibling order, not the order of start
+operands that overlap, not argument order within an `-exec … +` batch, and not
+which entry reaches `-quit` first. Output with no record separator, such as
+`-printf '%s'`, concatenates in whatever order entries finish.
+
+## Start operands
+
+Start operands run one after another, in operand order, when the expression has
+an effect (listed under Freshness) or `-quit`. Otherwise they may overlap.
+Printing to stdout with `-print`, `-printf` or `-ls` alone does not sequence
+them.
+
+`-quit` sequences starts because GNU stops inside the first start that reaches
+it; a later start running alongside could otherwise report a missing path and
+exit 1 first.
+
+## Concurrency and output
+
+The walk runs on a pool of up to min(16, CPUs) workers, capped at 8 for catalog
+walks and for `-maxdepth` 2 or less. A catalog walk with `-maxdepth` 2 or less
+stays on the calling thread, apart from directories it walks live and start
+operands that may overlap. `-maxdepth 0`, or a single CPU, starts no pool.
+
+Each worker evaluates whole expressions and runs their commands itself (F11 A).
+An `-exec … ;` is a test: its exit status decides whether the rest of the
+expression runs for that entry. Commands for different entries run concurrently,
+so commands with clashing side effects can leave a different tree from run to
+run.
+
+**An entry's output commits whole.** Everything one entry writes — its prints,
+`-printf` and `-ls` records, its commands' stdout, and its records for `-fprint`
+files — is written together when its expression ends, and never interleaves with
+another entry's. A command's stdout is a pipe, drained while it runs. Up to 64
+KiB per stream is held in memory; beyond that the stream spills to a private,
+unlinked file in `$TMPDIR`, so memory stays bounded while temporary storage
+grows with the entry's output. A command's stderr and stdin are inherited, not
+captured. `-ok` and `-okdir` prompts are serialised, and their commands run with
+stdin closed, as in GNU.
+
+**`-exec … {} +` uses one shared batch per action**, across all workers and
+start operands. A batch runs when the next argument would pass the argument
+limit, and once at exit. Batch boundaries follow the limit GNU uses; argument
+order within a batch is free. Full batches run outside the batch's lock while
+workers keep collecting, so two batches of one action may run at once. Workers
+stage up to 32 paths, or 4 KiB of path bytes, before merging into the shared
+batch. A batch command's stdout is written whole. `-execdir … {} +` batches stay
+per worker and per directory, and run when that worker's directory changes.
+
+**`-quit` commits exactly one winning entry.** The first entry to reach `-quit`
+commits its output and latches the quit; entries that finish later discard
+theirs, and no new entry starts. Commands and prompts already running finish and
+are waited for (DECISIONS, Find M5b, option A). Collected batches, shared,
+staged and per-directory, run at exit.
+
+## Configuration
+
+`$XDG_CONFIG_HOME/ferret/config` (default `~/.config/ferret/config`) holds one
+setting:
+
+```text
+# make -I the default
+find_no_ignore = true
+```
+
+The value is `true` or `false`. Blank lines and `#` comments, including at the
+end of a line, are allowed. A missing or empty file means `false`. Any other
+key, a duplicate, or a malformed value fails with exit 1. Explicit `-I` does not
+read the file.
+
+## Exit status
+
+`0` when every operation succeeded, whether or not anything matched. `1` for any
+error:
+
+- a usage or parse error, or a recognised feature that is not implemented;
+- in default mode, a missing or incompatible index, a start or reference operand
+  outside every indexed root, or a bad config file;
+- a traversal or metadata error, which is reported while the walk continues;
+- a failed `-delete`, or an `-exec … +` or `-execdir … +` batch whose command
+  fails;
+- a failure writing output, which stops the walk.
+
+An `-exec … ;` or `-ok … ;` whose command fails, or cannot be launched, is a
+false test and leaves the status unchanged; a launch failure is reported on
+stderr.
+
+## Known differences from GNU find
+
+Beyond the order rules:
+
+- **Default mode:** the ignore rules, freshness and `-empty` behaviour above.
+- **Concurrent commands** (F11 A). Under `-L`, two links to one directory can
+  send concurrent `rm` commands at the same files, and the outcome varies from
+  run to run.
+- **Command stdout is a pipe**, not the terminal, because it is captured.
+- **The walk is path-based** (F5 A). A tree deeper than PATH_MAX stops at the
+  first path that is too long, and an ancestor renamed mid-walk reports ENOENT;
+  both exit 1 where GNU carries on.
+- **Not implemented**, failing with exit 1: `-context`, `-files0-from`,
+  `-printf %Z`, the GNU regex word assertions `\<` and `\>`, and multi-byte
+  collating symbols.
+- **Regex backreferences** use a bounded search. A pattern that exhausts it is
+  an error for that entry, with exit 1, rather than an unbounded search.
+- **Dates and names:** `-printf` and `-ls` format times in UTC, whatever `TZ`
+  says, in the C locale. User and group names come from `/etc/passwd` and
+  `/etc/group` only.

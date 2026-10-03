@@ -14,25 +14,14 @@ its code.
 - [Research](docs/research/) — the 2026-09 survey and measured baseline
 
 `ferret index DIR` adds an indexed root. `ferret find [PATH...] [EXPRESSION]`
-then uses GNU find syntax over catalog visibility, respecting ignore rules.
-It uses parallel tree traversal and stored metadata: changes appear after
-re-indexing. Parents precede children; `-depth` and `-delete` reverse that
-relationship, and `-prune` stops descent. Read-only starts may overlap; effectful
-starts run in operand order. Sibling order need not match GNU find. Each entry's output stays together, including
-its commands' stdout. Ordinary `-exec … {} +` batches are shared across workers.
-`-quit` commits one winning entry and waits for commands already running.
-An explicitly named ignored start is walked live, with no nested ignore rules.
-Use `ferret find -I ...` or `--no-ignore` for an unrestricted live walk without
-an index. Add `find_no_ignore = true` to `~/.config/ferret/config` (or
-`$XDG_CONFIG_HOME/ferret/config`) to make that mode the default.
-
-A pasted `find … -delete` skips ignored files and still exits 0. Failed selected
-deletions still exit 1: for example, removing a visible directory containing
-ignored files fails because it is not empty. Default mode exits 1 with guidance
-to re-index or use `-I` if its index is missing/incompatible, a start cannot be
-resolved. New names are absent and deleted names remain until re-indexing.
-See [find sources and freshness](docs/FIND.md). Re-index after
-changing ignore rules. Both find modes exit 0 for no matches and 1 for errors.
+then takes GNU find syntax and answers from the index: ignored paths do not
+exist to it, and it sees the tree as of the last `ferret index`.
+`ferret find -I` (or `--no-ignore`) walks the disk live with no ignore rules,
+and `find_no_ignore = true` in `~/.config/ferret/config` makes that the default.
+Both walk in parallel: parents still come before children (after them under
+`-depth` and `-delete`), but sibling order need not be GNU's. Exit status is 0
+on success, matches or not, and 1 on any error. [docs/FIND.md](docs/FIND.md)
+is the full contract.
 
 Related repositories:
 
