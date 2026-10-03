@@ -206,3 +206,57 @@ fn failed_child_capture_is_an_output_error_and_reaps_the_child() {
     assert!(error.contains("/dev/null"), "{error}");
     assert!(!error.contains("find: head:"), "{error}");
 }
+
+#[test]
+fn catalog_resolution_stops_at_an_opaque_boundary_for_dotdot() {
+    // #5: the catalog-mode path resolver used to collapse `..` lexically
+    // even after crossing an ignored (opaque) directory, so it could walk
+    // back out through a symlink the catalog never indexed and land on the
+    // wrong inode. `tree/ignored/link` is a symlink into `outside/sub/deep`,
+    // kept out of the index by `.ferretignore`; `../../visible` must
+    // resolve against the symlink's real target (two levels up is
+    // `outside`), not against the lexical `tree/ignored` prefix (two levels
+    // up from which is the tree root).
+    let tree = Tree::new("opaque-dotdot");
+    fs::create_dir_all(tree.0.join("tree/ignored")).unwrap();
+    fs::create_dir_all(tree.0.join("outside/sub/deep")).unwrap();
+    fs::write(tree.0.join("tree/visible"), b"xxx").unwrap();
+    fs::write(tree.0.join("outside/visible"), b"123456789").unwrap();
+    std::os::unix::fs::symlink(
+        tree.0.join("outside/sub/deep"),
+        tree.0.join("tree/ignored/link"),
+    )
+    .unwrap();
+    fs::write(tree.0.join("tree/.ferretignore"), b"ignored/\n").unwrap();
+    tree.index(&["."]);
+
+    let args = ["tree/ignored/link/../../visible", "-printf", "%s\n"];
+    let expected = tree.run(true, &args);
+    assert!(expected.status.success(), "{expected:?}");
+    assert_eq!(expected.stdout, b"9\n", "GNU oracle: {expected:?}");
+
+    let actual = tree.catalog(&args);
+    assert!(actual.status.success(), "{actual:?}");
+    assert_eq!(actual.stdout, expected.stdout, "catalog mode: {actual:?}");
+}
+
+#[test]
+fn followed_dangling_reference_uses_the_link_itself() {
+    // #8: `-L dangling -samefile dangling` must compare the link's own
+    // identity, the same fallback live traversal already uses for a
+    // dangling link it is asked to follow, rather than failing as though
+    // the reference were outside the catalog or stale.
+    let tree = Tree::new("dangling-samefile");
+    std::os::unix::fs::symlink("missing", tree.0.join("dangling")).unwrap();
+    tree.index(&["."]);
+
+    let args = ["-L", "dangling", "-samefile", "dangling", "-print"];
+    let expected = tree.run(true, &args);
+    assert!(expected.status.success(), "{expected:?}");
+    assert_eq!(expected.stdout, b"dangling\n", "GNU oracle: {expected:?}");
+
+    let actual = tree.catalog(&args);
+    assert!(actual.status.success(), "{actual:?}");
+    assert!(actual.stderr.is_empty(), "{actual:?}");
+    assert_eq!(actual.stdout, expected.stdout, "catalog mode: {actual:?}");
+}

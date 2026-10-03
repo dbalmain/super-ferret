@@ -1208,6 +1208,15 @@ fn open_directory(entry: &Entry) -> io::Result<Arc<File>> {
 // Resolve links from the snapshot, including intermediate components. A ..
 // after a link applies to the target's parent, not to the link's lexical
 // parent.
+//
+// `..` is collapsed lexically against `prefix` only while every component
+// resolved so far is exact: a real, catalogued directory, not an opaque
+// (ignored) directory and not a symlink still waiting to be followed. Once
+// resolution crosses an opaque boundary, a later `..` no longer has a
+// trustworthy lexical parent (the opaque directory's real parent, after any
+// symlinks inside it are followed, is something only the live filesystem
+// knows), so the walk stops there and hands the whole reference to the
+// caller's live fallback (#5) rather than guessing a lexical answer.
 pub(super) fn resolve(
     catalog: &Catalog,
     path: &Path,
@@ -1218,19 +1227,36 @@ pub(super) fn resolve(
         let mut prefix = PathBuf::new();
         let parts: Vec<_> = pending.components().collect();
         let mut redirected = None;
+        // Whether `prefix` so far is an exact, catalogued directory - safe
+        // to pop a later `..` against lexically.
+        let mut exact = true;
+        let mut opaque = None;
         for (at, part) in parts.iter().enumerate() {
             match part {
                 std::path::Component::ParentDir => {
+                    if !exact {
+                        return Ok(opaque.map(|target| (target, true)));
+                    }
                     prefix.pop();
                 }
                 std::path::Component::CurDir => {}
                 part => prefix.push(part.as_os_str()),
             }
-            if (follow || at + 1 < parts.len())
-                && let Some(resolved) = catalog.resolve(prefix.as_os_str().as_bytes())
-                && resolved.remainder.is_empty()
-                && let Target::Inode(id) = resolved.target
+            let Some(resolved) = catalog.resolve(prefix.as_os_str().as_bytes()) else {
+                // No root matches this prefix yet (e.g. a bare "/" before
+                // the index root is reached) - inconclusive, not a
+                // boundary; keep lexically collapsing until something
+                // resolves.
+                continue;
+            };
+            if !resolved.remainder.is_empty() {
+                exact = false;
+                opaque = Some(resolved.target);
+                continue;
+            }
+            if let Target::Inode(id) = resolved.target
                 && catalog.kind(id) == Kind::Symlink
+                && (follow || at + 1 < parts.len())
             {
                 let target = Path::new(OsStr::from_bytes(
                     catalog.link_target(id).unwrap_or_default(),
@@ -1242,6 +1268,8 @@ pub(super) fn resolve(
                 redirected = Some(std::path::absolute(next)?);
                 break;
             }
+            exact = matches!(resolved.target, Target::Inode(dir) if dir.0 < catalog.dir_count());
+            opaque = Some(resolved.target);
         }
         match redirected {
             Some(next) => pending = next,
