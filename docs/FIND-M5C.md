@@ -1,10 +1,13 @@
 # Parallel find idioms
 
 M5c preserves free sibling order and concurrent `-exec … ;`. Read-only starts
-may overlap; effectful starts complete in operand order. Start scheduling reuses
-M5a's `has_actions`: all exec/execdir/ok/okdir variants, delete and all file-output
-primaries (`-fprint`, `-fprint0`, `-fprintf`, `-fls`). Stdout print/printf/ls and
-quit do not make a plan effectful.
+may overlap; effectful starts, and starts of an expression with `-quit`, complete
+in operand order. Start scheduling reuses M5a's `has_actions`: all
+exec/execdir/ok/okdir variants, delete and all file-output primaries (`-fprint`,
+`-fprint0`, `-fprintf`, `-fls`). `-quit` also sequences starts: GNU quits inside
+the first start that reaches it, so a concurrent later start must not report a
+missing path and exit 1 first (`find src missing -print -quit`, corpus
+`77e2ba5a5ff3`). Stdout print/printf/ls alone do not sequence starts.
 
 Each ordinary `-exec … {} +` action owns one shared argument batch across all
 workers and starts. Full batches detach under the lock, then spawn and wait

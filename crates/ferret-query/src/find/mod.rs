@@ -413,6 +413,23 @@ fn has_actions(expression: &Expression) -> bool {
     }
 }
 
+/// Whether start operands run one after another. Actions can change what a
+/// later start sees, and `-quit` must stop at the first start that reaches it
+/// before a later start can report a missing path.
+fn sequential_starts(expression: &Expression) -> bool {
+    fn has_quit(expression: &Expression) -> bool {
+        match expression {
+            Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {
+                has_quit(a) || has_quit(b)
+            }
+            Expression::Not(inner) => has_quit(inner),
+            Expression::Quit => true,
+            _ => false,
+        }
+    }
+    has_actions(expression) || has_quit(expression)
+}
+
 fn expression_sections(expression: &Expression, out: &mut Vec<ferret_catalog::Section>) {
     match expression {
         Expression::And(a, b) | Expression::Or(a, b) | Expression::Comma(a, b) => {

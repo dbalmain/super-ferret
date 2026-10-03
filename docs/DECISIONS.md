@@ -2527,3 +2527,8 @@ throughput. A cheap narrow-root donation guard made effectful starts slower
 (148.730 versus 135.290 ms live), so it was removed. The pool already persists
 across starts; no new scheduler policy is kept. FIND-M5C records measurements,
 loads, syscall evidence and final validation.
+
+The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap
+in overlapping read-only starts: with `-quit`, a later missing start reported
+ENOENT and exit 1 before the first start quit, where GNU exits 0 silently.
+Starts now also sequence when the expression contains `-quit`.

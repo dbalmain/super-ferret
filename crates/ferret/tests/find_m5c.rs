@@ -149,6 +149,27 @@ fn overlapping_starts_delete_with_gnus_status_and_empty_stderr() {
 }
 
 #[test]
+fn quit_in_an_early_start_never_reports_a_later_missing_start() {
+    // GNU quits inside `root` and never reaches `missing`. A concurrent second
+    // start would report ENOENT and exit 1 before the quit.
+    let tree = Tree::new("quit-starts");
+    let args = ["root", "missing", "-type", "f", "-print", "-quit"];
+    let expected = Command::new(GNU)
+        .args(args)
+        .current_dir(&tree.0)
+        .output()
+        .unwrap();
+    assert!(expected.status.success(), "{:?}", expected);
+    assert!(expected.stderr.is_empty(), "{:?}", expected);
+    for live in [false, true] {
+        for _ in 0..16 {
+            let output = tree.run(live, &args);
+            assert_eq!(output.stdout.iter().filter(|&&b| b == b'\n').count(), 1);
+        }
+    }
+}
+
+#[test]
 fn large_child_output_spills_and_keeps_the_entry_together() {
     let tree = Tree::new("spill");
     let body = vec![b'x'; 256 * 1024];

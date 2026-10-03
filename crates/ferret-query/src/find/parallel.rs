@@ -107,8 +107,8 @@ impl Task {
         true
     }
 
-    fn donate(&mut self, quit: &Arc<AtomicBool>, effectful: bool) -> Option<Self> {
-        let (walk, completion) = if !effectful && let Some(walk) = self.walk.split_start() {
+    fn donate(&mut self, quit: &Arc<AtomicBool>, sequential: bool) -> Option<Self> {
+        let (walk, completion) = if !sequential && let Some(walk) = self.walk.split_start() {
             (walk, None)
         } else {
             let (walk, completion) = self.walk.split()?;
@@ -160,7 +160,7 @@ impl Pool {
     fn worker(&self, plan: &Plan, expression: &Expression, mut effects: impl Effects) -> u64 {
         let mut errors = 0;
         let buffered = super::output::needs_record(expression);
-        let effectful = super::has_actions(expression);
+        let sequential = super::sequential_starts(expression);
         loop {
             let mut queue = self
                 .queue
@@ -197,7 +197,7 @@ impl Pool {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if queue.tasks.len() + queue.active < self.workers * 2
-                        && let Some(donated) = task.donate(&self.quit, effectful)
+                        && let Some(donated) = task.donate(&self.quit, sequential)
                     {
                         // Publish earlier records before children can
                         // evaluate.
@@ -290,7 +290,7 @@ impl Plan {
         let mut task = Task::new(source, None, &quit);
         task.control.cancelled = None;
         let buffered = super::output::needs_record(&expression);
-        let effectful = super::has_actions(&expression);
+        let sequential = super::sequential_starts(&expression);
         let shared = task.control.actions.shared.clone();
         while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects, buffered)
         {
@@ -299,8 +299,8 @@ impl Plan {
             }
             if (!shallow_catalog
                 || task.walk.in_live_directory()
-                || !effectful && task.walk.has_starts())
-                && let Some(donated) = task.donate(&quit, effectful)
+                || !sequential && task.walk.has_starts())
+                && let Some(donated) = task.donate(&quit, sequential)
             {
                 task.control.cancelled = Some(quit.clone());
                 if let Err(error) = task

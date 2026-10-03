@@ -6,10 +6,11 @@ nanoseconds) describe the last indexing observation. New names are absent;
 deleted names and old metadata remain queryable until re-indexing. Re-index
 when changing ignore policy. The daemon will maintain freshness in a later slice.
 
-Read-only start operands may overlap. Effectful starts run one after another;
+Read-only start operands may overlap. Starts run one after another when the
+expression has an action or `-quit`;
 siblings within each start may interleave.
 A parent's expression completes before its children start; `-depth` and
-`-delete` complete children first. `-prune` stops descent. Start scheduling reuses the effectful-plan flag. Live traversal, including default-mode live
+`-delete` complete children first. `-prune` stops descent. Live traversal, including default-mode live
 fallbacks, uses a bounded worker pool. Catalog work also uses workers where
 measurements show a gain; shallow catalog walks stay on the caller thread.
 
