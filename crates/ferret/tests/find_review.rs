@@ -761,3 +761,29 @@ fn deleting_an_explicit_ignored_start_counts_against_its_stored_parent() {
     assert!(output.status.success(), "{output:?}");
     assert!(!tree.0.join("tree/parent").exists(), "{output:?}");
 }
+
+#[test]
+fn an_observed_lookup_keeps_the_operands_trailing_slash() {
+    // R3 #1: `with_observed_path` rebuilt the operand from `name()`, which
+    // drops a trailing slash, so a non-directory named with one looked up
+    // as if the slash were absent instead of failing with ENOTDIR.
+    let tree = Tree::new("trailing-slash-operand");
+    fs::write(tree.0.join("victim"), b"").unwrap();
+    for oracle in [true, false] {
+        let output = tree.run(oracle, &["victim/", "-delete"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+    }
+    assert!(tree.0.join("victim").exists());
+
+    for oracle in [true, false] {
+        let output = tree.run(oracle, &["victim/", "-printf", "%p %y %l\n"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+    }
+
+    std::os::unix::fs::symlink("nowhere", tree.0.join("dangling")).unwrap();
+    for oracle in [true, false] {
+        let output = tree.run(oracle, &["dangling/", "-print"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(output.stdout, b"".as_slice(), "{output:?}");
+    }
+}

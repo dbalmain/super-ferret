@@ -222,8 +222,15 @@ impl Entry {
     // this observed name. /proc exposes it to std APIs without unsafe code.
     pub(super) fn with_observed_path<T>(&self, lookup: impl FnOnce(&Path) -> T) -> T {
         if let Some(parent) = &self.state.directory {
+            // `name()` drops a trailing slash; restore it so the lookup keeps
+            // the operand's own directory requirement (GNU reports ENOTDIR
+            // for a non-directory named with a trailing `/`).
+            let mut joined = self.name().to_vec();
+            if self.path.ends_with(b"/") && joined != b"/" {
+                joined.push(b'/');
+            }
             let path = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()))
-                .join(OsStr::from_bytes(self.name()));
+                .join(OsStr::from_bytes(&joined));
             lookup(&path)
         } else {
             lookup(self.path())
