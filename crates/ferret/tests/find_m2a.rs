@@ -4,6 +4,11 @@
 
 #[path = "../../../tests/support/gnu_find.rs"]
 mod gnu;
+mod support {
+    // Each test crate compiles the shared fixture; this one needs no timeout.
+    #[allow(dead_code)]
+    pub mod fixture;
+}
 
 use std::fs;
 use std::io::Write;
@@ -22,13 +27,8 @@ impl Tree {
         Self(path)
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(FERRET);
-        command
-            .arg("find")
-            .args(args)
-            .current_dir(&self.0)
-            .env("LC_ALL", "C")
-            .env("TZ", "UTC");
+        let mut command = support::fixture::command(FERRET, &self.0);
+        command.arg("find").args(args);
         command
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -530,8 +530,7 @@ fn catalog_empty_accounts_for_concurrent_deletion_and_ignored_children() {
             }
         }
         let index = tree.0.join("index");
-        let mut command = Command::new(FERRET);
-        let output = command
+        let output = support::fixture::command(FERRET, &tree.0)
             .args(["--index"])
             .arg(&index)
             .arg("index")
