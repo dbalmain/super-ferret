@@ -66,6 +66,7 @@ Predecessors, carried forward where still open:
 | D48 | The next move after S1                                   | answered       | A: compaction; name index only if 10M misses 1 GB                                                              |
 | D49 | A one-shot query with no daemon running                  | answered       | A: spawn on first use, in-process fallback                                                                     |
 | D50 | `ferret find` stretch calls F1–F13                       | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                     |
+| D51 | Compaction while the watcher is busy                     | open           |                                                                                                                |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2772,3 +2773,34 @@ The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap
 in overlapping read-only starts: with `-quit`, a later missing start reported
 ENOENT and exit 1 before the first start quit, where GNU exits 0 silently.
 Starts now also sequence when the expression contains `-quit`.
+
+## D51 — Compaction while the watcher is busy (open)
+
+**Status: open.** S1+ M0, 2026-10-03; [design](S1PLUS.md).
+
+**Question:** May an incremental checkpoint pause the writer for seconds, or
+must S1b keep applying bursts while it compacts? Queries keep their pinned
+generation in either case. This is a disagreement between fastest updates and
+the simplest implementation to maintain, not a question about query locking.
+
+The current v3 10.45M synthetic checkpoint is measured at 594.8 MB and a
+10.71 s build (ROADMAP S1c). Stable-id maps and document counts make the new
+10M checkpoint an estimated 761.5 MB; estimated compaction is 10–20 s.
+All new-format time/RAM figures below are estimates, to be measured in M7.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Idle-boundary checkpoint under the writer lock | Incoming updates wait 10–20 s at 10M when compaction runs; sustained churn eventually requires a pause. About 0.85 GB temporary disk and 0.2–0.5 GB plan RAM, plus pinned generations. | One writer, one generation publication proof, no catch-up protocol. Queries continue on the old view. |
+| B. Concurrent checkpoint with suffix replay | Build a pinned view at sequence S while the writer appends. At cutover, take the lock and copy/replay S's suffix to the new log, sync both files and publish one new manifest. At 1,000 content edits/s for 20 s the suffix is about 6.6 MB plus 20k transaction envelopes (about 6.6 MB total if each is a three-record burst), with an estimated 30–120 ms replay cost before sync. Extra pinned source/overlay RAM may be 0.1–0.8 GB; requires a bounded catch-up policy and tests for two generation pairs. | Ordinary bursts retain small-commit latency while the snapshot is built; cutover scales with the suffix rather than 10M rows. |
+| C. Defer checkpoints until the watcher is quiet | No compulsory pause during activity, but replay and overlay costs become unbounded: 5M records cost an estimated 2.5–10 s replay and roughly 200–600 MB overlay RAM, risking the 1 GB resident goal. | Smallest scheduler and no catch-up path. |
+
+**Recommendation:** A for M7, with a measured checkpoint pause and explicit
+backlog/freshness reporting before S1b ships. It is the smallest complete
+mechanism and does not change D32's reader guarantee. Do not choose C: deferred
+work still needs a bound. B is justified if sustained activity makes A's
+pause unacceptable; design its suffix handoff as a separate review slice then.
+
+**Fact that would change it:** a required worst-case freshness lag below
+10 s during sustained churn, or M7 measuring checkpoint pauses beyond the
+accepted lag even on an idle-priority run. Either favours B. S1b's observed
+burst rate and the permitted lag, rather than snapshot size alone, decide it.

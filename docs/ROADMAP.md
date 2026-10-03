@@ -337,6 +337,8 @@ the real run path checks.
 
 ## S1+ — Incremental catalog
 
+Design and build slices: [S1PLUS.md](S1PLUS.md) (M0, 2026-10-03).
+
 After S1a, ahead of the daemon (D40): a re-run writes what changed rather than
 the whole snapshot (D26 B's change log over A's snapshot), so a refresh costs
 the change and not the catalog. The daemon's small inotify bursts need it.
