@@ -831,3 +831,28 @@ fn a_first_child_directory_observation_survives_an_ancestor_rename() {
         "{output:?}"
     );
 }
+
+#[test]
+fn a_dotdot_that_leaves_and_reenters_coverage_still_resolves() {
+    // R3 #2: the resolver's `inside` flag meant "has ever entered coverage",
+    // so stepping outside the indexed root via `..` and back in looked like
+    // a missing child inside coverage. A missing child must still fail.
+    let tree = Tree::new("dotdot-leave-and-reenter");
+    fs::create_dir(tree.0.join("root")).unwrap();
+    fs::write(tree.0.join("root/file"), b"").unwrap();
+    tree.index(&["root"]);
+
+    let output = tree.catalog(&["root/../root/file", "-print"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"root/../root/file\n".as_slice(),
+        "{output:?}"
+    );
+
+    // Round 2's fix must hold: a missing component inside coverage still
+    // errors even though it is followed by a `..`.
+    let output = tree.catalog(&["root/missing/../file", "-print"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.stdout, b"".as_slice(), "{output:?}");
+}

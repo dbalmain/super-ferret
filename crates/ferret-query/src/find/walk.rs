@@ -1352,8 +1352,14 @@ fn resolve_catalog(
         // to pop a later `..` against lexically.
         let mut exact = true;
         let mut opaque = None;
+        // Whether the walk is currently inside catalog coverage. A `..` that
+        // steps back out of a catalogued directory onto an uncatalogued
+        // prefix is leaving coverage, not failing to find a child inside it,
+        // so it clears `inside` instead of erroring; a miss on any other
+        // component while `inside` is a genuinely missing child and errors.
         let mut inside = false;
         for (at, part) in parts.iter().enumerate() {
+            let via_parent = matches!(part, std::path::Component::ParentDir);
             match part {
                 std::path::Component::ParentDir => {
                     if !exact {
@@ -1365,9 +1371,10 @@ fn resolve_catalog(
                 part => prefix.push(part.as_os_str()),
             }
             let Some(resolved) = catalog.resolve(prefix.as_os_str().as_bytes()) else {
-                if inside {
+                if inside && !via_parent {
                     return Err(rustix::io::Errno::NOENT.into());
                 }
+                inside = false;
                 continue;
             };
             inside = true;
