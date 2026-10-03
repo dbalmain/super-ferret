@@ -435,44 +435,25 @@ experiments replace it with measurements.
 manifest rename. The term dictionary's structure (sorted front-coded blocks, an
 FST, …) is decided in S2 and is itself an experiment row.
 
-## Find syntax (milestone 1)
+## Find syntax
 
-`ferret-query::find` owns the GNU argument parser, expression evaluator and
-entry-source interface. Its live source uses safe `rustix` getdents iteration
-in sequential depth-first directory order, with physical symlink handling, pre-order by
-default and post-order under `-depth`. Each entry carries its exact path
-spelling and d_type-derived kind, and caches a lazy lstat observation (including
-failure). Starting paths are statted to establish existence. Directory metadata
-is read for `-xdev`; cheap name/type tests do not stat ordinary child entries.
-The engine sends prune feedback to the source and stops fetching on quit.
-`ferret` implements the output/diagnostic effects interface. The new crate edge
-is `ferret-query → rustix` for raw d_type access. The existing policy-driven
-parallel crawler stays separate.
+`ferret-query::find` owns `ferret find`: the GNU argument parser, the
+expression evaluator, the walk over the catalog or the live tree, the parallel
+scheduler and the actions. It reaches the outside world only through its
+`Effects` trait, which `ferret` implements in `src/find.rs` for output,
+diagnostics and running commands; `ferret` also owns the flags, the config file
+and opening the index.
 
-`ferret find -I` / `--no-ignore` uses this engine without opening an index,
-reading user config or writing a query log. Default mode loads the catalog's
-Names, Links, Roots and Entries sections, with no stat columns. `CatalogSource`
-shares the sequential traversal machinery with `LiveWalk`: kernel name listings
-supply readdir order, catalog entries supply visible names and kinds. Ignored
-children are skipped; explicit ignored starts and suffixes below opaque markers
-walk live without nested ignore rules. Unreadable opaque directories are opened
-live and report permission errors. Catalog entries cache live lstat data:
-directories are observed before descending, retaining that observation through
-post-order evaluation; regular files are statted lazily. A failed stat drops the
-entry as a deletion during traversal. `-empty` reads current directory contents
-(including ignored children), so child deletions can make a directory empty;
-`-links` uses live lstat. Missing/incompatible catalogs and unresolved starts
-fail with status 1 and re-index/`-I` guidance (D47). Newly observed uncatalogued
-names use live kinds and metadata; new directories walk live as visible, without
-nested ignore rules. A new name matching ignore policy is visible until the next
-index. Known deleted names are skipped; changed metadata is read live. Config at
-`$XDG_CONFIG_HOME/ferret/config` accepts `find_no_ignore = true` to make live
-mode the default. Explicit `-I` and informational commands bypass this file.
-Neither find mode writes a query log.
-Recognized but unevaluated primaries consume their complete operands and fail
-before traversal with the same diagnostic. Symlink following is deferred.
-`ferret search` retains the S1 atom grammar, flags, output and exit conventions.
-Find exits 0 even for no matches; invalid syntax and traversal errors exit 1.
+The walk reads directories with `rustix` (`RawDir` getdents, for the entry
+kinds) and uses it for `statx`, `access` and `statfs`. That is the
+`ferret-query → rustix` edge in § Crates; the policy-driven crawler in
+`ferret-crawl` stays separate.
+
+`-regex` and `-iregex` compile through `ferret-verify`, which holds the GNU
+regex dialects. The `regex` crate stays a dependency of `ferret-verify` alone.
+
+What `find` does — modes, freshness, order, concurrency, exit status and the
+differences from GNU — is specified in [FIND.md](FIND.md).
 
 ## Query (S1 for names and metadata, S2 onwards for content)
 
