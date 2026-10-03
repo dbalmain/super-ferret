@@ -2345,8 +2345,8 @@ per block. Does its high type sentinel justify a different physical encoding?
 
 **Recommendation: A.** The size difference is small and B has no consistent
 query win. Full listing, warm: A 1,369 ms vs B 1,354 ms; baseline 1,340 ms.
-Their recorded loads and all query/section numbers are in
-the measurement report (ROADMAP § S1c). The fact that would change it: a much
+ROADMAP § S1c summarises the section and query numbers; the full tables, with
+their loads, are in git history as `docs/FIND-M4A.md`. The fact that would change it: a much
 more ignored-heavy 10M fixture where nullable child/type or a separate ignored
 range saves materially more space or query time. Those two options were not
 implemented or measured here. There is no departure from the settled sentinel
@@ -2396,7 +2396,7 @@ bases. Explicit `-I` bypasses both config and index; help/version bypass them to
 The catalog's name order cannot reproduce readdir order. 4b retains live
 name listings solely for traversal order and intersects them with catalog
 entries. This preserves `-quit` and directory-local command batches without
-using stale stat columns. The cost is measured in ROADMAP § S1c.
+using stale stat columns. ROADMAP § S1c records the cost.
 
 A pasted `find … -delete` skips ignored files and still exits 0 when the
 selected deletions succeed. Deleting a visible directory that still contains
@@ -2409,8 +2409,8 @@ size/mtime about 170 ms with the same ordered source, but stale metadata and
 missed deletions. C: the later watch-backed stat cache, current within the
 watched set but requiring daemon work. **Recommendation: retain A**; Dave must
 choose any move to B. The fact that changes it: an explicit acceptable freshness
-contract. Trial patch is preserved and unapplied, with loads and all measurements
-in ROADMAP § S1c; eager size/mtime decoding costs about 5 ms on the
+contract. The trial patch was removed in M5a; its tables, with loads, are in git
+history as `docs/FIND-M4B.md`. Eager size/mtime decoding costs about 5 ms on the
 name/type controls. B alone still misses fd's roughly 51 ms stat median.
 
 **4b order/speed brief (2026-10-03).** How should exact current traversal order
