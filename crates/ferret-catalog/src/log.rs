@@ -157,6 +157,9 @@ impl Published {
     pub fn counts(&self) -> [u32; 4] {
         self.manifest.counts
     }
+    pub(crate) fn into_catalog(self) -> Catalog {
+        self.checkpoint.with_log(self.manifest, self.log)
+    }
     pub(crate) fn into_checkpoint(self) -> Result<Catalog, OpenError> {
         if self.log.transaction_count() != 0 {
             return Err(OpenError::OverlayRequired(self.manifest.generation));
@@ -299,6 +302,9 @@ impl Log {
             read: AtomicU64::new(read),
             checkpoint: m.generation.checkpoint,
         })
+    }
+    pub(crate) fn frames(&self) -> impl Iterator<Item = (u64, [u32; 3])> {
+        self.transactions.iter().map(|t| (t.sequence, t.counters))
     }
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
@@ -510,7 +516,11 @@ impl Writer {
     }
 }
 
-fn encode(changes: &ChangeSet, sequence: u64, previous: u64) -> Result<Vec<u8>, DecodeError> {
+pub(crate) fn encode(
+    changes: &ChangeSet,
+    sequence: u64,
+    previous: u64,
+) -> Result<Vec<u8>, DecodeError> {
     let mut blocks = Vec::new();
     for family in FAMILIES {
         let mut bytes = Vec::new();

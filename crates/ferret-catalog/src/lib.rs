@@ -23,6 +23,7 @@ mod generation;
 mod lock;
 pub mod log;
 mod migrate;
+mod overlay;
 mod packed;
 mod publication;
 pub mod read;
