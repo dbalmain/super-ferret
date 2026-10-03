@@ -21,7 +21,7 @@
 //! [`ContentState::Fault`](ferret_catalog::ContentState) and no document, and
 //! the next run reads it again.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
@@ -377,32 +377,23 @@ fn run(
         Ok(mut session) => {
             let previous = session.view();
             let roots = roots(Some(&previous))?;
-            let plan = Plan::new(
+            let mut plan = Plan::new(
                 Some(&previous),
                 &roots,
                 refresh,
                 options.sniffer,
                 fingerprint(options),
             )?;
-            let (batches, mut report) =
-                observe(Source::Session(&session, options.sniffer), &plan, options)?;
+            let (batches, mut report, changes) = observe_reconcile(&session, &mut plan, options)?;
             let started = Instant::now();
-            let changes = crate::reconcile::changes(
-                &session,
-                &batches,
-                &plan.refresh,
-                &plan.dropped,
-                fingerprint(options),
-                options.sniffer,
-            )
-            .map_err(IndexError::Update)?;
-            let (catalog, changed) = match changes {
+            let (catalog, changed, faulted) = match changes {
                 Some(changes) => {
                     let changed = !changes.records.is_empty();
+                    let faulted = faulted_inodes(&changes);
                     let catalog = session
                         .commit(&changes, options.sniffer)
                         .map_err(IndexError::Update)?;
-                    (catalog, changed)
+                    (catalog, changed, Some(faulted))
                 }
                 None => {
                     let mut txn = session.into_checkpoint(options.sniffer);
@@ -414,11 +405,11 @@ fn run(
                         txn.keep(root.as_os_str().as_bytes())
                             .map_err(IndexError::Keep)?;
                     }
-                    (txn.commit().map_err(IndexError::Commit)?, true)
+                    (txn.commit().map_err(IndexError::Commit)?, true, None)
                 }
             };
-            report.commit_time = started.elapsed();
-            finish_report(&mut report, &catalog, &plan, changed);
+            report.commit_time += started.elapsed();
+            finish_report(&mut report, &catalog, &plan, changed, faulted.as_deref());
             Ok(report)
         }
         Err(ferret_catalog::log::Error::MissingCheckpoint)
@@ -446,8 +437,8 @@ fn run(
                     .map_err(IndexError::Keep)?;
             }
             let catalog = txn.commit().map_err(IndexError::Commit)?;
-            report.commit_time = started.elapsed();
-            finish_report(&mut report, &catalog, &plan, true);
+            report.commit_time += started.elapsed();
+            finish_report(&mut report, &catalog, &plan, true, None);
             Ok(report)
         }
         Err(ferret_catalog::log::Error::Locked) => Err(IndexError::Begin(BeginError::Locked)),
@@ -467,36 +458,63 @@ pub fn recrawl(
     options: &IndexOptions,
 ) -> Result<Report, IndexError> {
     let previous = session.view();
-    let plan = Plan::new(
-        Some(&previous),
-        roots,
-        refresh,
-        options.sniffer,
-        fingerprint(options),
-    )?;
-    let (batches, mut report) = observe(Source::Session(session, options.sniffer), &plan, options)?;
+    let mut plan = Plan::new(Some(&previous), roots, refresh, options.sniffer, fingerprint(options))?;
+    let (_, mut report, changes) = observe_reconcile(session, &mut plan, options)?;
     let started = Instant::now();
-    let changes = crate::reconcile::changes(
-        session,
-        &batches,
-        &plan.refresh,
-        &plan.dropped,
-        fingerprint(options),
-        options.sniffer,
-    )
-    .map_err(IndexError::Update)?
-    .ok_or_else(|| {
-        IndexError::Update(ferret_catalog::log::Error::Invalid(
-            ferret_catalog::DecodeError::Corrupt("incomplete resident recrawl requires checkpoint"),
-        ))
-    })?;
+    let changes = changes.ok_or_else(|| IndexError::Update(ferret_catalog::log::Error::Invalid(ferret_catalog::DecodeError::Corrupt("incomplete resident recrawl requires checkpoint"))))?;
+    let faulted = faulted_inodes(&changes);
     let changed = !changes.records.is_empty();
     let catalog = session
         .commit(&changes, options.sniffer)
         .map_err(IndexError::Update)?;
-    report.commit_time = started.elapsed();
-    finish_report(&mut report, &catalog, &plan, changed);
+    report.commit_time += started.elapsed();
+    finish_report(&mut report, &catalog, &plan, changed, Some(&faulted));
     Ok(report)
+}
+
+fn observe_reconcile(session: &WriterSession, plan: &mut Plan, options: &IndexOptions) -> Result<(Vec<ferret_catalog::Batch>, Report, Option<ferret_catalog::log::ChangeSet>), IndexError> {
+    let source = Source::Session(session, options.sniffer);
+    let (mut batches, mut report) = observe(source, plan, options)?;
+    loop {
+        let started = Instant::now();
+        let changes = crate::reconcile::changes(session, &batches, &plan.refresh, &plan.dropped, fingerprint(options), options.sniffer).map_err(IndexError::Update)?;
+        report.commit_time += started.elapsed();
+        let Some(ref final_changes) = changes else { return Ok((batches, report, None)); };
+        let previous = session.view();
+        // A deleted last refreshed alias supplies no stat. Rewalk its kept
+        // root so nlink/ctime and content are observed, rather than publishing
+        // a stale shared row. M6 can narrow this to handle-relative alias scopes.
+        let observed: BTreeSet<_> = final_changes.records.iter().filter_map(|r| match r {
+            ferret_catalog::log::Record::InodePut { id, .. } => Some(*id), _ => None,
+        }).collect();
+        let missing: BTreeSet<_> = final_changes.records.iter().filter_map(|r| match r {
+            ferret_catalog::log::Record::LifePut { id, names, kind, .. } if *kind != ferret_catalog::Kind::Dir
+                && previous.is_live_inode(InoId(*id)) && *names > 0 && *names < session.name_references(InoId(*id)) && !observed.contains(id) => Some(*id),
+            _ => None,
+        }).collect();
+        if missing.is_empty() { return Ok((batches, report, changes)); }
+        let mut extra = BTreeSet::new();
+        for (name, _) in previous.names() {
+            let edge = previous.name(name);
+            if !missing.contains(&edge.child.0) { continue; }
+            let mut root = edge.parent;
+            while let Some(name) = previous.dir_name(root) { root = previous.name(name).parent; }
+            if let Some(path) = previous.roots().find(|(id, _)| *id == root).map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
+                && plan.keep.contains(&path) { extra.insert(path); }
+        }
+        if extra.is_empty() { return Ok((batches, report, changes)); }
+        let extra: Vec<_> = extra.into_iter().collect();
+        plan.keep.retain(|p| !extra.contains(p));
+        plan.refresh.extend(extra.iter().cloned()); plan.refresh.sort();
+        let added = Plan { roots: plan.roots.clone(), refresh: extra, keep: Vec::new(), dropped: Vec::new() };
+        let (more, mut extra_report) = observe(source, &added, options)?;
+        batches.extend(more);
+        report.counts.add(&extra_report.counts);
+        report.walk_time += extra_report.walk_time; report.hash_time += extra_report.hash_time;
+        report.content_faults.append(&mut extra_report.content_faults);
+        report.pattern_errors.append(&mut extra_report.pattern_errors);
+        report.refreshed.clone_from(&plan.refresh); report.kept.clone_from(&plan.keep);
+    }
 }
 
 fn fingerprint(options: &IndexOptions) -> ferret_catalog::Hash {
@@ -584,10 +602,16 @@ fn observe(
     Ok((batches, report))
 }
 
-fn finish_report(report: &mut Report, catalog: &Catalog, plan: &Plan, changed: bool) {
+fn faulted_inodes(changes: &ferret_catalog::log::ChangeSet) -> Vec<InoId> {
+    changes.records.iter().filter_map(|r| match r {
+        ferret_catalog::log::Record::InodePut { id, state: ContentState::Fault, .. } => Some(InoId(*id)), _ => None,
+    }).collect()
+}
+
+fn finish_report(report: &mut Report, catalog: &Catalog, plan: &Plan, changed: bool, faulted: Option<&[InoId]>) {
     let started = Instant::now();
     let seen = std::mem::take(&mut report.content_faults);
-    report.content_faults = content_faults(catalog, &plan.refresh, seen);
+    report.content_faults = content_faults_with(catalog, &plan.refresh, seen, faulted);
     report.counts.content_faults = report.content_faults.len() as u64;
     report.fault_time = started.elapsed();
     report.published = changed.then(|| Published::of(catalog));
@@ -602,18 +626,20 @@ fn finish_report(report: &mut Report, catalog: &Catalog, plan: &Plan, changed: b
 ///
 /// Paths come from the catalog, so the walk holds none; the scan over the
 /// names runs only when some inode is Fault.
+#[cfg(test)]
 pub(crate) fn content_faults(
     catalog: &Catalog,
     refresh: &[PathBuf],
     seen: Vec<(PathBuf, ContentFault)>,
 ) -> Vec<(PathBuf, ContentFault)> {
+    content_faults_with(catalog, refresh, seen, None)
+}
+
+fn content_faults_with(catalog: &Catalog, refresh: &[PathBuf], seen: Vec<(PathBuf, ContentFault)>, faulted: Option<&[InoId]>) -> Vec<(PathBuf, ContentFault)> {
     let fault = |id: InoId| catalog.state(id) == ContentState::Fault;
     let mut listed: BTreeMap<PathBuf, ContentFault> = seen.into_iter().collect();
-    if !catalog
-        .inode_ids()
-        .filter(|&id| !catalog.is_directory(id))
-        .any(fault)
-    {
+    let any = faulted.map_or_else(|| catalog.inode_ids().filter(|&id| !catalog.is_directory(id)).any(fault), |ids| ids.iter().copied().any(fault));
+    if !any {
         return listed.into_iter().collect();
     }
     let refreshed: Vec<InoId> = catalog

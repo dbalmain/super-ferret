@@ -21,7 +21,6 @@ pub struct WriterSession {
     directory_changes: BTreeMap<(u32, u64, u64), Vec<InoId>>,
     identity_changes: BTreeMap<(u64, u64), Option<InoId>>,
     document_changes: BTreeMap<Hash, Option<DocId>>,
-    references: Vec<u32>,
     next_batch: AtomicU32,
 }
 
@@ -40,12 +39,6 @@ impl WriterSession {
         documents.sort_unstable_by_key(|&id| view.doc_hash(id));
         let mut directories: Vec<_> = view.dir_ids().map(|id| (root_of(&view, id), id)).collect();
         directories.sort_unstable_by_key(|&(root, id)| (root, view.identity(id)));
-        let mut references = vec![0; view.next_inode().0 as usize];
-        for (id, _) in view.names() {
-            if let crate::Target::Inode(child) = view.name(id).target() {
-                references[child.0 as usize] += 1;
-            }
-        }
         Ok(Self {
             writer,
             lookup_base: view,
@@ -55,7 +48,6 @@ impl WriterSession {
             document_changes: BTreeMap::new(),
             directories,
             directory_changes: BTreeMap::new(),
-            references,
             next_batch: AtomicU32::new(0),
         })
     }
@@ -124,7 +116,7 @@ impl WriterSession {
 
     /// Exact indexed-name count, independent of filesystem `st_nlink`.
     pub fn name_references(&self, id: InoId) -> u32 {
-        self.references.get(id.0 as usize).copied().unwrap_or(0)
+        self.writer.view().indexed_name_count(id)
     }
 
     /// Carries only a matching version under the same sniffer.
@@ -154,7 +146,6 @@ impl WriterSession {
         self.writer
             .commit_with_sniffer(previous.generation(), changes, sniffer)?;
         let view = self.writer.view();
-        self.references.resize(view.next_inode().0 as usize, 0);
         for record in &changes.records {
             match record {
                 Record::InodePut { id, kind, stat, .. } if *kind != crate::Kind::Dir => {
@@ -178,9 +169,7 @@ impl WriterSession {
                         self.identity_changes
                             .insert(previous.identity(InoId(*id)), None);
                     }
-                    self.references[*id as usize] = 0;
                 }
-                Record::LifePut { id, names, .. } => self.references[*id as usize] = *names,
                 Record::DocPut { id, hash, .. } => {
                     self.document_changes.insert(*hash, Some(DocId(*id)));
                 }

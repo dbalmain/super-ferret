@@ -251,7 +251,7 @@ pub fn changes(
             None => allocate(&mut out.changes.counters[0], u32::MAX - 16)?,
         };
         dirs[i].id = Some(id);
-        dirs[i].root = root.unwrap_or(id);
+        dirs[i].root = parent.map_or(id, |p| dirs[p].root);
         out.observe_inode(id, Kind::Dir, d.stat, Content::Unindexed)?;
         if let Some(parent) = parent_id {
             out.edge(parent, id, d.name);
