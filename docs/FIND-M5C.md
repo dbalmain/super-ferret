@@ -31,8 +31,8 @@ open under Dave's stop/write-up instruction. The fifteen-sample read-only table
 passes all twelve inherited live-versus-default-bfs gates, while seven default
 medians exceed paired M5b by 0.37–2.30%. A speed-complete milestone is not
 claimed. Default's shallow catalog row was already slower than bfs in M5b.
-The one final full corpus is in progress; details and timing loads remain in
-the done-note. The code and binary stay frozen during that run.
+The one final full corpus is complete; details and timing loads remain in
+the done-note. The code and binary stayed frozen during that run.
 
 ## Cheapest next batching experiment
 
@@ -51,18 +51,32 @@ each root still drains its descendant barriers before the next starts. Fewer
 workers or caller-thread handling for narrow roots is a separate measurement;
 reintroducing concurrent starts would break the deletion idiom again.
 
-## Corpus checkpoint
+## Final corpus
 
-The single final run uses M5b's five trees and nine scored matrix rows, jobs 4,
-and the supplied release binary. Start load 2.36/1.98/2.30, with no competing
-compiler or benchmark. At 86,704/135,693 rows, 26 raw differences are classified:
-24 order-only and two explicitly allowed single-walk alias races; zero harness
-errors. The nine both-timeouts are inconclusive. Final totals and every row's
-current explanation will replace this checkpoint when the run completes.
+One final run, 135,693 rows in 2,026.076 seconds, same five trees and nine scored
+matrix rows as M5b, jobs 4. Start load 2.36/1.98/2.30; no competing compiler or
+benchmark. The supplied release binary remained frozen; no harness source edit.
 
-Shared echo/cat aggregate rows can still differ by legal argument order.
-Mixed outputs with newline-free delimiters can still differ when the scorer
-splits lines, although each entry group is now adjacent. Those are current
-order-only explanations, rather than the old worker-batch and action-interleave
-explanations. No wc/grep/ls/file partition, overlapping-start deletion or
-multiple-print quit race has appeared.
+| Target | agree | agree-unordered | raw differ | skipped | both-timeout | order-only | concurrency-only | real differ | error |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| default | 52618 | 301 | 18 | 7368 | 3 | 17 | 1 | 0 | 0 |
+| -I | 67086 | 300 | 28 | 7965 | 6 | 27 | 1 | 0 | 0 |
+
+Raw differences fell from 190 to 46 across 18 command IDs (formerly 53).
+146 old row scopes disappeared; two new legal-order scopes involve unseparated
+size output and single-batch binary cat argument order. All 46 rows have current
+individual explanations in the done-note and m5c/classifications.json, using
+M5b's ID-to-[class, explanation] format. Nine both-timeouts are inconclusive.
+
+The common-idiom partition/interleaving/quit/start-race explanations are gone.
+Remaining shared echo/cat aggregates differ by free argument order; mixed
+outputs with newline-free delimiters differ under legal whole-entry order;
+unseparated printf/tail records exceed the bounded witness; quit can choose a
+different legal entry or reach a symlink error branch first. The two remaining
+concurrency rows are the explicitly allowed single-walk followed-alias rm/delete
+races. No raw difference is claimed as harness-proved agreement.
+
+The four functional fixes are checked. Speed completion remains open under the
+measured-cost brief; this milestone is not claimed fully complete. All gates
+pass, 397 tests pass and four pre-existing tests remain ignored. Binary SHA256:
+`b75f73d455f816a42d04e66e8a9353d63af07a7f16e2a82eaba78744c4230a5a`.

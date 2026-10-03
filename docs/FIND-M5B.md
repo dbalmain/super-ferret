@@ -83,10 +83,10 @@ Ferret spawns 15 threads versus fd's 33 clone3 calls. These observations
 explain remaining metadata and concurrency costs; they are not traced timing
 comparisons. No dependency, unsafe or directory-fd rewrite was needed.
 
-Quit cancels new work and waits for started actions. Whether it should
-terminate running commands/prompts instead is an open decision, with A/B
-options in DECISIONS.md. Forced termination and finite quit latency are not
-claimed by this checkpoint.
+At the M5b checkpoint, quit cancelled new work and waited for started actions;
+the A/B termination choice remained open. M5c answers A: finish started actions
+and discard later entry output under a quit latch. Forced termination and finite
+quit latency are not claimed.
 
 Release binary: `/home/dave/w/super-ferret-wt/find-m5b/target/release/ferret`.
 All workspace gates and development oracles pass; 390 tests pass and four
