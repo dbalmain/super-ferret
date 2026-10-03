@@ -70,7 +70,11 @@ number, generation sequence, committed log end, checkpoint sequence, sniffer
 version, next InoId/NameId/DocId, live inode/name/directory/document counts,
 reserved zeros, and a 128-bit checksum over the preceding bytes. The exact
 field offsets become a format fixture in M1. The manifest's generation is a
-commit sequence, not an id namespace. The first snapshot embeds the same
+commit sequence, not an id namespace. A 128-bit catalog incarnation occupies
+16 of the reserved bytes and also appears in the snapshot and log headers;
+an explicit fresh index creates a new incarnation and invalidates external
+handles. Stable handles are scoped by incarnation, never just a bare u32.
+The first snapshot embeds the same
 allocation counters and checkpoint sequence. A log file starts with a 64 B
 checksummed header identifying the format and checkpoint.
 
@@ -79,11 +83,22 @@ order. Its head adds allocation counters, stable-id maps and document reference
 counts, and adds a 128-bit checksum per section plus one over the head/table.
 Every section size and descriptor still has an exact checked interpretation.
 Maps and reference counts are separate sections, not inode fields loaded by
-a name query. This is a new format version, with v3 queries refused as today.
+a name query. A nullable blocked RetainedAt column per directory stores its
+last trustworthy subtree sequence; none means no retained-fault subtree.
+Together with Entries and Traversed it preserves DirPut coverage flags across
+checkpoints. Its all-none cost on this 10M distribution is about 0.22 MB;
+a heavily faulted tree can cost up to about 8 B/directory. A writer-only Policy
+section stores a BLAKE3-128 fingerprint of global rule bytes and eligibility
+configuration, so a session can detect a global policy transition after restart.
+Namespace PolicyPut replaces that fingerprint after a completely covered
+transition, even if no entry changed. Sniffer version remains explicit. This is a new format version, with v3 queries refused as today.
 M1 provides an explicit v3-to-new checkpoint import so the initial migration
 can preserve existing DocIds and configured roots; otherwise an explicit
 fresh index is allowed and is an id-namespace reset. A reset is never silently
 substituted for compaction. No content postings exist yet to migrate.
+Imported dense v3 InoIds/NameIds become the initial stable ids, with next ids
+equal to their counts. A v3 reader already open keeps its original file.
+The import keeps that file available until the new manifest is durable.
 
 ### Transaction envelope
 
@@ -93,7 +108,11 @@ block payloads and a 32 B footer. Everything is little-endian and aligned to
 
 The header contains magic/version, total length, sequence and previous
 sequence, resulting allocation counters, block count and
-reserved zeros. Each descriptor contains family/flags, record count, relative
+reserved zeros. Its exact budget is 8 B magic, 4 B version, 4 B block count,
+three u64s (length/sequence/previous), three u32 counters, 4 B flags and
+8 B reserved. Live counts are in the manifest and are cross-checked when the
+corresponding families load. Each descriptor contains family/flags, record
+count, relative
 offset, byte length, a 128-bit payload checksum and reserved zeros (48 B).
 The footer repeats sequence and total length and holds a 128-bit checksum of
 the header and descriptor array. A descriptor checksum commits the payload
@@ -189,7 +208,9 @@ Readers neither recover nor truncate. Power-loss tests must establish that
 the old or new valid manifest survives each rename/sync boundary; derived
 data with storage damage beyond that guarantee requires re-indexing.
 
-Checkpoint publication writes and syncs a new snapshot and a new empty log,
+Compaction keeps the logical sequence S and changes only the checkpoint
+number; the new log begins after S. Checkpoint publication writes and syncs
+a new snapshot and a new empty log,
 syncs the directory entries naming both, then publishes/syncs the new manifest.
 An unsuccessful checkpoint leaves `current` naming the old pair. Retired pairs
 are unlinked only after the new manifest is durable. Already-open descriptors
@@ -198,7 +219,9 @@ from a freshly opened manifest on ENOENT; if it has opened both files it keeps
 them. Header mismatches on an already pinned pair are errors, not retries.
 One slow reader can pin one old checkpoint, so disk/RSS reporting includes
 retired-but-open generations. Directory creation keeps today's ancestor-sync
-discipline. No live or retired snapshot is truncated or rewritten.
+discipline. Recovery removes abandoned temp/orphan checkpoint files under the
+writer lock after establishing the manifest's pair; it never adopts them.
+No live or retired snapshot is truncated or rewritten.
 
 ## Ids and physical rows
 
@@ -206,7 +229,8 @@ InoId and NameId become stable logical u32 ids. Each allocation uses and
 increments a persisted high-water counter. No deleted id is reused, including
 after compaction. A failed, unpublished transaction need not reserve ids for
 external callers: allocated tokens do not escape before commit. Crossing the
-reserved top 16 inode values or the name limit fails before publication; no
+reserved top 16 inode values, the name limit or a sequence/counter limit
+fails before publication; no
 wrap or automatic reset. These limits concern historical allocations, not
 live entries. DocIds retain their current independent high-water rule.
 
@@ -220,14 +244,21 @@ physical rows or assume stable-id order encodes ancestry.
 
 Each table has a forward `row -> stable id` array of u32 and a persisted
 inverse `stable id -> row`. The inverse has an 8 B page-offset directory up
-to `ceil(high_water / 4096)` and allocated 4096-entry pages of u32 row numbers;
-none marks a hole. An all-hole page is absent. Section lengths bound every
-offset. At 10M ids the directory is about 20 kB per table, the pages about
-40 MB and the forward array about 40 MB: about 160 MB for both tables.
-Start with these plain arrays, not a second packing scheme for id maps.
-They give constant-time translation and reuse checked positional section
-loads; sequential scans carry physical rows and avoid translating each
-field separately. A later measured map compression is a separate slice.
+to `ceil(high_water / 4096)`. A dense page holds 4096 u32 row numbers, with
+none marking a hole. A sparse page holds a count/reserved header (8 B), sorted
+distinct u16 low-id keys and parallel u32 row numbers, each array padded to
+8 B. Use sparse encoding when `8 + align8(2*n) + align8(4*n)` is smaller than
+16,384 B; absent pages have no live ids. The aligned page-offset directory
+encodes dense/sparse in a low flag bit, with zero for absent. Bounds, key order,
+page coverage and the forward/inverse bijection are checked before lookup.
+Dense lookup is constant time; sparse lookup takes at most 12 comparisons
+within one page. At 10M dense ids the directory is about 20 kB per table,
+the pages about 40 MB and the forward array about 40 MB: about 160 MB for
+both tables.
+Use these two plain page encodings, not entropy packing for id maps.
+They reuse checked positional section loads; sequential scans carry physical
+rows and avoid translating each field separately. A later measured map
+compression is a separate slice.
 
 Between checkpoints a tombstone is a hole in the effective id-indexed view:
 the old base row still exists, but cannot be returned as live. A new id has
@@ -239,8 +270,18 @@ Logical holes and allocation counters remain. “Holes until compaction” in D2
 means reclaiming **physical storage**, not recycling ids; changing a live id
 would defeat the daemon's stable handle. The page directory alone remains
 bounded by the u32 id space (under 8.4 MB per inverse at exhaustion), even if
-most historical pages have become empty. Scattered sparse pages can still be
-expensive; measure 50% and 90% churn as well as the normal 2% case.
+most historical pages have become empty. Without sparse encoding, 100M
+historical ids with 10M scattered survivors would need about 800 MB of inverse
+pages for two tables, against about 80 MB with dense fresh ids. With sparse
+encoding, those two inverses cost about 120 MB plus page headers/directory
+instead. The two forward arrays still cost 80 MB. This keeps the checkpoint
+near 0.8 GB, rather than about 1.5 GB, at that churn level (estimates). At the
+most scattered possible u32 history there can be about 1.05M nonempty pages
+per table, so page headers/alignment and both full directories can add tens
+of MB; include them in the budget. Measure 50% and 90% churn as well as the
+normal 2% case. Compaction cannot reduce the high-water counters; sparse pages
+bound their storage consequence, and exhaustion still needs an explicit reset
+or a separately designed wider-id format.
 
 An InoId identifies an indexed inode lifetime, not a content or filesystem
 inode number forever. Reconcile continuing names and hard links by `(dev, ino)`
@@ -296,8 +337,13 @@ re-including them assigns new ids unless those rows were retained for a fault.
 the manifest, snapshot head, log head and the committed transaction framing;
 it does not load name, stat, hash or aux payloads. Loading Names reads its base
 dependencies, id maps needed for translation, and Namespace blocks. Loading
-a stat field reads that base column, its inode maps and Inodes blocks and
-projects just that field into the effective view. Loading Docs reads Docs,
+a stat field reads that base column, its inode maps, the Life projection of
+Namespace and Inodes blocks, and projects just that field into the effective
+view. The Life projection checks birth/death/id/count records independently;
+it does not require base Names or NameHeap. The Namespace payload checksum
+is verified in full once, but graph/child-key checks wait for the Names load.
+This keeps a metadata pass that rejects everything from loading names merely
+to discover inode tombstones. Loading Docs reads Docs,
 its reference counts and Docs blocks. Aux projections never force all inode
 columns. Cross-family bindings are checked when the relevant families load;
 anything used as an index must be checked before access. Unused payload
@@ -311,6 +357,12 @@ sequence order. Coalesce a transaction by id/key before committing. Derived
 `hash -> DocId`, full inode/name inverses and content inverses are writer-only
 or first-use structures, as D30 requires. They are not reconstructed by every
 name query.
+Derive old-key tombstones from the previous effective edge before coalescing
+a NamePut that changes parent/basename. Keep those tombstones in the child-key
+overlay until a checkpoint; an id-only replacement index is insufficient to
+hide its old lookup key. Validate sibling uniqueness and incoming-directory
+edges on the final transaction state. InoId type/liveness and DocId bindings
+are cross-checked before `load_all` succeeds and before any writer publishes.
 
 For resident generations, share the base buffers and unchanged overlay runs.
 Represent overlays as immutable sorted runs at geometric sizes: merging two
@@ -341,6 +393,8 @@ lock, including D34's widening for nested-root boundary changes. A long-lived
 writer session caches its identity lookup, live hash lookup, reference counts
 and current view. The batch CLI creates one session for its run; S1b keeps one
 between bursts. `Transaction::begin` must stop rebuilding these per burst.
+The session owns the writer lock; S1b routes root/index edits through that
+session, rather than opening a competing CLI writer alongside the daemon.
 Build base identity lookup as sorted u32 physical row ordinals, not copied
 stats, and hash lookup as sorted u32 doc row ordinals into already-loaded
 hashes. Overlay maps hold only changes. No second 24 B copy of every hash.
@@ -369,7 +423,11 @@ per-worker arrival order is not a persistence contract.
 M4 may retain whole-walk batches to bound its first review slice, but not build
 a second encoded snapshot. At 10M that is still about 1.2 GB of observation
 storage. M6 streams completed directory observations into reconciliation,
-retaining only changed rows, seen bits and the existing bounded alias backlog.
+retaining only changed file rows, seen bits, the directory token/coverage table
+and the existing bounded alias backlog. The directory table still costs
+O(directories); resolve continuing directory ids as tokens are minted and
+retain provisional token mappings for newly discovered/ambiguous moves. File
+observations need not survive once compared to their parent's old children.
 That is an explicit RSS milestone, not a claim that the first diff removes
 every allocation. A zero-change walk does no publication; telemetry may record
 its time outside the catalog. Content-fault reporting uses changed/fault inode
@@ -457,8 +515,10 @@ hard-link changes outside it may update the shared inode; retained names still
 refer to that inode, with fresh trustworthy observations winning as in D31.
 
 Retain an existing subtree by **not emitting deletes**, not by copying it.
-Only the faulted directory's coverage row/diagnostic changes. This is D26 A
-carried by B's log. When a later listing succeeds, reconcile against that
+Only the faulted directory's coverage row/diagnostic changes. The retained-at
+sequence identifies its last trustworthy subtree, not the latest failed
+attempt; repeated identical faults do not force a new generation. This is
+D26 A carried by B's log. When a later listing succeeds, reconcile against that
 retained subtree and clear its coverage marker in the same transaction.
 Protection under a changed global policy/sniffer cannot be represented under
 one advanced version; abort that version transition until every root is
@@ -467,7 +527,10 @@ coverage is visible even when other scopes commit successfully.
 
 ## Documents and checksum
 
-A metadata change never assigns a new DocId. After revalidation, equal content
+A metadata change never assigns a new DocId while its content binding remains
+live. Loss of eligibility or a content fault clears the binding without
+minting an id; reappearance after that document becomes dead follows D36 B,
+not a promise to remember retired content forever. After revalidation, equal content
 uses the existing live hash row, including content shared by another inode.
 Different content uses its already-live DocId or a new high-water id.
 Store a u32 indexed-inode reference count beside each live document in a
@@ -540,9 +603,14 @@ it is deliberately heavy in live documents, not a forecast of a typical tree.
 Normalising that distribution to exactly 10M names gives an **estimated**
 569.29 MB base, 290.60 MB name set, 9.959M inode rows and 8.131M docs.
 New id maps add at most about 159.7 MB at dense high water, document counts
-32.52 MB, and inode indexed-name counts derived once by the writer take
-39.84 MB RAM. Thus the estimated new checkpoint is **761.5 MB**, about
+32.52 MB, RetainedAt about 0.22 MB with no faults, and inode indexed-name
+counts derived once by the writer take
+39.84 MB RAM. Thus the estimated new checkpoint is **761.7 MB**, about
 76.2 B/name before page rounding and checksum/head overhead (under 0.1 MB).
+This assumes the current dense DocId sequence. Retiring documents can add up
+to 4 B per live doc to that sequence column, at most another 32.5 MB at this
+fixture's document fraction; steady churn checkpoints should budget roughly
+0.8 GB, not rely on the 761.7 MB lower bound.
 A cold name query needs about 160 MB of maps on top of its 291 MB name set
 in the conservative full-map loading scheme; a metadata-only column pass can
 use physical rows without loading name maps. Resident full catalog is about
@@ -600,13 +668,24 @@ the small commit; it is not the 1–10 ms scoped-update row. M4 measures both.
 ### Compaction and open
 
 Request a checkpoint at the first of: **64 MB log**, **500k log records**,
-**2% distinct dirty base rows** in either names or inodes, or **5% dead base
-rows**. These are initial measured-work targets, not format constants.
+**2% distinct new or overwritten rows** in either names or inodes, or
+**5% dead base rows**. These are initial measured-work targets, not format constants.
 Repeated updates of one file hit log/record limits even with only one dirty
-row. Dirty/dead fractions use checkpoint live counts, not lifetime high water.
+row. New/overwritten and dead fractions use checkpoint live counts, not
+lifetime high water; a deleted row is in the dead fraction, not both.
 At the 2% limit, an inode/doc overlay is roughly tens of MB on disk and
 20–80 MB resident (estimate, representation dependent). Geometric runs and
 queries retaining old runs can increase that; report it.
+
+Preflight the final transaction against these bounds. If an ordinary burst
+would cross a bound, checkpoint at that writer boundary before appending it.
+If the incoming diff itself exceeds a bound (a large policy change, root
+removal or widespread churn), build the next checkpoint directly from the
+old view plus that validated diff and publish it atomically, rather than
+appending a huge log only to rewrite it immediately. The commit result still
+contains the logical change set. This adds a full-write cost for large diffs
+and at threshold boundaries; report it separately from small-update latency.
+Limits bound a published log, not an assumption that every input fits a burst.
 
 Provisionally compact at an idle writer boundary, holding the writer lock;
 queries retain old views and keep running. The new snapshot traverses the
@@ -614,19 +693,23 @@ effective graph, packs only live physical rows, rebuilds id maps and verifies
 reference counts. Stream sections with bounded buffers as today; do not
 re-materialise 120 B walk batches for every row. Reuse the effective catalog
 as the row source, freeing plan arrays when their sections finish. Reserve
-about **0.85 GB additional disk** (checkpoint plus worst allowed suffix/temp
-space) beyond the old pair, and about **0.2–0.5 GB transient RAM** for ordering,
-maps and checks (estimates). Retired readers add pinned old buffers/files.
+about **0.9 GB additional disk** (checkpoint plus bounded suffix/temp space,
+including DocId holes) beyond the old pair, and about **0.2–0.9 GB transient
+RAM** for ordering, maps and validation (estimates). Free planning arrays
+before the read-back check; retaining the whole new checkpoint for validation
+alone adds about 0.8 GB. Resident engine plus writer/compaction scratch can
+exceed 1 GB transiently; D48's steady query-resident goal is reported apart
+from that peak. Retired readers add pinned old buffers/files.
 
-Estimated compaction at exactly 10M writes **761.5 MB** plus a log header and
-manifest, reads about **761.5 MB** of source and another **761.5 MB** for finished
+Estimated compaction at exactly 10M writes **761.7 MB** plus a log header and
+manifest, reads about **761.7 MB** of source and another **761.7 MB** for finished
 section checksum/self-check, and takes **10–20 s** with barriers, packing and
 map checks. For comparison, measured v3 build at 10.45M was **10.71 s** and
 **1,640.7 MiB** peak (ROADMAP S1c/M4a; load 7.86). Earlier v2 commit wall varied
 **7.7–14.4 s**, explicitly dominated by sync, in ROADMAP S1a's rerun series.
 Those are whole-build baselines, not an incremental compactor benchmark.
 Normal resident compaction may read its source from buffers rather than disk;
-do not count that as guaranteed cold I/O saved. A full cold load of 761.5 MB
+do not count that as guaranteed cold I/O saved. A full cold load of 761.7 MB
 adds about 0.76 s read and 0.38 s checksum under the model, plus validation.
 
 On open let T be transaction count, N record count and L log bytes:
@@ -686,7 +769,7 @@ existing paths are relative to the repository root. No watcher is built here.
 
 | Slice | Change and files touched | Tests and measurement gate |
 | --- | --- | --- |
-| **M1 — Checked checkpoint and stable ids** | `crates/ferret-catalog/src/{lib,format,read,build,transaction}.rs`, new `ids.rs`, `src/tests/{decode,round_trip,carry,roots}.rs`, new id/migration fixtures; workspace/crawl/catalog manifests and lockfile for sharing existing BLAKE3; `crates/ferret/tests/layering.rs`, DESIGN's dependency graph and decisions | v3 import preserves roots/DocIds; stable logical ids, holes, reserved limits, bidirectional map validation, every truncation/value flip, lazy checksum failures; measured bytes per section and maps at 10M, checksum throughput, no-log name/metadata/full open and RSS |
+| **M1 — Checked checkpoint and stable ids** | `crates/ferret-catalog/src/{lib,batch,format,read,build,transaction}.rs`, new `ids.rs`, `src/tests/{decode,round_trip,carry,roots}.rs`, new id/migration fixtures; workspace/crawl/catalog manifests and lockfile for sharing existing BLAKE3; `crates/ferret/tests/layering.rs`, DESIGN's dependency graph and decisions | v3 import preserves roots/DocIds; stable logical ids, holes, reserved limits, bidirectional map validation, every truncation/value flip, lazy checksum failures; measured bytes per section and maps at 10M, checksum throughput, no-log name/metadata/full open and RSS |
 | **M2 — Durable log transactions** | new catalog `src/log.rs`, `src/tests/log.rs`; `transaction.rs`, `read.rs`, `format.rs`, `src/tests/commit.rs`; `crates/ferret-bench/src/main.rs` | every append truncation and sync/rename crash point; published-prefix corruption refused, unpublished tail ignored; lock races, old-reader lazy loads after append/checkpoint unlink; measured tiny/batched writes, three barriers, header-only opens versus T/N |
 | **M3 — Effective reader and queries** | new catalog `src/overlay.rs`, log/read/id modules and tests; `crates/ferret-query/src/run.rs`, its tests and `src/find/{walk,test}.rs` as needed; `crates/ferret/src/stats.rs`, census/CLI tests | snapshot-plus-log matches a materialised oracle for create/delete/replace/rename/move, directory cycles rejected, ignored/special/traversed/root cases, hard links and docs, all candidate strategies; find prune/depth/delete semantics; measured 0/1/2% overlays, merge-carry latency, resident queries/RSS; no changes to free sibling-order contract |
 | **M4 — Recrawl diff producer** | new `crates/ferret-crawl/src/reconcile.rs`; `index.rs`, `observe.rs`, `src/tests/{index,lifecycle,parallel,race}.rs`; catalog batch/transaction seams; `crates/ferret-catalog/examples/synthetic.rs`, bench driver | unchanged pass writes zero; metadata equal-content DocId stable; ambiguous rename/reused identity, hard links across kept/refreshed roots, policy/sniffer changes and root boundaries; retain amended A′ fault rule; measure no-change, one-file and 1% full-recrawl writes/time/RSS including session setup |
