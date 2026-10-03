@@ -76,6 +76,7 @@ usage:
                                 use -delete or -I for deletion-aware emptiness
   ferret search [--json] [--limit N] [--] ATOM...
                                 print each path that matches every ATOM
+  ferret import-v3              import the legacy snapshot, preserving roots and DocIds
   ferret stats                  counts, sizes and a census of the index
   ferret help | --version
 
@@ -174,6 +175,15 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         Command::RootsList => crate::index::list(&context),
         Command::RootsRemove(roots) => crate::index::remove(&context, &roots),
         Command::Stats => crate::stats::run(&context),
+        Command::ImportV3 => {
+            match ferret_catalog::Transaction::import_v3(&context.index, [0; 16]) {
+                Ok(_) => Exit::Ok,
+                Err(e) => {
+                    error(&e.to_string());
+                    Exit::Error
+                }
+            }
+        }
         Command::Help | Command::Version | Command::Find(_) => Exit::Ok,
     }
 }

@@ -45,25 +45,26 @@ fn sample(name: &str) -> Vec<u8> {
         w.file(other, b"e", file_stat(14), Content::Fault);
         txn.add(w);
     });
-    std::fs::read(scratch.path.join("catalog")).unwrap()
+    std::fs::read(super::snapshot(&scratch.path)).unwrap()
 }
 
 /// Where `section` starts in `bytes`, from its table.
 fn section_start(bytes: &[u8], section: Section) -> usize {
-    let at = HEADER + section as usize * 16;
+    let at = HEADER + section as usize * 32;
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
 }
 
 /// Where `column`'s descriptor lies in `bytes`.
 fn descriptor(column: Column) -> usize {
-    TABLE_END - (COLUMNS.len() - column as usize) * 16
+    TABLE_END - 16 - (COLUMNS.len() - column as usize) * 16
 }
 
 /// Overwrites row `row` of `column` with the packed value `raw`, leaving
 /// everything else as it was. In a blocked column, `raw` is above the row's
 /// block's base, at its block's width.
 fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
-    let layout = format::decode_table(bytes, bytes.len() as u64).unwrap();
+    let signed = resigned(bytes.to_vec());
+    let layout = format::decode_table(&signed, bytes.len() as u64).unwrap();
     let placed = layout.columns[column as usize];
     let start =
         section_start(bytes, column.section()) + placed.start + placed.desc.dict_len as usize * 8;
@@ -93,7 +94,8 @@ fn set_raw(bytes: &mut [u8], column: Column, row: usize, raw: u64) {
 /// Overwrites the base of block `block` of the blocked column `column`: every
 /// row of the block moves with it.
 fn set_block_base(bytes: &mut [u8], column: Column, block: usize, base: u64) {
-    let layout = format::decode_table(bytes, bytes.len() as u64).unwrap();
+    let signed = resigned(bytes.to_vec());
+    let layout = format::decode_table(&signed, bytes.len() as u64).unwrap();
     let placed = layout.columns[column as usize];
     let entry = section_start(bytes, column.section())
         + placed.start
@@ -203,7 +205,47 @@ fn exercise(catalog: &Catalog) -> usize {
 /// Writes `bytes` as a catalog file in `dir`, for the lazy reader.
 fn write_catalog(dir: &Path, bytes: &[u8]) {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(dir.join("catalog"), bytes).unwrap();
+    if let Ok(layout) = format::decode_table(bytes, bytes.len() as u64) {
+        let manifest = crate::generation::Manifest::from_layout(&layout);
+        std::fs::write(dir.join("current"), manifest.encode()).unwrap();
+        std::fs::write(
+            dir.join(format!("snapshot.{}", layout.generation.checkpoint)),
+            bytes,
+        )
+        .unwrap();
+    } else {
+        if !dir.join("current").exists() {
+            let manifest = crate::generation::Manifest {
+                generation: crate::Generation {
+                    incarnation: [1; 16],
+                    checkpoint: 0,
+                    sequence: 0,
+                },
+                log_end: 0,
+                checkpoint_sequence: 0,
+                sniffer: SNIFFER,
+                counters: [0; 3],
+                counts: [0; 4],
+            };
+            std::fs::write(dir.join("current"), manifest.encode()).unwrap();
+        }
+        std::fs::write(super::snapshot(dir), bytes).unwrap();
+    }
+}
+
+/// Signs intentionally malformed fixtures, so structural regression tests
+/// reach the real decoder behind the integrity checks.
+fn resigned(mut bytes: Vec<u8>) -> Vec<u8> {
+    for section in SECTIONS {
+        let at = HEADER + section as usize * 32;
+        let start = format::u64_at(&bytes, at) as usize;
+        let len = format::u64_at(&bytes, at + 8) as usize;
+        let digest = crate::generation::checksum(&bytes[start..start + len]);
+        bytes[at + 16..at + 32].copy_from_slice(&digest);
+    }
+    let digest = crate::generation::checksum(&bytes[..TABLE_END - 16]);
+    bytes[TABLE_END - 16..TABLE_END].copy_from_slice(&digest);
+    bytes
 }
 
 /// Opens `dir` lazily and loads `sections`: `None` when the open or the load
@@ -277,9 +319,9 @@ fn a_file_truncated_under_an_open_reader_is_an_error_on_load() {
     catalog.load(&[Section::Names]).unwrap();
     std::fs::OpenOptions::new()
         .write(true)
-        .open(scratch.path.join("catalog"))
+        .open(super::snapshot(&scratch.path))
         .unwrap()
-        .set_len(bytes.len() as u64 - 30)
+        .set_len(section_start(&bytes, Section::Docs) as u64 + 1)
         .unwrap();
     assert!(matches!(
         catalog.load(&[Section::Docs]),
@@ -289,10 +331,10 @@ fn a_file_truncated_under_an_open_reader_is_an_error_on_load() {
 }
 
 #[test]
-fn every_single_bit_flip_is_an_error_or_reads_safely() {
+fn every_single_bit_flip_is_refused_when_its_section_loads() {
     let bytes = sample("decode-flip");
     let scratch = Scratch::new("decode-flip-lazy");
-    let (mut rejected, mut accepted) = (0, 0);
+    let mut rejected = 0;
     for at in 0..bytes.len() {
         for bit in 0..8 {
             let mut flipped = bytes.clone();
@@ -314,34 +356,11 @@ fn every_single_bit_flip_is_an_error_or_reads_safely() {
                     assert!(whole.is_none(), "{context}: accepted only lazily");
                     rejected += 1;
                 }
-                Ok(catalog) => {
-                    assert!(whole.is_some(), "{context}: refused only lazily");
-                    exercise(&catalog);
-                    assert_lookups_agree(&catalog, &context);
-                    accepted += 1;
-                    // The head of the file is fully checked, but for the
-                    // sniffer, the next DocId, the counts and the columns'
-                    // bases. A count can flip into another consistent
-                    // catalog: one more directory, when padding bits read as
-                    // a name edge that fits, makes the first file a
-                    // directory. The table and every width and dictionary
-                    // length are exact.
-                    let descriptors = descriptor(Column::NameParent);
-                    let base = at >= descriptors && (at - descriptors) % 16 < 8;
-                    assert!(
-                        at >= TABLE_END || (12..20).contains(&at) || (24..36).contains(&at) || base,
-                        "flip at {at} bit {bit} accepted"
-                    );
-                }
+                Ok(_) => panic!("{context}: accepted corrupt bytes"),
             }
         }
     }
-    // Most flips land in values nothing indexes by (times, hashes, bytes of a
-    // name), which decode reads back as different values.
-    assert!(
-        rejected > 0 && accepted > 0,
-        "{rejected} rejected, {accepted} accepted"
-    );
+    assert!(rejected > 0);
 }
 
 #[test]
@@ -355,7 +374,7 @@ fn a_corrupt_section_fails_only_the_load_that_reads_it() {
     let next = u64::from(docs.next_doc().0);
     set_descriptor(&mut bytes, Column::DocId, 0, &next.to_le_bytes());
     let scratch = Scratch::new("decode-partial-lazy");
-    write_catalog(&scratch.path, &bytes);
+    write_catalog(&scratch.path, &resigned(bytes.clone()));
 
     let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
     let names = [
@@ -399,7 +418,7 @@ fn doc_ids_that_stop_increasing_are_rejected() {
             txn.add(w);
         });
     }
-    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let mut bytes = std::fs::read(super::snapshot(&scratch.path)).unwrap();
     let catalog = Catalog::from_bytes(bytes.clone()).unwrap();
     let ids: Vec<u32> = catalog.docs().map(|(id, _)| id.0).collect();
     assert_eq!(ids, [0, 2, 3]);
@@ -416,7 +435,7 @@ fn a_blocked_column_whose_table_misplaces_a_block_is_rejected_on_load() {
     let layout = format::decode_table(&bytes, bytes.len() as u64).unwrap();
     let scratch = Scratch::new("decode-blocked-lazy");
     let blocked = COLUMNS.into_iter().filter(|c| c.coding().is_blocked());
-    assert_eq!(blocked.clone().count(), 12);
+    assert_eq!(blocked.clone().count(), 13);
     for column in blocked {
         let placed = layout.columns[column as usize];
         let entry = section_start(&bytes, column.section()) + placed.start + 8;
@@ -427,11 +446,11 @@ fn a_blocked_column_whose_table_misplaces_a_block_is_rejected_on_load() {
             let label = column.section().label();
             let context = format!("{column:?} {what}");
             assert_eq!(
-                Catalog::from_bytes(bad.clone()).err(),
+                Catalog::from_bytes(resigned(bad.clone())).err(),
                 Some(DecodeError::Corrupt(label)),
                 "{context}"
             );
-            write_catalog(&scratch.path, &bad);
+            write_catalog(&scratch.path, &resigned(bad.clone()));
             let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
             assert!(
                 matches!(
@@ -490,10 +509,10 @@ fn a_directory_whose_name_points_upwards_is_rejected() {
     let sub = catalog.dir_name(InoId(1)).unwrap();
     assert_eq!((sub, catalog.name(sub).parent), (NameId(1), InoId(0)));
 
-    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let mut bytes = std::fs::read(super::snapshot(&scratch.path)).unwrap();
     set_raw(&mut bytes, Column::NameParent, sub.0 as usize, 1);
     assert_eq!(
-        Catalog::from_bytes(bytes).err(),
+        Catalog::from_bytes(resigned(bytes)).err(),
         Some(DecodeError::Corrupt("dir names"))
     );
 }
@@ -515,11 +534,11 @@ fn a_name_that_makes_a_directory_its_own_descendant_is_rejected() {
     assert_eq!(catalog.child(NameId(0)), InoId(1));
     drop(catalog);
 
-    let path = scratch.path.join("catalog");
+    let path = super::snapshot(&scratch.path);
     let mut bytes = std::fs::read(&path).unwrap();
     // One name: its child's block is width 0, so the value is the base.
     set_block_base(&mut bytes, Column::NameChild, 0, 0);
-    std::fs::write(&path, &bytes).unwrap();
+    std::fs::write(&path, resigned(bytes.clone())).unwrap();
     // Retention is the walk that looped (about 1 GB in 5 s before the fix);
     // the writer must refuse the generation before it can keep anything.
     assert!(matches!(
@@ -529,7 +548,7 @@ fn a_name_that_makes_a_directory_its_own_descendant_is_rejected() {
         )))
     ));
     assert_eq!(
-        Catalog::from_bytes(bytes).err(),
+        Catalog::from_bytes(resigned(bytes)).err(),
         Some(DecodeError::Corrupt("dir names"))
     );
 }
@@ -550,12 +569,12 @@ fn siblings_out_of_order_are_rejected() {
     });
     assert_eq!(catalog.name(NameId(0)).bytes, b"c");
 
-    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let mut bytes = std::fs::read(super::snapshot(&scratch.path)).unwrap();
     let heap_start = section_start(&bytes, Section::NameHeap);
     assert_eq!(bytes[heap_start], b'c');
     bytes[heap_start] = b'g';
     assert_eq!(
-        Catalog::from_bytes(bytes).err(),
+        Catalog::from_bytes(resigned(bytes)).err(),
         Some(DecodeError::Corrupt("name order"))
     );
 }
@@ -571,12 +590,12 @@ fn files_under_root(name: &str, files: &[&[u8]]) -> Vec<u8> {
         }
         txn.add(w);
     });
-    std::fs::read(scratch.path.join("catalog")).unwrap()
+    std::fs::read(super::snapshot(&scratch.path)).unwrap()
 }
 
 fn assert_corrupt(bytes: Vec<u8>, what: &'static str) {
     assert_eq!(
-        Catalog::from_bytes(bytes).err(),
+        Catalog::from_bytes(resigned(bytes)).err(),
         Some(DecodeError::Corrupt(what))
     );
 }
@@ -653,7 +672,7 @@ fn directories_with_swapped_name_edges_are_rejected() {
     });
     assert_eq!(catalog.dir_name(InoId(1)), Some(NameId(0)));
     assert_eq!(catalog.dir_name(InoId(2)), Some(NameId(1)));
-    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let mut bytes = std::fs::read(super::snapshot(&scratch.path)).unwrap();
     set_raw(&mut bytes, Column::DirName, 1, 1);
     set_raw(&mut bytes, Column::DirName, 2, 0);
     assert_corrupt(bytes, "dir names");
@@ -663,7 +682,7 @@ fn directories_with_swapped_name_edges_are_rejected() {
 /// only the section's own length check can object. Bytes are added as zeros
 /// and removed from the end.
 fn resize_section(bytes: &[u8], section: Section, delta: isize) -> Vec<u8> {
-    let table = |i: usize| HEADER + i * 16;
+    let table = |i: usize| HEADER + i * 32;
     let at = section as usize;
     let read = |i: usize, off: usize| {
         u64::from_le_bytes(bytes[table(i) + off..][..8].try_into().unwrap()) as usize
@@ -684,7 +703,7 @@ fn resize_section(bytes: &[u8], section: Section, delta: isize) -> Vec<u8> {
         let offset = (read(i, 0) as isize + delta) as u64;
         out[table(i)..][..8].copy_from_slice(&offset.to_le_bytes());
     }
-    out
+    resigned(out)
 }
 
 /// A column section holds exactly its columns' dictionaries and padded
@@ -702,11 +721,11 @@ fn a_column_section_of_the_wrong_length_is_rejected_at_open() {
             let bad = resize_section(&bytes, section, delta);
             let expect = DecodeError::Corrupt(section.label());
             assert_eq!(
-                Catalog::from_bytes(bad.clone()).err(),
+                Catalog::from_bytes(resigned(bad.clone())).err(),
                 Some(expect),
                 "{section:?} {delta}"
             );
-            write_catalog(&scratch.path, &bad);
+            write_catalog(&scratch.path, &resigned(bad.clone()));
             assert!(
                 matches!(
                     Catalog::open(&scratch.path),
@@ -735,11 +754,11 @@ fn a_width_over_64_is_rejected_even_where_no_value_is_read() {
         w.root(b"/s", dir_stat(1));
         txn.add(w);
     });
-    let mut bytes = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let mut bytes = std::fs::read(super::snapshot(&scratch.path)).unwrap();
     assert!(Catalog::from_bytes(bytes.clone()).is_ok());
     set_descriptor(&mut bytes, Column::NameParent, 8, &65u32.to_le_bytes());
     assert_eq!(
-        Catalog::from_bytes(bytes).err(),
+        Catalog::from_bytes(resigned(bytes)).err(),
         Some(DecodeError::Corrupt("names"))
     );
 }
@@ -751,7 +770,7 @@ fn a_dictionary_on_a_column_that_has_none_is_rejected() {
     let mut bytes = resize_section(&sample("decode-stray-dict"), Section::Size, 8);
     set_descriptor(&mut bytes, Column::Size, 12, &1u32.to_le_bytes());
     assert_eq!(
-        Catalog::from_bytes(bytes).err(),
+        Catalog::from_bytes(resigned(bytes)).err(),
         Some(DecodeError::Corrupt("size"))
     );
 }
@@ -764,14 +783,14 @@ fn a_dictionary_index_past_the_end_is_rejected_on_load() {
     let mut bad = bytes.clone();
     set_raw(&mut bad, Column::Mode, 0, 3);
     let scratch = Scratch::new("decode-dict-index-lazy");
-    write_catalog(&scratch.path, &bad);
+    write_catalog(&scratch.path, &resigned(bad.clone()));
     let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
     assert!(matches!(
         catalog.load(&[Section::Mode]),
         Err(OpenError::Decode(DecodeError::Corrupt("mode")))
     ));
     assert_eq!(
-        Catalog::from_bytes(bad).err(),
+        Catalog::from_bytes(resigned(bad)).err(),
         Some(DecodeError::Corrupt("mode"))
     );
 }
@@ -786,7 +805,7 @@ fn a_dictionary_base_that_reaches_past_the_end_is_rejected() {
         let mut bad = bytes.clone();
         set_descriptor(&mut bad, Column::Owner, 0, &base.to_le_bytes());
         assert_eq!(
-            Catalog::from_bytes(bad).err(),
+            Catalog::from_bytes(resigned(bad)).err(),
             Some(DecodeError::Corrupt("owner")),
             "base {base}"
         );
@@ -801,8 +820,11 @@ fn counts_that_cannot_hold_are_rejected_at_open() {
     for (at, value) in [(24, inodes + 1), (28, u32::MAX), (32, u32::MAX)] {
         let mut bad = bytes.clone();
         bad[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        if at == 28 || at == 32 {
+            bad[at + 44..at + 48].copy_from_slice(&value.to_le_bytes());
+        }
         assert_eq!(
-            Catalog::from_bytes(bad).err(),
+            Catalog::from_bytes(resigned(bad)).err(),
             Some(DecodeError::Corrupt("counts")),
             "at {at}"
         );
@@ -981,7 +1003,7 @@ fn the_previous_packed_format_requires_reindexing() {
     let mut bytes = sample("decode-v2");
     bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
     assert_eq!(
-        Catalog::from_bytes(bytes).err(),
+        Catalog::from_bytes(resigned(bytes)).err(),
         Some(DecodeError::Version(2))
     );
 }
@@ -1055,7 +1077,7 @@ fn ignored_tags_and_special_rows_validate_before_access() {
     let marker = catalog.resolve(b"/r/.///ignored-0/child").unwrap();
     assert_eq!(marker.target, Target::Ignored(Kind::Dir));
     assert_eq!(marker.remainder, b"child");
-    let original = std::fs::read(scratch.path.join("catalog")).unwrap();
+    let original = std::fs::read(super::snapshot(&scratch.path)).unwrap();
     let mut tombstone = original.clone();
     // The mixed block spans a real id and high tags, so it has room for all
     // u32 values; set_raw takes the value relative to that block's base.
@@ -1070,7 +1092,7 @@ fn ignored_tags_and_special_rows_validate_before_access() {
         u64::from(format::NONE - 8) - base,
     );
     assert_eq!(
-        Catalog::from_bytes(tombstone).err(),
+        Catalog::from_bytes(resigned(tombstone)).err(),
         Some(DecodeError::Corrupt("names"))
     );
     for kind in [0u32, 2, 7, u32::MAX] {
@@ -1078,7 +1100,7 @@ fn ignored_tags_and_special_rows_validate_before_access() {
         let at = section_start(&bad, Section::Specials) + 4;
         bad[at..at + 4].copy_from_slice(&kind.to_le_bytes());
         assert_eq!(
-            Catalog::from_bytes(bad).err(),
+            Catalog::from_bytes(resigned(bad)).err(),
             Some(DecodeError::Corrupt("specials"))
         );
     }

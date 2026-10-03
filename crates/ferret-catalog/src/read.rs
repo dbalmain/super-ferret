@@ -23,7 +23,7 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,8 +32,11 @@ use crate::format::{
     self, COLUMNS, Column, Facts, HASH_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
     WORK_TREE_ROW, u32_at, u64_at,
 };
+use crate::generation::Manifest;
 use crate::packed::{self, Blocked};
-use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
+use crate::{
+    ContentState, DecodeError, DocId, Generation, Handle, Hash, InoId, NameId, RetryFromCurrent,
+};
 
 /// Inodes in one run of [`Catalog::size_run`] and [`Catalog::mtime_run`]:
 /// a bitset word's worth.
@@ -232,20 +235,63 @@ enum Source {
     },
 }
 
+fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
+    let file = match File::open(dir.join("current")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Legacy snapshots remain explicitly refused; only import reads v3.
+            if let Ok(file) = File::open(dir.join(FILE)) {
+                let mut head = [0; 12];
+                file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
+                return Err(OpenError::Decode(DecodeError::Version(u32_at(&head, 8))));
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(OpenError::Io(e)),
+    };
+    if file.metadata().map_err(OpenError::Io)?.len() != crate::generation::MANIFEST_LEN as u64 {
+        return Err(OpenError::Decode(DecodeError::Corrupt("manifest")));
+    }
+    let mut bytes = [0; crate::generation::MANIFEST_LEN];
+    file.read_exact_at(&mut bytes, 0).map_err(OpenError::Io)?;
+    Manifest::decode(&bytes)
+        .map(Some)
+        .map_err(OpenError::Decode)
+}
+
+fn open_snapshot(dir: &Path) -> Result<Option<(File, Manifest)>, OpenError> {
+    loop {
+        let Some(manifest) = read_manifest(dir)? else {
+            return Ok(None);
+        };
+        let path = dir.join(format!("snapshot.{}", manifest.generation.checkpoint));
+        match File::open(path) {
+            Ok(file) => return Ok(Some((file, manifest))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let current = read_manifest(dir)?;
+                if current.is_some_and(|next| next.generation != manifest.generation) {
+                    continue;
+                }
+                return Err(OpenError::Io(e));
+            }
+            Err(e) => return Err(OpenError::Io(e)),
+        }
+    }
+}
+
 impl Catalog {
     /// Opens the catalog in `dir`, reading and checking only the header and
     /// section table; no section is loaded. `Ok(None)` when nothing has been
     /// committed there yet.
     pub fn open(dir: &Path) -> Result<Option<Catalog>, OpenError> {
-        let file = match File::open(dir.join(FILE)) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(OpenError::Io(e)),
+        let Some((file, manifest)) = open_snapshot(dir)? else {
+            return Ok(None);
         };
         let len = file.metadata().map_err(OpenError::Io)?.len();
         let mut head = vec![0; (len as usize).min(TABLE_END)];
         file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
         let layout = format::decode_table(&head, len).map_err(OpenError::Decode)?;
+        manifest.check(&layout).map_err(OpenError::Decode)?;
         Ok(Some(Catalog {
             layout,
             source: Source::File {
@@ -255,6 +301,77 @@ impl Catalog {
                 facts: Facts::default(),
             },
         }))
+    }
+
+    /// Dense checkpoint allocation high water for inodes (no log in M1).
+    pub fn next_inode(&self) -> InoId {
+        InoId(self.inode_count())
+    }
+
+    /// Dense checkpoint allocation high water for names (no log in M1).
+    pub fn next_name(&self) -> NameId {
+        NameId(self.name_count())
+    }
+
+    /// This view's identity, including the inode/name epoch.
+    pub fn generation(&self) -> Generation {
+        self.layout.generation
+    }
+
+    /// Resolves a checked inode handle only after validating its source view.
+    pub fn checked_inode(&self, handle: Handle<InoId>) -> Result<InoId, RetryFromCurrent> {
+        self.generation().check(handle.generation)?;
+        assert!(
+            handle.id.0 < self.inode_count(),
+            "inode handle out of range"
+        );
+        Ok(handle.id)
+    }
+
+    /// Resolves a checked name handle only after validating its source view.
+    pub fn checked_name(&self, handle: Handle<NameId>) -> Result<NameId, RetryFromCurrent> {
+        self.generation().check(handle.generation)?;
+        assert!(handle.id.0 < self.name_count(), "name handle out of range");
+        Ok(handle.id)
+    }
+
+    /// The published snapshot path, for diagnostics and benchmark I/O.
+    /// Readers retain a descriptor; reopening this path does not pin a view.
+    pub fn snapshot_path(dir: &Path) -> Result<Option<PathBuf>, OpenError> {
+        let Some(manifest) = read_manifest(dir)? else {
+            return Ok(None);
+        };
+        Ok(Some(dir.join(format!(
+            "snapshot.{}",
+            manifest.generation.checkpoint
+        ))))
+    }
+
+    /// Last trustworthy subtree sequence. Requires RetainedAt.
+    pub fn retained_at(&self, dir: InoId) -> Option<u64> {
+        self.layout
+            .blocked(Column::RetainedAt, self.section(Section::RetainedAt))
+            .nullable(dir.0 as usize)
+    }
+
+    /// Writer policy fingerprint. Requires Policy.
+    pub fn policy(&self) -> Hash {
+        let mut fingerprint = [0; 16];
+        fingerprint.copy_from_slice(self.section(Section::Policy));
+        fingerprint
+    }
+
+    /// Indexed inode reference count for a live document. Requires DocRefs
+    /// (which loads Docs and Doc for validation).
+    pub fn doc_references(&self, id: DocId) -> Option<u32> {
+        self.docs()
+            .enumerate()
+            .find(|(_, (doc, _))| *doc == id)
+            .map(|(row, _)| u32_at(self.section(Section::DocRefs), row * 4))
+    }
+
+    pub(crate) fn manifest(&self) -> Manifest {
+        Manifest::from_layout(&self.layout)
     }
 
     /// Validates `bytes` as a whole snapshot file. Every section is loaded.

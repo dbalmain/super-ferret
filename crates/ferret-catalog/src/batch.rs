@@ -130,6 +130,7 @@ pub(crate) struct DirEntry {
     pub(crate) parent: Option<DirToken>,
     pub(crate) name: Span,
     pub(crate) traversed: bool,
+    pub(crate) retained_at: Option<u64>,
 }
 
 /// A file or symlink's place in the tree. Its stat, content and any link
@@ -275,6 +276,16 @@ impl Batch {
         self.entry_counts.push((dir, count.min(NONE - 1)));
     }
 
+    /// Records a retained subtree's last trustworthy sequence. The token must
+    /// belong to this batch. The writer rejects sequences beyond its view.
+    pub fn retained_at(&mut self, dir: DirToken, sequence: Option<u64>) {
+        assert_eq!(
+            dir.batch, self.id,
+            "retained directory belongs to another batch"
+        );
+        self.dirs[dir.index as usize].retained_at = sequence;
+    }
+
     /// A symlink's target, for file `index`.
     pub(crate) fn target(&self, index: usize) -> Option<&[u8]> {
         let at = self
@@ -307,6 +318,7 @@ impl Batch {
             parent,
             name,
             traversed,
+            retained_at: None,
         });
         self.dir_stats.push(stat);
         token

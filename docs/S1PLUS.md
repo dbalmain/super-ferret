@@ -1,7 +1,7 @@
 # S1+ — Incremental catalog
 
 M0 design, 2026-10-03. Implementation baseline: `4e38e77`, format v3.
-This document specifies the next format; it does not describe shipped code.
+M1 implements the checked version-4 checkpoint; later slices below remain a design.
 The build is split into slices below. D51 is open; its recommended choice is
 the provisional compaction schedule. D52 interprets D27 C as epoch-scoped ids:
 proceeding on the recommendation; Dave may veto. Neither is recorded as an
@@ -102,6 +102,53 @@ substituted for compaction. No content postings exist yet to migrate.
 Imported dense v3 InoIds/NameIds become the initial epoch ids, with next ids
 equal to their counts. A v3 reader already open keeps its original file.
 The import keeps that file available until the new manifest is durable.
+
+### M1 checkpoint wire layout (implemented)
+
+M1 uses version 4. Its 96 B header keeps v3's fields at 0..40, adds
+incarnation at 40..56, checkpoint at 56, checkpoint sequence at 64,
+next InoId at 72 and next NameId at 76, and reserves 80..96 as zeros.
+Twenty-six 32 B section entries hold offset, length and BLAKE3-128 checksum.
+Eighteen 16 B column descriptors follow, including nullable-blocked RetainedAt.
+A 16 B checksum over all preceding head bytes ends the 1,232 B head.
+DocRefs stores one u32 per live Docs row, counting indexed inode bindings;
+multiple hard links to one inode count once. Policy holds 16 B. Until M4
+supplies a fingerprint producer, zero means policy unknown; a checkpoint keeps
+an existing fingerprint and the writer can set an explicit one.
+
+`current`'s fixed layout is:
+
+| Offset | Field | Bytes |
+| ---: | --- | ---: |
+| 0 | `FERRETCR`, version u32, reserved zeros | 16 |
+| 16 | incarnation | 16 |
+| 32 | checkpoint, sequence, committed log end, checkpoint sequence | 32 |
+| 64 | sniffer version | 4 |
+| 68 | next InoId, NameId, DocId | 12 |
+| 80 | live inodes, names, directories, documents | 16 |
+| 96 | reserved zeros | 16 |
+| 112 | BLAKE3-128 over bytes 0..112 | 16 |
+
+M1 has no log: committed log end is zero, sequence equals checkpoint sequence,
+and inode/name counters equal dense base counts. Epoch-local holes arrive with
+M2/M3; DocId holes already persist. The existing full-rebuild writer advances
+both checkpoint and sequence on each publication until M4 can distinguish
+empty diffs. It streams and syncs a private snapshot, validates it, renames to
+`snapshot.<n>`, syncs that directory entry, then writes/syncs/renames `current`
+and syncs the directory. Retired snapshots are unlinked after that last sync;
+pinned descriptors retain their bytes. Abandoned suffixes are skipped rather
+than reused. The writer computes checksums with a bounded reread after
+streaming columns, since independent positional column writes are interleaved.
+
+`ferret import-v3` is the explicit import path. It copies packed columns without
+renumbering base ids or DocIds, fills all-none RetainedAt and computed DocRefs,
+and validates through the v4 decoder. A v3 file has no integrity digests, so
+import can detect structural damage but cannot detect arbitrary changed values
+that v3 never checksummed. The old file remains until the manifest is durable.
+Ordinary queries continue to refuse v3; explicit indexing with roots can reset
+that namespace as before. Raw InoId/NameId accessors are internal to a pinned
+query view; exported `Handle` requests check their complete generation before
+interpreting a numeric id.
 
 ### Transaction envelope
 
@@ -817,7 +864,7 @@ existing paths are relative to the repository root. No watcher is built here.
 
 | Slice | Change and files touched | Tests and measurement gate |
 | --- | --- | --- |
-| **M1 — Checked checkpoint and epoch ids** | `crates/ferret-catalog/src/{lib,batch,format,read,build,transaction}.rs`, new `generation.rs`, `src/tests/{decode,round_trip,carry,roots}.rs`, new epoch/migration fixtures; workspace/crawl/catalog manifests and lockfile for sharing existing BLAKE3; `crates/ferret/tests/layering.rs`, DESIGN's dependency graph and decisions | v3 import preserves roots/DocIds; dense base ids, tagged generation/epoch mismatch, epoch-local holes and reserved limits, every truncation/value flip, lazy checksum failures; measured bytes per section at 10M and the 602 MB checkpoint estimate, checksum throughput, no-log name/metadata/full open and RSS |
+| **M1 — Checked checkpoint and epoch ids** | `crates/ferret-catalog/src/{lib,batch,format,read,build,transaction}.rs`, new `generation.rs`, `src/tests/{decode,round_trip,carry,roots}.rs`, new epoch/migration fixtures; catalog manifest and lockfile for reusing crawl's existing BLAKE3 version; `crates/ferret/tests/layering.rs`, DESIGN's dependency graph and decisions | v3 import preserves roots/DocIds; dense base ids, tagged generation/epoch mismatch, epoch-local holes and reserved limits, every truncation/value flip, lazy checksum failures; measured bytes per section at 10M and the 602 MB checkpoint estimate, checksum throughput, no-log name/metadata/full open and RSS |
 | **M2 — Durable log transactions** | new catalog `src/log.rs`, `src/tests/log.rs`; `transaction.rs`, `read.rs`, `format.rs`, `src/tests/commit.rs`; `crates/ferret-bench/src/main.rs` | every append truncation and sync/rename crash point; published-prefix corruption refused, unpublished tail ignored; lock races, old-reader lazy loads after append/checkpoint unlink; measured tiny/batched writes, three barriers, header-only opens versus T/N |
 | **M3 — Effective reader and queries** | new catalog `src/overlay.rs`, log/read/generation modules and tests; `crates/ferret-query/src/run.rs`, its tests and `src/find/{walk,test}.rs` as needed; `crates/ferret/src/stats.rs`, census/CLI tests | snapshot-plus-log matches a materialised oracle for create/delete/replace/rename/move, directory cycles rejected, ignored/special/traversed/root cases, hard links and docs, all candidate strategies; find prune/depth/delete semantics; measured 0/1/2% overlays, merge-carry latency, resident queries/RSS; no changes to free sibling-order contract |
 | **M4 — Recrawl diff producer** | new `crates/ferret-crawl/src/reconcile.rs`; `index.rs`, `observe.rs`, `src/tests/{index,lifecycle,parallel,race}.rs`; catalog batch/transaction seams; `crates/ferret-catalog/examples/synthetic.rs`, bench driver | unchanged pass writes zero; metadata equal-content DocId stable; ambiguous rename/reused identity, hard links across kept/refreshed roots, policy/sniffer changes and root boundaries; retain amended A′ fault rule; measure no-change, one-file and 1% full-recrawl writes/time/RSS including session setup |

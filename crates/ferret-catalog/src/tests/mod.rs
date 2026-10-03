@@ -4,6 +4,7 @@
 mod carry;
 mod commit;
 mod decode;
+mod epoch;
 mod roots;
 mod round_trip;
 
@@ -122,4 +123,8 @@ fn at(catalog: &Catalog, path: &str) -> InoId {
     *paths(catalog)
         .get(path)
         .unwrap_or_else(|| panic!("{path} not catalogued"))
+}
+
+fn snapshot(dir: &Path) -> PathBuf {
+    Catalog::snapshot_path(dir).unwrap().unwrap()
 }

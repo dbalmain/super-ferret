@@ -221,7 +221,7 @@ fn a_crawl_publishes_what_the_tree_holds_and_a_recrawl_reproduces_it() {
 
     let report = index(&tmp.cat(), std::slice::from_ref(&root), Refresh::All, &opts).unwrap();
     assert_eq!(report.refreshed, vec![root.clone()]);
-    let first = fs::read(tmp.cat().join("catalog")).unwrap();
+    let first = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
     let (catalog, rows) = published(&tmp);
 
     let row = |rel: &str| rows[&tmp.at(rel)].clone();
@@ -259,9 +259,16 @@ fn a_crawl_publishes_what_the_tree_holds_and_a_recrawl_reproduces_it() {
     let again = index(&tmp.cat(), &[root], Refresh::All, &opts).unwrap();
     assert_eq!(again.counts.files_read, 0);
     assert_eq!(again.counts.carried, 5);
-    let second = fs::read(tmp.cat().join("catalog")).unwrap();
+    let second = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
     assert!(
-        first == second,
+        first[ferret_catalog::Catalog::open(&tmp.cat())
+            .unwrap()
+            .unwrap()
+            .head_len() as usize..]
+            == second[ferret_catalog::Catalog::open(&tmp.cat())
+                .unwrap()
+                .unwrap()
+                .head_len() as usize..],
         "an unchanged tree republishes byte for byte"
     );
 }
@@ -559,7 +566,7 @@ fn an_unreadable_directory_publishes_but_other_listing_faults_do_not() {
         .unwrap();
     assert_eq!(catalog.entry_count(dir), None);
     drop(catalog);
-    let before = fs::read(tmp.cat().join("catalog")).unwrap();
+    let before = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
 
     // Same tree: the accessible directory now encounters an actual listing
     // error from the injected getdents seam, rather than a mirrored classifier.
@@ -576,7 +583,10 @@ fn an_unreadable_directory_publishes_but_other_listing_faults_do_not() {
     assert_eq!(faults[0].path, Path::new("open"));
     assert_eq!(faults[0].error.raw_os_error(), Some(5));
     assert!(report.published.is_none());
-    assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+    assert_eq!(
+        fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
+        before
+    );
 }
 
 #[test]
@@ -602,7 +612,7 @@ fn a_readlink_failure_blocks_publication_and_keeps_the_old_generation() {
     std::os::unix::fs::symlink("f.txt", tmp.at("link")).unwrap();
     let roots = [tmp.tree()];
     run(&tmp, &roots, Refresh::All, 1);
-    let before = fs::read(tmp.cat().join("catalog")).unwrap();
+    let before = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
 
     tmp.write("new.txt", b"new\n");
     crate::walk::FAIL_READLINK.set(Some(Box::new(|name| name == "link")));
@@ -616,7 +626,10 @@ fn a_readlink_failure_blocks_publication_and_keeps_the_old_generation() {
         matches!(faults.as_slice(), [f] if f.op == IoOp::Readlink && f.path.ends_with("link")),
         "{faults:?}"
     );
-    assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+    assert_eq!(
+        fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
+        before
+    );
 }
 
 #[test]
@@ -1335,17 +1348,23 @@ fn ignored_names_opaque_directories_and_special_stats_round_trip() {
         // Root keep must copy ignored rows without indexing their reserved
         // child ids.
         drop(catalog);
-        let before = fs::read(tmp.cat().join("catalog")).unwrap();
+        let before = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
         // An ignored file's content, size and timestamps have no snapshot
         // representation: changing it must neither read content nor churn
         // bytes.
         tmp.write("regular.ignored", b"changed ignored content and size");
         let report = run(&tmp, &[tmp.tree()], Refresh::All, workers);
         assert_eq!(report.counts.files_read, 0);
-        assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+        assert_eq!(
+            fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
+            before
+        );
         let mut txn = ferret_catalog::Transaction::begin(&tmp.cat(), 1).unwrap();
         txn.keep(tmp.tree().as_os_str().as_bytes()).unwrap();
         txn.commit().unwrap();
-        assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+        assert_eq!(
+            fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
+            before
+        );
     }
 }

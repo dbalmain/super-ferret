@@ -18,6 +18,8 @@
 pub mod batch;
 mod build;
 mod format;
+mod generation;
+mod migrate;
 mod packed;
 pub mod read;
 pub mod transaction;
@@ -28,6 +30,7 @@ mod tests;
 pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
 pub use build::BuildError;
 pub use format::{DecodeError, Section};
+pub use generation::{Generation, Handle, RetryFromCurrent};
 pub use read::{
     Catalog, Contents, Entry, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN,
     Resolved, Target, WorkTree,

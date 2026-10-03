@@ -103,6 +103,9 @@ dependencies = [
 [[package]]
 name = "ferret-catalog"
 version = "0.0.0"
+dependencies = [
+ "blake3",
+]
 
 [[package]]
 name = "ferret-crawl"

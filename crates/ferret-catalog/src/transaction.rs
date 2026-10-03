@@ -31,14 +31,14 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::batch::{Batch, Content, Stat};
 use crate::build::{self, BuildError, Known};
 use crate::read::{self, Catalog, Kind, OpenError};
-use crate::{ContentState, DecodeError, Hash, InoId};
+use crate::{ContentState, DecodeError, Generation, Hash, InoId};
 
 const TEMP: &str = "catalog.tmp";
 const LOCK: &str = "lock";
@@ -148,6 +148,7 @@ pub struct Transaction {
     /// the `Drop` impl.
     lock: File,
     sniffer: u32,
+    policy: Hash,
     previous: Option<Catalog>,
     /// Old file and symlink rows sorted by `(dev, ino)`, for carry-over:
     /// 4 B per inode where a map measured 40 (D40). Empty when the sniffer
@@ -217,6 +218,7 @@ impl Transaction {
             dir: dir.to_owned(),
             lock,
             sniffer,
+            policy: previous.as_ref().map_or([0; 16], Catalog::policy),
             previous,
             by_identity,
             docs,
@@ -284,6 +286,7 @@ impl Transaction {
         let token = batch.root(path, old.inode(root).stat);
         let mut queue = vec![(root, token)];
         while let Some((dir, token)) = queue.pop() {
+            batch.retained_at(token, old.retained_at(dir));
             if let Some(count) = old.entry_count(dir) {
                 batch.entry_count(token, count);
             }
@@ -353,6 +356,53 @@ impl Transaction {
         Ok(())
     }
 
+    /// Imports the legacy `catalog` file in `dir` explicitly, preserving roots,
+    /// all base row ids and DocIds. Refuses an already published v4 index.
+    /// Holds the writer lock and retains v3 until `current` is durable.
+    pub fn import_v3(dir: &Path, policy: Hash) -> Result<Catalog, CommitError> {
+        let txn = Self::begin(dir, 0).map_err(|e| CommitError::Write(io::Error::other(e)))?;
+        if txn.previous.is_some() {
+            return Err(CommitError::Encode(DecodeError::Corrupt(
+                "import requires v3",
+            )));
+        }
+        let bytes = fs::read(dir.join(read::FILE)).map_err(CommitError::Write)?;
+        let mut generation = Generation::fresh().map_err(CommitError::Write)?;
+        while dir
+            .join(format!("snapshot.{}", generation.checkpoint))
+            .exists()
+        {
+            generation.checkpoint = generation
+                .checkpoint
+                .checked_add(1)
+                .filter(|&n| n != u64::MAX)
+                .ok_or(CommitError::Encode(DecodeError::Corrupt(
+                    "checkpoint exhausted",
+                )))?;
+        }
+        let temp = dir.join(TEMP);
+        let out = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .map_err(CommitError::Write)?;
+        crate::migrate::write(&bytes, &out, generation, policy)?;
+        out.sync_all().map_err(CommitError::Write)?;
+        let catalog = Catalog::from_bytes(fs::read(&temp).map_err(CommitError::Write)?)
+            .map_err(CommitError::Encode)?;
+        publish(dir, &temp, &catalog)?;
+        let _ = fs::remove_file(dir.join(read::FILE));
+        Ok(catalog)
+    }
+
+    /// Sets the fingerprint of global rule bytes and eligibility configuration.
+    /// M1 callers without a policy producer use the zero (unknown) fingerprint.
+    pub fn set_policy(&mut self, fingerprint: Hash) {
+        self.policy = fingerprint;
+    }
+
     /// Builds the new generation and publishes it: stream it to a temp
     /// file, fsync it, read it back and decode it as a self-check, rename it
     /// over the old one, fsync the directory. Returns the new generation,
@@ -365,6 +415,25 @@ impl Transaction {
         self.check_kept_roots()?;
         // The old generation is done with once the batches are filled; only
         // its documents and id counter reach the build.
+        let previous_generation = self.previous.as_ref().map(Catalog::generation);
+        let mut generation = match previous_generation {
+            Some(old) => old.successor().map_err(CommitError::Encode)?,
+            None => Generation::fresh().map_err(CommitError::Write)?,
+        };
+        // An abandoned checkpoint is never adopted or overwritten.
+        while self
+            .dir
+            .join(format!("snapshot.{}", generation.checkpoint))
+            .exists()
+        {
+            generation.checkpoint = generation
+                .checkpoint
+                .checked_add(1)
+                .filter(|&n| n != u64::MAX)
+                .ok_or(CommitError::Encode(DecodeError::Corrupt(
+                    "checkpoint exhausted",
+                )))?;
+        }
         let next_doc = self.previous.take().map_or(0, |old| old.next_doc().0);
         self.by_identity = Vec::new();
         let known = Known {
@@ -377,14 +446,16 @@ impl Transaction {
         self.docs = Vec::new();
 
         let temp = self.dir.join(TEMP);
-        let checked = write_synced(&temp, |out| build::write(plan, batches, out))
-            .map_err(CommitError::Write)
-            .and_then(|()| fs::read(&temp).map_err(CommitError::Write))
-            .and_then(|bytes| Catalog::from_bytes(bytes).map_err(CommitError::Encode))
-            .and_then(|catalog| {
-                fs::rename(&temp, self.dir.join(read::FILE)).map_err(CommitError::Write)?;
-                Ok(catalog)
-            });
+        let checked = write_synced(&temp, |out| {
+            build::write(plan, batches, out, generation, self.policy)
+        })
+        .map_err(CommitError::Write)
+        .and_then(|()| fs::read(&temp).map_err(CommitError::Write))
+        .and_then(|bytes| Catalog::from_bytes(bytes).map_err(CommitError::Encode))
+        .and_then(|catalog| {
+            publish(&self.dir, &temp, &catalog)?;
+            Ok(catalog)
+        });
         let catalog = match checked {
             Ok(catalog) => catalog,
             Err(e) => {
@@ -393,7 +464,11 @@ impl Transaction {
                 return Err(e);
             }
         };
-        sync_dir(&self.dir).map_err(CommitError::Undurable)?;
+        if let Some(old) = previous_generation {
+            let _ = fs::remove_file(self.dir.join(format!("snapshot.{}", old.checkpoint)));
+        }
+        // The legacy file remains available until the new manifest is durable.
+        let _ = fs::remove_file(self.dir.join(read::FILE));
         Ok(catalog)
     }
 }
@@ -433,9 +508,30 @@ fn identity(old: &Catalog, id: u32) -> (u64, u64) {
 }
 
 fn write_synced(path: &Path, write: impl FnOnce(&File) -> io::Result<()>) -> io::Result<()> {
-    let file = File::create(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
     write(&file)?;
     file.sync_all()
+}
+
+fn publish(dir: &Path, temp: &Path, catalog: &Catalog) -> Result<(), CommitError> {
+    let snapshot = dir.join(format!("snapshot.{}", catalog.generation().checkpoint));
+    fs::rename(temp, snapshot).map_err(CommitError::Write)?;
+    // Make the snapshot's directory entry durable before current can name it.
+    File::open(dir)
+        .and_then(|file| file.sync_all())
+        .map_err(CommitError::Write)?;
+    let manifest_temp = dir.join("current.tmp");
+    write_synced(&manifest_temp, |mut out| {
+        out.write_all(&catalog.manifest().encode())
+    })
+    .map_err(CommitError::Write)?;
+    fs::rename(manifest_temp, dir.join("current")).map_err(CommitError::Write)?;
+    sync_dir(dir).map_err(CommitError::Undurable)
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {

@@ -105,7 +105,7 @@ fn open_catalog(dir: &Path) -> Result<Catalog> {
 
 /// Drops the catalog file from the page cache.
 fn evict(dir: &Path) -> Result<()> {
-    let file = File::open(dir.join("catalog"))?;
+    let file = File::open(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?;
     rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)?;
     Ok(())
 }
@@ -120,7 +120,7 @@ fn ms(d: Duration) -> String {
 }
 
 fn describe(dir: &Path, catalog: &Catalog) -> Result<()> {
-    let size = std::fs::metadata(dir.join("catalog"))?.len();
+    let size = std::fs::metadata(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?.len();
     println!(
         "catalog {}: {} names, {} inodes, {} docs, file {:.1} MB",
         dir.display(),
@@ -217,7 +217,7 @@ fn sections(dir: &Path) -> Result<()> {
     let catalog = open_catalog(dir)?;
     describe(dir, &catalog)?;
     let names = f64::from(catalog.name_count());
-    let file = std::fs::metadata(dir.join("catalog"))?.len();
+    let file = std::fs::metadata(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?.len();
     println!("\n| section | bytes | B/name |");
     println!("|---|---:|---:|");
     for (section, len) in catalog.section_sizes() {
@@ -294,7 +294,7 @@ fn fault_split(dir: &Path, name_sections: &[Section]) -> Result<()> {
     catalog.load(name_sections)?;
     let len = catalog.bytes_read() as usize;
     drop(catalog);
-    let file = File::open(dir.join("catalog"))?;
+    let file = File::open(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?;
     let (mut fresh, mut resident) = (Vec::new(), Vec::new());
     let mut buffer = Vec::new();
     for _ in 0..WARM_RUNS {
