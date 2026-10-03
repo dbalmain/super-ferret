@@ -19,8 +19,10 @@ pub mod batch;
 mod build;
 mod format;
 mod generation;
+pub mod log;
 mod migrate;
 mod packed;
+mod publication;
 pub mod read;
 pub mod transaction;
 

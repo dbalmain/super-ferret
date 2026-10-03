@@ -204,8 +204,33 @@ RootPut/RootDelete key by root InoId and include the configured absolute path
 for a put. LinkPut/LinkDelete key by InoId, with target bytes for a put.
 WorkTreePut/WorkTreeDelete key by directory InoId, with kind, common identity
 and path for a put. These use the same record header and counted-string rule.
-M2 fixes their offsets and lengths alongside the fixed records above; M1
-contains no log records.
+M2 uses opcodes 1..15 in this order: LifePut, InodeDelete, NamePut,
+NameDelete, DirPut, RootPut, RootDelete, PolicyPut, InodePut, LinkPut,
+LinkDelete, WorkTreePut, WorkTreeDelete, DocPut, DocDelete. Family tags are
+u16 values 0..3 in the table order; descriptor flags are u16 at byte 2,
+record count is u32 at byte 4, offset/length are u64 at 8/16, digest is
+24..40 and 40..48 is reserved. RootPut and LinkPut have id at byte 8,
+string count at 12, bytes at 16 (`align8(16 + L + 1)`). WorkTreePut has
+id at 8, kind at 12, zeros at 13..16, common dev/ino at 16/24, string
+count at 32 and bytes at 36 (`align8(36 + L + 1)`). Their deletes are
+16 B id/reserved records. PolicyPut is 24 B, its hash at 8..24.
+DirPut flags use bits 0..3 for traversed, search suppressed, complete,
+retained fault; retained-at is u64::MAX for none. LifePut flags are currently
+zero; kind uses the `Kind` discriminants 0..6. All other flags are zero.
+The log header is magic `FERRETCL` at 0, version at 8, zeros at 12..16,
+incarnation at 16, checkpoint at 32, checkpoint sequence at 40 and checksum
+of 0..48 at 48. Transaction magic is `FERRETTX`.
+
+Accepted M1 manifests with log end zero identify a missing, empty log;
+only checkpoint sequence equal to published sequence is legal in that case.
+M2 checkpoints create the header and publish end 64. A log writer upgrades
+an M1 empty prefix under the writer lock before appending. `Published::open`
+pins the checked pair and provides explicit base checkpoint and lazy log
+family access. Until M3 provides an effective overlay, ordinary `Catalog::open`
+refuses a nonempty log with `OverlayRequired`, avoiding stale query answers.
+Live-count cross-checking needs overlay liveness and is therefore M3 work;
+M2 checks counter limits/monotonicity and the final envelope counters against
+current, plus each loaded record's wire invariants and references' bounds.
 LifePut carries kind without loading stat columns and counts **indexed names**,
 not `st_nlink`; ignored names have no LifePut. Directory flags include
 traversed/search-suppressed and complete/retained-fault coverage.

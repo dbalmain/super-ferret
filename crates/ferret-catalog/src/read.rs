@@ -53,6 +53,8 @@ pub enum OpenError {
     Io(io::Error),
     /// The file is not a valid catalog.
     Decode(DecodeError),
+    /// M2 pins log records; M3 will provide their effective query view.
+    OverlayRequired(Generation),
 }
 
 impl fmt::Display for OpenError {
@@ -60,6 +62,9 @@ impl fmt::Display for OpenError {
         match self {
             Self::Io(e) => write!(f, "reading the catalog: {e}"),
             Self::Decode(e) => e.fmt(f),
+            Self::OverlayRequired(g) => {
+                write!(f, "generation {g:?} requires the log overlay reader")
+            }
         }
     }
 }
@@ -235,7 +240,7 @@ enum Source {
     },
 }
 
-fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
+pub(crate) fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
     let file = match File::open(dir.join("current")) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -263,40 +268,23 @@ fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
         .map_err(OpenError::Decode)
 }
 
-fn open_snapshot(dir: &Path) -> Result<Option<(File, Manifest)>, OpenError> {
-    loop {
-        let Some(manifest) = read_manifest(dir)? else {
-            return Ok(None);
-        };
-        let path = dir.join(format!("snapshot.{}", manifest.generation.checkpoint));
-        match File::open(path) {
-            Ok(file) => return Ok(Some((file, manifest))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let current = read_manifest(dir)?;
-                if current.is_some_and(|next| next.generation != manifest.generation) {
-                    continue;
-                }
-                return Err(OpenError::Io(e));
-            }
-            Err(e) => return Err(OpenError::Io(e)),
-        }
-    }
-}
-
 impl Catalog {
     /// Opens the catalog in `dir`, reading and checking only the header and
     /// section table; no section is loaded. `Ok(None)` when nothing has been
     /// committed there yet.
     pub fn open(dir: &Path) -> Result<Option<Catalog>, OpenError> {
-        let Some((file, manifest)) = open_snapshot(dir)? else {
-            return Ok(None);
-        };
+        crate::log::Published::open(dir)?
+            .map(crate::log::Published::into_checkpoint)
+            .transpose()
+    }
+
+    pub(crate) fn open_checkpoint(file: File, manifest: &Manifest) -> Result<Catalog, OpenError> {
         let len = file.metadata().map_err(OpenError::Io)?.len();
         let mut head = vec![0; (len as usize).min(TABLE_END)];
         file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
         let layout = format::decode_table(&head, len).map_err(OpenError::Decode)?;
         manifest.check(&layout).map_err(OpenError::Decode)?;
-        Ok(Some(Catalog {
+        Ok(Catalog {
             layout,
             source: Source::File {
                 file,
@@ -304,7 +292,7 @@ impl Catalog {
                 read: AtomicU64::new(head.len() as u64),
                 facts: Facts::default(),
             },
-        }))
+        })
     }
 
     /// Dense checkpoint allocation high water for inodes (no log in M1).

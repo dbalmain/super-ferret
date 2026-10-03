@@ -84,7 +84,8 @@ pub(crate) fn checksum(bytes: &[u8]) -> [u8; 16] {
     digest
 }
 
-/// Fixed little-endian `current` manifest. M1 requires an empty log prefix.
+/// Fixed little-endian `current` manifest.
+#[derive(Clone)]
 pub(crate) struct Manifest {
     pub(crate) generation: Generation,
     pub(crate) log_end: u64,
@@ -192,12 +193,18 @@ impl Manifest {
 
     pub(crate) fn check(&self, l: &Layout) -> Result<(), DecodeError> {
         let expected = Self::from_layout(l);
-        if self.generation != l.generation
-            || self.log_end != 0
+        if self.generation.incarnation != l.generation.incarnation
+            || self.generation.checkpoint != l.generation.checkpoint
             || self.checkpoint_sequence != l.generation.sequence
             || self.sniffer != l.sniffer
-            || self.counters != expected.counters
-            || self.counts != expected.counts
+            || self
+                .counters
+                .iter()
+                .zip(expected.counters)
+                .any(|(a, b)| *a < b)
+            || (self.generation.sequence == self.checkpoint_sequence
+                && (self.counters != expected.counters || self.counts != expected.counts))
+            || (self.log_end == 0 && self.generation.sequence != self.checkpoint_sequence)
         {
             return Err(DecodeError::Corrupt("checkpoint identity"));
         }

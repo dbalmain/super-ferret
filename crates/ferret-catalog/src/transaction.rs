@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::batch::{Batch, Content, Stat};
 use crate::build::{self, BuildError, Known};
+use crate::publication::{self, Point};
 use crate::read::{self, Catalog, Kind, OpenError};
 use crate::{ContentState, DecodeError, Generation, Hash, InoId};
 
@@ -389,7 +390,7 @@ impl Transaction {
             .open(&temp)
             .map_err(CommitError::Write)?;
         crate::migrate::write(&bytes, &out, generation, policy)?;
-        out.sync_all().map_err(CommitError::Write)?;
+        publication::sync(&out, Point::SnapshotSync).map_err(CommitError::Write)?;
         let catalog = Catalog::from_bytes(fs::read(&temp).map_err(CommitError::Write)?)
             .map_err(CommitError::Encode)?;
         publish(dir, &temp, &catalog)?;
@@ -478,6 +479,7 @@ impl Transaction {
         };
         if let Some(old) = previous_generation {
             let _ = fs::remove_file(self.dir.join(format!("snapshot.{}", old.checkpoint)));
+            let _ = fs::remove_file(self.dir.join(format!("changes.{}", old.checkpoint)));
         }
         // The legacy file remains available until the new manifest is durable.
         let _ = fs::remove_file(self.dir.join(read::FILE));
@@ -527,22 +529,47 @@ fn write_synced(path: &Path, write: impl FnOnce(&File) -> io::Result<()>) -> io:
         .truncate(true)
         .open(path)?;
     write(&file)?;
-    file.sync_all()
+    publication::sync(&file, Point::SnapshotSync)
 }
 
 fn publish(dir: &Path, temp: &Path, catalog: &Catalog) -> Result<(), CommitError> {
     let snapshot = dir.join(format!("snapshot.{}", catalog.generation().checkpoint));
-    fs::rename(temp, snapshot).map_err(CommitError::Write)?;
-    // Make the snapshot's directory entry durable before current can name it.
-    File::open(dir)
-        .and_then(|file| file.sync_all())
+    publication::rename(temp, &snapshot, Point::SnapshotRename).map_err(CommitError::Write)?;
+    let log_temp = dir.join("changes.tmp");
+    let mut log = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&log_temp)
         .map_err(CommitError::Write)?;
-    let manifest_temp = dir.join("current.tmp");
-    write_synced(&manifest_temp, |mut out| {
-        out.write_all(&catalog.manifest().encode())
-    })
+    log.write_all(&crate::log::header(catalog.generation()))
+        .map_err(CommitError::Write)?;
+    publication::sync(&log, Point::HeaderSync).map_err(CommitError::Write)?;
+    publication::rename(
+        &log_temp,
+        &dir.join(format!("changes.{}", catalog.generation().checkpoint)),
+        Point::HeaderRename,
+    )
     .map_err(CommitError::Write)?;
+    publication::sync(
+        &File::open(dir).map_err(CommitError::Write)?,
+        Point::PairSync,
+    )
+    .map_err(CommitError::Write)?;
+    let manifest_temp = dir.join("current.tmp");
+    let mut manifest = catalog.manifest();
+    manifest.log_end = crate::log::HEADER;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&manifest_temp)
+        .map_err(CommitError::Write)?;
+    file.write_all(&manifest.encode())
+        .map_err(CommitError::Write)?;
+    publication::sync(&file, Point::ManifestSync).map_err(CommitError::Write)?;
     fs::rename(manifest_temp, dir.join("current")).map_err(CommitError::Write)?;
+    publication::hit(Point::ManifestRename).map_err(CommitError::Undurable)?;
     sync_dir(dir).map_err(CommitError::Undurable)
 }
 
@@ -553,7 +580,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     }
     #[cfg(test)]
     SYNCED_DIRS.with_borrow_mut(|synced| synced.push(dir.to_owned()));
-    File::open(dir)?.sync_all()
+    publication::sync(&File::open(dir)?, Point::DirectorySync)
 }
 
 /// Syncs every ancestor of `dir`, from its parent up to `/`, so the chain of

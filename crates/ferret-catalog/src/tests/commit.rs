@@ -85,7 +85,10 @@ fn a_failure_before_the_rename_publishes_nothing() {
     assert!(matches!(err, CommitError::Write(_)), "{err:?}");
     assert!(!err.published());
     assert_eq!(names(&reopen(&scratch.path)), ["/g/old"]);
-    assert_eq!(leftovers(&scratch.path), ["current", "lock", "snapshot.0"]);
+    assert_eq!(
+        leftovers(&scratch.path),
+        ["changes.0", "current", "lock", "snapshot.0"]
+    );
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
 
@@ -109,7 +112,14 @@ fn a_failure_after_the_rename_is_published_but_undurable() {
     assert_eq!(names(&reopen(&scratch.path)), ["/g/new"]);
     assert_eq!(
         leftovers(&scratch.path),
-        ["current", "lock", "snapshot.0", "snapshot.1"]
+        [
+            "changes.0",
+            "changes.1",
+            "current",
+            "lock",
+            "snapshot.0",
+            "snapshot.1"
+        ]
     );
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
@@ -124,14 +134,17 @@ fn dropping_a_transaction_publishes_nothing_and_a_stale_temp_is_cleared() {
     let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
     assert_eq!(
         leftovers(&scratch.path),
-        ["current", "lock", "snapshot.0"],
+        ["changes.0", "current", "lock", "snapshot.0"],
         "begin clears the stale temp"
     );
     fill(&mut txn, &["new"]);
     drop(txn);
 
     assert_eq!(names(&reopen(&scratch.path)), ["/g/old"]);
-    assert_eq!(leftovers(&scratch.path), ["current", "lock", "snapshot.0"]);
+    assert_eq!(
+        leftovers(&scratch.path),
+        ["changes.0", "current", "lock", "snapshot.0"]
+    );
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
 

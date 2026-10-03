@@ -5,6 +5,7 @@ mod carry;
 mod commit;
 mod decode;
 mod epoch;
+mod log;
 mod roots;
 mod round_trip;
 
