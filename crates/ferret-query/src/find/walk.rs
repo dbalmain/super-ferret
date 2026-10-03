@@ -853,12 +853,13 @@ impl LiveWalk {
             // depth limit; regular file metadata remains lazy.
             if target.is_none() && kind == Some(FileKind::Directory) && self.children.len() == start
             {
-                if separator {
-                    entry.path.push(b'/');
-                }
-                entry.path.extend_from_slice(name);
-                first = Some(cached_metadata(entry.path(), follow));
-                entry.path.truncate(path_len);
+                // Observed relative to the handle just opened for this
+                // listing, not the entry's pathname: an action run while
+                // listing (e.g. `-exec` renaming an ancestor) can make the
+                // pathname stale before this first child is even visited.
+                let observed = PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+                    .join(OsStr::from_bytes(name));
+                first = Some(cached_metadata(&observed, follow));
             }
             let name_start = self.names.len();
             self.names.extend_from_slice(name);

@@ -787,3 +787,47 @@ fn an_observed_lookup_keeps_the_operands_trailing_slash() {
         assert_eq!(output.stdout, b"".as_slice(), "{output:?}");
     }
 }
+
+#[test]
+fn a_first_child_directory_observation_survives_an_ancestor_rename() {
+    // R3 #3: the first child-directory stat taken while listing a directory
+    // used the entry's pathname (`cached_metadata(entry.path(), follow)`)
+    // instead of the handle just opened for that listing, so an `-exec`
+    // that renamed an ancestor during the walk made that first observation
+    // fail even though the handle-relative descent kept working.
+    let tree = Tree::new("first-child-observation-survives-rename");
+    fs::create_dir_all(tree.0.join("tree/sub/child")).unwrap();
+    fs::write(tree.0.join("tree/sub/child/leaf"), b"").unwrap();
+
+    let output = tree.run(
+        false,
+        &[
+            "tree",
+            "(",
+            "-name",
+            "sub",
+            "-exec",
+            "sh",
+            "-c",
+            "mv tree saved",
+            ";",
+            ")",
+            ",",
+            "-execdir",
+            "true",
+            ";",
+            ",",
+            "-printf",
+            "%p %s\n",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.split(' ').next().unwrap())
+            .collect::<Vec<_>>(),
+        ["tree", "tree/sub", "tree/sub/child", "tree/sub/child/leaf"],
+        "{output:?}"
+    );
+}
