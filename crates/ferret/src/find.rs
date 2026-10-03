@@ -2,7 +2,7 @@
 //! source.
 
 use std::ffi::OsString;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,10 +13,6 @@ use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
 
 use crate::cli::{self, Exit};
 use crate::xdg::Dirs;
-
-/// Destination buffer. The engine batches complete records and holds its
-/// commit gate until this buffer is flushed.
-const OUTPUT_BUFFER: usize = 64 * 1024;
 
 /// Runs a find command. Find errors and usage errors both exit 1; no matches
 /// is success. Explicit -I never reads config or opens an index; neither mode
@@ -97,10 +93,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
         );
     }
     let mut effects = Output {
-        writer: Arc::new(Mutex::new(BufWriter::with_capacity(
-            OUTPUT_BUFFER,
-            io::stdout(),
-        ))),
+        writer: Arc::new(Mutex::new(io::stdout())),
     };
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
@@ -134,7 +127,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
 }
 
 struct Output<W: Write = io::Stdout> {
-    writer: Arc<Mutex<BufWriter<W>>>,
+    writer: Arc<Mutex<W>>,
 }
 
 impl<W: Write> Clone for Output<W> {
@@ -226,6 +219,8 @@ fn parse_config(text: &str) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::BufWriter;
+
     use super::*;
 
     #[test]
@@ -284,7 +279,7 @@ mod tests {
         let plan = make_plan(&long);
         let other = make_plan(&short);
         let mut host = Output {
-            writer: Arc::new(Mutex::new(BufWriter::new(Vec::new()))),
+            writer: Arc::new(Mutex::new(Vec::new())),
         };
         let mut source = Interleave {
             entry: Entry::new(long, 0, FileKind::Symlink),
@@ -294,9 +289,138 @@ mod tests {
         let result = plan.run(&mut source, &mut host).unwrap();
         host.flush().unwrap();
         let shared = host.writer.lock().unwrap();
-        let records: Vec<_> = shared.get_ref().split(|&byte| byte == b'\n').collect();
+        let records: Vec<_> = shared.split(|&byte| byte == b'\n').collect();
         std::fs::remove_dir_all(directory).unwrap();
         assert_eq!(result.errors, 0);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].len(), 200_000);
+        assert!(records[0].iter().all(|&byte| byte == b'L'));
+        assert_eq!(records[1].len(), 100);
+        assert!(records[1].iter().all(|&byte| byte == b'S'));
+        assert!(records[2].is_empty());
+    }
+
+    #[test]
+    fn spilled_file_record_excludes_a_short_record_between_destination_writes() {
+        // R2 #4: interpose after the first actual file-destination write.
+        // The old single-action path allowed a second invocation of the same
+        // prepared plan to insert a short record there. Whole transactions
+        // bypass that byte-write seam; the source then runs the short record
+        // after the long evaluation. No thread scheduling or sleeps are used.
+        use ferret_query::find::{Entry, EntrySource, FileKind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct One {
+            entry: Entry,
+            yielded: bool,
+        }
+        impl EntrySource for One {
+            fn next(&mut self, _: bool) -> Option<Result<&Entry, WalkError>> {
+                if self.yielded {
+                    None
+                } else {
+                    self.yielded = true;
+                    Some(Ok(&self.entry))
+                }
+            }
+        }
+        fn short_record(plan: &Plan, path: &Path, mut host: Output<Vec<u8>>) {
+            let mut source = One {
+                entry: Entry::new(path.to_owned(), 0, FileKind::Symlink),
+                yielded: false,
+            };
+            assert_eq!(plan.run(&mut source, &mut host).unwrap().errors, 0);
+        }
+        struct Host {
+            cli: Output<Vec<u8>>,
+            plan: Arc<Plan>,
+            short: PathBuf,
+            emitted: Arc<AtomicBool>,
+        }
+        impl Effects for Host {
+            fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
+                self.cli.print(path, nul)
+            }
+            fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+                self.cli.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.cli.flush()
+            }
+            fn error(&mut self, error: &WalkError) {
+                panic!("{error:?}");
+            }
+            fn file(
+                &mut self,
+                file: &Arc<Mutex<Option<BufWriter<std::fs::File>>>>,
+                bytes: &[u8],
+            ) -> io::Result<()> {
+                self.cli.file(file, bytes)?;
+                if !self.emitted.swap(true, Ordering::SeqCst) {
+                    short_record(&self.plan, &self.short, self.cli.clone());
+                }
+                Ok(())
+            }
+        }
+        struct Source {
+            first: One,
+            plan: Arc<Plan>,
+            short: PathBuf,
+            cli: Output<Vec<u8>>,
+            emitted: Arc<AtomicBool>,
+        }
+        impl EntrySource for Source {
+            fn next(&mut self, _: bool) -> Option<Result<&Entry, WalkError>> {
+                if !self.first.yielded {
+                    return self.first.next(true);
+                }
+                if !self.emitted.swap(true, Ordering::SeqCst) {
+                    short_record(&self.plan, &self.short, self.cli.clone());
+                }
+                None
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("ferret-r2-cli-file-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let long = directory.join("long");
+        let short = directory.join("short");
+        let destination = directory.join("out");
+        std::os::unix::fs::symlink("L".repeat(2000), &long).unwrap();
+        std::os::unix::fs::symlink("S", &short).unwrap();
+        let plan = Arc::new(
+            Plan::parse(&[
+                "-I".into(),
+                long.as_os_str().to_owned(),
+                "-fprintf".into(),
+                destination.as_os_str().to_owned(),
+                format!("{}\\n", "%l".repeat(100)).into(),
+            ])
+            .unwrap(),
+        );
+        let cli = Output {
+            writer: Arc::new(Mutex::new(Vec::new())),
+        };
+        let emitted = Arc::new(AtomicBool::new(false));
+        let mut host = Host {
+            cli: cli.clone(),
+            plan: plan.clone(),
+            short: short.clone(),
+            emitted: emitted.clone(),
+        };
+        let mut source = Source {
+            first: One {
+                entry: Entry::new(long, 0, FileKind::Symlink),
+                yielded: false,
+            },
+            plan: plan.clone(),
+            short,
+            cli,
+            emitted,
+        };
+        assert_eq!(plan.run(&mut source, &mut host).unwrap().errors, 0);
+        let bytes = std::fs::read(&destination).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        let records: Vec<_> = bytes.split(|&byte| byte == b'\n').collect();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].len(), 200_000);
         assert!(records[0].iter().all(|&byte| byte == b'L'));
@@ -351,7 +475,7 @@ mod tests {
         let plan = Plan::parse(&args).unwrap();
         let (sent, received) = mpsc::channel();
         let effects = Output {
-            writer: Arc::new(Mutex::new(BufWriter::new(Sink(sent)))),
+            writer: Arc::new(Mutex::new(Sink(sent))),
         };
         let slow = effects.clone();
         let batch =

@@ -49,7 +49,7 @@ impl<W: EntrySource> Task<W> {
         plan: &Plan,
         expression: &Expression,
         effects: &mut impl Effects,
-        immediate: bool,
+        policy: super::output::Policy,
     ) -> bool {
         let Some(item) = self.walk.next_with(self.descend, &mut || {
             self.control.actions.flush(effects, true).inspect_err(|_| {
@@ -80,7 +80,7 @@ impl<W: EntrySource> Task<W> {
             self.control.quit = true;
             return false;
         }
-        let checkpoint = self.record.checkpoint();
+        let checkpoint = policy.checkpoint.then(|| self.record.checkpoint());
         let result = {
             let mut output = super::output::EntryEffects {
                 host: effects,
@@ -89,13 +89,12 @@ impl<W: EntrySource> Task<W> {
                 quit: &self.quit,
             };
             match evaluate(expression, entry, &mut output, &mut self.control) {
-                Ok(_) if immediate || output.record.full() => {
+                Ok(_) if policy.immediate || output.record.full() => {
                     output.commit(false).map_err(EvaluationError::Output)
                 }
                 Ok(_) => Ok(()),
-                Err(error) => output
-                    .record
-                    .rollback(checkpoint)
+                Err(error) => checkpoint
+                    .map_or(Ok(()), |checkpoint| output.record.rollback(checkpoint))
                     .and_then(|()| output.commit(false))
                     .map_err(EvaluationError::Output)
                     .and(Err(error)),
@@ -179,10 +178,10 @@ pub(super) fn run(
     let quit = Arc::new(AtomicBool::new(false));
     let mut task = Task::new(source, None, &quit);
     task.control.cancelled = None;
-    let immediate = super::output::immediate(&expression);
+    let policy = super::output::policy(&expression);
     let shared = task.control.actions.shared.clone();
     let gate = task.gate.clone();
-    while !quit.load(Ordering::Acquire) && task.step(plan, &expression, effects, immediate) {
+    while !quit.load(Ordering::Acquire) && task.step(plan, &expression, effects, policy) {
         if task.control.quit {
             break;
         }
@@ -216,7 +215,7 @@ impl Pool {
         // Keep allocation capacity with the worker when a task completes or
         // suspends. Queued tasks have already flushed their transactions.
         let mut record = super::output::Record::default();
-        let immediate = super::output::immediate(expression);
+        let policy = super::output::policy(expression);
         let sequential = super::sequential_starts(expression);
         loop {
             let mut queue = self
@@ -243,7 +242,7 @@ impl Pool {
             std::mem::swap(&mut record, &mut task.record);
             let mut steps = 0usize;
             while !self.quit.load(Ordering::Acquire)
-                && task.step(plan, expression, &mut effects, immediate)
+                && task.step(plan, expression, &mut effects, policy)
             {
                 if task.control.quit {
                     self.quit.store(true, Ordering::Release);
@@ -344,12 +343,11 @@ impl Plan {
         let quit = Arc::new(AtomicBool::new(false));
         let mut task = Task::new(source, None, &quit);
         task.control.cancelled = None;
-        let immediate = super::output::immediate(&expression);
+        let policy = super::output::policy(&expression);
         let sequential = super::sequential_starts(&expression);
         let shared = task.control.actions.shared.clone();
         let gate = task.gate.clone();
-        while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects, immediate)
-        {
+        while !quit.load(Ordering::Acquire) && task.step(self, &expression, &mut effects, policy) {
             if task.control.quit {
                 break;
             }

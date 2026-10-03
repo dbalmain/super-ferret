@@ -85,8 +85,17 @@ impl OutputBuffer {
             self.len += len as u64;
             Ok(())
         } else {
-            self.write_all(bytes)?;
-            self.write_all(terminator)
+            let len = self.len;
+            match self
+                .write_all(bytes)
+                .and_then(|()| self.write_all(terminator))
+            {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.truncate(len)?;
+                    Err(error)
+                }
+            }
         }
     }
 
@@ -343,16 +352,32 @@ impl<E: Effects> Effects for EntryEffects<'_, E> {
     }
 }
 
-// Commands and quit observe output immediately; pure output expressions may
-// stage complete records into a bounded transaction to amortize destination
-// I/O.
-pub(super) fn immediate(expression: &super::Expression) -> bool {
-    let mut immediate = false;
-    expression.visit(&mut |leaf| {
-        immediate |= matches!(
-            leaf,
-            super::Expression::Quit | super::Expression::Action(super::action::Action::Exec(_))
-        );
+#[derive(Clone, Copy)]
+pub(super) struct Policy {
+    pub immediate: bool,
+    pub checkpoint: bool,
+}
+
+// A single print appends its whole record atomically, including on a spill
+// failure. Other outputs can fail after capturing a prefix and need an entry
+// checkpoint. All records still reach destinations through the same commit.
+pub(super) fn policy(expression: &super::Expression) -> Policy {
+    let mut policy = Policy {
+        immediate: false,
+        checkpoint: false,
+    };
+    let mut prints = 0;
+    expression.visit(&mut |leaf| match leaf {
+        super::Expression::Quit | super::Expression::Action(super::action::Action::Exec(_)) => {
+            policy.immediate = true;
+            policy.checkpoint = true;
+        }
+        super::Expression::Action(
+            super::action::Action::Output(..) | super::action::Action::List(_),
+        ) => policy.checkpoint = true,
+        super::Expression::Print(_) => prints += 1,
+        _ => {}
     });
-    immediate
+    policy.checkpoint |= prints > 1;
+    policy
 }

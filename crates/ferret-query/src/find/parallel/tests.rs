@@ -350,7 +350,12 @@ fn a_batch_boundary_output_failure_cancels_queued_workers() {
     };
     let quit = Arc::new(super::AtomicBool::new(false));
     let mut failing = super::Task::new(plan.live_source(), None, &quit);
-    assert!(failing.step(&plan, &plan.expression, &mut output, true));
+    assert!(failing.step(
+        &plan,
+        &plan.expression,
+        &mut output,
+        crate::find::output::policy(&plan.expression)
+    ));
     let later = tree.plan(&["-maxdepth", "0", "-print"]);
     let queued = super::Task::new(later.live_source(), None, &quit);
     let pool = super::Pool {

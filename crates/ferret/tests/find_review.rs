@@ -463,6 +463,19 @@ fn rendering_spill_failure_discards_output_and_stops_before_the_next_start() {
     assert_eq!(error.lines().count(), 1, "{error}");
     assert!(error.contains("create output spill"), "{error}");
     assert!(error.contains("nonexistent/ferret-output-"), "{error}");
+    // A prior completed record may still be staged in the same destination.
+    // Roll back only the failing entry, retaining that earlier record.
+    let output = tree
+        .command(false)
+        .env("TMPDIR", tree.0.join("nonexistent"))
+        .args([
+            "a", "b", "(", "-name", "a", "-fprintf", "out", "%p\\n", ")", "-o", "(", "-name", "b",
+            "-fprintf", "out", "%100000p", ")",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read(tree.0.join("out")).unwrap(), b"a\n");
 }
 
 #[test]
