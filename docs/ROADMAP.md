@@ -367,6 +367,10 @@ bfs and fd.
 GB, with scan latency acceptable, means no name index (D48); otherwise a name
 index experiment (suffix array, terms, trigrams) comes before S2.
 
+### Where it stands
+
+(to fill: M1–M5c, dates, corpus status, R1, H2, Astra.)
+
 ## S2 — Content index
 
 `ferret-text`, `ferret-index`, `ferret-verify`, `ferret-query`:

@@ -1,81 +1,50 @@
-# Find sources and freshness
+# `ferret find`
 
-`ferret find` answers from the index. Names, kinds, visibility, size, permissions,
-ownership, link counts, inode/device identity, mtime and ctime (including
-nanoseconds) describe the last indexing observation. New names are absent;
-deleted names and old metadata remain queryable until re-indexing. Re-index
-when changing ignore policy. The daemon will maintain freshness in a later slice.
+The contract for `ferret find [PATH...] [EXPRESSION]`: find(1) syntax over the
+index. Why each choice was made is in [DECISIONS.md](DECISIONS.md) (D47, D50);
+what was built when, and the measurements, are in [ROADMAP.md](ROADMAP.md)
+§ S1c.
 
-Read-only start operands may overlap. Starts run one after another when the
-expression has an action or `-quit`;
-siblings within each start may interleave.
-A parent's expression completes before its children start; `-depth` and
-`-delete` complete children first. `-prune` stops descent. Live traversal, including default-mode live
-fallbacks, uses a bounded worker pool. Catalog work also uses workers where
-measurements show a gain; shallow catalog walks stay on the caller thread.
+## Modes
 
-Workers evaluate whole expressions and run actions concurrently. `-exec`'s
-exit status gates its remaining expression. Everything one entry produces,
-including child stdout and output-file records,
-commits together when its expression ends. Child stdout is drained while the
-command runs; output above 64 KiB per stream spills to a private, unlinked
-temporary file. Temporary storage grows with the entry's output, while memory
-stays bounded per stream and worker. Interactive prompts are serialized.
-Each ordinary `-exec … {} +` action has one shared batch across workers and
-starts, flushed at the argument limit and once at exit. Full batches are taken
-under the lock, then run outside it while workers collect the next batch.
-Workers stage at most 32 paths, merging at 4 KiB of path bytes (an oversized
-path merges immediately). Staged arguments merge on task completion, including
-quit. Only the shared batch partitions arguments. Argument order is free;
-`-execdir` retains directory-local boundaries. `-quit` commits the winning entry
-under the output lock and discards entries finishing later. Collected batches
-still flush at exit. Started commands and prompts finish and are awaited
-(DECISIONS option A). Errors are reported on stderr and set exit status 1,
-except that GNU treats a failed `-exec … ;` launch as
-a false test without changing exit status.
+(to fill)
 
-The catalog's raw directory entry count includes ignored names, so `-empty`
-answers exact **indexed** emptiness. Successful `-delete` actions subtract this walk's removals from
-that observation, including across worker tasks. Nested indexed roots supply their missing boundary edges from
-root records. Re-included ancestors are ordinary visible directories.
+## Freshness
 
-Explicit ignored starts, suffixes below opaque markers, and unreadable opaque
-directories walk live without nested ignore rules. Ignored reference operands
-use live metadata; indexed references use stored metadata. Fields not stored
-(access time, birth time, allocated blocks, and device major/minor numbers) need
-live observations only when the corresponding primary or format asks for them.
-Atime and block-column measurements are complete; their storage/fallback
-tradeoff remains open under milestone 5a's decision rule. Logical symlink
-following uses stored targets where indexed and live targets where no row
-exists.
+(to fill)
 
-`ferret find -I` / `--no-ignore` is the unrestricted live mode. It opens no index
-and reads no configuration. Set `find_no_ignore = true` in
-`$XDG_CONFIG_HOME/ferret/config` (default `~/.config/ferret/config`) to use it by
-default. Missing/empty config means false; comments and blank lines are accepted;
-unknown, duplicate or malformed settings fail. Neither mode logs queries.
+## Ignore rules
 
-Missing/incompatible indexes and unresolved explicit starts fail with status 1
-and re-index/`-I` guidance. Successful selected deletions exit 0, including when
-ignored files were skipped. A visible directory containing ignored files can
-fail with ENOTEMPTY and exit 1.
+(to fill)
 
-Effectful plans (`-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`,
-`-fprint`, `-fprint0`, `-fprintf`, `-fls`) validate live starts,
-observe which catalog names still exist when entering each directory, and open
-directories for descent errors and execdir handles. A later sibling removal
-does not hide a name already observed; a removed directory fails descent.
-Names created by actions remain absent from the snapshot. Stored predicates
-retain their indexed values. In default mode, `-empty` starts with the raw
-indexed child count, including ignored children, and subtracts successful
-removals made by this walk's `-delete`. It does not see removals made by
-`-exec` commands. Use `-delete` for this accounting or `-I` for live emptiness.
+## Stored and live metadata
 
-Validation, full-corpus classification, missing-field costs and the complete
-warm timing table are recorded in
-`/home/dave/w/super-ferret/.ai/find-m5a-done.md`. The checked checkpoint passes
-all workspace gates and all eight fd-comparable timing rows. Milestone 5a is
-not complete until its two decision conflicts above are resolved.
+(to fill)
 
-M5c's parallel-idiom contract and validation are recorded in FIND-M5C.md and
-`/home/dave/w/super-ferret/.ai/find-m5c-done.md`.
+## `-empty` in default mode
+
+(to fill)
+
+## Order
+
+(to fill)
+
+## Start operands
+
+(to fill)
+
+## Concurrency and output
+
+(to fill)
+
+## Configuration
+
+(to fill)
+
+## Exit status
+
+(to fill)
+
+## Known differences from GNU find
+
+(to fill)

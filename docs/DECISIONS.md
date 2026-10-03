@@ -2345,7 +2345,7 @@ per block. Does its high type sentinel justify a different physical encoding?
 **Recommendation: A.** The size difference is small and B has no consistent
 query win. Full listing, warm: A 1,369 ms vs B 1,354 ms; baseline 1,340 ms.
 Their recorded loads and all query/section numbers are in
-[the measurement report](FIND-M4A.md). The fact that would change it: a much
+the measurement report (ROADMAP § S1c). The fact that would change it: a much
 more ignored-heavy 10M fixture where nullable child/type or a separate ignored
 range saves materially more space or query time. Those two options were not
 implemented or measured here. There is no departure from the settled sentinel
@@ -2395,7 +2395,7 @@ bases. Explicit `-I` bypasses both config and index; help/version bypass them to
 The catalog's name order cannot reproduce readdir order. 4b retains live
 name listings solely for traversal order and intersects them with catalog
 entries. This preserves `-quit` and directory-local command batches without
-using stale stat columns. The cost is measured in [the 4b report](FIND-M4B.md).
+using stale stat columns. The cost is measured in ROADMAP § S1c.
 
 A pasted `find … -delete` skips ignored files and still exits 0 when the
 selected deletions succeed. Deleting a visible directory that still contains
@@ -2409,7 +2409,7 @@ missed deletions. C: the later watch-backed stat cache, current within the
 watched set but requiring daemon work. **Recommendation: retain A**; Dave must
 choose any move to B. The fact that changes it: an explicit acceptable freshness
 contract. Trial patch is preserved and unapplied, with loads and all measurements
-in [FIND-M4B.md](FIND-M4B.md); eager size/mtime decoding costs about 5 ms on the
+in ROADMAP § S1c; eager size/mtime decoding costs about 5 ms on the
 name/type controls. B alone still misses fd's roughly 51 ms stat median.
 
 **4b order/speed brief (2026-10-03).** How should exact current traversal order
@@ -2525,10 +2525,14 @@ merges at 32 paths or 4 KiB; only the shared batch fills/partitions argv. Partia
 stages merge even after quit, before shared exit flush. Staging recovers M5b
 throughput. A cheap narrow-root donation guard made effectful starts slower
 (148.730 versus 135.290 ms live), so it was removed. The pool already persists
-across starts; no new scheduler policy is kept. FIND-M5C records measurements,
+across starts; no new scheduler policy is kept. ROADMAP § S1c records measurements,
 loads, syscall evidence and final validation.
 
 The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap
 in overlapping read-only starts: with `-quit`, a later missing start reported
 ENOENT and exit 1 before the first start quit, where GNU exits 0 silently.
 Starts now also sequence when the expression contains `-quit`.
+
+## D50 — The `ferret find` stretch's calls (answered 2026-10-03, on the decisions page)
+
+(to fill: F1–F13.)

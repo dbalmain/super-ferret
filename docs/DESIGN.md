@@ -276,7 +276,7 @@ peak build RSS 1,630 → 1,641 MiB. The high-sentinel encoding is retained after
 measuring an adjacent tag range that saved 1.18 MB (0.20% of the snapshot).
 Name-search row counts stay identical; the final warm full listing costs 1.2%
 more in the resumed baseline/final series.
-See [the 4a report](FIND-M4A.md) for per-section bytes, build time, load averages,
+See [ROADMAP § S1c](ROADMAP.md#s1c--ferret-find-in-find1-syntax) for per-section bytes, build time, load averages,
 query timings and the encoding comparison.
 
 ## Policy and crawl (D10, D13)
