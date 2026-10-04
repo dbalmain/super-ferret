@@ -37,6 +37,8 @@ struct Directory<'a> {
     id: Option<u32>,
     root: u32,
     entries: Option<u32>,
+    blocked: bool,
+    opaque: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +129,26 @@ pub fn changes(
     policy: Hash,
     sniffer: u32,
 ) -> Result<Option<ChangeSet>, Error> {
+    let old = session.view();
+    let mut configured: Vec<_> = old.roots().map(|(_, p)| PathBuf::from(std::ffi::OsStr::from_bytes(p))).collect();
+    configured.retain(|p| !dropped.contains(p));
+    configured.extend(refreshed.iter().cloned());
+    configured.sort();
+    configured.dedup();
+    let protection = crate::coverage::resolve(session, batches, &[], &configured)
+        .ok_or_else(|| invalid("unresolvable retained observation"))?;
+    with_protection(session, batches, refreshed, dropped, policy, sniffer, &protection)
+}
+
+pub(crate) fn with_protection(
+    session: &WriterSession,
+    batches: &[Batch],
+    refreshed: &[PathBuf],
+    dropped: &[PathBuf],
+    policy: Hash,
+    sniffer: u32,
+    protection: &crate::coverage::Protection,
+) -> Result<Option<ChangeSet>, Error> {
     if batches.iter().any(Batch::overflowed) {
         return Err(invalid("recrawl batch overflow"));
     }
@@ -148,6 +170,8 @@ pub fn changes(
             id: None,
             root: 0,
             entries: None,
+            blocked: protection.tokens.contains(&observation.token),
+            opaque: protection.opaque.contains(&observation.token),
         })
         .collect();
     let mut tokens = Tokens::default();
@@ -168,11 +192,21 @@ pub fn changes(
         let i = *tokens.get(&token).ok_or_else(|| invalid("listing token"))?;
         dirs[i].entries = Some(count);
     }
-    if dirs
-        .iter()
-        .any(|d| d.entries.is_none() || d.observation.retained_at.is_some())
-    {
+    let mut protected: Vec<_> = dirs.iter().enumerate()
+        .filter(|(_, d)| d.blocked || d.opaque).map(|(i, _)| i).collect();
+    while let Some(i) = protected.pop() {
+        for child in dirs[i].children.clone() {
+            if !dirs[child].blocked {
+                dirs[child].blocked = true;
+                protected.push(child);
+            }
+        }
+    }
+    if dirs.iter().any(|d| d.entries.is_none() && !d.blocked && !d.opaque) {
         return Ok(None);
+    }
+    if !protection.is_empty() && (old.policy() != policy || old.sniffer_version() != sniffer) {
+        return Err(invalid("version transition under protection"));
     }
     // D29: only ancestors of an included row survive a Traverse observation.
     for batch in batches {
@@ -231,6 +265,18 @@ pub fn changes(
         document_refs: BTreeMap::new(),
         new_docs: BTreeMap::new(),
     };
+    // Retain only checked boundary IDs. Descendants stay untouched because
+    // sweeping stops before iterating that boundary's old child range.
+    for &id in &protection.directories {
+        out.inodes.insert(id);
+        if let Some(name) = out.old.dir_name(InoId(id)) { out.names.insert(name.0); }
+    }
+    for &id in &protection.edges {
+        out.names.insert(id);
+        if let Target::Inode(child) = out.old.name(NameId(id)).target() {
+            out.inodes.insert(child.0);
+        }
+    }
     let mut roots: Vec<_> = dirs
         .iter()
         .enumerate()
@@ -242,6 +288,7 @@ pub fn changes(
     if observed_roots
         != refreshed
             .iter()
+            .filter(|p| !out.old.roots().any(|(id, path)| path == p.as_os_str().as_bytes() && protection.directories.contains(&id.0) && !observed_roots.contains(&path)))
             .map(|p| p.as_os_str().as_bytes())
             .collect::<Vec<_>>()
     {
@@ -254,13 +301,14 @@ pub fn changes(
         let mut children = std::mem::take(&mut dirs[i].children);
         children.sort_unstable_by_key(|&c| dirs[c].observation.name);
         queue.extend(children);
+        if dirs[i].blocked { continue; }
         let d = dirs[i].observation;
         let parent = d.parent.map(|token| tokens[&token]);
         let parent_id = parent.and_then(|p| dirs[p].id);
         if parent.is_some() && parent_id.is_none() {
             continue;
         }
-        if !dirs[i].included {
+        if !dirs[i].included && !dirs[i].opaque {
             if let Some(parent) = parent_id {
                 out.edge(parent, ignored(Kind::Dir), d.name);
             }
@@ -337,6 +385,17 @@ pub fn changes(
         .iter()
         .enumerate()
         .flat_map(|(b, batch)| (0..batch.file_count()).map(move |f| File::Full(b as u32, f as u32)))
+        .filter(|&loc| {
+            let f = loc.observation(batches);
+            let dir = &dirs[tokens[&f.parent]];
+            if dir.blocked || dir.opaque { return false; }
+            if !protection.edges.is_empty() && let Some(id) = dir.id
+                && out.old.is_live_inode(InoId(id))
+                && let Some(name) = out.old.lookup(InoId(id), f.name)
+                && protection.edges.contains(&name.0)
+            { return false; }
+            true
+        })
         .collect();
     let file = |loc: File| loc.observation(batches);
     // An unmatched observation may be another alias of a compacted row, even
@@ -352,11 +411,15 @@ pub fn changes(
     for (b, batch) in batches.iter().enumerate() {
         let mut parent = None;
         let mut continuing = false;
+        let mut active = false;
         for (i, (token, name)) in batch.reused_files().enumerate() {
             if parent != Some(token) {
                 parent = Some(token);
-                continuing = dirs[tokens[&token]].id == token.previous_directory().map(|id| id.0);
+                let d = &dirs[tokens[&token]];
+                active = !d.blocked && !d.opaque;
+                continuing = d.id == token.previous_directory().map(|id| id.0);
             }
+            if !active || protection.edges.contains(&name.0) { continue; }
             let child = out.old.name(name).child;
             if continuing && !aliases.contains(child.0) {
                 out.names.insert(name.0);
@@ -431,6 +494,11 @@ pub fn changes(
     }
     for batch in batches {
         for (parent, name, kind) in batch.ignored_entries() {
+            let d = &dirs[tokens[&parent]];
+            if d.blocked || d.opaque { continue; }
+            if !protection.edges.is_empty() && let Some(id) = d.id
+                && out.old.is_live_inode(InoId(id)) && let Some(edge) = out.old.lookup(InoId(id), name)
+                && protection.edges.contains(&edge.0) { continue; }
             if let Some(parent) = dirs[tokens[&parent]].id {
                 out.edge(parent, ignored(kind), name);
             }
@@ -450,6 +518,7 @@ pub fn changes(
     for root in swept {
         let mut queue = vec![root];
         while let Some(dir) = queue.pop() {
+            if protection.directories.contains(&dir.0) { continue; }
             for name in out.old.children(dir) {
                 let edge = out.old.name(name);
                 if let Target::Inode(child) = edge.target()
@@ -482,6 +551,7 @@ pub fn changes(
             _ => None,
         })
         .collect();
+    let mut marked = BTreeSet::new();
     for d in &dirs {
         let Some(id) = d.id else {
             continue;
@@ -497,19 +567,33 @@ pub fn changes(
         } else {
             None
         };
-        let flags = 4 | if d.observation.traversed { 3 } else { 0 };
+        let stale = protection.markers.contains(&id);
+        let retained_at = stale.then(|| out.old.retained_at(InoId(id)).unwrap_or(out.old.generation().sequence));
+        let entries = if stale || d.opaque { None } else { d.entries };
+        let flags = if stale { 8 } else if d.opaque { 0 } else { 4 } | if d.observation.traversed { 3 } else { 0 };
+        if stale { marked.insert(id); }
         if !out.old.is_live_inode(InoId(id))
             || out.old.dir_name(InoId(id)).map(|n| n.0) != name
-            || out.old.entry_count(InoId(id)) != d.entries
+            || out.old.entry_count(InoId(id)) != entries
             || out.old.is_traversed(InoId(id)) != d.observation.traversed
-            || out.old.retained_at(InoId(id)).is_some()
+            || out.old.retained_at(InoId(id)) != retained_at
         {
             out.changes.records.push(Record::DirPut {
                 id,
                 name,
-                entries: d.entries,
+                entries,
                 flags,
-                retained_at: None,
+                retained_at,
+            });
+        }
+    }
+    for &id in protection.markers.difference(&marked) {
+        let dir = InoId(id);
+        let retained = out.old.retained_at(dir).unwrap_or(out.old.generation().sequence);
+        if out.old.entry_count(dir).is_some() || out.old.retained_at(dir) != Some(retained) {
+            out.changes.records.push(Record::DirPut {
+                id, name: out.old.dir_name(dir).map(|n| n.0), entries: None,
+                flags: 8 | if out.old.is_traversed(dir) { 3 } else { 0 }, retained_at: Some(retained),
             });
         }
     }
@@ -517,6 +601,7 @@ pub fn changes(
         .iter()
         .flat_map(Batch::work_tree_observations)
         .filter_map(|(token, kind, path, identity)| {
+            if dirs[tokens[&token]].blocked || dirs[tokens[&token]].opaque { return None; }
             dirs[tokens[&token]]
                 .id
                 .map(|id| (id, (kind, path, identity)))

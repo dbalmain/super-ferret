@@ -532,37 +532,31 @@ fn final_log_order_is_identical_across_walk_worker_counts() {
 }
 
 #[test]
-fn incomplete_eacces_coverage_blocks_resident_recrawl_and_batch_falls_back() {
+fn incomplete_eacces_retains_old_subtree_and_recovery_clears_the_marker() {
     let tmp = Tmp::new("recrawl-incomplete");
     tmp.write("dir/a", b"content");
-    // Equal siblings are compacted before the coverage fault. The owned
-    // checkpoint fallback must expand them, rather than dropping their rows.
-    for i in 0..8 {
-        tmp.write(&format!("stable-{i}"), b"unchanged");
-    }
-    let roots = [tmp.tree()];
-    let opts = options();
+    for i in 0..8 { tmp.write(&format!("stable-{i}"), b"unchanged"); }
+    let roots = [tmp.tree()]; let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
-    let old = session.view();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap(); let old = session.view();
     fs::set_permissions(tmp.at("dir"), fs::Permissions::from_mode(0o000)).unwrap();
-    let current = fs::read(tmp.cat().join("current")).unwrap();
-    let log = tmp
-        .cat()
-        .join(format!("changes.{}", old.generation().checkpoint));
-    let before = fs::read(&log).unwrap();
-    assert!(matches!(
-        recrawl(&mut session, &roots, Refresh::All, &opts),
-        Err(crate::IndexError::NeedsCheckpoint { .. })
-    ));
-    assert_eq!(session.view().generation(), old.generation());
-    assert_eq!(fs::read(tmp.cat().join("current")).unwrap(), current);
-    assert_eq!(fs::read(log).unwrap(), before);
+    let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    assert_eq!(report.protected_scopes, 1);
+    let mut want = listings(&old);
+    for row in &mut want {
+        if row.path == tmp.at("dir").as_os_str().as_bytes() {
+            row.entries = None; row.retained_at = Some(old.generation().sequence);
+        }
+    }
+    assert_eq!(listings(&session.view()), want);
+    assert_eq!(listings(&open(&tmp.cat())), want);
+    assert_eq!(session.view().generation().checkpoint, old.generation().checkpoint);
+    assert!(recrawl(&mut session, &roots, Refresh::All, &opts).unwrap().published.is_none());
     drop(session);
+    assert!(index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap().published.is_none());
+    fs::set_permissions(tmp.at("dir"), fs::Permissions::from_mode(0o755)).unwrap();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let fallback = open(&tmp.cat());
-    assert!(fallback.generation().checkpoint > old.generation().checkpoint);
-    oracle(&tmp, &roots, &opts, &fallback);
+    oracle(&tmp, &roots, &opts, &open(&tmp.cat()));
 }
 
 #[test]

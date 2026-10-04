@@ -78,6 +78,17 @@ impl Default for IndexOptions {
     }
 }
 
+/// Owned walker context retained until all workers have finished.
+#[derive(Clone, Debug)]
+pub enum CoverageContext {
+    /// Opening/statting/listing the configured root, possibly before a token.
+    Root,
+    /// A directory occurrence already observed by the walker.
+    Directory(DirToken),
+    /// A named entry of a checked directory occurrence.
+    Child { parent: DirToken, name: Vec<u8> },
+}
+
 /// A fault that stopped publication.
 #[derive(Debug)]
 pub struct CoverageFault {
@@ -89,6 +100,8 @@ pub struct CoverageFault {
     pub op: IoOp,
     /// Whether it was on the root itself.
     pub on_root: bool,
+    /// Checked directory/edge coordinates for retention, independent of paths.
+    pub context: CoverageContext,
     /// The OS error.
     pub error: io::Error,
 }
@@ -262,6 +275,10 @@ pub struct Report {
     pub content_faults: Vec<(PathBuf, ContentFault)>,
     /// Ignore-file problems, as text.
     pub pattern_errors: Vec<String>,
+    /// Typed faults retained by scoped reconciliation; stale counts are unknown.
+    pub coverage_faults: Vec<CoverageFault>,
+    /// Outermost retained edges/subtrees and new opaque directory scopes.
+    pub protected_scopes: usize,
     /// Walking and hashing, over every refreshed root.
     pub walk_time: Duration,
     /// Of the walk, time the workers spent sniffing and hashing file
@@ -515,13 +532,21 @@ fn observe_reconcile(
     let (mut batches, mut report) = observe(source, plan, options)?;
     loop {
         let started = Instant::now();
-        let changes = crate::reconcile::changes(
+        let Some(protection) = crate::coverage::resolve(session, &batches, &report.coverage_faults, &plan.roots) else {
+            return Err(IndexError::Coverage { faults: std::mem::take(&mut report.coverage_faults), report: Box::new(report) });
+        };
+        if !protection.is_empty() && (session.view().policy() != fingerprint(options) || session.view().sniffer_version() != options.sniffer) {
+            return Err(IndexError::Coverage { faults: std::mem::take(&mut report.coverage_faults), report: Box::new(report) });
+        }
+        report.protected_scopes = protection.directories.len() + protection.edges.len() + protection.opaque.len();
+        let changes = crate::reconcile::with_protection(
             session,
             &batches,
             &plan.refresh,
             &plan.dropped,
             fingerprint(options),
             options.sniffer,
+            &protection,
         )
         .map_err(IndexError::Update)?;
         report.commit_time += started.elapsed();
@@ -616,6 +641,7 @@ fn observe_reconcile(
         report
             .pattern_errors
             .append(&mut extra_report.pattern_errors);
+        report.coverage_faults.append(&mut extra_report.coverage_faults);
         report.refreshed.clone_from(&plan.refresh);
         report.kept.clone_from(&plan.keep);
     }
@@ -698,12 +724,18 @@ fn observe(
     report.content_faults.sort_by(|a, b| a.0.cmp(&b.0));
     report.counts.content_faults = report.content_faults.len() as u64;
     report.walk_time = started.elapsed();
-    if !faults.is_empty() {
+    if !faults.is_empty() && matches!(source, Source::Checkpoint(_)) {
+        // Initial/checkpoint indexing has no checked prior graph to retain.
+        // Preserve amended A′ for opaque EACCES, block other coverage faults.
+        faults.retain(|f| !(matches!(f.op, IoOp::OpenDir | IoOp::List) && f.error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())));
+    }
+    if !faults.is_empty() && matches!(source, Source::Checkpoint(_)) {
         return Err(IndexError::Coverage {
             faults,
             report: Box::new(report),
         });
     }
+    report.coverage_faults = faults;
     Ok((batches, report))
 }
 
@@ -1061,12 +1093,17 @@ impl<'a> Hasher<'a> {
             .file(decided.parent, decided.name.as_bytes(), stat, content);
     }
 
-    fn fault(&mut self, path: &Path, op: IoOp, on_root: bool, error: io::Error) {
+    fn fault(&mut self, path: &Path, op: IoOp, context: FaultContext<'_ , DirToken>, error: io::Error) {
         self.out.faults.push(CoverageFault {
             root: self.root.to_owned(),
             path: path.to_owned(),
             op,
-            on_root,
+            on_root: matches!(context, FaultContext::Root),
+            context: match context {
+                FaultContext::Root => CoverageContext::Root,
+                FaultContext::Dir(token) => CoverageContext::Directory(token),
+                FaultContext::Child { parent, name } => CoverageContext::Child { parent, name: name.as_bytes().to_vec() },
+            },
             error,
         });
     }
@@ -1232,13 +1269,8 @@ impl EventVisitor for Hasher<'_> {
                 let on_root = matches!(context, FaultContext::Root);
                 if op == IoOp::Lstat && !on_root && error.kind() == io::ErrorKind::NotFound {
                     self.out.counts.vanished += 1;
-                } else if matches!(op, IoOp::OpenDir | IoOp::List)
-                    && error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())
-                {
-                    // The directory row precedes its open/list. No Entered
-                    // event sets a count, so it remains unknown (D26).
                 } else {
-                    self.fault(path, op, on_root, error);
+                    self.fault(path, op, context, error);
                 }
                 None
             }

@@ -1,3 +1,4 @@
+mod coverage;
 mod gitfile;
 mod golden;
 mod index;

@@ -1,6 +1,9 @@
 //! `index` end to end, on real temp trees: every test drives the real
 //! pipeline and reads the published catalog back.
 
+#[path = "../../../ferret-catalog/tests/support/listing.rs"]
+mod checkpoint_oracle;
+
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -540,9 +543,9 @@ fn a_file_written_while_it_is_hashed_is_a_content_fault() {
 }
 
 /// D26: a permanent EACCES publishes the directory with unknown contents;
-/// any other listing fault keeps the previous generation byte for byte.
+/// M5 retains old children for both EACCES and other listing faults.
 #[test]
-fn an_unreadable_directory_publishes_but_other_listing_faults_do_not() {
+fn an_unreadable_directory_and_other_listing_faults_retain_old_children() {
     let tmp = Tmp::new("coverage");
     tmp.write("open/a.txt", b"a\n");
     tmp.write("shut/b.txt", b"b\n");
@@ -554,7 +557,7 @@ fn an_unreadable_directory_publishes_but_other_listing_faults_do_not() {
     assert!(report.published.is_some());
     let (_, rows) = published(&tmp);
     assert!(rows.contains_key(&tmp.at("shut")));
-    assert!(!rows.contains_key(&tmp.at("shut/b.txt")));
+    assert!(rows.contains_key(&tmp.at("shut/b.txt")));
     let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
     catalog.load_all().unwrap();
     let dir = catalog
@@ -577,14 +580,13 @@ fn an_unreadable_directory_publishes_but_other_listing_faults_do_not() {
     })));
     let result = index(&tmp.cat(), &roots, Refresh::All, &options(1));
     crate::walk::FAIL_LIST.set(None);
-    let IndexError::Coverage { faults, report } = result.unwrap_err() else {
-        panic!("expected a coverage fault");
-    };
-    assert_eq!(faults.len(), 1);
-    assert_eq!(faults[0].op, IoOp::List);
-    assert_eq!(faults[0].path, Path::new("open"));
-    assert_eq!(faults[0].error.raw_os_error(), Some(5));
-    assert!(report.published.is_none());
+    let report = result.unwrap();
+    let faults = &report.coverage_faults;
+    assert_eq!(faults.len(), 2);
+    let fault = faults.iter().find(|f| f.path == Path::new("open")).unwrap();
+    assert_eq!(fault.op, IoOp::List);
+    assert_eq!(fault.error.raw_os_error(), Some(5));
+    assert!(report.published.is_some());
     assert_eq!(
         fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
         before
@@ -606,9 +608,9 @@ fn a_denied_root_is_catalogued_with_unknown_contents() {
 }
 
 /// A `readlink` failure is a coverage fault (the walker reads through a
-/// held descriptor, so it is never a deletion race): nothing is published.
+/// held descriptor, so it is never a deletion race): retain that old edge.
 #[test]
-fn a_readlink_failure_blocks_publication_and_keeps_the_old_generation() {
+fn a_readlink_failure_retains_the_old_edge_and_publishes_trustworthy_siblings() {
     let tmp = Tmp::new("readlink");
     tmp.write("f.txt", b"f\n");
     std::os::unix::fs::symlink("f.txt", tmp.at("link")).unwrap();
@@ -620,10 +622,12 @@ fn a_readlink_failure_blocks_publication_and_keeps_the_old_generation() {
     crate::walk::FAIL_READLINK.set(Some(Box::new(|name| name == "link")));
     let result = index(&tmp.cat(), &roots, Refresh::All, &options(1));
     crate::walk::FAIL_READLINK.set(None);
-    let error = result.unwrap_err();
-    let IndexError::Coverage { faults, .. } = error else {
-        panic!("expected a coverage fault, got {error}");
-    };
+    let report = result.unwrap();
+    assert!(report.published.is_some());
+    let faults = &report.coverage_faults;
+    let (_, rows) = published(&tmp);
+    assert!(rows.contains_key(&tmp.at("link")));
+    assert!(rows.contains_key(&tmp.at("new.txt")));
     assert!(
         matches!(faults.as_slice(), [f] if f.op == IoOp::Readlink && f.path.ends_with("link")),
         "{faults:?}"
@@ -1360,11 +1364,12 @@ fn ignored_names_opaque_directories_and_special_stats_round_trip() {
         assert_eq!(report.counts.files_read, 0);
         let after = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
         assert_eq!(&after[head..], &before[head..]);
+        let effective = Catalog::open(&tmp.cat()).unwrap().unwrap();
+        let want = checkpoint_oracle::listings(&effective);
         let mut txn = ferret_catalog::Transaction::begin(&tmp.cat(), 1).unwrap();
         txn.keep(tmp.tree().as_os_str().as_bytes()).unwrap();
-        txn.commit().unwrap();
-        let after = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
-        assert_eq!(&after[head..], &before[head..]);
+        let materialised = txn.commit().unwrap();
+        assert_eq!(checkpoint_oracle::listings(&materialised), want);
     }
 }
 

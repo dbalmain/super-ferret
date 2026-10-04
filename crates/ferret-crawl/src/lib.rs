@@ -12,13 +12,14 @@
 //! unless the walk may have missed entries. This crate knows nothing about
 //! queries or index formats.
 
+mod coverage;
 mod index;
 mod observe;
 pub mod reconcile;
 mod walk;
 
 pub use index::{
-    Counts, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report, RootChange, index,
+    Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report, RootChange, index,
     index_change, recrawl,
 };
 pub use observe::ContentFault;

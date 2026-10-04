@@ -1,9 +1,9 @@
 //! Shared M3/M4 semantic comparison with a materialised checkpoint.
 use ferret_catalog::{Catalog, Hash, Kind, NameId, Stat, Target};
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Listing {
-    path: Vec<u8>,
+    pub(crate) path: Vec<u8>,
     kind: u8,
     state: Option<u8>,
     stat: Option<StatKey>,
@@ -11,12 +11,12 @@ pub(crate) struct Listing {
     refs: Option<u32>,
     link: Option<Vec<u8>>,
     traversed: bool,
-    entries: Option<u32>,
+    pub(crate) entries: Option<u32>,
     suppressed: bool,
-    retained_at: Option<u64>,
+    pub(crate) retained_at: Option<u64>,
     work_tree: Option<(u8, (u64, u64), Vec<u8>)>,
 }
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct StatKey([u64; 12]);
 fn stat_key(s: Stat) -> StatKey {
     StatKey([
@@ -100,3 +100,4 @@ pub(crate) fn listings(c: &Catalog) -> Vec<Listing> {
     rows.sort();
     rows
 }
+
