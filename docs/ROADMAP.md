@@ -787,6 +787,96 @@ full-recrawl CPU or transient memory. M4 also widens a kept alias root when the
 last refreshed hard-link name is deleted, to get trustworthy shared metadata;
 M6 can narrow that to checked alias scopes.
 
+### S1+ M4b — Directory-local recrawl reduction (2026-10-04)
+
+M4b replaces whole-file sorting with directory-local basename merging. Resident
+batches retain fully equal single-name files as compact old-name references;
+only changed/unmatched observations and possible aliases enter the global
+identity-sorted residue. Equality includes stat, kind, content state/hash and
+symlink target. Indexed alias counts matter as well as filesystem nlink. A later
+unmatched alias expands compact observations of that inode back into the group,
+preserving conflict handling and canonical ordering. Directory tokens carry
+checked old-directory hints and resolve through dense per-batch tables. The
+directory graph borrows stats; local listings reuse a name-byte buffer.
+Checkpoint child iteration uses its existing basename order without copying or
+sorting. Effective overlays keep their sparse child merging. The final-set
+edge/refcount logic, root widening and amended A′ fault rule remain M4's.
+
+This moves local observation reduction ahead of M6: eliminating the sort alone
+would leave whole file batches above the RSS target. It still retains directory
+observations and compact name references for the run; fully streamed directory
+scopes remain M6. M5 can build coverage scopes on this shape. Eighteen real-crawl
+recrawl tests pass, including M4's generated full-index oracle sequences and a
+new compact-row/new-alias conflict regression. The EACCES test now checks that
+fallback expands compact siblings. All workspace gates: **505 passed / 4 ignored**,
+zero warnings, real user log size/mtime unchanged.
+
+Measured production code **`8ffa06d`**, with the same release commands and
+**10,448,739-name** v4 fixture as M4. **One warm-up and three recorded samples
+per case**, second round reversed; fresh process/private manifest/log each time,
+immutable snapshot hardlinked from `/tmp/s1plus-m3-measure/index`. Before every
+invocation, the host-visible runner checks `uptime` and
+`pgrep -af 'harness.run|ferret_timing|ignore_timing|synthetic|ferret-bench'`,
+excluding only itself/ancestors and pgrep. No competing benchmark or compilation
+ran during timing. Evidence, commands, binary SHA-256s, environments and all loads
+are in `/home/dave/w/super-ferret/.ai/s1plus-m4b-measurements/recrawl-samples.json`;
+`recrawl-run.py` is the guard/runner and `report.py` generates these tables.
+
+```sh
+B=/home/dave/w/super-ferret-wt/s1plus/target/release/ferret-bench
+P=/home/dave/w/super-ferret-wt/s1plus/target/release/examples/recrawl
+export XDG_CONFIG_HOME=/tmp/s1plus-m4b-measure/config
+export XDG_DATA_HOME=/tmp/s1plus-m4b-measure/data
+export XDG_STATE_HOME=/tmp/s1plus-m4b-measure/state
+export XDG_CACHE_HOME=/tmp/s1plus-m4b-measure/cache
+# Set N to 0, 1 or 100000 for the corresponding command below.
+export FERRET_INDEX=/tmp/s1plus-m4b-measure/c${N}
+```
+
+These remain **synthetic observation replay** measurements, without filesystem
+walking or reading/hashing file contents. Replay now includes local equal-row
+comparison/reduction; moving that work out of diff is included in post-setup
+total. Logical writes are appended log bytes plus the manifest replacement,
+excluding fixture resets and filesystem block amplification. Final RSS follows
+batch release; peak covers the entire producer, including setup. Each phase's
+median is calculated independently. 100,000 means distinct indexed regular-file
+inodes (all aliases agree), nominal 1% of 10M, as in M4.
+
+| Changed file inodes | Log + manifest bytes | Replay / diff / commit median, ms | Post-setup total median (range), s | Final / peak RSS, MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| No change | 0 + 0 | 6686.98 / 2565.07 / 0.00 | 9.28 (9.24–9.40) | 764.52 / 1386.72 | `$B recrawl-once /tmp/s1plus-m4b-measure/c0 0 "$P"` | `8ffa06d` | 1.66–1.78 / 1.70–1.73 / 1.76–1.76 |
+| One file | 328 + 128 | 6680.29 / 2568.50 / 5.44 | 9.29 (9.24–9.35) | 764.57 / 1386.52 | `$B recrawl-once /tmp/s1plus-m4b-measure/c1 1 "$P"` | `8ffa06d` | 1.58–1.80 / 1.69–1.73 / 1.75–1.77 |
+| 100,000 (nominal 1%) | 13,600,192 + 128 | 7027.61 / 3236.60 / 260.38 | 10.57 (10.48–10.59) | 799.92 / 1435.52 | `$B recrawl-once /tmp/s1plus-m4b-measure/c100000 100000 "$P"` | `8ffa06d` | 1.49–1.76 / 1.66–1.72 / 1.74–1.76 |
+
+Session setup remains separate and retains `4ae23c0`'s cached-key sorts; M4b does
+not claim that earlier setup speedup. Setup opens/validates the view and builds
+resident identity/hash/directory lookups once per session.
+
+| Case | Session setup median (range), ms | Setup current / peak RSS, MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | --- | --- | --- |
+| No change | 3072.75 (3056.20–3096.50) | 721.59 / 871.19 | `$B recrawl-once /tmp/s1plus-m4b-measure/c0 0 "$P"` | `8ffa06d` | 1.66–1.78 / 1.70–1.73 / 1.76–1.76 |
+| One file | 3081.04 (3068.30–3084.30) | 721.52 / 870.91 | `$B recrawl-once /tmp/s1plus-m4b-measure/c1 1 "$P"` | `8ffa06d` | 1.58–1.80 / 1.69–1.73 / 1.75–1.77 |
+| 100,000 (nominal 1%) | 3063.01 (3052.55–3074.10) | 721.65 / 871.47 | `$B recrawl-once /tmp/s1plus-m4b-measure/c100000 100000 "$P"` | `8ffa06d` | 1.49–1.76 / 1.66–1.72 / 1.74–1.76 |
+
+**Both no-change targets are met:** median post-setup **9.28 s** (all three samples
+9.24–9.40 s, below 9.5 s), median whole-process peak **1.35 GiB** (below 1.6 GiB).
+Against M4's original table, post-setup falls from 45.04 to 9.28 s and peak from
+2.43 to 1.35 GiB. Setup is about **3.07 s**, giving roughly **12.35 s** for setup
+plus replay/reconcile/publication in a fresh writer; a resident session amortises
+setup. This satisfies the specified post-setup comparison with the 9.5 s full
+build, rather than establishing a sub-9.5 s fresh-writer total.
+
+No-change writes **0 B** and publishes no generation; one file writes **456 B**;
+100,000 writes **13,600,320 B**, preserving the checkpoint. Remaining no-change
+cost is about **6.69 s replay/local comparison** plus **2.57 s graph, seen/sweep
+and final reconciliation**. Whole directory tables and compact name references
+still dominate transient memory. The local buffer is bounded by the largest
+listing per worker; prior dirty overlays and retained readers are outside these
+clean-checkpoint timings. The filesystem observer's conservative content carry
+still uses its resident identity lookup; these synthetic measurements do not
+measure that filesystem observation cost. M6 owns narrower scopes, fully streamed
+directories and smaller alias/reference storage.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes

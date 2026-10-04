@@ -20,7 +20,8 @@ at exactly 10M names, rather than S1's 1.18 GB, but rewriting even that for each
 inotify burst is the wrong cost. The log saves roughly a million times the
 logical writes for one changed file. The price is bounded
 replay and occasional full compaction. An unchanged full recrawl still visits
-every entry; M4b sorts directory listings and only the changed/alias residue. S1+ cannot turn filesystem enumeration into a small update.
+every entry; M4b sorts directory listings and only the changed/alias residue.
+S1+ cannot turn filesystem enumeration into a small update.
 
 ## What the code does today
 
@@ -43,8 +44,9 @@ These are constraints found in the code, rather than inferred from DESIGN:
   documents. Kept observations yield to fresh ones.
 - `WriterSession::open` validates/warms the old view once, then caches sorted
   inode ids, immutable document-row ordinals and rooted directory identities.
-  Sparse maps track lookup changes. Name references reuse the reader's cached base inverse
-  and effective LifePut rows. `Transaction::begin` is the checkpoint fallback;
+  Sparse maps track lookup changes. Name references reuse the reader's cached
+  base inverse and effective LifePut rows. `Transaction::begin` is the checkpoint
+  fallback;
   its carry identity lookup is lazy and hash sorting happens at checkpoint commit.
   `keep` copies roots only for initial/checkpoint fallback publication. Ordinary
   recrawls leave kept roots in the view and append a final sparse change set.

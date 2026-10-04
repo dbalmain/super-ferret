@@ -93,3 +93,13 @@ findings). Each should name the guard that will eventually retire it.
 - **Guard:** derive the final root set once, then use membership during inode
   retirement. Existing real-crawl root-retirement and materialised-checkpoint
   oracle tests cover the resulting behavior. Applied in M4.
+
+### 2026-10-04 — an equal-row fast path can hide a later alias conflict
+
+- **What:** M4b can compact an equal single-link observation before a new alias
+  appears in another listing. Sorting only full observations would then miss
+  the version disagreement and publish Hashed instead of shared Fault.
+- **Guard:** expand compact observations of every inode appearing in the alias
+  residue before grouping. The real-crawl test
+  `compact_equal_observation_joins_a_new_alias_before_conflict_resolution` fails
+  Hashed vs Fault when expansion is disabled. Applied in M4b.
