@@ -1179,6 +1179,23 @@ impl<'a> Hasher<'a> {
         self.out
     }
 
+    fn promote_changed_parent(&self, token: DirToken, stat: &Stat, path: &Path) {
+        if let Some(selection) = self.selection {
+            let continuing = match (token.previous_directory(), self.txn) {
+                (Some(id), Source::Session(session, _)) => {
+                    session.view().inode(id).stat.same_version(stat)
+                }
+                _ => false,
+            };
+            if !continuing {
+                // Directory ctime can change for ordinary child edits too.
+                // Conservatively cover its subtree rather than trust a reused
+                // (dev, ino) as proof that the old parent still exists.
+                selection.promote(path);
+            }
+        }
+    }
+
     /// A file the policy sends to the index: carried, taken from another
     /// name's observation, read, or deferred.
     fn index_file(&mut self, decided: &Decided<'_, DirToken>, stat: Stat) {
@@ -1352,15 +1369,9 @@ impl EventVisitor for Hasher<'_> {
 
     fn root(&mut self, stat: crate::Stat<'_>) -> DirToken {
         self.out.counts.dirs += 1;
-        let token = self
-            .out
-            .batch
-            .root(self.root.as_os_str().as_bytes(), observe::from_walk(&stat));
-        if let Some(selection) = self.selection
-            && token.previous_directory().is_none()
-        {
-            selection.promote(Path::new(""));
-        }
+        let stat = observe::from_walk(&stat);
+        let token = self.out.batch.root(self.root.as_os_str().as_bytes(), stat);
+        self.promote_changed_parent(token, &stat, Path::new(""));
         token
     }
 
@@ -1398,21 +1409,13 @@ impl EventVisitor for Hasher<'_> {
                     Decision::Descend => {
                         self.out.counts.dirs += 1;
                         let token = self.out.batch.dir(decided.parent, name, stat);
-                        if let Some(selection) = self.selection
-                            && token.previous_directory().is_none()
-                        {
-                            selection.promote(decided.path);
-                        }
+                        self.promote_changed_parent(token, &stat, decided.path);
                         Some(token)
                     }
                     Decision::Traverse => {
                         self.out.counts.traversed += 1;
                         let token = self.out.batch.traversed_dir(decided.parent, name, stat);
-                        if let Some(selection) = self.selection
-                            && token.previous_directory().is_none()
-                        {
-                            selection.promote(decided.path);
-                        }
+                        self.promote_changed_parent(token, &stat, decided.path);
                         Some(token)
                     }
                     Decision::Catalog(Reason::Symlink) => {

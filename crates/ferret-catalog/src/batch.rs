@@ -291,8 +291,8 @@ impl Batch {
                 || self.pending_bytes.len() + name.len() + target.map_or(0, <[u8]>::len)
                     > OBSERVATION_BYTES
             {
-                self.chunked = true;
                 self.finish_observations();
+                self.chunked = true;
             }
             let name = push(&mut self.pending_bytes, name, &mut self.overflow);
             let target =
@@ -376,8 +376,9 @@ impl Batch {
                             return false;
                         }
                         let inode = old.inode(child);
+                        let kind = old.kind(child);
                         inode.stat == file.stat
-                            && old.kind(child) == Kind::from_mode(file.stat.mode)
+                            && kind == Kind::from_mode(file.stat.mode)
                             && inode.state == file.content.state()
                             && match file.content {
                                 Content::Hashed(hash) => {
@@ -385,12 +386,15 @@ impl Batch {
                                 }
                                 _ => true,
                             }
-                            && old.link_target(child) == target
+                            && if kind == Kind::Symlink {
+                                old.link_target(child) == target
+                            } else {
+                                target.is_none()
+                            }
                     });
                 if reusable {
-                    if let Some((id, _)) = matched {
-                        self.reused
-                            .insert(file.parent, id, Some(old.name(id).child), false);
+                    if let Some((id, edge)) = matched {
+                        self.reused.insert(file.parent, id, Some(edge.child));
                     }
                 } else {
                     self.push_file(file.parent, name, file.stat, file.content, target);
@@ -419,7 +423,7 @@ impl Batch {
             let preserved = std::mem::take(&mut self.preserved);
             for id in preserved.ids() {
                 let edge = old.name(id);
-                let parent = preserved.parents[&edge.parent];
+                let parent = preserved.parents[&edge.parent].0;
                 if let crate::Target::Ignored(kind) = edge.target() {
                     self.ignored(parent, edge.bytes, kind);
                 }
@@ -427,7 +431,7 @@ impl Batch {
             let reused = std::mem::take(&mut self.reused);
             for id in reused.ids() {
                 let edge = old.name(id);
-                let parent = reused.parents[&edge.parent];
+                let parent = reused.parents[&edge.parent].0;
                 let child = edge.child;
                 self.push_file(
                     parent,
@@ -449,7 +453,7 @@ impl Batch {
                 .and_then(|p| old.lookup(p, name))
             && old.name(id).target() == crate::Target::Ignored(kind)
         {
-            self.preserved.insert(parent, id, None, false);
+            self.preserved.insert(parent, id, None);
             return;
         }
         let name = push(&mut self.names, name, &mut self.overflow);
@@ -649,15 +653,15 @@ impl Batch {
         let Some(old) = &self.previous else {
             unreachable!("reused names require a pinned generation");
         };
-        self.reused.parents[&old.name(name).parent]
+        self.reused.parents[&old.name(name).parent].0
     }
     /// Included parents, without retaining one reference per equal file.
     pub fn reused_directories(&self) -> impl Iterator<Item = DirToken> + '_ {
-        self.reused.included.iter().copied()
+        self.reused.included()
     }
     /// Parents whose continuing hints must validate before bulk reuse.
     pub fn reused_parents(&self) -> impl Iterator<Item = DirToken> + '_ {
-        self.reused.parents.values().copied()
+        self.reused.parents.values().map(|&(parent, _)| parent)
     }
     /// Equal-name/inode seen words, valid only after parent validation.
     pub fn reused_words(&self) -> (&[u64], &[u64]) {
@@ -699,12 +703,7 @@ impl Batch {
             crate::Target::Inode(id) => Some(id),
             crate::Target::Ignored(_) => None,
         };
-        self.preserved.insert(
-            parent,
-            id,
-            child,
-            child.is_some_and(|id| old.is_directory(id)),
-        );
+        self.preserved.insert(parent, id, child);
     }
     /// Untouched edges and their validated parent tokens.
     pub fn preserved_files(&self) -> impl Iterator<Item = (DirToken, NameId)> + '_ {
@@ -712,12 +711,12 @@ impl Batch {
             let Some(old) = &self.previous else {
                 unreachable!("preserved edges require a pinned view")
             };
-            (self.preserved.parents[&old.name(name).parent], name)
+            (self.preserved.parents[&old.name(name).parent].0, name)
         })
     }
     /// Parent scopes containing preserved included rows (D29).
     pub fn preserved_parents(&self) -> impl Iterator<Item = DirToken> + '_ {
-        self.preserved.included.iter().copied()
+        self.preserved.included()
     }
     /// Peak local observation rows/bytes, excluding changed rows and seen bits.
     pub fn observation_peak(&self) -> (usize, usize) {

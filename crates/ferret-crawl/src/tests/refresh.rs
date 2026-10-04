@@ -20,17 +20,27 @@ fn options() -> IndexOptions {
     }
 }
 fn oracle(tmp: &Tmp, current: &Catalog) {
+    oracle_with(tmp, &[tmp.tree()], &options(), current);
+}
+fn oracle_with(tmp: &Tmp, roots: &[std::path::PathBuf], opts: &IndexOptions, current: &Catalog) {
     let path = tmp.base.join("oracle");
     if path.exists() {
         fs::remove_dir_all(&path).unwrap();
     }
-    index(&path, &[tmp.tree()], Refresh::All, &options()).unwrap();
+    index(&path, roots, Refresh::All, opts).unwrap();
     let fresh = Catalog::open(&path).unwrap().unwrap();
     fresh.load_all().unwrap();
     let disk = Catalog::open(&tmp.cat()).unwrap().unwrap();
     disk.load_all().unwrap();
     assert_eq!(listings(current), listings(&fresh));
     assert_eq!(listings(&disk), listings(&fresh));
+    assert_eq!(current.policy(), fresh.policy());
+    assert_eq!(disk.policy(), fresh.policy());
+    assert_eq!(current.sniffer_version(), fresh.sniffer_version());
+    assert_eq!(disk.sniffer_version(), fresh.sniffer_version());
+    let paths = |view: &Catalog| view.roots().map(|(_, p)| p.to_vec()).collect::<Vec<_>>();
+    assert_eq!(paths(current), paths(&fresh));
+    assert_eq!(paths(&disk), paths(&fresh));
 }
 fn request(session: &WriterSession, scopes: Vec<RefreshScope>) -> RefreshRequest {
     RefreshRequest {
@@ -75,7 +85,8 @@ fn a_simulated_burst_observes_final_state_deletion_and_adopts_the_same_epoch_vie
     let RefreshOutcome::Committed { changes } = result.outcome else {
         panic!("missing delta")
     };
-    let adopted = old.advance(old.generation(), &changes).unwrap();
+    assert_eq!(result.base_generation, old.generation());
+    let adopted = old.advance(result.base_generation, &changes).unwrap();
     assert_eq!(adopted.generation(), result.view.generation());
     assert_eq!(adopted.generation().checkpoint, old.generation().checkpoint);
     assert_eq!(listings(&adopted), listings(&result.view));
@@ -85,6 +96,63 @@ fn a_simulated_burst_observes_final_state_deletion_and_adopts_the_same_epoch_vie
         refresh(&mut session, req, &options()).unwrap().outcome,
         RefreshOutcome::Unchanged
     ));
+}
+
+#[test]
+fn an_entry_burst_with_global_policy_size_cap_or_sniffer_changes_refreshes_every_root() {
+    let tmp = Tmp::new("refresh-global-transitions");
+    tmp.write("left/a", b"left content");
+    tmp.write("right/a", b"right content");
+    let roots = [tmp.at("left"), tmp.at("right")];
+    let mut opts = options();
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    for step in 0..3 {
+        match step {
+            0 => opts.global = Some("a\n".into()),
+            1 => {
+                opts.global = None;
+                opts.config.size_cap = 1;
+            }
+            _ => {
+                opts.config.size_cap = u64::MAX;
+                opts.sniffer += 1;
+            }
+        }
+        let req = entry(&session, &tmp, "left", "a");
+        let result = refresh(&mut session, req, &opts).unwrap();
+        assert_eq!(result.report.refreshed.len(), roots.len());
+        assert!(result.report.kept.is_empty());
+        oracle_with(&tmp, &roots, &opts, &result.view);
+    }
+}
+
+#[test]
+fn a_scoped_burst_respects_nested_root_boundaries_and_overflow_refreshes_them_all() {
+    let tmp = Tmp::new("refresh-nested-boundaries");
+    tmp.write("outer/a", b"outer");
+    tmp.write("outer/inner/b", b"inner");
+    let roots = [tmp.at("outer"), tmp.at("outer/inner")];
+    index(&tmp.cat(), &roots, Refresh::All, &options()).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    tmp.write("outer/a", b"outer changed");
+    let req = entry(&session, &tmp, "outer", "a");
+    let result = refresh(&mut session, req, &options()).unwrap();
+    assert_eq!(result.report.refreshed, [roots[0].clone()]);
+    assert_eq!(result.report.kept, [roots[1].clone()]);
+    oracle_with(&tmp, &roots, &options(), &result.view);
+    fs::remove_file(tmp.at("outer/inner/b")).unwrap();
+    let req = entry(&session, &tmp, "outer/inner", "b");
+    let result = refresh(&mut session, req, &options()).unwrap();
+    assert_eq!(result.report.refreshed, [roots[1].clone()]);
+    oracle_with(&tmp, &roots, &options(), &result.view);
+    tmp.write("outer/new", b"new outer");
+    tmp.write("outer/inner/new", b"new inner");
+    let mut req = request(&session, vec![]);
+    req.reason = RefreshReason::Overflow;
+    let result = refresh(&mut session, req, &options()).unwrap();
+    assert_eq!(result.report.refreshed.len(), roots.len());
+    oracle_with(&tmp, &roots, &options(), &result.view);
 }
 
 #[test]
@@ -171,6 +239,22 @@ fn an_entry_scope_with_a_replaced_or_vanished_parent_promotes_to_a_containing_sc
 }
 
 #[test]
+fn an_entry_parent_with_changed_ctime_expands_its_subtree_instead_of_trusting_identity_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = Tmp::new("refresh-parent-ctime");
+    tmp.write("dir/a", b"selected");
+    tmp.write("dir/deep/b", b"old descendant");
+    index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let req = entry(&session, &tmp, "dir", "a");
+    tmp.write("dir/deep/b", b"new descendant");
+    fs::set_permissions(tmp.at("dir"), fs::Permissions::from_mode(0o700)).unwrap();
+    let result = refresh(&mut session, req, &options()).unwrap();
+    assert_eq!(result.report.counts.dirs, 3);
+    oracle(&tmp, &result.view);
+}
+
+#[test]
 fn move_hints_including_wrong_hints_observe_both_final_endpoints_without_trusting_identity() {
     for wrong in [false, true] {
         let tmp = Tmp::new("refresh-move-hint");
@@ -181,6 +265,14 @@ fn move_hints_including_wrong_hints_observe_both_final_endpoints_without_trustin
         let mut req = request(&session, vec![]);
         let old_parent = directory(&session.view(), &tmp, "old");
         let new_parent = directory(&session.view(), &tmp, "new");
+        let old_file = session
+            .view()
+            .name(session.view().lookup(old_parent, b"a").unwrap())
+            .child;
+        let other_file = session
+            .view()
+            .name(session.view().lookup(new_parent, b"other").unwrap())
+            .child;
         req.rename_hints.push(crate::RenameHint {
             old_parent,
             old_name: b"a".to_vec(),
@@ -197,6 +289,76 @@ fn move_hints_including_wrong_hints_observe_both_final_endpoints_without_trustin
         } else {
             fs::rename(tmp.at("old/a"), tmp.at("new/a")).unwrap();
         }
+        let result = refresh(&mut session, req, &options()).unwrap();
+        let name = result
+            .view
+            .lookup(new_parent, if wrong { b"other" } else { b"a" })
+            .unwrap();
+        assert_eq!(
+            result.view.name(name).child,
+            if wrong { other_file } else { old_file }
+        );
+        oracle(&tmp, &result.view);
+    }
+}
+
+#[test]
+fn a_scoped_directory_eacces_is_opaque_while_eio_retains_and_recovery_clears_coverage() {
+    use super::coverage::{Hook, retained_listings};
+    use crate::walk::IoPoint;
+    use std::path::Path;
+    for errno in [13, 5] {
+        let tmp = Tmp::new("refresh-directory-fault");
+        tmp.write("dir/old", b"old");
+        tmp.write("outside/a", b"outside");
+        index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        let scope = directory(&before, &tmp, "dir");
+        fs::remove_file(tmp.at("dir/old")).unwrap();
+        tmp.write("dir/new", b"new");
+        let hook = Hook::set(&tmp.tree(), move |point, path| {
+            (point == IoPoint::Directory && path == Path::new("dir"))
+                .then(|| (crate::IoOp::List, std::io::Error::from_raw_os_error(errno)))
+        });
+        let req = request(&session, vec![RefreshScope::Directory(scope)]);
+        let result = refresh(&mut session, req, &options()).unwrap();
+        let req = request(&session, vec![RefreshScope::Directory(scope)]);
+        assert!(matches!(
+            refresh(&mut session, req, &options()).unwrap().outcome,
+            RefreshOutcome::Unchanged
+        ));
+        if errno == 13 {
+            assert!(result.view.children(scope).next().is_none());
+            assert_eq!(result.view.entry_count(scope), None);
+            assert_eq!(result.view.retained_at(scope), None);
+            oracle(&tmp, &result.view);
+        } else {
+            // Retention expectations come from the real pre-fault checkpoint.
+            drop(hook);
+            let path = tmp.base.join("oracle");
+            index(&path, &[tmp.tree()], Refresh::All, &options()).unwrap();
+            let fresh = Catalog::open(&path).unwrap().unwrap();
+            fresh.load_all().unwrap();
+            let paths = vec![tmp.at("dir").as_os_str().as_bytes().to_vec()];
+            let expected = retained_listings(&fresh, &before, &paths, &paths);
+            let disk = Catalog::open(&tmp.cat()).unwrap().unwrap();
+            disk.load_all().unwrap();
+            assert_eq!(listings(&result.view), expected);
+            assert_eq!(listings(&disk), expected);
+            let req = request(&session, vec![RefreshScope::Directory(scope)]);
+            let result = refresh(&mut session, req, &options()).unwrap();
+            assert_eq!(result.view.retained_at(scope), None);
+            oracle(&tmp, &result.view);
+            continue;
+        }
+        let req = request(&session, vec![RefreshScope::Directory(scope)]);
+        assert!(matches!(
+            refresh(&mut session, req, &options()).unwrap().outcome,
+            RefreshOutcome::Unchanged
+        ));
+        drop(hook);
+        let req = request(&session, vec![RefreshScope::Directory(scope)]);
         let result = refresh(&mut session, req, &options()).unwrap();
         oracle(&tmp, &result.view);
     }
@@ -327,11 +489,20 @@ fn generated_entry_and_directory_bursts_match_the_full_index_after_every_final_s
 
 #[test]
 fn conflicting_alias_content_observations_publish_shared_fault_and_match_a_faulted_full_index() {
+    use super::coverage::Hook;
     use crate::observe::{CONTENT_IO_FAULTS, ContentIo};
-    use crate::walk::{IO_HOOKS, IoPoint};
+    use crate::walk::IoPoint;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
-    use std::sync::Arc;
+    struct ContentFault((u64, u64));
+    impl Drop for ContentFault {
+        fn drop(&mut self) {
+            CONTENT_IO_FAULTS
+                .lock()
+                .unwrap()
+                .retain(|(key, _)| *key != self.0);
+        }
+    }
     let tmp = Tmp::new("refresh-conflicting-aliases");
     tmp.write("left/a", b"shared");
     tmp.write("right/stable", b"stable");
@@ -358,23 +529,21 @@ fn conflicting_alias_content_observations_publish_shared_fault_and_match_a_fault
     fs::set_permissions(tmp.at("left/a"), fs::Permissions::from_mode(0o600)).unwrap();
     let stat = fs::metadata(tmp.at("left/a")).unwrap();
     let key = (stat.dev(), stat.ino());
-    IO_HOOKS.lock().unwrap().push((
-        tmp.tree(),
-        Arc::new(move |point, path| {
-            if point == IoPoint::Child {
-                if path == Path::new("left/a") {
-                    CONTENT_IO_FAULTS
-                        .lock()
-                        .unwrap()
-                        .push((key, ContentIo::Open));
-                }
-                if path == Path::new("right/b") {
-                    CONTENT_IO_FAULTS.lock().unwrap().retain(|(k, _)| *k != key);
-                }
+    let content_fault = ContentFault(key);
+    let hook = Hook::set(&tmp.tree(), move |point, path| {
+        if point == IoPoint::Child {
+            if path == Path::new("left/a") {
+                CONTENT_IO_FAULTS
+                    .lock()
+                    .unwrap()
+                    .push((key, ContentIo::Open));
             }
-            None
-        }),
-    ));
+            if path == Path::new("right/b") {
+                CONTENT_IO_FAULTS.lock().unwrap().retain(|(k, _)| *k != key);
+            }
+        }
+        None
+    });
     let opts = IndexOptions {
         workers: 1,
         ..options()
@@ -391,11 +560,11 @@ fn conflicting_alias_content_observations_publish_shared_fault_and_match_a_fault
     let fresh = Catalog::open(&path).unwrap().unwrap();
     fresh.load_all().unwrap();
     assert_eq!(listings(&result.view), listings(&fresh));
-    IO_HOOKS
-        .lock()
-        .unwrap()
-        .retain(|(root, _)| *root != tmp.tree());
-    CONTENT_IO_FAULTS.lock().unwrap().retain(|(k, _)| *k != key);
+    let disk = Catalog::open(&tmp.cat()).unwrap().unwrap();
+    disk.load_all().unwrap();
+    assert_eq!(listings(&disk), listings(&fresh));
+    drop(hook);
+    drop(content_fault);
     let req = entry(&session, &tmp, "left", "a");
     let result = refresh(&mut session, req, &options()).unwrap();
     oracle(&tmp, &result.view);

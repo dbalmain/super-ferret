@@ -12,9 +12,9 @@ use crate::{IndexOptions, IoOp, Refresh, index, recrawl};
 use checkpoint_oracle::{Listing, listings};
 use ferret_catalog::{Catalog, Contents, InoId, Target, WriterSession};
 
-struct Hook(PathBuf);
+pub(crate) struct Hook(PathBuf);
 impl Hook {
-    fn set(
+    pub(crate) fn set(
         root: &Path,
         body: impl Fn(IoPoint, &Path) -> Option<(IoOp, std::io::Error)> + Send + Sync + 'static,
     ) -> Self {

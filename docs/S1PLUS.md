@@ -3,7 +3,8 @@
 M0 design, 2026-10-03. Implementation baseline: `4e38e77`, format v3.
 M1–M3 implement the checked version-4 checkpoint, durable log and effective
 reader. M4/M4b implement the batch recrawl producer; M5 implements typed coverage
-retention. M6–M7 remain a design.
+retention. M6 implements resident scoped refresh and bounded file observations;
+M7 compaction remains a design.
 The build is split into slices below. D51 is open; its recommended choice is
 the provisional compaction schedule. D52 interprets D27 C as epoch-scoped ids:
 proceeding on the recommendation; Dave may veto. Neither is recorded as an
@@ -580,7 +581,8 @@ M6 reduces file observations in chunks of at most 4,096 rows and 1 MiB of
 name/target bytes, recording equal rows in epoch-sized seen bitsets. A very large
 listing uses keyed old-child lookup after its first chunk, avoiding repeated
 merge scans over the same listing. Finished workers release temporary buffers;
-equal ignored markers reduce to seen bits too. It retains only changed file rows, seen bits, the directory token/coverage table and the existing
+equal ignored markers reduce to seen bits too. It retains only changed file
+rows, seen bits, the directory token/coverage table and the existing
 bounded alias backlog. The directory table still costs O(directories); resolve
 continuing directory ids as tokens are minted and retain provisional mappings
 for newly discovered/ambiguous moves. File observations need not survive once
@@ -590,6 +592,11 @@ small burst. A resident first-name inverse and sparse extra aliases support
 checked alias-scope promotion. Directory/coverage tables remain O(directories);
 M6 scope selection preserves untouched child edges and stops sweeps at kept
 subtrees, independently of fault protection.
+The cap measures pending stat/content observations and their name/target bytes;
+the walker's raw `getdents` name listing still scales with its largest directory.
+These are separate from changed rows and the O(directories) graph. Streaming the
+raw walker listing would also change its count-before-children event contract;
+M6 preserves that contract and M5's joined-listing coverage proof.
 
 ### S1b's interface
 
@@ -623,6 +630,10 @@ mismatch returns RetryFromCurrent before dereferencing any request id or
 doing writes; expected_generation includes incarnation, checkpoint and sequence.
 A refreshed scope must resolve to the same root and inode identity under the lock; a changed or
 vanished parent promotes the request to a containing directory/root refresh.
+The scoped observer also promotes when the opened parent's version differs
+from its pinned stat, including ctime: a reused `(dev, ino)` alone cannot prove
+continuity. Ordinary child edits can cause this conservative subtree expansion;
+same-path directory ids still continue under the normal reconciliation rules.
 No external caller can submit an unobserved “delete this inode” from inotify.
 Retain a path or checked watch locator, or pin the source view, to re-resolve
 old scopes after an epoch change. A same-epoch committed delta lets the resident

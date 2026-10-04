@@ -2,7 +2,7 @@
 //! tokens still require generation and continuing-directory validation at
 //! reconciliation. Untouched scopes use the same storage, without asserting
 //! that the old file version was observed.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::{DirToken, InoId, NameId};
 
@@ -10,10 +10,10 @@ use crate::{DirToken, InoId, NameId};
 pub(super) struct Seen {
     pub names: Vec<u64>,
     pub inodes: Vec<u64>,
-    pub parents: BTreeMap<InoId, DirToken>,
-    pub included: BTreeSet<DirToken>,
-    pub directories: BTreeSet<InoId>,
+    pub parents: BTreeMap<InoId, (DirToken, bool)>,
     pub count: usize,
+    last_parent: Option<DirToken>,
+    last_included: bool,
 }
 fn insert(words: &mut Vec<u64>, id: u32) -> bool {
     let at = id as usize / 64;
@@ -24,24 +24,29 @@ fn insert(words: &mut Vec<u64>, id: u32) -> bool {
     new
 }
 impl Seen {
-    pub fn insert(
-        &mut self,
-        parent: DirToken,
-        name: NameId,
-        child: Option<InoId>,
-        directory: bool,
-    ) {
-        if let Some(old) = parent.previous_directory() {
-            self.parents.insert(old, parent);
+    pub fn insert(&mut self, parent: DirToken, name: NameId, child: Option<InoId>) {
+        if self.last_parent != Some(parent) {
+            if let Some(old) = parent.previous_directory() {
+                self.parents.entry(old).or_insert((parent, false)).0 = parent;
+            }
+            self.last_parent = Some(parent);
+            self.last_included = false;
         }
         self.count += usize::from(insert(&mut self.names, name.0));
         if let Some(child) = child {
             insert(&mut self.inodes, child.0);
-            self.included.insert(parent);
-            if directory {
-                self.directories.insert(child);
+            if !self.last_included {
+                if let Some(old) = parent.previous_directory() {
+                    self.parents.entry(old).or_insert((parent, false)).1 = true;
+                }
+                self.last_included = true;
             }
         }
+    }
+    pub fn included(&self) -> impl Iterator<Item = DirToken> + '_ {
+        self.parents
+            .values()
+            .filter_map(|&(parent, included)| included.then_some(parent))
     }
     pub fn ids(&self) -> impl Iterator<Item = NameId> + '_ {
         self.names.iter().enumerate().flat_map(|(at, &word)| {
