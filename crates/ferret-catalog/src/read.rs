@@ -831,6 +831,16 @@ impl Catalog {
         self.name_reader().get(id)
     }
 
+    /// Whether an epoch name remains live, including sparse births/deaths.
+    /// Requires Names. Check the generation before interpreting an external id.
+    pub fn is_live_name(&self, id: NameId) -> bool {
+        match self.ns_record(overlay::NAME, id.0) {
+            Some(Record::NamePut { .. }) => true,
+            Some(Record::NameDelete { .. }) => false,
+            _ => id.0 < self.base_name_count(),
+        }
+    }
+
     /// Where a name's bytes start in [`Catalog::name_heap`]. Needs
     /// [`Section::Names`]; the bytes run to the next name's start, less its
     /// NUL.

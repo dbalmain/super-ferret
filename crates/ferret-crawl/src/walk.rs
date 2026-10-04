@@ -411,6 +411,12 @@ pub trait EventVisitor {
     /// Returns the token for a directory's [`Event::Decided`] (see the
     /// lifecycle above); ignored otherwise.
     fn visit(&mut self, event: Event<'_, Self::Dir>) -> Option<Self::Dir>;
+
+    /// Selects work before child stat/open. A false result deliberately keeps
+    /// this untouched scope; it is not an ignored or vanished observation.
+    fn consider(&mut self, _parent: Self::Dir, _name: &OsStr, _path: &Path) -> bool {
+        true
+    }
 }
 
 /// A closure sees every event, has no tokens (`()`), and enters every
@@ -1177,7 +1183,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             let name = job.children.name(child);
             job.next += 1;
             let length = self.push(name);
-            let descended = self.consider(&here, name, child.kind);
+            let descended = if self.visit.consider(here.token, name, bytes_path(&self.rel)) {
+                self.consider(&here, name, child.kind)
+            } else {
+                None
+            };
             self.pop(length);
             if let Some(descended) = descended {
                 return Some((job, descended));

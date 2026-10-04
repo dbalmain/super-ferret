@@ -125,6 +125,8 @@ pub enum IndexError {
     NotConfigured(PathBuf),
     /// A request names an inode that is not a live directory in its generation.
     BadScope(InoId),
+    /// Entry scopes require a single nonempty basename, without NUL.
+    BadEntry(Vec<u8>),
     /// The catalog could not be opened for writing: another run holds it
     /// ([`BeginError::Locked`]) or the previous generation is unreadable.
     Begin(BeginError),
@@ -152,6 +154,9 @@ impl fmt::Display for IndexError {
         match self {
             Self::BadRoot(p) => write!(f, "root {} must be absolute, without `..`", p.display()),
             Self::NotConfigured(p) => write!(f, "{} is not a configured root", p.display()),
+            Self::BadEntry(name) => {
+                write!(f, "invalid entry basename {:?}", OsStr::from_bytes(name))
+            }
             Self::BadScope(id) => write!(f, "inode {} is not a live directory scope", id.0),
             Self::Begin(e) => write!(f, "{e}"),
             Self::Keep(e) => write!(f, "{e}"),
@@ -293,6 +298,11 @@ pub struct Report {
     /// ids; a checkpoint fallback checks every inode. Live names are scanned
     /// only when a fault needs its aliases reported.
     pub fault_time: Duration,
+    /// Sum of worker-local peak temporary file rows; changed final rows and
+    /// epoch-sized seen bits are reported separately from this bounded buffer.
+    pub observation_rows_peak: usize,
+    /// Conservative temporary row/name/target peak across worker buffers.
+    pub observation_bytes_peak: usize,
     /// The published generation's shape, when one was published.
     pub published: Option<Published>,
 }
@@ -498,6 +508,16 @@ pub(crate) fn recrawl_with_changes(
     refresh: Refresh<'_>,
     options: &IndexOptions,
 ) -> Result<(Report, ferret_catalog::log::ChangeSet), IndexError> {
+    recrawl_scoped(session, roots, refresh, options, BTreeMap::new())
+}
+
+pub(crate) fn recrawl_scoped(
+    session: &mut WriterSession,
+    roots: &[PathBuf],
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+    selections: BTreeMap<PathBuf, std::sync::Arc<crate::refresh::Selection>>,
+) -> Result<(Report, ferret_catalog::log::ChangeSet), IndexError> {
     let previous = session.view();
     let mut plan = Plan::new(
         Some(&previous),
@@ -506,6 +526,9 @@ pub(crate) fn recrawl_with_changes(
         options.sniffer,
         fingerprint(options),
     )?;
+    if previous.policy() == fingerprint(options) && previous.sniffer_version() == options.sniffer {
+        plan.selections = selections;
+    }
     let Reconciled {
         mut report,
         changes,
@@ -617,23 +640,53 @@ fn observe_reconcile(
             });
         }
         let mut extra = BTreeSet::new();
-        for (name, _) in previous.names() {
-            let edge = previous.name(name);
-            if !missing.contains(&edge.child.0) {
-                continue;
-            }
-            let mut root = edge.parent;
-            while let Some(name) = previous.dir_name(root) {
-                root = previous.name(name).parent;
-            }
-            if let Some(path) = previous
-                .roots()
-                .find(|(id, _)| *id == root)
-                .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
-                && plan.keep.contains(&path)
+        let removed: BTreeSet<_> = final_changes
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                ferret_catalog::log::Record::NameDelete { id } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let mut expanded = false;
+        for id in &missing {
+            for name in session
+                .names_for(InoId(*id))
+                .filter(|n| !removed.contains(&n.0))
             {
-                extra.insert(path);
+                let edge = previous.name(name);
+                let mut root = edge.parent;
+                while let Some(name) = previous.dir_name(root) {
+                    root = previous.name(name).parent;
+                }
+                let Some(path) = previous
+                    .roots()
+                    .find(|(id, _)| *id == root)
+                    .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
+                else {
+                    continue;
+                };
+                if let Some(selection) = plan.selections.get(&path) {
+                    let mut alias = Vec::new();
+                    previous.path(name, &mut alias);
+                    if let Ok(relative) = Path::new(OsStr::from_bytes(&alias)).strip_prefix(&path)
+                        && !selection.includes(relative)
+                    {
+                        selection.promote(relative);
+                        expanded = true;
+                    }
+                } else if plan.keep.contains(&path) {
+                    extra.insert(path);
+                }
             }
+        }
+        if expanded {
+            // Re-observe the expanded final scopes together: duplicate root
+            // token graphs from a second partial pass cannot be reconciled.
+            let (fresh, fresh_report) = observe(source, plan, options)?;
+            batches = fresh;
+            report = fresh_report;
+            continue;
         }
         if extra.is_empty() {
             return Ok(Reconciled {
@@ -651,6 +704,7 @@ fn observe_reconcile(
             refresh: extra,
             keep: Vec::new(),
             dropped: Vec::new(),
+            selections: BTreeMap::new(),
         };
         let (more, mut extra_report) = observe(source, &added, options)?;
         batches.extend(more);
@@ -727,7 +781,11 @@ fn observe(
             options.global.as_deref(),
             options.config,
             &walk_options,
-            || Hasher::with_source(source, &cache, root),
+            || {
+                let mut hasher = Hasher::with_source(source, &cache, root);
+                hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
+                hasher
+            },
         );
         let outputs: Vec<Output> = visitors
             .into_iter()
@@ -736,6 +794,9 @@ fn observe(
         for mut output in outputs {
             output.resolve(&cache);
             output.batch.finish_observations();
+            let (rows, bytes) = output.batch.observation_peak();
+            report.observation_rows_peak += rows;
+            report.observation_bytes_peak += bytes;
             report.counts.add(&output.counts);
             report.hash_time += output.read_time;
             report.content_faults.append(&mut output.content_faults);
@@ -911,6 +972,7 @@ struct Plan {
     refresh: Vec<PathBuf>,
     keep: Vec<PathBuf>,
     dropped: Vec<PathBuf>,
+    selections: BTreeMap<PathBuf, std::sync::Arc<crate::refresh::Selection>>,
 }
 
 impl Plan {
@@ -978,6 +1040,7 @@ impl Plan {
             refresh,
             keep,
             dropped,
+            selections: BTreeMap::new(),
         })
     }
 
@@ -1029,6 +1092,7 @@ pub(crate) struct Hasher<'a> {
     root: &'a Path,
     pub(crate) out: Output,
     reader: Reader,
+    selection: Option<&'a crate::refresh::Selection>,
 }
 
 /// What a worker leaves behind.
@@ -1070,6 +1134,7 @@ impl<'a> Hasher<'a> {
                 read_time: Duration::ZERO,
             },
             reader: Reader::new(),
+            selection: None,
         }
     }
 
@@ -1254,9 +1319,34 @@ impl EventVisitor for Hasher<'_> {
 
     fn root(&mut self, stat: crate::Stat<'_>) -> DirToken {
         self.out.counts.dirs += 1;
-        self.out
+        let token = self
+            .out
             .batch
-            .root(self.root.as_os_str().as_bytes(), observe::from_walk(&stat))
+            .root(self.root.as_os_str().as_bytes(), observe::from_walk(&stat));
+        if let Some(selection) = self.selection
+            && token.previous_directory().is_none()
+        {
+            selection.promote(Path::new(""));
+        }
+        token
+    }
+
+    fn consider(&mut self, parent: DirToken, name: &OsStr, path: &Path) -> bool {
+        let Some(selection) = self.selection else {
+            return true;
+        };
+        if let Some(old) = parent.previous_directory()
+            && let Source::Session(session, _) = self.txn
+            && session.view().entry_count(old).is_none()
+        {
+            selection.promote(path.parent().unwrap_or_else(|| Path::new("")));
+        }
+        if selection.includes(path) {
+            true
+        } else {
+            self.out.batch.preserve(parent, name.as_bytes());
+            false
+        }
     }
 
     fn visit(&mut self, event: Event<'_, DirToken>) -> Option<DirToken> {
@@ -1274,11 +1364,23 @@ impl EventVisitor for Hasher<'_> {
                     Decision::Skip => None,
                     Decision::Descend => {
                         self.out.counts.dirs += 1;
-                        Some(self.out.batch.dir(decided.parent, name, stat))
+                        let token = self.out.batch.dir(decided.parent, name, stat);
+                        if let Some(selection) = self.selection
+                            && token.previous_directory().is_none()
+                        {
+                            selection.promote(decided.path);
+                        }
+                        Some(token)
                     }
                     Decision::Traverse => {
                         self.out.counts.traversed += 1;
-                        Some(self.out.batch.traversed_dir(decided.parent, name, stat))
+                        let token = self.out.batch.traversed_dir(decided.parent, name, stat);
+                        if let Some(selection) = self.selection
+                            && token.previous_directory().is_none()
+                        {
+                            selection.promote(decided.path);
+                        }
+                        Some(token)
                     }
                     Decision::Catalog(Reason::Symlink) => {
                         let target = decided.stat.and_then(|s| s.link_target)?;

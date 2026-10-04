@@ -576,14 +576,20 @@ Checkpoint fallback expands compact references into ordinary observations.
 A zero-change walk does no publication; telemetry may record its time outside
 the catalog. ROADMAP S1+ reports setup, replay, diff and publication separately.
 
-M6 streams completed directory observations into reconciliation, retaining only
+M6 reduces file observations in chunks of at most 4,096 rows and 1 MiB of
+name/target bytes, recording equal rows in epoch-sized seen bitsets. A very large
+listing uses keyed old-child lookup after its first chunk, avoiding repeated
+merge scans over the same listing. It retains only
 changed file rows, seen bits, the directory token/coverage table and the existing
 bounded alias backlog. The directory table still costs O(directories); resolve
 continuing directory ids as tokens are minted and retain provisional mappings
 for newly discovered/ambiguous moves. File observations need not survive once
 compared to their parent's old children. Content-fault reporting uses
 changed/fault inode sets and live aliases, avoiding a full fault-state pass per
-small burst. Scoped alias lookup and bounded directory buffering remain M6 work.
+small burst. A resident first-name inverse and sparse extra aliases support
+checked alias-scope promotion. Directory/coverage tables remain O(directories);
+M6 scope selection preserves untouched child edges and stops sweeps at kept
+subtrees, independently of fault protection.
 
 ### S1b's interface
 

@@ -13,6 +13,14 @@
 //! at a time; this proof saves observation storage, not coverage validation.
 //! Checkpoint fallback expands those references into full observations.
 
+/// Maximum temporary file rows before local reconciliation releases them.
+pub const OBSERVATION_ROWS: usize = 4096;
+/// Maximum temporary name/target bytes between local reductions.
+pub const OBSERVATION_BYTES: usize = 1 << 20;
+
+mod seen;
+use seen::Seen;
+
 use crate::format::NONE;
 use crate::{Catalog, ContentState, Generation, Hash, InoId, Kind, NameId};
 
@@ -179,7 +187,11 @@ pub struct Batch {
     previous: Option<Catalog>,
     pending: Vec<PendingFile>,
     pending_bytes: Vec<u8>,
-    reused: Vec<(DirToken, NameId)>,
+    reused: Seen,
+    preserved: Seen,
+    pending_peak: usize,
+    pending_bytes_peak: usize,
+    chunked: bool,
     pub(crate) id: u32,
     /// Set for a root copied forward from the previous generation, whose file
     /// observations yield to fresh ones (D34).
@@ -209,7 +221,11 @@ impl Batch {
             previous: None,
             pending: Vec::new(),
             pending_bytes: Vec::new(),
-            reused: Vec::new(),
+            reused: Seen::default(),
+            preserved: Seen::default(),
+            pending_peak: 0,
+            pending_bytes_peak: 0,
+            chunked: false,
             id,
             carried,
             dirs: Vec::new(),
@@ -266,8 +282,16 @@ impl Batch {
         content: Content,
         target: Option<&[u8]>,
     ) {
-        if self.previous.is_some() && parent.old != NONE && stat.nlink <= 1 {
+        if self.previous.is_some() && parent.old != NONE {
             if self.pending.first().is_some_and(|f| f.parent != parent) {
+                self.finish_observations();
+                self.chunked = false;
+            }
+            if self.pending.len() >= OBSERVATION_ROWS
+                || self.pending_bytes.len() + name.len() + target.map_or(0, <[u8]>::len)
+                    > OBSERVATION_BYTES
+            {
+                self.chunked = true;
                 self.finish_observations();
             }
             let name = push(&mut self.pending_bytes, name, &mut self.overflow);
@@ -280,6 +304,8 @@ impl Batch {
                 content,
                 target,
             });
+            self.pending_peak = self.pending_peak.max(self.pending.len());
+            self.pending_bytes_peak = self.pending_bytes_peak.max(self.pending_bytes.len());
         } else {
             self.push_file(parent, name, stat, content, target);
         }
@@ -329,19 +355,24 @@ impl Batch {
             for file in &pending {
                 let name = file.name.of(&bytes);
                 let target = file.target.map(|span| span.of(&bytes));
-                while children.peek().is_some_and(|(_, edge)| edge.bytes < name) {
-                    children.next();
-                }
-                let matched = children
-                    .peek()
-                    .copied()
-                    .filter(|(_, edge)| edge.bytes == name);
+                let matched = if self.chunked {
+                    old.lookup(InoId(file.parent.old), name)
+                        .map(|id| (id, names.get(id)))
+                } else {
+                    while children.peek().is_some_and(|(_, edge)| edge.bytes < name) {
+                        children.next();
+                    }
+                    children
+                        .peek()
+                        .copied()
+                        .filter(|(_, edge)| edge.bytes == name)
+                };
                 let reusable = !duplicate
                     && matched.is_some_and(|(_, edge)| {
                         let crate::Target::Inode(child) = edge.target() else {
                             return false;
                         };
-                        if old.is_directory(child) || old.indexed_name_count(child) != 1 {
+                        if old.is_directory(child) {
                             return false;
                         }
                         let inode = old.inode(child);
@@ -358,7 +389,8 @@ impl Batch {
                     });
                 if reusable {
                     if let Some((id, _)) = matched {
-                        self.reused.push((file.parent, id));
+                        self.reused
+                            .insert(file.parent, id, Some(old.name(id).child), false);
                     }
                 } else {
                     self.push_file(file.parent, name, file.stat, file.content, target);
@@ -375,8 +407,10 @@ impl Batch {
         self.finish_observations();
         let old = self.previous.take();
         if let Some(old) = old {
-            for (parent, id) in std::mem::take(&mut self.reused) {
+            let reused = std::mem::take(&mut self.reused);
+            for id in reused.ids() {
                 let edge = old.name(id);
+                let parent = reused.parents[&edge.parent];
                 let child = edge.child;
                 self.push_file(
                     parent,
@@ -581,30 +615,38 @@ impl Batch {
     /// Equal rows proven against this batch's pinned generation. The token
     /// still needs to resolve to its hinted old directory before reuse.
     pub fn reused_files(&self) -> impl Iterator<Item = (DirToken, NameId)> + '_ {
-        self.reused.iter().copied()
+        self.reused
+            .ids()
+            .map(|name| (self.reused_parent(name), name))
     }
-    /// Parents whose included files survived local equal-row reduction.
+    fn reused_parent(&self, name: NameId) -> DirToken {
+        let Some(old) = &self.previous else {
+            unreachable!("reused names require a pinned generation");
+        };
+        self.reused.parents[&old.name(name).parent]
+    }
+    /// Included parents, without retaining one reference per equal file.
     pub fn reused_directories(&self) -> impl Iterator<Item = DirToken> + '_ {
-        let mut last = None;
-        self.reused.iter().filter_map(move |&(parent, _)| {
-            if last == Some(parent) {
-                None
-            } else {
-                last = Some(parent);
-                Some(parent)
-            }
-        })
+        self.reused.included.iter().copied()
+    }
+    /// Parents whose continuing hints must validate before bulk reuse.
+    pub fn reused_parents(&self) -> impl Iterator<Item = DirToken> + '_ {
+        self.reused.parents.values().copied()
+    }
+    /// Equal-name/inode seen words, valid only after parent validation.
+    pub fn reused_words(&self) -> (&[u64], &[u64]) {
+        (&self.reused.names, &self.reused.inodes)
     }
     /// Number of compact equal observations.
     pub fn reused_file_count(&self) -> usize {
-        self.reused.len()
+        self.reused.count
     }
-    /// Reconstructs a compact observation from the pinned view, for alias
-    /// conflict resolution or a changed parent. Index must be in range.
-    pub fn reused_file_observation(&self, index: usize) -> FileObservation<'_> {
-        let (parent, name) = self.reused[index];
-        let Some(old) = self.previous.as_ref() else {
-            unreachable!("reused observations are recorded only with a pinned view");
+    /// Reconstructs an equal observation by its seen NameId, for alias
+    /// grouping.
+    pub fn reused_name_observation(&self, name: NameId) -> FileObservation<'_> {
+        let parent = self.reused_parent(name);
+        let Some(old) = &self.previous else {
+            unreachable!("reused observations require a pinned generation");
         };
         let edge = old.name(name);
         FileObservation {
@@ -614,6 +656,49 @@ impl Batch {
             content: content(old, edge.child),
             target: old.link_target(edge.child),
         }
+    }
+    /// Preserves an untouched edge under a checked same-path parent. This is
+    /// scope retention, not a fresh observation or proof of child identity.
+    pub fn preserve(&mut self, parent: DirToken, name: &[u8]) {
+        let Some(old) = &self.previous else {
+            return;
+        };
+        let Some(id) = parent
+            .previous_directory()
+            .and_then(|p| old.lookup(p, name))
+        else {
+            return;
+        };
+        let child = match old.name(id).target() {
+            crate::Target::Inode(id) => Some(id),
+            crate::Target::Ignored(_) => None,
+        };
+        self.preserved.insert(
+            parent,
+            id,
+            child,
+            child.is_some_and(|id| old.is_directory(id)),
+        );
+    }
+    /// Untouched edges and their validated parent tokens.
+    pub fn preserved_files(&self) -> impl Iterator<Item = (DirToken, NameId)> + '_ {
+        self.preserved.ids().map(|name| {
+            let Some(old) = &self.previous else {
+                unreachable!("preserved edges require a pinned view")
+            };
+            (self.preserved.parents[&old.name(name).parent], name)
+        })
+    }
+    /// Parent scopes containing preserved included rows (D29).
+    pub fn preserved_parents(&self) -> impl Iterator<Item = DirToken> + '_ {
+        self.preserved.included.iter().copied()
+    }
+    /// Peak local observation rows/bytes, excluding changed rows and seen bits.
+    pub fn observation_peak(&self) -> (usize, usize) {
+        (
+            self.pending_peak,
+            self.pending_peak * std::mem::size_of::<PendingFile>() + self.pending_bytes_peak,
+        )
     }
     /// Generation against which compact observations were checked.
     pub fn observation_generation(&self) -> Option<Generation> {

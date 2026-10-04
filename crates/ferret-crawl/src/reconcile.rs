@@ -24,6 +24,11 @@ impl Seen {
     fn insert(&mut self, id: u32) {
         self.0[id as usize / 64] |= 1 << (id % 64);
     }
+    fn extend(&mut self, words: &[u64]) {
+        for (to, from) in self.0.iter_mut().zip(words) {
+            *to |= from;
+        }
+    }
     fn contains(&self, id: u32) -> bool {
         self.0
             .get(id as usize / 64)
@@ -52,7 +57,7 @@ impl File {
     fn observation(self, batches: &[Batch]) -> FileObservation<'_> {
         match self {
             Self::Full(b, i) => batches[b as usize].file_observation(i as usize),
-            Self::Reused(b, i) => batches[b as usize].reused_file_observation(i as usize),
+            Self::Reused(b, i) => batches[b as usize].reused_name_observation(NameId(i)),
         }
     }
 }
@@ -250,6 +255,16 @@ pub(crate) fn with_protection(
     if !protection.is_empty() && (old.policy() != policy || old.sniffer_version() != sniffer) {
         return Err(invalid("version transition under protection"));
     }
+    // Retained old scopes still prove their old re-inclusion ancestry (D29).
+    for d in &mut dirs {
+        if d.observation
+            .token
+            .previous_directory()
+            .is_some_and(|id| protection.directories.contains(&id.0))
+        {
+            d.included = true;
+        }
+    }
     // D29: only ancestors of an included row survive a Traverse observation.
     for batch in batches {
         for i in 0..batch.file_count() {
@@ -261,7 +276,7 @@ pub(crate) fn with_protection(
                 dirs[p].included = true;
             }
         }
-        for parent in batch.reused_directories() {
+        for parent in batch.reused_directories().chain(batch.preserved_parents()) {
             let p = *tokens
                 .get(&parent)
                 .ok_or_else(|| invalid("reused parent token"))?;
@@ -437,6 +452,25 @@ pub(crate) fn with_protection(
     if visited != dirs.len() {
         return Err(invalid("unreachable directory observation"));
     }
+    let mut kept = BTreeSet::new();
+    for batch in batches {
+        for (token, name) in batch.preserved_files() {
+            let d = &dirs[tokens[&token]];
+            if d.blocked || d.opaque {
+                continue;
+            }
+            if d.id != token.previous_directory().map(|id| id.0) {
+                return Err(invalid("untouched scope parent changed"));
+            }
+            out.names.insert(name.0);
+            if let Target::Inode(child) = out.old.name(name).target() {
+                out.inodes.insert(child.0);
+                if out.old.is_directory(child) {
+                    kept.insert(child.0);
+                }
+            }
+        }
+    }
     let mut files: Vec<File> = batches
         .iter()
         .enumerate()
@@ -473,7 +507,19 @@ pub(crate) fn with_protection(
         let mut parent = None;
         let mut continuing = false;
         let mut active = false;
-        for (i, (token, name)) in batch.reused_files().enumerate() {
+        if files.is_empty()
+            && protection.edges.is_empty()
+            && batch.reused_parents().all(|token| {
+                let d = &dirs[tokens[&token]];
+                !d.blocked && !d.opaque && d.id == token.previous_directory().map(|id| id.0)
+            })
+        {
+            let (names, inodes) = batch.reused_words();
+            out.names.extend(names);
+            out.inodes.extend(inodes);
+            continue;
+        }
+        for (token, name) in batch.reused_files() {
             if parent != Some(token) {
                 parent = Some(token);
                 let d = &dirs[tokens[&token]];
@@ -488,7 +534,7 @@ pub(crate) fn with_protection(
                 out.names.insert(name.0);
                 out.inodes.insert(child.0);
             } else {
-                files.push(File::Reused(b as u32, i as u32));
+                files.push(File::Reused(b as u32, name.0));
             }
         }
     }
@@ -588,7 +634,7 @@ pub(crate) fn with_protection(
     for root in swept {
         let mut queue = vec![root];
         while let Some(dir) = queue.pop() {
-            if protection.directories.contains(&dir.0) {
+            if protection.directories.contains(&dir.0) || kept.contains(&dir.0) {
                 continue;
             }
             for name in out.old.children(dir) {

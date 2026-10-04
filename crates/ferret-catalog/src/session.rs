@@ -2,12 +2,12 @@
 //! lookups and sparse lookup updates after publication. Reconciliation belongs
 //! to ferret-crawl; this module knows only observations and catalog records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::log::{ChangeSet, Error, Record, Writer};
-use crate::{Batch, Catalog, Content, ContentState, DocId, Hash, InoId, Stat};
+use crate::{Batch, Catalog, Content, ContentState, DocId, Hash, InoId, NameId, Stat, Target};
 
 /// A resident writer for same-epoch recrawls. Opening warms and validates the
 /// published view once. Failed durable publication poisons the underlying
@@ -21,6 +21,9 @@ pub struct WriterSession {
     directory_changes: BTreeMap<(u32, u64, u64), Vec<InoId>>,
     identity_changes: BTreeMap<(u64, u64), Option<InoId>>,
     document_changes: BTreeMap<Hash, Option<DocId>>,
+    first_names: Vec<u32>,
+    alias_names: BTreeMap<InoId, Vec<NameId>>,
+    name_changes: BTreeMap<InoId, BTreeSet<NameId>>,
     next_batch: AtomicU32,
 }
 
@@ -55,6 +58,21 @@ impl WriterSession {
         }
         let mut directories: Vec<_> = view.dir_ids().map(|id| (root_of(&view, id), id)).collect();
         directories.sort_by_cached_key(|&(root, id)| (root, view.identity(id)));
+        // One dense first-name id per inode, with sparse extra aliases. Scope
+        // promotion must not scan ten million names for one changed hard link.
+        let mut first_names = vec![u32::MAX; view.next_inode().0 as usize];
+        let mut alias_names: BTreeMap<InoId, Vec<NameId>> = BTreeMap::new();
+        let names = view.name_reader();
+        for (name, edge) in names.runs_from(NameId(0)) {
+            if let Target::Inode(child) = edge.target() {
+                let first = &mut first_names[child.0 as usize];
+                if *first == u32::MAX {
+                    *first = name.0;
+                } else {
+                    alias_names.entry(child).or_default().push(name);
+                }
+            }
+        }
         Ok(Self {
             writer,
             lookup_base: view,
@@ -64,6 +82,9 @@ impl WriterSession {
             document_changes,
             directories,
             directory_changes: BTreeMap::new(),
+            first_names,
+            alias_names,
+            name_changes: BTreeMap::new(),
             next_batch: AtomicU32::new(0),
         })
     }
@@ -136,6 +157,31 @@ impl WriterSession {
         self.writer.view().indexed_name_count(id)
     }
 
+    /// Current indexed aliases, without a whole-namespace search per burst.
+    /// These ids belong to `view()`'s epoch and change only after publication.
+    pub fn names_for(&self, id: InoId) -> impl Iterator<Item = NameId> + '_ {
+        let changed = self.name_changes.get(&id);
+        changed
+            .into_iter()
+            .flat_map(|ids| ids.iter().copied())
+            .chain(
+                self.first_names
+                    .get(id.0 as usize)
+                    .copied()
+                    .filter(|&first| first != u32::MAX && changed.is_none())
+                    .map(NameId)
+                    .into_iter()
+                    .chain(
+                        self.alias_names
+                            .get(&id)
+                            .into_iter()
+                            .flatten()
+                            .copied()
+                            .filter(move |_| changed.is_none()),
+                    ),
+            )
+    }
+
     /// Carries only a matching version under the same sniffer.
     pub fn carry(&self, stat: &Stat, sniffer: u32) -> Option<Content> {
         let view = self.writer.view();
@@ -160,9 +206,34 @@ impl WriterSession {
     /// Publishes a final set, updating cached lookups only after success.
     pub fn commit(&mut self, changes: &ChangeSet, sniffer: u32) -> Result<Catalog, Error> {
         let previous = self.writer.view();
+        let mut names: BTreeMap<InoId, BTreeSet<NameId>> = BTreeMap::new();
+        for record in &changes.records {
+            let name = match record {
+                Record::NamePut { id, .. } | Record::NameDelete { id } => NameId(*id),
+                _ => continue,
+            };
+            if previous.is_live_name(name)
+                && let Target::Inode(child) = previous.name(name).target()
+            {
+                names
+                    .entry(child)
+                    .or_insert_with(|| self.names_for(child).collect())
+                    .remove(&name);
+            }
+            if let Record::NamePut { child, .. } = record
+                && *child < u32::MAX - 16
+            {
+                let child = InoId(*child);
+                names
+                    .entry(child)
+                    .or_insert_with(|| self.names_for(child).collect())
+                    .insert(name);
+            }
+        }
         self.writer
             .commit_with_sniffer(previous.generation(), changes, sniffer)?;
         let view = self.writer.view();
+        self.name_changes.extend(names);
         for record in &changes.records {
             match record {
                 Record::InodePut { id, kind, stat, .. } if *kind != crate::Kind::Dir => {

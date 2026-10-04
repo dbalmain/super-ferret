@@ -416,12 +416,51 @@ impl Transaction {
     /// Every [`BuildError`] is found before the temp file is created. The
     /// batches are freed while the file is written, before it is read back,
     /// so the batches and the encoded file are never held at once (D40).
-    pub fn commit(mut self) -> Result<Catalog, CommitError> {
+    pub fn commit(self) -> Result<Catalog, CommitError> {
+        self.publish(false)
+    }
+
+    /// Publishes a fresh id epoch containing only the unchanged current roots.
+    /// The logical sequence stays unchanged (D52). This deliberately accepts
+    /// only roots copied with `keep`, with unchanged policy/sniffer and no
+    /// fresh batches; it is the correctness backstop, not M7's streaming
+    /// compactor.
+    pub fn checkpoint(self) -> Result<Catalog, CommitError> {
+        let Some(old) = &self.previous else {
+            return Err(CommitError::Encode(DecodeError::Corrupt(
+                "checkpoint requires current view",
+            )));
+        };
+        let before: HashSet<_> = old.roots().map(|(_, p)| p).collect();
+        let kept: HashSet<_> = self.kept.iter().map(Vec::as_slice).collect();
+        if before != kept
+            || self.batches.iter().any(|b| !b.carried)
+            || self.policy != old.policy()
+            || self.sniffer != old.sniffer_version()
+        {
+            return Err(CommitError::Encode(DecodeError::Corrupt(
+                "checkpoint must keep current state",
+            )));
+        }
+        self.publish(true)
+    }
+
+    fn publish(mut self, checkpoint: bool) -> Result<Catalog, CommitError> {
         self.check_kept_roots()?;
         // The old generation is done with once the batches are filled; only
         // its documents and id counter reach the build.
         let previous_generation = self.previous.as_ref().map(Catalog::generation);
         let mut generation = match previous_generation {
+            Some(old) if checkpoint => Generation {
+                checkpoint: old
+                    .checkpoint
+                    .checked_add(1)
+                    .filter(|&n| n != u64::MAX)
+                    .ok_or(CommitError::Encode(DecodeError::Corrupt(
+                        "checkpoint exhausted",
+                    )))?,
+                ..old
+            },
             Some(old) => old.successor().map_err(CommitError::Encode)?,
             None => Generation::fresh().map_err(CommitError::Write)?,
         };
