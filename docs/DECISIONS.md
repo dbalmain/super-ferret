@@ -66,6 +66,9 @@ Predecessors, carried forward where still open:
 | D48 | The next move after S1                                   | answered       | A: compaction; name index only if 10M misses 1 GB                                                              |
 | D49 | A one-shot query with no daemon running                  | answered       | A: spawn on first use, in-process fallback                                                                     |
 | D50 | `ferret find` stretch calls F1–F13                       | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                     |
+| D51 | Compaction while the watcher is busy                     | open           |                                                                                                                |
+| D52 | D27 C: ids across compaction                             | proceeding on the recommendation; Dave may veto | B: epoch-scoped InoId/NameId; DocId stays stable |
+| D53 | Cold-open overlay validation                             | open           | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2783,3 +2786,120 @@ The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap
 in overlapping read-only starts: with `-quit`, a later missing start reported
 ENOENT and exit 1 before the first start quit, where GNU exits 0 silently.
 Starts now also sequence when the expression contains `-quit`.
+
+## D51 — Compaction while the watcher is busy (open)
+
+**Status: open.** S1+ M0, 2026-10-03; [design](S1PLUS.md).
+
+**Question:** May an incremental checkpoint pause the writer for seconds, or
+must S1b keep applying bursts while it compacts? Queries keep their pinned
+generation in either case. This is a disagreement between fastest updates and
+the simplest implementation to maintain, not a question about query locking.
+
+The current v3 10.45M synthetic checkpoint is measured at 594.8 MB and a
+10.71 s build (ROADMAP S1c). With D52's epoch ids, document counts and coverage,
+the new 10M checkpoint is an estimated 602.0 MB, down from 761.7 MB with
+lifetime maps; estimated compaction is 9–20 s. Removing the maps saves about
+0.56 s of model read/write/checksum work, not the whole seconds-long pause.
+All new-format time/RAM figures below are estimates, to be measured in M7.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Idle-boundary checkpoint under the writer lock | Incoming updates wait 9–20 s at 10M when compaction runs; sustained churn eventually requires a pause. About 0.7 GB temporary disk and 0.2–0.7 GB transient RAM including validation, plus pinned generations. | One writer, one generation publication proof, no catch-up protocol. Queries continue on the old view. |
+| B. Concurrent checkpoint with suffix replay | Build a pinned view at sequence S while the writer appends. At cutover, take the lock, rebase S's suffix into the new epoch, write/checksum the new log, sync both files and publish one new manifest. Retain about 80 MB of transient old-to-new inode/name maps plus suffix births; map every parent/child/own-name/root/aux reference and reset epoch allocation counters while keeping DocIds. Raw suffix copying is invalid. At 1,000 unique-content edits/s for 20 s, each committed separately, the suffix is 2.72 MB payload + 3.84 MB framing = about 6.6 MB total, with an estimated 30–120 ms replay budget plus about 10 ms byte/check cost before sync; rebasing overhead is unmeasured and must be included in the cutover measurement. Extra pinned source/overlay RAM may be 0.1–0.8 GB, besides those remaps; requires a bounded catch-up policy, new-epoch writer lookups prepared in the background and tests for two epoch pairs. Queued old-epoch requests retry before id dereference. | Ordinary bursts retain small-commit latency while the snapshot is built; cutover scales with the suffix rather than 10M rows. |
+| C. Defer checkpoints until the watcher is quiet | No compulsory pause during activity, but replay and overlay costs become unbounded: 5M records cost an estimated 2.5–10 s replay and roughly 200–600 MB overlay RAM, risking the 1 GB resident goal. | Smallest scheduler and no catch-up path. |
+
+**Recommendation:** A for M7, with a measured checkpoint pause and explicit
+backlog/freshness reporting before S1b ships. It is the smallest complete
+mechanism and does not change D32's reader guarantee. Do not choose C: deferred
+work still needs a bound. B is justified if sustained activity makes A's
+pause unacceptable; design its suffix handoff as a separate review slice then.
+Epoch renumbering does not remove the pause and adds a rebasing protocol to B;
+the smaller checkpoint helps both options, so the recommendation stays A.
+
+**Fact that would change it:** a required worst-case freshness lag below
+10 s during sustained churn, or M7 measuring checkpoint pauses beyond the
+accepted lag even on an idle-priority run. Either favours B. S1b's observed
+burst rate and the permitted lag, rather than snapshot size alone, decide it.
+
+## D52 — D27 C: ids across compaction
+
+**Status: proceeding on the recommendation; Dave may veto.** S1+ M0 round 2,
+2026-10-03; [design and consumer check](S1PLUS.md#epoch-scoped-ids).
+
+**Question:** Does D27 C's “stable, never reused; holes until compaction” require
+InoId/NameId to survive compaction, or only remain stable within its epoch?
+The original C buys the same external stability as B. Dave's comment requires
+metadata edits to preserve DocId; it does not specify a compaction namespace.
+This brief records the interpretation, without claiming Dave has answered it.
+
+No concrete current, S1b or S2 consumer needs inode/name ids across compaction.
+DESIGN's `CandidateSource`/`DocCursor` and content structures, ROADMAP S2/S3,
+and `ferret-index`'s boundary use DocIds. Catalog inverses belong to a pinned
+view. S1b watch locations can use checked paths or rooted `(dev, ino)` identity;
+queued requests already have expected_generation and can retry/re-resolve.
+No separate external metadata index with a durable inode-id key is specified.
+
+Numbers below are **estimates at exactly 10M names**, normalised from the
+**measured** 594,837,226 B / 10,448,739-name v3 artifact in
+[S1PLUS's sourced cost model](S1PLUS.md#cost-model-at-10m). They include document
+reference counts and the all-none RetainedAt column; incremental timings are
+not measured. Both options retain identical 360 B metadata / 456 B unique
+content-replacement commits and independent stable DocIds.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Lifetime-stable logical ids, private physical rows | About 159.7 MB of forward/paged inverse maps at dense high water: 761.7 MB checkpoint, roughly 727 MiB encoded resident buffers and a conservative 450 MB name-load set. Translation at boundaries and map/bijection validation; sparse pages needed for churn, and lifetime high-water exhaustion remains. Roughly 100M historical ids/10M scattered survivors raise map storage toward 200 MB plus page overhead. | Inode/name handles survive compaction without re-resolution, useful only if an external consumer needs them. Physical rows can still pack densely. |
+| B. Epoch-scoped ids: id equals checkpoint row | About 602.0 MB checkpoint, roughly 574 MiB resident buffers and 291 MB name-load set. Compaction renumbers and invalidates old-epoch requests/caches; about 80 MB transient reference-remap arrays at 10M, plus bounded births. Concurrent checkpointing must rebase its suffix (D51). | Removes about 159.7 MB (21% of A), all persistent id maps/validation, scan translation and inode/name history growth. Dense BFS base ids preserve D29; log births/tombstones preserve ids and holes within the epoch. Compaction resets their high water. Pinned old readers retain their old namespace under D32. |
+
+**Recommendation: B; proceeding on the recommendation; Dave may veto.** It is
+both fastest and simplest for the identified consumers, so it is not another
+fastest-versus-maintenance question. A metadata edit retains its epoch InoId
+and live DocId; an epoch change can renumber the inode without content-index
+work. Generation must include `(incarnation, checkpoint, sequence)`: compaction
+can leave the sequence unchanged, so sequence-only comparison is insufficient.
+Reject stale scopes before interpreting ids; retain a locator or old pinned
+view for re-resolution. Keep DocId and next DocId across compaction.
+
+**Fact that would change it:** a concrete external structure or measured
+workload that requires persistent InoId/NameId references and cannot reasonably
+pin, rekey by path/identity, use DocId or retry across epochs. Its measured
+re-resolution/rebuild or freshness cost must outweigh A's extra 159.7 MB,
+translation and map maintenance. No such consumer was found in current code
+or the S1b/S2 plans. D51 remains open about the permitted writer pause.
+
+
+## D53 — Cold-open overlay validation (open)
+
+**Status: open.** S1+ M5 Part A, 2026-10-04; [design](S1PLUS.md).
+
+**Question:** Should a cold name reader replay and semantically validate the
+published overlay, trust the writer's validated transactions, or load a persisted
+materialised namespace? Fastest and simplest to maintain disagree.
+
+The post-merge 10M opens are about 330 ms at 0% and 558 ms at 1%. The earlier
+profile attributes 236 ms to namespace load, including 93 ms in addition checks;
+the rest includes required query construction. All 2% and alternate-reader
+numbers below are **estimates**, not new benchmark results. They assume a similar
+transaction mix and dirty-name slope. Checksums cover accidental corruption,
+not authentication or a writer checksumming its own invalid graph. The ordinary
+writer validates its successor before publication using the shared reader code.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep semantic validation | About 550–560 ms at 1%, 770–790 ms at 2%. Rebuild and check dirty namespace history on each cold name load. | No new code or publication proof; independently rejects invalid, correctly checksummed history at load, except bugs shared with writer validation. Simplest maintenance. |
+| B. Trust checksummed writer transactions | Estimated 420–470 ms at 1%, 510–610 ms at 2%; child-key/tombstone/name-heap construction remains. Lose independent graph/reference/count checks on correctly checksummed writer mistakes; retain safe decode/index checks and termination protection. Requires factoring trusted query construction from publication validation and amending the reader contract/tests. | Avoid part of duplicate validation without an extra durable file, but neither the fastest nor the smallest change. |
+| C. Persist a materialised namespace | Estimated 350–400 ms at 1%, 370–470 ms at 2%. Roughly 600–1,200 production lines plus comparable tests, not a prototype count. New checked index format and generation binding, an extra durable artifact before manifest publication, retention/cleanup and crash tests. Per-burst rewrite risks O(dirty-total) write amplification; cached prefixes need suffix replay. | Expected fastest cold name opens: no replay/sort of prefix history, just checked final-state buffers and any suffix. |
+
+**Recommendation:** A for M5/M6; evaluate C with M7's compaction/derived-state
+budgets if the cold-open requirement warrants its writer cost. Do not implement
+B or C in M5. C is expected fastest, A simplest, so this brief requires Dave's
+choice rather than silently exchanging the existing reader corruption contract.
+The current section reader owns checked buffers; adding actual mmap is a separate
+mechanism, not an existing format feature. Part A's detailed analysis is in
+`/home/dave/w/super-ferret/.ai/s1plus-m5-done.md`.
+
+**Fact that would change it:** a required cold name open below roughly 0.8 s at
+2%, or a C prototype meeting that goal with acceptable publication latency,
+write amplification and code cost. Measure query-only construction for B before
+crediting it with the full 220 ms gap.
