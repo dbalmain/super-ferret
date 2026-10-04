@@ -309,6 +309,7 @@ fn policy_sniffer_and_nested_root_boundary_changes_d34_match_full_index() {
             .published
             .is_none()
     );
+    oracle(&tmp, &roots, &opts, &session.view());
 }
 
 #[test]

@@ -19,8 +19,8 @@ D26 B and D27 C remain the right direction. Today's snapshot is about 569 MB
 at exactly 10M names, rather than S1's 1.18 GB, but rewriting even that for each
 inotify burst is the wrong cost. The log saves roughly a million times the
 logical writes for one changed file. The price is bounded
-replay and occasional full compaction. An unchanged full recrawl remains
-linear in entries; S1+ cannot turn filesystem enumeration into a small update.
+replay and occasional full compaction. An unchanged full recrawl still visits
+every entry, and M4 also sorts file observation locators. S1+ cannot turn filesystem enumeration into a small update.
 
 ## What the code does today
 
@@ -42,8 +42,8 @@ These are constraints found in the code, rather than inferred from DESIGN:
   `number_files` sorts identities; `assign_docs` sorts hashes and reuses live
   documents. Kept observations yield to fresh ones.
 - `WriterSession::open` validates/warms the old view once, then caches sorted
-  inode/doc ids and rooted directory identities against that view. Sparse maps
-  track lookup changes. Name references reuse the reader's cached base inverse
+  inode ids, immutable document-row ordinals and rooted directory identities.
+  Sparse maps track lookup changes. Name references reuse the reader's cached base inverse
   and effective LifePut rows. `Transaction::begin` is the checkpoint fallback;
   its carry identity lookup is lazy and hash sorting happens at checkpoint commit.
   `keep` copies roots only for initial/checkpoint fallback publication. Ordinary
@@ -549,10 +549,15 @@ untouched roots remain unswept. Collapse unsuccessful traversal with the
 existing reachability rule. Sort final changed rows deterministically; current
 per-worker arrival order is not a persistence contract.
 
-M4 may retain whole-walk batches to bound its first review slice, but not build
-a second encoded snapshot. At 10M that is still about 1.2 GB of observation
-storage. M6 streams completed directory observations into reconciliation,
-retaining only changed file rows, seen bits, the directory token/coverage table
+M4 retains whole-walk batches to bound its first review slice, without building
+a second encoded snapshot. It sorts an 8 B locator per file observation by
+kernel identity and parent/name to group hard links deterministically; this is
+O(files log files) comparison work, beyond the linear filesystem walk. Seen bits
+are sized by epoch high-water ids, not live counts. The 10.45M synthetic replay
+adds about 1.28 GiB RSS beyond the session before diff; reconciliation then adds
+locators, seen bits and directory tables. ROADMAP S1+ reports the measured peak and separates session setup, replay,
+diff and publication. M6 streams completed directory observations into
+reconciliation, retaining only changed file rows, seen bits, the directory token/coverage table
 and the existing bounded alias backlog. The directory table still costs
 O(directories); resolve continuing directory ids as tokens are minted and
 retain provisional token mappings for newly discovered/ambiguous moves. File
@@ -934,7 +939,7 @@ existing paths are relative to the repository root. No watcher is built here.
 | **M1 — Checked checkpoint and epoch ids** | `crates/ferret-catalog/src/{lib,batch,format,read,build,transaction}.rs`, new `generation.rs`, `src/tests/{decode,round_trip,carry,roots}.rs`, new epoch/migration fixtures; catalog manifest and lockfile for reusing crawl's existing BLAKE3 version; `crates/ferret/tests/layering.rs`, DESIGN's dependency graph and decisions | v3 import preserves roots/DocIds; dense base ids, tagged generation/epoch mismatch, epoch-local holes and reserved limits, every truncation/value flip, lazy checksum failures; measured bytes per section at 10M and the 602 MB checkpoint estimate, checksum throughput, no-log name/metadata/full open and RSS |
 | **M2 — Durable log transactions** | new catalog `src/log.rs`, `src/tests/log.rs`; `transaction.rs`, `read.rs`, `format.rs`, `src/tests/commit.rs`; `crates/ferret-bench/src/main.rs` | every append truncation and sync/rename crash point; published-prefix corruption refused, unpublished tail ignored; lock races, old-reader lazy loads after append/checkpoint unlink; measured tiny/batched writes, three barriers, header-only opens versus T/N |
 | **M3 — Effective reader and queries** | new catalog `src/overlay.rs`, log/read/generation modules and tests; `crates/ferret-query/src/run.rs`, its tests and `src/find/{walk,test}.rs` as needed; `crates/ferret/src/stats.rs`, census/CLI tests | snapshot-plus-log matches a materialised oracle for create/delete/replace/rename/move, directory cycles rejected, ignored/special/traversed/root cases, hard links and docs, all candidate strategies; find prune/depth/delete semantics; measured 0/1/2% overlays, merge-carry latency, resident queries/RSS; no changes to free sibling-order contract |
-| **M4 — Recrawl diff producer** | new `crates/ferret-crawl/src/reconcile.rs`; `index.rs`, `observe.rs`, `src/tests/{index,lifecycle,parallel,race}.rs`; catalog batch/transaction seams; `crates/ferret-catalog/examples/synthetic.rs`, bench driver | unchanged pass writes zero; metadata equal-content DocId stable; ambiguous rename/reused identity, hard links across kept/refreshed roots, policy/sniffer changes and root boundaries; retain amended A′ fault rule; measure no-change, one-file and 1% full-recrawl writes/time/RSS including session setup |
+| **M4 — Recrawl diff producer** | new crawl `src/reconcile.rs`, `src/tests/reconcile.rs` and `examples/recrawl.rs`; `index.rs`, CLI index reporting; new catalog `src/session.rs` plus batch/transaction/read/log/generation seams; shared M3 materialised-checkpoint oracle and bench driver | unchanged pass writes zero; metadata equal-content DocId stable; ambiguous rename/reused identity, hard links across kept/refreshed roots, policy/sniffer changes and root boundaries; retain amended A′ fault rule; measure no-change, one-file and 1% full-recrawl writes/time/RSS including session setup |
 | **M5 — Coverage reconciliation** | crawl `walk.rs`, `index.rs`, `reconcile.rs`, tests in `src/tests/{lifecycle,race,parallel,golden}.rs`; catalog directory flags/read/decode tests | inject each IoOp/error/context, partial listing on several workers, new/replaced directories, overlapping protection, stale counts, recovery, global/sniffer transitions; verify old subtree retained and find's live fallback; measured faulted-subtree writes independent of subtree size |
 | **M6 — Resident refresh seam and bounded observations** | crawl `lib.rs`, `index.rs`, `reconcile.rs`, new `src/refresh.rs` and `src/tests/refresh.rs`; catalog WriterSession/change-set API; synthetic example and bench driver | simulated bursts call the real crawl API: final-state deletes, move hints, stale sequences and epochs (including unchanged-sequence compaction), overflow, ignore changes, count refresh and conflicting aliases; no watcher; stream directory reconciliation and cap temporary storage; headline one-file/1% 10M measurements with near-threshold logs, resident setup amortised |
 | **M7 — Compaction and budgets** | new catalog `src/compact.rs`, `src/tests/compact.rs`; build/transaction/log/read/generation seams; bench/synthetic driver, stats budget reporting | pinned readers and crashes at every checkpoint boundary, dense BFS ids after each compaction, every reference remapped, old-reader ids still valid and stale requests rejected before dereference, counters reset without resetting DocId, refcounts recomputed, retained coverage, deterministic packed rows; measured disk/RSS peak including transient remaps, writes/time at 10M, repeated 50/90% cumulative churn without historical checkpoint growth, trigger/replay/overlay budgets; apply D51's answer |

@@ -340,8 +340,9 @@ the real run path checks.
 Design and build slices: [S1PLUS.md](S1PLUS.md) (M0, 2026-10-03).
 
 After S1a, ahead of the daemon (D40): a re-run writes what changed rather than
-the whole snapshot (D26 B's change log over A's snapshot), so a refresh costs
-the change and not the catalog. The daemon's small inotify bursts need it.
+the whole snapshot (D26 B's change log over A's snapshot), so publication costs
+the change. A full recrawl still walks and compares the tree. The daemon's small
+inotify bursts need this shared producer and resident session.
 
 **Measure:** bytes written and time for a one-file change at 10M entries.
 
@@ -697,6 +698,94 @@ M4 must batch name changes; M6 must account for this in namespace burst latency.
 A heap per immutable run would avoid this generation-wide sparse copy but adds
 multiple-heap span/ownership handling and query merging. It is a possible later
 optimisation, not part of this measured implementation. No base heap is copied.
+
+### S1+ M4 — Covered batch recrawl producer (2026-10-04)
+
+M4 is implemented: a resident writer session caches lookups and the checked
+view; the batch CLI appends a deterministic final change set instead of replacing
+the checkpoint. Unchanged recrawls publish nothing. Full coverage is required;
+incomplete EACCES keeps amended A′ through owned checkpoint fallback or a blocked
+resident request. Broad protected-scope recovery remains M5. Seventeen new
+real-crawl tests, including 8 seeds × 32 mutation prefixes, reuse M3's fresh
+materialised-checkpoint oracle. Workspace gates: **504 passed / 4 ignored**, all
+fmt/clippy/test gates green with zero warnings, real user log size/mtime unchanged.
+
+Measured production code **`6517fc7`**, release producer/driver built with
+`nix develop --command cargo build --release -p ferret-crawl --example recrawl`
+and `nix develop --command cargo build --release -p ferret-bench`. Same machine
+and existing v4 fixture as M1–M3: **10,448,739 names**, 10,405,730 inodes,
+1,800,947 directories, 8,495,924 documents, from
+`/tmp/s1plus-m3-measure/index`. The fixture has no filesystem tree. The producer
+replays its rows into real crawl batches and calls production reconciliation
+and the durable writer: these are **synthetic observation replay** measurements,
+not filesystem enumeration or content-hashing throughput. Changed cases alter
+N distinct indexed regular-file inodes, with consistent observations for every
+alias, fresh times and deterministic new content hashes. 100,000 is nominal 1%
+of 10M, rather than exactly 1% of the actual name count.
+
+One warm-up per case, then **three samples per case**, reversing case order in
+the second round; a fresh process/private manifest and log for every invocation.
+The immutable checkpoint is hardlinked into each private index. Its generation,
+size and mtime are checked unchanged, and the no-change producer asserts zero
+records, zero writes and no new generation. No compilation or other benchmark
+ran during timing. Before every invocation, the host-visible guard checks
+`uptime` and
+`pgrep -af 'harness.run|ferret_timing|ignore_timing|synthetic|ferret-bench'`;
+only runner ancestors and pgrep itself are excluded. No competing benchmark was
+present. Commands, per-invocation loads, binary SHA-256s, outputs and environments
+are archived under `/home/dave/w/super-ferret/.ai/s1plus-m4-measurements/`, in
+`recrawl-samples.json`; `recrawl-run.py` is the runner.
+
+Commands abbreviate:
+
+```sh
+B=/home/dave/w/super-ferret-wt/s1plus/target/release/ferret-bench
+P=/home/dave/w/super-ferret-wt/s1plus/target/release/examples/recrawl
+export XDG_CONFIG_HOME=/tmp/s1plus-m4-measure/config
+export XDG_DATA_HOME=/tmp/s1plus-m4-measure/data
+export XDG_STATE_HOME=/tmp/s1plus-m4-measure/state
+export XDG_CACHE_HOME=/tmp/s1plus-m4-measure/cache
+# Set N to 0, 1 or 100000 for the corresponding command below.
+export FERRET_INDEX=/tmp/s1plus-m4-measure/c${N}
+```
+
+Logical writes are appended log bytes plus the 128 B manifest replacement;
+filesystem block amplification and fixture reset are excluded. Post-setup total
+includes replay, diff, dropping batches and durable publication. RSS is measured
+in the producer; final RSS is after batches are dropped, peak spans the complete
+process. Phase medians are reported independently.
+
+| Changed file inodes | Log + manifest bytes | Replay / diff / commit median, ms | Post-setup total median (range), s | Final / peak RSS, MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| No change | 0 + 0 | 4165.49 / 40702.46 / 0.00 | 45.04 (44.79–45.05) | 811.41 / 2484.27 | `$B recrawl-once /tmp/s1plus-m4-measure/c0 0 "$P"` | `6517fc7` | 2.66–2.94 / 2.64–2.76 / 2.31–2.46 |
+| One file | 328 + 128 | 4252.96 / 40716.41 / 5.28 | 45.07 (44.88–45.39) | 811.52 / 2484.99 | `$B recrawl-once /tmp/s1plus-m4-measure/c1 1 "$P"` | `6517fc7` | 2.61–3.18 / 2.61–2.83 / 2.32–2.49 |
+| 100,000 (nominal 1%) | 13,600,192 + 128 | 4534.47 / 41439.60 / 249.11 | 46.32 (46.08–46.78) | 836.95 / 2508.18 | `$B recrawl-once /tmp/s1plus-m4-measure/c100000 100000 "$P"` | `6517fc7` | 2.80–3.05 / 2.63–2.86 / 2.34–2.52 |
+
+Session setup is separate: opening/validating the resident view, caching base
+reference counts and sorting identity/hash/directory lookups. A resident host
+pays this once, rather than per burst; it is outside the post-setup totals above.
+
+| Case | Session setup median (range), ms | Setup current / peak RSS, MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | --- | --- | --- |
+| No change | 10051.78 (10034.53–10116.76) | 721.55 / 721.55 | `$B recrawl-once /tmp/s1plus-m4-measure/c0 0 "$P"` | `6517fc7` | 2.66–2.94 / 2.64–2.76 / 2.31–2.46 |
+| One file | 10085.82 (10032.46–10168.30) | 721.65 / 721.65 | `$B recrawl-once /tmp/s1plus-m4-measure/c1 1 "$P"` | `6517fc7` | 2.61–3.18 / 2.61–2.83 / 2.32–2.49 |
+| 100,000 (nominal 1%) | 10154.17 (10034.52–10167.92) | 721.65 / 721.65 | `$B recrawl-once /tmp/s1plus-m4-measure/c100000 100000 "$P"` | `6517fc7` | 2.80–3.05 / 2.63–2.86 / 2.34–2.52 |
+
+The unchanged pass writes **0 B**; one changed content binding writes **456 B**
+(three records); 100,000 writes **13,600,320 B** (300,000 records), without a new
+checkpoint. M4 publishes even when a diff exceeds the proposed 1% target; M7
+owns compaction. Metadata-only changes are a different, smaller record workload.
+
+Publication scales with the changed set, but a whole recrawl is still expensive:
+about 4–4.6 s replay plus 40–42 s diff, before setup, and about 2.43–2.45 GiB
+peak RSS. After replay, resident batches add about **1.28 GiB** beyond the
+session. M4 sorts an 8 B locator per file observation to group hard links; its
+diff comparison work is O(files log files). These results do not establish the
+earlier warm full-recrawl estimate. M6 must stream observations and avoid this
+whole-file sort for scoped refreshes; small durable commits do not imply small
+full-recrawl CPU or transient memory. M4 also widens a kept alias root when the
+last refreshed hard-link name is deleted, to get trustworthy shared metadata;
+M6 can narrow that to checked alias scopes.
 
 ## S1b — The engine, batch mode and the daemon
 
