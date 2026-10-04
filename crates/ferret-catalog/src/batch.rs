@@ -308,24 +308,26 @@ impl Batch {
         pending.sort_unstable_by(|a, b| a.name.cmp(&b.name));
         let old = self.previous.clone();
         if let Some(old) = old {
-            let mut children = old.children(InoId(pending[0].parent.old)).peekable();
             let names = old.name_reader();
+            let mut children = old
+                .children(InoId(pending[0].parent.old))
+                .map(|id| (id, names.get(id)))
+                .peekable();
             // A duplicate observation is invalid even if both rows are equal.
             let duplicate = pending.windows(2).any(|p| p[0].name == p[1].name);
             for file in &pending {
                 while children
                     .peek()
-                    .is_some_and(|&id| names.get(id).bytes < file.name.as_slice())
+                    .is_some_and(|(_, edge)| edge.bytes < file.name.as_slice())
                 {
                     children.next();
                 }
                 let matched = children
                     .peek()
                     .copied()
-                    .filter(|&id| names.get(id).bytes == file.name);
+                    .filter(|(_, edge)| edge.bytes == file.name);
                 let reusable = !duplicate
-                    && matched.is_some_and(|id| {
-                        let edge = names.get(id);
+                    && matched.is_some_and(|(_, edge)| {
                         let crate::Target::Inode(child) = edge.target() else {
                             return false;
                         };
@@ -335,11 +337,17 @@ impl Batch {
                         let inode = old.inode(child);
                         inode.stat == file.stat
                             && old.kind(child) == Kind::from_mode(file.stat.mode)
-                            && content(&old, child) == file.content
+                            && inode.state == file.content.state()
+                            && match file.content {
+                                Content::Hashed(hash) => {
+                                    inode.doc.and_then(|doc| old.doc_hash(doc)) == Some(hash)
+                                }
+                                _ => true,
+                            }
                             && old.link_target(child) == file.target.as_deref()
                     });
                 if reusable {
-                    if let Some(id) = matched {
+                    if let Some((id, _)) = matched {
                         self.reused.push((file.parent, id));
                     }
                 } else {
@@ -538,7 +546,8 @@ impl Batch {
                 retained_at: dir.retained_at,
             })
     }
-    /// Number of file observations in this batch.
+    /// Number of full file observations, including an unfinished local listing.
+    /// Equal compact references are exposed separately by `reused_files`.
     pub fn file_count(&self) -> usize {
         self.files.len() + self.pending.len()
     }
@@ -646,7 +655,9 @@ fn content(old: &Catalog, id: InoId) -> Content {
         ContentState::Fault => Content::Fault,
         ContentState::Hashed => {
             let Some(hash) = old.doc(id).and_then(|doc| old.doc_hash(doc)) else {
-                unreachable!("writer validates hashed inode document bindings before batch creation");
+                unreachable!(
+                    "writer validates hashed inode document bindings before batch creation"
+                );
             };
             Content::Hashed(hash)
         }

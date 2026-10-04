@@ -66,6 +66,7 @@ fn run(dir: &Path, changed: usize) -> Result<(), Box<dyn Error>> {
         .map(|(_, p)| PathBuf::from(std::ffi::OsStr::from_bytes(p)))
         .collect();
     let mut queue = Vec::new();
+    let mut observed_files = 0usize;
     for (id, path) in old.roots() {
         let batch = &mut batches[id.0 as usize % 16];
         let token = batch.root(path, old.inode(id).stat);
@@ -122,18 +123,32 @@ fn run(dir: &Path, changed: usize) -> Result<(), Box<dyn Error>> {
                     tokens.insert(id, child);
                     queue.push(id);
                 }
-                Kind::Symlink => batch.symlink(
-                    token,
-                    edge.bytes,
-                    stat,
-                    old.link_target(id).unwrap_or_default(),
-                ),
-                _ => batch.file(token, edge.bytes, stat, content),
+                Kind::Symlink => {
+                    observed_files += 1;
+                    batch.symlink(
+                        token,
+                        edge.bytes,
+                        stat,
+                        old.link_target(id).unwrap_or_default(),
+                    );
+                }
+                _ => {
+                    observed_files += 1;
+                    batch.file(token, edge.bytes, stat, content);
+                }
             }
         }
     }
     for batch in &mut batches {
         batch.finish_observations();
+    }
+    if batches
+        .iter()
+        .map(|batch| batch.file_count() + batch.reused_file_count())
+        .sum::<usize>()
+        != observed_files
+    {
+        return Err("observation reduction lost file rows".into());
     }
     drop(tokens);
     drop(changed_ids);
