@@ -104,7 +104,13 @@ fn a_diff_crossing_each_budget_builds_the_checked_final_checkpoint_without_appen
             result.view.generation().sequence,
             old.generation().sequence + 1
         );
-        assert_eq!(result.view.next_doc().0, session.view().next_doc().0);
+        let births = u32::from(case != "dead");
+        assert_eq!(result.view.next_doc().0, old.next_doc().0 + births);
+        for (doc, hash) in old.docs() {
+            if result.view.docs().any(|(_, live)| live == hash) {
+                assert_eq!(result.view.doc_hash(doc), Some(hash));
+            }
+        }
         dense(&result.view);
         oracle(&tmp, &result.view);
         assert_eq!(session.budget_usage().records, 0);

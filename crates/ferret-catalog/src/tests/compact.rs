@@ -32,21 +32,51 @@ fn pinned_unloaded_readers_and_unchanged_sequence_handles_survive_dense_remappin
     let id = at(&view, "/root/other");
     let mut inode = view.inode(id);
     inode.stat.ctime_nsec += 1;
+    // Birth before the old first file in basename order forces its inode and
+    // alias names to move; a ctime-only update never exercised remapping.
+    let child = view.next_inode().0;
+    let doc = view.next_doc().0;
     let changes = crate::log::ChangeSet {
-        counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+        counters: [child + 1, view.next_name().0 + 1, doc + 1],
         counts: [
-            view.inode_count(),
-            view.name_count(),
+            view.inode_count() + 1,
+            view.name_count() + 1,
             view.dir_count(),
-            view.doc_count(),
+            view.doc_count() + 1,
         ],
-        records: vec![crate::log::Record::InodePut {
-            id: id.0,
-            kind: crate::Kind::File,
-            state: inode.state,
-            doc: inode.doc.map(|id| id.0),
-            stat: inode.stat,
-        }],
+        records: vec![
+            crate::log::Record::InodePut {
+                id: id.0,
+                kind: crate::Kind::File,
+                state: inode.state,
+                doc: inode.doc.map(|id| id.0),
+                stat: inode.stat,
+            },
+            crate::log::Record::LifePut {
+                id: child,
+                kind: crate::Kind::File,
+                flags: 0,
+                names: 1,
+            },
+            crate::log::Record::InodePut {
+                id: child,
+                kind: crate::Kind::File,
+                state: crate::ContentState::Hashed,
+                doc: Some(doc),
+                stat: file_stat(5),
+            },
+            crate::log::Record::NamePut {
+                id: view.next_name().0,
+                parent: view.roots().next().unwrap().0.0,
+                child,
+                name: b"a-first".to_vec(),
+            },
+            crate::log::Record::DocPut {
+                id: doc,
+                references: 1,
+                hash: hash(3),
+            },
+        ],
     };
     session.commit(&changes, SNIFFER).unwrap();
     let old = crate::Catalog::open(&s.path).unwrap().unwrap();
@@ -60,7 +90,10 @@ fn pinned_unloaded_readers_and_unchanged_sequence_handles_survive_dense_remappin
             .exists()
     );
     old.load_all().unwrap();
-    assert_eq!(super::paths(&old), super::paths(&new));
+    assert_eq!(
+        super::paths(&old).into_keys().collect::<Vec<_>>(),
+        super::paths(&new).into_keys().collect::<Vec<_>>()
+    );
     assert_eq!(
         old.inode(at(&old, "/root/other")),
         new.inode(at(&new, "/root/other"))
@@ -83,7 +116,26 @@ fn pinned_unloaded_readers_and_unchanged_sequence_handles_survive_dense_remappin
     assert_eq!(new.next_name().0, new.name_count());
     assert_eq!(new.next_doc(), old.next_doc());
     let file = at(&new, "/root/sub/a");
-    assert_eq!(session.names_for(file).count(), 2);
+    assert_ne!(
+        file,
+        at(&old, "/root/sub/a"),
+        "surviving inode really remapped"
+    );
+    let aliases: std::collections::BTreeSet<_> = session.names_for(file).collect();
+    let expected: std::collections::BTreeSet<_> = [
+        new.lookup(new.roots().next().unwrap().0, b"alias").unwrap(),
+        new.lookup(at(&new, "/root/sub"), b"a").unwrap(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(aliases, expected, "alias inverse rebuilt in the new epoch");
+    assert_ne!(
+        expected,
+        old.names()
+            .filter(|(id, _)| old.name(*id).child == at(&old, "/root/sub/a"))
+            .map(|(id, _)| id)
+            .collect()
+    );
     assert_eq!(new.doc_references(new.doc(file).unwrap()), Some(1));
     assert_eq!(session.identity(new.identity(file)), Some(file));
     assert_eq!(session.budget_usage().records, 0);
