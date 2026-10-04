@@ -583,3 +583,42 @@ fn local_policy_traversal_collapse_and_work_tree_changes_match_full_checkpoint()
     recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
     oracle(&tmp, &roots, &opts, &session.view());
 }
+
+#[test]
+fn reopening_session_preserves_document_hash_holes_and_never_resurrects_docids() {
+    let tmp = Tmp::new("recrawl-reopen-hashes");
+    tmp.write("a", b"old");
+    tmp.write("b", b"shared");
+    let roots = [tmp.tree()];
+    let opts = options();
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let old = open(&tmp.cat());
+    let id = file(&old, &roots[0], b"a");
+    let retired = old.doc(id).unwrap();
+    let shared = old.doc(file(&old, &roots[0], b"b")).unwrap();
+    fs::write(tmp.at("a"), b"shared").unwrap();
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    assert_eq!(session.view().doc(id), Some(shared));
+    assert_eq!(session.view().doc_hash(retired), None);
+    assert!(
+        recrawl(&mut session, &roots, Refresh::All, &opts)
+            .unwrap()
+            .published
+            .is_none()
+    );
+    oracle(&tmp, &roots, &opts, &session.view());
+    fs::write(tmp.at("a"), b"old").unwrap();
+    recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    assert_ne!(session.view().doc(id), Some(retired));
+    oracle(&tmp, &roots, &opts, &session.view());
+    drop(session);
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    assert!(
+        recrawl(&mut session, &roots, Refresh::All, &opts)
+            .unwrap()
+            .published
+            .is_none()
+    );
+    oracle(&tmp, &roots, &opts, &session.view());
+}

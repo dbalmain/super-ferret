@@ -1427,6 +1427,27 @@ impl Catalog {
         }
     }
 
+    /// Writer lookup ordinals address immutable base rows, including deaths.
+    pub(crate) fn base_doc_count(&self) -> u32 {
+        self.layout.docs as u32
+    }
+    pub(crate) fn base_doc(&self, row: u32) -> DocId {
+        DocId(self.column(Column::DocId).sequence(row as usize) as u32)
+    }
+    pub(crate) fn base_hash(&self, row: u32) -> Hash {
+        self.hash(row as usize)
+    }
+    pub(crate) fn changed_docs(&self) -> impl Iterator<Item = &Record> {
+        self.overlay
+            .iter()
+            .flat_map(|o| o.projection(Family::Docs).records(overlay::DOC))
+    }
+    pub(crate) fn base_doc_hash(&self, doc: DocId) -> Option<Hash> {
+        self.column(Column::DocId)
+            .sequence_row(u64::from(doc.0), self.layout.docs)
+            .map(|row| self.hash(row))
+    }
+
     /// Every live document with its hash, by id. Needs [`Section::Docs`].
     pub fn docs(&self) -> impl Iterator<Item = (DocId, Hash)> + '_ {
         let ids = self.column(Column::DocId);
@@ -1456,9 +1477,7 @@ impl Catalog {
             Some(Record::DocDelete { .. }) => return None,
             _ => {}
         }
-        self.column(Column::DocId)
-            .sequence_row(u64::from(doc.0), self.layout.docs)
-            .map(|row| self.hash(row))
+        self.base_doc_hash(doc)
     }
 
     /// Document row `row`'s hash.

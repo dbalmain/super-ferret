@@ -16,7 +16,7 @@ pub struct WriterSession {
     writer: Writer,
     lookup_base: Catalog,
     identities: Vec<InoId>,
-    documents: Vec<DocId>,
+    documents: Vec<u32>,
     directories: Vec<(InoId, InoId)>,
     directory_changes: BTreeMap<(u32, u64, u64), Vec<InoId>>,
     identity_changes: BTreeMap<(u64, u64), Option<InoId>>,
@@ -35,8 +35,22 @@ impl WriterSession {
             .filter(|&id| !view.is_directory(id))
             .collect();
         identities.sort_unstable_by_key(|&id| view.identity(id));
-        let mut documents: Vec<_> = view.docs().map(|(id, _)| id).collect();
-        documents.sort_unstable_by_key(|&id| view.doc_hash(id));
+        let mut documents: Vec<_> = (0..view.base_doc_count()).collect();
+        documents.sort_unstable_by_key(|&row| view.base_hash(row));
+        let mut document_changes = BTreeMap::new();
+        for record in view.changed_docs() {
+            match record {
+                Record::DocPut { id, hash, .. } => {
+                    document_changes.insert(*hash, Some(DocId(*id)));
+                }
+                Record::DocDelete { id } => {
+                    if let Some(hash) = view.base_doc_hash(DocId(*id)) {
+                        document_changes.insert(hash, None);
+                    }
+                }
+                _ => {}
+            }
+        }
         let mut directories: Vec<_> = view.dir_ids().map(|id| (root_of(&view, id), id)).collect();
         directories.sort_unstable_by_key(|&(root, id)| (root, view.identity(id)));
         Ok(Self {
@@ -45,7 +59,7 @@ impl WriterSession {
             identities,
             documents,
             identity_changes: BTreeMap::new(),
-            document_changes: BTreeMap::new(),
+            document_changes,
             directories,
             directory_changes: BTreeMap::new(),
             next_batch: AtomicU32::new(0),
@@ -109,9 +123,9 @@ impl WriterSession {
         }
         let at = self
             .documents
-            .binary_search_by_key(&Some(hash), |&id| self.lookup_base.doc_hash(id))
+            .binary_search_by_key(&hash, |&row| self.lookup_base.base_hash(row))
             .ok()?;
-        Some(self.documents[at])
+        Some(self.lookup_base.base_doc(self.documents[at]))
     }
 
     /// Exact indexed-name count, independent of filesystem `st_nlink`.
