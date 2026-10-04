@@ -69,7 +69,7 @@ Predecessors, carried forward where still open:
 | D51 | Compaction while the watcher is busy                     | answered       | A: idle-boundary compaction under the writer lock; pause measured and reported in M7                            |
 | D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
 | D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
-| D54 | In-memory names: interning, postings, row order          | open           | Recommend B: intern + row postings + terms, keep BFS order                                                     |
+| D54 | In-memory names: interning, postings, row order          | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                 |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2912,7 +2912,8 @@ crediting it with the full 220 ms gap.
 
 ## D54 — In-memory names: interning, postings, row order
 
-**Status: open.** Measured 2026-10-05 in the private bench repo
+**Status: answered, B after S1+ merges, after a prototype of the scoped-query
+check (Dave, 2026-10-05). The prototype passed; see the end of this entry.** Measured 2026-10-05 in the private bench repo
 `~/w/name-index-bench` (github.com/dbalmain/name-index-bench); its README
 holds the method and full tables.
 
@@ -2958,3 +2959,30 @@ gains are on queries that are already a few milliseconds.
 large subtree (the 79k-row monorepo, a nixpkgs checkout) misses ~10 ms, or the
 writer finding DFS order cheaper to maintain across compaction. Either would
 favour C.
+
+> Dave (2026-10-05): B, after S1+ merges — prototype the scoped-query check first.
+
+**Prototype (2026-10-05, name-index-bench `916825a`):** interned names in BFS
+order with BFS row postings, every output checked against the flat reference.
+
+- **Scoped check passes.** The slowest scoped name query is 7.4 ms (nixpkgs
+  `-name default.nix`, 13,935 hits; DFS 4.4 ms), under the 10 ms bar. Always
+  walking the scope stays under 10 ms on every scoped query (7.5 ms at worst).
+  The faster plan for a selective name in a large scope uses the global
+  postings, keeping the rows under the scope by walking parent ids up
+  (memoised). For example, nixpkgs `*ripgrep*` takes 0.63 ms that way against
+  7.5 ms walking. A planner chooses between them from the stored posting
+  counts. The wrong choice costs up to 10×: 69 ms for `default.nix` through
+  the postings.
+- **Measured memory for B** (the brief estimated it): int-bfs plus postings plus
+  terms is 8.6 MB on `$HOME` (18.6 B/row) and 39.0 MB on nix (9.3 B/row), the
+  smallest configuration measured. BFS's first-child and parent arrays are
+  cheaper than DFS's subtree arrays (5.4 MB on nix).
+- **Correction to the brief's figures:** the bench originally found a BFS
+  parent by predecessor search over first-child, about 0.5 µs per hit, where
+  ferret keeps a `NameParent` column. With a per-row parent column, raw-bfs
+  is 2–3× faster than the brief's table (`$HOME` `-name '*.rs'` 7.3 ms, not
+  22 ms). B matches or beats DFS on whole-index name queries: nix `Cargo.toml`
+  2.4 ms against 3.3, and `libc.so.6` 0.46 ms against 2.3 today. B's speed-up
+  over today is therefore 2–5× on selective names, not the brief's 3–10×. The
+  100–150× from the term index is unchanged.
