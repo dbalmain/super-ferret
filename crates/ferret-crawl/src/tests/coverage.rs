@@ -430,3 +430,260 @@ fn missing_existing_root_is_retained_and_root_boundary_edits_under_protection_ab
     assert_eq!(listings(&session.view()), want);
     assert_eq!(listings(&open(&tmp.cat())), want);
 }
+
+struct ContentHook((u64, u64), crate::observe::ContentIo);
+impl Drop for ContentHook {
+    fn drop(&mut self) {
+        crate::observe::CONTENT_IO_FAULTS
+            .lock()
+            .unwrap()
+            .retain(|item| *item != (self.0, self.1));
+    }
+}
+
+#[test]
+fn content_open_stat_read_and_closing_stat_faults_publish_valid_rows_without_minting_docs() {
+    use crate::ContentFault;
+    use crate::observe::{CONTENT_IO_FAULTS, ContentIo};
+    use std::os::unix::fs::MetadataExt;
+    for op in [
+        ContentIo::Open,
+        ContentIo::Stat,
+        ContentIo::Read,
+        ContentIo::AfterStat,
+    ] {
+        let tmp = Tmp::new(&format!("fault-content-{op:?}"));
+        let path = tmp.write("a", b"old");
+        tmp.write("stable", b"stable");
+        let opts = options();
+        let roots = [tmp.tree()];
+        index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        let id = directory(&before, &tmp.tree(), b"a");
+        let next_doc = before.next_doc();
+        fs::write(&path, b"new version must be read").unwrap();
+        let stat = fs::metadata(&path).unwrap();
+        let key = (stat.dev(), stat.ino());
+        CONTENT_IO_FAULTS.lock().unwrap().push((key, op));
+        let hook = ContentHook(key, op);
+        let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert!(report.coverage_faults.is_empty());
+        assert_eq!(report.protected_scopes, 0);
+        assert_eq!(report.content_faults.len(), 1);
+        assert!(matches!((&report.content_faults[0].1, op),
+            (ContentFault::Open(e), ContentIo::Open) | (ContentFault::Read(e), ContentIo::Read)
+            | (ContentFault::Stat(e), ContentIo::Stat | ContentIo::AfterStat) if e.raw_os_error() == Some(5)));
+        let current = session.view();
+        assert_eq!(directory(&current, &tmp.tree(), b"a"), id);
+        assert_eq!(current.state(id), ferret_catalog::ContentState::Fault);
+        assert_eq!(current.doc(id), None);
+        assert_eq!(current.next_doc(), next_doc);
+        // The fresh full checkpoint encounters the same injected real reader
+        // error. Its expected state is produced by the actual crawl/build API.
+        assert_eq!(listings(&current), expected(&tmp, &before, &[], &[]));
+        assert_eq!(listings(&current), listings(&open(&tmp.cat())));
+        assert!(
+            recrawl(&mut session, &roots, Refresh::All, &opts)
+                .unwrap()
+                .published
+                .is_none()
+        );
+        drop(hook);
+        recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+    }
+}
+
+#[test]
+fn child_lstat_not_found_alone_deletes_the_old_edge_and_directory_subtree() {
+    let tmp = Tmp::new("fault-vanished-directory");
+    tmp.write("dir/deep/a", b"old");
+    tmp.write("stable", b"stable");
+    let opts = options();
+    let roots = [tmp.tree()];
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let before = session.view();
+    let dir = directory(&before, &tmp.tree(), b"dir");
+    let path = tmp.at("dir");
+    let hook = Hook::set(&tmp.tree(), move |point, rel| {
+        if point == IoPoint::Child && rel == Path::new("dir") {
+            fs::remove_dir_all(&path).unwrap();
+            Some((IoOp::Lstat, std::io::Error::from_raw_os_error(2)))
+        } else {
+            None
+        }
+    });
+    let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    assert_eq!(report.counts.vanished, 1);
+    assert!(report.coverage_faults.is_empty());
+    assert_eq!(report.protected_scopes, 0);
+    assert!(!session.view().is_live_inode(dir));
+    assert_eq!(listings(&session.view()), listings(&open(&tmp.cat())));
+    drop(hook);
+    // First-pass root stat/count describe the pre-disappearance listing. A
+    // stable retry supplies the same observations as the fresh full oracle.
+    recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+}
+
+#[test]
+fn new_unknown_child_edge_protects_its_old_parent_and_bad_patterns_do_not_protect() {
+    for operation in [IoOp::Lstat, IoOp::Readlink] {
+        let tmp = Tmp::new(&format!("fault-new-edge-{operation:?}"));
+        tmp.write("parent/stable", b"old");
+        let opts = options();
+        let roots = [tmp.tree()];
+        index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        tmp.write("parent/new", b"new");
+        let hook = Hook::set(&tmp.tree(), move |point, rel| {
+            (point == IoPoint::Child && rel == Path::new("parent/new"))
+                .then(|| (operation, std::io::Error::from_raw_os_error(13)))
+        });
+        let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(report.protected_scopes, 1);
+        drop(hook);
+        assert_eq!(
+            listings(&session.view()),
+            expected(&tmp, &before, &["parent"], &["parent"])
+        );
+    }
+    let tmp = Tmp::new("fault-pattern");
+    tmp.write("a.skip", b"ignored");
+    tmp.write("b", b"included");
+    tmp.write(".ferretignore", b"bad\\\n*.skip\n");
+    let opts = options();
+    let roots = [tmp.tree()];
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let before = session.view();
+    let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    assert_eq!(report.counts.pattern_errors, 1);
+    assert!(report.coverage_faults.is_empty());
+    assert_eq!(report.protected_scopes, 0);
+    assert!(report.published.is_none());
+    assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+}
+
+#[test]
+fn a_proved_replaced_root_cannot_retain_and_a_disjoint_root_removal_can_commit() {
+    let tmp = Tmp::new("fault-replaced-root");
+    tmp.write("a", b"old");
+    let opts = options();
+    let roots = [tmp.tree()];
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let before = session.view().generation();
+    fs::rename(tmp.tree(), tmp.base.join("old-root-held")).unwrap();
+    tmp.write("new", b"new");
+    let hook = Hook::set(&tmp.tree(), |point, _| {
+        (point == IoPoint::Directory).then(|| {
+            (
+                IoOp::List,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "root identity changed"),
+            )
+        })
+    });
+    assert!(matches!(
+        recrawl(&mut session, &roots, Refresh::All, &opts),
+        Err(crate::IndexError::Coverage { .. })
+    ));
+    assert_eq!(session.view().generation(), before);
+    drop(hook);
+    drop(session);
+
+    let tmp = Tmp::new("fault-disjoint-root-edit");
+    tmp.write("a", b"old");
+    let other = tmp.base.join("other");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("b"), b"other").unwrap();
+    index(&tmp.cat(), &[tmp.tree(), other], Refresh::All, &opts).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let before = session.view();
+    let hook = Hook::set(&tmp.tree(), |point, _| {
+        (point == IoPoint::Root).then(|| (IoOp::List, std::io::Error::from_raw_os_error(5)))
+    });
+    let report = recrawl(&mut session, &[tmp.tree()], Refresh::All, &opts).unwrap();
+    assert!(report.published.is_some());
+    assert_eq!(report.protected_scopes, 1);
+    drop(hook);
+    assert_eq!(
+        listings(&session.view()),
+        expected(&tmp, &before, &[""], &[""])
+    );
+    assert_eq!(listings(&session.view()), listings(&open(&tmp.cat())));
+}
+
+#[test]
+fn protected_names_survive_last_link_moves_and_fresh_outside_aliases_update_the_shared_inode() {
+    for moved in [false, true] {
+        let tmp = Tmp::new(if moved {
+            "fault-last-link-move"
+        } else {
+            "fault-fresh-alias"
+        });
+        let inside = tmp.write("dir/a", b"old payload");
+        let outside = tmp.at("outside");
+        if !moved {
+            fs::hard_link(&inside, &outside).unwrap();
+        }
+        let opts = options();
+        let roots = [tmp.tree()];
+        index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        let dir = directory(&before, &tmp.tree(), b"dir");
+        let name = before.lookup(dir, b"a").unwrap();
+        let inode = before.name(name).child;
+        if moved {
+            fs::rename(&inside, &outside).unwrap();
+        } else {
+            fs::write(
+                &outside,
+                b"new content from the trusted outside observation",
+            )
+            .unwrap();
+        }
+        let hook = Hook::set(&tmp.tree(), |point, path| {
+            (point == IoPoint::Directory && path == Path::new("dir"))
+                .then(|| (IoOp::List, std::io::Error::from_raw_os_error(5)))
+        });
+        recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        let current = session.view();
+        assert_eq!(current.lookup(dir, b"a"), Some(name));
+        let root = directory(&current, &tmp.tree(), b"");
+        let external = current.lookup(root, b"outside").unwrap();
+        assert_ne!(
+            external, name,
+            "protection wins over inferred singleton rename"
+        );
+        assert_eq!(current.name(external).child, inode);
+        assert_eq!(
+            current
+                .doc(inode)
+                .and_then(|doc| current.doc_references(doc)),
+            Some(1)
+        );
+        drop(hook);
+        let mut want = expected(&tmp, &before, &["dir"], &["dir"]);
+        let fresh = expected(&tmp, &before, &[], &[]);
+        // Namespace comes from the actual pre-fault checkpoint. Physical inode
+        // data comes from the actual full checkpoint's trustworthy outside
+        // alias.
+        let mut physical = fresh
+            .iter()
+            .find(|r| r.path == outside.as_os_str().as_bytes())
+            .unwrap()
+            .clone();
+        physical.path = inside.as_os_str().as_bytes().to_vec();
+        let target = want.iter_mut().find(|r| r.path == physical.path).unwrap();
+        *target = physical;
+        assert_eq!(listings(&current), want);
+        assert_eq!(listings(&current), listings(&open(&tmp.cat())));
+        recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+    }
+}

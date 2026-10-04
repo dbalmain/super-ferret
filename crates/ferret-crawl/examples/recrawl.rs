@@ -2,7 +2,10 @@
 //! The fixture has no files on disk: replay borrows its names/stat/content into
 //! real batches, then calls the production reconciler and durable writer. This
 //! measures publication and whole-batch memory, not filesystem enumeration or
-//! hashing throughput. `ferret-bench recrawl-once` invokes this producer.
+//! hashing throughput. Fault modes use real root-open errors and the public
+//! crawl API; preparation makes one old leaf a nested configured root so small
+//! and large protected scopes can be timed without unrelated enumeration.
+//! `ferret-bench recrawl-once` invokes this producer.
 
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
@@ -16,9 +19,13 @@ use ferret_catalog::{Content, ContentState, DirToken, InoId, Kind, Target, Write
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [dir, changed] = args.as_slice() else {
-        return Err("usage: recrawl <catalog-dir> <changed-file-inodes>".into());
+        return Err("usage: recrawl <catalog-dir> <changed-file-inodes|fault-prepare|fault-small|fault-large>".into());
     };
-    run(Path::new(dir), changed.parse()?)
+    match changed.as_str() {
+        "fault-prepare" => prepare_fault_roots(Path::new(dir)),
+        "fault-small" | "fault-large" => fault_root(Path::new(dir), changed == "fault-small"),
+        _ => run(Path::new(dir), changed.parse()?),
+    }
 }
 
 fn rss() -> Result<(u64, u64), Box<dyn Error>> {
@@ -195,5 +202,214 @@ fn run(dir: &Path, changed: usize) -> Result<(), Box<dyn Error>> {
         "| {changed} | {setup_ms:.2} | {setup_rss}/{setup_peak} | {replay_ms:.2} | {diff_ms:.2} | {commit_ms:.2} | {total_ms:.2} | {batch_rss}/{final_rss}/{peak} | {log_bytes}/{manifest_bytes} | {} |",
         changes.records.len()
     );
+    Ok(())
+}
+
+// Split one real fixture leaf into a nested configured root using the durable
+// writer. This changes only its incoming edge/root boundary, not its subtree.
+// Both fault cases then start from exactly this same checked 10M view.
+fn prepare_fault_roots(dir: &Path) -> Result<(), Box<dyn Error>> {
+    use ferret_catalog::Catalog;
+    use ferret_catalog::log::{ChangeSet, Record};
+    let policy_tree = dir.join("policy-tree");
+    let policy_catalog = dir.join("policy-catalog");
+    fs::create_dir_all(&policy_tree)?;
+    let options = ferret_crawl::IndexOptions::default();
+    ferret_crawl::index(
+        &policy_catalog,
+        &[policy_tree],
+        ferret_crawl::Refresh::All,
+        &options,
+    )?;
+    let policy = Catalog::open(&policy_catalog)?.ok_or("missing policy probe")?;
+    policy.load_all()?;
+    let mut session = WriterSession::open(dir)?;
+    let old = session.view();
+    if old.roots().count() != 1 {
+        return Err("fault preparation requires original single-root fixture".into());
+    }
+    let mut path = Vec::new();
+    let small = old
+        .dir_ids()
+        .find(|&id| {
+            if old.is_traversed(id) || old.entry_count(id) != Some(1) || old.dir_name(id).is_none()
+            {
+                return false;
+            }
+            let mut children = old.children(id);
+            let Some(name) = children.next() else {
+                return false;
+            };
+            let Target::Inode(child) = old.name(name).target() else {
+                return false;
+            };
+            if children.next().is_some()
+                || old.kind(child) != Kind::File
+                || old.state(child) != ContentState::Hashed
+            {
+                return false;
+            }
+            path.clear();
+            old.dir_path(id, &mut path);
+            std::str::from_utf8(&path).is_ok()
+        })
+        .ok_or("no one-file leaf scope")?;
+    let name = old.dir_name(small).ok_or("leaf has no incoming edge")?;
+    let mut changes = ChangeSet {
+        counters: [old.next_inode().0, old.next_name().0, old.next_doc().0],
+        counts: [
+            old.inode_count(),
+            old.name_count() - 1,
+            old.dir_count(),
+            old.doc_count(),
+        ],
+        records: vec![
+            Record::NameDelete { id: name.0 },
+            Record::LifePut {
+                id: small.0,
+                kind: Kind::Dir,
+                flags: 0,
+                names: 0,
+            },
+            Record::DirPut {
+                id: small.0,
+                name: None,
+                entries: Some(1),
+                flags: 4,
+                retained_at: None,
+            },
+            Record::RootPut {
+                id: small.0,
+                path: path.clone(),
+            },
+        ],
+    };
+    if old.policy() != policy.policy() {
+        changes.records.push(Record::PolicyPut {
+            hash: policy.policy(),
+        });
+    }
+    let current = session.commit(&changes, options.sniffer)?;
+    // The old leaf contains exactly one name. Its detached incoming name is
+    // removed, and its child remains owned by the new nested root.
+    let large_names = current.name_count() - 1;
+    fs::write(
+        dir.join("coverage-scopes"),
+        format!("{}\n{}\n", small.0, large_names),
+    )?;
+    println!(
+        "prepared small_root={} path={} names=1; large_root=/synthetic names={large_names}; sequence={}",
+        small.0,
+        std::str::from_utf8(&path)?,
+        current.generation().sequence
+    );
+    Ok(())
+}
+
+fn fault_root(dir: &Path, small: bool) -> Result<(), Box<dyn Error>> {
+    use ferret_catalog::{Catalog, Section};
+    let setup = Instant::now();
+    let mut session = WriterSession::open(dir)?;
+    let setup_ms = setup.elapsed().as_secs_f64() * 1000.0;
+    let (setup_rss, setup_peak) = rss()?;
+    let old = session.view();
+    let scopes = fs::read_to_string(dir.join("coverage-scopes"))?;
+    let mut values = scopes.lines();
+    let leaf = InoId(values.next().ok_or("missing small scope")?.parse()?);
+    let large_names: u32 = values.next().ok_or("missing large scope")?.parse()?;
+    let (id, path) = old
+        .roots()
+        .find(|(id, path)| {
+            if small {
+                *id == leaf
+            } else {
+                *path == b"/synthetic"
+            }
+        })
+        .ok_or("missing fault root")?;
+    let scope = PathBuf::from(std::ffi::OsStr::from_bytes(path));
+    if fs::metadata(&scope).is_ok() {
+        return Err("synthetic fault path unexpectedly exists".into());
+    }
+    let roots: Vec<_> = old
+        .roots()
+        .map(|(_, path)| PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+        .collect();
+    let generation = old.generation();
+    let snapshot = dir.join(format!("snapshot.{}", generation.checkpoint));
+    let snapshot_before = fs::metadata(&snapshot)?;
+    let log = dir.join(format!("changes.{}", generation.checkpoint));
+    let before = fs::metadata(&log)?.len();
+    let started = Instant::now();
+    let report = ferret_crawl::recrawl(
+        &mut session,
+        &roots,
+        ferret_crawl::Refresh::Only(std::slice::from_ref(&scope)),
+        &ferret_crawl::IndexOptions::default(),
+    )?;
+    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let current = session.view();
+    if report.protected_scopes != 1
+        || report.coverage_faults.len() != 1
+        || report.coverage_faults[0].op != ferret_crawl::IoOp::OpenDir
+        || report.coverage_faults[0].error.kind() != std::io::ErrorKind::NotFound
+        || current.entry_count(id).is_some()
+        || current.retained_at(id) != Some(generation.sequence)
+        || current.generation().checkpoint != generation.checkpoint
+        || current.inode_count() != old.inode_count()
+        || current.name_count() != old.name_count()
+        || current.dir_count() != old.dir_count()
+        || current.doc_count() != old.doc_count()
+    {
+        return Err(
+            "fault recrawl changed retained namespace or failed to publish its marker".into(),
+        );
+    }
+    let after = fs::metadata(&snapshot)?;
+    if after.len() != snapshot_before.len() || after.modified()? != snapshot_before.modified()? {
+        return Err("fault recrawl rewrote checkpoint".into());
+    }
+    let bytes = fs::metadata(&log)?.len() - before;
+    let disk = Catalog::open(dir)?.ok_or("missing replayed fault view")?;
+    disk.load(&[
+        Section::Names,
+        Section::Roots,
+        Section::Entries,
+        Section::RetainedAt,
+    ])?;
+    if disk.entry_count(id).is_some()
+        || disk.retained_at(id) != Some(generation.sequence)
+        || disk.generation() != current.generation()
+    {
+        return Err("disk replay lost fault coverage".into());
+    }
+    drop(disk);
+    let (final_rss, peak) = rss()?;
+    println!(
+        "| protected names | setup ms | setup current/peak KiB | walk ms | reconciliation/publication ms | run ms | final/peak KiB | log/manifest bytes | scopes | retained sequence |"
+    );
+    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!(
+        "| {} | {setup_ms:.2} | {setup_rss}/{setup_peak} | {:.2} | {:.2} | {total_ms:.2} | {final_rss}/{peak} | {bytes}/128 | {} | {} |",
+        if small { 1 } else { large_names },
+        report.walk_time.as_secs_f64() * 1000.0,
+        report.commit_time.as_secs_f64() * 1000.0,
+        report.protected_scopes,
+        generation.sequence
+    );
+    // Repeat the same actual kernel error through the same API. Zero append
+    // and unchanged generation prove that retained-at is not a retry counter.
+    let repeated = ferret_crawl::recrawl(
+        &mut session,
+        &roots,
+        ferret_crawl::Refresh::Only(std::slice::from_ref(&scope)),
+        &ferret_crawl::IndexOptions::default(),
+    )?;
+    if repeated.published.is_some()
+        || session.view().generation() != current.generation()
+        || fs::metadata(&log)?.len() - before != bytes
+    {
+        return Err("identical root fault published again".into());
+    }
     Ok(())
 }
