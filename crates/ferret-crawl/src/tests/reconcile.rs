@@ -531,7 +531,7 @@ fn final_log_order_is_identical_across_walk_worker_counts() {
 }
 
 #[test]
-fn incomplete_eacces_retains_old_subtree_and_recovery_clears_the_marker() {
+fn directory_eacces_retires_old_subtree_and_recovery_matches_full_checkpoint() {
     let tmp = Tmp::new("recrawl-incomplete");
     tmp.write("dir/a", b"content");
     for i in 0..8 {
@@ -544,16 +544,14 @@ fn incomplete_eacces_retains_old_subtree_and_recovery_clears_the_marker() {
     let old = session.view();
     fs::set_permissions(tmp.at("dir"), fs::Permissions::from_mode(0o000)).unwrap();
     let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
-    assert_eq!(report.protected_scopes, 1);
-    let mut want = listings(&old);
-    for row in &mut want {
-        if row.path == tmp.at("dir").as_os_str().as_bytes() {
-            row.entries = None;
-            row.retained_at = Some(old.generation().sequence);
-        }
-    }
-    assert_eq!(listings(&session.view()), want);
-    assert_eq!(listings(&open(&tmp.cat())), want);
+    assert_eq!(report.protected_scopes, 0);
+    assert!(report.coverage_faults.is_empty());
+    let dir = file(&session.view(), &roots[0], b"dir");
+    assert_eq!(session.view().entry_count(dir), None);
+    assert_eq!(session.view().retained_at(dir), None);
+    assert_eq!(session.view().children(dir).count(), 0);
+    oracle(&tmp, &roots, &opts, &session.view());
+    assert_eq!(listings(&session.view()), listings(&open(&tmp.cat())));
     assert_eq!(
         session.view().generation().checkpoint,
         old.generation().checkpoint

@@ -114,7 +114,7 @@ fn every_typed_namespace_fault_row_retains_a_checked_scope() {
     let cases = [
         (IoPoint::Directory, "dir", IoOp::List, 5, "dir", "dir"),
         (IoPoint::Directory, "dir", IoOp::List, 2, "dir", "dir"),
-        (IoPoint::Directory, "dir", IoOp::OpenDir, 13, "dir", "dir"),
+        (IoPoint::Directory, "dir", IoOp::OpenDir, 2, "dir", "dir"),
         (IoPoint::Directory, "dir", IoOp::Reopen, 5, "dir", "dir"),
         (IoPoint::Directory, "dir", IoOp::Reopen, -1, "dir", "dir"),
         (IoPoint::Child, "dir/a", IoOp::Lstat, 13, "dir/a", "dir"),
@@ -130,7 +130,7 @@ fn every_typed_namespace_fault_row_retains_a_checked_scope() {
         (IoPoint::Directory, "dir", IoOp::ProbeGit, 2, "dir", "dir"),
         (IoPoint::Child, "dir/a", IoOp::ReadIgnore, 5, "dir", "dir"),
         (IoPoint::Child, "dir/a", IoOp::ProbeGit, 2, "dir", "dir"),
-        (IoPoint::Child, "dir", IoOp::OpenDir, 13, "dir", "dir"),
+        (IoPoint::Child, "dir", IoOp::OpenDir, 5, "dir", "dir"),
         (IoPoint::Root, "", IoOp::OpenDir, 2, "", ""),
         (IoPoint::Root, "", IoOp::Lstat, 2, "", ""),
         (IoPoint::Root, "", IoOp::List, 5, "", ""),
@@ -846,6 +846,109 @@ fn a_fault_after_a_directory_move_retains_a_live_old_ancestor() {
         drop(hook);
         assert_eq!(listings(&faulted), expected(&tmp, &before, &[""], &[""]));
         assert_eq!(listings(&faulted), listings(&open(&tmp.cat())));
+        recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+    }
+}
+
+#[test]
+fn directory_eacces_discards_prefixes_and_retires_subtrees_across_workers() {
+    let cases = [
+        (IoPoint::Directory, "dir", IoOp::OpenDir),
+        (IoPoint::Directory, "dir", IoOp::Reopen),
+        (IoPoint::OpenDirectory, "dir", IoOp::OpenDir),
+        (IoPoint::Directory, "dir", IoOp::List),
+        (IoPoint::Directory, "dir", IoOp::Reopen),
+        (IoPoint::Listing(2), "dir", IoOp::List),
+        (IoPoint::Listing(2), "", IoOp::List),
+        (IoPoint::Directory, "", IoOp::Reopen),
+    ];
+    for (i, &(point, path, op)) in cases.iter().enumerate() {
+        let tmp = Tmp::new(&format!("denied-directory-{i}"));
+        for n in 0..8 {
+            tmp.write(&format!("dir/child-{n}/a"), b"old");
+        }
+        tmp.write("dir/.git/HEAD", b"ref: refs/heads/main\n");
+        tmp.write("outside", b"outside");
+        let roots = [tmp.tree()];
+        let opts = options();
+        index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        let id = directory(&before, &tmp.tree(), path.as_bytes());
+        let hook = Hook::set(&tmp.tree(), move |at, rel| {
+            if i == 1 && at == IoPoint::Directory && rel == Path::new("dir/child-0") {
+                return Some((IoOp::List, std::io::Error::from_raw_os_error(5)));
+            }
+            (at == point && rel == Path::new(path))
+                .then(|| (op, std::io::Error::from_raw_os_error(13)))
+        });
+        let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert!(
+            report.coverage_faults.is_empty(),
+            "denial is not retained, case {i}"
+        );
+        assert_eq!(report.protected_scopes, 0);
+        let current = session.view();
+        assert_eq!(current.entry_count(id), None);
+        assert_eq!(current.retained_at(id), None);
+        assert_eq!(current.children(id).count(), 0);
+        assert!(current.work_tree(id).is_none());
+        // The real full builder observes the same fault. This also exercises
+        // initial-root denial and multi-worker prefix removal at checkpoint.
+        assert_eq!(
+            listings(&current),
+            expected(&tmp, &before, &[], &[]),
+            "case {i}"
+        );
+        assert_eq!(listings(&current), listings(&open(&tmp.cat())));
+        let log = tmp
+            .cat()
+            .join(format!("changes.{}", current.generation().checkpoint));
+        let bytes = fs::metadata(&log).unwrap().len();
+        assert!(
+            recrawl(&mut session, &roots, Refresh::All, &opts)
+                .unwrap()
+                .published
+                .is_none()
+        );
+        assert_eq!(fs::metadata(&log).unwrap().len(), bytes);
+        drop(hook);
+        recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+    }
+}
+
+#[test]
+fn directory_eacces_collapses_failed_reinclusion_to_the_full_checkpoint_boundary() {
+    for (point, op) in [
+        (IoPoint::OpenDirectory, IoOp::OpenDir),
+        (IoPoint::Directory, IoOp::Reopen),
+        (IoPoint::Listing(1), IoOp::List),
+    ] {
+        let tmp = Tmp::new("denied-reinclusion");
+        tmp.write("hidden/deep/a", b"old");
+        tmp.write("hidden/deep/b", b"ignored");
+        tmp.write(".ferretignore", b"hidden/\n!hidden/deep/a\n");
+        let roots = [tmp.tree()];
+        let opts = options();
+        index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        let hook = Hook::set(&tmp.tree(), move |at, rel| {
+            (at == point && rel == Path::new("hidden/deep"))
+                .then(|| (op, std::io::Error::from_raw_os_error(13)))
+        });
+        recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+        assert_eq!(listings(&session.view()), listings(&open(&tmp.cat())));
+        assert!(
+            recrawl(&mut session, &roots, Refresh::All, &opts)
+                .unwrap()
+                .published
+                .is_none()
+        );
+        drop(hook);
         recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
         assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
     }

@@ -40,6 +40,7 @@ struct Directory<'a> {
     entries: Option<u32>,
     blocked: bool,
     opaque: bool,
+    denied: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -185,7 +186,9 @@ pub(crate) fn with_protection(
             root: 0,
             entries: None,
             blocked: protection.tokens.contains(&observation.token),
-            opaque: protection.opaque.contains(&observation.token),
+            opaque: protection.opaque.contains(&observation.token)
+                || protection.denied.contains(&observation.token),
+            denied: protection.denied.contains(&observation.token),
         })
         .collect();
     let mut tokens = Tokens::default();
@@ -205,6 +208,24 @@ pub(crate) fn with_protection(
     for (token, count) in batches.iter().flat_map(Batch::entry_counts) {
         let i = *tokens.get(&token).ok_or_else(|| invalid("listing token"))?;
         dirs[i].entries = Some(count);
+    }
+    // D26 discards the whole denied prefix. Its included descendants must
+    // not keep Traverse ancestors alive after failed re-inclusion (D29).
+    if !protection.denied.is_empty() {
+        let mut denied: Vec<_> = dirs
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.denied)
+            .map(|(i, _)| i)
+            .collect();
+        while let Some(i) = denied.pop() {
+            for child in dirs[i].children.clone() {
+                if !dirs[child].denied {
+                    dirs[child].denied = true;
+                    denied.push(child);
+                }
+            }
+        }
     }
     let mut protected: Vec<_> = dirs
         .iter()
@@ -236,19 +257,23 @@ pub(crate) fn with_protection(
             let p = *tokens
                 .get(&parent)
                 .ok_or_else(|| invalid("file parent token"))?;
-            dirs[p].included = true;
+            if !dirs[p].denied {
+                dirs[p].included = true;
+            }
         }
         for parent in batch.reused_directories() {
             let p = *tokens
                 .get(&parent)
                 .ok_or_else(|| invalid("reused parent token"))?;
-            dirs[p].included = true;
+            if !dirs[p].denied {
+                dirs[p].included = true;
+            }
         }
     }
     let seeds: Vec<_> = dirs
         .iter()
         .enumerate()
-        .filter(|(_, d)| d.included)
+        .filter(|(_, d)| d.included && (!d.denied || !d.blocked))
         .map(|(i, _)| i)
         .collect();
     for mut i in seeds {
@@ -339,7 +364,7 @@ pub(crate) fn with_protection(
         if parent.is_some() && parent_id.is_none() {
             continue;
         }
-        if !dirs[i].included && !dirs[i].opaque {
+        if !dirs[i].included && (!dirs[i].opaque || dirs[i].denied) {
             if let Some(parent) = parent_id {
                 out.edge(parent, ignored(Kind::Dir), d.name);
             }

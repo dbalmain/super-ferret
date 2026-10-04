@@ -1400,11 +1400,19 @@ the file unhashed. Move to A when typed faults exist, and ideally only once
 incremental indexing makes it worth it.
 
 **Amendment (2026-10-02, find milestone 1):** the walker now tags operations.
-EACCES while opening or listing a directory is permanent user-chosen state:
-publish its directory row without traversing it, with an unknown entry count.
+EACCES while opening, listing or reopening a directory is permanent user-chosen
+state: publish its directory row without traversing it, with an unknown entry
+count.
 Every other coverage fault still blocks publication, including EACCES from an
 ignore-file read. An entry's lstat NotFound remains a deletion; content faults
 remain publishable as unhashed files.
+
+S1+ carries this EACCES amendment unchanged under the log: a covered opaque
+directory retires its old children and subtree in the same final set, including
+a partially listed prefix. New and initial denied roots publish as opaque roots;
+repeated identical denials publish no generation. Other typed coverage faults
+now follow M5's checked subtree retention (or block without a valid anchor),
+including EACCES from an ignore-file read.
 
 ## D27 — `InoId` and `NameId`: stable, or renumbered each snapshot
 

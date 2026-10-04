@@ -736,20 +736,28 @@ fn observe(
     report.content_faults.sort_by(|a, b| a.0.cmp(&b.0));
     report.counts.content_faults = report.content_faults.len() as u64;
     report.walk_time = started.elapsed();
-    if !faults.is_empty() && matches!(source, Source::Checkpoint(_)) {
-        // Initial/checkpoint indexing has no checked prior graph to retain.
-        // Preserve amended A′ for opaque EACCES, block other coverage faults.
-        faults.retain(|f| {
-            !(!f.on_root
-                && matches!(f.op, IoOp::OpenDir | IoOp::List)
-                && f.error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error()))
-        });
-    }
-    if !faults.is_empty() && matches!(source, Source::Checkpoint(_)) {
+    if crate::coverage::discard_denied_prefix_faults(&batches, &mut faults).is_none() {
         return Err(IndexError::Coverage {
             faults,
             report: Box::new(report),
         });
+    }
+    if !faults.is_empty()
+        && let Source::Checkpoint(txn) = source
+    {
+        // D26 directory EACCES is opaque even for an initial root. Every
+        // other initial fault still lacks a trustworthy retention anchor.
+        if faults.iter().all(crate::coverage::directory_denied)
+            && let Some(opaque) = crate::coverage::opaque_checkpoint(txn, &batches, &faults)
+        {
+            batches = opaque;
+            faults.clear();
+        } else {
+            return Err(IndexError::Coverage {
+                faults,
+                report: Box::new(report),
+            });
+        }
     }
     report.coverage_faults = faults;
     Ok((batches, report))
@@ -778,6 +786,9 @@ fn finish_report(
     faulted: Option<&[InoId]>,
 ) {
     let started = Instant::now();
+    report
+        .coverage_faults
+        .retain(|f| !crate::coverage::directory_denied(f));
     let seen = std::mem::take(&mut report.content_faults)
         .into_iter()
         .filter(|(path, _)| published_content_fault(catalog, path))

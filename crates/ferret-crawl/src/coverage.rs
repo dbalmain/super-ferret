@@ -1,13 +1,13 @@
-//! Typed walker faults to checked protection boundaries. This runs only after
-//! all workers finish, so a late fault overrides observations on other workers.
-//! Reconcile retains old subtrees by stopping sweeps, never copying
-//! descendants.
-use std::collections::{BTreeMap, BTreeSet};
+//! Typed walker faults to checked protection boundaries and D26 opaque denials.
+//! This runs only after all workers finish, so a late fault overrides
+//! observations on other workers. Reconcile retains old subtrees by stopping
+//! sweeps, never copying descendants.
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use ferret_catalog::batch::DirectoryObservation;
-use ferret_catalog::{Batch, Catalog, DirToken, InoId, Kind, WriterSession};
+use ferret_catalog::{Batch, Catalog, DirToken, InoId, Kind, Transaction, WriterSession};
 
 use crate::IoOp;
 use crate::index::{CoverageContext, CoverageFault};
@@ -18,12 +18,170 @@ pub(crate) struct Protection {
     pub edges: BTreeSet<u32>,
     pub tokens: BTreeSet<DirToken>,
     pub opaque: BTreeSet<DirToken>,
+    // Covered observations: these do not block global version transitions.
+    pub denied: BTreeSet<DirToken>,
     pub markers: BTreeSet<u32>,
 }
 impl Protection {
     pub fn is_empty(&self) -> bool {
         self.directories.is_empty() && self.edges.is_empty() && self.opaque.is_empty()
     }
+}
+
+/// D26: only directory EACCES is a covered opaque observation, not retention.
+pub(crate) fn directory_denied(fault: &CoverageFault) -> bool {
+    matches!(fault.op, IoOp::OpenDir | IoOp::List | IoOp::Reopen)
+        && fault.error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())
+}
+
+fn denied_tokens(
+    dirs: &BTreeMap<DirToken, DirectoryObservation<'_>>,
+    faults: &[CoverageFault],
+) -> Option<BTreeSet<DirToken>> {
+    faults
+        .iter()
+        .filter(|f| directory_denied(f))
+        .map(|fault| match &fault.context {
+            CoverageContext::Root => dirs
+                .values()
+                .find(|d| d.parent.is_none() && d.name == fault.root.as_os_str().as_bytes())
+                .map(|d| d.token),
+            CoverageContext::Directory(token) => dirs.contains_key(token).then_some(*token),
+            CoverageContext::Child { parent, name } if fault.op == IoOp::OpenDir => dirs
+                .values()
+                .find(|d| d.parent == Some(*parent) && d.name == name)
+                .map(|d| d.token),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Faults strictly below a denied boundary belong to its discarded prefix.
+/// Rule uncertainty at that directory itself or an ancestor still protects;
+/// unknown operations/contexts still block instead of acquiring a scope here.
+pub(crate) fn discard_denied_prefix_faults(
+    batches: &[Batch],
+    faults: &mut Vec<CoverageFault>,
+) -> Option<()> {
+    if !faults.iter().any(directory_denied) {
+        return Some(());
+    }
+    let dirs: BTreeMap<_, _> = batches
+        .iter()
+        .flat_map(Batch::directories)
+        .map(|d| (d.token, d))
+        .collect();
+    let denied = denied_tokens(&dirs, faults)?;
+    faults.retain(|fault| {
+        if directory_denied(fault) {
+            return true;
+        }
+        let (mut token, leaf) = match (&fault.context, fault.op) {
+            (
+                CoverageContext::Directory(token),
+                IoOp::OpenDir | IoOp::List | IoOp::Reopen | IoOp::ReadIgnore | IoOp::ProbeGit,
+            ) => (*token, false),
+            (
+                CoverageContext::Child { parent, .. },
+                IoOp::OpenDir | IoOp::Lstat | IoOp::Readlink,
+            ) => (*parent, true),
+            (CoverageContext::Child { parent, .. }, IoOp::ReadIgnore | IoOp::ProbeGit) => {
+                (*parent, false)
+            }
+            _ => return true,
+        };
+        let start = token;
+        let mut visited = BTreeSet::new();
+        while visited.insert(token) {
+            if denied.contains(&token) && (leaf || token != start) {
+                return false;
+            }
+            let Some(parent) = dirs.get(&token).and_then(|d| d.parent) else {
+                break;
+            };
+            token = parent;
+        }
+        true
+    });
+    Some(())
+}
+
+/// Initial indexing has no old namespace to sweep. Replay only trustworthy
+/// observations through real batches, dropping denied prefixes across workers.
+/// This fault-only path preserves transaction publication and needs no format
+/// or checkpoint-builder exception.
+pub(crate) fn opaque_checkpoint(
+    txn: &Transaction,
+    batches: &[Batch],
+    faults: &[CoverageFault],
+) -> Option<Vec<Batch>> {
+    let dirs: BTreeMap<_, _> = batches
+        .iter()
+        .flat_map(Batch::directories)
+        .map(|d| (d.token, d))
+        .collect();
+    let denied = denied_tokens(&dirs, faults)?;
+    if denied.is_empty() {
+        return None;
+    }
+    let counts: BTreeMap<_, _> = batches.iter().flat_map(Batch::entry_counts).collect();
+    let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    for d in dirs.values() {
+        if let Some(parent) = d.parent {
+            children.entry(parent).or_default().push(d.token);
+        } else {
+            queue.push_back(d.token);
+        }
+    }
+    let mut batch = txn.batch();
+    let mut mapped = BTreeMap::new();
+    while let Some(token) = queue.pop_front() {
+        let d = dirs.get(&token)?;
+        let next = match d.parent {
+            None => batch.root(d.name, *d.stat),
+            Some(parent) if d.traversed => {
+                batch.traversed_dir(*mapped.get(&parent)?, d.name, *d.stat)
+            }
+            Some(parent) => batch.dir(*mapped.get(&parent)?, d.name, *d.stat),
+        };
+        mapped.insert(token, next);
+        if !denied.contains(&token) {
+            if let Some(&count) = counts.get(&token) {
+                batch.entry_count(next, count);
+            }
+            queue.extend(children.remove(&token).unwrap_or_default());
+        }
+    }
+    for old in batches {
+        for f in (0..old.file_count()).map(|i| old.file_observation(i)) {
+            if !denied.contains(&f.parent)
+                && let Some(&parent) = mapped.get(&f.parent)
+            {
+                if let Some(target) = f.target {
+                    batch.symlink(parent, f.name, f.stat, target);
+                } else {
+                    batch.file(parent, f.name, f.stat, f.content);
+                }
+            }
+        }
+        for (parent, name, kind) in old.ignored_entries() {
+            if !denied.contains(&parent)
+                && let Some(&next) = mapped.get(&parent)
+            {
+                batch.ignored(next, name, kind);
+            }
+        }
+        for (token, kind, path, identity) in old.work_tree_observations() {
+            if !denied.contains(&token)
+                && let Some(&next) = mapped.get(&token)
+            {
+                batch.work_tree(next, kind, path, identity);
+            }
+        }
+    }
+    batch.finish_observations();
+    Some(vec![batch])
 }
 
 struct Resolver<'a> {
@@ -258,7 +416,11 @@ pub(crate) fn resolve(
     for token in retained {
         r.protect(token)?;
     }
+    r.out.denied = denied_tokens(&r.dirs, faults)?;
     for fault in faults {
+        if directory_denied(fault) {
+            continue;
+        }
         match (&fault.context, fault.op) {
             (CoverageContext::Root, IoOp::OpenDir | IoOp::Lstat | IoOp::List) => {
                 let id = r

@@ -542,9 +542,9 @@ fn a_file_written_while_it_is_hashed_is_a_content_fault() {
 }
 
 /// D26: a permanent EACCES publishes the directory with unknown contents;
-/// M5 retains old children for both EACCES and other listing faults.
+/// transient listing errors keep M5 retention.
 #[test]
-fn an_unreadable_directory_and_other_listing_faults_retain_old_children() {
+fn an_unreadable_directory_is_opaque_and_other_listing_faults_retain_old_children() {
     let tmp = Tmp::new("coverage");
     tmp.write("open/a.txt", b"a\n");
     tmp.write("shut/b.txt", b"b\n");
@@ -556,7 +556,7 @@ fn an_unreadable_directory_and_other_listing_faults_retain_old_children() {
     assert!(report.published.is_some());
     let (_, rows) = published(&tmp);
     assert!(rows.contains_key(&tmp.at("shut")));
-    assert!(rows.contains_key(&tmp.at("shut/b.txt")));
+    assert!(!rows.contains_key(&tmp.at("shut/b.txt")));
     let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
     catalog.load_all().unwrap();
     let dir = catalog
@@ -569,7 +569,16 @@ fn an_unreadable_directory_and_other_listing_faults_retain_old_children() {
         })
         .unwrap();
     assert_eq!(catalog.entry_count(dir), None);
-    drop(catalog);
+    assert_eq!(catalog.retained_at(dir), None);
+    assert_eq!(catalog.children(dir).count(), 0);
+    let oracle = tmp.base.join("oracle-denied");
+    index(&oracle, &roots, Refresh::All, &options(1)).unwrap();
+    let fresh = Catalog::open(&oracle).unwrap().unwrap();
+    fresh.load_all().unwrap();
+    assert_eq!(
+        checkpoint_oracle::listings(&catalog),
+        checkpoint_oracle::listings(&fresh)
+    );
     let before = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
 
     // Same tree: the accessible directory now encounters an actual listing
@@ -581,11 +590,20 @@ fn an_unreadable_directory_and_other_listing_faults_retain_old_children() {
     crate::walk::FAIL_LIST.set(None);
     let report = result.unwrap();
     let faults = &report.coverage_faults;
-    assert_eq!(faults.len(), 2);
+    assert_eq!(faults.len(), 1);
     let fault = faults.iter().find(|f| f.path == Path::new("open")).unwrap();
     assert_eq!(fault.op, IoOp::List);
     assert_eq!(fault.error.raw_os_error(), Some(5));
     assert!(report.published.is_some());
+    let (retained, rows) = published(&tmp);
+    assert!(rows.contains_key(&tmp.at("open/a.txt")));
+    assert!(rows.contains_key(&tmp.at("open/new.txt")));
+    assert!(!rows.contains_key(&tmp.at("shut/b.txt")));
+    let scopes = [tmp.at("open").as_os_str().as_bytes().to_vec()];
+    assert_eq!(
+        checkpoint_oracle::listings(&retained),
+        super::coverage::retained_listings(&fresh, &catalog, &scopes, &scopes)
+    );
     assert_eq!(
         fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
         before
@@ -593,13 +611,42 @@ fn an_unreadable_directory_and_other_listing_faults_retain_old_children() {
 }
 
 #[test]
-fn a_new_denied_root_has_no_retention_anchor_and_blocks_publication() {
-    let tmp = Tmp::new("denied-root");
-    tmp.write("hidden.txt", b"hidden");
-    chmod(&tmp.tree(), 0o000);
-    let error = index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options(1)).unwrap_err();
-    assert!(matches!(error, IndexError::Coverage { .. }));
-    assert!(Catalog::open(&tmp.cat()).unwrap().is_none());
+fn a_new_or_initial_denied_root_publishes_one_opaque_root() {
+    for initial in [false, true] {
+        let tmp = Tmp::new("denied-root");
+        let opts = options(1);
+        if !initial {
+            index(&tmp.cat(), &[], Refresh::All, &opts).unwrap();
+        }
+        tmp.write("hidden.txt", b"hidden");
+        chmod(&tmp.tree(), 0o000);
+        let roots = [tmp.tree()];
+        let report = index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+        assert!(report.published.is_some());
+        let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
+        catalog.load_all().unwrap();
+        let root = catalog.roots().next().unwrap().0;
+        assert_eq!(catalog.roots().count(), 1);
+        assert_eq!(catalog.entry_count(root), None);
+        assert_eq!(catalog.retained_at(root), None);
+        assert_eq!(catalog.children(root).count(), 0);
+        assert_eq!(catalog.inode_count(), 1);
+        assert_eq!(catalog.name_count(), 0);
+        let oracle = tmp.base.join("opaque-oracle");
+        index(&oracle, &roots, Refresh::All, &opts).unwrap();
+        let fresh = Catalog::open(&oracle).unwrap().unwrap();
+        fresh.load_all().unwrap();
+        assert_eq!(
+            checkpoint_oracle::listings(&catalog),
+            checkpoint_oracle::listings(&fresh)
+        );
+        assert!(
+            index(&tmp.cat(), &roots, Refresh::All, &opts)
+                .unwrap()
+                .published
+                .is_none()
+        );
+    }
 }
 
 /// A `readlink` failure is a coverage fault (the walker reads through a

@@ -883,6 +883,7 @@ thread_local! {
 pub(crate) enum IoPoint {
     Root,
     Directory,
+    OpenDirectory,
     Child,
     Listing(usize),
 }
@@ -1505,6 +1506,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         name: &OsStr,
         expected: &rustix::fs::Stat,
     ) -> Option<OwnedFd> {
+        #[cfg(test)]
+        if let Some((op, error)) = inject(&self.root, IoPoint::OpenDirectory, bytes_path(&self.rel))
+        {
+            self.fail_child(op, here.token, name, error);
+            return None;
+        }
         let fd = match openat(here.fd, name, child_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {

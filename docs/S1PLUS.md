@@ -57,8 +57,10 @@ These are constraints found in the code, rather than inferred from DESIGN:
   generate events. `index.rs` treats non-root Lstat/NotFound as deletion
   and resolves other typed faults after all workers finish. Existing unchanged
   old scopes are retained without copying; new unreadable child directories may
-  be opaque. A root fault without an old unchanged root, an unresolvable context
-  or a global policy/sniffer transition under protection blocks publication.
+  be opaque. Directory OpenDir/List/Reopen EACCES is instead a covered opaque
+  observation, including at a new or initial root (D26). Other root faults
+  without an old unchanged root, unresolvable contexts and global policy/sniffer
+  transitions under protection block publication.
 - Ignored edges have one of seven high child tags and no inode. Failed
   re-inclusion traversal collapses to an opaque ignored edge. Specials have
   stat rows and a sparse kind table. Directory entry counts include ignored
@@ -67,8 +69,10 @@ These are constraints found in the code, rather than inferred from DESIGN:
 M4/M4b implement the recrawl producer and resident `WriterSession`; M5 resolves
 coverage faults into checked directory/edge scopes and publishes retention with
 trustworthy updates in one log transaction. Initial indexing uses a checkpoint;
-without an old root to protect, a root fault blocks it. New child directory EACCES
-may still publish an opaque row. Never treat an unclassified fault as deletion.
+without an old root to protect, a root fault other than directory EACCES blocks
+it. Directory EACCES publishes an opaque row with no visible children, carrying
+the D26 amendment unchanged under the log. Never treat an unclassified fault as
+deletion.
 
 ## Files and publication
 
@@ -651,13 +655,24 @@ it releases directory observations incrementally.
 | Fault | Publication rule |
 | --- | --- |
 | Child Lstat/NotFound | Confirmed vanished edge; delete it and its old subtree if it was a directory. It is the only operation/error pair exempted as a disappearance. |
-| OpenDir/List/Reopen, including ENOENT, identity mismatch and EACCES | Protect that directory's old namespace subtree. Discard all new observations below it, including a partially listed prefix; retain old children and aux state, mark coverage stale and current raw count unknown. |
+| Directory OpenDir/List/Reopen EACCES | Covered opaque directory, including a new or initial root: publish its row with unknown entry count, discard any listed prefix and retire old children/subtree in the same final set. No retained-at marker; repeated identical denials publish no generation. |
+| OpenDir/List/Reopen other than EACCES, including ENOENT and identity mismatch | Protect that directory's old namespace subtree. Discard all new observations below it, including a partially listed prefix; retain old children and aux state, mark coverage stale and current raw count unknown. |
 | Child Lstat other than NotFound, or Readlink | Retain the old edge and subtree when identifiable. If the edge is new or its type is unknown, protect the old parent directory instead. |
-| Local ReadIgnore or ProbeGit, including ENOENT for a broken gitdir | Protect the directory whose rules are uncertain and its whole subtree; fresh decisions below it cannot be trusted. Missing optional ignore files that the walker accepts are not faults. |
-| Root open/stat/list fault | Protect the whole existing unchanged root. A missing root is not an implicit root removal. No old root to protect, or a root-set edit requiring its new boundary, blocks the transaction. |
+| Local ReadIgnore or ProbeGit, including EACCES and ENOENT for a broken gitdir | Protect the directory whose rules are uncertain and its whole subtree; fresh decisions below it cannot be trusted. Missing optional ignore files that the walker accepts are not faults. |
+| Root open/stat/list fault other than directory OpenDir/List/Reopen EACCES | Protect the whole existing unchanged root. A missing root is not an implicit root removal. No old root to protect, or a root-set edit requiring its new boundary, blocks the transaction. |
 | Global ignore/config read fault; unknown operation/context; unresolvable protection scope | Block publication of the entire transaction. |
 | Content open/stat/read fault, moving stat bracket or alias conflict | Publish the valid namespace/stat observation as Fault/no-doc; retry on a later refresh. No new DocId is minted for unknown content. |
 | Bad pattern (`Event::Pattern`) | Keep today's diagnostic and remaining rules; not an I/O coverage failure. |
+
+Directory EACCES is permanent user-chosen state, not a protected scope. This
+carries D26's amendment unchanged: a chmod-hidden directory must not keep its
+old searchable children. Faults strictly below its discarded prefix cannot
+retain those children; rule uncertainty at the denied directory itself or an
+ancestor still follows the protection/blocking rules above. An ignore-file
+EACCES never becomes a covered directory denial. Initial checkpoint publication
+likewise discards partially listed prefixes across workers. Policy remains in
+force: when denial prevents re-inclusion, D29 collapses a Traverse-only chain
+to its opaque ignored edge, as the full checkpoint builder does.
 
 Directory stat and raw count describe the observations, not an atomic
 filesystem snapshot. A child that vanishes after listing can leave those fields

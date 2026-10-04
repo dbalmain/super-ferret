@@ -545,8 +545,8 @@ fn json_round_trips_a_path_that_is_not_utf8() {
 }
 
 #[test]
-// M5 retains a denied directory's old children while trustworthy siblings
-// publish. The CLI reports that those counts/listings are stale.
+// D26: a denied directory is opaque and retires old children; trustworthy
+// siblings still publish.
 fn an_unreadable_directory_publishes_its_row_and_other_changes() {
     let env = Env::new("coverage");
     env.write("ok.txt", b"ok\n");
@@ -562,7 +562,7 @@ fn an_unreadable_directory_publishes_its_row_and_other_changes() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(paths(&env.run(&[os("search"), os("locked")])), [locked]);
-    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 0);
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
     assert_eq!(code(&env.run(&[os("search"), os("new")])), 0);
 }
 
@@ -2150,15 +2150,16 @@ fn stats_effective_depth_census_matches_a_fresh_checkpoint() {
 }
 
 #[test]
-fn retained_subtree_remains_searchable_and_find_uses_the_live_boundary() {
+fn transient_root_fault_retains_searchable_subtree_and_find_uses_the_live_boundary() {
     let env = Env::new("retained-find");
     env.seed_ignore_file();
     let old = env.write("locked/old.txt", b"old\n");
     let locked = old.parent().unwrap().to_owned();
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let displaced = env.tree().with_extension("displaced");
+    fs::rename(env.tree(), &displaced).unwrap();
     let recrawl = env.run(&[os("index")]);
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(&displaced, env.tree()).unwrap();
     assert_eq!(code(&recrawl), 0, "{}", stderr(&recrawl));
     assert!(stderr(&recrawl).contains("protected scope"));
     assert_eq!(
