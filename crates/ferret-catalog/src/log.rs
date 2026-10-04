@@ -766,6 +766,13 @@ pub(crate) fn recover(dir: &Path, pinned: &Published) -> Result<(), OpenError> {
             publication::sync(&file, Point::RecoverySync).map_err(io_error)?;
         }
     }
+    // A prior append can stop after current's rename without leaving obsolete
+    // files. Resolve its durability uncertainty before returning a writer.
+    publication::sync(
+        &File::open(dir).map_err(io_error)?,
+        Point::RecoveryDirectorySync,
+    )
+    .map_err(io_error)?;
     cleanup(dir, pinned.manifest.generation.checkpoint).map_err(io_error)
 }
 

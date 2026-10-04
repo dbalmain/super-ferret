@@ -897,3 +897,54 @@ fn optional_reserved_sentinels_and_impossible_reference_counts_are_rejected() {
         p.generation()
     );
 }
+
+#[test]
+fn recovery_syncs_an_adopted_append_manifest_without_obsolete_files_before_empty_commits() {
+    // An append stopped after rename has no retired pair to trigger cleanup.
+    let s = fixture("append-recovery-barrier");
+    let p = Published::open(&s.path).unwrap().unwrap();
+    let mut writer = Writer::open(&s.path).unwrap();
+    FAIL.set(Some(Point::ManifestRename));
+    assert!(
+        writer
+            .commit(p.generation(), &changes(&p))
+            .unwrap_err()
+            .published()
+    );
+    FAIL.set(None);
+    drop(writer);
+    let selected = Published::open(&s.path).unwrap().unwrap();
+    assert_eq!(selected.generation().sequence, p.generation().sequence + 1);
+    assert_eq!(
+        fs::metadata(log_path(&s)).unwrap().len(),
+        selected.log().committed_end()
+    );
+    assert!(!s.path.join("current.tmp").exists());
+    FAIL.set(Some(Point::RecoveryDirectorySync));
+    let refused = Writer::open(&s.path).is_err();
+    FAIL.set(None);
+    assert!(
+        refused,
+        "writer must establish durability independently of cleanup"
+    );
+    VISITED.with_borrow_mut(Vec::clear);
+    let mut recovered = Writer::open(&s.path).unwrap();
+    assert_eq!(
+        VISITED.with_borrow(Clone::clone),
+        [Point::RecoveryDirectorySync]
+    );
+    VISITED.with_borrow_mut(Vec::clear);
+    let empty = ChangeSet {
+        records: Vec::new(),
+        counters: selected.counters(),
+        counts: selected.counts(),
+    };
+    assert_eq!(
+        recovered.commit(selected.generation(), &empty).unwrap(),
+        selected.generation()
+    );
+    assert!(
+        VISITED.with_borrow(|points| points.is_empty()),
+        "resident empty commit has no IO barriers"
+    );
+}
