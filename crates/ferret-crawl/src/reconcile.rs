@@ -584,21 +584,23 @@ impl Final<'_> {
         Ok(())
     }
     fn finish_inodes(&mut self) -> Result<(), Error> {
+        let mut roots: BTreeSet<_> = self.old.roots().map(|(id, _)| id.0).collect();
+        for record in &self.changes.records {
+            match record {
+                Record::RootPut { id, .. } => {
+                    roots.insert(*id);
+                }
+                Record::RootDelete { id } => {
+                    roots.remove(id);
+                }
+                _ => {}
+            }
+        }
         for (&id, &delta) in &self.references {
             let live = self.old.is_live_inode(InoId(id));
             let names = i64::from(self.session.name_references(InoId(id))) + delta;
             let names = u32::try_from(names).map_err(|_| invalid("recrawl name references"))?;
-            let root = self.old.roots().any(|(r, _)| r.0 == id)
-                && !self
-                    .changes
-                    .records
-                    .iter()
-                    .any(|r| matches!(r, Record::RootDelete { id: root } if *root == id))
-                || self
-                    .changes
-                    .records
-                    .iter()
-                    .any(|r| matches!(r, Record::RootPut { id: root, .. } if *root == id));
+            let root = roots.contains(&id);
             if names == 0 && !root {
                 if !live {
                     return Err(invalid("unreachable inode birth"));

@@ -85,3 +85,11 @@ findings). Each should name the guard that will eventually retire it.
   made it fail before the fix.
 - **Guard:** every fix's test is run against the pre-fix tree. Briefs already
   ask for this; keep asking, because it caught this one.
+
+### 2026-10-04 — final-set validation rescanned its own records per inode
+
+- **What:** M4's root-liveness test scanned all changed records once per inode
+  whose name count changed, making large deletions quadratic in dirty rows.
+- **Guard:** derive the final root set once, then use membership during inode
+  retirement. Existing real-crawl root-retirement and materialised-checkpoint
+  oracle tests cover the resulting behavior. Applied in M4.
