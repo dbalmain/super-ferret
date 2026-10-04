@@ -877,6 +877,102 @@ still uses its resident identity lookup; these synthetic measurements do not
 measure that filesystem observation cost. M6 owns narrower scopes, fully streamed
 directories and smaller alias/reference storage.
 
+### S1+ M5 — Typed coverage reconciliation (2026-10-05)
+
+M5 resolves owned `IoOp`/context/error events after all walkers have joined.
+Checked old directory/edge scopes discard every worker's untrusted observations
+before alias grouping, and stop the old-name sweep at their boundaries. No
+protected subtree is copied. Overlapping scopes collapse; new unreadable child
+directories can be opaque, while replacements require an unchanged ancestor.
+A relocated old directory widens protection to its checked owner root when its
+old incoming path is no longer anchored. A protected file edge makes its parent
+count unknown while trustworthy siblings update. Fresh hard-link observations
+outside a scope can still update the shared inode. Successful recovery clears
+coverage and retained-at in the same transaction; identical faults publish
+nothing. Global policy/sniffer transitions under protection and uncertain new
+root boundaries abort. Disjoint root removals remain valid.
+
+The existing M1/M3 coverage flags and `RetainedAt` wire format were sufficient;
+reader semantic validation remains unchanged (D53 recommendation A, as directed).
+Tests use the real walker, crawl API, writer and disk reader, with M3's full-index
+oracle. Retained expectations take actual rows from the pre-fault checkpoint.
+The matrix covers namespace operations/errors/contexts, content I/O, vanished
+children, invalid patterns, partial listings across four workers, new/replaced
+and moved directories, overlapping scopes, stale counts, repeat/recovery,
+policy/sniffer changes and protected hard links. The CLI test verifies retained
+search results and find's live listing/metadata fallback. Workspace gates:
+**521 passed / 4 ignored**, zero warnings; real log size/mtime unchanged.
+
+Measured production **`3f7fc27`**, one warm-up and three recorded samples per
+case, second round reversed. The no-change row uses the original **10,448,739-name**
+M4b fixture at `/tmp/s1plus-m3-measure/index`, without modifications. Fault rows
+start from the same separately prepared, writer-validated view: promote one
+one-file leaf to a nested configured root and seed the default policy tag from
+a real empty crawl. This changes one root boundary, preserving paths, inode and
+document rows; the two scopes contain **1** and **10,448,737** names. Preparation
+and private manifest/log resets are outside timing and write totals. The snapshot
+is hardlinked and never rewritten.
+
+Before every invocation, including preparation and warm-ups, the host-visible
+runner checks `uptime` and
+`pgrep -af 'harness.run|ferret_timing|ignore_timing|synthetic|ferret-bench'`,
+excluding only runner ancestors and pgrep. No competing benchmark or compilation
+ran during timing. Commands, all loads, environments, binary SHA-256s and samples:
+`/home/dave/w/super-ferret/.ai/s1plus-m5-measurements/recrawl-samples.json`;
+`recrawl-run.py` guards/runs it, and `report.py` produces the medians.
+
+```sh
+B=/home/dave/w/super-ferret-wt/s1plus/target/release/ferret-bench
+P=/home/dave/w/super-ferret-wt/s1plus/target/release/examples/recrawl
+export XDG_CONFIG_HOME=/tmp/s1plus-m5-measure/config
+export XDG_DATA_HOME=/tmp/s1plus-m5-measure/data
+export XDG_STATE_HOME=/tmp/s1plus-m5-measure/state
+export XDG_CACHE_HOME=/tmp/s1plus-m5-measure/cache
+# N is 0, fault-small or fault-large; each private index is reset first.
+export FERRET_INDEX=/tmp/s1plus-m5-measure/${N}
+$B recrawl-once "$FERRET_INDEX" "$N" "$P"
+# One-time private fault preparation, before copying it to the two fault cases:
+FERRET_INDEX=/tmp/s1plus-m5-measure/fault-base \
+  $P /tmp/s1plus-m5-measure/fault-base fault-prepare
+```
+
+| Case | Log + manifest bytes | Post-setup median (range), ms | Final / peak RSS, MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| No change, original 10M fixture | 0 + 0 | 9198.74 (9197.28–9253.01) | 764.47 / 1386.92 | `$B recrawl-once /tmp/s1plus-m5-measure/0 0 "$P"` | `3f7fc27` | 1.27–2.32 / 1.22–1.49 / 1.08–1.18 |
+| Protect 1 name | 176 + 128 | 5.49 (2.84–6.51) | 724.02 / 1049.66 | `$B recrawl-once /tmp/s1plus-m5-measure/fault-small fault-small "$P"` | `3f7fc27` | 1.47–2.17 / 1.26–1.50 / 1.09–1.18 |
+| Protect 10,448,737 names | 176 + 128 | 6.07 (5.97–6.09) | 723.96 / 1049.78 | `$B recrawl-once /tmp/s1plus-m5-measure/fault-large fault-large "$P"` | `3f7fc27` | 1.59–2.08 / 1.29–1.49 / 1.10–1.18 |
+
+| Case (same command, commit and load as above) | Session setup median (range), ms | Setup current / peak RSS, MiB |
+| --- | ---: | ---: |
+| No change | 3052.91 (3042.30–3082.83) | 721.84 / 871.19 |
+| Protect 1 name | 3886.28 (3864.83–3909.61) | 721.95 / 871.06 |
+| Protect 10,448,737 names | 3870.43 (3855.85–3895.21) | 721.95 / 871.64 |
+
+No-change remains synthetic observation replay, including local equal-row
+reduction: median **6622.18 ms replay / 2554.04 ms reconciliation / 0 ms commit**.
+At **9.20 s** and **1.35 GiB** peak, there is no observed regression from M4b's
+9.28 s / 1.35 GiB; all three runs remain below 9.5 s / 1.6 GiB. Different loads
+and three samples do not establish a speedup.
+
+Fault cases call the **real resident recrawl API** with a selected-root refresh
+and get an actual kernel `OpenDir`/NotFound error on the nonexistent synthetic
+root. The other root is kept, isolating retention from unrelated enumeration.
+Median walk/reconciliation-publication is **0.07/5.31 ms** for the small scope,
+**0.08/5.87 ms** for the large scope. Both append one boundary `DirPut` and a
+manifest: **304 B** total. Protecting over ten million times as many names adds
+about **0.58 ms**, within the small-scope observed range, and about **0.12 MiB**
+peak: retention work depends on boundaries, not old descendant count. This does
+not measure walking healthy siblings or a faulted listing's already-read prefix.
+Fault setup includes the same prepared root-boundary overlay in both cases;
+compare its cost within that pair, not directly with the clean no-change setup.
+
+Peak RSS covers the whole producer, including setup, disk-reader coverage
+verification and an identical-fault retry that must append zero bytes and
+publish no generation. Those verification/retry steps are outside the first
+recrawl's post-setup timer. Logical writes exclude filesystem block amplification.
+All fault runs preserve inode/name/directory/document counts and checkpoint
+size/mtime; cold disk replay confirms the retained-at marker.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes

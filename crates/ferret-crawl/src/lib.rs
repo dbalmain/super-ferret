@@ -8,9 +8,9 @@
 //!
 //! [`index`] turns walks into a published catalog generation: it takes the
 //! writer lock, walks the roots that need it with a visitor that carries,
-//! sniffs and hashes content on the worker (D26, D31, D33), and commits
-//! unless the walk may have missed entries. This crate knows nothing about
-//! queries or index formats.
+//! sniffs and hashes content on the worker (D26, D31, D33), retains checked
+//! old scopes under typed coverage faults, and commits trustworthy changes.
+//! This crate knows nothing about queries or index formats.
 
 mod coverage;
 mod index;
