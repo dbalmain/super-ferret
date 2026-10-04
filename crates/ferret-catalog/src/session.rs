@@ -129,6 +129,19 @@ impl WriterSession {
         self.writer.budget_usage()
     }
 
+    /// Services an idle-boundary request, including an existing log produced
+    /// with larger host limits. Empty recrawl diffs still publish nothing.
+    pub fn compact_if_needed(&mut self) -> Result<Option<Catalog>, Error> {
+        let view = self.view();
+        if self.budget_usage().reached(self.limits)
+            || view.next_inode().0 == crate::format::NONE - 16
+            || view.next_name().0 == crate::format::NONE - 1
+        {
+            return self.compact().map(Some);
+        }
+        Ok(None)
+    }
+
     /// Compacts the published view without advancing its sequence. Every
     /// epoch cache is rebuilt before returning; queued handles must retry.
     pub fn compact(&mut self) -> Result<Catalog, Error> {

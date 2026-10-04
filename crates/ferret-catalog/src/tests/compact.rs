@@ -21,9 +21,36 @@ fn fixture(label: &str) -> Scratch {
 #[test]
 fn pinned_unloaded_readers_and_unchanged_sequence_handles_survive_dense_remapping() {
     let s = fixture("compact-pinned");
+    let mut session = WriterSession::open(&s.path).unwrap();
+    session.set_compaction_limits(crate::CompactionLimits {
+        log_bytes: u64::MAX,
+        records: u64::MAX,
+        dirty_percent: u32::MAX,
+        dead_percent: u32::MAX,
+    });
+    let view = session.view();
+    let id = at(&view, "/root/other");
+    let mut inode = view.inode(id);
+    inode.stat.ctime_nsec += 1;
+    let changes = crate::log::ChangeSet {
+        counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+        counts: [
+            view.inode_count(),
+            view.name_count(),
+            view.dir_count(),
+            view.doc_count(),
+        ],
+        records: vec![crate::log::Record::InodePut {
+            id: id.0,
+            kind: crate::Kind::File,
+            state: inode.state,
+            doc: inode.doc.map(|id| id.0),
+            stat: inode.stat,
+        }],
+    };
+    session.commit(&changes, SNIFFER).unwrap();
     let old = crate::Catalog::open(&s.path).unwrap().unwrap();
     let generation = old.generation();
-    let mut session = WriterSession::open(&s.path).unwrap();
     let new = session.compact().unwrap();
     assert_eq!(new.generation().sequence, generation.sequence);
     assert_ne!(new.generation().checkpoint, generation.checkpoint);
@@ -34,6 +61,10 @@ fn pinned_unloaded_readers_and_unchanged_sequence_handles_survive_dense_remappin
     );
     old.load_all().unwrap();
     assert_eq!(super::paths(&old), super::paths(&new));
+    assert_eq!(
+        old.inode(at(&old, "/root/other")),
+        new.inode(at(&new, "/root/other"))
+    );
     assert!(
         new.checked_inode(Handle {
             generation,
@@ -68,6 +99,9 @@ fn compacting_the_same_effective_state_twice_has_identical_packed_sections() {
     let a = fs::read(snapshot(&s.path)).unwrap();
     session.compact().unwrap();
     let b = fs::read(snapshot(&s.path)).unwrap();
+    assert_eq!(&a[..56], &b[..56]);
+    assert_ne!(&a[56..64], &b[56..64]);
+    assert_eq!(&a[64..crate::format::HEADER], &b[64..crate::format::HEADER]);
     // Only the epoch field and its head digest differ. Section descriptors,
     // offsets, payload checksums and every packed row must be identical.
     assert_eq!(
@@ -236,7 +270,8 @@ fn repeated_overwrites_count_once_and_deletions_are_dead_rather_than_dirty_after
         usage
     );
     let next_doc = session.view().next_doc();
-    session.compact().unwrap();
+    assert!(session.compact_if_needed().unwrap().is_some());
+    assert!(session.compact_if_needed().unwrap().is_none());
     assert_eq!(session.view().next_doc(), next_doc);
     assert_eq!(session.view().doc_count(), 1);
     assert_eq!(session.budget_usage().dead_inodes, 0);
@@ -244,4 +279,59 @@ fn repeated_overwrites_count_once_and_deletions_are_dead_rather_than_dirty_after
         session.budget_usage().base_inodes,
         session.view().inode_count()
     );
+}
+
+#[test]
+fn cumulative_bursts_cross_the_record_limit_before_the_triggering_delta_is_appended() {
+    let s = fixture("compact-cumulative");
+    let mut session = WriterSession::open(&s.path).unwrap();
+    session.set_compaction_limits(crate::CompactionLimits {
+        log_bytes: u64::MAX,
+        records: 3,
+        dirty_percent: u32::MAX,
+        dead_percent: u32::MAX,
+    });
+    let log = fs::File::open(s.path.join("changes.0")).unwrap();
+    let original = session.view().generation();
+    let mut end = 64;
+    for step in 1..=3 {
+        let view = session.view();
+        let id = at(&view, "/root/other");
+        let mut inode = view.inode(id);
+        inode.stat.ctime_nsec += 1;
+        let changes = crate::log::ChangeSet {
+            counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+            counts: [
+                view.inode_count(),
+                view.name_count(),
+                view.dir_count(),
+                view.doc_count(),
+            ],
+            records: vec![crate::log::Record::InodePut {
+                id: id.0,
+                kind: crate::Kind::File,
+                state: inode.state,
+                doc: inode.doc.map(|id| id.0),
+                stat: inode.stat,
+            }],
+        };
+        session.commit(&changes, SNIFFER).unwrap();
+        assert_eq!(
+            session.view().generation().sequence,
+            original.sequence + step
+        );
+        if step < 3 {
+            assert_eq!(session.view().generation().checkpoint, original.checkpoint);
+            end = log.metadata().unwrap().len();
+            assert_eq!(session.budget_usage().records, step);
+        } else {
+            assert_ne!(session.view().generation().checkpoint, original.checkpoint);
+            assert_eq!(log.metadata().unwrap().len(), end);
+            assert_eq!(session.budget_usage().records, 0);
+            assert_eq!(
+                reopen(&s.path).inode(at(&session.view(), "/root/other")),
+                inode
+            );
+        }
+    }
 }

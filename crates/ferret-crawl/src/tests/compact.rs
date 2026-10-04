@@ -117,6 +117,7 @@ fn generated_churn_compacts_dense_bfs_ids_preserving_docids_and_matches_a_full_c
  {
     let tmp = Tmp::new("compact-churn");
     tmp.write("stable", b"stable");
+    tmp.write("duplicate", b"stable");
     tmp.write("dir/a", b"initial");
     tmp.write("z/deep/file", b"nested");
     tmp.write(".git/config", b"");
@@ -151,6 +152,7 @@ fn generated_churn_compacts_dense_bfs_ids_preserving_docids_and_matches_a_full_c
         dense(&result.view);
         oracle(&tmp, &result.view);
         assert!(result.view.doc_hash(doc).is_some());
+        assert_eq!(result.view.doc_references(doc), Some(2));
         assert!(result.view.next_doc().0 >= next_doc);
         next_doc = result.view.next_doc().0;
         let before = result.view.generation();
