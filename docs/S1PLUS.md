@@ -659,6 +659,12 @@ it releases directory observations incrementally.
 | Content open/stat/read fault, moving stat bracket or alias conflict | Publish the valid namespace/stat observation as Fault/no-doc; retry on a later refresh. No new DocId is minted for unknown content. |
 | Bad pattern (`Event::Pattern`) | Keep today's diagnostic and remaining rules; not an I/O coverage failure. |
 
+Directory stat and raw count describe the observations, not an atomic
+filesystem snapshot. A child that vanishes after listing can leave those fields
+from before its disappearance. Stable injected-fault runs compare against the
+real full builder with the same fault; a real mutation race checks durable edge
+retirement first and the full-index oracle after a stable retry.
+
 Protection requires the old directory occurrence still belongs to the
 refreshed root and was not proved replaced. If its identity was replaced, there
 is no valid old subtree to attach: protect a proven unchanged ancestor instead,

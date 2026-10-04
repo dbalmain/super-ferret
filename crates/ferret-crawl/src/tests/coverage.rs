@@ -538,35 +538,45 @@ fn content_open_stat_read_and_closing_stat_faults_publish_valid_rows_without_min
 
 #[test]
 fn child_lstat_not_found_alone_deletes_the_old_edge_and_directory_subtree() {
-    let tmp = Tmp::new("fault-vanished-directory");
-    tmp.write("dir/deep/a", b"old");
-    tmp.write("stable", b"stable");
-    let opts = options();
-    let roots = [tmp.tree()];
-    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
-    let before = session.view();
-    let dir = directory(&before, &tmp.tree(), b"dir");
-    let path = tmp.at("dir");
-    let hook = Hook::set(&tmp.tree(), move |point, rel| {
-        if point == IoPoint::Child && rel == Path::new("dir") {
-            fs::remove_dir_all(&path).unwrap();
-            Some((IoOp::Lstat, std::io::Error::from_raw_os_error(2)))
-        } else {
-            None
+    for remove_during_walk in [false, true] {
+        let tmp = Tmp::new("fault-vanished-directory");
+        tmp.write("dir/deep/a", b"old");
+        tmp.write("stable", b"stable");
+        let opts = options();
+        let roots = [tmp.tree()];
+        index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        let dir = directory(&before, &tmp.tree(), b"dir");
+        let path = tmp.at("dir");
+        let hook = Hook::set(&tmp.tree(), move |point, rel| {
+            if point == IoPoint::Child && rel == Path::new("dir") {
+                if remove_during_walk {
+                    fs::remove_dir_all(&path).unwrap();
+                }
+                Some((IoOp::Lstat, std::io::Error::from_raw_os_error(2)))
+            } else {
+                None
+            }
+        });
+        let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(report.counts.vanished, 1);
+        assert!(report.coverage_faults.is_empty());
+        assert_eq!(report.protected_scopes, 0);
+        assert!(!session.view().is_live_inode(dir));
+        assert_eq!(listings(&session.view()), listings(&open(&tmp.cat())));
+        if !remove_during_walk {
+            // A stable injected disappearance must match the real full builder
+            // seeing the same syscall fault, without modelling the deletion
+            // rule.
+            assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
         }
-    });
-    let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
-    assert_eq!(report.counts.vanished, 1);
-    assert!(report.coverage_faults.is_empty());
-    assert_eq!(report.protected_scopes, 0);
-    assert!(!session.view().is_live_inode(dir));
-    assert_eq!(listings(&session.view()), listings(&open(&tmp.cat())));
-    drop(hook);
-    // First-pass root stat/count describe the pre-disappearance listing. A
-    // stable retry supplies the same observations as the fresh full oracle.
-    recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
-    assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+        drop(hook);
+        // First-pass root stat/count describe the pre-disappearance listing. A
+        // stable retry supplies the same observations as the fresh full oracle.
+        recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+    }
 }
 
 #[test]
