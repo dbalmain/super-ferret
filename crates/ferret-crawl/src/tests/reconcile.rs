@@ -10,8 +10,7 @@ use ferret_catalog::{Catalog, InoId, WriterSession};
 use super::index::Tmp;
 use crate::{IndexOptions, Refresh, index, recrawl};
 
-#[path = "../../../ferret-catalog/tests/support/listing.rs"]
-mod checkpoint_oracle;
+use super::checkpoint_oracle;
 use checkpoint_oracle::listings;
 
 fn options() -> IndexOptions {
@@ -535,25 +534,43 @@ fn final_log_order_is_identical_across_walk_worker_counts() {
 fn incomplete_eacces_retains_old_subtree_and_recovery_clears_the_marker() {
     let tmp = Tmp::new("recrawl-incomplete");
     tmp.write("dir/a", b"content");
-    for i in 0..8 { tmp.write(&format!("stable-{i}"), b"unchanged"); }
-    let roots = [tmp.tree()]; let opts = options();
+    for i in 0..8 {
+        tmp.write(&format!("stable-{i}"), b"unchanged");
+    }
+    let roots = [tmp.tree()];
+    let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap(); let old = session.view();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let old = session.view();
     fs::set_permissions(tmp.at("dir"), fs::Permissions::from_mode(0o000)).unwrap();
     let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
     assert_eq!(report.protected_scopes, 1);
     let mut want = listings(&old);
     for row in &mut want {
         if row.path == tmp.at("dir").as_os_str().as_bytes() {
-            row.entries = None; row.retained_at = Some(old.generation().sequence);
+            row.entries = None;
+            row.retained_at = Some(old.generation().sequence);
         }
     }
     assert_eq!(listings(&session.view()), want);
     assert_eq!(listings(&open(&tmp.cat())), want);
-    assert_eq!(session.view().generation().checkpoint, old.generation().checkpoint);
-    assert!(recrawl(&mut session, &roots, Refresh::All, &opts).unwrap().published.is_none());
+    assert_eq!(
+        session.view().generation().checkpoint,
+        old.generation().checkpoint
+    );
+    assert!(
+        recrawl(&mut session, &roots, Refresh::All, &opts)
+            .unwrap()
+            .published
+            .is_none()
+    );
     drop(session);
-    assert!(index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap().published.is_none());
+    assert!(
+        index(&tmp.cat(), &roots, Refresh::All, &opts)
+            .unwrap()
+            .published
+            .is_none()
+    );
     fs::set_permissions(tmp.at("dir"), fs::Permissions::from_mode(0o755)).unwrap();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
     oracle(&tmp, &roots, &opts, &open(&tmp.cat()));

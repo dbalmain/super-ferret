@@ -284,6 +284,7 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
     let (exit, outcome) = match &result {
         Ok(report) => {
             print_content_faults(report);
+            print_coverage_faults(report);
             (
                 print("the report", report_text(report).as_bytes()),
                 if report.published.is_some() {
@@ -358,6 +359,11 @@ fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
         .int("refreshed", report.refreshed.len() as u64)
         .int("kept", report.kept.len() as u64)
         .int("dropped", report.dropped.len() as u64)
+        .int("protected_scopes", report.protected_scopes as u64)
+        .int(
+            "retained_coverage_faults",
+            report.coverage_faults.len() as u64,
+        )
         .int("walk_us", report.walk_time.as_micros() as i128)
         .int("hash_us", report.hash_time.as_micros() as i128)
         .int("commit_us", report.commit_time.as_micros() as i128)
@@ -430,6 +436,29 @@ fn report_text(report: &Report) -> String {
         warn(&format!("ignore pattern skipped: {pattern}"));
     }
     text
+}
+
+/// A retained scope remains searchable, but its live count/listing is unknown.
+fn print_coverage_faults(report: &Report) {
+    if report.coverage_faults.is_empty() {
+        return;
+    }
+    warn(&format!(
+        "{} protected scope(s): old indexed data retained; directory counts and listings are stale",
+        report.protected_scopes
+    ));
+    let mut text = String::new();
+    for fault in report.coverage_faults.iter().take(SHOWN) {
+        let _ = writeln!(text, "  {fault}");
+    }
+    if report.coverage_faults.len() > SHOWN {
+        let _ = writeln!(
+            text,
+            "  … and {} more",
+            report.coverage_faults.len() - SHOWN
+        );
+    }
+    note(&text);
 }
 
 /// Content faults are warnings: the file is indexed without its content and

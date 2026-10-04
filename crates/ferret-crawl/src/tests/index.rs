@@ -1,8 +1,7 @@
 //! `index` end to end, on real temp trees: every test drives the real
 //! pipeline and reads the published catalog back.
 
-#[path = "../../../ferret-catalog/tests/support/listing.rs"]
-mod checkpoint_oracle;
+use super::checkpoint_oracle;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -594,17 +593,13 @@ fn an_unreadable_directory_and_other_listing_faults_retain_old_children() {
 }
 
 #[test]
-fn a_denied_root_is_catalogued_with_unknown_contents() {
+fn a_new_denied_root_has_no_retention_anchor_and_blocks_publication() {
     let tmp = Tmp::new("denied-root");
     tmp.write("hidden.txt", b"hidden");
     chmod(&tmp.tree(), 0o000);
-    let report = index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options(1)).unwrap();
-    assert!(report.published.is_some());
-    let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
-    assert_eq!(catalog.dir_count(), 1);
-    assert_eq!(catalog.name_count(), 0);
-    catalog.load_all().unwrap();
-    assert_eq!(catalog.entry_count(InoId(0)), None);
+    let error = index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options(1)).unwrap_err();
+    assert!(matches!(error, IndexError::Coverage { .. }));
+    assert!(Catalog::open(&tmp.cat()).unwrap().is_none());
 }
 
 /// A `readlink` failure is a coverage fault (the walker reads through a

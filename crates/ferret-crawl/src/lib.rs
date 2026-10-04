@@ -19,8 +19,8 @@ pub mod reconcile;
 mod walk;
 
 pub use index::{
-    Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report, RootChange, index,
-    index_change, recrawl,
+    Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report,
+    RootChange, index, index_change, recrawl,
 };
 pub use observe::ContentFault;
 

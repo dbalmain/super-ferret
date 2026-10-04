@@ -1,8 +1,9 @@
 //! Whole-walk observations to a sparse final change set. Directory tokens are
 //! resolved against the effective graph, never a renumbered candidate snapshot.
 //! Only completely covered refreshed roots are swept; kept roots remain in the
-//! pinned view. M5 owns retained fault scopes, so incomplete listings request
-//! the amended A′ checkpoint fallback instead of guessing which old edges died.
+//! pinned view. Typed protection scopes stop sweeps at checked old boundaries
+//! and discard every worker's new observations below them before alias
+//! grouping.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
@@ -117,10 +118,12 @@ fn ignored(kind: Kind) -> u32 {
 }
 
 /// Reconciles completed batches through the same producer used by `index`.
-/// `None` requests the M4 checkpoint fallback for incomplete coverage. The
-/// caller holds the session lock throughout planning, walking and publication.
-/// Refreshed/dropped paths must be the already widened root plan; batches must
-/// contain exactly the refreshed roots, with no retained-fault observations.
+/// `None` requests checkpoint fallback for unclassified incomplete coverage.
+/// The caller holds the session lock throughout planning, walking and
+/// publication. Refreshed/dropped paths must be the already widened root plan;
+/// batches must contain the refreshed roots. `Batch::retained_at` marks an
+/// explicitly protected old directory occurrence; an unanchored marker is
+/// rejected.
 pub fn changes(
     session: &WriterSession,
     batches: &[Batch],
@@ -130,14 +133,25 @@ pub fn changes(
     sniffer: u32,
 ) -> Result<Option<ChangeSet>, Error> {
     let old = session.view();
-    let mut configured: Vec<_> = old.roots().map(|(_, p)| PathBuf::from(std::ffi::OsStr::from_bytes(p))).collect();
+    let mut configured: Vec<_> = old
+        .roots()
+        .map(|(_, p)| PathBuf::from(std::ffi::OsStr::from_bytes(p)))
+        .collect();
     configured.retain(|p| !dropped.contains(p));
     configured.extend(refreshed.iter().cloned());
     configured.sort();
     configured.dedup();
     let protection = crate::coverage::resolve(session, batches, &[], &configured)
         .ok_or_else(|| invalid("unresolvable retained observation"))?;
-    with_protection(session, batches, refreshed, dropped, policy, sniffer, &protection)
+    with_protection(
+        session,
+        batches,
+        refreshed,
+        dropped,
+        policy,
+        sniffer,
+        &protection,
+    )
 }
 
 pub(crate) fn with_protection(
@@ -192,8 +206,12 @@ pub(crate) fn with_protection(
         let i = *tokens.get(&token).ok_or_else(|| invalid("listing token"))?;
         dirs[i].entries = Some(count);
     }
-    let mut protected: Vec<_> = dirs.iter().enumerate()
-        .filter(|(_, d)| d.blocked || d.opaque).map(|(i, _)| i).collect();
+    let mut protected: Vec<_> = dirs
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.blocked || d.opaque)
+        .map(|(i, _)| i)
+        .collect();
     while let Some(i) = protected.pop() {
         for child in dirs[i].children.clone() {
             if !dirs[child].blocked {
@@ -202,7 +220,10 @@ pub(crate) fn with_protection(
             }
         }
     }
-    if dirs.iter().any(|d| d.entries.is_none() && !d.blocked && !d.opaque) {
+    if dirs
+        .iter()
+        .any(|d| d.entries.is_none() && !d.blocked && !d.opaque)
+    {
         return Ok(None);
     }
     if !protection.is_empty() && (old.policy() != policy || old.sniffer_version() != sniffer) {
@@ -269,7 +290,9 @@ pub(crate) fn with_protection(
     // sweeping stops before iterating that boundary's old child range.
     for &id in &protection.directories {
         out.inodes.insert(id);
-        if let Some(name) = out.old.dir_name(InoId(id)) { out.names.insert(name.0); }
+        if let Some(name) = out.old.dir_name(InoId(id)) {
+            out.names.insert(name.0);
+        }
     }
     for &id in &protection.edges {
         out.names.insert(id);
@@ -288,7 +311,13 @@ pub(crate) fn with_protection(
     if observed_roots
         != refreshed
             .iter()
-            .filter(|p| !out.old.roots().any(|(id, path)| path == p.as_os_str().as_bytes() && protection.directories.contains(&id.0) && !observed_roots.contains(&path)))
+            .filter(|p| {
+                !out.old.roots().any(|(id, path)| {
+                    path == p.as_os_str().as_bytes()
+                        && protection.directories.contains(&id.0)
+                        && !observed_roots.contains(&path)
+                })
+            })
             .map(|p| p.as_os_str().as_bytes())
             .collect::<Vec<_>>()
     {
@@ -301,7 +330,9 @@ pub(crate) fn with_protection(
         let mut children = std::mem::take(&mut dirs[i].children);
         children.sort_unstable_by_key(|&c| dirs[c].observation.name);
         queue.extend(children);
-        if dirs[i].blocked { continue; }
+        if dirs[i].blocked {
+            continue;
+        }
         let d = dirs[i].observation;
         let parent = d.parent.map(|token| tokens[&token]);
         let parent_id = parent.and_then(|p| dirs[p].id);
@@ -388,12 +419,17 @@ pub(crate) fn with_protection(
         .filter(|&loc| {
             let f = loc.observation(batches);
             let dir = &dirs[tokens[&f.parent]];
-            if dir.blocked || dir.opaque { return false; }
-            if !protection.edges.is_empty() && let Some(id) = dir.id
+            if dir.blocked || dir.opaque {
+                return false;
+            }
+            if !protection.edges.is_empty()
+                && let Some(id) = dir.id
                 && out.old.is_live_inode(InoId(id))
                 && let Some(name) = out.old.lookup(InoId(id), f.name)
                 && protection.edges.contains(&name.0)
-            { return false; }
+            {
+                return false;
+            }
             true
         })
         .collect();
@@ -419,7 +455,9 @@ pub(crate) fn with_protection(
                 active = !d.blocked && !d.opaque;
                 continuing = d.id == token.previous_directory().map(|id| id.0);
             }
-            if !active || protection.edges.contains(&name.0) { continue; }
+            if !active || protection.edges.contains(&name.0) {
+                continue;
+            }
             let child = out.old.name(name).child;
             if continuing && !aliases.contains(child.0) {
                 out.names.insert(name.0);
@@ -495,10 +533,17 @@ pub(crate) fn with_protection(
     for batch in batches {
         for (parent, name, kind) in batch.ignored_entries() {
             let d = &dirs[tokens[&parent]];
-            if d.blocked || d.opaque { continue; }
-            if !protection.edges.is_empty() && let Some(id) = d.id
-                && out.old.is_live_inode(InoId(id)) && let Some(edge) = out.old.lookup(InoId(id), name)
-                && protection.edges.contains(&edge.0) { continue; }
+            if d.blocked || d.opaque {
+                continue;
+            }
+            if !protection.edges.is_empty()
+                && let Some(id) = d.id
+                && out.old.is_live_inode(InoId(id))
+                && let Some(edge) = out.old.lookup(InoId(id), name)
+                && protection.edges.contains(&edge.0)
+            {
+                continue;
+            }
             if let Some(parent) = dirs[tokens[&parent]].id {
                 out.edge(parent, ignored(kind), name);
             }
@@ -518,7 +563,9 @@ pub(crate) fn with_protection(
     for root in swept {
         let mut queue = vec![root];
         while let Some(dir) = queue.pop() {
-            if protection.directories.contains(&dir.0) { continue; }
+            if protection.directories.contains(&dir.0) {
+                continue;
+            }
             for name in out.old.children(dir) {
                 let edge = out.old.name(name);
                 if let Target::Inode(child) = edge.target()
@@ -568,10 +615,18 @@ pub(crate) fn with_protection(
             None
         };
         let stale = protection.markers.contains(&id);
-        let retained_at = stale.then(|| out.old.retained_at(InoId(id)).unwrap_or(out.old.generation().sequence));
+        let retained_at = stale.then(|| out.retained_sequence(InoId(id))).flatten();
         let entries = if stale || d.opaque { None } else { d.entries };
-        let flags = if stale { 8 } else if d.opaque { 0 } else { 4 } | if d.observation.traversed { 3 } else { 0 };
-        if stale { marked.insert(id); }
+        let flags = if retained_at.is_some() {
+            8
+        } else if stale || d.opaque {
+            0
+        } else {
+            4
+        } | if d.observation.traversed { 3 } else { 0 };
+        if stale {
+            marked.insert(id);
+        }
         if !out.old.is_live_inode(InoId(id))
             || out.old.dir_name(InoId(id)).map(|n| n.0) != name
             || out.old.entry_count(InoId(id)) != entries
@@ -589,11 +644,15 @@ pub(crate) fn with_protection(
     }
     for &id in protection.markers.difference(&marked) {
         let dir = InoId(id);
-        let retained = out.old.retained_at(dir).unwrap_or(out.old.generation().sequence);
-        if out.old.entry_count(dir).is_some() || out.old.retained_at(dir) != Some(retained) {
+        let retained = out.retained_sequence(dir);
+        if out.old.entry_count(dir).is_some() || out.old.retained_at(dir) != retained {
             out.changes.records.push(Record::DirPut {
-                id, name: out.old.dir_name(dir).map(|n| n.0), entries: None,
-                flags: 8 | if out.old.is_traversed(dir) { 3 } else { 0 }, retained_at: Some(retained),
+                id,
+                name: out.old.dir_name(dir).map(|n| n.0),
+                entries: None,
+                flags: if retained.is_some() { 8 } else { 0 }
+                    | if out.old.is_traversed(dir) { 3 } else { 0 },
+                retained_at: retained,
             });
         }
     }
@@ -601,7 +660,9 @@ pub(crate) fn with_protection(
         .iter()
         .flat_map(Batch::work_tree_observations)
         .filter_map(|(token, kind, path, identity)| {
-            if dirs[tokens[&token]].blocked || dirs[tokens[&token]].opaque { return None; }
+            if dirs[tokens[&token]].blocked || dirs[tokens[&token]].opaque {
+                return None;
+            }
             dirs[tokens[&token]]
                 .id
                 .map(|id| (id, (kind, path, identity)))
@@ -642,6 +703,13 @@ pub(crate) fn with_protection(
 }
 
 impl Final<'_> {
+    fn retained_sequence(&self, id: InoId) -> Option<u64> {
+        self.old.retained_at(id).or_else(|| {
+            self.old
+                .entry_count(id)
+                .map(|_| self.old.generation().sequence)
+        })
+    }
     fn edge(&mut self, parent: u32, child: u32, name: &[u8]) {
         if self.old.is_live_inode(InoId(parent))
             && let Some(id) = self.old.lookup(InoId(parent), name)

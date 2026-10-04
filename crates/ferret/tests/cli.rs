@@ -545,8 +545,8 @@ fn json_round_trips_a_path_that_is_not_utf8() {
 }
 
 #[test]
-// D26 amendment: a denied listing is permanent state, and publishes the
-// directory but no children. Other coverage faults still block publication.
+// M5 retains a denied directory's old children while trustworthy siblings
+// publish. The CLI reports that those counts/listings are stale.
 fn an_unreadable_directory_publishes_its_row_and_other_changes() {
     let env = Env::new("coverage");
     env.write("ok.txt", b"ok\n");
@@ -562,7 +562,7 @@ fn an_unreadable_directory_publishes_its_row_and_other_changes() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(paths(&env.run(&[os("search"), os("locked")])), [locked]);
-    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 0);
     assert_eq!(code(&env.run(&[os("search"), os("new")])), 0);
 }
 
@@ -2146,5 +2146,53 @@ fn stats_effective_depth_census_matches_a_fresh_checkpoint() {
     assert_eq!(
         text[0].split_once("\ncontent (file inodes)").unwrap().1,
         text[1].split_once("\ncontent (file inodes)").unwrap().1
+    );
+}
+
+#[test]
+fn retained_subtree_remains_searchable_and_find_uses_the_live_boundary() {
+    let env = Env::new("retained-find");
+    env.seed_ignore_file();
+    let old = env.write("locked/old.txt", b"old\n");
+    let locked = old.parent().unwrap().to_owned();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let recrawl = env.run(&[os("index")]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code(&recrawl), 0, "{}", stderr(&recrawl));
+    assert!(stderr(&recrawl).contains("protected scope"));
+    assert_eq!(
+        paths(&env.run(&[os("search"), os("old.txt")])),
+        std::slice::from_ref(&old)
+    );
+    // The retained indexed listing cannot see this addition. Find must cross
+    // its unknown-count boundary live, including metadata through the handle.
+    let added = env.write("locked/new.txt", b"new content\n");
+    let found = env.run(&[
+        os("find"),
+        env.tree().as_os_str(),
+        os("-name"),
+        os("*.txt"),
+        os("-print"),
+    ]);
+    let mut actual = paths(&found);
+    actual.sort();
+    let mut expected = vec![old.clone(), added];
+    expected.sort();
+    assert_eq!(code(&found), 0, "{}", stderr(&found));
+    assert_eq!(actual, expected);
+    fs::write(&old, b"updated live content with a different length\n").unwrap();
+    let metadata = env.run(&[
+        os("find"),
+        locked.as_os_str(),
+        os("-name"),
+        os("old.txt"),
+        os("-printf"),
+        os("%s"),
+    ]);
+    assert_eq!(code(&metadata), 0, "{}", stderr(&metadata));
+    assert_eq!(
+        String::from_utf8_lossy(&metadata.stdout),
+        fs::metadata(&old).unwrap().len().to_string()
     );
 }

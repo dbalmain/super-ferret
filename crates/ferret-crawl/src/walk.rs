@@ -880,15 +880,26 @@ thread_local! {
 /// Shared, root-keyed syscall seam for coverage tests across real workers.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IoPoint { Root, Directory, Child, Listing(usize) }
+pub(crate) enum IoPoint {
+    Root,
+    Directory,
+    Child,
+    Listing(usize),
+}
 #[cfg(test)]
-pub(crate) type IoHook = std::sync::Arc<dyn Fn(IoPoint, &Path) -> Option<(IoOp, io::Error)> + Send + Sync>;
+pub(crate) type IoHook =
+    std::sync::Arc<dyn Fn(IoPoint, &Path) -> Option<(IoOp, io::Error)> + Send + Sync>;
 #[cfg(test)]
-pub(crate) static IO_HOOKS: std::sync::Mutex<Vec<(PathBuf, IoHook)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static IO_HOOKS: std::sync::Mutex<Vec<(PathBuf, IoHook)>> =
+    std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 fn inject(root: &Path, point: IoPoint, rel: &Path) -> Option<(IoOp, io::Error)> {
-    let hook = IO_HOOKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter().find(|(r, _)| r == root).map(|(_, h)| h.clone());
+    let hook = IO_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(r, _)| r == root)
+        .map(|(_, h)| h.clone());
     hook.and_then(|h| h(point, rel))
 }
 
@@ -1119,7 +1130,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                         kind: entry.file_type(),
                     });
                     #[cfg(test)]
-                    if let Some((op, error)) = inject(&self.root, IoPoint::Listing(children.entries.len()), bytes_path(&self.rel)) {
+                    if let Some((op, error)) = inject(
+                        &self.root,
+                        IoPoint::Listing(children.entries.len()),
+                        bytes_path(&self.rel),
+                    ) {
                         self.fail(op, context, error);
                         children.complete = false;
                         break;
@@ -1236,7 +1251,14 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     ) -> Option<Job<V::Dir>> {
         #[cfg(test)]
         if let Some((op, error)) = inject(&self.root, IoPoint::Child, bytes_path(&self.rel)) {
-            self.fail(op, FaultContext::Child { parent: here.token, name }, error);
+            self.fail(
+                op,
+                FaultContext::Child {
+                    parent: here.token,
+                    name,
+                },
+                error,
+            );
             return None;
         }
         match kind {

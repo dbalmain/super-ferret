@@ -1,3 +1,5 @@
+#[path = "../../../ferret-catalog/tests/support/listing.rs"]
+mod checkpoint_oracle;
 mod coverage;
 mod gitfile;
 mod golden;

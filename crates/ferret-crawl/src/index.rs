@@ -11,17 +11,15 @@
 //! reconcile      resolve directory tokens; diff and sweep refreshed roots
 //!                promote a kept alias root if its shared inode needs a stat
 //! commit         append one final set; equal rows publish nothing
-//! fallback       initial indexing or incomplete EACCES builds a checkpoint
+//! retain         typed faults protect checked old boundaries across workers
+//! checkpoint     initial indexing or an explicit format migration
 //! ```
 //!
-//! A **coverage fault** is any [`Event::Io`] except an entry's `lstat`
-//! NotFound (a deletion), and EACCES from opening or listing a directory
-//! (a catalogued directory with unknown contents, D26 amendment). It means the
-//! walk may have missed entries or applied the wrong ignore rules, so nothing
-//! is published and the old generation stays. A **content fault** leaves the
-//! namespace intact: the file is published with
-//! [`ContentState::Fault`](ferret_catalog::ContentState) and no document, and
-//! the next run reads it again.
+//! A coverage fault protects a checked old edge or directory subtree. New
+//! observations in that scope are discarded after all workers finish; other
+//! trustworthy scopes can publish. Missing anchors, changed global versions
+//! and uncertain root boundaries block the transaction. Content faults publish
+//! valid namespace/stat observations as Fault/no-document and retry next run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -140,11 +138,10 @@ pub enum IndexError {
     /// Commit failed. [`CommitError::published`] says whether the new
     /// generation is visible anyway.
     Commit(CommitError),
-    /// Incremental reconciliation or publication failed. An incomplete resident
-    /// recrawl is blocked until M5 can represent protected fault scopes.
+    /// Incremental reconciliation or publication failed.
     Update(ferret_catalog::log::Error),
-    /// This resident run has incomplete directory coverage. M4 cannot retain
-    /// its protected scopes; an owned batch run can use checkpoint fallback.
+    /// An incomplete observation has no typed protection result. An owned
+    /// caller can transfer its session to an explicit checkpoint fallback.
     NeedsCheckpoint { report: Box<Report> },
 }
 
@@ -275,7 +272,8 @@ pub struct Report {
     pub content_faults: Vec<(PathBuf, ContentFault)>,
     /// Ignore-file problems, as text.
     pub pattern_errors: Vec<String>,
-    /// Typed faults retained by scoped reconciliation; stale counts are unknown.
+    /// Typed faults retained by scoped reconciliation; stale counts are
+    /// unknown.
     pub coverage_faults: Vec<CoverageFault>,
     /// Outermost retained edges/subtrees and new opaque directory scopes.
     pub protected_scopes: usize,
@@ -328,9 +326,10 @@ impl Published {
 /// - a root with another root added or removed strictly inside it is walked,
 ///   because its kept copy stopped at the old inner roots (D34).
 ///
-/// The writer lock is taken first and held until the commit. A coverage
-/// fault other than a directory listing/open EACCES publishes nothing
-/// ([`IndexError::Coverage`]).
+/// The writer lock is held through publication. Typed coverage faults retain
+/// checked old scopes while trustworthy observations elsewhere publish. An
+/// unresolvable scope or an incompatible version/root transition publishes
+/// nothing ([`IndexError::Coverage`]).
 pub fn index(
     catalog_dir: &Path,
     roots: &[PathBuf],
@@ -479,9 +478,8 @@ fn run(
 
 /// Recrawls using a resident session, retaining its lookups and writer lock.
 /// The complete configured root set and D34 widening have the same contract as
-/// `index`. Incomplete EACCES coverage blocks this resident API in M4; the
-/// batch CLI can transfer its owned session to the amended A′ checkpoint
-/// fallback.
+/// `index`. Typed faults retain checked old scopes in the same log transaction
+/// as trustworthy updates, without rebuilding the checkpoint.
 pub fn recrawl(
     session: &mut WriterSession,
     roots: &[PathBuf],
@@ -532,13 +530,25 @@ fn observe_reconcile(
     let (mut batches, mut report) = observe(source, plan, options)?;
     loop {
         let started = Instant::now();
-        let Some(protection) = crate::coverage::resolve(session, &batches, &report.coverage_faults, &plan.roots) else {
-            return Err(IndexError::Coverage { faults: std::mem::take(&mut report.coverage_faults), report: Box::new(report) });
+        let Some(protection) =
+            crate::coverage::resolve(session, &batches, &report.coverage_faults, &plan.roots)
+        else {
+            return Err(IndexError::Coverage {
+                faults: std::mem::take(&mut report.coverage_faults),
+                report: Box::new(report),
+            });
         };
-        if !protection.is_empty() && (session.view().policy() != fingerprint(options) || session.view().sniffer_version() != options.sniffer) {
-            return Err(IndexError::Coverage { faults: std::mem::take(&mut report.coverage_faults), report: Box::new(report) });
+        if !protection.is_empty()
+            && (session.view().policy() != fingerprint(options)
+                || session.view().sniffer_version() != options.sniffer)
+        {
+            return Err(IndexError::Coverage {
+                faults: std::mem::take(&mut report.coverage_faults),
+                report: Box::new(report),
+            });
         }
-        report.protected_scopes = protection.directories.len() + protection.edges.len() + protection.opaque.len();
+        report.protected_scopes =
+            protection.directories.len() + protection.edges.len() + protection.opaque.len();
         let changes = crate::reconcile::with_protection(
             session,
             &batches,
@@ -641,7 +651,9 @@ fn observe_reconcile(
         report
             .pattern_errors
             .append(&mut extra_report.pattern_errors);
-        report.coverage_faults.append(&mut extra_report.coverage_faults);
+        report
+            .coverage_faults
+            .append(&mut extra_report.coverage_faults);
         report.refreshed.clone_from(&plan.refresh);
         report.kept.clone_from(&plan.keep);
     }
@@ -727,7 +739,11 @@ fn observe(
     if !faults.is_empty() && matches!(source, Source::Checkpoint(_)) {
         // Initial/checkpoint indexing has no checked prior graph to retain.
         // Preserve amended A′ for opaque EACCES, block other coverage faults.
-        faults.retain(|f| !(matches!(f.op, IoOp::OpenDir | IoOp::List) && f.error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())));
+        faults.retain(|f| {
+            !(!f.on_root
+                && matches!(f.op, IoOp::OpenDir | IoOp::List)
+                && f.error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error()))
+        });
     }
     if !faults.is_empty() && matches!(source, Source::Checkpoint(_)) {
         return Err(IndexError::Coverage {
@@ -762,11 +778,41 @@ fn finish_report(
     faulted: Option<&[InoId]>,
 ) {
     let started = Instant::now();
-    let seen = std::mem::take(&mut report.content_faults);
+    let seen = std::mem::take(&mut report.content_faults)
+        .into_iter()
+        .filter(|(path, _)| published_content_fault(catalog, path))
+        .collect();
     report.content_faults = content_faults_with(catalog, &plan.refresh, seen, faulted);
     report.counts.content_faults = report.content_faults.len() as u64;
     report.fault_time = started.elapsed();
     report.published = changed.then(|| Published::of(catalog));
+}
+
+// Fault reports describe the effective indexed row, including retained data.
+// Resolve's live-fallback boundary is deliberately crossed through checked
+// child keys here; this is reporting, not permission to use a stale listing.
+fn published_content_fault(catalog: &Catalog, path: &Path) -> bool {
+    let Some(resolved) = catalog.resolve(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut target = resolved.target;
+    for component in resolved
+        .remainder
+        .split(|&b| b == b'/')
+        .filter(|part| !part.is_empty())
+    {
+        let ferret_catalog::Target::Inode(parent) = target else {
+            return false;
+        };
+        if !catalog.is_directory(parent) {
+            return false;
+        }
+        let Some(name) = catalog.lookup(parent, component) else {
+            return false;
+        };
+        target = catalog.name(name).target();
+    }
+    matches!(target, ferret_catalog::Target::Inode(id) if catalog.state(id) == ContentState::Fault)
 }
 
 /// Every name under a refreshed root whose inode the catalog published as
@@ -1093,7 +1139,13 @@ impl<'a> Hasher<'a> {
             .file(decided.parent, decided.name.as_bytes(), stat, content);
     }
 
-    fn fault(&mut self, path: &Path, op: IoOp, context: FaultContext<'_ , DirToken>, error: io::Error) {
+    fn fault(
+        &mut self,
+        path: &Path,
+        op: IoOp,
+        context: FaultContext<'_, DirToken>,
+        error: io::Error,
+    ) {
         self.out.faults.push(CoverageFault {
             root: self.root.to_owned(),
             path: path.to_owned(),
@@ -1102,7 +1154,10 @@ impl<'a> Hasher<'a> {
             context: match context {
                 FaultContext::Root => CoverageContext::Root,
                 FaultContext::Dir(token) => CoverageContext::Directory(token),
-                FaultContext::Child { parent, name } => CoverageContext::Child { parent, name: name.as_bytes().to_vec() },
+                FaultContext::Child { parent, name } => CoverageContext::Child {
+                    parent,
+                    name: name.as_bytes().to_vec(),
+                },
             },
             error,
         });

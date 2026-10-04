@@ -53,23 +53,21 @@ These are constraints found in the code, rather than inferred from DESIGN:
 - `walk.rs` already has `IoOp` and `FaultContext::{Root, Dir, Child}`. The
   original D33/D26 operation-tag addition has landed. `Entered.entries` is
   absent on a partial listing. Entries read before a listing fault can still
-  generate events. `index.rs` treats non-root Lstat/NotFound as deletion,
-  permits OpenDir/List EACCES and aborts on other coverage faults. The EACCES
-  exception currently writes the directory without its old children.
+  generate events. `index.rs` treats non-root Lstat/NotFound as deletion
+  and resolves other typed faults after all workers finish. Existing unchanged
+  old scopes are retained without copying; new unreadable child directories may
+  be opaque. A root fault without an old unchanged root, an unresolvable context
+  or a global policy/sniffer transition under protection blocks publication.
 - Ignored edges have one of seven high child tags and no inode. Failed
   re-inclusion traversal collapses to an opaque ignored edge. Specials have
   stat rows and a sparse kind table. Directory entry counts include ignored
   children and are distinct from the indexed child count.
 
-M4 implements the recrawl producer and resident `WriterSession`. The batch CLI
-uses log transactions for completely covered recrawls, initial indexing uses a
-checkpoint, and incomplete EACCES observations transfer the held lock to the
-existing checkpoint fallback. The resident `recrawl` API blocks those incomplete
-observations until M5 supplies protected fault scopes.
-
-The proposed fault reconciliation replaces the last two coverage rules only
-in its own slice. Until that slice lands, keep the current amended A′ rule.
-Do not temporarily treat an unclassified fault as a deletion.
+M4/M4b implement the recrawl producer and resident `WriterSession`; M5 resolves
+coverage faults into checked directory/edge scopes and publishes retention with
+trustworthy updates in one log transaction. Initial indexing uses a checkpoint;
+without an old root to protect, a root fault blocks it. New child directory EACCES
+may still publish an opaque row. Never treat an unclassified fault as deletion.
 
 ## Files and publication
 
@@ -643,7 +641,11 @@ Boundary. `Entered` starts descendants and cannot serve as their completion
 marker. The completion result can be aggregated by crawl from existing typed
 events; M5 tests whether an explicit walker completion event reduces state.
 Fault scopes are transaction-local directory tokens or checked old edge ids,
-not path-prefix string guesses.
+not path-prefix string guesses. M5 aggregates typed events after the joined walk;
+`Entered.entries` plus the complete set of typed faults supplies the final
+coverage result. No walker completion event is needed while the crawl joins
+all workers before reconciliation; M6 must preserve that completion proof when
+it releases directory observations incrementally.
 
 | Fault | Publication rule |
 | --- | --- |
@@ -668,15 +670,20 @@ hard-link changes outside it may update the shared inode; retained names still
 refer to that inode, with fresh trustworthy observations winning as in D31.
 
 Retain an existing subtree by **not emitting deletes**, not by copying it.
-Only the faulted directory's coverage row/diagnostic changes. The retained-at
+Only the faulted directory's coverage row/diagnostic changes. For a retained
+non-directory edge, the parent carries that diagnostic/unknown count while
+trustworthy siblings may still update; files have no directory coverage column. The retained-at
 sequence identifies its last trustworthy subtree, not the latest failed
 attempt; repeated identical faults do not force a new generation. This is
 D26 A carried by B's log. When a later listing succeeds, reconcile against that
 retained subtree and clear its coverage marker in the same transaction.
 Protection under a changed global policy/sniffer cannot be represented under
 one advanced version; abort that version transition until every root is
-reclassified. Report protected scopes and counts to the caller; partial
-coverage is visible even when other scopes commit successfully.
+reclassified. Report typed faults and the number of outermost protected scopes to the caller;
+the CLI warns about retained data and stale counts even when other scopes commit
+successfully. Root-set edits block only when their changed boundary lies within
+an anchored protected directory (or an opaque new directory), rather than
+blocking unrelated root removals.
 
 ## Documents and checksum
 

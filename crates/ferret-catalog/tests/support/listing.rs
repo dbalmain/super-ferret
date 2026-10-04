@@ -100,4 +100,3 @@ pub(crate) fn listings(c: &Catalog) -> Vec<Listing> {
     rows.sort();
     rows
 }
-
