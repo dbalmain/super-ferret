@@ -69,6 +69,7 @@ Predecessors, carried forward where still open:
 | D51 | Compaction while the watcher is busy                     | answered       | A: idle-boundary compaction under the writer lock; pause measured and reported in M7                            |
 | D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
 | D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
+| D54 | In-memory names: interning, postings, row order          | open           | Recommend B: intern + row postings + terms, keep BFS order                                                     |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2908,3 +2909,52 @@ write amplification and code cost. Measure query-only construction for B before
 crediting it with the full 220 ms gap.
 
 > Dave (2026-10-05): agreed with the recommendation, A. Keep semantic validation on cold open; evaluate C alongside M7's budgets.
+
+## D54 — In-memory names: interning, postings, row order
+
+**Status: open.** Measured 2026-10-05 in the private bench repo
+`~/w/name-index-bench` (github.com/dbalmain/name-index-bench); its README
+holds the method and full tables.
+
+**Question:** Should the in-memory name catalog keep D28 A's raw heap in BFS
+order, intern names and add row postings and a term index, or also move rows
+to DFS preorder?
+
+The bench models each layout over two walker dumps, `$HOME` (459,713 rows,
+133,749 distinct names) and `/nix/store` (4.2M rows, 357k distinct). It runs 46
+query shapes mined from 315 agent `find` calls, plus fuzzy and term queries.
+Everything is bit-packed with intpack, and every strategy's output equals a flat
+full-path reference. "Interning" means a sorted table of distinct names plus a
+bit-packed name id per row. A name query scans the distinct table, then either
+passes over the ids or, with **row postings** (name id → rows), jumps to the
+rows. The **term index** is a token FST with postings. The memory figures for
+interning were measured in DFS order; B's BFS figures are **estimates** (same
+ids and table, BFS first-child array in place of the DFS tree arrays).
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep the raw BFS heap (D28 A) | 25.4 B/row on `$HOME`, 17.1 on nix (11.7 / 72.0 MB); ~171 MB at 10M at nix density. Selective name queries 0.4–3 ms on `$HOME` and 2–22 ms on nix; no term or Levenshtein search beyond a 100–760 ms scan. | No work. Children stay one slice; nothing in S1+ changes. |
+| B. Intern names, add row postings and the term index; keep BFS order | ~16–19 B/row on `$HOME` and ~9–10 on nix, estimated (≈ 8.7 / 43 MB; ~100 MB at 10M). A distinct-table build and a postings build at compaction; name lookup by path goes through the table (binary search) rather than the heap. Scoped name queries over big subtrees stay a walk or a global hit list filtered by ancestor (unmeasured in BFS). | Selective name queries 0.1–0.8 ms on `$HOME`, 0.3–7 ms on nix (3–10× faster than A); terms 0.7–10 ms, Levenshtein 0.8–8 ms (30–150×). 25–250× faster than warm `fd -H`. Children stay a slice. |
+| C. B, and rows in DFS preorder | Measured: 18.9 B/row on `$HOME`, 10.2 on nix (8.7 / 42.8 MB). Every place that assumes `(parent, name)` order changes. Children are found by hopping subtrees, not a slice, so path lookup and re-runs cost more (unmeasured). | A scope is one contiguous row range: scoped name queries 0.2 ms against 2.8 ms (BFS walk) in a 79k-row monorepo; listings 1.3–1.8× faster; basename-driven path scans 1.7–2.5× faster than in BFS. |
+
+Across all three, path patterns usually imply a basename
+(`*/.github/workflows/*.yml` → names ending `.yml`). Scanning for it and
+verifying the path beats a walk by 10–40×, while anchored patterns must walk.
+That is a planner rule and needs no format change. Trigrams, a suffix array and
+an FST of names did not pay: none beat a scan of the distinct table by more than
+~20%, at 1.4–20 B/row.
+
+Fuzzy full-path search is the weak spot in every option: 60–90 ms on `$HOME`
+and 200–400 ms on nix, only 4.6× faster than `fd -H | fzf`. Per-directory
+subtree byte masks (1.4–2.2 B/row) speed long queries 2–3×. That belongs to a
+fuzzy brief when fuzzy search is scheduled, not to this one.
+
+**Recommendation:** B, after S1+ merges. Fastest and simplest disagree only on
+order. B takes most of the win — 2–2.5× less memory, and the 3–150× speed-ups —
+without touching the `(parent, name)` order S1+ is built on, and C's further
+gains are on queries that are already a few milliseconds.
+
+**Fact that would change it:** a B prototype where a scoped name query over a
+large subtree (the 79k-row monorepo, a nixpkgs checkout) misses ~10 ms, or the
+writer finding DFS order cheaper to maintain across compaction. Either would
+favour C.
