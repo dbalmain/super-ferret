@@ -898,7 +898,8 @@ Tests use the real walker, crawl API, writer and disk reader, with M3's full-ind
 oracle. Retained expectations take actual rows from the pre-fault checkpoint.
 The matrix covers namespace operations/errors/contexts, content I/O, vanished
 children, invalid patterns, partial listings across four workers, new/replaced
-and moved directories, overlapping scopes, stale counts, repeat/recovery,
+and moved directories, overlapping scopes, stale counts, retained work-tree
+auxiliary state, repeat/recovery,
 policy/sniffer changes and protected hard links. The CLI test verifies retained
 search results and find's live listing/metadata fallback. Workspace gates:
 **521 passed / 4 ignored**, zero warnings; real log size/mtime unchanged.

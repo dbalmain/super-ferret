@@ -208,11 +208,18 @@ fn partial_listing_across_workers_discards_the_observed_prefix_and_retains_stale
         tmp.write(&format!("dir/child-{i}/a"), b"old");
     }
     tmp.write("outside", b"stable");
+    tmp.write("dir/.git/HEAD", b"ref: refs/heads/main\n");
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
     let mut session = WriterSession::open(&tmp.cat()).unwrap();
     let before = session.view();
+    let old_dir = directory(&before, &tmp.tree(), b"dir");
+    let old_common = before.work_tree(old_dir).unwrap().common_id;
+    // Replacing Git metadata during a faulty listing must not clear or replace
+    // retained auxiliary state; recovery adopts it with fresh children.
+    fs::rename(tmp.at("dir/.git"), tmp.base.join("displaced-git")).unwrap();
+    tmp.write("dir/.git/HEAD", b"ref: refs/heads/main\n");
     for i in 0..20 {
         fs::write(tmp.at(&format!("dir/child-{i}/a")), b"new version").unwrap();
     }
@@ -224,6 +231,7 @@ fn partial_listing_across_workers_discards_the_observed_prefix_and_retains_stale
     assert!(report.counts.files_read > 0, "prefix really walked");
     let faulted = session.view();
     let dir = directory(&faulted, &tmp.tree(), b"dir");
+    assert_eq!(faulted.work_tree(dir).unwrap().common_id, old_common);
     assert_eq!(faulted.entry_count(dir), None);
     assert_eq!(faulted.has_children(dir), None);
     assert_eq!(
@@ -239,6 +247,7 @@ fn partial_listing_across_workers_discards_the_observed_prefix_and_retains_stale
     assert_eq!(listings(&faulted), listings(&open(&tmp.cat())));
     recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
     assert_eq!(session.view().retained_at(dir), None);
+    assert_ne!(session.view().work_tree(dir).unwrap().common_id, old_common);
     assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
 }
 
