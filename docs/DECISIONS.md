@@ -66,9 +66,9 @@ Predecessors, carried forward where still open:
 | D48 | The next move after S1                                   | answered       | A: compaction; name index only if 10M misses 1 GB                                                              |
 | D49 | A one-shot query with no daemon running                  | answered       | A: spawn on first use, in-process fallback                                                                     |
 | D50 | `ferret find` stretch calls F1–F13                       | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                     |
-| D51 | Compaction while the watcher is busy                     | open           |                                                                                                                |
-| D52 | D27 C: ids across compaction                             | proceeding on the recommendation; Dave may veto | B: epoch-scoped InoId/NameId; DocId stays stable |
-| D53 | Cold-open overlay validation                             | open           | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
+| D51 | Compaction while the watcher is busy                     | answered       | A: idle-boundary compaction under the writer lock; pause measured and reported in M7                            |
+| D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
+| D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2502,7 +2502,7 @@ explicit `ferretd` is the whole design.
 **Answer (2026-09-30): A.** Start the daemon on first use; build the engine in
 process when a background process is not allowed or `FERRET_NO_DAEMON` is set.
 
-## D50 — The `ferret find` stretch's calls (answered 2026-10-03, on the decisions page)
+## D50 — The `ferret find` stretch's calls (answered 2026-10-03)
 
 The find stretch (ROADMAP § S1c, milestones M1–M5c) asked its questions on an
 HTML decisions page rather than here, numbered F1–F13. Each is recorded below
@@ -2723,6 +2723,17 @@ times) and blocks 6.1 MB, against 553 MB of sections.
 lazy. The fact that would change it: query logs showing `-ls` or `%k` in normal
 use (then C).
 
+### README — which mode it leads with
+
+**Question:** Should README lead with `-I` instead of default mode, given F8's
+"not advertised until the daemon keeps the index current"?
+
+- A. Lead with `-I`, which is current without a daemon.
+- B. Keep README as it is, leading with default mode.
+
+**Answer: B.** Dave, 2026-10-03: "not advertised" means not posting about
+ferret online. The README may lead with default mode.
+
 ### M4b's own calls, recorded in D47
 
 The config key `find_no_ignore = true`, and refusing default mode without a
@@ -2789,9 +2800,9 @@ in overlapping read-only starts: with `-quit`, a later missing start reported
 ENOENT and exit 1 before the first start quit, where GNU exits 0 silently.
 Starts now also sequence when the expression contains `-quit`.
 
-## D51 — Compaction while the watcher is busy (open)
+## D51 — Compaction while the watcher is busy (answered 2026-10-05)
 
-**Status: open.** S1+ M0, 2026-10-03; [design](S1PLUS.md).
+**Status: answered, A (Dave, 2026-10-05).** S1+ M0, 2026-10-03; [design](S1PLUS.md).
 
 **Question:** May an incremental checkpoint pause the writer for seconds, or
 must S1b keep applying bursts while it compacts? Queries keep their pinned
@@ -2824,9 +2835,11 @@ the smaller checkpoint helps both options, so the recommendation stays A.
 accepted lag even on an idle-priority run. Either favours B. S1b's observed
 burst rate and the permitted lag, rather than snapshot size alone, decide it.
 
+> Dave (2026-10-05): agreed with the recommendation, A. Compaction pauses the writer at an idle boundary; M7 measures and reports the pause.
+
 ## D52 — D27 C: ids across compaction
 
-**Status: proceeding on the recommendation; Dave may veto.** S1+ M0 round 2,
+**Status: answered, B (Dave, 2026-10-05).** S1+ M0 round 2,
 2026-10-03; [design and consumer check](S1PLUS.md#epoch-scoped-ids).
 
 **Question:** Does D27 C's “stable, never reused; holes until compaction” require
@@ -2870,10 +2883,11 @@ re-resolution/rebuild or freshness cost must outweigh A's extra 159.7 MB,
 translation and map maintenance. No such consumer was found in current code
 or the S1b/S2 plans. D51 remains open about the permitted writer pause.
 
+> Dave (2026-10-05): agreed with the recommendation, B. Epoch-scoped InoId/NameId, renumbered at compaction; DocId stays stable.
 
-## D53 — Cold-open overlay validation (open)
+## D53 — Cold-open overlay validation (answered 2026-10-05)
 
-**Status: open.** S1+ M5 Part A, 2026-10-04; [design](S1PLUS.md).
+**Status: answered, A (Dave, 2026-10-05).** S1+ M5 Part A, 2026-10-04; [design](S1PLUS.md).
 
 **Question:** Should a cold name reader replay and semantically validate the
 published overlay, trust the writer's validated transactions, or load a persisted
@@ -2905,3 +2919,5 @@ mechanism, not an existing format feature. Part A's detailed analysis is in
 2%, or a C prototype meeting that goal with acceptable publication latency,
 write amplification and code cost. Measure query-only construction for B before
 crediting it with the full 220 ms gap.
+
+> Dave (2026-10-05): agreed with the recommendation, A. Keep semantic validation on cold open; evaluate C alongside M7's budgets.
