@@ -403,10 +403,27 @@ impl Batch {
         self.pending_bytes = bytes;
     }
 
+    /// Seals a worker's output and releases its temporary buffers. Metrics
+    /// survive; equal rows have already become seen bits and changed rows
+    /// remain available to the final reconciler.
+    pub fn seal(&mut self) {
+        self.finish_observations();
+        self.pending = Vec::new();
+        self.pending_bytes = Vec::new();
+    }
+
     pub(crate) fn materialize(&mut self) {
         self.finish_observations();
         let old = self.previous.take();
         if let Some(old) = old {
+            let preserved = std::mem::take(&mut self.preserved);
+            for id in preserved.ids() {
+                let edge = old.name(id);
+                let parent = preserved.parents[&edge.parent];
+                if let crate::Target::Ignored(kind) = edge.target() {
+                    self.ignored(parent, edge.bytes, kind);
+                }
+            }
             let reused = std::mem::take(&mut self.reused);
             for id in reused.ids() {
                 let edge = old.name(id);
@@ -426,6 +443,15 @@ impl Batch {
     /// Records an ignored name without stat or content. A directory is an
     /// opaque marker: nothing below it is recorded.
     pub fn ignored(&mut self, parent: DirToken, name: &[u8], kind: Kind) {
+        if let Some(old) = &self.previous
+            && let Some(id) = parent
+                .previous_directory()
+                .and_then(|p| old.lookup(p, name))
+            && old.name(id).target() == crate::Target::Ignored(kind)
+        {
+            self.preserved.insert(parent, id, None, false);
+            return;
+        }
         let name = push(&mut self.names, name, &mut self.overflow);
         self.ignored.push(IgnoredEntry { parent, name, kind });
     }

@@ -30,8 +30,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ferret_catalog::{
-    BeginError, Catalog, CommitError, Content, ContentState, DirToken, InoId, KeepError, Stat,
-    Transaction, WriterSession,
+    BeginError, Catalog, CommitError, Content, ContentState, DirToken, InoId, KeepError, NameId,
+    Stat, Transaction, WriterSession,
 };
 use ferret_policy::{Config, Decision, Reason};
 
@@ -429,14 +429,18 @@ fn run(
                 changes,
             } = observe_reconcile(&session, &mut plan, options)?;
             let started = Instant::now();
-            let (catalog, changed, faulted) = match changes {
+            let (catalog, changed, faulted, aliases) = match changes {
                 Some(changes) => {
                     let changed = !changes.records.is_empty();
                     let faulted = faulted_inodes(&changes);
                     let catalog = session
                         .commit(&changes, options.sniffer)
                         .map_err(IndexError::Update)?;
-                    (catalog, changed, Some(faulted))
+                    let aliases: Vec<_> = faulted
+                        .iter()
+                        .flat_map(|&id| session.names_for(id))
+                        .collect();
+                    (catalog, changed, Some(faulted), Some(aliases))
                 }
                 None => {
                     let mut txn = session.into_checkpoint(options.sniffer);
@@ -448,11 +452,18 @@ fn run(
                         txn.keep(root.as_os_str().as_bytes())
                             .map_err(IndexError::Keep)?;
                     }
-                    (txn.commit().map_err(IndexError::Commit)?, true, None)
+                    (txn.commit().map_err(IndexError::Commit)?, true, None, None)
                 }
             };
             report.commit_time += started.elapsed();
-            finish_report(&mut report, &catalog, &plan, changed, faulted.as_deref());
+            finish_report(
+                &mut report,
+                &catalog,
+                &plan,
+                changed,
+                faulted.as_deref(),
+                aliases.as_deref(),
+            );
             Ok(report)
         }
         Err(ferret_catalog::log::Error::MissingCheckpoint)
@@ -481,7 +492,7 @@ fn run(
             }
             let catalog = txn.commit().map_err(IndexError::Commit)?;
             report.commit_time += started.elapsed();
-            finish_report(&mut report, &catalog, &plan, true, None);
+            finish_report(&mut report, &catalog, &plan, true, None, None);
             Ok(report)
         }
         Err(ferret_catalog::log::Error::Locked) => Err(IndexError::Begin(BeginError::Locked)),
@@ -546,7 +557,18 @@ pub(crate) fn recrawl_scoped(
         .commit(&changes, options.sniffer)
         .map_err(IndexError::Update)?;
     report.commit_time += started.elapsed();
-    finish_report(&mut report, &catalog, &plan, changed, Some(&faulted));
+    let aliases: Vec<_> = faulted
+        .iter()
+        .flat_map(|&id| session.names_for(id))
+        .collect();
+    finish_report(
+        &mut report,
+        &catalog,
+        &plan,
+        changed,
+        Some(&faulted),
+        Some(&aliases),
+    );
     Ok((report, changes))
 }
 
@@ -791,18 +813,22 @@ fn observe(
             .into_iter()
             .map(|v| v.finish(&mut faults))
             .collect();
+        let mut observation_rows = 0;
+        let mut observation_bytes = 0;
         for mut output in outputs {
             output.resolve(&cache);
-            output.batch.finish_observations();
+            output.batch.seal();
             let (rows, bytes) = output.batch.observation_peak();
-            report.observation_rows_peak += rows;
-            report.observation_bytes_peak += bytes;
+            observation_rows += rows;
+            observation_bytes += bytes;
             report.counts.add(&output.counts);
             report.hash_time += output.read_time;
             report.content_faults.append(&mut output.content_faults);
             report.pattern_errors.append(&mut output.pattern_errors);
             batches.push(output.batch);
         }
+        report.observation_rows_peak = report.observation_rows_peak.max(observation_rows);
+        report.observation_bytes_peak = report.observation_bytes_peak.max(observation_bytes);
     }
     report.counts.cached_inodes = cache.len() as u64;
     report.counts.deferred_peak = cache.deferred_peak();
@@ -857,6 +883,7 @@ fn finish_report(
     plan: &Plan,
     changed: bool,
     faulted: Option<&[InoId]>,
+    aliases: Option<&[NameId]>,
 ) {
     let started = Instant::now();
     report
@@ -866,7 +893,7 @@ fn finish_report(
         .into_iter()
         .filter(|(path, _)| published_content_fault(catalog, path))
         .collect();
-    report.content_faults = content_faults_with(catalog, &plan.refresh, seen, faulted);
+    report.content_faults = content_faults_with(catalog, &plan.refresh, seen, faulted, aliases);
     report.counts.content_faults = report.content_faults.len() as u64;
     report.fault_time = started.elapsed();
     report.published = changed.then(|| Published::of(catalog));
@@ -914,7 +941,7 @@ pub(crate) fn content_faults(
     refresh: &[PathBuf],
     seen: Vec<(PathBuf, ContentFault)>,
 ) -> Vec<(PathBuf, ContentFault)> {
-    content_faults_with(catalog, refresh, seen, None)
+    content_faults_with(catalog, refresh, seen, None, None)
 }
 
 fn content_faults_with(
@@ -922,6 +949,7 @@ fn content_faults_with(
     refresh: &[PathBuf],
     seen: Vec<(PathBuf, ContentFault)>,
     faulted: Option<&[InoId]>,
+    aliases: Option<&[NameId]>,
 ) -> Vec<(PathBuf, ContentFault)> {
     let fault = |id: InoId| catalog.state(id) == ContentState::Fault;
     let mut listed: BTreeMap<PathBuf, ContentFault> = seen.into_iter().collect();
@@ -949,18 +977,23 @@ fn content_faults_with(
         dir
     };
     let mut buf = Vec::new();
-    for (id, _) in catalog.names() {
+    let report_alias = |id| {
         let name = catalog.name(id);
         if matches!(name.target(), ferret_catalog::Target::Ignored(_))
             || !fault(name.child)
             || !refreshed.contains(&root_of(name.parent))
         {
-            continue;
+            return;
         }
         buf.clear();
         catalog.path(id, &mut buf);
         let path = PathBuf::from(OsStr::from_bytes(&buf));
         listed.entry(path).or_insert(ContentFault::Alias);
+    };
+    if let Some(aliases) = aliases {
+        aliases.iter().copied().for_each(report_alias);
+    } else {
+        catalog.names().map(|(id, _)| id).for_each(report_alias);
     }
     listed.into_iter().collect()
 }

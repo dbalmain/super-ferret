@@ -579,8 +579,8 @@ the catalog. ROADMAP S1+ reports setup, replay, diff and publication separately.
 M6 reduces file observations in chunks of at most 4,096 rows and 1 MiB of
 name/target bytes, recording equal rows in epoch-sized seen bitsets. A very large
 listing uses keyed old-child lookup after its first chunk, avoiding repeated
-merge scans over the same listing. It retains only
-changed file rows, seen bits, the directory token/coverage table and the existing
+merge scans over the same listing. Finished workers release temporary buffers;
+equal ignored markers reduce to seen bits too. It retains only changed file rows, seen bits, the directory token/coverage table and the existing
 bounded alias backlog. The directory table still costs O(directories); resolve
 continuing directory ids as tokens are minted and retain provisional mappings
 for newly discovered/ambiguous moves. File observations need not survive once
@@ -604,15 +604,21 @@ ferret-crawl::RefreshRequest {
 }
 ferret-crawl::refresh(&mut WriterSession, request, options) -> RefreshReport
 
-ferret-catalog::ChangeSet {
-    base_generation, final row replacements/tombstones,
-    allocation counters, root edits, coverage diagnostics
+ferret-crawl::RefreshReport { base_generation, view, report, outcome }
+outcome: Unchanged | Committed { changes } | RetryFromCurrent(current)
+                   | Checkpointed (M7)
+
+ferret-catalog::log::ChangeSet {
+    final row replacements/tombstones, allocation counters, root edits,
+    coverage diagnostics
 }
-WriterSession::commit(changes) -> Unchanged | Committed { generation, changes }
-                              | Checkpointed { generation, view }
+WriterSession::commit(changes, sniffer) -> checked Catalog view
 ```
 
-These are proposed interfaces, not Rust declarations. Expected-generation
+These describe the implemented Rust seam; scopes and reasons are `RefreshScope`
+and `RefreshReason`, and move endpoints are `RenameHint`. `base_generation`
+belongs to the refresh result, so delta adoption can check its source before
+using ids. Checkpointed refresh publication remains M7 work. Expected-generation
 mismatch returns RetryFromCurrent before dereferencing any request id or
 doing writes; expected_generation includes incarnation, checkpoint and sequence.
 A refreshed scope must resolve to the same root and inode identity under the lock; a changed or
@@ -622,7 +628,9 @@ Retain a path or checked watch locator, or pin the source view, to re-resolve
 old scopes after an epoch change. A same-epoch committed delta lets the resident
 engine adopt the next view without reopening/replaying its entire log. A
 Checkpointed result replaces the view and invalidates epoch-specific caches.
-The returned view keeps base sections lazy; the resident host loads it before switching new queries.
+The resident returned view is already warm and checked: content carry and
+reference reconciliation require those sections. Independent cold readers keep
+their section laziness and full semantic validation (D53 A).
 
 The watcher coalesces names and parents and calls `refresh` for a burst. Crawl
 checks final disk state, opens parent descriptors and hashes with today's

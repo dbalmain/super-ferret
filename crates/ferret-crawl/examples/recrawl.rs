@@ -24,6 +24,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     match changed.as_str() {
         "fault-prepare" => prepare_fault_roots(Path::new(dir)),
         "fault-small" | "fault-large" => fault_root(Path::new(dir), changed == "fault-small"),
+        "resident-1" => resident(Path::new(dir), 1),
+        "resident-100000" => resident(Path::new(dir), 100000),
         _ => run(Path::new(dir), changed.parse()?),
     }
 }
@@ -147,7 +149,7 @@ fn run(dir: &Path, changed: usize) -> Result<(), Box<dyn Error>> {
         }
     }
     for batch in &mut batches {
-        batch.finish_observations();
+        batch.seal();
     }
     if batches
         .iter()
@@ -157,6 +159,8 @@ fn run(dir: &Path, changed: usize) -> Result<(), Box<dyn Error>> {
     {
         return Err("observation reduction lost file rows".into());
     }
+    let observation_rows: usize = batches.iter().map(|b| b.observation_peak().0).sum();
+    let observation_bytes: usize = batches.iter().map(|b| b.observation_peak().1).sum();
     drop(tokens);
     drop(changed_ids);
     let replay_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -201,6 +205,11 @@ fn run(dir: &Path, changed: usize) -> Result<(), Box<dyn Error>> {
     println!(
         "| {changed} | {setup_ms:.2} | {setup_rss}/{setup_peak} | {replay_ms:.2} | {diff_ms:.2} | {commit_ms:.2} | {total_ms:.2} | {batch_rss}/{final_rss}/{peak} | {log_bytes}/{manifest_bytes} | {} |",
         changes.records.len()
+    );
+    println!(
+        "temporary_observation_rows={observation_rows} temporary_observation_bytes={observation_bytes} cap_rows_per_worker={} cap_name_bytes_per_worker={}",
+        ferret_catalog::batch::OBSERVATION_ROWS,
+        ferret_catalog::batch::OBSERVATION_BYTES
     );
     Ok(())
 }
@@ -410,6 +419,137 @@ fn fault_root(dir: &Path, small: bool) -> Result<(), Box<dyn Error>> {
         report.commit_time.as_secs_f64() * 1000.0,
         report.protected_scopes,
         generation.sequence
+    );
+    Ok(())
+}
+
+// Scoped synthetic observations use the exact batch preservation, reducer,
+// final-set reconciler and durable session used by refresh. The fixture has no
+// filesystem tree: enumeration, handle opening and content hashing are
+// excluded.
+fn resident(dir: &Path, changed: usize) -> Result<(), Box<dyn Error>> {
+    let setup = Instant::now();
+    let mut session = WriterSession::open(dir)?;
+    let setup_ms = setup.elapsed().as_secs_f64() * 1000.0;
+    let (setup_rss, setup_peak) = rss()?;
+    let old = session.view();
+    let generation = old.generation();
+    let snapshot = dir.join(format!("snapshot.{}", generation.checkpoint));
+    let snapshot_before = fs::metadata(&snapshot)?;
+    let log = dir.join(format!("changes.{}", generation.checkpoint));
+    let log_before = fs::metadata(&log)?.len();
+    // Selecting the simulated watcher events belongs to the input fixture,
+    // outside burst latency. Ancestor resolution is timed as part of replay.
+    let chosen: BTreeSet<_> = old
+        .inode_ids()
+        .filter(|&id| old.kind(id) == Kind::File && old.state(id) == ContentState::Hashed)
+        .take(changed)
+        .collect();
+    if chosen.len() != changed {
+        return Err("not enough scoped regular files".into());
+    }
+    let input = Instant::now();
+    let mut wanted = BTreeSet::new();
+    for &id in &chosen {
+        for name in session.names_for(id) {
+            let mut parent = old.name(name).parent;
+            loop {
+                if !wanted.insert(parent) {
+                    break;
+                }
+                let Some(name) = old.dir_name(parent) else {
+                    break;
+                };
+                parent = old.name(name).parent;
+            }
+        }
+    }
+    let mut batch = session.batch();
+    let mut queue = Vec::new();
+    let roots: Vec<_> = old
+        .roots()
+        .map(|(_, p)| PathBuf::from(std::ffi::OsStr::from_bytes(p)))
+        .collect();
+    for (id, path) in old.roots() {
+        if wanted.contains(&id) {
+            queue.push((id, batch.root(path, old.inode(id).stat)));
+        }
+    }
+    let mut observed = 0;
+    while let Some((parent, token)) = queue.pop() {
+        if let Some(count) = old.entry_count(parent) {
+            batch.entry_count(token, count);
+        }
+        if let Some(work) = old.work_tree(parent) {
+            batch.work_tree(token, work.kind, work.common_dir, work.common_id);
+        }
+        for name in old.children(parent) {
+            let edge = old.name(name);
+            let Target::Inode(id) = edge.target() else {
+                batch.preserve(token, edge.bytes);
+                continue;
+            };
+            if old.is_directory(id) && wanted.contains(&id) {
+                let stat = old.inode(id).stat;
+                let next = if old.is_traversed(id) {
+                    batch.traversed_dir(token, edge.bytes, stat)
+                } else {
+                    batch.dir(token, edge.bytes, stat)
+                };
+                queue.push((id, next));
+            } else if chosen.contains(&id) {
+                let mut stat = old.inode(id).stat;
+                stat.mtime_sec += 1;
+                stat.ctime_sec += 1;
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"M6 scoped changed bytes\0");
+                hash.update(&id.0.to_le_bytes());
+                hash.update(&generation.sequence.to_le_bytes());
+                let mut bytes = [0; 16];
+                bytes.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+                batch.file(token, edge.bytes, stat, Content::Hashed(bytes));
+                observed += 1;
+            } else {
+                batch.preserve(token, edge.bytes);
+            }
+        }
+    }
+    batch.seal();
+    let observation_peak = batch.observation_peak();
+    let replay_ms = input.elapsed().as_secs_f64() * 1000.0;
+    let diff = Instant::now();
+    let changes = ferret_crawl::reconcile::changes(
+        &session,
+        &[batch],
+        &roots,
+        &[],
+        old.policy(),
+        old.sniffer_version(),
+    )?
+    .ok_or("incomplete scoped observations")?;
+    let diff_ms = diff.elapsed().as_secs_f64() * 1000.0;
+    let commit = Instant::now();
+    let current = session.commit(&changes, old.sniffer_version())?;
+    let commit_ms = commit.elapsed().as_secs_f64() * 1000.0;
+    let total_ms = input.elapsed().as_secs_f64() * 1000.0;
+    let (final_rss, peak) = rss()?;
+    let after = fs::metadata(snapshot)?;
+    if after.len() != snapshot_before.len()
+        || after.modified()? != snapshot_before.modified()?
+        || current.generation().checkpoint != generation.checkpoint
+        || current.inode_count() != old.inode_count()
+        || current.name_count() != old.name_count()
+    {
+        return Err("scoped refresh changed checkpoint or namespace".into());
+    }
+    let log_bytes = fs::metadata(log)?.len() - log_before;
+    println!(
+        "| scoped changed files | setup ms | setup current/peak KiB | replay ms | diff ms | commit ms | latency ms | final/peak KiB | log/manifest bytes | observed names | local peak rows/bytes |"
+    );
+    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!(
+        "| {changed} | {setup_ms:.2} | {setup_rss}/{setup_peak} | {replay_ms:.2} | {diff_ms:.2} | {commit_ms:.2} | {total_ms:.2} | {final_rss}/{peak} | {log_bytes}/128 | {observed} | {}/{} |",
+        observation_peak.0, observation_peak.1
     );
     Ok(())
 }

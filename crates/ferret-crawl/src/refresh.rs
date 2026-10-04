@@ -66,6 +66,9 @@ pub enum RefreshOutcome {
 
 /// The host can adopt `view` directly, without reopening the published log.
 pub struct RefreshReport {
+    /// Source generation for a committed delta; adoption checks this before
+    /// ids.
+    pub base_generation: Generation,
     pub outcome: RefreshOutcome,
     pub view: Catalog,
     pub report: Report,
@@ -179,6 +182,7 @@ pub fn refresh(
     let view = session.view();
     if let Err(stale) = view.generation().check(request.expected_generation) {
         return Ok(RefreshReport {
+            base_generation: request.expected_generation,
             outcome: RefreshOutcome::RetryFromCurrent(stale),
             view,
             report: Report::default(),
@@ -223,6 +227,7 @@ pub fn refresh(
     let (report, changes) =
         crate::index::recrawl_scoped(session, &roots, scope, options, selections)?;
     Ok(RefreshReport {
+        base_generation: request.expected_generation,
         outcome: if changes.records.is_empty() {
             RefreshOutcome::Unchanged
         } else {
