@@ -68,6 +68,7 @@ Predecessors, carried forward where still open:
 | D50 | `ferret find` stretch calls F1–F13                       | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                     |
 | D51 | Compaction while the watcher is busy                     | open           |                                                                                                                |
 | D52 | D27 C: ids across compaction                             | proceeding on the recommendation; Dave may veto | B: epoch-scoped InoId/NameId; DocId stays stable |
+| D53 | Cold-open overlay validation                             | open           | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2860,3 +2861,39 @@ pin, rekey by path/identity, use DocId or retry across epochs. Its measured
 re-resolution/rebuild or freshness cost must outweigh A's extra 159.7 MB,
 translation and map maintenance. No such consumer was found in current code
 or the S1b/S2 plans. D51 remains open about the permitted writer pause.
+
+
+## D53 — Cold-open overlay validation (open)
+
+**Status: open.** S1+ M5 Part A, 2026-10-04; [design](S1PLUS.md).
+
+**Question:** Should a cold name reader replay and semantically validate the
+published overlay, trust the writer's validated transactions, or load a persisted
+materialised namespace? Fastest and simplest to maintain disagree.
+
+The post-merge 10M opens are about 330 ms at 0% and 558 ms at 1%. The earlier
+profile attributes 236 ms to namespace load, including 93 ms in addition checks;
+the rest includes required query construction. All 2% and alternate-reader
+numbers below are **estimates**, not new benchmark results. They assume a similar
+transaction mix and dirty-name slope. Checksums cover accidental corruption,
+not authentication or a writer checksumming its own invalid graph. The ordinary
+writer validates its successor before publication using the shared reader code.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep semantic validation | About 550–560 ms at 1%, 770–790 ms at 2%. Rebuild and check dirty namespace history on each cold name load. | No new code or publication proof; independently rejects invalid, correctly checksummed history at load, except bugs shared with writer validation. Simplest maintenance. |
+| B. Trust checksummed writer transactions | Estimated 420–470 ms at 1%, 510–610 ms at 2%; child-key/tombstone/name-heap construction remains. Lose independent graph/reference/count checks on correctly checksummed writer mistakes; retain safe decode/index checks and termination protection. Requires factoring trusted query construction from publication validation and amending the reader contract/tests. | Avoid part of duplicate validation without an extra durable file, but neither the fastest nor the smallest change. |
+| C. Persist a materialised namespace | Estimated 350–400 ms at 1%, 370–470 ms at 2%. Roughly 600–1,200 production lines plus comparable tests, not a prototype count. New checked index format and generation binding, an extra durable artifact before manifest publication, retention/cleanup and crash tests. Per-burst rewrite risks O(dirty-total) write amplification; cached prefixes need suffix replay. | Expected fastest cold name opens: no replay/sort of prefix history, just checked final-state buffers and any suffix. |
+
+**Recommendation:** A for M5/M6; evaluate C with M7's compaction/derived-state
+budgets if the cold-open requirement warrants its writer cost. Do not implement
+B or C in M5. C is expected fastest, A simplest, so this brief requires Dave's
+choice rather than silently exchanging the existing reader corruption contract.
+The current section reader owns checked buffers; adding actual mmap is a separate
+mechanism, not an existing format feature. Part A's detailed analysis is in
+`/home/dave/w/super-ferret/.ai/s1plus-m5-done.md`.
+
+**Fact that would change it:** a required cold name open below roughly 0.8 s at
+2%, or a C prototype meeting that goal with acceptable publication latency,
+write amplification and code cost. Measure query-only construction for B before
+crediting it with the full 220 ms gap.
