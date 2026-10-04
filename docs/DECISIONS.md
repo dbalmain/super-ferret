@@ -45,7 +45,7 @@ Predecessors, carried forward where still open:
 | D27 | `InoId` and `NameId`: stable, or renumbered              | answered       | A: renumber each snapshot; C once indexing is incremental                                                      |
 | D28 | Name layout: raw sorted by parent, or front-coded        | answered       | A: raw NUL-terminated heap by (parent, name); suffix array a later experiment                                  |
 | D29 | How a parallel walk tells the catalog each parent        | answered       | A: the walker carries a per-directory value                                                                    |
-| D30 | What `ferret find` builds when it opens the catalog      | answered       | C: lazy, plus a persisted directory `InoId → NameId`; amended: only load and unloaded parts measured cold      |
+| D30 | What `ferret find` builds when it opens the catalog      | answered       | C: lazy, plus a persisted directory `InoId → NameId`; cold find measured                                       |
 | D31 | One inode, several names                                 | answered       | C: one row per file inode, per directory name; shared per-run hash cache                                       |
 | D32 | A reader while `ferret index` runs                       | answered       | A: generations plus a single-writer lock                                                                       |
 | D33 | What the walker must also hand the catalog               | answered       | A: walker hands over the directory handle and work-tree kind                                                   |
@@ -65,6 +65,10 @@ Predecessors, carried forward where still open:
 | D47 | `ferret find` as a drop-in for find(1)                   | answered       | C: find semantics except ignore rules                                                                          |
 | D48 | The next move after S1                                   | answered       | A: compaction; name index only if 10M misses 1 GB                                                              |
 | D49 | A one-shot query with no daemon running                  | answered       | A: spawn on first use, in-process fallback                                                                     |
+| D50 | `ferret find` stretch calls F1–F13                       | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                     |
+| D51 | Compaction while the watcher is busy                     | open           |                                                                                                                |
+| D52 | D27 C: ids across compaction                             | proceeding on the recommendation; Dave may veto | B: epoch-scoped InoId/NameId; DocId stays stable |
+| D53 | Cold-open overlay validation                             | open           | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -1395,6 +1399,13 @@ which only an entry's `lstat` NotFound is exempt and a content fault publishes
 the file unhashed. Move to A when typed faults exist, and ideally only once
 incremental indexing makes it worth it.
 
+**Amendment (2026-10-02, find milestone 1):** the walker now tags operations.
+EACCES while opening or listing a directory is permanent user-chosen state:
+publish its directory row without traversing it, with an unknown entry count.
+Every other coverage fault still blocks publication, including EACCES from an
+ignore-file read. An entry's lstat NotFound remains a deletion; content faults
+remain publishable as unhashed files.
+
 ## D27 — `InoId` and `NameId`: stable, or renumbered each snapshot
 
 **Question:** When an entry is deleted, what happens to its dense ids?
@@ -1555,24 +1566,6 @@ with a load average near 2.5 from other work. So opening is reading, and reading
 costs more than the name scan itself (5–8 ms). The name sections (names, heap,
 directory names, traversed, roots, strings) are the first 16.1 MB of the file;
 reading only them took 5.0 ms warm and 16.8 ms evicted. See D38.
-
-**Amended (2026-10-03).** The daemon is the normal mode (D46, D49), so a cold
-query without one is no longer a first-class measurement or a factor in the
-format. Two cold costs still count:
-
-- **Index load at start-up**: the time for a daemon, or a one-shot process, to
-  open and load what it keeps in memory.
-- **Cold reads of index parts that are not loaded at start-up**, such as the
-  trigram postings. A query pays these even with a live daemon.
-
-Otherwise, query speed is measured warm, as find-compat's timing already does.
-Default `ferret find` answers from the index (stored columns, catalog order). It
-will not be advertised until the daemon keeps the index current.
-
-> Dave: The only cold read I care about now is the index load time on start-up
-> and cold reads of the parts of the index that _don't_ get loaded into memory
-> on start up. These will be the indexes like the trigrams and will still cost
-> time when searching with a live daemon.
 
 ## D31 — One inode, several names
 
@@ -2326,6 +2319,124 @@ from what it teaches, not copied from it. Targets: GNU find (the oracle), bfs,
 busybox, fd (for its gitignore handling and speed; fd's syntax differs, so its
 adapter translates the subset it can express), and ferret.
 
+**Amendment (2026-10-02, compatibility handoff):** find has one evaluator over
+catalog and live entry sources. Default mode respects ignore rules; `-I` /
+`--no-ignore` selects GNU-exact behaviour. Ignored means uncatalogued beneath
+an opaque marker, not nonexistent: an explicitly named ignored start walks live
+without nested ignore rules, and ignored reference operands resolve normally.
+Re-included descendants have ordinary catalogued directory ancestors. Special
+files get name/stat rows without content. Ignored regular files get name-only
+rows; ignored directories with nothing visible beneath get opaque markers.
+The global setting making `-I` the default is deferred to milestone 4. Docs at
+that milestone must explain that a pasted `find ... -delete` skips ignored
+files and still exits 0. Milestone 1 builds the live engine and rejects default
+mode until those catalog and policy changes land.
+
+**4a encoding brief (2026-10-02, D40/D43).** The handoff's fixed-width
+12-byte name row predates S1a: child is now blocked frame-of-reference, 128 rows
+per block. Does its high type sentinel justify a different physical encoding?
+
+- **A, fixed high sentinels (retained):** seven values below NONE, one reserved
+  tombstone, no inode for an ignored name. Mixed blocks widen to 32 bits.
+  10.449M names: 594,837,226 B, 10.71 s build wall, 1,641 MiB peak RSS.
+  Build load 7.86/4.22/3.22. Tags stay fixed when stable inode ids are added.
+- **B, tags adjacent to inode_count (measured trial):** keep real ids unchanged,
+  put seven type codes immediately after them, translate in the reader. Same
+  names/inodes/docs: 593,660,890 B, 10.69 s wall, 1,639 MiB peak RSS.
+  Build load 9.98/7.00/4.56. Saves 1,176,336 B (0.20%), but tags move as the
+  inode count changes, complicating the future incremental writer.
+
+**Recommendation: A.** The size difference is small and B has no consistent
+query win. Full listing, warm: A 1,369 ms vs B 1,354 ms; baseline 1,340 ms.
+ROADMAP § S1c summarises the section and query numbers; the full tables, with
+their loads, are in git history as `docs/FIND-M4A.md`. The fact that would
+change it: a much more ignored-heavy 10M fixture where nullable child/type or a
+separate ignored range saves materially more space or query time. Those two options were not
+implemented or measured here. There is no departure from the settled sentinel
+encoding. All seven ignored kinds have name-only rows; visible special kinds
+use a sparse 8-byte-per-row Specials section so name search loads no stat
+columns. Re-included ancestors are ordinary for find but keep the existing
+search-suppression bit to preserve search counts (D29 compatibility). Visible
+special files are available to the find source but suppressed by search, which
+keeps its existing regular-file/directory/symlink result domain.
+
+**4b fallback and configuration (2026-10-03).** Default find needs an index
+covering each explicit start. Options: refuse with status 1; walk live with
+policy (a second policy crawl and changed costs); or walk as `-I` with a warning
+(scripted actions then reach ignored data). Chosen: **refuse** missing or
+incompatible catalogs and unresolved explicit starts, with re-index/`-I`
+guidance. **New names observed while listing are visible**, using live kinds
+and lstat; an uncatalogued directory walks live as visible, without nested
+ignore rules. This replaces 4b's initial refusal of new names: actions such as
+`-exec touch {}/new \;` must not invalidate their own walk. Dave selected this
+behavior after the full-corpus run. The tradeoff is that a name created after
+indexing that the ignore rules would hide shows up until the next index.
+Deleted catalog names disappear from listings or are dropped when live lstat
+fails. Metadata changes are read live, not treated as index invalidation. A
+snapshot cannot detect changes inside ignored opaque subtrees, and does not
+watch for policy-file edits: re-index after changing ignore rules. A policy-aware
+live source sharing the crawler's rules could remove the new-name tradeoff
+without duplicating traversal.
+
+Directories cache their live stat observation before descending, including in
+`-depth` and implicit depth from `-delete`; child actions must not change the
+mtime seen by the directory's later predicates. Regular-file metadata stays
+lazy. `-empty` checks current on-disk contents, including ignored entries,
+rather than the catalog's snapshot child count: deleting visible children may
+make the directory empty during the walk, while ignored children still prevent
+emptiness. Real CatalogSource regressions cover both timings and new names
+created by directory `-exec` actions.
+
+Q4's setting is **`find_no_ignore = true`**, in
+`$XDG_CONFIG_HOME/ferret/config` (default `~/.config/ferret/config`). Its boolean
+name states the behavior directly and matches `--no-ignore`. The smallest
+shape is one `key = true|false` line, optional whitespace, blank lines and `#`
+comments; missing/empty means false. Unknown keys, duplicate keys and malformed
+values fail with status 1. No dependency or general-purpose format parser.
+Config lookup resolves only its XDG base, independent of unused state/cache
+bases. Explicit `-I` bypasses both config and index; help/version bypass them too.
+
+The catalog's name order cannot reproduce readdir order. 4b retains live
+name listings solely for traversal order and intersects them with catalog
+entries. This preserves `-quit` and directory-local command batches without
+using stale stat columns. ROADMAP § S1c records the cost.
+
+A pasted `find … -delete` skips ignored files and still exits 0 when the
+selected deletions succeed. Deleting a visible directory that still contains
+ignored files can fail with ENOTEMPTY and exit 1, as a live deletion does.
+
+**4b stat freshness brief (2026-10-03).** Does the measured stat cost justify
+changing the settled lazy-live policy? A: live lstat, current metadata but one
+syscall per matching entry (size 443 ms, mtime 459 ms). B: snapshot columns,
+size/mtime about 170 ms with the same ordered source, but stale metadata and
+missed deletions. C: the later watch-backed stat cache, current within the
+watched set but requiring daemon work. **Recommendation: retain A**; Dave must
+choose any move to B. The fact that changes it: an explicit acceptable freshness
+contract. The trial patch was removed in M5a; its tables, with loads, are in git
+history as `docs/FIND-M4B.md`. Eager size/mtime decoding costs about 5 ms on the
+name/type controls. B alone still misses fd's roughly 51 ms stat median.
+
+**4b order/speed brief (2026-10-03).** How should exact current traversal order
+coexist with the speed gate? A: live name listings (implemented), preserving
+order but costing 160–220 ms on cheap queries; fd is 23–39 ms. B: persist
+traversal order during indexing and keep it current through watches, adding
+storage/crawl/daemon work but making catalog traversal possible. C: allow
+catalog order for read-only plans without quit/commands, fast for names but
+changing plain output order and the brief's exact-order contract. Existing
+catalog-only search takes 12–21 ms here, under a different output/order contract.
+**Recommendation: investigate B and measure its storage/freshness costs**, or
+explicitly choose C if that ordering relaxation is acceptable. No ordering
+relaxation is selected. The fact that changes it: Dave accepting catalog order
+for those plans, or evidence that persisted order can stay current cheaply.
+The functional implementation therefore does not complete the speed gate.
+
+**Superseded in part (2026-10-03, D50).** F7, F8, F10 and F12 replace 4b's
+live listing order, its new-name visibility, its live stat and its live
+`-empty`: default mode is now a pure index query in catalog order, with stored
+metadata, and `-empty` subtracts the walk's own `-delete` removals. The config
+key and the refusal without a covering index stand. [FIND.md](FIND.md) is the
+current contract.
+
 ## D48 — The next move after S1
 
 **Question:** S1 is done. What comes next?
@@ -2377,3 +2488,418 @@ explicit `ferretd` is the whole design.
 
 **Answer (2026-09-30): A.** Start the daemon on first use; build the engine in
 process when a background process is not allowed or `FERRET_NO_DAEMON` is set.
+
+## D50 — The `ferret find` stretch's calls (answered 2026-10-03)
+
+The find stretch (ROADMAP § S1c, milestones M1–M5c) asked its questions on an
+HTML decisions page rather than here, numbered F1–F13. Each is recorded below
+with its options, Dave's answer and the reason. The contract they produced is
+[FIND.md](FIND.md). Dave's standing rule for the stretch (2026-10-03): take the
+fastest answer and the simplest to maintain over time; more work now, and
+harness changes, are fine; discuss only where fastest and simplest disagree.
+
+F1, F2, F6 and F9 are changes to the private find-compat harness, not to
+ferret. They are recorded because they decide what "zero differ" means. After
+M4 the full corpus stood at `-I` 67,394 agree / 20 differ / 6 harness failures
+and default 52,909 / 28 / 3, and every one of those rows was F1, F2 or F9.
+
+### F1 — The sandbox root's link count
+
+**Question:** ferret's sandbox binds its XDG and index directories under
+`/ferret`, giving `/` one more link, so `ls -la` of the start's parent differs
+(20 rows). How should the harness stop that?
+
+- A. An empty `/ferret` in every target's sandbox: one line, identical
+  sandboxes; older bfs/busybox/fd results stop being comparable on those rows.
+- B. Bind ferret's directories under a directory that already exists: no new
+  root entry, but the harness paths change and a safe directory must exist.
+- C. Leave it and record a known artefact: every run report carries the list.
+
+**Answer: A** (harness change). Smallest change, identical sandboxes, no
+exception list.
+
+### F2 — Commands that hang on the tree's FIFO
+
+**Question:** Three commands `cat` or `grep` every entry and block on the FIFO
+in two trees, so both GNU and ferret time out (6 rows). How should such a row
+score?
+
+- A. A separate status, outside both differ and error, listed beside the gate.
+- B. Score a both-sides timeout as agree: one clean number, but it calls two
+  outputs equal without comparing them.
+- C. Remove the FIFO: loses the coverage that FIFOs are catalogued.
+
+**Answer: A** (harness change, the `both-timeout` status). A timed-out run's
+partial stdout depends on scheduling, so B would be a claim the harness cannot
+make.
+
+### F3 — Parallelism in the live walk
+
+**Question:** Should `ferret find -I` walk directories in parallel, given that
+its output order would then stop matching GNU's? After M3b, single-threaded
+`-I` beat GNU on every timing row and was at or below `bfs -j1` on all but
+`-maxdepth 2`; the gap to default bfs and to fd was threads.
+
+- A. Keep `-I` sequential; parallelise only default mode's live fallback.
+- B. `-I` goes parallel when the expression does not depend on order, which
+  needs a classifier for order-sensitive expressions.
+- C. Parallel only behind a flag or config key.
+
+**Answer: superseded by F10 B.** The live walk is parallel in every mode, with
+no order classifier; F11 settles actions.
+
+### F4 — A stray file in the repository root
+
+**Question:** May the untracked, empty `1T`, apparently a stray shell redirect,
+be deleted? A: delete it. B: leave it in `git status`.
+
+**Answer: A.** Deleted.
+
+### F5 — Walking relative to each directory's fd
+
+**Question:** Should `-I` open and stat entries relative to the parent
+directory's fd, as GNU does, instead of by full path? Two shapes outside the
+corpus differ: a tree deeper than PATH_MAX, and an ancestor renamed mid-walk.
+
+- A. Stay path-based: no cost; those two shapes stay wrong.
+- B. Go fd-relative: a medium slice touching every metadata call site, with no
+  measured speed gain.
+
+**Answer: A.** Same speed and less code. FIND.md lists both shapes as known
+differences.
+
+### F6 — The harness's catalogue listing used a retired command
+
+**Question:** find-compat's control 3 listed the catalogue with
+`ferret find --json -- '*'`, the atom grammar that moved to `ferret search`.
+What should it run?
+
+- A. `ferret search --json -- '*'`: one word, but search keeps its old
+  file/directory/symlink domain, so special files never appear.
+- B. Default-mode `ferret find / -print` once M4b landed: lists everything the
+  find source sees, special files included.
+
+**Answer: B** (harness change). Control 3 then passes for the right reason.
+
+### F7 — Output order in default mode
+
+**Question:** M4b listed each visible directory live to keep GNU's order, which
+made default mode as slow as the live walk: `-name '*.c'` took 185 ms against
+fd's 25 ms, while catalog-only search answered in 12 ms. May default mode print
+in catalog order?
+
+- A. Catalog order whenever the plan cannot observe order.
+- B. Persist readdir order in the catalog: exact and fast, but a permutation
+  column, crawl work, and staleness on every create and rename.
+- C. Keep the live listing: exact, and 4–7 times behind fd.
+
+**Answer: A, unconditionally** (under F10 B). Default mode prints in catalog
+order for every expression, `-quit` included; live listing is used only below
+opaque markers. It was the only option that met the speed goal without daemon
+work.
+
+### F8 — Where default mode gets stat data
+
+**Question:** Should default mode answer `-size`, `-mtime` and the other stat
+tests from stored columns instead of a live lstat? In M4b's ordered source,
+`-size +1024c` took 443 ms with live stat and 170 ms with stored columns; fd
+took 51 ms.
+
+- A. Live lstat, in parallel: current metadata; new code, speed unmeasured.
+- B. Stored columns: well below fd, with the index's freshness, like `locate`.
+- C. Stored columns only inside a daemon-watched set: fast and current, but
+  waits for the daemon.
+
+The recommendation was A now, C with the daemon.
+
+**Answer: B.** Default mode is a pure index query: catalog order, stored
+metadata, and a live walk only below opaque markers. It will not be advertised
+until the daemon keeps the index current; C follows with the daemon. Cold reads
+get less weight in performance work, since the daemon is the normal mode (D46,
+D49); D30 is amended to match. This replaces D47's 4b freshness brief, which
+retained live lstat.
+
+### F9 — Oracle skips that scored as differences
+
+**Question:** In default mode, 12 rows came out as "skipped: command not
+allowlisted" for the ferret oracle while ferret ran them, and scored as differ.
+How should the harness score them?
+
+The cause was found in the harness: its allowlist rewrite was not idempotent, so
+the oracle's second pass rejected its own output. B was to fix the rewrite
+(about three lines) and test that it is idempotent. The page did not preserve
+the other option's text.
+
+**Answer: B.** "It is a small change."
+
+### F10 — What order `ferret find` promises
+
+**Question:** When an expression can observe walk order, which order must
+`ferret find` produce? GNU's sibling order is readdir order, which on ext4 is
+hash order: arbitrary, and changed by copying the tree. fd and bfs do not keep
+it. The harness sorts line output, but order still shows in `-quit` (829 corpus
+commands), in `-printf` with no separator, and in `-exec +` argument order.
+
+- A. Free order unless the expression can observe it: zero differ stays
+  reachable, but a classifier must recognise every order-sensitive shape.
+- B. Free order everywhere, with only the structural rules: the simplest code,
+  fastest on `-quit` too; about 70 harness rows differ on order alone, and the
+  harness must learn to classify them.
+- C. GNU order always: no classifier; `-I` stays 3–5 times behind fd, and
+  default mode needs F7 B.
+
+**Answer: B.** Free order everywhere; the harness learns to classify order-only
+rows. The structural rules are a parent before its children, children first
+under `-depth` and `-delete`, and `-prune` stopping descent.
+
+### F11 — Actions under a parallel walk
+
+**Question:** When the walk is parallel, may `-exec`, `-execdir` and `-delete`
+run concurrently? `-exec` is a test, so a worker would otherwise wait on a
+single action thread for its exit status.
+
+- A. Concurrent actions, fd's model: workers run commands themselves; each
+  child's stdout is buffered and written whole; `-ok` prompts take a lock.
+  Commands with clashing side effects can leave a different tree from run to
+  run.
+- B. Serial actions: a deterministic tree for a given order, but workers stall
+  on every `-exec` used as a test, and a hand-off channel is more code.
+
+**Answer: A.** Both of Dave's criteria point at it. H1, on find-compat's
+`ferret-harness` branch, takes F1, F2, F6, F9 and order-only rows; M5a makes
+default mode a pure index query; M5b, the parallel walk, follows.
+
+### F12 — Index answers inside commands that change the tree
+
+**Question:** M5a's full corpus found 85 rows where actions went wrong. Opening
+directories and dropping vanished children, only when the expression has an
+action, fixed 77. The other 8 were `-depth … -type d -empty -delete`: the index
+still says a directory has children after the walk deleted them. Should
+effectful expressions read the disk?
+
+- A. Expressions with actions read stat live: one rule, which also stops a stale
+  `-mtime` deciding what `-delete` removes.
+- B. Live `-empty` only, when the expression has actions.
+- C. Index answers everywhere: accepts the 8 rows.
+- D. The walk counts the children it deleted itself: `-empty` is the indexed
+  count minus this walk's own `-delete` removals; no live reads, and it cannot
+  see `-exec rm` or `-exec rmdir`.
+
+A was recommended. A current daemon would not fix the 8 rows, because the walk
+reads index state before it starts and the daemon's updates arrive
+asynchronously; 91 of the corpus's 163 `-empty` commands also delete.
+
+**Answer: D.** `find . -depth -type d -empty -exec rmdir {} \;` leaving an
+emptied parent in default mode is accepted: use `-delete`, or `-I`. Revisit only
+if a user brings a case that neither solves.
+
+### F13 — Stat fields the catalog does not store
+
+**Question:** Should the catalog add atime and allocated-block columns, so that
+`-atime`, `-amin`, `-used`, `%a`, `%b`, `%k` and `-ls` stop doing a live lstat?
+Over 300k entries the fallback cost about 350 ms against about 40 ms stored. At
+10M: atime 31.1 MB on this fixture (up to about 77 MB with fully varying
+times) and blocks 6.1 MB, against 553 MB of sections.
+
+- A. Keep the lazy fallback: no format change; these primaries run at `-I`
+  speed; a stored atime is usually stale, since reading a file changes it.
+- B. Add both columns: index speed; about 37 MB at 10M and a migration.
+- C. Blocks only: 6 MB for index-speed `-ls` and `%k`.
+
+**Answer: A.** Atime, allocated blocks, birth time and device numbers stay
+lazy. The fact that would change it: query logs showing `-ls` or `%k` in normal
+use (then C).
+
+### README — which mode it leads with
+
+**Question:** Should README lead with `-I` instead of default mode, given F8's
+"not advertised until the daemon keeps the index current"?
+
+- A. Lead with `-I`, which is current without a daemon.
+- B. Keep README as it is, leading with default mode.
+
+**Answer: B.** Dave, 2026-10-03: "not advertised" means not posting about
+ferret online. The README may lead with default mode.
+
+### M4b's own calls, recorded in D47
+
+The config key `find_no_ignore = true`, and refusing default mode without a
+covering index, were decided inside M4b and are recorded under D47 (4b
+fallback and configuration). The page asked Dave to say if either should
+change; no change is recorded.
+
+The two follow-ups below were asked and answered during M5b and M5c, in this
+file, and refine F11.
+
+### Find M5b — quit while an action is running (answered)
+
+**Question.** Does F11's “stops every worker promptly” require terminating
+a command or interactive prompt already started on another worker, or
+only cancelling further traversal and expression evaluation? The M5b
+implementation does the latter, flushes collected batches, and reaps children.
+Dave answered the clarification in M5c, as recorded below.
+
+| Option | Behavior | Tradeoff |
+| --- | --- | --- |
+| A. Finish started actions | Cancel new traversal/evaluation immediately; flush collected batches; await already-started commands/prompts | Preserves completed child output and external effects with the existing process interface; exit can wait for a slow command or unanswered prompt |
+| B. Terminate started actions | Add cancellation to process-group execution, pipe collection and prompt input; terminate running commands and stop prompts | Bounds cancellation latency, but can leave partial external effects/output and changes command completion semantics; needs a cancellation-aware host interface |
+
+**Answer (2026-10-03): A.** Dave's M5c instruction settles the policy: already
+running commands finish and are awaited, with no forced termination. Quit is
+an output latch: the first entry reaching it commits under the output lock;
+entries finishing later discard their buffered output. Side effects already
+performed remain. Collected batches flush at exit. This accepts exit latency
+from a slow command or unanswered prompt and avoids cancellation machinery.
+
+### Find M5c — measured batching and many-start costs (answered)
+
+**Question.** The initial implementation sequences all starts and runs full
+shared batches while holding their mutex. Fifteen warm samples on the 300k tree
+showed many-starts default/live 21.565/130.593 ms versus M5b 17.261/26.694 ms;
+batch-all 189.923/243.461 ms versus 76.342/48.539 ms. The original brief attributed
+too much of this to append contention and treated read-only starts as effectful.
+
+| Option | Benefit | Cost |
+| --- | --- | --- |
+| A. Shared batch, execute outside its mutex | Minimal partition; collect while full batches run | Selected entries still synchronize on append |
+| B. Bounded worker staging into that shared batch | Amortize append synchronization | Partial stages must merge at task completion and quit; shared batch remains the sole partitioner |
+| C. Special scheduling for narrow effectful roots | Reduce short-task barriers | New scheduler policy must earn its cost in measurements |
+
+**Answer (2026-10-03): A, then measured B; overlap read-only starts.** Dave requires
+full batches to detach under the lock, then spawn and wait outside it. Concurrent
+full-batch commands are allowed by F11 A. Reuse M5a's `has_actions` for scheduling,
+extending it to all file-output actions as well as exec variants and delete.
+Only effectful starts sequence. Dave accepts 0.4–2.3% default-mode timing
+regressions as noise.
+
+After A, append contention remains on batch-all (144.411/188.290 ms versus paired
+M5b 75.811/49.490 ms), so Dave's conditional authorization for B applies. Staging
+merges at 32 paths or 4 KiB; only the shared batch fills/partitions argv. Partial
+stages merge even after quit, before shared exit flush. Staging recovers M5b
+throughput. A cheap narrow-root donation guard made effectful starts slower
+(148.730 versus 135.290 ms live), so it was removed. The pool already persists
+across starts; no new scheduler policy is kept. ROADMAP § S1c records the
+measurements; per-cell loads and the syscall profile are in find-compat's m5c
+scratch.
+
+The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap
+in overlapping read-only starts: with `-quit`, a later missing start reported
+ENOENT and exit 1 before the first start quit, where GNU exits 0 silently.
+Starts now also sequence when the expression contains `-quit`.
+
+## D51 — Compaction while the watcher is busy (open)
+
+**Status: open.** S1+ M0, 2026-10-03; [design](S1PLUS.md).
+
+**Question:** May an incremental checkpoint pause the writer for seconds, or
+must S1b keep applying bursts while it compacts? Queries keep their pinned
+generation in either case. This is a disagreement between fastest updates and
+the simplest implementation to maintain, not a question about query locking.
+
+The current v3 10.45M synthetic checkpoint is measured at 594.8 MB and a
+10.71 s build (ROADMAP S1c). With D52's epoch ids, document counts and coverage,
+the new 10M checkpoint is an estimated 602.0 MB, down from 761.7 MB with
+lifetime maps; estimated compaction is 9–20 s. Removing the maps saves about
+0.56 s of model read/write/checksum work, not the whole seconds-long pause.
+All new-format time/RAM figures below are estimates, to be measured in M7.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Idle-boundary checkpoint under the writer lock | Incoming updates wait 9–20 s at 10M when compaction runs; sustained churn eventually requires a pause. About 0.7 GB temporary disk and 0.2–0.7 GB transient RAM including validation, plus pinned generations. | One writer, one generation publication proof, no catch-up protocol. Queries continue on the old view. |
+| B. Concurrent checkpoint with suffix replay | Build a pinned view at sequence S while the writer appends. At cutover, take the lock, rebase S's suffix into the new epoch, write/checksum the new log, sync both files and publish one new manifest. Retain about 80 MB of transient old-to-new inode/name maps plus suffix births; map every parent/child/own-name/root/aux reference and reset epoch allocation counters while keeping DocIds. Raw suffix copying is invalid. At 1,000 unique-content edits/s for 20 s, each committed separately, the suffix is 2.72 MB payload + 3.84 MB framing = about 6.6 MB total, with an estimated 30–120 ms replay budget plus about 10 ms byte/check cost before sync; rebasing overhead is unmeasured and must be included in the cutover measurement. Extra pinned source/overlay RAM may be 0.1–0.8 GB, besides those remaps; requires a bounded catch-up policy, new-epoch writer lookups prepared in the background and tests for two epoch pairs. Queued old-epoch requests retry before id dereference. | Ordinary bursts retain small-commit latency while the snapshot is built; cutover scales with the suffix rather than 10M rows. |
+| C. Defer checkpoints until the watcher is quiet | No compulsory pause during activity, but replay and overlay costs become unbounded: 5M records cost an estimated 2.5–10 s replay and roughly 200–600 MB overlay RAM, risking the 1 GB resident goal. | Smallest scheduler and no catch-up path. |
+
+**Recommendation:** A for M7, with a measured checkpoint pause and explicit
+backlog/freshness reporting before S1b ships. It is the smallest complete
+mechanism and does not change D32's reader guarantee. Do not choose C: deferred
+work still needs a bound. B is justified if sustained activity makes A's
+pause unacceptable; design its suffix handoff as a separate review slice then.
+Epoch renumbering does not remove the pause and adds a rebasing protocol to B;
+the smaller checkpoint helps both options, so the recommendation stays A.
+
+**Fact that would change it:** a required worst-case freshness lag below
+10 s during sustained churn, or M7 measuring checkpoint pauses beyond the
+accepted lag even on an idle-priority run. Either favours B. S1b's observed
+burst rate and the permitted lag, rather than snapshot size alone, decide it.
+
+## D52 — D27 C: ids across compaction
+
+**Status: proceeding on the recommendation; Dave may veto.** S1+ M0 round 2,
+2026-10-03; [design and consumer check](S1PLUS.md#epoch-scoped-ids).
+
+**Question:** Does D27 C's “stable, never reused; holes until compaction” require
+InoId/NameId to survive compaction, or only remain stable within its epoch?
+The original C buys the same external stability as B. Dave's comment requires
+metadata edits to preserve DocId; it does not specify a compaction namespace.
+This brief records the interpretation, without claiming Dave has answered it.
+
+No concrete current, S1b or S2 consumer needs inode/name ids across compaction.
+DESIGN's `CandidateSource`/`DocCursor` and content structures, ROADMAP S2/S3,
+and `ferret-index`'s boundary use DocIds. Catalog inverses belong to a pinned
+view. S1b watch locations can use checked paths or rooted `(dev, ino)` identity;
+queued requests already have expected_generation and can retry/re-resolve.
+No separate external metadata index with a durable inode-id key is specified.
+
+Numbers below are **estimates at exactly 10M names**, normalised from the
+**measured** 594,837,226 B / 10,448,739-name v3 artifact in
+[S1PLUS's sourced cost model](S1PLUS.md#cost-model-at-10m). They include document
+reference counts and the all-none RetainedAt column; incremental timings are
+not measured. Both options retain identical 360 B metadata / 456 B unique
+content-replacement commits and independent stable DocIds.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Lifetime-stable logical ids, private physical rows | About 159.7 MB of forward/paged inverse maps at dense high water: 761.7 MB checkpoint, roughly 727 MiB encoded resident buffers and a conservative 450 MB name-load set. Translation at boundaries and map/bijection validation; sparse pages needed for churn, and lifetime high-water exhaustion remains. Roughly 100M historical ids/10M scattered survivors raise map storage toward 200 MB plus page overhead. | Inode/name handles survive compaction without re-resolution, useful only if an external consumer needs them. Physical rows can still pack densely. |
+| B. Epoch-scoped ids: id equals checkpoint row | About 602.0 MB checkpoint, roughly 574 MiB resident buffers and 291 MB name-load set. Compaction renumbers and invalidates old-epoch requests/caches; about 80 MB transient reference-remap arrays at 10M, plus bounded births. Concurrent checkpointing must rebase its suffix (D51). | Removes about 159.7 MB (21% of A), all persistent id maps/validation, scan translation and inode/name history growth. Dense BFS base ids preserve D29; log births/tombstones preserve ids and holes within the epoch. Compaction resets their high water. Pinned old readers retain their old namespace under D32. |
+
+**Recommendation: B; proceeding on the recommendation; Dave may veto.** It is
+both fastest and simplest for the identified consumers, so it is not another
+fastest-versus-maintenance question. A metadata edit retains its epoch InoId
+and live DocId; an epoch change can renumber the inode without content-index
+work. Generation must include `(incarnation, checkpoint, sequence)`: compaction
+can leave the sequence unchanged, so sequence-only comparison is insufficient.
+Reject stale scopes before interpreting ids; retain a locator or old pinned
+view for re-resolution. Keep DocId and next DocId across compaction.
+
+**Fact that would change it:** a concrete external structure or measured
+workload that requires persistent InoId/NameId references and cannot reasonably
+pin, rekey by path/identity, use DocId or retry across epochs. Its measured
+re-resolution/rebuild or freshness cost must outweigh A's extra 159.7 MB,
+translation and map maintenance. No such consumer was found in current code
+or the S1b/S2 plans. D51 remains open about the permitted writer pause.
+
+
+## D53 — Cold-open overlay validation (open)
+
+**Status: open.** S1+ M5 Part A, 2026-10-04; [design](S1PLUS.md).
+
+**Question:** Should a cold name reader replay and semantically validate the
+published overlay, trust the writer's validated transactions, or load a persisted
+materialised namespace? Fastest and simplest to maintain disagree.
+
+The post-merge 10M opens are about 330 ms at 0% and 558 ms at 1%. The earlier
+profile attributes 236 ms to namespace load, including 93 ms in addition checks;
+the rest includes required query construction. All 2% and alternate-reader
+numbers below are **estimates**, not new benchmark results. They assume a similar
+transaction mix and dirty-name slope. Checksums cover accidental corruption,
+not authentication or a writer checksumming its own invalid graph. The ordinary
+writer validates its successor before publication using the shared reader code.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep semantic validation | About 550–560 ms at 1%, 770–790 ms at 2%. Rebuild and check dirty namespace history on each cold name load. | No new code or publication proof; independently rejects invalid, correctly checksummed history at load, except bugs shared with writer validation. Simplest maintenance. |
+| B. Trust checksummed writer transactions | Estimated 420–470 ms at 1%, 510–610 ms at 2%; child-key/tombstone/name-heap construction remains. Lose independent graph/reference/count checks on correctly checksummed writer mistakes; retain safe decode/index checks and termination protection. Requires factoring trusted query construction from publication validation and amending the reader contract/tests. | Avoid part of duplicate validation without an extra durable file, but neither the fastest nor the smallest change. |
+| C. Persist a materialised namespace | Estimated 350–400 ms at 1%, 370–470 ms at 2%. Roughly 600–1,200 production lines plus comparable tests, not a prototype count. New checked index format and generation binding, an extra durable artifact before manifest publication, retention/cleanup and crash tests. Per-burst rewrite risks O(dirty-total) write amplification; cached prefixes need suffix replay. | Expected fastest cold name opens: no replay/sort of prefix history, just checked final-state buffers and any suffix. |
+
+**Recommendation:** A for M5/M6; evaluate C with M7's compaction/derived-state
+budgets if the cold-open requirement warrants its writer cost. Do not implement
+B or C in M5. C is expected fastest, A simplest, so this brief requires Dave's
+choice rather than silently exchanging the existing reader corruption contract.
+The current section reader owns checked buffers; adding actual mmap is a separate
+mechanism, not an existing format feature. Part A's detailed analysis is in
+`/home/dave/w/super-ferret/.ai/s1plus-m5-done.md`.
+
+**Fact that would change it:** a required cold name open below roughly 0.8 s at
+2%, or a C prototype meeting that goal with acceptable publication latency,
+write amplification and code cost. Measure query-only construction for B before
+crediting it with the full 220 ms gap.
