@@ -252,3 +252,56 @@ fn retained_eio_scopes_and_opaque_eacces_survive_compaction_and_recovery() {
         oracle(&tmp, &session.view());
     }
 }
+
+#[test]
+fn eleven_deletions_and_an_unreadable_highest_inode_report_the_surviving_alias_after_automatic_compaction()
+ {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    // Both callers formerly dereferenced reporting ids from the retired epoch.
+    for resident in [false, true] {
+        let tmp = Tmp::new(&format!("compact-content-fault-{resident}"));
+        for n in 0..12 {
+            tmp.write(&format!("file-{n:02}"), format!("contents-{n}").as_bytes());
+        }
+        index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+        let old = open(&tmp.cat());
+        let survivor = old
+            .inode_ids()
+            .filter(|&id| !old.is_directory(id))
+            .max_by_key(|id| id.0)
+            .unwrap();
+        let name = old
+            .names()
+            .find(|(id, _)| old.name(*id).child == survivor)
+            .unwrap()
+            .0;
+        let mut path = Vec::new();
+        old.path(name, &mut path);
+        let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&path));
+        for entry in fs::read_dir(tmp.tree()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path() != path {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = if resident {
+            let mut session = WriterSession::open(&tmp.cat()).unwrap();
+            crate::recrawl(&mut session, &[tmp.tree()], Refresh::All, &options()).unwrap()
+        } else {
+            index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap()
+        };
+        assert_eq!(report.content_faults.len(), 1);
+        assert_eq!(report.content_faults[0].0, path);
+        assert!(
+            matches!(&report.content_faults[0].1, crate::ContentFault::Open(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        let new = open(&tmp.cat());
+        assert_ne!(new.generation().checkpoint, old.generation().checkpoint);
+        let id = new.inode_ids().find(|&id| !new.is_directory(id)).unwrap();
+        assert_ne!(id, survivor, "the survivor was renumbered");
+        assert_eq!(new.state(id), ferret_catalog::ContentState::Fault);
+        oracle(&tmp, &new);
+    }
+}

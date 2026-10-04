@@ -432,15 +432,12 @@ fn run(
             let (catalog, changed, faulted, aliases) = match changes {
                 Some(changes) => {
                     let changed = !changes.records.is_empty();
-                    let faulted = faulted_inodes(&changes);
                     let catalog = session
                         .commit(&changes, options.sniffer)
                         .map_err(IndexError::Update)?;
-                    let aliases: Vec<_> = faulted
-                        .iter()
-                        .flat_map(|&id| session.names_for(id))
-                        .collect();
-                    (catalog, changed, Some(faulted), Some(aliases))
+                    let (faulted, aliases) =
+                        reporting_ids(&session, previous.generation(), &changes);
+                    (catalog, changed, faulted, aliases)
                 }
                 None => {
                     let mut txn = session.into_checkpoint(options.sniffer);
@@ -551,23 +548,19 @@ pub(crate) fn recrawl_scoped(
             report: Box::new(report),
         });
     };
-    let faulted = faulted_inodes(&changes);
     let changed = !changes.records.is_empty();
     let catalog = session
         .commit(&changes, options.sniffer)
         .map_err(IndexError::Update)?;
+    let (faulted, aliases) = reporting_ids(session, previous.generation(), &changes);
     report.commit_time += started.elapsed();
-    let aliases: Vec<_> = faulted
-        .iter()
-        .flat_map(|&id| session.names_for(id))
-        .collect();
     finish_report(
         &mut report,
         &catalog,
         &plan,
         changed,
-        Some(&faulted),
-        Some(&aliases),
+        faulted.as_deref(),
+        aliases.as_deref(),
     );
     Ok((report, changes))
 }
@@ -860,6 +853,24 @@ fn observe(
     }
     report.coverage_faults = faults;
     Ok((batches, report))
+}
+
+// Changes contain epoch-scoped ids. A checkpoint remaps them; reporting must
+// scan the resulting catalog before looking up any numeric id from the diff.
+fn reporting_ids(
+    session: &WriterSession,
+    previous: ferret_catalog::Generation,
+    changes: &ferret_catalog::log::ChangeSet,
+) -> (Option<Vec<InoId>>, Option<Vec<NameId>>) {
+    if session.view().generation().checkpoint != previous.checkpoint {
+        return (None, None);
+    }
+    let faulted = faulted_inodes(changes);
+    let aliases = faulted
+        .iter()
+        .flat_map(|&id| session.names_for(id))
+        .collect();
+    (Some(faulted), Some(aliases))
 }
 
 fn faulted_inodes(changes: &ferret_catalog::log::ChangeSet) -> Vec<InoId> {
