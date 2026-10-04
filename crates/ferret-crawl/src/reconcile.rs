@@ -284,11 +284,16 @@ pub fn changes(
     let mut at = 0;
     while at < files.len() {
         let first = file(files[at]);
-        let end = at
-            + files[at..].partition_point(|&loc| {
-                let st = file(loc).stat;
-                (st.dev, st.ino) == (first.stat.dev, first.stat.ino)
-            });
+        // Same-identity runs are almost always length 1, so scan forward: a
+        // binary search over the remaining slice per run is O(n log n).
+        let mut end = at + 1;
+        while end < files.len() {
+            let st = file(files[end]).stat;
+            if (st.dev, st.ino) != (first.stat.dev, first.stat.ino) {
+                break;
+            }
+            end += 1;
+        }
         let kind = Kind::from_mode(first.stat.mode);
         let id = match session
             .identity((first.stat.dev, first.stat.ino))

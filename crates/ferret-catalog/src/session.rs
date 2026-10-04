@@ -34,9 +34,11 @@ impl WriterSession {
             .inode_ids()
             .filter(|&id| !view.is_directory(id))
             .collect();
-        identities.sort_unstable_by_key(|&id| view.identity(id));
+        // Each key decodes columns; cache it rather than recompute it per
+        // comparison.
+        identities.sort_by_cached_key(|&id| view.identity(id));
         let mut documents: Vec<_> = (0..view.base_doc_count()).collect();
-        documents.sort_unstable_by_key(|&row| view.base_hash(row));
+        documents.sort_by_cached_key(|&row| view.base_hash(row));
         let mut document_changes = BTreeMap::new();
         for record in view.changed_docs() {
             match record {
@@ -52,7 +54,7 @@ impl WriterSession {
             }
         }
         let mut directories: Vec<_> = view.dir_ids().map(|id| (root_of(&view, id), id)).collect();
-        directories.sort_unstable_by_key(|&(root, id)| (root, view.identity(id)));
+        directories.sort_by_cached_key(|&(root, id)| (root, view.identity(id)));
         Ok(Self {
             writer,
             lookup_base: view,
