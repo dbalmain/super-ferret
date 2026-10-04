@@ -384,19 +384,6 @@ fn fault_root(dir: &Path, small: bool) -> Result<(), Box<dyn Error>> {
         return Err("disk replay lost fault coverage".into());
     }
     drop(disk);
-    let (final_rss, peak) = rss()?;
-    println!(
-        "| protected names | setup ms | setup current/peak KiB | walk ms | reconciliation/publication ms | run ms | final/peak KiB | log/manifest bytes | scopes | retained sequence |"
-    );
-    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
-    println!(
-        "| {} | {setup_ms:.2} | {setup_rss}/{setup_peak} | {:.2} | {:.2} | {total_ms:.2} | {final_rss}/{peak} | {bytes}/128 | {} | {} |",
-        if small { 1 } else { large_names },
-        report.walk_time.as_secs_f64() * 1000.0,
-        report.commit_time.as_secs_f64() * 1000.0,
-        report.protected_scopes,
-        generation.sequence
-    );
     // Repeat the same actual kernel error through the same API. Zero append
     // and unchanged generation prove that retained-at is not a retry counter.
     let repeated = ferret_crawl::recrawl(
@@ -411,5 +398,18 @@ fn fault_root(dir: &Path, small: bool) -> Result<(), Box<dyn Error>> {
     {
         return Err("identical root fault published again".into());
     }
+    let (final_rss, peak) = rss()?;
+    println!(
+        "| protected names | setup ms | setup current/peak KiB | walk ms | reconciliation/publication ms | run ms | final/peak KiB | log/manifest bytes | scopes | retained sequence |"
+    );
+    println!("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!(
+        "| {} | {setup_ms:.2} | {setup_rss}/{setup_peak} | {:.2} | {:.2} | {total_ms:.2} | {final_rss}/{peak} | {bytes}/128 | {} | {} |",
+        if small { 1 } else { large_names },
+        report.walk_time.as_secs_f64() * 1000.0,
+        report.commit_time.as_secs_f64() * 1000.0,
+        report.protected_scopes,
+        generation.sequence
+    );
     Ok(())
 }

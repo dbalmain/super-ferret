@@ -87,7 +87,7 @@ pub enum CoverageContext {
     Child { parent: DirToken, name: Vec<u8> },
 }
 
-/// A fault that stopped publication.
+/// A typed coverage fault retained in the report or blocking publication.
 #[derive(Debug)]
 pub struct CoverageFault {
     /// The root being walked.

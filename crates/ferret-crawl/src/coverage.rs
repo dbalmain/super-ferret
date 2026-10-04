@@ -42,42 +42,89 @@ impl Resolver<'_> {
         if !self.active.insert(token) {
             return None;
         }
-        let d = *self.dirs.get(&token)?;
-        let id = if let Some(parent) = d.parent {
-            let p = self.directory(parent)?;
-            match self.old.lookup(p, d.name).map(|n| self.old.name(n).child) {
-                Some(id) => (self.old.is_live_inode(id)
-                    && self.old.is_directory(id)
-                    && self.old.identity(id) == (d.stat.dev, d.stat.ino))
-                    .then_some(id),
-                None => {
-                    let mut root = p;
-                    while let Some(name) = self.old.dir_name(root) {
-                        root = self.old.name(name).parent;
+        let id = (|| {
+            let d = *self.dirs.get(&token)?;
+            if let Some(parent) = d.parent {
+                let p = self.directory(parent)?;
+                match self.old.lookup(p, d.name).map(|n| self.old.name(n).child) {
+                    Some(id) => (self.old.is_live_inode(id)
+                        && self.old.is_directory(id)
+                        && self.old.identity(id) == (d.stat.dev, d.stat.ino))
+                        .then_some(id),
+                    None => {
+                        let mut root = p;
+                        while let Some(name) = self.old.dir_name(root) {
+                            root = self.old.name(name).parent;
+                        }
+                        self.session
+                            .directory_identity(root, (d.stat.dev, d.stat.ino))
                     }
-                    self.session
-                        .directory_identity(root, (d.stat.dev, d.stat.ino))
                 }
+            } else {
+                self.old
+                    .roots()
+                    .find(|(_, path)| *path == d.name)
+                    .map(|(id, _)| id)
+                    .filter(|&id| self.old.identity(id) == (d.stat.dev, d.stat.ino))
             }
-        } else {
-            self.old
-                .roots()
-                .find(|(_, path)| *path == d.name)
-                .map(|(id, _)| id)
-                .filter(|&id| self.old.identity(id) == (d.stat.dev, d.stat.ino))
-        };
+        })();
         self.active.remove(&token);
         self.resolved.insert(token, id);
         id
     }
+    fn anchored_directory(&mut self, token: DirToken) -> Option<InoId> {
+        let id = self.directory(token)?;
+        let mut current = token;
+        let mut visited = BTreeSet::new();
+        while visited.insert(current) {
+            let d = *self.dirs.get(&current)?;
+            let Some(parent) = d.parent else {
+                return Some(id);
+            };
+            let child = self.directory(current)?;
+            let p = self.directory(parent)?;
+            if self.old.lookup(p, d.name).map(|n| self.old.name(n).child) != Some(child) {
+                return None;
+            }
+            current = parent;
+        }
+        None
+    }
+    fn old_root(&mut self, mut token: DirToken) -> Option<(DirToken, InoId)> {
+        let mut visited = BTreeSet::new();
+        while visited.insert(token) {
+            match self.dirs.get(&token)?.parent {
+                Some(parent) => token = parent,
+                None => return Some((token, self.directory(token)?)),
+            }
+        }
+        None
+    }
+    fn mark(&mut self, token: DirToken, id: InoId) {
+        self.out.directories.insert(id.0);
+        self.out.markers.insert(id.0);
+        self.out.tokens.insert(token);
+    }
     fn protect(&mut self, mut token: DirToken) -> Option<()> {
         let mut visited = BTreeSet::new();
         while visited.insert(token) {
-            if let Some(id) = self.directory(token) {
-                self.out.directories.insert(id.0);
-                self.out.markers.insert(id.0);
-                self.out.tokens.insert(token);
+            if let Some(id) = self.anchored_directory(token) {
+                self.mark(token, id);
                 return Some(());
+            }
+            // A relocated old directory cannot retain its old incoming edge
+            // while its former ancestors are swept. Protect the checked owner
+            // root rather than attaching old children to the new occurrence.
+            if let Some((root_token, root)) = self.old_root(token) {
+                let d = *self.dirs.get(&token)?;
+                if self
+                    .session
+                    .directory_identity(root, (d.stat.dev, d.stat.ino))
+                    .is_some()
+                {
+                    self.mark(root_token, root);
+                    return Some(());
+                }
             }
             // Replaced directories cannot carry their old subtrees. Only an
             // unchanged ancestor can anchor retention; new roots have none.
@@ -92,7 +139,7 @@ impl Resolver<'_> {
             .find(|d| d.parent == Some(parent) && d.name == name)
             .map(|d| d.token);
         if token.is_none()
-            && let Some(p) = self.directory(parent)
+            && let Some(p) = self.anchored_directory(parent)
             && let Some(edge) = self.old.lookup(p, name)
         {
             let child = self.old.name(edge).child;
@@ -103,10 +150,19 @@ impl Resolver<'_> {
             }
         }
         if let Some(token) = token {
-            if self.directory(token).is_some() {
+            if self.directory(token).is_some()
+                || self.old_root(token).is_some_and(|(_, root)| {
+                    let d = self.dirs[&token];
+                    self.session
+                        .directory_identity(root, (d.stat.dev, d.stat.ino))
+                        .is_some()
+                })
+            {
                 return self.protect(token);
             }
-            let p = self.directory(parent)?;
+            let Some(p) = self.anchored_directory(parent) else {
+                return self.protect(parent);
+            };
             if self.old.lookup(p, name).is_none() {
                 self.out.opaque.insert(token);
                 return Some(());
@@ -115,7 +171,9 @@ impl Resolver<'_> {
         self.protect(parent)
     }
     fn child_edge(&mut self, parent: DirToken, name: &[u8]) -> Option<()> {
-        let p = self.directory(parent)?;
+        let Some(p) = self.anchored_directory(parent) else {
+            return self.protect(parent);
+        };
         let Some(edge) = self.old.lookup(p, name) else {
             return self.protect(parent);
         };
@@ -275,6 +333,31 @@ pub(crate) fn resolve(
         let p = r.old.name(ferret_catalog::NameId(id)).parent;
         !r.out.directories.contains(&p.0) && outermost(&r.out.directories, p)
     });
+    // A new opaque scope beneath an old protected scope is discarded along
+    // with the rest of that ancestor's observations, not counted separately.
+    let mut opaque = BTreeSet::new();
+    for token in r.out.opaque.iter().copied().collect::<Vec<_>>() {
+        let mut parent = r.dirs.get(&token)?.parent;
+        let mut protected = false;
+        let mut visited = BTreeSet::new();
+        while let Some(p) = parent {
+            if !visited.insert(p) {
+                return None;
+            }
+            if r.out.tokens.contains(&p)
+                || r.directory(p)
+                    .is_some_and(|id| r.out.directories.contains(&id.0))
+            {
+                protected = true;
+                break;
+            }
+            parent = r.dirs.get(&p)?.parent;
+        }
+        if !protected {
+            opaque.insert(token);
+        }
+    }
+    r.out.opaque = opaque;
     // Root-boundary edits are normalised plan paths. Compare them only with
     // paths derived from checked graph IDs, never use paths to guess a scope.
     // A disjoint root edit does not invalidate an unchanged protected subtree.

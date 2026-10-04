@@ -1,9 +1,9 @@
 //! Whole-walk observations to a sparse final change set. Directory tokens are
 //! resolved against the effective graph, never a renumbered candidate snapshot.
-//! Only completely covered refreshed roots are swept; kept roots remain in the
-//! pinned view. Typed protection scopes stop sweeps at checked old boundaries
-//! and discard every worker's new observations below them before alias
-//! grouping.
+//! Only covered portions of refreshed roots are swept; kept roots remain in
+//! the pinned view. Typed protection scopes stop sweeps at checked old
+//! boundaries and discard every worker's new observations below them before
+//! alias grouping.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;

@@ -116,6 +116,7 @@ fn every_typed_namespace_fault_row_retains_a_checked_scope() {
         (IoPoint::Directory, "dir", IoOp::List, 2, "dir", "dir"),
         (IoPoint::Directory, "dir", IoOp::OpenDir, 13, "dir", "dir"),
         (IoPoint::Directory, "dir", IoOp::Reopen, 5, "dir", "dir"),
+        (IoPoint::Directory, "dir", IoOp::Reopen, -1, "dir", "dir"),
         (IoPoint::Child, "dir/a", IoOp::Lstat, 13, "dir/a", "dir"),
         (IoPoint::Child, "dir/a", IoOp::Readlink, 2, "dir/a", "dir"),
         (
@@ -139,17 +140,48 @@ fn every_typed_namespace_fault_row_retains_a_checked_scope() {
         tmp.write("dir/a", b"content");
         tmp.write("dir/deep/b", b"nested");
         tmp.write("stable", b"stable");
+        if op == IoOp::Readlink {
+            fs::remove_file(tmp.at("dir/a")).unwrap();
+            std::os::unix::fs::symlink("../stable", tmp.at("dir/a")).unwrap();
+        }
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
         let mut session = WriterSession::open(&tmp.cat()).unwrap();
         let before = session.view();
         let hook = Hook::set(&tmp.tree(), move |at, rel| {
-            (at == point && rel == Path::new(path))
-                .then(|| (op, std::io::Error::from_raw_os_error(error)))
+            (at == point && rel == Path::new(path)).then(|| {
+                (
+                    op,
+                    if error == -1 {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "directory identity changed",
+                        )
+                    } else {
+                        std::io::Error::from_raw_os_error(error)
+                    },
+                )
+            })
         });
         let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
         assert_eq!(report.coverage_faults.len(), 1, "case {i}");
+        let fault = &report.coverage_faults[0];
+        assert_eq!(fault.op, op, "case {i}");
+        assert_eq!(
+            fault.error.raw_os_error(),
+            (error != -1).then_some(error),
+            "case {i}"
+        );
+        assert!(
+            matches!(
+                (&fault.context, point),
+                (crate::CoverageContext::Root, IoPoint::Root)
+                    | (crate::CoverageContext::Directory(_), IoPoint::Directory)
+                    | (crate::CoverageContext::Child { .. }, IoPoint::Child)
+            ),
+            "case {i}"
+        );
         assert_eq!(report.protected_scopes, 1, "case {i}");
         let faulted = session.view();
         let generation = faulted.generation();
@@ -683,6 +715,118 @@ fn protected_names_survive_last_link_moves_and_fresh_outside_aliases_update_the_
         *target = physical;
         assert_eq!(listings(&current), want);
         assert_eq!(listings(&current), listings(&open(&tmp.cat())));
+        recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+    }
+}
+
+#[test]
+fn faults_below_new_or_replaced_parents_protect_a_proven_unchanged_ancestor() {
+    for replaced in [false, true] {
+        for listing in [false, true] {
+            let tmp = Tmp::new("fault-new-parent");
+            tmp.write("stable", b"stable");
+            if replaced {
+                tmp.write("parent/old", b"old subtree");
+            }
+            let roots = [tmp.tree()];
+            let opts = options();
+            index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+            let mut session = WriterSession::open(&tmp.cat()).unwrap();
+            let before = session.view();
+            if replaced {
+                fs::rename(tmp.at("parent"), tmp.base.join("displaced")).unwrap();
+            }
+            tmp.write("parent/dir/new", b"untrusted");
+            tmp.write("parent/new", b"untrusted");
+            let hook = Hook::set(&tmp.tree(), move |point, path| {
+                (if listing {
+                    point == IoPoint::Directory && path == Path::new("parent/dir")
+                } else {
+                    point == IoPoint::Child && path == Path::new("parent/new")
+                })
+                .then(|| {
+                    (
+                        if listing { IoOp::List } else { IoOp::Lstat },
+                        std::io::Error::from_raw_os_error(5),
+                    )
+                })
+            });
+            let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+            assert_eq!(report.protected_scopes, 1);
+            let faulted = session.view();
+            assert!(
+                recrawl(&mut session, &roots, Refresh::All, &opts)
+                    .unwrap()
+                    .published
+                    .is_none()
+            );
+            drop(hook);
+            assert_eq!(listings(&faulted), expected(&tmp, &before, &[""], &[""]));
+            assert_eq!(listings(&faulted), listings(&open(&tmp.cat())));
+            recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+            assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
+        }
+    }
+}
+
+#[test]
+fn an_outer_old_scope_discards_nested_new_opaque_scopes() {
+    let tmp = Tmp::new("fault-overlap-opaque");
+    tmp.write("parent/stable", b"old");
+    let roots = [tmp.tree()];
+    let opts = options();
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let before = session.view();
+    tmp.write("parent/new/child", b"untrusted");
+    let hook = Hook::set(&tmp.tree(), |point, path| {
+        (point == IoPoint::Directory
+            && [Path::new("parent"), Path::new("parent/new")].contains(&path))
+        .then(|| (IoOp::List, std::io::Error::from_raw_os_error(5)))
+    });
+    let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    assert_eq!(report.coverage_faults.len(), 2);
+    assert_eq!(report.protected_scopes, 1);
+    let faulted = session.view();
+    drop(hook);
+    assert_eq!(
+        listings(&faulted),
+        expected(&tmp, &before, &["parent"], &["parent"])
+    );
+    assert_eq!(listings(&faulted), listings(&open(&tmp.cat())));
+}
+
+#[test]
+fn a_fault_after_a_directory_move_retains_a_live_old_ancestor() {
+    for (remove_parent, new_parent) in [(false, false), (true, false), (true, true)] {
+        let tmp = Tmp::new("fault-moved-directory");
+        tmp.write("old/dir/child", b"old subtree");
+        if !new_parent {
+            tmp.write("new/stable", b"stable");
+        }
+        let roots = [tmp.tree()];
+        let opts = options();
+        index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        if new_parent {
+            tmp.write("new/stable", b"stable");
+        }
+        fs::rename(tmp.at("old/dir"), tmp.at("new/dir")).unwrap();
+        if remove_parent {
+            fs::remove_dir(tmp.at("old")).unwrap();
+        }
+        let hook = Hook::set(&tmp.tree(), |point, path| {
+            (point == IoPoint::Directory && path == Path::new("new/dir"))
+                .then(|| (IoOp::List, std::io::Error::from_raw_os_error(5)))
+        });
+        let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+        assert_eq!(report.protected_scopes, 1);
+        let faulted = session.view();
+        drop(hook);
+        assert_eq!(listings(&faulted), expected(&tmp, &before, &[""], &[""]));
+        assert_eq!(listings(&faulted), listings(&open(&tmp.cat())));
         recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
         assert_eq!(listings(&session.view()), expected(&tmp, &before, &[], &[]));
     }

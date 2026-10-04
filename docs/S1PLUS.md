@@ -2,7 +2,8 @@
 
 M0 design, 2026-10-03. Implementation baseline: `4e38e77`, format v3.
 M1–M3 implement the checked version-4 checkpoint, durable log and effective
-reader. M4 implements the covered batch recrawl producer; M5–M7 remain a design.
+reader. M4/M4b implement the batch recrawl producer; M5 implements typed coverage
+retention. M6–M7 remain a design.
 The build is split into slices below. D51 is open; its recommended choice is
 the provisional compaction schedule. D52 interprets D27 C as epoch-scoped ids:
 proceeding on the recommendation; Dave may veto. Neither is recorded as an
@@ -661,7 +662,9 @@ it releases directory observations incrementally.
 Protection requires the old directory occurrence still belongs to the
 refreshed root and was not proved replaced. If its identity was replaced, there
 is no valid old subtree to attach: protect a proven unchanged ancestor instead,
-or abort. New unreadable directories can be recorded as opaque, with no invented
+or abort. A relocated old directory whose old incoming path is no longer
+anchored protects its checked owner root, so retaining its old edge cannot leave
+a dead parent after the sweep. New unreadable directories can be recorded as opaque, with no invented
 children and unknown counts; uncertain new roots and policy scopes block if
 there is no valid anchor. Overlapping protection scopes reduce to the outermost
 ones before reconciliation, and may override observations from other workers.

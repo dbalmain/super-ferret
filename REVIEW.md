@@ -103,3 +103,14 @@ findings). Each should name the guard that will eventually retire it.
   residue before grouping. The real-crawl test
   `compact_equal_observation_joins_a_new_alias_before_conflict_resolution` fails
   Hashed vs Fault when expansion is disabled. Applied in M4b.
+
+### 2026-10-05 — retaining a moved scope also needs a live incoming path
+
+- **What:** protecting an old directory ID after it moved kept its incoming edge,
+  while the former parent could still be swept. Checking inode identity alone
+  did not prove that the old namespace occurrence stayed anchored.
+- **Guard:** check the complete old parent/name chain before selecting a scope;
+  a relocated occurrence protects its checked owner root. The real-crawl test
+  `a_fault_after_a_directory_move_retains_a_live_old_ancestor` covers surviving,
+  removed and newly created parents, plus disk replay and successful recovery.
+  Its pre-fix probe failed. Applied in S1+ M5.
