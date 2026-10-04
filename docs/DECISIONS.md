@@ -2486,7 +2486,7 @@ explicit `ferretd` is the whole design.
 **Answer (2026-09-30): A.** Start the daemon on first use; build the engine in
 process when a background process is not allowed or `FERRET_NO_DAEMON` is set.
 
-## D50 — The `ferret find` stretch's calls (answered 2026-10-03, on the decisions page)
+## D50 — The `ferret find` stretch's calls (answered 2026-10-03)
 
 The find stretch (ROADMAP § S1c, milestones M1–M5c) asked its questions on an
 HTML decisions page rather than here, numbered F1–F13. Each is recorded below
@@ -2706,6 +2706,17 @@ times) and blocks 6.1 MB, against 553 MB of sections.
 **Answer: A.** Atime, allocated blocks, birth time and device numbers stay
 lazy. The fact that would change it: query logs showing `-ls` or `%k` in normal
 use (then C).
+
+### README — which mode it leads with
+
+**Question:** Should README lead with `-I` instead of default mode, given F8's
+"not advertised until the daemon keeps the index current"?
+
+- A. Lead with `-I`, which is current without a daemon.
+- B. Keep README as it is, leading with default mode.
+
+**Answer: B.** Dave, 2026-10-03: "not advertised" means not posting about
+ferret online. The README may lead with default mode.
 
 ### M4b's own calls, recorded in D47
 
