@@ -685,6 +685,7 @@ fn observe(
             .collect();
         for mut output in outputs {
             output.resolve(&cache);
+            output.batch.finish_observations();
             report.counts.add(&output.counts);
             report.hash_time += output.read_time;
             report.content_faults.append(&mut output.content_faults);

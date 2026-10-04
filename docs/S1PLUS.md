@@ -20,7 +20,7 @@ at exactly 10M names, rather than S1's 1.18 GB, but rewriting even that for each
 inotify burst is the wrong cost. The log saves roughly a million times the
 logical writes for one changed file. The price is bounded
 replay and occasional full compaction. An unchanged full recrawl still visits
-every entry, and M4 also sorts file observation locators. S1+ cannot turn filesystem enumeration into a small update.
+every entry; M4b sorts directory listings and only the changed/alias residue. S1+ cannot turn filesystem enumeration into a small update.
 
 ## What the code does today
 
@@ -549,23 +549,36 @@ untouched roots remain unswept. Collapse unsuccessful traversal with the
 existing reachability rule. Sort final changed rows deterministically; current
 per-worker arrival order is not a persistence contract.
 
-M4 retains whole-walk batches to bound its first review slice, without building
-a second encoded snapshot. It sorts an 8 B locator per file observation by
-kernel identity and parent/name to group hard links deterministically; this is
-O(files log files) comparison work, beyond the linear filesystem walk. Seen bits
-are sized by epoch high-water ids, not live counts. The 10.45M synthetic replay
-adds about 1.28 GiB RSS beyond the session before diff; reconciliation then adds
-locators, seen bits and directory tables. ROADMAP S1+ reports the measured peak and separates session setup, replay,
-diff and publication. M6 streams completed directory observations into
-reconciliation, retaining only changed file rows, seen bits, the directory token/coverage table
-and the existing bounded alias backlog. The directory table still costs
-O(directories); resolve continuing directory ids as tokens are minted and
-retain provisional token mappings for newly discovered/ambiguous moves. File
-observations need not survive once compared to their parent's old children.
-That is an explicit RSS milestone, not a claim that the first diff removes
-every allocation. A zero-change walk does no publication; telemetry may record
-its time outside the catalog. Content-fault reporting uses changed/fault inode
-sets and live aliases, avoiding today's full fault-state pass per small burst.
+M4b reduces each worker's local file listing by basename against the sorted
+old children before retaining it. Fully equal single-name files retain a compact
+old-name reference, checked against a pinned generation and a same-path parent
+hint. Equality includes all stat fields, content state/hash and symlink target;
+policy/sniffer changes cannot bypass those checks. Files with multiple filesystem
+links or multiple indexed names keep full observations. Changed/unmatched rows
+and alias candidates alone enter the identity-sorted residue. An unmatched alias
+can name a compacted inode even with st_nlink == 1 (bind mounts); expand that
+inode's compact observations into the residue so conflict handling and canonical
+ordering still see the full group. Final edge and document lifetimes are unchanged.
+
+This moves directory-local observation reduction ahead of M6 to meet M4b's CPU
+and RSS budget. It does not yet stream the directory graph or complete coverage
+scopes. The observation batches still retain directories and compact name
+references for the run. Seen bits are sized by epoch high-water ids, not live
+counts. Directory tokens carry checked parent hints and use dense per-batch
+lookup arrays, rather than a tree lookup per observed file. The checkpoint's
+children are already sorted; only effective overlays need a sparse merge.
+Checkpoint fallback expands compact references into ordinary observations.
+A zero-change walk does no publication; telemetry may record its time outside
+the catalog. ROADMAP S1+ reports setup, replay, diff and publication separately.
+
+M6 streams completed directory observations into reconciliation, retaining only
+changed file rows, seen bits, the directory token/coverage table and the existing
+bounded alias backlog. The directory table still costs O(directories); resolve
+continuing directory ids as tokens are minted and retain provisional mappings
+for newly discovered/ambiguous moves. File observations need not survive once
+compared to their parent's old children. Content-fault reporting uses
+changed/fault inode sets and live aliases, avoiding a full fault-state pass per
+small burst. Scoped alias lookup and bounded directory buffering remain M6 work.
 
 ### S1b's interface
 

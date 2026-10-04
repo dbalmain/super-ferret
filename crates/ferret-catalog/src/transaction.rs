@@ -272,7 +272,8 @@ impl Transaction {
     }
 
     /// Hands back a filled batch.
-    pub fn add(&mut self, batch: Batch) {
+    pub fn add(&mut self, mut batch: Batch) {
+        batch.materialize();
         self.batches.push(batch);
     }
 

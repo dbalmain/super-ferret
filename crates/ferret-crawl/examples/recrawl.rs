@@ -132,6 +132,9 @@ fn run(dir: &Path, changed: usize) -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    for batch in &mut batches {
+        batch.finish_observations();
+    }
     drop(tokens);
     drop(changed_ids);
     let replay_ms = started.elapsed().as_secs_f64() * 1000.0;

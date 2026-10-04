@@ -535,6 +535,11 @@ fn final_log_order_is_identical_across_walk_worker_counts() {
 fn incomplete_eacces_coverage_blocks_resident_recrawl_and_batch_falls_back() {
     let tmp = Tmp::new("recrawl-incomplete");
     tmp.write("dir/a", b"content");
+    // Equal siblings are compacted before the coverage fault. The owned
+    // checkpoint fallback must expand them, rather than dropping their rows.
+    for i in 0..8 {
+        tmp.write(&format!("stable-{i}"), b"unchanged");
+    }
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();

@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use ferret_catalog::batch::DirectoryObservation;
+use ferret_catalog::batch::{DirectoryObservation, FileObservation};
 use ferret_catalog::log::{ChangeSet, Error, Record};
 use ferret_catalog::{
-    Batch, Catalog, Content, DecodeError, DocId, Hash, InoId, Kind, NameId, Stat, Target,
+    Batch, Catalog, Content, DecodeError, DirToken, DocId, Hash, InoId, Kind, NameId, Stat, Target,
     WriterSession,
 };
 
@@ -37,6 +37,46 @@ struct Directory<'a> {
     id: Option<u32>,
     root: u32,
     entries: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+enum File {
+    Full(u32, u32),
+    Reused(u32, u32),
+}
+impl File {
+    fn observation(self, batches: &[Batch]) -> FileObservation<'_> {
+        match self {
+            Self::Full(b, i) => batches[b as usize].file_observation(i as usize),
+            Self::Reused(b, i) => batches[b as usize].reused_file_observation(i as usize),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Tokens(BTreeMap<u32, Vec<usize>>);
+impl Tokens {
+    fn insert(&mut self, token: DirToken, index: usize) -> bool {
+        let (batch, row) = token.coordinates();
+        let rows = self.0.entry(batch).or_default();
+        rows.resize(rows.len().max(row as usize + 1), usize::MAX);
+        let before = std::mem::replace(&mut rows[row as usize], index);
+        before == usize::MAX
+    }
+    fn get(&self, token: &DirToken) -> Option<&usize> {
+        let (batch, row) = token.coordinates();
+        self.0
+            .get(&batch)?
+            .get(row as usize)
+            .filter(|&&i| i != usize::MAX)
+    }
+}
+impl std::ops::Index<&DirToken> for Tokens {
+    type Output = usize;
+    fn index(&self, token: &DirToken) -> &usize {
+        let (batch, row) = token.coordinates();
+        &self.0[&batch][row as usize]
+    }
 }
 
 struct Edge {
@@ -91,6 +131,13 @@ pub fn changes(
         return Err(invalid("recrawl batch overflow"));
     }
     let old = session.view();
+    if batches.iter().any(|batch| {
+        batch
+            .observation_generation()
+            .is_some_and(|g| g != old.generation())
+    }) {
+        return Err(invalid("stale observation generation"));
+    }
     let mut dirs: Vec<_> = batches
         .iter()
         .flat_map(Batch::directories)
@@ -103,13 +150,11 @@ pub fn changes(
             entries: None,
         })
         .collect();
-    let tokens: BTreeMap<_, _> = dirs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| (d.observation.token, i))
-        .collect();
-    if tokens.len() != dirs.len() {
-        return Err(invalid("duplicate directory token"));
+    let mut tokens = Tokens::default();
+    for (i, d) in dirs.iter().enumerate() {
+        if !tokens.insert(d.observation.token, i) {
+            return Err(invalid("duplicate directory token"));
+        }
     }
     for i in 0..dirs.len() {
         if let Some(parent) = dirs[i].observation.parent {
@@ -130,22 +175,27 @@ pub fn changes(
         return Ok(None);
     }
     // D29: only ancestors of an included row survive a Traverse observation.
-    let mut seeds: Vec<_> = dirs
+    for batch in batches {
+        for i in 0..batch.file_count() {
+            let parent = batch.file_observation(i).parent;
+            let p = *tokens
+                .get(&parent)
+                .ok_or_else(|| invalid("file parent token"))?;
+            dirs[p].included = true;
+        }
+        for parent in batch.reused_directories() {
+            let p = *tokens
+                .get(&parent)
+                .ok_or_else(|| invalid("reused parent token"))?;
+            dirs[p].included = true;
+        }
+    }
+    let seeds: Vec<_> = dirs
         .iter()
         .enumerate()
         .filter(|(_, d)| d.included)
         .map(|(i, _)| i)
         .collect();
-    for batch in batches {
-        for i in 0..batch.file_count() {
-            let parent = batch.file_observation(i).parent;
-            seeds.push(
-                *tokens
-                    .get(&parent)
-                    .ok_or_else(|| invalid("file parent token"))?,
-            );
-        }
-    }
     for mut i in seeds {
         loop {
             dirs[i].included = true;
@@ -225,27 +275,34 @@ pub fn changes(
             },
             |p| Some(dirs[p].root),
         );
-        let continuing = if let Some(parent) = parent_id {
-            out.old
-                .is_live_inode(InoId(parent))
-                .then(|| out.old.lookup(InoId(parent), d.name))
-                .flatten()
-                .map(|id| out.old.name(id).child)
-                .filter(|&id| {
-                    out.old.is_live_inode(id)
-                        && out.old.is_directory(id)
-                        && out.old.identity(id) == (d.stat.dev, d.stat.ino)
-                })
-                .or_else(|| {
-                    root.and_then(|r| {
-                        session.directory_identity(InoId(r), (d.stat.dev, d.stat.ino))
-                    })
-                })
-        } else {
-            root.map(InoId)
-                .filter(|&id| out.old.identity(id) == (d.stat.dev, d.stat.ino))
-        }
-        .filter(|id| !out.inodes.contains(id.0));
+        let hinted = d
+            .token
+            .previous_directory()
+            .filter(|&id| !out.inodes.contains(id.0));
+        let continuing = hinted
+            .or_else(|| {
+                if let Some(parent) = parent_id {
+                    out.old
+                        .is_live_inode(InoId(parent))
+                        .then(|| out.old.lookup(InoId(parent), d.name))
+                        .flatten()
+                        .map(|id| out.old.name(id).child)
+                        .filter(|&id| {
+                            out.old.is_live_inode(id)
+                                && out.old.is_directory(id)
+                                && out.old.identity(id) == (d.stat.dev, d.stat.ino)
+                        })
+                        .or_else(|| {
+                            root.and_then(|r| {
+                                session.directory_identity(InoId(r), (d.stat.dev, d.stat.ino))
+                            })
+                        })
+                } else {
+                    root.map(InoId)
+                        .filter(|&id| out.old.identity(id) == (d.stat.dev, d.stat.ino))
+                }
+            })
+            .filter(|id| !out.inodes.contains(id.0));
         let id = match continuing {
             Some(id) => id.0,
             None => allocate(&mut out.changes.counters[0], u32::MAX - 16)?,
@@ -266,12 +323,39 @@ pub fn changes(
     if visited != dirs.len() {
         return Err(invalid("unreachable directory observation"));
     }
-    let mut files: Vec<(u32, u32)> = batches
+    let mut files: Vec<File> = batches
         .iter()
         .enumerate()
-        .flat_map(|(b, batch)| (0..batch.file_count()).map(move |f| (b as u32, f as u32)))
+        .flat_map(|(b, batch)| (0..batch.file_count()).map(move |f| File::Full(b as u32, f as u32)))
         .collect();
-    let file = |(b, f): (u32, u32)| batches[b as usize].file_observation(f as usize);
+    let file = |loc: File| loc.observation(batches);
+    // An unmatched observation may be another alias of a compacted row, even
+    // with st_nlink == 1 (bind mounts). Expand that residue's equal aliases so
+    // conflicts and canonical first-observation selection remain unchanged.
+    let mut aliases = Seen::new(out.old.next_inode().0);
+    for &loc in &files {
+        let st = file(loc).stat;
+        if let Some(id) = session.identity((st.dev, st.ino)) {
+            aliases.insert(id.0);
+        }
+    }
+    for (b, batch) in batches.iter().enumerate() {
+        let mut parent = None;
+        let mut continuing = false;
+        for (i, (token, name)) in batch.reused_files().enumerate() {
+            if parent != Some(token) {
+                parent = Some(token);
+                continuing = dirs[tokens[&token]].id == token.previous_directory().map(|id| id.0);
+            }
+            let child = out.old.name(name).child;
+            if continuing && !aliases.contains(child.0) {
+                out.names.insert(name.0);
+                out.inodes.insert(child.0);
+            } else {
+                files.push(File::Reused(b as u32, i as u32));
+            }
+        }
+    }
     files.sort_unstable_by(|&a, &b| {
         let a = file(a);
         let b = file(b);

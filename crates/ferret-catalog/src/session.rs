@@ -81,6 +81,7 @@ impl WriterSession {
     /// Mints an observation batch; workers can call this concurrently.
     pub fn batch(&self) -> Batch {
         Batch::new(self.next_batch.fetch_add(1, Ordering::Relaxed), false)
+            .with_previous(self.view())
     }
 
     /// Finds a continuing non-directory inode by its kernel identity.

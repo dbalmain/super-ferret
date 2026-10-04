@@ -11,7 +11,7 @@
 //! where a bad one is a [`BuildError`](crate::BuildError).
 
 use crate::format::NONE;
-use crate::{ContentState, Hash, Kind};
+use crate::{Catalog, ContentState, Generation, Hash, InoId, Kind, NameId};
 
 /// A directory, as minted by the batch that recorded it. Valid only within the
 /// transaction whose batch minted it. `Copy + Send`, for the walker's
@@ -20,6 +20,8 @@ use crate::{ContentState, Hash, Kind};
 pub struct DirToken {
     pub(crate) batch: u32,
     pub(crate) index: u32,
+    /// Checked same-path directory hint in the batch's pinned view.
+    pub(crate) old: u32,
 }
 
 /// The `lstat` fields the catalog keeps. Times are split as the kernel gives
@@ -126,6 +128,7 @@ impl Span {
 }
 
 pub(crate) struct DirEntry {
+    pub(crate) old: u32,
     /// `None` for a root, whose `name` is then the root's path.
     pub(crate) parent: Option<DirToken>,
     pub(crate) name: Span,
@@ -155,6 +158,14 @@ pub(crate) struct WorkTreeEntry {
     pub(crate) common_id: (u64, u64),
 }
 
+struct PendingFile {
+    parent: DirToken,
+    name: Vec<u8>,
+    stat: Stat,
+    content: Content,
+    target: Option<Vec<u8>>,
+}
+
 /// The rows one worker recorded. Fill it, then hand it to
 /// [`Transaction::add`](crate::Transaction::add).
 ///
@@ -162,6 +173,9 @@ pub(crate) struct WorkTreeEntry {
 /// per file with byte ranges took 136 B. At 10M entries that difference is
 /// most of a gigabyte (D40).
 pub struct Batch {
+    previous: Option<Catalog>,
+    pending: Vec<PendingFile>,
+    reused: Vec<(DirToken, NameId)>,
     pub(crate) id: u32,
     /// Set for a root copied forward from the previous generation, whose file
     /// observations yield to fresh ones (D34).
@@ -188,6 +202,9 @@ pub struct Batch {
 impl Batch {
     pub(crate) fn new(id: u32, carried: bool) -> Self {
         Self {
+            previous: None,
+            pending: Vec::new(),
+            reused: Vec::new(),
             id,
             carried,
             dirs: Vec::new(),
@@ -228,10 +245,134 @@ impl Batch {
     /// Records a regular file. Each name of a hard-linked file is recorded
     /// with the same observation; the commit keeps one inode row (D31).
     pub fn file(&mut self, parent: DirToken, name: &[u8], stat: Stat, content: Content) {
+        self.observe_file(parent, name, stat, content, None);
+    }
+
+    pub(crate) fn with_previous(mut self, previous: Catalog) -> Self {
+        self.previous = Some(previous);
+        self
+    }
+
+    fn observe_file(
+        &mut self,
+        parent: DirToken,
+        name: &[u8],
+        stat: Stat,
+        content: Content,
+        target: Option<&[u8]>,
+    ) {
+        if self.previous.is_some() && parent.old != NONE && stat.nlink <= 1 {
+            if self.pending.first().is_some_and(|f| f.parent != parent) {
+                self.finish_observations();
+            }
+            self.pending.push(PendingFile {
+                parent,
+                name: name.to_vec(),
+                stat,
+                content,
+                target: target.map(<[u8]>::to_vec),
+            });
+        } else {
+            self.push_file(parent, name, stat, content, target);
+        }
+    }
+
+    fn push_file(
+        &mut self,
+        parent: DirToken,
+        name: &[u8],
+        stat: Stat,
+        content: Content,
+        target: Option<&[u8]>,
+    ) {
+        let index = self.files.len() as u32;
         let name = push(&mut self.names, name, &mut self.overflow);
         self.files.push(FileEntry { parent, name });
         self.file_stats.push(stat);
         self.contents.push(content);
+        if let Some(target) = target {
+            let span = push(&mut self.strings, target, &mut self.overflow);
+            self.targets.push((index, span));
+        }
+    }
+
+    /// Reduces a completed local listing against sorted old children. Equal
+    /// single-name rows retain only an old-name reference. Alias candidates
+    /// and changed observations stay complete for final-set reconciliation.
+    /// Unflushed observations remain visible through the borrowed accessors.
+    pub fn finish_observations(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let old = self.previous.clone();
+        if let Some(old) = old {
+            let mut children = old.children(InoId(pending[0].parent.old)).peekable();
+            let names = old.name_reader();
+            // A duplicate observation is invalid even if both rows are equal.
+            let duplicate = pending.windows(2).any(|p| p[0].name == p[1].name);
+            for file in &pending {
+                while children
+                    .peek()
+                    .is_some_and(|&id| names.get(id).bytes < file.name.as_slice())
+                {
+                    children.next();
+                }
+                let matched = children
+                    .peek()
+                    .copied()
+                    .filter(|&id| names.get(id).bytes == file.name);
+                let reusable = !duplicate
+                    && matched.is_some_and(|id| {
+                        let edge = names.get(id);
+                        let crate::Target::Inode(child) = edge.target() else {
+                            return false;
+                        };
+                        if old.is_directory(child) || old.indexed_name_count(child) != 1 {
+                            return false;
+                        }
+                        let inode = old.inode(child);
+                        inode.stat == file.stat
+                            && old.kind(child) == Kind::from_mode(file.stat.mode)
+                            && content(&old, child) == file.content
+                            && old.link_target(child) == file.target.as_deref()
+                    });
+                if reusable {
+                    if let Some(id) = matched {
+                        self.reused.push((file.parent, id));
+                    }
+                } else {
+                    self.push_file(
+                        file.parent,
+                        &file.name,
+                        file.stat,
+                        file.content,
+                        file.target.as_deref(),
+                    );
+                }
+            }
+        }
+        pending.clear();
+        self.pending = pending;
+    }
+
+    pub(crate) fn materialize(&mut self) {
+        self.finish_observations();
+        let old = self.previous.take();
+        if let Some(old) = old {
+            for (parent, id) in std::mem::take(&mut self.reused) {
+                let edge = old.name(id);
+                let child = edge.child;
+                self.push_file(
+                    parent,
+                    edge.bytes,
+                    old.inode(child).stat,
+                    content(&old, child),
+                    old.link_target(child),
+                );
+            }
+        }
     }
 
     /// Records an ignored name without stat or content. A directory is an
@@ -243,10 +384,7 @@ impl Batch {
 
     /// Records a symlink with its target as `readlink` returned it.
     pub fn symlink(&mut self, parent: DirToken, name: &[u8], stat: Stat, target: &[u8]) {
-        let index = self.files.len() as u32;
-        self.file(parent, name, stat, Content::Unindexed);
-        let target = push(&mut self.strings, target, &mut self.overflow);
-        self.targets.push((index, target));
+        self.observe_file(parent, name, stat, Content::Unindexed, Some(target));
     }
 
     /// Records that `dir` is the top of a work tree (D23). `common_id` is the
@@ -309,12 +447,34 @@ impl Batch {
         stat: Stat,
         traversed: bool,
     ) -> DirToken {
+        let old = self
+            .previous
+            .as_ref()
+            .and_then(|old| {
+                let id = match parent {
+                    Some(parent) if parent.old != NONE => old
+                        .lookup(InoId(parent.old), name)
+                        .map(|id| old.name(id).child),
+                    Some(_) => None,
+                    None => old
+                        .roots()
+                        .find(|(_, path)| *path == name)
+                        .map(|(id, _)| id),
+                }?;
+                (old.is_live_inode(id)
+                    && old.is_directory(id)
+                    && old.identity(id) == (stat.dev, stat.ino))
+                    .then_some(id.0)
+            })
+            .unwrap_or(NONE);
         let name = push(&mut self.names, name, &mut self.overflow);
         let token = DirToken {
             batch: self.id,
             index: self.dirs.len() as u32,
+            old,
         };
         self.dirs.push(DirEntry {
+            old,
             parent,
             name,
             traversed,
@@ -369,6 +529,7 @@ impl Batch {
                 token: DirToken {
                     batch: self.id,
                     index: i as u32,
+                    old: dir.old,
                 },
                 parent: dir.parent,
                 name: dir.name.of(&self.names),
@@ -379,10 +540,20 @@ impl Batch {
     }
     /// Number of file observations in this batch.
     pub fn file_count(&self) -> usize {
-        self.files.len()
+        self.files.len() + self.pending.len()
     }
     /// Borrows one file observation; `index` must be below `file_count`.
     pub fn file_observation(&self, index: usize) -> FileObservation<'_> {
+        if index >= self.files.len() {
+            let f = &self.pending[index - self.files.len()];
+            return FileObservation {
+                parent: f.parent,
+                name: &f.name,
+                stat: f.stat,
+                content: f.content,
+                target: f.target.as_deref(),
+            };
+        }
         let file = &self.files[index];
         FileObservation {
             parent: file.parent,
@@ -391,6 +562,47 @@ impl Batch {
             content: self.contents[index],
             target: self.target(index),
         }
+    }
+    /// Equal rows proven against this batch's pinned generation. The token
+    /// still needs to resolve to its hinted old directory before reuse.
+    pub fn reused_files(&self) -> impl Iterator<Item = (DirToken, NameId)> + '_ {
+        self.reused.iter().copied()
+    }
+    /// Parents whose included files survived local equal-row reduction.
+    pub fn reused_directories(&self) -> impl Iterator<Item = DirToken> + '_ {
+        let mut last = None;
+        self.reused.iter().filter_map(move |&(parent, _)| {
+            if last == Some(parent) {
+                None
+            } else {
+                last = Some(parent);
+                Some(parent)
+            }
+        })
+    }
+    /// Number of compact equal observations.
+    pub fn reused_file_count(&self) -> usize {
+        self.reused.len()
+    }
+    /// Reconstructs a compact observation from the pinned view, for alias
+    /// conflict resolution or a changed parent. Index must be in range.
+    pub fn reused_file_observation(&self, index: usize) -> FileObservation<'_> {
+        let (parent, name) = self.reused[index];
+        let Some(old) = self.previous.as_ref() else {
+            unreachable!("reused observations are recorded only with a pinned view");
+        };
+        let edge = old.name(name);
+        FileObservation {
+            parent,
+            name: edge.bytes,
+            stat: old.inode(edge.child).stat,
+            content: content(old, edge.child),
+            target: old.link_target(edge.child),
+        }
+    }
+    /// Generation against which compact observations were checked.
+    pub fn observation_generation(&self) -> Option<Generation> {
+        self.previous.as_ref().map(Catalog::generation)
     }
     /// Opaque ignored edges, without allocating inode observations.
     pub fn ignored_entries(&self) -> impl Iterator<Item = (DirToken, &[u8], Kind)> {
@@ -413,5 +625,30 @@ impl Batch {
     /// Whether an observation buffer exceeded the wire-format span limit.
     pub fn overflowed(&self) -> bool {
         self.overflow
+    }
+}
+
+impl DirToken {
+    /// Coordinates for a run-local dense token table.
+    pub fn coordinates(self) -> (u32, u32) {
+        (self.batch, self.index)
+    }
+    /// Same-path directory hint checked in the observation batch's view.
+    pub fn previous_directory(self) -> Option<InoId> {
+        (self.old != NONE).then_some(InoId(self.old))
+    }
+}
+
+fn content(old: &Catalog, id: InoId) -> Content {
+    match old.state(id) {
+        ContentState::Unindexed => Content::Unindexed,
+        ContentState::Binary => Content::Binary,
+        ContentState::Fault => Content::Fault,
+        ContentState::Hashed => {
+            let Some(hash) = old.doc(id).and_then(|doc| old.doc_hash(doc)) else {
+                unreachable!("writer validates hashed inode document bindings before batch creation");
+            };
+            Content::Hashed(hash)
+        }
     }
 }

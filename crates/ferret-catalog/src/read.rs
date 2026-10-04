@@ -860,15 +860,23 @@ impl Catalog {
     /// [`Section::Names`].
     pub fn children(&self, dir: InoId) -> impl Iterator<Item = NameId> + '_ {
         let (start, end) = self.child_range(dir);
-        let mut ids: Vec<_> = (start as u32..end as u32)
-            .map(NameId)
-            .filter(|&id| self.base_name_live(id))
-            .collect();
-        if let Some(o) = &self.overlay {
+        // Checkpoint children are already sorted by basename. Only a changed
+        // namespace needs to merge sparse names with its surviving base range.
+        let merged = self.overlay.as_ref().map(|o| {
+            let mut ids: Vec<_> = (start as u32..end as u32)
+                .map(NameId)
+                .filter(|&id| self.base_name_live(id))
+                .collect();
             ids.extend(o.namespace().children(dir.0).map(NameId));
-        }
-        ids.sort_unstable_by(|&a, &b| self.name(a).bytes.cmp(self.name(b).bytes));
-        ids.into_iter()
+            ids.sort_unstable_by(|&a, &b| self.name(a).bytes.cmp(self.name(b).bytes));
+            ids
+        });
+        let base = if merged.is_none() {
+            start as u32..end as u32
+        } else {
+            0..0
+        };
+        base.map(NameId).chain(merged.into_iter().flatten())
     }
 
     /// Children, visible and ignored, with raw names, kinds and optional stat
