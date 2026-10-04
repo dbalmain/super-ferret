@@ -949,7 +949,14 @@ for validation alone adds about 0.6–0.64 GB. Resident engine plus writer and
 compaction scratch can exceed 1 GB transiently; D48's steady query-resident
 goal is reported apart from that peak. Retired readers pin old buffers/files.
 
-Estimated compaction at exactly 10M writes **602.0 MB** plus a log header and
+M7 measured at the actual 10.45M fixture: **629.40 MB** of writes and a
+**22.55 s** median whole writer pause (19.41–24.06), including readback and
+resident epoch-cache rebuild, **1.59 GiB** peak RSS with an old reader pinned,
+and **0.629 GB** additional peak disk footprint. See ROADMAP § S1+ M7 for
+commands, loads, large-diff churn and queued-burst freshness. The earlier
+9–20 s estimate below was optimistic; D51 A remains unchanged.
+
+The pre-implementation estimate at exactly 10M writes **602.0 MB** plus a log header and
 manifest, reads about **602.0 MB** of source and another **602.0 MB** for finished
 section checksum/self-check, and takes **9–20 s** with barriers, graph planning,
 packing and remapping. This is a conservative planning range, not a measured

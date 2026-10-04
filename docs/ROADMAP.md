@@ -1088,6 +1088,117 @@ recording it once per parent, consolidating those tables, and keeping the first
 chunk's merge scan restored the target. Dirty 1% updates still publish;
 threshold-triggered compaction and its pause are M7 work.
 
+### S1+ M7 — Compaction and budgets (2026-10-05)
+
+Production code **`b8eac71`**, release build:
+`nix develop --command cargo build --release -p ferret-bench --bins -p ferret-crawl --example recrawl`.
+Same 10,448,739-name fixture: 10,405,730 inodes, 1,800,947 directories,
+8,495,924 documents; AMD Ryzen 9 9955HX, 32 logical CPUs, boost disabled, ext4.
+One warm-up then three fresh-process samples for headline/open rows, warm OS
+page cache. Churn is two consecutive rounds per process. Every reported timing
+uses a **host-visible** uptime/pgrep guard including ferret-bench; no competitor
+was present. Earlier sandbox-guarded trials are discarded. No gates or builds
+ran during timings. Raw commands, loads, environments, binary hashes and output:
+`/home/dave/w/super-ferret/.ai/s1plus-m7-measurements/{headline,cold,churn,budgets}.json`.
+
+```sh
+B=/home/dave/w/super-ferret-wt/s1plus/target/release/ferret-bench
+P=/home/dave/w/super-ferret-wt/s1plus/target/release/examples/recrawl
+I=/tmp/s1plus-m7-measure
+export XDG_CONFIG_HOME=$I/config XDG_DATA_HOME=$I/data
+export XDG_STATE_HOME=$I/state XDG_CACHE_HOME=$I/cache
+export FERRET_INDEX=$I/$CASE
+```
+
+Private manifest/log copies and immutable snapshot hardlinks leave the source
+fixtures unchanged. Writes are logical snapshot/log/manifest bytes, excluding
+preparation/reset traffic and filesystem amplification. Disk peak is the
+logical per-index sum, sampled every 5 ms. RSS is Linux VmHWM, including setup,
+remaps and cache rebuild; compaction deliberately pins an old reader.
+
+| Case | Post-setup median (range) | Writes, B | Peak RSS, MiB | Command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Compact the 100,000-row-per-family overlay, whole D51 pause | 22.549 s (19.408–24.058) | 629,401,634 | 1,626.22 | `$B compact-once $I/compact-percent` | `b8eac71` | 3.42–3.76 / 4.12–4.32 / 4.06–4.12 |
+| Full recrawl, no change | 9.362 s (9.336–9.437) | 0 | 1,408.57 | `$B recrawl-once $I/nochange 0 "$P"` | `b8eac71` | 3.41–3.74 / 4.09–4.18 / 4.05–4.07 |
+
+Setup is separate: compaction **4,368.01 ms** (4,349.11–4,414.02); no-change
+**3,259.18 ms** (3,256.77–3,259.51). Full recrawl measures synthetic observation
+replay/reconciliation, excluding filesystem getdents/stat/hash, as in M4b/M6.
+All no-change samples stay below **9.5 s**, with no new generation. Its peak
+**1.376 GiB** is effectively M6's 1.375 GiB; M4b was 1.35 GiB. M6's pending
+observation cap remains 49,584 rows / 7,812,096 B across 16 workers; M7 does not
+claim to fix the whole-recrawl memory review item.
+
+Compaction writes a **629,401,442 B** snapshot plus 64 B log and 128 B manifest.
+Disk starts at **643,400,290 B**, peaks at **1,272,801,924 B** and ends at
+**629,401,634 B**: peak additional footprint **629,401,634 B**, about 0.629 GB.
+RSS peaks at **1.59 GiB**, including transient remaps, new checked sections and
+lookup sorting with an old reader pinned. Against M6's approximately 0.953 GiB
+1% writer setup peak, the increase is about **0.64 GiB**, within the planned
+0.2–0.7 GiB scratch range. These are separate runs, not a subtracted measurement
+of individual allocation phases. The actual whole pause exceeds the former
+9–20 s planning estimate; no shorter cutover or concurrent rebasing is claimed.
+
+A real sampler queues simulated numeric bursts about every 10 ms during the
+pause. Measured backlog at release is **1,928–2,389**, with **19.408–24.058 s**
+oldest wait and **0.70–4.47 ms** newest wait. Every queued old-epoch handle is
+rejected, even at unchanged sequence. Those waits are freshness floors before
+service; queue coalescing, re-resolution and catch-up throughput are S1b and
+are not inferred from this sampler. D51 A remains idle-boundary compaction.
+
+Churn replaces regular-file inodes and **all their indexed aliases** using real
+validated births/deaths, preserving unchanged content and DocIds. The fraction
+denominator is **8,570,766 live regular-file inodes**, not all 10.45M names.
+Two rounds are 100% / 180% cumulative births for the 50% / 90% cases. Each final
+set itself exceeds published budgets and checkpoints directly, without a giant
+log append. Input preparation and session setup are outside publication pause;
+validation, compaction and resident cache rebuild are inside it.
+
+| Churn | Cumulative inode births | Snapshot, B | Publication pause | Writes, B | Peak RSS, MiB | Command | Commit | Load (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 50%, round 1 | 4,285,383 | 629,309,290 | 82.369 s | 629,309,482 | 8,326.58 | `$B churn-checkpoint $I/churn-50 50 2` | `b8eac71` | 2.80 / 3.65 / 3.89 |
+| 50%, round 2 | 8,570,766 | 629,324,234 | 76.890 s | 629,324,426 | 8,353.86 | same command | `b8eac71` | 2.80 / 3.65 / 3.89 |
+| 90%, round 1 | 7,713,689 | 629,608,906 | 111.931 s | 629,609,098 | 13,939.86 | `$B churn-checkpoint $I/churn-90 90 2` | `b8eac71` | 5.52 / 4.14 / 4.02 |
+| 90%, round 2 | 15,427,378 | 629,641,034 | 108.625 s | 629,641,226 | 14,099.27 | same command | `b8eac71` | 5.52 / 4.14 / 4.02 |
+
+Setup is 3,279.65 / 3,234.44 ms for the two processes; preparation per round is
+1,265.94 / 1,277.23 / 2,216.09 / 2,137.06 ms. Inode counters reset from
+**14,691,113 / 18,119,419** to **10,405,730**; name counters from
+**14,734,122 / 18,162,428** to **10,448,739**, each round. Next DocId stays
+**8,495,924**. The first→second snapshot increase is only **14,944 / 32,128 B**
+from changed inode/stat packing, rather than growth with historical allocation.
+Huge input sets have **21,426,915 / 38,568,445 records** and peak at
+**8.16 / 13.77 GiB**, including those records and their checked effective overlay.
+Streaming checkpoint buffers do not bound caller diff storage or that overlay.
+
+Defaults: **64 MiB log**, **500,000 records**, **1% distinct dirty names or
+inodes**, **5% dead base names or inodes**, first reached. Deletions are dead,
+not also dirty; fractions use each checkpoint's live count. At this fixture,
+ceil thresholds are 104,058 dirty inodes / 104,488 dirty names and 520,287 dead
+inodes / 522,437 dead names. Repeated overwrites count once for distinct rows,
+but every record/frame consumes replay/log budget. `stats` reports usage.
+An idle request also services an existing log written with larger host limits.
+
+The 1% fixture is 14,353,544 B / 200,000 records / one transaction, 100,000 dirty
+names and inodes (0.957% / 0.961%). The 2% fixture is 28,331,456 B / 400,000
+records / one transaction, 200,000 dirty names/inodes: above the production
+fractional target, still accepted by the reader. Bounds cap publication, not
+input diff size or the format reader.
+
+| Cold fresh-process open | Median (range), ms | Bytes read | Peak RSS, MiB | Command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Base name sections | 324.22 (319.64–335.47) | 302,596,889 | 292.23 | `$B open-once $I/cold-base names` | `b8eac71` | 3.36–3.49 / 3.90–3.92 / 3.99 |
+| ~1% overlay, name sections | 560.63 (555.42–567.29) | 308,150,433 | 379.55 | `$B open-once $I/cold-percent names` | `b8eac71` | 3.36–3.49 / 3.90–3.92 / 3.99 |
+| ~2% overlay, name sections | 806.94 (805.62–810.80) | 313,328,345 | 462.41 | `$B open-once $I/cold-two-percent names` | `b8eac71` | 3.36–3.49 / 3.90–3.92 / 3.99 |
+| Base framing only | 0.060 (0.045–0.069) | 1,232 + 64 | 3.46 | `$B log-open-once $I/replay-base` | `b8eac71` | 1.60 / 2.58 / 3.36 |
+| ~1% framing only | 0.066 (0.057–0.106) | 1,232 + 256 | 3.52 | `$B log-open-once $I/replay-percent` | `b8eac71` | 1.60 / 2.58 / 3.36 |
+| ~2% framing only | 0.065 (0.061–0.070) | 1,232 + 256 | 3.47 | `$B log-open-once $I/replay-two-percent` | `b8eac71` | 1.60 / 2.58 / 3.36 |
+
+Framing figures are not payload replay timings. Name opens include required
+checksums, replay, semantic validation and rebuilt namespace indexes. The
+measured 1% / 2% penalty remains **236.41 / 482.72 ms**. D53 A is retained;
+option C is written analysis only in the M7 done-note, with no implementation.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes
