@@ -860,8 +860,8 @@ impl Catalog {
     /// [`Section::Names`].
     pub fn children(&self, dir: InoId) -> impl Iterator<Item = NameId> + '_ {
         let (start, end) = self.child_range(dir);
-        // Checkpoint children are already sorted by basename. Effective overlays
-        // merge sparse names with their surviving base range.
+        // Checkpoint children are already sorted by basename. Effective
+        // overlays merge sparse names with their surviving base range.
         let merged = self.overlay.as_ref().map(|o| {
             let mut ids: Vec<_> = (start as u32..end as u32)
                 .map(NameId)
