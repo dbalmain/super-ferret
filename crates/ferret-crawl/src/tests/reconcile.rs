@@ -628,3 +628,57 @@ fn reopening_session_preserves_document_hash_holes_and_never_resurrects_docids()
     );
     oracle(&tmp, &roots, &opts, &session.view());
 }
+
+#[test]
+fn compact_equal_observation_joins_a_new_alias_before_conflict_resolution() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use ferret_catalog::ContentState;
+
+    use super::index::Hook;
+    use crate::index::Probe;
+
+    let tmp = Tmp::new("recrawl-compact-alias-conflict");
+    tmp.write("a", b"content");
+    fs::create_dir(tmp.at("z")).unwrap();
+    let roots = [tmp.tree()];
+    let opts = IndexOptions {
+        workers: 1,
+        ..options()
+    };
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let old = session.view();
+    let id = file(&old, &roots[0], b"a");
+    let changed = Arc::new(AtomicBool::new(false));
+    let tree = tmp.tree();
+    let hook = Hook::set(&tree, {
+        let tree = tree.clone();
+        let changed = Arc::clone(&changed);
+        move |probe| {
+            if let Probe::Carried(path) = probe
+                && path == Path::new("a")
+                && !changed.swap(true, Ordering::SeqCst)
+            {
+                fs::hard_link(tree.join("a"), tree.join("z/alias")).unwrap();
+            }
+        }
+    });
+    recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    drop(hook);
+    assert!(changed.load(Ordering::SeqCst));
+    let current = session.view();
+    // The old single-name row was fully equal and compacted. The new alias
+    // observes nlink/ctime after the mutation. Omitting the compact row from
+    // the residue would publish Hashed instead of the required shared Fault.
+    assert_eq!(file(&current, &roots[0], b"a"), id);
+    assert_eq!(current.state(id), ContentState::Fault);
+    assert_eq!(current.doc(id), None);
+    assert_eq!(session.name_references(id), 2);
+    assert_eq!(listings(&current), listings(&open(&tmp.cat())));
+    // A stable retry is compared with a fresh full crawl. The raced pass is
+    // deliberately Fault and cannot equal a later stable full observation.
+    recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    oracle(&tmp, &roots, &opts, &session.view());
+}

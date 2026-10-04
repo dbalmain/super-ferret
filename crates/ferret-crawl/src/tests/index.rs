@@ -171,12 +171,12 @@ fn blake3_128(bytes: &[u8]) -> [u8; 16] {
 }
 
 /// Installs a probe on walks of `root` until dropped.
-struct Hook {
+pub(super) struct Hook {
     root: PathBuf,
 }
 
 impl Hook {
-    fn set(root: &Path, hook: impl Fn(Probe<'_>) + Send + Sync + 'static) -> Self {
+    pub(super) fn set(root: &Path, hook: impl Fn(Probe<'_>) + Send + Sync + 'static) -> Self {
         PROBES
             .lock()
             .unwrap()

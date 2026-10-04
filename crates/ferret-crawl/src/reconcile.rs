@@ -309,9 +309,19 @@ pub fn changes(
         };
         dirs[i].id = Some(id);
         dirs[i].root = parent.map_or(id, |p| dirs[p].root);
-        out.observe_inode(id, Kind::Dir, d.stat, Content::Unindexed)?;
+        out.observe_inode(id, Kind::Dir, *d.stat, Content::Unindexed)?;
         if let Some(parent) = parent_id {
-            out.edge(parent, id, d.name);
+            let same_edge = hinted
+                .and_then(|_| out.old.dir_name(InoId(id)))
+                .filter(|&name| {
+                    let edge = out.old.name(name);
+                    edge.parent.0 == parent && edge.bytes == d.name
+                });
+            if let Some(name) = same_edge {
+                out.names.insert(name.0);
+            } else {
+                out.edge(parent, id, d.name);
+            }
         } else if continuing.is_none() {
             out.changes.records.push(Record::RootPut {
                 id,

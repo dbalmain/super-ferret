@@ -1,14 +1,17 @@
 //! The rows one walk worker produces (D29).
 //!
 //! A [`Batch`] is minted by [`Transaction::batch`](crate::Transaction::batch)
+//! or [`WriterSession::batch`](crate::WriterSession::batch)
 //! and filled on one worker without locks. Directories are named by
 //! [`DirToken`]s, which the walker carries to each child event on whichever
 //! worker reports it, so a batch may name a parent minted in another batch.
 //! Tokens are resolved, and every id assigned, only when the transaction
 //! commits.
 //!
-//! Nothing is validated here: names, tokens and roots are checked at commit,
-//! where a bad one is a [`BuildError`](crate::BuildError).
+//! Names, tokens and root coverage are validated at reconciliation/commit.
+//! Resident batches reduce equal rows against their pinned view one listing
+//! at a time; this proof saves observation storage, not coverage validation.
+//! Checkpoint fallback expands those references into full observations.
 
 use crate::format::NONE;
 use crate::{Catalog, ContentState, Generation, Hash, InoId, Kind, NameId};
@@ -160,10 +163,10 @@ pub(crate) struct WorkTreeEntry {
 
 struct PendingFile {
     parent: DirToken,
-    name: Vec<u8>,
+    name: Span,
     stat: Stat,
     content: Content,
-    target: Option<Vec<u8>>,
+    target: Option<Span>,
 }
 
 /// The rows one worker recorded. Fill it, then hand it to
@@ -175,6 +178,7 @@ struct PendingFile {
 pub struct Batch {
     previous: Option<Catalog>,
     pending: Vec<PendingFile>,
+    pending_bytes: Vec<u8>,
     reused: Vec<(DirToken, NameId)>,
     pub(crate) id: u32,
     /// Set for a root copied forward from the previous generation, whose file
@@ -204,6 +208,7 @@ impl Batch {
         Self {
             previous: None,
             pending: Vec::new(),
+            pending_bytes: Vec::new(),
             reused: Vec::new(),
             id,
             carried,
@@ -265,12 +270,15 @@ impl Batch {
             if self.pending.first().is_some_and(|f| f.parent != parent) {
                 self.finish_observations();
             }
+            let name = push(&mut self.pending_bytes, name, &mut self.overflow);
+            let target =
+                target.map(|target| push(&mut self.pending_bytes, target, &mut self.overflow));
             self.pending.push(PendingFile {
                 parent,
-                name: name.to_vec(),
+                name,
                 stat,
                 content,
-                target: target.map(<[u8]>::to_vec),
+                target,
             });
         } else {
             self.push_file(parent, name, stat, content, target);
@@ -305,7 +313,8 @@ impl Batch {
             return;
         }
         let mut pending = std::mem::take(&mut self.pending);
-        pending.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        let mut bytes = std::mem::take(&mut self.pending_bytes);
+        pending.sort_unstable_by(|a, b| a.name.of(&bytes).cmp(b.name.of(&bytes)));
         let old = self.previous.clone();
         if let Some(old) = old {
             let names = old.name_reader();
@@ -313,19 +322,20 @@ impl Batch {
                 .children(InoId(pending[0].parent.old))
                 .map(|id| (id, names.get(id)))
                 .peekable();
-            // A duplicate observation is invalid even if both rows are equal.
-            let duplicate = pending.windows(2).any(|p| p[0].name == p[1].name);
+            // Duplicate observations cannot become a single equal-row proof.
+            let duplicate = pending
+                .windows(2)
+                .any(|p| p[0].name.of(&bytes) == p[1].name.of(&bytes));
             for file in &pending {
-                while children
-                    .peek()
-                    .is_some_and(|(_, edge)| edge.bytes < file.name.as_slice())
-                {
+                let name = file.name.of(&bytes);
+                let target = file.target.map(|span| span.of(&bytes));
+                while children.peek().is_some_and(|(_, edge)| edge.bytes < name) {
                     children.next();
                 }
                 let matched = children
                     .peek()
                     .copied()
-                    .filter(|(_, edge)| edge.bytes == file.name);
+                    .filter(|(_, edge)| edge.bytes == name);
                 let reusable = !duplicate
                     && matched.is_some_and(|(_, edge)| {
                         let crate::Target::Inode(child) = edge.target() else {
@@ -344,25 +354,21 @@ impl Batch {
                                 }
                                 _ => true,
                             }
-                            && old.link_target(child) == file.target.as_deref()
+                            && old.link_target(child) == target
                     });
                 if reusable {
                     if let Some((id, _)) = matched {
                         self.reused.push((file.parent, id));
                     }
                 } else {
-                    self.push_file(
-                        file.parent,
-                        &file.name,
-                        file.stat,
-                        file.content,
-                        file.target.as_deref(),
-                    );
+                    self.push_file(file.parent, name, file.stat, file.content, target);
                 }
             }
         }
         pending.clear();
+        bytes.clear();
         self.pending = pending;
+        self.pending_bytes = bytes;
     }
 
     pub(crate) fn materialize(&mut self) {
@@ -512,7 +518,7 @@ pub struct DirectoryObservation<'a> {
     pub token: DirToken,
     pub parent: Option<DirToken>,
     pub name: &'a [u8],
-    pub stat: Stat,
+    pub stat: &'a Stat,
     pub traversed: bool,
     pub retained_at: Option<u64>,
 }
@@ -541,7 +547,7 @@ impl Batch {
                 },
                 parent: dir.parent,
                 name: dir.name.of(&self.names),
-                stat: self.dir_stats[i],
+                stat: &self.dir_stats[i],
                 traversed: dir.traversed,
                 retained_at: dir.retained_at,
             })
@@ -557,10 +563,10 @@ impl Batch {
             let f = &self.pending[index - self.files.len()];
             return FileObservation {
                 parent: f.parent,
-                name: &f.name,
+                name: f.name.of(&self.pending_bytes),
                 stat: f.stat,
                 content: f.content,
-                target: f.target.as_deref(),
+                target: f.target.map(|span| span.of(&self.pending_bytes)),
             };
         }
         let file = &self.files[index];

@@ -993,6 +993,8 @@ impl<'a> Hasher<'a> {
                 out.counts.carried += 1;
                 out.batch
                     .file(decided.parent, decided.name.as_bytes(), stat, content);
+                #[cfg(test)]
+                hook(self.root, Probe::Carried(decided.path));
                 return;
             }
         }
@@ -1254,6 +1256,8 @@ impl EventVisitor for Hasher<'_> {
 /// see only their own walks, on whichever worker the event happens.
 #[cfg(test)]
 pub(crate) enum Probe<'a> {
+    /// Carried content and recorded its observation, before the next entry.
+    Carried(&'a Path),
     /// A directory was listed; its children have not been statted.
     Entered,
     /// Claimed an inode in the cache, before reading it.
