@@ -378,8 +378,7 @@ impl Catalog {
         manifest.counters = changes.counters;
         manifest.counts = changes.counts;
         Manifest::decode(&manifest.encode()).map_err(Error::Invalid)?;
-        crate::log::encode(changes, manifest.generation.sequence, expected.sequence)
-            .map_err(Error::Invalid)?;
+        crate::log::checked_size(changes, manifest.generation.sequence).map_err(Error::Invalid)?;
         let mut view = self.clone();
         let parent = self
             .overlay
@@ -1057,6 +1056,11 @@ impl Catalog {
         if let Some(Record::DirPut { flags, .. }) = self.ns_record(overlay::DIR, dir.0) {
             return flags & 2 != 0;
         }
+        let bits = self.section(Section::Traversed);
+        let offset = self.layout.dirs.div_ceil(8);
+        if bits.len() == offset * 2 && offset != 0 {
+            return bits[offset + dir.0 as usize / 8] >> (dir.0 % 8) & 1 == 1;
+        }
         self.is_traversed(dir)
     }
     // ── paths ──
@@ -1466,7 +1470,8 @@ impl Catalog {
             .map(|row| self.hash(row))
     }
 
-    /// Every live document with its hash, by id. Needs [`Section::Docs`].
+    /// Every live document with its hash: base then replacements, each by id.
+    /// Needs [`Section::Docs`].
     pub fn docs(&self) -> impl Iterator<Item = (DocId, Hash)> + '_ {
         let ids = self.column(Column::DocId);
         let base = (0..self.layout.docs)

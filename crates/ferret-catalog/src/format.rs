@@ -21,7 +21,8 @@
 //! entries     column, per directory: the entries `getdents` returned, minus
 //!             `.` and `..`, before ignore rules; none if unknown (D47)
 //!             (nullable blocked)
-//! traversed   1 bit per directory: a structural row (D29), LSB first
+//! traversed   structural-directory bitset (D29), LSB first; optionally
+//!             followed by an independent search-suppression bitset
 //! roots       8 B rows: root InoId, offset of its path in strings
 //! strings     root paths, link targets, work-tree paths; NUL-terminated
 //! dev         column per inode, dictionary
@@ -1025,7 +1026,8 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
             return Err(DecodeError::Corrupt(section.label()));
         }
     }
-    if len(Section::Traversed) != u64::from(dirs).div_ceil(8) {
+    let bits = u64::from(dirs).div_ceil(8);
+    if len(Section::Traversed) != bits && len(Section::Traversed) != bits * 2 {
         return Err(DecodeError::Corrupt("traversed"));
     }
     if len(Section::States) != u64::from(inodes).div_ceil(4) {

@@ -893,6 +893,13 @@ An explicit idle-boundary compaction changes the checkpoint epoch but preserves
 the sequence. A diff which requests compaction advances the sequence once and
 publishes that final state directly in the new checkpoint.
 
+M5 may retain a subtree while search suppression differs from structural
+traversal. Compaction preserves that independently: the v4 Traversed section
+accepts its original bitset, or that bitset followed by an equal-length search
+suppression bitset. The extra bitset is written only when the flags differ;
+legacy snapshots retain their original meaning. An older decoder rejects the
+extended section length rather than silently changing D29 semantics.
+
 Determinism applies to packed sections, their descriptors and section checksums.
 Two compactions of the same effective state have identical bytes there; the
 mandatory new epoch and its head checksum differ (D52 B). Live DocIds are sorted

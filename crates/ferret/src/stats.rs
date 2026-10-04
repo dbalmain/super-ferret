@@ -13,8 +13,8 @@ use crate::index::bytes;
 
 /// `ferret stats`.
 pub fn run(context: &Context) -> Exit {
-    let catalog = match Catalog::open(&context.index) {
-        Ok(Some(catalog)) => catalog,
+    let published = match ferret_catalog::log::Published::open(&context.index) {
+        Ok(Some(published)) => published,
         Ok(None) => {
             error(&format!(
                 "no index in {}: run `ferret index DIR` first",
@@ -27,23 +27,18 @@ pub fn run(context: &Context) -> Exit {
             return Exit::Error;
         }
     };
-    if let Err(e) = catalog.load_all() {
-        error(&format!("{}: {e}", context.index.display()));
-        return Exit::Error;
-    }
-    let usage = match ferret_catalog::log::Published::open(&context.index) {
-        Ok(Some(published)) => match published.budget_usage() {
-            Ok(usage) => usage,
-            Err(e) => {
-                error(&e.to_string());
-                return Exit::Error;
-            }
-        },
-        _ => {
-            error("cannot read published budgets");
+    let usage = match published.budget_usage() {
+        Ok(usage) => usage,
+        Err(e) => {
+            error(&e.to_string());
             return Exit::Error;
         }
     };
+    let catalog = published.into_catalog();
+    if let Err(e) = catalog.load_all() {
+        error(&e.to_string());
+        return Exit::Error;
+    }
     let mut text = String::new();
     let _ = writeln!(text, "index {}", context.index.display());
     let _ = writeln!(

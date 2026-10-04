@@ -118,6 +118,10 @@ fn generated_churn_compacts_dense_bfs_ids_preserving_docids_and_matches_a_full_c
     let tmp = Tmp::new("compact-churn");
     tmp.write("stable", b"stable");
     tmp.write("dir/a", b"initial");
+    tmp.write("z/deep/file", b"nested");
+    tmp.write(".git/config", b"");
+    fs::hard_link(tmp.at("stable"), tmp.at("z/stable-alias")).unwrap();
+    std::os::unix::fs::symlink("../stable", tmp.at("z/link")).unwrap();
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
     let mut session = WriterSession::open(&tmp.cat()).unwrap();
     let doc = session
@@ -128,6 +132,14 @@ fn generated_churn_compacts_dense_bfs_ids_preserving_docids_and_matches_a_full_c
         .0;
     let mut next_doc = session.view().next_doc().0;
     for step in 0..32 {
+        if step % 4 == 0 {
+            let (from, to) = if tmp.at("z/deep").exists() {
+                ("z/deep", "dir/moved")
+            } else {
+                ("dir/moved", "z/deep")
+            };
+            fs::rename(tmp.at(from), tmp.at(to)).unwrap();
+        }
         let path = format!("dir/file-{}", step % 7);
         if step % 3 == 0 && tmp.at(&path).exists() {
             fs::remove_file(tmp.at(&path)).unwrap();
@@ -174,4 +186,67 @@ fn an_idle_compaction_at_unchanged_sequence_rejects_queued_numeric_scopes_before
         RefreshOutcome::RetryFromCurrent(_)
     ));
     oracle(&tmp, &result.view);
+}
+
+#[test]
+fn retained_eio_scopes_and_opaque_eacces_survive_compaction_and_recovery() {
+    use super::coverage::{Hook, retained_listings};
+    use crate::walk::IoPoint;
+    use crate::{IoOp, recrawl};
+    use std::os::unix::ffi::OsStrExt;
+    for denied in [false, true] {
+        let tmp = Tmp::new(&format!("compact-fault-{denied}"));
+        tmp.write("dir/old", b"retained");
+        tmp.write("stable", b"old");
+        index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
+        let before = session.view();
+        tmp.write("stable", b"fresh");
+        let hook = Hook::set(&tmp.tree(), move |point, path| {
+            (point == IoPoint::Directory && path == std::path::Path::new("dir")).then(|| {
+                (
+                    IoOp::List,
+                    std::io::Error::from_raw_os_error(if denied { 13 } else { 5 }),
+                )
+            })
+        });
+        recrawl(&mut session, &[tmp.tree()], Refresh::All, &options()).unwrap();
+        let faulted = session.view();
+        session.compact().unwrap();
+        assert_eq!(listings(&session.view()), listings(&faulted));
+        dense(&session.view());
+        assert_eq!(listings(&open(&tmp.cat())), listings(&faulted));
+        let root = session.view().roots().next().unwrap().0;
+        let dir = session
+            .view()
+            .name(session.view().lookup(root, b"dir").unwrap())
+            .child;
+        assert_eq!(session.view().entry_count(dir), None);
+        assert_eq!(session.view().retained_at(dir).is_some(), !denied);
+        assert_eq!(session.view().children(dir).count(), usize::from(!denied));
+        let generation = session.view().generation();
+        recrawl(&mut session, &[tmp.tree()], Refresh::All, &options()).unwrap();
+        assert_eq!(session.view().generation(), generation);
+        let oracle_path = tmp.base.join("fault-oracle");
+        if denied {
+            index(&oracle_path, &[tmp.tree()], Refresh::All, &options()).unwrap();
+            assert_eq!(listings(&session.view()), listings(&open(&oracle_path)));
+            drop(hook);
+        } else {
+            drop(hook);
+            index(&oracle_path, &[tmp.tree()], Refresh::All, &options()).unwrap();
+            let path = tmp.at("dir").as_os_str().as_bytes().to_vec();
+            assert_eq!(
+                listings(&session.view()),
+                retained_listings(
+                    &open(&oracle_path),
+                    &before,
+                    std::slice::from_ref(&path),
+                    std::slice::from_ref(&path)
+                )
+            );
+        }
+        burst(&tmp, &mut session);
+        oracle(&tmp, &session.view());
+    }
 }

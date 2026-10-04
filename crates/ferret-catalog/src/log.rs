@@ -157,7 +157,8 @@ impl Published {
     pub fn counts(&self) -> [u32; 4] {
         self.manifest.counts
     }
-    pub(crate) fn into_catalog(self) -> Catalog {
+    /// Consumes this pinned pair into an effective, lazily checked reader.
+    pub fn into_catalog(self) -> Catalog {
         self.checkpoint.with_log(self.manifest, self.log)
     }
 }
@@ -426,7 +427,7 @@ impl Writer {
                 .ok_or(Error::MissingCheckpoint)?;
             recover(dir, &pinned).map_err(Error::Previous)?;
             let mut manifest = pinned.manifest.clone();
-            let budget = crate::budget::Budget::open(&pinned).map_err(Error::Previous)?;
+            let mut budget = crate::budget::Budget::open(&pinned).map_err(Error::Previous)?;
             let current = pinned.into_catalog();
             current.load_all().map_err(Error::Previous)?;
             current.name_references();
@@ -452,6 +453,7 @@ impl Writer {
                 .write(true)
                 .open(path)
                 .map_err(Error::Io)?;
+            budget.usage.log_bytes = manifest.log_end;
             Ok((log, manifest, current, budget))
         })();
         let (log, manifest, current, budget) = result?;
@@ -518,13 +520,15 @@ impl Writer {
             .read(true)
             .write(true)
             .open(self.dir.join(format!("changes.{}", generation.checkpoint)))
-            .map_err(Error::Io)?;
+            .map_err(Error::Undurable)?;
         self.manifest = manifest;
         self.current = current;
         self.budget =
             crate::budget::Budget::empty(self.current.inode_count(), self.current.name_count());
         self.poisoned = false;
-        cleanup(&self.dir, generation.checkpoint).map_err(Error::Io)?;
+        // Retirement cannot undo durable publication or leave the session
+        // using old epoch caches. Recovery retries an interrupted cleanup.
+        let _ = cleanup(&self.dir, generation.checkpoint);
         Ok(generation)
     }
 
@@ -617,12 +621,11 @@ impl Writer {
                 "allocation counters decreased",
             )));
         }
-        let bytes =
-            encode(changes, next.generation.sequence, expected.sequence).map_err(Error::Invalid)?;
+        let length = checked_size(changes, next.generation.sequence).map_err(Error::Invalid)?;
         next.log_end = self
             .manifest
             .log_end
-            .checked_add(bytes.len() as u64)
+            .checked_add(length)
             .ok_or(Error::Invalid(DecodeError::Corrupt("log exhausted")))?;
         let current = self
             .current
@@ -631,12 +634,23 @@ impl Writer {
                 Error::Previous(OpenError::Decode(e)) => Error::Invalid(e),
                 other => other,
             })?;
-        let budget = self.budget.project(changes, bytes.len() as u64);
-        if limits.is_some_and(|limits| budget.usage.reached(limits)) {
-            // Never append an over-budget transaction or reuse its ids after
-            // compaction: encode the checked final view directly.
+        if limits.is_some_and(|limits| {
+            next.log_end >= limits.log_bytes
+                || self.budget.usage.records + changes.records.len() as u64 >= limits.records
+        }) || changes.counters[0] == crate::format::NONE - 16
+            || changes.counters[1] == crate::format::NONE - 1
+        {
             return self.checkpoint_view(current);
         }
+        let budget = self.budget.project(changes, length);
+        if limits.is_some_and(|limits| budget.usage.reached(limits)) {
+            return self.checkpoint_view(current);
+        }
+        // Serialize only a transaction that will actually be appended. A
+        // large preflighted diff needs bounded per-record codec scratch,
+        // rather than a discarded whole log transaction plus decoded copy.
+        let bytes =
+            encode(changes, next.generation.sequence, expected.sequence).map_err(Error::Invalid)?;
         self.poisoned = true;
         publication::append(&self.log, &bytes, self.manifest.log_end).map_err(Error::Io)?;
         publication::sync(&self.log, Point::LogSync).map_err(Error::Io)?;
@@ -647,6 +661,27 @@ impl Writer {
         self.poisoned = false;
         Ok(self.manifest.generation)
     }
+}
+
+/// Validate with the real record codec, keeping only one row's scratch.
+/// The framed length is exact, including nonempty-family descriptors/footer.
+pub(crate) fn checked_size(changes: &ChangeSet, sequence: u64) -> Result<u64, DecodeError> {
+    let mut scratch = Vec::new();
+    let mut counts = [0u32; FAMILIES.len()];
+    let mut length = 96u64;
+    for record in &changes.records {
+        scratch.clear();
+        record.encode(&mut scratch)?;
+        records::decode(&scratch, 1, record.family(), changes.counters, sequence)?;
+        let family = record.family() as usize;
+        counts[family] = counts[family]
+            .checked_add(1)
+            .ok_or(DecodeError::Corrupt("log record count"))?;
+        length = length
+            .checked_add(scratch.len() as u64)
+            .ok_or(DecodeError::Corrupt("log exhausted"))?;
+    }
+    Ok(length + counts.iter().filter(|&&n| n != 0).count() as u64 * 48)
 }
 
 pub(crate) fn encode(

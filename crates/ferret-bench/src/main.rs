@@ -91,6 +91,10 @@ fn main() -> ExitCode {
             ("recrawl-once", [dir, rows, producer]) => {
                 recrawl_once(Path::new(dir), rows, Path::new(producer))
             }
+            ("compact-once", [dir]) => compact_once(Path::new(dir)),
+            ("churn-checkpoint", [dir, percent, rounds]) => {
+                churn_checkpoint(Path::new(dir), percent, rounds)
+            }
             ("sections", [dir]) => sections(Path::new(dir)),
             ("query", [dir, queries @ ..]) => query(Path::new(dir), queries),
             _ => return usage(),
@@ -121,6 +125,8 @@ fn usage() -> ExitCode {
          ferret-bench overlay-carry <catalog-dir> <count>\n       \
          ferret-bench overlay-carry-boundary <catalog-dir> <rows>\n       \
          ferret-bench checksum <catalog-dir>\n       \
+         ferret-bench churn-checkpoint <catalog-dir> <percent> <rounds>\n       \
+         ferret-bench compact-once <catalog-dir>\n       \
          ferret-bench sections <catalog-dir>\n       \
          ferret-bench query <catalog-dir> [query...]"
     );
@@ -835,6 +841,238 @@ fn recrawl_once(dir: &Path, rows: &str, producer: &Path) -> Result<()> {
         .status()?;
     if !status.success() {
         return Err(format!("recrawl producer exited with {status}").into());
+    }
+    Ok(())
+}
+
+/// D51 A: the whole idle-boundary pause includes packed rewrite, durability,
+/// readback validation, retirement and rebuilding resident epoch caches.
+fn compact_once(dir: &Path) -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    let setup = Instant::now();
+    let mut session = ferret_catalog::WriterSession::open(dir)?;
+    let setup_ms = setup.elapsed().as_secs_f64() * 1000.0;
+    let old = session.view();
+    let before = session.budget_usage();
+    let disk = |path: &Path| -> std::io::Result<u64> {
+        std::fs::read_dir(path)?
+            .map(|entry| {
+                entry
+                    .and_then(|entry| entry.metadata())
+                    .map(|meta| meta.len())
+            })
+            .sum()
+    };
+    let initial_disk = disk(dir)?;
+    let running = Arc::new(AtomicBool::new(true));
+    let peak = Arc::new(AtomicU64::new(initial_disk));
+    let watch = running.clone();
+    let high = peak.clone();
+    let directory = dir.to_owned();
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let queued = arrivals.clone();
+    let sample = std::thread::spawn(move || {
+        let mut next_arrival = Instant::now();
+        while watch.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if now >= next_arrival {
+                if let Ok(mut queue) = queued.lock() {
+                    queue.push(now);
+                }
+                next_arrival = now + Duration::from_millis(10);
+            }
+            if let Ok(size) = disk(&directory) {
+                high.fetch_max(size, Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    let started = Instant::now();
+    let result = session.compact();
+    let finished = Instant::now();
+    let pause = finished.duration_since(started).as_secs_f64() * 1000.0;
+    running.store(false, Ordering::Relaxed);
+    sample.join().map_err(|_| "disk sampler panicked")?;
+    let current = result?;
+    let final_disk = disk(dir)?;
+    let snapshot_bytes =
+        std::fs::metadata(Catalog::snapshot_path(dir)?.ok_or("missing checkpoint")?)?.len();
+    if current.generation().sequence != old.generation().sequence
+        || current.next_doc() != old.next_doc()
+    {
+        return Err("compaction changed logical sequence or DocId counter".into());
+    }
+    let (resident, rss_peak) = memory()?;
+    let resident = resident.split_whitespace().next().ok_or("missing RSS")?;
+    let rss_peak = rss_peak
+        .split_whitespace()
+        .next()
+        .ok_or("missing peak RSS")?;
+    println!(
+        "compact setup_ms={setup_ms:.2} pause_ms={:.2} writes={} initial_disk={} peak_disk={} final_disk={} resident_kib={} peak_kib={} old_epoch={} new_epoch={} sequence={} records={} dirty_inodes={} dirty_names={} dead_inodes={} dead_names={}",
+        pause,
+        snapshot_bytes + 64 + 128,
+        initial_disk,
+        peak.load(Ordering::Relaxed),
+        final_disk,
+        resident,
+        rss_peak,
+        old.generation().checkpoint,
+        current.generation().checkpoint,
+        current.generation().sequence,
+        before.records,
+        before.dirty_inodes,
+        before.dirty_names,
+        before.dead_inodes,
+        before.dead_names
+    );
+    // A simulated numeric burst queued before the pause must retry from the
+    // new epoch even though the logical sequence is unchanged (D52 B).
+    let queued = ferret_catalog::Handle {
+        generation: old.generation(),
+        id: ferret_catalog::InoId(u32::MAX),
+    };
+    if current.checked_inode(queued).is_ok() {
+        return Err("queued old-epoch id was accepted".into());
+    }
+    let queue = arrivals.lock().map_err(|_| "burst queue poisoned")?;
+    let oldest = queue.first().map_or(0.0, |&at| {
+        finished.saturating_duration_since(at).as_secs_f64() * 1000.0
+    });
+    let newest = queue.last().map_or(0.0, |&at| {
+        finished.saturating_duration_since(at).as_secs_f64() * 1000.0
+    });
+    let retries = queue
+        .iter()
+        .filter(|_| current.checked_inode(queued).is_err())
+        .count();
+    println!(
+        "simulated_arrival_ms=10 queued_bursts={} oldest_wait_ms={oldest:.2} newest_wait_ms={newest:.2} epoch_retries={retries}; watcher/daemon queue service is S1b",
+        queue.len()
+    );
+    Ok(())
+}
+
+/// Replaces a stated fraction of live regular-file inodes, including every
+/// indexed alias. These are real validated final sets with inode/name births
+/// and deaths, rather than patched allocation counters. Each round compacts
+/// directly, exercising an input diff much larger than published log budgets.
+fn churn_checkpoint(dir: &Path, percent: &str, rounds: &str) -> Result<()> {
+    use ferret_catalog::{
+        InoId, Target,
+        log::{ChangeSet, Record},
+    };
+    let percent: usize = percent.parse()?;
+    let rounds: usize = rounds.parse()?;
+    if !(1..=100).contains(&percent) || rounds == 0 {
+        return Err("churn needs 1..100 percent and positive rounds".into());
+    }
+    let setup = Instant::now();
+    let mut session = ferret_catalog::WriterSession::open(dir)?;
+    println!("churn setup_ms={}", ms(setup.elapsed()));
+    for round in 1..=rounds {
+        let old = session.view();
+        let generation = old.generation();
+        let file_count = old
+            .inode_ids()
+            .filter(|&id| old.kind(id) == ferret_catalog::Kind::File)
+            .count();
+        let count = file_count * percent / 100;
+        let mut remap = vec![u32::MAX; old.next_inode().0 as usize];
+        let mut next_inode = old.next_inode().0;
+        let mut next_name = old.next_name().0;
+        let preparation = Instant::now();
+        let mut records = Vec::with_capacity(count * 5);
+        for id in old
+            .inode_ids()
+            .filter(|&id| old.kind(id) == ferret_catalog::Kind::File)
+            .take(count)
+        {
+            let new = next_inode;
+            next_inode = next_inode.checked_add(1).ok_or("inode counter exhausted")?;
+            remap[id.0 as usize] = new;
+            let mut inode = old.inode(id);
+            inode.stat.ino = inode.stat.ino.wrapping_add(1u64 << 40);
+            inode.stat.ctime_sec += 1;
+            records.push(Record::InodeDelete { id: id.0 });
+            records.push(Record::LifePut {
+                id: new,
+                kind: ferret_catalog::Kind::File,
+                flags: 0,
+                names: old.indexed_name_count(id),
+            });
+            records.push(Record::InodePut {
+                id: new,
+                kind: ferret_catalog::Kind::File,
+                state: inode.state,
+                doc: inode.doc.map(|id| id.0),
+                stat: inode.stat,
+            });
+        }
+        for (id, edge) in old.name_reader().runs_from(ferret_catalog::NameId(0)) {
+            if let Target::Inode(child) = edge.target()
+                && remap[child.0 as usize] != u32::MAX
+            {
+                records.push(Record::NameDelete { id: id.0 });
+                records.push(Record::NamePut {
+                    id: next_name,
+                    parent: edge.parent.0,
+                    child: remap[child.0 as usize],
+                    name: edge.bytes.to_vec(),
+                });
+                next_name = next_name.checked_add(1).ok_or("name counter exhausted")?;
+            }
+        }
+        drop(remap);
+        let changes = ChangeSet {
+            counters: [next_inode, next_name, old.next_doc().0],
+            counts: [
+                old.inode_count(),
+                old.name_count(),
+                old.dir_count(),
+                old.doc_count(),
+            ],
+            records,
+        };
+        let prepare_ms = ms(preparation.elapsed());
+        let started = Instant::now();
+        let current = session.commit(&changes, old.sniffer_version())?;
+        let pause_ms = ms(started.elapsed());
+        if current.generation().checkpoint == generation.checkpoint
+            || current.next_inode().0 != current.inode_count()
+            || current.next_name().0 != current.name_count()
+            || current.next_doc() != old.next_doc()
+            || current.doc_count() != old.doc_count()
+            || current.inode_count() != old.inode_count()
+        {
+            return Err("churn checkpoint lost counters or liveness".into());
+        }
+        let bytes =
+            std::fs::metadata(Catalog::snapshot_path(dir)?.ok_or("missing checkpoint")?)?.len();
+        let (resident, peak) = memory()?;
+        println!(
+            "churn percent={percent} round={round} replaced_files={count} cumulative_births={} prepare_ms={prepare_ms} publication_pause_ms={pause_ms} snapshot_bytes={bytes} writes={} preflight_inode={} dense_inode={} preflight_name={} dense_name={} next_doc={} records={} resident={} peak={}",
+            count * round,
+            bytes + 192,
+            next_inode,
+            current.next_inode().0,
+            next_name,
+            current.next_name().0,
+            current.next_doc().0,
+            changes.records.len(),
+            resident,
+            peak
+        );
+        let first = current
+            .inode_ids()
+            .find(|&id| current.kind(id) == ferret_catalog::Kind::File)
+            .ok_or("missing file")?;
+        if session.identity(current.identity(first)) != Some(InoId(first.0)) {
+            return Err("epoch cache was not rebuilt".into());
+        }
     }
     Ok(())
 }

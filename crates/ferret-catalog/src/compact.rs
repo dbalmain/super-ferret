@@ -203,7 +203,11 @@ impl Plan {
         }
         lens[Section::Roots as usize] = self.roots.len() as u64 * 8;
         lens[Section::WorkTrees as usize] = self.work_trees.len() as u64 * 32;
-        lens[Section::Traversed as usize] = self.dirs.div_ceil(8) as u64;
+        let independent_suppression = self.order[..self.dirs]
+            .iter()
+            .any(|&dir| view.is_search_suppressed(dir) != view.is_traversed(dir));
+        lens[Section::Traversed as usize] =
+            self.dirs.div_ceil(8) as u64 * if independent_suppression { 2 } else { 1 };
         lens[Section::States as usize] = self.order.len().div_ceil(4) as u64;
         lens[Section::Docs as usize] = self.docs.len() as u64 * 16;
         lens[Section::DocRefs as usize] = self.docs.len() as u64 * 4;
@@ -285,6 +289,13 @@ pub(crate) fn write(view: &Catalog, out: &File, generation: Generation) -> io::R
     entries.finish()?;
     retained.finish()?;
     bits.finish(&mut traversed)?;
+    if head.lens[Section::Traversed as usize] > plan.dirs.div_ceil(8) as u64 {
+        let mut suppressed = Bits::new(1);
+        for &dir in &plan.order[..plan.dirs] {
+            suppressed.push(&mut traversed, u8::from(view.is_search_suppressed(dir)))?;
+        }
+        suppressed.finish(&mut traversed)?;
+    }
     traversed.finish()?;
     plan.dir_names = Vec::new();
 

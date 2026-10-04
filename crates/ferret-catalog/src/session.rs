@@ -54,6 +54,18 @@ impl WriterSession {
 
     fn rebuild(&mut self) {
         let view = self.writer.view();
+        // Publication has selected a new epoch. Retire old lookup storage
+        // before cached-key sorts allocate their transient keys.
+        self.lookup_base = view.clone();
+        self.identities = Vec::new();
+        self.documents = Vec::new();
+        self.directories = Vec::new();
+        self.first_names = Vec::new();
+        self.alias_names.clear();
+        self.name_changes.clear();
+        self.identity_changes.clear();
+        self.document_changes.clear();
+        self.directory_changes.clear();
         let mut identities: Vec<_> = view
             .inode_ids()
             .filter(|&id| !view.is_directory(id))
@@ -242,6 +254,14 @@ impl WriterSession {
     /// Publishes a final set, updating cached lookups only after success.
     pub fn commit(&mut self, changes: &ChangeSet, sniffer: u32) -> Result<Catalog, Error> {
         let previous = self.writer.view();
+        self.writer
+            .commit_budgeted(previous.generation(), changes, sniffer, self.limits)?;
+        let view = self.writer.view();
+        if view.generation().checkpoint != previous.generation().checkpoint {
+            drop(previous);
+            self.rebuild();
+            return Ok(view);
+        }
         let mut names: BTreeMap<InoId, BTreeSet<NameId>> = BTreeMap::new();
         for record in &changes.records {
             let name = match record {
@@ -265,13 +285,6 @@ impl WriterSession {
                     .or_insert_with(|| self.names_for(child).collect())
                     .insert(name);
             }
-        }
-        self.writer
-            .commit_budgeted(previous.generation(), changes, sniffer, self.limits)?;
-        let view = self.writer.view();
-        if view.generation().checkpoint != previous.generation().checkpoint {
-            self.rebuild();
-            return Ok(view);
         }
         self.name_changes.extend(names);
         for record in &changes.records {

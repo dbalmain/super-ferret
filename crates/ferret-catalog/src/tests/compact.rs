@@ -118,3 +118,130 @@ fn crashes_at_every_compaction_checkpoint_boundary_select_an_old_or_new_complete
         assert!(!s.path.join("changes.tmp").exists());
     }
 }
+
+#[test]
+fn independent_retained_search_suppression_survives_packed_checkpoint_remapping() {
+    let s = fixture("compact-suppressed");
+    let mut session = WriterSession::open(&s.path).unwrap();
+    session.set_compaction_limits(crate::CompactionLimits {
+        log_bytes: u64::MAX,
+        records: u64::MAX,
+        dirty_percent: u32::MAX,
+        dead_percent: u32::MAX,
+    });
+    let before = session.view();
+    let dir = at(&before, "/root/sub");
+    let changes = crate::log::ChangeSet {
+        counters: [
+            before.next_inode().0,
+            before.next_name().0,
+            before.next_doc().0,
+        ],
+        counts: [
+            before.inode_count(),
+            before.name_count(),
+            before.dir_count(),
+            before.doc_count(),
+        ],
+        records: vec![crate::log::Record::DirPut {
+            id: dir.0,
+            name: before.dir_name(dir).map(|id| id.0),
+            entries: None,
+            flags: 2 | 8,
+            retained_at: Some(before.generation().sequence),
+        }],
+    };
+    session.commit(&changes, SNIFFER).unwrap();
+    assert!(!session.view().is_traversed(dir));
+    assert!(session.view().is_search_suppressed(dir));
+    session.compact().unwrap();
+    let new = reopen(&s.path);
+    let dir = at(&new, "/root/sub");
+    assert!(!new.is_traversed(dir));
+    assert!(new.is_search_suppressed(dir));
+    assert_eq!(new.retained_at(dir), Some(before.generation().sequence));
+    assert_eq!(new.children(dir).count(), 1);
+}
+
+#[test]
+fn repeated_overwrites_count_once_and_deletions_are_dead_rather_than_dirty_after_reopen() {
+    use crate::log::{ChangeSet, Record};
+    let s = fixture("compact-budget-replay");
+    let mut session = WriterSession::open(&s.path).unwrap();
+    session.set_compaction_limits(crate::CompactionLimits {
+        log_bytes: u64::MAX,
+        records: u64::MAX,
+        dirty_percent: u32::MAX,
+        dead_percent: u32::MAX,
+    });
+    for step in 0..7 {
+        let view = session.view();
+        let id = at(&view, "/root/other");
+        let mut inode = view.inode(id);
+        inode.stat.ctime_nsec += step + 1;
+        let changes = ChangeSet {
+            counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+            counts: [
+                view.inode_count(),
+                view.name_count(),
+                view.dir_count(),
+                view.doc_count(),
+            ],
+            records: vec![Record::InodePut {
+                id: id.0,
+                kind: crate::Kind::File,
+                stat: inode.stat,
+                state: inode.state,
+                doc: inode.doc.map(|id| id.0),
+            }],
+        };
+        session.commit(&changes, SNIFFER).unwrap();
+    }
+    assert_eq!(session.budget_usage().dirty_inodes, 1);
+    assert_eq!(session.budget_usage().records, 7);
+    let view = session.view();
+    let root = view.roots().next().unwrap().0;
+    let name = view.lookup(root, b"other").unwrap();
+    let id = view.name(name).child;
+    let changes = ChangeSet {
+        counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+        counts: [
+            view.inode_count() - 1,
+            view.name_count() - 1,
+            view.dir_count(),
+            view.doc_count() - 1,
+        ],
+        records: vec![
+            Record::InodeDelete { id: id.0 },
+            Record::NameDelete { id: name.0 },
+            Record::DocDelete {
+                id: view.doc(id).unwrap().0,
+            },
+        ],
+    };
+    session.commit(&changes, SNIFFER).unwrap();
+    let usage = session.budget_usage();
+    assert_eq!(usage.dirty_inodes, 0);
+    assert_eq!(usage.dead_inodes, 1);
+    assert_eq!(usage.dead_names, 1);
+    drop(session);
+    let mut session = WriterSession::open(&s.path).unwrap();
+    assert_eq!(session.budget_usage(), usage);
+    assert_eq!(
+        crate::log::Published::open(&s.path)
+            .unwrap()
+            .unwrap()
+            .budget_usage()
+            .unwrap(),
+        usage
+    );
+    let next_doc = session.view().next_doc();
+    session.compact().unwrap();
+    assert_eq!(session.view().next_doc(), next_doc);
+    assert_eq!(session.view().doc_count(), 1);
+    assert_eq!(session.budget_usage().dead_inodes, 0);
+    assert_eq!(
+        session.budget_usage().base_inodes,
+        session.view().inode_count()
+    );
+}
