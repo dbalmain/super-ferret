@@ -403,6 +403,30 @@ fn a_fresh_checkpoint_with_unchanged_sequence_invalidates_old_epoch_scopes() {
 }
 
 #[test]
+fn checkpoint_fallback_refuses_a_scoped_batch_instead_of_dropping_untouched_children() {
+    let tmp = Tmp::new("refresh-scoped-checkpoint");
+    tmp.write("dir/a", b"kept child");
+    index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+    let session = WriterSession::open(&tmp.cat()).unwrap();
+    let old = session.view();
+    let root = old.roots().next().unwrap().0;
+    let mut batch = session.batch();
+    let token = batch.root(tmp.tree().as_os_str().as_bytes(), old.inode(root).stat);
+    batch.entry_count(token, old.entry_count(root).unwrap());
+    batch.preserve(token, b"dir");
+    let mut txn = session.into_checkpoint(options().sniffer);
+    txn.set_policy(old.policy());
+    txn.add(batch);
+    assert!(matches!(
+        txn.commit(),
+        Err(ferret_catalog::CommitError::ScopedObservations)
+    ));
+    let disk = Catalog::open(&tmp.cat()).unwrap().unwrap();
+    assert_eq!(disk.generation(), old.generation());
+    oracle(&tmp, &old);
+}
+
+#[test]
 fn a_large_directory_listing_streams_equal_rows_with_a_fixed_temporary_observation_cap() {
     let tmp = Tmp::new("refresh-observation-cap");
     for n in 0..9000 {

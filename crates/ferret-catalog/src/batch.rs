@@ -196,6 +196,8 @@ pub struct Batch {
     /// Set for a root copied forward from the previous generation, whose file
     /// observations yield to fresh ones (D34).
     pub(crate) carried: bool,
+    /// Untouched inode edges require the resident final-set reconciler.
+    pub(crate) scoped: bool,
     pub(crate) dirs: Vec<DirEntry>,
     pub(crate) dir_stats: Vec<Stat>,
     pub(crate) files: Vec<FileEntry>,
@@ -228,6 +230,7 @@ impl Batch {
             chunked: false,
             id,
             carried,
+            scoped: false,
             dirs: Vec::new(),
             dir_stats: Vec::new(),
             files: Vec::new(),
@@ -689,6 +692,8 @@ impl Batch {
     }
     /// Preserves an untouched edge under a checked same-path parent. This is
     /// scope retention, not a fresh observation or proof of child identity.
+    /// Batches with preserved inode edges require resident log reconciliation;
+    /// checkpoint transactions refuse them rather than dropping old subtrees.
     pub fn preserve(&mut self, parent: DirToken, name: &[u8]) {
         let Some(old) = &self.previous else {
             return;
@@ -703,6 +708,7 @@ impl Batch {
             crate::Target::Inode(id) => Some(id),
             crate::Target::Ignored(_) => None,
         };
+        self.scoped |= child.is_some();
         self.preserved.insert(parent, id, child);
     }
     /// Untouched edges and their validated parent tokens.

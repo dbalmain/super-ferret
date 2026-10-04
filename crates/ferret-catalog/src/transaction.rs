@@ -93,6 +93,9 @@ impl std::error::Error for KeepError {}
 /// than assuming an error means nothing changed.
 #[derive(Debug)]
 pub enum CommitError {
+    /// Untouched inode edges need resident log reconciliation. Nothing was
+    /// published; fully observe those scopes before checkpoint publication.
+    ScopedObservations,
     /// The batches were inconsistent. Nothing was published.
     Build(BuildError),
     /// The encoded generation failed its own decode check: a bug. Nothing
@@ -121,6 +124,10 @@ impl CommitError {
 impl fmt::Display for CommitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ScopedObservations => write!(
+                f,
+                "catalog not written: scoped observations require resident reconciliation"
+            ),
             Self::Build(e) => write!(f, "catalog not written: {e}"),
             Self::Encode(e) => write!(f, "catalog not written, it failed its own check: {e}"),
             Self::Write(e) => write!(f, "catalog not written: {e}"),
@@ -446,6 +453,9 @@ impl Transaction {
     }
 
     fn publish(mut self, checkpoint: bool) -> Result<Catalog, CommitError> {
+        if self.batches.iter().any(|batch| batch.scoped) {
+            return Err(CommitError::ScopedObservations);
+        }
         self.check_kept_roots()?;
         // The old generation is done with once the batches are filled; only
         // its documents and id counter reach the build.

@@ -592,6 +592,9 @@ small burst. A resident first-name inverse and sparse extra aliases support
 checked alias-scope promotion. Directory/coverage tables remain O(directories);
 M6 scope selection preserves untouched child edges and stops sweeps at kept
 subtrees, independently of fault protection.
+Such partial batches require resident log reconciliation. Checkpoint transactions
+reject preserved inode edges; blindly expanding only equal file references would
+silently omit kept subtrees. M7 compacts the effective published view instead.
 The cap measures pending stat/content observations and their name/target bytes;
 the walker's raw `getdents` name listing still scales with its largest directory.
 These are separate from changed rows and the O(directories) graph. Streaming the
