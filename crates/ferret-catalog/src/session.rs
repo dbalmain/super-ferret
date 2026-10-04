@@ -26,6 +26,7 @@ pub struct WriterSession {
     name_changes: BTreeMap<InoId, BTreeSet<NameId>>,
     next_batch: AtomicU32,
     limits: crate::CompactionLimits,
+    input_limits: crate::InputLimits,
 }
 
 impl WriterSession {
@@ -47,6 +48,7 @@ impl WriterSession {
             name_changes: BTreeMap::new(),
             next_batch: AtomicU32::new(0),
             limits: crate::CompactionLimits::default(),
+            input_limits: crate::InputLimits::default(),
         };
         session.rebuild();
         Ok(session)
@@ -124,6 +126,19 @@ impl WriterSession {
     pub fn set_compaction_limits(&mut self, limits: crate::CompactionLimits) {
         self.limits = limits;
     }
+
+    /// Sets the provisional unpublished-input ceilings for subsequent crawls.
+    pub fn set_input_limits(&mut self, limits: crate::InputLimits) { self.input_limits = limits; }
+    pub fn input_limits(&self) -> crate::InputLimits { self.input_limits }
+    /// Full-root backstop publication, preserving live DocIds and the lock.
+    /// Scoped batches are refused. An uncertain failure requires reopening.
+    pub fn rebuild_checkpoint(&mut self, batches: Vec<Batch>, sniffer: u32, policy: Hash) -> Result<Catalog, Error> {
+        self.writer.rebuild_checkpoint(batches, sniffer, policy)?;
+        self.rebuild();
+        Ok(self.view())
+    }
+    /// Mints a full-builder batch, without compacting equal file observations.
+    pub fn checkpoint_batch(&self) -> Batch { self.batch().full_observations() }
 
     pub fn budget_usage(&self) -> crate::BudgetUsage {
         self.writer.budget_usage()

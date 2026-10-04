@@ -184,6 +184,8 @@ struct PendingFile {
 /// per file with byte ranges took 136 B. At 10M entries that difference is
 /// most of a gigabyte (D40).
 pub struct Batch {
+    input_budget: Option<std::sync::Arc<crate::InputBudget>>,
+    full: bool,
     previous: Option<Catalog>,
     pending: Vec<PendingFile>,
     pending_bytes: Vec<u8>,
@@ -220,6 +222,8 @@ pub struct Batch {
 impl Batch {
     pub(crate) fn new(id: u32, carried: bool) -> Self {
         Self {
+            input_budget: None,
+            full: false,
             previous: None,
             pending: Vec::new(),
             pending_bytes: Vec::new(),
@@ -272,6 +276,17 @@ impl Batch {
         self.observe_file(parent, name, stat, content, None);
     }
 
+    /// Attaches one run's changed-input guard before collecting observations.
+    pub fn with_input_budget(mut self, budget: std::sync::Arc<crate::InputBudget>) -> Self {
+        self.input_budget = Some(budget);
+        self
+    }
+    /// Collects complete checkpoint observations while retaining old parent
+    /// hints for fault anchoring. No equal rows are replaced by seen bits.
+    pub(crate) fn full_observations(mut self) -> Self { self.full = true; self }
+    fn reserve_input(&self, records: usize, bytes: usize) -> bool {
+        self.input_budget.as_ref().is_none_or(|b| b.charge(records, bytes).is_ok())
+    }
     pub(crate) fn with_previous(mut self, previous: Catalog) -> Self {
         self.previous = Some(previous);
         self
@@ -285,7 +300,7 @@ impl Batch {
         content: Content,
         target: Option<&[u8]>,
     ) {
-        if self.previous.is_some() && parent.old != NONE {
+        if !self.full && self.previous.is_some() && parent.old != NONE {
             if self.pending.first().is_some_and(|f| f.parent != parent) {
                 self.finish_observations();
                 self.chunked = false;
@@ -322,6 +337,7 @@ impl Batch {
         content: Content,
         target: Option<&[u8]>,
     ) {
+        if !self.reserve_input(1, std::mem::size_of::<Stat>() + 32 + name.len() + target.map_or(0, <[u8]>::len)) { return; }
         let index = self.files.len() as u32;
         let name = push(&mut self.names, name, &mut self.overflow);
         self.files.push(FileEntry { parent, name });
@@ -459,6 +475,7 @@ impl Batch {
             self.preserved.insert(parent, id, None);
             return;
         }
+        if !self.reserve_input(1, 32 + name.len()) { return; }
         let name = push(&mut self.names, name, &mut self.overflow);
         self.ignored.push(IgnoredEntry { parent, name, kind });
     }

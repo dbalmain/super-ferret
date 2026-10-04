@@ -3,7 +3,8 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;
 
-pub(crate) struct Lock(File);
+pub(crate) struct Lock(std::sync::Arc<Held>);
+struct Held(File);
 pub(crate) enum Error {
     Locked,
     Io(io::Error),
@@ -17,17 +18,20 @@ impl Lock {
             .open(dir.join("lock"))
             .map_err(Error::Io)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self(file)),
+            Ok(()) => Ok(Self(std::sync::Arc::new(Held(file)))),
             Err(TryLockError::WouldBlock) => Err(Error::Locked),
             Err(TryLockError::Error(e)) => Err(Error::Io(e)),
         }
     }
+    // Full rebuild transactions borrow ownership without unlocking the
+    // resident writer when their temporary guard is dropped.
+    pub(crate) fn share(&self) -> Self { Self(self.0.clone()) }
     #[cfg(test)]
     pub(crate) fn copy(&self) -> io::Result<File> {
-        self.0.try_clone()
+        self.0.0.try_clone()
     }
 }
-impl Drop for Lock {
+impl Drop for Held {
     fn drop(&mut self) {
         // flock belongs to the open file description. A child forked by
         // another thread may hold a copy until exec; merely closing our fd

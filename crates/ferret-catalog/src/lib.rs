@@ -22,6 +22,7 @@ mod build;
 mod compact;
 mod format;
 mod generation;
+mod input;
 mod lock;
 pub mod log;
 mod migrate;
@@ -39,6 +40,7 @@ pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
 pub use budget::{BudgetUsage, CompactionLimits};
 pub use build::BuildError;
 pub use format::{DecodeError, Section};
+pub use input::{InputBudget, InputLimits, InputUsage};
 pub use generation::{Generation, Handle, RetryFromCurrent};
 pub use read::{
     Catalog, Contents, Entry, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN,
