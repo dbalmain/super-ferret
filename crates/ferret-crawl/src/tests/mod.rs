@@ -8,6 +8,7 @@ mod lifecycle;
 mod parallel;
 mod race;
 mod reconcile;
+mod refresh;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

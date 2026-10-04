@@ -16,6 +16,7 @@ mod coverage;
 mod index;
 mod observe;
 pub mod reconcile;
+mod refresh;
 mod walk;
 
 pub use index::{
@@ -23,6 +24,9 @@ pub use index::{
     RootChange, index, index_change, recrawl,
 };
 pub use observe::ContentFault;
+pub use refresh::{
+    RefreshOutcome, RefreshReason, RefreshReport, RefreshRequest, RefreshScope, RenameHint, refresh,
+};
 
 pub use walk::{
     Boundary, Decided, Event, EventVisitor, FaultContext, IoOp, Stat, WalkOptions, WorkTree,

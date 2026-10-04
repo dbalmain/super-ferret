@@ -123,6 +123,8 @@ pub enum IndexError {
     BadRoot(PathBuf),
     /// A root to refresh that is not among the configured roots.
     NotConfigured(PathBuf),
+    /// A request names an inode that is not a live directory in its generation.
+    BadScope(InoId),
     /// The catalog could not be opened for writing: another run holds it
     /// ([`BeginError::Locked`]) or the previous generation is unreadable.
     Begin(BeginError),
@@ -150,6 +152,7 @@ impl fmt::Display for IndexError {
         match self {
             Self::BadRoot(p) => write!(f, "root {} must be absolute, without `..`", p.display()),
             Self::NotConfigured(p) => write!(f, "{} is not a configured root", p.display()),
+            Self::BadScope(id) => write!(f, "inode {} is not a live directory scope", id.0),
             Self::Begin(e) => write!(f, "{e}"),
             Self::Keep(e) => write!(f, "{e}"),
             Self::Coverage { faults, .. } => {
@@ -486,6 +489,15 @@ pub fn recrawl(
     refresh: Refresh<'_>,
     options: &IndexOptions,
 ) -> Result<Report, IndexError> {
+    recrawl_with_changes(session, roots, refresh, options).map(|(report, _)| report)
+}
+
+pub(crate) fn recrawl_with_changes(
+    session: &mut WriterSession,
+    roots: &[PathBuf],
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+) -> Result<(Report, ferret_catalog::log::ChangeSet), IndexError> {
     let previous = session.view();
     let mut plan = Plan::new(
         Some(&previous),
@@ -512,7 +524,7 @@ pub fn recrawl(
         .map_err(IndexError::Update)?;
     report.commit_time += started.elapsed();
     finish_report(&mut report, &catalog, &plan, changed, Some(&faulted));
-    Ok(report)
+    Ok((report, changes))
 }
 
 struct Reconciled {
