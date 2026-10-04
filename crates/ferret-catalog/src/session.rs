@@ -25,6 +25,7 @@ pub struct WriterSession {
     alias_names: BTreeMap<InoId, Vec<NameId>>,
     name_changes: BTreeMap<InoId, BTreeSet<NameId>>,
     next_batch: AtomicU32,
+    limits: crate::CompactionLimits,
 }
 
 impl WriterSession {
@@ -32,7 +33,27 @@ impl WriterSession {
     pub fn open(dir: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(dir).map_err(Error::Io)?;
         let writer = Writer::open(dir)?;
-        let view = writer.view();
+        let mut session = Self {
+            lookup_base: writer.view(),
+            writer,
+            identities: Vec::new(),
+            documents: Vec::new(),
+            directories: Vec::new(),
+            directory_changes: BTreeMap::new(),
+            identity_changes: BTreeMap::new(),
+            document_changes: BTreeMap::new(),
+            first_names: Vec::new(),
+            alias_names: BTreeMap::new(),
+            name_changes: BTreeMap::new(),
+            next_batch: AtomicU32::new(0),
+            limits: crate::CompactionLimits::default(),
+        };
+        session.rebuild();
+        Ok(session)
+    }
+
+    fn rebuild(&mut self) {
+        let view = self.writer.view();
         let mut identities: Vec<_> = view
             .inode_ids()
             .filter(|&id| !view.is_directory(id))
@@ -73,20 +94,35 @@ impl WriterSession {
                 }
             }
         }
-        Ok(Self {
-            writer,
-            lookup_base: view,
-            identities,
-            documents,
-            identity_changes: BTreeMap::new(),
-            document_changes,
-            directories,
-            directory_changes: BTreeMap::new(),
-            first_names,
-            alias_names,
-            name_changes: BTreeMap::new(),
-            next_batch: AtomicU32::new(0),
-        })
+        self.lookup_base = view;
+        self.identities = identities;
+        self.documents = documents;
+        self.identity_changes.clear();
+        self.document_changes = document_changes;
+        self.directories = directories;
+        self.directory_changes.clear();
+        self.first_names = first_names;
+        self.alias_names = alias_names;
+        self.name_changes.clear();
+        self.next_batch.store(0, Ordering::Relaxed);
+    }
+
+    /// Changes host-selected checkpoint budgets. The defaults are S1+'s
+    /// published limits; larger limits are useful for measuring replay costs.
+    pub fn set_compaction_limits(&mut self, limits: crate::CompactionLimits) {
+        self.limits = limits;
+    }
+
+    pub fn budget_usage(&self) -> crate::BudgetUsage {
+        self.writer.budget_usage()
+    }
+
+    /// Compacts the published view without advancing its sequence. Every
+    /// epoch cache is rebuilt before returning; queued handles must retry.
+    pub fn compact(&mut self) -> Result<Catalog, Error> {
+        self.writer.checkpoint_view(self.view())?;
+        self.rebuild();
+        Ok(self.view())
     }
 
     /// Transfers the held lock and view to the explicit checkpoint fallback.
@@ -231,8 +267,12 @@ impl WriterSession {
             }
         }
         self.writer
-            .commit_with_sniffer(previous.generation(), changes, sniffer)?;
+            .commit_budgeted(previous.generation(), changes, sniffer, self.limits)?;
         let view = self.writer.view();
+        if view.generation().checkpoint != previous.generation().checkpoint {
+            self.rebuild();
+            return Ok(view);
+        }
         self.name_changes.extend(names);
         for record in &changes.records {
             match record {

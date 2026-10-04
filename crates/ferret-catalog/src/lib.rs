@@ -17,7 +17,9 @@
 //! - [`log`]: durable changes, published prefixes and lazy family checks.
 
 pub mod batch;
+mod budget;
 mod build;
+mod compact;
 mod format;
 mod generation;
 mod lock;
@@ -34,6 +36,7 @@ pub mod transaction;
 mod tests;
 
 pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
+pub use budget::{BudgetUsage, CompactionLimits};
 pub use build::BuildError;
 pub use format::{DecodeError, Section};
 pub use generation::{Generation, Handle, RetryFromCurrent};

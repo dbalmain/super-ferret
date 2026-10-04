@@ -577,7 +577,7 @@ fn write_synced(path: &Path, write: impl FnOnce(&File) -> io::Result<()>) -> io:
     publication::sync(&file, Point::SnapshotSync)
 }
 
-fn publish(dir: &Path, temp: &Path, catalog: &Catalog) -> Result<(), CommitError> {
+pub(crate) fn publish(dir: &Path, temp: &Path, catalog: &Catalog) -> Result<(), CommitError> {
     let snapshot = dir.join(format!("snapshot.{}", catalog.generation().checkpoint));
     publication::rename(temp, &snapshot, Point::SnapshotRename).map_err(CommitError::Write)?;
     let log_temp = dir.join("changes.tmp");

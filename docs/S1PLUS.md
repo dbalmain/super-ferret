@@ -883,6 +883,23 @@ the small commit; it is not the 1–10 ms scoped-update row. M4 measures both.
 
 ### Compaction and open
 
+M7's resident writer preflights the validated final view before appending. Its
+built-in limits are 64 MiB, 500,000 records, 1% distinct dirty names or inodes,
+and 5% dead base names or inodes; each fraction uses its own checkpoint live
+count. Deleted rows are excluded from dirty counts. Small catalogs reach a
+fractional limit after a single row change and legitimately return
+`Checkpointed`; same-epoch tests can explicitly raise the host's limits.
+An explicit idle-boundary compaction changes the checkpoint epoch but preserves
+the sequence. A diff which requests compaction advances the sequence once and
+publishes that final state directly in the new checkpoint.
+
+Determinism applies to packed sections, their descriptors and section checksums.
+Two compactions of the same effective state have identical bytes there; the
+mandatory new epoch and its head checksum differ (D52 B). Live DocIds are sorted
+before packing; effective document iteration consists of base rows followed by
+replacements, rather than one globally sorted stream.
+
+
 Request a checkpoint at the first of: **64 MB log**, **500k log records**,
 **1% distinct new or overwritten rows** in either names or inodes, or
 **5% dead base rows**. These are initial measured-work targets, not format constants.

@@ -579,7 +579,6 @@ fn an_unreadable_directory_is_opaque_and_other_listing_faults_retain_old_childre
         checkpoint_oracle::listings(&catalog),
         checkpoint_oracle::listings(&fresh)
     );
-    let before = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
 
     // Same tree: the accessible directory now encounters an actual listing
     // error from the injected getdents seam, rather than a mirrored classifier.
@@ -604,10 +603,8 @@ fn an_unreadable_directory_is_opaque_and_other_listing_faults_retain_old_childre
         checkpoint_oracle::listings(&retained),
         super::coverage::retained_listings(&fresh, &catalog, &scopes, &scopes)
     );
-    assert_eq!(
-        fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
-        before
-    );
+    assert_eq!(retained.next_inode().0, retained.inode_count());
+    assert_eq!(retained.next_name().0, retained.name_count());
 }
 
 #[test]
@@ -658,7 +655,7 @@ fn a_readlink_failure_retains_the_old_edge_and_publishes_trustworthy_siblings() 
     std::os::unix::fs::symlink("f.txt", tmp.at("link")).unwrap();
     let roots = [tmp.tree()];
     run(&tmp, &roots, Refresh::All, 1);
-    let before = fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap();
+    let before = Catalog::open(&tmp.cat()).unwrap().unwrap();
 
     tmp.write("new.txt", b"new\n");
     crate::walk::FAIL_READLINK.set(Some(Box::new(|name| name == "link")));
@@ -674,9 +671,20 @@ fn a_readlink_failure_retains_the_old_edge_and_publishes_trustworthy_siblings() 
         matches!(faults.as_slice(), [f] if f.op == IoOp::Readlink && f.path.ends_with("link")),
         "{faults:?}"
     );
+    before.load_all().unwrap();
+    assert_eq!(before.name_count(), 2);
+    let oracle = tmp.base.join("readlink-oracle");
+    index(&oracle, &roots, Refresh::All, &options(1)).unwrap();
+    let fresh = Catalog::open(&oracle).unwrap().unwrap();
+    let effective = Catalog::open(&tmp.cat()).unwrap().unwrap();
     assert_eq!(
-        fs::read(Catalog::snapshot_path(&tmp.cat()).unwrap().unwrap()).unwrap(),
-        before
+        checkpoint_oracle::listings(&effective),
+        super::coverage::retained_listings(
+            &fresh,
+            &before,
+            &[tmp.at("link").as_os_str().as_bytes().to_vec()],
+            &[tmp.tree().as_os_str().as_bytes().to_vec()],
+        ),
     );
 }
 

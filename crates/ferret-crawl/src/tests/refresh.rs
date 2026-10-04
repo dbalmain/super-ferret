@@ -75,7 +75,7 @@ fn a_simulated_burst_observes_final_state_deletion_and_adopts_the_same_epoch_vie
     tmp.write("a", b"old");
     tmp.write("b", b"old");
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     tmp.write("a", b"intermediate");
     fs::remove_file(tmp.at("a")).unwrap();
@@ -106,7 +106,7 @@ fn an_entry_burst_with_global_policy_size_cap_or_sniffer_changes_refreshes_every
     let roots = [tmp.at("left"), tmp.at("right")];
     let mut opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     for step in 0..3 {
         match step {
             0 => opts.global = Some("a\n".into()),
@@ -134,7 +134,7 @@ fn a_scoped_burst_respects_nested_root_boundaries_and_overflow_refreshes_them_al
     tmp.write("outer/inner/b", b"inner");
     let roots = [tmp.at("outer"), tmp.at("outer/inner")];
     index(&tmp.cat(), &roots, Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     tmp.write("outer/a", b"outer changed");
     let req = entry(&session, &tmp, "outer", "a");
     let result = refresh(&mut session, req, &options()).unwrap();
@@ -160,7 +160,7 @@ fn stale_sequence_and_epoch_requests_return_before_invalid_ids_are_dereferenced(
     let tmp = Tmp::new("refresh-stale");
     tmp.write("a", b"old");
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let initial = session.view().generation();
     tmp.write("a", b"new");
     let req = request(&session, vec![RefreshScope::Root(tmp.tree())]);
@@ -188,7 +188,7 @@ fn overflow_discards_invalid_scopes_and_requests_a_complete_backstop_recrawl() {
     let tmp = Tmp::new("refresh-overflow");
     tmp.write("a", b"old");
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     fs::remove_file(tmp.at("a")).unwrap();
     tmp.write("new/a", b"new");
     let mut req = request(&session, vec![RefreshScope::Directory(InoId(u32::MAX))]);
@@ -205,7 +205,7 @@ fn an_entry_burst_refreshes_the_complete_parent_count_and_keeps_unrelated_subtre
     tmp.write("dir/b", b"kept");
     tmp.write("outside/deep/a", b"kept");
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let parent = directory(&session.view(), &tmp, "dir");
     let req = entry(&session, &tmp, "dir", "a");
     fs::remove_file(tmp.at("dir/a")).unwrap();
@@ -226,7 +226,7 @@ fn an_entry_scope_with_a_replaced_or_vanished_parent_promotes_to_a_containing_sc
         tmp.write("dir/a", b"old");
         tmp.write("outside/a", b"kept");
         index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let req = entry(&session, &tmp, "dir", "a");
         fs::rename(tmp.at("dir"), tmp.base.join("displaced")).unwrap();
         if replaced {
@@ -245,7 +245,7 @@ fn an_entry_parent_with_changed_ctime_expands_its_subtree_instead_of_trusting_id
     tmp.write("dir/a", b"selected");
     tmp.write("dir/deep/b", b"old descendant");
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let req = entry(&session, &tmp, "dir", "a");
     tmp.write("dir/deep/b", b"new descendant");
     fs::set_permissions(tmp.at("dir"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -261,7 +261,7 @@ fn move_hints_including_wrong_hints_observe_both_final_endpoints_without_trustin
         tmp.write("old/a", b"moved");
         tmp.write("new/other", b"other");
         index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let mut req = request(&session, vec![]);
         let old_parent = directory(&session.view(), &tmp, "old");
         let new_parent = directory(&session.view(), &tmp, "new");
@@ -312,7 +312,7 @@ fn a_scoped_directory_eacces_is_opaque_while_eio_retains_and_recovery_clears_cov
         tmp.write("dir/old", b"old");
         tmp.write("outside/a", b"outside");
         index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         let scope = directory(&before, &tmp, "dir");
         fs::remove_file(tmp.at("dir/old")).unwrap();
@@ -370,7 +370,7 @@ fn an_ignore_file_entry_expands_to_its_subtree_and_reinclusion_ancestors_follow_
     tmp.write("hidden/deep/a", b"included");
     tmp.write("hidden/deep/b", b"excluded");
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     for rules in ["hidden/\n!hidden/deep/a\n", "hidden/\n", ""] {
         let req = entry(&session, &tmp, "", ".ferretignore");
         tmp.write(".ferretignore", rules.as_bytes());
@@ -384,7 +384,7 @@ fn a_fresh_checkpoint_with_unchanged_sequence_invalidates_old_epoch_scopes() {
     let tmp = Tmp::new("refresh-checkpoint-epoch");
     tmp.write("a", b"content");
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let session = WriterSession::open(&tmp.cat()).unwrap();
+    let session = super::log_session(&tmp.cat()).unwrap();
     let mut req = request(&session, vec![RefreshScope::Directory(InoId(u32::MAX))]);
     let before = session.view().generation();
     req.expected_generation = before;
@@ -394,7 +394,7 @@ fn a_fresh_checkpoint_with_unchanged_sequence_invalidates_old_epoch_scopes() {
     let compacted = txn.checkpoint().unwrap();
     assert_eq!(compacted.generation().sequence, before.sequence);
     assert!(compacted.generation().checkpoint > before.checkpoint);
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     assert!(matches!(
         refresh(&mut session, req, &options()).unwrap().outcome,
         RefreshOutcome::RetryFromCurrent(_)
@@ -407,7 +407,7 @@ fn checkpoint_fallback_refuses_a_scoped_batch_instead_of_dropping_untouched_chil
     let tmp = Tmp::new("refresh-scoped-checkpoint");
     tmp.write("dir/a", b"kept child");
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let session = WriterSession::open(&tmp.cat()).unwrap();
+    let session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let root = old.roots().next().unwrap().0;
     let mut batch = session.batch();
@@ -433,7 +433,7 @@ fn a_large_directory_listing_streams_equal_rows_with_a_fixed_temporary_observati
         tmp.write(&format!("dir/{n:05}"), b"same");
     }
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let id = directory(&session.view(), &tmp, "dir");
     let req = request(&session, vec![RefreshScope::Directory(id)]);
     let result = refresh(&mut session, req, &options()).unwrap();
@@ -452,7 +452,7 @@ fn deleting_one_hard_link_promotes_a_kept_alias_scope_inside_the_same_root() {
     tmp.write("right/stable", b"stable");
     fs::hard_link(tmp.at("left/a"), tmp.at("right/b")).unwrap();
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let req = entry(&session, &tmp, "left", "a");
     fs::remove_file(tmp.at("left/a")).unwrap();
     let result = refresh(&mut session, req, &options()).unwrap();
@@ -467,7 +467,7 @@ fn generated_entry_and_directory_bursts_match_the_full_index_after_every_final_s
             tmp.write(&format!("d{n}/a"), b"initial");
         }
         index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let mut state = seed + 1u64;
         for step in 0..24 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -532,7 +532,7 @@ fn conflicting_alias_content_observations_publish_shared_fault_and_match_a_fault
     tmp.write("right/stable", b"stable");
     fs::hard_link(tmp.at("left/a"), tmp.at("right/b")).unwrap();
     index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let left = directory(&session.view(), &tmp, "left");
     let right = directory(&session.view(), &tmp, "right");
     let req = request(

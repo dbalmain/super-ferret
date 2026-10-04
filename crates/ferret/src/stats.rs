@@ -31,8 +31,36 @@ pub fn run(context: &Context) -> Exit {
         error(&format!("{}: {e}", context.index.display()));
         return Exit::Error;
     }
+    let usage = match ferret_catalog::log::Published::open(&context.index) {
+        Ok(Some(published)) => match published.budget_usage() {
+            Ok(usage) => usage,
+            Err(e) => {
+                error(&e.to_string());
+                return Exit::Error;
+            }
+        },
+        _ => {
+            error("cannot read published budgets");
+            return Exit::Error;
+        }
+    };
     let mut text = String::new();
     let _ = writeln!(text, "index {}", context.index.display());
+    let _ = writeln!(
+        text,
+        "log {} bytes / 67108864, {} records / 500000, {} transactions",
+        usage.log_bytes, usage.records, usage.transactions
+    );
+    let _ = writeln!(
+        text,
+        "dirty inodes {}/{}, names {}/{} (1%); dead base inodes {}, names {} (5%)",
+        usage.dirty_inodes,
+        usage.base_inodes,
+        usage.dirty_names,
+        usage.base_names,
+        usage.dead_inodes,
+        usage.dead_names
+    );
     report(&catalog, &mut Census::of(&catalog), &mut text);
     crate::cli::print("stats", text.as_bytes())
 }

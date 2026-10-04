@@ -376,7 +376,7 @@ impl Plan {
 }
 
 /// The inode columns read straight from a [`Stat`]: all but the `DocId`.
-const STAT_COLUMNS: [Column; 10] = [
+pub(crate) const STAT_COLUMNS: [Column; 10] = [
     Column::Dev,
     Column::Ino,
     Column::Size,
@@ -391,7 +391,7 @@ const STAT_COLUMNS: [Column; 10] = [
 
 /// One of [`STAT_COLUMNS`]' values, as the column stores it; the reader's
 /// accessors invert it.
-fn stat_field(column: Column, stat: &Stat) -> u64 {
+pub(crate) fn stat_field(column: Column, stat: &Stat) -> u64 {
     match column {
         Column::Dev => stat.dev,
         Column::Ino => stat.ino,

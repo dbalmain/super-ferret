@@ -300,6 +300,13 @@ impl Log {
     pub(crate) fn frames(&self) -> impl Iterator<Item = (u64, [u32; 3])> {
         self.transactions.iter().map(|t| (t.sequence, t.counters))
     }
+    pub fn record_count(&self) -> u64 {
+        self.transactions
+            .iter()
+            .flat_map(|frame| &frame.blocks)
+            .map(|block| u64::from(block.count))
+            .sum()
+    }
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
     }
@@ -371,6 +378,7 @@ pub struct Writer {
     manifest: Manifest,
     poisoned: bool,
     current: Catalog,
+    budget: crate::budget::Budget,
 }
 
 #[derive(Debug)]
@@ -412,12 +420,13 @@ impl Writer {
             crate::lock::Error::Locked => Error::Locked,
             crate::lock::Error::Io(e) => Error::Io(e),
         })?;
-        let result: Result<(File, Manifest, Catalog), Error> = (|| {
+        let result: Result<(File, Manifest, Catalog, crate::budget::Budget), Error> = (|| {
             let pinned = Published::open(dir)
                 .map_err(Error::Previous)?
                 .ok_or(Error::MissingCheckpoint)?;
             recover(dir, &pinned).map_err(Error::Previous)?;
             let mut manifest = pinned.manifest.clone();
+            let budget = crate::budget::Budget::open(&pinned).map_err(Error::Previous)?;
             let current = pinned.into_catalog();
             current.load_all().map_err(Error::Previous)?;
             current.name_references();
@@ -443,9 +452,9 @@ impl Writer {
                 .write(true)
                 .open(path)
                 .map_err(Error::Io)?;
-            Ok((log, manifest, current))
+            Ok((log, manifest, current, budget))
         })();
-        let (log, manifest, current) = result?;
+        let (log, manifest, current, budget) = result?;
         Ok(Self {
             dir: dir.to_owned(),
             _lock: lock,
@@ -453,8 +462,72 @@ impl Writer {
             manifest,
             poisoned: false,
             current,
+            budget,
         })
     }
+    /// Publishes the effective view at an idle boundary under this writer lock.
+    /// A preflighted diff has already been checked by `Catalog::advance`.
+    pub(crate) fn checkpoint_view(&mut self, view: Catalog) -> Result<Generation, Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let mut generation = view.generation();
+        generation.checkpoint = generation
+            .checkpoint
+            .checked_add(1)
+            .filter(|&n| n != u64::MAX)
+            .ok_or(Error::Invalid(DecodeError::Corrupt("checkpoint exhausted")))?;
+        while ["snapshot", "changes"].iter().any(|prefix| {
+            self.dir
+                .join(format!("{prefix}.{}", generation.checkpoint))
+                .exists()
+        }) {
+            generation.checkpoint = generation
+                .checkpoint
+                .checked_add(1)
+                .filter(|&n| n != u64::MAX)
+                .ok_or(Error::Invalid(DecodeError::Corrupt("checkpoint exhausted")))?;
+        }
+        let temp = self.dir.join("catalog.tmp");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .map_err(Error::Io)?;
+        crate::compact::write(&view, &file, generation).map_err(Error::Io)?;
+        publication::sync(&file, Point::SnapshotSync).map_err(Error::Io)?;
+        // Planning buffers have gone before readback. The checked sections are
+        // the new resident view, rather than a second whole-file allocation.
+        let mut bytes = [0; crate::format::TABLE_END];
+        file.read_exact_at(&mut bytes, 0).map_err(Error::Io)?;
+        let layout = crate::format::decode_table(&bytes, file.metadata().map_err(Error::Io)?.len())
+            .map_err(Error::Invalid)?;
+        let mut manifest = Manifest::from_layout(&layout);
+        let current = Catalog::open_checkpoint(file, &manifest).map_err(Error::Previous)?;
+        current.load_all().map_err(Error::Previous)?;
+        current.name_references();
+        self.poisoned = true;
+        crate::transaction::publish(&self.dir, &temp, &current).map_err(|e| match e {
+            crate::CommitError::Undurable(e) => Error::Undurable(e),
+            other => Error::Io(io::Error::other(other)),
+        })?;
+        manifest.log_end = HEADER;
+        self.log = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.dir.join(format!("changes.{}", generation.checkpoint)))
+            .map_err(Error::Io)?;
+        self.manifest = manifest;
+        self.current = current;
+        self.budget =
+            crate::budget::Budget::empty(self.current.inode_count(), self.current.name_count());
+        self.poisoned = false;
+        cleanup(&self.dir, generation.checkpoint).map_err(Error::Io)?;
+        Ok(generation)
+    }
+
     pub(crate) fn into_checkpoint(self, sniffer: u32) -> crate::Transaction {
         crate::Transaction::from_locked(self.dir, self._lock, Some(self.current), sniffer)
     }
@@ -481,6 +554,30 @@ impl Writer {
         expected: Generation,
         changes: &ChangeSet,
         sniffer: u32,
+    ) -> Result<Generation, Error> {
+        self.publish_changes(expected, changes, sniffer, None)
+    }
+
+    pub(crate) fn commit_budgeted(
+        &mut self,
+        expected: Generation,
+        changes: &ChangeSet,
+        sniffer: u32,
+        limits: crate::CompactionLimits,
+    ) -> Result<Generation, Error> {
+        self.publish_changes(expected, changes, sniffer, Some(limits))
+    }
+
+    pub fn budget_usage(&self) -> crate::BudgetUsage {
+        self.budget.usage
+    }
+
+    fn publish_changes(
+        &mut self,
+        expected: Generation,
+        changes: &ChangeSet,
+        sniffer: u32,
+        limits: Option<crate::CompactionLimits>,
     ) -> Result<Generation, Error> {
         if self.poisoned {
             return Err(Error::Poisoned);
@@ -534,12 +631,19 @@ impl Writer {
                 Error::Previous(OpenError::Decode(e)) => Error::Invalid(e),
                 other => other,
             })?;
+        let budget = self.budget.project(changes, bytes.len() as u64);
+        if limits.is_some_and(|limits| budget.usage.reached(limits)) {
+            // Never append an over-budget transaction or reuse its ids after
+            // compaction: encode the checked final view directly.
+            return self.checkpoint_view(current);
+        }
         self.poisoned = true;
         publication::append(&self.log, &bytes, self.manifest.log_end).map_err(Error::Io)?;
         publication::sync(&self.log, Point::LogSync).map_err(Error::Io)?;
         publish_manifest(&self.dir, &next)?;
         self.manifest = next;
         self.current = current;
+        self.budget = budget;
         self.poisoned = false;
         Ok(self.manifest.generation)
     }
@@ -630,7 +734,7 @@ pub(crate) fn recover(dir: &Path, pinned: &Published) -> Result<(), OpenError> {
     cleanup(dir, pinned.manifest.generation.checkpoint).map_err(io_error)
 }
 
-fn cleanup(dir: &Path, checkpoint: u64) -> io::Result<()> {
+pub(crate) fn cleanup(dir: &Path, checkpoint: u64) -> io::Result<()> {
     let mut obsolete = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;

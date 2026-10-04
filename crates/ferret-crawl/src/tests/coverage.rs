@@ -10,7 +10,7 @@ use super::index::Tmp;
 use crate::walk::{IO_HOOKS, IoHook, IoPoint};
 use crate::{IndexOptions, IoOp, Refresh, index, recrawl};
 use checkpoint_oracle::{Listing, listings};
-use ferret_catalog::{Catalog, Contents, InoId, Target, WriterSession};
+use ferret_catalog::{Catalog, Contents, InoId, Target};
 
 pub(crate) struct Hook(PathBuf);
 impl Hook {
@@ -147,7 +147,7 @@ fn every_typed_namespace_fault_row_retains_a_checked_scope() {
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         let hook = Hook::set(&tmp.tree(), move |at, rel| {
             (at == point && rel == Path::new(path)).then(|| {
@@ -212,7 +212,7 @@ fn partial_listing_across_workers_discards_the_observed_prefix_and_retains_stale
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let before = session.view();
     let old_dir = directory(&before, &tmp.tree(), b"dir");
     let old_common = before.work_tree(old_dir).unwrap().common_id;
@@ -263,7 +263,7 @@ fn global_policy_and_sniffer_transitions_under_protection_abort() {
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view().generation();
         let mut changed = opts.clone();
         if sniffer {
@@ -298,7 +298,7 @@ fn new_opaque_and_replaced_directories_have_distinct_retention_anchors() {
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         // Keep the old inode allocated so this is definitely a replacement.
         if replaced {
@@ -361,7 +361,7 @@ fn overlapping_protection_scopes_reduce_to_the_outermost_boundary() {
     let opts = options();
     let roots = [tmp.tree()];
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let before = session.view();
     fs::write(tmp.at("dir/deep/a"), b"untrusted replacement content").unwrap();
     let hook = Hook::set(&tmp.tree(), |point, path| {
@@ -390,7 +390,7 @@ fn unknown_context_and_unanchored_new_root_faults_block_publication() {
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view().generation();
         let _hook = Hook::set(&tmp.tree(), move |at, path| {
             (at == point && (point == IoPoint::Root || path == Path::new("dir")))
@@ -409,7 +409,7 @@ fn unknown_context_and_unanchored_new_root_faults_block_publication() {
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
     let other = tmp.base.join("other-root");
     fs::create_dir(&other).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let before = session.view().generation();
     let _hook = Hook::set(&other, |point, _| {
         (point == IoPoint::Root).then(|| (IoOp::OpenDir, std::io::Error::from_raw_os_error(2)))
@@ -428,7 +428,7 @@ fn missing_existing_root_is_retained_and_root_boundary_edits_under_protection_ab
     let opts = options();
     let roots = [tmp.tree()];
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let before = session.view();
     let hook = Hook::set(&tmp.at("dir"), |point, _| {
         (point == IoPoint::Root).then(|| (IoOp::OpenDir, std::io::Error::from_raw_os_error(5)))
@@ -499,7 +499,7 @@ fn content_open_stat_read_and_closing_stat_faults_publish_valid_rows_without_min
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         let id = directory(&before, &tmp.tree(), b"a");
         let next_doc = before.next_doc();
@@ -545,7 +545,7 @@ fn child_lstat_not_found_alone_deletes_the_old_edge_and_directory_subtree() {
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         let dir = directory(&before, &tmp.tree(), b"dir");
         let path = tmp.at("dir");
@@ -587,7 +587,7 @@ fn new_unknown_child_edge_protects_its_old_parent_and_bad_patterns_do_not_protec
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         tmp.write("parent/new", b"new");
         let hook = Hook::set(&tmp.tree(), move |point, rel| {
@@ -609,7 +609,7 @@ fn new_unknown_child_edge_protects_its_old_parent_and_bad_patterns_do_not_protec
     let opts = options();
     let roots = [tmp.tree()];
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let before = session.view();
     let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
     assert_eq!(report.counts.pattern_errors, 1);
@@ -626,7 +626,7 @@ fn a_proved_replaced_root_cannot_retain_and_a_disjoint_root_removal_can_commit()
     let opts = options();
     let roots = [tmp.tree()];
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let before = session.view().generation();
     fs::rename(tmp.tree(), tmp.base.join("old-root-held")).unwrap();
     tmp.write("new", b"new");
@@ -652,7 +652,7 @@ fn a_proved_replaced_root_cannot_retain_and_a_disjoint_root_removal_can_commit()
     fs::create_dir(&other).unwrap();
     fs::write(other.join("b"), b"other").unwrap();
     index(&tmp.cat(), &[tmp.tree(), other], Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let before = session.view();
     let hook = Hook::set(&tmp.tree(), |point, _| {
         (point == IoPoint::Root).then(|| (IoOp::List, std::io::Error::from_raw_os_error(5)))
@@ -684,7 +684,7 @@ fn protected_names_survive_last_link_moves_and_fresh_outside_aliases_update_the_
         let opts = options();
         let roots = [tmp.tree()];
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         let dir = directory(&before, &tmp.tree(), b"dir");
         let name = before.lookup(dir, b"a").unwrap();
@@ -751,7 +751,7 @@ fn faults_below_new_or_replaced_parents_protect_a_proven_unchanged_ancestor() {
             let roots = [tmp.tree()];
             let opts = options();
             index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-            let mut session = WriterSession::open(&tmp.cat()).unwrap();
+            let mut session = super::log_session(&tmp.cat()).unwrap();
             let before = session.view();
             if replaced {
                 fs::rename(tmp.at("parent"), tmp.base.join("displaced")).unwrap();
@@ -796,7 +796,7 @@ fn an_outer_old_scope_discards_nested_new_opaque_scopes() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let before = session.view();
     tmp.write("parent/new/child", b"untrusted");
     let hook = Hook::set(&tmp.tree(), |point, path| {
@@ -827,7 +827,7 @@ fn a_fault_after_a_directory_move_retains_a_live_old_ancestor() {
         let roots = [tmp.tree()];
         let opts = options();
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         if new_parent {
             tmp.write("new/stable", b"stable");
@@ -873,7 +873,7 @@ fn directory_eacces_discards_prefixes_and_retires_subtrees_across_workers() {
         let roots = [tmp.tree()];
         let opts = options();
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         let id = directory(&before, &tmp.tree(), path.as_bytes());
         let hook = Hook::set(&tmp.tree(), move |at, rel| {
@@ -933,7 +933,7 @@ fn directory_eacces_collapses_failed_reinclusion_to_the_full_checkpoint_boundary
         let roots = [tmp.tree()];
         let opts = options();
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let before = session.view();
         let hook = Hook::set(&tmp.tree(), move |at, rel| {
             (at == point && rel == Path::new("hidden/deep"))

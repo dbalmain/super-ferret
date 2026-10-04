@@ -228,7 +228,10 @@ pub fn refresh(
         crate::index::recrawl_scoped(session, &roots, scope, options, selections)?;
     Ok(RefreshReport {
         base_generation: request.expected_generation,
-        outcome: if changes.records.is_empty() {
+        outcome: if session.view().generation().checkpoint != request.expected_generation.checkpoint
+        {
+            RefreshOutcome::Checkpointed
+        } else if changes.records.is_empty() {
             RefreshOutcome::Unchanged
         } else {
             RefreshOutcome::Committed { changes }

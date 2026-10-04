@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use ferret_catalog::{Catalog, InoId, WriterSession};
+use ferret_catalog::{Catalog, InoId};
 
 use super::index::Tmp;
 use crate::{IndexOptions, Refresh, index, recrawl};
@@ -50,7 +50,7 @@ fn unchanged_pass_writes_zero_bytes_and_publishes_no_generation() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let previous = session.view().generation();
     let files: Vec<_> = fs::read_dir(tmp.cat())
         .unwrap()
@@ -90,7 +90,7 @@ fn metadata_only_change_keeps_docid_and_inoid() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let id = file(&old, &roots[0], b"a");
     let doc = old.doc(id);
@@ -128,7 +128,7 @@ fn rename_and_moving_last_hard_link_keep_inode_and_document() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let id = file(&old, &roots[0], b"a");
     let doc = old.doc(id);
@@ -149,7 +149,7 @@ fn delete_then_create_same_path_with_new_inode_gets_new_ids() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let id = file(&old, &roots[0], b"a");
     let doc = old.doc(id);
@@ -244,7 +244,7 @@ fn hard_links_across_kept_and_refreshed_roots_share_final_references() {
     let roots = [tmp.at("left"), tmp.at("right")];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let id = file(&old, &roots[0], b"a");
     let doc = old.doc(id).unwrap();
@@ -279,7 +279,7 @@ fn policy_sniffer_and_nested_root_boundary_changes_d34_match_full_index() {
     let mut roots = vec![tmp.at("kept"), tmp.at("outer")];
     let mut opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let epoch = session.view().generation().checkpoint;
     roots.push(tmp.at("outer/inner"));
     let report = recrawl(&mut session, &roots, Refresh::Only(&[]), &opts).unwrap();
@@ -319,7 +319,7 @@ fn moving_directory_keeps_descendant_parent_ids_and_overwrites_destination() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let dir = file(&old, &roots[0], b"a");
     let child_name = old.lookup(dir, b"child").unwrap();
@@ -346,7 +346,7 @@ fn generated_recrawl_sequences_match_fresh_materialised_checkpoints_at_every_pre
             tmp.write(name, name.as_bytes());
         }
         index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let mut session = super::log_session(&tmp.cat()).unwrap();
         let mut rng = seed;
         for step in 0..32 {
             rng ^= rng << 13;
@@ -391,7 +391,7 @@ fn moving_last_hard_link_by_create_and_delete_neither_kills_nor_recreates_ids() 
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let id = file(&old, &roots[0], b"a");
     let doc = old.doc(id);
@@ -415,7 +415,7 @@ fn ambiguous_hard_link_renames_allocate_edges_but_keep_inode_and_document() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let root = old.roots().next().unwrap().0;
     let id = file(&old, &roots[0], b"a");
@@ -446,7 +446,7 @@ fn explicit_root_removals_preserve_shared_inodes_until_the_final_root_disappears
     let roots = [tmp.at("left"), tmp.at("right")];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let id = file(&old, &roots[0], b"a");
     let doc = old.doc(id).unwrap();
@@ -471,7 +471,7 @@ fn shared_hash_replacement_reference_changes_are_one_final_set() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let id = file(&old, &roots[0], b"a");
     let doc = old.doc(id).unwrap();
@@ -540,7 +540,7 @@ fn directory_eacces_retires_old_subtree_and_recovery_matches_full_checkpoint() {
     let roots = [tmp.tree()];
     let opts = options();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     fs::set_permissions(tmp.at("dir"), fs::Permissions::from_mode(0o000)).unwrap();
     let report = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
@@ -585,7 +585,7 @@ fn local_policy_traversal_collapse_and_work_tree_changes_match_full_checkpoint()
         ..options()
     };
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     for rules in ["hidden/\n!hidden/deep/file.txt\n", "hidden/\n", ""] {
         tmp.write(".ferretignore", rules.as_bytes());
         recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
@@ -613,7 +613,7 @@ fn reopening_session_preserves_document_hash_holes_and_never_resurrects_docids()
     let shared = old.doc(file(&old, &roots[0], b"b")).unwrap();
     fs::write(tmp.at("a"), b"shared").unwrap();
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     assert_eq!(session.view().doc(id), Some(shared));
     assert_eq!(session.view().doc_hash(retired), None);
     assert!(
@@ -628,7 +628,7 @@ fn reopening_session_preserves_document_hash_holes_and_never_resurrects_docids()
     assert_ne!(session.view().doc(id), Some(retired));
     oracle(&tmp, &roots, &opts, &session.view());
     drop(session);
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     assert!(
         recrawl(&mut session, &roots, Refresh::All, &opts)
             .unwrap()
@@ -657,7 +657,7 @@ fn compact_equal_observation_joins_a_new_alias_before_conflict_resolution() {
         ..options()
     };
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
-    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
     let id = file(&old, &roots[0], b"a");
     let changed = Arc::new(AtomicBool::new(false));
