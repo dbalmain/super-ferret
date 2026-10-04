@@ -974,6 +974,120 @@ recrawl's post-setup timer. Logical writes exclude filesystem block amplificatio
 All fault runs preserve inode/name/directory/document counts and checkpoint
 size/mtime; cold disk replay confirms the retained-at marker.
 
+### S1+ M6 — Resident scopes and bounded file observations (2026-10-05)
+
+M6 exposes `ferret_crawl::refresh` on a retained `WriterSession`: Entry,
+Directory and configured Root scopes, move hints and reasons. It checks the
+whole expected generation before reading a request id; old epochs retry even
+when checkpointing leaves sequence unchanged. Opened parent identity/version
+changes promote work; ignore changes expand their subtree, global policy/sniffer
+changes expand roots, and overflow requests a complete backstop. Returned views
+adopt the checked same-epoch delta without reopening/replaying the log.
+Untouched subtrees stay in the effective view. Partial batches are refused by
+checkpoint fallback rather than silently dropping their kept children.
+
+Seventeen additional tests drive the real crawler, writer and disk reader,
+against the independent full-checkpoint oracle, including 72 generated bursts
+checked after every final state. M4/M5/M5c expectations remain unchanged.
+Gates at `0f876e9`: **540 passed / 4 ignored**, zero warnings. The real query
+log retains its size and mtime. D51 A, D52 B and D53 A are now answered; no
+watcher, auto-compaction, trusted-reader shortcut or persisted namespace is built.
+
+**Measurement source:** production `0f876e9`, release build:
+`nix develop --command cargo build --release -p ferret-crawl --example recrawl -p ferret-bench`.
+Same 10,448,739-name v4 fixture as M4b/M5, `/tmp/s1plus-m3-measure/index`;
+AMD Ryzen 9 9955HX, 32 logical CPUs, boost disabled, ext4 on `/dev/nvme0n1p2`.
+The clean log is 64 B. Near-threshold cases start from the checked M3 100,000
+name/inode overlay at `/tmp/s1plus-m3-overlays/p1` (14,353,544 B log), copied to
+private indexes. Snapshot hardlinks remain unchanged in size/mtime and epoch.
+100,000 means distinct indexed regular-file inodes, nominal 1% of 10M.
+
+These are **synthetic observation replay/core publication** timings: the fixture
+has no filesystem tree. Scoped replay uses the production batch preservation,
+reducer, final-set reconciler and resident durable writer. It excludes kernel
+enumeration/stat/hash and `RefreshRequest` scope construction; it does not claim
+end-to-end filesystem refresh latency. Event selection is fixture preparation
+outside latency; ancestor resolution, replay, reconciliation and publication
+are timed. Full replay is single-threaded into 16 worker batches; scoped replay
+uses one batch. Real API behaviour is exercised by the oracle tests.
+
+Warm page cache, one warm-up per case then three fresh-process samples with
+case order rotated/reversed. Setup opens/validates once per session and is
+outside the headline latency. Logical writes count log append plus the 128 B
+manifest replacement, excluding fixture resets and block amplification. RSS
+peak covers the whole producer, including setup; phase medians are independent.
+Before every invocation, the runner checks `uptime` and
+`pgrep -af 'harness.run|ferret_timing|ignore_timing|synthetic|ferret-bench'`,
+excluding only its own ancestors and pgrep. No competing benchmark was found;
+we ran no compilation/gates during timings. All samples, commands, private
+environments, loads and binary SHA-256s are saved in
+`/home/dave/w/super-ferret/.ai/s1plus-m6-measurements/recrawl-samples.json`;
+`run.py` guards the runs, `report.py` derives `summary.json`, and `machine.json`
+records the host/method.
+
+```sh
+B=/home/dave/w/super-ferret-wt/s1plus/target/release/ferret-bench
+P=/home/dave/w/super-ferret-wt/s1plus/target/release/examples/recrawl
+export XDG_CONFIG_HOME=/tmp/s1plus-m6-measure/config
+export XDG_DATA_HOME=/tmp/s1plus-m6-measure/data
+export XDG_STATE_HOME=/tmp/s1plus-m6-measure/state
+export XDG_CACHE_HOME=/tmp/s1plus-m6-measure/cache
+# CASE is nochange, clean-one, clean-percent, dirty-one or dirty-percent.
+export FERRET_INDEX=/tmp/s1plus-m6-measure/${CASE}
+# Private manifest/log are reset from the clean or dirty fixture before each run.
+```
+
+| Case | Log + manifest bytes | Post-setup median (range), ms | Final / peak RSS, MiB | Source command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Full recrawl, no change | 0 + 0 | 9167.56 (9144.66–9275.24) | 866.70 / 1408.38 | `$B recrawl-once /tmp/s1plus-m6-measure/nochange 0 "$P"` | `0f876e9` | 4.08–6.41 / 3.23–3.38 / 2.29–2.32 |
+| Resident, clean log, one file | 328 + 128 | 7.23 (6.24–11.83) | 762.09 / 872.09 | `$B recrawl-once /tmp/s1plus-m6-measure/clean-one resident-1 "$P"` | `0f876e9` | 3.84–5.57 / 3.23–3.35 / 2.29–2.32 |
+| Resident, clean log, 100,000 files | 13,600,192 + 128 | 1097.65 (1082.48–1119.10) | 853.48 / 871.36 | `$B recrawl-once /tmp/s1plus-m6-measure/clean-percent resident-100000 "$P"` | `0f876e9` | 3.93–5.45 / 3.25–3.36 / 2.29–2.33 |
+| Resident, ~1%-dirty log, one file | 328 + 128 | 6.38 (6.34–16.50) | 866.36 / 975.78 | `$B recrawl-once /tmp/s1plus-m6-measure/dirty-one resident-1 "$P"` | `0f876e9` | 3.78–5.45 / 3.25–3.36 / 2.30–2.33 |
+| Resident, ~1%-dirty log, 100,000 files | 13,600,192 + 128 | 1606.93 (1603.04–1628.48) | 946.64 / 976.02 | `$B recrawl-once /tmp/s1plus-m6-measure/dirty-percent resident-100000 "$P"` | `0f876e9` | 3.71–5.09 / 3.24–3.32 / 2.29–2.34 |
+
+| Case (same command, commit and load as above) | Session setup median (range), ms | Setup current / peak RSS, MiB |
+| --- | ---: | ---: |
+| Full recrawl, no change | 3289.30 (3234.31–3317.82) | 761.64 / 871.74 |
+| Resident, clean log, one file | 3269.35 (3267.68–3300.27) | 761.71 / 872.09 |
+| Resident, clean log, 100,000 files | 3284.14 (3271.12–3300.70) | 761.76 / 871.36 |
+| Resident, ~1%-dirty log, one file | 4300.94 (4282.53–4325.70) | 865.95 / 975.78 |
+| Resident, ~1%-dirty log, 100,000 files | 4295.60 (4292.09–4369.76) | 865.93 / 976.02 |
+
+**Measured setup amortization:** three additional processes each keep one
+session for 1,000 sequential one-file content bursts, including geometric-run
+carries. Command: `$B recrawl-once /tmp/s1plus-m6-measure/resident-repeat resident-repeat "$P"`,
+with `FERRET_INDEX` set to that private index and the same XDG isolation;
+commit `0f876e9`, load 2.28–2.42 / 2.91–2.94 / 2.31–2.32 (1 / 5 / 15 min).
+Median setup is **3266.68 ms**, or **3.267 ms/burst** amortised over
+1,000 bursts (range 3.234–3.308). Each series writes **328,000 + 128,000 B**.
+Per-series median burst latencies are 2.08, 2.00, 1.70 ms;
+observed burst range across the series is 1.47–6.09 ms. Median final/peak RSS
+is 766.42/870.89 MiB. These warm repeated-session results are separate from
+first-burst headline samples and do not establish a rate/latency guarantee.
+Raw series: `recrawl-amortized.json` in the same measurement directory.
+
+**Full-recrawl cap:** each worker's pending file buffer holds at most **4,096
+rows and 1 MiB of name/target bytes**. Equal files and ignored markers reduce to
+seen bits; completed workers release buffers, while changed rows survive for
+one final transaction. This full replay reports a conservative sum of worker
+high-waters of **49,584 rows / 7,812,096 B (7.45 MiB including row structs)**,
+below the 16-batch row limit of 65,536. The cap excludes changed rows, seen
+bitsets and the O(directories) token/coverage graph. The filesystem walk still
+buffers a raw name listing before child events; it scales with the largest
+directory and is not included in this synthetic replay.
+
+No-change median is **9.17 s** (9.14–9.28 s), under the **9.5 s** target;
+it writes **zero bytes** and publishes no generation. Whole-process peak is
+**1.37 GiB**, against M4b's **1.35 GiB**: 1408.38 vs 1386.72 MiB, about
+21.66 MiB higher. The new cached first-name inverse costs about 40 MiB; seen
+parent-table consolidation offsets some of it. The fixed observation cap does
+not imply a cap on the directory graph or total process RSS. No-change phase
+medians are **6904.75 ms replay / 2204.79 ms reconciliation / 0 ms commit**.
+The earlier over-budget trial (10.64 s) did parent-map/set work per equal file;
+recording it once per parent, consolidating those tables, and keeping the first
+chunk's merge scan restored the target. Dirty 1% updates still publish;
+threshold-triggered compaction and its pause are M7 work.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes

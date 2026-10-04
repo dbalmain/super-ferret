@@ -5,10 +5,11 @@ M1–M3 implement the checked version-4 checkpoint, durable log and effective
 reader. M4/M4b implement the batch recrawl producer; M5 implements typed coverage
 retention. M6 implements resident scoped refresh and bounded file observations;
 M7 compaction remains a design.
-The build is split into slices below. D51 is open; its recommended choice is
-the provisional compaction schedule. D52 interprets D27 C as epoch-scoped ids:
-proceeding on the recommendation; Dave may veto. Neither is recorded as an
-answer from Dave.
+The build is split into slices below. Dave answered D51 A, D52 B and D53 A on
+2026-10-05: idle-boundary compaction under the writer lock, epoch-scoped
+InoId/NameId with stable DocId, and semantic validation on cold open. M7 measures
+and reports the compaction pause and may evaluate a persisted overlay namespace
+against its cold-open budget; M6 keeps semantic validation unchanged.
 
 A refresh appends one atomic transaction containing changed rows to a packed
 snapshot. A resident writer keeps its lookup structures between refreshes.
@@ -939,7 +940,7 @@ buffers; do not count that as guaranteed cold I/O saved. A full cold load of
 602.0 MB adds about **0.60 s read + 0.30 s checksum**, plus validation: about
 0.24 s less model byte work than the former 761.7 MB checkpoint.
 
-Epoch renumbering leaves D51's recommendation at idle-boundary compaction.
+Epoch renumbering leaves D51's answered choice at idle-boundary compaction.
 Concurrent construction would need transient old-epoch → new-epoch maps through
 cutover, assign new-epoch ids for suffix births, and rebase every inode/name
 reference before rewriting suffix records, counters, framing and checksums.
@@ -1025,21 +1026,22 @@ M4 does not ship broad fault recovery before M5's scope tests. M6 makes the
 S1b interface useful and cheap; M7 is required before an unbounded daemon
 writer is released. Update module headers on both sides of each seam.
 
-## Open question
+## Answered compaction decisions
 
-Only a conflict between fastest updates and simplest long-term maintenance
-is raised. Record it as [D51](DECISIONS.md#d51--compaction-while-the-watcher-is-busy-open).
+The conflict between fastest updates and simplest long-term maintenance was
+raised as [D51](DECISIONS.md#d51--compaction-while-the-watcher-is-busy-answered-2026-10-05).
 
 **D51: May a checkpoint pause the writer for seconds?** Idle-boundary,
 single-writer compaction is the smaller implementation and reuses the commit
 proof, but blocks incoming bursts for an estimated 9–20 s at 10M. Concurrent
 checkpoint construction keeps bursts flowing but needs suffix id rebasing/replay,
-a second publication proof and a peak-memory budget. The initial recommendation is the
-idle-boundary version, measured before S1b adopts it; the deciding fact is the
-permitted worst-case freshness lag under sustained churn. The decision brief
+a second publication proof and a peak-memory budget. Dave chose the
+idle-boundary version (A); M7 measures and reports the pause before S1b adopts it.
+The deciding fact was the permitted worst-case freshness lag under sustained
+churn. The decision brief
 has named options and numerical costs. [D52](DECISIONS.md#d52--d27-c-ids-across-compaction)
 records the epoch interpretation with its competing option and numbers:
-proceeding on the recommendation; Dave may veto. No consumer requires the
+Dave chose epoch-scoped ids (B), with stable DocId. No consumer requires the
 lifetime-map option, so this is not a fastest-versus-simplest disagreement.
 Checksum choice, batch durability, typed retention and content identity do
 not ask Dave to re-answer their settled direction.

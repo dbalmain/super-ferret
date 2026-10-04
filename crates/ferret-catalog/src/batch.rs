@@ -334,8 +334,8 @@ impl Batch {
     }
 
     /// Reduces a completed local listing against sorted old children. Equal
-    /// single-name rows retain only an old-name reference. Alias candidates
-    /// and changed observations stay complete for final-set reconciliation.
+    /// rows retain seen bits and a checked parent hint. Relevant aliases are
+    /// reconstructed for final-set reconciliation; changed rows stay complete.
     /// Unflushed observations remain visible through the borrowed accessors.
     pub fn finish_observations(&mut self) {
         if self.pending.is_empty() {
