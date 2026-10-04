@@ -88,6 +88,9 @@ fn main() -> ExitCode {
             ("overlay-rename-once", [dir]) => overlay_rename_once(Path::new(dir)),
             ("overlay-carry", [dir, count]) => overlay_carry(Path::new(dir), count),
             ("overlay-carry-boundary", [dir, rows]) => overlay_carry_boundary(Path::new(dir), rows),
+            ("recrawl-once", [dir, rows, producer]) => {
+                recrawl_once(Path::new(dir), rows, Path::new(producer))
+            }
             ("sections", [dir]) => sections(Path::new(dir)),
             ("query", [dir, queries @ ..]) => query(Path::new(dir), queries),
             _ => return usage(),
@@ -106,6 +109,7 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: ferret-bench scan <catalog-dir> [needle...]\n       \
+         ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \
          ferret-bench log-fill <catalog-dir> <transactions> <records>\n       \
@@ -818,5 +822,19 @@ fn overlay_rename_once(dir: &Path) -> Result<()> {
     writer.commit(writer.generation(), &c)?;
     let (rss, peak) = memory()?;
     println!("rename {elapsed} ms; runs {before} -> {after}; RSS {rss}, peak {peak}");
+    Ok(())
+}
+
+/// The producer lives in crawl so the bench crate acquires no layering edge.
+/// Its output separates session setup, synthetic observation replay, production
+/// diff and durable publication. All timings come from that one child process.
+fn recrawl_once(dir: &Path, rows: &str, producer: &Path) -> Result<()> {
+    let status = std::process::Command::new(producer)
+        .arg(dir)
+        .arg(rows)
+        .status()?;
+    if !status.success() {
+        return Err(format!("recrawl producer exited with {status}").into());
+    }
     Ok(())
 }

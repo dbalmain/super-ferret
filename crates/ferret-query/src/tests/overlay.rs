@@ -5,7 +5,7 @@ use super::{DAY, Scratch, dir, file, paths};
 use crate::find::{Effects, Plan, WalkError};
 use ferret_catalog::log::{ChangeSet, Record, Writer};
 use ferret_catalog::{
-    Catalog, Content, ContentState, DirToken, Hash, InoId, Kind, NameId, Stat, Target, Transaction,
+    Catalog, Content, ContentState, DirToken, Hash, InoId, Kind, NameId, Stat, Transaction,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;

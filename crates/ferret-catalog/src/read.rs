@@ -442,9 +442,18 @@ impl Catalog {
     /// Indexed names referring to a live inode, independent of `st_nlink`.
     /// Requires Names; the base inverse is cached and log LifePut replaces it.
     pub fn indexed_name_count(&self, id: InoId) -> u32 {
-        if !self.is_live_inode(id) { return 0; }
-        if let Some(Record::LifePut { names, .. }) = self.overlay.as_ref().and_then(|o| o.life(id.0)) { return *names; }
-        self.name_references().get(id.0 as usize).copied().unwrap_or(0)
+        if !self.is_live_inode(id) {
+            return 0;
+        }
+        if let Some(Record::LifePut { names, .. }) =
+            self.overlay.as_ref().and_then(|o| o.life(id.0))
+        {
+            return *names;
+        }
+        self.name_references()
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(0)
     }
     /// Base deaths, in id order; requires Life. Used to clear base bitsets.
     pub fn deleted_base_inodes(&self) -> impl Iterator<Item = InoId> + '_ {

@@ -159,16 +159,17 @@ impl WriterSession {
                     ..
                 } => {
                     let root = root_of(&view, InoId(*id));
-                    self.directory_changes
+                    let ids = self
+                        .directory_changes
                         .entry((root.0, stat.dev, stat.ino))
-                        .or_default()
-                        .push(InoId(*id));
-                }
-                Record::InodeDelete { id } => {
-                    if !previous.is_directory(InoId(*id)) {
-                        self.identity_changes
-                            .insert(previous.identity(InoId(*id)), None);
+                        .or_default();
+                    if !ids.contains(&InoId(*id)) {
+                        ids.push(InoId(*id));
                     }
+                }
+                Record::InodeDelete { id } if !previous.is_directory(InoId(*id)) => {
+                    self.identity_changes
+                        .insert(previous.identity(InoId(*id)), None);
                 }
                 Record::DocPut { id, hash, .. } => {
                     self.document_changes.insert(*hash, Some(DocId(*id)));

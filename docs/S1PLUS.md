@@ -1,7 +1,8 @@
 # S1+ — Incremental catalog
 
 M0 design, 2026-10-03. Implementation baseline: `4e38e77`, format v3.
-M1 implements the checked version-4 checkpoint; later slices below remain a design.
+M1–M3 implement the checked version-4 checkpoint, durable log and effective
+reader. M4 implements the covered batch recrawl producer; M5–M7 remain a design.
 The build is split into slices below. D51 is open; its recommended choice is
 the provisional compaction schedule. D52 interprets D27 C as epoch-scoped ids:
 proceeding on the recommendation; Dave may veto. Neither is recorded as an
@@ -40,11 +41,13 @@ These are constraints found in the code, rather than inferred from DESIGN:
   duplicate names, reachability and conflicting hard-link observations.
   `number_files` sorts identities; `assign_docs` sorts hashes and reuses live
   documents. Kept observations yield to fresh ones.
-- `transaction.rs::begin` loads the old catalog in full and builds sorted
-  identity and hash lookups on **every run**. `keep` copies whole roots into
-  batches. `commit` streams a complete file, frees batches, reads it back
-  whole for validation, then renames and syncs the directory. None of these
-  three paths is suitable for a resident one-file update unchanged.
+- `WriterSession::open` validates/warms the old view once, then caches sorted
+  inode/doc ids and rooted directory identities against that view. Sparse maps
+  track lookup changes. Name references reuse the reader's cached base inverse
+  and effective LifePut rows. `Transaction::begin` is the checkpoint fallback;
+  its carry identity lookup is lazy and hash sorting happens at checkpoint commit.
+  `keep` copies roots only for initial/checkpoint fallback publication. Ordinary
+  recrawls leave kept roots in the view and append a final sparse change set.
 - `walk.rs` already has `IoOp` and `FaultContext::{Root, Dir, Child}`. The
   original D33/D26 operation-tag addition has landed. `Entered.entries` is
   absent on a partial listing. Entries read before a listing fault can still
@@ -118,9 +121,11 @@ Twenty-six 32 B section entries hold offset, length and BLAKE3-128 checksum.
 Eighteen 16 B column descriptors follow, including nullable-blocked RetainedAt.
 A 16 B checksum over all preceding head bytes ends the 1,232 B head.
 DocRefs stores one u32 per live Docs row, counting indexed inode bindings;
-multiple hard links to one inode count once. Policy holds 16 B. Until M4
-supplies a fingerprint producer, zero means policy unknown; a checkpoint keeps
-an existing fingerprint and the writer can set an explicit one.
+multiple hard links to one inode count once. Policy holds 16 B. M4 fingerprints
+its domain/version tag, size cap, global-rule presence and global-rule text with
+BLAKE3-128. A change refreshes every configured root before PolicyPut. Local
+rule bytes are read by the actual refreshed walk. Zero remains unknown for
+legacy imports and callers that supply no fingerprint.
 
 `current`'s fixed layout is:
 
@@ -138,8 +143,8 @@ an existing fingerprint and the writer can set an explicit one.
 M1 has no log: committed log end is zero, sequence equals checkpoint sequence,
 and inode/name counters equal dense base counts. Epoch-local holes arrive with
 M2/M3; DocId holes already persist. The existing full-rebuild writer advances
-both checkpoint and sequence on each publication until M4 can distinguish
-empty diffs. It streams and syncs a private snapshot, validates it, renames to
+both checkpoint and sequence on each explicit checkpoint publication. M4's
+ordinary recrawl increments only sequence, and an empty diff changes neither. It streams and syncs a private snapshot, validates it, renames to
 `snapshot.<n>`, syncs that directory entry, then writes/syncs/renames `current`
 and syncs the directory. Retired snapshots are unlinked after that last sync;
 pinned descriptors retain their bytes. Abandoned suffixes are skipped rather
@@ -536,7 +541,11 @@ Sweep only refreshed, completely covered scopes for unseen edges; never sweep
 kept roots or protected subtrees. Subtract root removals explicitly. Process
 edge deletions, replacement observations and refcount changes as one final
 set, so moving a last hard link within a transaction does not transiently kill
-and recreate its inode/document. Collapse unsuccessful traversal with the
+and recreate its inode/document. When deleting the last refreshed alias leaves
+names only in kept roots, M4 promotes those alias roots to refreshed roots and
+walks them before publication: otherwise no observation updates the shared
+inode's nlink/ctime/content. M6 can narrow that promotion to checked alias scopes;
+untouched roots remain unswept. Collapse unsuccessful traversal with the
 existing reachability rule. Sort final changed rows deterministically; current
 per-worker arrival order is not a persistence contract.
 

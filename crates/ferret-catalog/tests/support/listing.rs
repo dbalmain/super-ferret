@@ -12,6 +12,9 @@ pub(crate) struct Listing {
     link: Option<Vec<u8>>,
     traversed: bool,
     entries: Option<u32>,
+    suppressed: bool,
+    retained_at: Option<u64>,
+    work_tree: Option<(u8, (u64, u64), Vec<u8>)>,
 }
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct StatKey([u64; 12]);
@@ -70,6 +73,20 @@ pub(crate) fn listings(c: &Catalog) -> Vec<Listing> {
             link,
             traversed,
             entries,
+            suppressed: match target {
+                Target::Inode(id) if kind == Kind::Dir => c.is_search_suppressed(id),
+                _ => false,
+            },
+            retained_at: match target {
+                Target::Inode(id) if kind == Kind::Dir => c.retained_at(id),
+                _ => None,
+            },
+            work_tree: match target {
+                Target::Inode(id) if kind == Kind::Dir => c
+                    .work_tree(id)
+                    .map(|w| (w.kind as u8, w.common_id, w.common_dir.to_vec())),
+                _ => None,
+            },
         });
     };
     for (id, path) in c.roots() {
