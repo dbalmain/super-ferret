@@ -607,12 +607,38 @@ have IGNORED tombstones; unknown lifetime/reuse collapses to Overflow.
 `FERRET_WATCH_CAP` defaults to seven eighths of `max_user_watches`, reserving
 one eighth for other user tools. All three inotify sysctls are read, never changed.
 Cap/install failures become coverage gaps. `FERRET_BACKSTOP_MS` defaults to
-3600000 and `FERRET_POLL_MS` to 300000. The five-minute timer refreshes only
-uncovered, fault-retained, relocated or possibly aliased roots, using Root scopes
-with reason Burst. If none need polling, it does no refresh. Until M5b adds
-outside-tree policy watches, changes to those external inputs are an interim gap
-caught by the hourly full-root backstop. M5b also adds exact multi-occurrence
-mapping, the count census, complete status schema, and network/FUSE polling rules.
+3600000 and `FERRET_POLL_MS` to 300000. The five-minute timer refreshes only uncovered, fault-retained, relocated,
+unproven-alias or unreliable-filesystem roots, using Root scopes with reason
+Burst. If none need polling, it does no refresh. M5b removes the blanket alias
+fallback: each descriptor owns one physical identity and all observed rooted
+parent/name occurrences. An event resolves every occurrence in the checked view;
+the S1+ producer promotes shared aliases and hard links across kept roots.
+Unobserved hard links remain polling-dependent until the sparse physical
+parent/name proof covers `nlink`; bind occurrences of one name count once.
+Unknown descriptor lifetime or changed root boundaries still widens observation.
+
+Policy dependencies come from crawl's actual consultation callbacks, including
+missing inputs and gitdir/commondir directory entries. Contrary to the original
+slice wording, `ferret-policy` has no input discovery: its compiler remains pure
+(D13). Crawl's `policy_inputs` adapter uses the git binary to parse ordered
+system/global/common config, includes, conditional includes, optional
+`config.worktree`, HEAD and `core.excludesFile`. Newly found dependencies are
+armed before rules are used, followed by another config read. Config discovery
+uses private mode-0600 temporary include documents, a five-second subprocess
+wait bound and a 4 MiB output bound per pipe; failure is a typed observation
+fault. No git source is used. Missing parent directories watch the nearest
+existing ancestor. Followed policy symlinks watch their target and ancestor
+symlink entries. Complete unprotected root observations retire old dependencies;
+partial/protected work retains them. Global ferret rule parents and the reserved
+`config` slot are watched too; there is no ferret config-file parser yet.
+Inputs that cannot be watched put their owning roots in the poll set.
+
+M5b uses `fstatfs` on tree and policy-parent handles. NFS (`0x6969`),
+CIFS/SMB/SMB2 (`0xff534d42`, `0x517b`, `0xfe534d42`), 9P (`0x01021997`) and
+FUSE (`0x65735546`) poll even with installed watches: remote/userspace writes
+need not notify this client's inode. Failure to classify also polls. This small
+conservative list leaves ordinary ext, btrfs, XFS, tmpfs and overlay trees on
+watches; it is not a claim that every other filesystem guarantees events.
 These timers serialize through the one writer service. Pending intake/publication
 prevents idle exit; an explicitly enabled unit still uses idle zero. Restart
 always arms during observation and performs a complete startup backstop.
@@ -637,15 +663,34 @@ state, watch coverage and queued freshness separately; an incremented sequence
 alone does not prove complete or current coverage. `stats --json` adds the
 catalog census and D54 bytes/planner counters.
 
-M5a exposes `ferret status --json` (JSON is also the default) for an existing
-compatible daemon, without spawning one. It adds watch_installed, watch_needed,
-watch_failed, watch_uncovered, pending_scopes, oldest_pending_ms, backstop_reason,
-last_successful_refresh, last_complete_backstop, writer_busy, writer_commands, fault_retained and
-refresh_error alongside M4's generation/engine/bytes fields. Wall timestamps are
-Unix seconds; ages and waits are monotonic. A complete-backstop timestamp requires
-no retained coverage faults; ordinary opaque directory observations remain covered.
-The rest of the proposed status census is M5b. M6 owns pacing, battery and load;
-M5a starts a due burst immediately at the next serial writer boundary.
+M5b exposes the complete list for an existing compatible daemon, without
+spawning one. Without a host, status opens the local checked catalog and sets
+`host_running:false`; unavailable freshness history and watch coverage are null,
+not a claim of coverage. `stats --json` uses the same selected pin and adds the
+human census (including raw/unknown counts, histogram bins, extensions, content,
+hard-link and duplicate state) and D54 storage/planner counters.
+
+| State | JSON fields and types |
+| --- | --- |
+| Selection | `host_running`: boolean; `generation`: epoch/sequence object or null; `current_operation`: string; `pinned_internal_epochs`: integer array |
+| Checked coverage | `protected_scopes`, `opaque_directories`: integers; `fault_retained`: boolean; `refresh_error`: string or null |
+| Watch coverage | `watch_installed`, `watch_needed`, `watch_failed`: integers; `watch_uncovered`: boolean or null; `polling_roots`: byte-path array or null |
+| Queued freshness | `pending_scopes`, `pending_bytes`, `refreshes`: integers; `oldest_pending_ms`: integer or null; `backstop_reason`, `last_refresh_reason`: string or null |
+| Writer | `writer_busy`: boolean; `writer_commands`: integer; `writer_input_budget`, `writer_log_budget`: integer-field objects; `writer_input_usage`: object or null |
+| Display history | `last_successful_refresh`, `last_complete_backstop`: Unix-second integers or null |
+| Resident resources | `current_rss_kb`, `peak_rss_kb`: KiB integers or null; `catalog_bytes`, `planner_bytes`, `name_postings_bytes`: integers |
+
+Installed watches count distinct physical directory descriptors, shared between
+tree and policy occurrences. Failed counts include unresolved policy watch
+registrations; needed is installed plus failed. Polling dependence can exist
+without a failed syscall (network/FUSE or an unobserved hard link).
+Input usage is the last successful producer report; log/input budgets are current
+default admission ceilings. Planner counters accumulate selections and estimated
+candidates for the host lifetime; their build durations are microseconds.
+Waits and pending ages are monotonic. A complete-backstop wall timestamp requires
+no retained coverage faults; ordinary opaque observations remain covered.
+M6 owns pacing, battery/load and resource admission; due bursts currently start
+at the next serial writer boundary.
 
 ### Compaction, oversized fallback and politeness
 
@@ -898,7 +943,7 @@ reducers, generation handling or fault tables.
 | **M3 — D54 resident name projection and planner**    | catalog `src/{names,read}.rs`, new `resident_names.rs`, build/compact accessors; query new `name_index.rs`, `query.rs`, `run.rs`, find safe candidate seam; text `src/lib.rs`; bench driver              | Distinct/posting/term output equals flat reference and real full-index oracle after generated create/move/hardlink/ignore/retention/epoch sequences; explicit token versus substring distinctions; planner common/rare scoped cases, count estimates include delta, all prune/quit/depth/action tests unchanged. Measure D54 build/open peak and steady B/name at 10M, 0/1/2% query/update latency, compaction cache rebuild, scoped 10 ms prototype shapes.                                                                                                                    |
 | **M4 — Socket host, ordinary clients and lifecycle** | ferret `src/bin/ferretd.rs`, `src/{daemon,client,protocol,xdg,engine}.rs`, CLI query routes; `tests/daemon.rs`; user-unit template `contrib/systemd/ferretd.service`                          | D57 answer gates socket codec; D56 answer gates effectful client routing. Actual socket tests for singleton races, XDG/index separation, missing runtime/spawn denial/F_NO_DAEMON, loading timeout, version drain, cwd/context incompatibility, cancellation/backpressure/native status and no query replay. Query-only host takes no writer lock; writer routing moves to M5. No M4 timing runs (measurements are a separate slice). Verify idle exit/restart. Socket latency, cold attach, codec cost and concurrent RSS measurements belong to a separate measurement slice.                                                                                          |
 | **M5a — Writer ownership, intake and backstops** | crawl `src/watch.rs`, retained root-edit/observation seams; daemon writer service and CLI routing; `tests/watch.rs` | Retained writer lock, existing-daemon index/root routing, serial barriers, arm-before-list inotify, debounce/cookies, bounded pending intake, loss backstops, capped coverage/polling, startup/hourly/five-minute timers. Real tree and generated full-index oracle tests; no timing runs. |
-| **M5b — Occurrences, policy dependencies and census** | crawl watch mapping and policy seams; daemon status | Bind/alias and D34 multi-occurrence watches; external git/config policy inputs; count census; full status field list; network/FUSE polling. M5a uses conservative complete polling for these gaps. |
+| **M5b — Occurrences, policy dependencies and census** | crawl watch mapping and policy seams; daemon status | Bind/alias and D34 multi-occurrence watches; external git/config policy inputs; raw-count census; complete typed status/stat JSON; statfs network/FUSE polling. Implemented; proven occurrences use watches, unproven links and failed inputs poll. |
 | **M6 — Queue, controller and compaction admission**  | ferret `src/{scheduler,politeness,daemon,engine,stats,config}.rs`; crawl worker controls and `index.rs` bulk-admission seam; catalog compaction I/O hooks only where pacing needs them; systemd template | Inject signal transitions into the real scheduler/writer: ratchet/drop/battery/unknown probes, continued intake during paused writer, bounded queue collapse, D51 unchanged-sequence retries, arrivals during backstop, memory-deferred fallback keeps generation/caches, protected global transitions abort, output does not block writer. Measure whole paced/unpaced compaction, oldest/newest freshness/backlog drainage, concurrent query latency, 10M 50/90% and faulted fallback peaks with watches/pins, foreground load/cache effects.                                 |
 | **M7 — Budgets and host compatibility review**       | bench driver, host/oracle tests, `docs/{S1B,ROADMAP,DESIGN,FIND}.md`; small fixes only where evidence identifies them                                                                                    | All prior find suites unchanged; batch and socket against native CLI/GNU, find-compat output/status/effects/order classification; pure/action CLI gates per D56. Recheck 10M no-change core <=9.5 s unpaced, resident one-file/1% near threshold, D54 query/steady <1 GB goal, actual daemon/kernel/transient totals and D51 freshness. Report misses without weakening decisions. No watcher completeness claim on polling-only roots.                                                                                                                                         |
 

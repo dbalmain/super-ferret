@@ -278,6 +278,8 @@ mod tests {
                 Command::RootsRemove(vec!["x".into()]),
             ),
             (&["stats"], Command::Stats),
+            (&["stats", "--json"], Command::StatsJson),
+            (&["--json", "stats"], Command::StatsJson),
             (&["help"], Command::Help),
             (&["search", "--help"], Command::Help),
             (&["--version"], Command::Version),

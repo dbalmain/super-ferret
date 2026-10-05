@@ -299,7 +299,8 @@ ancestor within the configured root; `.gitignore` and `.git/info/exclude` inside
 a work tree that starts at or below the configured root (a `.git` file
 contributes exclude from its gitdir, or from that gitdir's `commondir` when it
 has one; a symlinked `.git` contributes none, and a symlinked `.gitignore` is
-disregarded, as git does); the user's global ignore file
+disregarded, as git does); `core.excludesFile` from git config, below
+`info/exclude`; the user's global ignore file
 (`$XDG_CONFIG_HOME/ferret/ignore`), which setup seeds once with the defaults
 (`node_modules/`, `target/`, `.venv/`, …) and which is the user's to edit from
 then on. A size cap and a binary check sit beside the patterns. `!pat` in a
@@ -315,7 +316,7 @@ allocate a joined path per entry. Re-inclusion pruning discards negations that a
 later exclusion provably supersedes; uncertain overlaps still permit traversal.
 
 Each directory's rules are one list (D19). Concatenating the files lowest
-precedence first — global, `info/exclude`, `.gitignore` root to here,
+precedence first — global ferret rules, git `core.excludesFile`, `info/exclude`, `.gitignore` root to here,
 `.ferretignore` root to here — and taking the last matching line gives the
 precedence above. Every rule in the list matches an entry's name alone. A
 pattern with no slash before its last character applies unchanged in every
@@ -352,7 +353,11 @@ the oldest one over only while another worker is idle. Each worker's visitor is
 built by a factory and returned at the end, so a consumer accumulates per thread
 with no lock. At most 128 waiting listings keep a descriptor. The rest reopen
 from the root one checked step at a time, which bounds the walker at 128 + 4N
-descriptors. `walk` is the same code with one worker. By default N is the
+directory/ignore descriptors in an ordinary walk. Git config discovery additionally
+retains a linked gitdir and subprocess setup/pipe handles. Its config text is
+bounded to 4 MiB per output pipe and each active subprocess wait to five seconds;
+a failure uses the existing protected observation seam. M6 admission must include
+these transient handles and subprocesses. `walk` is the same code with one worker. By default N is the
 available parallelism capped at 16 (D24).
 
 What the walker hands the catalog, besides decisions and stats: each directory
@@ -572,13 +577,30 @@ and 16 MiB; loss/reuse becomes all-root Overflow. Notifications never delete row
 Known directory endpoints observe subtrees; self/unknown locators and policy
 boundaries conservatively refresh roots. Watch failures
 and a configurable cap (default seven eighths of the kernel limit) report gaps.
-Startup/hourly backstops and five-minute full polling use the same serial producer.
-The full poll conservatively covers M5b's pending alias/outside-policy work.
+Startup/hourly backstops and five-minute polling of the actual uncovered,
+retained, relocated, unproven-link and network/FUSE roots use the same serial
+producer. M5b maps every proven rooted occurrence onto a shared physical watch;
+notifications refresh every locator, and S1+ promotes kept shared aliases. Sparse
+hard-link proofs count physical parent/name pairs against `nlink`, preserving
+polling for names outside observed roots. Watches and policy inputs share the
+physical identity map and cap.
+
+Crawl's actual policy-read callbacks supply dependencies, including absent files,
+gitdir/commondir metadata, git config origins/includes, HEAD, optional per-worktree
+config and external exclude files. The git binary parses a private ordered include
+document; another read follows newly armed dependencies. The policy compiler
+remains pure. Input-parent watches catch saves, creation, replacement and ancestor
+symlink changes. Only complete unprotected root observations retire old inputs.
+Global ferret rules and the reserved config entry share those parent watches.
+Unwatchable inputs poll. `fstatfs` classifies NFS, CIFS/SMB/SMB2, 9P and FUSE as
+polling-dependent, even after watch installation; classification failure also
+polls. Remote/userspace writes may not emit local notifications.
 
 D51 A pauses the writer at idle boundaries while queries keep old views. M5a
-provides the minimal watch/pending/refresh status and real-inotify full-index oracle
-tests. M5b adds multi-occurrence watches, external policy inputs, count census,
-full status and network/FUSE rules; M6 owns pacing, battery/load signals and
+provides the serial writer and real-inotify full-index oracle tests. M5b provides
+multi-occurrence watches, external policy dependencies and typed status/stat JSON,
+including local no-host state, checked protection/opacity, queued freshness,
+coverage, budgets, RSS, old pinned epochs, census and D54 planner counters; M6 owns pacing, battery/load signals and
 budget validation. S1B specifies those later controls, including the full-builder
 memory limit recorded in ROADMAP.
 

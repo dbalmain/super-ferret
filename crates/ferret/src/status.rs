@@ -107,6 +107,7 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
             .int("opaque_directories", 0)
             .int("catalog_bytes", 0)
             .int("planner_bytes", 0)
+            .int("name_postings_bytes", 0)
             .bool("fault_retained", false)
             .integers("pinned_internal_epochs", []);
     }

@@ -788,11 +788,12 @@ fn external_git_exclude_inputs_refresh_from_watches_without_a_backstop() {
     fs::create_dir_all(tree.path("src/.git/info")).unwrap();
     write(tree.path("src/.git/info/exclude"), "");
     write(tree.path("outside/excludes"), "");
+    std::os::unix::fs::symlink(tree.path("outside"), tree.path("outside/policy")).unwrap();
     write(
         tree.path("src/.git/config"),
         &format!(
             "[core]\nexcludesFile = {}\n",
-            tree.path("outside/excludes").display()
+            tree.path("outside/policy/excludes").display()
         ),
     );
     tree.success(tree.local(&["index"]));
@@ -826,6 +827,19 @@ fn external_git_exclude_inputs_refresh_from_watches_without_a_backstop() {
         number(&after, "last_complete_backstop"),
         number(&before, "last_complete_backstop")
     );
+    fs::create_dir(tree.path("other-policy")).unwrap();
+    write(tree.path("other-policy/excludes"), "");
+    let before_retarget = tree.status();
+    fs::remove_file(tree.path("outside/policy")).unwrap();
+    std::os::unix::fs::symlink(tree.path("other-policy"), tree.path("outside/policy")).unwrap();
+    tree.converges();
+    assert!(tree.run(&["search", "original.txt"]).status.success());
+    let after = tree.status();
+    assert!(number(&after, "refreshes") > number(&before_retarget, "refreshes"));
+    assert!(
+        after.contains("\"last_refresh_reason\":\"Burst\""),
+        "{after}"
+    );
 }
 
 #[test]
@@ -845,11 +859,33 @@ fn linked_worktree_commondir_metadata_changes_are_watched() {
     write(tree.path("outside/gitdir/commondir"), "../common-a\n");
     write(tree.path("outside/common-a/info/exclude"), "");
     write(tree.path("outside/common-b/info/exclude"), "original.txt\n");
+    write(
+        tree.path("outside/common-a/config"),
+        "[extensions]\nworktreeConfig = true\n",
+    );
+    write(tree.path("outside/worktree-rules"), "original.txt\n");
+    write(tree.path("outside/gitdir/config.worktree"), "");
     tree.success(tree.local(&["index"]));
     tree.start(&[]);
+    let before_config = tree.status();
+    write(
+        tree.path("outside/gitdir/config.worktree"),
+        &format!(
+            "[core]\nexcludesFile = {}\n",
+            tree.path("outside/worktree-rules").display()
+        ),
+    );
+    tree.converges();
+    assert_eq!(tree.run(&["search", "original.txt"]).status.code(), Some(1));
+    let after_config = tree.status();
+    assert!(number(&after_config, "refreshes") > number(&before_config, "refreshes"));
+    assert!(after_config.contains("\"last_refresh_reason\":\"Burst\""));
+    write(tree.path("outside/gitdir/config.worktree"), "");
+    tree.converges();
     let before = tree.status();
     write(tree.path("outside/gitdir/commondir"), "../common-b\n");
     tree.converges();
+    assert_eq!(tree.run(&["search", "original.txt"]).status.code(), Some(1));
     let after = tree.status();
     assert!(number(&after, "refreshes") > number(&before, "refreshes"));
     assert!(
@@ -910,7 +946,15 @@ fn json_status_and_stats_have_typed_fields_and_live_values() {
     let mut check = fixture::bounded_command("python3", &tree.base);
     check.args(["-c", r#"
 import json, sys
-s = json.load(sys.stdin)
+docs = [json.loads(line) for line in sys.stdin]
+local, s = docs
+assert local['host_running'] is False
+assert isinstance(local['generation'], dict)
+assert local['last_successful_refresh'] is None
+assert local['last_complete_backstop'] is None
+assert local['watch_uncovered'] is None
+for key in ['current_operation', 'protected_scopes', 'watch_installed', 'watch_needed', 'watch_failed', 'oldest_pending_ms', 'pending_scopes', 'pending_bytes', 'backstop_reason', 'writer_input_budget', 'writer_log_budget', 'current_rss_kb', 'peak_rss_kb', 'pinned_internal_epochs']:
+    assert key in local, (key, local)
 for key in ['generation', 'writer_input_budget', 'writer_log_budget', 'census', 'd54']:
     assert isinstance(s[key], dict), (key, s)
 for key in ['watch_installed', 'watch_needed', 'watch_failed', 'pending_scopes', 'pending_bytes', 'protected_scopes', 'opaque_directories', 'current_rss_kb', 'peak_rss_kb', 'last_successful_refresh', 'last_complete_backstop']:
@@ -920,8 +964,12 @@ assert s['oldest_pending_ms'] is None or type(s['oldest_pending_ms']) is int
 assert s['backstop_reason'] is None or isinstance(s['backstop_reason'], str)
 assert type(s['host_running']) is bool and s['host_running']
 assert type(s['watch_uncovered']) is bool
+assert s['refresh_error'] is None or isinstance(s['refresh_error'], str)
+assert isinstance(s['polling_roots'], list)
+assert isinstance(s['writer_input_usage'], dict)
 assert isinstance(s['pinned_internal_epochs'], list) and s['pinned_internal_epochs']
 assert all(type(n) is int for n in s['pinned_internal_epochs'])
+assert isinstance(s['census']['extensions'], list)
 assert s['d54']['scope_walk_plans'] + s['d54']['postings_plans'] > 0
 "#]).stdin(Stdio::piped());
     let mut child = check.spawn().unwrap();
@@ -929,7 +977,7 @@ assert s['d54']['scope_walk_plans'] + s['d54']['postings_plans'] > 0
         .stdin
         .take()
         .unwrap()
-        .write_all(&output.stdout)
+        .write_all(&[local.stdout, output.stdout].concat())
         .unwrap();
     assert!(child.wait().unwrap().success());
 }
@@ -1152,4 +1200,42 @@ fn an_unobserved_hard_link_is_polling_dependent_until_all_occurrences_are_known(
     tree.converges();
     let after = tree.status();
     assert!(after.contains("\"polling_roots\":[]"), "{after}");
+}
+
+#[test]
+fn watched_global_policy_changes_wait_for_protected_scope_recovery() {
+    let mut tree = Tree::new();
+    write(tree.path("src/left/.ferretignore"), "");
+    tree.success(tree.local(&["index"]));
+    tree.start(&[("FERRET_POLL_MS", "100")]);
+    fs::set_permissions(
+        tree.path("src/left/.ferretignore"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    wait(|| tree.status().contains("\"fault_retained\":true"));
+    let before = tree.status();
+    let output = tree.success(tree.run(&["search", "original.txt"]));
+    write(
+        tree.path("home/config/ferret/ignore"),
+        ".git/\noriginal.txt\n",
+    );
+    wait(|| tree.status().contains("\"refresh_error\":\""));
+    let blocked = tree.status();
+    assert_eq!(number(&blocked, "sequence"), number(&before, "sequence"));
+    assert!(blocked.contains("\"fault_retained\":true"), "{blocked}");
+    assert_eq!(
+        tree.success(tree.run(&["search", "original.txt"])).stdout,
+        output.stdout
+    );
+    fs::set_permissions(
+        tree.path("src/left/.ferretignore"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    tree.converges();
+    assert_eq!(tree.run(&["search", "original.txt"]).status.code(), Some(1));
+    let recovered = tree.status();
+    assert!(recovered.contains("\"refresh_error\":null"), "{recovered}");
+    assert!(recovered.contains("\"protected_scopes\":0"), "{recovered}");
 }

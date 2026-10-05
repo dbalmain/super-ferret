@@ -249,7 +249,7 @@ fn queued_locators_survive_compaction_without_saved_numeric_ids() {
 
 #[test]
 fn proven_occurrences_share_one_descriptor_without_polling() {
-    let tree = Tree::new("alias-fallback", 100, 1 << 20);
+    let mut tree = Tree::new("alias-fallback", 100, 1 << 20);
     let root = tree.path.join("root");
     let alias = tree.path.join("alias");
     std::os::unix::fs::symlink(&root, &alias).unwrap_or_else(|error| panic!("alias: {error:?}"));
@@ -261,13 +261,40 @@ fn proven_occurrences_share_one_descriptor_without_polling() {
     assert_eq!(tree.watch.status().backstop, None);
     assert!(!tree.watch.status().uncovered);
     let wd = tree.descriptor("");
-    let state = tree
-        .watch
-        .state
-        .lock()
-        .unwrap_or_else(|error| panic!("state: {error:?}"));
-    let occurrences = &state.descriptors[&wd];
-    assert_eq!(occurrences.len(), 2);
+    {
+        let state = tree
+            .watch
+            .state
+            .lock()
+            .unwrap_or_else(|error| panic!("state: {error:?}"));
+        assert_eq!(state.descriptors[&wd].len(), 2);
+    }
+    crate::session_change(
+        &mut tree.writer,
+        crate::RootChange {
+            add: std::slice::from_ref(&alias),
+            remove: &[],
+        },
+        Refresh::All,
+        &IndexOptions {
+            watch: Some(tree.watch.clone()),
+            workers: 1,
+            ..IndexOptions::default()
+        },
+    )
+    .unwrap();
+    tree.watch.event(wd, ReadFlags::MODIFY, 0, b"through-bind");
+    let request = tree.due().request(&tree.writer.view());
+    assert_eq!(
+        request.scopes.len(),
+        2,
+        "one physical event must retain both occurrences"
+    );
+    assert!(
+        request.scopes.iter().all(
+            |s| matches!(s, RefreshScope::Entry { basename, .. } if basename == b"through-bind")
+        )
+    );
 }
 
 #[test]
@@ -314,4 +341,38 @@ fn unreliable_filesystem_magic_keeps_successfully_watched_roots_in_the_poll_set(
         tree.watch.polling_roots(&tree.writer.view()),
         [tree.path.join("root")]
     );
+}
+
+#[test]
+fn a_complete_root_retires_old_policy_inputs_but_partial_work_keeps_them() {
+    let tree = Tree::new("policy-retirement", 100, 1 << 20);
+    let root = tree.path.join("root");
+    tree.watch.reconcile(&tree.writer.view());
+    let outside = tree.path.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let old = outside.join("old-rules");
+    fs::write(&old, "").unwrap();
+    tree.watch.policy_path(&root, &old);
+    tree.watch.reconcile(&tree.writer.view());
+    fs::write(&old, "one\n").unwrap();
+    tree.watch.drain().unwrap();
+    let first = tree.due();
+    assert!(
+        matches!(&first.request(&tree.writer.view()).scopes[0], RefreshScope::Root(path) if path == &root)
+    );
+    tree.watch.finish(first, true);
+    tree.watch.begin_policy_root(&root);
+    tree.watch.policy_path(&root, &outside.join("new-rules"));
+    tree.watch.reconcile(&tree.writer.view());
+    tree.watch.drain().unwrap();
+    fs::write(&old, "two\n").unwrap();
+    tree.watch.drain().unwrap();
+    assert_eq!(
+        tree.watch.status().pending,
+        0,
+        "an old dependency cannot cause refresh forever"
+    );
+    fs::write(outside.join("new-rules"), "three\n").unwrap();
+    tree.watch.drain().unwrap();
+    assert!(tree.watch.status().pending > 0);
 }

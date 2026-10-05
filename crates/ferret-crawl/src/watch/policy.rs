@@ -51,6 +51,7 @@ impl Watch {
                 Ok(fd) => {
                     if let Some(name) = candidate.file_name() {
                         self.policy_input(root, fd.as_fd(), name);
+                        self.policy_ancestors(root, path);
                     }
                     return;
                 }
@@ -67,6 +68,37 @@ impl Watch {
                         .unwrap_or_else(|_| path.to_owned());
                     failure(&mut s, root, key);
                     return;
+                }
+            }
+        }
+    }
+    /// Changing an ancestor symlink changes the policy namespace even when
+    /// the followed file and its watched physical parent do not move.
+    fn policy_ancestors(&self, root: &Path, path: &Path) {
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            prefix.push(component);
+            // Proc-fd paths already anchor held handles. They are not mutable
+            // namespace dependencies and must not install process watches.
+            if prefix.starts_with("/proc") {
+                return;
+            }
+            if !std::fs::symlink_metadata(&prefix).is_ok_and(|m| m.file_type().is_symlink()) {
+                continue;
+            }
+            if let Some(parent) = prefix.parent() {
+                match std::fs::File::open(parent) {
+                    Ok(fd) => {
+                        self.policy_input(root, fd.as_fd(), prefix.file_name().unwrap_or_default())
+                    }
+                    Err(_) => failure(
+                        &mut self
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        root,
+                        prefix.clone(),
+                    ),
                 }
             }
         }

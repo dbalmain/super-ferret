@@ -121,6 +121,27 @@ impl<'a> Object<'a> {
         self
     }
 
+    /// An array of structured census rows.
+    pub(crate) fn objects<T>(
+        &mut self,
+        key: &str,
+        items: impl IntoIterator<Item = T>,
+        mut fill: impl FnMut(&mut Object<'_>, T),
+    ) -> &mut Self {
+        self.key(key);
+        self.out.push(b'[');
+        for (i, item) in items.into_iter().enumerate() {
+            if i != 0 {
+                self.out.push(b',');
+            }
+            let mut object = Object::new(self.out);
+            fill(&mut object, item);
+            object.end();
+        }
+        self.out.push(b']');
+        self
+    }
+
     /// `"key":N`.
     pub fn int(&mut self, key: &str, value: impl Into<i128>) -> &mut Self {
         self.key(key);

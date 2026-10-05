@@ -599,7 +599,11 @@ impl Watch {
                 || s.backstop.is_some()
                 || !s.pending.is_empty()
                 || !s.scoped_roots.is_empty(),
-            uncovered: !s.gaps.is_empty(),
+            uncovered: !s.gaps.is_empty()
+                || !s.unreliable.is_empty()
+                || s.file_aliases
+                    .values()
+                    .any(|a| a.unproven_roots().next().is_some()),
         }
     }
     /// Earliest time at which accumulated hints can be detached.

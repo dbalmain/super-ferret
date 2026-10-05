@@ -1445,11 +1445,40 @@ watch counts, pending age/count, backstop reason and refresh/completion timestam
 Real temporary-tree daemon tests compare search/find against fresh production
 indexes, including generated bursts and crash restart. No timing runs.
 
-M5b is separate: bind/alias multi-occurrence mapping, external policy dependency
-watches, count census, full JSON status, and network/FUSE polling. M6 owns pacing,
-battery/load and resource admission. M5a gates: **675 passed / 6 ignored**, +28 passing tests over the 647/5
+M5b has landed the remaining occurrence, input and status work below. M6 owns
+pacing, battery/load and resource admission. M5a gates: **675 passed / 6 ignored**, +28 passing tests over the 647/5
 baseline. The default real-daemon watch addition reports about 4.2 seconds (including four deliberately delayed writer commands); the
 long generated run is ignored and takes an environment-variable round count.
+
+### S1b M5b — Occurrences, policy dependencies and census (2026-10-06)
+
+Physical directory watches now retain every proven rooted namespace occurrence.
+Bind aliases and D34 nested/overlapping roots refresh through all relevant
+locators; S1+ promotion refreshes shared hard links across kept roots. Sparse
+physical parent/name proofs remove blanket alias polling when they cover `nlink`;
+links outside observed roots retain polling. Unknown descriptor lifetime/boundary
+changes still widen observation.
+
+Actual crawl consultations register policy inputs and absent-input parents,
+including git info/exclude, gitdir/commondir indirection, config origins/includes,
+HEAD, optional per-worktree config and external `core.excludesFile`. Git config
+parsing uses the git binary with bounded output/waits and private temporary include
+documents. `ferret-policy` remains pure, correcting the brief's assumption that
+input discovery lived there. Full unprotected observations retire old dependencies.
+Symlink targets/ancestors, global ferret rules and the reserved config entry use
+parent watches; unwatchable inputs poll. There is no ferret config-file parser.
+Statfs magic puts NFS, CIFS/SMB/SMB2, 9P and FUSE roots into polling regardless of
+successful watches, because remote/userspace writes may lack local events.
+
+Entry refresh already enumerated complete raw parent counts; the census oracle
+now checks ignored-name churn too. Complete status/stat JSON reports local no-host
+state, separates checked opacity/protection from watch coverage and queued
+freshness, and includes budgets, RSS, pinned epochs and D54/census counters.
+Real isolated daemon tests assert watched policy changes publish for Burst, D37
+still blocks global transitions under protection, and bind tests use `unshare -rm`
+with real mount --bind (available in this sandbox). No timing runs.
+Workspace gates: **690 passed / 6 ignored**, +13 passing tests over the
+**677/6** starting baseline. Final verification also runs from a clean commit.
 
 ### S1b M1 — Resident engine library (2026-10-05)
 

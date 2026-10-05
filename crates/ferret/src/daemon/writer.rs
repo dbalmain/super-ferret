@@ -538,5 +538,7 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
         .bool("fault_retained", s.fault_retained);
     if let Some(error) = &s.error {
         o.str("refresh_error", error);
+    } else {
+        o.null("refresh_error");
     }
 }

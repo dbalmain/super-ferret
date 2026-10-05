@@ -275,6 +275,10 @@ fn a_query_paused_on_its_first_row_survives_append_and_dense_checkpoint_remappin
         let compact = engine.compact().unwrap();
         assert_eq!(append.sequence, compact.sequence);
         assert_ne!(append.checkpoint, compact.checkpoint);
+        assert_eq!(
+            engine.pinned_epochs(),
+            [old.generation().checkpoint, compact.checkpoint]
+        );
         let current = engine.pin();
         let new_id = current
             .catalog()
@@ -292,6 +296,8 @@ fn a_query_paused_on_its_first_row_survives_append_and_dense_checkpoint_remappin
     });
     // Compaction unlinked the old files; the old pin remains usable afterwards.
     assert_eq!(search(&old), wanted);
+    drop(old);
+    assert_eq!(engine.pinned_epochs(), [engine.generation().checkpoint]);
 }
 
 #[test]

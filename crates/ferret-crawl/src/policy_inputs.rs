@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 /// The effective git global exclude path. Consultations, including missing
 /// inputs, are delivered before their rules are used.
-pub struct GitInputs {
+pub(crate) struct GitInputs {
     pub excludes: Option<PathBuf>,
 }
 impl GitInputs {
@@ -19,8 +19,9 @@ impl GitInputs {
     /// Held parent descriptor paths are valid for `gitdir` and `worktree`.
     /// Config is explicit so discovery also works for a minimal `.git`
     /// directory.
-    pub fn discover(
+    pub(crate) fn discover(
         gitdir: &Path,
+        common: &Path,
         worktree: &Path,
         mut consulted: impl FnMut(&Path),
     ) -> io::Result<Self> {
@@ -40,7 +41,8 @@ impl GitInputs {
             sources.push(config.join("git/config"));
             sources.push(home.join(".gitconfig"));
         }
-        sources.push(gitdir.join("config"));
+        sources.push(common.join("config"));
+        consulted(&gitdir.join("HEAD"));
         sources.retain(|p| p != Path::new("/dev/null"));
         let mut excludes = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -60,75 +62,42 @@ impl GitInputs {
             }
         }
         if !present.is_empty() {
-            // One ordered include document preserves cross-scope conditional
-            // includes, while --file also permits a minimal .git directory.
-            let merged = ConfigFile::new(&present)?;
-            let command = || {
-                let mut command = Command::new("git");
-                command
-                    .current_dir(worktree)
-                    .arg("--git-dir")
-                    .arg(gitdir)
-                    .arg("config")
-                    .arg("--file")
-                    .arg(&merged.0)
-                    .arg("--includes");
-                command
-            };
-            let mut paths = present;
-            // Discover includes, arm them, then read again. Never use rules
-            // from a newly found dependency before its parent is watched.
-            for attempt in 0..16 {
-                let output = bounded(command().args(["--null", "--show-origin", "--list"]))?;
-                if !output.status.success() {
-                    return Err(io::Error::other(
-                        String::from_utf8_lossy(&output.stderr).into_owned(),
-                    ));
-                }
-                let before = paths.len();
-                for pair in output
-                    .stdout
-                    .split(|b| *b == 0)
-                    .collect::<Vec<_>>()
-                    .chunks(2)
-                {
-                    let Some(origin) = pair.first().and_then(|s| s.strip_prefix(b"file:")) else {
-                        continue;
-                    };
-                    let origin = absolute(worktree, Path::new(OsStr::from_bytes(origin)));
-                    if origin != merged.0 && !paths.contains(&origin) {
-                        consulted(&origin);
-                        paths.push(origin.clone());
+            // Arm config origins before even consulting a flag from an include.
+            // The second document adds an enabled per-worktree scope last.
+            let initial = ConfigFile::new(&present)?;
+            let mut paths = present.clone();
+            discover_paths(gitdir, worktree, &initial.0, &mut paths, &mut consulted)?;
+            let output = bounded(command(gitdir, worktree, &initial.0).args([
+                "--type=bool",
+                "--get",
+                "extensions.worktreeConfig",
+            ]))?;
+            if output.status.success() && output.stdout == b"true\n" {
+                let per_worktree = gitdir.join("config.worktree");
+                consulted(&per_worktree);
+                match std::fs::metadata(&per_worktree) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                    Ok(m) if !m.is_file() => {
+                        return Err(io::Error::other(
+                            "git worktree config is not a regular file",
+                        ));
                     }
-                    if let Some(record) = pair.get(1)
-                        && let Some(at) = record.iter().position(|b| *b == b'\n')
-                    {
-                        let key = &record[..at];
-                        if key == b"include.path"
-                            || (key.starts_with(b"includeif.") && key.ends_with(b".path"))
-                        {
-                            let include = expand(
-                                origin.parent().unwrap_or(worktree),
-                                Path::new(OsStr::from_bytes(&record[at + 1..])),
-                            );
-                            if !paths.contains(&include) {
-                                consulted(&include);
-                                paths.push(include);
-                            }
-                        }
-                    }
+                    Ok(_) => present.push(per_worktree),
                 }
-                if paths.len() == before {
-                    break;
-                }
-                if attempt == 15 {
-                    return Err(io::Error::other(
-                        "git policy dependencies did not stabilize",
-                    ));
-                }
+            } else if !output.status.success() && output.status.code() != Some(1) {
+                return Err(io::Error::other(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
             }
-            let output =
-                bounded(command().args(["--null", "--path", "--get", "core.excludesFile"]))?;
+            let merged = ConfigFile::new(&present)?;
+            discover_paths(gitdir, worktree, &merged.0, &mut paths, &mut consulted)?;
+            let output = bounded(command(gitdir, worktree, &merged.0).args([
+                "--null",
+                "--path",
+                "--get",
+                "core.excludesFile",
+            ]))?;
             if output.status.success() {
                 let raw = output.stdout.strip_suffix(&[0]).unwrap_or(&output.stdout);
                 excludes = (!raw.is_empty())
@@ -144,6 +113,79 @@ impl GitInputs {
         }
         Ok(Self { excludes })
     }
+}
+fn command(gitdir: &Path, worktree: &Path, file: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(worktree)
+        .arg("--git-dir")
+        .arg(gitdir)
+        .arg("config")
+        .arg("--file")
+        .arg(file)
+        .arg("--includes");
+    command
+}
+fn discover_paths(
+    gitdir: &Path,
+    worktree: &Path,
+    file: &Path,
+    paths: &mut Vec<PathBuf>,
+    consulted: &mut impl FnMut(&Path),
+) -> io::Result<()> {
+    // Discover includes, arm them, then read again. Never use rules
+    // from a newly found dependency before its parent is watched.
+    for attempt in 0..16 {
+        let output =
+            bounded(command(gitdir, worktree, file).args(["--null", "--show-origin", "--list"]))?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        let before = paths.len();
+        for pair in output
+            .stdout
+            .split(|b| *b == 0)
+            .collect::<Vec<_>>()
+            .chunks(2)
+        {
+            let Some(origin) = pair.first().and_then(|s| s.strip_prefix(b"file:")) else {
+                continue;
+            };
+            let origin = absolute(worktree, Path::new(OsStr::from_bytes(origin)));
+            if origin.as_path() != file && !paths.contains(&origin) {
+                consulted(&origin);
+                paths.push(origin.clone());
+            }
+            if let Some(record) = pair.get(1)
+                && let Some(at) = record.iter().position(|b| *b == b'\n')
+            {
+                let key = &record[..at];
+                if key == b"include.path"
+                    || (key.starts_with(b"includeif.") && key.ends_with(b".path"))
+                {
+                    let include = expand(
+                        origin.parent().unwrap_or(worktree),
+                        Path::new(OsStr::from_bytes(&record[at + 1..])),
+                    );
+                    if !paths.contains(&include) {
+                        consulted(&include);
+                        paths.push(include);
+                    }
+                }
+            }
+        }
+        if paths.len() == before {
+            break;
+        }
+        if attempt == 15 {
+            return Err(io::Error::other(
+                "git policy dependencies did not stabilize",
+            ));
+        }
+    }
+    Ok(())
 }
 fn absolute(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -227,8 +269,14 @@ fn bounded(command: &mut Command) -> io::Result<Output> {
         let err = scope.spawn(move || read(Box::new(stderr)));
         let deadline = Instant::now() + Duration::from_secs(5);
         let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break Ok(status);
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(error);
+                }
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();

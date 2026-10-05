@@ -393,6 +393,8 @@ fn histogram(out: &mut String, histogram: &Histogram, sizes: bool) {
 pub(crate) fn json_fields(o: &mut crate::json::Object<'_>, session: &crate::engine::QuerySession) {
     let catalog = session.catalog();
     let c = Census::of(catalog);
+    let mut extensions = c.extensions.iter().collect::<Vec<_>>();
+    extensions.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut raw_entries = 0u64;
     let mut unknown = 0u64;
     for dir in catalog.dir_ids() {
@@ -425,6 +427,15 @@ pub(crate) fn json_fields(o: &mut crate::json::Object<'_>, session: &crate::engi
             .int("duplicate_inodes", c.duplicates.1)
             .int("duplicate_bytes", c.duplicates.2)
             .int("dangling_documents", c.dangling)
+            .objects(
+                "extensions",
+                extensions,
+                |o, (extension, (names, bytes))| {
+                    o.bytes("extension", extension)
+                        .int("names", *names)
+                        .int("bytes", *bytes);
+                },
+            )
             .object("content_states", |o| {
                 for (key, (n, b)) in ["unindexed", "binary", "hashed", "fault"]
                     .into_iter()
