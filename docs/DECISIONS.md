@@ -3092,3 +3092,89 @@ A filesystem ferret indexes whose ctime is not reliably updated on mtime
 changes (some FUSE mounts) would make the ctime-only carry-over key unsafe
 there; those roots would need E for mtime. Indexing network mounts with
 badly skewed clocks would favour E for ctime on those roots.
+
+## D56 — Where an indexed find with actions executes
+
+**Status: open.** S1b M0, 2026-10-05; [design](S1B.md#cli-and-find-effects).
+
+**Question:** Should an indexed `find` with commands, deletion, prompts or file
+outputs execute in the client's instance of the shared engine, or keep its
+resident traversal in the daemon and call the client for observations/actions?
+Fastest for small selective queries and simplest to maintain disagree.
+
+F8 B/F12 D still bind both options: default predicates use stored metadata;
+only this invocation's own `-delete` corrects stored child counts. Commands
+are Boolean tests, actions run concurrently (F11 A), observed parent handles
+protect delete/execdir, and prune/depth/quit/start sequencing remain visible.
+A filtered path stream plus client commands cannot implement that contract.
+The client owns cwd, environment/PATH, umask, stdin and tty. The daemon must
+never substitute its launch context for them.
+
+S1+ M3 measured full reader opens at **709 / 1,012 / 1,351 ms** for clean / 1% /
+2% overlays on the actual 10.45M fixture (`2e12d7b`, warm OS cache, fresh process).
+D54-integrated opens are **estimated 1–4 s**, not measured. The socket has no
+measurement yet; **0.05–0.3 ms** per small request/response is a planning range.
+At 100 dependent callbacks that adds **5–30 ms**; at one million it adds
+**50–300 s** if serialised. B can overlap workers and batch independent work,
+but it cannot batch away a command's truth value before evaluating its branch.
+Those products describe serial work, not predicted whole-query elapsed time.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Execute action plans locally through the shared resident engine | A one-shot action query pays another full query-only open, currently 0.7–1.35 s before D54, plus roughly 0.6–0.8 GiB additional process RSS while the daemon remains resident. Proposed routing exception to D49; no separate cold-query implementation. Batch pays its open once. | Existing evaluator, live source, observed handles, command batching, tty/stdin/PATH and per-query deletion accounting stay in one process. No action RPC, capability transfer or replay proof. Fastest for dense cheap actions once loaded; simplest to maintain. |
+| B. Cooperative resident traversal with client-local observations/actions | New continuation protocol, descriptor/cwd capability transfer, per-worker action replies and shared batching, delete-count feedback, prompt serialization, output commit/cancellation and no-effect-replay proof. Additional safe syscall dependency/features need review. Estimated 0.05–0.3 ms per dependent callback, plus bulk output/observation bytes. Code/latency unmeasured; count them in a prototype before choosing. | Avoids full client open and duplicate reader RSS; fastest expected for selective commands with few callbacks, where 5–30 ms beats a 0.7 s load. Actions still use the client's own context. |
+
+**Recommendation: A.** The correctness surface is materially smaller, and
+batch amortises the load for agent suites. This is a recommendation awaiting
+Dave, not permission to alter D49 or the answered find semantics. Read-only
+find/search daemon queries and local batch actions can proceed independently;
+shipping action-client routing waits for this answer. `-I` remains the existing
+local live mode under either option.
+
+**Fact that would change it:** production agent traces dominated by selective
+indexed action queries, with the extra 0.7–4 s open visible in their latency,
+and a B prototype preserving the complete find action/mutation suite with
+measured callback and resident-memory savings large enough to justify its
+continuation protocol. Measure dense delete too; command spawning can hide RPC
+cost while deletion cannot.
+
+## D57 — Share JSON lines with the socket, or add binary framing
+
+**Status: open.** S1b M0, 2026-10-05; [design](S1B.md#endpoint-and-request-context).
+
+**Question:** Should the daemon use batch's tagged JSON-lines codec, or a
+second binary socket codec for query/output blocks? Binary is faster for large
+byte streams; one shared codec is simplest to maintain.
+
+Batch requires JSON input under D46. The current `ferret` crate only writes
+JSON; it has no general parser. Both options propose the external
+**`ferret → serde_json`** edge for batch input. The engine stays in the existing
+`ferret` library, with no new engine crate or internal dependency edge. Update
+DESIGN's enforced graph with the dependency in the implementation commit;
+M0 changes no manifest. This brief records the required proposed edge rather
+than smuggling a hand-written general JSON parser into the batch host.
+
+Find output can contain arbitrary bytes. Base64 is exactly **4/3** of input
+length rounded to four-byte groups before JSON framing: **800 MB → 1.067 GB**.
+Binary could save at least **267 MB** on that example. At an illustrative
+**1 GB/s** wire rate that is **267 ms** of transfer, before codec CPU. This is
+arithmetic, not a benchmark. Small connected JSON request/replies have an
+**estimated 0.05–0.3 ms** total transport/framing budget; no local JSON-versus-
+binary timing exists. Search's UTF-8 rows need not pay base64 for every path.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. One tagged JSONL codec for batch and socket | Base64's 33% byte expansion on arbitrary find output, JSON field/framing and encode/decode CPU. Bulk throughput must be measured; small-message budget is estimated 0.05–0.3 ms. Requires bounded lines/parts and a real parser. | One schema, byte convention, decoder, compatibility rule and end-status/cancellation test suite. Easy agent/CI inspection. Simplest maintenance. |
+| B. JSONL batch plus length-framed binary socket | Two encoders/decoders, equivalent schemas/version negotiation, truncation/length/cancellation tests and dual harness adapters. Small-message savings unknown. | 25% fewer payload bytes than base64 on byte output, avoiding its codec work. Expected fastest for bulk find/printf streams; no need to turn arbitrary output into text. |
+
+**Recommendation: A**, pending Dave. Bound frames and stream them; measure
+first/final row and wire/CPU cost before building B. There is no socket timing
+yet that justifies another codec, but B's byte advantage is real, so fastest
+and simplest do not automatically coincide. Batch and its required parser
+edge are common to both answers; the daemon codec slice waits for the answer.
+
+**Fact that would change it:** JSON encoding/transfer dominates measured query
+CPU or adds material end-to-end latency on the real agent workload, with a
+binary prototype reducing that cost enough to justify a second protocol. A
+large synthetic listing alone is useful evidence, not evidence that most agent
+queries have that shape.
