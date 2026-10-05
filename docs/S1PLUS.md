@@ -947,9 +947,10 @@ all epoch caches and return Checkpointed. Unanchored faults, protected global
 version transitions, and retained suppression/traversal combinations which the
 full builder cannot represent safely abort before changing the generation.
 Fresh aliases supersede individually carried retained observations, as in
-D31/D34. Faulted full-root preparation consumes worker batches progressively,
-releasing directory maps before file replay, rather than retaining a second
-whole observation set. Once rewalk and retention resolution finish, release
+D31/D34. Faulted full-root preparation prunes existing worker columns in place and
+appends only carried scopes, remapping cross-worker directory tokens without
+retaining a second whole observation set. Directory maps are released before
+pruning. Once rewalk and retention resolution finish, release
 old lookup arrays and full-batch source pins before building; restore epoch
 caches from the selected generation on success or recoverable failure under
 the same lock. The writer and external readers can still pin the old source.

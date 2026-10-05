@@ -758,9 +758,7 @@ fn replay_fault_churn(
         if let Some(entries) = old.entry_count(dir) {
             batch.entry_count(token, entries);
         }
-        if let Some(seq) = old.retained_at(dir) {
-            batch.retained_at(token, Some(seq));
-        }
+
         if let Some(work) = old.work_tree(dir) {
             batch.work_tree(token, work.kind, work.common_dir, work.common_id);
         }

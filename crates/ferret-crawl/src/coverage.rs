@@ -551,7 +551,7 @@ pub(crate) fn resolve(
 /// edges. None refuses unrepresentable coverage before publishing anything.
 pub(crate) fn checkpoint_observations(
     session: &WriterSession,
-    batches: Vec<Batch>,
+    mut batches: Vec<Batch>,
     protection: &Protection,
     configured: &[PathBuf],
 ) -> Option<Vec<Batch>> {
@@ -564,7 +564,6 @@ pub(crate) fn checkpoint_observations(
         .flat_map(Batch::directories)
         .map(|d| (d.token, d))
         .collect();
-    let counts: BTreeMap<_, _> = batches.iter().flat_map(Batch::entry_counts).collect();
     let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
     let mut queue = VecDeque::new();
     for d in dirs.values() {
@@ -582,19 +581,15 @@ pub(crate) fn checkpoint_observations(
         active: BTreeSet::new(),
         out: Protection::default(),
     };
-    let file_capacity = batches
-        .iter()
-        .map(Batch::file_count)
-        .sum::<usize>()
-        .max(old.name_count().saturating_sub(old.dir_count()) as usize);
-    let mut batch = session.checkpoint_batch(file_capacity);
-    let mut mapped = BTreeMap::new();
+    let mut carried = session.checkpoint_batch(0);
+    let mut live = BTreeSet::new();
+    let mut coverage = BTreeMap::new();
     let mut overridden: BTreeMap<DirToken, BTreeSet<Vec<u8>>> = BTreeMap::new();
     let mut represented = BTreeSet::new();
     while let Some(token) = queue.pop_front() {
         let d = *resolver.dirs.get(&token)?;
         let parent = match d.parent {
-            Some(p) => Some(*mapped.get(&p)?),
+            Some(p) => live.contains(&p).then_some(Some(p))?,
             None => None,
         };
         if d.parent.is_some_and(|p| {
@@ -606,27 +601,19 @@ pub(crate) fn checkpoint_observations(
         }
         if protection.tokens.contains(&token) {
             let id = resolver.directory(token)?;
-            copy_subtree(&old, &mut batch, id, parent, d.name, &protection.markers)?;
+            copy_subtree(&old, &mut carried, id, parent, d.name, &protection.markers)?;
             represented.insert(id.0);
             continue;
         }
-        let next = match parent {
-            None => batch.root(d.name, *d.stat),
-            Some(p) if d.traversed => batch.traversed_dir(p, d.name, *d.stat),
-            Some(p) => batch.dir(p, d.name, *d.stat),
-        };
-        mapped.insert(token, next);
+        live.insert(token);
         let opaque = protection.denied.contains(&token) || protection.opaque.contains(&token);
         if opaque {
+            coverage.insert(token, None);
             continue;
         }
         if let Some(id) = resolver.directory(token) {
             if protection.markers.contains(&id.0) {
-                if let Some(seq) = retained_sequence(&old, id) {
-                    batch.retained_at(next, Some(seq));
-                }
-            } else if let Some(&count) = counts.get(&token) {
-                batch.entry_count(next, count);
+                coverage.insert(token, retained_sequence(&old, id));
             }
             for name in old.children(id) {
                 let edge = old.name(name);
@@ -636,12 +623,10 @@ pub(crate) fn checkpoint_observations(
                         .entry(token)
                         .or_default()
                         .insert(edge.bytes.to_vec());
-                    copy_edge(&old, &mut batch, next, name, &protection.markers)?;
+                    copy_edge(&old, &mut carried, token, name, &protection.markers)?;
                     represented.insert(edge.child.0);
                 }
             }
-        } else if let Some(&count) = counts.get(&token) {
-            batch.entry_count(next, count);
         }
         queue.extend(children.remove(&token).unwrap_or_default());
     }
@@ -659,7 +644,7 @@ pub(crate) fn checkpoint_observations(
             if !protection.directories.contains(&id.0) {
                 return None;
             }
-            copy_subtree(&old, &mut batch, id, None, path, &protection.markers)?;
+            copy_subtree(&old, &mut carried, id, None, path, &protection.markers)?;
             represented.insert(id.0);
         }
     }
@@ -669,52 +654,32 @@ pub(crate) fn checkpoint_observations(
             dir = old.name(old.dir_name(dir)?).parent;
         }
     }
-    // The maps borrow the inputs. Release them before progressively consuming
-    // worker columns, so trustworthy files never coexist as two full sets.
     drop(resolver);
-    drop(counts);
     drop(children);
-    for input in batches {
-        for i in 0..input.file_count() {
-            let f = input.file_observation(i);
-            let Some(&parent) = mapped.get(&f.parent) else {
-                continue;
-            };
-            if protection.denied.contains(&f.parent)
-                || protection.opaque.contains(&f.parent)
-                || overridden
-                    .get(&f.parent)
-                    .is_some_and(|names| names.contains(f.name))
-            {
-                continue;
-            }
-            match f.target {
-                Some(target) => batch.symlink(parent, f.name, f.stat, target),
-                None => batch.file(parent, f.name, f.stat, f.content),
-            }
-        }
-        for (parent, name, kind) in input.ignored_entries() {
-            if let Some(&next) = mapped.get(&parent)
-                && !protection.denied.contains(&parent)
+    let mut mapping: BTreeMap<_, _> = batches
+        .iter()
+        .flat_map(|batch| batch.checkpoint_tokens(|token| live.contains(&token)))
+        .collect();
+    mapping.extend(carried.checkpoint_tokens(|_| true));
+    for batch in &mut batches {
+        batch.checkpoint_coverage(&coverage);
+        batch.retain_checkpoint(&mapping, |parent, name| {
+            !protection.denied.contains(&parent)
                 && !protection.opaque.contains(&parent)
                 && !overridden
                     .get(&parent)
                     .is_some_and(|names| names.contains(name))
-            {
-                batch.ignored(next, name, kind);
-            }
-        }
-        for (token, kind, path, identity) in input.work_tree_observations() {
-            if let Some(&next) = mapped.get(&token)
-                && !protection.denied.contains(&token)
-                && !protection.opaque.contains(&token)
-            {
-                batch.work_tree(next, kind, path, identity);
-            }
-        }
+        });
     }
-    batch.seal();
-    Some(vec![batch])
+    carried.retain_checkpoint(&mapping, |_, _| true);
+    carried.seal();
+    if carried.directories().next().is_some()
+        || carried.file_count() > 0
+        || carried.ignored_entries().next().is_some()
+    {
+        batches.push(carried);
+    }
+    Some(batches)
 }
 
 fn retained_sequence(old: &Catalog, id: InoId) -> Option<u64> {
