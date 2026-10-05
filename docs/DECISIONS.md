@@ -75,6 +75,11 @@ Predecessors, carried forward where still open:
 | D57 | Socket codec: shared JSON lines or binary framing       | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                          |
 | D58 | Batch input: serde_json or a hand-written reader         | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                 |
 | D59 | How intpack enters the workspace                         | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                     |
+| D60 | Reactivate a dead DocId when its content returns        | open           | rec B: no; reverted content gets a new DocId and is tokenized again (S2 M0)                                    |
+| D61 | Term frequencies in S2's postings                       | open           | rec B: doc ids only; frequencies arrive with ranking, by reindex (S2 M0)                                       |
+| D62 | `ferret search` syntax for content and booleans          | open           | rec A: `text:` atoms; find-style `OR`, `NOT`, `(` `)` as whole arguments (S2 M0)                               |
+| D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
+| D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3359,3 +3364,155 @@ intpack itself so that other indexing projects get them. Vendoring happens
 only for a change specific to Super Ferret. crates.io comes later, when the
 format settles. The `path = "../intpack"` dependency M3 started with switches
 to `git = "https://github.com/dbalmain/intpack", rev = "6423815…"`.
+
+## D60 — Reactivate a dead DocId when its content returns
+
+**Status: open.** S2 M0, 2026-10-06; [design](S2.md#segments-are-disjoint-docid-ranges).
+D36 B left this to S2: "Whether a revert reactivates its old `DocId` is an S2
+decision, where postings make it worth something."
+
+**Question:** When content that died comes back (a revert, a branch switched
+away and back), should it get its old DocId, whose postings may still sit in an
+unmerged segment, or a new one?
+
+Today the catalog drops a dead document's row and keeps only the counter
+(D36 B), so returning content gets the next DocId. In S2 the index follows the
+catalog and tokenizes every new DocId ([S2 § Writer and daemon
+seam](S2.md#writer-and-daemon-seam)). The crawl reads and hashes the returning
+file either way, so reactivation saves only the tokenizing and the new
+postings, never the read. All figures below are **estimates**: a branch switch
+of 5,000 files at the research's 21.6 KB mean is 108 MB, which is about
+0.36 core-s at the tokenizer's 300 MB/s/core target, plus about 7.3 MB of new
+segment bytes at the docs-only 6.8% (`108 MB × 0.068`), held until a merge
+purges the dead copy.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Reactivate while postings exist | The catalog keeps dead rows (D36 A's 16 B hash plus id per dead document) until the index purges their postings, so the index must tell the catalog which dead DocIds a merge purged. That is a new edge from index state into catalog state, against DESIGN's ownership table, and a new record type. Merges must keep their purge list until the catalog has applied it. | A flip-flopping branch costs no tokenizing and no new postings until merge; fewer holes in the DocId space (slightly smaller gaps, so marginally denser doc-id lists). |
+| B. Never reactivate (D36 B carried into S2) | Returning content is tokenized again: about 0.36 core-s and 7.3 MB of segment bytes per 5,000-file switch (estimate), read from the page cache. Until merge, the dead copy's postings sit beside the new ones; the 25% dead-fraction merge rule bounds that. | No code. Liveness stays one-way (live → dead), so a segment never needs to know whether a dead document might return, and the catalog stays ignorant of postings. |
+
+**Recommendation: B.** It is both the simplest and, within the noise, as fast:
+the read that dominates is paid either way. Fastest and simplest do not
+disagree here by more than a fraction of a core-second per switch, so this
+brief exists only because D36 deferred it by name.
+
+**Fact that would change it:** M5's steady-state measurement showing follow
+passes after branch switches costing seconds of CPU or noticeable postings
+churn on Dave's real repositories, for example a monorepo whose switches touch
+tens of thousands of large files.
+
+## D61 — Term frequencies in S2's postings
+
+**Status: open.** S2 M0, 2026-10-06; [design](S2.md#what-a-posting-holds).
+
+**Question:** Should S2's postings store a term frequency per (term, document),
+or doc ids only?
+
+D6 made the index a candidate filter: it decides which documents to verify,
+not how to order them. Frequencies are ranking's input (BM25 and relatives),
+and nothing in S2 ranks. Sizes are from
+[S2 § Bytes per content byte](S2.md#bytes-per-content-byte-estimate):
+doc ids **9.69 bits/posting, measured** (intpack `pfor128skip`, `words.docs`)
+and frequencies **4.33 bits/posting, measured** (intpack `pfor128`,
+`words.freqs`); the per-content-byte totals are **estimates**.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Store frequencies | A parallel unsorted stream per list: +45% on doc-id bytes, +33% on the whole index (6.8% → 9.0% of text). At 30 GB of text, about +0.68 GB. One more stream to write, merge and check. | BM25-style ranking later without reindexing. A "most occurrences first" order for agents. |
+| B. Doc ids only | Ranking later needs a format version and a full re-follow: one pass over all text, about 16 min per 30 GB under the background pacer plus about 400 core-s (estimate, [S2 § Cost model](S2.md#cost-model-at-10m)). Until then, results come in DocId order (near path order). | The densest index, matching the goals' "index size takes priority". One stream per list. A verifier can still count matches in the documents it reads, which gives exact frequencies for phrase and regex candidates at no index cost. |
+
+**Recommendation: B.** Fastest (fewer bytes to read) and simplest (one
+stream) agree; this is a product-scope question rather than an engineering
+one, which is why it is here. The reindex that A avoids is the same code path
+as any tokenizer change.
+
+**Fact that would change it:** ranked results scheduled for S4's agent skill or
+the TUI, which would make the reindex a certainty rather than an option; then
+A now.
+
+## D62 — `ferret search` syntax for content atoms and booleans
+
+**Status: open.** S2 M0, 2026-10-06; [design](S2.md#syntax-open-d62).
+
+**Question:** How does `ferret search` spell a content atom, and how does it
+spell OR, NOT and grouping?
+
+Today a query is a conjunction of atoms, one per argument, and a bare word is a
+**name substring** (the `ferret-query` crate doc). Agents already call it, and
+S4's skill will document it. find(1) spells booleans as whole arguments (`-o`,
+`!`, `(` `)`), which agents quote correctly.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. A `text:` prefix for content; `OR`, `NOT`, `(` and `)` as whole arguments | Two more characters per content atom. `OR`/`NOT` become reserved words: a file literally named `OR` needs `name:OR`-style quoting, which needs a spelling (proposed: any atom prefix, e.g. `path:OR`). | S1 queries keep their meaning. Mixed queries read naturally: `ferret search ext:rs text:serde NOT text:"derive serialize"`. `case:text:Foo` composes with the existing `case:` prefix. One grammar for both sides. |
+| B. Bare words search content and names together (a union) | Changes every existing S1 query's meaning and cost: `ferret search parse` becomes a content query over the whole index. Agents' and tests' expectations change. | The shortest spelling for the most common content query. |
+| C. A separate verb (`ferret grep TERMS [-- name predicates]`) | A second grammar and parser, and two answers to "how do I combine them". | grep-like familiarity. |
+
+For the booleans, the alternative to whole-argument words is Google-style
+`-atom` for NOT and `|` for OR: shorter, but `-` collides with option parsing
+and with names that start with `-`, and `|` needs quoting in every shell.
+
+**Recommendation: A.** Fastest and simplest are indifferent here; this is
+interface taste and compatibility, and it is Dave's interface.
+
+**Fact that would change it:** the query log or S4's agent traces showing bare
+words used mostly with content intent, which would argue for B's default with
+`name:` as the explicit form.
+
+## D63 — Tokenize in a follow pass, or in the crawl's hashing read
+
+**Status: open.** S2 M0, 2026-10-06; [design](S2.md#the-content-flow-d63).
+
+**Question:** Should the index tokenize new content in its own pass after the
+catalog commits (reading each new file a second time), or during the crawl's
+existing read, which already sniffs and hashes every new or changed file?
+
+The crawl worker reads a file, hashes it, and only the catalog build, later,
+decides which hashes are new and assigns their DocIds (DESIGN § The catalog,
+by sorting). Tokens therefore cannot be keyed by DocId on the worker. All
+sizes and times below are **estimates**: 30 GB of text, the S1b M6 background
+pacer of 32 MiB/s, 1 GB/s unpaced sequential reads (S1PLUS's modelling input),
+and postings per content byte from [S2](S2.md#bytes-per-content-byte-estimate).
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Follow pass: after each catalog publication, the index reads the live documents it has not covered, in DocId order, and tokenizes them | New content is read twice. First build: one more pass, about 16 min per 30 GB paced, or about 30 s unpaced. Steady state: the second read is of a file the crawl read moments earlier, so it should come from the page cache (M5 measures the hit rate). | No change to `ferret-crawl` and no new crawl edge. Postings are appended in DocId order: no sort, no remap, a bounded 64 MiB buffer. One code path for the first build, a tokenizer change, a deleted index and the steady state. The index commits independently, with coverage covering the gap. |
+| B. Fused: the crawl worker tokenizes from its read buffer, for hashes not already live | `ferret-crawl → ferret-text`. Either the whole file is buffered until its hash is known (8 MiB size cap × 16 workers = 128 MiB), or every read file is tokenized, including duplicates already indexed (linked work trees). Tokens are keyed by hash on the worker, then remapped to DocIds and sorted at commit: about 1.25G postings per 30 GB, an external sort of roughly 5–10 GB of pairs. A pre-commit hook in both the checkpoint build and the log-transaction paths. A first build is a different code path from steady state and from a tokenizer change, which still needs A's pass. | One read of each new byte: the first build saves one pass, about 16 min per 30 GB paced. |
+
+**Recommendation: A.** Simplest by a wide margin, and in steady state, which is
+where the daemon spends its life, it should cost no extra I/O. Fastest and
+simplest disagree only for the first bulk build, which B speeds up at the price
+of a second, separate code path that A still needs anyway.
+
+**Fact that would change it:** M5 measuring the second read's page-cache hit
+rate in steady state below roughly 90%, or the first build's wall-clock on
+Dave's real tree, from M1's census, being long enough that he calls it a
+product problem.
+
+## D64 — How segment bytes reach a query: positional reads or `mmap`
+
+**Status: open.** S2 M0, 2026-10-06; [design](S2.md#cost-model-at-10m).
+
+**Question:** Should queries read postings from segment files with positional
+reads into owned buffers, or map the segments?
+
+The catalog reads checked sections into owned buffers (D38 B), and its
+resident view is about 574 MiB at 10M (S1PLUS, estimate). The content index is
+**estimated** at 0.68–6.8 GB at 10M depending on text volume
+([S2](S2.md#bytes-per-content-byte-estimate)), so it cannot be resident under
+D48's 1 GB line in either option. Syscall and copy costs below are
+**estimates**: about 1–2 µs per warm `pread`, copies at about 10 GB/s.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Positional reads: block indexes resident (~0.4 B per term per segment), each list read with `pread` into per-query scratch | One syscall per (term, segment): a rare term across ~50 segments pays about 50–100 µs. Long lists are copied: a 1 MB list costs about 0.1 ms. A one-shot client and the daemon each copy what they read (the page cache itself is shared). | No `unsafe`; the same checked-read contract as the catalog, so a corrupt or truncated segment is an error, never a signal. Resident memory is only the block indexes. |
+| B. `mmap` each segment, read lists in place | One `unsafe` item under D11, with its ledger and the measurement that justifies it. A segment truncated or a device error under the mapping is SIGBUS in the daemon, not an error; immutability of segments makes truncation unlikely, not impossible. | Zero-copy reads and no syscall per list: the fastest rare-term lookups. Simple code once the mapping exists. |
+| C. Read whole segments resident, as the catalog does | 0.68–6.8 GB resident at 10M. | The fastest queries. Ruled out by D48's line; listed for completeness. |
+
+**Recommendation: A.** Simplest and safe; B is faster per lookup, so fastest
+and simplest disagree, but the difference is tens of microseconds on a query
+whose row emission costs milliseconds. Revisit with numbers, as D11 asks.
+
+**Fact that would change it:** M4 measuring `pread` and copying above about 20%
+of rare-term or phrase-intersection latency at 10M, with an `mmap` prototype
+removing most of it.
