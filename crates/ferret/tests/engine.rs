@@ -990,3 +990,84 @@ fn rare_scoped_postings_become_a_common_scope_walk_when_delta_births_change_the_
     assert_projection(&new, &tree);
     tree.oracle(&new);
 }
+
+#[test]
+fn pure_name_postings_preserve_operand_spelling_and_live_fault_fallback() {
+    let tree = Tree::new();
+    for i in 0..40 {
+        fs::write(tree.root().join(format!("sub/ordinary{i}.bin")), b"text").unwrap();
+    }
+    fs::write(tree.root().join("sub/RareAtom.rs"), b"rare").unwrap();
+    let ignore = tree.root().join("sub/.ferretignore");
+    fs::write(&ignore, b"ignored\n").unwrap();
+    index(&tree.index(), &[tree.root()], Refresh::All, &options()).unwrap();
+    let engine = writer_engine(&tree);
+    let compare = |pin: &QuerySession, start: &str| {
+        let args = [start.into(), "-name".into(), "RareAtom*".into()];
+        let plan = Plan::parse_at(&args, &tree.0, SystemTime::now()).unwrap();
+        let expected = Output::default();
+        plan.run(
+            &mut plan.catalog_source(pin.catalog().clone()),
+            &mut expected.clone(),
+        )
+        .unwrap();
+        let actual = Output::default();
+        pin.find(&plan, actual.clone(), 4).unwrap();
+        let expected = lines(&expected.0.lock().unwrap());
+        assert_eq!(lines(&actual.0.lock().unwrap()), expected, "{start}");
+        expected
+    };
+    for start in ["tree/sub", "tree//sub/", "tree/sub/."] {
+        assert_eq!(compare(&engine.pin(), start).len(), 1);
+    }
+    let denied = Denied::new(ignore);
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
+    let retained = engine.pin();
+    drop(denied);
+    fs::write(tree.root().join("sub/RareAtom-late.rs"), b"live fallback").unwrap();
+    assert_eq!(compare(&retained, "tree/sub").len(), 2);
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
+    tree.oracle(&engine.pin());
+    let denied = Denied::new(tree.root().join("sub"));
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
+    let opaque = engine.pin();
+    drop(denied);
+    assert_eq!(compare(&opaque, "tree/sub").len(), 2);
+    assert_projection(&opaque, &tree);
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
+    tree.oracle(&engine.pin());
+}
+
+#[test]
+fn an_independent_catalog_incarnation_cannot_reuse_another_name_term_base() {
+    let left = Tree::new();
+    let right = Tree::new();
+    fs::write(left.root().join("HTTPServer_cache.rs"), b"left").unwrap();
+    fs::write(right.root().join("unrelatedReceipt.txt"), b"right").unwrap();
+    for tree in [&left, &right] {
+        index(&tree.index(), &[tree.root()], Refresh::All, &options()).unwrap();
+    }
+    let old = Engine::open(&left.index()).unwrap().unwrap().pin();
+    let current = Engine::open(&right.index()).unwrap().unwrap().pin();
+    assert_eq!(old.generation().checkpoint, current.generation().checkpoint);
+    assert_ne!(
+        old.generation().incarnation,
+        current.generation().incarnation
+    );
+    let adopted = ferret_query::NameIndex::adopt(current.catalog(), Some(old.name_index()));
+    assert!(
+        old.name_index()
+            .select(current.catalog(), None, &[], |_| true)
+            .is_err()
+    );
+    let query = Query::parse("name-term:receipt", SystemTime::now()).unwrap();
+    let mut rows = Vec::new();
+    query
+        .run_indexed(current.catalog(), &adopted, None, |row| {
+            rows.push(row.path.to_vec());
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].ends_with(b"unrelatedReceipt.txt"));
+}

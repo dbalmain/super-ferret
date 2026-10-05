@@ -51,8 +51,25 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
     let mut object = crate::log::line(&mut line, "search", now);
     object
         .byte_strings("query", atoms.iter().map(|a| a.as_bytes()))
-        .str("plan", &query.explain())
-        .str("strategy", &format!("{:?}", query.strategy()))
+        .str(
+            "plan",
+            &outcome.stats.and_then(|stats| stats.name_plan).map_or_else(
+                || query.explain(),
+                |estimate| {
+                    format!(
+                        "{:?}: {} global name candidates, scope rows {:?}; exact evaluation",
+                        estimate.plan, estimate.hits, estimate.scope_rows
+                    )
+                },
+            ),
+        )
+        .str(
+            "strategy",
+            &outcome.stats.and_then(|stats| stats.name_plan).map_or_else(
+                || format!("{:?}", query.strategy()),
+                |estimate| format!("{:?}", estimate.plan),
+            ),
+        )
         .opt_int("limit", limit)
         .int("exit", exit as u8)
         .int("rows", outcome.rows)

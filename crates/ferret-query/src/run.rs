@@ -36,6 +36,8 @@ pub struct Stats {
     pub candidates: u64,
     /// Rows emitted.
     pub rows: u64,
+    /// The actual counted resident plan; None for raw-format execution.
+    pub name_plan: Option<crate::NameEstimate>,
 }
 
 /// A run that could not read the catalog.
@@ -81,6 +83,30 @@ const ROW_SECTIONS: [Section; 6] = [
 ];
 
 impl Query {
+    /// Plans this query's name candidates against a checked resident view.
+    pub fn name_selection(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+    ) -> Result<crate::name_index::NameSelection, ferret_catalog::RetryFromCurrent> {
+        let terms: Vec<_> = self
+            .names
+            .iter()
+            .filter_map(|test| match test {
+                NameTest::Term(token) => Some(token.as_slice()),
+                _ => None,
+            })
+            .collect();
+        index.select(catalog, scope, &terms, |name| {
+            self.names.iter().all(|test| test.matches(name))
+                && self
+                    .driver
+                    .as_ref()
+                    .is_none_or(|driver| driver.from != usize::MAX || driver.finder.is_match(name))
+        })
+    }
+
     /// Resident execution: term/dictionary matching and counted row candidates,
     /// followed by the same exact evaluator as the raw-format API.
     pub fn run_indexed(
@@ -93,21 +119,8 @@ impl Query {
         if scope.is_none() && self.names.is_empty() && self.driver.is_none() {
             return self.run(catalog, emit);
         }
-        let terms: Vec<_> = self
-            .names
-            .iter()
-            .filter_map(|test| match test {
-                NameTest::Term(token) => Some(token.as_slice()),
-                _ => None,
-            })
-            .collect();
-        let selection = index
-            .select(catalog, scope, &terms, |name| {
-                self.names.iter().all(|test| test.matches(name))
-                    && self.driver.as_ref().is_none_or(|driver| {
-                        driver.from != usize::MAX || driver.finder.is_match(name)
-                    })
-            })
+        let selection = self
+            .name_selection(catalog, index, scope)
             .map_err(RunError::Stale)?;
         let mut run = Run {
             query: self,
@@ -118,6 +131,7 @@ impl Query {
             up: None,
             path: Vec::new(),
         };
+        run.stats.name_plan = Some(selection.estimate);
         if selection.estimate.plan == crate::NamePlan::ScopeWalk && scope.is_none() {
             run.all_names(&mut emit)?;
             return Ok(run.stats);

@@ -2,7 +2,7 @@
 //! effective scope walk. Terms are derived here through ferret-text; catalog
 //! owns the packed lists. Base state is shared, delta estimates are per view.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use ferret_catalog::{
@@ -39,7 +39,7 @@ pub struct NameIndex {
     delta: BTreeMap<Vec<u8>, Vec<NameId>>,
     counts: BTreeMap<u32, i64>,
     scope_changes: BTreeMap<InoId, i64>,
-    directory_changes: bool,
+    unknown_scopes: BTreeSet<InoId>,
     live_scopes: bool,
 }
 
@@ -121,21 +121,37 @@ impl NameIndex {
             delta: BTreeMap::new(),
             counts: BTreeMap::new(),
             scope_changes: BTreeMap::new(),
-            directory_changes: false,
+            unknown_scopes: BTreeSet::new(),
             live_scopes: false,
         };
         for id in catalog.suppressed_base_names() {
             *out.counts.entry(names.key(id)).or_default() -= 1;
             let edge = checkpoint.name(id);
-            out.directory_changes |=
-                matches!(edge.target(), Target::Inode(child) if checkpoint.is_directory(child));
+            if let Target::Inode(child) = edge.target()
+                && checkpoint.is_directory(child)
+                && (!catalog.is_live_inode(child)
+                    || catalog
+                        .dir_name(child)
+                        .is_none_or(|id| catalog.name(id).parent != edge.parent))
+            {
+                out.mark_unknown(&checkpoint, edge.parent);
+            }
             out.adjust_scope(&checkpoint, edge.parent, -1);
         }
         for &(_, row) in catalog.delta_names().1 {
             let id = NameId(row);
             let edge = catalog.name(id);
-            out.directory_changes |=
-                matches!(edge.target(), Target::Inode(child) if catalog.is_directory(child));
+            if let Target::Inode(child) = edge.target()
+                && catalog.is_directory(child)
+            {
+                let parent = (child.0 < checkpoint.base_dir_count())
+                    .then(|| checkpoint.dir_name(child))
+                    .flatten()
+                    .map(|id| checkpoint.name(id).parent);
+                if parent != Some(edge.parent) {
+                    out.mark_unknown(catalog, edge.parent);
+                }
+            }
             out.delta.entry(edge.bytes.to_vec()).or_default().push(id);
             out.adjust_scope(catalog, edge.parent, 1);
         }
@@ -150,6 +166,16 @@ impl NameIndex {
                     && (catalog.entry_count(dir).is_none() || catalog.retained_at(dir).is_some())
             });
         out
+    }
+
+    fn mark_unknown(&mut self, catalog: &Catalog, mut dir: InoId) {
+        loop {
+            self.unknown_scopes.insert(dir);
+            let Some(edge) = catalog.dir_name(dir) else {
+                break;
+            };
+            dir = catalog.name(edge).parent;
+        }
     }
 
     fn adjust_scope(&mut self, catalog: &Catalog, mut dir: InoId, change: i64) {
@@ -235,7 +261,7 @@ impl NameIndex {
         // effective walk instead of treating the old count as current.
         let scope_rows = match scope {
             None => Some(u64::from(catalog.name_count())),
-            Some(_) if self.directory_changes => None,
+            Some(dir) if self.unknown_scopes.contains(&dir) => None,
             Some(dir) => self.base.scopes.get(dir.0 as usize).map(|&count| {
                 (i64::from(count) + self.scope_changes.get(&dir).copied().unwrap_or(0)).max(0)
                     as u64

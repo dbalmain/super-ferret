@@ -12,6 +12,7 @@ use crate::{NameId, NameReader};
 /// An owned fixed-width array; its codec is intpack, not a second decoder.
 pub(crate) struct Keys {
     width: u32,
+    len: usize,
     bytes: Vec<u8>,
 }
 
@@ -20,6 +21,7 @@ impl Keys {
         Self::from_values(values.iter().copied().map(u64::from))
     }
     fn from_values(values: impl ExactSizeIterator<Item = u64> + Clone) -> Self {
+        let len = values.len();
         let width = u64::BITS - values.clone().max().unwrap_or(0).leading_zeros();
         assert!(
             width <= 57,
@@ -31,9 +33,10 @@ impl Keys {
             writer.put(value, width);
         }
         bytes.extend_from_slice(&[0; 8]);
-        Self { width, bytes }
+        Self { width, len, bytes }
     }
     fn get_offset(&self, index: usize) -> usize {
+        assert!(index < self.len, "resident packed key out of range");
         bits::Reader::new(&self.bytes).get(index * self.width as usize, self.width) as usize
     }
     pub(crate) fn get(&self, index: usize) -> u32 {
@@ -54,6 +57,7 @@ pub struct ResidentNames {
     distinct: u32,
     rows: u32,
     legacy: OnceLock<Legacy>,
+    build_time: std::time::Duration,
 }
 
 struct Legacy {
@@ -63,22 +67,29 @@ struct Legacy {
 
 impl ResidentNames {
     pub(crate) fn build(names: NameReader<'_>, rows: u32) -> Self {
-        // Borrow conversion scratch from the checked source; it is released
-        // before that source is replaced, rather than kept beside the table.
-        let row_names: Vec<_> = names.runs_from(NameId(0)).map(|(_, n)| n.bytes).collect();
-        debug_assert_eq!(row_names.len(), rows as usize);
-        let mut distinct = row_names.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        let lookup: HashMap<_, _> = distinct
-            .iter()
-            .enumerate()
-            .map(|(i, &name)| (name, i as u32))
-            .collect();
-        let ids: Vec<_> = row_names.iter().map(|name| lookup[name]).collect();
+        let started = std::time::Instant::now();
+        // Intern while streaming rows. Sort only distinct names, never one
+        // borrowed slice per row; repeated names must not multiply build
+        // scratch.
+        let mut lookup = HashMap::new();
+        let mut ids = Vec::with_capacity(rows as usize);
+        for (_, name) in names.runs_from(NameId(0)) {
+            let next = lookup.len() as u32;
+            ids.push(*lookup.entry(name.bytes).or_insert(next));
+        }
+        debug_assert_eq!(ids.len(), rows as usize);
+        let mut distinct: Vec<_> = lookup.into_iter().collect();
+        distinct.sort_unstable_by_key(|&(name, _)| name);
+        let mut remap = vec![0u32; distinct.len()];
+        for (key, &(_, old)) in distinct.iter().enumerate() {
+            remap[old as usize] = key as u32;
+        }
+        for key in &mut ids {
+            *key = remap[*key as usize];
+        }
         let mut table = Vec::new();
         let mut offsets = Vec::with_capacity(distinct.len() + 1);
-        for name in &distinct {
+        for &(name, _) in &distinct {
             offsets.push(table.len() as u64);
             table.extend_from_slice(name);
             table.push(0);
@@ -102,15 +113,29 @@ impl ResidentNames {
         let postings = PackedNameLists::new(
             (0..counts.len()).map(|i| &postings_rows[starts[i]..starts[i + 1]]),
         );
+        let offsets = Keys::from_values(offsets.iter().copied());
+        let keys = Keys::new(&ids);
         Self {
             table,
-            offsets: Keys::from_values(offsets.iter().copied()),
-            keys: Keys::new(&ids),
+            offsets,
+            keys,
             postings,
             distinct: distinct.len() as u32,
             rows,
             legacy: OnceLock::new(),
+            build_time: started.elapsed(),
         }
+    }
+
+    /// Dictionary and postings construction, excluding checked-source release.
+    pub fn build_time(&self) -> std::time::Duration {
+        self.build_time
+    }
+    /// Extra storage only if a caller explicitly requested the legacy heap API.
+    pub fn raw_scan_bytes(&self) -> usize {
+        self.legacy.get().map_or(0, |legacy| {
+            legacy.heap.len() + legacy.offsets.len() * std::mem::size_of::<usize>()
+        })
     }
 
     pub fn distinct_count(&self) -> u32 {

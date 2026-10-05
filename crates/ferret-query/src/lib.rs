@@ -23,7 +23,7 @@
 //! ```text
 //! query  = atom*
 //! atom   = "case:" match | match | meta
-//! match  = word | glob | "re:" REGEX | "path:" TEXT | "ext:" EXT
+//! match  = word | glob | "re:" REGEX | "path:" TEXT | "ext:" EXT | "name-term:" TOKEN
 //! meta   = "size:" [<>] N [kKmMgGtT]   size in bytes, powers of 1024; no
 //!                                      comparison means exactly N
 //!        | "mtime:" (<|>) N (s|m|h|d|w|y)
@@ -33,6 +33,9 @@
 //!        | "type:" (f|d|l|file|dir|link)
 //! ```
 //!
+//! - `name-term:TOKEN` matches an exact D9-normalised basename token, including
+//!   whole identifiers and camel/snake/digit parts. It always normalises case;
+//!   it does not change the substring meaning of a bare word.
 //! - A **word** is a substring of the name. A word containing `/` is a
 //!   substring of the whole path instead, as is `path:TEXT`.
 //! - A **glob** is a word containing `*`, `?` or `[`. Without a `/` it matches
