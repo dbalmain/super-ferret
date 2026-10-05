@@ -103,6 +103,24 @@ impl<'a> Object<'a> {
         self
     }
 
+    /// An array of integer counters or epoch ids.
+    pub(crate) fn integers(
+        &mut self,
+        key: &str,
+        values: impl IntoIterator<Item = u64>,
+    ) -> &mut Self {
+        self.key(key);
+        self.out.push(b'[');
+        for (i, value) in values.into_iter().enumerate() {
+            if i != 0 {
+                self.out.push(b',');
+            }
+            let _ = write!(Utf8(self.out), "{value}");
+        }
+        self.out.push(b']');
+        self
+    }
+
     /// `"key":N`.
     pub fn int(&mut self, key: &str, value: impl Into<i128>) -> &mut Self {
         self.key(key);

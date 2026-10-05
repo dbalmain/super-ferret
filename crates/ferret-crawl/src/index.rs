@@ -1555,6 +1555,9 @@ impl EventVisitor for Hasher<'_> {
         }
         match event {
             Event::Decided(decided) => {
+                if let Some(watch) = self.watch {
+                    watch.file(self.root, &decided);
+                }
                 if decided.decision == Decision::Skip {
                     self.out
                         .batch

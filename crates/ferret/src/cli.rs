@@ -197,6 +197,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         Command::RootsRemove(roots) => crate::index::remove(&context, &roots),
         Command::Status => crate::daemon::status(&context),
         Command::Stats => crate::stats::run(&context),
+        Command::StatsJson => crate::daemon::stats_json(&context),
         Command::ImportV3 => {
             match ferret_catalog::Transaction::import_v3(&context.index, [0; 16]) {
                 Ok(_) => Exit::Ok,

@@ -9,7 +9,9 @@ compile_error!("ferretd requires panic unwinding for query isolation");
 mod client;
 mod endpoint;
 mod writer;
-pub(crate) use client::{daemon_status as status, find, search, writer_command as write};
+pub(crate) use client::{
+    daemon_stats as stats_json, daemon_status as status, find, search, writer_command as write,
+};
 
 use std::ffi::OsString;
 use std::fs;
@@ -678,6 +680,18 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
                 o.int("engine_opens", Engine::open_count())
                     .int("bytes", session.resident_bytes());
                 writer::fields(host, o);
+                crate::status::resources(o);
+                crate::status::catalog_fields(o, &session);
+                let engine = host
+                    .engine
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Loaded::Ready(engine) = &*engine {
+                    o.integers("pinned_internal_epochs", engine.pinned_epochs());
+                }
+                if request.args == [b"--stats".to_vec()] {
+                    crate::stats::json_fields(o, &session);
+                }
             },
         ),
     }

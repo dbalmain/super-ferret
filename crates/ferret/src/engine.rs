@@ -4,7 +4,7 @@
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use ferret_catalog::{Catalog, Generation, OpenError, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
@@ -18,6 +18,7 @@ static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 pub struct Engine {
     current: RwLock<QuerySession>,
     writer: Mutex<Option<WriterSession>>,
+    retired: Mutex<Vec<(u64, Weak<NameIndex>)>>,
 }
 
 /// A generation pinned for the whole query, including output callbacks.
@@ -42,6 +43,7 @@ impl Engine {
                 catalog,
             }),
             writer: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
         }))
     }
 
@@ -60,6 +62,7 @@ impl Engine {
                 catalog,
             }),
             writer: Mutex::new(Some(writer)),
+            retired: Mutex::new(Vec::new()),
         }
     }
 
@@ -169,9 +172,34 @@ impl Engine {
         Ok(generation)
     }
 
+    /// Checkpoint epochs still owned by the current view or an internal pin.
+    pub fn pinned_epochs(&self) -> Vec<u64> {
+        let current = self.pin();
+        let mut retired = self
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retired.retain(|(_, names)| names.strong_count() != 0);
+        let mut epochs = retired.iter().map(|(epoch, _)| *epoch).collect::<Vec<_>>();
+        epochs.push(current.generation().checkpoint);
+        epochs.sort_unstable();
+        epochs.dedup();
+        epochs
+    }
+
     fn select(&self, view: Catalog) {
         let previous = self.pin();
         let names = Arc::new(NameIndex::adopt(&view, Some(&previous.names)));
+        let mut retired = self
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retired.retain(|(_, names)| names.strong_count() != 0);
+        retired.push((
+            previous.generation().checkpoint,
+            Arc::downgrade(&previous.names),
+        ));
+        drop(retired);
         *self
             .current
             .write()

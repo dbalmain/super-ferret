@@ -46,5 +46,6 @@ pub(crate) mod protocol;
 pub mod search;
 pub mod setup;
 pub mod stats;
+mod status;
 mod transport;
 pub mod xdg;

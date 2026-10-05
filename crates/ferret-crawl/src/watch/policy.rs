@@ -49,6 +49,18 @@ impl Watch {
         let key = std::fs::read_link(&proc)
             .unwrap_or_else(|_| proc.clone())
             .join(name);
+        let Ok(stat) = fstat(parent) else {
+            self.gap(root);
+            return;
+        };
+        let identity = (stat.st_dev, stat.st_ino);
+        if rustix::fs::fstatfs(parent).map_or(true, |s| unreliable(s.f_type as u64)) {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unreliable
+                .insert(root.to_owned());
+        }
         let mut s = self
             .state
             .lock()
@@ -64,19 +76,22 @@ impl Watch {
             | WatchFlags::MOVE_SELF
             | WatchFlags::ONLYDIR
             | WatchFlags::MASK_ADD;
-        let installed = s
-            .descriptors
-            .keys()
-            .chain(s.policies.keys())
-            .collect::<BTreeSet<_>>()
-            .len();
-        let result = inotify::add_watch(&self.fd, &proc, mask);
+        let installed = s.identities.len();
+        let result = s
+            .identities
+            .get(&identity)
+            .copied()
+            .map_or_else(|| inotify::add_watch(&self.fd, &proc, mask), Ok);
         match result {
             Ok(wd)
                 if installed < self.config.watch_cap
                     || s.policies.contains_key(&wd)
                     || s.descriptors.contains_key(&wd) =>
             {
+                if s.removed.remove(&wd) {
+                    loss(&mut s, RefreshReason::Overflow);
+                }
+                s.identities.insert(identity, wd);
                 s.policies
                     .entry(wd)
                     .or_default()
@@ -95,7 +110,9 @@ impl Watch {
             }
         }
         drop(s);
-        if std::fs::symlink_metadata(proc.join(name)).is_ok_and(|m| m.file_type().is_symlink()) {
+        if !matches!(name.as_bytes(), b".git" | b".gitignore" | b"commondir")
+            && std::fs::symlink_metadata(proc.join(name)).is_ok_and(|m| m.file_type().is_symlink())
+        {
             match std::fs::canonicalize(proc.join(name)) {
                 Ok(target) if target != key => self.policy_path(root, &target),
                 _ => {

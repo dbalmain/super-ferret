@@ -52,6 +52,7 @@ pub enum Command {
     },
     /// `stats`.
     Stats,
+    StatsJson,
     Status,
     /// Explicit migration of the index directory's v3 snapshot.
     ImportV3,
@@ -200,7 +201,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
                 b"help" => "help",
                 _ => return Err(UsageError::UnknownCommand(name)),
             };
-            if json && other != b"status" {
+            if json && !matches!(other, b"status" | b"stats") {
                 return Err(UsageError::NotFor("--json", command));
             }
             if limit.is_some() {
@@ -215,7 +216,13 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
                         none("status", rest).map(|()| Command::Status)?
                     }
                 }
-                b"stats" => none("stats", rest).map(|()| Command::Stats)?,
+                b"stats" => {
+                    if rest == [OsString::from("--json")] || (json && rest.is_empty()) {
+                        Command::StatsJson
+                    } else {
+                        none("stats", rest).map(|()| Command::Stats)?
+                    }
+                }
                 b"import-v3" => none("import-v3", rest).map(|()| Command::ImportV3)?,
                 b"help" => none("help", rest).map(|()| Command::Help)?,
                 _ => roots(rest)?,
@@ -367,7 +374,6 @@ mod tests {
                 &["search", "--limit", "x"],
                 UsageError::BadValue("--limit", "x".into()),
             ),
-            (&["stats", "--json"], UsageError::NotFor("--json", "stats")),
             (
                 &["index", "--limit", "2"],
                 UsageError::NotFor("--limit", "index"),

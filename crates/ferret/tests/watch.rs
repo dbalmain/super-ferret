@@ -188,14 +188,32 @@ impl Tree {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    fn roots(&self) -> Vec<String> {
+        let catalog = ferret_catalog::Catalog::open(&self.path("index"))
+            .unwrap()
+            .unwrap();
+        catalog.load(&[ferret_catalog::Section::Roots]).unwrap();
+        catalog
+            .roots()
+            .map(|(_, p)| String::from_utf8(p.to_vec()).unwrap())
+            .collect()
+    }
+    fn find_args(&self) -> Vec<String> {
+        let mut args = vec!["find".to_owned()];
+        args.extend(self.roots());
+        args.extend(["-printf".to_owned(), "%y %p %s %T@\\0".to_owned()]);
+        args
+    }
     fn oracle(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let oracle = self.base.join("oracle");
         if oracle.exists() {
             fs::remove_dir_all(&oracle)
                 .unwrap_or_else(|error| panic!("remove old oracle: {error:?}"));
         }
+        let mut index_args = vec!["index".to_owned()];
+        index_args.extend(self.roots());
         let output = self
-            .command(&["index", "src"])
+            .command(&index_args.iter().map(String::as_str).collect::<Vec<_>>())
             .env("FERRET_NO_DAEMON", "1")
             .env("FERRET_INDEX", &oracle)
             .output()
@@ -210,7 +228,16 @@ impl Tree {
         };
         (
             records(query(&["search", "*"]), b'\n'),
-            records(query(&["find", "src", "-printf", "%y %p %s %T@\\0"]), 0),
+            records(
+                query(
+                    &self
+                        .find_args()
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                ),
+                0,
+            ),
         )
     }
     fn converges(&self) {
@@ -219,7 +246,16 @@ impl Tree {
         loop {
             let actual = (
                 records(self.run(&["search", "*"]), b'\n'),
-                records(self.run(&["find", "src", "-printf", "%y %p %s %T@\\0"]), 0),
+                records(
+                    self.run(
+                        &self
+                            .find_args()
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                    ),
+                    0,
+                ),
             );
             let s = self.status();
             if actual == expected
@@ -463,15 +499,16 @@ fn denied_directory_is_opaque_and_permission_recovery_is_polled() {
         .unwrap_or_else(|error| panic!("restore: {error:?}"));
     tree.converges();
     assert!(tree.run(&["search", "original.txt"]).status.success());
-    // A denied configured root has no visible watched parent. Its failed
-    // installation must still be reported and recovered by the polling timer.
+    // A denied configured root still has its global rule parent watched. Its
+    // failed installation must still be reported and recovered by the
+    // polling timer.
     fs::set_permissions(tree.path("src"), fs::Permissions::from_mode(0o000))
         .unwrap_or_else(|error| panic!("deny root: {error:?}"));
     tree.stop();
     tree.start(&[("FERRET_POLL_MS", "500")]);
     let denied_root = tree.status();
     assert!(
-        denied_root.contains("\"watch_installed\":0"),
+        denied_root.contains("\"watch_installed\":1"),
         "{denied_root}"
     );
     assert!(denied_root.contains("\"watch_failed\":1"), "{denied_root}");
@@ -730,4 +767,384 @@ fn generated_bursts_long() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1000),
     );
+}
+
+fn number(json: &str, key: &str) -> u64 {
+    json.split(&format!("\"{key}\":"))
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("missing number {key}: {json}"))
+}
+
+#[test]
+fn external_git_exclude_inputs_refresh_from_watches_without_a_backstop() {
+    let mut tree = Tree::new();
+    fs::create_dir_all(tree.path("src/.git/info")).unwrap();
+    write(tree.path("src/.git/info/exclude"), "");
+    write(tree.path("outside/excludes"), "");
+    write(
+        tree.path("src/.git/config"),
+        &format!(
+            "[core]\nexcludesFile = {}\n",
+            tree.path("outside/excludes").display()
+        ),
+    );
+    tree.success(tree.local(&["index"]));
+    tree.start(&[]);
+    let before = tree.status();
+    write(tree.path("src/.git/info/exclude"), "original.txt\n");
+    tree.converges();
+    let after = tree.status();
+    assert!(number(&after, "refreshes") > number(&before, "refreshes"));
+    assert!(
+        after.contains("\"last_refresh_reason\":\"Burst\""),
+        "{after}"
+    );
+    assert_eq!(
+        number(&after, "last_complete_backstop"),
+        number(&before, "last_complete_backstop")
+    );
+    write(tree.path("src/.git/info/exclude"), "");
+    tree.converges();
+    let before_external = tree.status();
+    write(tree.path("outside/excludes"), "original.txt\n");
+    tree.converges();
+    assert_eq!(tree.run(&["search", "original.txt"]).status.code(), Some(1));
+    let after = tree.status();
+    assert!(number(&after, "refreshes") > number(&before_external, "refreshes"));
+    assert!(
+        after.contains("\"last_refresh_reason\":\"Burst\""),
+        "{after}"
+    );
+    assert_eq!(
+        number(&after, "last_complete_backstop"),
+        number(&before, "last_complete_backstop")
+    );
+}
+
+#[test]
+fn linked_worktree_commondir_metadata_changes_are_watched() {
+    let mut tree = Tree::new();
+    for dir in [
+        "outside/gitdir",
+        "outside/common-a/info",
+        "outside/common-b/info",
+    ] {
+        fs::create_dir_all(tree.path(dir)).unwrap();
+    }
+    write(
+        tree.path("src/.git"),
+        &format!("gitdir: {}\n", tree.path("outside/gitdir").display()),
+    );
+    write(tree.path("outside/gitdir/commondir"), "../common-a\n");
+    write(tree.path("outside/common-a/info/exclude"), "");
+    write(tree.path("outside/common-b/info/exclude"), "original.txt\n");
+    tree.success(tree.local(&["index"]));
+    tree.start(&[]);
+    let before = tree.status();
+    write(tree.path("outside/gitdir/commondir"), "../common-b\n");
+    tree.converges();
+    let after = tree.status();
+    assert!(number(&after, "refreshes") > number(&before, "refreshes"));
+    assert!(
+        after.contains("\"last_refresh_reason\":\"Burst\""),
+        "{after}"
+    );
+}
+
+#[test]
+fn ignored_name_churn_preserves_the_full_raw_count_census() {
+    let mut tree = Tree::new();
+    write(tree.path("src/.ferretignore"), "*.ignored\n");
+    tree.success(tree.local(&["index"]));
+    tree.start(&[]);
+    for i in 0..25 {
+        write(tree.path(&format!("src/left/{i}.ignored")), "ignored");
+    }
+    for i in 0..12 {
+        fs::remove_file(tree.path(&format!("src/left/{i}.ignored"))).unwrap();
+    }
+    tree.converges();
+    let live = String::from_utf8(tree.success(tree.run(&["stats", "--json"])).stdout).unwrap();
+    let expected = String::from_utf8(
+        tree.success(
+            tree.command(&["stats", "--json"])
+                .env("FERRET_NO_DAEMON", "1")
+                .env("FERRET_INDEX", tree.path("oracle"))
+                .output()
+                .unwrap(),
+        )
+        .stdout,
+    )
+    .unwrap();
+    for key in ["raw_entries", "unknown_entry_counts", "names", "ignored"] {
+        assert_eq!(
+            number(&live, key),
+            number(&expected, key),
+            "{key}: {live} vs {expected}"
+        );
+    }
+}
+
+#[test]
+fn json_status_and_stats_have_typed_fields_and_live_values() {
+    let mut tree = Tree::new();
+    let local = tree.success(tree.local(&["status", "--json"]));
+    assert!(String::from_utf8_lossy(&local.stdout).contains("\"host_running\":false"));
+    tree.start(&[]);
+    let before = tree.status();
+    write(tree.path("src/left/new.txt"), "new");
+    tree.converges();
+    let after = tree.status();
+    assert!(number(&after, "refreshes") > number(&before, "refreshes"));
+    assert!(
+        number(&after, "last_successful_refresh") >= number(&before, "last_successful_refresh")
+    );
+    let output = tree.success(tree.run(&["stats", "--json"]));
+    let mut check = fixture::bounded_command("python3", &tree.base);
+    check.args(["-c", r#"
+import json, sys
+s = json.load(sys.stdin)
+for key in ['generation', 'writer_input_budget', 'writer_log_budget', 'census', 'd54']:
+    assert isinstance(s[key], dict), (key, s)
+for key in ['watch_installed', 'watch_needed', 'watch_failed', 'pending_scopes', 'pending_bytes', 'protected_scopes', 'opaque_directories', 'current_rss_kb', 'peak_rss_kb', 'last_successful_refresh', 'last_complete_backstop']:
+    assert type(s[key]) is int, (key, s)
+assert isinstance(s['current_operation'], str)
+assert s['oldest_pending_ms'] is None or type(s['oldest_pending_ms']) is int
+assert s['backstop_reason'] is None or isinstance(s['backstop_reason'], str)
+assert type(s['host_running']) is bool and s['host_running']
+assert type(s['watch_uncovered']) is bool
+assert isinstance(s['pinned_internal_epochs'], list) and s['pinned_internal_epochs']
+assert all(type(n) is int for n in s['pinned_internal_epochs'])
+assert s['d54']['scope_walk_plans'] + s['d54']['postings_plans'] > 0
+"#]).stdin(Stdio::piped());
+    let mut child = check.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&output.stdout)
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn nested_roots_and_cross_root_hard_links_use_all_checked_occurrences() {
+    let mut tree = Tree::new();
+    fs::hard_link(
+        tree.path("src/left/original.txt"),
+        tree.path("outside/linked.txt"),
+    )
+    .unwrap();
+    tree.success(tree.local(&["index", "src/left", "outside"]));
+    tree.start(&[]);
+    write(
+        tree.path("outside/linked.txt"),
+        "changed through kept root alias",
+    );
+    tree.converges();
+    let after = tree.status();
+    assert!(
+        after.contains("\"last_refresh_reason\":\"Burst\""),
+        "{after}"
+    );
+    assert!(after.contains("\"watch_uncovered\":false"), "{after}");
+    write(
+        tree.path("src/left/original.txt"),
+        "changed through nested root",
+    );
+    tree.converges();
+    fs::remove_file(tree.path("src/left/original.txt")).unwrap();
+    tree.converges();
+}
+
+#[test]
+fn bind_aliases_receive_edits_through_every_occurrence() {
+    const CHILD: &str = "FERRET_TEST_BIND_NAMESPACE";
+    if std::env::var_os(CHILD).is_none() {
+        let tree = Tree::new();
+        let available = fixture::bounded_command("unshare", &tree.base)
+            .args(["-rm", "true"])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !available {
+            // Same kernel descriptor fanout is also injected in intake tests.
+            eprintln!(
+                "unshare -rm unavailable; real bind fixture skipped, intake occurrence seam covered"
+            );
+            return;
+        }
+        let output = fixture::bounded_command("unshare", &tree.base)
+            .args(["-rm", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bind_aliases_receive_edits_through_every_occurrence",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut tree = Tree::new();
+    fs::create_dir_all(tree.path("src/bound")).unwrap();
+    let mounted = fixture::bounded_command("mount", &tree.base)
+        .arg("--bind")
+        .arg(tree.path("src/left"))
+        .arg(tree.path("src/bound"))
+        .status()
+        .unwrap();
+    assert!(mounted.success());
+    tree.success(tree.local(&["index"]));
+    tree.start(&[]);
+    write(tree.path("src/bound/original.txt"), "through bind alias");
+    tree.converges();
+    let after = tree.status();
+    assert!(
+        after.contains("\"last_refresh_reason\":\"Burst\""),
+        "{after}"
+    );
+    assert!(after.contains("\"watch_uncovered\":false"), "{after}");
+    write(
+        tree.path("src/left/deep/new.txt"),
+        "through original occurrence",
+    );
+    tree.converges();
+    tree.stop();
+    assert!(
+        fixture::bounded_command("umount", &tree.base)
+            .arg(tree.path("src/bound"))
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn unwatchable_external_policy_marks_its_root_for_polling_and_recovers() {
+    let mut tree = Tree::new();
+    fs::create_dir_all(tree.path("src/.git/info")).unwrap();
+    fs::create_dir_all(tree.path("outside/private")).unwrap();
+    write(tree.path("outside/private/excludes"), "");
+    write(
+        tree.path("src/.git/config"),
+        &format!(
+            "[core]\nexcludesFile = {}\n",
+            tree.path("outside/private/excludes").display()
+        ),
+    );
+    tree.success(tree.local(&["index"]));
+    fs::set_permissions(
+        tree.path("outside/private"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    tree.spawn(&[("FERRET_POLL_MS", "100")]);
+    let until = Instant::now() + BOUND;
+    loop {
+        let status = tree.status();
+        if status.contains("\"fault_retained\":true") {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "policy denial did not retain: {status}; {}",
+            fs::read_to_string(tree.path("daemon.log")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let denied = tree.status();
+    assert!(denied.contains("\"watch_uncovered\":true"), "{denied}");
+    assert!(number(&denied, "watch_failed") > 0, "{denied}");
+    fs::set_permissions(
+        tree.path("outside/private"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    write(tree.path("outside/private/excludes"), "original.txt\n");
+    tree.converges();
+    wait(|| tree.status().contains("\"watch_uncovered\":false"));
+}
+
+#[test]
+fn global_rules_and_config_include_dependencies_are_watched() {
+    let mut tree = Tree::new();
+    fs::create_dir_all(tree.path("src/.git/info")).unwrap();
+    write(tree.path("outside/excludes"), "");
+    write(
+        tree.path("outside/gitconfig"),
+        &format!(
+            "[core]\nexcludesFile = {}\n",
+            tree.path("outside/excludes").display()
+        ),
+    );
+    write(
+        tree.path("src/.git/config"),
+        &format!(
+            "[include]\npath = {}\n",
+            tree.path("outside/gitconfig").display()
+        ),
+    );
+    tree.success(tree.local(&["index"]));
+    tree.start(&[]);
+    write(tree.path("outside/empty"), "");
+    write(
+        tree.path("outside/gitconfig"),
+        &format!(
+            "[core]\nexcludesFile = {}\n",
+            tree.path("outside/empty").display()
+        ),
+    );
+    tree.converges();
+    let before = tree.status();
+    write(
+        tree.path("home/config/ferret/ignore"),
+        ".git/\noriginal.txt\n",
+    );
+    tree.converges();
+    let after = tree.status();
+    assert!(number(&after, "refreshes") > number(&before, "refreshes"));
+    assert!(
+        after.contains("\"last_refresh_reason\":\"Burst\""),
+        "{after}"
+    );
+}
+
+#[test]
+fn an_unobserved_hard_link_is_polling_dependent_until_all_occurrences_are_known() {
+    let mut tree = Tree::new();
+    fs::hard_link(
+        tree.path("src/left/original.txt"),
+        tree.path("outside/unobserved.txt"),
+    )
+    .unwrap();
+    tree.success(tree.local(&["index"]));
+    tree.start(&[("FERRET_POLL_MS", "100")]);
+    let before = tree.status();
+    assert!(!before.contains("\"polling_roots\":[]"), "{before}");
+    write(
+        tree.path("outside/unobserved.txt"),
+        "changed outside watched parents",
+    );
+    tree.converges();
+    tree.success(tree.run(&["index", "outside"]));
+    wait(|| tree.status().contains("\"polling_roots\":[]"));
+    // A rename cannot leave an old physical name in the completeness proof.
+    fs::rename(
+        tree.path("outside/unobserved.txt"),
+        tree.path("outside/moved.txt"),
+    )
+    .unwrap();
+    tree.converges();
+    let after = tree.status();
+    assert!(after.contains("\"polling_roots\":[]"), "{after}");
 }

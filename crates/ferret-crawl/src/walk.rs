@@ -1617,7 +1617,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         let (work_tree, git_exclude) = match git {
             GitProbe::Directory(fd) => {
                 let work_tree = self.main_work_tree(&fd, token);
-                (work_tree, self.read_exclude(fd, token))
+                (work_tree, self.read_exclude(fd, dir, token))
             }
             GitProbe::File(bytes) => self.read_gitfile(dir, &bytes, in_work_tree, token),
             GitProbe::Missing | GitProbe::Present => (None, None),
@@ -1649,8 +1649,13 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// `info` is opened `O_NOFOLLOW` relative to the held git directory (or
     /// common directory). `exclude` is an ordinary ignore file: a symlink of
     /// that name is followed.
-    fn read_exclude(&mut self, git: OwnedFd, token: V::Dir) -> Option<String> {
-        let config = self.git_config_exclude(git.as_fd(), token);
+    fn read_exclude(
+        &mut self,
+        git: OwnedFd,
+        work: BorrowedFd<'_>,
+        token: V::Dir,
+    ) -> Option<String> {
+        let config = self.git_config_exclude(git.as_fd(), work, token);
         self.visit.policy_input(git.as_fd(), OsStr::new("info"));
         let git_length = self.push(DOT_GIT);
         let info_length = self.push("info");
@@ -1703,27 +1708,33 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         }
     }
 
-    fn git_config_exclude(&mut self, git: BorrowedFd<'_>, token: V::Dir) -> Option<String> {
-        let handle = PathBuf::from(format!("/proc/self/fd/{}", git.as_raw_fd()));
-        // The child cannot inherit CLOEXEC handles. Resolve this observed git
-        // directory for config discovery; ignore/exclude opens stay anchored.
-        let path = match std::fs::read_link(handle) {
-            Ok(path) => path,
-            Err(error) => {
-                self.fail_at_git(error, token);
-                return None;
-            }
-        };
-        let inputs = match ferret_policy::GitInputs::discover(&path) {
+    fn git_config_exclude(
+        &mut self,
+        git: BorrowedFd<'_>,
+        work: BorrowedFd<'_>,
+        token: V::Dir,
+    ) -> Option<String> {
+        // The child opens the parent's held descriptors through procfs, so
+        // CLOEXEC does not require rebuilding either observed pathname.
+        let path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            git.as_raw_fd()
+        ));
+        let work = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            work.as_raw_fd()
+        ));
+        let inputs = match ferret_policy::GitInputs::discover(&path, &work, |path| {
+            self.visit.policy_path(path)
+        }) {
             Ok(inputs) => inputs,
             Err(error) => {
                 self.fail_at_git(error, token);
                 return None;
             }
         };
-        for path in &inputs.paths {
-            self.visit.policy_path(path);
-        }
         let path = inputs.excludes?;
         match open_ignore(rustix::fs::CWD, path.as_os_str()) {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
@@ -1842,7 +1853,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 common_dir: normalize(&common_path),
                 common_id,
             });
-        (work_tree, self.read_exclude(common, token))
+        (work_tree, self.read_exclude(common, work, token))
     }
 
     /// The directory being loaded, as a path: the root the caller gave, made

@@ -86,7 +86,7 @@ impl Drop for Tree {
 #[test]
 fn crawl_arms_all_directories_before_observation_and_ignores_its_reads() {
     let tree = Tree::new("arm-and-mask", 100, 1 << 20);
-    assert_eq!(tree.watch.status().installed, 3);
+    assert_eq!(tree.watch.status().installed, 4);
     fs::read(tree.path.join("root/a/old")).unwrap_or_else(|error| panic!("own read: {error:?}"));
     tree.watch
         .drain()
@@ -268,4 +268,50 @@ fn proven_occurrences_share_one_descriptor_without_polling() {
         .unwrap_or_else(|error| panic!("state: {error:?}"));
     let occurrences = &state.descriptors[&wd];
     assert_eq!(occurrences.len(), 2);
+}
+
+#[test]
+fn an_external_policy_parent_attributes_event_refreshes_its_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let tree = Tree::new("policy-parent-attributes", 100, 1 << 20);
+    let outside = tree.path.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("ignore"), "").unwrap();
+    tree.watch
+        .policy_path(&tree.path.join("root"), &outside.join("ignore"));
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o000)).unwrap();
+    tree.watch.drain().unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+    let burst = tree
+        .watch
+        .take()
+        .unwrap_or_else(|| panic!("policy parent attrib must schedule work"));
+    assert!(matches!(
+        &burst.request(&tree.writer.view()).scopes[0],
+        RefreshScope::Root(_)
+    ));
+}
+
+#[test]
+fn unreliable_filesystem_magic_keeps_successfully_watched_roots_in_the_poll_set() {
+    let tree = Tree::new("network-poll", 100, 1 << 20);
+    for magic in [
+        0x6969, 0xff534d42, 0x517b, 0xfe534d42, 0x01021997, 0x65735546,
+    ] {
+        assert!(policy::unreliable(magic));
+    }
+    for magic in [0xef53, 0x9123683e, 0x58465342, 0x01021994, 0x794c7630] {
+        assert!(!policy::unreliable(magic));
+    }
+    tree.watch
+        .state
+        .lock()
+        .unwrap()
+        .unreliable
+        .insert(tree.path.join("root"));
+    tree.watch.reconcile(&tree.writer.view());
+    assert_eq!(
+        tree.watch.polling_roots(&tree.writer.view()),
+        [tree.path.join("root")]
+    );
 }

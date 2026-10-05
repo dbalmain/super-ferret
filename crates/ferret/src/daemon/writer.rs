@@ -34,9 +34,10 @@ pub(super) struct Status {
     pub last_refresh: Option<u64>,
     pub last_backstop: Option<u64>,
     pub fault_retained: bool,
-    pub protected_scopes: usize,
     pub refreshes: u64,
     pub last_reason: Option<RefreshReason>,
+    pub operation: Option<&'static str>,
+    pub input_usage: ferret_catalog::InputUsage,
     pub error: Option<String>,
     pub retained_roots: std::collections::BTreeSet<PathBuf>,
 }
@@ -145,6 +146,14 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
         let message = receive.recv_timeout(deadline.saturating_duration_since(now));
         match message {
             Ok(Message::Command(command)) => {
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .operation = Some(if command.request.op == Op::Index {
+                    "index"
+                } else {
+                    "roots-remove"
+                });
                 host.writer_running.store(true, Ordering::Release);
                 #[cfg(debug_assertions)]
                 std::thread::sleep(duration("FERRET_WRITER_TEST_COMMAND_DELAY_MS", 0));
@@ -199,6 +208,7 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                         .map(|fault| fault.root.clone())
                         .collect();
                     if let Some(w) = &watch {
+                        w.adopt_aliases(engine.pin().catalog());
                         w.reconcile(engine.pin().catalog());
                     }
                 } else if let Err(error) = &result {
@@ -218,6 +228,10 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                 // and watch adoption finish before the next command begins.
                 let _ = command.reply.send(result);
                 host.writer_pending.fetch_sub(1, Ordering::AcqRel);
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .operation = None;
                 host.writer_running.store(false, Ordering::Release);
                 super::wake_listener(host, 1);
                 continue;
@@ -268,26 +282,34 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
         if burst.is_none() && !initial {
             continue;
         }
+        host.writer_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .operation = Some("refresh");
         host.writer_running.store(true, Ordering::Release);
         #[cfg(debug_assertions)]
         std::thread::sleep(duration("FERRET_WATCH_TEST_REFRESH_DELAY_MS", 0));
+        {
+            let pin = engine.pin();
+            if let (Some(w), Some(dirs)) = (&watch, &context.dirs) {
+                for (_, root) in pin.catalog().roots() {
+                    w.policy_path(
+                        std::path::Path::new(OsStr::from_bytes(root)),
+                        &dirs.ignore_file(),
+                    );
+                    w.policy_path(
+                        std::path::Path::new(OsStr::from_bytes(root)),
+                        &dirs.config.join("config"),
+                    );
+                }
+            }
+        }
+        let mut reason = RefreshReason::Backstop;
         let result = crate::index::global_ignore(&context)
             .map_err(io::Error::other)
             .and_then(|global| {
                 options.global = Some(global);
                 let pin = engine.pin();
-                if let (Some(w), Some(dirs)) = (&watch, &context.dirs) {
-                    for (_, root) in pin.catalog().roots() {
-                        w.policy_path(
-                            std::path::Path::new(OsStr::from_bytes(root)),
-                            &dirs.ignore_file(),
-                        );
-                        w.policy_path(
-                            std::path::Path::new(OsStr::from_bytes(root)),
-                            &dirs.config.join("config"),
-                        );
-                    }
-                }
                 let request = burst.as_ref().map_or_else(
                     || ferret_crawl::RefreshRequest {
                         expected_generation: pin.generation(),
@@ -297,10 +319,7 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                     },
                     |b| b.request(pin.catalog()),
                 );
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .last_reason = Some(request.reason);
+                reason = request.reason;
                 engine.refresh(request, &options).map_err(io::Error::other)
             });
         match &result {
@@ -313,16 +332,21 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                 host.writer_status
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .last_reason = Some(reason);
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retained_roots = report
                     .report
                     .coverage_faults
                     .iter()
                     .map(|fault| fault.root.clone())
                     .collect();
-                if let Some(w) = &watch
-                    && burst.as_ref().is_none_or(|b| b.reconcile_watches())
-                {
-                    w.reconcile(&report.view);
+                if let Some(w) = &watch {
+                    w.adopt_aliases(&report.view);
+                    if burst.as_ref().is_none_or(|b| b.reconcile_watches()) {
+                        w.reconcile(&report.view);
+                    }
                 }
                 initial = false;
                 retry_due = None;
@@ -340,6 +364,10 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
         {
             watch.finish(burst, result.is_ok());
         }
+        host.writer_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .operation = None;
         host.writer_running.store(false, Ordering::Release);
         super::wake_listener(host, 1);
     }
@@ -352,7 +380,7 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     status.last_refresh = Some(timestamp());
     status.refreshes += 1;
-    status.protected_scopes = report.protected_scopes;
+    status.input_usage = report.input_usage;
     if backstop {
         status.last_backstop = status.last_refresh;
     }
@@ -457,6 +485,10 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
             .int("watch_failed", w.failed as u64)
             .int("pending_scopes", w.pending as u64)
             .int("pending_bytes", w.bytes as u64)
+            .byte_strings(
+                "polling_roots",
+                w.polling_roots.iter().map(|p| p.as_os_str().as_bytes()),
+            )
             .opt_int("oldest_pending_ms", w.oldest.map(|d| d.as_millis() as i128))
             .bool("watch_uncovered", w.uncovered);
         if let Some(reason) = w.backstop {
@@ -471,6 +503,7 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
             .int("watch_failed", 0)
             .int("pending_scopes", 0)
             .int("pending_bytes", 0)
+            .null("polling_roots")
             .null("oldest_pending_ms")
             .null("backstop_reason");
     }
@@ -478,18 +511,22 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
         .str(
             "current_operation",
             if host.writer_running.load(Ordering::Acquire) {
-                "refresh"
+                s.operation.unwrap_or("refresh")
             } else {
                 "idle"
             },
         )
-        .int("protected_scopes", s.protected_scopes as u64)
         .int("refreshes", s.refreshes);
     if let Some(reason) = s.last_reason {
         o.str("last_refresh_reason", &format!("{reason:?}"));
     } else {
         o.null("last_refresh_reason");
     }
+    o.object("writer_input_usage", |o| {
+        o.int("records", s.input_usage.records as u64)
+            .int("owned_bytes", s.input_usage.owned_bytes as u64)
+            .bool("exceeded", s.input_usage.exceeded);
+    });
     o.opt_int("last_successful_refresh", s.last_refresh)
         .opt_int("last_complete_backstop", s.last_backstop)
         .int(

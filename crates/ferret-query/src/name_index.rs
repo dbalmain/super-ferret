@@ -3,6 +3,7 @@
 //! owns the packed lists. Base state is shared, delta estimates are per view.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ferret_catalog::{
@@ -48,6 +49,14 @@ pub struct NameIndex {
     scope_changes: BTreeMap<InoId, i64>,
     unknown_scopes: BTreeSet<InoId>,
     live_scopes: bool,
+    counters: Arc<PlanCounters>,
+}
+
+#[derive(Default)]
+struct PlanCounters {
+    postings: AtomicU64,
+    walks: AtomicU64,
+    hits: AtomicU64,
 }
 
 /// Selected distinct keys and delta rows. No postings are decoded until the
@@ -126,6 +135,8 @@ impl NameIndex {
             scope_changes: BTreeMap::new(),
             unknown_scopes: BTreeSet::new(),
             live_scopes: false,
+            counters: previous
+                .map_or_else(|| Arc::new(PlanCounters::default()), |p| p.counters.clone()),
         };
         for id in catalog.suppressed_base_names() {
             *out.counts.entry(names.key(id)).or_default() -= 1;
@@ -206,6 +217,27 @@ impl NameIndex {
     pub fn generation(&self) -> Generation {
         self.generation
     }
+    /// Cumulative plan selections and estimated candidates across adopted
+    /// generations of this resident planner.
+    pub fn counters(&self) -> (u64, u64, u64) {
+        (
+            self.counters.postings.load(Ordering::Relaxed),
+            self.counters.walks.load(Ordering::Relaxed),
+            self.counters.hits.load(Ordering::Relaxed),
+        )
+    }
+    /// Packed term postings, base scope counts, and changed-name storage.
+    pub fn byte_counts(&self) -> (usize, usize, usize) {
+        (
+            self.base
+                .terms
+                .get()
+                .map_or(0, |t| t.terms.bytes() + t.keys.bytes()),
+            self.base.scopes.capacity() * std::mem::size_of::<u32>(),
+            self.delta.iter().map(|(n, r)| n.len() + r.len() * 4).sum(),
+        )
+    }
+
     pub fn bytes(&self) -> usize {
         self.base
             .terms
@@ -300,6 +332,12 @@ impl NameIndex {
         } else {
             NamePlan::ScopeWalk
         };
+        match plan {
+            NamePlan::Postings => &self.counters.postings,
+            NamePlan::ScopeWalk => &self.counters.walks,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        self.counters.hits.fetch_add(hits, Ordering::Relaxed);
         Ok(NameSelection {
             estimate: NameEstimate {
                 plan,

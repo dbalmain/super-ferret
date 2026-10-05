@@ -75,10 +75,20 @@ pub(crate) fn daemon_status(context: &Context) -> Exit {
         SystemTime::now(),
         None,
     )
-    .unwrap_or_else(|| {
-        cli::error("no compatible running daemon for this index");
-        Exit::Error
-    })
+    .unwrap_or_else(|| crate::status::local(context, false))
+}
+
+pub(crate) fn daemon_stats(context: &Context) -> Exit {
+    query(
+        &context.index,
+        &["--stats".into()],
+        "status",
+        false,
+        None,
+        SystemTime::now(),
+        None,
+    )
+    .unwrap_or_else(|| crate::status::local(context, true))
 }
 
 fn spawn(endpoint: &Endpoint, index: &Path) -> io::Result<()> {

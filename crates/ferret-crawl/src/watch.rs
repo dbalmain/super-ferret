@@ -119,10 +119,27 @@ struct Hint {
     from: bool,
     to: bool,
 }
+type PhysicalName = ((u64, u64), Vec<u8>);
+
+#[derive(Clone, Debug)]
+struct FileAliases {
+    nlink: u64,
+    // Bind occurrences of one parent/name are one filesystem hard link.
+    names: BTreeMap<PhysicalName, BTreeSet<PathBuf>>,
+}
+impl FileAliases {
+    fn unproven_roots(&self) -> impl Iterator<Item = &PathBuf> {
+        self.names
+            .values()
+            .flatten()
+            .filter(|_| self.nlink > self.names.len() as u64)
+    }
+}
 #[derive(Debug)]
 struct State {
     descriptors: BTreeMap<i32, Vec<Arc<Directory>>>,
     identities: BTreeMap<(u64, u64), i32>,
+    file_aliases: BTreeMap<(u64, u64), FileAliases>,
     removed: BTreeSet<i32>,
     gaps: BTreeSet<PathBuf>,
     unreliable: BTreeSet<PathBuf>,
@@ -156,6 +173,7 @@ pub struct Status {
     pub failed: usize,
     pub pending: usize,
     pub bytes: usize,
+    pub polling_roots: Vec<PathBuf>,
     pub oldest: Option<Duration>,
     pub backstop: Option<RefreshReason>,
     pub busy: bool,
@@ -188,6 +206,7 @@ impl Watch {
             state: Mutex::new(State {
                 descriptors: BTreeMap::new(),
                 identities: BTreeMap::new(),
+                file_aliases: BTreeMap::new(),
                 removed: BTreeSet::new(),
                 gaps: BTreeSet::new(),
                 unreliable: BTreeSet::new(),
@@ -214,6 +233,9 @@ impl Watch {
             return;
         };
         let identity = (stat.st_dev, stat.st_ino);
+        if relative.as_os_str().is_empty() {
+            self.policy_path(root, root);
+        }
         if rustix::fs::fstatfs(fd).map_or(true, |s| policy::unreliable(s.f_type as u64)) {
             self.state
                 .lock()
@@ -267,7 +289,7 @@ impl Watch {
         {
             return;
         }
-        if state.descriptors.len() >= self.config.watch_cap
+        if state.identities.len() >= self.config.watch_cap
             && !state.identities.contains_key(&identity)
         {
             state.gaps.insert(root.to_owned());
@@ -326,6 +348,100 @@ impl Watch {
             }
         }
     }
+    /// Accounts for distinct physical hard-link names at observed handles.
+    /// A link outside indexed occurrences cannot promise directory events.
+    pub(crate) fn file(&self, root: &Path, entry: &crate::Decided<'_, ferret_catalog::DirToken>) {
+        let Some(stat) = entry.stat else {
+            return;
+        };
+        if entry.kind != ferret_catalog::Kind::File {
+            return;
+        }
+        let identity = (stat.dev, stat.ino);
+        if stat.nlink <= 1 {
+            return;
+        }
+        let Ok(parent) = fstat(entry.parent_fd) else {
+            self.gap(root);
+            return;
+        };
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let alias = s
+            .file_aliases
+            .entry(identity)
+            .or_insert_with(|| FileAliases {
+                nlink: stat.nlink,
+                names: BTreeMap::new(),
+            });
+        alias.nlink = stat.nlink;
+        alias
+            .names
+            .entry((
+                (parent.st_dev, parent.st_ino),
+                entry.name.as_bytes().to_vec(),
+            ))
+            .or_default()
+            .insert(root.to_owned());
+    }
+
+    /// Validates the sparse hard-link proof against the checked successor.
+    /// Retired names cannot inflate the number of observable physical links.
+    pub fn adopt_aliases(&self, view: &Catalog) {
+        let (mut aliases, parents) = {
+            let s = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let parents = s
+                .file_aliases
+                .values()
+                .flat_map(|a| a.names.keys().map(|(p, _)| *p))
+                .map(|p| {
+                    (
+                        p,
+                        s.identities
+                            .get(&p)
+                            .and_then(|wd| s.descriptors.get(wd))
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            (s.file_aliases.clone(), parents)
+        };
+        aliases.retain(|identity, alias| {
+            alias.names.retain(|(parent, name), owners| {
+                owners.clear();
+                for d in &parents[parent] {
+                    if d.resolve(view).is_none() {
+                        continue;
+                    }
+                    let path = d.path().join(OsStr::from_bytes(name));
+                    let Some(resolved) = view.resolve(path.as_os_str().as_bytes()) else {
+                        continue;
+                    };
+                    let ferret_catalog::Target::Inode(id) = resolved.target else {
+                        continue;
+                    };
+                    let stat = view.inode(id).stat;
+                    if resolved.remainder.is_empty() && (stat.dev, stat.ino) == *identity {
+                        owners.insert((*d.root).clone());
+                        alias.nlink = stat.nlink;
+                    }
+                }
+                !owners.is_empty()
+            });
+            alias.nlink > 1 && !alias.names.is_empty()
+        });
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .file_aliases = aliases;
+    }
+
     /// Attempt a watch even when the later readable directory open will be
     /// denied. O_PATH and the observed parent avoid rebuilding a live pathname.
     pub(crate) fn arm_entry(
@@ -423,11 +539,8 @@ impl Watch {
             if state.removed.remove(&wd) {
                 return;
             }
-            if let Some(old) = state.descriptors.remove(&wd) {
-                for d in old {
-                    state.identities.remove(&d.identity);
-                }
-            }
+            state.descriptors.remove(&wd);
+            state.identities.retain(|_, value| *value != wd);
             if let Some(inputs) = state.policies.remove(&wd) {
                 state.gaps.extend(inputs.into_iter().map(|(r, _)| r));
             }
@@ -557,22 +670,27 @@ impl Watch {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Status {
-            installed: s
-                .descriptors
-                .keys()
-                .chain(s.policies.keys())
-                .collect::<BTreeSet<_>>()
-                .len(),
-            needed: s
-                .descriptors
-                .keys()
-                .chain(s.policies.keys())
-                .collect::<BTreeSet<_>>()
-                .len()
-                + s.failed.len()
-                + s.policy_failed.len(),
+            installed: s.identities.len(),
+            needed: s.identities.len() + s.failed.len() + s.policy_failed.len(),
             failed: s.failed.len() + s.policy_failed.len(),
-            bytes: s.bytes,
+            polling_roots: s
+                .gaps
+                .iter()
+                .chain(&s.unreliable)
+                .chain(
+                    s.file_aliases
+                        .values()
+                        .flat_map(FileAliases::unproven_roots),
+                )
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            bytes: s.bytes
+                + s.scoped_roots
+                    .iter()
+                    .map(|r| r.as_os_str().len() + 64)
+                    .sum::<usize>(),
             pending: s.pending.len() + usize::from(s.backstop.is_some()) + s.scoped_roots.len(),
             oldest: s
                 .first
@@ -610,8 +728,7 @@ impl Watch {
             .scoped_roots
             .extend(roots);
     }
-    /// Roots whose watch coverage is incomplete or whose descriptor may have
-    /// multiple physical occurrences pending M5b's exact mapper.
+    /// Roots with missing/unreliable watches or unobserved hard-link names.
     pub fn polling_roots(&self, view: &Catalog) -> Vec<PathBuf> {
         let s = self
             .state
@@ -676,9 +793,12 @@ impl Watch {
     /// Retire watches only after checked catalog observation. Known removals
     /// have an expected IGNORED; every unknown descriptor lifetime is loss.
     pub fn reconcile(&self, view: &Catalog) {
+        let roots: BTreeSet<_> = view
+            .roots()
+            .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
+            .collect();
         let identities: BTreeSet<_> = view
-            .inode_ids()
-            .filter(|&id| view.is_directory(id))
+            .dir_ids()
             .map(|id| {
                 let stat = view.inode(id).stat;
                 (stat.dev, stat.ino)
@@ -690,6 +810,30 @@ impl Watch {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.failed.retain(|identity| identities.contains(identity));
+            s.file_aliases.retain(|_, aliases| {
+                aliases.names.retain(|_, owners| {
+                    owners.retain(|r| roots.contains(r));
+                    !owners.is_empty()
+                });
+                !aliases.names.is_empty()
+            });
+            s.policy_failed.retain(|(r, _)| roots.contains(r));
+            let mut retired = Vec::new();
+            for (&wd, inputs) in &mut s.policies {
+                inputs.retain(|(r, _)| roots.contains(r));
+                if inputs.is_empty() {
+                    retired.push(wd);
+                }
+            }
+            for wd in retired {
+                s.policies.remove(&wd);
+                if !s.descriptors.contains_key(&wd) {
+                    s.identities.retain(|_, value| *value != wd);
+                    if inotify::remove_watch(&self.fd, wd).is_ok() {
+                        s.removed.insert(wd);
+                    }
+                }
+            }
             s.unreliable
                 .retain(|root| view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
             if s.failed.is_empty() {
@@ -729,7 +873,9 @@ impl Watch {
                 continue;
             }
             s.descriptors.remove(&wd);
-            s.identities.retain(|_, value| *value != wd);
+            if !s.policies.contains_key(&wd) {
+                s.identities.retain(|_, value| *value != wd);
+            }
             if !s.policies.contains_key(&wd) && inotify::remove_watch(&self.fd, wd).is_ok() {
                 s.removed.insert(wd);
             }
@@ -769,21 +915,12 @@ impl Burst {
     }
     /// Loss/backstop reason associated with this detached watermark.
     pub fn reason(&self) -> RefreshReason {
-        if self.roots.is_empty() {
-            self.marker.map_or(RefreshReason::Burst, |(_, r)| r)
-        } else {
-            RefreshReason::Burst
-        }
+        self.marker.map_or(RefreshReason::Burst, |(_, r)| r)
     }
     /// Resolves parent/name locators in the current checked generation. Missing
     /// ancestry or changed root boundaries widen observation conservatively.
     pub fn request(&self, view: &Catalog) -> RefreshRequest {
-        let mut scopes = self
-            .roots
-            .iter()
-            .cloned()
-            .map(RefreshScope::Root)
-            .collect::<Vec<_>>();
+        let mut scopes = Vec::new();
         let mut roots = self.roots.clone();
         let mut moves: BTreeMap<u32, MovePair> = BTreeMap::new();
         for ((_, name), hint) in &self.pending {
@@ -810,6 +947,14 @@ impl Burst {
                     roots.insert((*directory.root).clone());
                 }
             }
+        }
+        if self.marker.is_some() {
+            return RefreshRequest {
+                expected_generation: view.generation(),
+                scopes: Vec::new(),
+                rename_hints: Vec::new(),
+                reason: self.reason(),
+            };
         }
         let changed_boundary = roots
             .iter()
@@ -853,9 +998,7 @@ impl Burst {
             expected_generation: view.generation(),
             scopes,
             rename_hints,
-            reason: if !self.roots.is_empty() {
-                RefreshReason::Burst
-            } else if changed_boundary {
+            reason: if changed_boundary {
                 RefreshReason::Backstop
             } else {
                 self.reason()
