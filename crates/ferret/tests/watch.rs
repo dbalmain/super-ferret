@@ -190,12 +190,17 @@ impl Tree {
     }
     fn roots(&self) -> Vec<String> {
         let catalog = ferret_catalog::Catalog::open(&self.path("index"))
-            .unwrap()
-            .unwrap();
-        catalog.load(&[ferret_catalog::Section::Roots]).unwrap();
+            .unwrap_or_else(|error| panic!("roots catalog: {error}"))
+            .unwrap_or_else(|| panic!("roots catalog absent"));
+        catalog
+            .load(&[ferret_catalog::Section::Roots])
+            .unwrap_or_else(|error| panic!("roots load: {error}"));
         catalog
             .roots()
-            .map(|(_, p)| String::from_utf8(p.to_vec()).unwrap())
+            .map(|(_, p)| {
+                String::from_utf8(p.to_vec())
+                    .unwrap_or_else(|error| panic!("fixture root UTF-8: {error}"))
+            })
             .collect()
     }
     fn find_args(&self) -> Vec<String> {
@@ -499,16 +504,16 @@ fn denied_directory_is_opaque_and_permission_recovery_is_polled() {
         .unwrap_or_else(|error| panic!("restore: {error:?}"));
     tree.converges();
     assert!(tree.run(&["search", "original.txt"]).status.success());
-    // A denied configured root still has its global rule parent watched. Its
-    // failed installation must still be reported and recovered by the
-    // polling timer.
+    // A denied configured root still has its root and global rule parents
+    // watched. Its failed installation must still be reported and recovered
+    // by the polling timer.
     fs::set_permissions(tree.path("src"), fs::Permissions::from_mode(0o000))
         .unwrap_or_else(|error| panic!("deny root: {error:?}"));
     tree.stop();
     tree.start(&[("FERRET_POLL_MS", "500")]);
     let denied_root = tree.status();
     assert!(
-        denied_root.contains("\"watch_installed\":1"),
+        denied_root.contains("\"watch_installed\":2"),
         "{denied_root}"
     );
     assert!(denied_root.contains("\"watch_failed\":1"), "{denied_root}");

@@ -74,7 +74,7 @@ pub struct RefreshReport {
     pub report: Report,
 }
 
-fn containing_root(view: &Catalog, mut id: InoId) -> Result<PathBuf, IndexError> {
+pub(crate) fn containing_root(view: &Catalog, mut id: InoId) -> Result<PathBuf, IndexError> {
     if !view.is_live_inode(id) || !view.is_directory(id) {
         return Err(IndexError::BadScope(id));
     }

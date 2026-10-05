@@ -123,7 +123,8 @@ find exit status: 0 success, 1 error (including invalid syntax).
   In default mode -empty sees this walk's -delete removals, not removals by
   -exec commands; use -delete or -I for deletion-aware emptiness.
 
-status [--json]     Show the running daemon’s writer/watch status.
+status [--json]     Show writer/watch status or the local catalog without a host.
+stats [--json]      Show the catalog census; JSON adds status and planner counters.
 
 search exit status: 0 success (search printed a row), 1 search matched nothing,
   2 usage error, 3 runtime error (no index, I/O, lock held, walk faults).

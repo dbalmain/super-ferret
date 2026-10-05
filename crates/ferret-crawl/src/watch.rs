@@ -20,7 +20,9 @@ use rustix::io::Errno;
 
 use crate::{RefreshReason, RefreshRequest, RefreshScope, RenameHint};
 
+mod aliases;
 mod policy;
+use aliases::FileAliases;
 
 const TRAILING: Duration = Duration::from_millis(200);
 const MAX_AGE: Duration = Duration::from_secs(1);
@@ -119,22 +121,6 @@ struct Hint {
     from: bool,
     to: bool,
 }
-type PhysicalName = ((u64, u64), Vec<u8>);
-
-#[derive(Clone, Debug)]
-struct FileAliases {
-    nlink: u64,
-    // Bind occurrences of one parent/name are one filesystem hard link.
-    names: BTreeMap<PhysicalName, BTreeSet<PathBuf>>,
-}
-impl FileAliases {
-    fn unproven_roots(&self) -> impl Iterator<Item = &PathBuf> {
-        self.names
-            .values()
-            .flatten()
-            .filter(|_| self.nlink > self.names.len() as u64)
-    }
-}
 #[derive(Debug)]
 struct State {
     descriptors: BTreeMap<i32, Vec<Arc<Directory>>>,
@@ -143,8 +129,10 @@ struct State {
     removed: BTreeSet<i32>,
     gaps: BTreeSet<PathBuf>,
     unreliable: BTreeSet<PathBuf>,
-    policies: BTreeMap<i32, BTreeSet<(PathBuf, Vec<u8>)>>,
-    policy_failed: BTreeSet<(PathBuf, PathBuf)>,
+    policies: BTreeMap<i32, BTreeMap<(PathBuf, Vec<u8>), u64>>,
+    policy_failed: BTreeMap<(PathBuf, PathBuf), u64>,
+    policy_epochs: BTreeMap<PathBuf, u64>,
+    policy_refreshed: BTreeSet<PathBuf>,
     failed: BTreeSet<(u64, u64)>,
     pending: BTreeMap<(i32, Vec<u8>), Hint>,
     bytes: usize,
@@ -211,7 +199,9 @@ impl Watch {
                 gaps: BTreeSet::new(),
                 unreliable: BTreeSet::new(),
                 policies: BTreeMap::new(),
-                policy_failed: BTreeSet::new(),
+                policy_failed: BTreeMap::new(),
+                policy_epochs: BTreeMap::new(),
+                policy_refreshed: BTreeSet::new(),
                 failed: BTreeSet::new(),
                 pending: BTreeMap::new(),
                 bytes: 0,
@@ -348,100 +338,6 @@ impl Watch {
             }
         }
     }
-    /// Accounts for distinct physical hard-link names at observed handles.
-    /// A link outside indexed occurrences cannot promise directory events.
-    pub(crate) fn file(&self, root: &Path, entry: &crate::Decided<'_, ferret_catalog::DirToken>) {
-        let Some(stat) = entry.stat else {
-            return;
-        };
-        if entry.kind != ferret_catalog::Kind::File {
-            return;
-        }
-        let identity = (stat.dev, stat.ino);
-        if stat.nlink <= 1 {
-            return;
-        }
-        let Ok(parent) = fstat(entry.parent_fd) else {
-            self.gap(root);
-            return;
-        };
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let alias = s
-            .file_aliases
-            .entry(identity)
-            .or_insert_with(|| FileAliases {
-                nlink: stat.nlink,
-                names: BTreeMap::new(),
-            });
-        alias.nlink = stat.nlink;
-        alias
-            .names
-            .entry((
-                (parent.st_dev, parent.st_ino),
-                entry.name.as_bytes().to_vec(),
-            ))
-            .or_default()
-            .insert(root.to_owned());
-    }
-
-    /// Validates the sparse hard-link proof against the checked successor.
-    /// Retired names cannot inflate the number of observable physical links.
-    pub fn adopt_aliases(&self, view: &Catalog) {
-        let (mut aliases, parents) = {
-            let s = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let parents = s
-                .file_aliases
-                .values()
-                .flat_map(|a| a.names.keys().map(|(p, _)| *p))
-                .map(|p| {
-                    (
-                        p,
-                        s.identities
-                            .get(&p)
-                            .and_then(|wd| s.descriptors.get(wd))
-                            .cloned()
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            (s.file_aliases.clone(), parents)
-        };
-        aliases.retain(|identity, alias| {
-            alias.names.retain(|(parent, name), owners| {
-                owners.clear();
-                for d in &parents[parent] {
-                    if d.resolve(view).is_none() {
-                        continue;
-                    }
-                    let path = d.path().join(OsStr::from_bytes(name));
-                    let Some(resolved) = view.resolve(path.as_os_str().as_bytes()) else {
-                        continue;
-                    };
-                    let ferret_catalog::Target::Inode(id) = resolved.target else {
-                        continue;
-                    };
-                    let stat = view.inode(id).stat;
-                    if resolved.remainder.is_empty() && (stat.dev, stat.ino) == *identity {
-                        owners.insert((*d.root).clone());
-                        alias.nlink = stat.nlink;
-                    }
-                }
-                !owners.is_empty()
-            });
-            alias.nlink > 1 && !alias.names.is_empty()
-        });
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .file_aliases = aliases;
-    }
-
     /// Attempt a watch even when the later readable directory open will be
     /// denied. O_PATH and the observed parent avoid rebuilding a live pathname.
     pub(crate) fn arm_entry(
@@ -542,7 +438,7 @@ impl Watch {
             state.descriptors.remove(&wd);
             state.identities.retain(|_, value| *value != wd);
             if let Some(inputs) = state.policies.remove(&wd) {
-                state.gaps.extend(inputs.into_iter().map(|(r, _)| r));
+                state.gaps.extend(inputs.into_keys().map(|(r, _)| r));
             }
             loss(&mut state, RefreshReason::Overflow);
             return;
@@ -552,7 +448,7 @@ impl Watch {
             .get(&wd)
             .map(|inputs| {
                 inputs
-                    .iter()
+                    .keys()
                     .filter(|(_, n)| n == name || name.is_empty())
                     .map(|(r, _)| r.clone())
                     .collect::<Vec<_>>()
@@ -736,7 +632,13 @@ impl Watch {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let roots = s
             .gaps
-            .union(&s.unreliable)
+            .iter()
+            .chain(&s.unreliable)
+            .chain(
+                s.file_aliases
+                    .values()
+                    .flat_map(FileAliases::unproven_roots),
+            )
             .cloned()
             .collect::<BTreeSet<_>>();
         roots
@@ -784,6 +686,7 @@ impl Watch {
                 s.backstop = None;
             }
         } else {
+            s.policy_refreshed.clear();
             loss(
                 &mut s,
                 burst.marker.map_or(RefreshReason::Backstop, |(_, r)| r),
@@ -804,6 +707,11 @@ impl Watch {
                 (stat.dev, stat.ino)
             })
             .collect();
+        let protected = view
+            .dir_ids()
+            .filter(|&id| view.retained_at(id).is_some())
+            .filter_map(|id| crate::refresh::containing_root(view, id).ok())
+            .collect::<BTreeSet<_>>();
         let snapshot = {
             let mut s = self
                 .state
@@ -817,10 +725,19 @@ impl Watch {
                 });
                 !aliases.names.is_empty()
             });
-            s.policy_failed.retain(|(r, _)| roots.contains(r));
+            let refreshed = std::mem::take(&mut s.policy_refreshed);
+            let epochs = s.policy_epochs.clone();
+            let keep = |r: &PathBuf, epoch: u64| {
+                roots.contains(r)
+                    && (!refreshed.contains(r)
+                        || protected.contains(r)
+                        || epochs.get(r).is_some_and(|current| *current == epoch))
+            };
+            s.policy_epochs.retain(|r, _| roots.contains(r));
+            s.policy_failed.retain(|(r, _), epoch| keep(r, *epoch));
             let mut retired = Vec::new();
             for (&wd, inputs) in &mut s.policies {
-                inputs.retain(|(r, _)| roots.contains(r));
+                inputs.retain(|(r, _), epoch| keep(r, *epoch));
                 if inputs.is_empty() {
                     retired.push(wd);
                 }
@@ -840,7 +757,7 @@ impl Watch {
                 s.gaps = s.unreliable.clone();
                 let failed = s
                     .policy_failed
-                    .iter()
+                    .keys()
                     .map(|(r, _)| r.clone())
                     .collect::<Vec<_>>();
                 s.gaps.extend(failed);

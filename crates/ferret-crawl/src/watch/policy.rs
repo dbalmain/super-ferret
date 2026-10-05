@@ -12,7 +12,32 @@ pub(super) fn unreliable(magic: u64) -> bool {
         0x6969 | 0xff534d42 | 0x517b | 0xfe534d42 | 0x01021997 | 0x65735546
     )
 }
+fn failure(s: &mut State, root: &Path, path: PathBuf) {
+    let epoch = s.policy_epochs.get(root).copied().unwrap_or(0);
+    s.gaps.insert(root.to_owned());
+    s.policy_failed.insert((root.to_owned(), path), epoch);
+}
 impl Watch {
+    /// Starts dependency retirement only for a complete root observation.
+    pub(crate) fn begin_policy_root(&self, root: &Path) {
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let epoch = s.policy_epochs.entry(root.to_owned()).or_default();
+        *epoch = epoch.wrapping_add(1);
+        s.policy_refreshed.insert(root.to_owned());
+        s.unreliable.remove(root);
+    }
+    /// Failed commands cannot later retire dependencies through a partial scan.
+    pub fn abort_policy_roots(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .policy_refreshed
+            .clear();
+    }
+
     /// Registers one actual policy consultation, including a missing input.
     /// The root is refreshed through the production policy/retention seam.
     pub fn policy_path(&self, root: &Path, path: &Path) {
@@ -37,8 +62,10 @@ impl Watch {
                         .state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    s.gaps.insert(root.to_owned());
-                    s.policy_failed.insert((root.to_owned(), path.to_owned()));
+                    let key = std::fs::canonicalize(parent)
+                        .map(|p| p.join(candidate.file_name().unwrap_or_default()))
+                        .unwrap_or_else(|_| path.to_owned());
+                    failure(&mut s, root, key);
                     return;
                 }
             }
@@ -77,6 +104,10 @@ impl Watch {
             | WatchFlags::ONLYDIR
             | WatchFlags::MASK_ADD;
         let installed = s.identities.len();
+        if installed >= self.config.watch_cap && !s.identities.contains_key(&identity) {
+            failure(&mut s, root, key);
+            return;
+        }
         let result = s
             .identities
             .get(&identity)
@@ -92,21 +123,20 @@ impl Watch {
                     loss(&mut s, RefreshReason::Overflow);
                 }
                 s.identities.insert(identity, wd);
+                let epoch = s.policy_epochs.get(root).copied().unwrap_or(0);
                 s.policies
                     .entry(wd)
                     .or_default()
-                    .insert((root.to_owned(), name.as_bytes().to_vec()));
+                    .insert((root.to_owned(), name.as_bytes().to_vec()), epoch);
                 s.policy_failed.remove(&(root.to_owned(), key.clone()));
             }
             Ok(wd) => {
                 let _ = inotify::remove_watch(&self.fd, wd);
                 s.removed.insert(wd);
-                s.gaps.insert(root.to_owned());
-                s.policy_failed.insert((root.to_owned(), key.clone()));
+                failure(&mut s, root, key.clone());
             }
             Err(_) => {
-                s.gaps.insert(root.to_owned());
-                s.policy_failed.insert((root.to_owned(), key.clone()));
+                failure(&mut s, root, key.clone());
             }
         }
         drop(s);
@@ -120,8 +150,7 @@ impl Watch {
                         .state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    s.gaps.insert(root.to_owned());
-                    s.policy_failed.insert((root.to_owned(), key));
+                    failure(&mut s, root, key);
                 }
             }
         }

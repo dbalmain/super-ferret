@@ -198,6 +198,7 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                     engine.index_change(change, refresh, &options)
                 };
                 if let Ok(report) = &result {
+                    global_inputs(watch.as_ref(), &engine, &context);
                     successful(host, report, false);
                     host.writer_status
                         .lock()
@@ -212,6 +213,9 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                         w.reconcile(engine.pin().catalog());
                     }
                 } else if let Err(error) = &result {
+                    if let Some(w) = &watch {
+                        w.abort_policy_roots();
+                    }
                     host.writer_status
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -289,21 +293,7 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
         host.writer_running.store(true, Ordering::Release);
         #[cfg(debug_assertions)]
         std::thread::sleep(duration("FERRET_WATCH_TEST_REFRESH_DELAY_MS", 0));
-        {
-            let pin = engine.pin();
-            if let (Some(w), Some(dirs)) = (&watch, &context.dirs) {
-                for (_, root) in pin.catalog().roots() {
-                    w.policy_path(
-                        std::path::Path::new(OsStr::from_bytes(root)),
-                        &dirs.ignore_file(),
-                    );
-                    w.policy_path(
-                        std::path::Path::new(OsStr::from_bytes(root)),
-                        &dirs.config.join("config"),
-                    );
-                }
-            }
-        }
+        global_inputs(watch.as_ref(), &engine, &context);
         let mut reason = RefreshReason::Backstop;
         let result = crate::index::global_ignore(&context)
             .map_err(io::Error::other)
@@ -324,6 +314,7 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
             });
         match &result {
             Ok(report) => {
+                global_inputs(watch.as_ref(), &engine, &context);
                 let complete = burst
                     .as_ref()
                     .is_none_or(|b| b.reason() != RefreshReason::Burst)
@@ -372,6 +363,16 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
         super::wake_listener(host, 1);
     }
     Ok(())
+}
+fn global_inputs(watch: Option<&Arc<Watch>>, engine: &Engine, context: &crate::cli::Context) {
+    if let (Some(w), Some(dirs)) = (watch, &context.dirs) {
+        let pin = engine.pin();
+        for (_, root) in pin.catalog().roots() {
+            let root = std::path::Path::new(OsStr::from_bytes(root));
+            w.policy_path(root, &dirs.ignore_file());
+            w.policy_path(root, &dirs.config.join("config"));
+        }
+    }
 }
 fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
     let mut status = host

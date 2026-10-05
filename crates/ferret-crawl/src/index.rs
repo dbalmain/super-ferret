@@ -853,6 +853,11 @@ fn observe(
     let mut faults = Vec::new();
     let mut batches = Vec::new();
     for root in &plan.refresh {
+        if !plan.selections.contains_key(root)
+            && let Some(watch) = &options.watch
+        {
+            watch.begin_policy_root(root);
+        }
         let walk_options = WalkOptions {
             workers: options.workers,
             boundaries: plan.boundaries(root),
