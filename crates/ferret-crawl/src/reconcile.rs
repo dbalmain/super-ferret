@@ -16,6 +16,33 @@ use ferret_catalog::{
     WriterSession,
 };
 
+/// Prepares complete configured-root observations for a full checkpoint.
+/// Fault locators are checked against the current published view. Returns the
+/// optional consumed batches and protected-scope count; None means retention
+/// cannot safely represent the observations or a global version transition.
+/// Scoped or partial inputs must never be supplied to this full-root seam.
+pub fn checkpoint_batches(
+    session: &WriterSession,
+    batches: Vec<Batch>,
+    faults: &[crate::CoverageFault],
+    configured: &[PathBuf],
+    sniffer: u32,
+    policy: Hash,
+) -> (Option<Vec<Batch>>, usize) {
+    let Some(protection) = crate::coverage::resolve(session, &batches, faults, configured) else {
+        return (None, 0);
+    };
+    let scopes = protection.directories.len() + protection.edges.len() + protection.opaque.len();
+    let old = session.view();
+    if !protection.is_empty() && (old.policy() != policy || old.sniffer_version() != sniffer) {
+        return (None, scopes);
+    }
+    (
+        crate::coverage::checkpoint_observations(session, batches, &protection, configured),
+        scopes,
+    )
+}
+
 struct Seen(Vec<u64>);
 impl Seen {
     fn new(bound: u32) -> Self {

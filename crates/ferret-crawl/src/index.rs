@@ -1610,7 +1610,29 @@ impl EventVisitor for Hasher<'_> {
             }
             Event::Pattern(error) => {
                 self.out.counts.pattern_errors += 1;
-                self.out.pattern_errors.push(error.to_string());
+                let ferret_policy::PatternError::Line {
+                    file,
+                    pattern,
+                    detail,
+                    ..
+                } = &error;
+                let path_bytes = match file {
+                    ferret_policy::IgnoreFile::Ferret(path)
+                    | ferret_policy::IgnoreFile::Git(path)
+                    | ferret_policy::IgnoreFile::GitExclude(path) => path.as_os_str().len(),
+                    ferret_policy::IgnoreFile::Global => 0,
+                };
+                // Lossy path display can expand each invalid byte to three;
+                // fixed overhead also covers the source label and line number.
+                if self.out.reserve(
+                    std::mem::size_of::<String>()
+                        + 64
+                        + path_bytes * 3
+                        + pattern.len()
+                        + detail.len(),
+                ) {
+                    self.out.pattern_errors.push(error.to_string());
+                }
                 None
             }
         }
@@ -1686,26 +1708,24 @@ fn full_rewalk(
         &plan,
         options,
     )?;
-    let protection =
-        crate::coverage::resolve(session, &batches, &report.coverage_faults, &plan.roots);
-    let rebuilt = protection.and_then(|protection| {
-        report.protected_scopes =
-            protection.directories.len() + protection.edges.len() + protection.opaque.len();
-        if !protection.is_empty()
-            && (old.policy() != fingerprint(options) || old.sniffer_version() != options.sniffer)
-        {
-            return None;
-        }
-        crate::coverage::checkpoint_observations(session, batches, &protection, &plan.roots)
-    });
+    let (rebuilt, scopes) = crate::reconcile::checkpoint_batches(
+        session,
+        batches,
+        &report.coverage_faults,
+        &plan.roots,
+        options.sniffer,
+        fingerprint(options),
+    );
     report.input_usage = usage;
     report.input_fallback = true;
+    report.protected_scopes = scopes;
     let Some(batches) = rebuilt else {
         return Err(IndexError::Coverage {
             faults: std::mem::take(&mut report.coverage_faults),
             report: Box::new(report),
         });
     };
+    drop(old);
     let started = Instant::now();
     let catalog = session
         .rebuild_checkpoint(batches, options.sniffer, fingerprint(options))

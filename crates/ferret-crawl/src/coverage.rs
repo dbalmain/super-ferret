@@ -577,24 +577,31 @@ pub(crate) fn checkpoint_observations(
     let mut resolver = Resolver {
         session,
         old: old.clone(),
-        dirs: dirs.clone(),
+        dirs,
         resolved: BTreeMap::new(),
         active: BTreeSet::new(),
         out: Protection::default(),
     };
-    let mut batch = session.checkpoint_batch(0);
+    let file_capacity = batches
+        .iter()
+        .map(Batch::file_count)
+        .sum::<usize>()
+        .max(old.name_count().saturating_sub(old.dir_count()) as usize);
+    let mut batch = session.checkpoint_batch(file_capacity);
     let mut mapped = BTreeMap::new();
-    let mut overridden: BTreeSet<(DirToken, Vec<u8>)> = BTreeSet::new();
+    let mut overridden: BTreeMap<DirToken, BTreeSet<Vec<u8>>> = BTreeMap::new();
     let mut represented = BTreeSet::new();
     while let Some(token) = queue.pop_front() {
-        let d = dirs.get(&token)?;
+        let d = *resolver.dirs.get(&token)?;
         let parent = match d.parent {
             Some(p) => Some(*mapped.get(&p)?),
             None => None,
         };
-        if d.parent
-            .is_some_and(|p| overridden.contains(&(p, d.name.to_vec())))
-        {
+        if d.parent.is_some_and(|p| {
+            overridden
+                .get(&p)
+                .is_some_and(|names| names.contains(d.name))
+        }) {
             continue;
         }
         if protection.tokens.contains(&token) {
@@ -625,7 +632,10 @@ pub(crate) fn checkpoint_observations(
                 let edge = old.name(name);
                 let retained_dir = matches!(edge.target(), ferret_catalog::Target::Inode(child) if old.is_directory(child) && protection.directories.contains(&child.0));
                 if protection.edges.contains(&name.0) || retained_dir {
-                    overridden.insert((token, edge.bytes.to_vec()));
+                    overridden
+                        .entry(token)
+                        .or_default()
+                        .insert(edge.bytes.to_vec());
                     copy_edge(&old, &mut batch, next, name, &protection.markers)?;
                     represented.insert(edge.child.0);
                 }
@@ -638,7 +648,8 @@ pub(crate) fn checkpoint_observations(
     // A failed root open can have no token. Only a checked old configured root
     // is allowed to fill that absence; new unanchored roots abort.
     for root in configured {
-        if !dirs
+        if !resolver
+            .dirs
             .values()
             .any(|d| d.parent.is_none() && d.name == root.as_os_str().as_bytes())
         {
@@ -658,7 +669,12 @@ pub(crate) fn checkpoint_observations(
             dir = old.name(old.dir_name(dir)?).parent;
         }
     }
-    for input in &batches {
+    // The maps borrow the inputs. Release them before progressively consuming
+    // worker columns, so trustworthy files never coexist as two full sets.
+    drop(resolver);
+    drop(counts);
+    drop(children);
+    for input in batches {
         for i in 0..input.file_count() {
             let f = input.file_observation(i);
             let Some(&parent) = mapped.get(&f.parent) else {
@@ -666,7 +682,9 @@ pub(crate) fn checkpoint_observations(
             };
             if protection.denied.contains(&f.parent)
                 || protection.opaque.contains(&f.parent)
-                || overridden.contains(&(f.parent, f.name.to_vec()))
+                || overridden
+                    .get(&f.parent)
+                    .is_some_and(|names| names.contains(f.name))
             {
                 continue;
             }
@@ -679,7 +697,9 @@ pub(crate) fn checkpoint_observations(
             if let Some(&next) = mapped.get(&parent)
                 && !protection.denied.contains(&parent)
                 && !protection.opaque.contains(&parent)
-                && !overridden.contains(&(parent, name.to_vec()))
+                && !overridden
+                    .get(&parent)
+                    .is_some_and(|names| names.contains(name))
             {
                 batch.ignored(next, name, kind);
             }

@@ -936,8 +936,8 @@ from small-update latency. These limits bound the published log.
 
 The producer also applies provisional **500,000 input rows/records** and
 **64 MiB owned changed-input bytes** ceilings before storing changed
-observations and reconciliation scratch. Names and link targets count toward
-bytes; equal-row seen bits and the base-sized directory graph are separate
+observations and reconciliation scratch. Names, link targets, deferred aliases and owned coverage/content/pattern
+fault reports count toward bytes; equal-row seen bits and the base-sized directory graph are separate
 resident storage. Charges are conservative across intermediate representations,
 not an RSS claim or a measured optimal crossover. On exhaustion, drop the
 unpublished attempt, retain the writer lock, and rewalk every configured root
@@ -947,7 +947,14 @@ all epoch caches and return Checkpointed. Unanchored faults, protected global
 version transitions, and retained suppression/traversal combinations which the
 full builder cannot represent safely abort before changing the generation.
 Fresh aliases supersede individually carried retained observations, as in
-D31/D34. Raw low-level ChangeSet callers own their input allocation; the crawl
+D31/D34. Faulted full-root preparation consumes worker batches progressively,
+releasing directory maps before file replay, rather than retaining a second
+whole observation set. Once rewalk and retention resolution finish, release
+old lookup arrays and full-batch source pins before building; restore epoch
+caches from the selected generation on success or recoverable failure under
+the same lock. The writer and external readers can still pin the old source.
+The full builder has no separate memory ceiling; this input guard does not
+bound full-builder observations, allocation overhead or whole-process RSS. Raw low-level ChangeSet callers own their input allocation; the crawl
 producer's guard cannot retroactively bound a caller's existing Vec.
 
 Provisionally compact at an idle writer boundary, holding the writer lock;

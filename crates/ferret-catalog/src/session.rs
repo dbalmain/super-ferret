@@ -59,15 +59,7 @@ impl WriterSession {
         // Publication has selected a new epoch. Retire old lookup storage
         // before cached-key sorts allocate their transient keys.
         self.lookup_base = view.clone();
-        self.identities = Vec::new();
-        self.documents = Vec::new();
-        self.directories = Vec::new();
-        self.first_names = Vec::new();
-        self.alias_names.clear();
-        self.name_changes.clear();
-        self.identity_changes.clear();
-        self.document_changes.clear();
-        self.directory_changes.clear();
+        self.release_lookups();
         let mut identities: Vec<_> = view
             .inode_ids()
             .filter(|&id| !view.is_directory(id))
@@ -121,6 +113,18 @@ impl WriterSession {
         self.next_batch.store(0, Ordering::Relaxed);
     }
 
+    fn release_lookups(&mut self) {
+        self.identities = Vec::new();
+        self.documents = Vec::new();
+        self.directories = Vec::new();
+        self.first_names = Vec::new();
+        self.alias_names.clear();
+        self.name_changes.clear();
+        self.identity_changes.clear();
+        self.document_changes.clear();
+        self.directory_changes.clear();
+    }
+
     /// Changes host-selected checkpoint budgets. The defaults are S1+'s
     /// published limits; larger limits are useful for measuring replay costs.
     pub fn set_compaction_limits(&mut self, limits: crate::CompactionLimits) {
@@ -138,12 +142,20 @@ impl WriterSession {
     /// Scoped batches are refused. An uncertain failure requires reopening.
     pub fn rebuild_checkpoint(
         &mut self,
-        batches: Vec<Batch>,
+        mut batches: Vec<Batch>,
         sniffer: u32,
         policy: Hash,
     ) -> Result<Catalog, Error> {
-        self.writer.rebuild_checkpoint(batches, sniffer, policy)?;
+        // Rewalk and retention resolution are complete. No old lookup is
+        // needed by the full builder; recoverable failures restore them under
+        // the same lock from the still-selected writer view.
+        self.release_lookups();
+        for batch in &mut batches {
+            batch.release_full_source();
+        }
+        let result = self.writer.rebuild_checkpoint(batches, sniffer, policy);
         self.rebuild();
+        result?;
         Ok(self.view())
     }
     /// Mints a full-builder batch, without compacting equal file observations.

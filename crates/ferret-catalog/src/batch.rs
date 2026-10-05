@@ -323,6 +323,13 @@ impl Batch {
         self.file_capacity = file_capacity;
         self
     }
+    pub(crate) fn release_full_source(&mut self) {
+        // Full observations own all rows; their old hints have already served
+        // fault anchoring. Compact batches still require the pinned source.
+        if self.full {
+            self.previous = None;
+        }
+    }
     fn reserve_input(&self, records: usize, bytes: usize) -> bool {
         self.input_budget
             .as_ref()

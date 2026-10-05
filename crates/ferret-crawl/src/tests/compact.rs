@@ -570,3 +570,89 @@ fn unchanged_children_with_lstat_eio_and_long_names_exhaust_the_shared_byte_guar
     );
     assert_eq!(listings(&result.view), listings(&open(&tmp.cat())));
 }
+
+#[test]
+fn one_denied_and_one_retained_directory_inside_a_forced_fallback_preserve_the_full_tree_oracle() {
+    use super::coverage::{Hook, retained_listings};
+    use crate::IoOp;
+    use crate::walk::IoPoint;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    let tmp = Tmp::new("bounded-mixed-small-faults");
+    for dir in 0..32 {
+        for file in 0..16 {
+            tmp.write(
+                &format!("dir-{dir:02}/file-{file:02}"),
+                format!("old-{dir}-{file}").as_bytes(),
+            );
+        }
+    }
+    index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let before = session.view();
+    session.set_input_limits(ferret_catalog::InputLimits {
+        records: 0,
+        owned_bytes: 0,
+    });
+    tmp.write("dir-02/file-00", b"fresh content");
+    tmp.write("dir-01/file-00", b"unobserved content");
+    let hook = Hook::set(&tmp.tree(), |point, path| {
+        if point != IoPoint::Directory {
+            return None;
+        }
+        let errno = if path == Path::new("dir-00") {
+            13
+        } else if path == Path::new("dir-01") {
+            5
+        } else {
+            return None;
+        };
+        Some((IoOp::List, std::io::Error::from_raw_os_error(errno)))
+    });
+    let result = burst(&tmp, &mut session);
+    assert!(result.report.input_fallback);
+    assert!(matches!(result.outcome, RefreshOutcome::Checkpointed));
+    assert_eq!(
+        result.report.coverage_faults.len(),
+        1,
+        "D26 denials are covered, not reported as retained faults"
+    );
+    let root = result.view.roots().next().unwrap().0;
+    let denied = result
+        .view
+        .name(result.view.lookup(root, b"dir-00").unwrap())
+        .child;
+    let retained = result
+        .view
+        .name(result.view.lookup(root, b"dir-01").unwrap())
+        .child;
+    assert_eq!(result.view.children(denied).count(), 0);
+    assert_eq!(result.view.entry_count(denied), None);
+    assert_eq!(result.view.retained_at(denied), None);
+    assert_eq!(result.view.children(retained).count(), 16);
+    assert_eq!(result.view.entry_count(retained), None);
+    assert!(result.view.retained_at(retained).is_some());
+    // The full oracle sees the real EACCES observation too; only EIO is
+    // disabled, so its expected subtree comes from the actual old checkpoint.
+    drop(hook);
+    let hook = Hook::set(&tmp.tree(), |point, path| {
+        (point == IoPoint::Directory && path == Path::new("dir-00"))
+            .then(|| (IoOp::List, std::io::Error::from_raw_os_error(13)))
+    });
+    let fresh = tmp.base.join("mixed-fault-oracle");
+    index(&fresh, &[tmp.tree()], Refresh::All, &options()).unwrap();
+    let scope = tmp.at("dir-01").as_os_str().as_bytes().to_vec();
+    assert_eq!(
+        listings(&result.view),
+        retained_listings(
+            &open(&fresh),
+            &before,
+            std::slice::from_ref(&scope),
+            std::slice::from_ref(&scope)
+        )
+    );
+    assert_eq!(listings(&result.view), listings(&open(&tmp.cat())));
+    drop(hook);
+    burst(&tmp, &mut session);
+    oracle(&tmp, &session.view());
+}

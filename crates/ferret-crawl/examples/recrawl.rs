@@ -14,7 +14,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ferret_catalog::{Content, ContentState, DirToken, InoId, Kind, Target, WriterSession};
+use ferret_catalog::{
+    Catalog, Content, ContentState, DirToken, InoId, Kind, Target, WriterSession,
+};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -24,6 +26,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     match changed.as_str() {
         "fault-prepare" => prepare_fault_roots(Path::new(dir)),
         "fault-small" | "fault-large" => fault_root(Path::new(dir), changed == "fault-small"),
+        "churn-50-fault" => churn_fault(Path::new(dir), 50),
+        "churn-90-fault" => churn_fault(Path::new(dir), 90),
         "resident-1" => resident(Path::new(dir), 1, 1),
         "resident-100000" => resident(Path::new(dir), 100000, 1),
         "resident-repeat" => resident(Path::new(dir), 1, 1000),
@@ -577,4 +581,240 @@ fn resident(dir: &Path, changed: usize, bursts: usize) -> Result<(), Box<dyn Err
         );
     }
     Ok(())
+}
+
+// Same lazy replacements as churn-rewalk, with two typed listing faults sent
+// through the production full-root preparation seam. The synthetic fixture has
+// no filesystem tree; this cannot measure getdents/stat/hash or syscall races.
+fn churn_fault(dir: &Path, percent: usize) -> Result<(), Box<dyn Error>> {
+    let setup = Instant::now();
+    let mut session = WriterSession::open(dir)?;
+    println!(
+        "fault_rewalk setup_ms={:.2}",
+        setup.elapsed().as_secs_f64() * 1000.0
+    );
+    for round in 1..=2 {
+        let old = session.view();
+        let total = old
+            .inode_ids()
+            .filter(|&id| old.kind(id) == Kind::File)
+            .count();
+        let count = total * percent / 100;
+        let boundary = old
+            .inode_ids()
+            .filter(|&id| old.kind(id) == Kind::File)
+            .nth(count - 1)
+            .ok_or("not enough files")?;
+        let leaf: Vec<_> = old
+            .dir_ids()
+            .filter(|&id| {
+                old.entry_count(id).is_some_and(|count| count > 0)
+                    && old.is_traversed(id) == old.is_search_suppressed(id)
+                    && old.children(id).all(|name| match old.name(name).target() {
+                        Target::Inode(child) => !old.is_directory(child),
+                        _ => true,
+                    })
+            })
+            .take(2)
+            .collect();
+        if leaf.len() != 2 {
+            return Err("need two nonempty leaves".into());
+        }
+        let faults = [(leaf[0], 13), (leaf[1], 5)];
+        let names_removed = old.children(leaf[0]).count();
+        let start = Instant::now();
+        let (_, usage, _) = replay_fault_churn(&session, boundary, false, &[])?;
+        if !usage.exceeded {
+            return Err("input guard did not trip".into());
+        }
+        let abandoned_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let replay = Instant::now();
+        let (batches, _, faults) = replay_fault_churn(&session, boundary, true, &faults)?;
+        let replay_ms = replay.elapsed().as_secs_f64() * 1000.0;
+        let prepare = Instant::now();
+        let roots: Vec<_> = old
+            .roots()
+            .map(|(_, p)| PathBuf::from(std::ffi::OsStr::from_bytes(p)))
+            .collect();
+        let (batches, scopes) = ferret_crawl::reconcile::checkpoint_batches(
+            &session,
+            batches,
+            &faults,
+            &roots,
+            old.sniffer_version(),
+            old.policy(),
+        );
+        let batches = batches.ok_or("synthetic coverage cannot be represented")?;
+        let prepare_ms = prepare.elapsed().as_secs_f64() * 1000.0;
+        let publish = Instant::now();
+        let current = session.rebuild_checkpoint(batches, old.sniffer_version(), old.policy())?;
+        let publication_ms = publish.elapsed().as_secs_f64() * 1000.0;
+        let pause_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if current.name_count() as usize != old.name_count() as usize - names_removed
+            || current.next_doc() != old.next_doc()
+        {
+            return Err("fault fallback changed namespace or DocId high-water incorrectly".into());
+        }
+        for (id, hash) in current.docs() {
+            if old.doc_hash(id) != Some(hash) {
+                return Err("live DocId changed".into());
+            }
+        }
+        for fault in &faults {
+            let path = fault.root.join(&fault.path);
+            let mut found = None;
+            let mut bytes = Vec::new();
+            for id in current.dir_ids() {
+                bytes.clear();
+                current.dir_path(id, &mut bytes);
+                if bytes == path.as_os_str().as_bytes() {
+                    found = Some(id);
+                    break;
+                }
+            }
+            let id = found.ok_or("fault directory disappeared")?;
+            if current.entry_count(id).is_some() {
+                return Err("fault count became known".into());
+            }
+            if fault.error.raw_os_error() == Some(13) {
+                if current.children(id).next().is_some() || current.retained_at(id).is_some() {
+                    return Err("EACCES was not opaque".into());
+                }
+            } else if current.retained_at(id).is_none() || current.children(id).next().is_none() {
+                return Err("EIO was not retained".into());
+            }
+        }
+        let bytes = fs::metadata(Catalog::snapshot_path(dir)?.ok_or("missing checkpoint")?)?.len();
+        let (resident, peak) = rss()?;
+        println!(
+            "fault_rewalk percent={percent} round={round} replaced_files={count} denied_names={names_removed} retained_scopes={scopes} abandoned_ms={abandoned_ms:.2} replay_ms={replay_ms:.2} prepare_ms={prepare_ms:.2} publication_ms={publication_ms:.2} pause_ms={pause_ms:.2} writes={} snapshot_bytes={bytes} charged_records={} charged_owned_bytes={} complete_diff_records=0 resident_kib={resident} peak_kib={peak}",
+            bytes + 192,
+            usage.records,
+            usage.owned_bytes
+        );
+    }
+    Ok(())
+}
+
+type FaultReplay = (
+    Vec<ferret_catalog::Batch>,
+    ferret_catalog::InputUsage,
+    Vec<ferret_crawl::CoverageFault>,
+);
+
+fn replay_fault_churn(
+    session: &ferret_catalog::WriterSession,
+    boundary: ferret_catalog::InoId,
+    full: bool,
+    fault_dirs: &[(InoId, i32)],
+) -> Result<FaultReplay, Box<dyn Error>> {
+    use ferret_catalog::{Content, ContentState, Kind, Target};
+    let old = session.view();
+    let roots: Vec<_> = old
+        .roots()
+        .map(|(_, p)| PathBuf::from(std::ffi::OsStr::from_bytes(p)))
+        .collect();
+    let mut faults = Vec::new();
+    let budget = std::sync::Arc::new(ferret_catalog::InputBudget::new(session.input_limits()));
+    let mut batches: Vec<_> = (0..16)
+        .map(|_| {
+            if full {
+                session.checkpoint_batch(
+                    (old.name_count().saturating_sub(old.dir_count()) as usize).div_ceil(16),
+                )
+            } else {
+                session.batch().with_input_budget(budget.clone())
+            }
+        })
+        .collect();
+    let mut queue = Vec::new();
+    for (id, path) in old.roots() {
+        let token = batches[id.0 as usize % 16].root(path, old.inode(id).stat);
+        queue.push((id, token));
+    }
+    let mut at = 0;
+    while at < queue.len() {
+        let (dir, token) = queue[at];
+        at += 1;
+        let batch = &mut batches[dir.0 as usize % 16];
+        if full && let Some(&(_, errno)) = fault_dirs.iter().find(|&&(id, _)| id == dir) {
+            let mut path = Vec::new();
+            old.dir_path(dir, &mut path);
+            let path = Path::new(std::ffi::OsStr::from_bytes(&path));
+            let root = roots
+                .iter()
+                .find(|root| path.starts_with(root))
+                .ok_or("fault outside configured roots")?;
+            faults.push(ferret_crawl::CoverageFault {
+                root: root.clone(),
+                path: path.strip_prefix(root)?.to_owned(),
+                op: ferret_crawl::IoOp::List,
+                on_root: false,
+                context: ferret_crawl::CoverageContext::Directory(token),
+                error: std::io::Error::from_raw_os_error(errno),
+            });
+            continue;
+        }
+        if let Some(entries) = old.entry_count(dir) {
+            batch.entry_count(token, entries);
+        }
+        if let Some(seq) = old.retained_at(dir) {
+            batch.retained_at(token, Some(seq));
+        }
+        if let Some(work) = old.work_tree(dir) {
+            batch.work_tree(token, work.kind, work.common_dir, work.common_id);
+        }
+        for name in old.children(dir) {
+            if budget.exceeded() {
+                return Ok((Vec::new(), budget.usage(), faults));
+            }
+            let edge = old.name(name);
+            let Target::Inode(id) = edge.target() else {
+                if let Target::Ignored(kind) = edge.target() {
+                    batch.ignored(token, edge.bytes, kind);
+                }
+                continue;
+            };
+            let inode = old.inode(id);
+            let mut stat = inode.stat;
+            let content = match inode.state {
+                ContentState::Unindexed => Content::Unindexed,
+                ContentState::Binary => Content::Binary,
+                ContentState::Fault => Content::Fault,
+                ContentState::Hashed => Content::Hashed(
+                    old.doc_hash(inode.doc.ok_or("missing content binding")?)
+                        .ok_or("missing live hash")?,
+                ),
+            };
+            if id <= boundary && old.kind(id) == Kind::File {
+                stat.ino = stat.ino.wrapping_add(1u64 << 40);
+                stat.ctime_sec += 1;
+            }
+            match old.kind(id) {
+                Kind::Dir => {
+                    let next = if old.is_traversed(id) {
+                        batch.traversed_dir(token, edge.bytes, stat)
+                    } else {
+                        batch.dir(token, edge.bytes, stat)
+                    };
+                    queue.push((id, next));
+                }
+                Kind::Symlink => batch.symlink(
+                    token,
+                    edge.bytes,
+                    stat,
+                    old.link_target(id).ok_or("missing target")?,
+                ),
+                _ => batch.file(token, edge.bytes, stat, content),
+            }
+        }
+        batch.finish_observations();
+    }
+    for batch in &mut batches {
+        batch.seal();
+    }
+    if budget.exceeded() {
+        return Ok((Vec::new(), budget.usage(), faults));
+    }
+    Ok((batches, budget.usage(), faults))
 }
