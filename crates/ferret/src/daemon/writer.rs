@@ -41,7 +41,13 @@ pub(super) struct Status {
     pub error: Option<String>,
     pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
     pub blocked: Option<ferret_catalog::bulk::Blocked>,
+    pub fallback_backstop: bool,
     pub retained_roots: std::collections::BTreeSet<PathBuf>,
+}
+impl Status {
+    fn fallback_busy(&self) -> bool {
+        self.fallback_backstop || self.watch.as_ref().is_some_and(|w| w.status().busy)
+    }
 }
 fn timestamp() -> u64 {
     SystemTime::now()
@@ -164,6 +170,10 @@ fn serve(
     let mut poll_due = Instant::now() + polling;
     let mut retry_due: Option<Duration> = None;
     let mut initial = watch.is_none();
+    host.writer_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .fallback_backstop = initial;
     loop {
         if host.stop.load(Ordering::Acquire) {
             break;
@@ -256,6 +266,12 @@ fn serve(
                             .blocked = Some(*reason);
                         if let Some(w) = &watch {
                             w.backstop(RefreshReason::Backstop);
+                        } else {
+                            initial = true;
+                            host.writer_status
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .fallback_backstop = true;
                         }
                     }
                     if let Some(w) = &watch {
@@ -301,6 +317,10 @@ fn serve(
                 w.backstop(RefreshReason::Backstop);
             } else {
                 initial = true;
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fallback_backstop = true;
             }
             full_due = Instant::now() + hourly;
         }
@@ -321,6 +341,10 @@ fn serve(
                 w.scoped_roots(scopes.into_iter().collect());
             } else {
                 initial = true;
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fallback_backstop = true;
             }
             poll_due = Instant::now() + polling;
         }
@@ -333,7 +357,13 @@ fn serve(
             .as_ref()
             .and_then(|w| w.take_admitted(paused.is_none()));
         if paused.is_some() && burst.is_none() {
-            retry_due = Some(scheduler.now() + Duration::from_secs(1));
+            if initial
+                || watch
+                    .as_ref()
+                    .is_some_and(|w| w.status().backstop.is_some())
+            {
+                retry_due = Some(scheduler.now() + Duration::from_secs(1));
+            }
             continue;
         }
         if burst.is_none() && !initial {
@@ -383,6 +413,10 @@ fn serve(
                 // A budget checkpoint may keep sequence unchanged. It did not
                 // observe the queued work; resolve the complete marker again.
                 initial = true;
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fallback_backstop = watch.is_none();
                 retry_due = Some(scheduler.now());
             }
             Ok(_) if deferred.is_some() => {
@@ -394,6 +428,10 @@ fn serve(
                     w.abort_policy_roots();
                 }
                 initial = true;
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fallback_backstop = watch.is_none();
                 retry_due = Some(scheduler.now() + Duration::from_secs(1));
             }
             Ok(report) => {
@@ -474,6 +512,7 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
     status.fault_retained = !report.coverage_faults.is_empty();
     status.error = None;
     status.blocked = None;
+    status.fallback_backstop = false;
 }
 pub(super) fn busy(host: &Host) -> bool {
     host.writer_running.load(Ordering::Acquire)
@@ -482,9 +521,7 @@ pub(super) fn busy(host: &Host) -> bool {
             .writer_status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .watch
-            .as_ref()
-            .is_some_and(|w| w.status().busy)
+            .fallback_busy()
 }
 pub(super) fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
     let (reply, receive) = mpsc::sync_channel(1);
@@ -589,11 +626,15 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
             .int("watch_installed", 0)
             .int("watch_needed", 0)
             .int("watch_failed", 0)
-            .int("pending_scopes", 0)
+            .int("pending_scopes", u64::from(s.fallback_backstop))
             .int("pending_bytes", 0)
             .null("polling_roots")
-            .null("oldest_pending_ms")
-            .null("backstop_reason");
+            .null("oldest_pending_ms");
+        if s.fallback_backstop {
+            o.str("backstop_reason", "Backstop");
+        } else {
+            o.null("backstop_reason");
+        }
     }
     o.bool("host_running", true)
         .str(

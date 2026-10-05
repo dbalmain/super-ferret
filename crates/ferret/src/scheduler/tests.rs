@@ -259,11 +259,24 @@ fn memory_deferred_fallback_keeps_generation_planner_and_writer_then_recovers() 
     };
     fs::write(tree.root().join("a.txt"), b"replacement")
         .unwrap_or_else(|e| panic!("fixture: {e:?}"));
+    let root_id = engine
+        .pin()
+        .catalog()
+        .roots()
+        .next()
+        .unwrap_or_else(|| panic!("root"))
+        .0;
+    let small = RefreshRequest {
+        expected_generation: engine.generation(),
+        scopes: vec![RefreshScope::Entry {
+            parent: root_id,
+            basename: b"a.txt".to_vec(),
+        }],
+        rename_hints: vec![],
+        reason: RefreshReason::Burst,
+    };
     let report = engine
-        .refresh(
-            request(&engine, tree.root(), RefreshReason::Burst),
-            &options,
-        )
+        .refresh(small, &options)
         .unwrap_or_else(|e| panic!("fixture: {e:?}"));
     assert!(matches!(
         report.outcome,
@@ -337,6 +350,55 @@ fn disk_refusal_and_live_watch_resources_are_admission_inputs() {
     assert_eq!(
         scheduler.admit(Kind::FullRewalk, &view),
         Err(Blocked::Memory)
+    );
+    // Actual sparse alias and policy registrations also consume admission
+    // headroom, not just the optional fixed reserve.
+    let watch = Arc::new(
+        Watch::new(WatchConfig {
+            scopes: 100,
+            bytes: 4096,
+            watch_cap: 100,
+        })
+        .unwrap_or_else(|e| panic!("watch: {e:?}")),
+    );
+    fs::hard_link(tree.root().join("a.txt"), tree.root().join("alias.txt"))
+        .unwrap_or_else(|e| panic!("alias: {e}"));
+    let mut writer = tree.writer();
+    ferret_crawl::recrawl(
+        &mut writer,
+        &[tree.root()],
+        Refresh::All,
+        &IndexOptions {
+            watch: Some(watch.clone()),
+            ..IndexOptions::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("observe: {e}"));
+    watch.policy_path(&tree.root(), &tree.0.join("outside-ignore"));
+    assert!(watch.resource_bytes() > 1024);
+    let (scheduler, source, _) = self::scheduler(
+        Config {
+            rate: 0,
+            full_memory: 0,
+            memory_floor: 100,
+            ..Config::default()
+        },
+        tree.index(),
+    );
+    scheduler.watch(Some(watch.clone()));
+    source
+        .0
+        .lock()
+        .unwrap_or_else(|e| panic!("signals: {e}"))
+        .memory = Some(1024);
+    scheduler.sample();
+    assert_eq!(
+        scheduler.admit(Kind::FullRewalk, &writer.view()),
+        Err(Blocked::Memory)
+    );
+    assert_eq!(
+        scheduler.status().required_memory,
+        100 + watch.resource_bytes()
     );
 }
 #[test]

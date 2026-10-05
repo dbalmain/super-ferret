@@ -24,13 +24,13 @@ pub(crate) struct Status {
 }
 #[derive(Debug)]
 struct Machine {
-    source: Box<dyn Signals>,
     status: Status,
     calm_since: Option<Duration>,
     watch: Option<Arc<ferret_crawl::watch::Watch>>,
 }
 #[derive(Debug)]
 pub(crate) struct Scheduler {
+    source: Mutex<Box<dyn Signals>>,
     config: Config,
     cpus: usize,
     index: PathBuf,
@@ -49,15 +49,15 @@ impl Scheduler {
         let sample = source.sample();
         let limiter = Arc::new(Limiter::new(config.rate, clock.clone()));
         let scheduler = Self {
+            source: Mutex::new(source),
             config,
             cpus: cpus.max(1),
             index,
             clock,
             limiter,
             machine: Mutex::new(Machine {
-                source,
                 status: Status {
-                    sample,
+                    sample: sample.clone(),
                     workers: 1,
                     paused: None,
                     admission: None,
@@ -69,15 +69,24 @@ impl Scheduler {
                 watch: None,
             }),
         };
-        scheduler.sample();
+        scheduler.update(sample);
         scheduler
     }
     pub fn sample(&self) {
+        // Proc/sys reads and an optional compositor probe never hold the state
+        // mutex needed by query status or by a writer admission decision.
+        let sample = self
+            .source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sample();
+        self.update(sample);
+    }
+    fn update(&self, sample: Sample) {
         let mut m = self
             .machine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sample = m.source.sample();
         let paused = match (self.config.battery_pause, sample.battery, sample.io) {
             (true, Some(true), _) => Some(Blocked::Battery),
             (true, None, _) | (_, _, None) => Some(Blocked::Unavailable),
@@ -176,6 +185,9 @@ impl Control for Scheduler {
         m.status.required_disk = required_disk;
         m.status.available_disk = disk;
         result
+    }
+    fn workers(&self) -> usize {
+        self.status().workers
     }
     fn limiter(&self) -> Arc<Limiter> {
         self.limiter.clone()

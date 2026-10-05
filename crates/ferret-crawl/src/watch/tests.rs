@@ -376,3 +376,37 @@ fn a_complete_root_retires_old_policy_inputs_but_partial_work_keeps_them() {
     tree.watch.drain().unwrap();
     assert!(tree.watch.status().pending > 0);
 }
+
+#[test]
+fn a_deferred_burst_keeps_its_oldest_age_when_collapsed_to_a_complete_backstop() {
+    let watch = Watch::new(Config {
+        scopes: 2,
+        bytes: 1024,
+        watch_cap: 10,
+    })
+    .unwrap_or_else(|e| panic!("fixture: {e:?}"));
+    watch.backstop(RefreshReason::Backstop);
+    let first = Instant::now() - Duration::from_secs(10);
+    watch
+        .state
+        .lock()
+        .unwrap_or_else(|e| panic!("fixture: {e:?}"))
+        .first = Some(first);
+    let burst = watch.take().unwrap_or_else(|| panic!("missing burst"));
+    watch.finish(burst, false);
+    assert_eq!(
+        watch
+            .state
+            .lock()
+            .unwrap_or_else(|e| panic!("fixture: {e:?}"))
+            .first,
+        Some(first)
+    );
+    assert!(
+        watch
+            .status()
+            .oldest
+            .is_some_and(|age| age >= Duration::from_secs(10))
+    );
+    assert_eq!(watch.status().backstop, Some(RefreshReason::Backstop));
+}

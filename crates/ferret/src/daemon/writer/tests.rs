@@ -81,16 +81,23 @@ fn command(host: &Host, root: &std::path::Path) -> Result<ferret_crawl::Report, 
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("writer reply: {e}"))
 }
-#[test]
-fn daemon_writer_reports_memory_blocked_preserves_caches_and_retries_the_complete_marker() {
+fn deferred_writer(reason: Blocked) {
     let tree = tree();
     let clock = Arc::new(Time::default());
     let source = Source(Arc::new(Mutex::new(Sample {
         cpu: Some(0.0),
-        io: Some(0.0),
-        battery: Some(false),
+        io: Some(if reason == Blocked::IoPressure {
+            11.0
+        } else {
+            0.0
+        }),
+        battery: Some(reason == Blocked::Battery),
         load: Some(0.0),
-        memory: Some(1 << 20),
+        memory: Some(if reason == Blocked::Memory {
+            1 << 20
+        } else {
+            10 << 30
+        }),
         idle: Idle::Unknown,
     })));
     let scheduler = Arc::new(Scheduler::new(
@@ -152,11 +159,21 @@ fn daemon_writer_reports_memory_blocked_preserves_caches_and_retries_the_complet
     };
     let old = engine.pin();
     fs::write(tree.0.join("tree/a.txt"), b"changed").unwrap_or_else(|e| panic!("fixture: {e}"));
-    assert!(matches!(
-        command(&host, &tree.0.join("tree")),
-        Err(IndexError::DeferredBulk(Blocked::Memory))
-    ));
+    assert!(
+        matches!(command(&host, &tree.0.join("tree")), Err(IndexError::DeferredBulk(actual)) if actual == reason)
+    );
     assert_eq!(engine.generation(), old.generation());
+    let query = ferret_query::Query::from_args([b"*.txt".as_slice()], std::time::SystemTime::now())
+        .unwrap_or_else(|e| panic!("query: {e}"));
+    let mut rows = 0;
+    engine
+        .pin()
+        .search(&query, |_| {
+            rows += 1;
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap_or_else(|e| panic!("query while paused: {e}"));
+    assert_eq!(rows, 1);
     assert!(std::ptr::eq(engine.pin().name_index(), old.name_index()));
     // The command's wake comes after the real deferred outcome was handled.
     server_receive
@@ -167,13 +184,18 @@ fn daemon_writer_reports_memory_blocked_preserves_caches_and_retries_the_complet
     super::fields(&host, &mut object);
     object.end();
     let json = String::from_utf8(json).unwrap_or_else(|e| panic!("status: {e}"));
-    assert!(json.contains("memory-blocked"), "{json}");
+    assert!(json.contains(reason.status()), "{json}");
     assert!(json.contains("Backstop"), "{json}");
     source
         .0
         .lock()
         .unwrap_or_else(|e| panic!("signals: {e}"))
         .memory = Some(10 << 30);
+    {
+        let mut sample = source.0.lock().unwrap_or_else(|e| panic!("signals: {e}"));
+        sample.io = Some(0.0);
+        sample.battery = Some(false);
+    }
     scheduler.sample();
     clock.sleep(Duration::from_secs(2));
     host.writer_send
@@ -201,4 +223,17 @@ fn daemon_writer_reports_memory_blocked_preserves_caches_and_retries_the_complet
         .unwrap_or_else(|_| panic!("writer panic"))
         .unwrap_or_else(|e| panic!("writer: {e}"));
     engine.close_writer();
+}
+
+#[test]
+fn daemon_writer_reports_memory_blocked_preserves_caches_and_retries_the_complete_marker() {
+    deferred_writer(Blocked::Memory);
+}
+#[test]
+fn daemon_writer_battery_pause_keeps_queries_usable_and_retries_after_charging() {
+    deferred_writer(Blocked::Battery);
+}
+#[test]
+fn daemon_writer_io_spike_keeps_queries_usable_and_retries_when_calm() {
+    deferred_writer(Blocked::IoPressure);
 }

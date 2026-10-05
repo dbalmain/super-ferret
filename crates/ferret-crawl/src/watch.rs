@@ -741,12 +741,15 @@ impl Watch {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.running = false;
-        s.inflight_first = None;
+        let observed_first = s.inflight_first.take();
         if success {
             if burst.marker.is_some() && s.backstop == burst.marker {
                 s.backstop = None;
             }
         } else {
+            // Admission refusals may repeat for hours. They must not reset
+            // the age of the work the daemon has still not observed.
+            s.first = s.first.into_iter().chain(observed_first).min();
             s.policy_refreshed.clear();
             loss(
                 &mut s,

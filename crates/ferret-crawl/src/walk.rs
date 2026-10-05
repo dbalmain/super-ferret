@@ -921,6 +921,7 @@ pub(crate) enum IoPoint {
     Directory,
     OpenDirectory,
     Child,
+    Readlink,
     Listing(usize),
 }
 #[cfg(test)]
@@ -938,25 +939,6 @@ fn inject(root: &Path, point: IoPoint, rel: &Path) -> Option<(IoOp, io::Error)> 
         .find(|(r, _)| r == root)
         .map(|(_, h)| h.clone());
     hook.and_then(|h| h(point, rel))
-}
-
-#[cfg(test)]
-pub(crate) type FailReadlink = Box<dyn Fn(&OsStr) -> bool>;
-
-#[cfg(test)]
-pub(crate) type FailList = Box<dyn Fn(&Path) -> Option<io::Error>>;
-
-#[cfg(test)]
-thread_local! {
-    /// Injects a listing error into the real walker on the calling thread.
-    pub(crate) static FAIL_LIST: std::cell::RefCell<Option<FailList>> =
-        const { std::cell::RefCell::new(None) };
-    /// Test seam: makes `readlink` fail for the names it accepts. The walker
-    /// reads a link through the `O_PATH` descriptor it just statted, which no
-    /// unprivileged test can make fail. Like [`AFTER_OPEN`], it reaches only
-    /// walks on the calling thread (one worker).
-    pub(crate) static FAIL_READLINK: std::cell::RefCell<Option<FailReadlink>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1140,10 +1122,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     fn list(&mut self, dir: BorrowedFd<'_>, context: FaultContext<'_, V::Dir>) -> Option<Children> {
         self.visit.observing(dir, bytes_path(&self.rel));
         #[cfg(test)]
-        if let Some(error) =
-            FAIL_LIST.with_borrow(|hook| hook.as_ref().and_then(|hook| hook(bytes_path(&self.rel))))
-        {
-            self.fail(IoOp::List, context, error);
+        if let Some((op, error)) = inject(&self.root, IoPoint::Listing(0), bytes_path(&self.rel)) {
+            self.fail(op, context, error);
             return None;
         }
         let mut children = Children {
@@ -1393,7 +1373,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         name: &OsStr,
         decision: Decision,
     ) -> Option<Job<V::Dir>> {
-        let (stat, target) = match observe_link(here.fd, name) {
+        let (stat, target) = match observe_link(here.fd, name, &self.root, bytes_path(&self.rel)) {
             Ok(pair) => pair,
             Err((op, error)) => {
                 self.fail_child(op, here.token, name, error);
@@ -1963,6 +1943,8 @@ fn normalize(path: &Path) -> PathBuf {
 fn observe_link(
     dir: BorrowedFd<'_>,
     name: &OsStr,
+    _root: &Path,
+    _relative: &Path,
 ) -> Result<(rustix::fs::Stat, Option<OsString>), (IoOp, io::Error)> {
     let lstat = |error: Errno| (IoOp::Lstat, io::Error::from(error));
     let fd = openat(dir, name, link_flags(), Mode::empty()).map_err(lstat)?;
@@ -1974,11 +1956,8 @@ fn observe_link(
     // to (Linux 2.6.39), so the target cannot be a different inode from
     // `stat`.
     #[cfg(test)]
-    if FAIL_READLINK.with_borrow(|fail| fail.as_ref().is_some_and(|fail| fail(name))) {
-        return Err((
-            IoOp::Readlink,
-            io::Error::other("injected readlink failure"),
-        ));
+    if let Some(error) = inject(_root, IoPoint::Readlink, _relative) {
+        return Err(error);
     }
     let raw = readlinkat(&fd, "", Vec::new())
         .map_err(|error| (IoOp::Readlink, io::Error::from(error)))?;

@@ -884,7 +884,9 @@ fn observe(
             watch.begin_policy_root(root);
         }
         let walk_options = WalkOptions {
-            workers: options.workers,
+            workers: options.bulk.as_ref().map_or(options.workers, |control| {
+                control.workers().min(options.workers.max(1))
+            }),
             boundaries: plan.boundaries(root),
         };
         let mut visitors = walk_parallel(
@@ -1389,7 +1391,7 @@ impl<'a> Hasher<'a> {
             hook(self.root, Probe::Claimed);
         }
         let mut file = file;
-        let content = self.reader.read(&mut file);
+        let content = self.reader.read(&mut file, stat.size);
         #[cfg(test)]
         hook(self.root, Probe::Hashed(decided.path));
         let content = content.and_then(|c| observe::bracket(&file, &stat, c));

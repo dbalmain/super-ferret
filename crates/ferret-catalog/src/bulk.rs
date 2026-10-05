@@ -49,6 +49,8 @@ impl std::fmt::Display for Blocked {
 pub trait Control: Send + Sync + std::fmt::Debug {
     fn admit(&self, kind: Kind, view: &Catalog) -> Result<(), Blocked>;
     fn limiter(&self) -> Arc<Limiter>;
+    /// Current concurrency ceiling when crawl starts a new worker pool.
+    fn workers(&self) -> usize;
 }
 
 /// Monotonic clock and waiting mechanism shared by production and tests.
@@ -112,10 +114,12 @@ impl Limiter {
     /// transfer, never after this one or after durable publication.
     pub fn transfer<T>(&self, bytes: usize, run: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
         if self.rate == 0 {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .bytes += bytes as u64;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.bytes = state.bytes.saturating_add(bytes as u64);
+            drop(state);
             return run();
         }
         let _transfer = self
@@ -131,11 +135,7 @@ impl Limiter {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.bytes = s.bytes.saturating_add(bytes as u64);
-            let delay = if self.rate == 0 {
-                Duration::ZERO
-            } else {
-                s.next.saturating_sub(self.clock.now())
-            };
+            let delay = s.next.saturating_sub(self.clock.now());
             if !delay.is_zero() {
                 s.waits += 1;
                 s.waiting += 1;
@@ -150,15 +150,13 @@ impl Limiter {
                 .waiting -= 1;
         }
         let result = run();
-        if self.rate != 0 {
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .next = self
-                .clock
-                .now()
-                .saturating_add(Duration::from_secs_f64(bytes as f64 / self.rate as f64));
-        }
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next = self
+            .clock
+            .now()
+            .saturating_add(Duration::from_secs_f64(bytes as f64 / self.rate as f64));
         result
     }
     /// Advice failure is diagnostic and never turns readable content into a
@@ -281,6 +279,22 @@ mod tests {
                 assert!(bytes as f64 <= 1024.0 * window.as_secs_f64() + 256.0);
             }
         }
+    }
+    #[test]
+    fn a_stalled_transfer_cannot_bunch_completed_bytes_with_the_next_burst() {
+        let clock = Arc::new(Time::default());
+        let limiter = Limiter::new(1024, clock.clone());
+        limiter
+            .transfer(256, || {
+                *clock.0.lock().unwrap_or_else(|e| panic!("clock: {e}")) += Duration::from_secs(10);
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("IO: {e}"));
+        let first = clock.now();
+        limiter
+            .transfer(256, || Ok(()))
+            .unwrap_or_else(|e| panic!("IO: {e}"));
+        assert!(clock.now() - first >= Duration::from_millis(250));
     }
     #[test]
     fn checkpoint_scope_is_restored_after_unwind() {

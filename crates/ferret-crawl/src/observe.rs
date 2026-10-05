@@ -260,7 +260,7 @@ impl Reader {
 
     /// Sniffs and hashes an open file. The caller then checks the result
     /// with [`bracket`].
-    pub(crate) fn read(&mut self, file: &mut File) -> Result<Content, ContentFault> {
+    pub(crate) fn read(&mut self, file: &mut File, size: u64) -> Result<Content, ContentFault> {
         #[cfg(test)]
         {
             let stat = fstat(file.as_fd()).map_err(|e| ContentFault::Stat(e.into()))?;
@@ -276,11 +276,10 @@ impl Reader {
                 limiter.advice_failed();
             }
         }
-        let remaining = file.metadata().map_err(ContentFault::Read)?.len();
         let mut source = BulkRead {
             file,
             limiter: self.limiter.as_deref(),
-            remaining,
+            remaining: size,
         };
         let content = Self::sniff_and_hash(
             &mut self.buffer,
@@ -395,9 +394,12 @@ struct BulkRead<'a> {
 }
 impl Read for BulkRead<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let len = bytes
-            .len()
-            .min(self.remaining.max(1).min(CHUNK as u64) as usize);
+        // The opened handle already matched this size; the final stat bracket
+        // detects growth/shrinkage. EOF needs no transfer allowance or syscall.
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let len = bytes.len().min(self.remaining.min(CHUNK as u64) as usize);
         let n = if let Some(limiter) = self.limiter {
             limiter.transfer(len, || self.file.read(&mut bytes[..len]))?
         } else {
@@ -433,7 +435,10 @@ mod pacing_tests {
         let mut reader = Reader::new();
         reader.limiter = Some(limiter.clone());
         let content = reader
-            .read(&mut File::open(&path).unwrap_or_else(|e| panic!("fixture: {e:?}")))
+            .read(
+                &mut File::open(&path).unwrap_or_else(|e| panic!("fixture: {e:?}")),
+                bytes.len() as u64,
+            )
             .unwrap_or_else(|e| panic!("fixture: {e:?}"));
         assert_eq!(reader.bytes_read, bytes.len() as u64);
         assert!(matches!(content, Content::Hashed(_)));
@@ -444,7 +449,10 @@ mod pacing_tests {
         assert!(state.waits >= 3);
         let mut foreground = Reader::new();
         foreground
-            .read(&mut File::open(&path).unwrap_or_else(|e| panic!("fixture: {e:?}")))
+            .read(
+                &mut File::open(&path).unwrap_or_else(|e| panic!("fixture: {e:?}")),
+                bytes.len() as u64,
+            )
             .unwrap_or_else(|e| panic!("fixture: {e:?}"));
         assert_eq!(limiter.status().reserved_bytes, state.reserved_bytes);
         std::fs::remove_file(path).unwrap_or_else(|e| panic!("fixture: {e:?}"));

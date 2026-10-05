@@ -1512,8 +1512,12 @@ those wrappers. Nice 19 derives best-effort I/O level 7 on BFQ, but Dave's nine
 SCHED_IDLE's small CFS/EEVDF weight difference does not warrant an unsafe D11
 exception absent M7 evidence of foreground harm.
 
-Progress gates: **704 passed / 6 ignored**, +15 passing tests over 689/6;
-formatter and strict Clippy pass. Final gates follow the completed implementation.
+M6 gates: **708 passed / 6 ignored**, +19 passing tests over 689/6;
+formatter and strict workspace/all-target Clippy pass with zero warnings.
+Deferred retries preserve oldest pending age, including complete markers;
+no-watch hosts retain an explicit pending backstop. The original single-thread
+fault probes now use the existing root-keyed syscall seam across dedicated
+index threads, preserving their assertions and test count.
 M7 must measure paced/unpaced full compaction, controller reaction between
 phases, foreground/query latency, queue freshness/drainage, pinned/faulted
 fallback peaks, reserve calibration and source page-cache effects. No timing

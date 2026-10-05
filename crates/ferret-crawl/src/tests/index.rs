@@ -582,11 +582,13 @@ fn an_unreadable_directory_is_opaque_and_other_listing_faults_retain_old_childre
 
     // Same tree: the accessible directory now encounters an actual listing
     // error from the injected getdents seam, rather than a mirrored classifier.
-    crate::walk::FAIL_LIST.set(Some(Box::new(|path| {
-        (path == Path::new("open")).then(|| std::io::Error::from_raw_os_error(5))
-    })));
-    let result = index(&tmp.cat(), &roots, Refresh::All, &options(1));
-    crate::walk::FAIL_LIST.set(None);
+    let result = {
+        let _fault = super::coverage::Hook::set(&tmp.tree(), |point, path| {
+            (point == crate::walk::IoPoint::Listing(0) && path == Path::new("open"))
+                .then(|| (IoOp::List, std::io::Error::from_raw_os_error(5)))
+        });
+        index(&tmp.cat(), &roots, Refresh::All, &options(1))
+    };
     let report = result.unwrap();
     let faults = &report.coverage_faults;
     assert_eq!(faults.len(), 1);
@@ -658,9 +660,13 @@ fn a_readlink_failure_retains_the_old_edge_and_publishes_trustworthy_siblings() 
     let before = Catalog::open(&tmp.cat()).unwrap().unwrap();
 
     tmp.write("new.txt", b"new\n");
-    crate::walk::FAIL_READLINK.set(Some(Box::new(|name| name == "link")));
-    let result = index(&tmp.cat(), &roots, Refresh::All, &options(1));
-    crate::walk::FAIL_READLINK.set(None);
+    let result = {
+        let _fault = super::coverage::Hook::set(&tmp.tree(), |point, path| {
+            (point == crate::walk::IoPoint::Readlink && path == Path::new("link"))
+                .then(|| (IoOp::Readlink, std::io::Error::from_raw_os_error(5)))
+        });
+        index(&tmp.cat(), &roots, Refresh::All, &options(1))
+    };
     let report = result.unwrap();
     assert!(report.published.is_some());
     let faults = &report.coverage_faults;
@@ -1556,20 +1562,24 @@ fn index_workers_lower_their_own_nice_without_lowering_query_threads() {
             recorded.lock().unwrap().push(priority());
         }
     });
-    let options = IndexOptions {
-        workers: 2,
-        ..IndexOptions::default()
-    };
-    index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options).unwrap();
-    let worker = seen.lock().unwrap();
-    assert!(!worker.is_empty());
-    for &(nice, policy) in worker.iter() {
-        assert_eq!(nice, 19);
-        assert_ne!(nice, query.0);
-        assert_eq!(
-            policy, query.1,
-            "the revised M6 decision leaves the scheduling policy unchanged"
-        );
+    for workers in [1, 2] {
+        tmp.write("a.txt", if workers == 1 { b"first" } else { b"second" });
+        seen.lock().unwrap().clear();
+        let options = IndexOptions {
+            workers,
+            ..IndexOptions::default()
+        };
+        index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options).unwrap();
+        let worker = seen.lock().unwrap();
+        assert!(!worker.is_empty());
+        for &(nice, policy) in worker.iter() {
+            assert_eq!(nice, 19);
+            assert_ne!(nice, query.0);
+            assert_eq!(
+                policy, query.1,
+                "the revised M6 decision leaves the scheduling policy unchanged"
+            );
+        }
     }
     assert_eq!(priority(), query, "caller/query priority must not change");
 }

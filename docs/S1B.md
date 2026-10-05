@@ -689,7 +689,9 @@ without a host; live status reports PSI/load as numbers or `"unavailable"`,
 battery as boolean or `"unavailable"`, idle classification, worker target,
 blocked reason, required/available headroom, last admission kind/result and
 rate-limit byte/wait counters. Sequential advice failures are diagnostic.
-No-reuse advice is disabled and unmeasured.
+No-reuse advice is disabled and unmeasured. Deferred retries preserve the
+oldest pending age; a host without watches still reports a complete backstop
+marker and retries it before idle exit.
 
 ### Compaction, oversized fallback and politeness
 
@@ -765,8 +767,8 @@ best-effort I/O level 7 from nice 19 on schedulers that honour priority (BFQ).
 Dave's nine block devices use `none`, which ignores I/O priority; the 32 MiB/s
 bulk limiter is the actual I/O protection there. SCHED_IDLE adds only a small
 CFS/EEVDF weight difference over nice 19. Revisit an unsafe D11 exception only
-if M7 measures foreground harm that nice 19 plus pacing does not prevent. Gate new jobs between
-refreshes; the current crawl does not support mid-listing cancellation or an
+if M7 measures foreground harm that nice 19 plus pacing does not prevent. Re-read the worker target before creating a new root/fallback worker pool.
+Gate new jobs between refreshes; the current crawl does not support mid-listing cancellation or an
 instantaneous worker-count change. Check between content files/bulk phases where
 safe, and measure controller reaction latency rather than claim it stops fsync.
 Even a single crawl index worker runs on a dedicated thread, so nice 19 cannot
