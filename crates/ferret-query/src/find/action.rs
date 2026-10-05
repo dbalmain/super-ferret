@@ -232,11 +232,14 @@ impl Batch {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let batch = batches
                 .entry(self.exec.id)
-                .or_insert_with(|| Self::new(&self.exec, None, None));
+                .or_insert_with(|| Self::new(&self.exec, self.directory.clone(), None));
             for path in self.paths.drain(..) {
                 let bytes = path.as_bytes().len() + 1;
                 if batch.full(bytes, limit) {
-                    ready.push(std::mem::replace(batch, Self::new(&self.exec, None, None)));
+                    ready.push(std::mem::replace(
+                        batch,
+                        Self::new(&self.exec, self.directory.clone(), None),
+                    ));
                 }
                 batch.paths.push(path);
                 batch.bytes += bytes;
@@ -417,7 +420,10 @@ fn execute(
         let (directory, path) = exec_path(entry.path());
         (Some(directory), path)
     } else {
-        (None, entry.path().as_os_str().to_owned())
+        (
+            entry.cwd().map(Path::to_owned),
+            entry.path().as_os_str().to_owned(),
+        )
     };
     let handle = if exec.directory {
         Some(
@@ -434,7 +440,7 @@ fn execute(
             let batch = state
                 .staged
                 .entry(exec.id)
-                .or_insert_with(|| Batch::new(exec, None, None));
+                .or_insert_with(|| Batch::new(exec, directory.clone(), None));
             batch.bytes += path.as_bytes().len() + 1;
             batch.paths.push(path);
             // Bound worker staging by count and bytes. A single oversized path

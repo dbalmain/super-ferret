@@ -78,6 +78,7 @@ struct Removals {
 /// per-name allocation; cached failures share an owned error.
 #[derive(Clone)]
 pub struct Entry {
+    cwd: Option<Arc<PathBuf>>,
     path: Vec<u8>,
     /// The start operand's spelling is always a prefix of `path`.
     root_len: usize,
@@ -103,6 +104,7 @@ impl Entry {
     pub fn new(path: PathBuf, depth: usize, kind: FileKind) -> Self {
         let path = path.into_os_string().into_vec();
         Self {
+            cwd: None,
             root_len: path.len(),
             path,
             check_directory: false,
@@ -233,8 +235,19 @@ impl Entry {
                 .join(OsStr::from_bytes(&joined));
             lookup(&path)
         } else {
-            lookup(self.path())
+            lookup(self.lookup_path().as_ref())
         }
+    }
+
+    fn lookup_path(&self) -> std::borrow::Cow<'_, Path> {
+        match &self.cwd {
+            Some(cwd) => std::borrow::Cow::Owned(cwd.join(self.path())),
+            None => std::borrow::Cow::Borrowed(self.path()),
+        }
+    }
+
+    pub(super) fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref().map(PathBuf::as_path)
     }
 
     pub(super) fn directory_handle(&self) -> Option<Arc<File>> {
@@ -248,9 +261,9 @@ impl Entry {
         let Some(catalog) = &self.state.catalog else {
             return Ok(());
         };
-        if let Some((Target::Inode(id), false)) = self
-            .with_observed_path(|observed| resolve_observed(catalog, self.path(), true, observed))?
-        {
+        if let Some((Target::Inode(id), false)) = self.with_observed_path(|observed| {
+            resolve_observed(catalog, self.lookup_path().as_ref(), true, observed)
+        })? {
             if catalog.kind(id) == Kind::Symlink {
                 return Ok(());
             }
@@ -271,6 +284,7 @@ impl Entry {
                 return self.kind();
             }
             let mut entry = Entry::new(self.path().to_owned(), self.state.depth, FileKind::Symlink);
+            entry.cwd = self.cwd.clone();
             entry.state.catalog = self.state.catalog.clone();
             entry.state.directory = self.state.directory.clone();
             entry.state.target = self.state.target;
@@ -742,8 +756,10 @@ impl LiveWalk {
                         PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
                             .join(OsStr::from_bytes(child.bytes))
                     });
-                    let missing = fs::symlink_metadata(observed.as_deref().unwrap_or(entry.path()))
-                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+                    let missing = fs::symlink_metadata(
+                        observed.as_deref().unwrap_or(entry.lookup_path().as_ref()),
+                    )
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
                     entry.path.truncate(own_len);
                     let removed_here = matches!(child.target, Target::Inode(id) if self.removed_children.as_ref().is_some_and(|removed| removed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entries.contains(&id)));
                     if missing && (child.kind != Kind::Dir || removed_here) {
@@ -940,6 +956,7 @@ impl LiveWalk {
                 let path = self.paths.next()?;
                 let follow = self.options.follow != Follow::Physical;
                 self.entry = Entry::new(path, 0, FileKind::File);
+                self.entry.cwd = self.options.cwd.clone();
                 self.entry.removed_children = self.removed_children.clone();
                 if self.options.retain_parent
                     && (self.catalog.is_none() || self.options.live_checks)
@@ -951,17 +968,18 @@ impl LiveWalk {
                 }
                 if let Some(catalog) = &self.catalog {
                     if self.options.delete {
-                        self.entry.state.parent = std::path::absolute(self.entry.path())
-                            .ok()
-                            .as_deref()
-                            .and_then(Path::parent)
-                            .and_then(|parent| resolve(catalog, parent, true).ok().flatten())
-                            .and_then(|(target, remainder)| match target {
-                                Target::Inode(id) if !remainder => Some(id),
-                                _ => None,
-                            });
+                        self.entry.state.parent =
+                            std::path::absolute(self.entry.lookup_path().as_ref())
+                                .ok()
+                                .as_deref()
+                                .and_then(Path::parent)
+                                .and_then(|parent| resolve(catalog, parent, true).ok().flatten())
+                                .and_then(|(target, remainder)| match target {
+                                    Target::Inode(id) if !remainder => Some(id),
+                                    _ => None,
+                                });
                     }
-                    let resolved = match resolve(catalog, self.entry.path(), follow || self.entry.path.ends_with(b"/")) {
+                    let resolved = match resolve(catalog, self.entry.lookup_path().as_ref(), follow || self.entry.path.ends_with(b"/")) {
                         Ok(Some(resolved)) => resolved,
                         Ok(None) => return Some(Err(self.entry.error(io::Error::other(
                             "start is outside the catalog or the index is stale; run ferret index DIR or use -I"
@@ -976,7 +994,7 @@ impl LiveWalk {
                         self.entry.state.kind = Some(catalog_kind(catalog.kind(id)));
                         self.entry.state.follow = follow || self.entry.path.ends_with(b"/");
                         self.entry.state.followed_symlink =
-                            resolve(catalog, self.entry.path(), false)
+                            resolve(catalog, self.entry.lookup_path().as_ref(), false)
                                 .ok()
                                 .flatten()
                                 .is_some_and(|(target, _)| target != resolved.0);
@@ -1107,7 +1125,10 @@ impl LiveWalk {
                     .metadata
                     .get_or_init(|| {
                         cached_metadata(
-                            Path::new(OsStr::from_bytes(&path[..level.path_len])),
+                            &entry.cwd.as_ref().map_or_else(
+                                || PathBuf::from(OsStr::from_bytes(&path[..level.path_len])),
+                                |cwd| cwd.join(OsStr::from_bytes(&path[..level.path_len])),
+                            ),
                             level.own.follow,
                         )
                     })
@@ -1274,7 +1295,7 @@ fn catalog_kind(kind: Kind) -> FileKind {
 }
 
 fn parent_handle(entry: &Entry) -> io::Result<Arc<File>> {
-    let (parent, _) = super::action::exec_path(entry.path());
+    let (parent, _) = super::action::exec_path(entry.lookup_path().as_ref());
     Ok(Arc::new(File::from(open(
         &parent,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,

@@ -11,7 +11,9 @@ use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, Instant, SystemTime};
 
-use ferret_catalog::{Catalog, Kind, Section};
+use ferret_catalog::{Catalog, Kind};
+
+use crate::engine::Engine;
 use ferret_query::{Query, Row, Stats};
 
 use crate::cli::{Context, Exit, error};
@@ -85,8 +87,8 @@ fn search(
     started: Instant,
     outcome: &mut Outcome,
 ) -> Exit {
-    let catalog = match Catalog::open(&context.index) {
-        Ok(Some(catalog)) => catalog,
+    let engine = match Engine::open(&context.index) {
+        Ok(Some(engine)) => engine,
         Ok(None) => {
             error(&format!(
                 "no index in {}: run `ferret index DIR` first",
@@ -101,23 +103,19 @@ fn search(
             return Exit::Error;
         }
     };
+    let session = engine.pin();
+    let catalog = session.catalog();
     outcome.size = Some((catalog.name_count(), catalog.inode_count()));
-    // A plain listing prints only paths, so it reads no inode column.
-    if json && let Err(e) = catalog.load(&JSON_SECTIONS) {
-        error(&format!("{}: {e}", context.index.display()));
-        outcome.error = Some("read");
-        return Exit::Error;
-    }
 
     let stdout = io::stdout();
     let tty = stdout.is_terminal();
     let mut out = BufWriter::with_capacity(64 << 10, stdout.lock());
     let mut line = Vec::new();
     let mut failed: Option<io::Error> = None;
-    let result = query.run(&catalog, |row| {
+    let result = session.search(query, |row| {
         line.clear();
         if json {
-            json_row(&mut line, &catalog, row);
+            json_row(&mut line, catalog, row);
         } else {
             line.extend_from_slice(row.path);
         }
@@ -165,9 +163,6 @@ fn search(
         Exit::NoMatch
     }
 }
-
-/// What [`json_row`] reads beyond the row itself.
-const JSON_SECTIONS: [Section; 3] = [Section::Size, Section::Mtime, Section::Doc];
 
 /// One `--json` row: `path` (and `path_base64` when it is not UTF-8; see
 /// [`crate::json`]), `type`, `size` in bytes, `mtime` in Unix seconds, and

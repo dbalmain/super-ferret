@@ -67,6 +67,7 @@ impl Expression {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Options {
+    cwd: Option<std::sync::Arc<std::path::PathBuf>>,
     pub max_depth: Option<usize>,
     pub min_depth: usize,
     pub depth_first: bool,
@@ -265,7 +266,29 @@ struct Control {
 impl Plan {
     /// Parses a GNU find argument list, including leading ferret `-I`.
     pub fn parse(args: &[OsString]) -> Result<Self, ParseError> {
-        let mut plan = parse::parse(args)?;
+        Self::parse_context(args, None, std::time::SystemTime::now())
+    }
+
+    /// Parses against an explicit absolute cwd and a captured query start time.
+    /// Operand spelling is retained for output; lookup and action paths use
+    /// cwd.
+    pub fn parse_at(
+        args: &[OsString],
+        cwd: &Path,
+        started: std::time::SystemTime,
+    ) -> Result<Self, ParseError> {
+        if !cwd.is_absolute() {
+            return Err(ParseError::Feature("query cwd must be absolute".into()));
+        }
+        Self::parse_context(args, Some(std::sync::Arc::new(cwd.to_owned())), started)
+    }
+
+    fn parse_context(
+        args: &[OsString],
+        cwd: Option<std::sync::Arc<std::path::PathBuf>>,
+        started: std::time::SystemTime,
+    ) -> Result<Self, ParseError> {
+        let mut plan = parse::parse(args, cwd, started)?;
         plan.options.live_checks = has_actions(&plan.expression);
         plan.expression.visit(&mut |leaf| {
             plan.options.retain_parent |= matches!(leaf,

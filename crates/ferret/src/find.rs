@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
-use ferret_catalog::Catalog;
+use crate::engine::Engine;
 
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
 
@@ -62,8 +62,8 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
                 cli::error("find: cannot locate index; set --index or FERRET_INDEX, or use -I");
                 return Exit::NoMatch;
             };
-            let catalog = match Catalog::open(&index) {
-                Ok(Some(catalog)) => catalog,
+            let engine = match Engine::open(&index) {
+                Ok(Some(engine)) => engine,
                 Ok(None) => {
                     cli::error(&format!(
                         "find: no index in {}; run ferret index DIR or use -I",
@@ -79,13 +79,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
                     return Exit::NoMatch;
                 }
             };
-            if let Err(error) = catalog.load(&plan.catalog_sections()) {
-                cli::error(&format!(
-                    "find: cannot read index: {error}; re-index or use -I"
-                ));
-                return Exit::NoMatch;
-            }
-            Some(catalog)
+            Some(engine)
         }
     };
     if plan.permission_warning() {
@@ -96,11 +90,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
     let mut effects = Output::Stdout;
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
-        Some(catalog) => plan.run_parallel(
-            plan.parallel_catalog_source(catalog),
-            effects.clone(),
-            workers,
-        ),
+        Some(engine) => engine.pin().find(&plan, effects.clone(), workers),
         None => plan.run_parallel(plan.live_source(), effects.clone(), workers),
     };
     let outcome = match result {

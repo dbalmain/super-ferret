@@ -27,6 +27,7 @@
 
 pub mod args;
 pub mod cli;
+pub mod engine;
 pub mod find;
 pub mod index;
 pub mod json;
