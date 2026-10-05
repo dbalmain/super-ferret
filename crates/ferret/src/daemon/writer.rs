@@ -399,6 +399,10 @@ fn serve(
         if retry_due.is_some_and(|retry| scheduler.now() < retry) {
             continue;
         }
+        // An expired retry is spent here. Left set, it would keep hiding the
+        // watch's next due time from the deadline, and a later `continue`
+        // would spin on the past deadline.
+        retry_due = None;
         options.workers = scheduler.status().workers;
         let paused = scheduler.status().paused;
         let burst = watch
