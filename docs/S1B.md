@@ -15,10 +15,10 @@ keeping BFS. D26's EACCES amendment, D29, D31, D34, D37 and the answered find
 F8/F10/F11/F12/F13 rules remain unchanged. D54 is Dave's later instruction to
 build the name index even though the earlier D48 conditional passed.
 
-D55 remains open. This design does not adopt its recommendation. D56 and D57
-are new open briefs: find action placement and socket encoding. Sections
-marked **proposed** depend on their answers; the engine and batch work can
-land before those host choices. No implementation should silently settle them.
+D55 remains open. This design does not adopt its recommendation. D56 A and
+D57 A are answered: actions execute locally through the shared engine, and
+batch and socket share the JSON-lines codec. D58 B selects the bounded
+hand-written request reader already built in M2a.
 
 M1's find context captures an open cwd capability as well as its absolute
 logical path and start time. A path alone fails if a command moves the cwd:
@@ -44,11 +44,9 @@ library; parsing/evaluation stays in `ferret-query`, observation stays in
 index-worker scheduling code belongs with crawl, using its existing `rustix`
 dependency. Any additional rustix features are reviewed in that build slice.
 
-The proposed JSON input codec does need **`ferret → serde_json`**, an external
-dependency absent today. D57 records that planned edge for batch as well as
-the socket. Update the enforced graph and manifest together when implementing
-it; this milestone changes neither. Reuse the current byte/base64 and JSON
-output helpers. Writing a second general JSON parser is not the engine's job.
+The JSON input codec uses the bounded hand-written request reader (D58 B),
+with round-trip and mutation-fuzz tests. Reuse the current byte/base64 and JSON
+output helpers; no new dependency edge is needed.
 
 ### Resident state
 
@@ -255,6 +253,46 @@ all committed output and contains the native status and timings. A parse or
 runtime failure still gets a begin/end block, with null generation when no
 view was selected. Never manufacture end after transport failure.
 
+Find requests add optional `capabilities`, an array of strings, and
+`child_stdin`, the string `"null"` or `"inherit"`. Unknown optional fields and
+unknown capability names are ignored; neither grants a known capability.
+Missing/null capabilities mean none. Missing/JSON-null child_stdin means no
+explicit policy, and is accepted for read-only requests only. Effects require
+`"local-effects"` and an explicit child_stdin policy. Interactive actions also
+require `"interactive"` and terminal stdin separate from the request stream.
+For example:
+
+```json
+{"id":"a1","op":"find","args":[".","-exec","echo","{}",";"],"cwd":"/work/project","capabilities":["local-effects"],"child_stdin":"null"}
+```
+
+Before preparation opens any output file or evaluation runs any action, find
+refusals emit `begin` then `end` with exit 1 and a typed `error` code:
+`LocalEffectsRequired`, `InteractiveRequired`, `Noninteractive`,
+`ChildStdinOnProtocol`, or `ChildStdinRequired`. `"inherit"` is forbidden on
+JSON-lines stdin even for read-only find; `--input FILE` permits it. Protocol
+stdin is never prompt input, even when attached to a terminal. No automatic
+approval occurs. File-input prompts are serialized, emitted as stderr bytes,
+and keep C-locale y/Y approval and closed child stdin after approval.
+
+Child stdout uses the existing bounded entry capture and commit gate. Child
+stderr streams independently as `stderr` events with the same `bytes_base64`,
+`record`, `part`, `last` fields as stdout. A scoped thread drains stderr while
+the worker drains stdout, avoiding deadlock when stderr fills before stdout.
+Each stderr read is a bounded record (at most 64 KiB, part 0, last true).
+Record ids are unique across both streams, allocated at each stdout commit or
+stderr read; concurrent reads/commits can reach the transport in a different
+id order. Stdout commit order and each child's stderr byte order are preserved;
+there is no total order between the streams or concurrent children. Stderr can
+interleave stdout parts and survives quit's discard of an entry's stdout,
+matching raw CLI stderr. End follows completed readers and awaited children.
+Child stderr never inherits either batch output descriptor. Transport failure
+ends the host without manufacturing an end event.
+
+Relative output-file names use the request's captured cwd handle. Batch never
+changes process cwd. Delete and execdir continue through observed parent
+handles, and default-mode predicates/deletion counts retain F8 B/F12 D.
+
 Set provisional limits of **1 MiB per input line**, **16,384 argv elements**
 and **64 KiB per output part**, checking encoded and decoded bytes. Reject an
 oversized/malformed request with a tagged error when its id is available;
@@ -311,7 +349,7 @@ permissions are the user's authentication, without a token or network service
 runtime directory under world-writable `/tmp`: absent usable XDG_RUNTIME_DIR,
 use the in-process fallback.
 
-**Proposed, D57 A:** use the batch JSON-lines query/event codec on the socket,
+**D57 A:** use the batch JSON-lines query/event codec on the socket,
 with a hello carrying protocol major/minor, build identity, catalog format,
 index identity, capabilities and limits. One active query per connection
 avoids a multiplexing scheduler; concurrent clients use separate connections.
@@ -581,7 +619,11 @@ render native output. Search's existing `--json` row schema stays intact; the
 wire begin/end framing does not leak into ordinary row-only search output.
 `ferret --json find ...` is a host flag, stripped before passing intact find
 argv, and emits structured stdout/diagnostic/end events for arbitrary output.
-Keep find operands named `--json` after `--` distinguishable. Add JSON output
+Keep find operands named `--json` after `--` distinguishable. M2c defers this
+CLI flag: the current raw find parser also rejects a leading-hyphen path after
+`--`, so satisfying that operand guard requires a parser extension beyond the
+flag and event writer. Batch's shared JSON effects adapter is built; CLI JSON
+and the operand parser follow separately. Add JSON output
 to stats, status and management commands too. Raw mode reproduces exact stdout
 and stderr bytes; the process returns the end block's native exit status.
 
@@ -598,14 +640,12 @@ live directory enumeration by pretending it is an index query. Pure indexed
 find may still do the live fallbacks in FIND. Explicit per-request cwd lookup
 and the existing observed parent handles apply there; the daemon never chdirs.
 
-**Proposed, D56 A:** find plans with `-exec`, `-execdir`, `-ok`, `-okdir`,
-`-delete` or file output execute in the **client**, through the same engine and
-find evaluator. Batch already hosts this evaluator in its own process. A
-one-shot effectful client opens a query-only resident engine; it does not use
-another tuned cold implementation. A daemon can continue watching changes,
-but does not execute, approve or proxy the client's commands. This is a proposed
-host-routing exception to D49's ordinary daemon query rule and needs Dave's
-answer before shipping it.
+**D56 A:** find plans with `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`
+or file output execute in the host receiving the request, through the same
+engine and find evaluator: batch now, the local client when the socket lands.
+A one-shot effectful client opens a query-only resident engine. A daemon can
+continue watching changes, but does not execute, approve or proxy commands.
+This is the answered host-routing exception to D49's ordinary daemon query rule.
 
 Keep stored default predicates and the per-invocation delete-count correction
 (F8 B/F12 D). Do **not** turn an action expression into all-live stat or `-I`.
@@ -628,13 +668,6 @@ Prompt serialization and closed command stdin after approval remain unchanged.
 Agents can use `-exec` instead. No daemon request is permitted to borrow its
 own startup tty/environment as a substitute for the client's.
 
-If D56 B wins, first build and review a continuation/capability protocol: live
-observations and actions stay client-side, their Boolean results gate server
-expression/traversal progress, observed directory descriptors and deletion
-accounting are carried correctly, command batching is shared, and per-query
-cancellation cannot repeat effects. Its cost is not just a new output message.
-Neither choice changes D47/FIND; the remaining disagreement is latency versus
-the amount of host machinery to maintain.
 
 Search query logging happens once at the originating host (CLI or batch),
 with end-to-end timing and separate server work time. Keep D45's typed query

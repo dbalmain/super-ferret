@@ -5,21 +5,19 @@ use std::io::{self, BufRead, Write};
 use std::ops::ControlFlow;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
-use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
+use ferret_query::find::Plan;
+
 use ferret_query::{Query, Row};
 
 use crate::cli;
 use crate::engine::{Engine, QuerySession};
+use crate::find_json::{FrameOutput, diagnostic};
 use crate::json::Object;
 use crate::protocol::{self, Op, Request};
 use crate::search::json_row;
 use crate::xdg::Dirs;
-
-const PART: usize = 64 * 1024;
 
 pub(crate) fn main(args: impl Iterator<Item = OsString>) -> cli::Exit {
     let mut args = args;
@@ -42,8 +40,8 @@ pub(crate) fn main(args: impl Iterator<Item = OsString>) -> cli::Exit {
         None => None,
     };
     let result = match file {
-        Some(file) => process(io::BufReader::new(file)),
-        None => process(io::stdin().lock()),
+        Some(file) => process(io::BufReader::new(file), false),
+        None => process(io::stdin().lock(), true),
     };
     if let Err(error) = result {
         cli::error(&format!("batch: {error}"));
@@ -53,7 +51,7 @@ pub(crate) fn main(args: impl Iterator<Item = OsString>) -> cli::Exit {
     }
 }
 
-fn process(reader: impl BufRead) -> io::Result<()> {
+fn process(reader: impl BufRead, protocol_stdin: bool) -> io::Result<()> {
     let dirs = Dirs::from_env().ok();
     let index = std::env::var_os("FERRET_INDEX")
         .filter(|value| !value.is_empty())
@@ -81,7 +79,13 @@ fn process(reader: impl BufRead) -> io::Result<()> {
             continue;
         }
         match protocol::parse_request(&line) {
-            Ok(request) => handle(&request, &launch_cwd, &mut engine, dirs.as_ref())?,
+            Ok(request) => handle(
+                &request,
+                &launch_cwd,
+                &mut engine,
+                dirs.as_ref(),
+                protocol_stdin,
+            )?,
             Err(error) => emit_request_error(error.id.as_deref(), &error.kind.to_string())?,
         }
     }
@@ -118,6 +122,7 @@ fn handle(
     launch_cwd: &Path,
     engine: &mut Option<Engine>,
     dirs: Option<&Dirs>,
+    protocol_stdin: bool,
 ) -> io::Result<()> {
     match request.op {
         Op::Status => {
@@ -165,7 +170,7 @@ fn handle(
             })
         }
         Op::Search => search_request(request, engine.as_ref(), dirs),
-        Op::Find => find_request(request, launch_cwd, engine.as_ref()),
+        Op::Find => find_request(request, launch_cwd, engine.as_ref(), protocol_stdin),
     }
 }
 
@@ -277,7 +282,12 @@ fn search_request(
     })
 }
 
-fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -> io::Result<()> {
+fn find_request(
+    request: &Request,
+    launch_cwd: &Path,
+    engine: Option<&Engine>,
+    protocol_stdin: bool,
+) -> io::Result<()> {
     let started = Instant::now();
     let now = SystemTime::now();
     let session = engine.map(Engine::pin);
@@ -297,23 +307,22 @@ fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -
         .collect();
     let parsed = Plan::parse_at(&args, &cwd, now);
     let mut status = 1u8;
-    let host = FrameOutput {
-        id: &request.id,
-        record: Arc::new(AtomicU64::new(0)),
-    };
+    let host = FrameOutput::new(
+        &request.id,
+        request.child_stdin.unwrap_or(protocol::ChildStdin::Null),
+    );
     let mut query_error = None;
     match parsed {
-        Ok(plan) if plan.has_side_effects() => {
-            diagnostic(&request.id, "actions_unavailable", "error", None)?;
-            event(request, "end", |o| {
-                o.int("exit", 1)
-                    .bool("cancelled", false)
-                    .str("error", "find actions are not available until M2c")
-                    .int("elapsed_us", started.elapsed().as_micros() as i128);
-            })?;
-            return Ok(());
-        }
         Ok(plan) => {
+            if let Some(error) = crate::find_json::refusal(&plan, request, protocol_stdin) {
+                event(request, "end", |o| {
+                    o.int("exit", 1)
+                        .bool("cancelled", false)
+                        .str("error", error.code())
+                        .int("elapsed_us", started.elapsed().as_micros() as i128);
+                })?;
+                return Ok(());
+            }
             if plan.permission_warning() {
                 diagnostic(&request.id, "permission", "warning", None)?;
             }
@@ -346,6 +355,7 @@ fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -
             query_error = Some(error.to_string());
         }
     }
+    host.check_transport()?;
     event(request, "end", |o| {
         o.int("exit", status)
             .bool("cancelled", false)
@@ -356,107 +366,6 @@ fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -
     })
 }
 
-#[derive(Clone)]
-struct FrameOutput<'a> {
-    id: &'a str,
-    record: Arc<AtomicU64>,
-}
-impl Effects for FrameOutput<'_> {
-    fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
-        let mut bytes = path.as_os_str().as_bytes().to_vec();
-        bytes.push(if nul { 0 } else { b'\n' });
-        self.emit(&bytes)
-    }
-    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.emit(bytes)
-    }
-    fn error(&mut self, error: &WalkError) {
-        let _ = diagnostic(
-            self.id,
-            "walk",
-            "error",
-            Some(error.path.as_os_str().as_bytes()),
-        );
-    }
-    fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
-        let record = self.record.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut writer = FrameWriter {
-            id: self.id,
-            record,
-            part: 0,
-            pending: Vec::with_capacity(PART),
-        };
-        buffer.write_to(&mut writer)?;
-        writer.finish()
-    }
-}
-impl FrameOutput<'_> {
-    fn emit(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let record = self.record.fetch_add(1, Ordering::Relaxed) + 1;
-        emit_parts(self.id, record, bytes)
-    }
-}
-
-struct FrameWriter<'a> {
-    id: &'a str,
-    record: u64,
-    part: u64,
-    pending: Vec<u8>,
-}
-impl Write for FrameWriter<'_> {
-    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
-        let total = bytes.len();
-        while !bytes.is_empty() {
-            if self.pending.len() == PART {
-                frame(self.id, self.record, self.part, &self.pending, false)?;
-                self.part += 1;
-                self.pending.clear();
-            }
-            let take = (PART - self.pending.len()).min(bytes.len());
-            self.pending.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-        }
-        Ok(total)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.finish()
-    }
-}
-impl FrameWriter<'_> {
-    fn finish(&mut self) -> io::Result<()> {
-        if !self.pending.is_empty() {
-            frame(self.id, self.record, self.part, &self.pending, true)?;
-            self.pending.clear();
-        }
-        Ok(())
-    }
-}
-fn emit_parts(id: &str, record: u64, bytes: &[u8]) -> io::Result<()> {
-    let chunks: Vec<_> = bytes.chunks(PART).collect();
-    for (part, chunk) in chunks.iter().enumerate() {
-        frame(id, record, part as u64, chunk, part + 1 == chunks.len())?;
-    }
-    Ok(())
-}
-
-fn frame(id: &str, record: u64, part: u64, bytes: &[u8], last: bool) -> io::Result<()> {
-    let mut line = Vec::new();
-    let mut object = Object::new(&mut line);
-    object
-        .str("id", id)
-        .str("event", "stdout")
-        .int("record", record)
-        .int("part", part)
-        .bool("last", last)
-        .str("bytes_base64", &base64(bytes));
-    object.end();
-    send(&line)
-}
-fn base64(bytes: &[u8]) -> String {
-    let mut out = Vec::new();
-    crate::json::encode_base64(&mut out, bytes);
-    String::from_utf8(out).unwrap_or_default()
-}
 fn generation(object: &mut Object<'_>, value: Option<ferret_catalog::Generation>) {
     if let Some(value) = value {
         object.object("generation", |o| {
@@ -476,19 +385,6 @@ fn event(id: &Request, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Re
     let mut o = Object::new(&mut line);
     o.str("id", &id.id).str("event", name);
     fill(&mut o);
-    o.end();
-    send(&line)
-}
-fn diagnostic(id: &str, code: &str, severity: &str, path: Option<&[u8]>) -> io::Result<()> {
-    let mut line = Vec::new();
-    let mut o = Object::new(&mut line);
-    o.str("id", id)
-        .str("event", "diagnostic")
-        .str("code", code)
-        .str("severity", severity);
-    if let Some(path) = path {
-        o.bytes("path", path);
-    }
     o.end();
     send(&line)
 }

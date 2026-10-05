@@ -74,7 +74,7 @@ fn resident_search_and_find_emit_tagged_blocks_and_recover_after_bad_lines() {
 }
 
 #[test]
-fn read_only_find_refuses_actions_before_running_them() {
+fn find_requires_effects_capability_before_running_actions() {
     let tree = Tree::new();
     let marker = tree.0.join("marker");
     let line = format!(
@@ -85,7 +85,7 @@ fn read_only_find_refuses_actions_before_running_them() {
     assert_eq!(output.status.code(), Some(0));
     assert!(!marker.exists());
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("actions are not available until M2c"));
+    assert!(text.contains("LocalEffectsRequired"));
 }
 
 fn request(id: &str, args: &[&str], cwd: &str) -> Vec<u8> {
@@ -347,4 +347,418 @@ fn reload_adopts_a_writer_refresh_while_the_batch_engine_is_resident() {
         "{rest}"
     );
     assert!(rest.contains("\"engine_opens\":2"), "{rest}");
+}
+
+fn effects_request(args: &[&str], tree: &Tree) -> Vec<u8> {
+    let mut line = request("effect", args, tree.0.to_str().unwrap());
+    line.truncate(line.len() - 2);
+    line.extend_from_slice(b",\"capabilities\":[\"local-effects\"],\"child_stdin\":\"null\"}\n");
+    line
+}
+
+fn decoded_frames(output: &[u8], event: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for line in String::from_utf8(output.to_vec()).unwrap().lines() {
+        if field(line, "event") != Some(event) {
+            continue;
+        }
+        let encoded = field(line, "bytes_base64").unwrap();
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for chunk in encoded.as_bytes().chunks(4) {
+            let value = |b| alphabet.iter().position(|byte| *byte == b).unwrap_or(0) as u8;
+            let [a, b, c, d] = [
+                value(chunk[0]),
+                value(chunk[1]),
+                value(chunk[2]),
+                value(chunk[3]),
+            ];
+            bytes.push(a << 2 | b >> 4);
+            if chunk[2] != b'=' {
+                bytes.push(b << 4 | c >> 2);
+            }
+            if chunk[3] != b'=' {
+                bytes.push(c << 6 | d);
+            }
+        }
+    }
+    bytes
+}
+
+fn tree_state(tree: &Tree) -> Vec<(std::path::PathBuf, &'static str, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        state: &mut Vec<(std::path::PathBuf, &'static str, Vec<u8>)>,
+    ) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let (kind, bytes) = if metadata.is_dir() {
+            ("dir", Vec::new())
+        } else if metadata.is_symlink() {
+            use std::os::unix::ffi::OsStrExt;
+            (
+                "symlink",
+                fs::read_link(path).unwrap().as_os_str().as_bytes().to_vec(),
+            )
+        } else {
+            ("file", fs::read(path).unwrap())
+        };
+        state.push((path.strip_prefix(root).unwrap().to_owned(), kind, bytes));
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), state);
+            }
+        }
+    }
+    let mut state = Vec::new();
+    for entry in fs::read_dir(&tree.0).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "index" && entry.file_name() != "home" {
+            visit(&tree.0, &entry.path(), &mut state);
+        }
+    }
+    state.sort();
+    state
+}
+
+#[test]
+fn effectful_find_matches_cli_bytes_status_and_tree() {
+    // These shapes also appear in find/action/tests.rs's differential corpus.
+    let cases: &[&[&str]] = &[
+        &["src", "-exec", "echo", "{}", ";"],
+        &["src", "-exec", "echo", "{}", "+"],
+        &["src", "-exec", "echo", "x{}y", ";"],
+        &["src", "-exec", "false", ";", "-o", "-print"],
+        &["src", "-exec", "false", "{}", "+", "-print"],
+        &["src", "-exec", "echo", "{}", "+", "-quit"],
+        &["src", "-print", "-exec", "echo", "{}", ";"],
+        &["src", "-execdir", "echo", "{}", ";"],
+        &["src", "-execdir", "echo", "{}", "+"],
+        &["src", "-delete", "-print"],
+        &[
+            "src", "-depth", "(", "-type", "f", "-o", "-empty", ")", "-delete", "-print",
+        ],
+        &["src", "-fprint", "result"],
+        &["src", "-fprint0", "result"],
+        &["src", "-fprintf", "result", "%p\\0"],
+        &["src", "missing", "-exec", "echo", "{}", ";", "-quit"],
+    ];
+    for args in cases {
+        let expected_tree = Tree::new();
+        let actual_tree = Tree::new();
+        let expected = fixture::command(FERRET, &expected_tree.0)
+            .arg("find")
+            .args(*args)
+            .output()
+            .unwrap();
+        let actual = actual_tree.run(&effects_request(args, &actual_tree));
+        assert!(actual.status.success(), "{args:?}: {:?}", actual.stderr);
+        assert_eq!(
+            decoded_frames(&actual.stdout, "stdout"),
+            expected.stdout,
+            "{args:?}"
+        );
+        let lines = event_lines(&actual.stdout, "effect");
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .contains(&format!("\"exit\":{}", expected.status.code().unwrap())),
+            "{args:?}: {lines:?}"
+        );
+        assert_eq!(
+            tree_state(&actual_tree),
+            tree_state(&expected_tree),
+            "{args:?}"
+        );
+    }
+}
+
+fn assert_json_lines(tree: &Tree, bytes: &[u8]) {
+    let mut child = fixture::command("python3", &tree.0)
+        .args([
+            "-c",
+            "import json,sys; [json.loads(line) for line in sys.stdin.buffer]",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn child_stderr_streams_exact_bytes_and_cannot_block_stdout() {
+    let tree = Tree::new();
+    // A sequential stdout-then-stderr drain hangs: the child fills stderr
+    // before ever writing stdout. The timeout bounds the entire process tree.
+    for script in [
+        "printf 'error\\000bytes\\377' >&2; printf output",
+        "head -c 131073 /dev/zero >&2; printf output",
+    ] {
+        let args = ["src", "-maxdepth", "0", "-exec", "sh", "-c", script, ";"];
+        let expected = fixture::bounded_command(FERRET, &tree.0)
+            .arg("find")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(expected.status.code(), Some(0));
+        let mut input = effects_request(&args, &tree);
+        input.extend_from_slice(b"{\"id\":\"after\",\"op\":\"status\"}\n");
+        let mut child = fixture::bounded_command(FERRET, &tree.0)
+            .arg("batch")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        let actual = child.wait_with_output().unwrap();
+        assert_eq!(
+            actual.status.code(),
+            Some(0),
+            "timeout or failure: {:?}",
+            actual.stderr
+        );
+        assert!(actual.stderr.is_empty());
+        assert_json_lines(&tree, &actual.stdout);
+        assert_eq!(decoded_frames(&actual.stdout, "stdout"), expected.stdout);
+        assert_eq!(decoded_frames(&actual.stdout, "stderr"), expected.stderr);
+        assert!(
+            String::from_utf8_lossy(&actual.stdout)
+                .contains("\"id\":\"after\",\"event\":\"status\"")
+        );
+        let lines = event_lines(&actual.stdout, "effect");
+        assert!(lines.last().unwrap().contains("\"exit\":0"));
+        let first_stderr = lines
+            .iter()
+            .position(|line| field(line, "event") == Some("stderr"))
+            .unwrap();
+        let first_stdout = lines
+            .iter()
+            .position(|line| field(line, "event") == Some("stdout"))
+            .unwrap();
+        assert!(
+            first_stderr < first_stdout,
+            "stderr should stream before the entry commits"
+        );
+    }
+}
+
+#[test]
+fn every_host_refusal_precedes_commands_and_output_file_preparation() {
+    for (options, expected_error, prompt) in [
+        (r#""child_stdin":"null""#, "LocalEffectsRequired", "-exec"),
+        (
+            r#""capabilities":["local-effects"],"child_stdin":"null""#,
+            "InteractiveRequired",
+            "-ok",
+        ),
+        (
+            r#""capabilities":["local-effects"],"child_stdin":"null""#,
+            "InteractiveRequired",
+            "-okdir",
+        ),
+        (
+            r#""capabilities":["local-effects","interactive"],"child_stdin":"null""#,
+            "Noninteractive",
+            "-ok",
+        ),
+        (
+            r#""capabilities":["local-effects","interactive"],"child_stdin":"null""#,
+            "Noninteractive",
+            "-okdir",
+        ),
+        (
+            r#""capabilities":["local-effects"],"child_stdin":"inherit""#,
+            "ChildStdinOnProtocol",
+            "-exec",
+        ),
+        (
+            r#""capabilities":["local-effects"]"#,
+            "ChildStdinRequired",
+            "-exec",
+        ),
+    ] {
+        let tree = Tree::new();
+        fs::write(tree.0.join("result"), b"do not truncate").unwrap();
+        // The unconditional exec and fprint precede the interactive action;
+        // validating only when confirm is reached would already mutate.
+        let mut input = request(
+            "refuse",
+            &[
+                "src",
+                "-exec",
+                "touch",
+                "MARKER",
+                ";",
+                "-fprint",
+                "result",
+                prompt,
+                "touch",
+                "PROMPT_MARKER",
+                ";",
+            ],
+            tree.0.to_str().unwrap(),
+        );
+        input.truncate(input.len() - 2);
+        input.extend_from_slice(format!(",{options}}}\n").as_bytes());
+        let output = tree.run(&input);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        assert_json_lines(&tree, &output.stdout);
+        assert!(!tree.0.join("MARKER").exists());
+        assert!(!tree.0.join("src/PROMPT_MARKER").exists());
+        assert!(!tree.0.join("PROMPT_MARKER").exists());
+        assert_eq!(fs::read(tree.0.join("result")).unwrap(), b"do not truncate");
+        let lines = event_lines(&output.stdout, "refuse");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].contains(&format!("\"error\":\"{expected_error}\"")),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("\"exit\":1"));
+    }
+}
+
+#[test]
+fn file_input_can_inherit_stdin_and_protocol_stdin_is_null_for_children() {
+    let tree = Tree::new();
+    let args = ["src", "-maxdepth", "0", "-exec", "cat", ";"];
+    let mut input = effects_request(&args, &tree);
+    let text = String::from_utf8(input.clone())
+        .unwrap()
+        .replace("\"child_stdin\":\"null\"", "\"child_stdin\":\"inherit\"");
+    fs::write(tree.0.join("requests"), text).unwrap();
+    let caller_stdin = b"caller input\0\xff\n";
+    fs::write(tree.0.join("caller"), caller_stdin).unwrap();
+    let actual = fixture::command(FERRET, &tree.0)
+        .args(["batch", "--input", "requests"])
+        .stdin(fs::File::open(tree.0.join("caller")).unwrap())
+        .output()
+        .unwrap();
+    let expected = fixture::command(FERRET, &tree.0)
+        .arg("find")
+        .args(args)
+        .stdin(fs::File::open(tree.0.join("caller")).unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(actual.status.code(), Some(0));
+    assert_eq!(decoded_frames(&actual.stdout, "stdout"), expected.stdout);
+    assert_eq!(expected.stdout, caller_stdin);
+    input.extend_from_slice(b"{\"id\":\"after\",\"op\":\"status\"}\n");
+    let actual = tree.run(&input);
+    assert_eq!(actual.status.code(), Some(0));
+    assert!(decoded_frames(&actual.stdout, "stdout").is_empty());
+    assert!(
+        String::from_utf8_lossy(&actual.stdout).contains("\"id\":\"after\",\"event\":\"status\"")
+    );
+}
+
+#[test]
+fn execdir_and_relative_file_outputs_use_request_cwd_without_chdir() {
+    let expected_tree = Tree::new();
+    let actual_tree = Tree::new();
+    let args = [
+        ".",
+        "-type",
+        "f",
+        "-execdir",
+        "sh",
+        "-c",
+        "test -f main.rs && touch MARKER && printf here",
+        ";",
+        "-fprint",
+        "result",
+    ];
+    let expected = fixture::command(FERRET, &expected_tree.0)
+        .current_dir(expected_tree.0.join("src"))
+        .arg("find")
+        .args(args)
+        .output()
+        .unwrap();
+    let input = String::from_utf8(effects_request(&args, &actual_tree))
+        .unwrap()
+        .replace(
+            &format!("\"cwd\":\"{}\"", actual_tree.0.display()),
+            &format!("\"cwd\":\"{}/src\"", actual_tree.0.display()),
+        );
+    let actual = actual_tree.run(input.as_bytes());
+    assert!(actual.status.success());
+    assert_eq!(decoded_frames(&actual.stdout, "stdout"), expected.stdout);
+    assert_eq!(expected.status.code(), Some(0));
+    assert!(
+        event_lines(&actual.stdout, "effect")
+            .last()
+            .unwrap()
+            .contains("\"exit\":0")
+    );
+    assert!(actual_tree.0.join("src/MARKER").exists());
+    assert!(expected_tree.0.join("src/MARKER").exists());
+    assert!(!actual_tree.0.join("MARKER").exists());
+    assert!(!actual_tree.0.join("result").exists());
+    assert_eq!(
+        fs::read(actual_tree.0.join("src/result")).unwrap(),
+        fs::read(expected_tree.0.join("src/result")).unwrap()
+    );
+    // The following request still resolves relative paths from launch cwd.
+    let after = actual_tree.run(&request(
+        "after",
+        &["src", "-maxdepth", "0", "-print"],
+        actual_tree.0.to_str().unwrap(),
+    ));
+    assert_eq!(decoded_frames(&after.stdout, "stdout"), b"src\n");
+}
+
+fn terminal_command(tree: &Tree, args: &[&str], answer: &str) -> std::process::Output {
+    fixture::bounded_command("python3", &tree.0).args([
+        "-c",
+        "import os,pty,subprocess,sys; master,slave=pty.openpty(); child=subprocess.Popen(sys.argv[2:],stdin=slave,stdout=subprocess.PIPE,stderr=subprocess.PIPE); os.close(slave); os.write(master,sys.argv[1].encode()+b'\\n'); out,err=child.communicate(); os.close(master); sys.stdout.buffer.write(out); sys.stderr.buffer.write(err); sys.exit(child.returncode)",
+        answer,
+        FERRET,
+    ]).args(args).output().unwrap()
+}
+
+#[test]
+fn file_input_interactive_actions_require_real_approval_and_close_child_stdin() {
+    for action in ["-ok", "-okdir"] {
+        for answer in ["y", "n"] {
+            let actual_tree = Tree::new();
+            let expected_tree = Tree::new();
+            let args = [
+                "src/main.rs",
+                action,
+                "sh",
+                "-c",
+                "touch MARKER; if read -r line; then printf unexpected; else printf closed; fi",
+                ";",
+            ];
+            let mut input = String::from_utf8(effects_request(&args, &actual_tree)).unwrap();
+            input = input.replace("[\"local-effects\"]", "[\"local-effects\",\"interactive\"]");
+            fs::write(actual_tree.0.join("requests"), input).unwrap();
+            let actual = terminal_command(&actual_tree, &["batch", "--input", "requests"], answer);
+            let mut cli_args = vec!["find"];
+            cli_args.extend_from_slice(&args);
+            let expected = terminal_command(&expected_tree, &cli_args, answer);
+            assert_eq!(actual.status.code(), Some(0), "{:?}", actual.stderr);
+            assert_eq!(actual.status, expected.status);
+            assert!(actual.stderr.is_empty());
+            assert_json_lines(&actual_tree, &actual.stdout);
+            assert_eq!(decoded_frames(&actual.stdout, "stdout"), expected.stdout);
+            assert_eq!(decoded_frames(&actual.stdout, "stderr"), expected.stderr);
+            assert_eq!(
+                actual_tree.0.join("MARKER").exists(),
+                expected_tree.0.join("MARKER").exists()
+            );
+            assert_eq!(
+                actual_tree.0.join("src/MARKER").exists(),
+                expected_tree.0.join("src/MARKER").exists()
+            );
+            if answer == "n" {
+                assert!(!actual_tree.0.join("MARKER").exists());
+                assert!(!actual_tree.0.join("src/MARKER").exists());
+            } else {
+                assert_eq!(expected.stdout, b"closed");
+            }
+        }
+    }
 }

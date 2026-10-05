@@ -41,6 +41,15 @@ pub(crate) struct Request {
     pub args: Vec<Vec<u8>>,
     pub cwd: Option<Vec<u8>>,
     pub limit: Option<u64>,
+    pub capabilities: Vec<String>,
+    pub child_stdin: Option<ChildStdin>,
+}
+
+/// Child stdin policy, independent of the host's request transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildStdin {
+    Null,
+    Inherit,
 }
 
 /// The `op` field: which command this request runs.
@@ -255,12 +264,32 @@ fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, Requ
         Some(_) => return Err(RequestErrorKind::InvalidField("limit")),
     };
 
+    let capabilities = match find_field(fields, "capabilities") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Arr(values)) => values
+            .iter()
+            .map(|value| match value {
+                Value::Str(name) => Ok(name.clone()),
+                _ => Err(RequestErrorKind::InvalidField("capabilities")),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(RequestErrorKind::InvalidField("capabilities")),
+    };
+    let child_stdin = match find_field(fields, "child_stdin") {
+        None | Some(Value::Null) => None,
+        Some(Value::Str(name)) if name == "null" => Some(ChildStdin::Null),
+        Some(Value::Str(name)) if name == "inherit" => Some(ChildStdin::Inherit),
+        Some(_) => return Err(RequestErrorKind::InvalidField("child_stdin")),
+    };
+
     Ok(Request {
         id,
         op,
         args,
         cwd,
         limit,
+        capabilities,
+        child_stdin,
     })
 }
 
@@ -709,9 +738,37 @@ mod tests {
                 op: Op::Search,
                 args: vec![],
                 cwd: None,
-                limit: None
+                limit: None,
+                capabilities: Vec::new(),
+                child_stdin: None,
             }
         );
+    }
+
+    #[test]
+    fn capabilities_and_child_stdin_are_typed_and_unknown_options_remain_ignored() {
+        let request = ok(br#"{"id":"a","op":"find","args":[],"capabilities":["local-effects","interactive","future"],"child_stdin":"inherit","future":{"nested":[true]}}"#);
+        assert_eq!(
+            request.capabilities,
+            ["local-effects", "interactive", "future"]
+        );
+        assert_eq!(request.child_stdin, Some(ChildStdin::Inherit));
+        assert_eq!(
+            ok(br#"{"id":"a","op":"find","args":[],"child_stdin":"null"}"#).child_stdin,
+            Some(ChildStdin::Null)
+        );
+        for (extra, field) in [
+            (r#""capabilities":"local-effects""#, "capabilities"),
+            (r#""capabilities":[true]"#, "capabilities"),
+            (r#""child_stdin":"pipe""#, "child_stdin"),
+            (r#""child_stdin":false"#, "child_stdin"),
+        ] {
+            let line = format!(r#"{{"id":"a","op":"find","args":[],{extra}}}"#);
+            assert_eq!(
+                err_kind(line.as_bytes()),
+                RequestErrorKind::InvalidField(field)
+            );
+        }
     }
 
     #[test]
@@ -968,6 +1025,18 @@ mod tests {
                 args,
                 cwd: self.bool().then(|| self.bytes(24)),
                 limit: self.bool().then(|| self.next() % 1_000_000),
+                capabilities: if self.bool() {
+                    vec!["local-effects".into(), "interactive".into()]
+                } else {
+                    vec![]
+                },
+                child_stdin: self.bool().then(|| {
+                    if self.bool() {
+                        ChildStdin::Null
+                    } else {
+                        ChildStdin::Inherit
+                    }
+                }),
             }
         }
     }
@@ -991,6 +1060,19 @@ mod tests {
         obj.byte_strings("args", req.args.iter().map(|a| a.as_slice()));
         obj.opt_byte_value("cwd", req.cwd.as_deref());
         obj.opt_int("limit", req.limit.map(|l| l as i128));
+        obj.byte_strings(
+            "capabilities",
+            req.capabilities.iter().map(String::as_bytes),
+        );
+        if let Some(policy) = req.child_stdin {
+            obj.str(
+                "child_stdin",
+                match policy {
+                    ChildStdin::Null => "null",
+                    ChildStdin::Inherit => "inherit",
+                },
+            );
+        }
         obj.end();
         out
     }

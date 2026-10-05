@@ -33,6 +33,7 @@ pub(crate) mod batch;
 pub mod cli;
 pub mod engine;
 pub mod find;
+mod find_json;
 pub mod index;
 pub mod json;
 pub mod log;

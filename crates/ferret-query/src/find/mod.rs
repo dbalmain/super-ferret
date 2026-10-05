@@ -381,6 +381,19 @@ impl Plan {
         has_actions(&self.expression)
     }
 
+    /// Whether the expression includes an interactive command action.
+    /// Hosts must validate prompt input before preparing any file or action.
+    pub fn requires_interactive(&self) -> bool {
+        let mut interactive = false;
+        self.expression.visit(&mut |leaf| {
+            interactive |= matches!(
+                leaf,
+                Expression::Action(action::Action::Exec(action::Exec { prompt: true, .. }))
+            );
+        });
+        interactive
+    }
+
     /// Creates the sequential live source. It never opens a catalog.
     pub fn live_source(&self) -> LiveWalk {
         LiveWalk::new(self.paths.clone(), self.options.clone())
