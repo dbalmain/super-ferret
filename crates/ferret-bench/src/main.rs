@@ -7,6 +7,10 @@
 //! ferret-bench query <catalog-dir> [query...]    the D40 query mix
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
+//! ferret-bench name-index-once <catalog-dir> open phases and query timings
+//! ferret-bench name-index-update <catalog-dir> <rows> publish that many name and inode rows and adopt
+//! ferret-bench name-index-compact <catalog-dir> compact and rebuild the index
+//! ferret-bench name-index-query <catalog-dir> <scope-path|-> <query> --plan postings|walk
 //! ferret-bench overlay-carry <catalog-dir> <count> one-inode geometric carries
 //! ferret-bench overlay-carry-boundary <catalog-dir> <rows> a large carry
 //! ```
@@ -88,6 +92,9 @@ fn main() -> ExitCode {
             ("name-index-once", [dir]) => name_index_once(Path::new(dir)),
             ("name-index-update", [dir, rows]) => name_index_update(Path::new(dir), rows),
             ("name-index-compact", [dir]) => name_index_compact(Path::new(dir)),
+            ("name-index-query", [dir, scope, query, flag, plan]) if flag == "--plan" => {
+                name_index_query(Path::new(dir), scope, query, plan)
+            }
             ("overlay-rename-once", [dir]) => overlay_rename_once(Path::new(dir)),
             ("overlay-carry", [dir, count]) => overlay_carry(Path::new(dir), count),
             ("overlay-carry-boundary", [dir, rows]) => overlay_carry_boundary(Path::new(dir), rows),
@@ -127,6 +134,10 @@ fn usage() -> ExitCode {
          ferret-bench log-open-once <catalog-dir>\n       \
          ferret-bench overlay-fill <catalog-dir> <rows>\n       \
          ferret-bench resident-once <catalog-dir> <query>\n       \
+         ferret-bench name-index-once <catalog-dir>\n       \
+         ferret-bench name-index-update <catalog-dir> <rows>\n       \
+         ferret-bench name-index-compact <catalog-dir>\n       \
+         ferret-bench name-index-query <catalog-dir> <scope-path|-> <query> --plan postings|walk\n       \
          ferret-bench overlay-rename-once <catalog-dir>\n       \
          ferret-bench overlay-carry <catalog-dir> <count>\n       \
          ferret-bench overlay-carry-boundary <catalog-dir> <rows>\n       \
@@ -1316,32 +1327,36 @@ fn name_index_once(dir: &Path) -> Result<()> {
     }
     // These are corpus scopes, not live filesystem lookups. Report absent
     // shapes instead of substituting a synthetic distribution for nixpkgs.
-    for basename in [
-        b"w".as_slice(),
-        b"super-ferret",
-        b"nixpkgs",
-        b"large-monorepo",
+    for (label, paths) in [
+        (
+            "w",
+            &[
+                "/synthetic/p0/w",
+                "/synthetic/p0.m3/transcend-offload.m3/dave-work-laptop.m3/dave.m3/w",
+                "/synthetic/p13.m3/transcend-offload.m3/dave-work-laptop.m3/dave.m3/w",
+            ][..],
+        ),
+        ("super-ferret", &["/synthetic/p0/w/super-ferret"][..]),
+        ("nixpkgs", &["/synthetic/p0/nixpkgs"][..]),
+        (
+            "large-monorepo",
+            &["/synthetic/p0/sandpit/large-monorepo"][..],
+        ),
     ] {
         let scope = catalog.dir_ids().find(|&dir| {
-            catalog
-                .dir_name(dir)
-                .is_some_and(|id| catalog.name(id).bytes == basename)
+            let mut path = Vec::new();
+            catalog.dir_path(dir, &mut path);
+            paths.iter().any(|expected| path == expected.as_bytes())
         });
         let Some(scope) = scope else {
-            println!("scope-unavailable {}", basename.escape_ascii());
+            println!("scope-unavailable {label}");
             continue;
         };
         let mut path = Vec::new();
         catalog.dir_path(scope, &mut path);
         println!("scope-path {}", path.escape_ascii());
         for text in ["case:package.json", "*.rs", "case:default.nix", "*ripgrep*"] {
-            name_query_samples(
-                &catalog,
-                &index,
-                text,
-                Some(scope),
-                &String::from_utf8_lossy(basename),
-            )?;
+            name_query_samples(&catalog, &index, text, Some(scope), label)?;
         }
     }
     println!("raw_scan_bytes={}", names.raw_scan_bytes());
@@ -1398,6 +1413,47 @@ fn name_query_samples(
     Ok(())
 }
 
+fn name_index_query(dir: &Path, scope_path: &str, text: &str, plan: &str) -> Result<()> {
+    use ferret_catalog::InoId;
+    let plan = match plan {
+        "postings" => ferret_query::NamePlan::Postings,
+        "walk" => ferret_query::NamePlan::ScopeWalk,
+        _ => return Err("--plan must be postings or walk".into()),
+    };
+    let catalog = open_catalog(dir)?.into_resident()?;
+    let index = ferret_query::NameIndex::new(&catalog);
+    let scope = if scope_path == "-" {
+        None
+    } else {
+        catalog
+            .dir_ids()
+            .find(|&id| {
+                let mut path = Vec::new();
+                catalog.dir_path(id, &mut path);
+                path == scope_path.as_bytes()
+            })
+            .ok_or("scope path not found")?
+            .into()
+    };
+    let scope = scope.map(|id: InoId| ferret_catalog::Handle {
+        generation: catalog.generation(),
+        id,
+    });
+    let query = Query::parse(text, SystemTime::now())?;
+    let start = Instant::now();
+    let mut rows = 0;
+    let stats = query.run_indexed_plan(&catalog, &index, scope, Some(plan), |_| {
+        rows += 1;
+        ControlFlow::Continue(())
+    })?;
+    println!(
+        "name-query query={text:?} plan={plan:?} rows={rows} candidates={} elapsed_ms={:.3}",
+        stats.candidates,
+        duration_ms(start.elapsed())
+    );
+    Ok(())
+}
+
 /// Name replacements and inode field changes, as in S1+'s overlay fixture.
 /// Publication and per-view cache adoption use real APIs. The fixture has no
 /// live filesystem, so kernel walking and hashing are deliberately excluded.
@@ -1405,6 +1461,7 @@ fn name_index_update(dir: &Path, count: &str) -> Result<()> {
     use ferret_catalog::log::{ChangeSet, Record};
     use ferret_catalog::{InoId, NameId, WriterSession};
     let count: u32 = count.parse()?;
+    refuse_shared_snapshot(dir)?;
     let setup = Instant::now();
     let mut session = WriterSession::open(dir)?;
     session.set_compaction_limits(ferret_catalog::CompactionLimits {
@@ -1414,6 +1471,7 @@ fn name_index_update(dir: &Path, count: &str) -> Result<()> {
         dead_percent: 100,
     });
     let previous = session.view();
+    let old_epoch = previous.generation().checkpoint;
     let writer_setup = setup.elapsed();
     let setup = Instant::now();
     let index = ferret_query::NameIndex::new(&previous);
@@ -1477,7 +1535,7 @@ fn name_index_update(dir: &Path, count: &str) -> Result<()> {
         duration_ms(publication + cache),
         rss.replace(' ', ""),
         peak.replace(' ', ""),
-        previous.generation().checkpoint,
+        old_epoch,
         current.generation().checkpoint
     );
     name_query_samples(&current, &next, "name-term:cache", None, "updated")?;
@@ -1485,9 +1543,11 @@ fn name_index_update(dir: &Path, count: &str) -> Result<()> {
 }
 
 fn name_index_compact(dir: &Path) -> Result<()> {
+    refuse_shared_snapshot(dir)?;
     let setup = Instant::now();
     let mut session = ferret_catalog::WriterSession::open(dir)?;
     let previous = session.view();
+    let old_epoch = previous.generation().checkpoint;
     let index = ferret_query::NameIndex::new(&previous);
     let setup_ms = duration_ms(setup.elapsed());
     let started = Instant::now();
@@ -1497,20 +1557,33 @@ fn name_index_compact(dir: &Path) -> Result<()> {
     let next = ferret_query::NameIndex::adopt(&current, Some(&index));
     let query_cache = started.elapsed();
     let names = current.resident_names().ok_or("resident compaction view")?;
-    let (rss, peak) = memory()?;
+    let (before_drop_rss, peak) = memory()?;
+    drop((index, previous));
+    let (after_drop_rss, _) = memory()?;
     println!(
-        "name-compact setup_ms={setup_ms:.3} writer_pause_ms={:.3} projection_build_ms={:.3} query_cache_ms={:.3} pause_ms={:.3} rss={} peak={} old_epoch={} epoch={} sequence={} index_payload_bytes={}",
+        "name-compact setup_ms={setup_ms:.3} writer_pause_ms={:.3} projection_build_ms={:.3} query_cache_ms={:.3} pause_ms={:.3} rss_before_drop={} rss_after_drop={} peak={} old_epoch={} epoch={} sequence={} index_payload_bytes={}",
         duration_ms(writer_pause),
         duration_ms(names.build_time()),
         duration_ms(query_cache),
         duration_ms(writer_pause + query_cache),
-        rss.replace(' ', ""),
+        before_drop_rss.replace(' ', ""),
+        after_drop_rss.replace(' ', ""),
         peak.replace(' ', ""),
-        previous.generation().checkpoint,
+        old_epoch,
         current.generation().checkpoint,
         current.generation().sequence,
         next.bytes()
     );
+    Ok(())
+}
+
+fn refuse_shared_snapshot(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let path = Catalog::snapshot_path(dir)?.ok_or("no snapshot")?;
+    let links = std::fs::metadata(path)?.nlink();
+    if links > 1 {
+        return Err(format!("refusing shared snapshot with {links} hard links").into());
+    }
     Ok(())
 }
 

@@ -1697,6 +1697,12 @@ impl<'c> NameReader<'c> {
     pub fn children(&self) -> impl Iterator<Item = InoId> + 'c {
         self.child_ids().map(|(_, child)| child)
     }
+    /// Base name parents in row order, decoding only the parent column.
+    pub fn parents(&self) -> impl Iterator<Item = InoId> + 'c {
+        let parents = self.parents;
+        packed::runs(self.count, move |first, out| parents.decode(first, out))
+            .map(|parent| InoId(parent as u32))
+    }
     /// Live epoch NameIds and their targets, decoding only the base child
     /// column.
     pub fn child_ids(&self) -> impl Iterator<Item = (NameId, InoId)> + 'c {

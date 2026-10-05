@@ -3,11 +3,29 @@
 //! The v4 encoder still obtains ordinary name bytes through those accessors.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
 
 use intpack::{bits, pfor128};
 
 use crate::{NameId, NameReader};
+
+#[derive(Default)]
+struct NameHasher(u64);
+
+impl Hasher for NameHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
+                .wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+}
 
 /// An owned fixed-width array; its codec is intpack, not a second decoder.
 pub(crate) struct Keys {
@@ -47,6 +65,60 @@ impl Keys {
     }
 }
 
+/// Sorted byte strings stored in one byte table with packed offsets.
+/// Strings are byte values: empty and non-UTF-8 entries are valid.
+pub struct PackedStrings {
+    table: Vec<u8>,
+    offsets: Keys,
+}
+
+impl PackedStrings {
+    /// Packs strings in the supplied order. The caller keeps them sorted when
+    /// binary search is required.
+    pub fn new(strings: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Self {
+        let strings: Vec<_> = strings.into_iter().collect();
+        let mut table = Vec::new();
+        let mut offsets = Vec::with_capacity(strings.len() + 1);
+        for string in strings {
+            offsets.push(table.len() as u64);
+            table.extend_from_slice(string.as_ref());
+        }
+        offsets.push(table.len() as u64);
+        Self {
+            table,
+            offsets: Keys::from_values(offsets.into_iter()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len - 1
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn get(&self, index: usize) -> &[u8] {
+        let start = self.offsets.get_offset(index);
+        let end = self.offsets.get_offset(index + 1);
+        &self.table[start..end]
+    }
+    pub fn binary_search(&self, needle: &[u8]) -> Result<usize, usize> {
+        let mut low = 0;
+        let mut high = self.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match self.get(mid).cmp(needle) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(low)
+    }
+    pub fn bytes(&self) -> usize {
+        self.table.capacity() + self.offsets.bytes()
+    }
+}
+
 /// Immutable base dictionary, packed row keys and PFor row postings. Keys are
 /// local to this object, never durable ids or handles across an epoch.
 pub struct ResidentNames {
@@ -71,7 +143,7 @@ impl ResidentNames {
         // Intern while streaming rows. Sort only distinct names, never one
         // borrowed slice per row; repeated names must not multiply build
         // scratch.
-        let mut lookup = HashMap::new();
+        let mut lookup: HashMap<_, _, BuildHasherDefault<NameHasher>> = HashMap::default();
         let mut ids = Vec::with_capacity(rows as usize);
         for (_, name) in names.runs_from(NameId(0)) {
             let next = lookup.len() as u32;
@@ -235,5 +307,41 @@ impl PackedNameLists {
     }
     pub fn bytes(&self) -> usize {
         self.counts.bytes() + self.offsets.bytes() + self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+mod packed_strings_tests {
+    use super::PackedStrings;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+    }
+
+    #[test]
+    fn packed_strings_round_trip_seeded_bytes() {
+        let mut rng = Rng(0x51b0_5eed);
+        let mut strings = vec![Vec::new(), vec![0xff, 0, 0x80], Vec::new()];
+        for _ in 0..512 {
+            let len = (rng.next() % 20) as usize;
+            strings.push((0..len).map(|_| rng.next() as u8).collect());
+        }
+        strings.sort();
+        strings.dedup();
+        let packed = PackedStrings::new(strings.iter());
+        assert_eq!(packed.len(), strings.len());
+        for (i, expected) in strings.iter().enumerate() {
+            assert_eq!(packed.get(i), expected);
+            assert_eq!(packed.binary_search(expected), Ok(i));
+        }
+        assert_eq!(packed.get(0), b"");
+        assert!(strings.iter().any(|string| !string.is_ascii()));
     }
 }

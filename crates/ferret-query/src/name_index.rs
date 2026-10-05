@@ -3,10 +3,11 @@
 //! owns the packed lists. Base state is shared, delta estimates are per view.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ferret_catalog::{
-    Catalog, Generation, Handle, InoId, NameId, PackedNameLists, RetryFromCurrent, Target,
+    Catalog, Generation, Handle, InoId, NameId, PackedNameLists, PackedStrings, RetryFromCurrent,
+    Target,
 };
 
 /// Candidate work, before the ordinary exact evaluator and output transaction.
@@ -25,10 +26,14 @@ pub struct NameEstimate {
 }
 
 struct Base {
-    terms: BTreeMap<Vec<u8>, u32>,
-    term_keys: PackedNameLists,
+    terms: OnceLock<TermIndex>,
     scopes: Vec<u32>,
     live_scopes: Vec<InoId>,
+}
+
+struct TermIndex {
+    terms: PackedStrings,
+    keys: PackedNameLists,
 }
 
 /// A resident name index for exactly one generation; old query pins retain
@@ -71,27 +76,9 @@ impl NameIndex {
             })
             .map_or_else(
                 || {
-                    let mut terms: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
-                    for key in 0..names.distinct_count() {
-                        let mut tokens = Vec::new();
-                        ferret_text::tokens(names.distinct_name(key), |token| {
-                            tokens.push(token.to_vec())
-                        });
-                        tokens.sort_unstable();
-                        tokens.dedup();
-                        for token in tokens {
-                            terms.entry(token).or_default().push(key);
-                        }
-                    }
-                    let term_keys = PackedNameLists::new(terms.values().map(Vec::as_slice));
-                    let terms = terms
-                        .into_keys()
-                        .enumerate()
-                        .map(|(i, term)| (term, i as u32))
-                        .collect();
                     let mut scopes = vec![0u32; checkpoint.base_dir_count() as usize];
-                    for (_, name) in checkpoint.name_reader().runs_from(NameId(0)) {
-                        scopes[name.parent.0 as usize] += 1;
+                    for parent in checkpoint.name_reader().parents() {
+                        scopes[parent.0 as usize] += 1;
                     }
                     for dir in (0..checkpoint.base_dir_count()).rev().map(InoId) {
                         if let Some(edge) = checkpoint.dir_name(dir) {
@@ -107,8 +94,7 @@ impl NameIndex {
                         })
                         .collect();
                     Arc::new(Base {
-                        terms,
-                        term_keys,
+                        terms: OnceLock::new(),
                         scopes,
                         live_scopes,
                     })
@@ -197,9 +183,11 @@ impl NameIndex {
         self.generation
     }
     pub fn bytes(&self) -> usize {
-        self.base.terms.keys().map(|term| term.len()).sum::<usize>()
-            + self.base.term_keys.bytes()
-            + self.base.scopes.len() * 4
+        self.base
+            .terms
+            .get()
+            .map_or(0, |terms| terms.terms.bytes() + terms.keys.bytes())
+            + self.base.scopes.capacity() * std::mem::size_of::<u32>()
             + self
                 .delta
                 .iter()
@@ -227,10 +215,11 @@ impl NameIndex {
             (0..names.distinct_count()).collect()
         } else {
             let mut candidates: Option<Vec<u32>> = None;
+            let term_index = self.base.terms.get_or_init(|| build_terms(names));
             for term in terms {
                 let mut keys = Vec::new();
-                if let Some(&list) = self.base.terms.get(*term) {
-                    self.base.term_keys.get(list, &mut keys);
+                if let Ok(list) = term_index.terms.binary_search(term) {
+                    term_index.keys.get(list as u32, &mut keys);
                 }
                 match &mut candidates {
                     None => candidates = Some(keys),
@@ -288,6 +277,27 @@ impl NameIndex {
             generation: self.generation,
             scope,
         })
+    }
+}
+
+fn build_terms(names: &ferret_catalog::ResidentNames) -> TermIndex {
+    let mut terms: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
+    for key in 0..names.distinct_count() {
+        let mut tokens = Vec::new();
+        ferret_text::tokens(names.distinct_name(key), |token| {
+            tokens.push(token.to_vec())
+        });
+        tokens.sort_unstable();
+        tokens.dedup();
+        for token in tokens {
+            terms.entry(token).or_default().push(key);
+        }
+    }
+    let strings = terms.keys().cloned().collect::<Vec<_>>();
+    let keys = PackedNameLists::new(terms.values().map(Vec::as_slice));
+    TermIndex {
+        terms: PackedStrings::new(strings),
+        keys,
     }
 }
 

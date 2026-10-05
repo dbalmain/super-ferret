@@ -47,7 +47,7 @@ pub use read::{
     Catalog, Contents, Entry, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN,
     Resolved, Target, WorkTree,
 };
-pub use resident_names::{PackedNameLists, ResidentNames};
+pub use resident_names::{PackedNameLists, PackedStrings, ResidentNames};
 pub use session::WriterSession;
 pub use transaction::{BeginError, CommitError, KeepError, Transaction};
 

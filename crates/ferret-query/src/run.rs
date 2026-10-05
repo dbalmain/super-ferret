@@ -114,14 +114,30 @@ impl Query {
         catalog: &Catalog,
         index: &crate::NameIndex,
         scope: Option<ferret_catalog::Handle<InoId>>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        self.run_indexed_plan(catalog, index, scope, None, emit)
+    }
+
+    /// Runs the measured name path with an optional forced candidate plan.
+    /// Intended for the benchmark driver to compare both strategies.
+    pub fn run_indexed_plan(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+        forced: Option<crate::NamePlan>,
         mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
         if scope.is_none() && self.names.is_empty() && self.driver.is_none() {
             return self.run(catalog, emit);
         }
-        let selection = self
+        let mut selection = self
             .name_selection(catalog, index, scope)
             .map_err(RunError::Stale)?;
+        if let Some(plan) = forced {
+            selection.estimate.plan = plan;
+        }
         let mut run = Run {
             query: self,
             catalog,
