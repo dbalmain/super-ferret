@@ -696,8 +696,10 @@ battery as boolean or `"unavailable"`, idle classification, worker target,
 blocked reason, required/available headroom, last admission kind/result and
 rate-limit byte/wait counters. Sequential advice failures are diagnostic.
 No-reuse advice is disabled and unmeasured. Deferred retries preserve the
-oldest pending age; a host without watches still reports a complete backstop
-marker and retries it before idle exit.
+oldest pending age and retain their locators when admission refuses a burst
+before observation begins. A lost queue, watch fault, or non-resumable partial
+attempt escalates to a complete backstop. A host without watches still reports
+a complete backstop marker and retries it before idle exit.
 
 ### Compaction, oversized fallback and politeness
 
@@ -738,10 +740,13 @@ configured reserve). A conservative estimate of current watch, locator, alias,
 policy dependency and pending-queue bytes is added to memory, alongside an
 optional fixed additional reserve. Existing resident and query-pin memory is
 already reflected in MemAvailable. Watch estimates run only at bulk admission,
-so ordinary entry bursts do not scan the descriptor map. Under insufficient headroom, discard the unpublished
-attempt, keep the selected generation and enqueue a complete backstop with a
-memory-blocked status. A typed deferred-bulk outcome must restore a usable
-writer/current caches under its lock. Do not checkpoint scoped batches, drop
+so ordinary entry bursts do not scan the descriptor map. Under insufficient
+headroom, discard the unpublished attempt and keep the selected generation.
+When refusal happens before observation begins, retain and retry its original
+scopes; escalate to a complete backstop only if the work was lost or cannot be
+resumed. Keep the memory-blocked status until the retry starts. A typed
+deferred-bulk outcome must restore a usable writer/current caches under its
+lock. Do not checkpoint scoped batches, drop
 retained faults, or launch another concurrent builder to catch up. Already
 admitted durable publication completes; recovery handles failures.
 

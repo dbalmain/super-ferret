@@ -171,6 +171,7 @@ pub struct Status {
 /// a new loss during observation has a different watermark and survives it.
 pub struct Burst {
     pending: BTreeMap<(i32, Vec<u8>), Hint>,
+    bytes: usize,
     marker: Option<(u64, RefreshReason)>,
     roots: BTreeSet<PathBuf>,
 }
@@ -724,11 +725,13 @@ impl Watch {
             return None;
         }
         s.running = true;
+        let bytes = s.bytes;
         s.bytes = 0;
         s.inflight_first = s.first.take();
         s.last = None;
         Some(Burst {
             pending: std::mem::take(&mut s.pending),
+            bytes,
             marker: s.backstop,
             roots: std::mem::take(&mut s.scoped_roots),
         })
@@ -755,6 +758,34 @@ impl Watch {
                 &mut s,
                 burst.marker.map_or(RefreshReason::Backstop, |(_, r)| r),
             );
+        }
+    }
+    /// Restores a burst refused before its observation began. Its locators and
+    /// age remain eligible when bulk admission opens again.
+    pub fn defer(&self, burst: Burst) {
+        let mut s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.running = false;
+        let observed_first = s.inflight_first.take();
+        s.first = s.first.into_iter().chain(observed_first).min();
+        s.policy_refreshed.clear();
+        for (key, hint) in burst.pending {
+            s.pending.entry(key).or_insert(hint);
+        }
+        s.bytes = s.bytes.saturating_add(burst.bytes);
+        s.scoped_roots.extend(burst.roots);
+        if let Some(marker) = burst.marker
+            && s.backstop.is_none_or(|current| current.0 < marker.0)
+        {
+            s.backstop = Some(marker);
+        }
+        if s.pending.len() > self.config.scopes || s.bytes > self.config.bytes {
+            loss(&mut s, RefreshReason::Overflow);
+        }
+        if !s.pending.is_empty() || !s.scoped_roots.is_empty() || s.backstop.is_some() {
+            s.last.get_or_insert_with(Instant::now);
         }
     }
     /// Retire watches only after checked catalog observation. Known removals

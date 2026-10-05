@@ -615,6 +615,55 @@ fn routed_index_commands_bypass_background_politeness_but_keep_admission() {
 }
 
 #[test]
+fn deferred_watch_burst_retries_its_scopes_after_battery_pause() {
+    let tree = Tree::new();
+    let proc = tree.base.join("signals/proc");
+    let power = tree.base.join("signals/power/BAT0");
+    fs::create_dir_all(proc.join("pressure")).unwrap();
+    fs::create_dir_all(&power).unwrap();
+    fs::write(proc.join("pressure/cpu"), "some avg10=0.00 avg60=0.00\n").unwrap();
+    fs::write(proc.join("pressure/io"), "some avg10=0.00 avg60=0.00\n").unwrap();
+    fs::write(proc.join("meminfo"), "MemAvailable: 1073741824 kB\n").unwrap();
+    fs::write(proc.join("loadavg"), "0.00 0.00 0.00 1/100 1\n").unwrap();
+    fs::write(power.join("type"), "Battery\n").unwrap();
+    fs::write(power.join("status"), "Charging\n").unwrap();
+    tree.start(&[
+        ("FERRET_SIGNAL_PROC", proc.to_str().unwrap()),
+        (
+            "FERRET_SIGNAL_POWER",
+            tree.base.join("signals/power").to_str().unwrap(),
+        ),
+        ("FERRET_BACKSTOP_MS", "60000"),
+    ]);
+    let (mut reader, _) = tree.connect();
+    wait(|| {
+        let status = block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n");
+        status.contains("\"current_operation\":\"idle\"")
+            && number(&status, "refreshes").unwrap_or_default() > 0
+    });
+
+    fs::write(power.join("status"), "Discharging\n").unwrap();
+    wait(|| block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n").contains("battery-paused"));
+    fs::write(
+        tree.base.join("src/deferred-burst.txt"),
+        "visible after resume",
+    )
+    .unwrap();
+    wait(|| {
+        let status = block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n");
+        status.contains("battery-paused")
+            && number(&status, "pending_scopes").unwrap_or_default() > 0
+    });
+    fs::write(power.join("status"), "Charging\n").unwrap();
+    wait(|| tree.run(&["search", "deferred-burst.txt"]).status.success());
+    let status = block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n");
+    assert!(
+        status.contains("\"last_refresh_reason\":\"Burst\""),
+        "deferred work escalated instead of resuming its scopes: {status}"
+    );
+}
+
+#[test]
 fn routed_full_rebuild_reports_memory_admission_reason_and_keeps_generation() {
     let tree = Tree::new();
     let proc = tree.base.join("signals/proc");

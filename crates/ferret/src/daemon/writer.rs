@@ -386,6 +386,12 @@ fn serve(
         if burst.is_none() && !initial {
             continue;
         }
+        if paused.is_none() {
+            host.writer_status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .blocked = None;
+        }
         host.writer_status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -441,14 +447,13 @@ fn serve(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .blocked = deferred;
-                if let Some(w) = &watch {
-                    w.abort_policy_roots();
+                if watch.is_none() {
+                    initial = true;
+                    host.writer_status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .fallback_backstop = true;
                 }
-                initial = true;
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .fallback_backstop = watch.is_none();
                 retry_due = Some(scheduler.now() + Duration::from_secs(1));
             }
             Ok(report) => {
@@ -491,10 +496,11 @@ fn serve(
         if let Some(burst) = burst
             && let Some(watch) = &watch
         {
-            watch.finish(
-                burst,
-                result.is_ok() && deferred.is_none() && !retry_current,
-            );
+            if deferred.is_some() {
+                watch.defer(burst);
+            } else {
+                watch.finish(burst, result.is_ok() && !retry_current);
+            }
         }
         host.writer_status
             .lock()
