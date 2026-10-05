@@ -70,7 +70,11 @@ Predecessors, carried forward where still open:
 | D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
 | D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 | D54 | In-memory names: interning, postings, row order          | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                 |
-| D55 | Storing mtime as an order rather than a value          | open           | rec D + F: blocked ordered dictionaries of seconds for mtime and ctime; racy rule for carry-over              |
+| D55 | Storing mtime as an order rather than a value          | answered       | D + F: seconds-only ordered dictionaries for mtime and ctime, exact per-block max, racy rule; no ordered structure |
+| D56 | Where an indexed find with actions executes            | answered       | A: action queries run in the client through the shared engine; routing exception to D49                        |
+| D57 | Socket codec: shared JSON lines or binary framing       | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                          |
+| D58 | Batch input: serde_json or a hand-written reader         | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                 |
+| D59 | How intpack enters the workspace                         | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                     |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3003,7 +3007,8 @@ order with BFS row postings, every output checked against the flat reference.
 
 ## D55 — Storing mtime as an order rather than a value
 
-**Status: open.** Raised by Dave, 2026-10-05. Measured the same day with
+**Status: answered, D + F with an exact per-block max (Dave, 2026-10-05).**
+Raised by Dave, 2026-10-05. Measured the same day with
 `scripts/mtime_columns.py` in the private `~/w/name-index-bench` (`d543475`), over a live walk of `$HOME` (4.2M entries, unfiltered, so
 including ignored paths) and `/nix/store` (4.5M), rows in ferret's order:
 directories breadth first, then files, siblings by name. **Revised the same
@@ -3106,9 +3111,67 @@ changes (some FUSE mounts) would make the ctime-only carry-over key unsafe
 there; those roots would need E for mtime. Indexing network mounts with
 badly skewed clocks would favour E for ctime on those roots.
 
+**Time bench (2026-10-05, private `~/w/time-index-bench` `804e592`,
+github.com/dbalmain/time-index-bench):** Rust, run by an Opus 5.5 subagent and
+spot-checked here. Load, per-event update, compaction and query costs for
+eight in-memory mtime structures under simulated events (single edits, a hot
+set, archive extracts with old mtimes, `npm install` ties, cargo build/clean,
+git checkout, `cp -p` restores, future mtimes, `rm -rf`, a mixed day), on
+`$HOME`, `/nix/store` and `$HOME` tiled ×22 (10.1M rows). Every answer is
+checked against a brute-force reference after every scenario, and a positive
+control proves the check catches a non-strict `-newer`, an ignored overlay and
+wrong tie order.
+
+| At 10M | b/row | `-mmin -5` | `-mtime -365` (5.6M hits) | newest 20 | update p99, single edit | compaction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| today's columns (sec + ns) | 44.7 | 5.5 ms | 8.0 ms | | | 265–297 ms |
+| C, seconds column | 14.1 | | | | | 97–132 ms |
+| D with block skipping | 11.6 | 1.03 ms | 6.45 ms | 2.65 ms | ~0.57 µs | 148–192 ms |
+| **D with an exact max per block** | **11.8** | **0.70 ms** | **6.0 ms** | **0.42 ms** | ~0.57 µs | 148–192 ms |
+| D + sorted permutation | 35.6 | 1 µs | 6.5 ms | 1.4 µs | ~0.57 µs | 282–329 ms |
+| D + binary heap | 75.6 | | ~230 ms | | 2.8 µs | 183–230 ms |
+| B-tree | 157.0 | 1 µs | 28 ms | | 2.0 µs | 346–385 ms |
+
+- No ordered structure earns its memory. The sorted permutation turns
+  selective windows and newest-k from sub-millisecond into microseconds for
+  +24 b/row (3× D's total) and 153 ms to build at load; the heap only answers
+  newest-k; the B-tree is 13× D's memory. Keeping any of them current is
+  cheap in CPU (microseconds per event); the cost is memory. Heap and B-tree
+  still pay at compaction, because renumbering InoIds relabels every id-keyed
+  order.
+- An exact maximum per block costs 0.25 b/row and gets the cheap part of the
+  permutation's win (newest 20: 2.65 → 0.42 ms).
+- D's base is 10.6 b/row at 10M against the 8.4 estimated above: ~0.44 is
+  ferret's 16 B block-table entry, the rest the tiled corpus's 27× distinct
+  seconds.
+- Combining with a name side, choosing between scanning the time column and
+  probing it per name-side id matters more than the structure: a probe costs
+  ~11 ns per id with D (~5 ns with the plain seconds column), and the
+  crossover at 10M is a name side of ~50–100k ids.
+- Block skipping weakens after compaction scatters recent edits (the bench
+  scatters them uniformly, which is pessimistic): `-mtime -1` 2.0 → 5.0 ms,
+  newest 20 0.42 → 2.3 ms. A real edit trace would settle how much.
+
+> Dave (2026-10-05): Agree with the recommendation.
+
+**Answer (2026-10-05):** D + F, with D's blocks carrying an exact maximum.
+
+- mtime: whole seconds as a blocked ordered dictionary (sorted distinct
+  seconds as packed deltas, a dense rank per inode in 128-row blocks), each
+  block with its exact maximum for skipping. The mtime nanoseconds column is
+  dropped; a printed mtime has whole seconds, and `-newer file` stats only
+  files in the reference's second to break that tie.
+- ctime: whole seconds in the same coding. D26's carry-over key becomes
+  `(dev, ino, size, ctime)` in seconds, with git's racy rule: a file whose
+  ctime is within a few seconds of its observation is recorded stale and
+  rehashed at the next crawl.
+- No in-memory ordered structure (sorted permutation, heap, B-tree). Time
+  queries scan with block skipping, and the planner chooses between scanning
+  and probing per name-side id from the name side's size.
+
 ## D56 — Where an indexed find with actions executes
 
-**Status: open.** S1b M0, 2026-10-05; [design](S1B.md#cli-and-find-effects).
+**Status: answered, A (Dave, 2026-10-05).** S1b M0, 2026-10-05; [design](S1B.md#cli-and-find-effects).
 
 **Question:** Should an indexed `find` with commands, deletion, prompts or file
 outputs execute in the client's instance of the shared engine, or keep its
@@ -3151,9 +3214,11 @@ measured callback and resident-memory savings large enough to justify its
 continuation protocol. Measure dense delete too; command spawning can hide RPC
 cost while deletion cannot.
 
+> Dave (2026-10-05): agreed with the recommendation, A.
+
 ## D57 — Share JSON lines with the socket, or add binary framing
 
-**Status: open.** S1b M0, 2026-10-05; [design](S1B.md#endpoint-and-request-context).
+**Status: answered, A (Dave, 2026-10-05).** S1b M0, 2026-10-05; [design](S1B.md#endpoint-and-request-context).
 
 **Question:** Should the daemon use batch's tagged JSON-lines codec, or a
 second binary socket codec for query/output blocks? Binary is faster for large
@@ -3192,9 +3257,11 @@ binary prototype reducing that cost enough to justify a second protocol. A
 large synthetic listing alone is useful evidence, not evidence that most agent
 queries have that shape.
 
+> Dave (2026-10-05): agreed with the recommendation, A.
+
 ## D58 — Batch input: adopt `serde_json`, or parse the request by hand
 
-**Status: open.** S1b M1 review, 2026-10-05. Raised because S1b M2, the batch host,
+**Status: answered, B (Dave, 2026-10-05).** S1b M1 review, 2026-10-05. Raised because S1b M2, the batch host,
 would add the workspace's first serde dependency. D57 records `ferret →
 serde_json` as common to both of its options. It does not offer the alternative.
 
@@ -3224,9 +3291,24 @@ the batch schema is small enough that B stays small.
 S1b M2 waits for this answer. M3 (D54's names) doesn't depend on it, so it goes
 first.
 
+> Dave (2026-10-05): I feel like B might be the right answer here. It gives
+> us more scope to optimise for our usecase. The thing that would steer me
+> toward serde would be if you think it's likely other tools might want to make
+> request to the daemon.
+
+**Answer (2026-10-05): B, a hand-written reader.** Other tools sending requests
+does not steer toward serde. The wire format is JSON lines either way (D57 A),
+so a client in any language uses its own JSON library, and the daemon's choice
+of parser is invisible to it. What other clients change is robustness: the
+reader must take any input. So B ships with a fuzz target and a property test
+that round-trips through `json.rs`'s writer and rejects malformed lines, with
+bounded depth and line length. The one case that would favour serde is a Rust
+client library shared with other tools. That would be a separate crate, and
+it could choose its own parser.
+
 ## D59 — How intpack enters the workspace
 
-**Status: open.** S1b M3, 2026-10-05.
+**Status: answered, A (Dave, 2026-10-05); intpack pushed at `6423815`.** S1b M3, 2026-10-05.
 
 **Question:** S1b M3 is the first code to use intpack, through D54's packed
 names and row postings in `ferret-catalog`. D11 said intpack "starts as a git
@@ -3264,3 +3346,16 @@ plan, and it keeps one copy of the codec.
 **Fact that would change it:** if intpack's API is going to churn alongside
 ferret for a while, so that most ferret changes need an intpack change, B
 removes the push-and-bump loop.
+
+> Dave (2026-10-05): We vendor in iff we want to make changes specific to our
+> project. Remember that we have plans for other indexing projects like a small
+> log search "Splunk in a single pod" utility. So, ideally, we'll keep adding
+> improvements that can be used in other projects and eventually, we'll push it
+> up to crates.io. Please do push it to GitHub though.
+
+**Answer (2026-10-05): A, a git dependency pinned by rev.** intpack's `main` was
+pushed on 2026-10-05 (`5e352f4..6423815`). General improvements go into
+intpack itself so that other indexing projects get them. Vendoring happens
+only for a change specific to Super Ferret. crates.io comes later, when the
+format settles. The `path = "../intpack"` dependency M3 started with switches
+to `git = "https://github.com/dbalmain/intpack", rev = "6423815…"`.
