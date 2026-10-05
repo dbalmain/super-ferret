@@ -76,6 +76,7 @@ usage:
                                 use -delete or -I for deletion-aware emptiness
   ferret search [--json] [--limit N] [--] ATOM...
                                 print each path that matches every ATOM
+  ferret batch [--input FILE]   process sequential JSON-lines requests
   ferret import-v3              import the legacy snapshot, preserving roots and DocIds
   ferret stats                  counts, sizes and a census of the index
   ferret help | --version

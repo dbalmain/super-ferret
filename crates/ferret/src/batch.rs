@@ -5,6 +5,8 @@ use std::io::{self, BufRead, Write};
 use std::ops::ControlFlow;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
@@ -294,7 +296,7 @@ fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -
     let mut status = 1u8;
     let host = FrameOutput {
         id: &request.id,
-        record: 0,
+        record: Arc::new(AtomicU64::new(0)),
     };
     match parsed {
         Ok(plan) if plan.has_side_effects() => {
@@ -348,7 +350,7 @@ fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -
 #[derive(Clone)]
 struct FrameOutput<'a> {
     id: &'a str,
-    record: u64,
+    record: Arc<AtomicU64>,
 }
 impl Effects for FrameOutput<'_> {
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
@@ -368,10 +370,10 @@ impl Effects for FrameOutput<'_> {
         );
     }
     fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
-        self.record += 1;
+        let record = self.record.fetch_add(1, Ordering::Relaxed) + 1;
         let mut writer = FrameWriter {
             id: self.id,
-            record: self.record,
+            record,
             part: 0,
             pending: Vec::with_capacity(PART),
         };
@@ -381,8 +383,8 @@ impl Effects for FrameOutput<'_> {
 }
 impl FrameOutput<'_> {
     fn emit(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.record += 1;
-        emit_parts(self.id, self.record, bytes)
+        let record = self.record.fetch_add(1, Ordering::Relaxed) + 1;
+        emit_parts(self.id, record, bytes)
     }
 }
 

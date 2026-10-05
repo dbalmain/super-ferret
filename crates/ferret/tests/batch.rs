@@ -163,6 +163,27 @@ fn find_frames_match_cli_bytes_for_a_find_compat_style_corpus() {
         let output = tree.run(&request(&format!("f{index}"), args, cwd));
         assert_eq!(output.status.code(), Some(0));
         let lines = event_lines(&output.stdout, &format!("f{index}"));
+        let records = lines
+            .iter()
+            .filter(|line| line.contains("\"event\":\"stdout\""))
+            .filter_map(|line| {
+                line.split_once("\"record\":")?
+                    .1
+                    .split_once(',')?
+                    .0
+                    .parse::<u64>()
+                    .ok()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let frame_count = lines
+            .iter()
+            .filter(|line| line.contains("\"event\":\"stdout\""))
+            .count();
+        assert_eq!(
+            records.len(),
+            frame_count,
+            "duplicate record id in {args:?}"
+        );
         let encoded = lines
             .iter()
             .filter_map(|line| field(line, "bytes_base64"))
