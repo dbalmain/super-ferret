@@ -439,10 +439,17 @@ fn query(
                     }
                 }
                 Some("diagnostic") if op == "find" => {
+                    if field_text(&value, "code") == Some("warning") {
+                        cli::error(&format!(
+                            "find: {}",
+                            field_text(&value, "message").unwrap_or("find warning")
+                        ));
+                    }
                     if !json {
                         out.flush().inspect_err(|_| output_failure = true)?;
                         match field_text(&value, "code") {
                             Some("permission") => cli::error(crate::find::PERMISSION_WARNING),
+                            Some("warning") => {}
                             Some("walk") => {
                                 let path = PathBuf::from(OsString::from_vec(bytes(
                                     &value,

@@ -923,6 +923,41 @@ fn socket_loss_after_first_bytes_is_transport_failure_and_never_replays() {
 }
 
 #[test]
+fn find_warnings_render_identically_on_local_socket_and_json_hosts() {
+    let tree = Tree::new();
+    for args in [
+        vec!["src", "-path", "x/", "-print"],
+        vec!["src", "-printf", "\\q"],
+    ] {
+        let mut local_args = vec!["find"];
+        local_args.extend(args.iter().copied());
+        let local = tree.local(&local_args);
+        let mut socket_args = vec!["find"];
+        socket_args.extend(args.iter().copied());
+        let socket = tree.run(&socket_args);
+        let mut json_args = vec!["--json", "find"];
+        json_args.extend(args.iter().copied());
+        let json = tree.run(&json_args);
+
+        assert_eq!(socket.status.code(), local.status.code());
+        assert_eq!(json.status.code(), local.status.code());
+        assert_eq!(socket.stderr, local.stderr);
+        assert_eq!(json.stderr, local.stderr);
+        assert!(!local.stderr.windows(8).any(|bytes| bytes == b"find: : "));
+        let json_stdout = String::from_utf8(json.stdout).unwrap();
+        assert!(
+            json_stdout.contains("\"code\":\"warning\""),
+            "{json_stdout}"
+        );
+        assert!(
+            json_stdout.contains("\"severity\":\"warning\""),
+            "{json_stdout}"
+        );
+        assert!(json_stdout.contains("\"message\":"), "{json_stdout}");
+    }
+}
+
+#[test]
 #[cfg(debug_assertions)]
 fn incompatible_context_falls_back_and_format_mismatch_replaces_host() {
     let tree = Tree::new();

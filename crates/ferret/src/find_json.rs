@@ -76,6 +76,7 @@ pub(crate) struct FrameOutput<'a> {
     record: Arc<AtomicU64>,
     stdin: ChildStdin,
     transport_error: Arc<Mutex<Option<io::Error>>>,
+    warning_stderr: bool,
     #[cfg(debug_assertions)]
     panic: Arc<AtomicBool>,
 }
@@ -99,6 +100,17 @@ impl Effects for FrameOutput<'_> {
                 .str("message", &error.error.to_string());
         });
         let _ = self.track(result);
+    }
+    fn warning(&mut self, message: &str) {
+        let result = emit_to(&self.destination, self.id, "diagnostic", |o| {
+            o.str("code", "warning")
+                .str("severity", "warning")
+                .str("message", message);
+        });
+        let _ = self.track(result);
+        if self.warning_stderr {
+            crate::cli::error(&format!("find: {message}"));
+        }
     }
     fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
         let record = self.record.fetch_add(1, Ordering::Relaxed) + 1;
@@ -181,12 +193,17 @@ impl FrameOutput<'_> {
             stdin,
             record: Arc::new(AtomicU64::new(0)),
             transport_error: Arc::new(Mutex::new(None)),
+            warning_stderr: false,
             #[cfg(debug_assertions)]
             panic: Arc::new(AtomicBool::new(false)),
         }
     }
     pub(crate) fn with_destination(mut self, destination: Destination) -> Self {
         self.destination = destination;
+        self
+    }
+    pub(crate) fn with_warning_stderr(mut self) -> Self {
+        self.warning_stderr = true;
         self
     }
     #[cfg(debug_assertions)]
@@ -200,6 +217,11 @@ impl FrameOutput<'_> {
             panic!("injected find worker panic");
         }
         self.destination.cancelled()
+            || self
+                .transport_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
     }
     pub(crate) fn check_transport(&self) -> io::Result<()> {
         match self

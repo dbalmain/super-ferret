@@ -168,47 +168,71 @@ pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
     let started = std::time::Instant::now();
     let now = std::time::SystemTime::now();
     let end = |status: i128, error: Option<&str>| {
-        let _ = find_json::emit(ID, "end", |o| {
+        find_json::emit(ID, "end", |o| {
             o.int("exit", status)
                 .bool("cancelled", false)
                 .int("elapsed_us", started.elapsed().as_micros() as i128);
             if let Some(error) = error {
                 o.str("error", error);
             }
-        });
+        })
+    };
+    let output_error = |error: io::Error| {
+        cli::error(&format!("find: writing stdout: {error}"));
+        Exit::NoMatch
     };
     let plan = match Plan::parse_started(args, now) {
         Ok(plan) => plan,
         Err(error) => {
-            let _ = find_json::emit(ID, "begin", |o| find_json::generation(o, None));
-            let _ = find_json::diagnostic(ID, "parse", "error", None);
-            end(1, Some(&error.to_string()));
+            if let Err(error) = find_json::emit(ID, "begin", |o| find_json::generation(o, None)) {
+                return output_error(error);
+            }
+            if let Err(error) = find_json::diagnostic(ID, "parse", "error", None) {
+                return output_error(error);
+            }
+            if let Err(error) = end(1, Some(&error.to_string())) {
+                return output_error(error);
+            }
             return Exit::NoMatch;
         }
     };
     if let Some(feature) = plan.unsupported() {
-        let _ = find_json::emit(ID, "begin", |o| find_json::generation(o, None));
+        if let Err(error) = find_json::emit(ID, "begin", |o| find_json::generation(o, None)) {
+            return output_error(error);
+        }
         let message = feature.to_string_lossy();
-        let _ = find_json::diagnostic(ID, &message, "error", None);
-        end(1, Some(&message));
+        if let Err(error) = find_json::diagnostic(ID, &message, "error", None) {
+            return output_error(error);
+        }
+        if let Err(error) = end(1, Some(&message)) {
+            return output_error(error);
+        }
         return Exit::NoMatch;
     }
     if let Some(exit) = remote(args, index, &plan, true, now) {
         return exit;
     }
-    let _ = find_json::emit(ID, "begin", |o| find_json::generation(o, None));
+    if let Err(error) = find_json::emit(ID, "begin", |o| find_json::generation(o, None)) {
+        return output_error(error);
+    }
     let catalog = match resolve_catalog(&plan, index) {
         Ok(catalog) => catalog,
         Err(message) => {
-            let _ = find_json::diagnostic(ID, "resolve", "error", None);
-            end(1, Some(&message));
+            if let Err(error) = find_json::diagnostic(ID, "resolve", "error", None) {
+                return output_error(error);
+            }
+            if let Err(error) = end(1, Some(&message)) {
+                return output_error(error);
+            }
             return Exit::NoMatch;
         }
     };
-    if plan.permission_warning() {
-        let _ = find_json::diagnostic(ID, "permission", "warning", None);
+    if plan.permission_warning()
+        && let Err(error) = find_json::diagnostic(ID, "permission", "warning", None)
+    {
+        return output_error(error);
     }
-    let host = FrameOutput::new(ID, ChildStdin::Inherit);
+    let host = FrameOutput::new(ID, ChildStdin::Inherit).with_warning_stderr();
     let workers = ferret_crawl::default_workers();
     let result = match catalog {
         Some(engine) => engine.pin().find(&plan, host.clone(), workers),
@@ -217,16 +241,21 @@ pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
     let status = match result {
         Ok(outcome) => i128::from(outcome.errors != 0),
         Err(error) => {
-            let _ = find_json::diagnostic(ID, "runtime", "error", None);
-            end(1, Some(&error.to_string()));
+            if let Err(error) = find_json::diagnostic(ID, "runtime", "error", None) {
+                return output_error(error);
+            }
+            if let Err(error) = end(1, Some(&error.to_string())) {
+                return output_error(error);
+            }
             return Exit::NoMatch;
         }
     };
     if let Err(error) = host.check_transport() {
-        end(1, Some(&error.to_string()));
-        return Exit::NoMatch;
+        return output_error(error);
     }
-    end(status, None);
+    if let Err(error) = end(status, None) {
+        return output_error(error);
+    }
     if status == 0 { Exit::Ok } else { Exit::NoMatch }
 }
 

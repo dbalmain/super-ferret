@@ -250,7 +250,8 @@ must not count records to count matches. Keep find's whole-entry commit gate, 64
 KiB capture threshold and unlinked spill file. A broken stream can deliver a
 prefix of a record, just as a broken pipe can today; it cannot claim that record
 complete. Diagnostics are tagged `diagnostic` events with a code, severity and
-optional byte path. End follows all committed output and contains the native
+optional byte path; a find warning uses code `warning`, severity `warning`, and
+a `message` without a path. End follows all committed output and contains the native
 status and timings. A parse or runtime failure still gets a begin/end block,
 with null generation when no view was selected. Never manufacture end after
 transport failure.

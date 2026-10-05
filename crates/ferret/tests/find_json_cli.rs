@@ -7,8 +7,9 @@
 mod fixture;
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{Output, Stdio};
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
 
@@ -141,4 +142,88 @@ fn an_exec_childs_stderr_reaches_a_stderr_event() {
     assert_eq!(json.status.code(), raw.status.code());
     assert_eq!(decoded(&json.stdout, "stderr"), raw.stderr);
     assert_eq!(decoded(&json.stdout, "stderr"), b"oops\n");
+}
+
+#[test]
+fn a_failed_json_begin_stops_before_find_actions() {
+    let tree = Tree::new("begin-broken-pipe");
+    let marker = tree.0.join("marker");
+    let mut command = fixture::command(FERRET, &tree.0);
+    command
+        .args([
+            "--json",
+            "find",
+            "-I",
+            "d",
+            "-maxdepth",
+            "0",
+            "-exec",
+            "touch",
+        ])
+        .arg(&marker)
+        .arg(";")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert_ne!(output.status.code(), Some(0));
+    assert!(!marker.exists(), "action ran after begin failed");
+    assert!(output.stderr.starts_with(b"ferret: find: writing stdout: "));
+}
+
+#[test]
+fn a_failed_json_end_flush_is_an_error_after_find_actions() {
+    let tree = Tree::new("end-broken-pipe");
+    let marker = tree.0.join("marker");
+    let mut command = fixture::command(FERRET, &tree.0);
+    command
+        .args([
+            "--json",
+            "find",
+            "-I",
+            "d",
+            "-maxdepth",
+            "0",
+            "-exec",
+            "touch",
+        ])
+        .arg(&marker)
+        .arg(";")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut begin = String::new();
+    reader.read_line(&mut begin).unwrap();
+    assert!(begin.contains("\"event\":\"begin\""), "{begin}");
+    drop(reader);
+    let output = child.wait_with_output().unwrap();
+    assert_ne!(output.status.code(), Some(0));
+    assert!(
+        marker.exists(),
+        "the action should precede the final end flush"
+    );
+    assert!(output.stderr.starts_with(b"ferret: find: writing stdout: "));
+}
+
+#[test]
+fn json_find_warnings_keep_their_severity_and_render_on_stderr() {
+    let tree = Tree::new("warnings");
+    for args in [
+        vec!["-I", "d", "-path", "x/", "-print"],
+        vec!["-I", "d", "-printf", "\\q"],
+    ] {
+        let raw = tree.raw(&args);
+        let json = tree.json(&args);
+        assert_eq!(json.status.code(), raw.status.code());
+        assert_eq!(json.stderr, raw.stderr);
+        assert!(!json.stderr.windows(8).any(|bytes| bytes == b"find: : "));
+        let text = String::from_utf8(json.stdout).unwrap();
+        assert!(text.contains("\"code\":\"warning\""), "{text}");
+        assert!(text.contains("\"severity\":\"warning\""), "{text}");
+        assert!(text.contains("\"message\":"), "{text}");
+        assert!(!text.contains("\"path\":\"\""), "{text}");
+    }
 }
