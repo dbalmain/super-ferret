@@ -617,6 +617,24 @@ fn every_host_refusal_precedes_commands_and_output_file_preparation() {
             "{lines:?}"
         );
         assert!(lines[1].contains("\"exit\":1"));
+        if expected_error == "Noninteractive" {
+            // File input frees stdin from the protocol, but a pipe/null fd is
+            // still not a terminal and must not reach either earlier action.
+            fs::write(tree.0.join("requests"), &input).unwrap();
+            let file_input = fixture::command(FERRET, &tree.0)
+                .args(["batch", "--input", "requests"])
+                .output()
+                .unwrap();
+            assert_eq!(file_input.status.code(), Some(0));
+            assert!(file_input.stderr.is_empty());
+            let lines = event_lines(&file_input.stdout, "refuse");
+            assert_eq!(lines.len(), 2);
+            assert!(lines[1].contains("\"error\":\"Noninteractive\""));
+            assert!(!tree.0.join("MARKER").exists());
+            assert!(!tree.0.join("PROMPT_MARKER").exists());
+            assert!(!tree.0.join("src/PROMPT_MARKER").exists());
+            assert_eq!(fs::read(tree.0.join("result")).unwrap(), b"do not truncate");
+        }
     }
 }
 

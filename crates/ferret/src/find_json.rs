@@ -94,13 +94,13 @@ impl Effects for FrameOutput<'_> {
     fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
         let record = self.record.fetch_add(1, Ordering::Relaxed) + 1;
         let mut writer = FrameWriter {
-            id: self.id,
+            host: self,
             record,
             part: 0,
             pending: Vec::with_capacity(PART),
         };
-        let result = buffer.write_to(&mut writer).and_then(|()| writer.finish());
-        self.track(result)
+        buffer.write_to(&mut writer)?;
+        writer.finish()
     }
     fn capture(&mut self, command: &mut Command, output: &mut dyn Write) -> io::Result<bool> {
         let mut child = command
@@ -202,25 +202,25 @@ impl FrameOutput<'_> {
     }
 }
 
-struct FrameWriter<'a> {
-    id: &'a str,
+struct FrameWriter<'host, 'id> {
+    host: &'host FrameOutput<'id>,
     record: u64,
     part: u64,
     pending: Vec<u8>,
 }
-impl Write for FrameWriter<'_> {
+impl Write for FrameWriter<'_, '_> {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
         let total = bytes.len();
         while !bytes.is_empty() {
             if self.pending.len() == PART {
-                frame(
-                    self.id,
+                self.host.track(frame(
+                    self.host.id,
                     "stdout",
                     self.record,
                     self.part,
                     &self.pending,
                     false,
-                )?;
+                ))?;
                 self.part += 1;
                 self.pending.clear();
             }
@@ -234,17 +234,17 @@ impl Write for FrameWriter<'_> {
         self.finish()
     }
 }
-impl FrameWriter<'_> {
+impl FrameWriter<'_, '_> {
     fn finish(&mut self) -> io::Result<()> {
         if !self.pending.is_empty() {
-            frame(
-                self.id,
+            self.host.track(frame(
+                self.host.id,
                 "stdout",
                 self.record,
                 self.part,
                 &self.pending,
                 true,
-            )?;
+            ))?;
             self.pending.clear();
         }
         Ok(())

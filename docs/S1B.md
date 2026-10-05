@@ -334,6 +334,15 @@ use file input and a PTY, or the ordinary CLI; they are not silently skipped.
 Batch request framing/exit handling belongs in the harness adapter, not in
 copies of find syntax or evaluation.
 
+M2c adds six real-binary integration tests: a 15-case action parity table against
+CLI stdout/status and complete throwaway tree state; exact binary stderr and a
+131,073-byte stderr-before-stdout pipe-pressure case under timeout; every
+preparation refusal; caller stdin with file input and null child stdin with a
+following request; execdir/file outputs with a distinct request cwd; and real
+PTY yes/no approval for both interactive actions with closed child stdin.
+All workspace gates pass at **620 passed / 5 ignored** (baseline 613/5).
+
+
 ## Daemon, socket and lifecycle
 
 ### Endpoint and request context
