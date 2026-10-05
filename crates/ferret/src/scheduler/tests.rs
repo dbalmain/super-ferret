@@ -152,7 +152,7 @@ fn idle_boundaries_missing_psi_and_battery_use_the_real_policy() {
         .unwrap_or_else(|e| panic!("fixture: {e:?}"))
         .io = None;
     scheduler.sample();
-    assert_eq!(scheduler.status().paused, Some(Blocked::Unavailable));
+    assert_eq!(scheduler.status().paused, None);
     source
         .0
         .lock()
@@ -171,7 +171,7 @@ fn idle_boundaries_missing_psi_and_battery_use_the_real_policy() {
         .unwrap_or_else(|e| panic!("fixture: {e:?}"))
         .battery = None;
     scheduler.sample();
-    assert_eq!(scheduler.status().paused, Some(Blocked::Unavailable));
+    assert_eq!(scheduler.status().paused, None);
 }
 struct Tree(std::path::PathBuf);
 impl Tree {
@@ -402,8 +402,8 @@ fn disk_refusal_and_live_watch_resources_are_admission_inputs() {
     );
 }
 #[test]
-fn psi_spike_and_battery_defer_checkpoint_while_queries_keep_serving() {
-    for battery in [false, true] {
+fn high_or_missing_io_psi_and_unknown_battery_admit_background_work() {
+    for (io, battery) in [(Some(66.0), Some(false)), (None, None)] {
         let tree = Tree::new();
         let engine = Engine::from_writer(tree.writer());
         let (scheduler, source, _) = scheduler(
@@ -413,37 +413,52 @@ fn psi_spike_and_battery_defer_checkpoint_while_queries_keep_serving() {
             },
             tree.index(),
         );
-        if battery {
-            source
-                .0
-                .lock()
-                .unwrap_or_else(|e| panic!("fixture: {e:?}"))
-                .battery = Some(true);
-        } else {
-            source
-                .0
-                .lock()
-                .unwrap_or_else(|e| panic!("fixture: {e:?}"))
-                .io = Some(10.1);
+        {
+            let mut sample = source.0.lock().unwrap_or_else(|e| panic!("fixture: {e:?}"));
+            sample.io = io;
+            sample.battery = battery;
         }
         scheduler.sample();
-        let before = engine.generation();
-        fs::write(tree.root().join("a.txt"), b"change")
-            .unwrap_or_else(|e| panic!("fixture: {e:?}"));
-        let options = IndexOptions {
-            bulk: Some(scheduler),
-            ..IndexOptions::default()
-        };
-        let result = engine
-            .refresh(
-                request(&engine, tree.root(), RefreshReason::Burst),
-                &options,
-            )
-            .unwrap_or_else(|e| panic!("fixture: {e:?}"));
-        assert!(matches!(result.outcome, RefreshOutcome::DeferredBulk(_)));
-        assert_eq!(engine.generation(), before);
-        assert_eq!(query(&engine), 1);
+        assert_eq!(scheduler.status().paused, None);
+        assert_eq!(
+            scheduler.admit(Kind::FullRewalk, engine.pin().catalog()),
+            Ok(()),
+            "I/O PSI {io:?}, battery {battery:?}"
+        );
     }
+}
+#[test]
+fn battery_still_pauses_background_checkpoint_while_queries_keep_serving() {
+    let tree = Tree::new();
+    let engine = Engine::from_writer(tree.writer());
+    let (scheduler, source, _) = scheduler(
+        Config {
+            rate: 0,
+            ..Config::default()
+        },
+        tree.index(),
+    );
+    source
+        .0
+        .lock()
+        .unwrap_or_else(|e| panic!("fixture: {e:?}"))
+        .battery = Some(true);
+    scheduler.sample();
+    let before = engine.generation();
+    fs::write(tree.root().join("a.txt"), b"change").unwrap_or_else(|e| panic!("fixture: {e:?}"));
+    let options = IndexOptions {
+        bulk: Some(scheduler),
+        ..IndexOptions::default()
+    };
+    let result = engine
+        .refresh(
+            request(&engine, tree.root(), RefreshReason::Burst),
+            &options,
+        )
+        .unwrap_or_else(|e| panic!("fixture: {e:?}"));
+    assert!(matches!(result.outcome, RefreshOutcome::DeferredBulk(_)));
+    assert_eq!(engine.generation(), before);
+    assert_eq!(query(&engine), 1);
 }
 #[test]
 fn paused_intake_is_bounded_and_sustained_arrivals_do_not_postpone_d51() {
@@ -484,7 +499,7 @@ fn paused_intake_is_bounded_and_sustained_arrivals_do_not_postpone_d51() {
         .0
         .lock()
         .unwrap_or_else(|e| panic!("fixture: {e:?}"))
-        .io = Some(11.0);
+        .battery = Some(true);
     scheduler.sample();
     watch.backstop(RefreshReason::Backstop);
     for n in 0..20 {
@@ -509,7 +524,7 @@ fn paused_intake_is_bounded_and_sustained_arrivals_do_not_postpone_d51() {
         .0
         .lock()
         .unwrap_or_else(|e| panic!("fixture: {e:?}"))
-        .io = Some(0.0);
+        .battery = Some(false);
     scheduler.sample();
     let pending = watch
         .take_admitted(true)

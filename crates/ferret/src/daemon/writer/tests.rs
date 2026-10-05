@@ -86,11 +86,7 @@ fn deferred_writer(reason: Blocked) {
     let clock = Arc::new(Time::default());
     let source = Source(Arc::new(Mutex::new(Sample {
         cpu: Some(0.0),
-        io: Some(if reason == Blocked::IoPressure {
-            11.0
-        } else {
-            0.0
-        }),
+        io: Some(66.0),
         battery: Some(reason == Blocked::Battery),
         load: Some(0.0),
         memory: Some(if reason == Blocked::Memory {
@@ -160,7 +156,7 @@ fn deferred_writer(reason: Blocked) {
     let old = engine.pin();
     fs::write(tree.0.join("tree/a.txt"), b"changed").unwrap_or_else(|e| panic!("fixture: {e}"));
     let result = command(&host, &tree.0.join("tree"));
-    if matches!(reason, Blocked::Battery | Blocked::IoPressure) {
+    if reason == Blocked::Battery {
         assert!(result.is_ok(), "command was politely deferred: {result:?}");
         assert_ne!(engine.generation(), old.generation());
         host.stop.store(true, Ordering::Release);
@@ -249,8 +245,4 @@ fn daemon_writer_reports_memory_blocked_preserves_caches_and_retries_the_complet
 #[test]
 fn daemon_writer_command_ignores_battery_pause() {
     deferred_writer(Blocked::Battery);
-}
-#[test]
-fn daemon_writer_command_ignores_io_pressure() {
-    deferred_writer(Blocked::IoPressure);
 }

@@ -87,12 +87,8 @@ impl Scheduler {
             .machine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let paused = match (self.config.battery_pause, sample.battery, sample.io) {
-            (true, Some(true), _) => Some(Blocked::Battery),
-            (true, None, _) | (_, _, None) => Some(Blocked::Unavailable),
-            (_, _, Some(io)) if io > 10.0 => Some(Blocked::IoPressure),
-            _ => None,
-        };
+        let paused =
+            (self.config.battery_pause && sample.battery == Some(true)).then_some(Blocked::Battery);
         let desired = if paused.is_some() || sample.cpu.is_none_or(|cpu| cpu > 20.0) {
             1
         } else {

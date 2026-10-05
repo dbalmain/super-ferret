@@ -762,13 +762,15 @@ Poll cheap signals at **1 Hz**: CPU and I/O PSI `some avg10`, battery state,
 load for diagnostics, and optional compositor idle time. PSI describes stalled
 time, not CPU usage
 ([kernel PSI documentation](https://docs.kernel.org/accounting/psi.html)). When
-battery pause is enabled or I/O PSI exceeds **10%**, admit no new bulk jobs;
-above **20% CPU PSI**, use one index worker. Otherwise use one while input idle
+battery pause is enabled and the battery is known to be discharging, admit no
+new bulk jobs; unknown battery state does not pause. I/O PSI is reported in
+status but never gates work. Above **20% CPU PSI**, use one index worker.
+Otherwise use one while input idle
 is at most **30 s**, `max(1, CPUs/4)` at 30–300 s, and `max(1, CPUs/2)` beyond
 that, capped by configured crawler concurrency. Raise by one worker after **10
 s** calm; drop immediately. Headless means no interactive session, not just a
-failed idle probe. Unknown desktop idleness uses one worker; missing PSI uses
-conservative concurrency and reports the unavailable signal. Core operation must
+failed idle probe. Unknown desktop idleness uses one worker; missing CPU PSI
+uses conservative concurrency and reports the unavailable signal. Core operation must
 work without a compositor library or an interactive probe.
 
 Apply per-thread nice 19 to index workers; socket, watcher and query threads
@@ -794,7 +796,7 @@ not create an unsafe host wrapper to avoid a reviewed dependency.
 M6 rate-limits noninteractive bulk read/write work at **32 MiB/s**,
 configurable, for backstops, whole-root observations, fallback reads and
 checkpoint writes. Explicit writer commands (`ferret index`, root add and root
-remove) bypass byte pacing and battery/PSI/worker-ramp gates like direct
+remove) bypass byte pacing and battery/worker-ramp gates like direct
 foreground indexing, while retaining memory and disk admission; query reads and
 small burst commits remain excluded.
 One shared limiter serializes the bounded transfer seam across index workers;

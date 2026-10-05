@@ -1485,10 +1485,20 @@ Workspace gates: **690 passed / 6 ignored**, +13 passing tests over the
 The daemon samples CPU/I/O PSI, battery, memory and diagnostic load at one Hz.
 The real scheduler uses one worker for unknown desktop idle or missing CPU PSI,
 idle steps capped by configured concurrency, ten-second one-worker increases
-and immediate drops. Battery pause and I/O PSI over 10% gate new bulk work;
+and immediate drops. A known discharging battery pauses background bulk work;
 intake continues to coalesce within M5a's bounds. All crawl index workers use
 per-thread nice 19, including a dedicated thread for single-worker indexing;
 query/socket/intake threads retain normal priority.
+
+M7c removed the I/O-pressure pause (2026-10-06). On the development desktop,
+system I/O PSI sat at `some avg10` ~66% (avg300 68.6%) with load 0.6, no task
+in D state and about 25 NVMe writes in 5 s; per-cgroup `io.pressure` placed it
+in a terminal scope, not in disk contention. Under the 10% gate a real
+`ferretd` made zero refreshes in 120 s. Every earlier test injected calm
+signals. Background work stays bounded by the 32 MiB/s limiter and per-thread
+nice 19, and M7b measured no foreground impact. I/O PSI remains in status as
+information. Unreadable PSI or battery state no longer pauses work, since it
+would otherwise pause it forever.
 
 Compaction and full rewalk/fallback admission stay under the one writer lock.
 Reserves scale linearly from 3 GiB full-build memory and 700 MB checkpoint

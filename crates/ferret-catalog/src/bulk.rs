@@ -24,8 +24,6 @@ pub enum Blocked {
     Memory,
     Disk,
     Battery,
-    IoPressure,
-    Unavailable,
 }
 impl Blocked {
     pub fn status(self) -> &'static str {
@@ -33,8 +31,6 @@ impl Blocked {
             Self::Memory => "memory-blocked",
             Self::Disk => "disk-blocked",
             Self::Battery => "battery-paused",
-            Self::IoPressure => "io-pressure",
-            Self::Unavailable => "signal-unavailable",
         }
     }
 }
