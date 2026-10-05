@@ -1389,6 +1389,13 @@ met and was not held as a requirement.
 
 Design and build slices: [S1B.md](S1B.md) (M0, 2026-10-05).
 
+M0 specifies the shared library engine in `ferret`, batch JSON lines first,
+D54's interned BFS names/postings/terms, then socket clients, watches/backstops
+and scheduling/budget validation. D55 remains open; D56 (find action hosting)
+and D57 (socket encoding and the proposed JSON-parser edge) are open briefs.
+The cost model distinguishes query resident bytes from writer caches, kernel
+watches and the measured 2.57–2.78 GiB oversized-rebuild path.
+
 One engine: open the catalog resident (names and inodes read in full, indexes
 mapped) and answer from memory (D46). Hosts: `ferret batch` (many queries in one
 run: CI and the test suites) and `ferretd` (inotify with a re-crawl backstop,
@@ -1410,6 +1417,10 @@ bfs and fd.
 **Measure:** the 10M catalog's resident size with full `find` support. Under 1
 GB, with scan latency acceptable, means no name index (D48); otherwise a name
 index experiment (suffix array, terms, trigrams) comes before S2.
+
+D54 B subsequently answers the name-index choice: S1b builds interning, row
+postings and a term index in BFS order. The older conditional above records
+the S1c measurement gate, rather than overruling that later answer.
 
 **Built** (2026-10-02 to 2026-10-03, branch `wt/find`, milestones M1–M5c). The
 contract is [FIND.md](FIND.md); the decisions are D47 and D50.

@@ -41,12 +41,12 @@ ferret-daemon  → later
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
 | `ferret-policy`  | `DirRules::decide(path, entry) -> Decision`, `sniff`; `.ferretignore` / `.gitignore` / global (D13); the defaults setup writes | the catalog, the index         |
 | `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing                                                          | query, index formats           |
-| `ferret-catalog` | names, inodes, documents, the snapshot, name scan (D14)                                                                        | tokens, postings               |
+| `ferret-catalog` | names, inodes, documents, storage, name dictionary and catalog row postings (D54, S1b)                                        | content tokens and document postings |
 | `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                                         | files, ids                     |
 | `ferret-index`   | segments over doc ids; each structure implements `CandidateSource`                                                             | files, paths, inodes           |
 | `ferret-verify`  | re-reading a file and matching a query atom against its bytes                                                                  | how candidates were found      |
 | `ferret-query`   | query syntax, planning, execution, result rows                                                                                 | any structure's on-disk format |
-| `ferret`         | the CLI, config, XDG directories, setup, JSON lines output, the query log                                                      | —                              |
+| `ferret`         | CLI, config, XDG, JSON output, query log; shared engine coordination and batch/daemon hosts (S1b)                              | —                              |
 
 Two boundaries carry the design, and both are where D1 said the thought goes:
 
@@ -147,8 +147,12 @@ Liveness is catalog state: a doc is live while some inode points at it. The
 index reads a live-docs bitset from the catalog rather than keeping its own
 tombstones, so there is one source of truth.
 
-**Storage.** One snapshot file per catalog directory, rebuilt by every run
-(D26): a versioned header (magic, format version, sniffer version, next
+**Storage.** S1+ now publishes a checked v4 snapshot plus a bounded transaction
+log under a manifest, with epoch-scoped inode/name ids and stable DocIds.
+[S1PLUS.md](S1PLUS.md) defines the implemented publication, recovery and
+effective-reader contract. The column-layout description below records the
+S1a/find baseline; its per-run snapshot replacement is superseded by S1+.
+The snapshot contains a versioned header (magic, format version, sniffer version, next
 `DocId`, the directory, inode, name and document counts), a table of 23 sections by
 offset and length, a descriptor per packed column, and the sections themselves.
 Every id and inode field is a bit-packed column (S1a): `count` values of
@@ -532,14 +536,29 @@ cannot be written is a warning, never a failed command.
 The CLI's JSON lines write a path that is not UTF-8 as `path` (lossy text) plus
 `path_base64` (the exact bytes). The `ferret` crate doc states this contract.
 
-## Resident daemon (later, optional — D14)
+## Resident engine, batch and daemon (S1b — D46, D49, D54)
 
-`ferretd` watches the roots (inotify, with the re-crawl as the backstop), keeps
-the catalog and hot index files resident so queries never start cold, and runs
-indexing at idle priority. The CLI works identically with or without it: it
-opens the catalog and index read-only. The research's politeness design
-([architecture.html § Change detection](research/claude/architecture.html))
-applies when this slice starts.
+[S1B.md](S1B.md) defines one library engine in `ferret`, with `ferret batch`
+and a `ferretd` binary in that package as hosts. The current dependency graph
+already permits that coordination. The historical `ferret-daemon → later`
+placeholder above is not a proposed new crate. D57 records the proposed
+external JSON-parser edge; the enforced graph changes with its implementation.
+
+Both hosts open checked catalog buffers resident, validate the effective
+snapshot-plus-overlay view (D53 A), and pin generations per query. Future
+content indexes are mapped by their owning crate in S2; none exists today.
+D54 adds resident interned names and row postings in catalog, and a name-term
+index/planner in query using text's tokenizer, retaining BFS. These catalog
+row postings do not change the content-index boundary. D55 remains open.
+
+Ordinary queries connect to the daemon, spawning it on first use; unavailable
+background operation or `FERRET_NO_DAEMON` uses the same engine in process.
+D56 leaves action-plan host routing open without changing find semantics.
+The daemon consumes inotify hints through S1+'s real refresh seam, maintains
+raw directory counts, and uses scoped/full recrawls for gaps. D51 A pauses the
+writer at idle boundaries while queries keep old views. S1B specifies queue
+bounds, freshness reporting and the research-derived politeness controller,
+including the full-builder memory limit recorded in ROADMAP.
 
 ## Not yet designed
 
