@@ -298,13 +298,15 @@ fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -
         id: &request.id,
         record: Arc::new(AtomicU64::new(0)),
     };
+    let mut query_error = None;
     match parsed {
         Ok(plan) if plan.has_side_effects() => {
             diagnostic(&request.id, "actions_unavailable", "error", None)?;
             event(request, "end", |o| {
                 o.int("exit", 1)
                     .bool("cancelled", false)
-                    .str("error", "find actions are not available until M2c");
+                    .str("error", "find actions are not available until M2c")
+                    .int("elapsed_us", started.elapsed().as_micros() as i128);
             })?;
             return Ok(());
         }
@@ -315,7 +317,10 @@ fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -
             if let Some(feature) = plan.unsupported() {
                 diagnostic(&request.id, &feature.to_string_lossy(), "error", None)?;
                 event(request, "end", |o| {
-                    o.int("exit", 1).bool("cancelled", false);
+                    o.int("exit", 1)
+                        .bool("cancelled", false)
+                        .str("error", &feature.to_string_lossy())
+                        .int("elapsed_us", started.elapsed().as_micros() as i128);
                 })?;
                 return Ok(());
             }
@@ -327,23 +332,24 @@ fn find_request(request: &Request, launch_cwd: &Path, engine: Option<&Engine>) -
             };
             match result {
                 Ok(outcome) => status = if outcome.errors == 0 { 0 } else { 1 },
-                Err(error) => diagnostic(
-                    &request.id,
-                    "runtime",
-                    "error",
-                    Some(error.to_string().as_bytes()),
-                )?,
+                Err(error) => {
+                    diagnostic(&request.id, "runtime", "error", None)?;
+                    query_error = Some(error.to_string());
+                }
             }
         }
         Err(error) => {
             diagnostic(&request.id, "parse", "error", None)?;
-            let _ = error;
+            query_error = Some(error.to_string());
         }
     }
     event(request, "end", |o| {
         o.int("exit", status)
             .bool("cancelled", false)
             .int("elapsed_us", started.elapsed().as_micros() as i128);
+        if let Some(error) = query_error.as_deref() {
+            o.str("error", error);
+        }
     })
 }
 
