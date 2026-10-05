@@ -1387,6 +1387,8 @@ met and was not held as a requirement.
 
 ## S1b — The engine, batch mode and the daemon
 
+Design and build slices: [S1B.md](S1B.md) (M0, 2026-10-05).
+
 One engine: open the catalog resident (names and inodes read in full, indexes
 mapped) and answer from memory (D46). Hosts: `ferret batch` (many queries in one
 run: CI and the test suites) and `ferretd` (inotify with a re-crawl backstop,
