@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -414,6 +414,12 @@ pub trait EventVisitor {
 
     /// Observed directory handle, before its complete listing. A watch host
     /// arms here so notifications during observation survive into its next run.
+    /// Policy input consulted relative to the held parent, before reading.
+    /// An external policy dependency returned by config discovery.
+    fn policy_path(&mut self, _path: &Path) {}
+
+    fn policy_input(&mut self, _parent: BorrowedFd<'_>, _name: &OsStr) {}
+
     fn observing(&mut self, _fd: BorrowedFd<'_>, _path: &Path) {}
 
     /// Selects work before child stat/open. A false result deliberately keeps
@@ -1582,6 +1588,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         in_work_tree: bool,
         token: V::Dir,
     ) -> Ignores {
+        self.visit.policy_input(dir, OsStr::new(".ferretignore"));
+        self.visit.policy_input(dir, OsStr::new(DOT_GIT));
+        if in_work_tree {
+            self.visit.policy_input(dir, OsStr::new(".gitignore"));
+        }
         let listed = |name: &str| children.contains(name);
         let ferretignore = listed(".ferretignore")
             .then(|| self.read_named(dir, ".ferretignore", token))
@@ -1594,6 +1605,9 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         // A `.gitignore` outside a work tree cannot affect decisions, so it is
         // not opened. A FIFO of that name must not stall a walk that is not in
         // a repository.
+        if git.is_root() {
+            self.visit.policy_input(dir, OsStr::new(".gitignore"));
+        }
         let gitignore = if (in_work_tree || git.is_root()) && listed(".gitignore") {
             self.read_named(dir, ".gitignore", token)
         } else {
@@ -1618,8 +1632,9 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     }
 
     fn read_named(&mut self, dir: BorrowedFd<'_>, name: &str, token: V::Dir) -> Option<String> {
+        self.visit.policy_input(dir, OsStr::new(name));
         let length = self.push(name);
-        let text = match open_ignore(dir, name) {
+        let text = match open_ignore(dir, OsStr::new(name)) {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
             Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
@@ -1635,13 +1650,15 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// common directory). `exclude` is an ordinary ignore file: a symlink of
     /// that name is followed.
     fn read_exclude(&mut self, git: OwnedFd, token: V::Dir) -> Option<String> {
+        let config = self.git_config_exclude(git.as_fd(), token);
+        self.visit.policy_input(git.as_fd(), OsStr::new("info"));
         let git_length = self.push(DOT_GIT);
         let info_length = self.push("info");
         let info = match openat(git.as_fd(), "info", child_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => {
                 self.pop(git_length);
-                return None;
+                return config;
             }
             Err(error) => {
                 self.push("exclude");
@@ -1656,6 +1673,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             }
         };
         drop(git);
+        self.visit.policy_input(info.as_fd(), OsStr::new("exclude"));
         self.push("exclude");
         let opened = match openat(info.as_fd(), "exclude", ignore_flags(), Mode::empty()) {
             Ok(fd) => {
@@ -1675,7 +1693,46 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         };
         self.pop(info_length);
         self.pop(git_length);
-        text
+        match (config, text) {
+            (Some(mut global), Some(local)) => {
+                global.push('\n');
+                global.push_str(&local);
+                Some(global)
+            }
+            (global, local) => local.or(global),
+        }
+    }
+
+    fn git_config_exclude(&mut self, git: BorrowedFd<'_>, token: V::Dir) -> Option<String> {
+        let handle = PathBuf::from(format!("/proc/self/fd/{}", git.as_raw_fd()));
+        // The child cannot inherit CLOEXEC handles. Resolve this observed git
+        // directory for config discovery; ignore/exclude opens stay anchored.
+        let path = match std::fs::read_link(handle) {
+            Ok(path) => path,
+            Err(error) => {
+                self.fail_at_git(error, token);
+                return None;
+            }
+        };
+        let inputs = match ferret_policy::GitInputs::discover(&path) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                self.fail_at_git(error, token);
+                return None;
+            }
+        };
+        for path in &inputs.paths {
+            self.visit.policy_path(path);
+        }
+        let path = inputs.excludes?;
+        match open_ignore(rustix::fs::CWD, path.as_os_str()) {
+            Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
+            Ok(Opened::Missing | Opened::NotRegular) => None,
+            Err(error) => {
+                self.fail_at_git(error, token);
+                None
+            }
+        }
     }
 
     fn probe_git(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
@@ -1848,6 +1905,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         gitdir: OwnedFd,
         token: V::Dir,
     ) -> Option<(OwnedFd, Option<OsString>)> {
+        self.visit
+            .policy_input(gitdir.as_fd(), OsStr::new("commondir"));
         let opened = match openat(
             gitdir.as_fd(),
             "commondir",
@@ -1946,7 +2005,7 @@ fn observe_link(
 
 /// Opens ignore file `name`: `.gitignore` without following a symlink, which
 /// then reads as absent; any other name through one.
-fn open_ignore(dir: BorrowedFd<'_>, name: &str) -> io::Result<Opened> {
+fn open_ignore(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Opened> {
     let flags = if name == ".gitignore" {
         gitignore_flags()
     } else {

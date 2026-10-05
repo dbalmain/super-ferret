@@ -61,7 +61,10 @@ impl Tree {
             .unwrap_or_else(|error| panic!("state: {error:?}"))
             .descriptors
             .iter()
-            .find(|(_, d)| d.path() == self.path.join("root").join(suffix))
+            .find(|(_, d)| {
+                d.iter()
+                    .any(|d| d.path() == self.path.join("root").join(suffix))
+            })
             .map(|(&wd, _)| wd)
             .unwrap_or_else(|| panic!("installed descriptor"))
     }
@@ -245,7 +248,7 @@ fn queued_locators_survive_compaction_without_saved_numeric_ids() {
 }
 
 #[test]
-fn known_alias_fallback_does_not_create_an_endless_backstop_loop() {
+fn proven_occurrences_share_one_descriptor_without_polling() {
     let tree = Tree::new("alias-fallback", 100, 1 << 20);
     let root = tree.path.join("root");
     let alias = tree.path.join("alias");
@@ -254,14 +257,15 @@ fn known_alias_fallback_does_not_create_an_endless_backstop_loop() {
         fs::File::open(&alias).unwrap_or_else(|error| panic!("alias handle: {error:?}"));
     use std::os::fd::AsFd;
     tree.watch.arm(&alias, Path::new(""), directory.as_fd());
-    assert_eq!(tree.watch.status().backstop, Some(RefreshReason::Overflow));
-    let burst = tree
-        .watch
-        .take()
-        .unwrap_or_else(|| panic!("alias backstop"));
     tree.watch.arm(&root, Path::new(""), directory.as_fd());
-    tree.watch.arm(&alias, Path::new(""), directory.as_fd());
-    tree.watch.finish(burst, true);
     assert_eq!(tree.watch.status().backstop, None);
-    assert!(tree.watch.status().uncovered);
+    assert!(!tree.watch.status().uncovered);
+    let wd = tree.descriptor("");
+    let state = tree
+        .watch
+        .state
+        .lock()
+        .unwrap_or_else(|error| panic!("state: {error:?}"));
+    let occurrences = &state.descriptors[&wd];
+    assert_eq!(occurrences.len(), 2);
 }

@@ -20,6 +20,8 @@ use rustix::io::Errno;
 
 use crate::{RefreshReason, RefreshRequest, RefreshScope, RenameHint};
 
+mod policy;
+
 const TRAILING: Duration = Duration::from_millis(200);
 const MAX_AGE: Duration = Duration::from_secs(1);
 
@@ -110,7 +112,7 @@ impl Directory {
 }
 #[derive(Debug)]
 struct Hint {
-    directory: Arc<Directory>,
+    directories: Vec<Arc<Directory>>,
     subtree: bool,
     cookie: u32,
     ambiguous_cookie: bool,
@@ -119,11 +121,13 @@ struct Hint {
 }
 #[derive(Debug)]
 struct State {
-    descriptors: BTreeMap<i32, Arc<Directory>>,
+    descriptors: BTreeMap<i32, Vec<Arc<Directory>>>,
     identities: BTreeMap<(u64, u64), i32>,
     removed: BTreeSet<i32>,
     gaps: BTreeSet<PathBuf>,
-    aliases: BTreeSet<PathBuf>,
+    unreliable: BTreeSet<PathBuf>,
+    policies: BTreeMap<i32, BTreeSet<(PathBuf, Vec<u8>)>>,
+    policy_failed: BTreeSet<(PathBuf, PathBuf)>,
     failed: BTreeSet<(u64, u64)>,
     pending: BTreeMap<(i32, Vec<u8>), Hint>,
     bytes: usize,
@@ -151,6 +155,7 @@ pub struct Status {
     pub needed: usize,
     pub failed: usize,
     pub pending: usize,
+    pub bytes: usize,
     pub oldest: Option<Duration>,
     pub backstop: Option<RefreshReason>,
     pub busy: bool,
@@ -185,7 +190,9 @@ impl Watch {
                 identities: BTreeMap::new(),
                 removed: BTreeSet::new(),
                 gaps: BTreeSet::new(),
-                aliases: BTreeSet::new(),
+                unreliable: BTreeSet::new(),
+                policies: BTreeMap::new(),
+                policy_failed: BTreeSet::new(),
                 failed: BTreeSet::new(),
                 pending: BTreeMap::new(),
                 bytes: 0,
@@ -207,6 +214,13 @@ impl Watch {
             return;
         };
         let identity = (stat.st_dev, stat.st_ino);
+        if rustix::fs::fstatfs(fd).map_or(true, |s| policy::unreliable(s.f_type as u64)) {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unreliable
+                .insert(root.to_owned());
+        }
         let parent_identity = if relative.as_os_str().is_empty() {
             None
         } else {
@@ -224,10 +238,21 @@ impl Watch {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let parent = parent_identity
-            .and_then(|key| state.identities.get(&key))
-            .and_then(|wd| state.descriptors.get(wd))
-            .cloned();
+        let path = root.join(relative);
+        let parent = if relative.as_os_str().is_empty() {
+            None
+        } else {
+            state
+                .identities
+                .get(&parent_identity.unwrap_or_default())
+                .and_then(|wd| state.descriptors.get(wd))
+                .and_then(|ds| {
+                    ds.iter().find(|d| {
+                        Some(d.path().as_path()) == path.parent() && d.root.as_path() == root
+                    })
+                })
+                .cloned()
+        };
         if !relative.as_os_str().is_empty() && parent.is_none() {
             state.gaps.insert(root.to_owned());
             state.failed.insert(identity);
@@ -235,10 +260,10 @@ impl Watch {
         }
         let basename = relative.file_name().map_or(&b""[..], OsStr::as_bytes);
         if let Some(wd) = state.identities.get(&identity)
-            && let Some(old) = state.descriptors.get(wd)
-            && old.parent.as_ref().map(|p| p.identity) == parent_identity
-            && old.basename == basename
-            && old.root.as_path() == root
+            && state
+                .descriptors
+                .get(wd)
+                .is_some_and(|ds| ds.iter().any(|d| d.path() == path))
         {
             return;
         }
@@ -263,44 +288,35 @@ impl Watch {
             | WatchFlags::CLOSE_WRITE
             | WatchFlags::MOVE_SELF
             | WatchFlags::DELETE_SELF
-            | WatchFlags::ONLYDIR;
+            | WatchFlags::ONLYDIR
+            | WatchFlags::MASK_ADD;
         match inotify::add_watch(&self.fd, path.as_str(), mask) {
             Ok(wd) => {
                 if state.removed.remove(&wd) {
                     loss(&mut state, RefreshReason::Overflow);
                 }
-                if let Some(old) = state.descriptors.get(&wd).cloned() {
-                    // M5b supplies multiple occurrences. Until then, aliases
-                    // are polling-dependent and events request all roots. A
-                    // known alias must not create endless backstop retries just
-                    // because observation visits its two paths in succession.
-                    if old.identity != identity {
-                        state.identities.remove(&old.identity);
-                        loss(&mut state, RefreshReason::Overflow);
-                    }
-                    if old.path() != root.join(relative) {
-                        let old_root = (*old.root).clone();
-                        state.gaps.insert(old_root.clone());
-                        state.gaps.insert(root.to_owned());
-                        let new_gap =
-                            state.aliases.insert(old_root) | state.aliases.insert(root.to_owned());
-                        if new_gap {
-                            loss(&mut state, RefreshReason::Overflow);
-                        }
-                    }
+                if state
+                    .descriptors
+                    .get(&wd)
+                    .is_some_and(|ds| ds.iter().any(|d| d.identity != identity))
+                {
+                    state.descriptors.remove(&wd);
+                    state.identities.retain(|_, value| *value != wd);
+                    loss(&mut state, RefreshReason::Overflow);
                 }
                 let root = parent
                     .as_ref()
                     .map_or_else(|| Arc::new(root.to_owned()), |p| p.root.clone());
-                state.descriptors.insert(
-                    wd,
-                    Arc::new(Directory {
+                state
+                    .descriptors
+                    .entry(wd)
+                    .or_default()
+                    .push(Arc::new(Directory {
                         identity,
                         parent,
                         basename: basename.to_vec(),
                         root,
-                    }),
-                );
+                    }));
                 state.identities.insert(identity, wd);
                 state.failed.remove(&identity);
             }
@@ -408,22 +424,43 @@ impl Watch {
                 return;
             }
             if let Some(old) = state.descriptors.remove(&wd) {
-                state.identities.remove(&old.identity);
+                for d in old {
+                    state.identities.remove(&d.identity);
+                }
+            }
+            if let Some(inputs) = state.policies.remove(&wd) {
+                state.gaps.extend(inputs.into_iter().map(|(r, _)| r));
             }
             loss(&mut state, RefreshReason::Overflow);
             return;
         }
-        let Some(directory) = state.descriptors.get(&wd).cloned() else {
+        let policy_roots = state
+            .policies
+            .get(&wd)
+            .map(|inputs| {
+                inputs
+                    .iter()
+                    .filter(|(_, n)| n == name || name.is_empty())
+                    .map(|(r, _)| r.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !policy_roots.is_empty() {
+            state.scoped_roots.extend(policy_roots);
+            state.first.get_or_insert_with(Instant::now);
+        }
+        if !state.descriptors.contains_key(&wd) && state.policies.contains_key(&wd) {
+            return;
+        }
+        let Some(directories) = state.descriptors.get(&wd).cloned() else {
             loss(&mut state, RefreshReason::Overflow);
             return;
         };
         if flags.contains(ReadFlags::UNMOUNT) {
-            state.gaps.insert((*directory.root).clone());
+            state
+                .gaps
+                .extend(directories.iter().map(|d| (*d.root).clone()));
             loss(&mut state, RefreshReason::Overflow);
-            return;
-        }
-        if state.aliases.contains(directory.root.as_path()) {
-            loss(&mut state, RefreshReason::Backstop);
             return;
         }
         let now = Instant::now();
@@ -447,7 +484,10 @@ impl Watch {
             hint.to |= flags.contains(ReadFlags::MOVED_TO);
             return;
         }
-        let charge = std::mem::size_of::<Hint>() + 64 + name.len() + directory.charged_bytes();
+        let charge = std::mem::size_of::<Hint>()
+            + 64
+            + name.len()
+            + directories.iter().map(|d| d.charged_bytes()).sum::<usize>();
         if state.pending.len() >= self.config.scopes
             || state.bytes.saturating_add(charge) > self.config.bytes
         {
@@ -458,7 +498,7 @@ impl Watch {
         state.pending.insert(
             key,
             Hint {
-                directory,
+                directories,
                 subtree: flags
                     .intersects(ReadFlags::ISDIR | ReadFlags::MOVE_SELF | ReadFlags::DELETE_SELF),
                 cookie,
@@ -484,7 +524,7 @@ impl Watch {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .descriptors
             .iter()
-            .find(|(_, d)| d.path() == path)
+            .find(|(_, d)| d.iter().any(|d| d.path() == path))
             .map(|(&wd, _)| wd);
         if let Some(wd) = wd {
             self.event(
@@ -517,9 +557,22 @@ impl Watch {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Status {
-            installed: s.descriptors.len(),
-            needed: s.descriptors.len() + s.failed.len(),
-            failed: s.failed.len(),
+            installed: s
+                .descriptors
+                .keys()
+                .chain(s.policies.keys())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            needed: s
+                .descriptors
+                .keys()
+                .chain(s.policies.keys())
+                .collect::<BTreeSet<_>>()
+                .len()
+                + s.failed.len()
+                + s.policy_failed.len(),
+            failed: s.failed.len() + s.policy_failed.len(),
+            bytes: s.bytes,
             pending: s.pending.len() + usize::from(s.backstop.is_some()) + s.scoped_roots.len(),
             oldest: s
                 .first
@@ -564,7 +617,11 @@ impl Watch {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let roots = s.gaps.union(&s.aliases).cloned().collect::<BTreeSet<_>>();
+        let roots = s
+            .gaps
+            .union(&s.unreliable)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         roots
             .into_iter()
             .filter(|root| view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()))
@@ -633,10 +690,16 @@ impl Watch {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             s.failed.retain(|identity| identities.contains(identity));
-            s.aliases
+            s.unreliable
                 .retain(|root| view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
             if s.failed.is_empty() {
-                s.gaps = s.aliases.clone();
+                s.gaps = s.unreliable.clone();
+                let failed = s
+                    .policy_failed
+                    .iter()
+                    .map(|(r, _)| r.clone())
+                    .collect::<Vec<_>>();
+                s.gaps.extend(failed);
             }
             s.descriptors
                 .iter()
@@ -645,23 +708,29 @@ impl Watch {
         };
         // Resolution may traverse a large watch set. Kernel intake must not
         // wait on its catalog/path work or on a sweep's removal syscalls.
-        for (wd, directory) in snapshot {
-            if directory.resolve(view).is_some() {
-                continue;
-            }
+        for (wd, directories) in snapshot {
+            let kept = directories
+                .iter()
+                .filter(|d| d.resolve(view).is_some())
+                .cloned()
+                .collect::<Vec<_>>();
             let mut s = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if s.descriptors
-                .get(&wd)
-                .is_none_or(|d| !Arc::ptr_eq(d, &directory))
-            {
+            if s.descriptors.get(&wd).is_none_or(|ds| {
+                ds.len() != directories.len()
+                    || ds.iter().zip(&directories).any(|(a, b)| !Arc::ptr_eq(a, b))
+            }) {
+                continue;
+            }
+            if !kept.is_empty() {
+                s.descriptors.insert(wd, kept);
                 continue;
             }
             s.descriptors.remove(&wd);
-            s.identities.remove(&directory.identity);
-            if inotify::remove_watch(&self.fd, wd).is_ok() {
+            s.identities.retain(|_, value| *value != wd);
+            if !s.policies.contains_key(&wd) && inotify::remove_watch(&self.fd, wd).is_ok() {
                 s.removed.insert(wd);
             }
         }
@@ -718,26 +787,28 @@ impl Burst {
         let mut roots = self.roots.clone();
         let mut moves: BTreeMap<u32, MovePair> = BTreeMap::new();
         for ((_, name), hint) in &self.pending {
-            if name.is_empty()
-                || matches!(name.as_slice(), b".git" | b".gitignore" | b".ferretignore")
-            {
-                roots.insert((*hint.directory.root).clone());
-            } else if let Some(parent) = hint.directory.resolve(view) {
-                scopes.push(RefreshScope::Entry {
-                    parent,
-                    basename: name.clone(),
-                });
-                if hint.cookie != 0 {
-                    let pair = moves.entry(hint.cookie).or_default();
-                    if hint.from {
-                        pair.old.push((parent, name.clone()));
+            for directory in &hint.directories {
+                if name.is_empty()
+                    || matches!(name.as_slice(), b".git" | b".gitignore" | b".ferretignore")
+                {
+                    roots.insert((*directory.root).clone());
+                } else if let Some(parent) = directory.resolve(view) {
+                    scopes.push(RefreshScope::Entry {
+                        parent,
+                        basename: name.clone(),
+                    });
+                    if hint.cookie != 0 {
+                        let pair = moves.entry(hint.cookie).or_default();
+                        if hint.from {
+                            pair.old.push((parent, name.clone()));
+                        }
+                        if hint.to {
+                            pair.new.push((parent, name.clone()));
+                        }
                     }
-                    if hint.to {
-                        pair.new.push((parent, name.clone()));
-                    }
+                } else {
+                    roots.insert((*directory.root).clone());
                 }
-            } else {
-                roots.insert((*hint.directory.root).clone());
             }
         }
         let changed_boundary = roots

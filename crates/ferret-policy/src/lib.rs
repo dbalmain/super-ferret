@@ -6,12 +6,13 @@
 //! file ([`DEFAULT_IGNORE`]), and the size cap and binary check that separate
 //! *catalogued* from *content-indexed*.
 //!
-//! Pure: no file-system I/O. The crawler (`ferret-crawl`) walks the tree,
-//! reads ignore files and each file's head, and asks this crate what to do:
-//! [`DirRules::root`] once per configured root, [`DirRules::enter`] or
-//! [`DirRules::traverse`] per directory it walks into, [`DirRules::decide`]
-//! per entry, and [`sniff`] per file it would index. Knows nothing about the
-//! catalog or the index. Tested against the golden corpus in `tests/golden/`.
+//! Rule compilation is pure; `GitInputs` discovers config through git. The
+//! crawler (`ferret-crawl`) walks the tree, reads ignore files and each file's
+//! head, and asks this crate what to do: [`DirRules::root`] once per configured
+//! root, [`DirRules::enter`] or [`DirRules::traverse`] per directory it walks
+//! into, [`DirRules::decide`] per entry, and [`sniff`] per file it would index.
+//! Knows nothing about the catalog or the index. Tested against the golden
+//! corpus in `tests/golden/`.
 //!
 //! Seams: `rules` holds the precedence order as one list of rules per
 //! directory (D19), including the one extension over gitignore semantics
@@ -19,6 +20,9 @@
 //! so each distinct one is compiled once. Pattern syntax and matching are
 //! implemented in this crate (D16), behind this API so callers do not depend
 //! on matcher details.
+
+mod inputs;
+pub use inputs::GitInputs;
 
 mod gitignore;
 mod lists;

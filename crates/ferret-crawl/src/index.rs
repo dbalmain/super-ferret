@@ -1502,6 +1502,18 @@ impl Output {
 impl EventVisitor for Hasher<'_> {
     type Dir = DirToken;
 
+    fn policy_path(&mut self, path: &Path) {
+        if let Some(watch) = self.watch {
+            watch.policy_path(self.root, path);
+        }
+    }
+
+    fn policy_input(&mut self, fd: std::os::fd::BorrowedFd<'_>, name: &OsStr) {
+        if let Some(watch) = self.watch {
+            watch.policy_input(self.root, fd, name);
+        }
+    }
+
     fn observing(&mut self, fd: std::os::fd::BorrowedFd<'_>, path: &Path) {
         if let Some(watch) = self.watch {
             watch.arm(self.root, path, fd);

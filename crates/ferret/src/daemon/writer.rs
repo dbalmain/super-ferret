@@ -34,6 +34,9 @@ pub(super) struct Status {
     pub last_refresh: Option<u64>,
     pub last_backstop: Option<u64>,
     pub fault_retained: bool,
+    pub protected_scopes: usize,
+    pub refreshes: u64,
+    pub last_reason: Option<RefreshReason>,
     pub error: Option<String>,
     pub retained_roots: std::collections::BTreeSet<PathBuf>,
 }
@@ -273,6 +276,18 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
             .and_then(|global| {
                 options.global = Some(global);
                 let pin = engine.pin();
+                if let (Some(w), Some(dirs)) = (&watch, &context.dirs) {
+                    for (_, root) in pin.catalog().roots() {
+                        w.policy_path(
+                            std::path::Path::new(OsStr::from_bytes(root)),
+                            &dirs.ignore_file(),
+                        );
+                        w.policy_path(
+                            std::path::Path::new(OsStr::from_bytes(root)),
+                            &dirs.config.join("config"),
+                        );
+                    }
+                }
                 let request = burst.as_ref().map_or_else(
                     || ferret_crawl::RefreshRequest {
                         expected_generation: pin.generation(),
@@ -282,6 +297,10 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                     },
                     |b| b.request(pin.catalog()),
                 );
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .last_reason = Some(request.reason);
                 engine.refresh(request, &options).map_err(io::Error::other)
             });
         match &result {
@@ -332,6 +351,8 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     status.last_refresh = Some(timestamp());
+    status.refreshes += 1;
+    status.protected_scopes = report.protected_scopes;
     if backstop {
         status.last_backstop = status.last_refresh;
     }
@@ -435,6 +456,7 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
             .int("watch_needed", w.needed as u64)
             .int("watch_failed", w.failed as u64)
             .int("pending_scopes", w.pending as u64)
+            .int("pending_bytes", w.bytes as u64)
             .opt_int("oldest_pending_ms", w.oldest.map(|d| d.as_millis() as i128))
             .bool("watch_uncovered", w.uncovered);
         if let Some(reason) = w.backstop {
@@ -446,7 +468,27 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
         o.bool("watch_uncovered", true)
             .int("watch_installed", 0)
             .int("watch_needed", 0)
-            .int("watch_failed", 0);
+            .int("watch_failed", 0)
+            .int("pending_scopes", 0)
+            .int("pending_bytes", 0)
+            .null("oldest_pending_ms")
+            .null("backstop_reason");
+    }
+    o.bool("host_running", true)
+        .str(
+            "current_operation",
+            if host.writer_running.load(Ordering::Acquire) {
+                "refresh"
+            } else {
+                "idle"
+            },
+        )
+        .int("protected_scopes", s.protected_scopes as u64)
+        .int("refreshes", s.refreshes);
+    if let Some(reason) = s.last_reason {
+        o.str("last_refresh_reason", &format!("{reason:?}"));
+    } else {
+        o.null("last_refresh_reason");
     }
     o.opt_int("last_successful_refresh", s.last_refresh)
         .opt_int("last_complete_backstop", s.last_backstop)
