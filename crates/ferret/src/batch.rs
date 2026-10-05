@@ -7,8 +7,8 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use ferret_query::Query;
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
+use ferret_query::{Query, Row};
 
 use crate::cli;
 use crate::engine::{Engine, QuerySession};
@@ -124,9 +124,14 @@ fn handle(
             if let Some(engine) = engine {
                 let session = engine.pin();
                 generation(&mut object, Some(session.generation()));
-                object.int("bytes", session.name_index().bytes() as u64);
+                object
+                    .int("bytes", session.resident_bytes())
+                    .int("engine_opens", Engine::open_count());
             } else {
-                object.null("generation").int("bytes", 0);
+                object
+                    .null("generation")
+                    .int("bytes", 0)
+                    .int("engine_opens", Engine::open_count());
             }
             object.end();
             send(&line)
@@ -136,13 +141,23 @@ fn handle(
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .or_else(|| dirs.map(|dirs| dirs.data.clone()));
-            *engine = next.as_deref().and_then(open_engine);
+            if let Some(path) = next.as_deref() {
+                if let Ok(Some(reloaded)) = Engine::open(path) {
+                    if engine
+                        .as_ref()
+                        .is_none_or(|current| current.generation() != reloaded.generation())
+                    {
+                        *engine = Some(reloaded);
+                    }
+                }
+            }
             event(request, "reload", |o| {
                 if let Some(engine) = engine {
                     generation(o, Some(engine.generation()));
                 } else {
                     o.null("generation");
                 }
+                o.int("engine_opens", Engine::open_count());
             })
         }
         Op::Search => search_request(request, engine.as_ref(), dirs),
@@ -171,29 +186,50 @@ fn search_request(
     let mut rows = 0u64;
     let mut status = 3u8;
     let mut query_error = None;
+    let mut first_row = None;
+    let mut stats = None;
+    let mut bytes_read = 0u64;
+    let mut plan_text = String::new();
+    let mut strategy = String::new();
     if let Ok(query) = parsed {
+        plan_text = query.explain();
+        strategy = format!("{:?}", query.strategy());
         if let Some(session) = session.as_ref() {
             let catalog = session.catalog();
-            let result = session.search(&query, |row| {
-                let mut bytes = Vec::new();
-                json_row(&mut bytes, catalog, row);
-                let mut output = Vec::new();
-                let mut object = Object::new(&mut output);
-                object.str("id", &request.id).str("event", "row");
-                object.raw_fields(&bytes[1..bytes.len() - 1]);
-                object.end();
-                if send(&output).is_err() {
-                    return ControlFlow::Break(());
-                }
-                rows += 1;
-                if request.limit.is_some_and(|limit| rows >= limit) {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            });
+            bytes_read = catalog.bytes_read();
+            let mut output_error = None;
+            let result = if request.limit == Some(0) {
+                Ok(ferret_query::Stats::default())
+            } else {
+                session.search(&query, |row: &Row<'_>| {
+                    let mut bytes = Vec::new();
+                    json_row(&mut bytes, catalog, row);
+                    let mut output = Vec::new();
+                    let mut object = Object::new(&mut output);
+                    object.str("id", &request.id).str("event", "row");
+                    object.raw_fields(&bytes[1..bytes.len() - 1]);
+                    object.end();
+                    if let Err(error) = send(&output) {
+                        output_error = Some(error);
+                        return ControlFlow::Break(());
+                    }
+                    first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
+                    rows += 1;
+                    if request.limit.is_some_and(|limit| rows >= limit) {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+            };
+            if let Some(error) = output_error {
+                return Err(error);
+            }
             match result {
-                Ok(_) => status = if rows == 0 { 1 } else { 0 },
+                Ok(result) => {
+                    stats = Some(result);
+                    status = if rows == 0 { 1 } else { 0 };
+                }
                 Err(error) => query_error = Some(error.to_string()),
             }
         } else {
@@ -206,12 +242,33 @@ fn search_request(
         }
     }
     let elapsed = started.elapsed().as_micros() as i128;
-    log_search(dirs, request, now, status, rows, elapsed);
+    log_search(
+        dirs,
+        request,
+        now,
+        status,
+        rows,
+        elapsed,
+        first_row,
+        bytes_read,
+        &plan_text,
+        &strategy,
+        stats,
+        query_error.as_deref(),
+    );
     event(request, "end", |o| {
         o.int("exit", status)
             .int("rows", rows)
             .bool("cancelled", false)
             .int("elapsed_us", elapsed);
+        o.opt_int("first_row_us", first_row)
+            .int("bytes_read", bytes_read);
+        if let Some(stats) = stats {
+            o.object("stats", |o| {
+                o.int("candidates", stats.candidates)
+                    .int("rows", stats.rows);
+            });
+        }
         if let Some(error) = query_error.as_deref() {
             o.str("error", error);
         }
@@ -314,25 +371,64 @@ impl Effects for FrameOutput<'_> {
         );
     }
     fn output(&mut self, buffer: &mut OutputBuffer) -> io::Result<()> {
-        let mut bytes = Vec::new();
-        buffer.write_to(&mut bytes)?;
-        self.emit(&bytes)
+        self.record += 1;
+        let mut writer = FrameWriter {
+            id: self.id,
+            record: self.record,
+            part: 0,
+            pending: Vec::with_capacity(PART),
+        };
+        buffer.write_to(&mut writer)?;
+        writer.finish()
     }
 }
 impl FrameOutput<'_> {
     fn emit(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.record += 1;
-        for (part, chunk) in bytes.chunks(PART).enumerate() {
-            frame(
-                self.id,
-                self.record,
-                part as u64,
-                chunk,
-                (part + 1) * PART >= bytes.len(),
-            )?;
+        emit_parts(self.id, self.record, bytes)
+    }
+}
+
+struct FrameWriter<'a> {
+    id: &'a str,
+    record: u64,
+    part: u64,
+    pending: Vec<u8>,
+}
+impl Write for FrameWriter<'_> {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let total = bytes.len();
+        while !bytes.is_empty() {
+            if self.pending.len() == PART {
+                frame(self.id, self.record, self.part, &self.pending, false)?;
+                self.part += 1;
+                self.pending.clear();
+            }
+            let take = (PART - self.pending.len()).min(bytes.len());
+            self.pending.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+        }
+        Ok(total)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.finish()
+    }
+}
+impl FrameWriter<'_> {
+    fn finish(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            frame(self.id, self.record, self.part, &self.pending, true)?;
+            self.pending.clear();
         }
         Ok(())
     }
+}
+fn emit_parts(id: &str, record: u64, bytes: &[u8]) -> io::Result<()> {
+    let chunks: Vec<_> = bytes.chunks(PART).collect();
+    for (part, chunk) in chunks.iter().enumerate() {
+        frame(id, record, part as u64, chunk, part + 1 == chunks.len())?;
+    }
+    Ok(())
 }
 
 fn frame(id: &str, record: u64, part: u64, bytes: &[u8], last: bool) -> io::Result<()> {
@@ -413,15 +509,34 @@ fn log_search(
     exit: u8,
     rows: u64,
     elapsed: i128,
+    first_row: Option<i128>,
+    bytes_read: u64,
+    plan: &str,
+    strategy: &str,
+    stats: Option<ferret_query::Stats>,
+    error: Option<&str>,
 ) {
     if let Some(dirs) = dirs {
         let mut line = Vec::new();
         let mut o = crate::log::line(&mut line, "search", at);
         o.byte_strings("query", request.args.iter().map(Vec::as_slice))
+            .str("plan", plan)
+            .str("strategy", strategy)
             .opt_int("limit", request.limit)
             .int("exit", exit)
             .int("rows", rows)
-            .int("total_us", elapsed);
+            .opt_int("first_row_us", first_row)
+            .int("total_us", elapsed)
+            .int("bytes_read", bytes_read);
+        if let Some(stats) = stats {
+            o.object("stats", |o| {
+                o.int("candidates", stats.candidates)
+                    .int("rows", stats.rows);
+            });
+        }
+        if let Some(error) = error {
+            o.str("error", error);
+        }
         o.end();
         let _ = crate::log::append(&dirs.state, &line);
     }

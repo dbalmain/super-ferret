@@ -3,12 +3,15 @@
 
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ferret_catalog::{Catalog, Generation, OpenError, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
 use ferret_query::{NameIndex, Query, Row, RunError, Stats};
+
+static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// A checked, fully loaded query engine. A query-only engine takes no writer
 /// lock; attaching a writer shares its already loaded catalog buffers.
@@ -32,6 +35,7 @@ impl Engine {
             return Ok(None);
         };
         let catalog = catalog.into_resident()?;
+        OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
         Ok(Some(Self {
             current: RwLock::new(QuerySession {
                 names: Arc::new(NameIndex::new(&catalog)),
@@ -39,6 +43,11 @@ impl Engine {
             }),
             writer: Mutex::new(None),
         }))
+    }
+
+    /// Number of successful catalog engine opens in this process.
+    pub fn open_count() -> u64 {
+        OPEN_COUNT.load(Ordering::Relaxed)
     }
 
     /// Takes ownership of a resident writer and its checked, loaded view.
@@ -64,6 +73,11 @@ impl Engine {
     /// Generation currently selected by this resident engine.
     pub fn generation(&self) -> Generation {
         self.pin().generation()
+    }
+
+    /// Bytes retained by the fully resident catalog and its name planner.
+    pub fn resident_bytes(&self) -> u64 {
+        self.pin().resident_bytes()
     }
 
     /// Observes final disk state under the writer lock and adopts the checked
@@ -108,6 +122,11 @@ impl Engine {
 }
 
 impl QuerySession {
+    /// Bytes retained by the fully resident catalog and its name planner.
+    pub fn resident_bytes(&self) -> u64 {
+        self.catalog.bytes_read() + self.names.bytes() as u64
+    }
+
     pub fn name_index(&self) -> &NameIndex {
         &self.names
     }

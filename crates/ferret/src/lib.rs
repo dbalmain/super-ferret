@@ -4,6 +4,7 @@
 //! and writer adoption for this host and the future batch/daemon hosts.
 //!
 //! - [`cli`]: the entry point, exit statuses, where the index is, usage.
+//! - [`batch`]: one resident engine and the sequential S1B JSON-lines host.
 //! - [`args`]: the command line, parsed; pure.
 //! - [`find`], [`search`], [`index`] (with `roots`), [`stats`]: one module per
 //!   command.
@@ -12,8 +13,7 @@
 //!   path or an id, but query text is logged as typed and may contain a path.
 //! - [`xdg`] resolves directories from the environment and touches no files;
 //!   [`setup`] writes the files a new install starts with.
-//! - [`protocol`]: the batch request reader (S1B's batch protocol). No caller
-//!   yet; M2b adds the batch host.
+//! - [`protocol`]: the shared request reader for batch and the future socket.
 //!
 //! **Paths that are not UTF-8.** Human output writes a path's raw bytes. In
 //! JSON lines, `path` is always a string: the path's text, with each invalid

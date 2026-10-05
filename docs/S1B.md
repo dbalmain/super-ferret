@@ -277,6 +277,13 @@ queries retain normal snapshot freshness until an explicit re-index/reload.
 It does not claim daemon freshness. Simulated refresh tests use the library
 writer API, not a batch-only imitation of reconciliation.
 
+The local host's built `status` event includes `generation`, `bytes` and
+`engine_opens`. `bytes` counts the loaded resident catalog payload plus the
+resident name planner's byte storage. `engine_opens` is an engine counter used
+to verify that sequential queries share one open; explicit reloads increment
+it. Search end events include `elapsed_us`, `first_row_us`, `bytes_read` and
+query stats when available. Find end events include `elapsed_us`.
+
 The suites can issue many read-only queries against one fixture/session,
 compare every block with current CLI output and pinned GNU findutils 4.11.0,
 and rerun against the socket host. Find-compat's driver groups cases by fixture,
