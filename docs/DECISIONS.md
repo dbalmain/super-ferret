@@ -70,7 +70,7 @@ Predecessors, carried forward where still open:
 | D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
 | D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 | D54 | In-memory names: interning, postings, row order          | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                 |
-| D55 | Storing mtime as an order rather than a value          | open           | rec D + F, D with an exact per-block max; time bench: no ordered structure earns its memory                   |
+| D55 | Storing mtime as an order rather than a value          | answered       | D + F: seconds-only ordered dictionaries for mtime and ctime, exact per-block max, racy rule; no ordered structure |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2990,7 +2990,8 @@ order with BFS row postings, every output checked against the flat reference.
 
 ## D55 — Storing mtime as an order rather than a value
 
-**Status: open.** Raised by Dave, 2026-10-05. Measured the same day with
+**Status: answered, D + F with an exact per-block max (Dave, 2026-10-05).**
+Raised by Dave, 2026-10-05. Measured the same day with
 `scripts/mtime_columns.py` in the private `~/w/name-index-bench` (`d543475`), over a live walk of `$HOME` (4.2M entries, unfiltered, so
 including ignored paths) and `/nix/store` (4.5M), rows in ferret's order:
 directories breadth first, then files, siblings by name. **Revised the same
@@ -3219,3 +3220,20 @@ wrong tie order.
 - Block skipping weakens after compaction scatters recent edits (the bench
   scatters them uniformly, which is pessimistic): `-mtime -1` 2.0 → 5.0 ms,
   newest 20 0.42 → 2.3 ms. A real edit trace would settle how much.
+
+> Dave (2026-10-05): Agree with the recommendation.
+
+**Answer (2026-10-05):** D + F, with D's blocks carrying an exact maximum.
+
+- mtime: whole seconds as a blocked ordered dictionary (sorted distinct
+  seconds as packed deltas, a dense rank per inode in 128-row blocks), each
+  block with its exact maximum for skipping. The mtime nanoseconds column is
+  dropped; a printed mtime has whole seconds, and `-newer file` stats only
+  files in the reference's second to break that tie.
+- ctime: whole seconds in the same coding. D26's carry-over key becomes
+  `(dev, ino, size, ctime)` in seconds, with git's racy rule: a file whose
+  ctime is within a few seconds of its observation is recorded stale and
+  rehashed at the next crawl.
+- No in-memory ordered structure (sorted permutation, heap, B-tree). Time
+  queries scan with block skipping, and the planner chooses between scanning
+  and probing per name-side id from the name side's size.
