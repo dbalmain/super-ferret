@@ -18,10 +18,11 @@ mod observe;
 pub mod reconcile;
 mod refresh;
 mod walk;
+pub mod watch;
 
 pub use index::{
     Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report,
-    RootChange, index, index_change, recrawl,
+    RootChange, index, index_change, recrawl, session_change,
 };
 pub use observe::ContentFault;
 pub use refresh::{

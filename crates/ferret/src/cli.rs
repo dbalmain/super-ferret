@@ -123,6 +123,8 @@ find exit status: 0 success, 1 error (including invalid syntax).
   In default mode -empty sees this walk's -delete removals, not removals by
   -exec commands; use -delete or -I for deletion-aware emptiness.
 
+status [--json]     Show the running daemon’s writer/watch status.
+
 search exit status: 0 success (search printed a row), 1 search matched nothing,
   2 usage error, 3 runtime error (no index, I/O, lock held, walk faults).
 
@@ -193,6 +195,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         Command::Index(roots) => crate::index::index(&context, &roots),
         Command::RootsList => crate::index::list(&context),
         Command::RootsRemove(roots) => crate::index::remove(&context, &roots),
+        Command::Status => crate::daemon::status(&context),
         Command::Stats => crate::stats::run(&context),
         Command::ImportV3 => {
             match ferret_catalog::Transaction::import_v3(&context.index, [0; 16]) {

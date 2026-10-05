@@ -129,6 +129,11 @@ fn handle(
     protocol_stdin: bool,
 ) -> io::Result<()> {
     match request.op {
+        Op::Index | Op::RootsRemove => request_error(
+            &Destination::Stdout,
+            Some(&request.id),
+            "writer commands require the daemon socket",
+        ),
         Op::Status => {
             let mut line = Vec::new();
             let mut object = Object::new(&mut line);

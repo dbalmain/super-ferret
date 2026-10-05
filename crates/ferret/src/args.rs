@@ -46,9 +46,13 @@ pub enum Command {
     /// structured-event host instead of find's raw stdout/stderr; it is not
     /// passed to find's own parser, so a `--json` operand after `find` (or
     /// after `--`) is unaffected and reaches find intact.
-    Find { args: Vec<OsString>, json: bool },
+    Find {
+        args: Vec<OsString>,
+        json: bool,
+    },
     /// `stats`.
     Stats,
+    Status,
     /// Explicit migration of the index directory's v3 snapshot.
     ImportV3,
     /// `help`, `-h` or `--help`.
@@ -190,12 +194,13 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             let command = match other {
                 b"index" => "index",
                 b"roots" => "roots",
+                b"status" => "status",
                 b"stats" => "stats",
                 b"import-v3" => "import-v3",
                 b"help" => "help",
                 _ => return Err(UsageError::UnknownCommand(name)),
             };
-            if json {
+            if json && other != b"status" {
                 return Err(UsageError::NotFor("--json", command));
             }
             if limit.is_some() {
@@ -203,6 +208,13 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             }
             match other {
                 b"index" => Command::Index(paths(rest)),
+                b"status" => {
+                    if rest.len() == 1 && rest[0] == "--json" {
+                        Command::Status
+                    } else {
+                        none("status", rest).map(|()| Command::Status)?
+                    }
+                }
                 b"stats" => none("stats", rest).map(|()| Command::Stats)?,
                 b"import-v3" => none("import-v3", rest).map(|()| Command::ImportV3)?,
                 b"help" => none("help", rest).map(|()| Command::Help)?,

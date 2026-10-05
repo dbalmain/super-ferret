@@ -63,6 +63,8 @@ pub struct IndexOptions {
     pub workers: usize,
     /// The sniffer's version. A change refreshes every root (D37).
     pub sniffer: u32,
+    /// Optional daemon intake, armed before directory listing.
+    pub watch: Option<std::sync::Arc<crate::watch::Watch>>,
 }
 
 impl Default for IndexOptions {
@@ -72,6 +74,7 @@ impl Default for IndexOptions {
             config: Config::default(),
             workers: crate::default_workers(),
             sniffer: ferret_policy::SNIFFER_VERSION,
+            watch: None,
         }
     }
 }
@@ -381,30 +384,47 @@ pub fn index_change(
 ) -> Result<Report, IndexError> {
     run(
         catalog_dir,
-        |previous| {
-            let mut roots: Vec<PathBuf> = previous
-                .map(|p| {
-                    p.roots()
-                        .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for gone in change.remove {
-                let gone = normalise(gone)?;
-                let before = roots.len();
-                roots.retain(|r| *r != gone);
-                if roots.len() == before {
-                    return Err(IndexError::NotConfigured(gone));
-                }
-            }
-            for added in change.add {
-                roots.push(normalise(added)?);
-            }
-            Ok(roots)
-        },
+        |previous| changed_roots(previous, change),
         refresh,
         options,
     )
+}
+
+/// Applies root edits under an already retained session lock, using the same
+/// D34 widening and publication producer as the foreground index command.
+pub fn session_change(
+    session: &mut WriterSession,
+    change: RootChange<'_>,
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+) -> Result<Report, IndexError> {
+    let roots = changed_roots(Some(&session.view()), change)?;
+    recrawl(session, &roots, refresh, options)
+}
+
+fn changed_roots(
+    previous: Option<&Catalog>,
+    change: RootChange<'_>,
+) -> Result<Vec<PathBuf>, IndexError> {
+    let mut roots: Vec<PathBuf> = previous
+        .map(|p| {
+            p.roots()
+                .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
+                .collect()
+        })
+        .unwrap_or_default();
+    for gone in change.remove {
+        let gone = normalise(gone)?;
+        let before = roots.len();
+        roots.retain(|r| *r != gone);
+        if roots.len() == before {
+            return Err(IndexError::NotConfigured(gone));
+        }
+    }
+    for added in change.add {
+        roots.push(normalise(added)?);
+    }
+    Ok(roots)
 }
 
 /// One run, with the configured roots decided by `roots` from the previous
@@ -844,6 +864,7 @@ fn observe(
             &walk_options,
             || {
                 let mut hasher = Hasher::with_source(source, &cache, root);
+                hasher.watch = options.watch.as_deref();
                 hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
                 hasher
             },
@@ -1197,6 +1218,7 @@ pub(crate) struct Hasher<'a> {
     pub(crate) out: Output,
     reader: Reader,
     selection: Option<&'a crate::refresh::Selection>,
+    watch: Option<&'a crate::watch::Watch>,
 }
 
 /// What a worker leaves behind.
@@ -1241,6 +1263,7 @@ impl<'a> Hasher<'a> {
             },
             reader: Reader::new(),
             selection: None,
+            watch: None,
         }
     }
 
@@ -1478,6 +1501,12 @@ impl Output {
 
 impl EventVisitor for Hasher<'_> {
     type Dir = DirToken;
+
+    fn observing(&mut self, fd: std::os::fd::BorrowedFd<'_>, path: &Path) {
+        if let Some(watch) = self.watch {
+            watch.arm(self.root, path, fd);
+        }
+    }
 
     fn root(&mut self, stat: crate::Stat<'_>) -> DirToken {
         self.out.counts.dirs += 1;

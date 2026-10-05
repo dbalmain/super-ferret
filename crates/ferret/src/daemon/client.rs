@@ -41,6 +41,46 @@ pub(crate) fn find(index: &Path, args: &[OsString], json: bool, now: SystemTime)
     query(index, args, "find", json, None, now, None)
 }
 
+pub(crate) fn writer_command(
+    context: &Context,
+    command: &str,
+    change: ferret_crawl::RootChange<'_>,
+    global: &str,
+) -> Option<Exit> {
+    let mut args = vec![OsString::from(global)];
+    args.extend(
+        change
+            .add
+            .iter()
+            .chain(change.remove)
+            .map(|p| p.as_os_str().to_owned()),
+    );
+    query(
+        &context.index,
+        &args,
+        command,
+        false,
+        None,
+        SystemTime::now(),
+        Some(context),
+    )
+}
+pub(crate) fn daemon_status(context: &Context) -> Exit {
+    query(
+        &context.index,
+        &[],
+        "status",
+        false,
+        None,
+        SystemTime::now(),
+        None,
+    )
+    .unwrap_or_else(|| {
+        cli::error("no compatible running daemon for this index");
+        Exit::Error
+    })
+}
+
 fn spawn(endpoint: &Endpoint, index: &Path) -> io::Result<()> {
     let binary = std::env::var_os("FERRET_DAEMON_BIN")
         .map(PathBuf::from)
@@ -78,7 +118,11 @@ fn event(reader: &mut BufReader<UnixStream>, line: &mut Vec<u8>) -> io::Result<V
     protocol::parse_object(line)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon event"))
 }
-fn connect(endpoint: &Endpoint, index: &Path) -> io::Result<BufReader<UnixStream>> {
+fn connect(
+    endpoint: &Endpoint,
+    index: &Path,
+    can_spawn: bool,
+) -> io::Result<BufReader<UnixStream>> {
     let expected = ferret_catalog::Catalog::open(index)
         .map_err(io::Error::other)?
         .ok_or_else(|| io::Error::other("no index"))?
@@ -128,6 +172,11 @@ fn connect(endpoint: &Endpoint, index: &Path) -> io::Result<BufReader<UnixStream
                         || field_number(&hello, "format") != Some(FORMAT)
                         || !supports_queries(&hello)
                     {
+                        if !can_spawn {
+                            return Err(io::Error::other(
+                                "incompatible writer owner; use ferret status --json",
+                            ));
+                        }
                         reader.get_mut().write_all(b"{\"op\":\"drain\"}\n")?;
                         // Wait for the owning lock and socket to be released.
                         // Active queries finish; the same deadline bounds
@@ -153,6 +202,7 @@ fn connect(endpoint: &Endpoint, index: &Path) -> io::Result<BufReader<UnixStream
                     }
                 }
             }
+            Err(error) if !can_spawn => return Err(error),
             Err(_) if !spawned => {
                 spawn(endpoint, index)?;
                 spawned = true;
@@ -214,7 +264,7 @@ fn query(
     }
     let index = fs::canonicalize(index).ok()?;
     let endpoint = Endpoint::open(&index).ok()?;
-    let mut reader = connect(&endpoint, &index).ok()?;
+    let mut reader = connect(&endpoint, &index, matches!(op, "search" | "find")).ok()?;
     let cwd = std::env::current_dir().ok()?;
     let mut request = Vec::new();
     let mut object = Object::new(&mut request);
@@ -252,6 +302,15 @@ fn query(
             }
             match field_text(&value, "event") {
                 Some("begin") => {}
+                Some("log") if matches!(op, "index" | "roots-remove") => {
+                    if let Some(context) = context {
+                        context.log(&bytes(&value, "bytes", "bytes_base64")?);
+                    }
+                }
+                Some("status") if op == "status" => {
+                    write(&mut out, &line, &mut output_failure)?;
+                    return Ok(Exit::Ok);
+                }
                 Some("row") if op == "search" => {
                     rows += 1;
                     if json {
@@ -276,9 +335,9 @@ fn query(
                     first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
                     out.flush()?;
                 }
-                Some("stdout" | "stderr") if op == "find" => {
+                Some("stdout" | "stderr") if matches!(op, "find" | "index" | "roots-remove") => {
                     if !json {
-                        let data = bytes(&value, "", "bytes_base64")?;
+                        let data = bytes(&value, "bytes", "bytes_base64")?;
                         if field_text(&value, "event") == Some("stdout") {
                             write(&mut out, &data, &mut output_failure)?;
                         } else {
@@ -348,7 +407,7 @@ fn query(
             Exit::Error
         }
     };
-    if let Some(context) = context {
+    if let Some(context) = context.filter(|_| op == "search") {
         let mut line = Vec::new();
         let mut object = crate::log::line(&mut line, "search", now);
         object

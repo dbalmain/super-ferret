@@ -60,6 +60,8 @@ pub(crate) enum Op {
     Find,
     Status,
     Reload,
+    Index,
+    RootsRemove,
 }
 
 impl Op {
@@ -69,6 +71,8 @@ impl Op {
             "find" => Some(Op::Find),
             "status" => Some(Op::Status),
             "reload" => Some(Op::Reload),
+            "index" => Some(Op::Index),
+            "roots-remove" => Some(Op::RootsRemove),
             _ => None,
         }
     }
@@ -1104,6 +1108,8 @@ mod tests {
                 Op::Find => "find",
                 Op::Status => "status",
                 Op::Reload => "reload",
+                Op::Index => "index",
+                Op::RootsRemove => "roots-remove",
             },
         );
         obj.byte_strings("args", req.args.iter().map(|a| a.as_slice()));

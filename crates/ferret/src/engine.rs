@@ -94,6 +94,27 @@ impl Engine {
         Ok(report)
     }
 
+    /// Runs an explicit root/index command under the retained writer lock and
+    /// publishes its checked view before returning the ordinary producer
+    /// report.
+    pub fn index_change(
+        &self,
+        change: ferret_crawl::RootChange<'_>,
+        refresh: ferret_crawl::Refresh<'_>,
+        options: &IndexOptions,
+    ) -> Result<ferret_crawl::Report, ferret_crawl::IndexError> {
+        let mut guard = self
+            .writer
+            .lock()
+            .map_err(|_| ferret_crawl::IndexError::Begin(ferret_catalog::BeginError::Locked))?;
+        let writer = guard.as_mut().ok_or(ferret_crawl::IndexError::Begin(
+            ferret_catalog::BeginError::Locked,
+        ))?;
+        let report = ferret_crawl::session_change(writer, change, refresh, options)?;
+        self.select(writer.view());
+        Ok(report)
+    }
+
     /// Services an explicit idle-boundary compaction. Old query pins continue
     /// to own the old buffers and descriptors after retired files are unlinked.
     pub fn compact(&self) -> Result<Generation, Error> {

@@ -1,14 +1,15 @@
-//! Query-only socket lifecycle. Endpoint security lives in `endpoint`, ordinary
-//! CLI fallback/rendering in `client`; query events use batch/find_json
-//! unchanged. No query holds the engine-selection mutex during evaluation or
-//! socket writes.
+//! Socket lifecycle and retained writer ownership. Endpoint security lives in
+//! `endpoint`, ordinary CLI fallback/rendering in `client`; query events use
+//! batch/find_json unchanged. No query holds the engine-selection mutex during
+//! evaluation or socket writes.
 
 #[cfg(panic = "abort")]
 compile_error!("ferretd requires panic unwinding for query isolation");
 
 mod client;
 mod endpoint;
-pub(crate) use client::{find, search};
+mod writer;
+pub(crate) use client::{daemon_status as status, find, search, writer_command as write};
 
 use std::ffi::OsString;
 use std::fs;
@@ -54,6 +55,11 @@ struct Host {
     query_limit: usize,
     workers: usize,
     format: u64,
+    writer_send: mpsc::SyncSender<writer::Command>,
+    writer_status: Mutex<writer::Status>,
+    writer_running: AtomicBool,
+    writer_pending: AtomicUsize,
+    stop: AtomicBool,
 }
 
 /// Runs ferretd. An unusable endpoint or catalog is an operational error; a
@@ -134,6 +140,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let cleanup = SocketCleanup(&endpoint, own_socket.dev(), own_socket.ino());
     fs::set_permissions(endpoint.socket(), fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
+    let (writer_send, writer_receive) = mpsc::sync_channel(32);
     let host = Arc::new(Host {
         engine: Mutex::new(Loaded::Loading),
         lifecycle: Mutex::new(Lifecycle {
@@ -147,30 +154,15 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         build: test_build(),
         query_limit: QUERIES.min(ferret_crawl::default_workers()),
         format: advertised_format(),
+        writer_send,
+        writer_status: Mutex::new(writer::Status::default()),
+        writer_running: AtomicBool::new(true),
+        writer_pending: AtomicUsize::new(0),
+        stop: AtomicBool::new(false),
         workers: ferret_crawl::default_workers().min(16)
             / QUERIES.min(ferret_crawl::default_workers()),
     });
-    let loader = host.clone();
-    std::thread::spawn(move || {
-        #[cfg(debug_assertions)]
-        {
-            let delay = duration("FERRET_DAEMON_LOAD_DELAY_MS", 0);
-            if !delay.is_zero() {
-                std::thread::sleep(delay);
-            }
-        }
-        let loaded = std::panic::catch_unwind(|| Engine::open(&loader.index));
-        let state = match loaded {
-            Ok(Ok(Some(engine))) => Loaded::Ready(Arc::new(engine)),
-            Ok(Ok(None)) => Loaded::Failed("no index".into()),
-            Ok(Err(error)) => Loaded::Failed(error.to_string()),
-            Err(_) => Loaded::Failed("engine loading panicked".into()),
-        };
-        *loader
-            .engine
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
-    });
+    let writer = writer::start(host.clone(), writer_receive);
     let mut idle_since = Instant::now();
     loop {
         let draining = host
@@ -179,10 +171,13 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .draining;
         let clients = host.clients.load(Ordering::Acquire);
-        if clients != 0 {
+        if clients != 0 || writer::busy(&host) {
             idle_since = Instant::now();
         }
-        if (draining && clients == 0)
+        if (draining
+            && clients == 0
+            && !host.writer_running.load(Ordering::Acquire)
+            && host.writer_pending.load(Ordering::Acquire) == 0)
             || (!idle.is_zero() && clients == 0 && idle_since.elapsed() >= idle)
         {
             break;
@@ -203,6 +198,8 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+    host.stop.store(true, Ordering::Release);
+    let _ = writer.join();
     // The lifetime-held endpoint lock excludes starters through cleanup. Never
     // unlink a replacement created by somebody else after our socket vanished.
     if let Ok(current) = fs::symlink_metadata(endpoint.socket())
@@ -273,7 +270,7 @@ fn hello(destination: &Destination, host: &Host) -> io::Result<bool> {
             .int("pid", std::process::id())
             .byte_strings(
                 "capabilities",
-                [b"query-only".as_slice(), b"cancel", b"drain"],
+                [b"query-only".as_slice(), b"cancel", b"drain", b"writer"],
             )
             .object("limits", |o| {
                 o.int("line", protocol::MAX_LINE_BYTES as u64)
@@ -356,16 +353,6 @@ fn pin(host: &Host) -> io::Result<QuerySession> {
     let identity = fs::metadata(&host.index)?;
     if format!("{:x}-{:x}", identity.dev(), identity.ino()) != host.identity {
         return Err(io::Error::other("index directory identity changed"));
-    }
-    let peek = ferret_catalog::Catalog::open(&host.index)
-        .map_err(io::Error::other)?
-        .ok_or_else(|| io::Error::other("index disappeared"))?;
-    if peek.generation() != engine.generation() {
-        *engine = Arc::new(
-            Engine::open(&host.index)
-                .map_err(io::Error::other)?
-                .ok_or_else(|| io::Error::other("index disappeared"))?,
-        );
     }
     Ok(engine.pin())
 }
@@ -509,6 +496,9 @@ fn runtime_status(request: &Request) -> u8 {
     if request.op == Op::Find { 1 } else { 3 }
 }
 fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
+    if matches!(request.op, Op::Index | Op::RootsRemove) {
+        return writer::execute(host, request, destination);
+    }
     // Freshness preparation can itself panic before batch emits begin. Turn
     // that failure into an ordinary null-generation runtime-error block.
     let selected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(host)))
@@ -528,6 +518,9 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
         }
     };
     match request.op {
+        Op::Index | Op::RootsRemove => {
+            unreachable!("writer requests routed before query selection")
+        }
         Op::Search => crate::batch::search_request(request, Some(session), None, destination),
         Op::Find => {
             // Clear all action grants. Even a direct socket caller cannot ask
@@ -557,6 +550,7 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
                 generation(o, Some(session.generation()));
                 o.int("engine_opens", Engine::open_count())
                     .int("bytes", session.resident_bytes());
+                writer::fields(host, o);
             },
         ),
     }

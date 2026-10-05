@@ -412,6 +412,10 @@ pub trait EventVisitor {
     /// lifecycle above); ignored otherwise.
     fn visit(&mut self, event: Event<'_, Self::Dir>) -> Option<Self::Dir>;
 
+    /// Observed directory handle, before its complete listing. A watch host
+    /// arms here so notifications during observation survive into its next run.
+    fn observing(&mut self, _fd: BorrowedFd<'_>, _path: &Path) {}
+
     /// Selects work before child stat/open. A false result deliberately keeps
     /// this untouched scope; it is not an ignored or vanished observation.
     fn consider(&mut self, _parent: Self::Dir, _name: &OsStr, _path: &Path) -> bool {
@@ -1108,6 +1112,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// it as uncertain coverage like any other listing fault (D26 A′): it says
     /// the opened directory is gone, not that its path is.
     fn list(&mut self, dir: BorrowedFd<'_>, context: FaultContext<'_, V::Dir>) -> Option<Children> {
+        self.visit.observing(dir, bytes_path(&self.rel));
         #[cfg(test)]
         if let Some(error) =
             FAIL_LIST.with_borrow(|hook| hook.as_ref().and_then(|hook| hook(bytes_path(&self.rel))))
