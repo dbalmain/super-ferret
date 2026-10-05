@@ -120,11 +120,12 @@ impl QuerySession {
         effects: E,
         workers: usize,
     ) -> Result<Outcome, Unsupported> {
-        plan.run_parallel(
-            plan.parallel_catalog_source(self.catalog.clone()),
-            effects,
-            workers,
-        )
+        let source = if plan.no_ignore() || plan.is_information() {
+            plan.live_source()
+        } else {
+            plan.parallel_catalog_source(self.catalog.clone())
+        };
+        plan.run_parallel(source, effects, workers)
     }
 }
 

@@ -115,6 +115,10 @@ fn lines(bytes: &[u8]) -> Vec<Vec<u8>> {
 #[test]
 fn search_and_find_match_current_hosts_and_two_queries_share_one_load() {
     let tree = Tree::new();
+    fs::write(tree.root().join(".ferretignore"), b"secret/\n").unwrap();
+    fs::create_dir(tree.root().join("secret")).unwrap();
+    fs::write(tree.root().join("secret/hidden.txt"), b"hidden by policy").unwrap();
+    index(&tree.index(), &[tree.root()], Refresh::All, &options()).unwrap();
     let engine = Engine::open(&tree.index()).unwrap().unwrap();
     let pin = engine.pin();
     let loaded = pin.catalog().bytes_read();
@@ -146,6 +150,30 @@ fn search_and_find_match_current_hosts_and_two_queries_share_one_load() {
         String::from_utf8_lossy(&cli.stderr)
     );
     assert_eq!(lines(&cli.stdout), lines(&output.0.lock().unwrap()));
+    assert!(!lines(&cli.stdout).contains(&b"tree/secret/hidden.txt".to_vec()));
+    let live_plan = Plan::parse_at(
+        &["-I".into(), "tree".into(), "-type".into(), "f".into()],
+        &tree.0,
+        SystemTime::now(),
+    )
+    .unwrap();
+    let live = Output::default();
+    pin.find(&live_plan, live.clone(), 4).unwrap();
+    let live_cli = fixture::bounded_command(env!("CARGO_BIN_EXE_ferret"), &tree.0)
+        .args(["find", "-I", "tree", "-type", "f"])
+        .output()
+        .unwrap();
+    assert!(live_cli.status.success(), "{live_cli:?}");
+    assert_eq!(lines(&live.0.lock().unwrap()), lines(&live_cli.stdout));
+    assert!(lines(&live_cli.stdout).contains(&b"tree/secret/hidden.txt".to_vec()));
+    assert_eq!(engine.pin().catalog().bytes_read(), loaded);
+    // A counter on a newly reopened catalog could start over at the same
+    // value. Remove the backing paths to prove new queries share this load.
+    fs::remove_dir_all(tree.index()).unwrap();
+    assert_eq!(search(&engine.pin()), expected);
+    let repeated = Output::default();
+    engine.pin().find(&plan, repeated.clone(), 4).unwrap();
+    assert_eq!(lines(&repeated.0.lock().unwrap()), lines(&cli.stdout));
     assert_eq!(engine.pin().catalog().bytes_read(), loaded);
 }
 
@@ -617,4 +645,55 @@ fn a_captured_nonprocess_cwd_survives_a_move_before_reference_output_and_exec() 
             vec![b"alpha".to_vec(), b"beta".to_vec()]
         );
     }
+}
+
+#[derive(Clone, Default)]
+struct TraversalOutput {
+    output: Output,
+    errors: Arc<Mutex<Vec<PathBuf>>>,
+}
+impl Effects for TraversalOutput {
+    fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
+        self.output.print(path, nul)
+    }
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.output.write(bytes)
+    }
+    fn error(&mut self, error: &WalkError) {
+        self.errors.lock().unwrap().push(error.path.clone());
+    }
+}
+
+#[test]
+fn a_moved_cwd_with_an_external_symlink_back_to_a_catalog_ancestor_reports_the_first_loop() {
+    let tree = Tree::new();
+    std::os::unix::fs::symlink("../..", tree.root().join("sub/outside")).unwrap();
+    index(&tree.index(), &[tree.root()], Refresh::All, &options()).unwrap();
+    let engine = Engine::open(&tree.index()).unwrap().unwrap();
+    tree.oracle(&engine.pin());
+    let plan = Plan::parse_at(
+        &[
+            "-L".into(),
+            "tree".into(),
+            "-maxdepth".into(),
+            "6".into(),
+            "-type".into(),
+            "d".into(),
+        ],
+        &tree.0,
+        SystemTime::now(),
+    )
+    .unwrap();
+    let _moved = MovedCwd::new(&tree.0);
+    let output = TraversalOutput::default();
+    let result = engine.pin().find(&plan, output.clone(), 4).unwrap();
+    assert!(result.errors > 0);
+    assert!(
+        output
+            .errors
+            .lock()
+            .unwrap()
+            .contains(&PathBuf::from("tree/sub/outside/tree"))
+    );
+    assert!(!lines(&output.output.0.lock().unwrap()).contains(&b"tree/sub/outside/tree".to_vec()));
 }

@@ -1147,24 +1147,36 @@ impl LiveWalk {
             && entry.kind().map_err(|error| entry.error(error))? == FileKind::Directory
         {
             let stat = entry.metadata().map_err(|error| entry.error(error))?;
-            let path = &entry.path;
             if self.levels.iter().any(|level| {
-                level
-                    .own
-                    .metadata
-                    .get_or_init(|| {
-                        cached_metadata(
-                            &entry.cwd.as_ref().map_or_else(
-                                || PathBuf::from(OsStr::from_bytes(&path[..level.path_len])),
-                                |cwd| cwd.join(OsStr::from_bytes(&path[..level.path_len])),
-                            ),
-                            level.own.follow,
-                        )
-                    })
-                    .as_ref()
-                    .is_ok_and(|ancestor| {
+                // Live ancestors own an observed directory descriptor. Pure
+                // catalog ancestors have a stored identity and need no stat.
+                if let Some(cached) = level.own.metadata.get() {
+                    // Pure live walks close directory descriptors after
+                    // listing. Their already observed
+                    // metadata still proves ancestry.
+                    cached.as_ref().is_ok_and(|ancestor| {
                         ancestor.dev() == stat.dev() && ancestor.ino() == stat.ino()
                     })
+                } else if let Some(handle) = &level.handle {
+                    level
+                        .own
+                        .metadata
+                        .get_or_init(|| handle.metadata().map_err(Arc::new))
+                        .as_ref()
+                        .is_ok_and(|ancestor| {
+                            ancestor.dev() == stat.dev() && ancestor.ino() == stat.ino()
+                        })
+                } else {
+                    level
+                        .own
+                        .catalog
+                        .as_ref()
+                        .zip(level.own.target)
+                        .is_some_and(|(catalog, target)| {
+                            matches!(target,
+                            Target::Inode(id) if catalog.identity(id) == (stat.dev(), stat.ino()))
+                        })
+                }
             }) {
                 return Err(WalkError {
                     path: entry.path().to_owned(),

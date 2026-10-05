@@ -1406,6 +1406,50 @@ engine in process when it cannot (D49).
 **Measure:** open time and resident bytes per name at 10M, against D48's 1 GB
 line.
 
+
+### S1b M1 — Resident engine library (2026-10-05)
+
+Production **`c57be70`** implements the common resident engine in `ferret`.
+Search and indexed find pin one fully loaded, checked catalog generation;
+refresh/compaction adopt the writer's returned checked view without reopening.
+A query pin survives append, remapping and retired-file cleanup. Explicit find
+contexts hold a cwd descriptor as well as the logical path and start time.
+Names/inodes remain packed buffers; no D54 index or daemon is included yet.
+
+Measurements use the existing M3 clean/1%/2% synthetic catalogs, each with
+**10,448,739 names**, release `engine_open`, five fresh processes per case after
+one excluded warmup. OS cache is warm, not flushed. Current RSS is the median
+immediately after full open; peak is the maximum process VmHWM across those
+five samples. B/name divides whole-process resident bytes by live names.
+`case:Flamegraph` matches 92 rows; first-row time is its first callback after
+open, without output I/O. The last latency column is open plus first callback,
+excluding parsing and the harness's RSS sample. These are query-only engine
+costs, without writer lookup caches, concurrent old pins, D54 indexes or watches.
+
+| Overlay | Full open median (range), ms | Current / highest peak RSS, MiB | Resident B/name | First callback, ms | Open + callback, ms | Command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| Clean | 672.05 (668.10–685.74) | 603.38 / 635.31 | 60.55 | 7.93 | 679.89 | `$B "$I/p0" case:Flamegraph` | `c57be70` | 1.61–1.67 / 1.49–1.50 / 1.25 |
+| 1% | 960.21 (953.73–965.70) | 699.49 / 729.97 | 70.20 | 8.71 | 968.91 | `$B "$I/p1" case:Flamegraph` | `c57be70` | 1.56–1.61 / 1.48–1.49 / 1.25 |
+| 2% | 1285.06 (1271.17–1297.79) | 796.20 / 823.87 | 79.90 | 8.34 | 1293.19 | `$B "$I/p2" case:Flamegraph` | `c57be70` | 1.48–1.52 / 1.46–1.47 / 1.25 |
+
+Build: `nix develop --command cargo build -p ferret --release --example engine_open`.
+`$I=/tmp/s1plus-m3-overlays`; `$B=/tmp/s1b-m1-ferret-bench` is a symlink to
+`/home/dave/w/super-ferret-wt/s1b/target/release/examples/engine_open`, so other
+agents' benchmark guards see it. The serial runner is
+`python3 /tmp/s1b_m1_measure.py`; raw samples and every pre-run uptime/pgrep
+check are in `/tmp/s1b-m1-measure/{samples,guards}.jsonl`. Each process isolates
+HOME, every XDG directory, runtime and FERRET_INDEX. No active benchmark,
+including time-index-bench, was present during the samples.
+
+The resident baseline remains below D48's decimal 1 GB line even at 2%.
+These results broadly match M0's 60.56/70.21/79.91 B/name; the lower open times
+than M3's 709/1012/1351 ms are different revision/load measurements, not an
+engine optimization claim. D53 semantic validation remains in every open.
+The old name-only CLI now also rejects corruption in unused metadata before
+printing rows, as D46's common full opener requires. Low-level selective-load
+catalog/query APIs remain available. Gates: **571 passed / 4 ignored**, no Rust
+warnings; the real query log's size and nanosecond mtime remain unchanged.
+
 ## S1c — `ferret find` in find(1) syntax
 
 POSIX.1-2024 `find` over the index, plus GNU extensions ranked by real use,

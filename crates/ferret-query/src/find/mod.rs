@@ -298,8 +298,9 @@ impl Plan {
     }
 
     /// Parses against an explicit absolute cwd and a captured query start time.
-    /// Operand spelling is retained for output; lookup and action paths use
-    /// cwd.
+    /// Captures an open cwd capability for relative lookup and actions while
+    /// retaining operand spelling. It remains valid if that directory moves.
+    /// Help and unsupported expressions need no cwd descriptor.
     pub fn parse_at(
         args: &[OsString],
         cwd: &Path,
