@@ -516,3 +516,105 @@ fn a_production_limit_refresh_adopts_its_automatic_checkpoint_and_keeps_the_old_
     assert_eq!(search(&engine.pin()).len(), previous.len() + 1);
     tree.oracle(&engine.pin());
 }
+
+#[test]
+fn a_cli_exec_that_renames_its_cwd_keeps_that_cwd_for_later_commands() {
+    let tree = Tree::new();
+    let renamed = tree.0.with_extension("renamed");
+    let output = fixture::bounded_command(env!("CARGO_BIN_EXE_ferret"), &tree.0)
+        .args([
+            "find",
+            "tree/a.txt",
+            "-exec",
+            "sh",
+            "-c",
+            "mv -- \"$1\" \"$2\"",
+            "sh",
+        ])
+        .arg(&tree.0)
+        .arg(&renamed)
+        .args([";", "-exec", "pwd", ";"])
+        .output()
+        .unwrap();
+    fs::rename(&renamed, &tree.0).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        lines(&output.stdout),
+        vec![renamed.as_os_str().as_bytes().to_vec()]
+    );
+}
+
+struct MovedCwd(PathBuf, PathBuf);
+impl MovedCwd {
+    fn new(from: &Path) -> Self {
+        let to = from.with_extension("captured-cwd-moved");
+        fs::rename(from, &to).unwrap();
+        Self(from.to_owned(), to)
+    }
+}
+impl Drop for MovedCwd {
+    fn drop(&mut self) {
+        fs::rename(&self.1, &self.0).unwrap();
+    }
+}
+
+#[test]
+fn a_captured_nonprocess_cwd_survives_a_move_before_reference_output_and_exec() {
+    let tree = Tree::new();
+    fs::write(tree.root().join("a.txt"), b"alpha\n").unwrap();
+    fs::write(tree.root().join("sub/b.txt"), b"beta\n").unwrap();
+    index(&tree.index(), &[tree.root()], Refresh::All, &options()).unwrap();
+    let engine = Engine::open(&tree.index()).unwrap().unwrap();
+    let reference = Plan::parse_at(
+        &[
+            "tree/a.txt".into(),
+            "-samefile".into(),
+            "tree/a.txt".into(),
+            "-fprint".into(),
+            "result".into(),
+        ],
+        &tree.0,
+        SystemTime::now(),
+    )
+    .unwrap();
+    let mut plans = Vec::new();
+    for action in ["-exec", "-execdir"] {
+        plans.push(
+            Plan::parse_at(
+                &[
+                    "tree".into(),
+                    "-type".into(),
+                    "f".into(),
+                    action.into(),
+                    "cat".into(),
+                    "{}".into(),
+                    "+".into(),
+                ],
+                &tree.0,
+                SystemTime::now(),
+            )
+            .unwrap(),
+        );
+    }
+    let moved = MovedCwd::new(&tree.0);
+    assert_eq!(
+        engine
+            .pin()
+            .find(&reference, Output::default(), 4)
+            .unwrap()
+            .errors,
+        0
+    );
+    assert_eq!(fs::read(moved.1.join("result")).unwrap(), b"tree/a.txt\n");
+    for plan in plans {
+        let output = Output::default();
+        assert_eq!(
+            engine.pin().find(&plan, output.clone(), 4).unwrap().errors,
+            0
+        );
+        assert_eq!(
+            lines(&output.0.lock().unwrap()),
+            vec![b"alpha".to_vec(), b"beta".to_vec()]
+        );
+    }
+}

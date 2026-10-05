@@ -68,6 +68,8 @@ impl Expression {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Options {
     cwd: Option<std::sync::Arc<std::path::PathBuf>>,
+    cwd_handle: Option<std::sync::Arc<std::fs::File>>,
+    inherit_cwd: bool,
     pub max_depth: Option<usize>,
     pub min_depth: usize,
     pub depth_first: bool,
@@ -77,6 +79,26 @@ pub(crate) struct Options {
     pub retain_parent: bool,
     pub delete: bool,
     guard: Option<CandidateGuard>,
+}
+
+impl Options {
+    fn logical_path<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+        match &self.cwd {
+            Some(cwd) => std::borrow::Cow::Owned(cwd.join(path)),
+            None => std::borrow::Cow::Borrowed(path),
+        }
+    }
+
+    fn observed_path<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+        use std::os::fd::AsRawFd;
+        match &self.cwd_handle {
+            Some(handle) if path.is_relative() => std::borrow::Cow::Owned(
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+                    .join(path),
+            ),
+            _ => self.logical_path(path),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -264,9 +286,15 @@ struct Control {
 }
 
 impl Plan {
-    /// Parses a GNU find argument list, including leading ferret `-I`.
+    /// Parses a GNU find argument list for the current process, including `-I`.
+    /// Relative lookups capture its cwd; ordinary exec inherits its cwd.
     pub fn parse(args: &[OsString]) -> Result<Self, ParseError> {
-        Self::parse_context(args, None, std::time::SystemTime::now())
+        Self::parse_context(
+            args,
+            std::env::current_dir().ok().map(std::sync::Arc::new),
+            std::time::SystemTime::now(),
+            true,
+        )
     }
 
     /// Parses against an explicit absolute cwd and a captured query start time.
@@ -280,15 +308,41 @@ impl Plan {
         if !cwd.is_absolute() {
             return Err(ParseError::Feature("query cwd must be absolute".into()));
         }
-        Self::parse_context(args, Some(std::sync::Arc::new(cwd.to_owned())), started)
+        Self::parse_context(
+            args,
+            Some(std::sync::Arc::new(cwd.to_owned())),
+            started,
+            false,
+        )
     }
 
     fn parse_context(
         args: &[OsString],
         cwd: Option<std::sync::Arc<std::path::PathBuf>>,
         started: std::time::SystemTime,
+        inherit_cwd: bool,
     ) -> Result<Self, ParseError> {
         let mut plan = parse::parse(args, cwd, started)?;
+        if let Some(cwd) = &plan.options.cwd
+            && !plan.is_information()
+            && plan.unsupported().is_none()
+        {
+            plan.options.inherit_cwd = inherit_cwd;
+            let path = if plan.options.inherit_cwd {
+                Path::new(".")
+            } else {
+                cwd.as_path()
+            };
+            let handle = rustix::fs::open(
+                path,
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| ParseError::Feature(format!("cannot open query cwd: {error}")))?;
+            plan.options.cwd_handle = Some(std::sync::Arc::new(std::fs::File::from(handle)));
+        }
         plan.options.live_checks = has_actions(&plan.expression);
         plan.expression.visit(&mut |leaf| {
             plan.options.retain_parent |= matches!(leaf,
@@ -393,7 +447,7 @@ impl Plan {
             return Ok(None);
         }
         let mut expression = self.expression.clone();
-        if let Err(error) = prepare_expression(&mut expression, source.catalog()) {
+        if let Err(error) = prepare_expression(&mut expression, source.catalog(), &self.options) {
             effects.error(&WalkError {
                 path: ".".into(),
                 error,
@@ -497,11 +551,12 @@ fn expression_sections(expression: &Expression, out: &mut Vec<ferret_catalog::Se
 fn prepare_expression(
     expression: &mut Expression,
     catalog: Option<&ferret_catalog::Catalog>,
+    options: &Options,
 ) -> io::Result<()> {
     expression.try_visit_mut(&mut |leaf| match leaf {
-        Expression::Test(test) => test.resolve_reference(catalog),
+        Expression::Test(test) => test.resolve_reference(catalog, options),
         Expression::Action(action::Action::Output(target, _) | action::Action::List(target)) => {
-            target.open()
+            target.open(options)
         }
         _ => Ok(()),
     })

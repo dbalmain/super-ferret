@@ -18,6 +18,12 @@ are new open briefs: find action placement and socket encoding. Sections
 marked **proposed** depend on their answers; the engine and batch work can
 land before those host choices. No implementation should silently settle them.
 
+M1's find context captures an open cwd capability as well as its absolute
+logical path and start time. A path alone fails if a command moves the cwd:
+relative live lookup, reference/output files and explicit-context commands
+need the descriptor. The one-shot process wrapper keeps ordinary exec's
+inherited cwd; the explicit library context never changes the process cwd.
+
 ## Engine ownership and open
 
 The existing library target of **`ferret`** owns `Engine`: coordination of a

@@ -18,14 +18,7 @@ use crate::xdg::Dirs;
 /// is success. Explicit -I never reads config or opens an index; neither mode
 /// writes a query log.
 pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
-    let started = std::time::SystemTime::now();
-    let parsed = match std::env::current_dir() {
-        Ok(cwd) => Plan::parse_at(args, &cwd, started),
-        // Help and syntax still work in an unlinked cwd. The ordinary live
-        // source reports lookup failures if this is an actual traversal.
-        Err(_) => Plan::parse(args),
-    };
-    let plan = match parsed {
+    let plan = match Plan::parse(args) {
         Ok(plan) => plan,
         Err(error) => {
             cli::error(&format!("find: {error}"));

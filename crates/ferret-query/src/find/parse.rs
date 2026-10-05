@@ -535,10 +535,7 @@ impl<'a> Parser<'a> {
                 let value = self.argument(&primary)?;
                 let test = super::test::Test::reference(
                     primary.as_bytes(),
-                    self.options
-                        .cwd
-                        .as_ref()
-                        .map_or_else(|| PathBuf::from(value), |cwd| cwd.join(value)),
+                    PathBuf::from(value),
                     follow_references,
                 );
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
@@ -573,16 +570,7 @@ impl<'a> Parser<'a> {
                         stamp,
                     })
                 } else {
-                    super::test::Test::newer_xy(
-                        x,
-                        y,
-                        self.options
-                            .cwd
-                            .as_ref()
-                            .map_or_else(|| PathBuf::from(value), |cwd| cwd.join(value)),
-                        now,
-                        follow_references,
-                    )
+                    super::test::Test::newer_xy(x, y, PathBuf::from(value), now, follow_references)
                 };
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }
@@ -613,11 +601,7 @@ impl<'a> Parser<'a> {
 
     fn target(&mut self, primary: &OsStr) -> Result<Target, ParseError> {
         let value = self.argument(primary)?;
-        let path = self
-            .options
-            .cwd
-            .as_ref()
-            .map_or_else(|| PathBuf::from(value), |cwd| cwd.join(value));
+        let path = PathBuf::from(value);
         if path == std::path::Path::new("/dev/stdout") {
             return Ok(Target::Stdout);
         }

@@ -79,6 +79,8 @@ struct Removals {
 #[derive(Clone)]
 pub struct Entry {
     cwd: Option<Arc<PathBuf>>,
+    cwd_handle: Option<Arc<File>>,
+    inherit_cwd: bool,
     path: Vec<u8>,
     /// The start operand's spelling is always a prefix of `path`.
     root_len: usize,
@@ -105,6 +107,8 @@ impl Entry {
         let path = path.into_os_string().into_vec();
         Self {
             cwd: None,
+            cwd_handle: None,
+            inherit_cwd: false,
             root_len: path.len(),
             path,
             check_directory: false,
@@ -235,7 +239,16 @@ impl Entry {
                 .join(OsStr::from_bytes(&joined));
             lookup(&path)
         } else {
-            lookup(self.lookup_path().as_ref())
+            lookup(self.observed_path().as_ref())
+        }
+    }
+
+    fn observed_path(&self) -> std::borrow::Cow<'_, Path> {
+        match &self.cwd_handle {
+            Some(handle) if self.path().is_relative() => std::borrow::Cow::Owned(
+                PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd())).join(self.path()),
+            ),
+            _ => self.lookup_path(),
         }
     }
 
@@ -247,7 +260,19 @@ impl Entry {
     }
 
     pub(super) fn cwd(&self) -> Option<&Path> {
-        self.cwd.as_deref().map(PathBuf::as_path)
+        if self.inherit_cwd {
+            None
+        } else {
+            self.cwd.as_deref().map(PathBuf::as_path)
+        }
+    }
+
+    pub(super) fn command_cwd(&self) -> Option<Arc<File>> {
+        if self.inherit_cwd {
+            None
+        } else {
+            self.cwd_handle.clone()
+        }
     }
 
     pub(super) fn directory_handle(&self) -> Option<Arc<File>> {
@@ -285,6 +310,8 @@ impl Entry {
             }
             let mut entry = Entry::new(self.path().to_owned(), self.state.depth, FileKind::Symlink);
             entry.cwd = self.cwd.clone();
+            entry.cwd_handle = self.cwd_handle.clone();
+            entry.inherit_cwd = self.inherit_cwd;
             entry.state.catalog = self.state.catalog.clone();
             entry.state.directory = self.state.directory.clone();
             entry.state.target = self.state.target;
@@ -957,6 +984,8 @@ impl LiveWalk {
                 let follow = self.options.follow != Follow::Physical;
                 self.entry = Entry::new(path, 0, FileKind::File);
                 self.entry.cwd = self.options.cwd.clone();
+                self.entry.cwd_handle = self.options.cwd_handle.clone();
+                self.entry.inherit_cwd = self.options.inherit_cwd;
                 self.entry.removed_children = self.removed_children.clone();
                 if self.options.retain_parent
                     && (self.catalog.is_none() || self.options.live_checks)
@@ -1295,7 +1324,7 @@ fn catalog_kind(kind: Kind) -> FileKind {
 }
 
 fn parent_handle(entry: &Entry) -> io::Result<Arc<File>> {
-    let (parent, _) = super::action::exec_path(entry.lookup_path().as_ref());
+    let (parent, _) = super::action::exec_path(entry.observed_path().as_ref());
     Ok(Arc::new(File::from(open(
         &parent,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -1335,7 +1364,7 @@ pub(super) fn resolve(
     resolve_observed(catalog, path, follow, path)
 }
 
-fn resolve_observed(
+pub(super) fn resolve_observed(
     catalog: &Catalog,
     path: &Path,
     follow: bool,
