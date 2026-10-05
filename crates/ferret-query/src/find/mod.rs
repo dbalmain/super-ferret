@@ -394,6 +394,18 @@ impl Plan {
         interactive
     }
 
+    /// Whether evaluation spawns a child process (`-exec`, `-execdir`, `-ok`
+    /// or `-okdir`). Only these actions inspect the host's child stdin;
+    /// `-delete` and the file-writing actions spawn nothing and need no
+    /// stdin policy.
+    pub fn runs_commands(&self) -> bool {
+        let mut runs = false;
+        self.expression.visit(&mut |leaf| {
+            runs |= matches!(leaf, Expression::Action(action::Action::Exec(_)));
+        });
+        runs
+    }
+
     /// Creates the sequential live source. It never opens a catalog.
     pub fn live_source(&self) -> LiveWalk {
         LiveWalk::new(self.paths.clone(), self.options.clone())

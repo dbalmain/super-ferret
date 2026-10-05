@@ -60,7 +60,7 @@ pub(crate) fn refusal(plan: &Plan, request: &Request, protocol_stdin: bool) -> O
             return Some(Refusal::Noninteractive);
         }
     }
-    if plan.has_side_effects() && request.child_stdin.is_none() {
+    if plan.runs_commands() && request.child_stdin.is_none() {
         return Some(Refusal::ChildStdinRequired);
     }
     None
@@ -291,6 +291,37 @@ fn base64(bytes: &[u8]) -> String {
     crate::json::encode_base64(&mut out, bytes);
     String::from_utf8(out).unwrap_or_default()
 }
+/// Writes one tagged event line: `{"id":ID,"event":NAME,...fill...}`. Shared
+/// by batch's per-request begin/end framing and the CLI's `--json find`
+/// host, so both encode the same event shape through one writer.
+pub(crate) fn emit(id: &str, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
+    let mut line = Vec::new();
+    let mut object = Object::new(&mut line);
+    object.str("id", id).str("event", name);
+    fill(&mut object);
+    object.end();
+    send(&line)
+}
+
+/// Writes a `"generation"` field: an object for a pinned engine, else null.
+/// Shared between batch's `begin`/`status`/`reload` events and the CLI's
+/// `--json find` host.
+pub(crate) fn generation(object: &mut Object<'_>, value: Option<ferret_catalog::Generation>) {
+    if let Some(value) = value {
+        object.object("generation", |o| {
+            o.str("incarnation", &hex(&value.incarnation))
+                .int("checkpoint", value.checkpoint)
+                .int("sequence", value.sequence);
+        });
+    } else {
+        object.null("generation");
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub(crate) fn diagnostic(
     id: &str,
     code: &str,

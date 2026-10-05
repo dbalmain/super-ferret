@@ -780,3 +780,44 @@ fn file_input_interactive_actions_require_real_approval_and_close_child_stdin() 
         }
     }
 }
+
+#[test]
+fn delete_needs_local_effects_but_no_child_stdin_while_exec_still_needs_both() {
+    // -delete and -fprint spawn no child, so they must not be gated on
+    // `child_stdin`: only an action that runs a command needs it.
+    let tree = Tree::new();
+    let target = tree.0.join("src/main.rs");
+    assert!(target.exists());
+    let mut input = request("del", &["src/main.rs", "-delete"], tree.0.to_str().unwrap());
+    input.truncate(input.len() - 2);
+    input.extend_from_slice(b",\"capabilities\":[\"local-effects\"]}\n");
+    let output = tree.run(&input);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("\"id\":\"del\",\"event\":\"end\",\"exit\":0"),
+        "{text}"
+    );
+    assert!(
+        !target.exists(),
+        "-delete should have run without child_stdin"
+    );
+
+    // An exec action, by contrast, is still refused without child_stdin, and
+    // nothing it would have run actually ran.
+    let tree = Tree::new();
+    let marker = tree.0.join("MARKER");
+    let mut input = request(
+        "exec",
+        &["src", "-exec", "touch", "MARKER", ";"],
+        tree.0.to_str().unwrap(),
+    );
+    input.truncate(input.len() - 2);
+    input.extend_from_slice(b",\"capabilities\":[\"local-effects\"]}\n");
+    let output = tree.run(&input);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("ChildStdinRequired"), "{text}");
+    assert!(!marker.exists(), "-exec must not run without child_stdin");
+    assert!(!tree.0.join("src/MARKER").exists());
+}

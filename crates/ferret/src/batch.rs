@@ -13,7 +13,7 @@ use ferret_query::{Query, Row};
 
 use crate::cli;
 use crate::engine::{Engine, QuerySession};
-use crate::find_json::{FrameOutput, diagnostic};
+use crate::find_json::{FrameOutput, diagnostic, generation};
 use crate::json::Object;
 use crate::protocol::{self, Op, Request};
 use crate::search::json_row;
@@ -366,27 +366,8 @@ fn find_request(
     })
 }
 
-fn generation(object: &mut Object<'_>, value: Option<ferret_catalog::Generation>) {
-    if let Some(value) = value {
-        object.object("generation", |o| {
-            o.str("incarnation", &hex(&value.incarnation))
-                .int("checkpoint", value.checkpoint)
-                .int("sequence", value.sequence);
-        });
-    } else {
-        object.null("generation");
-    }
-}
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
 fn event(id: &Request, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
-    let mut line = Vec::new();
-    let mut o = Object::new(&mut line);
-    o.str("id", &id.id).str("event", name);
-    fill(&mut o);
-    o.end();
-    send(&line)
+    crate::find_json::emit(&id.id, name, fill)
 }
 fn emit_request_error(id: Option<&str>, message: &str) -> io::Result<()> {
     let mut line = Vec::new();

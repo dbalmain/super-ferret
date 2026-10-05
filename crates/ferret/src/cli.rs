@@ -74,6 +74,10 @@ usage:
                                 pasted find ... -delete skips ignored files and still exits 0
                                 -empty sees this walk's -delete removals, not -exec removals;
                                 use -delete or -I for deletion-aware emptiness
+  ferret --json find ...        same walk, as tagged JSON-lines events
+                                (begin/stdout/stderr/diagnostic/end, id \"find\");
+                                --json here is a host flag before `find` and
+                                never reaches find's own argument parser
   ferret search [--json] [--limit N] [--] ATOM...
                                 print each path that matches every ATOM
   ferret batch [--input FILE]   process sequential JSON-lines requests
@@ -146,7 +150,17 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         }
     };
     match args.command {
-        Command::Find(ref find_args) => return crate::find::run(find_args, args.index.as_deref()),
+        Command::Find {
+            args: ref find_args,
+            json,
+        } => {
+            let index = args.index.as_deref();
+            return if json {
+                crate::find::run_json(find_args, index)
+            } else {
+                crate::find::run(find_args, index)
+            };
+        }
         Command::Help => return print("usage", USAGE.as_bytes()),
         Command::Version => {
             let version = format!("ferret {}\n", env!("CARGO_PKG_VERSION"));
@@ -189,7 +203,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
                 }
             }
         }
-        Command::Help | Command::Version | Command::Find(_) => Exit::Ok,
+        Command::Help | Command::Version | Command::Find { .. } => Exit::Ok,
     }
 }
 

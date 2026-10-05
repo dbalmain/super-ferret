@@ -42,8 +42,11 @@ pub enum Command {
         limit: Option<u64>,
     },
     /// `find [OPTIONS] [PATH...] [EXPRESSION]`, passed intact to the find
-    /// parser.
-    Find(Vec<OsString>),
+    /// parser. `--json`, given before the `find` operand, requests the
+    /// structured-event host instead of find's raw stdout/stderr; it is not
+    /// passed to find's own parser, so a `--json` operand after `find` (or
+    /// after `--`) is unaffected and reaches find intact.
+    Find { args: Vec<OsString>, json: bool },
     /// `stats`.
     Stats,
     /// Explicit migration of the index directory's v3 snapshot.
@@ -113,15 +116,15 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if operands.is_empty() && arg == "find" {
-            if json {
-                return Err(UsageError::NotFor("--json", "find"));
-            }
             if limit.is_some() {
                 return Err(UsageError::NotFor("--limit", "find"));
             }
             return Ok(Args {
                 index,
-                command: Command::Find(args.collect()),
+                command: Command::Find {
+                    args: args.collect(),
+                    json,
+                },
             });
         }
         let bytes = arg.as_bytes();
@@ -290,6 +293,22 @@ mod tests {
                     atoms: vec!["-".into()],
                     json: false,
                     limit: None,
+                },
+            ),
+            (
+                &["find", "a", "-print"],
+                Command::Find {
+                    args: vec!["a".into(), "-print".into()],
+                    json: false,
+                },
+            ),
+            // --json before `find` selects the structured host; find's own
+            // argv, including a later --json, passes through untouched.
+            (
+                &["--json", "find", "a", "-name", "--json", "-print"],
+                Command::Find {
+                    args: vec!["a".into(), "-name".into(), "--json".into(), "-print".into()],
+                    json: true,
                 },
             ),
         ];
