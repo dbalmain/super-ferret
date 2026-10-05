@@ -1199,6 +1199,108 @@ checksums, replay, semantic validation and rebuilt namespace indexes. The
 measured 1% / 2% penalty remains **236.41 / 482.72 ms**. D53 A is retained;
 option C is written analysis only in the M7 done-note, with no implementation.
 
+### S1+ R1 — Input fallback and compaction phases (2026-10-05)
+
+Production code **`6dd6d87`**, same release build and 10M fixture as M7.
+Host-visible uptime/pgrep guards found no competing benchmark before each run;
+private XDG directories and FERRET_INDEX were used throughout. Raw commands,
+loads, environments, binary hashes and output are archived under
+`/home/dave/w/super-ferret/.ai/s1plus-r1-measurements/`.
+Use `$B` and `$P` from M7, with `$I=/tmp/s1plus-r1-measure` and the same private
+XDG exports. Churn is two consecutive rounds in one process per percentage;
+no-change is one warm-up plus three fresh-process samples, warm OS cache.
+Writes exclude fixture preparation; RSS is whole-process VmHWM including setup.
+
+The producer now abandons changed observations/reconciliation at provisional
+**500,000 input rows/records or 64 MiB owned bytes**, before constructing a
+complete diff or successor overlay. These conservative ownership charges
+include names and link targets, and are not an RSS bound. Equal seen words,
+resident directory graphs and bounded worker pending buffers are separate.
+The lock remains held during a full configured-root rewalk. Scoped observations
+are discarded, never checkpointed; DocIds and representable typed retention
+survive. Unsafe protected cases refuse publication. Low-level callers which
+already own a ChangeSet still own its allocation budget.
+
+| Churn | Cumulative inode births | Setup, ms | Whole backstop pause, s | Writes, B | Snapshot, B | Peak RSS, MiB | Command | Commit | Load (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 50%, round 1 | 4,285,383 | 3,197.66 | 16.690 | 629,309,482 | 629,309,290 | 2,686.39 | `$B churn-rewalk $I/churn-50 50 2` | `6dd6d87` | 1.46 / 1.91 / 1.94 |
+| 50%, round 2 | 8,570,766 | amortised above | 21.470 | 629,324,426 | 629,324,234 | 2,742.12 | same command | `6dd6d87` | 1.46 / 1.91 / 1.94 |
+| 90%, round 1 | 7,713,689 | 3,204.75 | 23.112 | 629,609,098 | 629,608,906 | 2,685.74 | `$B churn-rewalk $I/churn-90 90 2` | `6dd6d87` | 1.72 / 1.91 / 1.94 |
+| 90%, round 2 | 15,427,378 | amortised above | 19.234 | 629,641,226 | 629,641,034 | 2,743.06 | same command | `6dd6d87` | 1.72 / 1.91 / 1.94 |
+
+The pause includes the abandoned attempt (**399–410 ms**), full observation
+replay (**3,845–3,968 ms**), full-builder publication and cache adoption
+(**12,447–18,742 ms**). Setup is excluded and amortises to 1,599 / 1,602 ms
+per round for this two-round run. Every attempt stops at **500,000 charged
+records / 64,892,705 owned bytes**, with **zero complete-diff records**.
+The synthetic driver lazily replays the same inode replacement workload as M7;
+it models the rewalk without filesystem syscalls or hashing. Real-tree tests
+exercise the actual walker, full-root fallback, faults and full-index oracle.
+
+Maximum RSS is **2.678 / 2.679 GiB**, versus M7's **8.16 / 13.77 GiB**;
+pauses improve from **76.890–82.369 / 108.625–111.931 s**. This **misses the
+1.6 GiB target** by about 1.08 GiB. The complete diff and overlay are gone, but
+the loaded pinned source and session caches coexist with full-builder batches,
+live-document bookkeeping and planning. First-use column estimates and fixed
+16,384-row extra growth avoid geometric over-allocation; they do not make the
+legacy full builder streaming. Snapshot sizes match M7 exactly, including its
+small packing changes between rounds, rather than growing with history.
+
+| Case | Setup median, ms | Post-setup median (range), s | Writes, B | Peak RSS, MiB | Command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| Full recrawl, no change | 3,270.34 | 9.065 (8.988–9.187) | 0 | 1,408.50 | `$B recrawl-once $I/nochange 0 "$P"` | `6dd6d87` | 1.21–1.55 / 1.39–1.46 / 1.70–1.72 |
+
+All samples remain below 9.5 s and publish no generation. The pending observation
+cap remains **49,584 rows / 7,812,096 B**; the whole peak is **1.376 GiB**.
+M6's units above are corrected to **1408.38 MiB / 1.375 GiB**, against M4b's
+**1386.72 MiB / 1.354 GiB**.
+
+The D51 pause is profiled with temporary timers, one warm-up plus three
+fresh-process samples against the same 1% overlay. Pre-optimization source is
+`2693d31` plus `profile-before.patch`; final source is `6dd6d87` plus
+`profile.patch`. These patches and raw `profile-before.json`, `profile.json`
+and `phase-summary.json` are in the artifact directory. A documentation edit
+also appears in the final run's dirty-tree metadata; it has no runtime effect.
+Timers were removed after measurement and ordinary binaries rebuilt.
+Command for both: `$B compact-once $I/compact-profile`.
+
+| Phase | Before median (range), s | After median (range), s |
+| --- | ---: | ---: |
+| Planning: BFS + layout | 8.046 (8.042–8.151) | 6.943 (6.922–6.985) |
+| Encoding and seal | 7.682 (7.661–7.717) | 6.347 (6.338–6.350) |
+| Publication and retirement syncs | 5.723 (3.766–11.535) | 5.910 (0.454–6.552) |
+| Read-back validation | 0.750 (0.733–0.750) | 0.743 (0.740–0.747) |
+| Epoch cache rebuild | 2.424 (2.416–2.437) | 2.494 (2.492–2.505) |
+| Remaining publication work | 0.003 (0.003–0.003) | 0.003 (0.003–0.004) |
+| **Whole idle-boundary pause** | **24.781 (22.639–30.424)** | **22.451 (16.949–23.131)** |
+
+The table gives phase medians independently; their sum need not equal the
+median pause. Setup is **4,307.93 ms** before / **4,348.73 ms** after, excluded
+from the pause, including the recovery sync. Retirement's final directory
+barrier is inside the pause. Loads are **1.52–2.37 / 1.49–1.71 / 1.32–1.41**
+before and **2.67–3.35 / 2.49–2.59 / 2.10–2.12** after; no competitor was present.
+Final writes remain **629,401,634 B**, peak RSS **1,626.42 MiB**, sampled disk
+peak **1,272,801,796 B**. This is 128 B below M7's sampled peak; both are sampled interim footprints,
+while final snapshot bytes remain identical.
+
+Layout and encoding repeatedly requested whole inherited inode rows. The row
+lookup already proved there was no override, but each field getter repeated
+the overlay search. A five-line base-row return removes those repeated probes.
+BFS is almost unchanged (**2.721 → 2.705 s**); layout improves **5.330 →
+4.237 s**, encoding **7.682 → 6.347 s**. Per-sample pause minus measured sync
+has median **18.889 → 16.541 s**, a **2.35 s** reduction. Snapshot sync remains
+the largest source of timing spread; the final snapshot barrier alone varies
+**0.452–6.525 s**. This supports the small lookup fix, not a claim that the
+whole pause now always meets the former 9–20 s estimate.
+
+The final sampler queues **1,679–2,296** simulated 10 ms arrivals during the
+pause, with **16.949–23.130 s** oldest wait and **1.09–9.76 ms** newest wait;
+all old-epoch handles retry. Queue service remains unmeasured S1b work.
+**D51 A remains idle-boundary compaction under the lock. D53 A remains full
+semantic cold-open validation.** No concurrent rebase or persisted namespace
+is implemented.
+
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes
