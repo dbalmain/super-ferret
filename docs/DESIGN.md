@@ -29,7 +29,7 @@ ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, fer
 ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text, rustix
 ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
 ferret-index   → ferret-text
-ferret-catalog → blake3 (checkpoint integrity), intpack (local path for M3; permanent form open — D59)
+ferret-catalog → blake3 (checkpoint integrity), intpack (git dependency pinned by rev — D59)
 ferret-verify  → regex
 ferret-policy  → (std only)
 ferret-text    → (std only)

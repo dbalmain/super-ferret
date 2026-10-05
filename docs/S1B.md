@@ -154,8 +154,8 @@ name-key-to-NameId postings with stored counts. Those are catalog row postings,
 not content postings. M3's implementation preflight found intpack absent from the manifests despite
 its planned DESIGN edge. The approved placement is `ferret-catalog → intpack`
 (D59): catalog owns name storage and row postings, while index stays a document
-candidate source. M3 uses the local path revision measured by the prototype;
-the permanent dependency form remains open. The resident projection uses the
+candidate source. intpack is a git dependency pinned to the revision the
+prototype measured (`6423815`, D59 A). The resident projection uses the
 codec library rather than copying its implementation.
 
 `ferret-query` owns the term-to-name-key index and its
