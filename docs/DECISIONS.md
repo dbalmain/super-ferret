@@ -69,6 +69,8 @@ Predecessors, carried forward where still open:
 | D51 | Compaction while the watcher is busy                     | answered       | A: idle-boundary compaction under the writer lock; pause measured and reported in M7                            |
 | D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
 | D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
+| D54 | In-memory names: interning, postings, row order          | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                 |
+| D55 | Storing mtime as an order rather than a value          | open           | rec D + F: blocked ordered dictionaries of seconds for mtime and ctime; racy rule for carry-over              |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2921,3 +2923,185 @@ write amplification and code cost. Measure query-only construction for B before
 crediting it with the full 220 ms gap.
 
 > Dave (2026-10-05): agreed with the recommendation, A. Keep semantic validation on cold open; evaluate C alongside M7's budgets.
+
+## D54 — In-memory names: interning, postings, row order
+
+**Status: answered, B after S1+ merges, after a prototype of the scoped-query
+check (Dave, 2026-10-05). The prototype passed; see the end of this entry.** Measured 2026-10-05 in the private bench repo
+`~/w/name-index-bench` (github.com/dbalmain/name-index-bench); its README
+holds the method and full tables.
+
+**Question:** Should the in-memory name catalog keep D28 A's raw heap in BFS
+order, intern names and add row postings and a term index, or also move rows
+to DFS preorder?
+
+The bench models each layout over two walker dumps, `$HOME` (459,713 rows,
+133,749 distinct names) and `/nix/store` (4.2M rows, 357k distinct). It runs 46
+query shapes mined from 315 agent `find` calls, plus fuzzy and term queries.
+Everything is bit-packed with intpack, and every strategy's output equals a flat
+full-path reference. "Interning" means a sorted table of distinct names plus a
+bit-packed name id per row. A name query scans the distinct table, then either
+passes over the ids or, with **row postings** (name id → rows), jumps to the
+rows. The **term index** is a token FST with postings. The memory figures for
+interning were measured in DFS order; B's BFS figures are **estimates** (same
+ids and table, BFS first-child array in place of the DFS tree arrays).
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep the raw BFS heap (D28 A) | 25.4 B/row on `$HOME`, 17.1 on nix (11.7 / 72.0 MB); ~171 MB at 10M at nix density. Selective name queries 0.4–3 ms on `$HOME` and 2–22 ms on nix; no term or Levenshtein search beyond a 100–760 ms scan. | No work. Children stay one slice; nothing in S1+ changes. |
+| B. Intern names, add row postings and the term index; keep BFS order | ~16–19 B/row on `$HOME` and ~9–10 on nix, estimated (≈ 8.7 / 43 MB; ~100 MB at 10M). A distinct-table build and a postings build at compaction; name lookup by path goes through the table (binary search) rather than the heap. Scoped name queries over big subtrees stay a walk or a global hit list filtered by ancestor (unmeasured in BFS). | Selective name queries 0.1–0.8 ms on `$HOME`, 0.3–7 ms on nix (3–10× faster than A); terms 0.7–10 ms, Levenshtein 0.8–8 ms (30–150×). 25–250× faster than warm `fd -H`. Children stay a slice. |
+| C. B, and rows in DFS preorder | Measured: 18.9 B/row on `$HOME`, 10.2 on nix (8.7 / 42.8 MB). Every place that assumes `(parent, name)` order changes. Children are found by hopping subtrees, not a slice, so path lookup and re-runs cost more (unmeasured). | A scope is one contiguous row range: scoped name queries 0.2 ms against 2.8 ms (BFS walk) in a 79k-row monorepo; listings 1.3–1.8× faster; basename-driven path scans 1.7–2.5× faster than in BFS. |
+
+Across all three, path patterns usually imply a basename
+(`*/.github/workflows/*.yml` → names ending `.yml`). Scanning for it and
+verifying the path beats a walk by 10–40×, while anchored patterns must walk.
+That is a planner rule and needs no format change. Trigrams, a suffix array and
+an FST of names did not pay: none beat a scan of the distinct table by more than
+~20%, at 1.4–20 B/row.
+
+Fuzzy full-path search is the weak spot in every option: 60–90 ms on `$HOME`
+and 200–400 ms on nix, only 4.6× faster than `fd -H | fzf`. Per-directory
+subtree byte masks (1.4–2.2 B/row) speed long queries 2–3×. That belongs to a
+fuzzy brief when fuzzy search is scheduled, not to this one.
+
+**Recommendation:** B, after S1+ merges. Fastest and simplest disagree only on
+order. B takes most of the win — 2–2.5× less memory, and the 3–150× speed-ups —
+without touching the `(parent, name)` order S1+ is built on, and C's further
+gains are on queries that are already a few milliseconds.
+
+**Fact that would change it:** a B prototype where a scoped name query over a
+large subtree (the 79k-row monorepo, a nixpkgs checkout) misses ~10 ms, or the
+writer finding DFS order cheaper to maintain across compaction. Either would
+favour C.
+
+> Dave (2026-10-05): B, after S1+ merges — prototype the scoped-query check first.
+
+**Prototype (2026-10-05, name-index-bench `916825a`):** interned names in BFS
+order with BFS row postings, every output checked against the flat reference.
+
+- **Scoped check passes.** The slowest scoped name query is 7.4 ms (nixpkgs
+  `-name default.nix`, 13,935 hits; DFS 4.4 ms), under the 10 ms bar. Always
+  walking the scope stays under 10 ms on every scoped query (7.5 ms at worst).
+  The faster plan for a selective name in a large scope uses the global
+  postings, keeping the rows under the scope by walking parent ids up
+  (memoised). For example, nixpkgs `*ripgrep*` takes 0.63 ms that way against
+  7.5 ms walking. A planner chooses between them from the stored posting
+  counts. The wrong choice costs up to 10×: 69 ms for `default.nix` through
+  the postings.
+- **Measured memory for B** (the brief estimated it): int-bfs plus postings plus
+  terms is 8.6 MB on `$HOME` (18.6 B/row) and 39.0 MB on nix (9.3 B/row), the
+  smallest configuration measured. BFS's first-child and parent arrays are
+  cheaper than DFS's subtree arrays (5.4 MB on nix).
+- **Correction to the brief's figures:** the bench originally found a BFS
+  parent by predecessor search over first-child, about 0.5 µs per hit, where
+  ferret keeps a `NameParent` column. With a per-row parent column, raw-bfs
+  is 2–3× faster than the brief's table (`$HOME` `-name '*.rs'` 7.3 ms, not
+  22 ms). B matches or beats DFS on whole-index name queries: nix `Cargo.toml`
+  2.4 ms against 3.3, and `libc.so.6` 0.46 ms against 2.3 today. B's speed-up
+  over today is therefore 2–5× on selective names, not the brief's 3–10×. The
+  100–150× from the term index is unchanged.
+
+## D55 — Storing mtime as an order rather than a value
+
+**Status: open.** Raised by Dave, 2026-10-05. Measured the same day with
+`scripts/mtime_columns.py` in the private `~/w/name-index-bench` (`d543475`), over a live walk of `$HOME` (4.2M entries, unfiltered, so
+including ignored paths) and `/nix/store` (4.5M), rows in ferret's order:
+directories breadth first, then files, siblings by name. **Revised the same
+day:** the first draft sized ranks as a plain permutation, 23 b/row; Dave
+pointed out they deserve the same blocked packing as the seconds, and packed
+that way they cost 13.2 b/row on `$HOME`. Options D and E come from that, and
+F from asking why ctime kept its nanoseconds.
+
+**Question:** Should the catalog store each inode's mtime as its rank in mtime
+order, rather than as a value, to save space and make time queries cheap?
+
+Dave's proposal: on disk, each inode holds its rank in mtime order. In memory,
+inodes are held in mtime order, in a structure that moves an inode to the top
+cheaply. An updated mtime is nearly always the newest, so only the last few
+seconds' actual values need keeping. `-newer file` finds the reference's rank
+and lists everything after it; sorting is free. An absolute time
+(`-mtime -1`, `-newermt DATE`) binary-searches the order, stating files on disk
+at each probe.
+
+A rank packs well when blocked, because siblings made together have nearby
+ranks: a block's width is the log of how many other times fall between its
+own. A **dense** rank, where equal times share a rank, is also an index into
+the sorted table of distinct times, so keeping that table (sorted, it packs as
+blocked deltas) makes the rank a lossless coding of the value. That is an
+ordered dictionary, blocked.
+
+What each encoding costs, in bits per row:
+
+| Encoding | `$HOME` | `/nix/store` |
+| --- | --- | --- |
+| Today: mtime seconds + nanoseconds, each blocked | 10.9 + 25.7 = **36.6** | 0.6 + 0.6 = **1.2** |
+| Rank, a plain permutation | 23 | 23 |
+| Rank, unique (ties broken by row), blocked | 14.7 | 7.6 |
+| Rank, dense over (sec, ns), blocked | 13.2 | 0.6 |
+| Dense rank over seconds, blocked, + sorted distinct seconds | 8.0 + 0.4 = **8.4** | 0.6 + 0.0 = **0.6** |
+| Dense rank over (sec, ns), blocked, + sorted distinct (sec, ns) | 13.2 + 14.7 = **27.9** | 0.6 + 0.0 = **0.6** |
+| Today: ctime seconds + nanoseconds, each blocked | 8.5 + 27.1 = 35.6 | 5.0 + 27.3 = 32.3 |
+| ctime: dense rank over (sec, ns) + sorted distinct (sec, ns) | 12.1 + 13.7 = 25.8 | 8.8 + 0.6 = 9.4 |
+| ctime: dense rank over seconds + sorted distinct seconds | 6.5 + 0.3 = 6.8 | 2.9 + 0.0 = 2.9 |
+
+How find's time predicates are used, from the find-compat corpus (24,461
+`find` occurrences): `-mtime` 1,789, `-mmin` 1,234, `-newerXY` 1,207,
+`-newer file` 597, `-printf` with a time 230, `-ls` 211, ctime 170, atime 157.
+Absolute windows outnumber relative-to-a-file ones about 7 to 1.
+
+With a stored table (D, E), every time query works as today against ids
+instead of values: an absolute window or a reference file's time becomes an id
+threshold by binary search of the table, then the scan compares ids, at the
+same cost as comparing values. Sorting by time is sorting by id. A printed time
+is a table lookup. A new time the table lacks lives in the in-memory overlay
+until compaction, which rebuilds the table and the ids. New times nearly always
+sort after every stored one, as Dave says, so the rebuild seldom moves old
+ids, though correctness does not depend on that.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep both mtime columns as they are | 36.6 b/row on `$HOME`. | No work. Every time predicate and printed time answers from the index (D47). |
+| B. Rank only (Dave's proposal), blocked | 13.2 b/row on `$HOME`, 0.6 on nix, with no values kept. Listing in mtime order needs the inverse permutation in memory, a further ~23 b/row that does not pack. New times are often not the newest (`tar x`, `cp -p`, `rsync -a`, `unzip`, `curl -R`, `touch -d`), so the in-memory order must insert anywhere. Absolute queries, the common case, cost ~23 stats each, leave the index (D47) and fail on files deleted, unreadable or on an unmounted drive; printed times cost a stat per result. | Newest-first and `-newer file` in O(results) with no scan; exact sub-second order. |
+| C. Drop the mtime nanoseconds column; key carry-over on ctime | 10.9 b/row on `$HOME`. Sub-second mtime is gone: a printed mtime has whole seconds unless the result is stated, and `-newer file` must stat files in the reference's second to break that tie (find compares full timestamps). D26's carry-over key becomes `(dev, ino, size, ctime)`. | −70% on `$HOME`, no new coding. The key loses nothing: any change to mtime, by a write or by `utimensat`, sets ctime to the current time, which userspace cannot set, so a matching ctime implies a matching mtime. |
+| D. C, with seconds coded as a blocked ordered dictionary | 8.4 b/row on `$HOME`, 0.6 on nix. C's costs, plus a new column coding (sorted delta-packed table, blocked ids) and an indirection to print a time. | −77% on `$HOME`; exact seconds; every predicate from the index. |
+| E. Blocked ordered dictionary over full (sec, ns) | 27.9 b/row on `$HOME`, 0.6 on nix. The new coding, as D. | −24% with no semantic change: exact sub-second times, carry-over untouched, `-newer` needs no stat. |
+
+The same coding applies to ctime. Under C and D, ctime is carry-over's only
+test that a file changed since it was hashed, and the question is whether it
+needs its nanoseconds:
+
+- **Why keep them:** a file written again in the same second it was stated
+  and hashed, at the same size, matches `(dev, ino, size, ctime)` in whole
+  seconds. Its old hash would be carried over and stay wrong until the next
+  change. This is git's racy-index problem; nanoseconds make the collision
+  practically impossible.
+- **Git's fix needs no nanoseconds:** a file whose ctime second is not before
+  the second it was observed has an untrusted hash. It is recorded stale and
+  rehashed at the next crawl. That is one check at observation and no stored
+  field. The stat bracket around each read (`ferret-crawl` `observe.rs`
+  `bracket`) is unaffected: it compares two fresh stats in memory, at full
+  precision.
+
+| ctime option | ctime b/row, `$HOME` / nix | Costs | Buys |
+| --- | --- | --- | --- |
+| E. Ordered dictionary over (sec, ns) | 25.8 / 9.4 (today 35.6 / 32.3) | The new coding. | Carry-over exactly as today. |
+| F. Ordered dictionary over seconds, plus the racy rule | 6.8 / 2.9 | One check when a file is observed; files written in the second before observation are rehashed at the next crawl. A network filesystem whose clock lags ours could stamp a later write with an earlier second and slip past the rule; treating ctime within a few seconds of the observation as racy covers modest skew for a few more rehashes. | −81% on `$HOME`, −91% on nix against today. |
+
+Per-block minimum and maximum, implied by each block's base and width, let
+newest-first and narrow windows skip blocks under any of these. That is a scan
+optimisation for S1b, not part of this decision.
+
+**Recommendation:** D for mtime and F for ctime. Together the time columns go
+from 72.2 to 15.2 b/row on `$HOME` (−79%) and from 33.5 to 3.5 on nix (−90%),
+with every query still answered from the index. (D with E for ctime: 34.2 and
+10.0.) B gets most of
+D's space saving but none of its values, and its speed edge (newest-first) is
+the case block skipping covers.
+
+**Fact that would change it:** if exact find parity on `-newer` without stating
+anything matters more than ~19.5 b/row on `$HOME`, take E for mtime as well.
+Agent query logs dominated by newest-N with printed times rare would favour B.
+A filesystem ferret indexes whose ctime is not reliably updated on mtime
+changes (some FUSE mounts) would make the ctime-only carry-over key unsafe
+there; those roots would need E for mtime. Indexing network mounts with
+badly skewed clocks would favour E for ctime on those roots.
