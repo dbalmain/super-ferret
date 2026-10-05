@@ -1,0 +1,858 @@
+//! Deterministic regressions for Astra's first whole-find review.
+#![allow(clippy::unwrap_used)] // Fixture setup failures identify the failed step.
+
+#[path = "../../../tests/support/gnu_find.rs"]
+mod gnu;
+mod support {
+    pub mod fixture;
+}
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
+
+struct Tree(PathBuf);
+impl Tree {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("ferret-review-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+    fn command(&self, oracle: bool) -> Command {
+        let oracle_command = gnu::command();
+        let mut command = support::fixture::bounded_command(
+            if oracle {
+                oracle_command.get_program()
+            } else {
+                std::ffi::OsStr::new(FERRET)
+            },
+            &self.0,
+        );
+        if !oracle {
+            command.args(["find", "-I"]);
+        }
+        command
+    }
+    fn index(&self, paths: &[&str]) {
+        let output = support::fixture::bounded_command(FERRET, &self.0)
+            .arg("index")
+            .args(paths)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    fn catalog(&self, args: &[&str]) -> Output {
+        let output = support::fixture::bounded_command(FERRET, &self.0)
+            .arg("find")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_ne!(output.status.code(), Some(124), "timed out: {output:?}");
+        output
+    }
+    fn run(&self, oracle: bool, args: &[&str]) -> Output {
+        let output = gnu::output(self.command(oracle).args(args));
+        assert_ne!(output.status.code(), Some(124), "timed out: {output:?}");
+        output
+    }
+}
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn delete_uses_the_observed_parent_after_an_ancestor_is_replaced() {
+    // #1: pathname unlink deleted outside/victim after this synchronous exec.
+    for explicit in [false, true] {
+        for oracle in [true, false] {
+            // GNU also redirects deletion for an explicit file start. The
+            // retained-parent safety contract is deliberately stronger.
+            if explicit && oracle {
+                continue;
+            }
+            let tree = Tree::new(&format!("delete-{explicit}-{oracle}"));
+            for directory in ["tree", "outside"] {
+                fs::create_dir(tree.0.join(directory)).unwrap();
+                fs::write(tree.0.join(directory).join("victim"), b"x").unwrap();
+            }
+            let output = tree.run(
+                oracle,
+                &[
+                    if explicit { "tree/victim" } else { "tree" },
+                    "-name",
+                    "victim",
+                    "-exec",
+                    "sh",
+                    "-c",
+                    "mv tree tree.old; ln -s outside tree",
+                    ";",
+                    "-delete",
+                ],
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert!(
+                tree.0.join("outside/victim").exists(),
+                "explicit={explicit}, oracle={oracle}"
+            );
+            assert!(!tree.0.join("tree.old/victim").exists());
+        }
+    }
+}
+
+#[test]
+fn physical_descent_refuses_a_start_replaced_by_a_symlink() {
+    // #2: depth zero formerly permitted following, regardless of -P.
+    for oracle in [true, false] {
+        let tree = Tree::new(&format!("physical-{oracle}"));
+        fs::create_dir(tree.0.join("tree")).unwrap();
+        fs::create_dir(tree.0.join("outside")).unwrap();
+        fs::write(tree.0.join("outside/victim"), b"x").unwrap();
+        let output = tree.run(
+            oracle,
+            &[
+                "tree",
+                "-exec",
+                "sh",
+                "-c",
+                "if [ \"$1\" = tree ]; then mv tree tree.old; ln -s outside tree; fi",
+                "sh",
+                "{}",
+                ";",
+                "-print",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(output.stdout, b"tree\n");
+        assert!(!output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn physical_start_with_a_trailing_slash_still_follows_the_link() {
+    // #2: no-follow descent must preserve the operand's explicit slash.
+    let tree = Tree::new("trailing-slash");
+    fs::create_dir(tree.0.join("outside")).unwrap();
+    fs::write(tree.0.join("outside/victim"), b"x").unwrap();
+    std::os::unix::fs::symlink("outside", tree.0.join("link")).unwrap();
+    for args in [
+        vec!["link/", "-print"],
+        vec!["-H", "link", "-print"],
+        vec!["-L", "link", "-print"],
+    ] {
+        let expected = tree.run(true, &args);
+        let actual = tree.run(false, &args);
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout, expected.stdout);
+        assert!(actual.stderr.is_empty(), "{actual:?}");
+        assert_eq!(actual.stdout.iter().filter(|&&b| b == b'\n').count(), 2);
+    }
+}
+
+#[test]
+fn catalog_delete_retains_the_parent_for_explicit_directory_starts() {
+    // #1 also applies to directory unlinkat and the catalog start path.
+    for explicit in [false, true] {
+        let tree = Tree::new(&format!("catalog-delete-{explicit}"));
+        for directory in ["tree/victim", "outside/victim"] {
+            fs::create_dir_all(tree.0.join(directory)).unwrap();
+        }
+        tree.index(&["tree"]);
+        let output = tree.catalog(&[
+            if explicit { "tree/victim" } else { "tree" },
+            "-name",
+            "victim",
+            "-exec",
+            "sh",
+            "-c",
+            "mv tree tree.old; ln -s outside tree",
+            ";",
+            "-delete",
+        ]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(tree.0.join("outside/victim").exists());
+        assert!(!tree.0.join("tree.old/victim").exists());
+    }
+}
+
+#[test]
+fn failed_child_capture_is_an_output_error_and_reaps_the_child() {
+    // #3: spill creation used to masquerade as ENOENT launching head, exit 0.
+    let tree = Tree::new("capture-error");
+    let output = tree
+        .command(false)
+        .env("TMPDIR", tree.0.join("nonexistent"))
+        .args([
+            "/dev/null",
+            "-maxdepth",
+            "0",
+            "-exec",
+            "head",
+            "-c",
+            "131072",
+            "/dev/zero",
+            ";",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.stdout.is_empty(),
+        "failed capture emitted {} bytes",
+        output.stdout.len()
+    );
+    assert!(error.contains("create output spill"), "{error}");
+    assert!(error.contains("nonexistent/ferret-output-"), "{error}");
+    assert!(!error.contains("find: head:"), "{error}");
+}
+
+#[test]
+fn catalog_resolution_stops_at_an_opaque_boundary_for_dotdot() {
+    // #5: the catalog-mode path resolver used to collapse `..` lexically
+    // even after crossing an ignored (opaque) directory, so it could walk
+    // back out through a symlink the catalog never indexed and land on the
+    // wrong inode. `tree/ignored/link` is a symlink into `outside/sub/deep`,
+    // kept out of the index by `.ferretignore`; `../../visible` must
+    // resolve against the symlink's real target (two levels up is
+    // `outside`), not against the lexical `tree/ignored` prefix (two levels
+    // up from which is the tree root).
+    let tree = Tree::new("opaque-dotdot");
+    fs::create_dir_all(tree.0.join("tree/ignored")).unwrap();
+    fs::create_dir_all(tree.0.join("outside/sub/deep")).unwrap();
+    fs::write(tree.0.join("tree/visible"), b"xxx").unwrap();
+    fs::write(tree.0.join("outside/visible"), b"123456789").unwrap();
+    std::os::unix::fs::symlink(
+        tree.0.join("outside/sub/deep"),
+        tree.0.join("tree/ignored/link"),
+    )
+    .unwrap();
+    fs::write(tree.0.join("tree/.ferretignore"), b"ignored/\n").unwrap();
+    tree.index(&["."]);
+
+    let args = ["tree/ignored/link/../../visible", "-printf", "%s\n"];
+    let expected = tree.run(true, &args);
+    assert!(expected.status.success(), "{expected:?}");
+    assert_eq!(expected.stdout, b"9\n", "GNU oracle: {expected:?}");
+
+    let actual = tree.catalog(&args);
+    assert!(actual.status.success(), "{actual:?}");
+    assert_eq!(actual.stdout, expected.stdout, "catalog mode: {actual:?}");
+}
+
+#[test]
+fn followed_dangling_reference_uses_the_link_itself() {
+    // #8: `-L dangling -samefile dangling` must compare the link's own
+    // identity, the same fallback live traversal already uses for a
+    // dangling link it is asked to follow, rather than failing as though
+    // the reference were outside the catalog or stale.
+    let tree = Tree::new("dangling-samefile");
+    std::os::unix::fs::symlink("missing", tree.0.join("dangling")).unwrap();
+    tree.index(&["."]);
+
+    let args = ["-L", "dangling", "-samefile", "dangling", "-print"];
+    let expected = tree.run(true, &args);
+    assert!(expected.status.success(), "{expected:?}");
+    assert_eq!(expected.stdout, b"dangling\n", "GNU oracle: {expected:?}");
+
+    let actual = tree.catalog(&args);
+    assert!(actual.status.success(), "{actual:?}");
+    assert!(actual.stderr.is_empty(), "{actual:?}");
+    assert_eq!(actual.stdout, expected.stdout, "catalog mode: {actual:?}");
+}
+
+#[test]
+fn deleting_an_explicit_start_counts_against_its_catalog_parent() {
+    // #7: an explicit start operand's `Entry` retained `parent: None`, so
+    // deleting it never incremented its catalog parent's removed-children
+    // count - the same walk's own later `-empty` check on that parent
+    // therefore disagreed with the deletion it had just performed.
+    // `parent/child` is empty; deleting it as an explicit start should make
+    // `parent` empty too, in the same `find` invocation.
+    let tree = Tree::new("explicit-start-empty-accounting");
+    fs::create_dir_all(tree.0.join("parent/child")).unwrap();
+    tree.index(&["."]);
+
+    let args = ["parent/child", "parent", "-empty", "-delete"];
+    let expected = tree.run(true, &args);
+    assert!(expected.status.success(), "{expected:?}");
+    assert!(
+        !tree.0.join("parent/child").exists(),
+        "GNU oracle: {expected:?}"
+    );
+    assert!(!tree.0.join("parent").exists(), "GNU oracle: {expected:?}");
+
+    let tree = Tree::new("explicit-start-empty-accounting-ferret");
+    fs::create_dir_all(tree.0.join("parent/child")).unwrap();
+    tree.index(&["."]);
+
+    let actual = tree.catalog(&args);
+    assert!(actual.status.success(), "{actual:?}");
+    assert!(
+        !tree.0.join("parent/child").exists(),
+        "catalog mode: {actual:?}"
+    );
+    assert!(
+        !tree.0.join("parent").exists(),
+        "catalog mode must also remove the now-empty parent: {actual:?}"
+    );
+}
+
+#[test]
+fn live_descent_does_not_hold_one_fd_per_ancestor() {
+    // #10: a live (non-catalog) directory listing kept its open fd in the
+    // traversal's `Level` for the whole subtree beneath it - not just for
+    // the listing itself - so a pure query's fd use grew with *depth*
+    // rather than staying bounded by its own level. Under a 100-level
+    // chain and RLIMIT_NOFILE=64, that aborted with EMFILE partway down,
+    // before reaching `leaf`. A plain query (no -delete/-execdir) never
+    // asks a child for its parent's fd, so the listing handle can close
+    // once its own getdents pass finishes, the same way catalog mode
+    // already never opens one at all for a pure query.
+    let tree = Tree::new("fd-per-ancestor");
+    let mut dir = tree.0.join("chain");
+    fs::create_dir(&dir).unwrap();
+    for _ in 0..100 {
+        dir.push("x");
+        fs::create_dir(&dir).unwrap();
+    }
+    fs::write(dir.join("leaf"), b"").unwrap();
+
+    let output = support::fixture::command("sh", &tree.0)
+        .arg("-c")
+        .arg(r#"ulimit -n 64 && exec "$0" find -I chain -name leaf"#)
+        .arg(FERRET)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .ends_with("leaf"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn reference_observation_and_output_truncation_run_in_expression_order() {
+    // #6: `-fprint`/`-fprintf` used to open (and truncate) their target at
+    // parse time, unconditionally before any `-newer`-style reference test
+    // observed its mtime - regardless of which came first in the
+    // expression. `reference` and `-fprint reference` name the same file;
+    // whether `-newer reference`'s observation sees its original mtime
+    // (1000s) or the fresh mtime truncation gives it depends only on
+    // expression order now.
+    // `reference` starts far in the past; `candidate` is a few seconds
+    // old - newer than the original `reference`, but older than "now",
+    // which is what `reference` becomes the instant `-fprint` truncates
+    // it. That is exactly what should flip `-newer reference`'s answer
+    // depending on which runs first.
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    let new = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+    let seed = |tree: &Tree| {
+        fs::write(tree.0.join("reference"), b"ref").unwrap();
+        fs::write(tree.0.join("candidate"), b"cand").unwrap();
+        fs::File::open(tree.0.join("reference"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        fs::File::open(tree.0.join("candidate"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(new))
+            .unwrap();
+    };
+
+    for (at, args) in [
+        vec!["candidate", "-newer", "reference", "-fprint", "reference"],
+        vec!["candidate", "-fprint", "reference", "-newer", "reference"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let gnu_tree = Tree::new(&format!("reference-output-order-gnu-{at}"));
+        seed(&gnu_tree);
+        let expected = gnu_tree.run(true, &args);
+        assert!(expected.status.success(), "{expected:?}");
+
+        let ferret_tree = Tree::new(&format!("reference-output-order-ferret-{at}"));
+        seed(&ferret_tree);
+        let actual = ferret_tree.run(false, &args);
+        assert!(actual.status.success(), "{actual:?}");
+        assert_eq!(actual.stdout, expected.stdout, "args={args:?}: {actual:?}");
+        assert_eq!(
+            fs::read(ferret_tree.0.join("reference")).unwrap(),
+            fs::read(gnu_tree.0.join("reference")).unwrap(),
+            "args={args:?}: ferret's reference content must match GNU's"
+        );
+    }
+}
+
+#[test]
+fn mixed_short_and_spilled_link_records_commit_whole_through_the_cli() {
+    // R2 #4: single output actions bypassed transactions; the CLI also kept
+    // a spilled record's tail in a worker buffer after releasing its gate.
+    use std::os::unix::fs::symlink;
+    let tree = Tree::new("mixed-records");
+    fs::create_dir(tree.0.join("tree")).unwrap();
+    for directory in 0..16 {
+        let parent = tree.0.join(format!("tree/d{directory:02}"));
+        fs::create_dir(&parent).unwrap();
+        for link in 0..24 {
+            symlink(
+                if link % 2 == 0 {
+                    "L".repeat(2000)
+                } else {
+                    "S".into()
+                },
+                parent.join(format!("l{link:02}")),
+            )
+            .unwrap();
+        }
+    }
+    let format = format!("{}\\n", "%l".repeat(100));
+    for file in [false, true] {
+        let args = if file {
+            vec!["tree", "-type", "l", "-fprintf", "out", &format]
+        } else {
+            vec!["tree", "-type", "l", "-printf", &format]
+        };
+        let output = tree.run(false, &args);
+        assert!(output.status.success(), "{output:?}");
+        let bytes = if file {
+            fs::read(tree.0.join("out")).unwrap()
+        } else {
+            output.stdout
+        };
+        assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), 384);
+        let mut counts = [0, 0];
+        for record in bytes.split(|&b| b == b'\n').filter(|r| !r.is_empty()) {
+            if record.len() == 200_000 && record.iter().all(|&b| b == b'L') {
+                counts[0] += 1;
+            } else if record.len() == 100 && record.iter().all(|&b| b == b'S') {
+                counts[1] += 1;
+            } else {
+                panic!("file={file}: corrupt record, length {}", record.len());
+            }
+        }
+        assert_eq!(counts, [192, 192]);
+    }
+}
+
+#[test]
+fn rendering_spill_failure_discards_output_and_stops_before_the_next_start() {
+    // R2 #9: a sink failure was classified as metadata and tried both starts.
+    let tree = Tree::new("render-spill-error");
+    for path in ["a", "b"] {
+        fs::write(tree.0.join(path), b"").unwrap();
+    }
+    let output = tree
+        .command(false)
+        .env("TMPDIR", tree.0.join("nonexistent"))
+        .args(["a", "b", "-fprintf", "out", "%100000p"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(fs::read(tree.0.join("out")).unwrap().is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert!(error.contains("create output spill"), "{error}");
+    assert!(error.contains("nonexistent/ferret-output-"), "{error}");
+    // A prior completed record may still be staged in the same destination.
+    // Roll back only the failing entry, retaining that earlier record.
+    let output = tree
+        .command(false)
+        .env("TMPDIR", tree.0.join("nonexistent"))
+        .args([
+            "a", "b", "(", "-name", "a", "-fprintf", "out", "%p\\n", ")", "-o", "(", "-name", "b",
+            "-fprintf", "out", "%100000p", ")",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read(tree.0.join("out")).unwrap(), b"a\n");
+}
+
+#[test]
+fn explicit_delete_needs_search_and_write_but_no_parent_read_permission() {
+    // R2 #1: RDONLY parent retention made a searchable 0333 parent fail.
+    use std::os::unix::fs::PermissionsExt;
+    for (oracle, catalog) in [(true, false), (false, false), (false, true)] {
+        let tree = Tree::new(&format!("delete-permission-{oracle}-{catalog}"));
+        fs::create_dir(tree.0.join("parent")).unwrap();
+        fs::write(tree.0.join("parent/victim"), b"").unwrap();
+        if catalog {
+            tree.index(&["parent"]);
+        }
+        fs::set_permissions(tree.0.join("parent"), fs::Permissions::from_mode(0o333)).unwrap();
+        let output = if catalog {
+            tree.catalog(&["parent/victim", "-delete"])
+        } else {
+            tree.run(oracle, &["parent/victim", "-delete"])
+        };
+        fs::set_permissions(tree.0.join("parent"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(!tree.0.join("parent/victim").exists());
+    }
+}
+
+#[test]
+fn file_output_does_not_retain_one_directory_descriptor_per_ancestor() {
+    // R2 #10: file output needs freshness checks, but no ancestor capability.
+    let tree = Tree::new("file-output-fds");
+    let mut path = tree.0.join("chain");
+    fs::create_dir(&path).unwrap();
+    for _ in 0..100 {
+        path.push("d");
+        fs::create_dir(&path).unwrap();
+    }
+    fs::write(path.join("leaf"), b"").unwrap();
+    tree.index(&["chain"]);
+    for mode in ["live", "catalog"] {
+        let output = support::fixture::bounded_command("sh", &tree.0)
+            .args(["-c", "ulimit -n 64; if test \"$2\" = live; then exec \"$1\" find -I chain -name leaf -fprint out; else exec \"$1\" find chain -name leaf -fprint out; fi", "sh", FERRET, mode])
+            .output().unwrap();
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert!(fs::read(tree.0.join("out")).unwrap().ends_with(b"/leaf\n"));
+    }
+}
+
+#[test]
+fn explicit_execdir_and_link_reads_use_the_observed_parent() {
+    // R2 pattern: replacing an explicit start's parent must not redirect
+    // execdir's cwd or live %l/%Y reads. Mutation completes in the first exec.
+    use std::os::unix::fs::symlink;
+    for (catalog, execdir) in [(false, false), (false, true), (true, false), (true, true)] {
+        let tree = Tree::new(&format!("observed-link-parent-{catalog}-{execdir}"));
+        for parent in ["tree", "outside"] {
+            fs::create_dir(tree.0.join(parent)).unwrap();
+        }
+        fs::write(tree.0.join("tree/target"), b"").unwrap();
+        fs::create_dir(tree.0.join("outside/target")).unwrap();
+        fs::write(tree.0.join("original"), b"").unwrap();
+        symlink("../original", tree.0.join("tree/link")).unwrap();
+        symlink("other", tree.0.join("outside/link")).unwrap();
+        let script = "mv tree tree.old; ln -s outside tree";
+        if catalog {
+            tree.index(&["tree"]);
+        }
+        let mut args = vec!["tree/link", "-exec", "sh", "-c", script, ";"];
+        if execdir {
+            args.extend(["-execdir", "sh", "-c", "test -f target", ";"]);
+        }
+        args.extend(["-printf", "%l %Y\\n"]);
+        let output = if catalog {
+            tree.catalog(&args)
+        } else {
+            tree.run(false, &args)
+        };
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"../original f\n", "{output:?}");
+    }
+}
+
+#[test]
+fn reference_and_start_resolution_share_following_and_dangling_policy() {
+    // R2 #8: live dangling references, catalog access-time references and
+    // followed links outside index coverage must use traversal's fallback.
+    use std::os::unix::fs::symlink;
+    let tree = Tree::new("reference-policy");
+    fs::create_dir(tree.0.join("tree")).unwrap();
+    fs::write(tree.0.join("outside"), b"").unwrap();
+    symlink("missing", tree.0.join("tree/dangling")).unwrap();
+    symlink("../outside", tree.0.join("tree/link")).unwrap();
+    tree.index(&["tree"]);
+    for args in [
+        vec![
+            "-L",
+            "tree/dangling",
+            "-samefile",
+            "tree/dangling",
+            "-print",
+        ],
+        vec!["-L", "tree/dangling", "-neweraa", "tree/dangling", "-print"],
+        vec!["-L", "tree/link", "-samefile", "tree/link", "-print"],
+    ] {
+        let expected = tree.run(true, &args);
+        for actual in [tree.run(false, &args), tree.catalog(&args)] {
+            assert_eq!(
+                actual.status.code(),
+                expected.status.code(),
+                "{args:?}: {actual:?}"
+            );
+            assert_eq!(actual.stdout, expected.stdout, "{args:?}: {actual:?}");
+            assert!(actual.stderr.is_empty(), "{args:?}: {actual:?}");
+        }
+    }
+}
+
+#[test]
+fn a_missing_component_inside_a_catalog_root_cannot_be_cancelled_by_dotdot() {
+    // R2 #5: unresolved prefixes were treated as outside-root prefixes.
+    use std::os::unix::fs::symlink;
+    let tree = Tree::new("missing-component");
+    fs::create_dir(tree.0.join("tree")).unwrap();
+    symlink("target", tree.0.join("tree/link")).unwrap();
+    tree.index(&["tree"]);
+    for args in [
+        vec!["tree/missing/../link", "-printf", "%l\\n"],
+        vec!["tree/link", "-samefile", "tree/missing/../link", "-print"],
+    ] {
+        let expected = tree.run(true, &args);
+        let actual = tree.catalog(&args);
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "{args:?}: {actual:?}"
+        );
+        assert_eq!(actual.stdout, expected.stdout, "{args:?}: {actual:?}");
+    }
+}
+
+#[test]
+fn deletion_counts_resolve_symlink_parents_and_exclude_dot_noops() {
+    // R2 #7: symlinked parent identity was missed; deleting '.' counted a
+    // removed name even though it intentionally performs no unlink.
+    use std::os::unix::fs::symlink;
+    for dot in [false, true] {
+        let tree = Tree::new(&format!("deletion-counts-{dot}"));
+        fs::create_dir_all(tree.0.join("parent/child")).unwrap();
+        symlink("parent", tree.0.join("alias")).unwrap();
+        tree.index(&["."]);
+        let args = if dot {
+            vec![
+                "parent/child/.",
+                "parent",
+                "-maxdepth",
+                "0",
+                "-empty",
+                "-delete",
+            ]
+        } else {
+            vec!["alias/child", "parent", "-empty", "-delete"]
+        };
+        let output = tree.catalog(&args);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(tree.0.join("parent").exists(), dot, "{output:?}");
+    }
+}
+
+#[test]
+fn externally_removed_catalog_directory_still_reports_enoent() {
+    // R2 removed-directory exception: only this walk's -delete may suppress
+    // a cataloged directory, even if it vanished before membership checks.
+    let tree = Tree::new("external-directory-removal");
+    fs::create_dir_all(tree.0.join("tree/child")).unwrap();
+    tree.index(&["tree"]);
+    let output = tree.catalog(&[
+        "tree",
+        "-exec",
+        "sh",
+        "-c",
+        "if test \"$1\" = tree; then rmdir tree/child; fi",
+        "sh",
+        "{}",
+        ";",
+        "-print",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tree/child"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn cli_bounds_parenthesis_and_negation_nesting_before_descent() {
+    // R2 #11: parentheses bypassed the AST operator limit and aborted.
+    let tree = Tree::new("parser-nesting");
+    for token in ["(", "-not"] {
+        let mut boundary = vec!["/dev/null"];
+        boundary.extend(std::iter::repeat_n(token, 128));
+        boundary.push("-true");
+        if token == "(" {
+            boundary.extend(std::iter::repeat_n(")", 128));
+        }
+        let output = tree.run(false, &boundary);
+        assert!(output.status.success(), "128 nested {token}: {output:?}");
+        let mut args = vec!["/dev/null"; 1];
+        args.extend(std::iter::repeat_n(token, 20_000));
+        args.push("-true");
+        if token == "(" {
+            args.extend(std::iter::repeat_n(")", 20_000));
+        }
+        let output = tree.run(false, &args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("nesting"),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn live_empty_and_access_tests_use_an_already_retained_parent() {
+    // R2 pattern section: these adjacent live lookups also redirected after
+    // replacement, even though execdir had retained the observed parent.
+    use std::os::unix::fs::PermissionsExt;
+    for empty in [true, false] {
+        let tree = Tree::new(&format!("observed-live-test-{empty}"));
+        for parent in ["tree", "outside"] {
+            fs::create_dir(tree.0.join(parent)).unwrap();
+        }
+        if empty {
+            fs::create_dir(tree.0.join("tree/victim")).unwrap();
+            fs::create_dir(tree.0.join("outside/victim")).unwrap();
+            fs::write(tree.0.join("outside/victim/child"), b"").unwrap();
+        } else {
+            fs::write(tree.0.join("tree/victim"), b"").unwrap();
+            fs::write(tree.0.join("outside/victim"), b"").unwrap();
+            fs::set_permissions(
+                tree.0.join("tree/victim"),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+        let output = tree.run(
+            false,
+            &[
+                "tree/victim",
+                "-maxdepth",
+                "0",
+                "-exec",
+                "sh",
+                "-c",
+                "mv tree tree.old; ln -s outside tree",
+                ";",
+                "-execdir",
+                "true",
+                ";",
+                if empty { "-empty" } else { "-readable" },
+                "-print",
+            ],
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            if empty {
+                b"tree/victim\n".as_slice()
+            } else {
+                b""
+            },
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn deleting_an_explicit_ignored_start_counts_against_its_stored_parent() {
+    // R2 resolver/accounting pattern: an opaque start resolves live, but its
+    // parent still has a stored raw count including that ignored child.
+    let tree = Tree::new("ignored-start-deletion-count");
+    fs::create_dir_all(tree.0.join("tree/parent/child")).unwrap();
+    fs::write(tree.0.join("tree/.ferretignore"), b"parent/child\n").unwrap();
+    tree.index(&["tree"]);
+    let output = tree.catalog(&["tree/parent/child", "tree/parent", "-empty", "-delete"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!tree.0.join("tree/parent").exists(), "{output:?}");
+}
+
+#[test]
+fn an_observed_lookup_keeps_the_operands_trailing_slash() {
+    // R3 #1: `with_observed_path` rebuilt the operand from `name()`, which
+    // drops a trailing slash, so a non-directory named with one looked up
+    // as if the slash were absent instead of failing with ENOTDIR.
+    let tree = Tree::new("trailing-slash-operand");
+    fs::write(tree.0.join("victim"), b"").unwrap();
+    for oracle in [true, false] {
+        let output = tree.run(oracle, &["victim/", "-delete"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+    }
+    assert!(tree.0.join("victim").exists());
+
+    for oracle in [true, false] {
+        let output = tree.run(oracle, &["victim/", "-printf", "%p %y %l\n"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+    }
+
+    std::os::unix::fs::symlink("nowhere", tree.0.join("dangling")).unwrap();
+    for oracle in [true, false] {
+        let output = tree.run(oracle, &["dangling/", "-print"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(output.stdout, b"".as_slice(), "{output:?}");
+    }
+}
+
+#[test]
+fn a_first_child_directory_observation_survives_an_ancestor_rename() {
+    // R3 #3: the first child-directory stat taken while listing a directory
+    // used the entry's pathname (`cached_metadata(entry.path(), follow)`)
+    // instead of the handle just opened for that listing, so an `-exec`
+    // that renamed an ancestor during the walk made that first observation
+    // fail even though the handle-relative descent kept working.
+    let tree = Tree::new("first-child-observation-survives-rename");
+    fs::create_dir_all(tree.0.join("tree/sub/child")).unwrap();
+    fs::write(tree.0.join("tree/sub/child/leaf"), b"").unwrap();
+
+    let output = tree.run(
+        false,
+        &[
+            "tree",
+            "(",
+            "-name",
+            "sub",
+            "-exec",
+            "sh",
+            "-c",
+            "mv tree saved",
+            ";",
+            ")",
+            ",",
+            "-execdir",
+            "true",
+            ";",
+            ",",
+            "-printf",
+            "%p %s\n",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.split(' ').next().unwrap())
+            .collect::<Vec<_>>(),
+        ["tree", "tree/sub", "tree/sub/child", "tree/sub/child/leaf"],
+        "{output:?}"
+    );
+}
+
+#[test]
+fn a_dotdot_that_leaves_and_reenters_coverage_still_resolves() {
+    // R3 #2: the resolver's `inside` flag meant "has ever entered coverage",
+    // so stepping outside the indexed root via `..` and back in looked like
+    // a missing child inside coverage. A missing child must still fail.
+    let tree = Tree::new("dotdot-leave-and-reenter");
+    fs::create_dir(tree.0.join("root")).unwrap();
+    fs::write(tree.0.join("root/file"), b"").unwrap();
+    tree.index(&["root"]);
+
+    let output = tree.catalog(&["root/../root/file", "-print"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"root/../root/file\n".as_slice(),
+        "{output:?}"
+    );
+
+    // Round 2's fix must hold: a missing component inside coverage still
+    // errors even though it is followed by a `..`.
+    let output = tree.catalog(&["root/missing/../file", "-print"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(output.stdout, b"".as_slice(), "{output:?}");
+}

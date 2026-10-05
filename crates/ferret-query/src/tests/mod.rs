@@ -1,6 +1,5 @@
 //! Queries run against real catalogs, committed through `ferret-catalog`'s
-//! transaction and reopened lazily, as `ferret find` will.
-#![allow(clippy::unwrap_used)]
+//! transaction and reopened lazily, as `ferret search` does.
 
 mod grammar;
 mod pattern;

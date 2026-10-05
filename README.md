@@ -13,6 +13,16 @@ its code.
   and the answer
 - [Research](docs/research/) — the 2026-09 survey and measured baseline
 
+`ferret index DIR` adds an indexed root. `ferret find [PATH...] [EXPRESSION]`
+then takes GNU find syntax and answers from the index: ignored paths do not
+exist to it, and it sees the tree as of the last `ferret index`.
+`ferret find -I` (or `--no-ignore`) walks the disk live with no ignore rules,
+and `find_no_ignore = true` in `~/.config/ferret/config` makes that the default.
+Both walk in parallel: parents still come before children (after them under
+`-depth` and `-delete`), but sibling order need not be GNU's. Exit status is 0
+on success, matches or not, and 1 on any error. [docs/FIND.md](docs/FIND.md)
+is the full contract.
+
 Related repositories:
 
 - [intpack](https://github.com/dbalmain/intpack) — integer-sequence codecs for

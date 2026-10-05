@@ -59,25 +59,36 @@ impl Dirs {
 
     /// Resolves from `var`, which returns an environment variable's value.
     pub fn resolve(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, Error> {
-        let base = |name: &'static str, default: &str| -> Result<PathBuf, Error> {
-            if let Some(path) = absolute(var(name)) {
-                return Ok(path.join("ferret"));
-            }
-            let home = absolute(var("HOME")).ok_or(Error::NoHome { var: name })?;
-            Ok(home.join(default).join("ferret"))
-        };
         Ok(Self {
-            config: base("XDG_CONFIG_HOME", ".config")?,
-            data: base("XDG_DATA_HOME", ".local/share")?,
-            state: base("XDG_STATE_HOME", ".local/state")?,
-            cache: base("XDG_CACHE_HOME", ".cache")?,
+            config: base(&var, "XDG_CONFIG_HOME", ".config")?,
+            data: base(&var, "XDG_DATA_HOME", ".local/share")?,
+            state: base(&var, "XDG_STATE_HOME", ".local/state")?,
+            cache: base(&var, "XDG_CACHE_HOME", ".cache")?,
         })
+    }
+
+    /// Resolves only the configuration directory. Find's config setting must
+    /// work even when an unused data/state/cache base cannot be resolved.
+    pub fn config_from_env() -> Result<PathBuf, Error> {
+        base(&|name| std::env::var_os(name), "XDG_CONFIG_HOME", ".config")
     }
 
     /// The user's global ignore file, which setup seeds with the defaults.
     pub fn ignore_file(&self) -> PathBuf {
         self.config.join("ignore")
     }
+}
+
+fn base(
+    var: &impl Fn(&str) -> Option<OsString>,
+    name: &'static str,
+    default: &str,
+) -> Result<PathBuf, Error> {
+    if let Some(path) = absolute(var(name)) {
+        return Ok(path.join("ferret"));
+    }
+    let home = absolute(var("HOME")).ok_or(Error::NoHome { var: name })?;
+    Ok(home.join(default).join("ferret"))
 }
 
 /// `value` as a path if it is absolute; the spec treats anything else,

@@ -118,21 +118,21 @@ pub enum Entry {
     },
     /// A symbolic link. Catalogued, never followed.
     Symlink,
-    /// A socket, FIFO or device. Always skipped.
+    /// A socket, FIFO or device. Catalogued without content when included.
     Other,
 }
 
 /// What the crawler does with one entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// Not catalogued; for a directory, not walked into.
+    /// Ignored: retain only its name and type; a directory is not walked into.
     Skip,
     /// Directory: catalogue it, read its ignore files and walk into it with
     /// [`DirRules::enter`].
     Descend,
     /// Directory that is excluded, but beneath which a `!` pattern in a
-    /// `.ferretignore` could re-include something. Not catalogued; walk into
-    /// it with [`DirRules::traverse`], without reading its ignore files (D13:
+    /// `.ferretignore` could re-include something. Walk into it with
+    /// [`DirRules::traverse`], without reading its ignore files (D13:
     /// an excluded directory's ignore files are never read).
     Traverse,
     /// File or symlink: catalogue its name and metadata, do not index content.
@@ -148,6 +148,8 @@ pub enum Reason {
     TooLarge,
     /// A symlink; its target is not followed.
     Symlink,
+    /// A FIFO, socket or device; never read as content.
+    Special,
 }
 
 /// What a file's head says about its content.

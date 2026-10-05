@@ -62,6 +62,8 @@
 //! literal tests the inode rows first ([`Strategy::InodeScan`]); anything
 //! else tests every name ([`Strategy::AllNames`]).
 
+pub mod find;
+
 mod pattern;
 mod query;
 mod run;

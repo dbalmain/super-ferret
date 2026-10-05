@@ -10,9 +10,12 @@ All green with zero warnings before a change is done:
 
 ```sh
 nix run .#fmt        # cargo fmt --all with the pinned nightly rustfmt
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+nix develop --command cargo test --workspace
 ```
+
+The dev shell supplies the pinned GNU findutils 4.11.0 differential oracle via
+`FERRET_GNU_FIND`. Missing or different oracle versions fail the tests.
 
 Formatting needs nightly rustfmt because `rustfmt.toml` wraps comments; the
 flake pins it, and the build stays on stable. Plain `cargo fmt` with stable
@@ -29,16 +32,19 @@ Style: `~/style-guide/rust.md` and `~/style-guide/common.md`
 
 ## Where things go
 
-| Change                                         | Crate            |
-| ---------------------------------------------- | ---------------- |
-| ignore rules, size cap, binary check           | `ferret-policy`  |
-| walking roots, change detection, hashing       | `ferret-crawl`   |
-| names, inodes, documents, name search, storage | `ferret-catalog` |
-| what a token is                                | `ferret-text`    |
-| a new index structure                          | `ferret-index`   |
-| matching a candidate's bytes                   | `ferret-verify`  |
-| query syntax, planning, result rows            | `ferret-query`   |
-| CLI flags, output, config, query log           | `ferret`         |
+| Change                                                 | Crate                           |
+| ------------------------------------------------------ | ------------------------------- |
+| ignore rules, size cap, binary check                   | `ferret-policy`                 |
+| walking roots, change detection, hashing               | `ferret-crawl`                  |
+| names, inodes, documents, name search, storage         | `ferret-catalog`                |
+| what a token is                                        | `ferret-text`                   |
+| a new index structure                                  | `ferret-index`                  |
+| matching a candidate's bytes                           | `ferret-verify`                 |
+| GNU regex dialects for `-regex`; the only `regex` user | `ferret-verify`, `src/dialect*` |
+| query syntax, planning, result rows                    | `ferret-query`                  |
+| `find`: parser, evaluator, walk, actions               | `ferret-query`, `src/find/`     |
+| CLI flags, output, config, query log                   | `ferret`                        |
+| `find`'s CLI host                                      | `ferret`, `src/find.rs`         |
 
 The crate graph is enforced: `crates/ferret/tests/layering.rs` fails if any
 crate's `[dependencies]` differ from the graph in DESIGN.md § Crates. To add a

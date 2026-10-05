@@ -133,6 +133,7 @@ dependencies = [
  "ferret-index",
  "ferret-text",
  "ferret-verify",
+ "rustix",
 ]
 
 [[package]]

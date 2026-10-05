@@ -409,6 +409,7 @@ fn fill_counts(txn: &Transaction) -> Vec<Batch> {
     b.entry_count(root, 6);
     a.entry_count(full, 1);
     b.entry_count(empty, 0);
+    a.file(traversed, b"visible", file_stat(13), Content::Unindexed);
     b.entry_count(traversed, 40);
     vec![a, b]
 }

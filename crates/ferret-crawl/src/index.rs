@@ -13,11 +13,13 @@
 //! ```
 //!
 //! A **coverage fault** is any [`Event::Io`] except an entry's `lstat`
-//! NotFound, which is a deletion. It means the walk may have missed entries
-//! or applied the wrong ignore rules, so nothing is published and the old
-//! generation stays. A **content fault** leaves the namespace intact: the file
-//! is published with [`ContentState::Fault`](ferret_catalog::ContentState) and
-//! no document, and the next run reads it again.
+//! NotFound (a deletion), and EACCES from opening or listing a directory
+//! (a catalogued directory with unknown contents, D26 amendment). It means the
+//! walk may have missed entries or applied the wrong ignore rules, so nothing
+//! is published and the old generation stays. A **content fault** leaves the
+//! namespace intact: the file is published with
+//! [`ContentState::Fault`](ferret_catalog::ContentState) and no document, and
+//! the next run reads it again.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -161,6 +163,8 @@ pub struct Counts {
     pub files: u64,
     /// Symlinks catalogued.
     pub symlinks: u64,
+    /// Visible FIFOs, sockets and devices catalogued without content.
+    pub specials: u64,
     /// File names the policy sent to the index.
     pub indexed: u64,
     /// Of those, whose content came from the previous generation unread.
@@ -196,6 +200,7 @@ impl Counts {
             traversed,
             files,
             symlinks,
+            specials,
             indexed,
             carried,
             aliased,
@@ -213,6 +218,7 @@ impl Counts {
         self.traversed += traversed;
         self.files += files;
         self.symlinks += symlinks;
+        self.specials += specials;
         self.indexed += indexed;
         self.carried += carried;
         self.aliased += aliased;
@@ -292,7 +298,8 @@ impl Published {
 ///   because its kept copy stopped at the old inner roots (D34).
 ///
 /// The writer lock is taken first and held until the commit. A coverage
-/// fault anywhere publishes nothing ([`IndexError::Coverage`]).
+/// fault other than a directory listing/open EACCES publishes nothing
+/// ([`IndexError::Coverage`]).
 pub fn index(
     catalog_dir: &Path,
     roots: &[PathBuf],
@@ -465,7 +472,10 @@ pub(crate) fn content_faults(
     let mut buf = Vec::new();
     for id in (0..catalog.name_count()).map(NameId) {
         let name = catalog.name(id);
-        if !fault(name.child) || !refreshed.contains(&root_of(name.parent)) {
+        if matches!(name.target(), ferret_catalog::Target::Ignored(_))
+            || !fault(name.child)
+            || !refreshed.contains(&root_of(name.parent))
+        {
             continue;
         }
         buf.clear();
@@ -813,6 +823,12 @@ impl EventVisitor for Hasher<'_> {
     fn visit(&mut self, event: Event<'_, DirToken>) -> Option<DirToken> {
         match event {
             Event::Decided(decided) => {
+                if decided.decision == Decision::Skip {
+                    self.out
+                        .batch
+                        .ignored(decided.parent, decided.name.as_bytes(), decided.kind);
+                    return None;
+                }
                 let stat = decided.stat.as_ref().map(observe::from_walk)?;
                 let name = decided.name.as_bytes();
                 match decided.decision {
@@ -835,6 +851,13 @@ impl EventVisitor for Hasher<'_> {
                     }
                     Decision::Catalog(Reason::TooLarge) => {
                         self.out.counts.files += 1;
+                        self.out
+                            .batch
+                            .file(decided.parent, name, stat, Content::Unindexed);
+                        None
+                    }
+                    Decision::Catalog(Reason::Special) => {
+                        self.out.counts.specials += 1;
                         self.out
                             .batch
                             .file(decided.parent, name, stat, Content::Unindexed);
@@ -885,6 +908,11 @@ impl EventVisitor for Hasher<'_> {
                 let on_root = matches!(context, FaultContext::Root);
                 if op == IoOp::Lstat && !on_root && error.kind() == io::ErrorKind::NotFound {
                     self.out.counts.vanished += 1;
+                } else if matches!(op, IoOp::OpenDir | IoOp::List)
+                    && error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())
+                {
+                    // The directory row precedes its open/list. No Entered
+                    // event sets a count, so it remains unknown (D26).
                 } else {
                     self.fault(path, op, on_root, error);
                 }

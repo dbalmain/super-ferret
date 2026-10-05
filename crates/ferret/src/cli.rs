@@ -1,9 +1,9 @@
-//! The program: parse the command line, find the index and ferret's
+//! The program: parse the command line, locate the index and ferret's
 //! directories, run one command, and map its outcome to an exit status.
 //!
-//! Each command lives in its own module ([`crate::find`], [`crate::index`],
-//! [`crate::stats`]) and returns an [`Exit`]; this module is the only one
-//! that reads the process environment.
+//! Each command lives in its own module ([`crate::find`], [`crate::search`],
+//! [`crate::index`], [`crate::stats`]) and returns an [`Exit`]; this module is
+//! the only one that reads the process environment.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -14,12 +14,12 @@ use crate::args::{self, Command};
 use crate::xdg::Dirs;
 
 /// ferret's exit statuses. They are stable: scripts and the agent skill
-/// depend on them. grep's convention, with usage and runtime errors split.
+/// depend on them. Search follows grep's convention; find uses GNU's 0/1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
-    /// The command succeeded; for `find`, at least one row was printed.
+    /// The command succeeded; for `search`, at least one row was printed.
     Ok = 0,
-    /// `find` ran and matched nothing.
+    /// `search` matched nothing, or `find` encountered an error.
     NoMatch = 1,
     /// The command line, or a query atom in it, is not valid. Nothing ran.
     Usage = 2,
@@ -61,20 +61,34 @@ impl Context {
 
 /// The usage text, printed by `ferret help`.
 pub const USAGE: &str = "\
-ferret: find files by name and metadata.
+ferret: search files by name and metadata.
 
 usage:
   ferret index [DIR...]         add each DIR as a root and index it;
                                 with none, re-index every root
   ferret roots list             print the roots, one per line
   ferret roots remove DIR...    stop indexing DIR (roots inside it stay)
-  ferret find [--json] [--limit N] [--] ATOM...
+  ferret find [-I|--no-ignore] [-P] [PATH...] [EXPRESSION]
+                                GNU find syntax; -I walks without an index
+                                default uses catalog visibility and respects ignore rules
+                                pasted find ... -delete skips ignored files and still exits 0
+                                -empty sees this walk's -delete removals, not -exec removals;
+                                use -delete or -I for deletion-aware emptiness
+  ferret search [--json] [--limit N] [--] ATOM...
                                 print each path that matches every ATOM
   ferret stats                  counts, sizes and a census of the index
   ferret help | --version
 
   --index DIR   the index to use; else $FERRET_INDEX, else
                 $XDG_DATA_HOME/ferret (~/.local/share/ferret)
+
+find expressions:
+  -name/-iname GLOB, -path/-ipath GLOB, -wholename/-iwholename GLOB
+  -type f,d,l,p,s,b,c          one type or a comma list
+  -maxdepth N, -mindepth N, -depth, -xdev/-mount
+  -print, -print0, -prune, -quit, -true, -false
+  ( EXPR ), !/-not, -a/-and, -o/-or, comma; adjacent tests imply AND
+  No action adds -print to the entire expression. Stars match dots and slashes.
 
 query atoms (all must match; one atom per argument):
   WORD            the name contains WORD; with a '/', the path does
@@ -94,13 +108,22 @@ output: one path per line, raw bytes, in index order (unsorted);
   {\"path\":…,\"type\":\"file\"|\"dir\"|\"symlink\",\"size\":N,\"mtime\":SECONDS,\"doc\":N|null}
   and \"path_base64\" with the exact bytes when the path is not UTF-8.
 
-exit status: 0 success (find printed a row), 1 find matched nothing,
+find exit status: 0 success, 1 error (including invalid syntax).
+  Default mode needs an index covering each start. Missing/incompatible indexes
+  and unresolved starts fail: re-index or use -I.
+  $XDG_CONFIG_HOME/ferret/config: find_no_ignore = true makes -I the default.
+  Pasted find ... -delete skips ignored files and still exits 0; a failed
+  deletion (for example a directory still holding ignored files) exits 1.
+  In default mode -empty sees this walk's -delete removals, not removals by
+  -exec commands; use -delete or -I for deletion-aware emptiness.
+
+search exit status: 0 success (search printed a row), 1 search matched nothing,
   2 usage error, 3 runtime error (no index, I/O, lock held, walk faults).
 
-each find and index run appends one JSON line to
+each search and index run appends one JSON line to
 $XDG_STATE_HOME/ferret/log.jsonl (mode 0600): the query as typed, its plan,
 counts and timings. No field holds a result path, a root path or an id, but
-the query text may itself contain a path (find path:/some/dir).
+the query text may itself contain a path (search path:/some/dir).
 ";
 
 /// Runs `ferret` with the process's arguments and environment.
@@ -117,6 +140,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         }
     };
     match args.command {
+        Command::Find(ref find_args) => return crate::find::run(find_args, args.index.as_deref()),
         Command::Help => return print("usage", USAGE.as_bytes()),
         Command::Version => {
             let version = format!("ferret {}\n", env!("CARGO_PKG_VERSION"));
@@ -145,12 +169,12 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         dirs: dirs.ok(),
     };
     match args.command {
-        Command::Find { atoms, json, limit } => crate::find::run(&context, &atoms, json, limit),
+        Command::Search { atoms, json, limit } => crate::search::run(&context, &atoms, json, limit),
         Command::Index(roots) => crate::index::index(&context, &roots),
         Command::RootsList => crate::index::list(&context),
         Command::RootsRemove(roots) => crate::index::remove(&context, &roots),
         Command::Stats => crate::stats::run(&context),
-        Command::Help | Command::Version => Exit::Ok,
+        Command::Help | Command::Version | Command::Find(_) => Exit::Ok,
     }
 }
 

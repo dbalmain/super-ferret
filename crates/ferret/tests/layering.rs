@@ -120,3 +120,27 @@ fn design_graph_parses() {
     assert!(designed["ferret-query"].contains("ferret-index"));
     assert!(designed["ferret-catalog"].is_empty());
 }
+
+#[test]
+fn crates_have_no_literal_nix_store_paths() {
+    // A collected machine-specific store path once made the test gate depend
+    // on another repository's dev shell and garbage-collection roots.
+    let mut pending = vec![root().join("crates")];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(
+                fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path()),
+            );
+        } else {
+            let bytes = fs::read(&path).unwrap();
+            let needle = concat!("/nix/", "store/").as_bytes();
+            assert!(
+                !bytes.windows(needle.len()).any(|window| window == needle),
+                "literal Nix store path in {}",
+                path.display()
+            );
+        }
+    }
+}

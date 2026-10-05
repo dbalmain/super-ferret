@@ -67,6 +67,7 @@ fn main() -> ExitCode {
         counts.index += visitor.counts.index;
         counts.too_large += visitor.counts.too_large;
         counts.symlink += visitor.counts.symlink;
+        counts.special += visitor.counts.special;
         counts.errors += visitor.counts.errors;
         devices.extend(visitor.devices);
     }
@@ -78,6 +79,7 @@ fn main() -> ExitCode {
     println!("index {}", counts.index);
     println!("too-large {}", counts.too_large);
     println!("symlink {}", counts.symlink);
+    println!("special {}", counts.special);
     println!("errors {}", counts.errors);
     println!("entered {}", counts.descend + 1);
     println!("devices {}", devices.len());
@@ -108,6 +110,7 @@ impl EventVisitor for CountsVisitor {
                     Decision::Traverse => self.counts.traverse += 1,
                     Decision::Index => self.counts.index += 1,
                     Decision::Catalog(Reason::TooLarge) => self.counts.too_large += 1,
+                    Decision::Catalog(Reason::Special) => self.counts.special += 1,
                     Decision::Catalog(Reason::Symlink) => self.counts.symlink += 1,
                 }
             }
@@ -126,6 +129,7 @@ struct Counts {
     index: u64,
     too_large: u64,
     symlink: u64,
+    special: u64,
     errors: u64,
 }
 

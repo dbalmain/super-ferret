@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// A temp directory holding `tree/` (what is indexed), `index/`, and the
 /// XDG homes under `home/`.
@@ -93,7 +93,7 @@ impl Env {
     /// `file` is findable, and the log holds exactly one line: an index run
     /// that published and exited with `exit`.
     fn assert_published_and_logged(&self, file: &Path, exit: i32) {
-        let found = self.run(&[os("find"), file.file_name().unwrap()]);
+        let found = self.run(&[os("search"), file.file_name().unwrap()]);
         assert_eq!(paths(&found), [file]);
         let lines = self.log_lines();
         let line = &lines[0];
@@ -158,7 +158,7 @@ fn index_find_remove_find() {
 
     let indexed = env.run(&[os("index"), outer.as_os_str(), inner.as_os_str()]);
     assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
-    let found = env.run(&[os("find"), os(".txt")]);
+    let found = env.run(&[os("search"), os(".txt")]);
     assert_eq!(code(&found), 0);
     let mut rows = paths(&found);
     rows.sort();
@@ -168,7 +168,7 @@ fn index_find_remove_find() {
 
     let removed = env.run(&[os("roots"), os("remove"), outer.as_os_str()]);
     assert_eq!(code(&removed), 0, "{}", stderr(&removed));
-    let found = env.run(&[os("find"), os(".txt")]);
+    let found = env.run(&[os("search"), os(".txt")]);
     assert_eq!(paths(&found), [inner_file]);
     let roots = env.run(&[os("roots"), os("list")]);
     assert_eq!(paths(&roots), std::slice::from_ref(&inner));
@@ -180,7 +180,7 @@ fn index_find_remove_find() {
     // Removing the last root publishes an empty catalog.
     let removed = env.run(&[os("roots"), os("remove"), inner.as_os_str()]);
     assert_eq!(code(&removed), 0, "{}", stderr(&removed));
-    assert_eq!(code(&env.run(&[os("find"), os(".txt")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os(".txt")])), 1);
     assert!(paths(&env.run(&[os("roots"), os("list")])).is_empty());
 }
 
@@ -196,7 +196,7 @@ fn bare_index_refreshes_every_root_and_a_relative_root_is_made_absolute() {
     let two = env.write("a/two.txt", b"2\n");
     let refreshed = env.run(&[os("index")]);
     assert_eq!(code(&refreshed), 0, "{}", stderr(&refreshed));
-    assert_eq!(paths(&env.run(&[os("find"), os("two")])), [two]);
+    assert_eq!(paths(&env.run(&[os("search"), os("two")])), [two]);
 }
 
 #[test]
@@ -286,7 +286,7 @@ fn bare_index_with_no_roots_and_no_terminal_fails() {
 fn exit_codes_are_stable() {
     let env = Env::new("exit");
     env.write("hit.txt", b"x\n");
-    let no_index = env.run(&[os("find"), os("hit")]);
+    let no_index = env.run(&[os("search"), os("hit")]);
     assert_eq!(code(&no_index), 3, "find before any index");
     assert!(stderr(&no_index).contains("no index"));
     assert_eq!(code(&env.run(&[os("stats")])), 3, "stats before any index");
@@ -297,16 +297,16 @@ fn exit_codes_are_stable() {
 
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
     let cases: &[(&[&str], i32)] = &[
-        (&["find", "hit"], 0),
-        (&["find", "--limit", "1", "hit"], 0),
-        (&["find", "miss"], 1),
-        (&["find", "--nope", "hit"], 2),
-        (&["find", "--limit"], 2),
-        (&["find", "size:huge"], 2),
-        (&["find", "re:("], 2),
+        (&["search", "hit"], 0),
+        (&["search", "--limit", "1", "hit"], 0),
+        (&["search", "miss"], 1),
+        (&["search", "--nope", "hit"], 2),
+        (&["search", "--limit"], 2),
+        (&["search", "size:huge"], 2),
+        (&["search", "re:("], 2),
         // An empty atom once reached the heap scan and panicked (101).
-        (&["find", ""], 2),
-        (&["find", "case:"], 2),
+        (&["search", ""], 2),
+        (&["search", "case:"], 2),
         (&["frobnicate"], 2),
         (&["stats"], 0),
         (&["roots", "list"], 0),
@@ -335,7 +335,7 @@ fn a_catalog_from_another_version_says_how_to_rebuild_and_index_replaces_it() {
     .unwrap();
 
     for args in [
-        &["find", "hit"][..],
+        &["search", "hit"][..],
         &["stats"],
         &["roots", "list"],
         &["index"],
@@ -361,7 +361,7 @@ fn a_catalog_from_another_version_says_how_to_rebuild_and_index_replaces_it() {
         "{}",
         stderr(&rebuilt)
     );
-    assert_eq!(paths(&env.run(&[os("find"), os("hit")])), [file]);
+    assert_eq!(paths(&env.run(&[os("search"), os("hit")])), [file]);
     assert_eq!(
         code(&env.run(&[os("index")])),
         0,
@@ -440,9 +440,9 @@ fn limit_stops_after_n_rows() {
         env.write(&format!("f{i}.txt"), b"x\n");
     }
     env.run(&[os("index"), env.tree().as_os_str()]);
-    let all = env.run(&[os("find"), os("txt")]);
+    let all = env.run(&[os("search"), os("txt")]);
     assert_eq!(paths(&all).len(), 5);
-    let two = env.run(&[os("find"), os("--limit=2"), os("txt")]);
+    let two = env.run(&[os("search"), os("--limit=2"), os("txt")]);
     assert_eq!(paths(&two), paths(&all)[..2]);
 }
 
@@ -489,7 +489,7 @@ fn json_round_trips_a_path_that_is_not_utf8() {
     let plain = env.write("caf\u{e9}-plain.txt", b"plain\n");
     env.run(&[os("index"), env.tree().as_os_str()]);
 
-    let output = env.run(&[os("find"), os("--json"), os("caf")]);
+    let output = env.run(&[os("search"), os("--json"), os("caf")]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let text = String::from_utf8(output.stdout).expect("JSON output is UTF-8");
     let lines: Vec<&str> = text.lines().collect();
@@ -528,9 +528,9 @@ fn json_round_trips_a_path_that_is_not_utf8() {
 }
 
 #[test]
-// D26 A′: a walk fault may hide entries, so nothing is published and the
-// previous generation stays byte for byte.
-fn a_coverage_fault_publishes_nothing_and_fails() {
+// D26 amendment: a denied listing is permanent state, and publishes the
+// directory but no children. Other coverage faults still block publication.
+fn an_unreadable_directory_publishes_its_row_and_other_changes() {
     let env = Env::new("coverage");
     env.write("ok.txt", b"ok\n");
     let locked = env
@@ -539,22 +539,14 @@ fn a_coverage_fault_publishes_nothing_and_fails() {
         .unwrap()
         .to_owned();
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
-    let before = fs::read(env.index().join("catalog")).unwrap();
-
     env.write("new.txt", b"new\n");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
     let output = env.run(&[os("index")]);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-
-    assert_eq!(code(&output), 3);
-    let message = stderr(&output);
-    assert!(message.contains("nothing published"), "{message}");
-    assert!(
-        message.contains("locked"),
-        "the fault names the path: {message}"
-    );
-    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
-    assert_eq!(code(&env.run(&[os("find"), os("new")])), 1);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&env.run(&[os("search"), os("locked")])), [locked]);
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("new")])), 0);
 }
 
 #[test]
@@ -579,8 +571,8 @@ fn an_unreadable_ignore_file_publishes_nothing_and_fails() {
     let message = stderr(&output);
     assert!(message.contains("nothing published"), "{message}");
     assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
-    assert_eq!(code(&env.run(&[os("find"), os("new")])), 1);
-    assert_eq!(code(&env.run(&[os("find"), os("secret")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("new")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
 }
 
 #[test]
@@ -602,7 +594,7 @@ fn a_dangling_ignore_symlink_publishes_nothing_and_fails() {
     assert_eq!(code(&output), 3, "{}", stderr(&output));
     assert!(stderr(&output).contains("nothing published"));
     assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
-    assert_eq!(code(&env.run(&[os("find"), os("secret")])), 1);
+    assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
 }
 
 #[test]
@@ -620,9 +612,9 @@ fn a_missing_ignore_file_is_the_defaults() {
     assert!(!env.ignore_file().exists());
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(stderr(&output).contains("default ignore rules"));
-    assert_eq!(code(&env.run(&[os("find"), os("ok")])), 0);
+    assert_eq!(code(&env.run(&[os("search"), os("ok")])), 0);
     assert_eq!(
-        code(&env.run(&[os("find"), target.file_name().unwrap()])),
+        code(&env.run(&[os("search"), target.file_name().unwrap()])),
         1
     );
 }
@@ -640,7 +632,7 @@ fn a_content_fault_is_a_warning() {
     let message = stderr(&output);
     assert!(message.contains("warning"), "{message}");
     assert!(message.contains("private.txt"), "{message}");
-    let json = env.run(&[os("find"), os("--json"), os("private")]);
+    let json = env.run(&[os("search"), os("--json"), os("private")]);
     assert!(String::from_utf8_lossy(&json.stdout).contains("\"doc\":null"));
 }
 
@@ -650,9 +642,9 @@ fn the_log_gains_one_line_per_find_and_index_run() {
     env.write("a/f.txt", b"f\n");
     let steps: &[(&[&str], usize)] = &[
         (&["index", "a"], 1),
-        (&["find", "f.txt"], 1),
-        (&["find", "missing"], 1),
-        (&["find", "size:bad"], 0),
+        (&["search", "f.txt"], 1),
+        (&["search", "missing"], 1),
+        (&["search", "size:bad"], 0),
         (&["stats"], 0),
         (&["roots", "list"], 0),
         (&["index"], 1),
@@ -668,7 +660,7 @@ fn the_log_gains_one_line_per_find_and_index_run() {
     let lines = env.log_lines();
     let find = &lines[1];
     for key in [
-        "\"cmd\":\"find\"",
+        "\"cmd\":\"search\"",
         "\"query\":[\"f.txt\"]",
         "\"plan\":",
         "\"rows\":1",
@@ -709,7 +701,7 @@ fn a_log_that_cannot_be_written_does_not_fail_the_command() {
     fs::write(env.state(), b"not a directory").unwrap();
     let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
     assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
-    let found = env.run(&[os("find"), os("f.txt")]);
+    let found = env.run(&[os("search"), os("f.txt")]);
     assert_eq!(code(&found), 0);
     assert_eq!(paths(&found), [env.at("f.txt")]);
     assert!(stderr(&found).contains("query log"), "{}", stderr(&found));
@@ -795,7 +787,7 @@ fn index_with_a_closed_stderr_still_publishes_and_logs() {
 
 #[test]
 // A report that cannot be written for a reason other than a closed pipe
-// is a failure (exit 3), as it is for `find` and `stats`, but the generation
+// is a failure (exit 3), as it is for `search` and `stats`, but the generation
 // it reports on is published and logged as such.
 fn index_into_a_full_device_publishes_and_exits_3() {
     let env = Env::new("index-full");
@@ -817,7 +809,7 @@ fn index_into_a_full_device_publishes_and_exits_3() {
 
 #[test]
 // Every command that writes to stdout treats a reader that went away as
-// done, not failed. `find` has written rows (more than its 64 KiB buffer,
+// done, not failed. `search` has written rows (more than its 64 KiB buffer,
 // so the error comes mid-stream) and exits 0 as it would have.
 fn every_command_exits_normally_into_a_closed_pipe() {
     let env = Env::new("epipe");
@@ -826,8 +818,8 @@ fn every_command_exits_normally_into_a_closed_pipe() {
     }
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
     let cases: &[&[&str]] = &[
-        &["find", "txt"],
-        &["find", "--json", "txt"],
+        &["search", "txt"],
+        &["search", "--json", "txt"],
         &["roots", "list"],
         &["stats"],
         &["help"],
@@ -859,7 +851,7 @@ fn a_readable_log_is_made_private_before_it_is_written() {
 #[test]
 // The log is best-effort, so a stopped holder of its lock (SIGSTOP, a
 // debugger) must not hang a command that has finished its work. With the
-// lock held for the whole run, `find` prints its row, gives up on the lock
+// lock held for the whole run, `search` prints its row, gives up on the lock
 // within its bound, warns, writes no line and exits 0.
 fn a_held_log_lock_drops_the_line_and_the_command_finishes() {
     let env = Env::new("log-lock");
@@ -870,7 +862,7 @@ fn a_held_log_lock_drops_the_line_and_the_command_finishes() {
 
     let started = Instant::now();
     let mut child = env
-        .command(&[os("find"), os("f.txt")])
+        .command(&[os("search"), os("f.txt")])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -905,7 +897,7 @@ fn concurrent_log_lines_are_whole() {
     assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
     let children: Vec<_> = (0..8)
         .map(|_| {
-            env.command(&[os("find"), os("f.txt")])
+            env.command(&[os("search"), os("f.txt")])
                 .stdout(Stdio::null())
                 .spawn()
                 .unwrap()
@@ -918,7 +910,7 @@ fn concurrent_log_lines_are_whole() {
     assert_eq!(lines.len(), 9);
     for line in &lines[1..] {
         assert!(
-            line.starts_with(r#"{"v":1,"cmd":"find","#) && line.ends_with('}'),
+            line.starts_with(r#"{"v":1,"cmd":"search","#) && line.ends_with('}'),
             "{line}"
         );
         assert_eq!(line.matches(r#""v":1"#).count(), 1, "{line}");
@@ -950,4 +942,992 @@ fn an_index_run_while_another_holds_the_lock_fails_clearly() {
 
     lock.unlock().unwrap();
     assert_eq!(code(&env.run(&[os("index")])), 0);
+}
+
+#[test]
+fn find_probe_needs_no_index_config_home_or_log() {
+    let env = Env::new("find-probe");
+    let tree = env.tree();
+    let args = [
+        os("find"),
+        os("-I"),
+        tree.as_os_str(),
+        os("-maxdepth"),
+        os("0"),
+        os("-print"),
+    ];
+    let output = env
+        .command(&args)
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, [tree.as_os_str().as_bytes(), b"\n"].concat());
+    assert!(output.stderr.is_empty());
+    assert!(!env.index().exists());
+    assert!(!env.log().exists());
+
+    env.seed_ignore_file();
+    let other = env.base.join("other");
+    fs::create_dir(&other).unwrap();
+    assert_eq!(code(&env.run(&[os("index"), other.as_os_str()])), 0);
+    let before = fs::read(env.index().join("catalog")).unwrap();
+    fs::set_permissions(
+        env.index().join("catalog"),
+        fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    fs::set_permissions(env.index(), fs::Permissions::from_mode(0o500)).unwrap();
+    let output = env.run(&args);
+    fs::set_permissions(env.index(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, [tree.as_os_str().as_bytes(), b"\n"].concat());
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
+    assert_eq!(env.log_lines().len(), 1, "only index logged");
+}
+
+#[test]
+fn find_perm_zero_any_mode_warns_but_still_matches() {
+    let env = Env::new("find-perm-warning");
+    let tree = env.tree();
+    for mode in ["/000", "-000"] {
+        let output = env.run(&[
+            os("find"),
+            os("-I"),
+            tree.as_os_str(),
+            os("-maxdepth"),
+            os("0"),
+            os("-perm"),
+            os(mode),
+        ]);
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        assert_eq!(output.stdout, [tree.as_os_str().as_bytes(), b"\n"].concat());
+        assert_eq!(output.stderr.is_empty(), mode == "-000");
+    }
+}
+
+#[test]
+fn find_reports_usage_and_unsupported_features_with_status_one() {
+    let env = Env::new("find-errors");
+    let tree = env.tree();
+    let cases: &[(&[&str], bool)] = &[
+        (&["-name"], false),
+        (&["-unknown"], false),
+        (&["-type", "q"], false),
+        (&["-type", "f,f"], false),
+        (&["-type", "D"], false),
+        (&["-perm", "+066"], false),
+        (&["(", ")"], false),
+        (&["-regex", r".*\(a\)\2"], false),
+        (&["-printf", "%"], false),
+        (&["-prune", "-delete"], false),
+    ];
+    for (expression, unsupported) in cases {
+        let mut args = vec![os("find"), os("-I"), tree.as_os_str()];
+        args.extend(expression.iter().map(os));
+        let output = env.run(&args);
+        assert_eq!(code(&output), 1, "{expression:?}: {}", stderr(&output));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            stderr(&output).contains("not implemented yet"),
+            *unsupported,
+            "{expression:?}"
+        );
+    }
+    let output = env.run(&[os("find"), tree.as_os_str(), os("-maxdepth"), os("0")]);
+    assert_eq!(code(&output), 1);
+    assert!(stderr(&output).contains("no index"));
+    let output = env.run(&[
+        os("find"),
+        os("--no-ignore"),
+        os("-P"),
+        os("-O3"),
+        tree.as_os_str(),
+        os("-false"),
+    ]);
+    assert_eq!(code(&output), 0);
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+/// 4a: the real binary's search must hide name-only rows, while stats must
+/// count their types without indexing reserved child tags as stat-row ids.
+#[test]
+fn ignored_names_and_special_files_survive_index_search_and_stats() {
+    let env = Env::new("ignored-special-stats");
+    env.seed_ignore_file();
+    env.write(".ferretignore", b"*.ignored\nbuild/\n");
+    env.write("kept.txt", b"visible");
+    env.write("hidden.ignored", b"ignored");
+    env.write("build/hidden.txt", b"ignored");
+    let pipe = env.at("pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _socket = std::os::unix::net::UnixListener::bind(env.at("socket")).unwrap();
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let output = env.run(&[os("search"), os("*")]);
+    let found = paths(&output);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(found.contains(&env.at("kept.txt")));
+    for missing in [
+        "pipe",
+        "socket",
+        "hidden.ignored",
+        "build",
+        "build/hidden.txt",
+    ] {
+        assert!(!found.contains(&env.at(missing)), "{found:?}");
+    }
+    let stats = env.run(&[os("stats")]);
+    assert_eq!(code(&stats), 0, "{}", stderr(&stats));
+    let text = String::from_utf8(stats.stdout).unwrap();
+    assert!(
+        text.contains("ignored   2 names without inode rows"),
+        "{text}"
+    );
+    assert!(text.contains("1 FIFO names, 1 socket names"), "{text}");
+    assert!(text.contains("2 visible inodes"), "{text}");
+}
+
+mod find_expressions {
+    include!("../../ferret-query/src/find/tests/expressions.rs");
+}
+
+fn sorted_records(bytes: &[u8], separator: u8) -> Vec<&[u8]> {
+    let mut records: Vec<_> = bytes
+        .split(|&byte| byte == separator || (separator == b' ' && byte == b'\n'))
+        .filter(|record| !record.is_empty())
+        .collect();
+    records.sort_unstable();
+    records
+}
+
+#[test]
+fn catalog_find_matches_live_across_the_differential_expressions_as_sorted_records() {
+    // Sibling order is catalog order; GNU sibling order is not promised.
+    let env = Env::new("catalog-equivalence");
+    env.seed_ignore_file();
+    for name in [
+        "z.c",
+        "b.txt",
+        ".hidden",
+        "ABC",
+        "a1",
+        "[",
+        "dir/file",
+        "dir/sub/deep.c",
+        "back\\slash",
+        "reference",
+    ] {
+        env.write(name, b"contents");
+    }
+    fs::create_dir(env.at("empty")).unwrap();
+    env.write("only-empty", b"");
+    env.write("target/not-ignored", b"visible");
+    env.write(".gitignore", b"# no rules\n");
+    env.write(".ferretignore", b"# no rules\n");
+    env.write("nonutf8-placeholder", b"");
+    fs::rename(
+        env.at("nonutf8-placeholder"),
+        env.tree().join(OsStr::from_bytes(b"nonutf8-\xff")),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("dir", env.at("link")).unwrap();
+    std::os::unix::fs::symlink("missing", env.at("broken")).unwrap();
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    for start in [".", "./", "dir/", "dir/..", "link", "broken", "b.txt"] {
+        for template in find_expressions::EXPRESSIONS {
+            let reference = env.at("reference");
+            let expression: Vec<_> = template
+                .iter()
+                .map(|arg| {
+                    if *arg == "@REFERENCE@" {
+                        reference.as_os_str()
+                    } else {
+                        os(arg)
+                    }
+                })
+                .collect();
+            let mut args = vec![os("find"), os(start)];
+            args.extend(&expression);
+            let catalog = env.command(&args).current_dir(env.tree()).output().unwrap();
+            args.insert(1, os("-I"));
+            let live = env.command(&args).current_dir(env.tree()).output().unwrap();
+            assert_eq!(
+                code(&catalog),
+                code(&live),
+                "status {start} {template:?}: {}",
+                stderr(&catalog)
+            );
+            if template.contains(&"-quit") {
+                let all: Vec<_> = args
+                    .iter()
+                    .copied()
+                    .filter(|arg| *arg != os("-quit"))
+                    .collect();
+                let all = env.command(&all).current_dir(env.tree()).output().unwrap();
+                let records = sorted_records(&catalog.stdout, b'\n');
+                assert!(records.len() <= 16);
+                for record in records {
+                    assert!(sorted_records(&all.stdout, b'\n').contains(&record));
+                }
+            } else {
+                let separator = if template.contains(&"-print0") {
+                    0
+                } else {
+                    b'\n'
+                };
+                assert_eq!(
+                    sorted_records(&catalog.stdout, separator),
+                    sorted_records(&live.stdout, separator),
+                    "set {start} {template:?}"
+                );
+            }
+            assert_eq!(
+                catalog.stderr.is_empty(),
+                live.stderr.is_empty(),
+                "stderr {start} {template:?}: {}",
+                stderr(&catalog)
+            );
+        }
+    }
+    for expression in [
+        vec!["-type", "f", "-exec", "echo", "{}", "+"],
+        vec!["-type", "f", "-execdir", "echo", "{}", "+"],
+        vec!["-printf", "%H|%P|%p|%y|%s|%n\\n"],
+    ] {
+        let mut args = vec![os("find"), os(".")];
+        args.extend(expression.iter().map(os));
+        let catalog = env.command(&args).current_dir(env.tree()).output().unwrap();
+        args.insert(1, os("-I"));
+        let live = env.command(&args).current_dir(env.tree()).output().unwrap();
+        assert_eq!(
+            code(&catalog),
+            code(&live),
+            "{expression:?}: {}",
+            stderr(&catalog)
+        );
+        let separator = if expression.contains(&"-printf") {
+            b'\n'
+        } else {
+            b' '
+        };
+        assert_eq!(
+            sorted_records(&catalog.stdout, separator),
+            sorted_records(&live.stdout, separator),
+            "{expression:?}"
+        );
+        assert_eq!(catalog.stderr.is_empty(), live.stderr.is_empty());
+    }
+    assert_eq!(env.log_lines().len(), 1, "find does not append query logs");
+}
+
+#[test]
+fn catalog_find_skips_ignored_recursion_but_walks_explicit_starts_and_references() {
+    let env = Env::new("catalog-ignored");
+    env.seed_ignore_file();
+    env.write(
+        ".ferretignore",
+        b"*.tmp\nbuild/\nonly/hidden\ntarget/\n!/target/doc/**\n",
+    );
+    env.write("visible", b"v");
+    env.write("hidden.tmp", b"h");
+    env.write("build/nested/.ferretignore", b"*\n");
+    env.write("build/nested/result.tmp", b"h");
+    env.write("only/hidden", b"h");
+    env.write("target/doc/api.html", b"visible");
+    env.write("target/hidden.tmp", b"h");
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let run = |args: &[&str]| {
+        env.command(&args.iter().map(os).collect::<Vec<_>>())
+            .current_dir(env.tree())
+            .output()
+            .unwrap()
+    };
+    let output = run(&["find", "."]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("hidden"));
+    assert!(!text.contains("build"));
+    assert!(text.contains("./target\n"));
+    assert!(text.contains("./target/doc/api.html\n"));
+    for start in [
+        "build",
+        "build/nested",
+        "build/nested/result.tmp",
+        "hidden.tmp",
+        "only/hidden",
+    ] {
+        let catalog = run(&["find", start]);
+        let live = run(&["find", "-I", start]);
+        assert_eq!(code(&catalog), 0, "{start}: {}", stderr(&catalog));
+        assert_eq!(catalog.stdout, live.stdout, "{start}");
+    }
+    let output = run(&["find", "only", "-empty"]);
+    assert_eq!(code(&output), 0);
+    assert!(output.stdout.is_empty());
+    let output = run(&["find", ".", "-newer", "build/nested/result.tmp"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let output = run(&["find", ".", "-path", "./target", "-prune", "-o", "-print"]);
+    assert_eq!(code(&output), 0);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("target"));
+    let output = run(&["find", ".", "-name", "visible", "-delete"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(!env.at("visible").exists());
+    assert!(env.at("hidden.tmp").exists());
+    assert_eq!(code(&env.run(&[os("index")])), 0);
+    let output = run(&["find", ".", "-type", "f", "-delete"]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(env.at("hidden.tmp").exists());
+    assert!(env.at("build/nested/result.tmp").exists());
+    assert!(env.at("target/hidden.tmp").exists());
+}
+
+#[test]
+fn catalog_find_uses_stored_stat_and_names_and_walks_opaque_directories_live() {
+    let env = Env::new("catalog-stat");
+    env.seed_ignore_file();
+    env.write("changed", b"old");
+    env.write("cheap", b"old");
+    env.write("deleted", b"old");
+    env.write("denied/file", b"contents");
+    fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o000)).unwrap();
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    env.write("changed", b"new size");
+    fs::remove_file(env.at("deleted")).unwrap();
+    let run = |args: &[&str]| {
+        env.command(&args.iter().map(os).collect::<Vec<_>>())
+            .current_dir(env.tree())
+            .output()
+            .unwrap()
+    };
+    // Stored name, kind and stat fields remain usable after an action removes
+    // this entry. New entries still need existence checks before effects.
+    let output = run(&[
+        "find", ".", "-name", "cheap", "-exec", "rm", "{}", ";", "-type", "f", "-print",
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"./cheap\n");
+    fs::hard_link(env.at("changed"), env.base.join("alias")).unwrap();
+    let output = run(&["find", ".", "-name", "changed", "-links", "1"]);
+    assert_eq!(code(&output), 0);
+    assert_eq!(output.stdout, b"./changed\n");
+    let output = run(&["find", ".", "-name", "changed", "-size", "3c"]);
+    assert_eq!(code(&output), 0);
+    assert_eq!(output.stdout, b"./changed\n");
+    let output = run(&["find", ".", "-name", "deleted"]);
+    assert_eq!(code(&output), 0);
+    assert_eq!(output.stdout, b"./deleted\n");
+    let output = run(&[
+        "find", ".", "-name", "changed", "-exec", "rm", "{}", ";", "-size", "3c", "-print",
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"./changed\n");
+    fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = fs::read_dir(env.at("denied")).is_ok();
+    let output = run(&["find", "."]);
+    fs::set_permissions(env.at("denied"), fs::Permissions::from_mode(0o700)).unwrap();
+    // Privileged test runners can read mode 000 directories.
+    if !readable {
+        assert_eq!(code(&output), 1);
+        assert!(stderr(&output).contains("Permission denied"));
+    }
+}
+
+#[test]
+fn catalog_find_refuses_unresolved_starts_and_config_can_select_live_mode() {
+    let env = Env::new("catalog-config");
+    env.seed_ignore_file();
+    let run = |args: &[&str]| {
+        env.command(&args.iter().map(os).collect::<Vec<_>>())
+            .current_dir(env.tree())
+            .output()
+            .unwrap()
+    };
+    let output = run(&["find", "."]);
+    assert_eq!(code(&output), 1);
+    assert!(stderr(&output).contains("no index"));
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    fs::create_dir(env.base.join("outside")).unwrap();
+    env.write("new-after-index", b"contents");
+    for start in ["../outside", "new-after-index", "missing"] {
+        let output = run(&["find", start]);
+        assert_eq!(code(&output), 1, "{start}");
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+    let output = run(&["find", "."]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    assert!(!paths(&output).contains(&PathBuf::from("./new-after-index")));
+    fs::write(
+        env.base.join("home/config/ferret/config"),
+        b"find_no_ignore = true\n",
+    )
+    .unwrap();
+    let configured = run(&["find", "../outside"]);
+    assert_eq!(code(&configured), 0, "{}", stderr(&configured));
+    assert_eq!(configured.stdout, run(&["find", "-I", "../outside"]).stdout);
+    // Config lookup must not depend on the unused state/cache directories.
+    let configured = env
+        .command(&[os("find"), os("../outside")])
+        .current_dir(env.tree())
+        .env_remove("HOME")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(code(&configured), 0, "{}", stderr(&configured));
+    fs::write(env.base.join("home/config/ferret/config"), b"invalid\n").unwrap();
+    assert_eq!(code(&run(&["find", "."])), 1);
+    assert_eq!(code(&run(&["find", "-I", "."])), 0);
+}
+
+#[test]
+fn catalog_find_crosses_nested_index_roots_and_honours_the_inner_policy() {
+    // D34 boundaries have a root record, but no child name in the outer crawl.
+    let env = Env::new("catalog-inner-root");
+    env.seed_ignore_file();
+    env.write("outer", b"visible");
+    env.write("nested/inner/.ferretignore", b"hidden\n");
+    env.write("nested/inner/visible", b"visible");
+    env.write("nested/inner/hidden", b"ignored");
+    let indexed = env.run(&[
+        os("index"),
+        env.tree().as_os_str(),
+        env.at("nested/inner").as_os_str(),
+    ]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let args = [os("find"), os(".")];
+    let output = env.command(&args).current_dir(env.tree()).output().unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("./nested/inner\n"));
+    assert!(text.contains("./nested/inner/visible\n"));
+    assert!(!text.contains("hidden"));
+}
+
+fn catalog_delete_tree(name: &str) -> Env {
+    let env = Env::new(name);
+    env.seed_ignore_file();
+    env.write(
+        ".ferretignore",
+        b"target/\n!/target/doc/**\n!/target/visible\nnode_modules/\n!/node_modules/visible\n",
+    );
+    for path in [
+        "sub/visible",
+        "node_modules/visible",
+        "target/doc/visible",
+        "target/visible",
+        "target/hidden",
+    ] {
+        env.write(path, b"contents");
+    }
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    // Change live mtimes after indexing to guard the decided snapshot contract
+    // even when a deletion expression asks for those times.
+    let old = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+    for path in [
+        ".ferretignore",
+        "sub/visible",
+        "node_modules/visible",
+        "target/doc/visible",
+        "target/visible",
+        "target/hidden",
+        "sub",
+        "node_modules",
+        "target/doc",
+        "target",
+        ".",
+    ] {
+        File::open(env.at(path))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+    env
+}
+
+#[test]
+fn catalog_find_keeps_indexed_mtime_after_live_timestamps_change() {
+    let env = catalog_delete_tree("catalog-delete-mtime");
+    let output = env
+        .command(&[os("find"), os("."), os("-mmin"), os("+720"), os("-delete")])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    for dir in ["sub", "node_modules", "target/doc"] {
+        assert!(env.at(dir).exists(), "{dir} used live mtime");
+    }
+    assert!(env.at("target/hidden").exists());
+    assert!(env.tree().exists());
+}
+
+#[test]
+fn catalog_find_counts_its_own_deletions_for_indexed_emptiness() {
+    // Successful child deletes reduce the indexed count before -empty runs.
+    let env = catalog_delete_tree("catalog-delete-empty");
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-depth"),
+            os("("),
+            os("-type"),
+            os("f"),
+            os("-name"),
+            os("visible"),
+            os("-or"),
+            os("-type"),
+            os("d"),
+            os("-empty"),
+            os(")"),
+            os("-delete"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    for dir in ["sub", "node_modules", "target/doc"] {
+        assert!(
+            !env.at(dir).exists(),
+            "{dir} remained after its last child was deleted"
+        );
+    }
+    assert!(
+        env.at("target").exists(),
+        "ignored child must count toward -empty"
+    );
+    assert!(env.at("target/hidden").exists());
+}
+
+#[test]
+fn catalog_find_failed_delete_does_not_reduce_indexed_emptiness() {
+    let env = Env::new("catalog-delete-empty-failure");
+    env.seed_ignore_file();
+    env.write("kept/file", b"contents");
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-depth"),
+            os("-type"),
+            os("d"),
+            os("-delete"),
+            os("-o"),
+            os("-empty"),
+            os("-print"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(env.at("kept").exists());
+    assert!(
+        !output
+            .stdout
+            .windows(b"./kept\n".len())
+            .any(|w| w == b"./kept\n")
+    );
+}
+
+#[test]
+fn catalog_find_exec_rmdir_removals_do_not_change_indexed_emptiness() {
+    // The child command removes `inner`; its parent still sees the raw count.
+    let env = Env::new("catalog-exec-rmdir-empty");
+    env.seed_ignore_file();
+    fs::create_dir_all(env.at("outer/inner")).unwrap();
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let output = env
+        .command(&[
+            os("find"),
+            os("outer"),
+            os("-depth"),
+            os("-type"),
+            os("d"),
+            os("-empty"),
+            os("-exec"),
+            os("rmdir"),
+            os("{}"),
+            os(";"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(env.at("outer").exists());
+    assert!(!env.at("outer/inner").exists());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn catalog_find_does_not_evaluate_names_created_by_exec() {
+    // A directory's pre-order -exec creates a name before its listing.
+    let env = Env::new("catalog-exec-touch-new");
+    env.seed_ignore_file();
+    env.write(".ferretignore", b"*.tmp\n");
+    env.write("parent/child/original", b"contents");
+    env.write("old.tmp", b"ignored");
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-type"),
+            os("d"),
+            os("-exec"),
+            os("touch"),
+            os("{}/new.tmp"),
+            os(";"),
+            os("-o"),
+            os("-type"),
+            os("f"),
+            os("-name"),
+            os("*.tmp"),
+            os("-print"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    let found = paths(&output);
+    for (printed, path) in [
+        ("./new.tmp", "new.tmp"),
+        ("./parent/new.tmp", "parent/new.tmp"),
+        ("./parent/child/new.tmp", "parent/child/new.tmp"),
+    ] {
+        assert!(!found.contains(&PathBuf::from(printed)), "{found:?}");
+        assert!(env.at(path).exists());
+    }
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn catalog_find_excludes_directories_created_after_indexing() {
+    let env = Env::new("catalog-new-directory");
+    env.seed_ignore_file();
+    env.write(".ferretignore", b"*.tmp\n");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    env.write("new-dir/nested/new.tmp", b"contents");
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-type"),
+            os("f"),
+            os("-name"),
+            os("*.tmp"),
+            os("-size"),
+            os("8c"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn catalog_find_keeps_metadata_and_reference_values_after_live_entries_vanish() {
+    // A pure index query must work even when the entire indexed tree is gone.
+    let env = Env::new("catalog-vanished-tree");
+    env.seed_ignore_file();
+    env.write("reference", b"reference");
+    env.write("child", b"old");
+    std::os::unix::fs::symlink("child", env.at("link")).unwrap();
+    let old = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+    File::open(env.at("reference"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    // Move the live reference forward; default still compares against the old
+    // catalog value, while -I sees the newly modified reference.
+    File::open(env.at("reference"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+        .unwrap();
+    let reference = env.at("reference");
+    let tree = env.tree();
+    let args = [
+        os("find"),
+        tree.as_os_str(),
+        os("-name"),
+        os("child"),
+        os("-newer"),
+        reference.as_os_str(),
+    ];
+    let output = env.run(&args);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [env.at("child")]);
+    fs::remove_dir_all(env.tree()).unwrap();
+    let output = env.run(&args);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [env.at("child")]);
+    let output = env.run(&[
+        os("find"),
+        env.tree().as_os_str(),
+        os("-name"),
+        os("child"),
+        os("-size"),
+        os("3c"),
+        os("-links"),
+        os("1"),
+        os("-printf"),
+        os("%s|%n|%y\\n"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"3|1|f\n");
+    let output = env.run(&[
+        os("find"),
+        env.tree().as_os_str(),
+        os("-lname"),
+        os("child"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [env.at("link")]);
+}
+
+#[test]
+fn catalog_find_guarantees_parent_order_depth_order_and_prune() {
+    let env = Env::new("catalog-order");
+    env.seed_ignore_file();
+    for path in ["z/child", "a/child", "middle"] {
+        env.write(path, b"contents");
+    }
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let run = |expression: &[&OsStr]| {
+        let tree = env.tree();
+        let mut args = vec![os("find"), tree.as_os_str()];
+        args.extend(expression);
+        env.run(&args)
+    };
+    for expression in [vec![], vec![os("-depth")]] {
+        let output = run(&expression);
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        let found = paths(&output);
+        for dir in [".", "a", "z"] {
+            let parent = if dir == "." { env.tree() } else { env.at(dir) };
+            let parent_at = found.iter().position(|path| *path == parent).unwrap();
+            for (at, child) in found.iter().enumerate() {
+                if child != &parent && child.starts_with(&parent) {
+                    assert_eq!(parent_at < at, expression.is_empty());
+                }
+            }
+        }
+    }
+    let output = run(&[os("-name"), os("a"), os("-prune"), os("-o"), os("-print")]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(!paths(&output).contains(&env.at("a/child")));
+    let output = run(&[os("-type"), os("f"), os("-print"), os("-quit")]);
+    let found = paths(&output);
+    assert!(!found.is_empty());
+    assert!(found.len() <= 3);
+    assert!(
+        found
+            .iter()
+            .all(|path| [env.at("a/child"), env.at("z/child"), env.at("middle")].contains(path))
+    );
+}
+
+#[test]
+fn catalog_find_resolves_symlink_starts_and_references_from_the_snapshot() {
+    // Resolving aliases through canonicalize would fail after the live tree
+    // vanished, and lexical .. would choose the link's parent incorrectly.
+    let env = Env::new("catalog-snapshot-links");
+    env.seed_ignore_file();
+    env.write("place/inside/file", b"old");
+    let reference = env.write("reference", b"reference");
+    File::open(&reference)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(86_400)),
+        )
+        .unwrap();
+    std::os::unix::fs::symlink("place/inside", env.at("alias")).unwrap();
+    std::os::unix::fs::symlink("reference", env.at("ref-link")).unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    fs::remove_dir_all(env.tree()).unwrap();
+    let start = env.at("alias/..");
+    let output = env.run(&[
+        os("find"),
+        start.as_os_str(),
+        os("-name"),
+        os("file"),
+        os("-size"),
+        os("3c"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [start.join("inside/file")]);
+    let start = env.at("alias");
+    let link = env.at("ref-link");
+    let output = env.run(&[
+        os("find"),
+        os("-H"),
+        start.as_os_str(),
+        os("-name"),
+        os("file"),
+        os("-newer"),
+        link.as_os_str(),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [start.join("file")]);
+    let output = env.run(&[
+        os("find"),
+        os("-H"),
+        start.as_os_str(),
+        os("-maxdepth"),
+        os("0"),
+        os("-xtype"),
+        os("l"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(paths(&output), [start]);
+    let output = env.run(&[
+        os("find"),
+        env.at("ref-link").as_os_str(),
+        os("-printf"),
+        os("%Y|%l\\n"),
+    ]);
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"f|reference\n");
+}
+
+#[test]
+fn catalog_find_reports_removed_directory_descent_and_skips_deleted_files_on_repeated_starts() {
+    // Catalog children outlive rm -rf and repeated -delete operands. GNU
+    // faults on the removed directory, but relisting a kept directory sees
+    // no previously deleted files and therefore performs no second deletion.
+    let env = Env::new("catalog-effect-descent");
+    env.seed_ignore_file();
+    env.write("sub/child", b"contents");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-type"),
+            os("d"),
+            os("-name"),
+            os("sub"),
+            os("-exec"),
+            os("rm"),
+            os("-rf"),
+            os("{}"),
+            os(";"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 1, "{}", stderr(&output));
+    assert!(stderr(&output).contains("No such file or directory"));
+    assert!(!env.at("sub").exists());
+
+    let env = Env::new("catalog-effect-repeated-starts");
+    env.seed_ignore_file();
+    env.write("sub/child", b"contents");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("sub"),
+            os("sub"),
+            os("-type"),
+            os("f"),
+            os("-delete"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(output.stderr.is_empty());
+    assert!(env.at("sub").is_dir());
+    assert!(!env.at("sub/child").exists());
+    let env = Env::new("catalog-effect-listed-sibling");
+    env.seed_ignore_file();
+    env.write("a", b"a");
+    env.write("b", b"b");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let output = env
+        .command(&[
+            os("find"),
+            os("."),
+            os("-name"),
+            os("a"),
+            os("-exec"),
+            os("rm"),
+            os("./b"),
+            os(";"),
+            os("-o"),
+            os("-name"),
+            os("b"),
+            os("-print"),
+        ])
+        .current_dir(env.tree())
+        .output()
+        .unwrap();
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert_eq!(output.stdout, b"./b\n");
+}
+
+#[test]
+fn catalog_find_candidate_guards_preserve_earlier_effects_and_followed_directory_links() {
+    let env = Env::new("catalog-candidate-guards");
+    env.seed_ignore_file();
+    env.write("dir/file", b"contents");
+    std::os::unix::fs::symlink("dir", env.at("link")).unwrap();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    for expression in [
+        vec!["-print", "-type", "d"],
+        vec!["-type", "d", "-o", "-print"],
+        vec!["-type", "f", "-o", "-type", "d"],
+        vec!["-follow", "-type", "d"],
+        vec!["-print", "-name", "file"],
+        vec!["-name", "file", "-o", "-print"],
+        vec!["-name", "file", "-o", "-name", "link"],
+        vec!["-name", "file", "-exec", "echo", "{}", ";"],
+        vec!["-not", "-name", "file"],
+    ] {
+        let mut args = vec![os("find"), os(".")];
+        args.extend(expression.iter().map(os));
+        let catalog = env.command(&args).current_dir(env.tree()).output().unwrap();
+        args.insert(1, os("-I"));
+        let live = env.command(&args).current_dir(env.tree()).output().unwrap();
+        assert_eq!(
+            code(&catalog),
+            code(&live),
+            "{expression:?}: {}",
+            stderr(&catalog)
+        );
+        assert_eq!(
+            sorted_records(&catalog.stdout, b'\n'),
+            sorted_records(&live.stdout, b'\n'),
+            "{expression:?}"
+        );
+        assert_eq!(catalog.stderr.is_empty(), live.stderr.is_empty());
+    }
 }

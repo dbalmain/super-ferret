@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use ferret_catalog::{Catalog, ContentState, InoId, Kind, NameId};
+use ferret_catalog::{Catalog, ContentState, InoId, Kind, NameId, Target};
 
 use crate::cli::{Context, Exit, error};
 use crate::index::bytes;
@@ -95,8 +95,10 @@ struct Census {
     files: u64,
     symlinks: u64,
     traversed: u64,
-    /// Names by the kind they name: directory, file, symlink.
-    names_by_kind: [u64; 3],
+    ignored: u64,
+    specials: u64,
+    /// All names by kind, including stat-free ignored rows.
+    names_by_kind: [u64; 7],
     depth: Histogram,
     name_len: Histogram,
     file_size: Histogram,
@@ -131,12 +133,20 @@ impl Census {
         let mut names_of = vec![0u32; catalog.inode_count() as usize];
         for id in (0..catalog.name_count()).map(NameId) {
             let name = catalog.name(id);
-            let kind = catalog.kind(name.child);
-            names_of[name.child.0 as usize] += 1;
+            let kind = match name.target() {
+                Target::Inode(inode) => {
+                    names_of[inode.0 as usize] += 1;
+                    catalog.kind(inode)
+                }
+                Target::Ignored(kind) => {
+                    census.ignored += 1;
+                    kind
+                }
+            };
             census.names_by_kind[kind as usize] += 1;
             census.depth.add_kept(depth[name.parent.0 as usize] + 1);
             census.name_len.add_kept(name.bytes.len() as u32);
-            if kind == Kind::File {
+            if kind == Kind::File && matches!(name.target(), Target::Inode(_)) {
                 let size = catalog.size(name.child);
                 let entry = census.extensions.entry(extension(name.bytes)).or_default();
                 entry.0 += 1;
@@ -149,9 +159,16 @@ impl Census {
         // churn, and nothing is sized by `next_doc` (D36 B).
         let mut held = Vec::new();
         for id in (dirs..catalog.inode_count()).map(InoId) {
-            if catalog.kind(id) == Kind::Symlink {
-                census.symlinks += 1;
-                continue;
+            match catalog.kind(id) {
+                Kind::Symlink => {
+                    census.symlinks += 1;
+                    continue;
+                }
+                Kind::File => {}
+                _ => {
+                    census.specials += 1;
+                    continue;
+                }
             }
             census.files += 1;
             let size = catalog.size(id);
@@ -197,7 +214,15 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
         0 => 0.0,
         _ => n as f64 / names as f64,
     };
-    let [dir_names, file_names, link_names] = census.names_by_kind;
+    let [
+        dir_names,
+        file_names,
+        link_names,
+        pipes,
+        sockets,
+        blocks,
+        characters,
+    ] = census.names_by_kind;
     let _ = writeln!(
         out,
         "\nentries   {names} names: {dir_names} directories, {file_names} files, \
@@ -212,6 +237,16 @@ fn report(catalog: &Catalog, census: &mut Census, out: &mut String) {
         census.files,
         census.symlinks
     );
+    if census.ignored > 0 {
+        let _ = writeln!(out, "ignored   {} names without inode rows", census.ignored);
+    }
+    if pipes + sockets + blocks + characters > 0 {
+        let _ = writeln!(
+            out,
+            "specials  {pipes} FIFO names, {sockets} socket names, {blocks} block-device names, {characters} character-device names; {} visible inodes",
+            census.specials
+        );
+    }
     let live = catalog.doc_count();
     let next = catalog.next_doc().0;
     let _ = writeln!(

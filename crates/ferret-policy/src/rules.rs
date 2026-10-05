@@ -225,7 +225,7 @@ impl DirRules {
     /// decisions do not allocate a joined path for each entry; only its last
     /// component is read.
     ///
-    /// Special files are always skipped. Otherwise an entry is included when
+    /// An entry is included when
     /// the last matching rule whitelists it or no rule matches; while
     /// traversing an excluded directory, only a `.ferretignore` whitelist
     /// includes. An included directory descends, a file indexes unless it is
@@ -258,7 +258,7 @@ impl DirRules {
             }
             Entry::File { .. } => Decision::Index,
             Entry::Symlink => Decision::Catalog(Reason::Symlink),
-            Entry::Other => Decision::Skip,
+            Entry::Other => Decision::Catalog(Reason::Special),
         }
     }
 }

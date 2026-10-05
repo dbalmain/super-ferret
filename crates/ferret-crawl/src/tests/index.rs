@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind};
+use ferret_catalog::{BeginError, Catalog, ContentState, DocId, InoId, Kind, NameId};
 use ferret_policy::Config;
 
 use crate::index::{DRAIN_MIN, Deferred, Hasher, PROBES, Probe, content_faults};
@@ -127,7 +127,9 @@ fn listing(catalog: &Catalog) -> BTreeMap<PathBuf, Row> {
     for (id, _) in catalog.names() {
         path.clear();
         catalog.path(id, &mut path);
-        let ino = catalog.name(id).child;
+        let ferret_catalog::Target::Inode(ino) = catalog.name(id).target() else {
+            continue;
+        };
         let inode = catalog.inode(ino);
         let row = Row {
             ino,
@@ -148,7 +150,16 @@ fn published(tmp: &Tmp) -> (Catalog, BTreeMap<PathBuf, Row>) {
     let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
     catalog.load_all().unwrap();
     let rows = listing(&catalog);
-    assert_eq!(rows.len(), catalog.name_count() as usize);
+    let ignored = (0..catalog.name_count())
+        .map(NameId)
+        .filter(|&id| {
+            matches!(
+                catalog.name(id).target(),
+                ferret_catalog::Target::Ignored(_)
+            )
+        })
+        .count();
+    assert_eq!(rows.len() + ignored, catalog.name_count() as usize);
     (catalog, rows)
 }
 
@@ -520,27 +531,66 @@ fn a_file_written_while_it_is_hashed_is_a_content_fault() {
     assert_eq!(rows[&tmp.at("still.txt")].state, ContentState::Hashed);
 }
 
+/// D26: a permanent EACCES publishes the directory with unknown contents;
+/// any other listing fault keeps the previous generation byte for byte.
 #[test]
-fn an_unreadable_directory_blocks_publication_and_keeps_the_old_generation() {
+fn an_unreadable_directory_publishes_but_other_listing_faults_do_not() {
     let tmp = Tmp::new("coverage");
     tmp.write("open/a.txt", b"a\n");
-    let roots = [tmp.tree()];
-    run(&tmp, &roots, Refresh::All, 2);
-    let before = fs::read(tmp.cat().join("catalog")).unwrap();
-
     tmp.write("shut/b.txt", b"b\n");
+    let roots = [tmp.tree()];
+    run(&tmp, &roots, Refresh::All, 1);
     chmod(&tmp.at("shut"), 0o000);
     tmp.write("open/new.txt", b"new\n");
-    let error = index(&tmp.cat(), &roots, Refresh::All, &options(2)).unwrap_err();
-    let IndexError::Coverage { faults, report } = error else {
-        panic!("expected a coverage fault, got {error}");
+    let report = index(&tmp.cat(), &roots, Refresh::All, &options(1)).unwrap();
+    assert!(report.published.is_some());
+    let (_, rows) = published(&tmp);
+    assert!(rows.contains_key(&tmp.at("shut")));
+    assert!(!rows.contains_key(&tmp.at("shut/b.txt")));
+    let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
+    catalog.load_all().unwrap();
+    let dir = (0..catalog.name_count())
+        .map(NameId)
+        .find_map(|id| {
+            let mut path = Vec::new();
+            catalog.path(id, &mut path);
+            (path == tmp.at("shut").as_os_str().as_bytes()).then(|| catalog.name(id).child)
+        })
+        .unwrap();
+    assert_eq!(catalog.entry_count(dir), None);
+    drop(catalog);
+    let before = fs::read(tmp.cat().join("catalog")).unwrap();
+
+    // Same tree: the accessible directory now encounters an actual listing
+    // error from the injected getdents seam, rather than a mirrored classifier.
+    crate::walk::FAIL_LIST.set(Some(Box::new(|path| {
+        (path == Path::new("open")).then(|| std::io::Error::from_raw_os_error(5))
+    })));
+    let result = index(&tmp.cat(), &roots, Refresh::All, &options(1));
+    crate::walk::FAIL_LIST.set(None);
+    let IndexError::Coverage { faults, report } = result.unwrap_err() else {
+        panic!("expected a coverage fault");
     };
     assert_eq!(faults.len(), 1);
-    assert_eq!(faults[0].op, IoOp::OpenDir);
-    assert_eq!(faults[0].path, Path::new("shut"));
-    assert_eq!(faults[0].error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(faults[0].op, IoOp::List);
+    assert_eq!(faults[0].path, Path::new("open"));
+    assert_eq!(faults[0].error.raw_os_error(), Some(5));
     assert!(report.published.is_none());
     assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+}
+
+#[test]
+fn a_denied_root_is_catalogued_with_unknown_contents() {
+    let tmp = Tmp::new("denied-root");
+    tmp.write("hidden.txt", b"hidden");
+    chmod(&tmp.tree(), 0o000);
+    let report = index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options(1)).unwrap();
+    assert!(report.published.is_some());
+    let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
+    assert_eq!(catalog.dir_count(), 1);
+    assert_eq!(catalog.name_count(), 0);
+    catalog.load_all().unwrap();
+    assert_eq!(catalog.entry_count(InoId(0)), None);
 }
 
 /// A `readlink` failure is a coverage fault (the walker reads through a
@@ -1172,4 +1222,130 @@ fn a_kept_root_keeps_its_entry_and_link_counts() {
         "refreshed root"
     );
     assert_eq!(after.inode(rows[&f].ino).stat.nlink, 2, "kept file");
+}
+
+/// 4a: ignored rows must never acquire stat/content, and unsuccessful anchored
+/// traversal must collapse to one marker rather than leak its ignored children.
+#[test]
+fn ignored_names_opaque_directories_and_special_stats_round_trip() {
+    use ferret_catalog::{Contents, Target};
+    use std::os::unix::net::UnixListener;
+
+    for workers in [1, 4] {
+        let tmp = Tmp::new(&format!("ignored-specials-{workers}"));
+        tmp.write(
+            ".ferretignore",
+            b"*.ignored\ndrop/\nprobe/\n!/probe/missing.txt\nkeep/\n!/keep/deep/ok.txt\n",
+        );
+        tmp.write("regular.ignored", b"never read");
+        tmp.write("drop/hidden.txt", b"never read");
+        tmp.write("probe/hidden.ignored", b"never read");
+        tmp.write("keep/deep/ok.txt", b"visible");
+        tmp.write("keep/deep/no.ignored", b"never read");
+        tmp.write("only/child.ignored", b"never read");
+        fs::create_dir(tmp.at("dir.ignored")).unwrap();
+        std::os::unix::fs::symlink("missing", tmp.at("link.ignored")).unwrap();
+        super::mkfifo(&tmp.at("pipe.ignored"));
+        super::mkfifo(&tmp.at("pipe"));
+        let _ignored_socket = UnixListener::bind(tmp.at("socket.ignored")).unwrap();
+        let _socket = UnixListener::bind(tmp.at("socket")).unwrap();
+        tmp.write("unreadable/secret", b"never read");
+        chmod(&tmp.at("unreadable"), 0o000);
+        let report = run(&tmp, &[tmp.tree()], Refresh::All, workers);
+        assert_eq!(
+            report.counts.files_read, 2,
+            "only rules and re-included file read"
+        );
+        assert_eq!(report.counts.specials, 2);
+        let catalog = Catalog::open(&tmp.cat()).unwrap().unwrap();
+        catalog.load_all().unwrap();
+        let root = catalog.roots().next().unwrap().0;
+        let entries: BTreeMap<_, _> = catalog
+            .entries(root)
+            .map(|e| (e.bytes.to_vec(), e))
+            .collect();
+        for (name, kind) in [
+            ("regular.ignored", Kind::File),
+            ("dir.ignored", Kind::Dir),
+            ("link.ignored", Kind::Symlink),
+            ("pipe.ignored", Kind::Fifo),
+            ("socket.ignored", Kind::Socket),
+            ("drop", Kind::Dir),
+            ("probe", Kind::Dir),
+        ] {
+            let entry = entries[name.as_bytes()];
+            assert_eq!(entry.target, Target::Ignored(kind));
+            assert_eq!(entry.kind, kind);
+        }
+        assert_eq!(
+            catalog.contents(entries[b"drop".as_slice()].target),
+            Some(Contents::Ignored)
+        );
+        let path = tmp.at("drop/hidden.txt");
+        let resolved = catalog.resolve(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(resolved.target, Target::Ignored(Kind::Dir));
+        assert_eq!(resolved.remainder, b"hidden.txt");
+        let mut paths = Vec::new();
+        for (id, _) in catalog.names() {
+            let mut path = Vec::new();
+            catalog.path(id, &mut path);
+            paths.push(path);
+        }
+        for absent in [
+            "drop/hidden.txt",
+            "probe/hidden.ignored",
+            "unreadable/secret",
+        ] {
+            assert!(!paths.contains(&tmp.at(absent).as_os_str().as_bytes().to_vec()));
+        }
+        for dir in ["keep", "keep/deep"] {
+            let path = tmp.at(dir);
+            let resolved = catalog.resolve(path.as_os_str().as_bytes()).unwrap();
+            assert!(matches!(resolved.target, Target::Inode(_)));
+            assert_eq!(
+                catalog.contents(resolved.target),
+                Some(Contents::Catalogued)
+            );
+        }
+        let Target::Inode(only) = entries[b"only".as_slice()].target else {
+            panic!("visible dir");
+        };
+        assert_eq!(catalog.has_children(only), Some(true));
+        let child = catalog.entries(only).collect::<Vec<_>>();
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].target, Target::Ignored(Kind::File));
+        let Target::Inode(unreadable) = entries[b"unreadable".as_slice()].target else {
+            panic!("visible denied dir");
+        };
+        assert_eq!(
+            catalog.contents(Target::Inode(unreadable)),
+            Some(Contents::Unreadable)
+        );
+        assert_eq!(catalog.has_children(unreadable), None);
+        for (name, kind) in [("pipe", Kind::Fifo), ("socket", Kind::Socket)] {
+            let entry = entries[name.as_bytes()];
+            assert_eq!(entry.kind, kind);
+            let Target::Inode(inode) = entry.target else {
+                panic!("special stat row");
+            };
+            assert_eq!(Kind::from_mode(catalog.inode(inode).stat.mode), kind);
+            assert_eq!(catalog.state(inode), ContentState::Unindexed);
+            assert_eq!(catalog.doc(inode), None);
+        }
+        // Root keep must copy ignored rows without indexing their reserved
+        // child ids.
+        drop(catalog);
+        let before = fs::read(tmp.cat().join("catalog")).unwrap();
+        // An ignored file's content, size and timestamps have no snapshot
+        // representation: changing it must neither read content nor churn
+        // bytes.
+        tmp.write("regular.ignored", b"changed ignored content and size");
+        let report = run(&tmp, &[tmp.tree()], Refresh::All, workers);
+        assert_eq!(report.counts.files_read, 0);
+        assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+        let mut txn = ferret_catalog::Transaction::begin(&tmp.cat(), 1).unwrap();
+        txn.keep(tmp.tree().as_os_str().as_bytes()).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(fs::read(tmp.cat().join("catalog")).unwrap(), before);
+    }
 }

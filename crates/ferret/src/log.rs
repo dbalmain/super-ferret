@@ -1,4 +1,4 @@
-//! The local query and timing log: one JSON line per `find` and per index
+//! The local query and timing log: one JSON line per `search` and per index
 //! run, appended to `$XDG_STATE_HOME/ferret/log.jsonl`.
 //!
 //! It is the future source of the opt-in upload and of structure choices
@@ -6,7 +6,7 @@
 //! counts and timings. No field holds an id (D27 renumbers them), a result
 //! path or a root path; a line says how many rows or roots there were. The
 //! query atoms are logged as typed, though, so **query text may itself
-//! contain a path** (`find path:/home/me/private`) or any other name the
+//! contain a path** (`search path:/home/me/private`) or any other name the
 //! user searched for (D45).
 //!
 //! The file is private: [`append`] sets it to 0600 on every write, not only

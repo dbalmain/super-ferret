@@ -26,7 +26,7 @@ crate's `Cargo.toml` disagrees with it.
 
 ```text
 ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify, ferret-policy
-ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text
+ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text, rustix
 ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
 ferret-index   → ferret-text, intpack (git dependency, may be vendored — D11)
 ferret-catalog → (std only)
@@ -96,7 +96,7 @@ never reused (D36); `roots`, `links` and `worktrees` hang off an existing
 
 | Table       | Id       | Row                                                                                                                                                                     |
 | ----------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId`                                                                                                  |
+| `names`     | `NameId` | parent directory `InoId`, name bytes (in the name heap), child `InoId` or an ignored-type tag (no inode row)                                                            |
 | `inodes`    | `InoId`  | `(dev, ino)`, size, mtime, ctime, mode, uid, gid, nlink, `DocId` or none; a 2-bit content state beside it (D37); a directory's raw entry count (D47)                    |
 | `docs`      | `DocId`  | content hash (BLAKE3, 128 bits kept); rows sorted by id, with holes where content died, the ids a sequence column (implicit when there are no holes)                    |
 | `roots`     | —        | configured root paths and the `InoId` of each; nested roots are separate trees, and adding or removing a root inside a kept root requires refreshing the kept one (D34) |
@@ -106,11 +106,20 @@ never reused (D36); `roots`, `links` and `worktrees` hang off an existing
 Directories are numbered first, breadth-first from the roots in path order, so
 their `InoId`s are `0..dirs` and a parent's id is always below its child's; the
 snapshot persists each directory's own `NameId` (none for a root) and a bitset
-of traversed directories, which exist only as parents and are excluded from
-search (D29). A path is the walk from a name through its parent's name to a
-root. Nothing else is derived at open (D30): `hash → DocId` is built by the
+of traversed directories, retained to exclude structural ancestors from
+`ferret search` (D29). For find these ancestors are ordinary visible directories
+when traversal found a re-included descendant. Traversal that finds none is
+collapsed to one ignored directory name, with no inode or children. A path is
+the walk from a name through its parent's name to a root. Nothing else is derived at open (D30): `hash → DocId` is built by the
 writer only, and `DocId → [InoId]`, the full `InoId → [NameId]` and a
 directory's work tree are built when a query first needs them.
+
+Default `ferret find` traverses those catalog edges and reads stored stat
+columns with snapshot freshness. It guarantees parent/child ordering, reverses
+it for depth/delete, and honours prune; sibling GNU order is not promised.
+Explicit ignored starts and opaque subtrees walk live. `-I` is unrestricted
+live traversal. [FIND.md](FIND.md) describes field fallbacks and effectful
+observations.
 
 A symlink is catalogued as itself — an `inodes` row of kind symlink, named like
 any file — and never followed. Its target text is stored now so that D18's
@@ -140,7 +149,7 @@ tombstones, so there is one source of truth.
 
 **Storage.** One snapshot file per catalog directory, rebuilt by every run
 (D26): a versioned header (magic, format version, sniffer version, next
-`DocId`, the directory, inode, name and document counts), a table of 22 sections by
+`DocId`, the directory, inode, name and document counts), a table of 23 sections by
 offset and length, a descriptor per packed column, and the sections themselves.
 Every id and inode field is a bit-packed column (S1a): `count` values of
 `width` bits, least significant bit first, ending in 8 bytes of padding
@@ -181,7 +190,7 @@ section, since every name read needs all three. The name heap holds
 NUL-terminated names in `(parent, name)` order (D28 A) and is contiguous on
 purpose: it is what filename search scans (D14). The strings heap holds root
 paths, link targets and work-tree paths; roots, links, work trees and document
-hashes stay fixed-width rows. A reader opens the file by reading its head alone (664
+hashes stay fixed-width rows. A reader opens the file by reading its head alone (680
 B), which fixes every section's and column's exact length, and then reads each
 section positionally when a query first needs it (D38 B), together with the
 sections it is checked against (names need the heap; directory names need names;
@@ -224,6 +233,53 @@ execs.
 catalog row; unchanged means no read and no hash. A reused `(dev, ino)` after a
 delete carries a new ctime, so it is re-read and re-hashed like any change.
 
+**Ignored names and find sources (4a).** Format v3 reserves child values
+`u32::MAX - 1 ..= u32::MAX - 7` for ignored directory, file, symlink, FIFO,
+socket, block and character types, respectively. `u32::MAX - 8` is reserved
+for future tombstones and is rejected today; inode ids stop below the top 16
+values. An ignored name has no inode, stat, content state or document. An
+ignored directory is one opaque marker, with no names underneath. Workers keep
+ignored names in a separate compact batch vector, without stat data. The writer
+checks directory reachability before pruning unsuccessful re-inclusion traversal,
+then propagates visible descendants upward and numbers the retained directories.
+The surviving ancestors have stat rows and ordinary find visibility; the old
+traversed bit still suppresses them in search to preserve existing result counts.
+
+FIFOs, sockets and devices have ordinary names and stat rows, with Unindexed
+content and no document. A sparse `Specials` section holds `(InoId, kind)` pairs
+for those visible types, in inode order. `Links` loads this small table too, so
+kind lookup and name search need no mode-column load. Search continues to return
+only regular files, directories and symlinks; special entries are available to
+find through the catalog API. Search tests special kinds after its existing
+name, metadata and path filters, so rejected path matches need no kind lookup.
+EACCES while opening or
+listing a directory retains its ordinary directory inode, no children and an
+unknown raw entry count. Other coverage faults still prevent publication.
+
+The read API for find is `Catalog::entries(dir)` (name id, raw basename, kind and
+`Target::Inode(id)` or `Target::Ignored(kind)`), `contents(target)` (catalogued,
+ignored opaque, or unreadable opaque), `has_children(dir)` (raw count nonzero,
+unknown if unreadable), and `resolve(absolute_bytes)`. Resolution returns a root
+or name target plus any unresolved suffix below an opaque marker, for a live
+source to finish; it never follows symlinks or resolves `..`. Children need Names
+and Links; contents/emptiness need Entries; resolution needs Roots and Entries.
+The legacy name accessors expose the raw tagged child; callers must check
+`Name::target()` before using it as an inode id. Search filters ignored tags
+before stat reads in every candidate strategy, and content-fault reporting and
+root carry-forward do the same. The stats census counts ignored names by type
+without reading a stat row and reports visible special inodes separately. Format v2 is refused with the version error and
+re-indexed by the writer.
+
+Measured at 10M (D40/D43): v2 592.6 MB, v3 594.8 MB for 43,010 additional
+ignored names, with identical inode/document counts and stat-column sizes;
+peak build RSS 1,630 → 1,641 MiB. The high-sentinel encoding is retained after
+measuring an adjacent tag range that saved 1.18 MB (0.20% of the snapshot).
+Name-search row counts stay identical; the final warm full listing costs 1.2%
+more in the resumed baseline/final series.
+[ROADMAP § S1c](ROADMAP.md#s1c--ferret-find-in-find1-syntax) summarises the
+section bytes, build time and query timings; D47's 4a brief has the encoding
+comparison.
+
 ## Policy and crawl (D10, D13)
 
 `ferret-policy` is pure: the crawler carries a `DirRules` per directory (`root`,
@@ -241,7 +297,7 @@ disregarded, as git does); the user's global ignore file
 then on. A size cap and a binary check sit beside the patterns. `!pat` in a
 `.ferretignore` overrides an ancestor `.ferretignore` or any `.gitignore`, and
 can re-include below an excluded directory; the walker traverses an excluded
-directory (uncatalogued, its ignore files unread) only when an anchored
+directory (its ignore files unread) only when an anchored
 `.ferretignore` `!` pattern could match inside it — never for an unanchored one
 such as `!*.pdf`. A `.ferretignore` inside an excluded directory is never read;
 overriding an exclusion takes a `!` pattern at that directory's level or above
@@ -324,11 +380,13 @@ the first name to claim it reads it, a later name takes the stored observation
 whole if its own stat agrees and is a content fault if not, and a name that
 meets the inode in flight is set aside and resolved once the inode is finished
 (the backlog is drained as inodes finish, and the rest when its root's walk
-ends, so no root's backlog outlives it), so no worker ever waits on another. Faults are typed (D26 A′): a coverage fault — listing,
-opening or reopening a directory, reading an ignore file (the global one
-included: missing is the defaults, unreadable fails the run), probing git,
-`readlink`, anything on a root — publishes nothing and leaves the old
-generation; an entry that vanished before its `lstat` is a deletion; a content
+ends, so no root's backlog outlives it), so no worker ever waits on another.
+Faults are typed (D26 A′, amended): EACCES from opening or listing a directory
+publishes its row without children and with an unknown entry count. Other
+coverage faults — listing, opening or reopening a directory, reading an ignore
+file (the global one included: missing is the defaults, unreadable fails the
+run), probing git, `readlink`, a root's lstat — publish nothing and leave the
+old generation; an entry that vanished before its `lstat` is a deletion; a content
 fault — open, stat or read failing, the bracket moving, aliases disagreeing —
 publishes the file with content state failed and no document, and it is re-read
 next run. The build is the authority on which inodes fault, since only it sees
@@ -377,6 +435,26 @@ experiments replace it with measurements.
 manifest rename. The term dictionary's structure (sorted front-coded blocks, an
 FST, …) is decided in S2 and is itself an experiment row.
 
+## Find syntax
+
+`ferret-query::find` owns `ferret find`: the GNU argument parser, the
+expression evaluator, the walk over the catalog or the live tree, the parallel
+scheduler and the actions. It reaches the outside world only through its
+`Effects` trait, which `ferret` implements in `src/find.rs` for output,
+diagnostics and running commands; `ferret` also owns the flags, the config file
+and opening the index.
+
+The walk reads directories with `rustix` (`RawDir` getdents, for the entry
+kinds) and uses it for `statx`, `access` and `statfs`. That is the
+`ferret-query → rustix` edge in § Crates; the policy-driven crawler in
+`ferret-crawl` stays separate.
+
+`-regex` and `-iregex` compile through `ferret-verify`, which holds the GNU
+regex dialects. The `regex` crate stays a dependency of `ferret-verify` alone.
+
+What `find` does — modes, freshness, order, concurrency, exit status and the
+differences from GNU — is specified in [FIND.md](FIND.md).
+
 ## Query (S1 for names and metadata, S2 onwards for content)
 
 1. **Parse** into atoms combined with AND / OR / NOT: `term`, `"phrase"`,
@@ -406,7 +484,7 @@ loading the column as its pass begins and decoding only the runs of 64 inodes
 that an earlier test left a bit set in, and a test that leaves none ends the
 conjunction with the later columns unread. Everything else tests every name, read in decoded
 runs. A name query loads
-the name, directory, root, traversed and link sections, never the document rows,
+the name, directory, root, traversed and link/special sections, never the document rows,
 and no inode columns for plain output (`--json` loads Size, Mtime and Doc); a
 metadata test loads only the columns it reads. Paths are resolved once per
 parent directory, and a directory's from its parent's when the directory before
@@ -429,8 +507,8 @@ upload of those logs and the local query log. The local query and timing log
 exists from S1 and is the source of both.
 
 The log is `$XDG_STATE_HOME/ferret/log.jsonl` (mode 0600), one JSON line per
-`find` and per index run (`ferret index`, `ferret roots remove`), each with
-`"v":1`. A `find` line records:
+`search` and per index run (`ferret index`, `ferret roots remove`), each with
+`"v":1`. A `search` line records:
 
 - the query atoms, the plan (`explain()`) and the strategy;
 - `Stats`, the rows, the time to the first row and the total time;
@@ -444,7 +522,7 @@ An index line records:
 
 No field holds an id (D27 renumbers them), a result path or a root path. The
 query atoms are logged as typed, though, so query text may itself contain a path
-(`find path:/home/me/private`) or any name the user searched for (D45). The file
+(`search path:/home/me/private`) or any name the user searched for (D45). The file
 is set to 0600 on every append, and each line is written under an exclusive
 `flock`, so concurrent processes never interleave within a line. The lock is
 tried for at most 150 ms, then the line is dropped with a warning, so a stopped

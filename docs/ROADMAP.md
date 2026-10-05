@@ -41,7 +41,7 @@ that guide, created by the first item that needs it rather than empty now.
   whose `(dev, ino, size, mtime, ctime)` is unchanged keeps its hash and doc id
   without being re-read. Hashing and doc ids are assigned here (D4) so S2 starts
   from a populated catalog.
-- `ferret find`: name substring, glob and regex by scanning the name heap (D14);
+- `ferret search`: name substring, glob and regex by scanning the name heap (D14);
   metadata predicates (`ext:`, `size:`, `mtime:`, `type:`, `path:`). Output per
   path; JSON lines behind a flag.
 - `ferret stats`: file and byte census by extension, size histogram, directory
@@ -176,7 +176,7 @@ bits, 3.1 B).
 
 Peak `find` RSS at 10M is now 333 MiB for a name query and 372-376 MiB with a
 metadata atom, a third of D48's 1 GB line (it was 990 MiB). The 15 MiB Python
-floor is in every RSS figure on both sides. `find --json` reads the three
+floor is in every RSS figure on both sides. `search --json` reads the three
 columns it prints: `flamegraph` 0.33 s, `test` 0.49 s at 10M.
 
 What changed the numbers, separated as far as the data allows (`perf` on the 10M
@@ -358,14 +358,118 @@ line.
 ## S1c — `ferret find` in find(1) syntax
 
 POSIX.1-2024 `find` over the index, plus GNU extensions ranked by real use,
-matching GNU `find` except that ignored paths do not exist (D47). The S1 atom
-grammar moves to `ferret search`. Tested with our own cases, written from what
+matching GNU `find` in `-I` mode and respecting ignore rules by default (D47).
+The S1 atom grammar moves to `ferret search`. Tested with our own cases, written from what
 the private differential corpus (`~/w/find-compat`) teaches, against GNU find,
 bfs and fd.
 
 **Measure:** the 10M catalog's resident size with full `find` support. Under 1
 GB, with scan latency acceptable, means no name index (D48); otherwise a name
 index experiment (suffix array, terms, trigrams) comes before S2.
+
+**Built** (2026-10-02 to 2026-10-03, branch `wt/find`, milestones M1–M5c). The
+contract is [FIND.md](FIND.md); the decisions are D47 and D50.
+
+- **M1** (2026-10-02): the find parser (GNU leading options, every corpus
+  primary and operator), C-locale byte globs, the evaluator and a sequential
+  live walk. S1's atom grammar moved to `ferret search`. GNU differential: 36
+  expressions.
+- **M2a** (2026-10-02): actions and output: `-exec`, `-execdir`, `-ok`,
+  `-okdir`, `-delete`, `-printf`/`-fprintf`, `-fprint*`, `-ls`/`-fls`, `-regex`
+  with its dialects, `-H`/`-L`, `-xtype`, `-lname`. Differential: 297
+  expressions.
+- **M2b** (2026-10-02): the stat tests (`-perm`, `-size`, the time tests,
+  `-newer*` including GNU's date forms, ownership, `-links`, `-inum`, `-empty`,
+  access, `-fstype`). Differential: 108 expressions.
+- **M3a** (2026-10-02): the GNU regex dialects in `ferret-verify`, with
+  backreferences on a bounded search. 1,352 new regex expressions; the evaluator
+  differential reached 1,718.
+- **M3b** (2026-10-02): single-threaded live walk speed, mostly allocation. `-I`
+  beat GNU on all twelve timing rows, and was within 2% of `bfs -j1` or faster
+  on all but `-maxdepth 2`.
+- **M4a** (2026-10-02 to 03): catalog format v3, with name-only rows for ignored
+  names and a sparse Specials section for visible FIFOs, sockets and devices
+  (D47's 4a brief).
+- **M4b** (2026-10-03): default mode over the catalog, the `find_no_ignore` key,
+  and refusal without a covering index. The full corpus after M4: `-I` 67,394
+  agree, 20 differ, 6 harness failures; default 52,909 agree, 28 differ, 3
+  harness failures. Every one of those rows was a harness artefact (F1, F2, F9),
+  handled in find-compat's H1 slice.
+- **M5a** (2026-10-03): default mode became a pure index query: catalog order and
+  stored metadata (F7, F8, F10). Its full corpus found 399 new differ rows: 314
+  order-only and 85 real action rows; 77 were fixed, and the other 8 led to F12.
+- **M5b** (2026-10-03): the parallel walk with concurrent actions (F10 B, F11 A),
+  on up to min(16, CPUs) workers. Full corpus: zero real differences, zero
+  errors, 190 raw differ rows (61 default, 129 `-I`), each explained by hand.
+- **M5c** (2026-10-03): shared `-exec +` batches, whole-entry output, the `-quit`
+  latch, and sequenced starts for effectful expressions. Raw differ rows fell to
+  46 (18 default, 28 `-I`).
+
+**Measured** (300k-entry timing tree in find-compat, 32 CPUs, warm medians in
+ms, fd 10.4.2). M5c's final table, 15 samples per cell, start load
+3.11/2.39/2.66:
+
+| Query                        | GNU     | bfs     | fd     | ferret -I | ferret |
+| ---------------------------- | ------: | ------: | -----: | --------: | -----: |
+| `-name *.c`                  | 204.061 | 80.203  | 27.234 | 31.701    | 10.925 |
+| `-type f`                    | 163.122 | 53.899  | 28.556 | 32.650    | 21.073 |
+| `-maxdepth 2 -mindepth 1`    | 14.320  | 3.815   | 12.398 | 3.357     | 7.355  |
+| `-type f -size +1024c`       | 426.948 | 142.608 | 53.655 | 46.979    | 22.940 |
+| `-print0`                    | 150.435 | 43.480  | 29.976 | 32.417    | 22.594 |
+| `-mtime 0`                   | 438.028 | 163.259 | 49.482 | 51.110    | 23.347 |
+| `-name *.c -o -name *.h`     | 244.356 | 116.896 | —      | 35.230    | 12.448 |
+| `-path */d1*/* -name *.rs`   | 205.189 | 90.709  | —      | 29.920    | 22.556 |
+| `-type d`                    | 147.352 | 36.051  | 23.764 | 31.470    | 9.629  |
+| `-empty`                     | 497.313 | 248.014 | 47.467 | 55.022    | 22.085 |
+| `-name *.py -newer ./README` | 243.451 | 193.020 | —      | 35.944    | 11.805 |
+| `-regex .*\.\(c\|h\)`        | 310.941 | 88.624  | —      | 35.910    | 28.905 |
+
+fd has no equivalent for the rows marked —. bfs's `-regex` row matches nothing,
+so it does different work. Default mode was within 1.84% faster and 2.29% slower
+than M5b on every row, which Dave accepted as noise. Per-cell loads are in
+`find-compat/.scratch/ferret-impl/m5c/revised-timing.json`.
+
+For comparison, on the same rows other than `-maxdepth`, M3b's single-threaded
+`-I` took 117–471 ms, and M4b's default mode, which listed each directory live
+to keep GNU's order, took 161–453 ms. Those figures drove F3, F7 and F10.
+
+M5c's targeted probes, 15 samples, start load 2.71/1.93/2.53:
+
+| Probe                                    | M5b default | M5c default | M5b `-I` | M5c `-I` |
+| ---------------------------------------- | ----------: | ----------: | -------: | -------: |
+| 368 read-only starts                     | 17.843      | 17.832      | 27.251   | 27.766   |
+| 368 effectful starts, unreachable exec   | 31.915      | 39.398      | 28.152   | 133.455  |
+| `-exec +` on name-selected files         | 24.121      | 21.998      | 46.694   | 36.760   |
+| `-exec +` on every file                  | 74.055      | 76.600      | 47.793   | 54.168   |
+
+Sequencing effectful starts costs real time on many small starts; a cheap guard
+against donating narrow roots made it worse (148.730 against 135.290 ms `-I`)
+and was removed. Before staging, `-exec +` on every file took 144.411/188.290 ms
+(default/`-I`) against M5b's 75.811/49.490, which is what justified staging.
+
+Catalog v3 (M4a) at 10M, against v2: 594,837,226 B against 592,577,217 B, all of
+the 2,260,009 B difference in Names (+1,786,998 B), NameHeap (+472,995 B) and the
+header (+16 B); 43,010 more names (the ignored ones, 0.41%); identical inode,
+document and stat sections. Build 10.71 s against 10.12 s, peak RSS 1,640.7
+against 1,630.4 MiB, at higher load (7.86 against 1.36). The final search guard
+cost 1.2% on a warm full listing (1,348.46 to 1,365.20 ms) and 0.4–4.9% on the
+other name queries. An adjacent-tag encoding measured 1,176,336 B (0.20%)
+smaller and was rejected (D47).
+
+**Where it stands** (2026-10-03). The last full corpus ran on bfe0d37's binary:
+135,693 rows, zero errors, 47 differ (16 default, 31 `-I`), plus 9 rows where
+both sides timed out, which sit outside the gate (F2).
+
+- 45 rows are output from an order the contract allows, which the harness cannot
+  yet prove. The find-compat harness slice H2 is teaching it to.
+- 1 row is a `-L` alias race between concurrent `rm` commands, accepted under
+  F11 A. (H2 names a second such command; it did not differ in this run.)
+- 1 row, `77e2ba5a5ff3`, was a real gap: a read-only later start reported a
+  missing path before an earlier start's `-quit`. 98d4b4c fixed it by sequencing
+  starts under `-quit`; the corpus has not been re-run since.
+
+Review fixes from the main-thread review (`REVIEW.md`) are in flight as R1. An
+Astra review of the whole stretch follows, before `wt/find` merges to main.
 
 ## S2 — Content index
 

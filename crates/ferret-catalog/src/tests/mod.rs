@@ -1,6 +1,5 @@
 //! Tests of the catalog through its public API: batches in, a committed file
 //! out, read back through [`Catalog`].
-#![allow(clippy::unwrap_used)]
 
 mod carry;
 mod commit;

@@ -1,4 +1,4 @@
-//! JSON output: one object per line, for `find --json` and the query log.
+//! JSON output: one object per line, for `search --json` and the query log.
 //!
 //! Hand-written because the surface is small: objects of strings, integers,
 //! nulls, arrays of strings and nested objects, written straight into a buffer.

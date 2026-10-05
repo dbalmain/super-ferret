@@ -8,7 +8,8 @@
 //! policy.
 //!
 //! With `--stat` each decided entry's line also carries its `lstat` fields,
-//! tab-separated after the decision, for the `synthetic` example in
+//! tab-separated after the decision (only type bits for an ignored name),
+//! for the `synthetic` example in
 //! `ferret-catalog` to replay. Two lines come first, unsorted: a header
 //! naming the columns (`<tab>columns<tab>size<tab>...`), so a reader takes
 //! them by name and a later column is an addition, not a break, and
@@ -144,9 +145,25 @@ impl EventVisitor for Dump {
         let line = match event {
             Event::Decided(decided) => {
                 let mut line = format!("{}\t{:?}", decided.path.display(), decided.decision);
-                if let Some(stat) = decided.stat.filter(|_| self.stat) {
+                if self.stat {
                     line.push('\t');
-                    line.push_str(&columns(&stat));
+                    if let Some(stat) = decided.stat {
+                        line.push_str(&columns(&stat));
+                    } else {
+                        // Ignored names carry d_type, not stat. Keep its mode
+                        // bits so the synthetic driver retains the same type;
+                        // zeros elsewhere never become inode columns.
+                        let mode = match decided.kind {
+                            ferret_catalog::Kind::Dir => 0o040_000,
+                            ferret_catalog::Kind::File => 0o100_000,
+                            ferret_catalog::Kind::Symlink => 0o120_000,
+                            ferret_catalog::Kind::Fifo => 0o010_000,
+                            ferret_catalog::Kind::Socket => 0o140_000,
+                            ferret_catalog::Kind::Block => 0o060_000,
+                            ferret_catalog::Kind::Character => 0o020_000,
+                        };
+                        line.push_str(&format!("0\t0\t0\t0\t0\t{mode}\t0\t0\t0\t0\t0"));
+                    }
                 }
                 line
             }
