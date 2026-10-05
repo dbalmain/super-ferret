@@ -174,7 +174,7 @@ impl Tree {
         };
         (
             records(query(&["search", "*"]), b'\n'),
-            records(query(&["find", "src", "-printf", "%y %p\\0"]), 0),
+            records(query(&["find", "src", "-printf", "%y %p %s %T@\\0"]), 0),
         )
     }
     fn converges(&self) {
@@ -183,7 +183,7 @@ impl Tree {
         loop {
             let actual = (
                 records(self.run(&["search", "*"]), b'\n'),
-                records(self.run(&["find", "src", "-printf", "%y %p\\0"]), 0),
+                records(self.run(&["find", "src", "-printf", "%y %p %s %T@\\0"]), 0),
             );
             let s = self.status();
             if actual == expected
@@ -244,6 +244,10 @@ fn write(path: impl AsRef<Path>, value: &str) {
 fn ordinary_edits_and_atomic_save_match_a_fresh_index() {
     let mut tree = Tree::new();
     tree.start(&[]);
+    // Modification alone changes no namespace. Compare stored size/mtime too,
+    // so an unrelated create/rename cannot mask a missing MODIFY subscription.
+    write(tree.path("src/left/original.txt"), "modified content alone");
+    tree.converges();
     write(tree.path("src/created.txt"), "create");
     write(tree.path("src/left/original.txt"), "modified content");
     write(tree.path("src/temp-save"), "atomic save");
@@ -383,6 +387,25 @@ fn denied_directory_is_opaque_and_permission_recovery_is_polled() {
         .unwrap_or_else(|error| panic!("restore: {error:?}"));
     tree.converges();
     assert!(tree.run(&["search", "original.txt"]).status.success());
+    // A denied configured root has no visible watched parent. Its failed
+    // installation must still be reported and recovered by the polling timer.
+    fs::set_permissions(tree.path("src"), fs::Permissions::from_mode(0o000))
+        .unwrap_or_else(|error| panic!("deny root: {error:?}"));
+    tree.stop();
+    tree.start(&[("FERRET_POLL_MS", "500")]);
+    let denied_root = tree.status();
+    assert!(
+        denied_root.contains("\"watch_installed\":0"),
+        "{denied_root}"
+    );
+    assert!(denied_root.contains("\"watch_failed\":1"), "{denied_root}");
+    assert!(
+        denied_root.contains("\"watch_uncovered\":true"),
+        "{denied_root}"
+    );
+    fs::set_permissions(tree.path("src"), fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("restore root: {error:?}"));
+    tree.converges();
 }
 
 #[test]
@@ -452,6 +475,54 @@ fn explicit_index_and_root_commands_publish_before_reply_with_one_lock() {
     tree.stop();
     let local = tree.success(tree.local(&["index", "src"]));
     assert_eq!(remote.stdout, local.stdout);
+}
+
+#[test]
+fn queued_writer_commands_never_consume_read_query_permits() {
+    let mut tree = Tree::new();
+    tree.start(&[("FERRET_WRITER_TEST_COMMAND_DELAY_MS", "1000")]);
+    let mut readers = Vec::new();
+    for i in 0..4 {
+        let stream = UnixStream::connect(tree.socket().unwrap_or_else(|| panic!("socket")))
+            .unwrap_or_else(|error| panic!("connect: {error:?}"));
+        stream
+            .set_read_timeout(Some(BOUND))
+            .unwrap_or_else(|error| panic!("timeout: {error:?}"));
+        let mut reader = BufReader::new(stream);
+        let mut hello = String::new();
+        reader
+            .read_line(&mut hello)
+            .unwrap_or_else(|error| panic!("hello: {error:?}"));
+        assert!(hello.contains("\"state\":\"ready\""));
+        let request = format!(
+            "{{\"id\":\"w{i}\",\"op\":\"index\",\"args\":[\"\",\"{}\"]}}\n",
+            tree.path("src").display()
+        );
+        reader
+            .get_mut()
+            .write_all(request.as_bytes())
+            .unwrap_or_else(|error| panic!("writer request: {error:?}"));
+        readers.push(reader);
+    }
+    wait(|| tree.status().contains("\"writer_commands\":4"));
+    tree.success(tree.run(&["search", "original.txt"]));
+    assert!(
+        tree.status().contains("\"writer_commands\":4"),
+        "a read query waited for a writer command to finish"
+    );
+    for mut reader in readers {
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .unwrap_or_else(|error| panic!("reply: {error:?}"));
+            assert!(!line.is_empty());
+            if line.contains("\"event\":\"end\"") {
+                assert!(line.contains("\"exit\":0"), "{line}");
+                break;
+            }
+        }
+    }
 }
 
 #[test]

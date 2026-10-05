@@ -134,6 +134,8 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
         match receive.try_recv() {
             Ok(command) => {
                 host.writer_running.store(true, Ordering::Release);
+                #[cfg(debug_assertions)]
+                std::thread::sleep(duration("FERRET_WRITER_TEST_COMMAND_DELAY_MS", 0));
                 // The first argv item is the originating client's rules. Paths
                 // are absolute bytes, checked again by the real producer.
                 let global = command
@@ -424,6 +426,10 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
     }
     o.opt_int("last_successful_refresh", s.last_refresh)
         .opt_int("last_complete_backstop", s.last_backstop)
+        .int(
+            "writer_commands",
+            host.writer_pending.load(Ordering::Acquire) as u64,
+        )
         .bool("writer_busy", host.writer_running.load(Ordering::Acquire))
         .bool("fault_retained", s.fault_retained);
     if let Some(error) = &s.error {

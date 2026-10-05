@@ -638,7 +638,7 @@ catalog census and D54 bytes/planner counters.
 M5a exposes `ferret status --json` (JSON is also the default) for an existing
 compatible daemon, without spawning one. It adds watch_installed, watch_needed,
 watch_failed, watch_uncovered, pending_scopes, oldest_pending_ms, backstop_reason,
-last_successful_refresh, last_complete_backstop, writer_busy, fault_retained and
+last_successful_refresh, last_complete_backstop, writer_busy, writer_commands, fault_retained and
 refresh_error alongside M4's generation/engine/bytes fields. Wall timestamps are
 Unix seconds; ages and waits are monotonic. A complete-backstop timestamp requires
 no retained coverage faults; ordinary opaque directory observations remain covered.
@@ -909,7 +909,8 @@ filesystem tree for watch/syscall/freshness claims. D54 additionally uses the
 HOME/nix/nixpkgs prototype shapes; their row distributions are different.
 
 M5a's generated default watch test compares each quiescent publication with a
-fresh full production index through search paths and find path/type records. The
+fresh full production index through search paths and find path/type/size/mtime
+records. A modification-only phase cannot be masked by a namespace event. The
 longer version is ignored: `FERRET_WATCH_BURST_ROUNDS=1000 cargo test -p ferret
 --test watch -- --ignored generated_bursts_long`. Each process/socket/poll has a
 deadline; every fixture isolates HOME, XDG, runtime and both indexes.

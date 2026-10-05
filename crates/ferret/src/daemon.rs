@@ -200,6 +200,13 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     }
     host.stop.store(true, Ordering::Release);
     let _ = writer.join();
+    if let Loaded::Ready(engine) = &*host
+        .engine
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        engine.close_writer();
+    }
     // The lifetime-held endpoint lock excludes starters through cleanup. Never
     // unlink a replacement created by somebody else after our socket vanished.
     if let Ok(current) = fs::symlink_metadata(endpoint.socket())
@@ -248,8 +255,8 @@ fn hello(destination: &Destination, host: &Host) -> io::Result<bool> {
             Loaded::Failed(error) => ("failed", None, Some(error.clone())),
         }
     };
-    // A replaced catalog incarnation must not strand clients on an old
-    // hello forever. Refresh ready state before reporting its identity.
+    // Check the endpoint's index directory before advertising a checked pin.
+    // Publication recovery never invalidates the last checked query view.
     let (state, selected, error) = if state == "ready" {
         let selected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(host)))
             .unwrap_or_else(|_| Err(io::Error::other("engine selection panicked")));
@@ -466,8 +473,13 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                     continue;
                 }
             };
-            let Some(_permit) = admit(host, &cancelled) else {
-                break;
+            let _permit = if matches!(request.op, Op::Search | Op::Find) {
+                let Some(permit) = admit(host, &cancelled) else {
+                    break;
+                };
+                Some(permit)
+            } else {
+                None
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 execute(host, &request, &destination)

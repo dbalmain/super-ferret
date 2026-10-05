@@ -1445,8 +1445,8 @@ indexes, including generated bursts and crash restart. No timing runs.
 
 M5b is separate: bind/alias multi-occurrence mapping, external policy dependency
 watches, count census, full JSON status, and network/FUSE polling. M6 owns pacing,
-battery/load and resource admission. M5a gates: **674 passed / 6 ignored**, +27 passing tests over the 647/5
-baseline. The default real-daemon watch addition reports about 1.4 seconds; the
+battery/load and resource admission. M5a gates: **675 passed / 6 ignored**, +28 passing tests over the 647/5
+baseline. The default real-daemon watch addition reports about 4.2 seconds (including four deliberately delayed writer commands); the
 long generated run is ignored and takes an environment-variable round count.
 
 ### S1b M1 — Resident engine library (2026-10-05)

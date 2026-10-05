@@ -662,7 +662,17 @@ impl<V: EventVisitor> Walker<'_, V> {
                 if error == Errno::ACCESS {
                     // A root denied at open still has a catalog row, just as
                     // a denied child does. Follow the user's root symlink.
-                    match statat(rustix::fs::CWD, root, AtFlags::empty()) {
+                    let observed = match open_path(
+                        root,
+                        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => {
+                            fstat(&fd).inspect(|_| self.visit.observing(fd.as_fd(), Path::new("")))
+                        }
+                        Err(_) => statat(rustix::fs::CWD, root, AtFlags::empty()),
+                    };
+                    match observed {
                         Ok(stat) if file_type(&stat) == FileType::Directory => {
                             self.visit.root(public_stat(&stat, None));
                         }

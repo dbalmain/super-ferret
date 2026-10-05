@@ -63,6 +63,17 @@ impl Engine {
         }
     }
 
+    /// The daemon calls this after its writer queue stops, before releasing
+    /// endpoint ownership. Query pins never retain this lock; closing it here
+    /// prevents a replacement host from winning the endpoint but losing the
+    /// still-live old engine's writer lock.
+    pub(crate) fn close_writer(&self) {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
     /// Pins the selected generation without holding a lock during execution.
     pub fn pin(&self) -> QuerySession {
         self.current
