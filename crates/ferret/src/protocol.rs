@@ -12,9 +12,8 @@
 //! daemon over this same codec), so [`parse_request`] never panics and never
 //! allocates without a bound tied to the input it has already validated.
 //!
-//! `#[allow(dead_code)]` on the module: M2b (the batch host) adds the first
-//! caller. This slice is the reader alone, with its own tests.
-#![allow(dead_code)]
+//! The batch host calls this reader; the socket host will reuse the codec
+//! unchanged.
 
 /// Maximum length of one input line, in bytes, encoded form (S1B's batch
 /// protocol limit).
@@ -148,9 +147,15 @@ pub(crate) fn parse_request(line: &[u8]) -> Result<Request, RequestError> {
         pos: 0,
     };
     parser.skip_ws();
-    let value = parser
-        .parse_value(1)
-        .map_err(|kind| RequestError { id: None, kind })?;
+    let value = match parser.parse_value(1) {
+        Ok(value) => value,
+        Err(kind) => {
+            return Err(RequestError {
+                id: recover_id(line),
+                kind,
+            });
+        }
+    };
     parser.skip_ws();
     if parser.pos != line.len() {
         return Err(RequestError {
@@ -183,6 +188,33 @@ pub(crate) fn parse_request(line: &[u8]) -> Result<Request, RequestError> {
     };
 
     build_request(&fields, id.clone()).map_err(|kind| RequestError { id: Some(id), kind })
+}
+
+/// Recovers a validated leading id even when a later part of the line is
+/// malformed or exceeds the host's retained input bound.
+pub(crate) fn recover_id(line: &[u8]) -> Option<String> {
+    let mut parser = Parser {
+        input: line,
+        pos: 0,
+    };
+    parser.skip_ws();
+    if parser.peek() != Some(b'{') {
+        return None;
+    }
+    parser.pos += 1;
+    parser.skip_ws();
+    if parser.peek() != Some(b'"') || parser.parse_string().ok()? != "id" {
+        return None;
+    }
+    parser.skip_ws();
+    if parser.peek() != Some(b':') {
+        return None;
+    }
+    parser.pos += 1;
+    match parser.parse_value(2).ok()? {
+        Value::Str(id) if !id.is_empty() => Some(id),
+        _ => None,
+    }
 }
 
 fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, RequestErrorKind> {

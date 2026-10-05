@@ -199,6 +199,14 @@ fn batch_statuses_limits_protocol_recovery_and_actual_open_count() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("LineTooLong"));
     assert!(text.contains("\"id\":\"after\",\"event\":\"status\""));
+    let mut oversized =
+        b"{\"id\":\"large-id\",\"op\":\"status\",\"args\":[],\"padding\":\"".to_vec();
+    oversized.extend(std::iter::repeat_n(b'x', 1_048_600));
+    oversized.extend_from_slice(b"\"}\n");
+    let output = tree.run(&oversized);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"id\":\"large-id\",\"event\":\"error\"")
+    );
 }
 
 #[test]
@@ -221,7 +229,9 @@ fn large_find_record_splits_at_64_kib_and_eof_partial_request_is_reported() {
         4 * (64 * 1024 / 3 + 1)
     );
     let partial = tree.run(b"{\"id\":\"eof\",\"op\":\"search\"");
-    assert!(String::from_utf8_lossy(&partial.stdout).contains("\"id\":null,\"event\":\"error\""));
+    assert!(
+        String::from_utf8_lossy(&partial.stdout).contains("\"id\":\"eof\",\"event\":\"error\"")
+    );
 }
 
 #[test]

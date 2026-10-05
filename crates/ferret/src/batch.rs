@@ -74,7 +74,8 @@ fn process(reader: impl BufRead) -> io::Result<()> {
             line.pop();
         }
         if line.len() > protocol::MAX_LINE_BYTES {
-            emit_request_error(None, "LineTooLong")?;
+            let id = protocol::recover_id(&line);
+            emit_request_error(id.as_deref(), "LineTooLong")?;
             continue;
         }
         match protocol::parse_request(&line) {
@@ -141,15 +142,13 @@ fn handle(
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .or_else(|| dirs.map(|dirs| dirs.data.clone()));
-            if let Some(path) = next.as_deref() {
-                if let Ok(Some(reloaded)) = Engine::open(path) {
-                    if engine
-                        .as_ref()
-                        .is_none_or(|current| current.generation() != reloaded.generation())
-                    {
-                        *engine = Some(reloaded);
-                    }
-                }
+            if let Some(path) = next.as_deref()
+                && let Ok(Some(reloaded)) = Engine::open(path)
+                && engine
+                    .as_ref()
+                    .is_none_or(|current| current.generation() != reloaded.generation())
+            {
+                *engine = Some(reloaded);
             }
             event(request, "reload", |o| {
                 if let Some(engine) = engine {
@@ -242,20 +241,18 @@ fn search_request(
         }
     }
     let elapsed = started.elapsed().as_micros() as i128;
-    log_search(
-        dirs,
-        request,
-        now,
+    let log = SearchLog {
         status,
         rows,
         elapsed,
         first_row,
         bytes_read,
-        &plan_text,
-        &strategy,
+        plan: &plan_text,
+        strategy: &strategy,
         stats,
-        query_error.as_deref(),
-    );
+        error: query_error.as_deref(),
+    };
+    log_search(dirs, request, now, &log);
     event(request, "end", |o| {
         o.int("exit", status)
             .int("rows", rows)
@@ -502,20 +499,30 @@ fn send(line: &[u8]) -> io::Result<()> {
     out.write_all(b"\n")?;
     out.flush()
 }
-fn log_search(
-    dirs: Option<&Dirs>,
-    request: &Request,
-    at: SystemTime,
-    exit: u8,
+struct SearchLog<'a> {
+    status: u8,
     rows: u64,
     elapsed: i128,
     first_row: Option<i128>,
     bytes_read: u64,
-    plan: &str,
-    strategy: &str,
+    plan: &'a str,
+    strategy: &'a str,
     stats: Option<ferret_query::Stats>,
-    error: Option<&str>,
-) {
+    error: Option<&'a str>,
+}
+
+fn log_search(dirs: Option<&Dirs>, request: &Request, at: SystemTime, log: &SearchLog<'_>) {
+    let SearchLog {
+        status,
+        rows,
+        elapsed,
+        first_row,
+        bytes_read,
+        plan,
+        strategy,
+        stats,
+        error,
+    } = log;
     if let Some(dirs) = dirs {
         let mut line = Vec::new();
         let mut o = crate::log::line(&mut line, "search", at);
@@ -523,11 +530,11 @@ fn log_search(
             .str("plan", plan)
             .str("strategy", strategy)
             .opt_int("limit", request.limit)
-            .int("exit", exit)
-            .int("rows", rows)
-            .opt_int("first_row_us", first_row)
-            .int("total_us", elapsed)
-            .int("bytes_read", bytes_read);
+            .int("exit", *status)
+            .int("rows", *rows)
+            .opt_int("first_row_us", *first_row)
+            .int("total_us", *elapsed)
+            .int("bytes_read", *bytes_read);
         if let Some(stats) = stats {
             o.object("stats", |o| {
                 o.int("candidates", stats.candidates)
