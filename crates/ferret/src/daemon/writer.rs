@@ -6,7 +6,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,10 @@ pub(super) struct Command {
     request: Request,
     reply: mpsc::SyncSender<Result<ferret_crawl::Report, ferret_crawl::IndexError>>,
 }
+pub(super) enum Message {
+    Command(Command),
+    Intake,
+}
 #[derive(Default)]
 pub(super) struct Status {
     pub watch: Option<Arc<Watch>>,
@@ -31,6 +35,7 @@ pub(super) struct Status {
     pub last_backstop: Option<u64>,
     pub fault_retained: bool,
     pub error: Option<String>,
+    pub retained_roots: std::collections::BTreeSet<PathBuf>,
 }
 fn timestamp() -> u64 {
     SystemTime::now()
@@ -40,7 +45,7 @@ fn timestamp() -> u64 {
 }
 pub(super) fn start(
     host: Arc<Host>,
-    receive: mpsc::Receiver<Command>,
+    receive: mpsc::Receiver<Message>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result =
@@ -57,6 +62,8 @@ pub(super) fn start(
         if matches!(*loaded, Loaded::Loading) {
             *loaded = Loaded::Failed(error.clone());
         }
+        drop(loaded);
+        host.engine_ready.notify_all();
         host.writer_status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -65,7 +72,7 @@ pub(super) fn start(
         host.writer_running.store(false, Ordering::Release);
     })
 }
-fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
+fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
     #[cfg(debug_assertions)]
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
     let session = WriterSession::open(&host.index).map_err(io::Error::other)?;
@@ -83,7 +90,7 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
         {
             config.scopes = cap;
         }
-        Watch::new(config).ok().map(Arc::new)
+        Watch::new_blocking(config).ok().map(Arc::new)
     });
     host.writer_status
         .lock()
@@ -96,23 +103,16 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
         .engine
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Loaded::Ready(engine.clone());
-    let stop = Arc::new(AtomicBool::new(false));
-    let intake = watch.as_ref().map(|watch| {
+    host.engine_ready.notify_all();
+    if let Some(watch) = &watch {
         let watch = watch.clone();
-        let stop = stop.clone();
+        let send = host.writer_send.clone();
         std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
-                if watch.drain().is_err() {
-                    watch.backstop(RefreshReason::Overflow);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        })
-    });
-    let _intake = Intake {
-        stop,
-        thread: intake,
-    };
+            watch.run_intake(|| {
+                let _ = send.try_send(Message::Intake);
+            })
+        });
+    }
     let context = crate::cli::Context {
         index: host.index.clone(),
         dirs: crate::xdg::Dirs::from_env().ok(),
@@ -125,14 +125,23 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
     let polling = duration("FERRET_POLL_MS", 5 * 60 * 1000).max(Duration::from_millis(1));
     let mut full_due = Instant::now() + hourly;
     let mut poll_due = Instant::now() + polling;
-    let mut retry_due = Instant::now();
+    let mut retry_due = None;
     let mut initial = watch.is_none();
     loop {
         if host.stop.load(Ordering::Acquire) {
             break;
         }
-        match receive.try_recv() {
-            Ok(command) => {
+        let now = Instant::now();
+        let mut deadline = full_due.min(poll_due);
+        if let Some(retry) = retry_due {
+            deadline = deadline.min(retry);
+        }
+        if let Some(due) = watch.as_ref().and_then(|w| w.next_due()) {
+            deadline = deadline.min(due);
+        }
+        let message = receive.recv_timeout(deadline.saturating_duration_since(now));
+        match message {
+            Ok(Message::Command(command)) => {
                 host.writer_running.store(true, Ordering::Release);
                 #[cfg(debug_assertions)]
                 std::thread::sleep(duration("FERRET_WRITER_TEST_COMMAND_DELAY_MS", 0));
@@ -178,6 +187,14 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
                 };
                 if let Ok(report) = &result {
                     successful(host, report, false);
+                    host.writer_status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retained_roots = report
+                        .coverage_faults
+                        .iter()
+                        .map(|fault| fault.root.clone())
+                        .collect();
                     if let Some(w) = &watch {
                         w.reconcile(engine.pin().catalog());
                     }
@@ -199,10 +216,11 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
                 let _ = command.reply.send(result);
                 host.writer_pending.fetch_sub(1, Ordering::AcqRel);
                 host.writer_running.store(false, Ordering::Release);
+                super::wake_listener(host, 1);
                 continue;
             }
-            Err(mpsc::TryRecvError::Disconnected) => break,
-            Err(mpsc::TryRecvError::Empty) => {}
+            Ok(Message::Intake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         if host
             .lifecycle
@@ -210,7 +228,6 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .draining
         {
-            std::thread::sleep(Duration::from_millis(10));
             continue;
         }
         if Instant::now() >= full_due {
@@ -222,22 +239,30 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
             full_due = Instant::now() + hourly;
         }
         if Instant::now() >= poll_due {
-            // External policy dependencies and alias mapping are M5b. A full
-            // five-minute poll is the conservative fallback for those gaps.
             if let Some(w) = &watch {
-                w.backstop(RefreshReason::Backstop);
+                let pin = engine.pin();
+                let roots = w.polling_roots(pin.catalog());
+                let retained = host
+                    .writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retained_roots
+                    .clone();
+                let scopes = roots
+                    .into_iter()
+                    .chain(retained)
+                    .collect::<std::collections::BTreeSet<_>>();
+                w.scoped_roots(scopes.into_iter().collect());
             } else {
                 initial = true;
             }
             poll_due = Instant::now() + polling;
         }
-        if Instant::now() < retry_due {
-            std::thread::sleep(Duration::from_millis(10));
+        if retry_due.is_some_and(|retry| Instant::now() < retry) {
             continue;
         }
         let burst = watch.as_ref().and_then(|w| w.take());
         if burst.is_none() && !initial {
-            std::thread::sleep(Duration::from_millis(10));
             continue;
         }
         host.writer_running.store(true, Ordering::Release);
@@ -266,19 +291,29 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
                     .is_none_or(|b| b.reason() != RefreshReason::Burst)
                     && report.report.coverage_faults.is_empty();
                 successful(host, &report.report, complete);
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retained_roots = report
+                    .report
+                    .coverage_faults
+                    .iter()
+                    .map(|fault| fault.root.clone())
+                    .collect();
                 if let Some(w) = &watch
                     && burst.as_ref().is_none_or(|b| b.reconcile_watches())
                 {
                     w.reconcile(&report.view);
                 }
                 initial = false;
+                retry_due = None;
             }
             Err(error) => {
                 host.writer_status
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .error = Some(error.to_string());
-                retry_due = Instant::now() + Duration::from_secs(1);
+                retry_due = Some(Instant::now() + Duration::from_secs(1));
             }
         }
         if let Some(burst) = burst
@@ -287,6 +322,7 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
             watch.finish(burst, result.is_ok());
         }
         host.writer_running.store(false, Ordering::Release);
+        super::wake_listener(host, 1);
     }
     Ok(())
 }
@@ -301,18 +337,6 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
     }
     status.fault_retained = !report.coverage_faults.is_empty();
     status.error = None;
-}
-struct Intake {
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-impl Drop for Intake {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
 }
 pub(super) fn busy(host: &Host) -> bool {
     host.writer_running.load(Ordering::Acquire)
@@ -330,10 +354,10 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
     host.writer_pending.fetch_add(1, Ordering::AcqRel);
     if host
         .writer_send
-        .try_send(Command {
+        .try_send(Message::Command(Command {
             request: request.clone(),
             reply,
-        })
+        }))
         .is_err()
     {
         host.writer_pending.fetch_sub(1, Ordering::AcqRel);

@@ -607,10 +607,12 @@ have IGNORED tombstones; unknown lifetime/reuse collapses to Overflow.
 `FERRET_WATCH_CAP` defaults to seven eighths of `max_user_watches`, reserving
 one eighth for other user tools. All three inotify sysctls are read, never changed.
 Cap/install failures become coverage gaps. `FERRET_BACKSTOP_MS` defaults to
-3600000 and `FERRET_POLL_MS` to 300000. The five-minute timer currently observes
-**all roots** as a conservative M5b fallback for external policy/alias coverage;
-M5b will add exact multi-occurrence mapping, outside-tree policy watches, the
-count census, the complete status schema, and network/FUSE polling rules.
+3600000 and `FERRET_POLL_MS` to 300000. The five-minute timer refreshes only
+uncovered, fault-retained, relocated or possibly aliased roots, using Root scopes
+with reason Burst. If none need polling, it does no refresh. Until M5b adds
+outside-tree policy watches, changes to those external inputs are an interim gap
+caught by the hourly full-root backstop. M5b also adds exact multi-occurrence
+mapping, the count census, complete status schema, and network/FUSE polling rules.
 These timers serialize through the one writer service. Pending intake/publication
 prevents idle exit; an explicitly enabled unit still uses idle zero. Restart
 always arms during observation and performs a complete startup backstop.

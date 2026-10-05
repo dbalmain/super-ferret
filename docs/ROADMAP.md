@@ -1436,9 +1436,11 @@ locators survive catalog epochs, unique cookies become rename hints, and bounded
 intake/kernel/lifetime loss requests a complete all-roots backstop.
 
 The default watch cap reserves one eighth of the kernel limit for other tools;
-failures report uncovered coverage. Startup/hourly backstops and five-minute full
-polling converge without overlapping crawls. The full poll is a conservative
-fallback for M5b's pending outside-policy/alias coverage. Status exposes M5a's
+failures report uncovered coverage. Startup and hourly full-root backstops run
+alongside five-minute polling for uncovered, fault-retained, relocated or
+possibly aliased roots; an empty polling set does no refresh. Until M5b adds
+outside-tree policy watches, their changes are an interim gap caught by the
+hourly full-root backstop. Status exposes M5a's
 watch counts, pending age/count, backstop reason and refresh/completion timestamps.
 Real temporary-tree daemon tests compare search/find against fresh production
 indexes, including generated bursts and crash restart. No timing runs.

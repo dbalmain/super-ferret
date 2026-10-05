@@ -13,13 +13,13 @@ pub(crate) use client::{daemon_status as status, find, search, writer_command as
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::engine::{Engine, QuerySession};
@@ -46,20 +46,31 @@ enum Loaded {
 }
 struct Host {
     engine: Mutex<Loaded>,
+    engine_ready: Condvar,
     lifecycle: Mutex<Lifecycle>,
+    lifecycle_changed: Condvar,
     clients: AtomicUsize,
     index: PathBuf,
+    server_send: mpsc::Sender<ServerEvent>,
     identity: String,
     context: String,
     build: String,
     query_limit: usize,
     workers: usize,
     format: u64,
-    writer_send: mpsc::SyncSender<writer::Command>,
+    writer_send: mpsc::SyncSender<writer::Message>,
     writer_status: Mutex<writer::Status>,
     writer_running: AtomicBool,
     writer_pending: AtomicUsize,
     stop: AtomicBool,
+}
+enum ServerEvent {
+    Accepted(io::Result<UnixStream>),
+    Wake(u8),
+}
+enum ClientMessage {
+    Line(Vec<u8>),
+    Wake,
 }
 
 /// Runs ferretd. An unusable endpoint or catalog is an operational error; a
@@ -113,7 +124,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         match lock.try_lock() {
             Ok(()) => break,
             Err(fs::TryLockError::WouldBlock) => {
-                if UnixStream::connect(endpoint.socket()).is_ok() {
+                if owner_responds(&endpoint.socket()) {
                     return Ok(());
                 }
                 // A draining owner may have unlinked just before releasing
@@ -135,20 +146,39 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let listener = UnixListener::bind(endpoint.socket())?;
+    let socket = endpoint.socket();
+    let listener = UnixListener::bind(&socket)?;
     let own_socket = fs::symlink_metadata(endpoint.socket())?;
     let cleanup = SocketCleanup(&endpoint, own_socket.dev(), own_socket.ino());
     fs::set_permissions(endpoint.socket(), fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
+    let (server_send, server_receive) = mpsc::channel();
+    let accept_send = server_send.clone();
+    let accept_lock = lock.try_clone()?;
+    std::thread::spawn(move || {
+        let _lock = &accept_lock;
+        loop {
+            if accept_send
+                .send(ServerEvent::Accepted(
+                    listener.accept().map(|(stream, _)| stream),
+                ))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     let (writer_send, writer_receive) = mpsc::sync_channel(32);
     let host = Arc::new(Host {
         engine: Mutex::new(Loaded::Loading),
+        engine_ready: Condvar::new(),
         lifecycle: Mutex::new(Lifecycle {
             draining: false,
             queries: 0,
         }),
+        lifecycle_changed: Condvar::new(),
         clients: AtomicUsize::new(0),
         index,
+        server_send,
         identity: endpoint.identity.clone(),
         context: advertised_context()?,
         build: test_build(),
@@ -182,8 +212,26 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         {
             break;
         }
-        match listener.accept() {
-            Ok((stream, _)) if !draining && clients < CLIENTS => {
+        let event = if idle.is_zero() {
+            server_receive
+                .recv()
+                .map_err(|_| io::Error::other("accept loop stopped"))?
+        } else {
+            match server_receive.recv_timeout(idle.saturating_sub(idle_since.elapsed())) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other("accept loop stopped"));
+                }
+            }
+        };
+        match event {
+            ServerEvent::Wake(reason) => {
+                if reason != 0 && clients == 0 && !writer::busy(&host) {
+                    idle_since = Instant::now();
+                }
+            }
+            ServerEvent::Accepted(Ok(stream)) if !draining && clients < CLIENTS => {
                 host.clients.fetch_add(1, Ordering::AcqRel);
                 let host = host.clone();
                 std::thread::spawn(move || {
@@ -191,14 +239,12 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
                     let _ = connection(stream, &host);
                 });
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10))
-            }
-            Err(error) => return Err(error),
+            ServerEvent::Accepted(Ok(_)) => {}
+            ServerEvent::Accepted(Err(error)) => return Err(error),
         }
     }
     host.stop.store(true, Ordering::Release);
+    let _ = host.writer_send.try_send(writer::Message::Intake);
     let _ = writer.join();
     if let Loaded::Ready(engine) = &*host
         .engine
@@ -216,9 +262,37 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         endpoint.remove_socket()?;
     }
     drop(cleanup);
-    drop(listener);
     drop(lock);
     Ok(())
+}
+fn owner_responds(socket: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .is_err()
+    {
+        return false;
+    }
+    let mut byte = [0];
+    matches!(stream.read(&mut byte), Ok(1))
+}
+fn wake_listener(host: &Host, reason: u8) {
+    let _ = host.server_send.send(ServerEvent::Wake(reason));
+}
+fn cancel(host: &Host, cancelled: &AtomicBool) {
+    let _engine = host
+        .engine
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lifecycle = host
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cancelled.store(true, Ordering::Release);
+    host.engine_ready.notify_all();
+    host.lifecycle_changed.notify_all();
 }
 fn test_build() -> String {
     #[cfg(debug_assertions)]
@@ -320,6 +394,8 @@ struct ClientCount<'a>(&'a Host);
 impl Drop for ClientCount<'_> {
     fn drop(&mut self) {
         self.0.clients.fetch_sub(1, Ordering::AcqRel);
+        self.0.lifecycle_changed.notify_all();
+        wake_listener(self.0, 1);
     }
 }
 struct QueryPermit<'a>(&'a Host);
@@ -330,6 +406,7 @@ impl Drop for QueryPermit<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .queries -= 1;
+        self.0.lifecycle_changed.notify_one();
     }
 }
 fn admit<'a>(host: &'a Host, cancelled: &AtomicBool) -> Option<QueryPermit<'a>> {
@@ -345,8 +422,11 @@ fn admit<'a>(host: &'a Host, cancelled: &AtomicBool) -> Option<QueryPermit<'a>> 
             state.queries += 1;
             return Some(QueryPermit(host));
         }
+        state = host
+            .lifecycle_changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(state);
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 fn pin(host: &Host) -> io::Result<QuerySession> {
@@ -396,7 +476,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
             });
             match op.as_deref() {
                 Some("cancel") => {
-                    reader_cancel.store(true, Ordering::Release);
+                    cancel(&reader_host, &reader_cancel);
                     let _ = reader.get_ref().shutdown(std::net::Shutdown::Write);
                     break;
                 }
@@ -406,37 +486,39 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .draining = true;
+                    reader_host.lifecycle_changed.notify_all();
+                    let _ = send.try_send(ClientMessage::Wake);
+                    wake_listener(&reader_host, 2);
                 }
                 _ => {
-                    if send.try_send(line.clone()).is_err() {
+                    if send.try_send(ClientMessage::Line(line.clone())).is_err() {
                         break;
                     }
                 }
             }
         }
-        reader_cancel.store(true, Ordering::Release);
+        cancel(&reader_host, &reader_cancel);
         // Wake a blocked writer on hangup/cancel; a partial frame is a broken
         // transport and cannot be followed by a fabricated successful end.
         let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
     });
     let result = (|| {
         if !hello(&destination, host)? {
-            loop {
-                if cancelled.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                if !matches!(
-                    *host
-                        .engine
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    Loaded::Loading
-                ) {
-                    hello(&destination, host)?;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+            let mut loaded = host
+                .engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while matches!(*loaded, Loaded::Loading) && !cancelled.load(Ordering::Acquire) {
+                loaded = host
+                    .engine_ready
+                    .wait(loaded)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            drop(loaded);
+            hello(&destination, host)?;
         }
         loop {
             if host
@@ -447,15 +529,21 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
             {
                 break;
             }
-            let line = match receive.recv_timeout(Duration::from_millis(20)) {
-                Ok(line) => line,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if cancelled.load(Ordering::Acquire) {
+            let line = match receive.recv() {
+                Ok(ClientMessage::Line(line)) => line,
+                Ok(ClientMessage::Wake) => {
+                    if cancelled.load(Ordering::Acquire)
+                        || host
+                            .lifecycle
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .draining
+                    {
                         break;
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(_) => break,
             };
             if line.len() > protocol::MAX_LINE_BYTES {
                 let id = protocol::recover_id(&line);

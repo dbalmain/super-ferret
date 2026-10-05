@@ -131,6 +131,7 @@ struct State {
     inflight_first: Option<Instant>,
     last: Option<Instant>,
     backstop: Option<(u64, RefreshReason)>,
+    scoped_roots: BTreeSet<PathBuf>,
     serial: u64,
     running: bool,
 }
@@ -160,12 +161,24 @@ pub struct Status {
 pub struct Burst {
     pending: BTreeMap<(i32, Vec<u8>), Hint>,
     marker: Option<(u64, RefreshReason)>,
+    roots: BTreeSet<PathBuf>,
 }
 impl Watch {
     /// Creates one CLOEXEC, nonblocking instance with the given intake bounds.
     pub fn new(config: Config) -> Result<Self, Errno> {
+        Self::new_with_flags(config, true)
+    }
+    /// Creates a blocking instance for a dedicated daemon intake thread.
+    pub fn new_blocking(config: Config) -> Result<Self, Errno> {
+        Self::new_with_flags(config, false)
+    }
+    fn new_with_flags(config: Config, nonblocking: bool) -> Result<Self, Errno> {
         Ok(Self {
-            fd: inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)?,
+            fd: inotify::init(if nonblocking {
+                inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC
+            } else {
+                inotify::CreateFlags::CLOEXEC
+            })?,
             config,
             state: Mutex::new(State {
                 descriptors: BTreeMap::new(),
@@ -180,6 +193,7 @@ impl Watch {
                 inflight_first: None,
                 last: None,
                 backstop: None,
+                scoped_roots: BTreeSet::new(),
                 serial: 0,
                 running: false,
             }),
@@ -354,6 +368,29 @@ impl Watch {
             }
         }
     }
+    /// Runs blocking intake and notifies the writer for each observed event.
+    pub fn run_intake(&self, mut ready: impl FnMut()) {
+        let mut buffer = [MaybeUninit::uninit(); 64 << 10];
+        let mut reader = inotify::Reader::new(&self.fd, &mut buffer);
+        loop {
+            match reader.next() {
+                Ok(event) => {
+                    self.event(
+                        event.wd(),
+                        event.events(),
+                        event.cookie(),
+                        event.file_name().map_or(&[], |s| s.to_bytes()),
+                    );
+                    ready();
+                }
+                Err(Errno::INTR) => continue,
+                Err(_) => {
+                    self.backstop(RefreshReason::Overflow);
+                    ready();
+                }
+            }
+        }
+    }
     fn event(&self, wd: i32, flags: ReadFlags, cookie: u32, name: &[u8]) {
         let mut state = self
             .state
@@ -483,7 +520,7 @@ impl Watch {
             installed: s.descriptors.len(),
             needed: s.descriptors.len() + s.failed.len(),
             failed: s.failed.len(),
-            pending: s.pending.len() + usize::from(s.backstop.is_some()),
+            pending: s.pending.len() + usize::from(s.backstop.is_some()) + s.scoped_roots.len(),
             oldest: s
                 .first
                 .into_iter()
@@ -491,9 +528,47 @@ impl Watch {
                 .min()
                 .map(|t| t.elapsed()),
             backstop: s.backstop.map(|(_, r)| r),
-            busy: s.running || s.backstop.is_some() || !s.pending.is_empty(),
+            busy: s.running
+                || s.backstop.is_some()
+                || !s.pending.is_empty()
+                || !s.scoped_roots.is_empty(),
             uncovered: !s.gaps.is_empty(),
         }
+    }
+    /// Earliest time at which accumulated hints can be detached.
+    pub fn next_due(&self) -> Option<Instant> {
+        let s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if s.backstop.is_some() || !s.scoped_roots.is_empty() {
+            return Some(Instant::now());
+        }
+        let (Some(first), Some(last)) = (s.first, s.last) else {
+            return None;
+        };
+        Some((last + TRAILING).min(first + MAX_AGE))
+    }
+    /// Schedules a known local watch gap for scoped polling.
+    pub fn scoped_roots(&self, roots: Vec<PathBuf>) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scoped_roots
+            .extend(roots);
+    }
+    /// Roots whose watch coverage is incomplete or whose descriptor may have
+    /// multiple physical occurrences pending M5b's exact mapper.
+    pub fn polling_roots(&self, view: &Catalog) -> Vec<PathBuf> {
+        let s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let roots = s.gaps.union(&s.aliases).cloned().collect::<BTreeSet<_>>();
+        roots
+            .into_iter()
+            .filter(|root| view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()))
+            .collect()
     }
     /// Detaches at most one due burst. Loss markers bypass debounce; new
     /// arrivals are accumulated independently while the host observes this one.
@@ -504,6 +579,7 @@ impl Watch {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.running
             || (s.backstop.is_none()
+                && s.scoped_roots.is_empty()
                 && (s.pending.is_empty()
                     || s.last.is_some_and(|t| t.elapsed() < TRAILING)
                         && s.first.is_some_and(|t| t.elapsed() < MAX_AGE)))
@@ -517,6 +593,7 @@ impl Watch {
         Some(Burst {
             pending: std::mem::take(&mut s.pending),
             marker: s.backstop,
+            roots: std::mem::take(&mut s.scoped_roots),
         })
     }
     /// Acknowledges this watermark on success, or retains complete work after
@@ -616,19 +693,29 @@ impl Burst {
     /// bursts do not scan the entire watch set at each publication.
     pub fn reconcile_watches(&self) -> bool {
         self.marker.is_some()
+            || !self.roots.is_empty()
             || self.pending.iter().any(|((_, name), h)| {
                 h.subtree || matches!(name.as_slice(), b".git" | b".gitignore" | b".ferretignore")
             })
     }
     /// Loss/backstop reason associated with this detached watermark.
     pub fn reason(&self) -> RefreshReason {
-        self.marker.map_or(RefreshReason::Burst, |(_, r)| r)
+        if self.roots.is_empty() {
+            self.marker.map_or(RefreshReason::Burst, |(_, r)| r)
+        } else {
+            RefreshReason::Burst
+        }
     }
     /// Resolves parent/name locators in the current checked generation. Missing
     /// ancestry or changed root boundaries widen observation conservatively.
     pub fn request(&self, view: &Catalog) -> RefreshRequest {
-        let mut scopes = Vec::new();
-        let mut roots = BTreeSet::new();
+        let mut scopes = self
+            .roots
+            .iter()
+            .cloned()
+            .map(RefreshScope::Root)
+            .collect::<Vec<_>>();
+        let mut roots = self.roots.clone();
         let mut moves: BTreeMap<u32, MovePair> = BTreeMap::new();
         for ((_, name), hint) in &self.pending {
             if name.is_empty()
@@ -695,7 +782,9 @@ impl Burst {
             expected_generation: view.generation(),
             scopes,
             rename_hints,
-            reason: if changed_boundary {
+            reason: if !self.roots.is_empty() {
+                RefreshReason::Burst
+            } else if changed_boundary {
                 RefreshReason::Backstop
             } else {
                 self.reason()

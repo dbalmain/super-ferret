@@ -99,16 +99,46 @@ impl Tree {
             cmd.spawn()
                 .unwrap_or_else(|error| panic!("daemon spawn: {error:?}")),
         );
-        wait(|| {
-            self.socket()
-                .is_some_and(|p| UnixStream::connect(p).is_ok())
-        });
+        let until = Instant::now() + BOUND;
+        while self
+            .socket()
+            .is_none_or(|p| UnixStream::connect(p).is_err())
+        {
+            assert!(
+                Instant::now() < until,
+                "daemon did not bind: {}",
+                fs::read_to_string(self.base.join("daemon.log")).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn stop(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
             let _ = daemon.kill();
             let _ = daemon.wait();
         }
+    }
+    fn voluntary_switches(&self) -> u64 {
+        let pid = self
+            .daemon
+            .as_ref()
+            .map(Child::id)
+            .unwrap_or_else(|| panic!("daemon was not started"));
+        fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap_or_else(|error| panic!("read daemon tasks: {error}"))
+            .map(|task| {
+                let task = task.unwrap_or_else(|error| panic!("read daemon task entry: {error}"));
+                let status = fs::read_to_string(task.path().join("status"))
+                    .unwrap_or_else(|error| panic!("read daemon task status: {error}"));
+                status
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("voluntary_ctxt_switches:")
+                            .and_then(|value| value.trim().parse::<u64>().ok())
+                    })
+                    .unwrap_or(0)
+            })
+            .sum()
     }
     fn event(&self, request: &str) -> String {
         let stream = UnixStream::connect(self.socket().unwrap_or_else(|| panic!("socket")))
@@ -145,12 +175,18 @@ impl Tree {
         self.event("{\"id\":\"s\",\"op\":\"status\"}\n")
     }
     fn quiet(&self) {
-        wait(|| {
+        let until = Instant::now() + BOUND;
+        loop {
             let s = self.status();
-            s.contains("\"pending_scopes\":0")
+            if s.contains("\"pending_scopes\":0")
                 && s.contains("\"writer_busy\":false")
                 && !s.contains("\"last_complete_backstop\":null")
-        });
+            {
+                break;
+            }
+            assert!(Instant::now() < until, "daemon did not become quiet: {s}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fn oracle(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let oracle = self.base.join("oracle");
@@ -203,6 +239,22 @@ impl Tree {
     fn path(&self, name: &str) -> PathBuf {
         self.base.join(name)
     }
+}
+
+#[test]
+fn idle_daemon_blocks_without_waking_its_threads() {
+    let mut tree = Tree::new();
+    tree.start(&[("FERRET_POLL_MS", "300000")]);
+    std::thread::sleep(Duration::from_millis(250));
+    let before = tree.voluntary_switches();
+    std::thread::sleep(Duration::from_secs(2));
+    let after = tree.voluntary_switches();
+    let switches = after.saturating_sub(before);
+    eprintln!("idle daemon voluntary context switches in 2 seconds: {switches}");
+    assert!(
+        switches <= 20,
+        "idle daemon made {switches} voluntary context switches in 2 seconds"
+    );
 }
 impl Drop for Tree {
     fn drop(&mut self) {
@@ -373,6 +425,30 @@ fn watch_cap_reports_uncovered_and_polling_preserves_the_tree() {
     write(tree.path("src/left/deep/unwatched.txt"), "polled");
     tree.converges();
     assert!(tree.run(&["search", "original.txt"]).status.success());
+}
+
+#[test]
+fn polling_does_not_refresh_a_fully_covered_tree() {
+    let mut tree = Tree::new();
+    tree.start(&[("FERRET_POLL_MS", "500")]);
+    let status = tree.status();
+    let last = status
+        .split("\"last_successful_refresh\":")
+        .nth(1)
+        .and_then(|tail| tail.split([',', '}']).next())
+        .unwrap()
+        .to_owned();
+    std::thread::sleep(Duration::from_millis(2200));
+    let after = tree.status();
+    let last_after = after
+        .split("\"last_successful_refresh\":")
+        .nth(1)
+        .and_then(|tail| tail.split([',', '}']).next())
+        .unwrap();
+    assert_eq!(
+        last, last_after,
+        "covered roots were refreshed by polling: {after}"
+    );
 }
 
 #[test]
