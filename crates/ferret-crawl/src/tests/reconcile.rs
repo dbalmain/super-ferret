@@ -691,3 +691,63 @@ fn compact_equal_observation_joins_a_new_alias_before_conflict_resolution() {
     recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
     oracle(&tmp, &roots, &opts, &session.view());
 }
+
+#[test]
+fn reused_residue_alias_expansion_exhausts_the_input_guard() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::index::Hook;
+    use crate::index::Probe;
+
+    const ALIASES: usize = 2000;
+    let tmp = Tmp::new("recrawl-residue-alias-guard");
+    tmp.write("content", b"shared");
+    fs::create_dir(tmp.at("aaa")).unwrap();
+    for n in 0..ALIASES {
+        fs::hard_link(tmp.at("content"), tmp.at(&format!("aaa/link-{n:04}"))).unwrap();
+    }
+    tmp.write("m", b"trigger");
+    fs::create_dir(tmp.at("zzz")).unwrap();
+    let roots = [tmp.tree()];
+    let opts = IndexOptions {
+        workers: 1,
+        ..options()
+    };
+    index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
+    let mut session = super::log_session(&tmp.cat()).unwrap();
+    session.set_input_limits(ferret_catalog::InputLimits {
+        records: usize::MAX,
+        owned_bytes: 8192,
+    });
+    let changed = Arc::new(AtomicBool::new(false));
+    let tree = tmp.tree();
+    let hook = Hook::set(&tree, {
+        let tree = tree.clone();
+        let changed = Arc::clone(&changed);
+        move |probe| {
+            if let Probe::Carried(path) = probe
+                && path == Path::new("m")
+                && !changed.swap(true, Ordering::SeqCst)
+            {
+                // By now "aaa"'s 2000 equal hard-link names have already been
+                // lstat'd and matched against the old generation, well before
+                // this new alias (sharing the same inode, discovered only when
+                // "zzz" is listed later) can be observed. Expanding the
+                // compacted residue to keep conflict resolution correct must
+                // still be charged against the shared input guard.
+                fs::hard_link(tree.join("content"), tree.join("zzz/alias")).unwrap();
+            }
+        }
+    });
+    let result = recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
+    drop(hook);
+    assert!(changed.load(Ordering::SeqCst));
+    assert!(
+        result.input_fallback,
+        "unguarded alias-residue expansion must trip the shared input guard"
+    );
+    assert!(result.input_usage.exceeded);
+    assert!(result.input_usage.owned_bytes <= 8192);
+    oracle(&tmp, &roots, &opts, &session.view());
+}

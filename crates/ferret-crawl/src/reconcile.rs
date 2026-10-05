@@ -592,6 +592,7 @@ pub(crate) fn with_budget(
                 out.names.insert(name.0);
                 out.inodes.insert(child.0);
             } else {
+                out.budget.charge(1, std::mem::size_of::<File>())?;
                 files.push(File::Reused(b as u32, name.0));
             }
         }
