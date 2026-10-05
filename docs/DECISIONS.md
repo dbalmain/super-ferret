@@ -70,6 +70,7 @@ Predecessors, carried forward where still open:
 | D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
 | D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 | D54 | In-memory names: interning, postings, row order          | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                 |
+| D55 | Storing mtime as an order rather than a value          | open           | rec C: drop mtime nanoseconds; carry-over keyed on ctime                                                         |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2986,3 +2987,73 @@ order with BFS row postings, every output checked against the flat reference.
   2.4 ms against 3.3, and `libc.so.6` 0.46 ms against 2.3 today. B's speed-up
   over today is therefore 2–5× on selective names, not the brief's 3–10×. The
   100–150× from the term index is unchanged.
+
+## D55 — Storing mtime as an order rather than a value
+
+**Status: open.** Raised by Dave, 2026-10-05. Measured the same day with
+`scripts/mtime_columns.py` in the private `~/w/name-index-bench` (`8a93043`),
+over a live walk of `$HOME` (4.2M entries, unfiltered, so including ignored
+paths) and `/nix/store` (4.5M), rows in ferret's order: directories breadth
+first, then files, siblings by name.
+
+**Question:** Should the catalog store each inode's mtime as its rank in mtime
+order, rather than as a value, to save space and make newer-than and
+newest-first queries cheap?
+
+Dave's proposal: on disk, each inode holds its rank in mtime order. In memory,
+inodes are held in mtime order, in a structure that moves an inode to the top
+cheaply. An updated mtime is nearly always the newest, so only the last few
+seconds' actual values need keeping. `-newer file` finds the reference's rank
+and lists everything after it; sorting is free. An absolute time
+(`-mtime -1`, `-newermt DATE`) binary-searches the order, stating files on disk
+at each probe.
+
+What each encoding costs, in bits per row:
+
+| Encoding | `$HOME` | `/nix/store` |
+| --- | --- | --- |
+| Today: mtime seconds, 128-row blocked | 10.9 | 0.6 |
+| Today: mtime nanoseconds, blocked | 25.7 | 0.6 |
+| **Today: mtime total** | **36.6** | **1.2** |
+| Rank in mtime order | 23 | 23 |
+| Ordered dictionary of seconds (sorted distinct values + id per row) | 18 + 1.45 MB | 1 |
+| Today: ctime seconds / nanoseconds (for reference) | 8.5 / 27.1 | 5.0 / 27.3 |
+
+A rank is a permutation, so it is essentially incompressible at about
+log₂ N bits (24 at 10M) whatever the data. The blocked seconds column is cheap
+because siblings share times; on `/nix/store`, where every mtime is 1, it is
+nearly free and a rank costs 19× more. The saving available on `$HOME` is
+almost entirely the nanoseconds column.
+
+How find's time predicates are used, from the find-compat corpus (24,461
+`find` occurrences): `-mtime` 1,789, `-mmin` 1,234, `-newerXY` 1,207,
+`-newer file` 597, `-printf` with a time 230, `-ls` 211, ctime 170, atime 157.
+Absolute windows outnumber relative-to-a-file ones about 7 to 1.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep both mtime columns as they are | 36.6 b/row on `$HOME` (19.3 MB). | No work. Every time predicate and printed time answers from the index (D47). |
+| B. Rank in mtime order (Dave's proposal) | 23 b/row on disk everywhere; 19× today's on a tree of equal mtimes. In memory both directions are needed, inode → rank for filters and `-newer`, rank → inode for listing and sorting: ~46 b/row, above today's 36.6. New mtimes are often not the newest (`tar x`, `cp -p`, `rsync -a`, `unzip`, `curl -R`, `touch -d`; /nix/store's 4.5M equal mtimes), so the structure must insert anywhere and record ties, or newer-than returns tied files. Absolute queries, the common case, cost ~23 stats each: fast when warm, but it leaves the index (D47) and fails on files deleted, unreadable or on an unmounted drive, and an update mid-search needs handling. Printed times (`-printf %t`, `-ls`, `--json` mtime) cost a stat per result. | Newest-first and `-newer file` in O(results) with no scan. The rank needs no frame of reference and no nanoseconds. |
+| C. Drop the mtime nanoseconds column; key carry-over on ctime | Sub-second mtime is gone from the index: a printed mtime has whole seconds unless the result is stated, and `-newer file` must stat files whose mtime falls in the reference's second to break that tie (find compares full timestamps). D26's carry-over key becomes `(dev, ino, size, ctime)`. | −25.7 b/row on `$HOME` (−70% of mtime's cost, against B's −37%), every predicate still answered from the index. The key loses nothing: any change to mtime, by a write or by `utimensat`, sets ctime to the current time, which userspace cannot set, so a matching ctime implies a matching mtime. |
+
+With C, a per-block minimum and maximum, already implied by each blocked
+column's base and width, lets newest-first and narrow windows skip blocks; the
+in-memory overlay of changes since compaction already holds the newest inodes.
+That is a scan optimisation for S1b, not part of this decision.
+
+**Recommendation:** C. B saves less than C on a typical tree and costs more on a
+tree of equal times. It costs more in memory, and it answers the common
+absolute-time query worst of the three. Its real strength is newest-first,
+which C plus block skipping covers at a few milliseconds. Fastest and simplest
+agree here.
+
+**Fact that would change it:** agent query logs showing newest-N and
+`-newer file` dominating absolute windows, with printed times rare, would favour
+B for speed. B's premise, that new values always arrive at the top, does hold
+for ctime. A filesystem ferret indexes whose ctime is not reliably updated on
+mtime changes (some FUSE mounts) would make C's carry-over key unsafe there,
+and those roots would keep the nanoseconds.
+
+Not part of this brief: ctime nanoseconds, at ~27 b/row, would become the
+largest time column. Carry-over only ever compares it for equality, so whether
+a short fingerprint suffices is a separate question.
