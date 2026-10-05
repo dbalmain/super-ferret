@@ -70,7 +70,7 @@ Predecessors, carried forward where still open:
 | D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
 | D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 | D54 | In-memory names: interning, postings, row order          | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                 |
-| D55 | Storing mtime as an order rather than a value          | open           | rec D + F: blocked ordered dictionaries of seconds for mtime and ctime; racy rule for carry-over              |
+| D55 | Storing mtime as an order rather than a value          | open           | rec D + F, D with an exact per-block max; time bench: no ordered structure earns its memory                   |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3178,3 +3178,44 @@ CPU or adds material end-to-end latency on the real agent workload, with a
 binary prototype reducing that cost enough to justify a second protocol. A
 large synthetic listing alone is useful evidence, not evidence that most agent
 queries have that shape.
+
+**Time bench (2026-10-05, private `~/w/time-index-bench` `804e592`,
+github.com/dbalmain/time-index-bench):** Rust, run by an Opus 5.5 subagent and
+spot-checked here. Load, per-event update, compaction and query costs for
+eight in-memory mtime structures under simulated events (single edits, a hot
+set, archive extracts with old mtimes, `npm install` ties, cargo build/clean,
+git checkout, `cp -p` restores, future mtimes, `rm -rf`, a mixed day), on
+`$HOME`, `/nix/store` and `$HOME` tiled ×22 (10.1M rows). Every answer is
+checked against a brute-force reference after every scenario, and a positive
+control proves the check catches a non-strict `-newer`, an ignored overlay and
+wrong tie order.
+
+| At 10M | b/row | `-mmin -5` | `-mtime -365` (5.6M hits) | newest 20 | update p99, single edit | compaction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| today's columns (sec + ns) | 44.7 | 5.5 ms | 8.0 ms | | | 265–297 ms |
+| C, seconds column | 14.1 | | | | | 97–132 ms |
+| D with block skipping | 11.6 | 1.03 ms | 6.45 ms | 2.65 ms | ~0.57 µs | 148–192 ms |
+| **D with an exact max per block** | **11.8** | **0.70 ms** | **6.0 ms** | **0.42 ms** | ~0.57 µs | 148–192 ms |
+| D + sorted permutation | 35.6 | 1 µs | 6.5 ms | 1.4 µs | ~0.57 µs | 282–329 ms |
+| D + binary heap | 75.6 | | ~230 ms | | 2.8 µs | 183–230 ms |
+| B-tree | 157.0 | 1 µs | 28 ms | | 2.0 µs | 346–385 ms |
+
+- No ordered structure earns its memory. The sorted permutation turns
+  selective windows and newest-k from sub-millisecond into microseconds for
+  +24 b/row (3× D's total) and 153 ms to build at load; the heap only answers
+  newest-k; the B-tree is 13× D's memory. Keeping any of them current is
+  cheap in CPU (microseconds per event); the cost is memory. Heap and B-tree
+  still pay at compaction, because renumbering InoIds relabels every id-keyed
+  order.
+- An exact maximum per block costs 0.25 b/row and gets the cheap part of the
+  permutation's win (newest 20: 2.65 → 0.42 ms).
+- D's base is 10.6 b/row at 10M against the 8.4 estimated above: ~0.44 is
+  ferret's 16 B block-table entry, the rest the tiled corpus's 27× distinct
+  seconds.
+- Combining with a name side, choosing between scanning the time column and
+  probing it per name-side id matters more than the structure: a probe costs
+  ~11 ns per id with D (~5 ns with the plain seconds column), and the
+  crossover at 10M is a name side of ~50–100k ids.
+- Block skipping weakens after compaction scatters recent edits (the bench
+  scatters them uniformly, which is pessimistic): `-mtime -1` 2.0 → 5.0 ms,
+  newest 20 0.42 → 2.3 ms. A real edit trace would settle how much.
