@@ -1246,6 +1246,18 @@ fn battery_paused_startup_drains_without_a_writer_command() {
     wait(|| !socket.exists() && exited(&tree, pid));
 }
 
+/// User plus system CPU ticks consumed by a process, from /proc.
+fn cpu_ticks(pid: u32) -> u64 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
 #[test]
 #[cfg(debug_assertions)]
 fn loading_blocks_expired_idle_deadline_without_spinning() {
@@ -1259,16 +1271,7 @@ fn loading_blocks_expired_idle_deadline_without_spinning() {
             ("FERRET_DAEMON_LOAD_DELAY_MS", "3000"),
         ],
     );
-    let ticks = || {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let fields: Vec<_> = stat
-            .rsplit_once(')')
-            .unwrap()
-            .1
-            .split_whitespace()
-            .collect();
-        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
-    };
+    let ticks = || cpu_ticks(pid);
     let mut loading = BufReader::new(UnixStream::connect(tree.socket()).unwrap());
     loading.get_ref().set_read_timeout(Some(BOUND)).unwrap();
     assert!(line(&mut loading).contains("\"state\":\"loading\""));
@@ -1345,4 +1348,34 @@ fn oversized_read_only_requests_answer_locally_without_reaching_or_starting_a_da
         !log.contains("\"host\":\"socket\""),
         "an oversized search reached the daemon: {log}"
     );
+}
+
+#[test]
+fn draining_writer_waits_for_a_message_past_expired_background_deadlines() {
+    // Drain forbids background work, so the writer used to spin on a zero
+    // timeout once a poll deadline expired while a query kept drain open.
+    let tree = Tree::new();
+    let pid = tree.start(&[("FERRET_POLL_MS", "50")]);
+    let socket = tree.socket();
+    let mut active = begin_large(&tree);
+    let (mut control, _) = tree.connect();
+    control
+        .get_mut()
+        .write_all(b"{\"op\":\"drain\"}\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let before = cpu_ticks(pid);
+    std::thread::sleep(Duration::from_millis(500));
+    let consumed = cpu_ticks(pid) - before;
+    assert!(
+        consumed <= 2,
+        "draining daemon consumed {consumed} CPU ticks"
+    );
+    loop {
+        if line(&mut active).contains("\"event\":\"end\"") {
+            break;
+        }
+    }
+    drop(active);
+    wait(|| !socket.exists() && exited(&tree, pid));
 }

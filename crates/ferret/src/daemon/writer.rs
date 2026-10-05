@@ -207,7 +207,21 @@ fn serve(
         {
             deadline = deadline.min(due);
         }
-        let message = receive.recv_timeout(deadline.saturating_duration_since(now));
+        let draining = host
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .draining;
+        // Drain forbids background work, so its deadlines never advance and
+        // an expired one would spin until stop. Only a command or the stop
+        // intake can change anything.
+        let message = if draining {
+            receive
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            receive.recv_timeout(deadline.saturating_duration_since(now))
+        };
         match message {
             Ok(Message::Command(command)) => {
                 let mut command_options = options.clone();
