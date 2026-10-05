@@ -70,7 +70,7 @@ Predecessors, carried forward where still open:
 | D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
 | D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
 | D54 | In-memory names: interning, postings, row order          | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                 |
-| D55 | Storing mtime as an order rather than a value          | open           | rec D: blocked ordered dictionary of seconds, mtime ns dropped; same coding for ctime (sec, ns)                 |
+| D55 | Storing mtime as an order rather than a value          | open           | rec D + F: blocked ordered dictionaries of seconds for mtime and ctime; racy rule for carry-over              |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -2991,12 +2991,13 @@ order with BFS row postings, every output checked against the flat reference.
 ## D55 — Storing mtime as an order rather than a value
 
 **Status: open.** Raised by Dave, 2026-10-05. Measured the same day with
-`scripts/mtime_columns.py` in the private `~/w/name-index-bench` (`ebc170b`), over a live walk of `$HOME` (4.2M entries, unfiltered, so
+`scripts/mtime_columns.py` in the private `~/w/name-index-bench` (`d543475`), over a live walk of `$HOME` (4.2M entries, unfiltered, so
 including ignored paths) and `/nix/store` (4.5M), rows in ferret's order:
 directories breadth first, then files, siblings by name. **Revised the same
 day:** the first draft sized ranks as a plain permutation, 23 b/row; Dave
 pointed out they deserve the same blocked packing as the seconds, and packed
-that way they cost 13.2 b/row on `$HOME`. Options D and E come from that.
+that way they cost 13.2 b/row on `$HOME`. Options D and E come from that, and
+F from asking why ctime kept its nanoseconds.
 
 **Question:** Should the catalog store each inode's mtime as its rank in mtime
 order, rather than as a value, to save space and make time queries cheap?
@@ -3028,6 +3029,7 @@ What each encoding costs, in bits per row:
 | Dense rank over (sec, ns), blocked, + sorted distinct (sec, ns) | 13.2 + 14.7 = **27.9** | 0.6 + 0.0 = **0.6** |
 | Today: ctime seconds + nanoseconds, each blocked | 8.5 + 27.1 = 35.6 | 5.0 + 27.3 = 32.3 |
 | ctime: dense rank over (sec, ns) + sorted distinct (sec, ns) | 12.1 + 13.7 = 25.8 | 8.8 + 0.6 = 9.4 |
+| ctime: dense rank over seconds + sorted distinct seconds | 6.5 + 0.3 = 6.8 | 2.9 + 0.0 = 2.9 |
 
 How find's time predicates are used, from the find-compat corpus (24,461
 `find` occurrences): `-mtime` 1,789, `-mmin` 1,234, `-newerXY` 1,207,
@@ -3051,16 +3053,35 @@ ids, though correctness does not depend on that.
 | D. C, with seconds coded as a blocked ordered dictionary | 8.4 b/row on `$HOME`, 0.6 on nix. C's costs, plus a new column coding (sorted delta-packed table, blocked ids) and an indirection to print a time. | −77% on `$HOME`; exact seconds; every predicate from the index. |
 | E. Blocked ordered dictionary over full (sec, ns) | 27.9 b/row on `$HOME`, 0.6 on nix. The new coding, as D. | −24% with no semantic change: exact sub-second times, carry-over untouched, `-newer` needs no stat. |
 
-The same coding applies to ctime, which carry-over compares exactly: E's coding
-takes ctime from 35.6 to 25.8 b/row on `$HOME` and from 32.3 to 9.4 on nix.
+The same coding applies to ctime. Under C and D, ctime is carry-over's only
+test that a file changed since it was hashed, and the question is whether it
+needs its nanoseconds:
+
+- **Why keep them:** a file written again in the same second it was stated
+  and hashed, at the same size, matches `(dev, ino, size, ctime)` in whole
+  seconds. Its old hash would be carried over and stay wrong until the next
+  change. This is git's racy-index problem; nanoseconds make the collision
+  practically impossible.
+- **Git's fix needs no nanoseconds:** a file whose ctime second is not before
+  the second it was observed has an untrusted hash. It is recorded stale and
+  rehashed at the next crawl. That is one check at observation and no stored
+  field. The stat bracket around each read (`ferret-crawl` `observe.rs`
+  `bracket`) is unaffected: it compares two fresh stats in memory, at full
+  precision.
+
+| ctime option | ctime b/row, `$HOME` / nix | Costs | Buys |
+| --- | --- | --- | --- |
+| E. Ordered dictionary over (sec, ns) | 25.8 / 9.4 (today 35.6 / 32.3) | The new coding. | Carry-over exactly as today. |
+| F. Ordered dictionary over seconds, plus the racy rule | 6.8 / 2.9 | One check when a file is observed; files written in the second before observation are rehashed at the next crawl. A network filesystem whose clock lags ours could stamp a later write with an earlier second and slip past the rule; treating ctime within a few seconds of the observation as racy covers modest skew for a few more rehashes. | −81% on `$HOME`, −91% on nix against today. |
 
 Per-block minimum and maximum, implied by each block's base and width, let
 newest-first and narrow windows skip blocks under any of these. That is a scan
 optimisation for S1b, not part of this decision.
 
-**Recommendation:** D for mtime, and E's coding for ctime. Together the time
-columns go from 72.2 to 34.2 b/row on `$HOME` (−53%) and from 33.5 to 10.0 on
-nix (−70%), with every query still answered from the index. B gets most of
+**Recommendation:** D for mtime and F for ctime. Together the time columns go
+from 72.2 to 15.2 b/row on `$HOME` (−79%) and from 33.5 to 3.5 on nix (−90%),
+with every query still answered from the index. (D with E for ctime: 34.2 and
+10.0.) B gets most of
 D's space saving but none of its values, and its speed edge (newest-first) is
 the case block skipping covers.
 
@@ -3069,4 +3090,5 @@ anything matters more than ~19.5 b/row on `$HOME`, take E for mtime as well.
 Agent query logs dominated by newest-N with printed times rare would favour B.
 A filesystem ferret indexes whose ctime is not reliably updated on mtime
 changes (some FUSE mounts) would make the ctime-only carry-over key unsafe
-there; those roots would need E.
+there; those roots would need E for mtime. Indexing network mounts with
+badly skewed clocks would favour E for ctime on those roots.
