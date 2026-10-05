@@ -403,7 +403,7 @@ the winner. Under that lock, remove a stale socket only after failing to
 connect. The writer lock remains a separate catalog lock.
 
 Hello distinguishes missing, loading and ready from protocol/version errors. A
-starting daemon can acknowledge loading without blocking the event loop. Give
+starting daemon can acknowledge loading without blocking the event loop.
 If spawning is denied, fall back to a batch-of-one engine in process.
 `FERRET_NO_DAEMON` bypasses connection and spawn. Runtime-directory failures,
 sandboxes, incompatible filesystem context and unreachable sockets fall back
@@ -419,9 +419,12 @@ explicitly enabled unit stays resident; disable its idle timeout to avoid
 restart loops. On exit, finish a started durable publication, release watches
 and locks and unlink only this host's socket under the endpoint lock. Restart
 always re-arms watches and schedules a complete backstop for the downtime gap.
-A timed retry or not-yet-due debounced hint does not block idle exit: restart
-re-arms watches and runs a complete backstop, so dropped delayed work is
-recovered.
+Writer activity is scoped to loading or an executing operation. Battery-paused
+startup work does not block idle exit or drain. When an executing operation
+blocks an expired idle deadline, the listener waits for a lifecycle notification
+without polling. A timed retry or not-yet-due debounced hint does not block idle
+exit: restart re-arms watches and runs a complete backstop, so dropped delayed
+work is recovered.
 
 Protocol majors must match; minors negotiate capabilities. M4 conservatively
 drains on any build or catalog-format mismatch; it does not try to certify
@@ -463,7 +466,9 @@ Control envelopes are `{"op":"cancel"}` and `{"op":"drain"}`. A bounded
 reader per connection receives controls during blocking output. Cancel or
 hangup latches cancellation and shuts down the socket to wake a blocked writer;
 no end is fabricated for a partially transmitted frame. Drain closes admission
-and finishes active queries, including one on the control connection. Query
+and broadcasts to all connection handlers: idle persistent connections close
+promptly, and active queries finish, including one on the control connection.
+Loading admission waiters also wake on drain. Query
 execution catches unwinding panics (find workers wake their siblings on unwind) and emits a typed `RuntimeError` end; release
 and development profiles retain unwinding, enforced by a compile-time guard. Engine pins and event writes happen
 outside the selection lock, and poisoned locks recover checked immutable state.
@@ -471,7 +476,9 @@ There are at most 32 connections and `min(4, CPUs)` admitted queries, with at
 most `min(16, CPUs)` total query worker permits.
 
 `FERRET_DAEMON_STARTUP_MS` bounds singleton lock acquisition and draining an
-incompatible daemon (default 10000); it is not a query ready wait.
+incompatible daemon (default 10000). It also bounds a writer command waiting
+for an observed owner to become ready; ordinary queries answer locally during
+loading.
 `FERRET_DAEMON_IDLE_MS` or `--idle-ms` sets idle exit (default 900000, zero
 means disabled). `FERRET_DAEMON_BIN` overrides the sibling `ferretd` used for
 spawn. Diagnostic output goes to the private endpoint `.log`. Debug builds also
@@ -501,7 +508,13 @@ publication; a remote index is not an inotify hint. Extend the session root-edit
 seam where today's `index_change` would otherwise open a second lock. A
 foreground no-daemon writer encountering a daemon-owned lock fails with
 owner/status advice; it does not silently stop the daemon or wait indefinitely.
-A query-only fallback needs no writer lock.
+Once a writer command connects to an owner, loading/ready handshake failures
+never fall back to direct ownership. Loading is bounded by
+`FERRET_DAEMON_STARTUP_MS`; timeout returns the typed `OwnerTimeout` error with
+status/retry advice, without submitting the command. Other observed-owner
+failures also return an explicit error. Only absence of an owner (or an explicit
+`FERRET_NO_DAEMON` bypass) permits direct indexing. The user can retry after
+loading completes. A query-only fallback needs no writer lock.
 
 Maintain a single writer queue with root/policy commands as ordering barriers.
 Queries continue on the last checked view while these commands run. After

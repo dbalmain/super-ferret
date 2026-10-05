@@ -44,6 +44,28 @@ pub(super) struct Status {
     pub fallback_backstop: bool,
     pub retained_roots: std::collections::BTreeSet<PathBuf>,
 }
+struct Operation<'a>(&'a Host);
+impl<'a> Operation<'a> {
+    fn start(host: &'a Host, name: &'static str) -> Self {
+        host.writer_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .operation = Some(name);
+        host.writer_running.store(true, Ordering::Release);
+        Self(host)
+    }
+}
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        self.0
+            .writer_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .operation = None;
+        self.0.writer_running.store(false, Ordering::Release);
+        super::wake_listener(self.0);
+    }
+}
 fn timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -96,7 +118,7 @@ pub(super) fn start(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .error = Some(error);
         host.writer_pending.store(0, Ordering::Release);
-        host.writer_running.store(false, Ordering::Release);
+        super::wake_listener(&host);
     })
 }
 fn serve(
@@ -104,6 +126,7 @@ fn serve(
     receive: mpsc::Receiver<Message>,
     scheduler: Arc<crate::scheduler::Scheduler>,
 ) -> io::Result<()> {
+    let loading = Operation::start(host, "loading");
     #[cfg(debug_assertions)]
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
     let session = WriterSession::open(&host.index).map_err(io::Error::other)?;
@@ -136,6 +159,7 @@ fn serve(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Loaded::Ready(engine.clone());
     host.engine_ready.notify_all();
+    drop(loading);
     if let Some(watch) = &watch {
         let watch = watch.clone();
         let send = host.writer_send.clone();
@@ -189,15 +213,14 @@ fn serve(
                 let mut command_options = options.clone();
                 command_options.workers = scheduler.configured_workers();
                 command_options.bulk = Some(scheduler.command_control());
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .operation = Some(if command.request.op == Op::Index {
-                    "index"
-                } else {
-                    "roots-remove"
-                });
-                host.writer_running.store(true, Ordering::Release);
+                let _operation = Operation::start(
+                    host,
+                    if command.request.op == Op::Index {
+                        "index"
+                    } else {
+                        "roots-remove"
+                    },
+                );
                 #[cfg(debug_assertions)]
                 std::thread::sleep(duration("FERRET_WRITER_TEST_COMMAND_DELAY_MS", 0));
                 // The first argv item is the originating client's rules. Paths
@@ -310,12 +333,6 @@ fn serve(
                 // and watch adoption finish before the next command begins.
                 let _ = command.reply.send(result);
                 host.writer_pending.fetch_sub(1, Ordering::AcqRel);
-                host.writer_status
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .operation = None;
-                host.writer_running.store(false, Ordering::Release);
-                super::wake_listener(host);
                 continue;
             }
             Ok(Message::Intake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -392,11 +409,7 @@ fn serve(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .blocked = None;
         }
-        host.writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .operation = Some("refresh");
-        host.writer_running.store(true, Ordering::Release);
+        let _operation = Operation::start(host, "refresh");
         #[cfg(debug_assertions)]
         std::thread::sleep(duration("FERRET_WATCH_TEST_REFRESH_DELAY_MS", 0));
         global_inputs(watch.as_ref(), &engine, &context);
@@ -502,12 +515,6 @@ fn serve(
                 watch.finish(burst, result.is_ok() && !retry_current);
             }
         }
-        host.writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .operation = None;
-        host.writer_running.store(false, Ordering::Release);
-        super::wake_listener(host);
     }
     Ok(())
 }
@@ -538,7 +545,14 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
     status.fallback_backstop = false;
 }
 pub(super) fn busy(host: &Host) -> bool {
-    host.writer_running.load(Ordering::Acquire) || host.writer_pending.load(Ordering::Acquire) != 0
+    matches!(
+        *host
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        Loaded::Loading
+    ) || host.writer_running.load(Ordering::Acquire)
+        || host.writer_pending.load(Ordering::Acquire) != 0
 }
 pub(super) fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
     let (reply, receive) = mpsc::sync_channel(1);

@@ -115,6 +115,8 @@ fn deferred_writer(reason: Blocked) {
         lifecycle: Mutex::new(Lifecycle {
             draining: false,
             queries: 0,
+            connections: std::collections::BTreeMap::new(),
+            next_connection: 0,
         }),
         lifecycle_changed: Condvar::new(),
         clients: AtomicUsize::new(0),

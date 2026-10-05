@@ -40,6 +40,8 @@ const CLIENTS: usize = 32;
 struct Lifecycle {
     draining: bool,
     queries: usize,
+    connections: std::collections::BTreeMap<usize, mpsc::SyncSender<ClientMessage>>,
+    next_connection: usize,
 }
 enum Loaded {
     Loading,
@@ -176,6 +178,8 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         lifecycle: Mutex::new(Lifecycle {
             draining: false,
             queries: 0,
+            connections: std::collections::BTreeMap::new(),
+            next_connection: 0,
         }),
         lifecycle_changed: Condvar::new(),
         clients: AtomicUsize::new(0),
@@ -188,7 +192,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         format: advertised_format(),
         writer_send,
         writer_status: Mutex::new(writer::Status::default()),
-        writer_running: AtomicBool::new(true),
+        writer_running: AtomicBool::new(false),
         writer_pending: AtomicUsize::new(0),
         stop: AtomicBool::new(false),
         workers: ferret_crawl::default_workers().min(16)
@@ -207,15 +211,14 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         if clients != 0 {
             idle_since = Instant::now();
         }
-        if (draining
-            && clients == 0
-            && !host.writer_running.load(Ordering::Acquire)
-            && host.writer_pending.load(Ordering::Acquire) == 0)
+        if (draining && clients == 0 && !busy)
             || (!idle.is_zero() && clients == 0 && !busy && idle_since.elapsed() >= idle)
         {
             break;
         }
-        let event = if idle.is_zero() {
+        // Once work blocks an expired deadline, its completion notification
+        // supplies the next wakeup; a zero timeout would spin.
+        let event = if idle.is_zero() || clients != 0 || (busy && idle_since.elapsed() >= idle) {
             server_receive
                 .recv()
                 .map_err(|_| io::Error::other("accept loop stopped"))?
@@ -442,10 +445,53 @@ fn pin(host: &Host) -> io::Result<QuerySession> {
     }
     Ok(engine.pin())
 }
+struct ConnectionRegistration<'a>(&'a Host, usize);
+impl Drop for ConnectionRegistration<'_> {
+    fn drop(&mut self) {
+        self.0
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connections
+            .remove(&self.1);
+    }
+}
+fn drain(host: &Host) {
+    // Match the engine -> lifecycle lock order used by cancellation and the
+    // loading waiter, so drain cannot be lost between its check and wait.
+    let _loaded = host
+        .engine
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = host
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.draining = true;
+    for send in state.connections.values() {
+        let _ = send.try_send(ClientMessage::Wake);
+    }
+    host.engine_ready.notify_all();
+    host.lifecycle_changed.notify_all();
+    wake_listener(host);
+}
 fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let destination = Destination::socket(stream.try_clone()?, cancelled.clone())?;
     let (send, receive) = mpsc::sync_channel(1);
+    let _registration = {
+        let mut state = host
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.draining {
+            return Ok(());
+        }
+        let id = state.next_connection;
+        state.next_connection += 1;
+        state.connections.insert(id, send.clone());
+        ConnectionRegistration(host, id)
+    };
     let input = stream.try_clone()?;
     let reader_host = host.clone();
     let reader_cancel = cancelled.clone();
@@ -477,14 +523,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                     break;
                 }
                 Some("drain") => {
-                    reader_host
-                        .lifecycle
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .draining = true;
-                    reader_host.lifecycle_changed.notify_all();
-                    let _ = send.try_send(ClientMessage::Wake);
-                    wake_listener(&reader_host);
+                    drain(&reader_host);
                 }
                 _ => {
                     if send.try_send(ClientMessage::Line(line.clone())).is_err() {
@@ -494,6 +533,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
             }
         }
         cancel(&reader_host, &reader_cancel);
+        let _ = send.try_send(ClientMessage::Wake);
         // Wake a blocked writer on hangup/cancel; a partial frame is a broken
         // transport and cannot be followed by a fabricated successful end.
         let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
@@ -504,13 +544,26 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                 .engine
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while matches!(*loaded, Loaded::Loading) && !cancelled.load(Ordering::Acquire) {
+            while matches!(*loaded, Loaded::Loading)
+                && !cancelled.load(Ordering::Acquire)
+                && !host
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .draining
+            {
                 loaded = host
                     .engine_ready
                     .wait(loaded)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            if cancelled.load(Ordering::Acquire) {
+            if cancelled.load(Ordering::Acquire)
+                || host
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .draining
+            {
                 return Ok(());
             }
             drop(loaded);

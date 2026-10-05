@@ -128,11 +128,45 @@ fn event(reader: &mut BufReader<UnixStream>, line: &mut Vec<u8>) -> io::Result<V
     protocol::parse_object(line)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon event"))
 }
+enum ConnectError {
+    NoOwner(io::Error),
+    Owner(io::Error),
+    OwnerTimeout,
+}
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoOwner(error) | Self::Owner(error) => error.fmt(f),
+            Self::OwnerTimeout => f.write_str("daemon owner did not become ready before the startup deadline; it may still be loading or draining; check ferret status --json and retry"),
+        }
+    }
+}
 fn connect(
     endpoint: &Endpoint,
     index: &Path,
     can_spawn: bool,
     writer: bool,
+) -> Result<BufReader<UnixStream>, ConnectError> {
+    let mut observed_owner = false;
+    connect_owner(endpoint, index, can_spawn, writer, &mut observed_owner).map_err(|error| {
+        if !observed_owner {
+            ConnectError::NoOwner(error)
+        } else if matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) {
+            ConnectError::OwnerTimeout
+        } else {
+            ConnectError::Owner(error)
+        }
+    })
+}
+fn connect_owner(
+    endpoint: &Endpoint,
+    index: &Path,
+    can_spawn: bool,
+    writer: bool,
+    observed_owner: &mut bool,
 ) -> io::Result<BufReader<UnixStream>> {
     let incarnation = ferret_catalog::Catalog::open(index)
         .ok()
@@ -163,6 +197,7 @@ fn connect(
         });
         match connected {
             Ok(stream) => {
+                *observed_owner = true;
                 stream.set_read_timeout(Some(
                     until
                         .saturating_duration_since(Instant::now())
@@ -227,7 +262,7 @@ fn connect(
                     _ => return Err(io::Error::other("daemon could not open the catalog")),
                 }
             }
-            Err(error) if !can_spawn => return Err(error),
+            Err(error) if !can_spawn || *observed_owner && writer => return Err(error),
             Err(_) => {
                 spawn(endpoint, index)?;
                 return Err(io::Error::new(
@@ -293,37 +328,41 @@ fn query(
     }
     let index = fs::canonicalize(index).ok()?;
     let endpoint = Endpoint::open(&index).ok()?;
-    let mut reader = connect(
-        &endpoint,
-        &index,
-        matches!(op, "search" | "find"),
-        matches!(op, "index" | "roots-remove"),
-    )
-    .ok()?;
-    let cwd = std::env::current_dir().ok()?;
-    let mut request = Vec::new();
-    let mut object = Object::new(&mut request);
-    object
-        .str("id", op)
-        .str("op", op)
-        .byte_strings("args", args.iter().map(|s| s.as_bytes()))
-        .opt_int("limit", limit)
-        .int(
-            "start_unix_ns",
-            now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos() as u64,
-        )
-        .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
-    object.end();
-    if protocol::parse_request(&request).is_err() {
-        return None;
-    }
-    request.push(b'\n');
+    let writer = matches!(op, "index" | "roots-remove");
+    let mut reader = match connect(&endpoint, &index, matches!(op, "search" | "find"), writer) {
+        Ok(reader) => reader,
+        Err(ConnectError::NoOwner(_)) => return None,
+        Err(error) if writer => {
+            cli::error(&format!("writer command: {error}"));
+            return Some(Exit::Error);
+        }
+        Err(_) => return None,
+    };
     let mut first_row = None;
     let mut summary = None;
     let mut rows = 0u64;
     let mut output_failure = false;
     let mut first_frame = true;
     let result = (|| -> io::Result<Exit> {
+        let cwd = std::env::current_dir()?;
+        let mut request = Vec::new();
+        let mut object = Object::new(&mut request);
+        object
+            .str("id", op)
+            .str("op", op)
+            .byte_strings("args", args.iter().map(|s| s.as_bytes()))
+            .opt_int("limit", limit)
+            .int(
+                "start_unix_ns",
+                now.duration_since(SystemTime::UNIX_EPOCH)
+                    .map_err(io::Error::other)?
+                    .as_nanos() as u64,
+            )
+            .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
+        object.end();
+        protocol::parse_request(&request)
+            .map_err(|error| io::Error::other(error.kind.to_string()))?;
+        request.push(b'\n');
         reader.get_mut().write_all(&request)?;
         let mut line = Vec::new();
         let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());

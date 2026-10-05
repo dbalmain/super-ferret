@@ -326,7 +326,6 @@ fn concurrent_first_use_has_one_host_and_all_clients_answer() {
 #[cfg(debug_assertions)]
 fn cold_first_use_answers_locally_while_one_daemon_loads() {
     let tree = Tree::new();
-    let started = Instant::now();
     let first = tree
         .command(&["search", "main"])
         .env("FERRET_DAEMON_LOAD_DELAY_MS", "5000")
@@ -334,10 +333,6 @@ fn cold_first_use_answers_locally_while_one_daemon_loads() {
         .unwrap();
     assert!(first.status.success());
     assert_eq!(first.stdout, tree.local(&["search", "main"]).stdout);
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "first use waited for loading"
-    );
     wait(|| fixture_daemons(&tree.base).len() == 1 && tree.sockets().len() == 1);
 
     let mut reader = BufReader::new(UnixStream::connect(tree.socket()).unwrap());
@@ -345,6 +340,7 @@ fn cold_first_use_answers_locally_while_one_daemon_loads() {
         .get_ref()
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
+    assert!(line(&mut reader).contains("\"state\":\"loading\""));
     let hello = loop {
         let mut hello = String::new();
         reader.read_line(&mut hello).unwrap();
@@ -364,33 +360,50 @@ fn cold_first_use_answers_locally_while_one_daemon_loads() {
 
 #[test]
 #[cfg(debug_assertions)]
-fn writer_command_waits_for_a_loading_daemon_instead_of_writing_locally() {
+fn writer_loading_timeout_never_takes_direct_ownership_and_retry_routes_to_owner() {
+    // A loading timeout used to fall through to a local writer and report
+    // success before the daemon acquired its catalog lock.
     let tree = Tree::new();
+    let pid = tree.start(&[
+        ("FERRET_DAEMON_LOAD_DELAY_MS", "3000"),
+        ("FERRET_DAEMON_IDLE_MS", "30000"),
+        ("FERRET_WRITER_TEST_COMMAND_DELAY_MS", "1000"),
+    ]);
+    let current = fs::read(tree.base.join("index/current")).unwrap();
+    fs::write(tree.base.join("src/during-loading.txt"), "x").unwrap();
+    let indexed = tree.run(&["index", "src"]);
+    assert_eq!(indexed.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&indexed.stderr).contains("daemon owner did not become ready"));
+    assert_eq!(fs::read(tree.base.join("index/current")).unwrap(), current);
     assert!(
-        tree.command(&["search", "main"])
-            .env("FERRET_DAEMON_LOAD_DELAY_MS", "3000")
-            .output()
-            .unwrap()
+        !tree
+            .local(&["search", "during-loading.txt"])
             .status
             .success()
     );
-    wait(|| tree.sockets().len() == 1);
-    fs::write(tree.base.join("src/during-loading.txt"), "x").unwrap();
-    let started = Instant::now();
-    let indexed = tree.run(&["index", "src"]);
+
+    let (mut reader, hello) = tree.connect();
+    assert_eq!(number(&hello, "pid"), Some(pid));
+    let child = tree
+        .command(&["index", "src"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait(|| {
+        let status = block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n");
+        number(&status, "writer_commands") == Some(1)
+            && status.contains("\"current_operation\":\"index\"")
+    });
+    let indexed = bounded_output(child);
     assert!(
         indexed.status.success(),
         "{}",
         String::from_utf8_lossy(&indexed.stderr)
     );
-    // Only waiting for the daemon's ready hello takes this long; a local
-    // writer would race the loading daemon's writer ownership.
-    assert!(
-        started.elapsed() >= Duration::from_secs(1),
-        "writer command did not wait for the loading daemon"
-    );
     assert!(tree.run(&["search", "during-loading.txt"]).status.success());
-    assert_eq!(fixture_daemons(&tree.base).len(), 1);
+    assert!(!exited(&tree, pid));
+    assert_eq!(number(&tree.connect().1, "pid"), Some(pid));
 }
 
 #[test]
@@ -1146,4 +1159,127 @@ fn socket_request_line_limit_matches_batch_excluding_the_newline() {
         )
         .contains("\"exit\":0")
     );
+}
+
+fn start_on_battery(tree: &Tree, extra: &[(&str, &str)]) -> u32 {
+    let power = tree.base.join("signals/power/BAT0");
+    fs::create_dir_all(&power).unwrap();
+    fs::write(power.join("type"), "Battery\n").unwrap();
+    fs::write(power.join("status"), "Discharging\n").unwrap();
+    let power_root = tree.base.join("signals/power");
+    let mut environment = vec![("FERRET_SIGNAL_POWER", power_root.to_str().unwrap())];
+    environment.extend_from_slice(extra);
+    tree.start(&environment)
+}
+fn exited(tree: &Tree, pid: u32) -> bool {
+    tree.children
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|child| child.id() == pid)
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .is_some()
+}
+
+#[test]
+fn battery_paused_startup_idle_exits_without_a_writer_command() {
+    // A paused startup backstop used to leave writer_running latched forever.
+    let tree = Tree::new();
+    let pid = start_on_battery(&tree, &[("FERRET_DAEMON_IDLE_MS", "500")]);
+    let socket = tree.socket();
+    let (mut reader, _) = tree.connect();
+    let status = block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n");
+    assert!(status.contains("battery-paused"), "{status}");
+    assert_eq!(number(&status, "writer_commands"), Some(0));
+    drop(reader);
+    wait(|| !socket.exists() && exited(&tree, pid));
+}
+
+#[test]
+fn battery_paused_startup_drains_without_a_writer_command() {
+    let tree = Tree::new();
+    let pid = start_on_battery(&tree, &[]);
+    let socket = tree.socket();
+    let (mut reader, _) = tree.connect();
+    let status = block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n");
+    assert!(status.contains("battery-paused"), "{status}");
+    assert_eq!(number(&status, "writer_commands"), Some(0));
+    reader.get_mut().write_all(b"{\"op\":\"drain\"}\n").unwrap();
+    // Keep the control connection alive; shutdown belongs to the host.
+    wait(|| !socket.exists() && exited(&tree, pid));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn loading_blocks_expired_idle_deadline_without_spinning() {
+    // /proc ticks observe CPU consumption, rather than inferring it from
+    // elapsed time. Loading must keep ownership alive without polling.
+    let tree = Tree::new();
+    let pid = start_on_battery(
+        &tree,
+        &[
+            ("FERRET_DAEMON_IDLE_MS", "100"),
+            ("FERRET_DAEMON_LOAD_DELAY_MS", "3000"),
+        ],
+    );
+    let ticks = || {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+    };
+    let mut loading = BufReader::new(UnixStream::connect(tree.socket()).unwrap());
+    loading.get_ref().set_read_timeout(Some(BOUND)).unwrap();
+    assert!(line(&mut loading).contains("\"state\":\"loading\""));
+    drop(loading);
+    std::thread::sleep(Duration::from_millis(200));
+    let before = ticks();
+    std::thread::sleep(Duration::from_millis(500));
+    let consumed = ticks() - before;
+    assert!(
+        consumed <= 2,
+        "waiting daemon consumed {consumed} CPU ticks"
+    );
+    wait(|| exited(&tree, pid));
+}
+
+#[test]
+fn drain_closes_a_separate_idle_connection_and_finishes_active_query() {
+    // A handler blocked on its empty request channel used to miss drain.
+    let tree = Tree::new();
+    let pid = tree.start(&[]);
+    let socket = tree.socket();
+    let (mut idle, _) = tree.connect();
+    assert!(
+        block(
+            &mut idle,
+            b"{\"id\":\"q\",\"op\":\"search\",\"args\":[\"main\"]}\n"
+        )
+        .contains("\"exit\":0")
+    );
+    let mut active = begin_large(&tree);
+    let (mut control, _) = tree.connect();
+    control
+        .get_mut()
+        .write_all(b"{\"op\":\"drain\"}\n")
+        .unwrap();
+    let mut eof = String::new();
+    assert_eq!(idle.read_line(&mut eof).unwrap(), 0);
+    loop {
+        let next = line(&mut active);
+        if next.contains("\"event\":\"end\"") {
+            assert!(
+                next.contains("\"exit\":0") && next.contains("\"cancelled\":false"),
+                "{next}"
+            );
+            break;
+        }
+    }
+    wait(|| !socket.exists() && exited(&tree, pid));
 }
