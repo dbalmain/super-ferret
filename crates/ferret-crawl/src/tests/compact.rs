@@ -527,3 +527,46 @@ fn bounded_full_rewalk_fresh_alias_supersedes_the_retained_alias_observation() {
         retained_listings(&open(&path), &before, &[], &[scope])
     );
 }
+
+#[test]
+fn unchanged_children_with_lstat_eio_and_long_names_exhaust_the_shared_byte_guard() {
+    use super::coverage::{Hook, retained_listings};
+    use crate::IoOp;
+    use crate::walk::IoPoint;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = Tmp::new("bounded-child-fault-paths");
+    for n in 0..32 {
+        tmp.write(&format!("{n:02}-{}", "x".repeat(200)), b"unchanged");
+    }
+    index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let before = session.view();
+    session.set_input_limits(ferret_catalog::InputLimits {
+        records: usize::MAX,
+        owned_bytes: 8192,
+    });
+    let hook = Hook::set(&tmp.tree(), |point, _| {
+        (point == IoPoint::Child).then(|| (IoOp::Lstat, std::io::Error::from_raw_os_error(5)))
+    });
+    let result = burst(&tmp, &mut session);
+    // These unchanged children create no changed file observations. Their
+    // owned coverage paths must trip the guard before reconciliation begins.
+    assert!(result.report.input_fallback);
+    assert!(result.report.input_usage.exceeded);
+    assert!(result.report.input_usage.owned_bytes <= 8192);
+    assert!(matches!(result.outcome, RefreshOutcome::Checkpointed));
+    assert_eq!(
+        result.report.coverage_faults.len(),
+        32,
+        "rewalk reports every fault"
+    );
+    drop(hook);
+    let fresh = tmp.base.join("child-fault-oracle");
+    index(&fresh, &[tmp.tree()], Refresh::All, &options()).unwrap();
+    let root = tmp.tree().as_os_str().as_bytes().to_vec();
+    assert_eq!(
+        listings(&result.view),
+        retained_listings(&open(&fresh), &before, &[], std::slice::from_ref(&root))
+    );
+    assert_eq!(listings(&result.view), listings(&open(&tmp.cat())));
+}

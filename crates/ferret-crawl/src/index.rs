@@ -801,6 +801,12 @@ impl Source<'_> {
             Self::Rebuild(session, _, hint) => session.checkpoint_batch(hint),
         }
     }
+    fn budget(self) -> Option<std::sync::Arc<ferret_catalog::InputBudget>> {
+        match self {
+            Self::Bounded(_, _, budget) => Some(budget.clone()),
+            _ => None,
+        }
+    }
     fn carry(self, stat: &Stat) -> Option<Content> {
         match self {
             Self::Checkpoint(txn) => txn.carry(stat),
@@ -1195,6 +1201,7 @@ pub(crate) struct Hasher<'a> {
 
 /// What a worker leaves behind.
 pub(crate) struct Output {
+    budget: Option<std::sync::Arc<ferret_catalog::InputBudget>>,
     pub(crate) batch: ferret_catalog::Batch,
     pub(crate) counts: Counts,
     faults: Vec<CoverageFault>,
@@ -1222,6 +1229,7 @@ impl<'a> Hasher<'a> {
             cache,
             root,
             out: Output {
+                budget: txn.budget(),
                 batch: txn.batch(),
                 counts: Counts::default(),
                 faults: Vec::new(),
@@ -1291,6 +1299,13 @@ impl<'a> Hasher<'a> {
             match self.cache.claim(key) {
                 Lookup::Claimed => {}
                 Lookup::InFlight => {
+                    if !out.reserve(
+                        std::mem::size_of::<Deferred>()
+                            + decided.name.as_bytes().len()
+                            + joined_bytes(self.root, decided.path),
+                    ) {
+                        return;
+                    }
                     let alias = Deferred {
                         parent: decided.parent,
                         name: decided.name.as_bytes().to_vec(),
@@ -1336,7 +1351,11 @@ impl<'a> Hasher<'a> {
         stat: Stat,
         content: Result<Content, ContentFault>,
     ) {
-        let content = self.out.outcome(|| self.root.join(decided.path), content);
+        let content = self.out.outcome(
+            joined_bytes(self.root, decided.path),
+            || self.root.join(decided.path),
+            content,
+        );
         self.out
             .batch
             .file(decided.parent, decided.name.as_bytes(), stat, content);
@@ -1349,6 +1368,18 @@ impl<'a> Hasher<'a> {
         context: FaultContext<'_, DirToken>,
         error: io::Error,
     ) {
+        let name_bytes = match context {
+            FaultContext::Child { name, .. } => name.as_bytes().len(),
+            _ => 0,
+        };
+        if !self.out.reserve(
+            std::mem::size_of::<CoverageFault>()
+                + self.root.as_os_str().len()
+                + path.as_os_str().len()
+                + name_bytes,
+        ) {
+            return;
+        }
         self.out.faults.push(CoverageFault {
             root: self.root.to_owned(),
             path: path.to_owned(),
@@ -1367,17 +1398,33 @@ impl<'a> Hasher<'a> {
     }
 }
 
+// Conservatively include a separator without allocating the joined path.
+fn joined_bytes(root: &Path, path: &Path) -> usize {
+    root.as_os_str().len() + 1 + path.as_os_str().len()
+}
+
 impl Output {
+    fn reserve(&self, bytes: usize) -> bool {
+        self.budget
+            .as_ref()
+            .is_none_or(|budget| budget.charge(1, bytes).is_ok())
+    }
     /// The content to publish for one name, listing a fault with its path.
     /// These are the faults a worker saw, with their errors; the build may
     /// fault more names, which `index` lists from the published catalog.
     fn outcome(
         &mut self,
+        path_bytes: usize,
         path: impl FnOnce() -> PathBuf,
         content: Result<Content, ContentFault>,
     ) -> Content {
         content.unwrap_or_else(|fault| {
-            self.content_faults.push((path(), fault));
+            if self.reserve(std::mem::size_of::<(PathBuf, ContentFault)>() + path_bytes) {
+                self.content_faults.push((path(), fault));
+            }
+            // A refused report marks the shared attempt exhausted. The caller
+            // discards all output and rewalks; this placeholder never
+            // publishes.
             Content::Fault
         })
     }
@@ -1424,7 +1471,7 @@ impl Output {
             Some(stored) => observe::consume(stored, &alias.stat),
             None => (alias.stat, Err(ContentFault::Alias)),
         };
-        let content = self.outcome(|| alias.path, content);
+        let content = self.outcome(alias.path.as_os_str().len(), || alias.path, content);
         self.batch.file(alias.parent, &alias.name, stat, content);
     }
 }
