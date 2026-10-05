@@ -137,6 +137,15 @@ impl Scheduler {
     pub fn rate_status(&self) -> ferret_catalog::bulk::RateStatus {
         self.limiter.status()
     }
+    pub fn command_control(self: &Arc<Self>) -> Arc<dyn Control> {
+        Arc::new(CommandControl(self.clone()))
+    }
+    pub fn configured_workers(&self) -> usize {
+        self.config.concurrency.max(1)
+    }
+    fn admit_command(&self, kind: Kind, view: &Catalog) -> Result<(), Blocked> {
+        self.admit_policy(kind, view, false)
+    }
 }
 fn scaled(bytes: u64, names: u32) -> u64 {
     // Linear at 10M; a floor covers fixed scratch on small catalogs. Ceil so
@@ -147,6 +156,17 @@ fn scaled(bytes: u64, names: u32) -> u64 {
 }
 impl Control for Scheduler {
     fn admit(&self, kind: Kind, view: &Catalog) -> Result<(), Blocked> {
+        self.admit_policy(kind, view, true)
+    }
+    fn limiter(&self) -> Arc<Limiter> {
+        self.limiter.clone()
+    }
+    fn workers(&self) -> usize {
+        self.status().workers
+    }
+}
+impl Scheduler {
+    fn admit_policy(&self, kind: Kind, view: &Catalog, polite: bool) -> Result<(), Blocked> {
         let disk = ferret_crawl::available_disk(&self.index).ok();
         let watch = self
             .machine
@@ -171,7 +191,7 @@ impl Control for Scheduler {
             .saturating_add(watch_bytes);
         let required_disk =
             scaled(self.config.disk, view.name_count()).max(self.config.disk.min(16 << 20));
-        let result = if let Some(reason) = m.status.paused {
+        let result = if polite && let Some(reason) = m.status.paused {
             Err(reason)
         } else if m.status.sample.memory.is_none_or(|n| n < required_memory) {
             Err(Blocked::Memory)
@@ -186,11 +206,21 @@ impl Control for Scheduler {
         m.status.available_disk = disk;
         result
     }
-    fn workers(&self) -> usize {
-        self.status().workers
+}
+#[derive(Debug)]
+struct CommandControl(Arc<Scheduler>);
+impl Control for CommandControl {
+    fn admit(&self, kind: Kind, view: &Catalog) -> Result<(), Blocked> {
+        self.0.admit_command(kind, view)
     }
     fn limiter(&self) -> Arc<Limiter> {
-        self.limiter.clone()
+        self.0.limiter()
+    }
+    fn paced(&self) -> bool {
+        false
+    }
+    fn workers(&self) -> usize {
+        self.0.configured_workers()
     }
 }
 

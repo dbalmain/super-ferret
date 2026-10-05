@@ -780,8 +780,12 @@ safe hard full-builder ceiling. Process-wide idle priority would violate the
 responsive watcher/query design. Use existing crawl-owned safe Linux calls; do
 not create an unsafe host wrapper to avoid a reviewed dependency.
 
-M6 rate-limits bulk read/write work at **32 MiB/s**, configurable, for
-backstops, whole-root observations, fallback reads and checkpoint writes.
+M6 rate-limits noninteractive bulk read/write work at **32 MiB/s**,
+configurable, for backstops, whole-root observations, fallback reads and
+checkpoint writes. Explicit writer commands (`ferret index`, root add and root
+remove) bypass byte pacing and battery/PSI/worker-ramp gates like direct
+foreground indexing, while retaining memory and disk admission; query reads and
+small burst commits remain excluded.
 One shared limiter serializes the bounded transfer seam across index workers;
 allowance starts at completion, so slow reads cannot finish together as multiple
 bursts. It waits before the next transfer, with a maximum 256 KiB read burst

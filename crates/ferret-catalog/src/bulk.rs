@@ -49,6 +49,10 @@ impl std::fmt::Display for Blocked {
 pub trait Control: Send + Sync + std::fmt::Debug {
     fn admit(&self, kind: Kind, view: &Catalog) -> Result<(), Blocked>;
     fn limiter(&self) -> Arc<Limiter>;
+    /// Whether bulk transfers for this operation use the shared byte limiter.
+    fn paced(&self) -> bool {
+        true
+    }
     /// Current concurrency ceiling when crawl starts a new worker pool.
     fn workers(&self) -> usize;
 }

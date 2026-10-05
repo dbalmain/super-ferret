@@ -540,9 +540,13 @@ impl Writer {
             .truncate(true)
             .open(&temp)
             .map_err(Error::Io)?;
-        crate::bulk::writes(self.bulk.as_ref().map(|c| c.limiter()), || {
-            crate::compact::write(&view, &file, generation)
-        })
+        crate::bulk::writes(
+            self.bulk
+                .as_ref()
+                .filter(|control| control.paced())
+                .map(|control| control.limiter()),
+            || crate::compact::write(&view, &file, generation),
+        )
         .map_err(Error::Io)?;
         publication::sync(&file, Point::SnapshotSync).map_err(Error::Io)?;
         // Planning buffers have gone before readback. The checked sections are
@@ -594,14 +598,19 @@ impl Writer {
             txn.add(batch);
         }
         self.poisoned = true;
-        let current =
-            match crate::bulk::writes(self.bulk.as_ref().map(|c| c.limiter()), || txn.commit()) {
-                Ok(current) => current,
-                Err(error) => {
-                    self.poisoned = error.published();
-                    return Err(Error::Rebuild(error));
-                }
-            };
+        let current = match crate::bulk::writes(
+            self.bulk
+                .as_ref()
+                .filter(|control| control.paced())
+                .map(|control| control.limiter()),
+            || txn.commit(),
+        ) {
+            Ok(current) => current,
+            Err(error) => {
+                self.poisoned = error.published();
+                return Err(Error::Rebuild(error));
+            }
+        };
         self.manifest = current.manifest();
         self.manifest.log_end = HEADER;
         self.log = OpenOptions::new()

@@ -191,7 +191,9 @@ fn serve(
         let message = receive.recv_timeout(deadline.saturating_duration_since(now));
         match message {
             Ok(Message::Command(command)) => {
-                options.workers = scheduler.status().workers;
+                let mut command_options = options.clone();
+                command_options.workers = scheduler.configured_workers();
+                command_options.bulk = Some(scheduler.command_control());
                 host.writer_status
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -220,7 +222,7 @@ fn serve(
                 let result = if global.is_none() {
                     Err(ferret_crawl::IndexError::BadRoot(PathBuf::new()))
                 } else {
-                    options.global = global;
+                    command_options.global = global;
                     let (change, refresh) = match command.request.op {
                         Op::Index => (
                             RootChange {
@@ -241,7 +243,20 @@ fn serve(
                             Refresh::Only(&[]),
                         ),
                     };
-                    engine.index_change(change, refresh, &options)
+                    engine
+                        .index_change(change, refresh, &command_options)
+                        .map_err(|error| match error {
+                            ferret_crawl::IndexError::DeferredBulk(
+                                ferret_catalog::bulk::Blocked::Memory,
+                            ) => {
+                                let status = scheduler.status();
+                                ferret_crawl::IndexError::DeferredMemory {
+                                    required: status.required_memory,
+                                    available: status.sample.memory.unwrap_or(0),
+                                }
+                            }
+                            other => other,
+                        })
                 };
                 if let Ok(report) = &result {
                     global_inputs(watch.as_ref(), &engine, &context);
@@ -259,11 +274,18 @@ fn serve(
                         w.reconcile(engine.pin().catalog());
                     }
                 } else if let Err(error) = &result {
-                    if let ferret_crawl::IndexError::DeferredBulk(reason) = error {
+                    let deferred = match error {
+                        ferret_crawl::IndexError::DeferredBulk(reason) => Some(*reason),
+                        ferret_crawl::IndexError::DeferredMemory { .. } => {
+                            Some(ferret_catalog::bulk::Blocked::Memory)
+                        }
+                        _ => None,
+                    };
+                    if let Some(reason) = deferred {
                         host.writer_status
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .blocked = Some(*reason);
+                            .blocked = Some(reason);
                         if let Some(w) = &watch {
                             w.backstop(RefreshReason::Backstop);
                         } else {

@@ -159,9 +159,26 @@ fn deferred_writer(reason: Blocked) {
     };
     let old = engine.pin();
     fs::write(tree.0.join("tree/a.txt"), b"changed").unwrap_or_else(|e| panic!("fixture: {e}"));
-    assert!(
-        matches!(command(&host, &tree.0.join("tree")), Err(IndexError::DeferredBulk(actual)) if actual == reason)
-    );
+    let result = command(&host, &tree.0.join("tree"));
+    if matches!(reason, Blocked::Battery | Blocked::IoPressure) {
+        assert!(result.is_ok(), "command was politely deferred: {result:?}");
+        assert_ne!(engine.generation(), old.generation());
+        host.stop.store(true, Ordering::Release);
+        let _ = host.writer_send.send(Message::Intake);
+        writer
+            .join()
+            .unwrap_or_else(|_| panic!("writer panic"))
+            .unwrap_or_else(|e| panic!("writer: {e}"));
+        engine.close_writer();
+        return;
+    }
+    if reason == Blocked::Memory {
+        assert!(
+            matches!(result, Err(IndexError::DeferredMemory { required, available }) if required > available)
+        );
+    } else {
+        assert!(matches!(result, Err(IndexError::DeferredBulk(actual)) if actual == reason));
+    }
     assert_eq!(engine.generation(), old.generation());
     let query = ferret_query::Query::from_args([b"*.txt".as_slice()], std::time::SystemTime::now())
         .unwrap_or_else(|e| panic!("query: {e}"));
@@ -230,10 +247,10 @@ fn daemon_writer_reports_memory_blocked_preserves_caches_and_retries_the_complet
     deferred_writer(Blocked::Memory);
 }
 #[test]
-fn daemon_writer_battery_pause_keeps_queries_usable_and_retries_after_charging() {
+fn daemon_writer_command_ignores_battery_pause() {
     deferred_writer(Blocked::Battery);
 }
 #[test]
-fn daemon_writer_io_spike_keeps_queries_usable_and_retries_when_calm() {
+fn daemon_writer_command_ignores_io_pressure() {
     deferred_writer(Blocked::IoPressure);
 }

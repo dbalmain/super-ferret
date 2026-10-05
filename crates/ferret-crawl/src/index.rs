@@ -127,6 +127,8 @@ impl fmt::Display for CoverageFault {
 pub enum IndexError {
     /// No publication or cache mutation; retry a complete backstop later.
     DeferredBulk(ferret_catalog::bulk::Blocked),
+    /// A command's full rebuild was refused by memory admission.
+    DeferredMemory { required: u64, available: u64 },
     /// Lowering an index thread priority failed.
     Priority(io::Error),
     /// A root that is not absolute, or has a `..` component.
@@ -163,6 +165,13 @@ impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DeferredBulk(reason) => reason.fmt(f),
+            Self::DeferredMemory {
+                required,
+                available,
+            } => write!(
+                f,
+                "insufficient memory for a full rebuild: need {required} bytes, have {available}"
+            ),
             Self::Priority(error) => write!(f, "index thread priority: {error}"),
             Self::BadRoot(p) => write!(f, "root {} must be absolute, without `..`", p.display()),
             Self::NotConfigured(p) => write!(f, "{} is not a configured root", p.display()),
@@ -898,7 +907,11 @@ fn observe(
                 let mut hasher = Hasher::with_source(source, &cache, root);
                 hasher.watch = options.watch.as_deref();
                 if bulk_read {
-                    hasher.reader.limiter = options.bulk.as_ref().map(|c| c.limiter());
+                    hasher.reader.limiter = options
+                        .bulk
+                        .as_ref()
+                        .filter(|control| control.paced())
+                        .map(|control| control.limiter());
                 }
                 hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
                 hasher

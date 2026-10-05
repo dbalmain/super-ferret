@@ -443,6 +443,100 @@ fn unchanged_queries_do_not_reopen_and_real_index_publication_is_adopted() {
 }
 
 #[test]
+fn routed_index_commands_bypass_background_politeness_but_keep_admission() {
+    let tree = Tree::new();
+    let proc = tree.base.join("signals/proc");
+    let power = tree.base.join("signals/power/BAT0");
+    fs::create_dir_all(proc.join("pressure")).unwrap();
+    fs::create_dir_all(&power).unwrap();
+    fs::write(proc.join("pressure/cpu"), "some avg10=0.00 avg60=0.00\n").unwrap();
+    fs::write(proc.join("pressure/io"), "some avg10=11.00 avg60=0.00\n").unwrap();
+    fs::write(proc.join("meminfo"), "MemAvailable: 1073741824 kB\n").unwrap();
+    fs::write(proc.join("loadavg"), "0.00 0.00 0.00 1/100 1\n").unwrap();
+    fs::write(power.join("type"), "Battery\n").unwrap();
+    fs::write(power.join("status"), "Discharging\n").unwrap();
+    tree.start(&[
+        ("FERRET_SIGNAL_PROC", proc.to_str().unwrap()),
+        (
+            "FERRET_SIGNAL_POWER",
+            tree.base.join("signals/power").to_str().unwrap(),
+        ),
+        ("FERRET_BULK_BYTES_PER_SECOND", "1024"),
+        ("FERRET_BACKSTOP_MS", "20"),
+    ]);
+    let (mut reader, _) = tree.connect();
+    wait(|| {
+        block(&mut reader, b"{\"id\":\"status\",\"op\":\"status\"}\n").contains("battery-paused")
+    });
+
+    let large = tree.base.join("src/command-content.bin");
+    fs::write(&large, vec![b'x'; 64 << 10]).unwrap();
+    let started = Instant::now();
+    let indexed = tree.run(&["index", "src"]);
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "command was paced"
+    );
+    assert!(
+        tree.run(&["search", "command-content.bin"])
+            .status
+            .success()
+    );
+
+    // A later filesystem change remains pending under the background gate.
+    fs::write(
+        tree.base.join("src/background-pending.bin"),
+        vec![b'y'; 64 << 10],
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        !tree
+            .run(&["search", "background-pending.bin"])
+            .status
+            .success()
+    );
+    let status = block(&mut reader, b"{\"id\":\"status2\",\"op\":\"status\"}\n");
+    assert!(status.contains("battery-paused"), "{status}");
+}
+
+#[test]
+fn routed_full_rebuild_reports_memory_admission_reason_and_keeps_generation() {
+    let tree = Tree::new();
+    let proc = tree.base.join("signals/proc");
+    fs::create_dir_all(proc.join("pressure")).unwrap();
+    fs::write(proc.join("pressure/cpu"), "some avg10=0.00 avg60=0.00\n").unwrap();
+    fs::write(proc.join("pressure/io"), "some avg10=0.00 avg60=0.00\n").unwrap();
+    fs::write(proc.join("meminfo"), "MemAvailable: 1024 kB\n").unwrap();
+    fs::write(proc.join("loadavg"), "0.00 0.00 0.00 1/100 1\n").unwrap();
+    let power = tree.base.join("signals/power");
+    fs::create_dir_all(&power).unwrap();
+    tree.start(&[
+        ("FERRET_SIGNAL_PROC", proc.to_str().unwrap()),
+        ("FERRET_SIGNAL_POWER", power.to_str().unwrap()),
+    ]);
+    fs::write(tree.base.join("src/refused.rs"), "new content").unwrap();
+    let refused = tree.run(&["index", "src"]);
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("insufficient memory for a full rebuild"),
+        "{message}"
+    );
+    assert!(
+        message.contains("need ") && message.contains("have 1048576"),
+        "{message}"
+    );
+    assert!(tree.run(&["search", "main.rs"]).status.success());
+    assert!(!tree.run(&["search", "refused.rs"]).status.success());
+}
+
+#[test]
 fn short_idle_exit_unlinks_own_socket() {
     let tree = Tree::new();
     let pid = tree.start(&[("FERRET_DAEMON_IDLE_MS", "100")]);
