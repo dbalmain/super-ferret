@@ -70,6 +70,8 @@ impl Env {
             .arg(self.index())
             .args(args)
             .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("FERRET_NO_DAEMON", "1")
             .env("XDG_CONFIG_HOME", home.join("config"))
             .env("XDG_DATA_HOME", home.join("data"))
             .env("XDG_STATE_HOME", self.state())
@@ -760,6 +762,8 @@ fn the_index_comes_from_the_flag_then_the_environment_then_xdg() {
         command
             .args(["index", &*env.tree().to_string_lossy()])
             .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("FERRET_NO_DAEMON", "1")
             .env("XDG_DATA_HOME", home.join("data"))
             .env("XDG_STATE_HOME", env.state())
             .env("XDG_CONFIG_HOME", home.join("config"))

@@ -293,7 +293,10 @@ fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, Requ
         child_stdin,
         start_unix_ns: match find_field(fields, "start_unix_ns") {
             None | Some(Value::Null) => None,
-            Some(Value::Num(n)) => Some(n.as_u64().ok_or(RequestErrorKind::InvalidField("start_unix_ns"))?),
+            Some(Value::Num(n)) => Some(
+                n.as_u64()
+                    .ok_or(RequestErrorKind::InvalidField("start_unix_ns"))?,
+            ),
             _ => return Err(RequestErrorKind::InvalidField("start_unix_ns")),
         },
     })
@@ -717,6 +720,42 @@ fn decode_base64_char(b: u8) -> Option<u8> {
         b'+' => Some(62),
         b'/' => Some(63),
         _ => None,
+    }
+}
+
+// Socket envelopes and client events use the same bounded JSON reader as
+// requests.
+pub(crate) fn parse_object(line: &[u8]) -> Option<Value> {
+    if line.len() > MAX_LINE_BYTES {
+        return None;
+    }
+    let mut parser = Parser {
+        input: line,
+        pos: 0,
+    };
+    parser.skip_ws();
+    let value = parser.parse_value(1).ok()?;
+    parser.skip_ws();
+    (parser.pos == line.len() && matches!(value, Value::Obj(_))).then_some(value)
+}
+impl Value {
+    pub(crate) fn field(&self, name: &str) -> Option<&Self> {
+        match self {
+            Self::Obj(fields) => find_field(fields, name),
+            _ => None,
+        }
+    }
+    pub(crate) fn text(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    pub(crate) fn number(&self) -> Option<u64> {
+        match self {
+            Self::Num(n) => n.as_u64(),
+            _ => None,
+        }
     }
 }
 
@@ -1164,26 +1203,5 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(200_000);
         mutation_fuzz(iterations);
-    }
-}
-
-// Socket envelopes and client events use the same bounded JSON reader as requests.
-pub(crate) fn parse_object(line: &[u8]) -> Option<Value> {
-    if line.len() > MAX_LINE_BYTES { return None; }
-    let mut parser = Parser { input: line, pos: 0 };
-    parser.skip_ws();
-    let value = parser.parse_value(1).ok()?;
-    parser.skip_ws();
-    (parser.pos == line.len() && matches!(value, Value::Obj(_))).then_some(value)
-}
-impl Value {
-    pub(crate) fn field(&self, name: &str) -> Option<&Self> {
-        match self { Self::Obj(fields) => find_field(fields, name), _ => None }
-    }
-    pub(crate) fn text(&self) -> Option<&str> {
-        match self { Self::Str(s) => Some(s), _ => None }
-    }
-    pub(crate) fn number(&self) -> Option<u64> {
-        match self { Self::Num(n) => n.as_u64(), _ => None }
     }
 }

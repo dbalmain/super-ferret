@@ -14,10 +14,10 @@ use ferret_query::{Query, Row};
 use crate::cli;
 use crate::engine::{Engine, QuerySession};
 use crate::find_json::{FrameOutput, diagnostic_to, generation};
-use crate::transport::Destination;
 use crate::json::Object;
 use crate::protocol::{self, Op, Request};
 use crate::search::json_row;
+use crate::transport::Destination;
 use crate::xdg::Dirs;
 
 pub(crate) fn main(args: impl Iterator<Item = OsString>) -> cli::Exit {
@@ -97,7 +97,10 @@ fn open_engine(index: &Path) -> Option<Engine> {
     Engine::open(index).ok().flatten()
 }
 
-pub(crate) fn read_line_bounded(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
+pub(crate) fn read_line_bounded(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+) -> io::Result<usize> {
     let mut total = 0;
     loop {
         let buffer = reader.fill_buf()?;
@@ -170,8 +173,20 @@ fn handle(
                 o.int("engine_opens", Engine::open_count());
             })
         }
-        Op::Search => search_request(request, engine.as_ref().map(Engine::pin), dirs, &Destination::Stdout),
-        Op::Find => find_request(request, launch_cwd, engine.as_ref().map(Engine::pin), protocol_stdin, &Destination::Stdout),
+        Op::Search => search_request(
+            request,
+            engine.as_ref().map(Engine::pin),
+            dirs,
+            &Destination::Stdout,
+        ),
+        Op::Find => find_request(
+            request,
+            launch_cwd,
+            engine.as_ref().map(Engine::pin),
+            protocol_stdin,
+            &Destination::Stdout,
+            ferret_crawl::default_workers(),
+        ),
     }
 }
 
@@ -182,7 +197,9 @@ pub(crate) fn search_request(
     destination: &Destination,
 ) -> io::Result<()> {
     let started = Instant::now();
-    let now = request.start_unix_ns.map_or_else(SystemTime::now, |ns| SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns));
+    let now = request.start_unix_ns.map_or_else(SystemTime::now, |ns| {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns)
+    });
     event_to(destination, request, "begin", |o| {
         generation(o, session.as_ref().map(QuerySession::generation))
     })?;
@@ -212,9 +229,13 @@ pub(crate) fn search_request(
                 Ok(ferret_query::Stats::default())
             } else {
                 session.search(&query, |row: &Row<'_>| {
-                    if destination.cancelled() { return ControlFlow::Break(()); }
+                    if destination.cancelled() {
+                        return ControlFlow::Break(());
+                    }
                     #[cfg(debug_assertions)]
-                    if request.capabilities.iter().any(|c| c == "test-panic") { panic!("injected query panic"); }
+                    if request.capabilities.iter().any(|c| c == "test-panic") {
+                        panic!("injected query panic");
+                    }
                     let mut bytes = Vec::new();
                     json_row(&mut bytes, catalog, row);
                     let mut output = Vec::new();
@@ -254,6 +275,13 @@ pub(crate) fn search_request(
             query_error = Some(error.to_string());
         }
     }
+    if let Some(estimate) = stats.and_then(|stats| stats.name_plan) {
+        plan_text = format!(
+            "{:?}: {} global name candidates, scope rows {:?}; exact evaluation",
+            estimate.plan, estimate.hits, estimate.scope_rows
+        );
+        strategy = format!("{:?}", estimate.plan);
+    }
     let elapsed = started.elapsed().as_micros() as i128;
     let log = SearchLog {
         status,
@@ -271,9 +299,15 @@ pub(crate) fn search_request(
         o.int("exit", status)
             .int("rows", rows)
             .bool("cancelled", destination.cancelled())
-            .int("elapsed_us", elapsed);
+            .int("elapsed_us", elapsed)
+            .str("plan", &plan_text)
+            .str("strategy", &strategy);
         o.opt_int("first_row_us", first_row)
             .int("bytes_read", bytes_read);
+        if let Some(session) = session.as_ref() {
+            o.int("names", session.catalog().name_count())
+                .int("inodes", session.catalog().inode_count());
+        }
         if let Some(stats) = stats {
             o.object("stats", |o| {
                 o.int("candidates", stats.candidates)
@@ -292,9 +326,12 @@ pub(crate) fn find_request(
     session: Option<QuerySession>,
     protocol_stdin: bool,
     destination: &Destination,
+    workers: usize,
 ) -> io::Result<()> {
     let started = Instant::now();
-    let now = request.start_unix_ns.map_or_else(SystemTime::now, |ns| SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns));
+    let now = request.start_unix_ns.map_or_else(SystemTime::now, |ns| {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns)
+    });
     event_to(destination, request, "begin", |o| {
         generation(o, session.as_ref().map(QuerySession::generation))
     })?;
@@ -314,7 +351,8 @@ pub(crate) fn find_request(
     let host = FrameOutput::new(
         &request.id,
         request.child_stdin.unwrap_or(protocol::ChildStdin::Null),
-    ).with_destination(destination.clone());
+    )
+    .with_destination(destination.clone());
     let mut query_error = None;
     match parsed {
         Ok(plan) => {
@@ -331,7 +369,13 @@ pub(crate) fn find_request(
                 diagnostic_to(destination, &request.id, "permission", "warning", None)?;
             }
             if let Some(feature) = plan.unsupported() {
-                diagnostic_to(destination, &request.id, &feature.to_string_lossy(), "error", None)?;
+                diagnostic_to(
+                    destination,
+                    &request.id,
+                    &feature.to_string_lossy(),
+                    "error",
+                    None,
+                )?;
                 event_to(destination, request, "end", |o| {
                     o.int("exit", 1)
                         .bool("cancelled", destination.cancelled())
@@ -340,7 +384,6 @@ pub(crate) fn find_request(
                 })?;
                 return Ok(());
             }
-            let workers = ferret_crawl::default_workers();
             let result = if let Some(session) = session {
                 session.find(&plan, host.clone(), workers)
             } else {
@@ -373,7 +416,12 @@ pub(crate) fn find_request(
 fn event(id: &Request, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
     event_to(&Destination::Stdout, id, name, fill)
 }
-fn event_to(destination: &Destination, id: &Request, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
+fn event_to(
+    destination: &Destination,
+    id: &Request,
+    name: &str,
+    fill: impl FnOnce(&mut Object<'_>),
+) -> io::Result<()> {
     crate::find_json::emit_to(destination, &id.id, name, fill)
 }
 

@@ -43,6 +43,9 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
             return Exit::Usage;
         }
     };
+    if let Some(exit) = crate::daemon::search(context, atoms, json, limit, now) {
+        return exit;
+    }
     let mut outcome = Outcome::default();
     let exit = search(context, &query, json, limit, started, &mut outcome);
     let total = started.elapsed();

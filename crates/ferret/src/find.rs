@@ -61,11 +61,39 @@ fn resolve_catalog(plan: &Plan, index: Option<&Path>) -> Result<Option<Engine>, 
     }
 }
 
+// Routing must precede engine open, but follow the same plan/config checks as
+// local execution. Effects, information and configured live walks stay local.
+fn remote(
+    args: &[OsString],
+    index: Option<&Path>,
+    plan: &Plan,
+    json: bool,
+    now: std::time::SystemTime,
+) -> Option<Exit> {
+    if plan.has_side_effects() || plan.no_ignore() || plan.is_information() {
+        return None;
+    }
+    let config = Dirs::config_from_env().ok()?.join("config");
+    if read_config(&config).ok()? {
+        return None;
+    }
+    let index = index
+        .map(Path::to_owned)
+        .or_else(|| {
+            std::env::var_os("FERRET_INDEX")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| Dirs::from_env().ok().map(|dirs| dirs.data))?;
+    crate::daemon::find(&index, args, json, now)
+}
+
 /// Runs a find command. Find errors and usage errors both exit 1; no matches
 /// is success. Explicit -I never reads config or opens an index; neither mode
 /// writes a query log.
 pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
-    let plan = match Plan::parse(args) {
+    let now = std::time::SystemTime::now();
+    let plan = match Plan::parse_started(args, now) {
         Ok(plan) => plan,
         Err(error) => {
             cli::error(&format!("find: {error}"));
@@ -78,6 +106,9 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
             feature.to_string_lossy()
         ));
         return Exit::NoMatch;
+    }
+    if let Some(exit) = remote(args, index, &plan, false, now) {
+        return exit;
     }
     let catalog = match resolve_catalog(&plan, index) {
         Ok(catalog) => catalog,
@@ -134,6 +165,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
 pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
     const ID: &str = "find";
     let started = std::time::Instant::now();
+    let now = std::time::SystemTime::now();
     let end = |status: i128, error: Option<&str>| {
         let _ = find_json::emit(ID, "end", |o| {
             o.int("exit", status)
@@ -144,21 +176,26 @@ pub fn run_json(args: &[OsString], index: Option<&Path>) -> Exit {
             }
         });
     };
-    let _ = find_json::emit(ID, "begin", |o| find_json::generation(o, None));
-    let plan = match Plan::parse(args) {
+    let plan = match Plan::parse_started(args, now) {
         Ok(plan) => plan,
         Err(error) => {
+            let _ = find_json::emit(ID, "begin", |o| find_json::generation(o, None));
             let _ = find_json::diagnostic(ID, "parse", "error", None);
             end(1, Some(&error.to_string()));
             return Exit::NoMatch;
         }
     };
     if let Some(feature) = plan.unsupported() {
+        let _ = find_json::emit(ID, "begin", |o| find_json::generation(o, None));
         let message = feature.to_string_lossy();
         let _ = find_json::diagnostic(ID, &message, "error", None);
         end(1, Some(&message));
         return Exit::NoMatch;
     }
+    if let Some(exit) = remote(args, index, &plan, true, now) {
+        return exit;
+    }
+    let _ = find_json::emit(ID, "begin", |o| find_json::generation(o, None));
     let catalog = match resolve_catalog(&plan, index) {
         Ok(catalog) => catalog,
         Err(message) => {

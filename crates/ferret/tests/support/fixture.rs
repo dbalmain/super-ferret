@@ -27,6 +27,7 @@ fn isolate(command: &mut Command, base: &Path) {
         .env("XDG_CACHE_HOME", home.join("cache"))
         .env("XDG_RUNTIME_DIR", home.join("runtime"))
         .env("FERRET_INDEX", base.join("index"))
+        .env("FERRET_NO_DAEMON", "1")
         .env("LC_ALL", "C")
         .env("TZ", "UTC")
         .stdin(Stdio::null());

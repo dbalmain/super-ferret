@@ -31,7 +31,10 @@ impl Destination {
         match self {
             Self::Stdout => write(&mut io::stdout().lock(), line),
             Self::Socket { writer, .. } => write(
-                &mut *writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner), line,
+                &mut *writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                line,
             ),
         }
     }

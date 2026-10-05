@@ -1407,6 +1407,23 @@ engine in process when it cannot (D49).
 line.
 
 
+### S1b M4 — Socket host and ordinary clients (2026-10-06)
+
+`ferretd` serves search and read-only indexed find through the existing batch
+JSON-lines executor and encoders. Ordinary clients attach or start the sibling
+binary, check ready/context/version, and render native bytes/status. Private
+runtime endpoints use index dev/ino, singleton locking, bounded admission,
+entry-boundary cancellation, panic isolation, graceful version drain and idle
+cleanup. Unchanged generations do not reopen; direct index/root publications
+are adopted through the checked opener before queries. Effects, live and
+information-only find, and batch remain local. No timing runs in this slice.
+
+**M4 is query-only. M5 owns WriterSession retention and writer command routing**,
+with watches and refresh scheduling. The user service is a template only.
+Verification counts and protocol details are in [S1B](S1B.md); gate results are
+recorded after the final checks. Existing parallel find record order remains
+schedule-dependent, so byte-parity tests use deterministic traversal scopes.
+
 ### S1b M1 — Resident engine library (2026-10-05)
 
 Production **`c57be70`** implements the common resident engine in `ferret`.

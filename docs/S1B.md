@@ -75,7 +75,7 @@ DocId liveness from the pinned catalog. S1b allocates no dummy mappings and adds
 no catalog mmap. D54's name structures are resident derived state, described
 below; they are not document postings in `ferret-index`.
 
-A query-only engine stops after resident validation and query-state setup. A
+A query-only engine stops after resident validation and query-state setup. From M5 a
 daemon attaches one `WriterSession`, sharing that session's checked `Catalog`
 buffers with the query view rather than opening another complete reader. Its
 identity/hash/refcount/alias lookups are additional writer memory, reported
@@ -412,9 +412,9 @@ restart loops. On exit, finish a started durable publication, release watches
 and locks and unlink only this host's socket under the endpoint lock. Restart
 always re-arms watches and schedules a complete backstop for the downtime gap.
 
-Protocol majors must match; minors negotiate capabilities. A matching protocol
-with different builds is reusable only when format and requested semantic
-capabilities match. Otherwise request a graceful drain/restart: admit no new
+Protocol majors must match; minors negotiate capabilities. M4 conservatively
+drains on any build or catalog-format mismatch; it does not try to certify
+semantic compatibility between different builds. Request a graceful drain/restart: admit no new
 queries, finish current queries and publication, release the endpoint, then
 start the client's binary. Do not kill active find actions or a writer mid-sync
 to accelerate an upgrade. If drain cannot complete in the startup deadline, use
@@ -423,7 +423,57 @@ after it emitted bytes or performed effects; that would duplicate output or
 actions. An already accepted query keeps its original generation through a
 daemon upgrade.
 
+
+M4 implements `daemon.rs` with `daemon/{endpoint,client}.rs`. Endpoint names are
+`<dev-hex>-<ino-hex>.sock`, with matching `.lock` and `.log` files. std's Linux
+`OpenOptionsExt` no-follow/directory flags and retained handles under
+`/proc/self/fd` prevent a substituted runtime or `ferret/` symlink from being
+followed. Both directories require this effective uid and exact mode 0700;
+lock/log files require 0600, regular-file type and one link. There is no fallback
+runtime path. The startup lock is held through the host's lifetime and cleanup;
+a loser connects to the winner and exits. Cleanup checks the bound socket's
+dev/ino under that lock. The systemd template disables idle exit with
+`--idle-ms 0`; it is not installed or enabled.
+
+Hello is an `id:"hello", event:"hello"` JSON object carrying `major`, `minor`,
+`build`, `format`, `index` dev/ino, `generation` (including incarnation),
+`context`, `pid`, `capabilities` and `limits`. `loading` means the endpoint is
+bound while checked resident loading runs; `ready` means the checked engine can
+admit queries; `failed` includes the opening error. Build identity hashes sorted
+workspace Rust sources and Cargo.lock at compile time. The client compares all
+uid/gid slots, supplementary groups and mount/user namespace dev/ino from Linux
+procfs. Permissions authenticate same-user access; M4 does not transfer cwd
+handles, authenticate a supplied pid, or compare ACL/security-module context.
+Failure to obtain or match the checked context falls back locally.
+
+Control envelopes are `{"op":"cancel"}` and `{"op":"drain"}`. A bounded
+reader per connection receives controls during blocking output. Cancel or
+hangup latches cancellation and shuts down the socket to wake a blocked writer;
+no end is fabricated for a partially transmitted frame. Drain closes admission
+and finishes active queries, including one on the control connection. Query
+execution catches unwinding panics and emits a typed `RuntimeError` end; release
+and development profiles retain unwinding. Engine pins and event writes happen
+outside the selection lock, and poisoned locks recover checked immutable state.
+There are at most 32 connections and `min(4, CPUs)` admitted queries, with at
+most `min(16, CPUs)` total query worker permits.
+
+`FERRET_DAEMON_STARTUP_MS` sets the ready deadline (default 10000);
+`FERRET_DAEMON_IDLE_MS` or `--idle-ms` sets idle exit (default 900000, zero
+means disabled). `FERRET_DAEMON_BIN` overrides the sibling `ferretd` used for
+spawn. Diagnostic output goes to the private endpoint `.log`. Debug builds also
+provide load-delay, build/format/context override and query-panic hooks solely
+for the real-binary integration tests; release builds omit them.
+
 ### Writer ownership
+
+**Slice boundary:** M4 is query-only and retains no WriterSession or writer
+lock. It has no watches or refresh producer to service yet. `ferret index` and
+root edits keep their direct path; before each admitted query the daemon peeks
+`current` through the lazy catalog opener and adopts a changed generation through
+`Engine::open`. Failed adoption returns a runtime error instead of silently
+querying stale data. An admitted query pins its generation. **M5 owns writer
+routing and retained writer ownership**, together with the first watch producer.
+The remainder of this subsection describes that M5 shape.
 
 The daemon retains one WriterSession and its lock between bursts. This means an
 unrelated CLI writer cannot simply open the catalog while it runs.
@@ -632,7 +682,7 @@ policy within scheduling, not a change to content carry or find semantics.
 ## CLI and find effects
 
 Ordinary `ferret search` and read-only default `ferret find` are socket clients
-once that host lands. They construct the request, consume the tagged block and
+through the M4 host. They construct the request, consume the tagged block and
 render native output. Search's existing `--json` row schema stays intact; the
 wire begin/end framing does not leak into ordinary row-only search output.
 `ferret --json find ...` is a host flag that must precede the `find` operand; it
@@ -706,6 +756,12 @@ later answered brief changes that. Add the promised shared config `log = false`
 / `log = "shape"` with host config parsing, without changing `find_no_ignore`.
 Tests/benchmarks isolate XDG and FERRET_INDEX and disable or redirect logs.
 Daemon operational status is not another copy of the query log.
+
+M4 byte parity tests use deterministic shallow indexed walks. Existing parallel
+find workers can reorder complete records between two identical local runs;
+the socket retains that executor and its whole-entry commit ordering rather
+than adding sorting or changing the answered F10 parallel semantics. Exact
+bytes within each committed record and native statuses remain unchanged.
 
 ## Cost model at the reference 10M
 
@@ -785,8 +841,8 @@ reducers, generation handling or fault tables.
 | **M1 — Resident engine library**                     | `crates/ferret/src/engine.rs`, `lib.rs`, `search.rs`, `find.rs`; query `find/{parse,walk,parallel}.rs` for explicit context/start time; catalog read API as required                                     | Search/find parity with current hosts, two queries share one load, real writer refresh adoption, pinned old query during append/checkpoint, unchanged-sequence stale epoch rejection before dereference, retained/EACCES live fallback. Measure clean/1/2% full open, current/peak RSS, B/name, first-row latency.                                                                                                                                                                                                                                                              |
 | **M2 — Batch host and common codec**                 | ferret `src/{batch,protocol,config}.rs`, `args.rs`, `cli.rs`, `json.rs`, `log.rs`, `find.rs`, `search.rs`; `tests/batch.rs`; planned serde_json manifest/graph edge in DESIGN                            | Real indexed fixtures through JSONL: native statuses, invalid/non-UTF-8 argv/output, printf/NUL, bounded output and malformed input, effect framing/explicit stdin/interactive refusal, cwd/trailing-slash cases; GNU comparisons and find-compat adapter. Measure one versus 1,000 queries, open amortisation, codec throughput/RSS; prove no per-query catalog reopen. Local actions already run here.                                                                                                                                                                        |
 | **M3 — D54 resident name projection and planner**    | catalog `src/{names,read}.rs`, new `resident_names.rs`, build/compact accessors; query new `name_index.rs`, `query.rs`, `run.rs`, find safe candidate seam; text `src/lib.rs`; bench driver              | Distinct/posting/term output equals flat reference and real full-index oracle after generated create/move/hardlink/ignore/retention/epoch sequences; explicit token versus substring distinctions; planner common/rare scoped cases, count estimates include delta, all prune/quit/depth/action tests unchanged. Measure D54 build/open peak and steady B/name at 10M, 0/1/2% query/update latency, compaction cache rebuild, scoped 10 ms prototype shapes.                                                                                                                    |
-| **M4 — Socket host, ordinary clients and lifecycle** | ferret `src/bin/ferretd.rs`, `src/{daemon,client,protocol,xdg,engine}.rs`, CLI query/index/root routes; `tests/daemon.rs`; user-unit template `contrib/systemd/ferretd.service`                          | D57 answer gates socket codec; D56 answer gates effectful client routing. Actual socket tests for singleton races, XDG/index separation, missing runtime/spawn denial/F_NO_DAEMON, loading timeout, version drain, cwd/context incompatibility, cancellation/backpressure/native status and no query replay. Writer CLI routes avoid second-lock deadlock. Measure socket versus batch first/final row and codec costs, cold spawn/attach, idle exit/restart and concurrent query RSS.                                                                                          |
-| **M5 — Watch intake, scopes and backstops**          | crawl `src/watch.rs`, `lib.rs`, refresh/root-edit seams as needed; ferret `src/{daemon,engine}.rs`, new watch integration tests; find-compat host adapter                                                | Real inotify tree plus injected event loss: atomic saves, wrong/unpaired cookies, directory moved in while populating, alias/bind/root boundary, ignore dependencies, vanished parent, count census, denied watch versus opaque directory, retained EIO/recovery, watch exhaustion and kernel/userspace overflow. Generated bursts compare every published view with full materialised oracle; crash restart's full backstop covers lost intake. Measure installation time/kernel and user watch bytes, coverage at limits, event-to-first/final publication and caught-up lag. |
+| **M4 — Socket host, ordinary clients and lifecycle** | ferret `src/bin/ferretd.rs`, `src/{daemon,client,protocol,xdg,engine}.rs`, CLI query routes; `tests/daemon.rs`; user-unit template `contrib/systemd/ferretd.service`                          | D57 answer gates socket codec; D56 answer gates effectful client routing. Actual socket tests for singleton races, XDG/index separation, missing runtime/spawn denial/F_NO_DAEMON, loading timeout, version drain, cwd/context incompatibility, cancellation/backpressure/native status and no query replay. Query-only host takes no writer lock; writer routing moves to M5. No M4 timing runs (measurements are a separate slice). Measure socket versus batch first/final row and codec costs, cold spawn/attach, idle exit/restart and concurrent query RSS.                                                                                          |
+| **M5 — Watch intake, scopes and backstops**          | crawl `src/watch.rs`, `lib.rs`, refresh/root-edit seams and writer CLI routes; ferret `src/{daemon,engine}.rs`, new watch integration tests; find-compat host adapter                                                | Real inotify tree plus injected event loss: atomic saves, wrong/unpaired cookies, directory moved in while populating, alias/bind/root boundary, ignore dependencies, vanished parent, count census, denied watch versus opaque directory, retained EIO/recovery, watch exhaustion and kernel/userspace overflow. Generated bursts compare every published view with full materialised oracle; crash restart's full backstop covers lost intake. Measure installation time/kernel and user watch bytes, coverage at limits, event-to-first/final publication and caught-up lag. |
 | **M6 — Queue, controller and compaction admission**  | ferret `src/{scheduler,politeness,daemon,engine,stats,config}.rs`; crawl worker controls and `index.rs` bulk-admission seam; catalog compaction I/O hooks only where pacing needs them; systemd template | Inject signal transitions into the real scheduler/writer: ratchet/drop/battery/unknown probes, continued intake during paused writer, bounded queue collapse, D51 unchanged-sequence retries, arrivals during backstop, memory-deferred fallback keeps generation/caches, protected global transitions abort, output does not block writer. Measure whole paced/unpaced compaction, oldest/newest freshness/backlog drainage, concurrent query latency, 10M 50/90% and faulted fallback peaks with watches/pins, foreground load/cache effects.                                 |
 | **M7 — Budgets and host compatibility review**       | bench driver, host/oracle tests, `docs/{S1B,ROADMAP,DESIGN,FIND}.md`; small fixes only where evidence identifies them                                                                                    | All prior find suites unchanged; batch and socket against native CLI/GNU, find-compat output/status/effects/order classification; pure/action CLI gates per D56. Recheck 10M no-change core <=9.5 s unpaced, resident one-file/1% near threshold, D54 query/steady <1 GB goal, actual daemon/kernel/transient totals and D51 freshness. Report misses without weakening decisions. No watcher completeness claim on polling-only roots.                                                                                                                                         |
 

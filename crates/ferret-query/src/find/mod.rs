@@ -155,7 +155,9 @@ pub(super) fn unmark_output_failure(error: io::Error) -> io::Error {
 /// reported through `error`, like any other I/O failure.
 pub trait Effects {
     /// Checked before taking the next entry. Already started commits finish.
-    fn cancelled(&self) -> bool { false }
+    fn cancelled(&self) -> bool {
+        false
+    }
 
     /// Writes the path's exact bytes, followed by a newline or NUL.
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()>;
@@ -292,10 +294,19 @@ impl Plan {
     /// Parses a GNU find argument list for the current process, including `-I`.
     /// Relative lookups capture its cwd; ordinary exec inherits its cwd.
     pub fn parse(args: &[OsString]) -> Result<Self, ParseError> {
+        Self::parse_started(args, std::time::SystemTime::now())
+    }
+
+    /// Parses in the current process with a time captured by its query host.
+    /// Keeps ordinary exec's inherited cwd, including for local effects.
+    pub fn parse_started(
+        args: &[OsString],
+        started: std::time::SystemTime,
+    ) -> Result<Self, ParseError> {
         Self::parse_context(
             args,
             std::env::current_dir().ok().map(std::sync::Arc::new),
-            std::time::SystemTime::now(),
+            started,
             true,
         )
     }
