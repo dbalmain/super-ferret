@@ -170,7 +170,15 @@ fn connect(
                 ))?;
                 let mut reader = BufReader::new(stream);
                 let mut line = Vec::new();
-                let hello = event(&mut reader, &mut line)?;
+                // Writer commands wait out loading on this connection, within
+                // the startup deadline: answering in-process would race the
+                // daemon's writer ownership. Queries answer in-process instead.
+                let hello = loop {
+                    let hello = event(&mut reader, &mut line)?;
+                    if !(writer && field_text(&hello, "state") == Some("loading")) {
+                        break hello;
+                    }
+                };
                 if field_text(&hello, "event") != Some("hello")
                     || field_number(&hello, "major") != Some(MAJOR)
                     || field_text(&hello, "index") != Some(&endpoint.identity)

@@ -363,6 +363,37 @@ fn cold_first_use_answers_locally_while_one_daemon_loads() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn writer_command_waits_for_a_loading_daemon_instead_of_writing_locally() {
+    let tree = Tree::new();
+    assert!(
+        tree.command(&["search", "main"])
+            .env("FERRET_DAEMON_LOAD_DELAY_MS", "3000")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    wait(|| tree.sockets().len() == 1);
+    fs::write(tree.base.join("src/during-loading.txt"), "x").unwrap();
+    let started = Instant::now();
+    let indexed = tree.run(&["index", "src"]);
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    // Only waiting for the daemon's ready hello takes this long; a local
+    // writer would race the loading daemon's writer ownership.
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "writer command did not wait for the loading daemon"
+    );
+    assert!(tree.run(&["search", "during-loading.txt"]).status.success());
+    assert_eq!(fixture_daemons(&tree.base).len(), 1);
+}
+
+#[test]
 fn stale_socket_is_replaced_and_index_identities_are_isolated() {
     let tree = Tree::new();
     let directory = tree.base.join("home/runtime/ferret");
