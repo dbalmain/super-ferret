@@ -25,7 +25,9 @@ impl Lock {
     }
     // Full rebuild transactions borrow ownership without unlocking the
     // resident writer when their temporary guard is dropped.
-    pub(crate) fn share(&self) -> Self { Self(self.0.clone()) }
+    pub(crate) fn share(&self) -> Self {
+        Self(self.0.clone())
+    }
     #[cfg(test)]
     pub(crate) fn copy(&self) -> io::Result<File> {
         self.0.0.try_clone()

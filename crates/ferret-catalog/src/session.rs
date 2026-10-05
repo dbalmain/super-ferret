@@ -128,17 +128,28 @@ impl WriterSession {
     }
 
     /// Sets the provisional unpublished-input ceilings for subsequent crawls.
-    pub fn set_input_limits(&mut self, limits: crate::InputLimits) { self.input_limits = limits; }
-    pub fn input_limits(&self) -> crate::InputLimits { self.input_limits }
+    pub fn set_input_limits(&mut self, limits: crate::InputLimits) {
+        self.input_limits = limits;
+    }
+    pub fn input_limits(&self) -> crate::InputLimits {
+        self.input_limits
+    }
     /// Full-root backstop publication, preserving live DocIds and the lock.
     /// Scoped batches are refused. An uncertain failure requires reopening.
-    pub fn rebuild_checkpoint(&mut self, batches: Vec<Batch>, sniffer: u32, policy: Hash) -> Result<Catalog, Error> {
+    pub fn rebuild_checkpoint(
+        &mut self,
+        batches: Vec<Batch>,
+        sniffer: u32,
+        policy: Hash,
+    ) -> Result<Catalog, Error> {
         self.writer.rebuild_checkpoint(batches, sniffer, policy)?;
         self.rebuild();
         Ok(self.view())
     }
     /// Mints a full-builder batch, without compacting equal file observations.
-    pub fn checkpoint_batch(&self) -> Batch { self.batch().full_observations() }
+    pub fn checkpoint_batch(&self) -> Batch {
+        self.batch().full_observations()
+    }
 
     pub fn budget_usage(&self) -> crate::BudgetUsage {
         self.writer.budget_usage()

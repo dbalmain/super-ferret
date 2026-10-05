@@ -932,7 +932,23 @@ unchanged, or write a huge log only to rewrite it. Checkpointed returns the
 new epoch view; the host cannot treat it as a same-epoch delta. An unrelated
 checkpoint racing a queued request causes RetryFromCurrent. This adds a
 full-write cost for large diffs and threshold boundaries; report it separately
-from small-update latency. Limits bound the published log, not input size.
+from small-update latency. These limits bound the published log.
+
+The producer also applies provisional **500,000 input rows/records** and
+**64 MiB owned changed-input bytes** ceilings before storing changed
+observations and reconciliation scratch. Names and link targets count toward
+bytes; equal-row seen bits and the base-sized directory graph are separate
+resident storage. Charges are conservative across intermediate representations,
+not an RSS claim or a measured optimal crossover. On exhaustion, drop the
+unpublished attempt, retain the writer lock, and rewalk every configured root
+through the full checkpoint builder. Scoped batches are never checkpointed.
+Preserve live DocIds, typed retention and directory EACCES opacity; rebuild
+all epoch caches and return Checkpointed. Unanchored faults, protected global
+version transitions, and retained suppression/traversal combinations which the
+full builder cannot represent safely abort before changing the generation.
+Fresh aliases supersede individually carried retained observations, as in
+D31/D34. Raw low-level ChangeSet callers own their input allocation; the crawl
+producer's guard cannot retroactively bound a caller's existing Vec.
 
 Provisionally compact at an idle writer boundary, holding the writer lock;
 queries retain old views and keep running. Traverse the effective graph,

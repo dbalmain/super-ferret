@@ -398,6 +398,7 @@ pub enum Error {
 impl Error {
     pub fn published(&self) -> bool {
         matches!(self, Self::Undurable(_))
+            || matches!(self, Self::Rebuild(error) if error.published())
     }
 }
 impl fmt::Display for Error {
@@ -536,18 +537,33 @@ impl Writer {
         Ok(generation)
     }
 
-    pub(crate) fn rebuild_checkpoint(&mut self, batches: Vec<crate::Batch>, sniffer: u32, policy: crate::Hash) -> Result<(), Error> {
-        if self.poisoned { return Err(Error::Poisoned); }
+    pub(crate) fn rebuild_checkpoint(
+        &mut self,
+        batches: Vec<crate::Batch>,
+        sniffer: u32,
+        policy: crate::Hash,
+    ) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
         let lock = self._lock.share();
-        let mut txn = crate::Transaction::from_locked(self.dir.clone(), lock, Some(self.view()), sniffer);
+        let mut txn =
+            crate::Transaction::from_locked(self.dir.clone(), lock, Some(self.view()), sniffer);
         txn.set_policy(policy);
-        for batch in batches { txn.add(batch); }
+        for batch in batches {
+            txn.add(batch);
+        }
         self.poisoned = true;
         let current = txn.commit().map_err(Error::Rebuild)?;
         self.manifest = current.manifest();
         self.manifest.log_end = HEADER;
-        self.log = OpenOptions::new().read(true).write(true)
-            .open(self.dir.join(format!("changes.{}", current.generation().checkpoint)))
+        self.log = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                self.dir
+                    .join(format!("changes.{}", current.generation().checkpoint)),
+            )
             .map_err(Error::Undurable)?;
         self.budget = crate::budget::Budget::empty(current.inode_count(), current.name_count());
         self.current = current;

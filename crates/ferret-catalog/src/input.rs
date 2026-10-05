@@ -10,7 +10,12 @@ pub struct InputLimits {
     pub owned_bytes: usize,
 }
 impl Default for InputLimits {
-    fn default() -> Self { Self { records: 500_000, owned_bytes: 64 * 1024 * 1024 } }
+    fn default() -> Self {
+        Self {
+            records: 500_000,
+            owned_bytes: 64 * 1024 * 1024,
+        }
+    }
 }
 /// High-water accounting for an unpublished attempt. Refused allocations are
 /// excluded; exceeded means the attempt must be discarded without publication.
@@ -25,15 +30,37 @@ pub struct InputUsage {
 pub struct InputBudget {
     limits: InputLimits,
     usage: Mutex<InputUsage>,
+    exceeded: std::sync::atomic::AtomicBool,
 }
 impl InputBudget {
-    pub fn new(limits: InputLimits) -> Self { Self { limits, usage: Mutex::new(InputUsage::default()) } }
-    pub fn usage(&self) -> InputUsage { *self.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
+    pub fn new(limits: InputLimits) -> Self {
+        Self {
+            limits,
+            usage: Mutex::new(InputUsage::default()),
+            exceeded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    pub fn exceeded(&self) -> bool {
+        self.exceeded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn usage(&self) -> InputUsage {
+        *self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     pub fn charge(&self, records: usize, bytes: usize) -> Result<(), crate::log::Error> {
-        let mut usage = self.usage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if usage.exceeded || records > self.limits.records.saturating_sub(usage.records)
-            || bytes > self.limits.owned_bytes.saturating_sub(usage.owned_bytes) {
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if usage.exceeded
+            || records > self.limits.records.saturating_sub(usage.records)
+            || bytes > self.limits.owned_bytes.saturating_sub(usage.owned_bytes)
+        {
             usage.exceeded = true;
+            self.exceeded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(crate::log::Error::InputLimit(*usage));
         }
         usage.records += records;

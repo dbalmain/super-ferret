@@ -203,6 +203,7 @@ pub struct Batch {
     pub(crate) dirs: Vec<DirEntry>,
     pub(crate) dir_stats: Vec<Stat>,
     pub(crate) files: Vec<FileEntry>,
+    retained_files: Vec<u64>,
     pub(crate) ignored: Vec<IgnoredEntry>,
     pub(crate) file_stats: Vec<Stat>,
     pub(crate) contents: Vec<Content>,
@@ -238,6 +239,7 @@ impl Batch {
             dirs: Vec::new(),
             dir_stats: Vec::new(),
             files: Vec::new(),
+            retained_files: Vec::new(),
             ignored: Vec::new(),
             file_stats: Vec::new(),
             contents: Vec::new(),
@@ -276,16 +278,52 @@ impl Batch {
         self.observe_file(parent, name, stat, content, None);
     }
 
+    /// Copies a checked retained namespace occurrence. Fresh aliases of the
+    /// same inode supersede this observation (D31/D34), rather than conflict.
+    pub fn retained_file(
+        &mut self,
+        parent: DirToken,
+        name: &[u8],
+        stat: Stat,
+        content: Content,
+        target: Option<&[u8]>,
+    ) {
+        let index = self.files.len();
+        self.push_file(parent, name, stat, content, target);
+        if self.files.len() > index {
+            self.retained_files
+                .resize(self.retained_files.len().max(index / 64 + 1), 0);
+            self.retained_files[index / 64] |= 1 << (index % 64);
+        }
+    }
+    pub(crate) fn file_carried(&self, index: usize) -> bool {
+        self.carried
+            || self
+                .retained_files
+                .get(index / 64)
+                .is_some_and(|word| word & (1 << (index % 64)) != 0)
+    }
+
     /// Attaches one run's changed-input guard before collecting observations.
     pub fn with_input_budget(mut self, budget: std::sync::Arc<crate::InputBudget>) -> Self {
         self.input_budget = Some(budget);
         self
     }
+    /// Whether any worker exhausted the shared guard. Outputs from that
+    /// attempt must be discarded, never interpreted as missing entries.
+    pub fn input_exceeded(&self) -> bool {
+        self.input_budget.as_ref().is_some_and(|b| b.exceeded())
+    }
     /// Collects complete checkpoint observations while retaining old parent
     /// hints for fault anchoring. No equal rows are replaced by seen bits.
-    pub(crate) fn full_observations(mut self) -> Self { self.full = true; self }
+    pub(crate) fn full_observations(mut self) -> Self {
+        self.full = true;
+        self
+    }
     fn reserve_input(&self, records: usize, bytes: usize) -> bool {
-        self.input_budget.as_ref().is_none_or(|b| b.charge(records, bytes).is_ok())
+        self.input_budget
+            .as_ref()
+            .is_none_or(|b| b.charge(records, bytes).is_ok())
     }
     pub(crate) fn with_previous(mut self, previous: Catalog) -> Self {
         self.previous = Some(previous);
@@ -337,7 +375,12 @@ impl Batch {
         content: Content,
         target: Option<&[u8]>,
     ) {
-        if !self.reserve_input(1, std::mem::size_of::<Stat>() + 32 + name.len() + target.map_or(0, <[u8]>::len)) { return; }
+        if !self.reserve_input(
+            1,
+            std::mem::size_of::<Stat>() + 32 + name.len() + target.map_or(0, <[u8]>::len),
+        ) {
+            return;
+        }
         let index = self.files.len() as u32;
         let name = push(&mut self.names, name, &mut self.overflow);
         self.files.push(FileEntry { parent, name });
@@ -466,7 +509,8 @@ impl Batch {
     /// Records an ignored name without stat or content. A directory is an
     /// opaque marker: nothing below it is recorded.
     pub fn ignored(&mut self, parent: DirToken, name: &[u8], kind: Kind) {
-        if let Some(old) = &self.previous
+        if !self.full
+            && let Some(old) = &self.previous
             && let Some(id) = parent
                 .previous_directory()
                 .and_then(|p| old.lookup(p, name))
@@ -475,7 +519,9 @@ impl Batch {
             self.preserved.insert(parent, id, None);
             return;
         }
-        if !self.reserve_input(1, 32 + name.len()) { return; }
+        if !self.reserve_input(1, 32 + name.len()) {
+            return;
+        }
         let name = push(&mut self.names, name, &mut self.overflow);
         self.ignored.push(IgnoredEntry { parent, name, kind });
     }
@@ -565,6 +611,22 @@ impl Batch {
                     .then_some(id.0)
             })
             .unwrap_or(NONE);
+        let changed = old == NONE
+            || self.previous.as_ref().is_some_and(|view| {
+                view.inode(InoId(old)).stat != stat || view.is_traversed(InoId(old)) != traversed
+            });
+        if changed
+            && !self.reserve_input(
+                1,
+                std::mem::size_of::<DirEntry>() + std::mem::size_of::<Stat>() + name.len(),
+            )
+        {
+            return DirToken {
+                batch: self.id,
+                index: NONE,
+                old: NONE,
+            };
+        }
         let name = push(&mut self.names, name, &mut self.overflow);
         let token = DirToken {
             batch: self.id,

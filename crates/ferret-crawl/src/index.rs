@@ -303,6 +303,10 @@ pub struct Report {
     pub observation_rows_peak: usize,
     /// Conservative temporary row/name/target peak across worker buffers.
     pub observation_bytes_peak: usize,
+    /// Guard high-water before publication; refused allocations are excluded.
+    pub input_usage: ferret_catalog::InputUsage,
+    /// The bounded attempt was discarded and every configured root rewalked.
+    pub input_fallback: bool,
     /// The published generation's shape, when one was published.
     pub published: Option<Published>,
 }
@@ -427,7 +431,12 @@ fn run(
                 batches,
                 mut report,
                 changes,
-            } = observe_reconcile(&session, &mut plan, options)?;
+            } = match observe_reconcile(&session, &mut plan, options) {
+                Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
+                    return full_rewalk(&mut session, &plan.roots, options, usage);
+                }
+                result => result?,
+            };
             let started = Instant::now();
             let (catalog, changed, faulted, aliases) = match changes {
                 Some(changes) => {
@@ -541,7 +550,26 @@ pub(crate) fn recrawl_scoped(
         mut report,
         changes,
         ..
-    } = observe_reconcile(session, &mut plan, options)?;
+    } = match observe_reconcile(session, &mut plan, options) {
+        Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
+            let report = full_rewalk(session, &plan.roots, options, usage)?;
+            let view = session.view();
+            return Ok((
+                report,
+                ferret_catalog::log::ChangeSet {
+                    records: Vec::new(),
+                    counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+                    counts: [
+                        view.inode_count(),
+                        view.name_count(),
+                        view.dir_count(),
+                        view.doc_count(),
+                    ],
+                },
+            ));
+        }
+        result => result?,
+    };
     let started = Instant::now();
     let Some(changes) = changes else {
         return Err(IndexError::NeedsCheckpoint {
@@ -576,7 +604,8 @@ fn observe_reconcile(
     plan: &mut Plan,
     options: &IndexOptions,
 ) -> Result<Reconciled, IndexError> {
-    let source = Source::Session(session, options.sniffer);
+    let budget = std::sync::Arc::new(ferret_catalog::InputBudget::new(session.input_limits()));
+    let source = Source::Bounded(session, options.sniffer, &budget);
     let (mut batches, mut report) = observe(source, plan, options)?;
     loop {
         let started = Instant::now();
@@ -599,17 +628,18 @@ fn observe_reconcile(
         }
         report.protected_scopes =
             protection.directories.len() + protection.edges.len() + protection.opaque.len();
-        let changes = crate::reconcile::with_protection(
+        let changes = crate::reconcile::with_budget(
             session,
             &batches,
             &plan.refresh,
             &plan.dropped,
             fingerprint(options),
             options.sniffer,
-            &protection,
+            (&protection, budget.clone()),
         )
         .map_err(IndexError::Update)?;
         report.commit_time += started.elapsed();
+        report.input_usage = budget.usage();
         let Some(ref final_changes) = changes else {
             return Ok(Reconciled {
                 batches,
@@ -754,19 +784,29 @@ fn fingerprint(options: &IndexOptions) -> ferret_catalog::Hash {
 #[derive(Clone, Copy)]
 enum Source<'a> {
     Checkpoint(&'a Transaction),
-    Session(&'a WriterSession, u32),
+    Bounded(
+        &'a WriterSession,
+        u32,
+        &'a std::sync::Arc<ferret_catalog::InputBudget>,
+    ),
+    Rebuild(&'a WriterSession, u32),
 }
 impl Source<'_> {
     fn batch(self) -> ferret_catalog::Batch {
         match self {
             Self::Checkpoint(txn) => txn.batch(),
-            Self::Session(session, _) => session.batch(),
+            Self::Bounded(session, _, budget) => {
+                session.batch().with_input_budget((*budget).clone())
+            }
+            Self::Rebuild(session, _) => session.checkpoint_batch(),
         }
     }
     fn carry(self, stat: &Stat) -> Option<Content> {
         match self {
             Self::Checkpoint(txn) => txn.carry(stat),
-            Self::Session(session, sniffer) => session.carry(stat, sniffer),
+            Self::Bounded(session, sniffer, _) | Self::Rebuild(session, sniffer) => {
+                session.carry(stat, sniffer)
+            }
         }
     }
 }
@@ -802,6 +842,13 @@ fn observe(
                 hasher
             },
         );
+        if let Source::Bounded(_, _, budget) = source
+            && budget.exceeded()
+        {
+            return Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(
+                budget.usage(),
+            )));
+        }
         let outputs: Vec<Output> = visitors
             .into_iter()
             .map(|v| v.finish(&mut faults))
@@ -811,6 +858,13 @@ fn observe(
         for mut output in outputs {
             output.resolve(&cache);
             output.batch.seal();
+            if let Source::Bounded(_, _, budget) = source
+                && budget.exceeded()
+            {
+                return Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(
+                    budget.usage(),
+                )));
+            }
             let (rows, bytes) = output.batch.observation_peak();
             observation_rows += rows;
             observation_bytes += bytes;
@@ -1193,7 +1247,7 @@ impl<'a> Hasher<'a> {
     fn promote_changed_parent(&self, token: DirToken, stat: &Stat, path: &Path) {
         if let Some(selection) = self.selection {
             let continuing = match (token.previous_directory(), self.txn) {
-                (Some(id), Source::Session(session, _)) => {
+                (Some(id), Source::Bounded(session, _, _) | Source::Rebuild(session, _)) => {
                     session.view().inode(id).stat.same_version(stat)
                 }
                 _ => false,
@@ -1387,11 +1441,14 @@ impl EventVisitor for Hasher<'_> {
     }
 
     fn consider(&mut self, parent: DirToken, name: &OsStr, path: &Path) -> bool {
+        if self.out.batch.input_exceeded() {
+            return false;
+        }
         let Some(selection) = self.selection else {
             return true;
         };
         if let Some(old) = parent.previous_directory()
-            && let Source::Session(session, _) = self.txn
+            && let Source::Bounded(session, _, _) | Source::Rebuild(session, _) = self.txn
             && session.view().entry_count(old).is_none()
         {
             selection.promote(path.parent().unwrap_or_else(|| Path::new("")));
@@ -1405,6 +1462,9 @@ impl EventVisitor for Hasher<'_> {
     }
 
     fn visit(&mut self, event: Event<'_, DirToken>) -> Option<DirToken> {
+        if self.out.batch.input_exceeded() {
+            return None;
+        }
         match event {
             Event::Decided(decided) => {
                 if decided.decision == Decision::Skip {
@@ -1547,4 +1607,48 @@ fn hook(root: &Path, probe: Probe<'_>) {
     if let Some(hook) = found {
         hook(probe);
     }
+}
+
+// All configured roots are observed again: scoped batches cannot describe a
+// checkpoint. The abandoned attempt has dropped before this function starts.
+fn full_rewalk(
+    session: &mut WriterSession,
+    roots: &[PathBuf],
+    options: &IndexOptions,
+    usage: ferret_catalog::InputUsage,
+) -> Result<Report, IndexError> {
+    let old = session.view();
+    let plan = Plan::new(
+        Some(&old),
+        roots,
+        Refresh::All,
+        options.sniffer,
+        fingerprint(options),
+    )?;
+    let (batches, mut report) = observe(Source::Rebuild(session, options.sniffer), &plan, options)?;
+    let protection =
+        crate::coverage::resolve(session, &batches, &report.coverage_faults, &plan.roots);
+    let batches = protection
+        .and_then(|protection| {
+            if !protection.is_empty()
+                && (old.policy() != fingerprint(options)
+                    || old.sniffer_version() != options.sniffer)
+            {
+                return None;
+            }
+            crate::coverage::checkpoint_observations(session, batches, &protection, &plan.roots)
+        })
+        .ok_or_else(|| IndexError::Coverage {
+            faults: std::mem::take(&mut report.coverage_faults),
+            report: Box::new(Report::default()),
+        })?;
+    let started = Instant::now();
+    let catalog = session
+        .rebuild_checkpoint(batches, options.sniffer, fingerprint(options))
+        .map_err(IndexError::Update)?;
+    report.commit_time += started.elapsed();
+    report.input_usage = usage;
+    report.input_fallback = true;
+    finish_report(&mut report, &catalog, &plan, true, None, None);
+    Ok(report)
 }

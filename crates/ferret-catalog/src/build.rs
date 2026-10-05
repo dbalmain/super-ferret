@@ -751,7 +751,10 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
 /// whether it is a fault: the first fresh one if any, else the first carried
 /// one; a fault when another observation of the same kind disagrees with it.
 fn choose(index: &Index, batches: &[Batch], members: &[u32]) -> (u32, bool) {
-    let carried = |f: u32| batches[index.file(f as usize).0].carried;
+    let carried = |f: u32| {
+        let (batch, row) = index.file(f as usize);
+        batches[batch].file_carried(row)
+    };
     let winner = members
         .iter()
         .copied()

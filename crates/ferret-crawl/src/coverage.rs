@@ -545,3 +545,238 @@ pub(crate) fn resolve(
     }
     Some(r.out)
 }
+
+/// Replays complete rewalk observations and checked retained boundaries through
+/// the full builder. Numeric ids select old rows only; new tokens own all
+/// edges. None refuses unrepresentable coverage before publishing anything.
+pub(crate) fn checkpoint_observations(
+    session: &WriterSession,
+    batches: Vec<Batch>,
+    protection: &Protection,
+    configured: &[PathBuf],
+) -> Option<Vec<Batch>> {
+    if protection.is_empty() && protection.denied.is_empty() {
+        return Some(batches);
+    }
+    let old = session.view();
+    let dirs: BTreeMap<_, _> = batches
+        .iter()
+        .flat_map(Batch::directories)
+        .map(|d| (d.token, d))
+        .collect();
+    let counts: BTreeMap<_, _> = batches.iter().flat_map(Batch::entry_counts).collect();
+    let mut children: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    for d in dirs.values() {
+        if let Some(parent) = d.parent {
+            children.entry(parent).or_default().push(d.token);
+        } else {
+            queue.push_back(d.token);
+        }
+    }
+    let mut resolver = Resolver {
+        session,
+        old: old.clone(),
+        dirs: dirs.clone(),
+        resolved: BTreeMap::new(),
+        active: BTreeSet::new(),
+        out: Protection::default(),
+    };
+    let mut batch = session.checkpoint_batch();
+    let mut mapped = BTreeMap::new();
+    let mut overridden: BTreeSet<(DirToken, Vec<u8>)> = BTreeSet::new();
+    let mut represented = BTreeSet::new();
+    while let Some(token) = queue.pop_front() {
+        let d = dirs.get(&token)?;
+        let parent = match d.parent {
+            Some(p) => Some(*mapped.get(&p)?),
+            None => None,
+        };
+        if d.parent
+            .is_some_and(|p| overridden.contains(&(p, d.name.to_vec())))
+        {
+            continue;
+        }
+        if protection.tokens.contains(&token) {
+            let id = resolver.directory(token)?;
+            copy_subtree(&old, &mut batch, id, parent, d.name, &protection.markers)?;
+            represented.insert(id.0);
+            continue;
+        }
+        let next = match parent {
+            None => batch.root(d.name, *d.stat),
+            Some(p) if d.traversed => batch.traversed_dir(p, d.name, *d.stat),
+            Some(p) => batch.dir(p, d.name, *d.stat),
+        };
+        mapped.insert(token, next);
+        let opaque = protection.denied.contains(&token) || protection.opaque.contains(&token);
+        if opaque {
+            continue;
+        }
+        if let Some(id) = resolver.directory(token) {
+            if protection.markers.contains(&id.0) {
+                if let Some(seq) = retained_sequence(&old, id) {
+                    batch.retained_at(next, Some(seq));
+                }
+            } else if let Some(&count) = counts.get(&token) {
+                batch.entry_count(next, count);
+            }
+            for name in old.children(id) {
+                let edge = old.name(name);
+                let retained_dir = matches!(edge.target(), ferret_catalog::Target::Inode(child) if old.is_directory(child) && protection.directories.contains(&child.0));
+                if protection.edges.contains(&name.0) || retained_dir {
+                    overridden.insert((token, edge.bytes.to_vec()));
+                    copy_edge(&old, &mut batch, next, name, &protection.markers)?;
+                    represented.insert(edge.child.0);
+                }
+            }
+        } else if let Some(&count) = counts.get(&token) {
+            batch.entry_count(next, count);
+        }
+        queue.extend(children.remove(&token).unwrap_or_default());
+    }
+    // A failed root open can have no token. Only a checked old configured root
+    // is allowed to fill that absence; new unanchored roots abort.
+    for root in configured {
+        if !dirs
+            .values()
+            .any(|d| d.parent.is_none() && d.name == root.as_os_str().as_bytes())
+        {
+            let (id, path) = old
+                .roots()
+                .find(|(_, path)| *path == root.as_os_str().as_bytes())?;
+            if !protection.directories.contains(&id.0) {
+                return None;
+            }
+            copy_subtree(&old, &mut batch, id, None, path, &protection.markers)?;
+            represented.insert(id.0);
+        }
+    }
+    for &id in &protection.directories {
+        let mut dir = InoId(id);
+        while !represented.contains(&dir.0) {
+            dir = old.name(old.dir_name(dir)?).parent;
+        }
+    }
+    for input in &batches {
+        for i in 0..input.file_count() {
+            let f = input.file_observation(i);
+            let Some(&parent) = mapped.get(&f.parent) else {
+                continue;
+            };
+            if protection.denied.contains(&f.parent)
+                || protection.opaque.contains(&f.parent)
+                || overridden.contains(&(f.parent, f.name.to_vec()))
+            {
+                continue;
+            }
+            match f.target {
+                Some(target) => batch.symlink(parent, f.name, f.stat, target),
+                None => batch.file(parent, f.name, f.stat, f.content),
+            }
+        }
+        for (parent, name, kind) in input.ignored_entries() {
+            if let Some(&next) = mapped.get(&parent)
+                && !protection.denied.contains(&parent)
+                && !protection.opaque.contains(&parent)
+                && !overridden.contains(&(parent, name.to_vec()))
+            {
+                batch.ignored(next, name, kind);
+            }
+        }
+        for (token, kind, path, identity) in input.work_tree_observations() {
+            if let Some(&next) = mapped.get(&token)
+                && !protection.denied.contains(&token)
+                && !protection.opaque.contains(&token)
+            {
+                batch.work_tree(next, kind, path, identity);
+            }
+        }
+    }
+    batch.seal();
+    Some(vec![batch])
+}
+
+fn retained_sequence(old: &Catalog, id: InoId) -> Option<u64> {
+    old.retained_at(id)
+        .or_else(|| old.entry_count(id).map(|_| old.generation().sequence))
+}
+
+fn copy_subtree(
+    old: &Catalog,
+    batch: &mut Batch,
+    id: InoId,
+    parent: Option<DirToken>,
+    name: &[u8],
+    markers: &BTreeSet<u32>,
+) -> Option<()> {
+    // The legacy full builder cannot express an independently suppressed old
+    // directory. Refuse that rare protected case instead of changing D29.
+    if old.is_traversed(id) != old.is_search_suppressed(id) {
+        return None;
+    }
+    let stat = old.inode(id).stat;
+    let token = match parent {
+        None => batch.root(name, stat),
+        Some(p) if old.is_traversed(id) => batch.traversed_dir(p, name, stat),
+        Some(p) => batch.dir(p, name, stat),
+    };
+    if markers.contains(&id.0) {
+        if let Some(seq) = retained_sequence(old, id) {
+            batch.retained_at(token, Some(seq));
+        }
+    } else {
+        if let Some(count) = old.entry_count(id) {
+            batch.entry_count(token, count);
+        }
+        if let Some(seq) = old.retained_at(id) {
+            batch.retained_at(token, Some(seq));
+        }
+    }
+    if let Some(wt) = old.work_tree(id) {
+        batch.work_tree(token, wt.kind, wt.common_dir, wt.common_id);
+    }
+    for name in old.children(id) {
+        copy_edge(old, batch, token, name, markers)?;
+    }
+    Some(())
+}
+
+fn copy_edge(
+    old: &Catalog,
+    batch: &mut Batch,
+    parent: DirToken,
+    name: ferret_catalog::NameId,
+    markers: &BTreeSet<u32>,
+) -> Option<()> {
+    use ferret_catalog::{Content, ContentState, Target};
+    let edge = old.name(name);
+    let Target::Inode(id) = edge.target() else {
+        if let Target::Ignored(kind) = edge.target() {
+            batch.ignored(parent, edge.bytes, kind);
+        }
+        return Some(());
+    };
+    if old.is_directory(id) {
+        return copy_subtree(old, batch, id, Some(parent), edge.bytes, markers);
+    }
+    let inode = old.inode(id);
+    if old.kind(id) == Kind::Symlink {
+        batch.retained_file(
+            parent,
+            edge.bytes,
+            inode.stat,
+            Content::Unindexed,
+            Some(old.link_target(id)?),
+        );
+    } else {
+        let content = match inode.state {
+            ContentState::Unindexed => Content::Unindexed,
+            ContentState::Binary => Content::Binary,
+            ContentState::Fault => Content::Fault,
+            ContentState::Hashed => Content::Hashed(old.doc_hash(inode.doc?)?),
+        };
+        batch.retained_file(parent, edge.bytes, inode.stat, content, None);
+    }
+    Some(())
+}

@@ -171,7 +171,15 @@ pub(crate) fn with_protection(
     protection: &crate::coverage::Protection,
 ) -> Result<Option<ChangeSet>, Error> {
     let budget = std::sync::Arc::new(ferret_catalog::InputBudget::new(session.input_limits()));
-    with_budget(session, batches, refreshed, dropped, policy, sniffer, protection, budget)
+    with_budget(
+        session,
+        batches,
+        refreshed,
+        dropped,
+        policy,
+        sniffer,
+        (protection, budget),
+    )
 }
 
 pub(crate) fn with_budget(
@@ -181,9 +189,12 @@ pub(crate) fn with_budget(
     dropped: &[PathBuf],
     policy: Hash,
     sniffer: u32,
-    protection: &crate::coverage::Protection,
-    budget: std::sync::Arc<ferret_catalog::InputBudget>,
+    guarded: (
+        &crate::coverage::Protection,
+        std::sync::Arc<ferret_catalog::InputBudget>,
+    ),
 ) -> Result<Option<ChangeSet>, Error> {
+    let (protection, budget) = guarded;
     if batches.iter().any(Batch::overflowed) {
         return Err(invalid("recrawl batch overflow"));
     }
@@ -458,10 +469,14 @@ pub(crate) fn with_budget(
                 out.edge(parent, id, d.name)?;
             }
         } else if continuing.is_none() {
-            push(&out.budget, &mut out.changes.records, Record::RootPut {
-                id,
-                path: d.name.to_vec(),
-            })?;
+            push(
+                &out.budget,
+                &mut out.changes.records,
+                Record::RootPut {
+                    id,
+                    path: d.name.to_vec(),
+                },
+            )?;
         }
     }
     // A disconnected/cyclic token graph cannot reach publication.
@@ -603,10 +618,14 @@ pub(crate) fn with_budget(
         if kind == Kind::Symlink
             && (!out.old.is_live_inode(InoId(id)) || out.old.link_target(InoId(id)) != first.target)
         {
-            push(&out.budget, &mut out.changes.records, Record::LinkPut {
-                id,
-                target: first.target.unwrap_or_default().to_vec(),
-            })?;
+            push(
+                &out.budget,
+                &mut out.changes.records,
+                Record::LinkPut {
+                    id,
+                    target: first.target.unwrap_or_default().to_vec(),
+                },
+            )?;
         }
         for &loc in &files[at..end] {
             let f = file(loc);
@@ -672,7 +691,11 @@ pub(crate) fn with_budget(
                 .any(|(id, path)| id == root && path == p.as_os_str().as_bytes())
         }) || !out.inodes.contains(root.0)
         {
-            push(&out.budget, &mut out.changes.records, Record::RootDelete { id: root.0 })?;
+            push(
+                &out.budget,
+                &mut out.changes.records,
+                Record::RootDelete { id: root.0 },
+            )?;
             out.references.entry(root.0).or_default();
         }
     }
@@ -721,27 +744,35 @@ pub(crate) fn with_budget(
             || out.old.is_traversed(InoId(id)) != d.observation.traversed
             || out.old.retained_at(InoId(id)) != retained_at
         {
-            push(&out.budget, &mut out.changes.records, Record::DirPut {
-                id,
-                name,
-                entries,
-                flags,
-                retained_at,
-            })?;
+            push(
+                &out.budget,
+                &mut out.changes.records,
+                Record::DirPut {
+                    id,
+                    name,
+                    entries,
+                    flags,
+                    retained_at,
+                },
+            )?;
         }
     }
     for &id in protection.markers.difference(&marked) {
         let dir = InoId(id);
         let retained = out.retained_sequence(dir);
         if out.old.entry_count(dir).is_some() || out.old.retained_at(dir) != retained {
-            push(&out.budget, &mut out.changes.records, Record::DirPut {
-                id,
-                name: out.old.dir_name(dir).map(|n| n.0),
-                entries: None,
-                flags: if retained.is_some() { 8 } else { 0 }
-                    | if out.old.is_traversed(dir) { 3 } else { 0 },
-                retained_at: retained,
-            })?;
+            push(
+                &out.budget,
+                &mut out.changes.records,
+                Record::DirPut {
+                    id,
+                    name: out.old.dir_name(dir).map(|n| n.0),
+                    entries: None,
+                    flags: if retained.is_some() { 8 } else { 0 }
+                        | if out.old.is_traversed(dir) { 3 } else { 0 },
+                    retained_at: retained,
+                },
+            )?;
         }
     }
     let work_trees: BTreeMap<_, _> = batches
@@ -771,27 +802,38 @@ pub(crate) fn with_budget(
                     old.kind != kind || old.common_dir != path || old.common_id != common_id
                 }) =>
             {
-                push(&out.budget, &mut out.changes.records, Record::WorkTreePut {
-                    id,
-                    kind,
-                    common_id,
-                    path: path.to_vec(),
-                })?;
+                push(
+                    &out.budget,
+                    &mut out.changes.records,
+                    Record::WorkTreePut {
+                        id,
+                        kind,
+                        common_id,
+                        path: path.to_vec(),
+                    },
+                )?;
             }
-            (Some(_), None) => push(&out.budget, &mut out.changes.records, Record::WorkTreeDelete { id })?,
+            (Some(_), None) => push(
+                &out.budget,
+                &mut out.changes.records,
+                Record::WorkTreeDelete { id },
+            )?,
             _ => {}
         }
     }
     out.finish_inodes()?;
     if out.old.policy() != policy || out.old.sniffer_version() != sniffer {
-        push(&out.budget, &mut out.changes.records, Record::PolicyPut { hash: policy })?;
+        push(
+            &out.budget,
+            &mut out.changes.records,
+            Record::PolicyPut { hash: policy },
+        )?;
     }
     out.changes.records.sort_unstable_by_key(record_key);
     Ok(Some(out.changes))
 }
 
 impl Final<'_> {
-
     fn retained_sequence(&self, id: InoId) -> Option<u64> {
         self.old.retained_at(id).or_else(|| {
             self.old
@@ -809,7 +851,8 @@ impl Final<'_> {
                 return Ok(());
             }
         }
-        self.budget.charge(1, std::mem::size_of::<Edge>() + name.len())?;
+        self.budget
+            .charge(1, std::mem::size_of::<Edge>() + name.len())?;
         self.pending.push(Edge {
             parent,
             child,
@@ -911,19 +954,27 @@ impl Final<'_> {
             if rename.is_none() && edge.child < u32::MAX - 16 {
                 *self.references.entry(edge.child).or_default() += 1;
             }
-            push(&self.budget, &mut self.changes.records, Record::NamePut {
-                id,
-                parent: edge.parent,
-                child: edge.child,
-                name: edge.name,
-            })?;
+            push(
+                &self.budget,
+                &mut self.changes.records,
+                Record::NamePut {
+                    id,
+                    parent: edge.parent,
+                    child: edge.child,
+                    name: edge.name,
+                },
+            )?;
         }
         for &id in &self.removed {
             if let Target::Inode(child) = self.old.name(NameId(id)).target() {
                 *self.references.entry(child.0).or_default() -= 1;
             }
             self.changes.counts[1] -= 1;
-            push(&self.budget, &mut self.changes.records, Record::NameDelete { id })?;
+            push(
+                &self.budget,
+                &mut self.changes.records,
+                Record::NameDelete { id },
+            )?;
         }
         Ok(())
     }
@@ -950,15 +1001,27 @@ impl Final<'_> {
                     return Err(invalid("unreachable inode birth"));
                 }
                 self.puts.remove(&id);
-                push(&self.budget, &mut self.changes.records, Record::InodeDelete { id })?;
+                push(
+                    &self.budget,
+                    &mut self.changes.records,
+                    Record::InodeDelete { id },
+                )?;
                 self.changes.counts[0] -= 1;
                 if self.old.is_directory(InoId(id)) {
                     self.changes.counts[2] -= 1;
                     if self.old.work_tree(InoId(id)).is_some() {
-                        push(&self.budget, &mut self.changes.records, Record::WorkTreeDelete { id })?;
+                        push(
+                            &self.budget,
+                            &mut self.changes.records,
+                            Record::WorkTreeDelete { id },
+                        )?;
                     }
                 } else if self.old.kind(InoId(id)) == Kind::Symlink {
-                    push(&self.budget, &mut self.changes.records, Record::LinkDelete { id })?;
+                    push(
+                        &self.budget,
+                        &mut self.changes.records,
+                        Record::LinkDelete { id },
+                    )?;
                 }
                 if let Some(doc) = self.old.doc(InoId(id)) {
                     *self.document_refs.entry(doc.0).or_default() -= 1;
@@ -981,12 +1044,16 @@ impl Final<'_> {
                         self.changes.counts[2] += 1;
                     }
                 }
-                push(&self.budget, &mut self.changes.records, Record::LifePut {
-                    id,
-                    kind,
-                    flags: 0,
-                    names,
-                })?;
+                push(
+                    &self.budget,
+                    &mut self.changes.records,
+                    Record::LifePut {
+                        id,
+                        kind,
+                        flags: 0,
+                        names,
+                    },
+                )?;
             }
         }
         for (&id, record) in &self.puts {
@@ -1008,7 +1075,9 @@ impl Final<'_> {
                 }
             }
         }
-        for record in std::mem::take(&mut self.puts).into_values() { push(&self.budget, &mut self.changes.records, record)?; }
+        for record in std::mem::take(&mut self.puts).into_values() {
+            push(&self.budget, &mut self.changes.records, record)?;
+        }
         let hashes: BTreeMap<_, _> = self
             .new_docs
             .iter()
@@ -1023,7 +1092,11 @@ impl Final<'_> {
             let refs = u32::try_from(refs).map_err(|_| invalid("recrawl document references"))?;
             if refs == 0 {
                 self.changes.counts[3] -= 1;
-                push(&self.budget, &mut self.changes.records, Record::DocDelete { id })?;
+                push(
+                    &self.budget,
+                    &mut self.changes.records,
+                    Record::DocDelete { id },
+                )?;
             } else {
                 let hash = self
                     .old
@@ -1033,11 +1106,15 @@ impl Final<'_> {
                 if old.is_none() {
                     self.changes.counts[3] += 1;
                 }
-                push(&self.budget, &mut self.changes.records, Record::DocPut {
-                    id,
-                    references: refs,
-                    hash,
-                })?;
+                push(
+                    &self.budget,
+                    &mut self.changes.records,
+                    Record::DocPut {
+                        id,
+                        references: refs,
+                        hash,
+                    },
+                )?;
             }
         }
         Ok(())
@@ -1064,15 +1141,18 @@ fn record_key(record: &Record) -> (u8, u32) {
     }
 }
 
-fn push(budget: &ferret_catalog::InputBudget, records: &mut Vec<Record>, record: Record) -> Result<(), Error> {
-        let bytes = match &record {
-            Record::NamePut { name, .. } => name.len(),
-            Record::RootPut { path, .. } | Record::WorkTreePut { path, .. } => path.len(),
-            Record::LinkPut { target, .. } => target.len(),
-            _ => 0,
-        };
-        budget.charge(1, std::mem::size_of::<Record>() + bytes)?;
-        records.push(record);
-        Ok(())
-    }
-
+fn push(
+    budget: &ferret_catalog::InputBudget,
+    records: &mut Vec<Record>,
+    record: Record,
+) -> Result<(), Error> {
+    let bytes = match &record {
+        Record::NamePut { name, .. } => name.len(),
+        Record::RootPut { path, .. } | Record::WorkTreePut { path, .. } => path.len(),
+        Record::LinkPut { target, .. } => target.len(),
+        _ => 0,
+    };
+    budget.charge(1, std::mem::size_of::<Record>() + bytes)?;
+    records.push(record);
+    Ok(())
+}

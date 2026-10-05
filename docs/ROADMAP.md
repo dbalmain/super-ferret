@@ -1078,7 +1078,7 @@ directory and is not included in this synthetic replay.
 
 No-change median is **9.17 s** (9.14–9.28 s), under the **9.5 s** target;
 it writes **zero bytes** and publishes no generation. Whole-process peak is
-**1.37 GiB**, against M4b's **1.35 GiB**: 1408.38 vs 1386.72 MiB, about
+**1408.38 MiB (1.375 GiB)**, against M4b's **1386.72 MiB (1.354 GiB)**: 1408.38 vs 1386.72 MiB, about
 21.66 MiB higher. The new cached first-name inverse costs about 40 MiB; seen
 parent-table consolidation offsets some of it. The fixed observation cap does
 not imply a cap on the directory graph or total process RSS. No-change phase

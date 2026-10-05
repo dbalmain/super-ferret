@@ -40,8 +40,8 @@ pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
 pub use budget::{BudgetUsage, CompactionLimits};
 pub use build::BuildError;
 pub use format::{DecodeError, Section};
-pub use input::{InputBudget, InputLimits, InputUsage};
 pub use generation::{Generation, Handle, RetryFromCurrent};
+pub use input::{InputBudget, InputLimits, InputUsage};
 pub use read::{
     Catalog, Contents, Entry, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN,
     Resolved, Target, WorkTree,

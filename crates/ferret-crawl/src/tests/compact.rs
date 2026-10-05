@@ -311,3 +311,219 @@ fn eleven_deletions_and_an_unreadable_highest_inode_report_the_surviving_alias_a
         oracle(&tmp, &new);
     }
 }
+
+#[test]
+fn small_record_and_owned_name_budgets_discard_scoped_diffs_and_rewalk_all_roots_preserving_docids()
+{
+    use ferret_catalog::InputLimits;
+    use std::os::unix::ffi::OsStrExt;
+    for by_bytes in [false, true] {
+        let tmp = Tmp::new(&format!("input-budget-{by_bytes}"));
+        tmp.write("changed/a", b"old");
+        tmp.write("untouched/stable", b"stable");
+        for n in 0..40 {
+            tmp.write(
+                &format!("changed/{}-{n:02}", "long-owned-name".repeat(6)),
+                b"initial",
+            );
+        }
+        index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let old = session.view();
+        let root = old.roots().next().unwrap().0;
+        let dir = old.name(old.lookup(root, b"changed").unwrap()).child;
+        let stable = old
+            .docs()
+            .find(|(_, hash)| *hash == blake3::hash(b"stable").as_bytes()[..16])
+            .unwrap()
+            .0;
+        let limits = InputLimits {
+            records: if by_bytes { usize::MAX } else { 8 },
+            owned_bytes: if by_bytes { 512 } else { usize::MAX },
+        };
+        session.set_input_limits(limits);
+        for entry in fs::read_dir(tmp.at("changed")).unwrap() {
+            fs::write(entry.unwrap().path(), b"replacement").unwrap();
+        }
+        let request = RefreshRequest {
+            expected_generation: old.generation(),
+            scopes: vec![RefreshScope::Directory(dir)],
+            rename_hints: Vec::new(),
+            reason: RefreshReason::Burst,
+        };
+        let result = refresh(&mut session, request, &options()).unwrap();
+        assert!(matches!(result.outcome, RefreshOutcome::Checkpointed));
+        assert!(result.report.input_fallback && result.report.input_usage.exceeded);
+        assert!(result.report.input_usage.records <= limits.records);
+        assert!(result.report.input_usage.owned_bytes <= limits.owned_bytes);
+        assert_eq!(result.view.doc_hash(stable), old.doc_hash(stable));
+        assert_eq!(result.view.next_doc().0, old.next_doc().0 + 1);
+        assert!(
+            result
+                .view
+                .resolve(tmp.at("untouched/stable").as_os_str().as_bytes())
+                .is_some()
+        );
+        assert!(
+            matches!(
+                WriterSession::open(&tmp.cat()),
+                Err(ferret_catalog::log::Error::Locked)
+            ),
+            "fallback kept the writer lock"
+        );
+        for id in result
+            .view
+            .inode_ids()
+            .filter(|&id| !result.view.is_directory(id))
+        {
+            assert_eq!(session.identity(result.view.identity(id)), Some(id));
+        }
+        oracle(&tmp, &result.view);
+    }
+}
+
+#[test]
+fn bounded_full_rewalk_keeps_transient_subtrees_and_publishes_directory_eacces_opaque() {
+    use super::coverage::{Hook, retained_listings};
+    use crate::walk::IoPoint;
+    use crate::{IoOp, recrawl};
+    use std::os::unix::ffi::OsStrExt;
+    for denied in [false, true] {
+        let tmp = Tmp::new(&format!("bounded-fault-{denied}"));
+        tmp.write("dir/old", b"retained");
+        tmp.write("outside", b"old");
+        index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        session.set_input_limits(ferret_catalog::InputLimits {
+            records: 0,
+            owned_bytes: 0,
+        });
+        tmp.write("outside", b"trustworthy change");
+        tmp.write("dir/old", b"unobserved change");
+        let hook = Hook::set(&tmp.tree(), move |point, path| {
+            (point == IoPoint::Directory && path == std::path::Path::new("dir")).then(|| {
+                (
+                    IoOp::List,
+                    std::io::Error::from_raw_os_error(if denied { 13 } else { 5 }),
+                )
+            })
+        });
+        let result = burst(&tmp, &mut session);
+        assert!(result.report.input_fallback);
+        assert!(matches!(result.outcome, RefreshOutcome::Checkpointed));
+        let dir = result
+            .view
+            .name(
+                result
+                    .view
+                    .lookup(result.view.roots().next().unwrap().0, b"dir")
+                    .unwrap(),
+            )
+            .child;
+        assert_eq!(result.view.entry_count(dir), None);
+        assert_eq!(result.view.children(dir).count(), usize::from(!denied));
+        assert_eq!(result.view.retained_at(dir).is_some(), !denied);
+        if denied {
+            oracle(&tmp, &result.view);
+            drop(hook);
+        } else {
+            drop(hook);
+            let fresh_path = tmp.base.join("bounded-fault-oracle");
+            index(&fresh_path, &[tmp.tree()], Refresh::All, &options()).unwrap();
+            let scope = tmp.at("dir").as_os_str().as_bytes().to_vec();
+            assert_eq!(
+                listings(&result.view),
+                retained_listings(
+                    &open(&fresh_path),
+                    &before,
+                    std::slice::from_ref(&scope),
+                    std::slice::from_ref(&scope)
+                )
+            );
+        }
+        recrawl(&mut session, &[tmp.tree()], Refresh::All, &options()).unwrap();
+        oracle(&tmp, &session.view());
+    }
+}
+
+#[test]
+fn bounded_full_rewalk_under_protected_policy_or_sniffer_transitions_leaves_the_generation_intact()
+{
+    use super::coverage::Hook;
+    use crate::walk::IoPoint;
+    use crate::{IoOp, recrawl};
+    for sniffer in [false, true] {
+        let tmp = Tmp::new(&format!("bounded-transition-{sniffer}"));
+        tmp.write("dir/old", b"old");
+        tmp.write("outside", b"old");
+        index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+        let mut session = WriterSession::open(&tmp.cat()).unwrap();
+        let before = session.view();
+        session.set_input_limits(ferret_catalog::InputLimits {
+            records: 0,
+            owned_bytes: 0,
+        });
+        tmp.write("outside", b"changed");
+        let hook = Hook::set(&tmp.tree(), |point, path| {
+            (point == IoPoint::Directory && path == std::path::Path::new("dir"))
+                .then(|| (IoOp::List, std::io::Error::from_raw_os_error(5)))
+        });
+        let mut changed = options();
+        if sniffer {
+            changed.sniffer += 1;
+        } else {
+            changed.global = Some("unrelated-rule\n".into());
+        }
+        assert!(matches!(
+            recrawl(&mut session, &[tmp.tree()], Refresh::All, &changed),
+            Err(crate::IndexError::Coverage { .. })
+        ));
+        assert_eq!(session.view().generation(), before.generation());
+        assert_eq!(open(&tmp.cat()).generation(), before.generation());
+        assert_eq!(listings(&session.view()), listings(&before));
+        drop(hook);
+        recrawl(&mut session, &[tmp.tree()], Refresh::All, &changed).unwrap();
+        assert_ne!(
+            session.view().generation().checkpoint,
+            before.generation().checkpoint
+        );
+    }
+}
+
+#[test]
+fn bounded_full_rewalk_fresh_alias_supersedes_the_retained_alias_observation() {
+    use super::coverage::{Hook, retained_listings};
+    use crate::IoOp;
+    use crate::walk::IoPoint;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = Tmp::new("bounded-retained-alias");
+    tmp.write("dir/alias", b"old content");
+    fs::hard_link(tmp.at("dir/alias"), tmp.at("fresh-alias")).unwrap();
+    index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options()).unwrap();
+    let mut session = WriterSession::open(&tmp.cat()).unwrap();
+    let before = session.view();
+    session.set_input_limits(ferret_catalog::InputLimits {
+        records: 0,
+        owned_bytes: 0,
+    });
+    tmp.write("fresh-alias", b"fresh shared content");
+    let hook = Hook::set(&tmp.tree(), |point, path| {
+        (point == IoPoint::Directory && path == std::path::Path::new("dir"))
+            .then(|| (IoOp::List, std::io::Error::from_raw_os_error(5)))
+    });
+    let result = burst(&tmp, &mut session);
+    assert!(result.report.input_fallback);
+    assert!(
+        result.report.content_faults.is_empty(),
+        "retained observations yield to fresh aliases"
+    );
+    drop(hook);
+    let path = tmp.base.join("alias-full-oracle");
+    index(&path, &[tmp.tree()], Refresh::All, &options()).unwrap();
+    let scope = tmp.at("dir").as_os_str().as_bytes().to_vec();
+    assert_eq!(
+        listings(&result.view),
+        retained_listings(&open(&path), &before, &[], &[scope])
+    );
+}
