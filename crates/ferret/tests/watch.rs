@@ -300,11 +300,43 @@ fn idle_daemon_blocks_without_waking_its_threads() {
 impl Drop for Tree {
     fn drop(&mut self) {
         self.stop();
+        terminate_fixture_daemons(&self.base);
+        assert!(
+            fixture_daemons(&self.base).is_empty(),
+            "fixture daemon survived Drop"
+        );
         let _ = Command::new("chmod")
             .args(["-R", "u+rwx"])
             .arg(&self.base)
             .status();
         let _ = fs::remove_dir_all(&self.base);
+    }
+}
+fn fixture_daemons(base: &Path) -> Vec<u32> {
+    let prefix = base.as_os_str().as_encoded_bytes();
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let command = fs::read(entry.path().join("cmdline")).ok()?;
+            (command.starts_with(DAEMON.as_bytes())
+                && command.windows(prefix.len()).any(|part| part == prefix))
+            .then_some(pid)
+        })
+        .collect()
+}
+fn terminate_fixture_daemons(base: &Path) {
+    for pid in fixture_daemons(base) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    let until = Instant::now() + Duration::from_secs(2);
+    while !fixture_daemons(base).is_empty() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for pid in fixture_daemons(base) {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
     }
 }
 fn wait(mut predicate: impl FnMut() -> bool) {
@@ -688,7 +720,7 @@ fn hourly_backstop_observes_an_unwatched_tree() {
 }
 
 #[test]
-fn idle_exit_waits_for_startup_and_pending_publication() {
+fn idle_exit_waits_for_publication_and_restart_backstops_debounced_hints() {
     let mut tree = Tree::new();
     tree.spawn(&[
         ("FERRET_DAEMON_IDLE_MS", "80"),
@@ -713,8 +745,10 @@ fn idle_exit_waits_for_startup_and_pending_publication() {
             .unwrap_or_else(|| panic!("daemon"))
             .try_wait()
             .unwrap_or_else(|error| panic!("try wait: {error:?}"))
-            .is_none()
+            .is_some()
     );
+    tree.stop();
+    tree.start(&[]);
     tree.converges();
 }
 

@@ -44,11 +44,6 @@ pub(super) struct Status {
     pub fallback_backstop: bool,
     pub retained_roots: std::collections::BTreeSet<PathBuf>,
 }
-impl Status {
-    fn fallback_busy(&self) -> bool {
-        self.fallback_backstop || self.watch.as_ref().is_some_and(|w| w.status().busy)
-    }
-}
 fn timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -320,7 +315,7 @@ fn serve(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .operation = None;
                 host.writer_running.store(false, Ordering::Release);
-                super::wake_listener(host, 1);
+                super::wake_listener(host);
                 continue;
             }
             Ok(Message::Intake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -506,7 +501,7 @@ fn serve(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .operation = None;
         host.writer_running.store(false, Ordering::Release);
-        super::wake_listener(host, 1);
+        super::wake_listener(host);
     }
     Ok(())
 }
@@ -537,13 +532,7 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
     status.fallback_backstop = false;
 }
 pub(super) fn busy(host: &Host) -> bool {
-    host.writer_running.load(Ordering::Acquire)
-        || host.writer_pending.load(Ordering::Acquire) != 0
-        || host
-            .writer_status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .fallback_busy()
+    host.writer_running.load(Ordering::Acquire) || host.writer_pending.load(Ordering::Acquire) != 0
 }
 pub(super) fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
     let (reply, receive) = mpsc::sync_channel(1);

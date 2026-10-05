@@ -394,15 +394,17 @@ capability/descriptor transfer for client actions; that is part of its cost.
 The CLI connects first. If no server answers and background operation is
 allowed, start the installed matching `ferretd` with the selected index/config
 identity and detached stdin; stdout/stderr go to a private daemon diagnostic
-log, never the requesting terminal. Concurrent starters use an endpoint startup
-lock held by the daemon before binding; the loser connects to the winner. Under
-that lock, remove a stale socket only after failing to connect. The writer lock
-remains a separate catalog lock.
+log, never the requesting terminal. This query immediately opens and answers
+in-process; it does not wait for the detached daemon to become ready. A query
+that finds an already-bound daemon still loading also answers in-process.
+Later queries use the daemon once it is ready. Concurrent starters use an
+endpoint startup lock held by the daemon before binding; the loser connects to
+the winner. Under that lock, remove a stale socket only after failing to
+connect. The writer lock remains a separate catalog lock.
 
 Hello distinguishes missing, loading and ready from protocol/version errors. A
 starting daemon can acknowledge loading without blocking the event loop. Give
-first use a provisional 10 s startup wait, configurable for slow storage; on
-expiry or denied spawn, fall back to a batch-of-one engine in process.
+If spawning is denied, fall back to a batch-of-one engine in process.
 `FERRET_NO_DAEMON` bypasses connection and spawn. Runtime-directory failures,
 sandboxes, incompatible filesystem context and unreachable sockets fall back
 without asking an agent a question. Invalid catalog data is reported, not hidden
@@ -417,6 +419,9 @@ explicitly enabled unit stays resident; disable its idle timeout to avoid
 restart loops. On exit, finish a started durable publication, release watches
 and locks and unlink only this host's socket under the endpoint lock. Restart
 always re-arms watches and schedules a complete backstop for the downtime gap.
+A timed retry or not-yet-due debounced hint does not block idle exit: restart
+re-arms watches and runs a complete backstop, so dropped delayed work is
+recovered.
 
 Protocol majors must match; minors negotiate capabilities. M4 conservatively
 drains on any build or catalog-format mismatch; it does not try to certify
@@ -465,7 +470,8 @@ outside the selection lock, and poisoned locks recover checked immutable state.
 There are at most 32 connections and `min(4, CPUs)` admitted queries, with at
 most `min(16, CPUs)` total query worker permits.
 
-`FERRET_DAEMON_STARTUP_MS` sets the ready deadline (default 10000);
+`FERRET_DAEMON_STARTUP_MS` bounds singleton lock acquisition and draining an
+incompatible daemon (default 10000); it is not a query ready wait.
 `FERRET_DAEMON_IDLE_MS` or `--idle-ms` sets idle exit (default 900000, zero
 means disabled). `FERRET_DAEMON_BIN` overrides the sibling `ferretd` used for
 spawn. Diagnostic output goes to the private endpoint `.log`. Debug builds also

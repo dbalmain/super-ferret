@@ -3,7 +3,7 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
@@ -140,14 +140,15 @@ fn connect(
         .map(|catalog| crate::find_json::hex(&catalog.generation().incarnation));
     let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
     let context = endpoint::context()?;
-    let mut spawned = false;
-    let mut draining = false;
+    let mut draining_socket = None;
     while Instant::now() < until {
-        if draining && fs::symlink_metadata(endpoint.socket()).is_ok() {
+        if let Some(identity) = draining_socket
+            && fs::symlink_metadata(endpoint.socket())
+                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
+        {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
-        draining = false;
         let connected = fs::symlink_metadata(endpoint.socket()).and_then(|metadata| {
             if !metadata.file_type().is_socket()
                 || metadata.uid() != endpoint::uid()?
@@ -169,59 +170,64 @@ fn connect(
                 ))?;
                 let mut reader = BufReader::new(stream);
                 let mut line = Vec::new();
-                loop {
-                    let hello = event(&mut reader, &mut line)?;
-                    if field_text(&hello, "event") != Some("hello")
-                        || field_number(&hello, "major") != Some(MAJOR)
-                        || field_text(&hello, "index") != Some(&endpoint.identity)
-                        || field_text(&hello, "context") != Some(&context)
-                    {
-                        return Err(io::Error::other("incompatible daemon context or protocol"));
+                let hello = event(&mut reader, &mut line)?;
+                if field_text(&hello, "event") != Some("hello")
+                    || field_number(&hello, "major") != Some(MAJOR)
+                    || field_text(&hello, "index") != Some(&endpoint.identity)
+                    || field_text(&hello, "context") != Some(&context)
+                {
+                    return Err(io::Error::other("incompatible daemon context or protocol"));
+                }
+                if field_text(&hello, "build") != Some(BUILD)
+                    || field_number(&hello, "format") != Some(FORMAT)
+                    || !supports_queries(&hello)
+                    || writer && !has_capability(&hello, "writer")
+                {
+                    if !can_spawn {
+                        return Err(io::Error::other(
+                            "incompatible writer owner; use ferret status --json",
+                        ));
                     }
-                    if field_text(&hello, "build") != Some(BUILD)
-                        || field_number(&hello, "format") != Some(FORMAT)
-                        || !supports_queries(&hello)
-                        || writer && !has_capability(&hello, "writer")
-                    {
-                        if !can_spawn {
-                            return Err(io::Error::other(
-                                "incompatible writer owner; use ferret status --json",
-                            ));
+                    reader.get_mut().write_all(b"{\"op\":\"drain\"}\n")?;
+                    // Wait for the owning lock and socket to be released.
+                    // Active queries finish; the same deadline bounds
+                    // fallback.
+                    draining_socket = fs::symlink_metadata(endpoint.socket())
+                        .ok()
+                        .map(|metadata| (metadata.dev(), metadata.ino()));
+                    continue;
+                }
+                match field_text(&hello, "state") {
+                    Some("loading") => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "daemon is still loading; using the in-process engine",
+                        ));
+                    }
+                    Some("ready") => {
+                        if let Some(incarnation) = &incarnation
+                            && hello
+                                .field("generation")
+                                .and_then(|generation| field_text(generation, "incarnation"))
+                                != Some(incarnation.as_str())
+                        {
+                            return Err(io::Error::other("incompatible catalog incarnation"));
                         }
-                        reader.get_mut().write_all(b"{\"op\":\"drain\"}\n")?;
-                        // Wait for the owning lock and socket to be released.
-                        // Active queries finish; the same deadline bounds
-                        // fallback.
-                        spawned = false;
-                        draining = true;
-                        break;
+                        reader.get_ref().set_read_timeout(None)?;
+                        return Ok(reader);
                     }
-                    match field_text(&hello, "state") {
-                        Some("loading") => continue,
-                        Some("ready") => {
-                            if let Some(incarnation) = &incarnation
-                                && hello
-                                    .field("generation")
-                                    .and_then(|generation| field_text(generation, "incarnation"))
-                                    != Some(incarnation.as_str())
-                            {
-                                return Err(io::Error::other("incompatible catalog incarnation"));
-                            }
-                            reader.get_ref().set_read_timeout(None)?;
-                            return Ok(reader);
-                        }
-                        _ => return Err(io::Error::other("daemon could not open the catalog")),
-                    }
+                    _ => return Err(io::Error::other("daemon could not open the catalog")),
                 }
             }
             Err(error) if !can_spawn => return Err(error),
-            Err(_) if !spawned => {
+            Err(_) => {
                 spawn(endpoint, index)?;
-                spawned = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "daemon started; using the in-process engine for this query",
+                ));
             }
-            Err(_) => {}
         }
-        std::thread::sleep(Duration::from_millis(20));
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -308,10 +314,11 @@ fn query(
     let mut summary = None;
     let mut rows = 0u64;
     let mut output_failure = false;
+    let mut first_frame = true;
     let result = (|| -> io::Result<Exit> {
         reader.get_mut().write_all(&request)?;
         let mut line = Vec::new();
-        let mut out = io::stdout().lock();
+        let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
         let mut err = io::stderr().lock();
         loop {
             let value = event(&mut reader, &mut line)?;
@@ -320,6 +327,15 @@ fn query(
             }
             if op == "find" && json {
                 write(&mut out, &line, &mut output_failure)?;
+                let event_name = field_text(&value, "event");
+                if (first_frame && matches!(event_name, Some("row" | "stdout")))
+                    || matches!(event_name, Some("diagnostic" | "stderr" | "end"))
+                {
+                    out.flush().inspect_err(|_| output_failure = true)?;
+                }
+                if matches!(event_name, Some("row" | "stdout")) {
+                    first_frame = false;
+                }
             }
             match field_text(&value, "event") {
                 Some("begin") => {}
@@ -330,6 +346,7 @@ fn query(
                 }
                 Some("status") if op == "status" => {
                     write(&mut out, &line, &mut output_failure)?;
+                    out.flush().inspect_err(|_| output_failure = true)?;
                     return Ok(Exit::Ok);
                 }
                 Some("row") if op == "search" => {
@@ -354,14 +371,21 @@ fn query(
                         write(&mut out, b"\n", &mut output_failure)?;
                     }
                     first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
-                    out.flush()?;
+                    if rows == 1 {
+                        out.flush().inspect_err(|_| output_failure = true)?;
+                    }
                 }
                 Some("stdout" | "stderr") if matches!(op, "find" | "index" | "roots-remove") => {
                     if !json {
                         let data = bytes(&value, "bytes", "bytes_base64")?;
                         if field_text(&value, "event") == Some("stdout") {
                             write(&mut out, &data, &mut output_failure)?;
+                            if first_frame {
+                                out.flush().inspect_err(|_| output_failure = true)?;
+                                first_frame = false;
+                            }
                         } else {
+                            out.flush().inspect_err(|_| output_failure = true)?;
                             err.write_all(&data)?;
                             err.flush()?;
                         }
@@ -369,6 +393,7 @@ fn query(
                 }
                 Some("diagnostic") if op == "find" => {
                     if !json {
+                        out.flush().inspect_err(|_| output_failure = true)?;
                         match field_text(&value, "code") {
                             Some("permission") => cli::error(crate::find::PERMISSION_WARNING),
                             Some("walk") => {
@@ -388,6 +413,7 @@ fn query(
                     }
                 }
                 Some("end") => {
+                    out.flush().inspect_err(|_| output_failure = true)?;
                     let exit = status(
                         field_number(&value, "exit")
                             .ok_or_else(|| io::Error::other("missing native status"))?,
@@ -476,8 +502,5 @@ fn query(
 }
 
 fn write(writer: &mut impl Write, bytes: &[u8], failed: &mut bool) -> io::Result<()> {
-    writer
-        .write_all(bytes)
-        .and_then(|()| writer.flush())
-        .inspect_err(|_| *failed = true)
+    writer.write_all(bytes).inspect_err(|_| *failed = true)
 }

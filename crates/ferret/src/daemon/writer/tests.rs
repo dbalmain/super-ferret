@@ -222,7 +222,7 @@ fn deferred_writer(reason: Blocked) {
         let event = server_receive
             .recv_timeout(Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("retry: {e}"));
-        if matches!(event, ServerEvent::Wake(_)) && engine.generation() != old.generation() {
+        if matches!(event, ServerEvent::Wake) && engine.generation() != old.generation() {
             break;
         }
     }

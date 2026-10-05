@@ -57,7 +57,7 @@ impl Tree {
             .env_remove("FERRET_NO_DAEMON")
             .env("FERRET_DAEMON_BIN", DAEMON)
             .env("FERRET_DAEMON_STARTUP_MS", "1500")
-            .env("FERRET_DAEMON_IDLE_MS", "3000");
+            .env("FERRET_DAEMON_IDLE_MS", "30000");
         cmd
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -85,7 +85,7 @@ impl Tree {
     fn start(&self, extra: &[(&str, &str)]) -> u32 {
         let mut cmd = fixture::command(DAEMON, &self.base);
         cmd.env_remove("FERRET_NO_DAEMON")
-            .env("FERRET_DAEMON_IDLE_MS", "3000")
+            .env("FERRET_DAEMON_IDLE_MS", "30000")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         for (name, value) in extra {
@@ -94,7 +94,13 @@ impl Tree {
         let child = cmd.spawn().unwrap();
         let pid = child.id();
         self.children.lock().unwrap().push(child);
-        self.socket();
+        let socket = self.socket();
+        if !extra
+            .iter()
+            .any(|(name, _)| *name == "FERRET_DAEMON_IDLE_MS")
+        {
+            ready(UnixStream::connect(socket).unwrap());
+        }
         pid
     }
     fn connect(&self) -> (BufReader<UnixStream>, String) {
@@ -129,7 +135,39 @@ impl Drop for Tree {
             let _ = child.kill();
             let _ = child.wait();
         }
+        terminate_fixture_daemons(&self.base);
+        assert!(
+            fixture_daemons(&self.base).is_empty(),
+            "fixture daemon survived Drop"
+        );
         let _ = fs::remove_dir_all(&self.base);
+    }
+}
+fn fixture_daemons(base: &std::path::Path) -> Vec<u32> {
+    let prefix = base.as_os_str().as_encoded_bytes();
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let command = fs::read(entry.path().join("cmdline")).ok()?;
+            (command.starts_with(DAEMON.as_bytes())
+                && command.windows(prefix.len()).any(|part| part == prefix))
+            .then_some(pid)
+        })
+        .collect()
+}
+fn terminate_fixture_daemons(base: &std::path::Path) {
+    for pid in fixture_daemons(base) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    let until = Instant::now() + Duration::from_secs(2);
+    while !fixture_daemons(base).is_empty() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for pid in fixture_daemons(base) {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
     }
 }
 fn wait(mut condition: impl FnMut() -> bool) {
@@ -282,6 +320,46 @@ fn concurrent_first_use_has_one_host_and_all_clients_answer() {
             .count()
             == 1
     });
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn cold_first_use_answers_locally_while_one_daemon_loads() {
+    let tree = Tree::new();
+    let started = Instant::now();
+    let first = tree
+        .command(&["search", "main"])
+        .env("FERRET_DAEMON_LOAD_DELAY_MS", "5000")
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    assert_eq!(first.stdout, tree.local(&["search", "main"]).stdout);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "first use waited for loading"
+    );
+    wait(|| fixture_daemons(&tree.base).len() == 1 && tree.sockets().len() == 1);
+
+    let mut reader = BufReader::new(UnixStream::connect(tree.socket()).unwrap());
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let hello = loop {
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        if hello.contains("\"state\":\"ready\"") {
+            break hello;
+        }
+        assert!(hello.contains("\"state\":\"loading\""), "{hello}");
+    };
+    assert!(number(&hello, "pid").is_some());
+    let second = tree.run(&["search", "main"]);
+    assert!(second.status.success());
+    assert_eq!(second.stdout, first.stdout);
+    let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
+    assert!(log.contains("\"host\":\"socket\""), "{log}");
+    assert_eq!(fixture_daemons(&tree.base).len(), 1);
 }
 
 #[test]
@@ -560,6 +638,15 @@ fn short_idle_exit_unlinks_own_socket() {
 }
 
 #[test]
+fn idle_exit_discards_a_permanently_failing_root_retry() {
+    let tree = Tree::new();
+    fs::remove_dir_all(tree.base.join("src")).unwrap();
+    tree.start(&[("FERRET_DAEMON_IDLE_MS", "2000")]);
+    let socket = tree.socket();
+    wait(|| !socket.exists());
+}
+
+#[test]
 fn effectful_find_child_parent_is_the_client_and_local_modes_do_not_attach() {
     let tree = Tree::new();
     let pid = tree.start(&[]);
@@ -783,6 +870,7 @@ fn find_worker_panic_wakes_siblings_and_next_query_succeeds() {
 #[test]
 fn structured_read_only_find_attaches_and_keeps_its_tagged_codec() {
     let tree = Tree::new();
+    tree.start(&[]);
     let output = tree.run(&["--json", "find", "src", "-maxdepth", "0", "-print0"]);
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
@@ -885,6 +973,7 @@ fn search_broken_pipe_is_quiet_and_sigint_cancels_without_killing_host() {
 fn failed_manifest_read_keeps_the_daemons_last_checked_view() {
     let tree = Tree::new();
     assert!(tree.run(&["search", "main"]).status.success());
+    tree.connect();
     let current = tree.base.join("index/current");
     let original = fs::read(&current).unwrap();
     // M5a owns publication; a failed manifest read must not invalidate an
@@ -921,6 +1010,7 @@ fn a_rebuilt_catalog_incarnation_is_confirmed_and_adopted() {
     assert!(tree.run(&["index", "src"]).status.success());
     assert!(tree.run(&["search", "reborn"]).status.success());
     let (mut reader, new) = tree.connect();
+    assert!(tree.run(&["search", "reborn"]).status.success());
     let incarnation = |hello: String| {
         hello
             .split_once("\"incarnation\":\"")

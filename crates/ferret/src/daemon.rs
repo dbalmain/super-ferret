@@ -68,7 +68,7 @@ struct Host {
 }
 enum ServerEvent {
     Accepted(io::Result<UnixStream>),
-    Wake(u8),
+    Wake,
 }
 enum ClientMessage {
     Line(Vec<u8>),
@@ -203,14 +203,15 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .draining;
         let clients = host.clients.load(Ordering::Acquire);
-        if clients != 0 || writer::busy(&host) {
+        let busy = writer::busy(&host);
+        if clients != 0 {
             idle_since = Instant::now();
         }
         if (draining
             && clients == 0
             && !host.writer_running.load(Ordering::Acquire)
             && host.writer_pending.load(Ordering::Acquire) == 0)
-            || (!idle.is_zero() && clients == 0 && idle_since.elapsed() >= idle)
+            || (!idle.is_zero() && clients == 0 && !busy && idle_since.elapsed() >= idle)
         {
             break;
         }
@@ -228,11 +229,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
             }
         };
         match event {
-            ServerEvent::Wake(reason) => {
-                if reason != 0 && clients == 0 && !writer::busy(&host) {
-                    idle_since = Instant::now();
-                }
-            }
+            ServerEvent::Wake => {}
             ServerEvent::Accepted(Ok(stream)) if !draining && clients < CLIENTS => {
                 host.clients.fetch_add(1, Ordering::AcqRel);
                 let host = host.clone();
@@ -280,8 +277,8 @@ fn owner_responds(socket: &Path) -> bool {
     let mut byte = [0];
     matches!(stream.read(&mut byte), Ok(1))
 }
-fn wake_listener(host: &Host, reason: u8) {
-    let _ = host.server_send.send(ServerEvent::Wake(reason));
+fn wake_listener(host: &Host) {
+    let _ = host.server_send.send(ServerEvent::Wake);
 }
 fn cancel(host: &Host, cancelled: &AtomicBool) {
     let _engine = host
@@ -397,7 +394,7 @@ impl Drop for ClientCount<'_> {
     fn drop(&mut self) {
         self.0.clients.fetch_sub(1, Ordering::AcqRel);
         self.0.lifecycle_changed.notify_all();
-        wake_listener(self.0, 1);
+        wake_listener(self.0);
     }
 }
 struct QueryPermit<'a>(&'a Host);
@@ -447,10 +444,7 @@ fn pin(host: &Host) -> io::Result<QuerySession> {
 }
 fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let destination = Destination::Socket {
-        writer: Arc::new(Mutex::new(stream.try_clone()?)),
-        cancelled: cancelled.clone(),
-    };
+    let destination = Destination::socket(stream.try_clone()?, cancelled.clone())?;
     let (send, receive) = mpsc::sync_channel(1);
     let input = stream.try_clone()?;
     let reader_host = host.clone();
@@ -490,7 +484,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                         .draining = true;
                     reader_host.lifecycle_changed.notify_all();
                     let _ = send.try_send(ClientMessage::Wake);
-                    wake_listener(&reader_host, 2);
+                    wake_listener(&reader_host);
                 }
                 _ => {
                     if send.try_send(ClientMessage::Line(line.clone())).is_err() {
