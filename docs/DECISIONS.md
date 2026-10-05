@@ -3237,3 +3237,35 @@ wrong tie order.
 - No in-memory ordered structure (sorted permutation, heap, B-tree). Time
   queries scan with block skipping, and the planner chooses between scanning
   and probing per name-side id from the name side's size.
+
+## D58 — Batch input: adopt `serde_json`, or parse the request by hand
+
+**Status: open.** S1b M1 review, 2026-10-05. Raised because S1b M2, the batch host,
+would add the workspace's first serde dependency. D57 records `ferret →
+serde_json` as common to both of its options. It does not offer the alternative.
+
+**Question:** `ferret batch` reads JSON-lines requests (argv, cwd, mode and
+options for each query). Should the `ferret` crate depend on `serde_json` to
+parse them, or parse the request schema with a small hand-written reader?
+
+Today nothing in the workspace uses serde. Every JSON byte `ferret` writes is
+produced by its own `json.rs`. The external dependencies are `rustix`,
+`blake3`, `regex` (confined to `ferret-verify`) and intpack.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. `serde_json` (with `serde` for derive, or `serde_json::Value` without it) | Two to five new crates in the lockfile: `serde`, `serde_json`, `itoa`, `ryu`, `memchr`, plus `serde_derive`, `proc-macro2`, `quote` and `syn` if derive is used, which adds compile time. A DESIGN graph line. | A parser that has been fuzzed for years; request types added later cost one struct each. D57's socket codec, if A there, reuses it. |
+| B. A hand-written reader for the request schema only | About 200–300 lines: strings with escapes and `\u` surrogates, arrays, objects, integers and booleans, with a depth bound. It needs its own property test (round-trip through `json.rs`'s writer, plus rejection of malformed lines) and a fuzz target. Every new request field is hand-wired. | No new dependency. It matches how output is already written. Errors can name the exact field in ferret's own terms. |
+
+**Recommendation: A, `serde_json::Value` without derive**. That is four small
+crates, no proc-macro build cost, and a parser nobody has to maintain. "Build,
+not adopt" is about the index structures, which are the part worth learning;
+a JSON reader isn't. Fastest is a wash, since parsing a request is noise next
+to the query.
+
+**Fact that would change it:** if you want the dependency list kept minimal for
+its own sake (audit surface, offline builds), B is a bounded, testable job, and
+the batch schema is small enough that B stays small.
+
+S1b M2 waits for this answer. M3 (D54's names) doesn't depend on it, so it goes
+first.
