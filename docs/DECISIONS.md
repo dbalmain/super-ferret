@@ -3223,3 +3223,44 @@ the batch schema is small enough that B stays small.
 
 S1b M2 waits for this answer. M3 (D54's names) doesn't depend on it, so it goes
 first.
+
+## D59 — How intpack enters the workspace
+
+**Status: open.** S1b M3, 2026-10-05.
+
+**Question:** S1b M3 is the first code to use intpack, through D54's packed
+names and row postings in `ferret-catalog`. D11 said intpack "starts as a git
+dependency and may be vendored". In what form should it enter for good?
+
+**Facts, checked on 2026-10-05:**
+
+- DESIGN listed `ferret-index → intpack`, but no manifest or lockfile had it.
+  The layering test only checks that external dependencies are allowed, not
+  that they are present.
+- `~/w/intpack` `main` is **20 commits ahead of `origin/main`**, and those
+  include the pfor128 and skip-table speedups. The D54 prototype
+  (`~/w/name-index-bench`) uses it as a `path = "../intpack"` dependency.
+- So a git dependency pinned to what is on GitHub today would build against
+  code older than what D54 measured.
+
+**What M3 is doing meanwhile:**
+
+- The edge `ferret-catalog → intpack` is approved. It is within D11 and
+  DESIGN's ownership table, since catalog owns the name dictionary and row
+  postings.
+- The dependency is `path = "../intpack"`, with a symlink at
+  `~/w/super-ferret-wt/intpack` so worktrees resolve it too.
+- There is no Nix package build of ferret, so nothing else breaks.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Git dependency pinned by `rev` | You push intpack's 20 commits first. Every intpack change is a push plus a rev bump. Offline builds need the git cache. | One copy. intpack stays its own repo, with its bench and ledger. D11's stated default. |
+| B. Vendor into `crates/intpack` | Two copies that drift. intpack's own bench harness keeps pointing at the other one. Its toolchain ledger moves into this repo. | Builds anywhere with no network and no sibling checkout. Changes to the codec land in the same commit as their consumer. |
+| C. Keep the path dependency | Builds only where `~/w/intpack` sits beside the checkout. CI and other machines break. | Zero friction while both are moving fast. |
+
+**Recommendation: A**, after you push intpack, and C until then. It is D11's
+plan, and it keeps one copy of the codec.
+
+**Fact that would change it:** if intpack's API is going to churn alongside
+ferret for a while, so that most ferret changes need an intpack change, B
+removes the push-and-bump loop.
