@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError, mark_output_failure};
 
 use crate::json::Object;
+use crate::transport::Destination;
 use crate::protocol::{ChildStdin, Request};
 
 const PART: usize = 64 * 1024;
@@ -69,11 +70,13 @@ pub(crate) fn refusal(plan: &Plan, request: &Request, protocol_stdin: bool) -> O
 #[derive(Clone)]
 pub(crate) struct FrameOutput<'a> {
     id: &'a str,
+    destination: Destination,
     record: Arc<AtomicU64>,
     stdin: ChildStdin,
     transport_error: Arc<Mutex<Option<io::Error>>>,
 }
 impl Effects for FrameOutput<'_> {
+    fn cancelled(&self) -> bool { self.cancelled() }
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
         let mut bytes = path.as_os_str().as_bytes().to_vec();
         bytes.push(if nul { 0 } else { b'\n' });
@@ -83,7 +86,8 @@ impl Effects for FrameOutput<'_> {
         self.emit("stdout", bytes)
     }
     fn error(&mut self, error: &WalkError) {
-        let result = diagnostic(
+        let result = diagnostic_to(
+            &self.destination,
             self.id,
             "walk",
             "error",
@@ -168,11 +172,17 @@ impl FrameOutput<'_> {
     pub(crate) fn new(id: &'_ str, stdin: ChildStdin) -> FrameOutput<'_> {
         FrameOutput {
             id,
+            destination: Destination::Stdout,
             stdin,
             record: Arc::new(AtomicU64::new(0)),
             transport_error: Arc::new(Mutex::new(None)),
         }
     }
+    pub(crate) fn with_destination(mut self, destination: Destination) -> Self {
+        self.destination = destination;
+        self
+    }
+    fn cancelled(&self) -> bool { self.destination.cancelled() }
     pub(crate) fn check_transport(&self) -> io::Result<()> {
         match self
             .transport_error
@@ -198,7 +208,7 @@ impl FrameOutput<'_> {
     }
     fn emit(&mut self, event: &str, bytes: &[u8]) -> io::Result<()> {
         let record = self.record.fetch_add(1, Ordering::Relaxed) + 1;
-        self.track(emit_parts(self.id, event, record, bytes))
+        self.track(emit_parts(&self.destination, self.id, event, record, bytes))
     }
 }
 
@@ -214,6 +224,7 @@ impl Write for FrameWriter<'_, '_> {
         while !bytes.is_empty() {
             if self.pending.len() == PART {
                 self.host.track(frame(
+                    &self.host.destination,
                     self.host.id,
                     "stdout",
                     self.record,
@@ -238,6 +249,7 @@ impl FrameWriter<'_, '_> {
     fn finish(&mut self) -> io::Result<()> {
         if !self.pending.is_empty() {
             self.host.track(frame(
+                    &self.host.destination,
                 self.host.id,
                 "stdout",
                 self.record,
@@ -250,10 +262,11 @@ impl FrameWriter<'_, '_> {
         Ok(())
     }
 }
-fn emit_parts(id: &str, event: &str, record: u64, bytes: &[u8]) -> io::Result<()> {
+fn emit_parts(destination: &Destination, id: &str, event: &str, record: u64, bytes: &[u8]) -> io::Result<()> {
     let chunks: Vec<_> = bytes.chunks(PART).collect();
     for (part, chunk) in chunks.iter().enumerate() {
         frame(
+            destination,
             id,
             event,
             record,
@@ -266,6 +279,7 @@ fn emit_parts(id: &str, event: &str, record: u64, bytes: &[u8]) -> io::Result<()
 }
 
 fn frame(
+    destination: &Destination,
     id: &str,
     event: &str,
     record: u64,
@@ -283,7 +297,7 @@ fn frame(
         .bool("last", last)
         .str("bytes_base64", &base64(bytes));
     object.end();
-    send(&line)
+    destination.send(&line)
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -295,12 +309,16 @@ fn base64(bytes: &[u8]) -> String {
 /// by batch's per-request begin/end framing and the CLI's `--json find`
 /// host, so both encode the same event shape through one writer.
 pub(crate) fn emit(id: &str, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
+    emit_to(&Destination::Stdout, id, name, fill)
+}
+
+pub(crate) fn emit_to(destination: &Destination, id: &str, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
     let mut line = Vec::new();
     let mut object = Object::new(&mut line);
     object.str("id", id).str("event", name);
     fill(&mut object);
     object.end();
-    send(&line)
+    destination.send(&line)
 }
 
 /// Writes a `"generation"` field: an object for a pinned engine, else null.
@@ -328,6 +346,10 @@ pub(crate) fn diagnostic(
     severity: &str,
     path: Option<&[u8]>,
 ) -> io::Result<()> {
+    diagnostic_to(&Destination::Stdout, id, code, severity, path)
+}
+
+pub(crate) fn diagnostic_to(destination: &Destination, id: &str, code: &str, severity: &str, path: Option<&[u8]>) -> io::Result<()> {
     let mut line = Vec::new();
     let mut object = Object::new(&mut line);
     object
@@ -339,11 +361,5 @@ pub(crate) fn diagnostic(
         object.bytes("path", path);
     }
     object.end();
-    send(&line)
-}
-fn send(line: &[u8]) -> io::Result<()> {
-    let mut out = io::stdout().lock();
-    out.write_all(line)?;
-    out.write_all(b"\n")?;
-    out.flush()
+    destination.send(&line)
 }

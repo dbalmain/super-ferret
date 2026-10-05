@@ -20,6 +20,11 @@ when content changes.
 
 ## Crates
 
+`ferret` also builds `ferretd`, the query-only socket host. std supplies
+Unix sockets, file locking and Linux no-follow opens through OpenOptionsExt.
+Retained directory handles anchor endpoint operations through /proc/self/fd.
+Writer routing arrives in S1b M5.
+
 One cargo workspace (D1). Each line lists a crate's dependencies; there are no
 cycles. This block is enforced: `crates/ferret/tests/layering.rs` fails when a
 crate's `Cargo.toml` disagrees with it.
@@ -34,7 +39,6 @@ ferret-verify  → regex
 ferret-policy  → (std only)
 ferret-text    → (std only)
 ferret-bench   → anything; nothing depends on it
-ferret-daemon  → later
 ```
 
 | Crate            | Owns                                                                                                                           | Knows nothing about            |

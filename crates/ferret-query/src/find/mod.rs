@@ -154,6 +154,9 @@ pub(super) fn unmark_output_failure(error: io::Error) -> io::Error {
 /// The host supplies process output. A failed print stops the walk and is
 /// reported through `error`, like any other I/O failure.
 pub trait Effects {
+    /// Checked before taking the next entry. Already started commits finish.
+    fn cancelled(&self) -> bool { false }
+
     /// Writes the path's exact bytes, followed by a newline or NUL.
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()>;
     /// Reports an I/O error. Execution continues after traversal errors.

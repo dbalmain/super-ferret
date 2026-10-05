@@ -51,6 +51,10 @@ impl<W: EntrySource> Task<W> {
         effects: &mut impl Effects,
         policy: super::output::Policy,
     ) -> bool {
+        if effects.cancelled() {
+            self.quit.store(true, Ordering::Release);
+            return false;
+        }
         let Some(item) = self.walk.next_with(self.descend, &mut || {
             self.control.actions.flush(effects, true).inspect_err(|_| {
                 self.control.quit = true;

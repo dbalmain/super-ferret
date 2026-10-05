@@ -13,7 +13,8 @@ use ferret_query::{Query, Row};
 
 use crate::cli;
 use crate::engine::{Engine, QuerySession};
-use crate::find_json::{FrameOutput, diagnostic, generation};
+use crate::find_json::{FrameOutput, diagnostic_to, generation};
+use crate::transport::Destination;
 use crate::json::Object;
 use crate::protocol::{self, Op, Request};
 use crate::search::json_row;
@@ -96,7 +97,7 @@ fn open_engine(index: &Path) -> Option<Engine> {
     Engine::open(index).ok().flatten()
 }
 
-fn read_line_bounded(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
+pub(crate) fn read_line_bounded(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<usize> {
     let mut total = 0;
     loop {
         let buffer = reader.fill_buf()?;
@@ -169,20 +170,20 @@ fn handle(
                 o.int("engine_opens", Engine::open_count());
             })
         }
-        Op::Search => search_request(request, engine.as_ref(), dirs),
-        Op::Find => find_request(request, launch_cwd, engine.as_ref(), protocol_stdin),
+        Op::Search => search_request(request, engine.as_ref().map(Engine::pin), dirs, &Destination::Stdout),
+        Op::Find => find_request(request, launch_cwd, engine.as_ref().map(Engine::pin), protocol_stdin, &Destination::Stdout),
     }
 }
 
-fn search_request(
+pub(crate) fn search_request(
     request: &Request,
-    engine: Option<&Engine>,
+    session: Option<QuerySession>,
     dirs: Option<&Dirs>,
+    destination: &Destination,
 ) -> io::Result<()> {
     let started = Instant::now();
-    let now = SystemTime::now();
-    let session = engine.map(Engine::pin);
-    event(request, "begin", |o| {
+    let now = request.start_unix_ns.map_or_else(SystemTime::now, |ns| SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns));
+    event_to(destination, request, "begin", |o| {
         generation(o, session.as_ref().map(QuerySession::generation))
     })?;
     let atoms: Vec<_> = request
@@ -211,6 +212,9 @@ fn search_request(
                 Ok(ferret_query::Stats::default())
             } else {
                 session.search(&query, |row: &Row<'_>| {
+                    if destination.cancelled() { return ControlFlow::Break(()); }
+                    #[cfg(debug_assertions)]
+                    if request.capabilities.iter().any(|c| c == "test-panic") { panic!("injected query panic"); }
                     let mut bytes = Vec::new();
                     json_row(&mut bytes, catalog, row);
                     let mut output = Vec::new();
@@ -218,7 +222,7 @@ fn search_request(
                     object.str("id", &request.id).str("event", "row");
                     object.raw_fields(&bytes[1..bytes.len() - 1]);
                     object.end();
-                    if let Err(error) = send(&output) {
+                    if let Err(error) = destination.send(&output) {
                         output_error = Some(error);
                         return ControlFlow::Break(());
                     }
@@ -263,10 +267,10 @@ fn search_request(
         error: query_error.as_deref(),
     };
     log_search(dirs, request, now, &log);
-    event(request, "end", |o| {
+    event_to(destination, request, "end", |o| {
         o.int("exit", status)
             .int("rows", rows)
-            .bool("cancelled", false)
+            .bool("cancelled", destination.cancelled())
             .int("elapsed_us", elapsed);
         o.opt_int("first_row_us", first_row)
             .int("bytes_read", bytes_read);
@@ -282,16 +286,16 @@ fn search_request(
     })
 }
 
-fn find_request(
+pub(crate) fn find_request(
     request: &Request,
     launch_cwd: &Path,
-    engine: Option<&Engine>,
+    session: Option<QuerySession>,
     protocol_stdin: bool,
+    destination: &Destination,
 ) -> io::Result<()> {
     let started = Instant::now();
-    let now = SystemTime::now();
-    let session = engine.map(Engine::pin);
-    event(request, "begin", |o| {
+    let now = request.start_unix_ns.map_or_else(SystemTime::now, |ns| SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(ns));
+    event_to(destination, request, "begin", |o| {
         generation(o, session.as_ref().map(QuerySession::generation))
     })?;
     let cwd = request
@@ -310,27 +314,27 @@ fn find_request(
     let host = FrameOutput::new(
         &request.id,
         request.child_stdin.unwrap_or(protocol::ChildStdin::Null),
-    );
+    ).with_destination(destination.clone());
     let mut query_error = None;
     match parsed {
         Ok(plan) => {
             if let Some(error) = crate::find_json::refusal(&plan, request, protocol_stdin) {
-                event(request, "end", |o| {
+                event_to(destination, request, "end", |o| {
                     o.int("exit", 1)
-                        .bool("cancelled", false)
+                        .bool("cancelled", destination.cancelled())
                         .str("error", error.code())
                         .int("elapsed_us", started.elapsed().as_micros() as i128);
                 })?;
                 return Ok(());
             }
             if plan.permission_warning() {
-                diagnostic(&request.id, "permission", "warning", None)?;
+                diagnostic_to(destination, &request.id, "permission", "warning", None)?;
             }
             if let Some(feature) = plan.unsupported() {
-                diagnostic(&request.id, &feature.to_string_lossy(), "error", None)?;
-                event(request, "end", |o| {
+                diagnostic_to(destination, &request.id, &feature.to_string_lossy(), "error", None)?;
+                event_to(destination, request, "end", |o| {
                     o.int("exit", 1)
-                        .bool("cancelled", false)
+                        .bool("cancelled", destination.cancelled())
                         .str("error", &feature.to_string_lossy())
                         .int("elapsed_us", started.elapsed().as_micros() as i128);
                 })?;
@@ -345,20 +349,20 @@ fn find_request(
             match result {
                 Ok(outcome) => status = if outcome.errors == 0 { 0 } else { 1 },
                 Err(error) => {
-                    diagnostic(&request.id, "runtime", "error", None)?;
+                    diagnostic_to(destination, &request.id, "runtime", "error", None)?;
                     query_error = Some(error.to_string());
                 }
             }
         }
         Err(error) => {
-            diagnostic(&request.id, "parse", "error", None)?;
+            diagnostic_to(destination, &request.id, "parse", "error", None)?;
             query_error = Some(error.to_string());
         }
     }
     host.check_transport()?;
-    event(request, "end", |o| {
+    event_to(destination, request, "end", |o| {
         o.int("exit", status)
-            .bool("cancelled", false)
+            .bool("cancelled", destination.cancelled())
             .int("elapsed_us", started.elapsed().as_micros() as i128);
         if let Some(error) = query_error.as_deref() {
             o.str("error", error);
@@ -367,8 +371,12 @@ fn find_request(
 }
 
 fn event(id: &Request, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
-    crate::find_json::emit(&id.id, name, fill)
+    event_to(&Destination::Stdout, id, name, fill)
 }
+fn event_to(destination: &Destination, id: &Request, name: &str, fill: impl FnOnce(&mut Object<'_>)) -> io::Result<()> {
+    crate::find_json::emit_to(destination, &id.id, name, fill)
+}
+
 fn emit_request_error(id: Option<&str>, message: &str) -> io::Result<()> {
     let mut line = Vec::new();
     let mut o = Object::new(&mut line);

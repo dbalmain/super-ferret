@@ -43,6 +43,7 @@ pub(crate) struct Request {
     pub limit: Option<u64>,
     pub capabilities: Vec<String>,
     pub child_stdin: Option<ChildStdin>,
+    pub start_unix_ns: Option<u64>,
 }
 
 /// Child stdin policy, independent of the host's request transport.
@@ -290,6 +291,11 @@ fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, Requ
         limit,
         capabilities,
         child_stdin,
+        start_unix_ns: match find_field(fields, "start_unix_ns") {
+            None | Some(Value::Null) => None,
+            Some(Value::Num(n)) => Some(n.as_u64().ok_or(RequestErrorKind::InvalidField("start_unix_ns"))?),
+            _ => return Err(RequestErrorKind::InvalidField("start_unix_ns")),
+        },
     })
 }
 
@@ -324,7 +330,7 @@ fn byte_value(value: &Value) -> Option<Vec<u8>> {
 /// instead use the `{"base64":"..."}` convention at the schema level, not a
 /// different `Value` shape.)
 #[derive(Debug, Clone, PartialEq)]
-enum Value {
+pub(crate) enum Value {
     Null,
     Bool(bool),
     Num(Num),
@@ -336,14 +342,14 @@ enum Value {
 /// A JSON number, kept unevaluated beyond its grammar shape; callers convert
 /// to the type their field needs (here, only `as_u64`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Num {
+pub(crate) struct Num {
     negative: bool,
     integer: String,
     has_frac_or_exp: bool,
 }
 
 impl Num {
-    fn as_u64(&self) -> Option<u64> {
+    pub(crate) fn as_u64(&self) -> Option<u64> {
         if self.negative || self.has_frac_or_exp {
             return None;
         }
@@ -653,7 +659,7 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
 /// [`json`](crate::json) encodes (its encoder is private to that module, so
 /// this is written independently against the RFC, not derived from it).
 /// Rejects bad padding and non-alphabet bytes rather than guessing.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(4) {
         return None;
@@ -741,6 +747,7 @@ mod tests {
                 limit: None,
                 capabilities: Vec::new(),
                 child_stdin: None,
+                start_unix_ns: None,
             }
         );
     }
@@ -1030,6 +1037,7 @@ mod tests {
                 } else {
                     vec![]
                 },
+                start_unix_ns: None,
                 child_stdin: self.bool().then(|| {
                     if self.bool() {
                         ChildStdin::Null
@@ -1156,5 +1164,26 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(200_000);
         mutation_fuzz(iterations);
+    }
+}
+
+// Socket envelopes and client events use the same bounded JSON reader as requests.
+pub(crate) fn parse_object(line: &[u8]) -> Option<Value> {
+    if line.len() > MAX_LINE_BYTES { return None; }
+    let mut parser = Parser { input: line, pos: 0 };
+    parser.skip_ws();
+    let value = parser.parse_value(1).ok()?;
+    parser.skip_ws();
+    (parser.pos == line.len() && matches!(value, Value::Obj(_))).then_some(value)
+}
+impl Value {
+    pub(crate) fn field(&self, name: &str) -> Option<&Self> {
+        match self { Self::Obj(fields) => find_field(fields, name), _ => None }
+    }
+    pub(crate) fn text(&self) -> Option<&str> {
+        match self { Self::Str(s) => Some(s), _ => None }
+    }
+    pub(crate) fn number(&self) -> Option<u64> {
+        match self { Self::Num(n) => n.as_u64(), _ => None }
     }
 }

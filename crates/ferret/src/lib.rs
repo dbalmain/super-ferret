@@ -32,6 +32,8 @@ pub mod args;
 pub(crate) mod batch;
 pub mod cli;
 pub mod engine;
+pub mod daemon;
+mod transport;
 pub mod find;
 mod find_json;
 pub mod index;
