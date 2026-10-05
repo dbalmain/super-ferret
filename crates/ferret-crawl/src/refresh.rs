@@ -55,6 +55,8 @@ pub struct RefreshRequest {
 #[derive(Debug)]
 pub enum RefreshOutcome {
     Unchanged,
+    /// The selected generation and caches survive; retry all roots later.
+    DeferredBulk(ferret_catalog::bulk::Blocked),
     Committed {
         changes: ChangeSet,
     },
@@ -224,8 +226,16 @@ pub fn refresh(
         }
         RefreshReason::Burst => Refresh::Only(&named),
     };
-    let (report, changes) =
-        crate::index::recrawl_scoped(session, &roots, scope, options, selections)?;
+    let (report, changes) = match crate::index::recrawl_scoped(session, &roots, scope, options, selections) {
+        Ok(result) => result,
+        Err(IndexError::DeferredBulk(reason)) => return Ok(RefreshReport {
+            base_generation: request.expected_generation,
+            outcome: RefreshOutcome::DeferredBulk(reason),
+            view: session.view(),
+            report: Report::default(),
+        }),
+        Err(error) => return Err(error),
+    };
     Ok(RefreshReport {
         base_generation: request.expected_generation,
         outcome: if session.view().generation().checkpoint != request.expected_generation.checkpoint

@@ -177,6 +177,7 @@ pub(crate) fn consume(stored: Observation, own: &Stat) -> (Stat, Result<Content,
 /// A worker's reusable read buffer and counters.
 pub(crate) struct Reader {
     buffer: Vec<u8>,
+    pub(crate) limiter: Option<std::sync::Arc<ferret_catalog::bulk::Limiter>>,
     pub(crate) files_read: u64,
     pub(crate) bytes_read: u64,
     /// Time spent in [`Reader::read`]: sniffing and hashing.
@@ -219,6 +220,7 @@ impl Reader {
     pub(crate) fn new() -> Self {
         Self {
             buffer: vec![0; CHUNK],
+            limiter: None,
             files_read: 0,
             bytes_read: 0,
             read_time: Duration::ZERO,
@@ -268,35 +270,42 @@ impl Reader {
             }
         }
         let started = Instant::now();
-        let content = self.sniff_and_hash(file);
+        if self.limiter.is_some() {
+            // No DONTNEED or NOREUSE: foreground readers may share these pages.
+            rustix::fs::fadvise(&*file, 0, None, rustix::fs::Advice::Sequential)
+                .map_err(|e| ContentFault::Read(e.into()))?;
+        }
+        let remaining = file.metadata().map_err(ContentFault::Read)?.len();
+        let mut source = BulkRead { file, limiter: self.limiter.as_deref(), remaining };
+        let content = Self::sniff_and_hash(&mut self.buffer, &mut self.files_read, &mut self.bytes_read, &mut source);
         self.read_time += started.elapsed();
         content
     }
 
-    fn sniff_and_hash(&mut self, file: &mut File) -> Result<Content, ContentFault> {
-        self.files_read += 1;
+    fn sniff_and_hash(buffer: &mut [u8], files_read: &mut u64, bytes_read: &mut u64, file: &mut impl Read) -> Result<Content, ContentFault> {
+        *files_read += 1;
         let mut head = 0;
         while head < ferret_policy::SNIFF_LEN {
-            match file.read(&mut self.buffer[head..]) {
+            match file.read(&mut buffer[head..]) {
                 Ok(0) => break,
                 Ok(n) => head += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(ContentFault::Read(e)),
             }
         }
-        self.bytes_read += head as u64;
-        let sniffed = ferret_policy::sniff(&self.buffer[..head.min(ferret_policy::SNIFF_LEN)]);
+        *bytes_read += head as u64;
+        let sniffed = ferret_policy::sniff(&buffer[..head.min(ferret_policy::SNIFF_LEN)]);
         let content = match sniffed {
             ferret_policy::Content::Binary => Content::Binary,
             ferret_policy::Content::Text => {
                 let mut hasher = blake3::Hasher::new();
-                hasher.update(&self.buffer[..head]);
+                hasher.update(&buffer[..head]);
                 loop {
-                    match file.read(&mut self.buffer) {
+                    match file.read(buffer) {
                         Ok(0) => break,
                         Ok(n) => {
-                            self.bytes_read += n as u64;
-                            hasher.update(&self.buffer[..n]);
+                            *bytes_read += n as u64;
+                            hasher.update(&buffer[..n]);
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                         Err(e) => return Err(ContentFault::Read(e)),
@@ -361,5 +370,20 @@ pub(crate) fn from_walk(stat: &crate::Stat<'_>) -> Stat {
         uid: stat.uid,
         gid: stat.gid,
         nlink: stat.nlink,
+    }
+}
+
+struct BulkRead<'a> {
+    file: &'a mut File,
+    limiter: Option<&'a ferret_catalog::bulk::Limiter>,
+    remaining: u64,
+}
+impl Read for BulkRead<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let len = bytes.len().min(self.remaining.max(1).min(CHUNK as u64) as usize);
+        if let Some(limiter) = self.limiter { limiter.acquire(len); }
+        let n = self.file.read(&mut bytes[..len])?;
+        self.remaining = self.remaining.saturating_sub(n as u64);
+        Ok(n)
     }
 }

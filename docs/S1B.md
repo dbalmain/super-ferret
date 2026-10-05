@@ -746,8 +746,14 @@ failed idle probe. Unknown desktop idleness uses one worker; missing PSI uses
 conservative concurrency and reports the unavailable signal. Core operation must
 work without a compositor library or an interactive probe.
 
-Apply nice 19, idle I/O priority and where supported SCHED_IDLE to index
-workers, not the socket, watcher or query threads. Gate new jobs between
+Apply per-thread nice 19 to index workers; socket, watcher and query threads
+keep normal priority. M6's revised priority decision drops idle I/O class and
+SCHED_IDLE: rustix 1.1.5 does not supply those calls. Linux derives default
+best-effort I/O level 7 from nice 19 on schedulers that honour priority (BFQ).
+Dave's nine block devices use `none`, which ignores I/O priority; the 32 MiB/s
+bulk limiter is the actual I/O protection there. SCHED_IDLE adds only a small
+CFS/EEVDF weight difference over nice 19. Revisit an unsafe D11 exception only
+if M7 measures foreground harm that nice 19 plus pacing does not prevent. Gate new jobs between
 refreshes; the current crawl does not support mid-listing cancellation or an
 instantaneous worker-count change. Check between content files/bulk phases where
 safe, and measure controller reaction latency rather than claim it stops fsync.

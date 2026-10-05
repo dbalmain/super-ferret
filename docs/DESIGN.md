@@ -597,6 +597,14 @@ coverage, budgets, RSS, old pinned epochs, census and D54 planner counters; M6 o
 budget validation. S1B specifies those later controls, including the full-builder
 memory limit recorded in ROADMAP.
 
+M6's revised priority decision uses per-thread nice 19 only, via rustix's
+`process`/`thread` features. No idle I/O class or SCHED_IDLE is applied.
+Default Linux best-effort I/O priority derives level 7 from nice 19 where the
+scheduler honours it (BFQ); Dave's nine devices use `none` and ignore I/O
+priority, so bulk byte pacing supplies the I/O protection. SCHED_IDLE offers
+only a small CFS/EEVDF weight difference. Consider unsafe under D11 only if M7
+finds foreground harm with nice 19 plus the limiter.
+
 ## Not yet designed
 
 Decided inside the slice that needs them, recorded in DECISIONS.md if they

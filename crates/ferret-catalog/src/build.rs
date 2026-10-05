@@ -36,7 +36,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
 
 use crate::batch::{Batch, Content, DirToken, Stat};
 use crate::format::{
@@ -875,7 +874,7 @@ pub(crate) fn write(
     let (mut head, dicts) = plan.head(&batches);
     head.generation = generation;
     let (bytes, len) = head.encode();
-    out.write_all_at(&bytes, 0)?;
+    crate::bulk::write_at(out, &bytes, 0)?;
     // The reader's placement of every section and column, from the head just
     // made: the writer puts each exactly where a reader will look.
     let layout = format::decode_table(&bytes, len).map_err(io::Error::other)?;

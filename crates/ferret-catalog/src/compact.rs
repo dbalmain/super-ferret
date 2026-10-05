@@ -3,7 +3,6 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
 
 use crate::build::{STAT_COLUMNS, stat_field};
 use crate::format::{
@@ -247,7 +246,7 @@ pub(crate) fn write(view: &Catalog, out: &File, generation: Generation) -> io::R
     let mut plan = Plan::new(view)?;
     let (head, dicts) = plan.head(view, generation)?;
     let (bytes, len) = head.encode();
-    out.write_all_at(&bytes, 0)?;
+    crate::bulk::write_at(out, &bytes, 0)?;
     let layout = format::decode_table(&bytes, len).map_err(io::Error::other)?;
     let column = |c: Column| ColumnWriter::start(out, &layout, c, &dicts[c as usize]);
     let section = |s: Section| At::new(out, layout.range(s).0 as u64);

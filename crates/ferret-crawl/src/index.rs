@@ -65,6 +65,10 @@ pub struct IndexOptions {
     pub sniffer: u32,
     /// Optional daemon intake, armed before directory listing.
     pub watch: Option<std::sync::Arc<crate::watch::Watch>>,
+    /// Host bulk admission and pacing; absent for direct foreground indexing.
+    pub bulk: Option<std::sync::Arc<dyn ferret_catalog::bulk::Control>>,
+    /// Lower only indexing threads, never intake or query threads.
+    pub background: bool,
 }
 
 impl Default for IndexOptions {
@@ -75,6 +79,8 @@ impl Default for IndexOptions {
             workers: crate::default_workers(),
             sniffer: ferret_policy::SNIFFER_VERSION,
             watch: None,
+            bulk: None,
+            background: false,
         }
     }
 }
@@ -122,6 +128,10 @@ impl fmt::Display for CoverageFault {
 /// Why [`index`] published nothing, or published with a caveat.
 #[derive(Debug)]
 pub enum IndexError {
+    /// No publication or cache mutation; retry a complete backstop later.
+    DeferredBulk(ferret_catalog::bulk::Blocked),
+    /// Lowering an index thread priority failed.
+    Priority(io::Error),
     /// A root that is not absolute, or has a `..` component.
     BadRoot(PathBuf),
     /// A root to refresh that is not among the configured roots.
@@ -155,6 +165,8 @@ pub enum IndexError {
 impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DeferredBulk(reason) => reason.fmt(f),
+            Self::Priority(error) => write!(f, "index thread priority: {error}"),
             Self::BadRoot(p) => write!(f, "root {} must be absolute, without `..`", p.display()),
             Self::NotConfigured(p) => write!(f, "{} is not a configured root", p.display()),
             Self::BadEntry(name) => {
@@ -438,6 +450,7 @@ fn run(
     let session = WriterSession::open(catalog_dir);
     match session {
         Ok(mut session) => {
+            session.set_bulk_control(options.bulk.clone());
             let previous = session.view();
             let roots = roots(Some(&previous))?;
             let mut plan = Plan::new(
@@ -463,7 +476,7 @@ fn run(
                     let changed = !changes.records.is_empty();
                     let catalog = session
                         .commit(&changes, options.sniffer)
-                        .map_err(IndexError::Update)?;
+                        .map_err(update_error)?;
                     let (faulted, aliases) =
                         reporting_ids(&session, previous.generation(), &changes);
                     (catalog, changed, faulted, aliases)
@@ -555,6 +568,7 @@ pub(crate) fn recrawl_scoped(
     options: &IndexOptions,
     selections: BTreeMap<PathBuf, std::sync::Arc<crate::refresh::Selection>>,
 ) -> Result<(Report, ferret_catalog::log::ChangeSet), IndexError> {
+    session.set_bulk_control(options.bulk.clone());
     let previous = session.view();
     let mut plan = Plan::new(
         Some(&previous),
@@ -599,7 +613,7 @@ pub(crate) fn recrawl_scoped(
     let changed = !changes.records.is_empty();
     let catalog = session
         .commit(&changes, options.sniffer)
-        .map_err(IndexError::Update)?;
+        .map_err(update_error)?;
     let (faulted, aliases) = reporting_ids(session, previous.generation(), &changes);
     report.commit_time += started.elapsed();
     finish_report(
@@ -657,7 +671,7 @@ fn observe_reconcile(
             options.sniffer,
             (&protection, budget.clone()),
         )
-        .map_err(IndexError::Update)?;
+        .map_err(update_error)?;
         report.commit_time += started.elapsed();
         report.input_usage = budget.usage();
         let Some(ref final_changes) = changes else {
@@ -862,7 +876,7 @@ fn observe(
             workers: options.workers,
             boundaries: plan.boundaries(root),
         };
-        let visitors = walk_parallel(
+        let mut visitors = walk_parallel(
             root,
             options.global.as_deref(),
             options.config,
@@ -870,10 +884,17 @@ fn observe(
             || {
                 let mut hasher = Hasher::with_source(source, &cache, root);
                 hasher.watch = options.watch.as_deref();
+                hasher.background = options.background;
+                if matches!(source, Source::Rebuild(..)) || plan.selections.is_empty() {
+                    hasher.reader.limiter = options.bulk.as_ref().map(|c| c.limiter());
+                }
                 hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
                 hasher
             },
         );
+        if let Some(error) = visitors.iter_mut().find_map(|v| v.priority_error.take()) {
+            return Err(IndexError::Priority(error));
+        }
         if let Source::Bounded(_, _, budget) = source
             && budget.exceeded()
         {
@@ -1224,6 +1245,8 @@ pub(crate) struct Hasher<'a> {
     reader: Reader,
     selection: Option<&'a crate::refresh::Selection>,
     watch: Option<&'a crate::watch::Watch>,
+    background: bool,
+    priority_error: Option<io::Error>,
 }
 
 /// What a worker leaves behind.
@@ -1269,6 +1292,8 @@ impl<'a> Hasher<'a> {
             reader: Reader::new(),
             selection: None,
             watch: None,
+            background: false,
+            priority_error: None,
         }
     }
 
@@ -1505,6 +1530,11 @@ impl Output {
 }
 
 impl EventVisitor for Hasher<'_> {
+    fn worker_started(&mut self) {
+        if self.background {
+            self.priority_error = crate::lower_index_priority().err();
+        }
+    }
     type Dir = DirToken;
 
     fn policy_path(&mut self, path: &Path) {
@@ -1740,6 +1770,7 @@ fn full_rewalk(
     options: &IndexOptions,
     usage: ferret_catalog::InputUsage,
 ) -> Result<Report, IndexError> {
+    session.admit_full_rewalk().map_err(update_error)?;
     let old = session.view();
     let plan = Plan::new(
         Some(&old),
@@ -1783,10 +1814,17 @@ fn full_rewalk(
     let started = Instant::now();
     let catalog = session
         .rebuild_checkpoint(batches, options.sniffer, fingerprint(options))
-        .map_err(IndexError::Update)?;
+        .map_err(update_error)?;
     report.commit_time += started.elapsed();
     report.input_usage = usage;
     report.input_fallback = true;
     finish_report(&mut report, &catalog, &plan, true, None, None);
     Ok(report)
+}
+
+fn update_error(error: ferret_catalog::log::Error) -> IndexError {
+    match error {
+        ferret_catalog::log::Error::Deferred(reason) => IndexError::DeferredBulk(reason),
+        error => IndexError::Update(error),
+    }
 }

@@ -125,6 +125,14 @@ impl WriterSession {
         self.directory_changes.clear();
     }
 
+    /// Installs host admission and pacing for checkpoints under this lock.
+    pub fn set_bulk_control(&mut self, control: Option<std::sync::Arc<dyn crate::bulk::Control>>) {
+        self.writer.set_bulk_control(control);
+    }
+    /// Checks headroom before a complete rewalk allocates observations.
+    pub fn admit_full_rewalk(&self) -> Result<(), Error> {
+        self.writer.admit_bulk(crate::bulk::Kind::FullRewalk)
+    }
     /// Changes host-selected checkpoint budgets. The defaults are S1+'s
     /// published limits; larger limits are useful for measuring replay costs.
     pub fn set_compaction_limits(&mut self, limits: crate::CompactionLimits) {

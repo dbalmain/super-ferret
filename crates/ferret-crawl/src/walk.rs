@@ -418,6 +418,9 @@ pub trait EventVisitor {
     /// A path-valued policy dependency outside the observed directory handle.
     fn policy_path(&mut self, _path: &Path) {}
 
+    /// Called on the executing worker, including a single-worker walk.
+    fn worker_started(&mut self) {}
+
     fn policy_input(&mut self, _parent: BorrowedFd<'_>, _name: &OsStr) {}
 
     fn observing(&mut self, _fd: BorrowedFd<'_>, _path: &Path) {}
@@ -616,6 +619,7 @@ fn run_guarded<V: EventVisitor>(walker: Walker<'_, V>, shared: &Shared<V::Dir>) 
 }
 
 fn run_worker<V: EventVisitor>(mut walker: Walker<'_, V>, shared: &Shared<V::Dir>) -> V {
+    walker.visit.worker_started();
     let mut local = VecDeque::new();
     let Some(mut current) = shared.take() else {
         return walker.visit;
