@@ -1371,6 +1371,20 @@ round two. It is retained as `fault-churn-progressive.json`, not a successful
 measurement. Final preparation never copies trustworthy file columns, including
 with one worker. Temporary directory maps are released before pruning.
 
+### S1+ status — closed (2026-10-05)
+
+Astra's end-of-stretch review (gpt-6-astra, four rounds, `8a81fa8..7e60c17`)
+closed S1+ for S1b to depend on. Round 3's last gap, uncharged reused-alias
+expansion in reconciliation, is fixed in `7e60c17` with a regression test.
+
+**Known limit.** The oversized-change fallback to a full rebuild peaks at
+**2.57 GiB** faultless and **2.71–2.78 GiB** with one EACCES and one retained
+EIO directory, on the 10M synthetic replay. That is a measurement of this
+workload, not a ceiling: directory graphs, seen bits, raw listings, allocator
+overhead and the full builder sit outside the input guard, and the full builder
+has no memory budget of its own. The 1.6 GiB target set in the R1 brief is not
+met and was not held as a requirement.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes
