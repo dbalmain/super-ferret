@@ -41,6 +41,10 @@ pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
 pub use budget::{BudgetUsage, CompactionLimits};
 pub use build::BuildError;
 pub use format::{DecodeError, Section};
+
+/// Checkpoint format understood by this reader, for host compatibility hello.
+pub const FORMAT_VERSION: u32 = format::VERSION;
+
 pub use generation::{Generation, Handle, RetryFromCurrent};
 pub use input::{InputBudget, InputLimits, InputUsage};
 pub use read::{

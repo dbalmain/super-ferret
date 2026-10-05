@@ -16,6 +16,12 @@ pub(crate) enum Destination {
 }
 
 impl Destination {
+    pub(crate) fn cancellation(&self) -> Option<&AtomicBool> {
+        match self {
+            Self::Stdout => None,
+            Self::Socket { cancelled, .. } => Some(cancelled),
+        }
+    }
     pub(crate) fn cancelled(&self) -> bool {
         match self {
             Self::Stdout => false,

@@ -1420,8 +1420,9 @@ information-only find, and batch remain local. No timing runs in this slice.
 
 **M4 is query-only. M5 owns WriterSession retention and writer command routing**,
 with watches and refresh scheduling. The user service is a template only.
-Verification counts and protocol details are in [S1B](S1B.md); gate results are
-recorded after the final checks. Existing parallel find record order remains
+All gates pass at **647 passed / 5 ignored**, zero Rust warnings (+22 over
+625/5). The 21 daemon tests cover actual sockets/binaries; one engine test checks
+candidate-boundary cancellation. Protocol details are in [S1B](S1B.md). Existing parallel find record order remains
 schedule-dependent, so byte-parity tests use deterministic traversal scopes.
 
 ### S1b M1 — Resident engine library (2026-10-05)

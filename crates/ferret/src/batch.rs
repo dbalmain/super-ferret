@@ -228,7 +228,7 @@ pub(crate) fn search_request(
             let result = if request.limit == Some(0) {
                 Ok(ferret_query::Stats::default())
             } else {
-                session.search(&query, |row: &Row<'_>| {
+                session.search_until(&query, destination.cancellation(), |row: &Row<'_>| {
                     if destination.cancelled() {
                         return ControlFlow::Break(());
                     }
@@ -353,6 +353,13 @@ pub(crate) fn find_request(
         request.child_stdin.unwrap_or(protocol::ChildStdin::Null),
     )
     .with_destination(destination.clone());
+    #[cfg(debug_assertions)]
+    let host = host.with_panic(
+        request
+            .capabilities
+            .iter()
+            .any(|capability| capability == "test-find-panic"),
+    );
     let mut query_error = None;
     match parsed {
         Ok(plan) => {
@@ -426,6 +433,13 @@ fn event_to(
 }
 
 fn emit_request_error(id: Option<&str>, message: &str) -> io::Result<()> {
+    request_error(&Destination::Stdout, id, message)
+}
+pub(crate) fn request_error(
+    destination: &Destination,
+    id: Option<&str>,
+    message: &str,
+) -> io::Result<()> {
     let mut line = Vec::new();
     let mut o = Object::new(&mut line);
     if let Some(id) = id {
@@ -435,7 +449,7 @@ fn emit_request_error(id: Option<&str>, message: &str) -> io::Result<()> {
     }
     o.str("event", "error").str("message", message);
     o.end();
-    send(&line)
+    destination.send(&line)
 }
 fn send(line: &[u8]) -> io::Result<()> {
     let mut out = io::stdout().lock();

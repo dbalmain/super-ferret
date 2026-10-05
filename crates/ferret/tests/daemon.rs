@@ -346,7 +346,7 @@ fn unsafe_runtime_and_symlink_directory_fall_back_without_creating_files() {
 
 #[test]
 fn bypass_missing_runtime_denied_spawn_and_loading_timeout_fall_back() {
-    for case in 0..4 {
+    for case in 0..if cfg!(debug_assertions) { 4 } else { 3 } {
         let tree = Tree::new();
         let mut cmd = tree.command(&["search", "main"]);
         match case {
@@ -370,6 +370,11 @@ fn bypass_missing_runtime_denied_spawn_and_loading_timeout_fall_back() {
         let local = tree.local(&["search", "main"]);
         assert_eq!(out.status.code(), local.status.code());
         assert_eq!(out.stdout, local.stdout);
+        let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
+        assert!(
+            !log.contains("\"host\":\"socket\""),
+            "case {case} did not fall back"
+        );
         if case < 3 {
             assert!(tree.sockets().is_empty());
         }
@@ -377,6 +382,7 @@ fn bypass_missing_runtime_denied_spawn_and_loading_timeout_fall_back() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn panic_isolated_in_real_query_and_effects_are_refused() {
     let tree = Tree::new();
     tree.start(&[]);
@@ -558,6 +564,7 @@ fn cancelling_blocked_output_and_hangup_release_all_query_slots() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn build_mismatch_drains_finishes_in_flight_and_restarts_client_binary() {
     let tree = Tree::new();
     let old_pid = tree.start(&[("FERRET_DAEMON_TEST_BUILD", "old-build")]);
@@ -642,6 +649,7 @@ fn socket_loss_after_first_bytes_is_transport_failure_and_never_replays() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn incompatible_context_falls_back_and_format_mismatch_replaces_host() {
     let tree = Tree::new();
     tree.start(&[("FERRET_DAEMON_TEST_CONTEXT", "different-groups-or-mount")]);
@@ -657,4 +665,208 @@ fn incompatible_context_falls_back_and_format_mismatch_replaces_host() {
     let (_, hello) = tree.connect();
     assert_ne!(number(&hello, "pid"), Some(old_pid));
     assert_eq!(number(&hello, "format"), Some(4));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn find_worker_panic_wakes_siblings_and_next_query_succeeds() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    let (mut reader, _) = tree.connect();
+    let request = format!(
+        "{{\"id\":\"p\",\"op\":\"find\",\"cwd\":\"{}\",\"args\":[\"src\",\"-print\"],\"capabilities\":[\"test-find-panic\"]}}\n",
+        tree.base.display()
+    );
+    let result = block(&mut reader, request.as_bytes());
+    assert!(result.contains("RuntimeError"), "{result}");
+    let result = block(
+        &mut reader,
+        b"{\"id\":\"q\",\"op\":\"search\",\"args\":[\"main\"]}\n",
+    );
+    assert!(result.contains("\"exit\":0"));
+}
+
+#[test]
+fn structured_read_only_find_attaches_and_keeps_its_tagged_codec() {
+    let tree = Tree::new();
+    let output = tree.run(&["--json", "find", "src", "-maxdepth", "0", "-print0"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("\"id\":\"find\",\"event\":\"begin\",\"generation\":{")
+            && text.contains("c3JjAA==")
+            && text.contains("\"event\":\"end\",\"exit\":0"),
+        "{text}"
+    );
+    assert_eq!(tree.sockets().len(), 1);
+}
+
+#[test]
+fn drain_on_active_connection_finishes_the_query_before_exit() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    let socket = tree.socket();
+    let mut reader = begin_large(&tree);
+    reader.get_mut().write_all(b"{\"op\":\"drain\"}\n").unwrap();
+    loop {
+        let next = line(&mut reader);
+        if next.contains("\"event\":\"end\"") {
+            assert!(
+                next.contains("\"exit\":0") && next.contains("\"cancelled\":false"),
+                "{next}"
+            );
+            break;
+        }
+    }
+    drop(reader);
+    wait(|| !socket.exists());
+}
+
+#[test]
+fn idle_cleanup_does_not_unlink_a_replacement_socket() {
+    let tree = Tree::new();
+    tree.start(&[("FERRET_DAEMON_IDLE_MS", "150")]);
+    let socket = tree.socket();
+    {
+        let _ = tree.connect();
+    }
+    fs::remove_file(&socket).unwrap();
+    let replacement = UnixListener::bind(&socket).unwrap();
+    let ino = fs::symlink_metadata(&socket).unwrap().ino();
+    wait(|| {
+        tree.children.lock().unwrap()[0]
+            .try_wait()
+            .unwrap()
+            .is_some()
+    });
+    assert_eq!(fs::symlink_metadata(&socket).unwrap().ino(), ino);
+    drop(replacement);
+}
+
+#[test]
+fn search_broken_pipe_is_quiet_and_sigint_cancels_without_killing_host() {
+    use std::os::unix::process::ExitStatusExt;
+    let tree = Tree::new();
+    let pid = tree.start(&[]);
+    let mut command = tree.command(&["search", "*"]);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    drop(child.stdout.take());
+    wait(|| child.try_wait().unwrap().is_some());
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let format = "z".repeat(100_000);
+    let mut command = fixture::command(FERRET, &tree.base);
+    command
+        .env_remove("FERRET_NO_DAEMON")
+        .env("FERRET_DAEMON_BIN", DAEMON)
+        .args(["find", "src", "-printf", &format])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let first = std::thread::spawn(move || {
+        let mut bytes = [0; 4096];
+        stdout.read_exact(&mut bytes).unwrap();
+        stdout
+    });
+    wait(|| first.is_finished());
+    child.stdout = Some(first.join().unwrap());
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = bounded_output(child);
+    assert_eq!(output.status.signal(), Some(2));
+    assert!(tree.run(&["search", "main"]).status.success());
+    let (_, hello) = tree.connect();
+    assert_eq!(number(&hello, "pid"), Some(pid));
+}
+
+#[test]
+fn failed_freshness_check_returns_native_error_without_serving_old_rows() {
+    let tree = Tree::new();
+    assert!(tree.run(&["search", "main"]).status.success());
+    let current = tree.base.join("index/current");
+    let original = fs::read(&current).unwrap();
+    fs::write(&current, b"not a current header").unwrap();
+    let search = tree.run(&["search", "main"]);
+    assert_eq!(search.status.code(), Some(3));
+    assert!(search.stdout.is_empty());
+    let find = tree.run(&["find", "src", "-print"]);
+    assert_eq!(find.status.code(), Some(1));
+    assert!(find.stdout.is_empty());
+    fs::write(current, original).unwrap();
+    assert!(tree.run(&["search", "main"]).status.success());
+}
+
+#[test]
+fn a_rebuilt_catalog_incarnation_is_confirmed_and_adopted() {
+    let tree = Tree::new();
+    assert!(tree.run(&["search", "main"]).status.success());
+    let (_, old) = tree.connect();
+    fs::remove_file(tree.base.join("index/current")).unwrap();
+    fs::write(tree.base.join("src/reborn.rs"), "reborn").unwrap();
+    assert!(tree.run(&["index", "src"]).status.success());
+    assert!(tree.run(&["search", "reborn"]).status.success());
+    let (mut reader, new) = tree.connect();
+    let incarnation = |hello: String| {
+        hello
+            .split_once("\"incarnation\":\"")
+            .unwrap()
+            .1
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(incarnation(old), incarnation(new));
+    assert_eq!(
+        number(
+            &block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n"),
+            "engine_opens"
+        ),
+        Some(2)
+    );
+    let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
+    assert!(
+        log.lines().last().unwrap().contains("\"host\":\"socket\""),
+        "incarnation change stranded the client on fallback"
+    );
+}
+
+#[test]
+fn socket_request_line_limit_matches_batch_excluding_the_newline() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    let (mut reader, _) = tree.connect();
+    let prefix = b"{\"id\":\"boundary\",\"op\":\"search\",\"args\":[\"main\"],\"padding\":\"";
+    let suffix = b"\"}";
+    let mut request = prefix.to_vec();
+    request.extend(std::iter::repeat_n(
+        b'x',
+        (1 << 20) - prefix.len() - suffix.len(),
+    ));
+    request.extend_from_slice(suffix);
+    assert_eq!(request.len(), 1 << 20);
+    request.push(b'\n');
+    assert!(block(&mut reader, &request).contains("\"exit\":0"));
+    request.insert(request.len() - 3, b'x');
+    reader.get_mut().write_all(&request).unwrap();
+    let error = line(&mut reader);
+    assert!(
+        error.contains("\"id\":\"boundary\"") && error.contains("LineTooLong"),
+        "{error}"
+    );
+    assert!(
+        block(
+            &mut reader,
+            b"{\"id\":\"q\",\"op\":\"search\",\"args\":[\"main\"]}\n"
+        )
+        .contains("\"exit\":0")
+    );
 }

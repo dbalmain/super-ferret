@@ -5,6 +5,8 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -74,6 +76,8 @@ pub(crate) struct FrameOutput<'a> {
     record: Arc<AtomicU64>,
     stdin: ChildStdin,
     transport_error: Arc<Mutex<Option<io::Error>>>,
+    #[cfg(debug_assertions)]
+    panic: Arc<AtomicBool>,
 }
 impl Effects for FrameOutput<'_> {
     fn cancelled(&self) -> bool {
@@ -177,13 +181,24 @@ impl FrameOutput<'_> {
             stdin,
             record: Arc::new(AtomicU64::new(0)),
             transport_error: Arc::new(Mutex::new(None)),
+            #[cfg(debug_assertions)]
+            panic: Arc::new(AtomicBool::new(false)),
         }
     }
     pub(crate) fn with_destination(mut self, destination: Destination) -> Self {
         self.destination = destination;
         self
     }
+    #[cfg(debug_assertions)]
+    pub(crate) fn with_panic(self, enabled: bool) -> Self {
+        self.panic.store(enabled, Ordering::Release);
+        self
+    }
     fn cancelled(&self) -> bool {
+        #[cfg(debug_assertions)]
+        if self.record.load(Ordering::Acquire) > 0 && self.panic.swap(false, Ordering::AcqRel) {
+            panic!("injected find worker panic");
+        }
         self.destination.cancelled()
     }
     pub(crate) fn check_transport(&self) -> io::Result<()> {
@@ -350,7 +365,7 @@ pub(crate) fn generation(object: &mut Object<'_>, value: Option<ferret_catalog::
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

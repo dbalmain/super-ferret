@@ -1071,3 +1071,36 @@ fn an_independent_catalog_incarnation_cannot_reuse_another_name_term_base() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].ends_with(b"unrelatedReceipt.txt"));
 }
+
+#[test]
+fn host_cancellation_stops_search_before_the_next_candidate_is_evaluated() {
+    use std::sync::atomic::AtomicBool;
+    let tree = Tree::new();
+    let engine = Engine::open(&tree.index()).unwrap().unwrap();
+    let pin = engine.pin();
+    for atom in [b"*.txt".as_slice(), b"type:f"] {
+        let query = Query::from_args([atom], SystemTime::now()).unwrap();
+        let mut full_rows = 0;
+        let full = pin
+            .search(&query, |_| {
+                full_rows += 1;
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(full_rows, 2);
+        let cancelled = AtomicBool::new(false);
+        let mut rows = 0;
+        // Returning Continue is essential: the cancellation flag, rather than
+        // the output callback's ordinary limit break, must stop the evaluator.
+        let result = pin
+            .search_until(&query, Some(&cancelled), |_| {
+                rows += 1;
+                cancelled.store(true, Ordering::Release);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert!(result.candidates <= full.candidates);
+        assert_eq!(search(&engine.pin()).len(), 2);
+    }
+}

@@ -79,6 +79,11 @@ fn event(reader: &mut BufReader<UnixStream>, line: &mut Vec<u8>) -> io::Result<V
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon event"))
 }
 fn connect(endpoint: &Endpoint, index: &Path) -> io::Result<BufReader<UnixStream>> {
+    let expected = ferret_catalog::Catalog::open(index)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("no index"))?
+        .generation();
+    let incarnation = crate::find_json::hex(&expected.incarnation);
     let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
     let context = endpoint::context()?;
     let mut spawned = false;
@@ -121,6 +126,7 @@ fn connect(endpoint: &Endpoint, index: &Path) -> io::Result<BufReader<UnixStream
                     }
                     if field_text(&hello, "build") != Some(BUILD)
                         || field_number(&hello, "format") != Some(FORMAT)
+                        || !supports_queries(&hello)
                     {
                         reader.get_mut().write_all(b"{\"op\":\"drain\"}\n")?;
                         // Wait for the owning lock and socket to be released.
@@ -133,6 +139,13 @@ fn connect(endpoint: &Endpoint, index: &Path) -> io::Result<BufReader<UnixStream
                     match field_text(&hello, "state") {
                         Some("loading") => continue,
                         Some("ready") => {
+                            if hello
+                                .field("generation")
+                                .and_then(|generation| field_text(generation, "incarnation"))
+                                != Some(&incarnation)
+                            {
+                                return Err(io::Error::other("incompatible catalog incarnation"));
+                            }
                             reader.get_ref().set_read_timeout(None)?;
                             return Ok(reader);
                         }
@@ -152,6 +165,16 @@ fn connect(endpoint: &Endpoint, index: &Path) -> io::Result<BufReader<UnixStream
         io::ErrorKind::TimedOut,
         "daemon startup deadline",
     ))
+}
+fn supports_queries(hello: &Value) -> bool {
+    let Some(Value::Arr(capabilities)) = hello.field("capabilities") else {
+        return false;
+    };
+    ["query-only", "cancel", "drain"].iter().all(|required| {
+        capabilities
+            .iter()
+            .any(|value| value.text() == Some(*required))
+    })
 }
 fn cancel(stream: &mut UnixStream) {
     let _ = stream.write_all(b"{\"op\":\"cancel\"}\n");
@@ -230,13 +253,18 @@ fn query(
             match field_text(&value, "event") {
                 Some("begin") => {}
                 Some("row") if op == "search" => {
+                    rows += 1;
                     if json {
-                        let offset = line
-                            .windows(8)
-                            .position(|bytes| bytes == b",\"path\":")
-                            .ok_or_else(|| io::Error::other("missing row path"))?;
-                        write(&mut out, b"{", &mut output_failure)?;
-                        write(&mut out, &line[offset + 1..], &mut output_failure)?;
+                        // The shared encoder prefixes native row fields with
+                        // the fixed id/event envelope. Preserve those fields
+                        // verbatim rather than encoding a second row schema.
+                        let fields = line
+                            .strip_prefix(br#"{"id":"search","event":"row","#)
+                            .ok_or_else(|| io::Error::other("invalid row envelope"))?;
+                        let mut native = Vec::with_capacity(fields.len() + 1);
+                        native.push(b'{');
+                        native.extend_from_slice(fields);
+                        write(&mut out, &native, &mut output_failure)?;
                     } else {
                         write(
                             &mut out,
@@ -246,7 +274,6 @@ fn query(
                         write(&mut out, b"\n", &mut output_failure)?;
                     }
                     first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
-                    rows += 1;
                     out.flush()?;
                 }
                 Some("stdout" | "stderr") if op == "find" => {
@@ -263,9 +290,7 @@ fn query(
                 Some("diagnostic") if op == "find" => {
                     if !json {
                         match field_text(&value, "code") {
-                            Some("permission") => cli::error(
-                                "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form",
-                            ),
+                            Some("permission") => cli::error(crate::find::PERMISSION_WARNING),
                             Some("walk") => {
                                 let path = PathBuf::from(OsString::from_vec(bytes(
                                     &value,

@@ -16,6 +16,9 @@ use crate::find_json::{self, FrameOutput};
 use crate::protocol::ChildStdin;
 use crate::xdg::Dirs;
 
+pub(crate) const PERMISSION_WARNING: &str =
+    "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form";
+
 /// Resolves the catalog a find plan should walk through: `None` for a live,
 /// unindexed walk (`-I`, a configured `find_no_ignore`, or an information
 /// plan), `Some` for a catalog-backed walk, or an error message (without a
@@ -118,9 +121,7 @@ pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
         }
     };
     if plan.permission_warning() {
-        cli::error(
-            "find: warning: -perm /000 now matches all files; use -perm -000 for the equivalent form",
-        );
+        cli::error(PERMISSION_WARNING);
     }
     let mut effects = Output::Stdout;
     let workers = ferret_crawl::default_workers();

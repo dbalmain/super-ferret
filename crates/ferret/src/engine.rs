@@ -3,7 +3,7 @@
 
 use std::ops::ControlFlow;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ferret_catalog::{Catalog, Generation, OpenError, WriterSession};
@@ -157,7 +157,17 @@ impl QuerySession {
         query: &Query,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
-        query.run_indexed(&self.catalog, &self.names, None, emit)
+        self.search_until(query, None, emit)
+    }
+
+    /// Streams rows, checking host cancellation at every candidate boundary.
+    pub fn search_until(
+        &self,
+        query: &Query,
+        cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit)
     }
 
     /// Runs find with the plan's captured cwd/time and the host's effects.

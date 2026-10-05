@@ -544,9 +544,8 @@ The CLI's JSON lines write a path that is not UTF-8 as `path` (lossy text) plus
 
 [S1B.md](S1B.md) defines one library engine in `ferret`, with `ferret batch`
 and a `ferretd` binary in that package as hosts. The current dependency graph
-already permits that coordination. The historical `ferret-daemon → later`
-placeholder above is not a proposed new crate. D57 records the proposed
-external JSON-parser edge; the enforced graph changes with its implementation.
+already permits that coordination. There is no separate daemon crate. D57 A and D58 B select the shared bounded
+JSON-lines reader and event writer; no external parser dependency is needed.
 
 Both hosts open checked catalog buffers resident, validate the effective
 snapshot-plus-overlay view (D53 A), and pin generations per query. Future
@@ -557,8 +556,10 @@ row postings do not change the content-index boundary. D55 remains open.
 
 Ordinary queries connect to the daemon, spawning it on first use; unavailable
 background operation or `FERRET_NO_DAEMON` uses the same engine in process.
-D56 leaves action-plan host routing open without changing find semantics.
-The daemon consumes inotify hints through S1+'s real refresh seam, maintains
+D56 A keeps effectful find in the local client; live/information-only find
+and batch remain local too. M4 is query-only and adopts checked direct-writer
+publications before admission. M5 owns retained writer sessions and writer
+command routing. From M5 the daemon consumes inotify hints through S1+'s real refresh seam, maintains
 raw directory counts, and uses scoped/full recrawls for gaps. D51 A pauses the
 writer at idle boundaries while queries keep old views. S1B specifies queue
 bounds, freshness reporting and the research-derived politeness controller,

@@ -726,6 +726,8 @@ fn decode_base64_char(b: u8) -> Option<u8> {
 // Socket envelopes and client events use the same bounded JSON reader as
 // requests.
 pub(crate) fn parse_object(line: &[u8]) -> Option<Value> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.len() > MAX_LINE_BYTES {
         return None;
     }
@@ -1076,7 +1078,7 @@ mod tests {
                 } else {
                     vec![]
                 },
-                start_unix_ns: None,
+                start_unix_ns: self.bool().then(|| self.next()),
                 child_stdin: self.bool().then(|| {
                     if self.bool() {
                         ChildStdin::Null
@@ -1107,6 +1109,7 @@ mod tests {
         obj.byte_strings("args", req.args.iter().map(|a| a.as_slice()));
         obj.opt_byte_value("cwd", req.cwd.as_deref());
         obj.opt_int("limit", req.limit.map(|l| l as i128));
+        obj.opt_int("start_unix_ns", req.start_unix_ns);
         obj.byte_strings(
             "capabilities",
             req.capabilities.iter().map(String::as_bytes),

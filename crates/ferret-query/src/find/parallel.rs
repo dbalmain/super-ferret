@@ -213,8 +213,26 @@ struct Pool {
     workers: usize,
 }
 
+// A worker panic must wake siblings before the scoped join can propagate it.
+// Taking the queue lock closes the check-then-condvar-wait lost-wakeup window.
+struct PanicStop<'a>(&'a Pool);
+impl Drop for PanicStop<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let _queue = self
+                .0
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.0.quit.store(true, Ordering::Release);
+            self.0.changed.notify_all();
+        }
+    }
+}
+
 impl Pool {
     fn worker(&self, plan: &Plan, expression: &Expression, mut effects: impl Effects) -> u64 {
+        let _panic = PanicStop(self);
         let mut errors = 0;
         // Keep allocation capacity with the worker when a task completes or
         // suspends. Queued tasks have already flushed their transactions.

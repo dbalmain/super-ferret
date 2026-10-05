@@ -3,6 +3,9 @@
 //! unchanged. No query holds the engine-selection mutex during evaluation or
 //! socket writes.
 
+#[cfg(panic = "abort")]
+compile_error!("ferretd requires panic unwinding for query isolation");
+
 mod client;
 mod endpoint;
 pub(crate) use client::{find, search};
@@ -27,7 +30,7 @@ use endpoint::Endpoint;
 const BUILD: &str = env!("FERRET_BUILD");
 const MAJOR: u64 = 1;
 const MINOR: u64 = 0;
-const FORMAT: u64 = 4;
+const FORMAT: u64 = ferret_catalog::FORMAT_VERSION as u64;
 const QUERIES: usize = 4;
 const CLIENTS: usize = 32;
 
@@ -74,6 +77,7 @@ fn duration(name: &str, default: u64) -> Duration {
 }
 fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let mut index = std::env::var_os("FERRET_INDEX")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| crate::xdg::Dirs::from_env().ok().map(|dirs| dirs.data));
     let mut idle = duration("FERRET_DAEMON_IDLE_MS", 15 * 60 * 1000);
@@ -98,19 +102,23 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let index = fs::canonicalize(index.ok_or_else(|| io::Error::other("no index directory"))?)?;
     let endpoint = Endpoint::open(&index)?;
     let lock = endpoint.private_file("lock")?;
-    if let Err(error) = lock.try_lock() {
-        match error {
-            fs::TryLockError::WouldBlock => {
-                let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
-                while Instant::now() < until {
-                    if UnixStream::connect(endpoint.socket()).is_ok() {
-                        return Ok(());
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
+    let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {
+                if UnixStream::connect(endpoint.socket()).is_ok() {
+                    return Ok(());
                 }
-                return Err(io::Error::other("singleton winner did not bind"));
+                // A draining owner may have unlinked just before releasing
+                // its lock. Retry acquisition so that starter can become the
+                // new winner instead of waiting for a departed host to bind.
+                if Instant::now() >= until {
+                    return Err(io::Error::other("singleton winner did not bind"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            fs::TryLockError::Error(error) => return Err(error),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
         }
     }
     if UnixStream::connect(endpoint.socket()).is_ok() {
@@ -122,8 +130,9 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     let listener = UnixListener::bind(endpoint.socket())?;
-    fs::set_permissions(endpoint.socket(), fs::Permissions::from_mode(0o600))?;
     let own_socket = fs::symlink_metadata(endpoint.socket())?;
+    let cleanup = SocketCleanup(&endpoint, own_socket.dev(), own_socket.ino());
+    fs::set_permissions(endpoint.socket(), fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let host = Arc::new(Host {
         engine: Mutex::new(Loaded::Loading),
@@ -143,9 +152,12 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     });
     let loader = host.clone();
     std::thread::spawn(move || {
-        let delay = duration("FERRET_DAEMON_LOAD_DELAY_MS", 0);
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
+        #[cfg(debug_assertions)]
+        {
+            let delay = duration("FERRET_DAEMON_LOAD_DELAY_MS", 0);
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
         }
         let loaded = std::panic::catch_unwind(|| Engine::open(&loader.index));
         let state = match loaded {
@@ -180,8 +192,8 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
                 host.clients.fetch_add(1, Ordering::AcqRel);
                 let host = host.clone();
                 std::thread::spawn(move || {
+                    let _client = ClientCount(&host);
                     let _ = connection(stream, &host);
-                    host.clients.fetch_sub(1, Ordering::AcqRel);
                 });
             }
             Ok(_) => {}
@@ -199,6 +211,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     {
         endpoint.remove_socket()?;
     }
+    drop(cleanup);
     drop(listener);
     drop(lock);
     Ok(())
@@ -238,6 +251,18 @@ fn hello(destination: &Destination, host: &Host) -> io::Result<bool> {
             Loaded::Failed(error) => ("failed", None, Some(error.clone())),
         }
     };
+    // A replaced catalog incarnation must not strand clients on an old
+    // hello forever. Refresh ready state before reporting its identity.
+    let (state, selected, error) = if state == "ready" {
+        let selected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(host)))
+            .unwrap_or_else(|_| Err(io::Error::other("engine selection panicked")));
+        match selected {
+            Ok(session) => ("ready", Some(session.generation()), None),
+            Err(error) => ("failed", None, Some(error.to_string())),
+        }
+    } else {
+        (state, selected, error)
+    };
     emit_to(destination, "hello", "hello", |o| {
         o.int("major", MAJOR)
             .int("minor", MINOR)
@@ -274,6 +299,25 @@ fn hello(destination: &Destination, host: &Host) -> io::Result<bool> {
     Ok(state != "loading")
 }
 
+// Created after binding and before fallible setup; dropped before the
+// lifetime-held endpoint lock, including on fatal startup/accept errors.
+struct SocketCleanup<'a>(&'a Endpoint, u64, u64);
+impl Drop for SocketCleanup<'_> {
+    fn drop(&mut self) {
+        if let Ok(current) = fs::symlink_metadata(self.0.socket())
+            && current.dev() == self.1
+            && current.ino() == self.2
+        {
+            let _ = self.0.remove_socket();
+        }
+    }
+}
+struct ClientCount<'a>(&'a Host);
+impl Drop for ClientCount<'_> {
+    fn drop(&mut self) {
+        self.0.clients.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 struct QueryPermit<'a>(&'a Host);
 impl Drop for QueryPermit<'_> {
     fn drop(&mut self) {
@@ -344,6 +388,12 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
             let op = protocol::parse_object(&line).and_then(|value| {
                 value
                     .field("op")
@@ -364,7 +414,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                         .draining = true;
                 }
                 _ => {
-                    if send.send(line.clone()).is_err() {
+                    if send.try_send(line.clone()).is_err() {
                         break;
                     }
                 }
@@ -413,16 +463,18 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
+            if line.len() > protocol::MAX_LINE_BYTES {
+                let id = protocol::recover_id(&line);
+                crate::batch::request_error(&destination, id.as_deref(), "LineTooLong")?;
+                continue;
+            }
             let request = match protocol::parse_request(&line) {
                 Ok(request) => request,
                 Err(error) => {
-                    emit_to(
+                    crate::batch::request_error(
                         &destination,
-                        error.id.as_deref().unwrap_or(""),
-                        "error",
-                        |o| {
-                            o.str("error", &error.kind.to_string());
-                        },
+                        error.id.as_deref(),
+                        &error.kind.to_string(),
                     )?;
                     continue;
                 }
@@ -436,7 +488,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
             match result {
                 Ok(result) => result?,
                 Err(_) => emit_to(&destination, &request.id, "end", |o| {
-                    o.int("exit", 3)
+                    o.int("exit", runtime_status(&request))
                         .bool("cancelled", false)
                         .str("error", "RuntimeError")
                         .str("message", "query panicked");
@@ -453,15 +505,22 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     let _ = reader.join();
     result
 }
+fn runtime_status(request: &Request) -> u8 {
+    if request.op == Op::Find { 1 } else { 3 }
+}
 fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
-    let session = match pin(host) {
+    // Freshness preparation can itself panic before batch emits begin. Turn
+    // that failure into an ordinary null-generation runtime-error block.
+    let selected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pin(host)))
+        .unwrap_or_else(|_| Err(io::Error::other("engine selection panicked")));
+    let session = match selected {
         Ok(session) => session,
         Err(error) => {
             emit_to(destination, &request.id, "begin", |o| {
                 o.null("generation");
             })?;
             return emit_to(destination, &request.id, "end", |o| {
-                o.int("exit", 3)
+                o.int("exit", runtime_status(request))
                     .bool("cancelled", false)
                     .str("error", "RuntimeError")
                     .str("message", &error.to_string());
@@ -474,8 +533,9 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
             // Clear all action grants. Even a direct socket caller cannot ask
             // the daemon to execute, prompt, delete or open an output file.
             let mut request = request.clone();
-            request.capabilities.clear();
-            request.child_stdin = None;
+            request
+                .capabilities
+                .retain(|capability| capability == "test-find-panic");
             crate::batch::find_request(
                 &request,
                 Path::new("/"),
