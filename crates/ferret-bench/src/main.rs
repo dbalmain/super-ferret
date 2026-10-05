@@ -1565,14 +1565,17 @@ fn name_index_compact(dir: &Path) -> Result<()> {
     let (before_drop_rss, peak) = memory()?;
     drop((index, previous));
     let (after_drop_rss, _) = memory()?;
+    drop(session);
+    let (after_writer_drop_rss, _) = memory()?;
     println!(
-        "name-compact setup_ms={setup_ms:.3} writer_pause_ms={:.3} projection_build_ms={:.3} query_cache_ms={:.3} pause_ms={:.3} rss_before_drop={} rss_after_drop={} peak={} old_epoch={} epoch={} sequence={} index_payload_bytes={}",
+        "name-compact setup_ms={setup_ms:.3} writer_pause_ms={:.3} projection_build_ms={:.3} query_cache_ms={:.3} pause_ms={:.3} rss_before_drop={} rss_after_drop={} rss_after_writer_drop={} peak={} old_epoch={} epoch={} sequence={} index_payload_bytes={}",
         duration_ms(writer_pause),
         duration_ms(names.build_time()),
         duration_ms(query_cache),
         duration_ms(writer_pause + query_cache),
         before_drop_rss.replace(' ', ""),
         after_drop_rss.replace(' ', ""),
+        after_writer_drop_rss.replace(' ', ""),
         peak.replace(' ', ""),
         old_epoch,
         current.generation().checkpoint,

@@ -80,8 +80,21 @@ impl NameIndex {
                 || {
                     let scope_started = std::time::Instant::now();
                     let mut scopes = vec![0u32; checkpoint.base_dir_count() as usize];
+                    let mut current = None;
+                    let mut count = 0u32;
                     for parent in checkpoint.name_reader().parents() {
-                        scopes[parent.0 as usize] += 1;
+                        if current == Some(parent) {
+                            count += 1;
+                        } else {
+                            if let Some(previous) = current {
+                                scopes[previous.0 as usize] = count;
+                            }
+                            current = Some(parent);
+                            count = 1;
+                        }
+                    }
+                    if let Some(parent) = current {
+                        scopes[parent.0 as usize] = count;
                     }
                     for dir in (0..checkpoint.base_dir_count()).rev().map(InoId) {
                         if let Some(edge) = checkpoint.dir_name(dir) {

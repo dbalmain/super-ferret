@@ -3,29 +3,11 @@
 //! The v4 encoder still obtains ordinary name bytes through those accessors.
 
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
 
 use intpack::{bits, pfor128};
 
 use crate::{NameId, NameReader};
-
-#[derive(Default)]
-struct NameHasher(u64);
-
-impl Hasher for NameHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
-                .wrapping_mul(0x517c_c1b7_2722_0a95);
-        }
-    }
-}
 
 /// An owned fixed-width array; its codec is intpack, not a second decoder.
 pub(crate) struct Keys {
@@ -142,7 +124,7 @@ impl ResidentNames {
         // Intern while streaming rows. Sort only distinct names, never one
         // borrowed slice per row; repeated names must not multiply build
         // scratch.
-        let mut lookup: HashMap<_, _, BuildHasherDefault<NameHasher>> = HashMap::default();
+        let mut lookup = HashMap::new();
         let mut ids = Vec::with_capacity(rows as usize);
         for (_, name) in names.runs_from(NameId(0)) {
             let next = lookup.len() as u32;
