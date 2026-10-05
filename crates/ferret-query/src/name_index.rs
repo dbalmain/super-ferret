@@ -29,11 +29,13 @@ struct Base {
     terms: OnceLock<TermIndex>,
     scopes: Vec<u32>,
     live_scopes: Vec<InoId>,
+    scope_build_time: std::time::Duration,
 }
 
 struct TermIndex {
     terms: PackedStrings,
     keys: PackedNameLists,
+    build_time: std::time::Duration,
 }
 
 /// A resident name index for exactly one generation; old query pins retain
@@ -76,6 +78,7 @@ impl NameIndex {
             })
             .map_or_else(
                 || {
+                    let scope_started = std::time::Instant::now();
                     let mut scopes = vec![0u32; checkpoint.base_dir_count() as usize];
                     for parent in checkpoint.name_reader().parents() {
                         scopes[parent.0 as usize] += 1;
@@ -97,6 +100,7 @@ impl NameIndex {
                         terms: OnceLock::new(),
                         scopes,
                         live_scopes,
+                        scope_build_time: scope_started.elapsed(),
                     })
                 },
                 |old| old.base.clone(),
@@ -122,7 +126,7 @@ impl NameIndex {
             {
                 out.mark_unknown(&checkpoint, edge.parent);
             }
-            out.adjust_scope(&checkpoint, edge.parent, -1);
+            *out.scope_changes.entry(edge.parent).or_default() -= 1;
         }
         for &(_, row) in catalog.delta_names().1 {
             let id = NameId(row);
@@ -139,8 +143,9 @@ impl NameIndex {
                 }
             }
             out.delta.entry(edge.bytes.to_vec()).or_default().push(id);
-            out.adjust_scope(catalog, edge.parent, 1);
+            *out.scope_changes.entry(edge.parent).or_default() += 1;
         }
+        out.propagate_scope_changes(catalog);
         out.live_scopes = out
             .base
             .live_scopes
@@ -164,13 +169,19 @@ impl NameIndex {
         }
     }
 
-    fn adjust_scope(&mut self, catalog: &Catalog, mut dir: InoId, change: i64) {
-        loop {
+    fn propagate_scope_changes(&mut self, catalog: &Catalog) {
+        let mut pending = std::mem::take(&mut self.scope_changes);
+        while let Some((&dir, &change)) = pending.last_key_value() {
+            pending.pop_last();
             *self.scope_changes.entry(dir).or_default() += change;
-            let Some(edge) = catalog.dir_name(dir) else {
-                break;
-            };
-            dir = catalog.name(edge).parent;
+            if let Some(edge) = catalog.dir_name(dir) {
+                let parent = catalog.name(edge).parent;
+                // Reparented directories make both affected ancestor chains
+                // unknown; their approximate counts are never used to plan.
+                if parent < dir {
+                    *pending.entry(parent).or_default() += change;
+                }
+            }
         }
     }
 
@@ -193,6 +204,16 @@ impl NameIndex {
                 .iter()
                 .map(|(name, rows)| name.len() + rows.len() * 4)
                 .sum::<usize>()
+    }
+
+    /// Time spent building base scope cardinalities, excluding overlay edits.
+    pub fn scope_build_time(&self) -> std::time::Duration {
+        self.base.scope_build_time
+    }
+
+    /// Time spent constructing the shared lazy term table, if first used.
+    pub fn term_build_time(&self) -> Option<std::time::Duration> {
+        self.base.terms.get().map(|terms| terms.build_time)
     }
 
     /// Terms constrain the distinct table first; an empty slice scans all
@@ -281,6 +302,7 @@ impl NameIndex {
 }
 
 fn build_terms(names: &ferret_catalog::ResidentNames) -> TermIndex {
+    let started = std::time::Instant::now();
     let mut terms: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
     for key in 0..names.distinct_count() {
         let mut tokens = Vec::new();
@@ -298,6 +320,7 @@ fn build_terms(names: &ferret_catalog::ResidentNames) -> TermIndex {
     TermIndex {
         terms: PackedStrings::new(strings),
         keys,
+        build_time: started.elapsed(),
     }
 }
 

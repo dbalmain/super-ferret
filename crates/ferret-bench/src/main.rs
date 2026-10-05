@@ -1359,6 +1359,11 @@ fn name_index_once(dir: &Path) -> Result<()> {
             name_query_samples(&catalog, &index, text, Some(scope), label)?;
         }
     }
+    println!(
+        "name-index-build scope_ms={:.3} term_ms={:?}",
+        duration_ms(index.scope_build_time()),
+        index.term_build_time().map(duration_ms)
+    );
     println!("raw_scan_bytes={}", names.raw_scan_bytes());
     Ok(())
 }

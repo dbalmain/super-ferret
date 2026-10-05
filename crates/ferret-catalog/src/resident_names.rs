@@ -61,7 +61,7 @@ impl Keys {
         self.get_offset(index) as u32
     }
     pub(crate) fn bytes(&self) -> usize {
-        self.bytes.len()
+        self.bytes.capacity()
     }
 }
 
@@ -122,8 +122,7 @@ impl PackedStrings {
 /// Immutable base dictionary, packed row keys and PFor row postings. Keys are
 /// local to this object, never durable ids or handles across an epoch.
 pub struct ResidentNames {
-    table: Vec<u8>,
-    offsets: Keys,
+    distinct_names: PackedStrings,
     keys: Keys,
     postings: PackedNameLists,
     distinct: u32,
@@ -159,14 +158,7 @@ impl ResidentNames {
         for key in &mut ids {
             *key = remap[*key as usize];
         }
-        let mut table = Vec::new();
-        let mut offsets = Vec::with_capacity(distinct.len() + 1);
-        for &(name, _) in &distinct {
-            offsets.push(table.len() as u64);
-            table.extend_from_slice(name);
-            table.push(0);
-        }
-        offsets.push(table.len() as u64);
+        let distinct_names = PackedStrings::new(distinct.iter().map(|&(name, _)| name));
         // One row array and a prefix sum, rather than one allocation per name.
         let mut counts = vec![0u32; distinct.len()];
         for &key in &ids {
@@ -185,11 +177,9 @@ impl ResidentNames {
         let postings = PackedNameLists::new(
             (0..counts.len()).map(|i| &postings_rows[starts[i]..starts[i + 1]]),
         );
-        let offsets = Keys::from_values(offsets.iter().copied());
         let keys = Keys::new(&ids);
         Self {
-            table,
-            offsets,
+            distinct_names,
             keys,
             postings,
             distinct: distinct.len() as u32,
@@ -218,9 +208,7 @@ impl ResidentNames {
     }
     pub fn distinct_name(&self, key: u32) -> &[u8] {
         assert!(key < self.distinct);
-        let start = self.offsets.get_offset(key as usize);
-        let end = self.offsets.get_offset(key as usize + 1);
-        &self.table[start..end - 1]
+        self.distinct_names.get(key as usize)
     }
     pub fn key(&self, row: NameId) -> u32 {
         assert!(row.0 < self.rows);
@@ -240,7 +228,7 @@ impl ResidentNames {
         self.postings.get(key, out);
     }
     pub fn bytes(&self) -> usize {
-        self.table.len() + self.offsets.bytes() + self.keys.bytes() + self.postings.bytes()
+        self.distinct_names.bytes() + self.keys.bytes() + self.postings.bytes()
     }
     // Compatibility for explicitly requested raw-heap scans. Resident engine
     // execution uses dictionary/posting APIs and never creates this copy.
@@ -306,7 +294,7 @@ impl PackedNameLists {
         pfor128::decode_sorted(self.count(list) as usize, &self.bytes[start..end], out);
     }
     pub fn bytes(&self) -> usize {
-        self.counts.bytes() + self.offsets.bytes() + self.bytes.len()
+        self.counts.bytes() + self.offsets.bytes() + self.bytes.capacity()
     }
 }
 
