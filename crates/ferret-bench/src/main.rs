@@ -92,6 +92,9 @@ fn main() -> ExitCode {
                 recrawl_once(Path::new(dir), rows, Path::new(producer))
             }
             ("compact-once", [dir]) => compact_once(Path::new(dir)),
+            ("churn-rewalk", [dir, percent, rounds]) => {
+                churn_rewalk(Path::new(dir), percent, rounds)
+            }
             ("churn-checkpoint", [dir, percent, rounds]) => {
                 churn_checkpoint(Path::new(dir), percent, rounds)
             }
@@ -126,6 +129,7 @@ fn usage() -> ExitCode {
          ferret-bench overlay-carry-boundary <catalog-dir> <rows>\n       \
          ferret-bench checksum <catalog-dir>\n       \
          ferret-bench churn-checkpoint <catalog-dir> <percent> <rounds>\n       \
+         ferret-bench churn-rewalk <catalog-dir> <percent> <rounds>\n       \
          ferret-bench compact-once <catalog-dir>\n       \
          ferret-bench sections <catalog-dir>\n       \
          ferret-bench query <catalog-dir> [query...]"
@@ -1075,4 +1079,190 @@ fn churn_checkpoint(dir: &Path, percent: &str, rounds: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Same replacement-inode/stat workload as churn-checkpoint, generated lazily
+/// from the 10M fixture. The fixture has no disk tree: full replay stands in
+/// for the crawler's full rewalk, then uses the real full checkpoint builder.
+fn churn_rewalk(dir: &Path, percent: &str, rounds: &str) -> Result<()> {
+    let percent: usize = percent.parse()?;
+    let rounds: usize = rounds.parse()?;
+    if !(1..=100).contains(&percent) || rounds == 0 {
+        return Err("churn needs 1..100 percent and positive rounds".into());
+    }
+    let setup = Instant::now();
+    let mut session = ferret_catalog::WriterSession::open(dir)?;
+    println!("rewalk setup_ms={}", ms(setup.elapsed()));
+    for round in 1..=rounds {
+        let old = session.view();
+        let total = old
+            .inode_ids()
+            .filter(|&id| old.kind(id) == ferret_catalog::Kind::File)
+            .count();
+        let count = total * percent / 100;
+        let boundary = old
+            .inode_ids()
+            .filter(|&id| old.kind(id) == ferret_catalog::Kind::File)
+            .nth(count - 1)
+            .ok_or("not enough files")?;
+        let start = Instant::now();
+        let (_, usage) = replay_churn(&session, boundary, false)?;
+        if !usage.exceeded {
+            return Err("large churn did not exhaust input guard".into());
+        }
+        let abandoned_ms = ms(start.elapsed());
+        let full = Instant::now();
+        let (batches, _) = replay_churn(&session, boundary, true)?;
+        let full_ms = ms(full.elapsed());
+        let publish = Instant::now();
+        let current = session.rebuild_checkpoint(batches, old.sniffer_version(), old.policy())?;
+        let publish_ms = ms(publish.elapsed());
+        let pause_ms = ms(start.elapsed());
+        if current.next_doc() != old.next_doc()
+            || current.doc_count() != old.doc_count()
+            || current.inode_count() != old.inode_count()
+            || current.name_count() != old.name_count()
+            || current.next_inode().0 != current.inode_count()
+        {
+            return Err("full churn rewalk changed counters or content liveness".into());
+        }
+        // Full semantic comparison by basename across the dense BFS graphs,
+        // independent of inode numbering; every alias carries the same edit.
+        let mut checked = 0usize;
+        let mut changed_names = 0usize;
+        for (before, after) in old
+            .name_reader()
+            .runs_from(ferret_catalog::NameId(0))
+            .zip(current.name_reader().runs_from(ferret_catalog::NameId(0)))
+        {
+            let (_, a) = before;
+            let (_, b) = after;
+            if a.bytes != b.bytes || a.parent != b.parent {
+                return Err("rewalk changed namespace order".into());
+            }
+            if let (ferret_catalog::Target::Inode(ai), ferret_catalog::Target::Inode(bi)) =
+                (a.target(), b.target())
+            {
+                let mut expected = old.inode(ai);
+                if ai <= boundary && old.kind(ai) == ferret_catalog::Kind::File {
+                    expected.stat.ino = expected.stat.ino.wrapping_add(1u64 << 40);
+                    expected.stat.ctime_sec += 1;
+                    changed_names += 1;
+                }
+                if current.inode(bi) != expected {
+                    return Err("rewalk changed a stat or live DocId binding".into());
+                }
+            } else if a.target() != b.target() {
+                return Err("rewalk changed ignored markers".into());
+            }
+            checked += 1;
+        }
+        if checked != old.name_count() as usize {
+            return Err("rewalk lost names".into());
+        }
+        let bytes =
+            std::fs::metadata(Catalog::snapshot_path(dir)?.ok_or("missing checkpoint")?)?.len();
+        let (resident, peak) = memory()?;
+        println!(
+            "rewalk percent={percent} round={round} replaced_files={count} changed_names={changed_names} cumulative_births={} abandoned_ms={abandoned_ms} replay_ms={full_ms} publication_ms={publish_ms} pause_ms={pause_ms} snapshot_bytes={bytes} writes={} charged_records={} charged_owned_bytes={} complete_diff_records=0 resident={} peak={}",
+            count * round,
+            bytes + 192,
+            usage.records,
+            usage.owned_bytes,
+            resident,
+            peak
+        );
+    }
+    Ok(())
+}
+
+fn replay_churn(
+    session: &ferret_catalog::WriterSession,
+    boundary: ferret_catalog::InoId,
+    full: bool,
+) -> Result<(Vec<ferret_catalog::Batch>, ferret_catalog::InputUsage)> {
+    use ferret_catalog::{Content, ContentState, Kind, Target};
+    let old = session.view();
+    let budget = std::sync::Arc::new(ferret_catalog::InputBudget::new(session.input_limits()));
+    let mut batches: Vec<_> = (0..16)
+        .map(|_| {
+            if full {
+                session.checkpoint_batch()
+            } else {
+                session.batch().with_input_budget(budget.clone())
+            }
+        })
+        .collect();
+    let mut queue = Vec::new();
+    for (id, path) in old.roots() {
+        let token = batches[id.0 as usize % 16].root(path, old.inode(id).stat);
+        queue.push((id, token));
+    }
+    let mut at = 0;
+    while at < queue.len() {
+        let (dir, token) = queue[at];
+        at += 1;
+        let batch = &mut batches[dir.0 as usize % 16];
+        if let Some(entries) = old.entry_count(dir) {
+            batch.entry_count(token, entries);
+        }
+        if let Some(seq) = old.retained_at(dir) {
+            batch.retained_at(token, Some(seq));
+        }
+        if let Some(work) = old.work_tree(dir) {
+            batch.work_tree(token, work.kind, work.common_dir, work.common_id);
+        }
+        for name in old.children(dir) {
+            if budget.exceeded() {
+                return Ok((Vec::new(), budget.usage()));
+            }
+            let edge = old.name(name);
+            let Target::Inode(id) = edge.target() else {
+                if let Target::Ignored(kind) = edge.target() {
+                    batch.ignored(token, edge.bytes, kind);
+                }
+                continue;
+            };
+            let inode = old.inode(id);
+            let mut stat = inode.stat;
+            let content = match inode.state {
+                ContentState::Unindexed => Content::Unindexed,
+                ContentState::Binary => Content::Binary,
+                ContentState::Fault => Content::Fault,
+                ContentState::Hashed => Content::Hashed(
+                    old.doc_hash(inode.doc.ok_or("missing content binding")?)
+                        .ok_or("missing live hash")?,
+                ),
+            };
+            if id <= boundary && old.kind(id) == Kind::File {
+                stat.ino = stat.ino.wrapping_add(1u64 << 40);
+                stat.ctime_sec += 1;
+            }
+            match old.kind(id) {
+                Kind::Dir => {
+                    let next = if old.is_traversed(id) {
+                        batch.traversed_dir(token, edge.bytes, stat)
+                    } else {
+                        batch.dir(token, edge.bytes, stat)
+                    };
+                    queue.push((id, next));
+                }
+                Kind::Symlink => batch.symlink(
+                    token,
+                    edge.bytes,
+                    stat,
+                    old.link_target(id).ok_or("missing target")?,
+                ),
+                _ => batch.file(token, edge.bytes, stat, content),
+            }
+        }
+        batch.finish_observations();
+    }
+    for batch in &mut batches {
+        batch.seal();
+    }
+    if budget.exceeded() {
+        return Ok((Vec::new(), budget.usage()));
+    }
+    Ok((batches, budget.usage()))
 }
