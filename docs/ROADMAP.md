@@ -1500,6 +1500,43 @@ nice 19, and M7b measured no foreground impact. I/O PSI remains in status as
 information. Unreadable PSI or battery state no longer pauses work, since it
 would otherwise pause it forever.
 
+End-of-sprint review (2026-10-06). Astra's round 1 found five defects:
+
+- a battery-paused daemon could neither idle-exit nor drain;
+- a writer that timed out on a loading daemon fell back to direct indexing;
+- one idle connection blocked drain;
+- `--json find` exited 0 after losing its output;
+- find warnings were rendered as walk errors.
+
+Sol fixed the first three in `aec0319` and Luna the last two in `12b117b`. Each
+fix has a test that fails without it. Astra's round 2 was cut off by a codex
+usage limit after naming three leads, and all three were real:
+
+- `17bacf1`: a request the protocol rejects now answers in-process instead of
+  reaching or spawning a daemon;
+- `902746e`: a draining writer blocks on a message instead of spinning on an
+  expired deadline;
+- `f2139d8`: a reader exit releases its drain-registry sender, so the handler
+  can't strand.
+
+An Opus subagent made those fixes, and an independent Opus review then closed
+the round. `9c0a507` adds one line of hardening: an expired `retry_due` is
+cleared. The suite stands at 725 passed / 6 ignored. On `f046f26` the full
+find-compat corpus scored 135,693 rows with 0 errors and 3 noignore differences.
+All three are order races: the two known `-L` ones and an unseparated
+`-printf %s` that agreed on 2 of 3 reruns.
+
+Follow-ups, none blocking:
+
+- an oversized `index`/`roots-remove` reports a catalog-lock error rather
+  than "request too large";
+- `run_intake` (`watch.rs`) has no back-off on a repeating read error, which
+  nothing produces today;
+- paced compaction at 10M is unmeasured, because no command forces or routes
+  compaction;
+- the event kind could be passed into `Destination::send`;
+- a daemon-level test of the checkpoint limiter's reservations.
+
 Compaction and full rewalk/fallback admission stay under the one writer lock.
 Reserves scale linearly from 3 GiB full-build memory and 700 MB checkpoint
 RAM/disk at 10M live names, with small-catalog floors and sparse watch/alias/
