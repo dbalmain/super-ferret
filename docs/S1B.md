@@ -3,7 +3,9 @@
 M0 design, 2026-10-05. Code baseline: `75dcd49`, after the S1+, find and main
 merges into `wt/s1b`. This is a build specification. M1 now implements the
 resident engine library and uses it for indexed one-shot search/find. Batch
-and daemon hosts, name indexes and watches remain later slices.
+and daemon hosts, name indexes and watches remain later slices. M1 is verified
+at **571 passed / 4 ignored**, with zero Rust warnings; its 10M full-open and
+resident-memory results are recorded in [ROADMAP § S1b M1](ROADMAP.md#s1b-m1--resident-engine-library-2026-10-05).
 
 [D46 C plus batch](DECISIONS.md#d46--is-the-daemon-the-only-mode-of-operation)
 and [D49 A](DECISIONS.md#d49--a-one-shot-query-with-no-daemon-running) bind the
