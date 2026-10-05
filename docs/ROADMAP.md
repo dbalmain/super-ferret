@@ -1301,6 +1301,76 @@ semantic cold-open validation.** No concurrent rebase or persisted namespace
 is implemented.
 
 
+### S1+ R2 — Complete attempt charging and in-place fault fallback (2026-10-05)
+
+Production **`7d213df`**, same 10M fixture, machine and release build as R1.
+Every timing used a host-visible uptime/pgrep guard (including ferret-bench and
+the recrawl example), with no competitor present. One benchmark at a time;
+no builds/gates during timings. Raw commands, loads, private environments,
+binary hashes and stdout/stderr are under
+`/home/dave/w/super-ferret/.ai/s1plus-r2-measurements/{churn,fault-churn}.json`.
+Two consecutive rounds per process; one process per percentage/variant, warm
+OS cache. `$B` and `$P` are the same binaries as R1; use `$I=/tmp/s1plus-r2-measure`
+and private XDG directories and FERRET_INDEX as above.
+
+Deferred aliases and owned coverage/content/pattern diagnostics are now charged
+before allocation. A refused report exhausts and discards the attempt; the
+full rewalk reports the authoritative faults. Faulted full-root preparation
+prunes the original worker columns in place, remaps cross-worker tokens and
+appends only carried scopes. Lookup arrays and full-batch source pins are
+released before full building; caches rebuild under the held lock after
+success or failure. These changes preserve typed retention and D26 opacity.
+
+| Variant | Churn / round | Setup, ms | Whole pause, s | Writes, B | Peak RSS, MiB | Command | Commit | Load (1 / 5 / 15 min) |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| Faultless | 50% / 1 | 3,282.18 | 23.087 | 629,309,482 | 2,571.01 | `$B churn-rewalk $I/churn-50 50 2` | `7d213df` | 1.03 / 1.67 / 1.70 |
+| Faultless | 50% / 2 | amortised above | 19.207 | 629,324,426 | 2,631.36 | same command | `7d213df` | 1.03 / 1.67 / 1.70 |
+| Faultless | 90% / 1 | 3,274.17 | 19.709 | 629,609,098 | 2,570.68 | `$B churn-rewalk $I/churn-90 90 2` | `7d213df` | 1.56 / 1.71 / 1.71 |
+| Faultless | 90% / 2 | amortised above | 23.570 | 629,641,226 | 2,630.95 | same command | `7d213df` | 1.56 / 1.71 / 1.71 |
+| One EACCES + one EIO | 50% / 1 | 3,214.86 | 22.436 | 629,305,965 | 2,643.11 | `$P $I/fault-churn-50 churn-50-fault` | `7d213df` | 1.87 / 1.99 / 1.78 |
+| One EACCES + one EIO | 50% / 2 | amortised above | 24.313 | 631,462,237 | 2,777.39 | same command | `7d213df` | 1.87 / 1.99 / 1.78 |
+| One EACCES + one EIO | 90% / 1 | 3,202.88 | 29.680 | 629,605,581 | 2,643.13 | `$P $I/fault-churn-90 churn-90-fault` | `7d213df` | 1.90 / 1.97 / 1.78 |
+| One EACCES + one EIO | 90% / 2 | amortised above | 24.609 | 631,778,941 | 2,777.52 | same command | `7d213df` | 1.90 / 1.97 / 1.78 |
+
+Setup excludes the pause and amortises to 1,641 / 1,637 ms per faultless round,
+1,607 / 1,601 ms per faulted round. Whole pause includes the abandoned guarded
+attempt, full replay, retention preparation when faulted, publication and cache
+rebuild. Verification is outside the pause; VmHWM is sampled afterward and is
+cumulative within each process. Logical writes exclude fixture preparation.
+Each attempt stops at **500,000 charged records / 64,892,705 owned bytes**;
+**zero complete-diff records** are built. Guard cost is **365–412 ms**, full
+replay **3,857–3,985 ms**. Fault preparation takes **5,687–5,714 ms**, including
+checking anchors, directory/token maps, in-place pruning and carried rows.
+
+Maximum faultless RSS is **2.570 GiB**, down from R1's **2.679 GiB**; the
+reduction is about **0.109 GiB** after releasing lookup arrays. Faulted peak is
+**2.712 GiB**, about **0.143 GiB** above faultless. The **1.6 GiB target is not
+met**, and is not a requirement. The loaded source remains pinned by the
+writer/lookup_base and the benchmark's external old reader; complete full-builder
+observations, live-document bookkeeping, plans and output/readback still
+coexist. Directory/token maps and allocator retention also contribute on the
+faulted path; these figures do not isolate allocator retention as a measured
+allocation phase. There is no separate full-builder memory ceiling.
+
+Faultless snapshots match R1 exactly. Faulted snapshots are **629,305,773 /
+631,462,045 B** at 50% and **629,605,389 / 631,778,749 B** at 90%; next DocId
+never resets and every surviving DocId retains its hash. The synthetic driver
+selects two nonempty leaf directories each round: EACCES removes **2 / 3 names**,
+EIO retains one checked scope. The second round starts from the effective view,
+so previously opaque children stay absent and the selected leaves can differ.
+This sends real typed List contexts through the same production preparation
+seam as fallback, but **does not perform filesystem listing/stat/hash syscalls,
+syscall races or recovery of hidden EACCES contents**. The real-tree oracle
+checks those semantics and later recovery separately, with one/four workers,
+a nested retained subtree and a trustworthy symlink.
+
+The initial progressive worker-copy trial at `4f6ea89` was abandoned: a single
+worker could still duplicate its whole tree. Its faulted first round reached
+2,833.75 MiB, then the example hit a cross-worker retained-token assertion in
+round two. It is retained as `fault-churn-progressive.json`, not a successful
+measurement. Final preparation never copies trustworthy file columns, including
+with one worker. Temporary directory maps are released before pruning.
+
 ## S1b — The engine, batch mode and the daemon
 
 One engine: open the catalog resident (names and inodes read in full, indexes

@@ -947,16 +947,15 @@ all epoch caches and return Checkpointed. Unanchored faults, protected global
 version transitions, and retained suppression/traversal combinations which the
 full builder cannot represent safely abort before changing the generation.
 Fresh aliases supersede individually carried retained observations, as in
-D31/D34. Faulted full-root preparation prunes existing worker columns in place and
-appends only carried scopes, remapping cross-worker directory tokens without
+D31/D34. Faulted full-root preparation prunes existing worker columns in place
+and appends only carried scopes, remapping cross-worker directory tokens without
 retaining a second whole observation set. Directory maps are released before
-pruning. Once rewalk and retention resolution finish, release
-old lookup arrays and full-batch source pins before building; restore epoch
+pruning. Once rewalk and retention resolution finish, release old lookup arrays and full-batch source pins before building; restore epoch
 caches from the selected generation on success or recoverable failure under
 the same lock. The writer and external readers can still pin the old source.
 The full builder has no separate memory ceiling; this input guard does not
-bound full-builder observations, allocation overhead or whole-process RSS. Raw low-level ChangeSet callers own their input allocation; the crawl
-producer's guard cannot retroactively bound a caller's existing Vec.
+bound full-builder observations, allocation overhead or whole-process RSS.
+Raw low-level ChangeSet callers own their input allocation; the crawl producer's guard cannot retroactively bound a caller's existing Vec.
 
 Provisionally compact at an idle writer boundary, holding the writer lock;
 queries retain old views and keep running. Traverse the effective graph,
