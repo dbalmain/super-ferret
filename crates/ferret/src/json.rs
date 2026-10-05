@@ -82,6 +82,18 @@ impl<'a> Object<'a> {
         self
     }
 
+    /// `"key":null`, or as by [`Object::bytes`].
+    pub fn opt_bytes(&mut self, key: &str, value: Option<&[u8]>) -> &mut Self {
+        match value {
+            Some(v) => self.bytes(key, v),
+            None => {
+                self.key(key);
+                self.out.extend_from_slice(b"null");
+                self
+            }
+        }
+    }
+
     /// `"key":N`.
     pub fn int(&mut self, key: &str, value: impl Into<i128>) -> &mut Self {
         self.key(key);
