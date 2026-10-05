@@ -380,7 +380,13 @@ impl Batch {
     ) {
         if !self.reserve_input(
             1,
-            std::mem::size_of::<Stat>() + 32 + name.len() + target.map_or(0, <[u8]>::len),
+            std::mem::size_of::<Stat>()
+                + std::mem::size_of::<FileEntry>()
+                + std::mem::size_of::<Content>()
+                + name.len()
+                + target.map_or(0, |target| {
+                    std::mem::size_of::<(u32, Span)>() + target.len()
+                }),
         ) {
             return;
         }
@@ -389,6 +395,15 @@ impl Batch {
             self.file_stats.reserve_exact(self.file_capacity);
             self.contents.reserve_exact(self.file_capacity);
             self.file_capacity = 0;
+        }
+        if self.full && self.files.len() == self.files.capacity() {
+            // Full rewalks know approximately how many rows they replace.
+            // Extra rows grow in bounded increments, not by doubling every
+            // large column. Each reserve completes before any column push.
+            const ROWS: usize = 16_384;
+            self.files.reserve_exact(ROWS);
+            self.file_stats.reserve_exact(ROWS);
+            self.contents.reserve_exact(ROWS);
         }
         let index = self.files.len() as u32;
         let name = push(&mut self.names, name, &mut self.overflow);
@@ -549,6 +564,21 @@ impl Batch {
         common_dir: &[u8],
         common_id: (u64, u64),
     ) {
+        let changed = self.input_budget.is_some()
+            && self.previous.as_ref().is_none_or(|old| {
+                dir.previous_directory()
+                    .and_then(|id| old.work_tree(id))
+                    .is_none_or(|old| {
+                        old.kind != kind
+                            || old.common_dir != common_dir
+                            || old.common_id != common_id
+                    })
+            });
+        if changed
+            && !self.reserve_input(1, std::mem::size_of::<WorkTreeEntry>() + common_dir.len())
+        {
+            return;
+        }
         let common_dir = push(&mut self.strings, common_dir, &mut self.overflow);
         self.work_trees.push(WorkTreeEntry {
             dir,
@@ -620,10 +650,12 @@ impl Batch {
                     .then_some(id.0)
             })
             .unwrap_or(NONE);
-        let changed = old == NONE
-            || self.previous.as_ref().is_some_and(|view| {
-                view.inode(InoId(old)).stat != stat || view.is_traversed(InoId(old)) != traversed
-            });
+        let changed = self.input_budget.is_some()
+            && (old == NONE
+                || self.previous.as_ref().is_some_and(|view| {
+                    view.inode(InoId(old)).stat != stat
+                        || view.is_traversed(InoId(old)) != traversed
+                }));
         if changed
             && !self.reserve_input(
                 1,
