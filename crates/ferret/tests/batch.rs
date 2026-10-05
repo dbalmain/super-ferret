@@ -310,6 +310,14 @@ fn reload_adopts_a_writer_refresh_while_the_batch_engine_is_resident() {
     let mut before = String::new();
     output.read_line(&mut before).unwrap();
     assert!(before.contains("\"sequence\":0"), "{before}");
+    // An unchanged generation must not rebuild the resident engine, and a
+    // control request needs no `args`.
+    writeln!(input, "{{\"id\":\"same\",\"op\":\"reload\"}}").unwrap();
+    input.flush().unwrap();
+    let mut same = String::new();
+    output.read_line(&mut same).unwrap();
+    assert!(same.contains("\"event\":\"reload\""), "{same}");
+    assert!(same.contains("\"engine_opens\":1"), "{same}");
 
     fs::write(tree.0.join("src/newleaf.rs"), b"pub fn newleaf() {}\n").unwrap();
     index(

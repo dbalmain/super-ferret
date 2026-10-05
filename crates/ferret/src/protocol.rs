@@ -236,6 +236,8 @@ fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, Requ
             out
         }
         Some(_) => return Err(RequestErrorKind::InvalidField("args")),
+        // Control requests take no arguments; queries must say theirs.
+        None if matches!(op, Op::Status | Op::Reload) => Vec::new(),
         None => return Err(RequestErrorKind::MissingField("args")),
     };
 
@@ -775,6 +777,14 @@ mod tests {
         let e = parse_request(line).unwrap_err();
         assert_eq!(e.id, Some("a".into()));
         assert_eq!(e.kind, RequestErrorKind::UnknownOp);
+    }
+
+    #[test]
+    fn control_requests_need_no_args_but_queries_do() {
+        let status = parse_request(br#"{"id":"s","op":"status"}"#).unwrap();
+        assert!(status.args.is_empty());
+        let e = parse_request(br#"{"id":"q","op":"search"}"#).unwrap_err();
+        assert_eq!(e.kind, RequestErrorKind::MissingField("args"));
     }
 
     #[test]

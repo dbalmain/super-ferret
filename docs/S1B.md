@@ -245,6 +245,8 @@ Search rows preserve today's `path` plus `path_base64` when needed, type,
 size, mtime and stable DocId. Find's arbitrary printf, NUL and command output
 is exact bytes in stdout frames, not guessed line records. Large committed
 entry output splits into numbered parts; no other entry's parts interleave.
+`record` numbers commit units, not entries: one unit holds one or more whole
+entries, so a client must not count records to count matches.
 Keep find's whole-entry commit gate, 64 KiB capture threshold and unlinked
 spill file. A broken stream can deliver a prefix of a record, just as a broken
 pipe can today; it cannot claim that record complete. Diagnostics are tagged

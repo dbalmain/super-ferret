@@ -144,11 +144,14 @@ fn handle(
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .or_else(|| dirs.map(|dirs| dirs.data.clone()));
+            // A lazy open reads only the header and log, so an unchanged
+            // generation costs no resident rebuild.
             if let Some(path) = next.as_deref()
-                && let Ok(Some(reloaded)) = Engine::open(path)
+                && let Ok(Some(peek)) = ferret_catalog::Catalog::open(path)
                 && engine
                     .as_ref()
-                    .is_none_or(|current| current.generation() != reloaded.generation())
+                    .is_none_or(|current| current.generation() != peek.generation())
+                && let Ok(Some(reloaded)) = Engine::open(path)
             {
                 *engine = Some(reloaded);
             }
