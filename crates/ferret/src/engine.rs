@@ -52,6 +52,7 @@ impl Engine {
 
     /// Takes ownership of a resident writer and its checked, loaded view.
     pub fn from_writer(writer: WriterSession) -> Self {
+        OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
         let catalog = writer.view();
         Self {
             current: RwLock::new(QuerySession {
@@ -89,7 +90,14 @@ impl Engine {
     ) -> Result<RefreshReport, Error> {
         let mut writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
         let writer = writer.as_mut().ok_or(Error::ReadOnly)?;
-        let report = ferret_crawl::refresh(writer, request, options).map_err(Error::Refresh)?;
+        let report = match ferret_crawl::refresh(writer, request, options) {
+            Ok(report) => report,
+            Err(error) => {
+                self.recover_failed_write(writer, &error)
+                    .map_err(Error::Refresh)?;
+                return Err(Error::Refresh(error));
+            }
+        };
         self.select(report.view.clone());
         Ok(report)
     }
@@ -110,9 +118,30 @@ impl Engine {
         let writer = guard.as_mut().ok_or(ferret_crawl::IndexError::Begin(
             ferret_catalog::BeginError::Locked,
         ))?;
-        let report = ferret_crawl::session_change(writer, change, refresh, options)?;
+        let report = match ferret_crawl::session_change(writer, change, refresh, options) {
+            Ok(report) => report,
+            Err(error) => {
+                self.recover_failed_write(writer, &error)?;
+                return Err(error);
+            }
+        };
         self.select(writer.view());
         Ok(report)
+    }
+
+    fn recover_failed_write(
+        &self,
+        writer: &mut WriterSession,
+        error: &ferret_crawl::IndexError,
+    ) -> Result<(), ferret_crawl::IndexError> {
+        if matches!(
+            error,
+            ferret_crawl::IndexError::Update(_) | ferret_crawl::IndexError::Commit(_)
+        ) {
+            let view = writer.recover().map_err(ferret_crawl::IndexError::Update)?;
+            self.select(view);
+        }
+        Ok(())
     }
 
     /// Services an explicit idle-boundary compaction. Old query pins continue

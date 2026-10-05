@@ -122,12 +122,12 @@ fn connect(
     endpoint: &Endpoint,
     index: &Path,
     can_spawn: bool,
+    writer: bool,
 ) -> io::Result<BufReader<UnixStream>> {
-    let expected = ferret_catalog::Catalog::open(index)
-        .map_err(io::Error::other)?
-        .ok_or_else(|| io::Error::other("no index"))?
-        .generation();
-    let incarnation = crate::find_json::hex(&expected.incarnation);
+    let incarnation = ferret_catalog::Catalog::open(index)
+        .ok()
+        .flatten()
+        .map(|catalog| crate::find_json::hex(&catalog.generation().incarnation));
     let until = Instant::now() + duration("FERRET_DAEMON_STARTUP_MS", 10_000);
     let context = endpoint::context()?;
     let mut spawned = false;
@@ -171,6 +171,7 @@ fn connect(
                     if field_text(&hello, "build") != Some(BUILD)
                         || field_number(&hello, "format") != Some(FORMAT)
                         || !supports_queries(&hello)
+                        || writer && !has_capability(&hello, "writer")
                     {
                         if !can_spawn {
                             return Err(io::Error::other(
@@ -188,10 +189,11 @@ fn connect(
                     match field_text(&hello, "state") {
                         Some("loading") => continue,
                         Some("ready") => {
-                            if hello
-                                .field("generation")
-                                .and_then(|generation| field_text(generation, "incarnation"))
-                                != Some(&incarnation)
+                            if let Some(incarnation) = &incarnation
+                                && hello
+                                    .field("generation")
+                                    .and_then(|generation| field_text(generation, "incarnation"))
+                                    != Some(incarnation.as_str())
                             {
                                 return Err(io::Error::other("incompatible catalog incarnation"));
                             }
@@ -215,6 +217,9 @@ fn connect(
         io::ErrorKind::TimedOut,
         "daemon startup deadline",
     ))
+}
+fn has_capability(hello: &Value, capability: &str) -> bool {
+    matches!(hello.field("capabilities"), Some(Value::Arr(values)) if values.iter().any(|v| v.text() == Some(capability)))
 }
 fn supports_queries(hello: &Value) -> bool {
     let Some(Value::Arr(capabilities)) = hello.field("capabilities") else {
@@ -264,7 +269,13 @@ fn query(
     }
     let index = fs::canonicalize(index).ok()?;
     let endpoint = Endpoint::open(&index).ok()?;
-    let mut reader = connect(&endpoint, &index, matches!(op, "search" | "find")).ok()?;
+    let mut reader = connect(
+        &endpoint,
+        &index,
+        matches!(op, "search" | "find"),
+        matches!(op, "index" | "roots-remove"),
+    )
+    .ok()?;
     let cwd = std::env::current_dir().ok()?;
     let mut request = Vec::new();
     let mut object = Object::new(&mut request);

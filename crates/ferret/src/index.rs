@@ -375,7 +375,7 @@ pub(crate) fn render(result: &Result<Report, IndexError>) -> Rendered {
         Err(IndexError::Begin(ferret_catalog::BeginError::Locked)) => {
             append_error(
                 &mut diagnostics,
-                "another writer owns the catalog lock (a running ferretd retains it); use ferret status --json, and run ferret index without FERRET_NO_DAEMON to route to its owner",
+                "another `ferret index` holds the catalog lock (or a running ferretd owns it); use ferret status --json, and run ferret index without FERRET_NO_DAEMON to route to its owner",
             );
             (Exit::Error, "error")
         }

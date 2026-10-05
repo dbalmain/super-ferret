@@ -61,6 +61,7 @@ pub(super) fn start(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .error = Some(error);
+        host.writer_pending.store(0, Ordering::Release);
         host.writer_running.store(false, Ordering::Release);
     })
 }
@@ -178,6 +179,18 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
                     if let Some(w) = &watch {
                         w.reconcile(engine.pin().catalog());
                     }
+                } else if let Err(error) = &result {
+                    host.writer_status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .error = Some(error.to_string());
+                    if matches!(
+                        error,
+                        ferret_crawl::IndexError::Update(_) | ferret_crawl::IndexError::Commit(_)
+                    ) && let Some(w) = &watch
+                    {
+                        w.backstop(RefreshReason::Backstop);
+                    }
                 }
                 // The reply is detached from socket backpressure. Publication
                 // and watch adoption finish before the next command begins.
@@ -251,7 +264,9 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Command>) -> io::Result<()> {
                     .is_none_or(|b| b.reason() != RefreshReason::Burst)
                     && report.report.coverage_faults.is_empty();
                 successful(host, &report.report, complete);
-                if let Some(w) = &watch {
+                if let Some(w) = &watch
+                    && burst.as_ref().is_none_or(|b| b.reconcile_watches())
+                {
                     w.reconcile(&report.view);
                 }
                 initial = false;
@@ -320,12 +335,28 @@ pub(super) fn execute(host: &Host, request: &Request, destination: &Destination)
         .is_err()
     {
         host.writer_pending.fetch_sub(1, Ordering::AcqRel);
+        emit_to(destination, &request.id, "begin", |o| {
+            o.null("generation");
+        })?;
         return emit_to(destination, &request.id, "end", |o| {
             o.int("exit", 3).str("error", "WriterUnavailable");
         });
     }
     let started = Instant::now();
-    let result = receive.recv().map_err(io::Error::other)?;
+    let result = match receive.recv() {
+        Ok(result) => result,
+        Err(_) => {
+            emit_to(destination, &request.id, "begin", |o| {
+                o.null("generation");
+            })?;
+            return emit_to(destination, &request.id, "end", |o| {
+                o.int("exit", 3).str("error", "WriterUnavailable").str(
+                    "message",
+                    "writer failed; inspect ferret status --json and restart ferretd",
+                );
+            });
+        }
+    };
     let rendered = crate::index::render(&result);
     let session = super::pin(host)?;
     emit_to(destination, &request.id, "begin", |o| {

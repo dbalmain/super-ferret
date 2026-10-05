@@ -20,10 +20,10 @@ when content changes.
 
 ## Crates
 
-`ferret` also builds `ferretd`, the query-only socket host. std supplies
+`ferret` also builds `ferretd`, the socket host and retained serial writer. std supplies
 Unix sockets, file locking and Linux no-follow opens through OpenOptionsExt.
 Retained directory handles anchor endpoint operations through /proc/self/fd.
-Writer routing arrives in S1b M5.
+S1b M5a routes index/root commands to an existing compatible host; index never spawns it.
 
 One cargo workspace (D1). Each line lists a crate's dependencies; there are no
 cycles. This block is enforced: `crates/ferret/tests/layering.rs` fails when a
@@ -557,13 +557,30 @@ row postings do not change the content-index boundary. D55 remains open.
 Ordinary queries connect to the daemon, spawning it on first use; unavailable
 background operation or `FERRET_NO_DAEMON` uses the same engine in process.
 D56 A keeps effectful find in the local client; live/information-only find
-and batch remain local too. M4 is query-only and adopts checked direct-writer
-publications before admission. M5 owns retained writer sessions and writer
-command routing. From M5 the daemon consumes inotify hints through S1+'s real refresh seam, maintains
-raw directory counts, and uses scoped/full recrawls for gaps. D51 A pauses the
-writer at idle boundaries while queries keep old views. S1B specifies queue
-bounds, freshness reporting and the research-derived politeness controller,
-including the full-builder memory limit recorded in ROADMAP.
+and batch remain local too. M5a retains one WriterSession and its lock;
+explicit index/root commands are ordering barriers in one writer queue. Commands
+use the real session producer and return the ordinary report after publication.
+No-daemon indexing stays direct and fails promptly against a daemon-held lock.
+Queries pin the last checked view while refresh/recovery runs. Recovery retains
+the same lock and revalidates the durable prefix before rebuilding writer lookups.
+
+Crawl owns one nonblocking rustix inotify instance and compact physical-identity,
+parent/name locators, independent of catalog ids. It arms through observed handles
+before listing; a separate thread drains during refresh/compaction. A 200 ms
+trailing/1 s maximum debounce pairs unique move cookies, bounded at 100,000 scopes
+and 16 MiB; loss/reuse becomes all-root Overflow. Notifications never delete rows.
+Known directory endpoints observe subtrees; self/unknown locators and policy
+boundaries conservatively refresh roots. Watch failures
+and a configurable cap (default seven eighths of the kernel limit) report gaps.
+Startup/hourly backstops and five-minute full polling use the same serial producer.
+The full poll conservatively covers M5b's pending alias/outside-policy work.
+
+D51 A pauses the writer at idle boundaries while queries keep old views. M5a
+provides the minimal watch/pending/refresh status and real-inotify full-index oracle
+tests. M5b adds multi-occurrence watches, external policy inputs, count census,
+full status and network/FUSE rules; M6 owns pacing, battery/load signals and
+budget validation. S1B specifies those later controls, including the full-builder
+memory limit recorded in ROADMAP.
 
 ## Not yet designed
 

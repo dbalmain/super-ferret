@@ -948,3 +948,36 @@ fn recovery_syncs_an_adopted_append_manifest_without_obsolete_files_before_empty
         "resident empty commit has no IO barriers"
     );
 }
+
+#[test]
+fn retained_session_recovers_uncertain_append_without_releasing_ownership() {
+    for point in [Point::PartialLogWrite, Point::ManifestRename] {
+        let s = fixture(&format!("retained-recovery-{point:?}"));
+        let published = Published::open(&s.path).unwrap().unwrap();
+        let changes = changes(&published);
+        let mut session = crate::WriterSession::open(&s.path).unwrap();
+        // This test targets append failure; the tiny fixture would otherwise
+        // cross the normal dirty-row fraction and checkpoint before append.
+        session.set_compaction_limits(crate::CompactionLimits {
+            log_bytes: u64::MAX,
+            records: u64::MAX,
+            dirty_percent: u32::MAX,
+            dead_percent: u32::MAX,
+        });
+        FAIL.set(Some(point));
+        assert!(session.commit(&changes, SNIFFER).is_err());
+        FAIL.set(None);
+        assert!(matches!(Writer::open(&s.path), Err(Error::Locked)));
+        let view = session.recover().unwrap();
+        assert!(matches!(Writer::open(&s.path), Err(Error::Locked)));
+        assert_eq!(
+            view.generation().sequence,
+            published.generation().sequence + u64::from(point == Point::ManifestRename)
+        );
+        assert_eq!(
+            session.identity((file_stat(2).dev, file_stat(2).ino)),
+            Some(crate::InoId(1))
+        );
+        session.commit(&changes, SNIFFER).unwrap();
+    }
+}

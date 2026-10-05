@@ -1418,12 +1418,36 @@ cleanup. Unchanged generations do not reopen; direct index/root publications
 are adopted through the checked opener before queries. Effects, live and
 information-only find, and batch remain local. No timing runs in this slice.
 
-**M4 is query-only. M5 owns WriterSession retention and writer command routing**,
-with watches and refresh scheduling. The user service is a template only.
-All gates pass at **647 passed / 5 ignored**, zero Rust warnings (+22 over
-625/5). The 21 daemon tests cover actual sockets/binaries; one engine test checks
-candidate-boundary cancellation. Protocol details are in [S1B](S1B.md). Existing parallel find record order remains
-schedule-dependent, so byte-parity tests use deterministic traversal scopes.
+M4's historical query-only gate was **647 passed / 5 ignored**, zero Rust
+warnings (+22 over 625/5). Its 21 daemon tests remain; M5a updates adoption checks
+for the retained writer, and rebuild recovery explicitly drains/restarts the host.
+Existing parallel find record order remains schedule-dependent, so byte parity
+uses deterministic traversal scopes. The user service is a template only.
+
+### S1b M5a — Writer ownership, intake and backstops (2026-10-06)
+
+M5a retains one writer lock, routes index/root edits to an existing compatible
+host without spawning from index, and returns the real producer report after
+publication. One writer queue serializes commands and debounced inotify refreshes;
+queries keep the last checked view. Uncertain publication recovers under the
+same lock. Crawl arms watches through observed directory handles before listing;
+a separate intake thread drains during crawl and compaction. Physical parent/name
+locators survive catalog epochs, unique cookies become rename hints, and bounded
+intake/kernel/lifetime loss requests a complete all-roots backstop.
+
+The default watch cap reserves one eighth of the kernel limit for other tools;
+failures report uncovered coverage. Startup/hourly backstops and five-minute full
+polling converge without overlapping crawls. The full poll is a conservative
+fallback for M5b's pending outside-policy/alias coverage. Status exposes M5a's
+watch counts, pending age/count, backstop reason and refresh/completion timestamps.
+Real temporary-tree daemon tests compare search/find against fresh production
+indexes, including generated bursts and crash restart. No timing runs.
+
+M5b is separate: bind/alias multi-occurrence mapping, external policy dependency
+watches, count census, full JSON status, and network/FUSE polling. M6 owns pacing,
+battery/load and resource admission. M5a gates: **674 passed / 6 ignored**, +27 passing tests over the 647/5
+baseline. The default real-daemon watch addition reports about 1.4 seconds; the
+long generated run is ignored and takes an environment-variable round count.
 
 ### S1b M1 — Resident engine library (2026-10-05)
 

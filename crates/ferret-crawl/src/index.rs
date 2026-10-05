@@ -1549,6 +1549,11 @@ impl EventVisitor for Hasher<'_> {
                         .ignored(decided.parent, decided.name.as_bytes(), decided.kind);
                     return None;
                 }
+                if matches!(decided.decision, Decision::Descend | Decision::Traverse)
+                    && let Some(watch) = self.watch
+                {
+                    watch.arm_entry(self.root, &decided);
+                }
                 let stat = decided.stat.as_ref().map(observe::from_walk)?;
                 let name = decided.name.as_bytes();
                 match decided.decision {

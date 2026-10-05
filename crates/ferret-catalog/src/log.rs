@@ -426,6 +426,9 @@ impl Writer {
             crate::lock::Error::Locked => Error::Locked,
             crate::lock::Error::Io(e) => Error::Io(e),
         })?;
+        Self::open_locked(dir, lock)
+    }
+    fn open_locked(dir: &Path, lock: crate::lock::Lock) -> Result<Self, Error> {
         let result: Result<(File, Manifest, Catalog, crate::budget::Budget), Error> = (|| {
             let pinned = Published::open(dir)
                 .map_err(Error::Previous)?
@@ -471,6 +474,15 @@ impl Writer {
             current,
             budget,
         })
+    }
+    /// Revalidates the published prefix and retires an uncertain tail while
+    /// retaining the same writer lock. A failed recovery leaves this writer
+    /// poisoned; its last checked view remains readable.
+    pub(crate) fn recover(&mut self) -> Result<(), Error> {
+        self.poisoned = true;
+        let recovered = Self::open_locked(&self.dir, self._lock.share())?;
+        *self = recovered;
+        Ok(())
     }
     /// Publishes the effective view at an idle boundary under this writer lock.
     /// A preflighted diff has already been checked by `Catalog::advance`.

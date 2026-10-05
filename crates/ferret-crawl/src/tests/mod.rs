@@ -29,7 +29,7 @@ use crate::{Decided, Event, Stat, walk};
 /// Tests that count this process's descriptors hold it exclusively; tests
 /// that open many at once (the index tests, with eight workers each) hold it
 /// shared. Without it the counts include other tests' descriptors.
-static FDS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+pub(crate) static FDS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 struct Scratch {
     path: PathBuf,

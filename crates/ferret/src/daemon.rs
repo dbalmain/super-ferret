@@ -30,7 +30,7 @@ use endpoint::Endpoint;
 
 const BUILD: &str = env!("FERRET_BUILD");
 const MAJOR: u64 = 1;
-const MINOR: u64 = 0;
+const MINOR: u64 = 1;
 const FORMAT: u64 = ferret_catalog::FORMAT_VERSION as u64;
 const QUERIES: usize = 4;
 const CLIENTS: usize = 32;
@@ -498,6 +498,33 @@ fn runtime_status(request: &Request) -> u8 {
 fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Result<()> {
     if matches!(request.op, Op::Index | Op::RootsRemove) {
         return writer::execute(host, request, destination);
+    }
+    #[cfg(debug_assertions)]
+    if request.op == Op::Status {
+        let status = host
+            .writer_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(watch) = &status.watch {
+            if request
+                .capabilities
+                .iter()
+                .any(|c| c == "test-watch-overflow")
+            {
+                watch.inject_overflow();
+            }
+            if request.capabilities.iter().any(|c| c == "test-watch-move")
+                && request.args.len() == 4
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let path = Path::new(std::ffi::OsStr::from_bytes(&request.args[0]));
+                let cookie = std::str::from_utf8(&request.args[2])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                watch.inject_move(path, &request.args[1], cookie, request.args[3] == b"from");
+            }
+        }
     }
     // Freshness preparation can itself panic before batch emits begin. Turn
     // that failure into an ordinary null-generation runtime-error block.

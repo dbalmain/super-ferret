@@ -430,7 +430,7 @@ fn unchanged_queries_do_not_reopen_and_real_index_publication_is_adopted() {
             &block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n"),
             "engine_opens"
         ),
-        Some(2)
+        Some(1)
     );
     assert!(tree.run(&["search", "new.rs"]).status.success());
     assert_eq!(
@@ -438,7 +438,7 @@ fn unchanged_queries_do_not_reopen_and_real_index_publication_is_adopted() {
             &block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n"),
             "engine_opens"
         ),
-        Some(2)
+        Some(1)
     );
 }
 
@@ -788,18 +788,21 @@ fn search_broken_pipe_is_quiet_and_sigint_cancels_without_killing_host() {
 }
 
 #[test]
-fn failed_freshness_check_returns_native_error_without_serving_old_rows() {
+fn failed_manifest_read_keeps_the_daemons_last_checked_view() {
     let tree = Tree::new();
     assert!(tree.run(&["search", "main"]).status.success());
     let current = tree.base.join("index/current");
     let original = fs::read(&current).unwrap();
+    // M5a owns publication; a failed manifest read must not invalidate an
+    // already checked query pin. Recovery may retain this view until
+    // successful.
     fs::write(&current, b"not a current header").unwrap();
     let search = tree.run(&["search", "main"]);
-    assert_eq!(search.status.code(), Some(3));
-    assert!(search.stdout.is_empty());
+    assert!(search.status.success());
+    assert!(!search.stdout.is_empty());
     let find = tree.run(&["find", "src", "-print"]);
-    assert_eq!(find.status.code(), Some(1));
-    assert!(find.stdout.is_empty());
+    assert!(find.status.success());
+    assert!(!find.stdout.is_empty());
     fs::write(current, original).unwrap();
     assert!(tree.run(&["search", "main"]).status.success());
 }
@@ -809,6 +812,16 @@ fn a_rebuilt_catalog_incarnation_is_confirmed_and_adopted() {
     let tree = Tree::new();
     assert!(tree.run(&["search", "main"]).status.success());
     let (_, old) = tree.connect();
+    // M5a retains the writer lock: rebuilding the catalog now requires an
+    // explicit drain/restart, rather than an unrelated second writer.
+    let socket = tree.socket();
+    let (mut control, _) = tree.connect();
+    control
+        .get_mut()
+        .write_all(b"{\"op\":\"drain\"}\n")
+        .unwrap();
+    drop(control);
+    wait(|| !socket.exists());
     fs::remove_file(tree.base.join("index/current")).unwrap();
     fs::write(tree.base.join("src/reborn.rs"), "reborn").unwrap();
     assert!(tree.run(&["index", "src"]).status.success());
@@ -830,7 +843,7 @@ fn a_rebuilt_catalog_incarnation_is_confirmed_and_adopted() {
             &block(&mut reader, b"{\"id\":\"s\",\"op\":\"status\"}\n"),
             "engine_opens"
         ),
-        Some(2)
+        Some(1)
     );
     let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
     assert!(

@@ -480,14 +480,11 @@ connections for concurrent queries.
 
 ### Writer ownership
 
-**Slice boundary:** M4 is query-only and retains no WriterSession or writer
-lock. It has no watches or refresh producer to service yet. `ferret index` and
-root edits keep their direct path; before each admitted query the daemon peeks
-`current` through the lazy catalog opener and adopts a changed generation through
-`Engine::open`. Failed adoption returns a runtime error instead of silently
-querying stale data. An admitted query pins its generation. **M5 owns writer
-routing and retained writer ownership**, together with the first watch producer.
-The remainder of this subsection describes that M5 shape.
+M4 originally hosted queries only. M5a retains the writer and publishes through
+that same resident engine; it no longer reopens an unrelated foreground writer's
+catalog before each query. On a failed manifest read or publication, queries
+continue on the last checked view and status reports the refresh failure.
+Uncertain writer recovery validates the durable prefix under the same held lock.
 
 The daemon retains one WriterSession and its lock between bursts. This means an
 unrelated CLI writer cannot simply open the catalog while it runs.
@@ -505,6 +502,17 @@ Queries continue on the last checked view while these commands run. After
 success, update configured-root boundaries and watch coverage together with view
 adoption. If a protected scope prevents a global policy/sniffer transition,
 retain the old header and report the failed command (D37).
+
+M5a's socket protocol is major 1/minor 1. `index` and `roots-remove` are
+explicit writer operations; argv item zero contains the originating client's
+global rules, followed by absolute byte-valued paths. Index with no paths refreshes
+all roots; with paths it adds/refreshes those roots. Roots-remove is a D34 barrier.
+The compatible hello advertises `writer` alongside the read-only query capability.
+Replies use begin, bounded stdout/stderr parts, a byte-valued originating-host log
+record, and end, after checked publication and watch adoption. Sending commits
+the client to that command: transport failure never replays it. Index does not
+spawn a host when none is running. `FERRET_NO_DAEMON` preserves direct indexing;
+a retained-lock conflict fails promptly with owner/status advice.
 
 ### Watches and reconciliation
 
@@ -586,6 +594,27 @@ through the real refresh seam. Root boundary changes refresh the kept enclosing
 roots too (D34). Network/FUSE event gaps require polling regardless of nominal
 watch installation.
 
+M5a implements this intake with one rustix instance and an observed-handle hook
+before each complete directory listing. Compact immutable parent/name locators
+capture physical `(dev, ino)` and a shared root path; they have no catalog ids.
+Directory endpoints observe their affected subtrees through Entry scopes; self
+notifications and unknown locators conservatively refresh the containing root.
+Ordinary entry notifications resolve locators in the current generation; policy
+and changed root boundaries widen work. Move hints pair unique cookies; wrong,
+duplicate and missing endpoints still observe disk. Explicit known watch removals
+have IGNORED tombstones; unknown lifetime/reuse collapses to Overflow.
+
+`FERRET_WATCH_CAP` defaults to seven eighths of `max_user_watches`, reserving
+one eighth for other user tools. All three inotify sysctls are read, never changed.
+Cap/install failures become coverage gaps. `FERRET_BACKSTOP_MS` defaults to
+3600000 and `FERRET_POLL_MS` to 300000. The five-minute timer currently observes
+**all roots** as a conservative M5b fallback for external policy/alias coverage;
+M5b will add exact multi-occurrence mapping, outside-tree policy watches, the
+count census, the complete status schema, and network/FUSE polling rules.
+These timers serialize through the one writer service. Pending intake/publication
+prevents idle exit; an explicitly enabled unit still uses idle zero. Restart
+always arms during observation and performs a complete startup backstop.
+
 ### Counts, coverage and status
 
 Entry refresh must obtain the parent's complete raw entry count, including
@@ -605,6 +634,16 @@ durations for waits and wall times for display. Label opaque state, protected
 state, watch coverage and queued freshness separately; an incremented sequence
 alone does not prove complete or current coverage. `stats --json` adds the
 catalog census and D54 bytes/planner counters.
+
+M5a exposes `ferret status --json` (JSON is also the default) for an existing
+compatible daemon, without spawning one. It adds watch_installed, watch_needed,
+watch_failed, watch_uncovered, pending_scopes, oldest_pending_ms, backstop_reason,
+last_successful_refresh, last_complete_backstop, writer_busy, fault_retained and
+refresh_error alongside M4's generation/engine/bytes fields. Wall timestamps are
+Unix seconds; ages and waits are monotonic. A complete-backstop timestamp requires
+no retained coverage faults; ordinary opaque directory observations remain covered.
+The rest of the proposed status census is M5b. M6 owns pacing, battery and load;
+M5a starts a due burst immediately at the next serial writer boundary.
 
 ### Compaction, oversized fallback and politeness
 
@@ -868,6 +907,12 @@ FERRET_INDEX. Record command, commit, load, cache condition, repetitions and
 units. Use the existing synthetic fixture for core comparisons and a real
 filesystem tree for watch/syscall/freshness claims. D54 additionally uses the
 HOME/nix/nixpkgs prototype shapes; their row distributions are different.
+
+M5a's generated default watch test compares each quiescent publication with a
+fresh full production index through search paths and find path/type records. The
+longer version is ignored: `FERRET_WATCH_BURST_ROUNDS=1000 cargo test -p ferret
+--test watch -- --ignored generated_bursts_long`. Each process/socket/poll has a
+deadline; every fixture isolates HOME, XDG, runtime and both indexes.
 
 ## Open questions and dependencies
 

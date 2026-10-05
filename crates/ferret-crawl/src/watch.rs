@@ -31,6 +31,7 @@ pub struct Limits {
     pub queued_events: usize,
 }
 impl Limits {
+    /// Reads the three Linux per-user inotify limits.
     pub fn read() -> std::io::Result<Self> {
         let read = |name| {
             std::fs::read_to_string(format!("/proc/sys/fs/inotify/{name}"))?
@@ -54,6 +55,7 @@ pub struct Config {
     pub bytes: usize,
 }
 impl Config {
+    /// Reserves one eighth of the kernel watch limit for other applications.
     pub fn from_limits(limits: &Limits) -> Self {
         Self {
             watch_cap: limits.watches.saturating_sub(limits.watches / 8),
@@ -72,10 +74,26 @@ struct Directory {
 }
 impl Directory {
     fn path(&self) -> PathBuf {
-        match &self.parent {
-            Some(parent) => parent.path().join(OsStr::from_bytes(&self.basename)),
-            None => (*self.root).clone(),
+        let mut names = Vec::new();
+        let mut directory = self;
+        while let Some(parent) = &directory.parent {
+            names.push(directory.basename.as_slice());
+            directory = parent;
         }
+        let mut path = (*directory.root).clone();
+        for name in names.into_iter().rev() {
+            path.push(OsStr::from_bytes(name));
+        }
+        path
+    }
+    fn charged_bytes(&self) -> usize {
+        let mut bytes = self.root.as_os_str().len();
+        let mut directory = Some(self);
+        while let Some(node) = directory {
+            bytes += std::mem::size_of::<Self>() + 16 + node.basename.len();
+            directory = node.parent.as_deref();
+        }
+        bytes
     }
     fn resolve(&self, view: &Catalog) -> Option<InoId> {
         let path = self.path();
@@ -95,6 +113,7 @@ struct Hint {
     directory: Arc<Directory>,
     subtree: bool,
     cookie: u32,
+    ambiguous_cookie: bool,
     from: bool,
     to: bool,
 }
@@ -104,10 +123,12 @@ struct State {
     identities: BTreeMap<(u64, u64), i32>,
     removed: BTreeSet<i32>,
     gaps: BTreeSet<PathBuf>,
+    aliases: BTreeSet<PathBuf>,
     failed: BTreeSet<(u64, u64)>,
     pending: BTreeMap<(i32, Vec<u8>), Hint>,
     bytes: usize,
     first: Option<Instant>,
+    inflight_first: Option<Instant>,
     last: Option<Instant>,
     backstop: Option<(u64, RefreshReason)>,
     serial: u64,
@@ -141,6 +162,7 @@ pub struct Burst {
     marker: Option<(u64, RefreshReason)>,
 }
 impl Watch {
+    /// Creates one CLOEXEC, nonblocking instance with the given intake bounds.
     pub fn new(config: Config) -> Result<Self, Errno> {
         Ok(Self {
             fd: inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)?,
@@ -150,10 +172,12 @@ impl Watch {
                 identities: BTreeMap::new(),
                 removed: BTreeSet::new(),
                 gaps: BTreeSet::new(),
+                aliases: BTreeSet::new(),
                 failed: BTreeSet::new(),
                 pending: BTreeMap::new(),
                 bytes: 0,
                 first: None,
+                inflight_first: None,
                 last: None,
                 backstop: None,
                 serial: 0,
@@ -214,6 +238,8 @@ impl Watch {
         // /proc/self/fd follows the already observed handle, including after an
         // ancestor rename. ONLYDIR rejects a non-directory without a path race.
         let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        // UNMOUNT and IGNORED are automatically reported by inotify; only
+        // subscriptions with user-selectable mask bits belong here.
         let mask = WatchFlags::CREATE
             | WatchFlags::DELETE
             | WatchFlags::MOVED_FROM
@@ -226,14 +252,27 @@ impl Watch {
             | WatchFlags::ONLYDIR;
         match inotify::add_watch(&self.fd, path.as_str(), mask) {
             Ok(wd) => {
-                if let Some(old) = state.descriptors.get(&wd) {
-                    // M5b supplies multiple occurrences. Until then, any alias
-                    // or relocation gets complete observation and polling.
-                    if old.identity != identity || old.path() != root.join(relative) {
-                        let old_root = (*old.root).clone();
-                        state.gaps.insert(old_root);
-                        state.gaps.insert(root.to_owned());
+                if state.removed.remove(&wd) {
+                    loss(&mut state, RefreshReason::Overflow);
+                }
+                if let Some(old) = state.descriptors.get(&wd).cloned() {
+                    // M5b supplies multiple occurrences. Until then, aliases
+                    // are polling-dependent and events request all roots. A
+                    // known alias must not create endless backstop retries just
+                    // because observation visits its two paths in succession.
+                    if old.identity != identity {
+                        state.identities.remove(&old.identity);
                         loss(&mut state, RefreshReason::Overflow);
+                    }
+                    if old.path() != root.join(relative) {
+                        let old_root = (*old.root).clone();
+                        state.gaps.insert(old_root.clone());
+                        state.gaps.insert(root.to_owned());
+                        let new_gap =
+                            state.aliases.insert(old_root) | state.aliases.insert(root.to_owned());
+                        if new_gap {
+                            loss(&mut state, RefreshReason::Overflow);
+                        }
                     }
                 }
                 let root = parent
@@ -254,6 +293,35 @@ impl Watch {
             Err(_) => {
                 state.gaps.insert(root.to_owned());
                 state.failed.insert(identity);
+            }
+        }
+    }
+    /// Attempt a watch even when the later readable directory open will be
+    /// denied. O_PATH and the observed parent avoid rebuilding a live pathname.
+    pub(crate) fn arm_entry(
+        &self,
+        root: &Path,
+        entry: &crate::Decided<'_, ferret_catalog::DirToken>,
+    ) {
+        let Some(stat) = entry.stat else {
+            return;
+        };
+        match openat(
+            entry.parent_fd,
+            entry.name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => {
+                if fstat(&fd).is_ok_and(|s| (s.st_dev, s.st_ino) == (stat.dev, stat.ino)) {
+                    self.arm(root, entry.path, std::os::fd::AsFd::as_fd(&fd));
+                } else {
+                    self.gap(root);
+                    self.backstop(RefreshReason::Overflow);
+                }
+            }
+            Err(_) => {
+                self.gap(root);
             }
         }
     }
@@ -292,6 +360,9 @@ impl Watch {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if flags.contains(ReadFlags::QUEUE_OVERFLOW) {
+            // Overflow may have dropped expected IGNORED records as well. A
+            // stale tombstone cannot be trusted at a later descriptor reuse.
+            state.removed.clear();
             loss(&mut state, RefreshReason::Overflow);
             return;
         }
@@ -314,6 +385,10 @@ impl Watch {
             loss(&mut state, RefreshReason::Overflow);
             return;
         }
+        if state.aliases.contains(directory.root.as_path()) {
+            loss(&mut state, RefreshReason::Backstop);
+            return;
+        }
         let now = Instant::now();
         state.first.get_or_insert(now);
         state.last = Some(now);
@@ -321,8 +396,13 @@ impl Watch {
         if let Some(hint) = state.pending.get_mut(&key) {
             // Multiple moves involving one endpoint are ambiguous. Observation
             // is still required, but it must not manufacture a cookie pair.
-            if hint.cookie != cookie {
-                hint.cookie = 0;
+            if cookie != 0 && flags.intersects(ReadFlags::MOVED_FROM | ReadFlags::MOVED_TO) {
+                if hint.cookie != 0 && hint.cookie != cookie {
+                    hint.cookie = 0;
+                    hint.ambiguous_cookie = true;
+                } else if !hint.ambiguous_cookie {
+                    hint.cookie = cookie;
+                }
             }
             hint.subtree |=
                 flags.intersects(ReadFlags::ISDIR | ReadFlags::MOVE_SELF | ReadFlags::DELETE_SELF);
@@ -330,8 +410,7 @@ impl Watch {
             hint.to |= flags.contains(ReadFlags::MOVED_TO);
             return;
         }
-        let charge =
-            std::mem::size_of::<Hint>() + 64 + name.len() + directory.path().as_os_str().len();
+        let charge = std::mem::size_of::<Hint>() + 64 + name.len() + directory.charged_bytes();
         if state.pending.len() >= self.config.scopes
             || state.bytes.saturating_add(charge) > self.config.bytes
         {
@@ -346,11 +425,45 @@ impl Watch {
                 subtree: flags
                     .intersects(ReadFlags::ISDIR | ReadFlags::MOVE_SELF | ReadFlags::DELETE_SELF),
                 cookie,
+                ambiguous_cookie: false,
                 from: flags.contains(ReadFlags::MOVED_FROM),
                 to: flags.contains(ReadFlags::MOVED_TO),
             },
         );
     }
+    /// Debug-build injection at the exact kernel intake seam. Release hosts
+    /// expose no event injection. This exercises loss and cookie ambiguity
+    /// without requiring the kernel to generate an impossible event sequence.
+    #[cfg(debug_assertions)]
+    pub fn inject_overflow(&self) {
+        self.event(-1, ReadFlags::QUEUE_OVERFLOW, 0, &[]);
+    }
+    /// Debug-build move endpoint at an installed directory locator.
+    #[cfg(debug_assertions)]
+    pub fn inject_move(&self, path: &Path, name: &[u8], cookie: u32, from: bool) {
+        let wd = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .descriptors
+            .iter()
+            .find(|(_, d)| d.path() == path)
+            .map(|(&wd, _)| wd);
+        if let Some(wd) = wd {
+            self.event(
+                wd,
+                if from {
+                    ReadFlags::MOVED_FROM
+                } else {
+                    ReadFlags::MOVED_TO
+                },
+                cookie,
+                name,
+            );
+        }
+    }
+
+    /// Collapses pending hints to a new complete all-roots observation marker.
     pub fn backstop(&self, reason: RefreshReason) {
         loss(
             &mut self
@@ -360,6 +473,7 @@ impl Watch {
             reason,
         );
     }
+    /// Snapshots intake coverage and monotonic pending age under a short lock.
     pub fn status(&self) -> Status {
         let s = self
             .state
@@ -370,12 +484,19 @@ impl Watch {
             needed: s.descriptors.len() + s.failed.len(),
             failed: s.failed.len(),
             pending: s.pending.len() + usize::from(s.backstop.is_some()),
-            oldest: s.first.map(|t| t.elapsed()),
+            oldest: s
+                .first
+                .into_iter()
+                .chain(s.inflight_first)
+                .min()
+                .map(|t| t.elapsed()),
             backstop: s.backstop.map(|(_, r)| r),
             busy: s.running || s.backstop.is_some() || !s.pending.is_empty(),
             uncovered: !s.gaps.is_empty(),
         }
     }
+    /// Detaches at most one due burst. Loss markers bypass debounce; new
+    /// arrivals are accumulated independently while the host observes this one.
     pub fn take(&self) -> Option<Burst> {
         let mut s = self
             .state
@@ -391,19 +512,22 @@ impl Watch {
         }
         s.running = true;
         s.bytes = 0;
-        s.first = None;
+        s.inflight_first = s.first.take();
         s.last = None;
         Some(Burst {
             pending: std::mem::take(&mut s.pending),
             marker: s.backstop,
         })
     }
+    /// Acknowledges this watermark on success, or retains complete work after
+    /// failure. A new loss watermark is never cleared by an older observation.
     pub fn finish(&self, burst: Burst, success: bool) {
         let mut s = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         s.running = false;
+        s.inflight_first = None;
         if success {
             if burst.marker.is_some() && s.backstop == burst.marker {
                 s.backstop = None;
@@ -418,20 +542,48 @@ impl Watch {
     /// Retire watches only after checked catalog observation. Known removals
     /// have an expected IGNORED; every unknown descriptor lifetime is loss.
     pub fn reconcile(&self, view: &Catalog) {
-        let mut s = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let gone: Vec<_> = s
-            .descriptors
-            .iter()
-            .filter(|(_, d)| d.resolve(view).is_none())
-            .map(|(&wd, _)| wd)
+        let identities: BTreeSet<_> = view
+            .inode_ids()
+            .filter(|&id| view.is_directory(id))
+            .map(|id| {
+                let stat = view.inode(id).stat;
+                (stat.dev, stat.ino)
+            })
             .collect();
-        for wd in gone {
-            if let Some(d) = s.descriptors.remove(&wd) {
-                s.identities.remove(&d.identity);
+        let snapshot = {
+            let mut s = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.failed.retain(|identity| identities.contains(identity));
+            s.aliases
+                .retain(|root| view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
+            if s.failed.is_empty() {
+                s.gaps = s.aliases.clone();
             }
+            s.descriptors
+                .iter()
+                .map(|(&wd, d)| (wd, d.clone()))
+                .collect::<Vec<_>>()
+        };
+        // Resolution may traverse a large watch set. Kernel intake must not
+        // wait on its catalog/path work or on a sweep's removal syscalls.
+        for (wd, directory) in snapshot {
+            if directory.resolve(view).is_some() {
+                continue;
+            }
+            let mut s = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if s.descriptors
+                .get(&wd)
+                .is_none_or(|d| !Arc::ptr_eq(d, &directory))
+            {
+                continue;
+            }
+            s.descriptors.remove(&wd);
+            s.identities.remove(&directory.identity);
             if inotify::remove_watch(&self.fd, wd).is_ok() {
                 s.removed.insert(wd);
             }
@@ -454,18 +606,32 @@ fn loss(s: &mut State, reason: RefreshReason) {
     s.first.get_or_insert_with(Instant::now);
     s.last = Some(Instant::now());
 }
+#[derive(Default)]
+struct MovePair {
+    old: Vec<(InoId, Vec<u8>)>,
+    new: Vec<(InoId, Vec<u8>)>,
+}
 impl Burst {
+    /// Whether this observation can retire directory watches. Ordinary file
+    /// bursts do not scan the entire watch set at each publication.
+    pub fn reconcile_watches(&self) -> bool {
+        self.marker.is_some()
+            || self.pending.iter().any(|((_, name), h)| {
+                h.subtree || matches!(name.as_slice(), b".git" | b".gitignore" | b".ferretignore")
+            })
+    }
+    /// Loss/backstop reason associated with this detached watermark.
     pub fn reason(&self) -> RefreshReason {
         self.marker.map_or(RefreshReason::Burst, |(_, r)| r)
     }
+    /// Resolves parent/name locators in the current checked generation. Missing
+    /// ancestry or changed root boundaries widen observation conservatively.
     pub fn request(&self, view: &Catalog) -> RefreshRequest {
         let mut scopes = Vec::new();
         let mut roots = BTreeSet::new();
-        let mut moves: BTreeMap<u32, (Vec<(InoId, Vec<u8>)>, Vec<(InoId, Vec<u8>)>)> =
-            BTreeMap::new();
+        let mut moves: BTreeMap<u32, MovePair> = BTreeMap::new();
         for ((_, name), hint) in &self.pending {
-            if hint.subtree
-                || name.is_empty()
+            if name.is_empty()
                 || matches!(name.as_slice(), b".git" | b".gitignore" | b".ferretignore")
             {
                 roots.insert((*hint.directory.root).clone());
@@ -477,23 +643,40 @@ impl Burst {
                 if hint.cookie != 0 {
                     let pair = moves.entry(hint.cookie).or_default();
                     if hint.from {
-                        pair.0.push((parent, name.clone()));
+                        pair.old.push((parent, name.clone()));
                     }
                     if hint.to {
-                        pair.1.push((parent, name.clone()));
+                        pair.new.push((parent, name.clone()));
                     }
                 }
             } else {
                 roots.insert((*hint.directory.root).clone());
             }
         }
-        scopes.extend(roots.into_iter().map(RefreshScope::Root));
-        let rename_hints = if self.marker.is_some() {
+        let changed_boundary = roots
+            .iter()
+            .any(|root| !view.roots().any(|(_, p)| p == root.as_os_str().as_bytes()));
+        if changed_boundary {
+            scopes.clear();
+        } else {
+            scopes.retain(|scope| match scope {
+                RefreshScope::Entry { parent, .. } => {
+                    let mut path = Vec::new();
+                    view.dir_path(*parent, &mut path);
+                    !roots
+                        .iter()
+                        .any(|root| Path::new(OsStr::from_bytes(&path)).starts_with(root))
+                }
+                _ => true,
+            });
+            scopes.extend(roots.into_iter().map(RefreshScope::Root));
+        }
+        let rename_hints = if self.marker.is_some() || changed_boundary {
             Vec::new()
         } else {
             moves
                 .into_values()
-                .filter_map(|(mut old, mut new)| {
+                .filter_map(|MovePair { mut old, mut new }| {
                     if old.len() != 1 || new.len() != 1 {
                         return None;
                     }
@@ -512,7 +695,14 @@ impl Burst {
             expected_generation: view.generation(),
             scopes,
             rename_hints,
-            reason: self.reason(),
+            reason: if changed_boundary {
+                RefreshReason::Backstop
+            } else {
+                self.reason()
+            },
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

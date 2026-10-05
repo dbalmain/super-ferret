@@ -182,6 +182,14 @@ impl WriterSession {
         Ok(None)
     }
 
+    /// Recovers an uncertain publication under the existing retained lock,
+    /// rebuilding every writer lookup from the validated published view.
+    pub fn recover(&mut self) -> Result<Catalog, Error> {
+        self.writer.recover()?;
+        self.rebuild();
+        Ok(self.view())
+    }
+
     /// Compacts the published view without advancing its sequence. Every
     /// epoch cache is rebuilt before returning; queued handles must retry.
     pub fn compact(&mut self) -> Result<Catalog, Error> {
