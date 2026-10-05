@@ -151,7 +151,17 @@ BFS order; traversal uses effective edges. Compaction restores dense BFS ids.
 
 `ferret-catalog` owns a resident name dictionary, row-to-name keys and
 name-key-to-NameId postings with stored counts. Those are catalog row postings,
-not content postings. `ferret-query` owns the term-to-name-key index and its
+not content postings. M3's implementation preflight found that intpack is
+listed as a planned `ferret-index` dependency in DESIGN, but is absent from
+both that crate's manifest and the workspace lockfile. The prototype uses
+intpack for its packed columns and PFor postings. Using that codec here needs
+an explicitly approved `ferret-catalog → intpack` edge; placing catalog row
+postings in the document-only `ferret-index` would change its boundary.
+Reusing catalog's existing column codec is an alternative, but its posting
+size and latency have not been compared with the prototype. M3 pauses at the
+brief's dependency gate; D54 B's ownership and BFS order remain unchanged.
+
+`ferret-query` owns the term-to-name-key index and its
 planner, using the shared D9 tokenizer in `ferret-text`; that tokenizer's
 contract is presently unimplemented and is part of this slice. An initial
 sorted term dictionary suffices for exact term lookup without a new FST
