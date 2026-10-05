@@ -73,8 +73,8 @@ Predecessors, carried forward where still open:
 | D55 | Storing mtime as an order rather than a value          | answered       | D + F: seconds-only ordered dictionaries for mtime and ctime, exact per-block max, racy rule; no ordered structure |
 | D56 | Where an indexed find with actions executes            | answered       | A: action queries run in the client through the shared engine; routing exception to D49                        |
 | D57 | Socket codec: shared JSON lines or binary framing       | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                          |
-| D58 | Batch input: serde_json or a hand-written reader         | open           | rec A: `serde_json::Value` without derive                                                                       |
-| D59 | How intpack enters the workspace                         | open           | rec A (git rev) after intpack is pushed; path dependency meanwhile                                             |
+| D58 | Batch input: serde_json or a hand-written reader         | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                 |
+| D59 | How intpack enters the workspace                         | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                     |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3248,7 +3248,7 @@ queries have that shape.
 
 ## D58 — Batch input: adopt `serde_json`, or parse the request by hand
 
-**Status: open.** S1b M1 review, 2026-10-05. Raised because S1b M2, the batch host,
+**Status: answered, B (Dave, 2026-10-05).** S1b M1 review, 2026-10-05. Raised because S1b M2, the batch host,
 would add the workspace's first serde dependency. D57 records `ferret →
 serde_json` as common to both of its options. It does not offer the alternative.
 
@@ -3278,9 +3278,24 @@ the batch schema is small enough that B stays small.
 S1b M2 waits for this answer. M3 (D54's names) doesn't depend on it, so it goes
 first.
 
+> Dave (2026-10-05): I feel like B might be the right answer here. It gives
+> us more scope to optimise for our usecase. The thing that would steer me
+> toward serde would be if you think it's likely other tools might want to make
+> request to the daemon.
+
+**Answer (2026-10-05): B, a hand-written reader.** Other tools sending requests
+does not steer toward serde. The wire format is JSON lines either way (D57 A),
+so a client in any language uses its own JSON library, and the daemon's choice
+of parser is invisible to it. What other clients change is robustness: the
+reader must take any input. So B ships with a fuzz target and a property test
+that round-trips through `json.rs`'s writer and rejects malformed lines, with
+bounded depth and line length. The one case that would favour serde is a Rust
+client library shared with other tools. That would be a separate crate, and
+it could choose its own parser.
+
 ## D59 — How intpack enters the workspace
 
-**Status: open.** S1b M3, 2026-10-05.
+**Status: answered, A (Dave, 2026-10-05); intpack pushed at `6423815`.** S1b M3, 2026-10-05.
 
 **Question:** S1b M3 is the first code to use intpack, through D54's packed
 names and row postings in `ferret-catalog`. D11 said intpack "starts as a git
@@ -3318,3 +3333,16 @@ plan, and it keeps one copy of the codec.
 **Fact that would change it:** if intpack's API is going to churn alongside
 ferret for a while, so that most ferret changes need an intpack change, B
 removes the push-and-bump loop.
+
+> Dave (2026-10-05): We vendor in iff we want to make changes specific to our
+> project. Remember that we have plans for other indexing projects like a small
+> log search "Splunk in a single pod" utility. So, ideally, we'll keep adding
+> improvements that can be used in other projects and eventually, we'll push it
+> up to crates.io. Please do push it to GitHub though.
+
+**Answer (2026-10-05): A, a git dependency pinned by rev.** intpack's `main` was
+pushed on 2026-10-05 (`5e352f4..6423815`). General improvements go into
+intpack itself so that other indexing projects get them. Vendoring happens
+only for a change specific to Super Ferret. crates.io comes later, when the
+format settles. The `path = "../intpack"` dependency M3 started with switches
+to `git = "https://github.com/dbalmain/intpack", rev = "6423815…"`.
