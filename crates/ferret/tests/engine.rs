@@ -371,6 +371,8 @@ fn an_unreadable_ferretignore_retains_real_old_rows_and_find_uses_live_fallback(
     let report = engine.refresh(request(&engine, &tree), &options()).unwrap();
     assert_eq!(report.report.protected_scopes, 1);
     let retained = engine.pin();
+    assert_projection(&retained, &tree);
+    assert!(!retained.name_index().can_accelerate_find());
     let scope = tree.root().join("sub").as_os_str().as_bytes().to_vec();
     let resolved = retained.catalog().resolve(&scope).unwrap();
     let ferret_catalog::Target::Inode(id) = resolved.target else {
@@ -429,6 +431,8 @@ fn directory_eacces_removes_old_children_and_the_opaque_row_keeps_live_fallback(
     let report = engine.refresh(request(&engine, &tree), &options()).unwrap();
     assert_eq!(report.report.protected_scopes, 0);
     let opaque = engine.pin();
+    assert_projection(&opaque, &tree);
+    assert!(!opaque.name_index().can_accelerate_find());
     let resolved = opaque
         .catalog()
         .resolve(denied.0.as_os_str().as_bytes())
@@ -696,4 +700,293 @@ fn a_moved_cwd_with_an_external_symlink_back_to_a_catalog_ancestor_reports_the_f
             .contains(&PathBuf::from("tree/sub/outside/tree"))
     );
     assert!(!lines(&output.output.0.lock().unwrap()).contains(&b"tree/sub/outside/tree".to_vec()));
+}
+
+fn assert_projection(pin: &QuerySession, tree: &Tree) {
+    let disk = Catalog::open(&tree.index()).unwrap().unwrap();
+    disk.load_all().unwrap();
+    let base = disk.checkpoint_base();
+    let names = pin.catalog().resident_names().unwrap();
+    let mut distinct: Vec<_> = base.names().map(|(_, name)| name.to_vec()).collect();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        (0..names.distinct_count())
+            .map(|key| names.distinct_name(key).to_vec())
+            .collect::<Vec<_>>(),
+        distinct
+    );
+    for key in 0..names.distinct_count() {
+        let mut postings = Vec::new();
+        names.postings(key, &mut postings);
+        let expected: Vec<_> = base
+            .names()
+            .filter(|(_, name)| *name == names.distinct_name(key))
+            .map(|(id, _)| id.0)
+            .collect();
+        assert_eq!(postings, expected);
+        assert_eq!(names.count(key), expected.len() as u32);
+    }
+    for text in [
+        "*",
+        "cache",
+        "*.rs",
+        "name-term:cache",
+        "name-term:http",
+        "name-term:b",
+        "name-term:OpenHTTP",
+    ] {
+        let query = Query::parse(text, SystemTime::now()).unwrap();
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        pin.search(&query, |row| {
+            actual.push(row.path.to_vec());
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        query
+            .run(&disk, |row| {
+                expected.push(row.path.to_vec());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected, "{text}");
+    }
+}
+
+#[test]
+fn generated_create_move_hardlink_ignore_retention_and_epoch_name_sequences_match_the_full_oracle()
+{
+    let tree = Tree::new();
+    let engine = writer_engine(&tree);
+    let mut files = vec![tree.root().join("a.txt"), tree.root().join("sub/b.txt")];
+    for step in 0..24 {
+        let old = engine.pin();
+        let old_rows = search(&old);
+        let selected = step as usize % files.len();
+        match step % 8 {
+            0 => {
+                let path = tree.root().join(format!("sub/OpenHTTP{step}_cache.rs"));
+                fs::write(&path, b"birth").unwrap();
+                files.push(path);
+            }
+            1 => {
+                let path = tree.root().join(format!("movedCache{step}.txt"));
+                fs::rename(&files[selected], &path).unwrap();
+                files[selected] = path;
+            }
+            2 => {
+                let path = tree.root().join(format!("sub/cacheAlias{step}.rs"));
+                fs::hard_link(&files[selected], &path).unwrap();
+                files.push(path);
+            }
+            3 => {
+                fs::write(
+                    tree.root().join(".ferretignore"),
+                    if step % 16 == 3 {
+                        b"hidden*\n".as_slice()
+                    } else {
+                        b"".as_slice()
+                    },
+                )
+                .unwrap();
+                fs::write(tree.root().join(format!("hidden{step}.txt")), b"ignored").unwrap();
+            }
+            4 => {
+                fs::remove_file(files.remove(selected)).unwrap();
+            }
+            5 => {
+                fs::write(&files[selected], format!("changed {step}")).unwrap();
+                let ignore = tree.root().join("sub/.ferretignore");
+                fs::write(&ignore, b"ignored\n").unwrap();
+                engine.refresh(request(&engine, &tree), &options()).unwrap();
+                let before_fault = engine.pin();
+                let denied = Denied::new(ignore);
+                let late = tree.root().join(format!("sub/lateCache{step}.rs"));
+                fs::write(&late, b"retained until recovery").unwrap();
+                files.push(late);
+                engine.refresh(request(&engine, &tree), &options()).unwrap();
+                let faulted = engine.pin();
+                let mut expected = oracle::listings(before_fault.catalog());
+                let scope = tree.root().join("sub");
+                for row in &mut expected {
+                    if row.path == scope.as_os_str().as_bytes() {
+                        row.entries = None;
+                        row.retained_at = Some(before_fault.generation().sequence);
+                    }
+                }
+                assert_eq!(oracle::listings(faulted.catalog()), expected);
+                assert_projection(&faulted, &tree);
+                drop(denied);
+            }
+            6 => {
+                let dir = tree.root().join(format!("directory{step}"));
+                fs::create_dir(&dir).unwrap();
+                let path = dir.join("HTTPServer_cache.rs");
+                fs::write(&path, b"nested birth").unwrap();
+                files.push(path);
+            }
+            _ => {
+                let sequence = old.generation().sequence;
+                engine.compact().unwrap();
+                let current = engine.pin();
+                assert_eq!(sequence, current.generation().sequence);
+                assert_ne!(old.generation().checkpoint, current.generation().checkpoint);
+                assert!(matches!(
+                    current.search_in(
+                        ferret_catalog::Handle {
+                            generation: old.generation(),
+                            id: ferret_catalog::InoId(u32::MAX)
+                        },
+                        &query(),
+                        |_| ControlFlow::Continue(())
+                    ),
+                    Err(ferret_query::RunError::Stale(_))
+                ));
+                assert!(
+                    old.name_index()
+                        .select(current.catalog(), None, &[], |_| true)
+                        .is_err()
+                );
+            }
+        }
+        engine.refresh(request(&engine, &tree), &options()).unwrap();
+        assert_eq!(search(&old), old_rows, "pinned step {step}");
+        let pin = engine.pin();
+        assert_projection(&pin, &tree);
+        tree.oracle(&pin);
+        // Fresh full-index query is independent of the resident dictionary.
+        let fresh = Catalog::open(&tree.0.join("oracle")).unwrap().unwrap();
+        for text in ["name-term:cache", "name-term:http", "*.rs", "cache"] {
+            let query = Query::parse(text, SystemTime::now()).unwrap();
+            let mut expected = Vec::new();
+            let mut actual = Vec::new();
+            query
+                .run(&fresh, |row| {
+                    expected.push(row.path.to_vec());
+                    ControlFlow::Continue(())
+                })
+                .unwrap();
+            pin.search(&query, |row| {
+                actual.push(row.path.to_vec());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected, "step {step}: {text}");
+        }
+    }
+}
+
+#[test]
+fn explicit_name_token_is_distinct_from_substring_and_gnu_glob() {
+    let tree = Tree::new();
+    for name in [
+        "cache.rs",
+        "cacheable.rs",
+        "HTTPServer_cache2.rs",
+        "mycache.rs",
+    ] {
+        fs::write(tree.root().join(name), b"text").unwrap();
+    }
+    index(&tree.index(), &[tree.root()], Refresh::All, &options()).unwrap();
+    let pin = Engine::open(&tree.index()).unwrap().unwrap().pin();
+    let run = |text| {
+        let mut rows = Vec::new();
+        pin.search(&Query::parse(text, SystemTime::now()).unwrap(), |row| {
+            rows.push(row.path.to_vec());
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        rows.sort();
+        rows
+    };
+    assert_eq!(run("cache").len(), 4);
+    assert_eq!(run("cache*.rs").len(), 2);
+    let token = run("name-term:cache");
+    assert_eq!(token.len(), 2);
+    assert!(
+        token
+            .iter()
+            .any(|path| path.ends_with(b"HTTPServer_cache2.rs"))
+    );
+    assert!(!token.iter().any(|path| path.ends_with(b"cacheable.rs")));
+    assert_eq!(run("name-term:http").len(), 1);
+    assert_eq!(run("name-term:server").len(), 1);
+    assert!(Query::parse("name-term:cache*", SystemTime::now()).is_err());
+    assert_projection(&pin, &tree);
+    tree.oracle(&pin);
+}
+
+#[test]
+fn rare_scoped_postings_become_a_common_scope_walk_when_delta_births_change_the_stored_counts() {
+    use ferret_catalog::{Handle, Target};
+    use ferret_query::NamePlan;
+    let tree = Tree::new();
+    for i in 0..80 {
+        fs::write(tree.root().join(format!("sub/ordinary{i}.rs")), b"text").unwrap();
+    }
+    fs::write(tree.root().join("sub/RareAtom.rs"), b"rare").unwrap();
+    fs::write(tree.root().join("sub/common.rs"), b"common").unwrap();
+    for i in 0..60 {
+        let dir = tree.root().join(format!("outside{i}"));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("common.rs"), b"common").unwrap();
+    }
+    index(&tree.index(), &[tree.root()], Refresh::All, &options()).unwrap();
+    let engine = writer_engine(&tree);
+    let plan = |pin: &QuerySession, needle: &[u8]| {
+        let Target::Inode(dir) = pin
+            .catalog()
+            .resolve(tree.root().join("sub").as_os_str().as_bytes())
+            .unwrap()
+            .target
+        else {
+            panic!("scope")
+        };
+        pin.name_index()
+            .select(
+                pin.catalog(),
+                Some(Handle {
+                    generation: pin.generation(),
+                    id: dir,
+                }),
+                &[],
+                |name| name.starts_with(needle),
+            )
+            .unwrap()
+    };
+    let old = engine.pin();
+    let rare = plan(&old, b"RareAtom");
+    assert_eq!(rare.estimate.hits, 1);
+    assert_eq!(rare.estimate.plan, NamePlan::Postings);
+    assert_eq!(rare.rows(old.catalog()).unwrap().len(), 1);
+    assert_eq!(plan(&old, b"common").estimate.plan, NamePlan::ScopeWalk);
+    let args = ["tree/sub".into(), "-name".into(), "RareAtom*".into()];
+    let find = Plan::parse_at(&args, &tree.0, SystemTime::now()).unwrap();
+    let output = Output::default();
+    old.find(&find, output.clone(), 4).unwrap();
+    assert_eq!(lines(&output.0.lock().unwrap()).len(), 1);
+    for i in 0..12 {
+        fs::write(
+            tree.root().join(format!("sub/RareAtom-born-{i}.rs")),
+            b"birth",
+        )
+        .unwrap();
+    }
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
+    let new = engine.pin();
+    let common = plan(&new, b"RareAtom");
+    assert_eq!(common.estimate.hits, 13);
+    assert_eq!(common.estimate.scope_rows, Some(95)); // b.txt + 80 ordinary + RareAtom + common + 12 births.
+    assert_eq!(common.estimate.plan, NamePlan::ScopeWalk);
+    assert_eq!(plan(&old, b"RareAtom").estimate.plan, NamePlan::Postings);
+    let output = Output::default();
+    new.find(&find, output.clone(), 4).unwrap();
+    assert_eq!(lines(&output.0.lock().unwrap()).len(), 13);
+    assert_projection(&new, &tree);
+    tree.oracle(&new);
 }

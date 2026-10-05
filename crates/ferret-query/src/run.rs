@@ -40,11 +40,17 @@ pub struct Stats {
 
 /// A run that could not read the catalog.
 #[derive(Debug)]
-pub struct RunError(pub OpenError);
+pub enum RunError {
+    Open(OpenError),
+    Stale(ferret_catalog::RetryFromCurrent),
+}
 
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        match self {
+            Self::Open(error) => error.fmt(f),
+            Self::Stale(error) => write!(f, "retry from {:?}", error.current),
+        }
     }
 }
 
@@ -52,7 +58,7 @@ impl std::error::Error for RunError {}
 
 impl From<OpenError> for RunError {
     fn from(e: OpenError) -> Self {
-        RunError(e)
+        RunError::Open(e)
     }
 }
 
@@ -75,6 +81,61 @@ const ROW_SECTIONS: [Section; 6] = [
 ];
 
 impl Query {
+    /// Resident execution: term/dictionary matching and counted row candidates,
+    /// followed by the same exact evaluator as the raw-format API.
+    pub fn run_indexed(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+        mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        if scope.is_none() && self.names.is_empty() && self.driver.is_none() {
+            return self.run(catalog, emit);
+        }
+        let terms: Vec<_> = self
+            .names
+            .iter()
+            .filter_map(|test| match test {
+                NameTest::Term(token) => Some(token.as_slice()),
+                _ => None,
+            })
+            .collect();
+        let selection = index
+            .select(catalog, scope, &terms, |name| {
+                self.names.iter().all(|test| test.matches(name))
+                    && self.driver.as_ref().is_none_or(|driver| {
+                        driver.from != usize::MAX || driver.finder.is_match(name)
+                    })
+            })
+            .map_err(RunError::Stale)?;
+        let mut run = Run {
+            query: self,
+            catalog,
+            meta_loaded: false,
+            stats: Stats::default(),
+            dir: None,
+            up: None,
+            path: Vec::new(),
+        };
+        if selection.estimate.plan == crate::NamePlan::ScopeWalk && scope.is_none() {
+            run.all_names(&mut emit)?;
+            return Ok(run.stats);
+        }
+        let rows = selection.rows(catalog).map_err(RunError::Stale)?;
+        let mut kinds = catalog.kinds();
+        for id in rows {
+            run.stats.candidates += 1;
+            if run
+                .consider(&mut kinds, id, catalog.name(id), None, false, &mut emit)?
+                .is_break()
+            {
+                break;
+            }
+        }
+        Ok(run.stats)
+    }
+
     /// Runs the query, calling `emit` with each row, in name order (parent
     /// directory, then name). `emit` returns `Break` to stop early; the path
     /// it is lent is valid only for the call.

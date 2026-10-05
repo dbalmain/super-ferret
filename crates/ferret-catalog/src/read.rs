@@ -244,7 +244,7 @@ pub struct Catalog {
 
 enum Source {
     Resident {
-        names: crate::ResidentNames,
+        names: Box<crate::ResidentNames>,
         sections: Box<[Arc<[u8]>; SECTIONS.len()]>,
         read: u64,
     },
@@ -369,7 +369,7 @@ impl Catalog {
             Source::Resident { read, .. } => *read,
         };
         self.source = Arc::new(Source::Resident {
-            names,
+            names: Box::new(names),
             sections,
             read,
         });
@@ -395,6 +395,17 @@ impl Catalog {
             Source::Resident { names, .. } => Some(names),
             _ => None,
         }
+    }
+
+    /// Directory coverage/count rows replaced in the selected log prefix.
+    pub fn changed_directory_scopes(&self) -> impl Iterator<Item = InoId> + '_ {
+        self.overlay
+            .iter()
+            .flat_map(|overlay| overlay.projection(Family::Namespace).records(overlay::DIR))
+            .filter_map(|record| match record {
+                Record::DirPut { id, .. } => Some(InoId(*id)),
+                _ => None,
+            })
     }
 
     /// Base edges overwritten or removed by the selected generation.

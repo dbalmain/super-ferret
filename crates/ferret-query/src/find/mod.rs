@@ -404,6 +404,102 @@ impl Plan {
         self.catalog_source(catalog).walk
     }
 
+    /// Counted postings are safe only for a name test followed by printing,
+    /// without traversal controls, effects, symlink following or live scopes.
+    /// Candidates still use the ordinary entry evaluator and output commit.
+    pub fn indexed_catalog_source(
+        &self,
+        catalog: ferret_catalog::Catalog,
+        index: &crate::NameIndex,
+    ) -> LiveWalk {
+        use ferret_catalog::{Handle, Target};
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let fallback = || self.parallel_catalog_source(catalog.clone());
+        let Expression::And(left, right) = &self.expression else {
+            return fallback();
+        };
+        let (Expression::Name(pattern), Expression::Print(_)) = (&**left, &**right) else {
+            return fallback();
+        };
+        if self.no_ignore
+            || !index.can_accelerate_find()
+            || self.options.max_depth.is_some()
+            || self.options.min_depth != 0
+            || self.options.depth_first
+            || self.options.xdev
+            || self.options.follow != Follow::Physical
+            || self.unsupported.is_some()
+        {
+            return fallback();
+        }
+        // Nested configured roots are separate catalog graph roots but the
+        // find walker attaches them at physical boundaries. Keep that walker.
+        let roots: Vec<_> = catalog
+            .roots()
+            .map(|(_, path)| Path::new(std::ffi::OsStr::from_bytes(path)))
+            .collect();
+        if roots.iter().enumerate().any(|(i, path)| {
+            roots
+                .iter()
+                .enumerate()
+                .any(|(j, other)| i != j && path.starts_with(other))
+        }) {
+            return fallback();
+        }
+        let mut paths = Vec::new();
+        for start in &self.paths {
+            let logical = self.options.logical_path(start);
+            let Some(resolved) = catalog.resolve(logical.as_os_str().as_bytes()) else {
+                return fallback();
+            };
+            let Target::Inode(dir) = resolved.target else {
+                return fallback();
+            };
+            if !resolved.remainder.is_empty() || !catalog.is_directory(dir) {
+                return fallback();
+            }
+            let Ok(selection) = index.select(
+                &catalog,
+                Some(Handle {
+                    generation: catalog.generation(),
+                    id: dir,
+                }),
+                &[],
+                |name| pattern.matches(name),
+            ) else {
+                return fallback();
+            };
+            if selection.estimate.plan != crate::NamePlan::Postings {
+                return fallback();
+            }
+            let Ok(rows) = selection.rows(&catalog) else {
+                return fallback();
+            };
+            // Include the starting entry even when its own basename matches.
+            paths.push(start.clone());
+            let mut prefix = Vec::new();
+            catalog.dir_path(dir, &mut prefix);
+            let mut full = Vec::new();
+            for row in rows {
+                if !matches!(catalog.name(row).target(), Target::Inode(_)) {
+                    continue;
+                }
+                full.clear();
+                catalog.path(row, &mut full);
+                let Some(suffix) = full
+                    .strip_prefix(prefix.as_slice())
+                    .and_then(|suffix| suffix.strip_prefix(b"/"))
+                else {
+                    return fallback();
+                };
+                paths.push(start.join(OsString::from_vec(suffix.to_vec())));
+            }
+        }
+        let mut options = self.options.clone();
+        options.max_depth = Some(0);
+        CatalogSource::new(catalog, paths, options).walk
+    }
+
     /// Creates a catalog walk. Load `catalog_sections()` before construction.
     pub fn catalog_source(&self, catalog: ferret_catalog::Catalog) -> CatalogSource {
         let mut options = self.options.clone();

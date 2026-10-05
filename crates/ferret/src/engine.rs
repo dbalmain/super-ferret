@@ -3,17 +3,17 @@
 
 use std::ops::ControlFlow;
 use std::path::Path;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ferret_catalog::{Catalog, Generation, OpenError, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
-use ferret_query::{Query, Row, RunError, Stats};
+use ferret_query::{NameIndex, Query, Row, RunError, Stats};
 
 /// A checked, fully loaded query engine. A query-only engine takes no writer
 /// lock; attaching a writer shares its already loaded catalog buffers.
 pub struct Engine {
-    current: RwLock<Catalog>,
+    current: RwLock<QuerySession>,
     writer: Mutex<Option<WriterSession>>,
 }
 
@@ -21,6 +21,7 @@ pub struct Engine {
 #[derive(Clone)]
 pub struct QuerySession {
     catalog: Catalog,
+    names: Arc<NameIndex>,
 }
 
 impl Engine {
@@ -32,28 +33,32 @@ impl Engine {
         };
         let catalog = catalog.into_resident()?;
         Ok(Some(Self {
-            current: RwLock::new(catalog),
+            current: RwLock::new(QuerySession {
+                names: Arc::new(NameIndex::new(&catalog)),
+                catalog,
+            }),
             writer: Mutex::new(None),
         }))
     }
 
     /// Takes ownership of a resident writer and its checked, loaded view.
     pub fn from_writer(writer: WriterSession) -> Self {
+        let catalog = writer.view();
         Self {
-            current: RwLock::new(writer.view()),
+            current: RwLock::new(QuerySession {
+                names: Arc::new(NameIndex::new(&catalog)),
+                catalog,
+            }),
             writer: Mutex::new(Some(writer)),
         }
     }
 
     /// Pins the selected generation without holding a lock during execution.
     pub fn pin(&self) -> QuerySession {
-        QuerySession {
-            catalog: self
-                .current
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-        }
+        self.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Observes final disk state under the writer lock and adopts the checked
@@ -85,14 +90,33 @@ impl Engine {
     }
 
     fn select(&self, view: Catalog) {
+        let previous = self.pin();
+        let names = Arc::new(NameIndex::adopt(&view, Some(&previous.names)));
         *self
             .current
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = view;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = QuerySession {
+            catalog: view,
+            names,
+        };
     }
 }
 
 impl QuerySession {
+    pub fn name_index(&self) -> &NameIndex {
+        &self.names
+    }
+
+    /// A checked directory scope for hosts that already resolved a start.
+    pub fn search_in(
+        &self,
+        scope: ferret_catalog::Handle<ferret_catalog::InoId>,
+        query: &Query,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        query.run_indexed(&self.catalog, &self.names, Some(scope), emit)
+    }
+
     /// Identifies the epoch and sequence in which this pin's ids are valid.
     pub fn generation(&self) -> Generation {
         self.catalog.generation()
@@ -109,7 +133,7 @@ impl QuerySession {
         query: &Query,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
-        query.run(&self.catalog, emit)
+        query.run_indexed(&self.catalog, &self.names, None, emit)
     }
 
     /// Runs find with the plan's captured cwd/time and the host's effects.
@@ -123,7 +147,7 @@ impl QuerySession {
         let source = if plan.no_ignore() || plan.is_information() {
             plan.live_source()
         } else {
-            plan.parallel_catalog_source(self.catalog.clone())
+            plan.indexed_catalog_source(self.catalog.clone(), &self.names)
         };
         plan.run_parallel(source, effects, workers)
     }

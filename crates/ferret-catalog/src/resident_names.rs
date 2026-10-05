@@ -17,17 +17,27 @@ pub(crate) struct Keys {
 
 impl Keys {
     pub(crate) fn new(values: &[u32]) -> Self {
-        let width = u32::BITS - values.iter().copied().max().unwrap_or(0).leading_zeros();
+        Self::from_values(values.iter().copied().map(u64::from))
+    }
+    fn from_values(values: impl ExactSizeIterator<Item = u64> + Clone) -> Self {
+        let width = u64::BITS - values.clone().max().unwrap_or(0).leading_zeros();
+        assert!(
+            width <= 57,
+            "resident byte offset exceeds addressable codec width"
+        );
         let mut bytes = Vec::with_capacity((values.len() * width as usize).div_ceil(8) + 8);
         let mut writer = bits::Writer::new(&mut bytes);
-        for &value in values {
-            writer.put(u64::from(value), width);
+        for value in values {
+            writer.put(value, width);
         }
         bytes.extend_from_slice(&[0; 8]);
         Self { width, bytes }
     }
+    fn get_offset(&self, index: usize) -> usize {
+        bits::Reader::new(&self.bytes).get(index * self.width as usize, self.width) as usize
+    }
     pub(crate) fn get(&self, index: usize) -> u32 {
-        bits::Reader::new(&self.bytes).get(index * self.width as usize, self.width) as u32
+        self.get_offset(index) as u32
     }
     pub(crate) fn bytes(&self) -> usize {
         self.bytes.len()
@@ -69,17 +79,11 @@ impl ResidentNames {
         let mut table = Vec::new();
         let mut offsets = Vec::with_capacity(distinct.len() + 1);
         for name in &distinct {
-            offsets.push(
-                u32::try_from(table.len())
-                    .unwrap_or_else(|_| panic!("resident name table exceeds u32")),
-            );
+            offsets.push(table.len() as u64);
             table.extend_from_slice(name);
             table.push(0);
         }
-        offsets.push(
-            u32::try_from(table.len())
-                .unwrap_or_else(|_| panic!("resident name table exceeds u32")),
-        );
+        offsets.push(table.len() as u64);
         // One row array and a prefix sum, rather than one allocation per name.
         let mut counts = vec![0u32; distinct.len()];
         for &key in &ids {
@@ -100,7 +104,7 @@ impl ResidentNames {
         );
         Self {
             table,
-            offsets: Keys::new(&offsets),
+            offsets: Keys::from_values(offsets.iter().copied()),
             keys: Keys::new(&ids),
             postings,
             distinct: distinct.len() as u32,
@@ -117,8 +121,8 @@ impl ResidentNames {
     }
     pub fn distinct_name(&self, key: u32) -> &[u8] {
         assert!(key < self.distinct);
-        let start = self.offsets.get(key as usize) as usize;
-        let end = self.offsets.get(key as usize + 1) as usize;
+        let start = self.offsets.get_offset(key as usize);
+        let end = self.offsets.get_offset(key as usize + 1);
         &self.table[start..end - 1]
     }
     pub fn key(&self, row: NameId) -> u32 {
@@ -186,19 +190,13 @@ impl PackedNameLists {
             counts.push(
                 u32::try_from(list.len()).unwrap_or_else(|_| panic!("name postings exceed u32")),
             );
-            offsets.push(
-                u32::try_from(bytes.len())
-                    .unwrap_or_else(|_| panic!("packed name postings exceed u32")),
-            );
+            offsets.push(bytes.len() as u64);
             pfor128::encode_sorted(list, &mut bytes);
         }
-        offsets.push(
-            u32::try_from(bytes.len())
-                .unwrap_or_else(|_| panic!("packed name postings exceed u32")),
-        );
+        offsets.push(bytes.len() as u64);
         Self {
             counts: Keys::new(&counts),
-            offsets: Keys::new(&offsets),
+            offsets: Keys::from_values(offsets.iter().copied()),
             bytes,
         }
     }
@@ -206,8 +204,8 @@ impl PackedNameLists {
         self.counts.get(list as usize)
     }
     pub fn get(&self, list: u32, out: &mut Vec<u32>) {
-        let start = self.offsets.get(list as usize) as usize;
-        let end = self.offsets.get(list as usize + 1) as usize;
+        let start = self.offsets.get_offset(list as usize);
+        let end = self.offsets.get_offset(list as usize + 1);
         pfor128::decode_sorted(self.count(list) as usize, &self.bytes[start..end], out);
     }
     pub fn bytes(&self) -> usize {

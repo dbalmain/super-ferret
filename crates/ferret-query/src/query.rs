@@ -52,6 +52,7 @@ pub(crate) struct Driver {
 #[derive(Debug)]
 pub(crate) enum NameTest {
     Substring(Finder),
+    Term(Vec<u8>),
     /// A name ending in `.ext`, ASCII-folded when the flag is set.
     Ext(Vec<u8>, bool),
     Glob(Regex, Vec<u8>),
@@ -85,6 +86,7 @@ pub enum ParseError {
     /// `size:` needs `N`, `<N` or `>N`, with an optional `k`, `M`, `G` or
     /// `T` (powers of 1024).
     Size(String),
+    Term(String),
     /// `mtime:` needs `<N` or `>N` with a unit `s`, `m`, `h`, `d`, `w` or
     /// `y`.
     Age(String),
@@ -105,6 +107,10 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Term(a) => write!(
+                f,
+                "`{a}`: name-term needs one alphanumeric/underscore token"
+            ),
             Self::Size(a) => write!(f, "`{a}`: size is N, <N or >N, with k, M, G or T"),
             Self::Age(a) => write!(f, "`{a}`: mtime is <N or >N with s, m, h, d, w or y"),
             Self::Type(a) => write!(f, "`{a}`: type is f, d or l"),
@@ -261,6 +267,10 @@ fn parse_atom(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
             other => Ok(other),
         }
     };
+    if let Some(v) = value(b"name-term:")? {
+        let token = ferret_text::normalize_token(v).ok_or_else(|| ParseError::Term(text()))?;
+        return Ok(Atom::Name(NameTest::Term(token), None));
+    }
     if let Some(v) = value(b"re:")? {
         let pattern = std::str::from_utf8(v).map_err(|_| ParseError::NotUtf8(arg.to_vec()))?;
         let regex = Regex::new(pattern, fold).map_err(|e| ParseError::Regex(text(), e))?;
@@ -395,6 +405,7 @@ impl NameTest {
     pub(crate) fn matches(&self, name: &[u8]) -> bool {
         match self {
             NameTest::Substring(finder) => finder.is_match(name),
+            NameTest::Term(token) => ferret_text::has_token(name, token),
             NameTest::Ext(suffix, fold) => {
                 let Some(end) = name.len().checked_sub(suffix.len()).filter(|&at| at > 0) else {
                     return false;
@@ -414,6 +425,7 @@ impl NameTest {
 
     fn describe(&self) -> String {
         match self {
+            NameTest::Term(token) => format!("name term {}", token.escape_ascii()),
             NameTest::Substring(f) => format!(
                 "name has \"{}\"{}",
                 f.needle().escape_ascii(),

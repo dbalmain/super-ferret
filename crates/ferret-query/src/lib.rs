@@ -64,6 +64,7 @@
 
 pub mod find;
 
+pub mod name_index;
 mod pattern;
 mod query;
 mod run;
@@ -71,5 +72,6 @@ mod run;
 #[cfg(test)]
 mod tests;
 
+pub use name_index::{NameEstimate, NameIndex, NamePlan};
 pub use query::{ParseError, Query, Strategy};
 pub use run::{Row, RunError, Stats};
