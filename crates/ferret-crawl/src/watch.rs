@@ -397,7 +397,7 @@ impl Watch {
         }
     }
     /// Runs blocking intake and notifies the writer for each observed event.
-    pub fn run_intake(&self, mut ready: impl FnMut()) {
+    pub fn run_intake(&self, mut ready: impl FnMut() -> bool) {
         let mut buffer = [MaybeUninit::uninit(); 64 << 10];
         let mut reader = inotify::Reader::new(&self.fd, &mut buffer);
         loop {
@@ -409,12 +409,16 @@ impl Watch {
                         event.cookie(),
                         event.file_name().map_or(&[], |s| s.to_bytes()),
                     );
-                    ready();
+                    if !ready() {
+                        return;
+                    }
                 }
                 Err(Errno::INTR) => continue,
                 Err(_) => {
                     self.backstop(RefreshReason::Overflow);
-                    ready();
+                    if !ready() {
+                        return;
+                    }
                 }
             }
         }
@@ -559,6 +563,53 @@ impl Watch {
             reason,
         );
     }
+    /// Conservative live heap plus kernel-watch estimate for bulk reserves.
+    /// Shared ancestor Arcs may be counted more than once, deliberately.
+    pub fn resource_bytes(&self) -> u64 {
+        let s = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let directories: usize = s
+            .descriptors
+            .values()
+            .flatten()
+            .map(|d| d.charged_bytes() + 64)
+            .sum();
+        let policies: usize = s
+            .policies
+            .values()
+            .flat_map(|m| m.keys())
+            .map(|(root, name)| root.as_os_str().len() + name.len() + 128)
+            .sum();
+        let aliases: usize = s
+            .file_aliases
+            .values()
+            .map(|a| {
+                128 + a
+                    .names
+                    .iter()
+                    .map(|((_, name), roots)| {
+                        name.len()
+                            + 128
+                            + roots
+                                .iter()
+                                .map(|r| r.as_os_str().len() + 64)
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        (s.identities.len() * 1024
+            + directories
+            + policies
+            + aliases
+            + s.bytes
+            + s.policy_failed
+                .keys()
+                .map(|(r, p)| r.as_os_str().len() + p.as_os_str().len() + 128)
+                .sum::<usize>()) as u64
+    }
     /// Snapshots intake coverage and monotonic pending age under a short lock.
     pub fn status(&self) -> Status {
         let s = self
@@ -653,11 +704,17 @@ impl Watch {
     /// Detaches at most one due burst. Loss markers bypass debounce; new
     /// arrivals are accumulated independently while the host observes this one.
     pub fn take(&self) -> Option<Burst> {
+        self.take_admitted(true)
+    }
+    /// Leaves bulk markers queued during a controller pause. Intake keeps
+    /// coalescing under the same bounds; ordinary scoped hints remain eligible.
+    pub fn take_admitted(&self, bulk: bool) -> Option<Burst> {
         let mut s = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.running
+            || (!bulk && s.backstop.is_some())
             || (s.backstop.is_none()
                 && s.scoped_roots.is_empty()
                 && (s.pending.is_empty()

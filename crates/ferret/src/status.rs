@@ -84,7 +84,8 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
         .int("refreshes", 0)
         .null("last_refresh_reason")
         .null("refresh_error")
-        .null("writer_input_usage");
+        .null("writer_input_usage")
+        .null("controller");
     resources(&mut o);
     if let Some(engine) = &engine {
         let session = engine.pin();

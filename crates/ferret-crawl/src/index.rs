@@ -67,8 +67,6 @@ pub struct IndexOptions {
     pub watch: Option<std::sync::Arc<crate::watch::Watch>>,
     /// Host bulk admission and pacing; absent for direct foreground indexing.
     pub bulk: Option<std::sync::Arc<dyn ferret_catalog::bulk::Control>>,
-    /// Lower only indexing threads, never intake or query threads.
-    pub background: bool,
 }
 
 impl Default for IndexOptions {
@@ -80,7 +78,6 @@ impl Default for IndexOptions {
             sniffer: ferret_policy::SNIFFER_VERSION,
             watch: None,
             bulk: None,
-            background: false,
         }
     }
 }
@@ -867,6 +864,20 @@ fn observe(
     let mut faults = Vec::new();
     let mut batches = Vec::new();
     for root in &plan.refresh {
+        let bulk_read = matches!(source, Source::Rebuild(..))
+            || plan.selections.is_empty()
+            || plan.selections.get(root).is_some_and(|s| s.whole_root());
+        if bulk_read
+            && let Source::Bounded(session, ..) = source
+            && let Some(control) = &options.bulk
+        {
+            // Between roots is a safe phase boundary. A refusal drops all
+            // unpublished batches; no partial listing is published or
+            // cancelled.
+            control
+                .admit(ferret_catalog::bulk::Kind::FullRewalk, &session.view())
+                .map_err(IndexError::DeferredBulk)?;
+        }
         if !plan.selections.contains_key(root)
             && let Some(watch) = &options.watch
         {
@@ -884,8 +895,7 @@ fn observe(
             || {
                 let mut hasher = Hasher::with_source(source, &cache, root);
                 hasher.watch = options.watch.as_deref();
-                hasher.background = options.background;
-                if matches!(source, Source::Rebuild(..)) || plan.selections.is_empty() {
+                if bulk_read {
                     hasher.reader.limiter = options.bulk.as_ref().map(|c| c.limiter());
                 }
                 hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
@@ -1245,7 +1255,6 @@ pub(crate) struct Hasher<'a> {
     reader: Reader,
     selection: Option<&'a crate::refresh::Selection>,
     watch: Option<&'a crate::watch::Watch>,
-    background: bool,
     priority_error: Option<io::Error>,
 }
 
@@ -1292,7 +1301,6 @@ impl<'a> Hasher<'a> {
             reader: Reader::new(),
             selection: None,
             watch: None,
-            background: false,
             priority_error: None,
         }
     }
@@ -1530,10 +1538,11 @@ impl Output {
 }
 
 impl EventVisitor for Hasher<'_> {
+    fn dedicated_worker(&self) -> bool {
+        true
+    }
     fn worker_started(&mut self) {
-        if self.background {
-            self.priority_error = crate::lower_index_priority().err();
-        }
+        self.priority_error = crate::lower_index_priority().err();
     }
     type Dir = DirToken;
 

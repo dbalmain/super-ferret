@@ -270,19 +270,34 @@ impl Reader {
             }
         }
         let started = Instant::now();
-        if self.limiter.is_some() {
+        if let Some(limiter) = &self.limiter {
             // No DONTNEED or NOREUSE: foreground readers may share these pages.
-            rustix::fs::fadvise(&*file, 0, None, rustix::fs::Advice::Sequential)
-                .map_err(|e| ContentFault::Read(e.into()))?;
+            if rustix::fs::fadvise(&*file, 0, None, rustix::fs::Advice::Sequential).is_err() {
+                limiter.advice_failed();
+            }
         }
         let remaining = file.metadata().map_err(ContentFault::Read)?.len();
-        let mut source = BulkRead { file, limiter: self.limiter.as_deref(), remaining };
-        let content = Self::sniff_and_hash(&mut self.buffer, &mut self.files_read, &mut self.bytes_read, &mut source);
+        let mut source = BulkRead {
+            file,
+            limiter: self.limiter.as_deref(),
+            remaining,
+        };
+        let content = Self::sniff_and_hash(
+            &mut self.buffer,
+            &mut self.files_read,
+            &mut self.bytes_read,
+            &mut source,
+        );
         self.read_time += started.elapsed();
         content
     }
 
-    fn sniff_and_hash(buffer: &mut [u8], files_read: &mut u64, bytes_read: &mut u64, file: &mut impl Read) -> Result<Content, ContentFault> {
+    fn sniff_and_hash(
+        buffer: &mut [u8],
+        files_read: &mut u64,
+        bytes_read: &mut u64,
+        file: &mut impl Read,
+    ) -> Result<Content, ContentFault> {
         *files_read += 1;
         let mut head = 0;
         while head < ferret_policy::SNIFF_LEN {
@@ -380,10 +395,58 @@ struct BulkRead<'a> {
 }
 impl Read for BulkRead<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let len = bytes.len().min(self.remaining.max(1).min(CHUNK as u64) as usize);
-        if let Some(limiter) = self.limiter { limiter.acquire(len); }
-        let n = self.file.read(&mut bytes[..len])?;
+        let len = bytes
+            .len()
+            .min(self.remaining.max(1).min(CHUNK as u64) as usize);
+        let n = if let Some(limiter) = self.limiter {
+            limiter.transfer(len, || self.file.read(&mut bytes[..len]))?
+        } else {
+            self.file.read(&mut bytes[..len])?
+        };
         self.remaining = self.remaining.saturating_sub(n as u64);
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+    use ferret_catalog::bulk::{Clock, Limiter};
+    use std::sync::Arc;
+    #[derive(Debug, Default)]
+    struct Time(Mutex<Duration>);
+    impl Clock for Time {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap_or_else(|e| panic!("fixture: {e:?}"))
+        }
+        fn sleep(&self, duration: Duration) {
+            *self.0.lock().unwrap_or_else(|e| panic!("fixture: {e:?}")) += duration;
+        }
+    }
+    #[test]
+    fn bulk_content_read_seam_is_paced_and_foreground_reads_are_excluded() {
+        let path = std::env::temp_dir().join(format!("ferret-bulk-read-{}", std::process::id()));
+        let bytes = vec![b'a'; CHUNK * 4];
+        std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("fixture: {e:?}"));
+        let clock = Arc::new(Time::default());
+        let limiter = Arc::new(Limiter::new(CHUNK as u64, clock.clone()));
+        let mut reader = Reader::new();
+        reader.limiter = Some(limiter.clone());
+        let content = reader
+            .read(&mut File::open(&path).unwrap_or_else(|e| panic!("fixture: {e:?}")))
+            .unwrap_or_else(|e| panic!("fixture: {e:?}"));
+        assert_eq!(reader.bytes_read, bytes.len() as u64);
+        assert!(matches!(content, Content::Hashed(_)));
+        let state = limiter.status();
+        assert!(
+            reader.bytes_read as f64 <= CHUNK as f64 * clock.now().as_secs_f64() + CHUNK as f64
+        );
+        assert!(state.waits >= 3);
+        let mut foreground = Reader::new();
+        foreground
+            .read(&mut File::open(&path).unwrap_or_else(|e| panic!("fixture: {e:?}")))
+            .unwrap_or_else(|e| panic!("fixture: {e:?}"));
+        assert_eq!(limiter.status().reserved_bytes, state.reserved_bytes);
+        std::fs::remove_file(path).unwrap_or_else(|e| panic!("fixture: {e:?}"));
     }
 }

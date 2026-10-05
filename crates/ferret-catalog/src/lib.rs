@@ -18,8 +18,8 @@
 
 pub mod batch;
 mod budget;
-pub mod bulk;
 mod build;
+pub mod bulk;
 mod compact;
 mod format;
 mod generation;

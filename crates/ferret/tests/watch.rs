@@ -1153,3 +1153,69 @@ fn global_ferret_rules_wait_for_protected_scope_recovery() {
     assert!(recovered.contains("\"refresh_error\":null"), "{recovered}");
     assert!(recovered.contains("\"protected_scopes\":0"), "{recovered}");
 }
+
+#[test]
+fn a_slow_query_socket_keeps_its_old_epoch_without_blocking_publication() {
+    let mut tree = Tree::new();
+    let suffix = "x".repeat(180);
+    for n in 0..3000 {
+        write(tree.path(&format!("src/left/{n:04}-{suffix}.txt")), "small");
+    }
+    tree.success(tree.local(&["index", "src"]));
+    tree.start(&[]);
+    let before = tree.status();
+    let old_epoch = number(&before, "checkpoint");
+    let stream = UnixStream::connect(tree.socket().unwrap_or_else(|| panic!("socket")))
+        .unwrap_or_else(|e| panic!("slow client: {e}"));
+    stream
+        .set_read_timeout(Some(BOUND))
+        .unwrap_or_else(|e| panic!("timeout: {e}"));
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .unwrap_or_else(|e| panic!("hello: {e}"));
+    reader
+        .get_mut()
+        .write_all(b"{\"id\":\"slow\",\"op\":\"search\",\"args\":[\"*.txt\"]}\n")
+        .unwrap_or_else(|e| panic!("query: {e}"));
+    line.clear();
+    reader
+        .read_line(&mut line)
+        .unwrap_or_else(|e| panic!("begin: {e}"));
+    assert!(line.contains("begin"), "{line}");
+    line.clear();
+    reader
+        .read_line(&mut line)
+        .unwrap_or_else(|e| panic!("row: {e}"));
+    assert!(line.contains("row"), "{line}");
+    // Leave more than a socket buffer of output unread. This pins the query's
+    // epoch while a serial writer command must still publish its successor.
+    write(
+        tree.path("src/left/original.txt"),
+        "changed while output is blocked",
+    );
+    for n in 0..40 {
+        write(
+            tree.path(&format!("src/left/{n:04}-{suffix}.txt")),
+            "changed",
+        );
+    }
+    tree.success(tree.run(&["index", "src"]));
+    let after = tree.status();
+    assert_ne!(number(&after, "checkpoint"), old_epoch, "{after}");
+    let epochs = after
+        .split("\"pinned_internal_epochs\":")
+        .nth(1)
+        .unwrap_or_else(|| panic!("epochs: {after}"));
+    let epochs = epochs
+        .split(']')
+        .next()
+        .unwrap_or_else(|| panic!("epochs: {after}"));
+    assert!(
+        epochs.contains(&old_epoch.to_string()),
+        "old query pin was lost: {after}"
+    );
+    tree.success(tree.run(&["search", "original.txt"]));
+    drop(reader);
+}

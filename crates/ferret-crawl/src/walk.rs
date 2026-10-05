@@ -418,6 +418,12 @@ pub trait EventVisitor {
     /// A path-valued policy dependency outside the observed directory handle.
     fn policy_path(&mut self, _path: &Path) {}
 
+    /// Requires a separate thread even for one worker, so lowering an index
+    /// worker's priority cannot affect the caller's query or intake work.
+    fn dedicated_worker(&self) -> bool {
+        false
+    }
+
     /// Called on the executing worker, including a single-worker walk.
     fn worker_started(&mut self) {}
 
@@ -479,7 +485,7 @@ pub fn walk_parallel<V: EventVisitor + Send>(
     };
     let root_id = first.root_id;
     let shared = Shared::new(root_job);
-    if count == 1 {
+    if count == 1 && !first.visit.dedicated_worker() {
         return vec![run_worker(first, &shared)];
     }
     thread::scope(|scope| {

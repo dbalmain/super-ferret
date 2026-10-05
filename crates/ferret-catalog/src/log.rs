@@ -490,12 +490,17 @@ impl Writer {
         self.bulk = bulk;
         Ok(())
     }
-    pub(crate) fn set_bulk_control(&mut self, control: Option<std::sync::Arc<dyn crate::bulk::Control>>) {
+    pub(crate) fn set_bulk_control(
+        &mut self,
+        control: Option<std::sync::Arc<dyn crate::bulk::Control>>,
+    ) {
         self.bulk = control;
     }
     pub(crate) fn admit_bulk(&self, kind: crate::bulk::Kind) -> Result<(), Error> {
         if let Some(control) = &self.bulk {
-            control.admit(kind, &self.current).map_err(Error::Deferred)?;
+            control
+                .admit(kind, &self.current)
+                .map_err(Error::Deferred)?;
         }
         Ok(())
     }
@@ -506,7 +511,9 @@ impl Writer {
             return Err(Error::Poisoned);
         }
         if let Some(control) = &self.bulk {
-            control.admit(crate::bulk::Kind::Checkpoint, &view).map_err(Error::Deferred)?;
+            control
+                .admit(crate::bulk::Kind::Checkpoint, &view)
+                .map_err(Error::Deferred)?;
         }
         let mut generation = view.generation();
         generation.checkpoint = generation
@@ -535,7 +542,8 @@ impl Writer {
             .map_err(Error::Io)?;
         crate::bulk::writes(self.bulk.as_ref().map(|c| c.limiter()), || {
             crate::compact::write(&view, &file, generation)
-        }).map_err(Error::Io)?;
+        })
+        .map_err(Error::Io)?;
         publication::sync(&file, Point::SnapshotSync).map_err(Error::Io)?;
         // Planning buffers have gone before readback. The checked sections are
         // the new resident view, rather than a second whole-file allocation.
@@ -586,13 +594,14 @@ impl Writer {
             txn.add(batch);
         }
         self.poisoned = true;
-        let current = match crate::bulk::writes(self.bulk.as_ref().map(|c| c.limiter()), || txn.commit()) {
-            Ok(current) => current,
-            Err(error) => {
-                self.poisoned = error.published();
-                return Err(Error::Rebuild(error));
-            }
-        };
+        let current =
+            match crate::bulk::writes(self.bulk.as_ref().map(|c| c.limiter()), || txn.commit()) {
+                Ok(current) => current,
+                Err(error) => {
+                    self.poisoned = error.published();
+                    return Err(Error::Rebuild(error));
+                }
+            };
         self.manifest = current.manifest();
         self.manifest.log_end = HEADER;
         self.log = OpenOptions::new()
@@ -604,7 +613,7 @@ impl Writer {
             )
             .map_err(Error::Undurable)?;
         self.budget = crate::budget::Budget::empty(current.inode_count(), current.name_count());
-        self.current = current;
+        self.current = current.into_resident().map_err(Error::Previous)?;
         self.poisoned = false;
         Ok(())
     }

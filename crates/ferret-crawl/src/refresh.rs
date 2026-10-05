@@ -107,6 +107,12 @@ impl Selection {
             ancestors: RwLock::new(ancestors),
         }
     }
+    pub(crate) fn whole_root(&self) -> bool {
+        self.paths
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(Path::new(""))
+    }
     pub(crate) fn includes(&self, path: &Path) -> bool {
         let paths = self
             .paths
@@ -181,6 +187,18 @@ pub fn refresh(
     request: RefreshRequest,
     options: &IndexOptions,
 ) -> Result<RefreshReport, IndexError> {
+    session.set_bulk_control(options.bulk.clone());
+    if let Err(error) = session.compact_if_needed() {
+        if let ferret_catalog::log::Error::Deferred(reason) = error {
+            return Ok(RefreshReport {
+                base_generation: request.expected_generation,
+                outcome: RefreshOutcome::DeferredBulk(reason),
+                view: session.view(),
+                report: Report::default(),
+            });
+        }
+        return Err(IndexError::Update(error));
+    }
     let view = session.view();
     if let Err(stale) = view.generation().check(request.expected_generation) {
         return Ok(RefreshReport {
@@ -226,16 +244,19 @@ pub fn refresh(
         }
         RefreshReason::Burst => Refresh::Only(&named),
     };
-    let (report, changes) = match crate::index::recrawl_scoped(session, &roots, scope, options, selections) {
-        Ok(result) => result,
-        Err(IndexError::DeferredBulk(reason)) => return Ok(RefreshReport {
-            base_generation: request.expected_generation,
-            outcome: RefreshOutcome::DeferredBulk(reason),
-            view: session.view(),
-            report: Report::default(),
-        }),
-        Err(error) => return Err(error),
-    };
+    let (report, changes) =
+        match crate::index::recrawl_scoped(session, &roots, scope, options, selections) {
+            Ok(result) => result,
+            Err(IndexError::DeferredBulk(reason)) => {
+                return Ok(RefreshReport {
+                    base_generation: request.expected_generation,
+                    outcome: RefreshOutcome::DeferredBulk(reason),
+                    view: session.view(),
+                    report: Report::default(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
     Ok(RefreshReport {
         base_generation: request.expected_generation,
         outcome: if session.view().generation().checkpoint != request.expected_generation.checkpoint

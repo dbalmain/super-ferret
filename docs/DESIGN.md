@@ -593,9 +593,15 @@ D51 A pauses the writer at idle boundaries while queries keep old views. M5a
 provides the serial writer and real-inotify full-index oracle tests. M5b provides
 multi-occurrence watches, external policy dependencies and typed status/stat JSON,
 including local no-host state, checked protection/opacity, queued freshness,
-coverage, budgets, RSS, old pinned epochs, census and D54 planner counters; M6 owns pacing, battery/load signals and
-budget validation. S1B specifies those later controls, including the full-builder
-memory limit recorded in ROADMAP.
+coverage, budgets, RSS, old pinned epochs, census and D54 planner counters; M6 supplies a one-Hz procfs/sysfs signal source, the worker ratchet, bulk gates
+and configurable admission under the writer lock. Full-build memory scales
+from 3 GiB at 10M live names; checkpoint RAM/disk from 700 MB, with fixed floors
+and watch/alias/dependency estimates. Deferred bulk work keeps the current
+planner and generation and becomes a complete backstop. Already admitted
+publication completes. Shared byte pacing covers bulk source reads and
+checkpoint writes, excluding query reads and small log commits. Sequential
+source advice is enabled; no-reuse is disabled and unmeasured. S1B records
+configuration, status and the required M7 reserve/cache measurements.
 
 M6's revised priority decision uses per-thread nice 19 only, via rustix's
 `process`/`thread` features. No idle I/O class or SCHED_IDLE is applied.

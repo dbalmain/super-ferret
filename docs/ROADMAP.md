@@ -1480,6 +1480,45 @@ with real mount --bind (available in this sandbox). No timing runs.
 Workspace gates: **690 passed / 6 ignored**, +13 passing tests over the
 **677/6** starting baseline. Final verification also runs from a clean commit.
 
+### S1b M6 — Controller, politeness and bulk admission (2026-10-06)
+
+The daemon samples CPU/I/O PSI, battery, memory and diagnostic load at one Hz.
+The real scheduler uses one worker for unknown desktop idle or missing CPU PSI,
+idle steps capped by configured concurrency, ten-second one-worker increases
+and immediate drops. Battery pause and I/O PSI over 10% gate new bulk work;
+intake continues to coalesce within M5a's bounds. All crawl index workers use
+per-thread nice 19, including a dedicated thread for single-worker indexing;
+query/socket/intake threads retain normal priority.
+
+Compaction and full rewalk/fallback admission stay under the one writer lock.
+Reserves scale linearly from 3 GiB full-build memory and 700 MB checkpoint
+RAM/disk at 10M live names, with small-catalog floors and sparse watch/alias/
+dependency estimates. Refusal returns typed deferred work, preserves the current
+planner/generation and retries a complete marker. D51 checkpoints do not wait
+for an empty arrival queue; an unchanged-sequence epoch retry does not advance
+freshness. Full rebuild adoption now makes names resident before rebuilding the
+engine planner.
+
+A shared default 32 MiB/s limiter paces actual bulk read/checkpoint write calls,
+with bounded chunks and no post-publication sleep. Query reads and small burst
+appends are excluded. Sequential source advice is applied; no-reuse is off and
+unmeasured. Status exposes signals, worker target, blocked/admission decisions,
+headroom and byte/wait counters. Private proc/sys fixtures use the production
+signal trait and parser; scheduler, fallback and seam tests use fake clocks.
+
+The revised priority decision omits idle I/O class and SCHED_IDLE: rustix lacks
+those wrappers. Nice 19 derives best-effort I/O level 7 on BFQ, but Dave's nine
+`none` devices ignore I/O priority, leaving pacing as the I/O protection.
+SCHED_IDLE's small CFS/EEVDF weight difference does not warrant an unsafe D11
+exception absent M7 evidence of foreground harm.
+
+Progress gates: **704 passed / 6 ignored**, +15 passing tests over 689/6;
+formatter and strict Clippy pass. Final gates follow the completed implementation.
+M7 must measure paced/unpaced full compaction, controller reaction between
+phases, foreground/query latency, queue freshness/drainage, pinned/faulted
+fallback peaks, reserve calibration and source page-cache effects. No timing
+run is part of M6.
+
 ### S1b M1 — Resident engine library (2026-10-05)
 
 Production **`c57be70`** implements the common resident engine in `ferret`.

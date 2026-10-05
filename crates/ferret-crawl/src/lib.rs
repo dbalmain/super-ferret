@@ -42,7 +42,8 @@ mod tests;
 pub fn lower_index_priority() -> std::io::Result<()> {
     rustix::process::setpriority_process(Some(rustix::thread::gettid()), 19).map_err(Into::into)
 }
-/// Additional checkpoint space available to this uid, excluding reserved blocks.
+/// Additional checkpoint space available to this uid, excluding reserved
+/// blocks.
 pub fn available_disk(path: &std::path::Path) -> std::io::Result<u64> {
     let stat = rustix::fs::statvfs(path)?;
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))

@@ -683,8 +683,13 @@ default admission ceilings. Planner counters accumulate selections and estimated
 candidates for the host lifetime; their build durations are microseconds.
 Waits and pending ages are monotonic. A complete-backstop wall timestamp requires
 no retained coverage faults; ordinary opaque observations remain covered.
-M6 owns pacing, battery/load and resource admission; due bursts currently start
-at the next serial writer boundary.
+M6 implements signal sampling, worker targets, bulk pause gates, headroom
+admission and byte pacing at the serial writer boundary. `controller` is null
+without a host; live status reports PSI/load as numbers or `"unavailable"`,
+battery as boolean or `"unavailable"`, idle classification, worker target,
+blocked reason, required/available headroom, last admission kind/result and
+rate-limit byte/wait counters. Sequential advice failures are diagnostic.
+No-reuse advice is disabled and unmeasured.
 
 ### Compaction, oversized fallback and politeness
 
@@ -718,7 +723,14 @@ automatic fallback inside crawl, not just before the original small burst. Use a
 configurable memory/disk reserve; provisionally require about **3 GiB available
 memory** for a 10M full-build attempt and **0.7 GB additional disk** for a
 checkpoint, then measure with watches and pins. These are admission heuristics,
-not allocation proofs. Under insufficient headroom, discard the unpublished
+not allocation proofs. M6 scales the full-build reserve linearly with live names
+from 3 GiB at 10M; checkpoint memory uses 700 MB at 10M. Both have a configurable
+64 MiB floor. Disk scales from 700 MB at 10M with a 16 MiB floor (or the smaller
+configured reserve). A conservative estimate of current watch, locator, alias,
+policy dependency and pending-queue bytes is added to memory, alongside an
+optional fixed additional reserve. Existing resident and query-pin memory is
+already reflected in MemAvailable. Watch estimates run only at bulk admission,
+so ordinary entry bursts do not scan the descriptor map. Under insufficient headroom, discard the unpublished
 attempt, keep the selected generation and enqueue a complete backstop with a
 memory-blocked status. A typed deferred-bulk outcome must restore a usable
 writer/current caches under its lock. Do not checkpoint scoped batches, drop
@@ -757,20 +769,26 @@ if M7 measures foreground harm that nice 19 plus pacing does not prevent. Gate n
 refreshes; the current crawl does not support mid-listing cancellation or an
 instantaneous worker-count change. Check between content files/bulk phases where
 safe, and measure controller reaction latency rather than claim it stops fsync.
-Optional systemd resource weights/MemoryHigh are additional whole-service
+Even a single crawl index worker runs on a dedicated thread, so nice 19 cannot
+leak into a calling query/intake thread. Generic visitor walks retain their
+single-worker caller execution. Optional systemd resource weights/MemoryHigh are additional whole-service
 protection; they also affect queries and intake, so default to normal CPU
 service weight and measure before imposing stronger limits. MemoryHigh is not a
 safe hard full-builder ceiling. Process-wide idle priority would violate the
 responsive watcher/query design. Use existing crawl-owned safe Linux calls; do
 not create an unsafe host wrapper to avoid a reviewed dependency.
 
-Rate-limit bulk read/write work with bounded per-second byte accounting,
-initially **32 MiB/s** and configurable, for noninteractive backstops. S1+'s
+M6 rate-limits bulk read/write work at **32 MiB/s**, configurable, for
+backstops, whole-root observations, fallback reads and checkpoint writes.
+One shared limiter serializes the bounded transfer seam across index workers;
+allowance starts at completion, so slow reads cannot finish together as multiple
+bursts. It waits before the next transfer, with a maximum 256 KiB read burst
+and 64 KiB write chunks. Checkpoint writes use a scoped, unwind-safe context on
+the index owner thread; query reads and small log appends never enter it. S1+'s
 unthrottled 629 MB checkpoint already needs roughly 19 s of transfer allowance
 at that rate; the idle-priority daemon pause may exceed 22 s. Record both
-unthrottled regression rows and deployed politeness rows. Implement the rate
-limiter at actual bulk I/O seams; an artificial sleep after publication does not
-protect the desktop. Query reads and small burst commits are excluded.
+unthrottled regression rows and deployed politeness rows. The limiter is at actual read/write calls; there is no sleep after publication.
+Query reads and small burst commits are excluded.
 
 The research's unconditional DONTNEED advice needs care: these pages may also
 belong to a foreground editor or verifier. Use sequential/streaming advice for
@@ -778,6 +796,17 @@ bulk source reads and evaluate no-reuse advice on the deployed kernel; measure
 foreground cache misses before evicting shared source pages. Do not evict the
 catalog/index the engine intentionally keeps resident. This is an advisory
 policy within scheduling, not a change to content carry or find semantics.
+
+M6 configuration uses environment keys: `FERRET_INDEX_WORKERS`,
+`FERRET_BATTERY_PAUSE` (0 disables), `FERRET_FULL_MEMORY_BYTES`,
+`FERRET_CHECKPOINT_MEMORY_BYTES`, `FERRET_MEMORY_FLOOR_BYTES`,
+`FERRET_ADDITIONAL_MEMORY_BYTES`, `FERRET_CHECKPOINT_DISK_BYTES`, and
+`FERRET_BULK_BYTES_PER_SECOND` (0 disables pacing). Signal mounts can be supplied
+through `FERRET_SIGNAL_PROC` and `FERRET_SIGNAL_POWER`; defaults are `/proc` and
+`/sys/class/power_supply`. Binary fixtures use private calm mounts through the
+same production reader, avoiding dependence on ambient host pressure. Trait
+injection and fake monotonic clocks exercise pressure changes and the actual
+scheduler/writer without wall-clock waits.
 
 ## CLI and find effects
 

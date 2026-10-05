@@ -42,6 +42,18 @@ impl<'a> Object<'a> {
         self
     }
 
+    /// A finite numeric signal, or null if the source supplied a nonfinite
+    /// value.
+    pub fn number(&mut self, key: &str, value: f64) -> &mut Self {
+        self.key(key);
+        if value.is_finite() {
+            self.out.extend_from_slice(value.to_string().as_bytes());
+        } else {
+            self.out.extend_from_slice(b"null");
+        }
+        self
+    }
+
     /// `"key":"text"`, plus `"key_base64":"…"` when `value` is not UTF-8;
     /// see the module doc.
     pub fn bytes(&mut self, key: &str, value: &[u8]) -> &mut Self {

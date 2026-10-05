@@ -112,7 +112,12 @@ impl Engine {
                 return Err(Error::Refresh(error));
             }
         };
-        self.select(report.view.clone());
+        if !matches!(
+            report.outcome,
+            ferret_crawl::RefreshOutcome::DeferredBulk(_)
+        ) {
+            self.select(report.view.clone());
+        }
         Ok(report)
     }
 

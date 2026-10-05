@@ -39,6 +39,8 @@ pub(super) struct Status {
     pub operation: Option<&'static str>,
     pub input_usage: ferret_catalog::InputUsage,
     pub error: Option<String>,
+    pub scheduler: Option<Arc<crate::scheduler::Scheduler>>,
+    pub blocked: Option<ferret_catalog::bulk::Blocked>,
     pub retained_roots: std::collections::BTreeSet<PathBuf>,
 }
 fn timestamp() -> u64 {
@@ -51,9 +53,29 @@ pub(super) fn start(
     host: Arc<Host>,
     receive: mpsc::Receiver<Message>,
 ) -> std::thread::JoinHandle<()> {
+    let scheduler = Arc::new(crate::scheduler::Scheduler::new(
+        crate::config::Controller::from_env(),
+        std::thread::available_parallelism().map_or(1, |n| n.get()),
+        host.index.clone(),
+        Box::new(crate::politeness::Linux::from_env()),
+        Arc::new(ferret_catalog::bulk::Monotonic::default()),
+    ));
+    host.writer_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .scheduler = Some(scheduler.clone());
+    let signal_host = host.clone();
+    let signals = scheduler.clone();
     std::thread::spawn(move || {
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serve(&host, receive)));
+        while !signal_host.stop.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_secs(1));
+            signals.sample();
+        }
+    });
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            serve(&host, receive, scheduler)
+        }));
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(error)) => error.to_string(),
@@ -76,7 +98,11 @@ pub(super) fn start(
         host.writer_running.store(false, Ordering::Release);
     })
 }
-fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
+fn serve(
+    host: &Arc<Host>,
+    receive: mpsc::Receiver<Message>,
+    scheduler: Arc<crate::scheduler::Scheduler>,
+) -> io::Result<()> {
     #[cfg(debug_assertions)]
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
     let session = WriterSession::open(&host.index).map_err(io::Error::other)?;
@@ -96,6 +122,7 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
         }
         Watch::new_blocking(config).ok().map(Arc::new)
     });
+    scheduler.watch(watch.clone());
     host.writer_status
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -111,9 +138,11 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
     if let Some(watch) = &watch {
         let watch = watch.clone();
         let send = host.writer_send.clone();
+        let intake_host = host.clone();
         std::thread::spawn(move || {
             watch.run_intake(|| {
                 let _ = send.try_send(Message::Intake);
+                !intake_host.stop.load(Ordering::Acquire)
             })
         });
     }
@@ -121,15 +150,19 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
         index: host.index.clone(),
         dirs: crate::xdg::Dirs::from_env().ok(),
     };
+    // Intake and sampler were spawned at normal priority; only this retained
+    // index owner and its subsequently created index workers are lowered.
+    ferret_crawl::lower_index_priority()?;
     let mut options = IndexOptions {
         watch: watch.clone(),
+        bulk: Some(scheduler.clone()),
         ..IndexOptions::default()
     };
     let hourly = duration("FERRET_BACKSTOP_MS", 60 * 60 * 1000).max(Duration::from_millis(1));
     let polling = duration("FERRET_POLL_MS", 5 * 60 * 1000).max(Duration::from_millis(1));
     let mut full_due = Instant::now() + hourly;
     let mut poll_due = Instant::now() + polling;
-    let mut retry_due = None;
+    let mut retry_due: Option<Duration> = None;
     let mut initial = watch.is_none();
     loop {
         if host.stop.load(Ordering::Acquire) {
@@ -138,14 +171,17 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
         let now = Instant::now();
         let mut deadline = full_due.min(poll_due);
         if let Some(retry) = retry_due {
-            deadline = deadline.min(retry);
+            deadline = deadline.min(now + retry.saturating_sub(scheduler.now()));
         }
-        if let Some(due) = watch.as_ref().and_then(|w| w.next_due()) {
+        if retry_due.is_none()
+            && let Some(due) = watch.as_ref().and_then(|w| w.next_due())
+        {
             deadline = deadline.min(due);
         }
         let message = receive.recv_timeout(deadline.saturating_duration_since(now));
         match message {
             Ok(Message::Command(command)) => {
+                options.workers = scheduler.status().workers;
                 host.writer_status
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -213,6 +249,15 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                         w.reconcile(engine.pin().catalog());
                     }
                 } else if let Err(error) = &result {
+                    if let ferret_crawl::IndexError::DeferredBulk(reason) = error {
+                        host.writer_status
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .blocked = Some(*reason);
+                        if let Some(w) = &watch {
+                            w.backstop(RefreshReason::Backstop);
+                        }
+                    }
                     if let Some(w) = &watch {
                         w.abort_policy_roots();
                     }
@@ -279,10 +324,18 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
             }
             poll_due = Instant::now() + polling;
         }
-        if retry_due.is_some_and(|retry| Instant::now() < retry) {
+        if retry_due.is_some_and(|retry| scheduler.now() < retry) {
             continue;
         }
-        let burst = watch.as_ref().and_then(|w| w.take());
+        options.workers = scheduler.status().workers;
+        let paused = scheduler.status().paused;
+        let burst = watch
+            .as_ref()
+            .and_then(|w| w.take_admitted(paused.is_none()));
+        if paused.is_some() && burst.is_none() {
+            retry_due = Some(scheduler.now() + Duration::from_secs(1));
+            continue;
+        }
         if burst.is_none() && !initial {
             continue;
         }
@@ -312,7 +365,37 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                 reason = request.reason;
                 engine.refresh(request, &options).map_err(io::Error::other)
             });
+        let deferred = result
+            .as_ref()
+            .ok()
+            .and_then(|report| match report.outcome {
+                ferret_crawl::RefreshOutcome::DeferredBulk(reason) => Some(reason),
+                _ => None,
+            });
+        let retry_current = result.as_ref().is_ok_and(|report| {
+            matches!(
+                report.outcome,
+                ferret_crawl::RefreshOutcome::RetryFromCurrent(_)
+            )
+        });
         match &result {
+            Ok(_) if retry_current => {
+                // A budget checkpoint may keep sequence unchanged. It did not
+                // observe the queued work; resolve the complete marker again.
+                initial = true;
+                retry_due = Some(scheduler.now());
+            }
+            Ok(_) if deferred.is_some() => {
+                host.writer_status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .blocked = deferred;
+                if let Some(w) = &watch {
+                    w.abort_policy_roots();
+                }
+                initial = true;
+                retry_due = Some(scheduler.now() + Duration::from_secs(1));
+            }
             Ok(report) => {
                 global_inputs(watch.as_ref(), &engine, &context);
                 let complete = burst
@@ -347,13 +430,16 @@ fn serve(host: &Arc<Host>, receive: mpsc::Receiver<Message>) -> io::Result<()> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .error = Some(error.to_string());
-                retry_due = Some(Instant::now() + Duration::from_secs(1));
+                retry_due = Some(scheduler.now() + Duration::from_secs(1));
             }
         }
         if let Some(burst) = burst
             && let Some(watch) = &watch
         {
-            watch.finish(burst, result.is_ok());
+            watch.finish(
+                burst,
+                result.is_ok() && deferred.is_none() && !retry_current,
+            );
         }
         host.writer_status
             .lock()
@@ -387,6 +473,7 @@ fn successful(host: &Host, report: &ferret_crawl::Report, backstop: bool) {
     }
     status.fault_retained = !report.coverage_faults.is_empty();
     status.error = None;
+    status.blocked = None;
 }
 pub(super) fn busy(host: &Host) -> bool {
     host.writer_running.load(Ordering::Acquire)
@@ -536,9 +623,81 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
         )
         .bool("writer_busy", host.writer_running.load(Ordering::Acquire))
         .bool("fault_retained", s.fault_retained);
+    if let Some(scheduler) = &s.scheduler {
+        let c = scheduler.status();
+        o.object("controller", |o| {
+            for (key, value) in [
+                ("cpu_psi_some_avg10", c.sample.cpu),
+                ("io_psi_some_avg10", c.sample.io),
+                ("load", c.sample.load),
+            ] {
+                if let Some(value) = value {
+                    o.number(key, value);
+                } else {
+                    o.str(key, "unavailable");
+                }
+            }
+            if let Some(battery) = c.sample.battery {
+                o.bool("on_battery", battery);
+            } else {
+                o.str("on_battery", "unavailable");
+            }
+            match c.sample.idle {
+                crate::politeness::Idle::Unknown => {
+                    o.str("idle", "unknown");
+                }
+                crate::politeness::Idle::Headless => {
+                    o.str("idle", "headless");
+                }
+                crate::politeness::Idle::Desktop(duration) => {
+                    o.int("idle_seconds", duration.as_secs());
+                }
+            }
+            o.int("worker_target", c.workers as u64)
+                .opt_int("available_memory_bytes", c.sample.memory)
+                .opt_int("available_disk_bytes", c.available_disk)
+                .int("required_memory_bytes", c.required_memory)
+                .int("required_disk_bytes", c.required_disk)
+                .str("priority", "per-thread nice 19")
+                .bool("no_reuse_advice", false);
+            if let Some(reason) = c.paused.or(s.blocked) {
+                o.str("blocked_reason", reason.status());
+            } else {
+                o.null("blocked_reason");
+            }
+            if let Some((kind, result)) = c.admission {
+                o.str(
+                    "admission_kind",
+                    match kind {
+                        ferret_catalog::bulk::Kind::Checkpoint => "checkpoint",
+                        ferret_catalog::bulk::Kind::FullRewalk => "full-rewalk",
+                    },
+                );
+                o.str(
+                    "admission",
+                    result.err().map_or("admitted", |reason| reason.status()),
+                );
+            } else {
+                o.null("admission_kind").null("admission");
+            }
+            let rate = scheduler.rate_status();
+            o.object("rate_limit", |o| {
+                o.int("bytes_per_second", rate.bytes_per_second)
+                    .int("reserved_bytes", rate.reserved_bytes)
+                    .int("waits", rate.waits)
+                    .int("waiting", rate.waiting)
+                    .int("sequential_advice_failures", rate.advice_failures);
+            });
+        });
+    } else {
+        o.null("controller");
+    }
     if let Some(error) = &s.error {
         o.str("refresh_error", error);
     } else {
         o.null("refresh_error");
     }
 }
+
+#[cfg(test)]
+mod tests;

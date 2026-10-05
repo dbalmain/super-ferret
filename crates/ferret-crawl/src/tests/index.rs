@@ -1532,3 +1532,44 @@ fn effective_content_faults_use_live_names_and_graph_roots() {
         assert!(actual.iter().all(|(_, f)| matches!(f, ContentFault::Alias)));
     }
 }
+
+#[test]
+fn index_workers_lower_their_own_nice_without_lowering_query_threads() {
+    fn priority() -> (i32, u32) {
+        let tid = rustix::thread::gettid().as_raw_nonzero().get();
+        let stat = fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap();
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        (fields[16].parse().unwrap(), fields[38].parse().unwrap())
+    }
+    let query = std::thread::spawn(priority).join().unwrap();
+    let tmp = Tmp::new("worker-nice");
+    tmp.write("a.txt", b"alpha");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let _hook = Hook::set(&tmp.tree(), move |probe| {
+        if matches!(probe, Probe::Hashed(_)) {
+            recorded.lock().unwrap().push(priority());
+        }
+    });
+    let options = IndexOptions {
+        workers: 2,
+        ..IndexOptions::default()
+    };
+    index(&tmp.cat(), &[tmp.tree()], Refresh::All, &options).unwrap();
+    let worker = seen.lock().unwrap();
+    assert!(!worker.is_empty());
+    for &(nice, policy) in worker.iter() {
+        assert_eq!(nice, 19);
+        assert_ne!(nice, query.0);
+        assert_eq!(
+            policy, query.1,
+            "the revised M6 decision leaves the scheduling policy unchanged"
+        );
+    }
+    assert_eq!(priority(), query, "caller/query priority must not change");
+}
