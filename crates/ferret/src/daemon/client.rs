@@ -329,6 +329,25 @@ fn query(
     let index = fs::canonicalize(index).ok()?;
     let endpoint = Endpoint::open(&index).ok()?;
     let writer = matches!(op, "index" | "roots-remove");
+    // Build and validate before connecting: a request the protocol rejects
+    // (an argv past its line or element limit) answers in-process, and must
+    // neither reach a daemon nor start one.
+    let cwd = std::env::current_dir().ok()?;
+    let mut request = Vec::new();
+    let mut object = Object::new(&mut request);
+    object
+        .str("id", op)
+        .str("op", op)
+        .byte_strings("args", args.iter().map(|s| s.as_bytes()))
+        .opt_int("limit", limit)
+        .int(
+            "start_unix_ns",
+            now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos() as u64,
+        )
+        .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
+    object.end();
+    protocol::parse_request(&request).ok()?;
+    request.push(b'\n');
     let mut reader = match connect(&endpoint, &index, matches!(op, "search" | "find"), writer) {
         Ok(reader) => reader,
         Err(ConnectError::NoOwner(_)) => return None,
@@ -344,25 +363,6 @@ fn query(
     let mut output_failure = false;
     let mut first_frame = true;
     let result = (|| -> io::Result<Exit> {
-        let cwd = std::env::current_dir()?;
-        let mut request = Vec::new();
-        let mut object = Object::new(&mut request);
-        object
-            .str("id", op)
-            .str("op", op)
-            .byte_strings("args", args.iter().map(|s| s.as_bytes()))
-            .opt_int("limit", limit)
-            .int(
-                "start_unix_ns",
-                now.duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(io::Error::other)?
-                    .as_nanos() as u64,
-            )
-            .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
-        object.end();
-        protocol::parse_request(&request)
-            .map_err(|error| io::Error::other(error.kind.to_string()))?;
-        request.push(b'\n');
         reader.get_mut().write_all(&request)?;
         let mut line = Vec::new();
         let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());

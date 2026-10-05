@@ -1318,3 +1318,31 @@ fn drain_closes_a_separate_idle_connection_and_finishes_active_query() {
     }
     wait(|| !socket.exists() && exited(&tree, pid));
 }
+
+#[test]
+fn oversized_read_only_requests_answer_locally_without_reaching_or_starting_a_daemon() {
+    // A request the protocol rejects, past its argv element or line limit,
+    // used to become a transport failure on a ready daemon's connection.
+    let tree = Tree::new();
+    let search: Vec<&str> = std::iter::once("search")
+        .chain(std::iter::repeat_n("main", 16_385))
+        .collect();
+    let pattern = "x".repeat(120_000);
+    let mut find = vec!["find", "src", "-name", "main.rs"];
+    for _ in 0..9 {
+        find.extend(["-o", "-name", pattern.as_str()]);
+    }
+    assert!(tree.local(&search).status.success());
+    // With no owner, nothing starts a daemon for a request it cannot send.
+    parity(&tree, &search);
+    assert!(tree.sockets().is_empty(), "{:?}", tree.sockets());
+    tree.start(&[]);
+    for args in [&search, &find] {
+        parity(&tree, args);
+    }
+    let log = fs::read_to_string(tree.base.join("home/state/ferret/log.jsonl")).unwrap();
+    assert!(
+        !log.contains("\"host\":\"socket\""),
+        "an oversized search reached the daemon: {log}"
+    );
+}
