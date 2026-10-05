@@ -10,6 +10,7 @@ repository = "https://github.com/dbalmain/super-ferret"
 publish = false
 
 [workspace.dependencies]
+intpack = { path = "../intpack" }
 ferret-catalog = { path = "crates/ferret-catalog" }
 ferret-crawl = { path = "crates/ferret-crawl" }
 ferret-index = { path = "crates/ferret-index" }

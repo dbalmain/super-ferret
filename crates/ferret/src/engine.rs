@@ -30,7 +30,7 @@ impl Engine {
         let Some(catalog) = Catalog::open(index)? else {
             return Ok(None);
         };
-        catalog.load_all()?;
+        let catalog = catalog.into_resident()?;
         Ok(Some(Self {
             current: RwLock::new(catalog),
             writer: Mutex::new(None),

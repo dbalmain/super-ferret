@@ -434,7 +434,7 @@ impl Writer {
             let mut manifest = pinned.manifest.clone();
             let mut budget = crate::budget::Budget::open(&pinned).map_err(Error::Previous)?;
             let current = pinned.into_catalog();
-            current.load_all().map_err(Error::Previous)?;
+            let current = current.into_resident().map_err(Error::Previous)?;
             current.name_references();
             let path = dir.join(format!("changes.{}", manifest.generation.checkpoint));
             if manifest.log_end == 0 {
@@ -527,7 +527,7 @@ impl Writer {
             .open(self.dir.join(format!("changes.{}", generation.checkpoint)))
             .map_err(Error::Undurable)?;
         self.manifest = manifest;
-        self.current = current;
+        self.current = current.into_resident().map_err(Error::Previous)?;
         self.budget =
             crate::budget::Budget::empty(self.current.inode_count(), self.current.name_count());
         self.poisoned = false;
@@ -701,7 +701,7 @@ impl Writer {
         publication::sync(&self.log, Point::LogSync).map_err(Error::Io)?;
         publish_manifest(&self.dir, &next)?;
         self.manifest = next;
-        self.current = current;
+        self.current = current.into_resident().map_err(Error::Previous)?;
         self.budget = budget;
         self.poisoned = false;
         Ok(self.manifest.generation)

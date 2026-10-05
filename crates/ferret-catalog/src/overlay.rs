@@ -85,6 +85,7 @@ impl Projection {
     }
 }
 /// A view owns its prefix, or shares a predecessor and one checked transaction.
+#[derive(Clone)]
 pub(crate) struct Overlay {
     pub(crate) manifest: Manifest,
     pub(crate) base: Catalog,

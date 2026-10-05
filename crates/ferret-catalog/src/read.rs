@@ -243,13 +243,18 @@ pub struct Catalog {
 }
 
 enum Source {
+    Resident {
+        names: crate::ResidentNames,
+        sections: Box<[Arc<[u8]>; SECTIONS.len()]>,
+        read: u64,
+    },
     /// A whole file in memory, every section validated
     /// ([`Catalog::from_bytes`]).
     Whole(Vec<u8>),
     /// An open file whose sections load on demand.
     File {
         file: File,
-        sections: Box<[OnceLock<Box<[u8]>>; SECTIONS.len()]>,
+        sections: Box<[OnceLock<Arc<[u8]>>; SECTIONS.len()]>,
         /// Bytes read from the file so far, header and table included.
         read: AtomicU64,
         /// What the checks of loaded sections found, for later checks.
@@ -329,6 +334,76 @@ impl Catalog {
         }
         self
     }
+    /// Converts a fully checked generation to interned names, releasing its raw
+    /// heap and offset column. Same-epoch successors share this source.
+    /// Existing pins retain their own representation; no borrowed section
+    /// is invalidated.
+    pub fn into_resident(mut self) -> Result<Self, OpenError> {
+        self.load_all()?;
+        if self.resident_names().is_some() {
+            return Ok(self);
+        }
+        let mut base = self.clone();
+        base.overlay = None;
+        let names = crate::ResidentNames::build(base.name_reader(), self.base_name_count());
+        let sections = Box::new(std::array::from_fn(|i| {
+            let section = SECTIONS[i];
+            if section == Section::NameHeap {
+                return Arc::from([]);
+            }
+            if section == Section::Names {
+                let end = self.layout.columns[Column::NameOffset as usize].start;
+                return Arc::from(&self.section(section)[..end]);
+            }
+            match self.source.as_ref() {
+                Source::File { sections, .. } => sections[i]
+                    .get()
+                    .unwrap_or_else(|| unreachable!("checked section"))
+                    .clone(),
+                _ => Arc::from(self.section(section)),
+            }
+        }));
+        let read = match self.source.as_ref() {
+            Source::Whole(bytes) => bytes.len() as u64,
+            Source::File { read, .. } => read.load(Ordering::Relaxed),
+            Source::Resident { read, .. } => *read,
+        };
+        self.source = Arc::new(Source::Resident {
+            names,
+            sections,
+            read,
+        });
+        if let Some(overlay) = &mut self.overlay {
+            let overlay = Arc::make_mut(overlay);
+            overlay.base.source = self.source.clone();
+        }
+        Ok(self)
+    }
+
+    /// The checked immutable checkpoint, excluding the selected log overlay.
+    /// Used only to construct epoch-local derived indexes, never as the query's
+    /// effective view. Its generation has the checkpoint's original sequence.
+    pub fn checkpoint_base(&self) -> Self {
+        let mut base = self.clone();
+        base.overlay = None;
+        base
+    }
+
+    /// The immutable epoch base; sparse effective names are in `delta_names`.
+    pub fn resident_names(&self) -> Option<&crate::ResidentNames> {
+        match self.source.as_ref() {
+            Source::Resident { names, .. } => Some(names),
+            _ => None,
+        }
+    }
+
+    /// Base edges overwritten or removed by the selected generation.
+    pub fn suppressed_base_names(&self) -> impl Iterator<Item = NameId> + '_ {
+        self.overlay
+            .iter()
+            .flat_map(|overlay| overlay.namespace().suppressed.iter().copied().map(NameId))
+    }
+
     /// Applies one checked same-epoch transaction without copying base buffers.
     /// A mismatched generation is rejected before any supplied id is read.
     pub fn advance(
@@ -680,7 +755,7 @@ impl Catalog {
         })
         .map_err(OpenError::Decode)?;
         // A racing loader may have set it first; its bytes are the same.
-        let _ = slot.set(bytes);
+        let _ = slot.set(bytes.into());
         Ok(())
     }
 
@@ -688,7 +763,7 @@ impl Catalog {
     /// has every section.
     pub fn is_loaded(&self, section: Section) -> bool {
         let base = match self.source.as_ref() {
-            Source::Whole(_) => true,
+            Source::Whole(_) | Source::Resident { .. } => true,
             Source::File { sections, .. } => sections[section as usize].get().is_some(),
         };
         base && self.overlay.as_ref().is_none_or(|o| o.loaded(section))
@@ -699,6 +774,7 @@ impl Catalog {
     pub fn bytes_read(&self) -> u64 {
         let base = match self.source.as_ref() {
             Source::Whole(bytes) => bytes.len() as u64,
+            Source::Resident { read, .. } => *read,
             Source::File { read, .. } => read.load(Ordering::Relaxed),
         };
         base + self.overlay.as_ref().map_or(0, |o| o.bytes_read())
@@ -715,6 +791,7 @@ impl Catalog {
     fn section(&self, section: Section) -> &[u8] {
         match self.source.as_ref() {
             Source::Whole(bytes) => self.layout.section(bytes, section),
+            Source::Resident { sections, .. } => &sections[section as usize],
             Source::File { sections, .. } => sections[section as usize]
                 .get()
                 .unwrap_or_else(|| panic!("catalog section {section:?} read before it was loaded")),
@@ -801,7 +878,10 @@ impl Catalog {
     /// inside a name, so a literal match cannot straddle two;
     /// [`Catalog::name_at`] maps a match's offset back to its name.
     pub fn name_heap(&self) -> &[u8] {
-        self.section(Section::NameHeap)
+        self.resident_names().map_or_else(
+            || self.section(Section::NameHeap),
+            |names| names.legacy_heap(),
+        )
     }
 
     /// Every name with its id, in heap order. Needs [`Section::Names`].
@@ -816,8 +896,16 @@ impl Catalog {
     pub fn name_reader(&self) -> NameReader<'_> {
         let rows = self.section(Section::Names);
         NameReader {
-            heap: self.name_heap(),
-            offsets: self.layout.blocked(Column::NameOffset, rows),
+            heap: if self.resident_names().is_some() {
+                &[]
+            } else {
+                self.name_heap()
+            },
+            resident: self.resident_names(),
+            offsets: self
+                .resident_names()
+                .is_none()
+                .then(|| self.layout.blocked(Column::NameOffset, rows)),
             parents: self.layout.blocked(Column::NameParent, rows),
             children: self.layout.blocked(Column::NameChild, rows),
             count: self.layout.names,
@@ -844,7 +932,10 @@ impl Catalog {
     /// [`Section::Names`]; the bytes run to the next name's start, less its
     /// NUL.
     pub fn name_start(&self, id: NameId) -> usize {
-        self.blocked(Column::NameOffset).get(id.0 as usize) as usize
+        self.resident_names().map_or_else(
+            || self.blocked(Column::NameOffset).get(id.0 as usize) as usize,
+            |names| names.legacy_start(id),
+        )
     }
 
     /// The raw child column, without reading name bytes. Ignored rows carry
@@ -857,6 +948,9 @@ impl Catalog {
     /// The name whose bytes (or terminator) hold heap offset `offset`, or
     /// `None` past the end of the heap. Needs [`Section::Names`].
     pub fn name_at(&self, offset: usize) -> Option<NameId> {
+        if let Some(names) = self.resident_names() {
+            return names.legacy_at(offset);
+        }
         if offset >= self.name_heap().len() {
             return None;
         }
@@ -1523,7 +1617,8 @@ impl Catalog {
 #[derive(Clone, Copy)]
 pub struct NameReader<'c> {
     heap: &'c [u8],
-    offsets: Blocked<'c>,
+    offsets: Option<Blocked<'c>>,
+    resident: Option<&'c crate::ResidentNames>,
     parents: Blocked<'c>,
     children: Blocked<'c>,
     count: usize,
@@ -1555,15 +1650,19 @@ impl<'c> NameReader<'c> {
             return (n.parent, n.bytes);
         }
         let i = id.0 as usize;
+        if let Some(names) = self.resident {
+            return (InoId(self.parents.get(i) as u32), names.name(id));
+        }
+        let offsets = self.offsets.unwrap_or_else(|| unreachable!("raw offsets"));
         // A name runs to the next one's start, less its NUL: decoding checked
         // that the spans tile the heap. One decode is cheaper than a search.
         let end = match i + 1 < self.count {
-            true => self.offsets.get(i + 1) as usize,
+            true => offsets.get(i + 1) as usize,
             false => self.heap.len(),
         };
         (
             InoId(self.parents.get(i) as u32),
-            &self.heap[self.offsets.get(i) as usize..end - 1],
+            &self.heap[offsets.get(i) as usize..end - 1],
         )
     }
 
@@ -1646,11 +1745,11 @@ impl NameRuns<'_> {
         let first = self.next / NAME_RUN * NAME_RUN;
         let len = NAME_RUN.min(names.count - first);
         let more = first + len < names.count;
-        names
-            .offsets
-            .decode(first, &mut self.offsets[..len + usize::from(more)]);
-        if !more {
-            self.offsets[len] = names.heap.len() as u64;
+        if let Some(offsets) = names.offsets {
+            offsets.decode(first, &mut self.offsets[..len + usize::from(more)]);
+            if !more {
+                self.offsets[len] = names.heap.len() as u64;
+            }
         }
         names.parents.decode(first, &mut self.parents[..len]);
         names.children.decode(first, &mut self.children[..len]);
@@ -1693,7 +1792,10 @@ impl<'c> Iterator for NameRuns<'c> {
             Name {
                 parent: InoId(self.parents[j] as u32),
                 child: InoId(self.children[j] as u32),
-                bytes: &self.names.heap[start..end - 1],
+                bytes: self.names.resident.map_or_else(
+                    || &self.names.heap[start..end - 1],
+                    |names| names.name(NameId(i as u32)),
+                ),
             },
         ))
     }
