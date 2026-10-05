@@ -4,8 +4,9 @@
 //! Hand-written per D58 B: the wire format is JSON lines (D57 A), but the
 //! `ferret` crate parses only its own small request schema, never a general
 //! `serde_json::Value`. [`json`](crate::json) is the matching writer; a
-//! byte-valued field here is the inverse of [`json::Object::bytes`]: a UTF-8
-//! string, or `{"base64":"..."}` with the exact bytes.
+//! byte-valued field here is the inverse of
+//! [`json::Object::byte_strings`]'s per-item encoding: a UTF-8 string, or
+//! `{"base64":"..."}` with the exact bytes.
 //!
 //! This reader takes untrusted input (other tools may eventually talk to the
 //! daemon over this same codec), so [`parse_request`] never panics and never
@@ -14,8 +15,6 @@
 //! `#[allow(dead_code)]` on the module: M2b (the batch host) adds the first
 //! caller. This slice is the reader alone, with its own tests.
 #![allow(dead_code)]
-
-use crate::json;
 
 /// Maximum length of one input line, in bytes, encoded form (S1B's batch
 /// protocol limit).
@@ -144,7 +143,10 @@ pub(crate) fn parse_request(line: &[u8]) -> Result<Request, RequestError> {
         });
     }
 
-    let mut parser = Parser { input: line, pos: 0 };
+    let mut parser = Parser {
+        input: line,
+        pos: 0,
+    };
     parser.skip_ws();
     let value = parser
         .parse_value(1)
@@ -183,10 +185,7 @@ pub(crate) fn parse_request(line: &[u8]) -> Result<Request, RequestError> {
     build_request(&fields, id.clone()).map_err(|kind| RequestError { id: Some(id), kind })
 }
 
-fn build_request(
-    fields: &[(String, Value)],
-    id: String,
-) -> Result<Request, RequestErrorKind> {
+fn build_request(fields: &[(String, Value)], id: String) -> Result<Request, RequestErrorKind> {
     let op = match find_field(fields, "op") {
         Some(Value::Str(s)) => Op::from_name(s).ok_or(RequestErrorKind::UnknownOp)?,
         Some(_) => return Err(RequestErrorKind::InvalidField("op")),
@@ -208,18 +207,27 @@ fn build_request(
         None => return Err(RequestErrorKind::MissingField("args")),
     };
 
+    // An explicit JSON `null` is the same as the field being absent — that
+    // is what `json.rs`'s `opt_bytes`/`opt_int` write for `None`, and the
+    // round-trip property relies on it.
     let cwd = match find_field(fields, "cwd") {
+        Some(Value::Null) | None => None,
         Some(v) => Some(byte_value(v).ok_or(RequestErrorKind::InvalidField("cwd"))?),
-        None => None,
     };
 
     let limit = match find_field(fields, "limit") {
+        Some(Value::Null) | None => None,
         Some(Value::Num(n)) => Some(n.as_u64().ok_or(RequestErrorKind::InvalidField("limit"))?),
         Some(_) => return Err(RequestErrorKind::InvalidField("limit")),
-        None => None,
     };
 
-    Ok(Request { id, op, args, cwd, limit })
+    Ok(Request {
+        id,
+        op,
+        args,
+        cwd,
+        limit,
+    })
 }
 
 fn find_field<'a>(fields: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
@@ -474,9 +482,8 @@ impl<'a> Parser<'a> {
                 if !(0xDC00..=0xDFFF).contains(&low) {
                     return Err(RequestErrorKind::InvalidJson);
                 }
-                let combined = 0x10000u32
-                    + (u32::from(cp - 0xD800) << 10)
-                    + u32::from(low - 0xDC00);
+                let combined =
+                    0x10000u32 + (u32::from(cp - 0xD800) << 10) + u32::from(low - 0xDC00);
                 char::from_u32(combined).ok_or(RequestErrorKind::InvalidJson)
             } else {
                 Err(RequestErrorKind::InvalidJson)
@@ -518,8 +525,13 @@ impl<'a> Parser<'a> {
             }
             _ => return Err(RequestErrorKind::InvalidJson),
         }
-        let integer =
-            String::from_utf8(self.input[int_start..self.pos].to_vec()).expect("ASCII digits");
+        // All bytes in this range are ASCII digits by construction above, so
+        // a byte-by-byte cast to `char` is exact and needs no fallible
+        // UTF-8 decode.
+        let integer: String = self.input[int_start..self.pos]
+            .iter()
+            .map(|&b| b as char)
+            .collect();
 
         let mut has_frac_or_exp = false;
         if self.peek() == Some(b'.') {
@@ -545,7 +557,11 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
             }
         }
-        Ok(Num { negative, integer, has_frac_or_exp })
+        Ok(Num {
+            negative,
+            integer,
+            has_frac_or_exp,
+        })
     }
 }
 
@@ -570,10 +586,10 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<(char, usize)> {
     Some((ch, len))
 }
 
-/// Decodes standard, padded base64 (RFC 4648 § 4) — the inverse of
-/// [`json::base64`]... but that encoder is private, so this is written
-/// independently against the same RFC, not derived from it. Rejects bad
-/// padding and non-alphabet bytes rather than guessing.
+/// Decodes standard, padded base64 (RFC 4648 § 4), matching what
+/// [`json`](crate::json) encodes (its encoder is private to that module, so
+/// this is written independently against the RFC, not derived from it).
+/// Rejects bad padding and non-alphabet bytes rather than guessing.
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(4) {
@@ -654,16 +670,21 @@ mod tests {
         let r = ok(br#"{"id":"a","op":"search","args":[]}"#);
         assert_eq!(
             r,
-            Request { id: "a".into(), op: Op::Search, args: vec![], cwd: None, limit: None }
+            Request {
+                id: "a".into(),
+                op: Op::Search,
+                args: vec![],
+                cwd: None,
+                limit: None
+            }
         );
     }
 
     #[test]
     fn every_escape_decodes() {
-        let line =
-            br#"{"id":"a","op":"search","args":["\"\\\/\b\f\n\r\t\u0041"]}"#;
+        let line = br#"{"id":"a","op":"search","args":["\"\\\/\b\f\n\r\t\u0041"]}"#;
         let r = ok(line);
-        assert_eq!(r.args, vec![b"\"\\/\x08\x0c\n\r\t A".to_vec()]);
+        assert_eq!(r.args, vec![b"\"\\/\x08\x0c\n\r\tA".to_vec()]);
     }
 
     #[test]
@@ -679,13 +700,13 @@ mod tests {
         // The discriminating case: a plausible-but-wrong reader accepts this
         // and emits U+FFFD. Ours must reject it outright.
         let line = br#"{"id":"a","op":"search","args":["\ud800"]}"#;
-        assert_eq!(err_kind(line), RequestErrorKind::InvalidField("args"));
+        assert_eq!(err_kind(line), RequestErrorKind::InvalidJson);
     }
 
     #[test]
     fn lone_low_surrogate_is_rejected() {
         let line = br#"{"id":"a","op":"search","args":["\udc00"]}"#;
-        assert_eq!(err_kind(line), RequestErrorKind::InvalidField("args"));
+        assert_eq!(err_kind(line), RequestErrorKind::InvalidJson);
     }
 
     #[test]
@@ -775,9 +796,12 @@ mod tests {
 
     #[test]
     fn argv_one_over_the_bound_is_rejected() {
-        let args = "\"x\",".repeat(MAX_ARGV_ELEMENTS);
+        let args = "\"x\",".repeat(MAX_ARGV_ELEMENTS) + "\"x\"";
         let line = format!(r#"{{"id":"a","op":"search","args":[{args}]}}"#);
-        assert_eq!(err_kind(line.as_bytes()), RequestErrorKind::InvalidField("args"));
+        assert_eq!(
+            err_kind(line.as_bytes()),
+            RequestErrorKind::InvalidField("args")
+        );
     }
 
     /// Builds `{"id":"a","op":"search","args":[],"extra":<nested arrays
@@ -803,7 +827,10 @@ mod tests {
 
     #[test]
     fn nesting_one_level_deeper_is_rejected() {
-        assert_eq!(err_kind(&nested_extra(MAX_NESTING_DEPTH)), RequestErrorKind::NestingTooDeep);
+        assert_eq!(
+            err_kind(&nested_extra(MAX_NESTING_DEPTH)),
+            RequestErrorKind::NestingTooDeep
+        );
     }
 
     #[test]
@@ -821,7 +848,8 @@ mod tests {
 
     #[test]
     fn whitespace_everywhere_legal_is_accepted() {
-        let line = b"  \t\n{ \"id\" : \"a\" ,\n\"op\"\t:\"search\",\"args\"  :[  \"x\" ,  \"y\"  ]  }  \n";
+        let line =
+            b"  \t\n{ \"id\" : \"a\" ,\n\"op\"\t:\"search\",\"args\"  :[  \"x\" ,  \"y\"  ]  }  \n";
         let r = ok(line);
         assert_eq!(r.args, vec![b"x".to_vec(), b"y".to_vec()]);
     }
@@ -907,7 +935,7 @@ mod tests {
     /// writer side of the same schema the parser reads.
     fn encode(req: &Request) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut obj = json::Object::new(&mut out);
+        let mut obj = crate::json::Object::new(&mut out);
         obj.str("id", &req.id);
         obj.str(
             "op",
@@ -919,7 +947,7 @@ mod tests {
             },
         );
         obj.byte_strings("args", req.args.iter().map(|a| a.as_slice()));
-        obj.opt_bytes("cwd", req.cwd.as_deref());
+        obj.opt_byte_value("cwd", req.cwd.as_deref());
         obj.opt_int("limit", req.limit.map(|l| l as i128));
         obj.end();
         out
@@ -970,22 +998,20 @@ mod tests {
     }
 
     fn mutation_fuzz(iterations: u64) {
-        let mut rng = Rng(0x0ddba11_cafe_f00d);
+        let mut rng = Rng(0x0dba_11ca_fef0_0d42);
         for i in 0..iterations {
             let mut req_rng = Rng(0x5eed ^ i);
             let base = encode(&req_rng.request());
             let mutated = mutate(&mut rng, &base);
-            match parse_request(&mutated) {
-                Ok(req) => {
-                    // An accepted mutation must re-encode to a request that
-                    // parses equal: no mutation may be accepted into
-                    // something the writer itself couldn't produce.
-                    let re_encoded = encode(&req);
-                    let reparsed = parse_request(&re_encoded)
-                        .expect("re-encoding an accepted request must parse");
-                    assert_eq!(reparsed, req);
-                }
-                Err(_) => {} // rejection is always fine; only a panic is a bug
+            // Rejection is always fine; only a panic is a bug. An accepted
+            // mutation must re-encode to a request that parses equal: no
+            // mutation may be accepted into something the writer itself
+            // couldn't produce.
+            if let Ok(req) = parse_request(&mutated) {
+                let re_encoded = encode(&req);
+                let reparsed =
+                    parse_request(&re_encoded).expect("re-encoding an accepted request must parse");
+                assert_eq!(reparsed, req);
             }
         }
     }

@@ -82,16 +82,25 @@ impl<'a> Object<'a> {
         self
     }
 
-    /// `"key":null`, or as by [`Object::bytes`].
-    pub fn opt_bytes(&mut self, key: &str, value: Option<&[u8]>) -> &mut Self {
+    /// `"key":null`, `"key":"text"`, or `"key":{"base64":"..."}` — the
+    /// scalar counterpart of [`Object::byte_strings`]'s per-item encoding,
+    /// used by the batch protocol's optional byte-valued fields (`cwd`; see
+    /// `protocol.rs`). Not [`Object::bytes`]'s two-key output convention,
+    /// which a scalar protocol field doesn't use.
+    pub fn opt_byte_value(&mut self, key: &str, value: Option<&[u8]>) -> &mut Self {
+        self.key(key);
         match value {
-            Some(v) => self.bytes(key, v),
-            None => {
-                self.key(key);
-                self.out.extend_from_slice(b"null");
-                self
-            }
+            None => self.out.extend_from_slice(b"null"),
+            Some(v) => match std::str::from_utf8(v) {
+                Ok(text) => string(self.out, text),
+                Err(_) => {
+                    self.out.extend_from_slice(b"{\"base64\":\"");
+                    base64(self.out, v);
+                    self.out.extend_from_slice(b"\"}");
+                }
+            },
         }
+        self
     }
 
     /// `"key":N`.

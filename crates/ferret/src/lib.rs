@@ -12,8 +12,8 @@
 //!   path or an id, but query text is logged as typed and may contain a path.
 //! - [`xdg`] resolves directories from the environment and touches no files;
 //!   [`setup`] writes the files a new install starts with.
-//! - [`protocol`]: the batch request reader (S1B's batch protocol). No
-//!   caller yet; M2b adds the batch host.
+//! - [`protocol`]: the batch request reader (S1B's batch protocol). No caller
+//!   yet; M2b adds the batch host.
 //!
 //! **Paths that are not UTF-8.** Human output writes a path's raw bytes. In
 //! JSON lines, `path` is always a string: the path's text, with each invalid
