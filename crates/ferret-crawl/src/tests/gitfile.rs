@@ -272,6 +272,22 @@ fn a_symlinked_exclude_applies_with_both_git_layouts() {
     }
 }
 
+#[test]
+fn core_excludes_file_in_git_config_does_not_exclude_entries() {
+    let tree = Tree::new("core-excludes-file-ignored");
+    let repo = tree.join("repo");
+    write(
+        &repo.join(".git/config"),
+        "[core]\nexcludesFile = ../rules\n",
+    );
+    write(&tree.join("rules"), "secret.txt\n");
+    write(&repo.join("secret.txt"), "visible to ferret\n");
+
+    let walk = walked(&repo, None, Config::default());
+    assert!(walk.io.is_empty(), "{:?}", walk.io);
+    assert_eq!(decision(&walk, "secret.txt"), Decision::Index);
+}
+
 /// A `gitdir:` path is followed as git follows it, symlinks included: the
 /// gitdir's text can already name any directory, so refusing a symlink as
 /// its last component protects nothing and breaks a working layout.

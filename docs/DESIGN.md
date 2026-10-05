@@ -299,8 +299,7 @@ ancestor within the configured root; `.gitignore` and `.git/info/exclude` inside
 a work tree that starts at or below the configured root (a `.git` file
 contributes exclude from its gitdir, or from that gitdir's `commondir` when it
 has one; a symlinked `.git` contributes none, and a symlinked `.gitignore` is
-disregarded, as git does); `core.excludesFile` from git config, below
-`info/exclude`; the user's global ignore file
+disregarded, as git does); the user's global ignore file
 (`$XDG_CONFIG_HOME/ferret/ignore`), which setup seeds once with the defaults
 (`node_modules/`, `target/`, `.venv/`, …) and which is the user's to edit from
 then on. A size cap and a binary check sit beside the patterns. `!pat` in a
@@ -316,7 +315,7 @@ allocate a joined path per entry. Re-inclusion pruning discards negations that a
 later exclusion provably supersedes; uncertain overlaps still permit traversal.
 
 Each directory's rules are one list (D19). Concatenating the files lowest
-precedence first — global ferret rules, git `core.excludesFile`, `info/exclude`, `.gitignore` root to here,
+precedence first — global ferret rules, `info/exclude`, `.gitignore` root to here,
 `.ferretignore` root to here — and taking the last matching line gives the
 precedence above. Every rule in the list matches an entry's name alone. A
 pattern with no slash before its last character applies unchanged in every
@@ -353,11 +352,7 @@ the oldest one over only while another worker is idle. Each worker's visitor is
 built by a factory and returned at the end, so a consumer accumulates per thread
 with no lock. At most 128 waiting listings keep a descriptor. The rest reopen
 from the root one checked step at a time, which bounds the walker at 128 + 4N
-directory/ignore descriptors in an ordinary walk. Git config discovery additionally
-retains a linked gitdir and subprocess setup/pipe handles. Its config text is
-bounded to 4 MiB per output pipe and each active subprocess wait to five seconds;
-a failure uses the existing protected observation seam. M6 admission must include
-these transient handles and subprocesses. `walk` is the same code with one worker. By default N is the
+descriptors. `walk` is the same code with one worker. By default N is the
 available parallelism capped at 16 (D24).
 
 What the walker hands the catalog, besides decisions and stats: each directory
@@ -586,13 +581,11 @@ polling for names outside observed roots. Watches and policy inputs share the
 physical identity map and cap.
 
 Crawl's actual policy-read callbacks supply dependencies, including absent files,
-gitdir/commondir metadata, git config origins/includes, HEAD, optional per-worktree
-config and external exclude files. The git binary parses a private ordered include
-document; another read follows newly armed dependencies. The policy compiler
-remains pure. Input-parent watches catch saves, creation, replacement and ancestor
-symlink changes. Only complete unprotected root observations retire old inputs.
-Global ferret rules and the reserved config entry share those parent watches.
-Unwatchable inputs poll. `fstatfs` classifies NFS, CIFS/SMB/SMB2, 9P and FUSE as
+gitdir/commondir metadata and the global ferret ignore file. Input-parent watches
+catch saves, creation, replacement and ancestor symlink changes. Only complete
+unprotected root observations retire old inputs. Global ferret rules and the
+reserved config entry share those parent watches. Unwatchable inputs poll.
+`fstatfs` classifies NFS, CIFS/SMB/SMB2, 9P and FUSE as
 polling-dependent, even after watch installation; classification failure also
 polls. Remote/userspace writes may not emit local notifications.
 

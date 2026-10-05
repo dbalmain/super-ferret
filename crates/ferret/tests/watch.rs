@@ -783,104 +783,60 @@ fn number(json: &str, key: &str) -> u64 {
 }
 
 #[test]
-fn external_git_exclude_inputs_refresh_from_watches_without_a_backstop() {
-    let mut tree = Tree::new();
-    fs::create_dir_all(tree.path("src/.git/info")).unwrap();
-    write(tree.path("src/.git/info/exclude"), "");
-    write(tree.path("outside/excludes"), "");
-    std::os::unix::fs::symlink(tree.path("outside"), tree.path("outside/policy")).unwrap();
-    write(
-        tree.path("src/.git/config"),
-        &format!(
-            "[core]\nexcludesFile = {}\n",
-            tree.path("outside/policy/excludes").display()
-        ),
-    );
-    tree.success(tree.local(&["index"]));
-    tree.start(&[]);
-    let before = tree.status();
-    write(tree.path("src/.git/info/exclude"), "original.txt\n");
-    tree.converges();
-    let after = tree.status();
-    assert!(number(&after, "refreshes") > number(&before, "refreshes"));
-    assert!(
-        after.contains("\"last_refresh_reason\":\"Burst\""),
-        "{after}"
-    );
-    assert_eq!(
-        number(&after, "last_complete_backstop"),
-        number(&before, "last_complete_backstop")
-    );
-    write(tree.path("src/.git/info/exclude"), "");
-    tree.converges();
-    let before_external = tree.status();
-    write(tree.path("outside/excludes"), "original.txt\n");
-    tree.converges();
-    assert_eq!(tree.run(&["search", "original.txt"]).status.code(), Some(1));
-    let after = tree.status();
-    assert!(number(&after, "refreshes") > number(&before_external, "refreshes"));
-    assert!(
-        after.contains("\"last_refresh_reason\":\"Burst\""),
-        "{after}"
-    );
-    assert_eq!(
-        number(&after, "last_complete_backstop"),
-        number(&before, "last_complete_backstop")
-    );
-    fs::create_dir(tree.path("other-policy")).unwrap();
-    write(tree.path("other-policy/excludes"), "");
-    let before_retarget = tree.status();
-    fs::remove_file(tree.path("outside/policy")).unwrap();
-    std::os::unix::fs::symlink(tree.path("other-policy"), tree.path("outside/policy")).unwrap();
-    tree.converges();
-    assert!(tree.run(&["search", "original.txt"]).status.success());
-    let after = tree.status();
-    assert!(number(&after, "refreshes") > number(&before_retarget, "refreshes"));
-    assert!(
-        after.contains("\"last_refresh_reason\":\"Burst\""),
-        "{after}"
-    );
-}
-
-#[test]
-fn linked_worktree_commondir_metadata_changes_are_watched() {
+fn linked_worktree_commondir_changes_are_watched() {
     let mut tree = Tree::new();
     for dir in [
         "outside/gitdir",
         "outside/common-a/info",
         "outside/common-b/info",
+        "outside/policy-a",
+        "outside/policy-b",
     ] {
         fs::create_dir_all(tree.path(dir)).unwrap();
     }
+    std::os::unix::fs::symlink(
+        tree.path("outside/policy-a"),
+        tree.path("outside/policy-link"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        tree.path("outside/policy-link/exclude"),
+        tree.path("outside/common-a/info/exclude"),
+    )
+    .unwrap();
     write(
         tree.path("src/.git"),
         &format!("gitdir: {}\n", tree.path("outside/gitdir").display()),
     );
     write(tree.path("outside/gitdir/commondir"), "../common-a\n");
-    write(tree.path("outside/common-a/info/exclude"), "");
+    write(tree.path("outside/policy-a/exclude"), "");
+    write(tree.path("outside/policy-b/exclude"), "original.txt\n");
     write(tree.path("outside/common-b/info/exclude"), "original.txt\n");
-    write(
-        tree.path("outside/common-a/config"),
-        "[extensions]\nworktreeConfig = true\n",
-    );
-    write(tree.path("outside/worktree-rules"), "original.txt\n");
-    write(tree.path("outside/gitdir/config.worktree"), "");
     tree.success(tree.local(&["index"]));
     tree.start(&[]);
-    let before_config = tree.status();
-    write(
-        tree.path("outside/gitdir/config.worktree"),
-        &format!(
-            "[core]\nexcludesFile = {}\n",
-            tree.path("outside/worktree-rules").display()
-        ),
-    );
+    let before_info = tree.status();
+    write(tree.path("outside/policy-a/exclude"), "original.txt\n");
     tree.converges();
     assert_eq!(tree.run(&["search", "original.txt"]).status.code(), Some(1));
-    let after_config = tree.status();
-    assert!(number(&after_config, "refreshes") > number(&before_config, "refreshes"));
-    assert!(after_config.contains("\"last_refresh_reason\":\"Burst\""));
-    write(tree.path("outside/gitdir/config.worktree"), "");
+    let after_info = tree.status();
+    assert!(number(&after_info, "refreshes") > number(&before_info, "refreshes"));
+    assert!(after_info.contains("\"last_refresh_reason\":\"Burst\""));
+    write(tree.path("outside/policy-a/exclude"), "");
+    tree.converges();
+    fs::remove_file(tree.path("outside/policy-link")).unwrap();
+    std::os::unix::fs::symlink(
+        tree.path("outside/policy-b"),
+        tree.path("outside/policy-link"),
+    )
+    .unwrap();
+    tree.converges();
+    assert_eq!(tree.run(&["search", "original.txt"]).status.code(), Some(1));
+    fs::remove_file(tree.path("outside/policy-link")).unwrap();
+    std::os::unix::fs::symlink(
+        tree.path("outside/policy-a"),
+        tree.path("outside/policy-link"),
+    )
+    .unwrap();
     tree.converges();
     let before = tree.status();
     write(tree.path("outside/gitdir/commondir"), "../common-b\n");
@@ -1085,16 +1041,15 @@ fn bind_aliases_receive_edits_through_every_occurrence() {
 #[test]
 fn unwatchable_external_policy_marks_its_root_for_polling_and_recovers() {
     let mut tree = Tree::new();
-    fs::create_dir_all(tree.path("src/.git/info")).unwrap();
-    fs::create_dir_all(tree.path("outside/private")).unwrap();
-    write(tree.path("outside/private/excludes"), "");
+    fs::create_dir_all(tree.path("outside/private/gitdir/info")).unwrap();
     write(
-        tree.path("src/.git/config"),
+        tree.path("src/.git"),
         &format!(
-            "[core]\nexcludesFile = {}\n",
-            tree.path("outside/private/excludes").display()
+            "gitdir: {}\n",
+            tree.path("outside/private/gitdir").display()
         ),
     );
+    write(tree.path("outside/private/gitdir/info/exclude"), "");
     tree.success(tree.local(&["index"]));
     fs::set_permissions(
         tree.path("outside/private"),
@@ -1123,53 +1078,12 @@ fn unwatchable_external_policy_marks_its_root_for_polling_and_recovers() {
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    write(tree.path("outside/private/excludes"), "original.txt\n");
+    write(
+        tree.path("outside/private/gitdir/info/exclude"),
+        "original.txt\n",
+    );
     tree.converges();
     wait(|| tree.status().contains("\"watch_uncovered\":false"));
-}
-
-#[test]
-fn global_rules_and_config_include_dependencies_are_watched() {
-    let mut tree = Tree::new();
-    fs::create_dir_all(tree.path("src/.git/info")).unwrap();
-    write(tree.path("outside/excludes"), "");
-    write(
-        tree.path("outside/gitconfig"),
-        &format!(
-            "[core]\nexcludesFile = {}\n",
-            tree.path("outside/excludes").display()
-        ),
-    );
-    write(
-        tree.path("src/.git/config"),
-        &format!(
-            "[include]\npath = {}\n",
-            tree.path("outside/gitconfig").display()
-        ),
-    );
-    tree.success(tree.local(&["index"]));
-    tree.start(&[]);
-    write(tree.path("outside/empty"), "");
-    write(
-        tree.path("outside/gitconfig"),
-        &format!(
-            "[core]\nexcludesFile = {}\n",
-            tree.path("outside/empty").display()
-        ),
-    );
-    tree.converges();
-    let before = tree.status();
-    write(
-        tree.path("home/config/ferret/ignore"),
-        ".git/\noriginal.txt\n",
-    );
-    tree.converges();
-    let after = tree.status();
-    assert!(number(&after, "refreshes") > number(&before, "refreshes"));
-    assert!(
-        after.contains("\"last_refresh_reason\":\"Burst\""),
-        "{after}"
-    );
 }
 
 #[test]
@@ -1203,7 +1117,7 @@ fn an_unobserved_hard_link_is_polling_dependent_until_all_occurrences_are_known(
 }
 
 #[test]
-fn watched_global_policy_changes_wait_for_protected_scope_recovery() {
+fn global_ferret_rules_wait_for_protected_scope_recovery() {
     let mut tree = Tree::new();
     write(tree.path("src/left/.ferretignore"), "");
     tree.success(tree.local(&["index"]));

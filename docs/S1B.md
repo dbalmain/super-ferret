@@ -618,20 +618,14 @@ parent/name proof covers `nlink`; bind occurrences of one name count once.
 Unknown descriptor lifetime or changed root boundaries still widens observation.
 
 Policy dependencies come from crawl's actual consultation callbacks, including
-missing inputs and gitdir/commondir directory entries. Contrary to the original
-slice wording, `ferret-policy` has no input discovery: its compiler remains pure
-(D13). Crawl's `policy_inputs` adapter uses the git binary to parse ordered
-system/global/common config, includes, conditional includes, optional
-`config.worktree`, HEAD and `core.excludesFile`. Newly found dependencies are
-armed before rules are used, followed by another config read. Config discovery
-uses private mode-0600 temporary include documents, a five-second subprocess
-wait bound and a 4 MiB output bound per pipe; failure is a typed observation
-fault. No git source is used. Missing parent directories watch the nearest
-existing ancestor. Followed policy symlinks watch their target and ancestor
-symlink entries. Complete unprotected root observations retire old dependencies;
-partial/protected work retains them. Global ferret rule parents and the reserved
-`config` slot are watched too; there is no ferret config-file parser yet.
-Inputs that cannot be watched put their owning roots in the poll set.
+missing inputs, `.git` entries, gitdir/commondir metadata and the global ferret
+ignore file. `ferret-policy` has no input discovery: its compiler remains pure
+(D13). Missing parent directories watch the nearest existing ancestor. Followed
+policy symlinks watch their targets and ancestor symlink entries. Complete
+unprotected root observations retire old dependencies; partial/protected work
+retains them. Global ferret rule parents and the reserved `config` slot are
+watched too; there is no ferret config-file parser yet. Inputs that cannot be
+watched put their owning roots in the poll set.
 
 M5b uses `fstatfs` on tree and policy-parent handles. NFS (`0x6969`),
 CIFS/SMB/SMB2 (`0xff534d42`, `0x517b`, `0xfe534d42`), 9P (`0x01021997`) and

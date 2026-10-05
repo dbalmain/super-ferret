@@ -1460,13 +1460,13 @@ links outside observed roots retain polling. Unknown descriptor lifetime/boundar
 changes still widen observation.
 
 Actual crawl consultations register policy inputs and absent-input parents,
-including git info/exclude, gitdir/commondir indirection, config origins/includes,
-HEAD, optional per-worktree config and external `core.excludesFile`. Git config
-parsing uses the git binary with bounded output/waits and private temporary include
-documents. `ferret-policy` remains pure, correcting the brief's assumption that
-input discovery lived there. Full unprotected observations retire old dependencies.
-Symlink targets/ancestors, global ferret rules and the reserved config entry use
-parent watches; unwatchable inputs poll. There is no ferret config-file parser.
+including `.gitignore`, `.ferretignore`, git `info/exclude`, gitdir/commondir
+indirection and the global ferret ignore file. `ferret-policy` remains pure;
+full unprotected observations retire old dependencies. Symlink targets/ancestors,
+global ferret rules and the reserved config entry use parent watches; unwatchable
+inputs poll. There is no ferret config-file parser. `core.excludesFile` is
+deliberately not honoured: it costs git subprocesses per repository per crawl,
+and the global ferret ignore file covers the need.
 Statfs magic puts NFS, CIFS/SMB/SMB2, 9P and FUSE roots into polling regardless of
 successful watches, because remote/userspace writes may lack local events.
 

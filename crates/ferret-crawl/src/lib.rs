@@ -15,7 +15,6 @@
 mod coverage;
 mod index;
 mod observe;
-mod policy_inputs;
 pub mod reconcile;
 mod refresh;
 mod walk;

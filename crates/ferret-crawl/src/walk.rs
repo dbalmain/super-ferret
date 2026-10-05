@@ -11,12 +11,11 @@
 //! `Condvar`. Jobs in local stacks and the shared queue hold at most 128
 //! directory descriptors combined. Beyond that, a continuation closes its
 //! descriptor and reopens by checked `openat` steps from the root when resumed.
-//! Each worker holds one active job and at most three extra directory/ignore
-//! descriptors in the ordinary walk (128 + 4N total). Git config discovery
-//! additionally retains a linked gitdir and bounded subprocess pipe handles;
-//! its process setup descriptors are outside that directory-handle bound.
+//! Each worker holds one active job and at most three extra descriptors while
+//! opening a child and reading `.git/info/exclude`. Thus a parallel walk with N
+//! workers holds at most 128 + 4N descriptors, independent of depth and width.
 //! The git directory closes as soon as `info` opens, and `info` closes as soon
-//! as `exclude` opens.
+//! as `exclude` opens, so five worker descriptors never overlap.
 //! `EMFILE` opening a child is an [`Event::Io`] and the walk continues. There
 //! is no path-based fallback below the root.
 //! Listings store names in one byte buffer with offsets, and a worker reuses
@@ -416,7 +415,7 @@ pub trait EventVisitor {
     /// Observed directory handle, before its complete listing. A watch host
     /// arms here so notifications during observation survive into its next run.
     /// Policy input consulted relative to the held parent, before reading.
-    /// An external policy dependency returned by config discovery.
+    /// A path-valued policy dependency outside the observed directory handle.
     fn policy_path(&mut self, _path: &Path) {}
 
     fn policy_input(&mut self, _parent: BorrowedFd<'_>, _name: &OsStr) {}
@@ -1618,7 +1617,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         let (work_tree, git_exclude) = match git {
             GitProbe::Directory(fd) => {
                 let work_tree = self.main_work_tree(&fd, token);
-                (work_tree, self.read_exclude(fd, None, dir, token))
+                (work_tree, self.read_exclude(fd, token))
             }
             GitProbe::File(bytes) => self.read_gitfile(dir, &bytes, in_work_tree, token),
             GitProbe::Missing | GitProbe::Present => (None, None),
@@ -1650,20 +1649,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// `info` is opened `O_NOFOLLOW` relative to the held git directory (or
     /// common directory). `exclude` is an ordinary ignore file: a symlink of
     /// that name is followed.
-    fn read_exclude(
-        &mut self,
-        git: OwnedFd,
-        linked: Option<OwnedFd>,
-        work: BorrowedFd<'_>,
-        token: V::Dir,
-    ) -> Option<String> {
-        let config = self.git_config_exclude(
-            linked.as_ref().map_or(git.as_fd(), AsFd::as_fd),
-            git.as_fd(),
-            work,
-            token,
-        );
-        drop(linked);
+    fn read_exclude(&mut self, git: OwnedFd, token: V::Dir) -> Option<String> {
         self.visit.policy_input(git.as_fd(), OsStr::new("info"));
         let git_length = self.push(DOT_GIT);
         let info_length = self.push("info");
@@ -1671,7 +1657,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             Ok(fd) => fd,
             Err(Errno::NOENT) => {
                 self.pop(git_length);
-                return config;
+                return None;
             }
             Err(error) => {
                 self.push("exclude");
@@ -1706,59 +1692,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         };
         self.pop(info_length);
         self.pop(git_length);
-        match (config, text) {
-            (Some(mut global), Some(local)) => {
-                global.push('\n');
-                global.push_str(&local);
-                Some(global)
-            }
-            (global, local) => local.or(global),
-        }
-    }
-
-    fn git_config_exclude(
-        &mut self,
-        git: BorrowedFd<'_>,
-        common: BorrowedFd<'_>,
-        work: BorrowedFd<'_>,
-        token: V::Dir,
-    ) -> Option<String> {
-        // The child opens the parent's held descriptors through procfs, so
-        // CLOEXEC does not require rebuilding either observed pathname.
-        let path = PathBuf::from(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            git.as_raw_fd()
-        ));
-        let work = PathBuf::from(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            work.as_raw_fd()
-        ));
-        let common = PathBuf::from(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            common.as_raw_fd()
-        ));
-        let inputs =
-            match crate::policy_inputs::GitInputs::discover(&path, &common, &work, |path| {
-                self.visit.policy_path(path)
-            }) {
-                Ok(inputs) => inputs,
-                Err(error) => {
-                    self.fail_at_git(error, token);
-                    return None;
-                }
-            };
-        let path = inputs.excludes?;
-        match open_ignore(rustix::fs::CWD, path.as_os_str()) {
-            Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
-            Ok(Opened::Missing | Opened::NotRegular) => None,
-            Err(error) => {
-                self.fail_at_git(error, token);
-                None
-            }
-        }
+        text
     }
 
     fn probe_git(&mut self, dir: BorrowedFd<'_>, token: V::Dir) -> GitProbe {
@@ -1853,7 +1787,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             return (None, None);
         };
         let gitdir_path = self.here_path().join(raw);
-        let Some((common, commondir, linked)) = self.common_dir(gitdir, token) else {
+        let Some((common, commondir)) = self.common_dir(gitdir, token) else {
             return (None, None);
         };
         let (kind, common_path) = match commondir {
@@ -1868,7 +1802,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                 common_dir: normalize(&common_path),
                 common_id,
             });
-        (work_tree, self.read_exclude(common, linked, work, token))
+        (work_tree, self.read_exclude(common, token))
     }
 
     /// The directory being loaded, as a path: the root the caller gave, made
@@ -1941,7 +1875,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         &mut self,
         gitdir: OwnedFd,
         token: V::Dir,
-    ) -> Option<(OwnedFd, Option<OsString>, Option<OwnedFd>)> {
+    ) -> Option<(OwnedFd, Option<OsString>)> {
         self.visit
             .policy_input(gitdir.as_fd(), OsStr::new("commondir"));
         let opened = match openat(
@@ -1955,7 +1889,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             Err(error) => Err(io::Error::from(error)),
         };
         match opened {
-            Ok(Opened::Missing) => Some((gitdir, None, None)),
+            Ok(Opened::Missing) => Some((gitdir, None)),
             Ok(Opened::NotRegular) => {
                 self.fail_at_git(
                     io::Error::new(
@@ -1975,7 +1909,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                     return None;
                 };
                 let common = self.open_git_directory(gitdir.as_fd(), raw, token)?;
-                Some((common, Some(raw.to_os_string()), Some(gitdir)))
+                drop(gitdir);
+                Some((common, Some(raw.to_os_string())))
             }
             Err(error) => {
                 self.fail_at_git(error, token);

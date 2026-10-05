@@ -175,8 +175,29 @@ impl Watch {
         if !matches!(name.as_bytes(), b".git" | b".gitignore" | b"commondir")
             && std::fs::symlink_metadata(proc.join(name)).is_ok_and(|m| m.file_type().is_symlink())
         {
-            match std::fs::canonicalize(proc.join(name)) {
-                Ok(target) if target != key => self.policy_path(root, &target),
+            match std::fs::read_link(proc.join(name)) {
+                Ok(target) => {
+                    let target = if target.is_absolute() {
+                        target
+                    } else {
+                        key.parent().unwrap_or(Path::new("/")).join(target)
+                    };
+                    // Keep the link spelling for ancestor watches;
+                    // canonicalizing first would lose a
+                    // symlinked parent that can be retargeted.
+                    self.policy_ancestors(root, &target);
+                    match std::fs::canonicalize(&target) {
+                        Ok(target) if target != key => self.policy_path(root, &target),
+                        _ => failure(
+                            &mut self
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            root,
+                            key,
+                        ),
+                    }
+                }
                 _ => {
                     let mut s = self
                         .state
