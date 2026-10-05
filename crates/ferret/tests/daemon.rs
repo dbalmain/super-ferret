@@ -1379,3 +1379,31 @@ fn draining_writer_waits_for_a_message_past_expired_background_deadlines() {
     drop(active);
     wait(|| !socket.exists() && exited(&tree, pid));
 }
+
+#[test]
+#[cfg(debug_assertions)]
+fn a_reader_exit_with_a_queued_bad_line_never_strands_its_handler() {
+    // The drain registry holds a clone of each handler's request sender, so a
+    // reader exit no longer disconnects the channel. When the exit wake met a
+    // full channel, the handler answered the queued line and blocked forever,
+    // holding its client count and so the daemon's idle exit.
+    let tree = Tree::new();
+    let pid = tree.start(&[
+        ("FERRET_DAEMON_IDLE_MS", "300"),
+        ("FERRET_DAEMON_TEST_READER_EXIT_DELAY_MS", "300"),
+    ]);
+    let socket = tree.socket();
+    let (mut client, _) = tree.connect();
+    client
+        .get_mut()
+        .write_all(&b"not json\n".repeat(1_000))
+        .unwrap();
+    // Half-close: the handler's error replies still succeed.
+    client
+        .get_ref()
+        .shutdown(std::net::Shutdown::Write)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    drop(client);
+    wait(|| !socket.exists() && exited(&tree, pid));
+}

@@ -448,13 +448,15 @@ fn pin(host: &Host) -> io::Result<QuerySession> {
 struct ConnectionRegistration<'a>(&'a Host, usize);
 impl Drop for ConnectionRegistration<'_> {
     fn drop(&mut self) {
-        self.0
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .connections
-            .remove(&self.1);
+        unregister(self.0, self.1);
     }
+}
+fn unregister(host: &Host, id: usize) {
+    host.lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .connections
+        .remove(&id);
 }
 fn drain(host: &Host) {
     // Match the engine -> lifecycle lock order used by cancellation and the
@@ -479,7 +481,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let destination = Destination::socket(stream.try_clone()?, cancelled.clone())?;
     let (send, receive) = mpsc::sync_channel(1);
-    let _registration = {
+    let registration = {
         let mut state = host
             .lifecycle
             .lock()
@@ -492,6 +494,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
         state.connections.insert(id, send.clone());
         ConnectionRegistration(host, id)
     };
+    let id = registration.1;
     let input = stream.try_clone()?;
     let reader_host = host.clone();
     let reader_cancel = cancelled.clone();
@@ -533,7 +536,16 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
             }
         }
         cancel(&reader_host, &reader_cancel);
-        let _ = send.try_send(ClientMessage::Wake);
+        // Release the drain registry's sender with this one, so the handler's
+        // channel disconnects once it has taken any queued line. A wake alone
+        // is lost when that line fills the channel, and the handler would
+        // then answer it and block forever.
+        unregister(&reader_host, id);
+        drop(send);
+        // Widens the window in which the handler can still answer a queued
+        // line before the socket shuts down.
+        #[cfg(debug_assertions)]
+        std::thread::sleep(duration("FERRET_DAEMON_TEST_READER_EXIT_DELAY_MS", 0));
         // Wake a blocked writer on hangup/cancel; a partial frame is a broken
         // transport and cannot be followed by a fabricated successful end.
         let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
