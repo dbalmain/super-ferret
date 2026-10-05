@@ -196,6 +196,25 @@ pub(crate) enum Opened {
     Fault(ContentFault),
 }
 
+/// Content syscall errors are separate from namespace IoOp faults. The seam is
+/// keyed by a real inode so unrelated concurrent crawl tests never share it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentIo {
+    Open,
+    Stat,
+    Read,
+    AfterStat,
+}
+#[cfg(test)]
+pub(crate) static CONTENT_IO_FAULTS: Mutex<Vec<((u64, u64), ContentIo)>> = Mutex::new(Vec::new());
+#[cfg(test)]
+fn injected_content_error(key: (u64, u64), op: ContentIo) -> Option<io::Error> {
+    lock(&CONTENT_IO_FAULTS)
+        .contains(&(key, op))
+        .then(|| io::Error::from_raw_os_error(5))
+}
+
 impl Reader {
     pub(crate) fn new() -> Self {
         Self {
@@ -209,11 +228,19 @@ impl Reader {
     /// Opens `name` in `parent` and checks, with `fstat`, that it is the
     /// version the walk statted.
     pub(crate) fn open(parent: BorrowedFd<'_>, name: &std::ffi::OsStr, walked: &Stat) -> Opened {
+        #[cfg(test)]
+        if let Some(error) = injected_content_error((walked.dev, walked.ino), ContentIo::Open) {
+            return Opened::Fault(ContentFault::Open(error));
+        }
         let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let fd = match openat(parent, name, flags, rustix::fs::Mode::empty()) {
             Ok(fd) => fd,
             Err(e) => return Opened::Fault(ContentFault::Open(e.into())),
         };
+        #[cfg(test)]
+        if let Some(error) = injected_content_error((walked.dev, walked.ino), ContentIo::Stat) {
+            return Opened::Fault(ContentFault::Stat(error));
+        }
         let stat = match fstat(&fd) {
             Ok(stat) => stat,
             Err(e) => return Opened::Fault(ContentFault::Stat(e.into())),
@@ -232,6 +259,14 @@ impl Reader {
     /// Sniffs and hashes an open file. The caller then checks the result
     /// with [`bracket`].
     pub(crate) fn read(&mut self, file: &mut File) -> Result<Content, ContentFault> {
+        #[cfg(test)]
+        {
+            let stat = fstat(file.as_fd()).map_err(|e| ContentFault::Stat(e.into()))?;
+            if let Some(error) = injected_content_error((stat.st_dev, stat.st_ino), ContentIo::Read)
+            {
+                return Err(ContentFault::Read(error));
+            }
+        }
         let started = Instant::now();
         let content = self.sniff_and_hash(file);
         self.read_time += started.elapsed();
@@ -284,6 +319,10 @@ pub(crate) fn bracket(
     walked: &Stat,
     content: Content,
 ) -> Result<Content, ContentFault> {
+    #[cfg(test)]
+    if let Some(error) = injected_content_error((walked.dev, walked.ino), ContentIo::AfterStat) {
+        return Err(ContentFault::Stat(error));
+    }
     match fstat(file.as_fd()) {
         Ok(after) if catalog_stat(&after).same_version(walked) => Ok(content),
         Ok(_) => Err(ContentFault::Changed),

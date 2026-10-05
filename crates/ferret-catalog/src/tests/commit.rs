@@ -85,7 +85,10 @@ fn a_failure_before_the_rename_publishes_nothing() {
     assert!(matches!(err, CommitError::Write(_)), "{err:?}");
     assert!(!err.published());
     assert_eq!(names(&reopen(&scratch.path)), ["/g/old"]);
-    assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
+    assert_eq!(
+        leftovers(&scratch.path),
+        ["changes.0", "current", "lock", "snapshot.0"]
+    );
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
 
@@ -107,7 +110,17 @@ fn a_failure_after_the_rename_is_published_but_undurable() {
         "callers must not read this as nothing published"
     );
     assert_eq!(names(&reopen(&scratch.path)), ["/g/new"]);
-    assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
+    assert_eq!(
+        leftovers(&scratch.path),
+        [
+            "changes.0",
+            "changes.1",
+            "current",
+            "lock",
+            "snapshot.0",
+            "snapshot.1"
+        ]
+    );
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
 
@@ -121,14 +134,17 @@ fn dropping_a_transaction_publishes_nothing_and_a_stale_temp_is_cleared() {
     let mut txn = Transaction::begin(&scratch.path, SNIFFER).unwrap();
     assert_eq!(
         leftovers(&scratch.path),
-        ["catalog", "lock"],
+        ["changes.0", "current", "lock", "snapshot.0"],
         "begin clears the stale temp"
     );
     fill(&mut txn, &["new"]);
     drop(txn);
 
     assert_eq!(names(&reopen(&scratch.path)), ["/g/old"]);
-    assert_eq!(leftovers(&scratch.path), ["catalog", "lock"]);
+    assert_eq!(
+        leftovers(&scratch.path),
+        ["changes.0", "current", "lock", "snapshot.0"]
+    );
     drop(Transaction::begin(&scratch.path, SNIFFER).unwrap());
 }
 
@@ -154,7 +170,7 @@ fn an_old_reader_keeps_its_generation_across_a_commit() {
 fn a_corrupt_previous_generation_stops_the_writer() {
     let scratch = Scratch::new("corrupt-previous");
     commit(&scratch.path, |txn| fill(txn, &["a"]));
-    let file = scratch.path.join("catalog");
+    let file = super::snapshot(&scratch.path);
     let mut bytes = fs::read(&file).unwrap();
     bytes.truncate(bytes.len() - 1);
     fs::write(&file, bytes).unwrap();
@@ -176,6 +192,7 @@ const V1_CATALOG: &[u8] = include_bytes!("v1.catalog");
 #[test]
 fn a_catalog_from_another_format_version_is_replaced_not_read() {
     let scratch = Scratch::new("old-version");
+    fs::create_dir_all(&scratch.path).unwrap();
     fs::create_dir_all(&scratch.path).unwrap();
     fs::write(scratch.path.join("catalog"), V1_CATALOG).unwrap();
 
@@ -224,4 +241,22 @@ fn a_first_publication_syncs_every_ancestor_of_the_index_directory() {
     assert_eq!(synced_during(publish), expected);
     // Later generations sync only the index directory, after the rename.
     assert_eq!(synced_during(publish), [dir]);
+}
+
+#[test]
+fn catalog_clones_share_lazy_checked_buffers_after_checkpoint_retirement() {
+    let scratch = Scratch::new("shared-reader");
+    commit(&scratch.path, |txn| fill(txn, &["old"]));
+    let reader = Catalog::open(&scratch.path).unwrap().unwrap();
+    let shared = reader.clone();
+    commit(&scratch.path, |txn| fill(txn, &["new"]));
+    shared.load(&[crate::Section::Names]).unwrap();
+    assert!(reader.is_loaded(crate::Section::Names));
+    let bytes = reader.bytes_read();
+    reader.load(&[crate::Section::Names]).unwrap();
+    assert_eq!(reader.bytes_read(), bytes);
+    assert_eq!(reader.name_heap().as_ptr(), shared.name_heap().as_ptr());
+    assert_eq!(reader.generation(), shared.generation());
+    reader.load_all().unwrap();
+    assert_eq!(names(&reader), ["/g/old"]);
 }

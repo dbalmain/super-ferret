@@ -13,16 +13,23 @@ findings). Each should name the guard that will eventually retire it.
   syscall on an entry the walk has already observed (delete, stat, readlink,
   access, `-empty`, descent, `-execdir`'s chdir) must be relative to the
   retained directory handle, never a rebuilt pathname. Ask: if an earlier
-  `-exec` renames or replaces an ancestor here, what does this call reach?
-  Seen in four separate places across three review rounds (2026-10-03/04).
-  Guard: the `find_review.rs` mutation tests; a lint-style test that rejects
-  pathname `std::fs` calls in `find/walk.rs` and `find/action.rs` would retire
-  this check. Not applied yet.
-- **All output commits through one transaction.** A new output primitive,
-  sink, batch kind or size class must use the shared commit, through to the
-  final flush. Two rounds found records split by a path that bypassed it
-  (batches, then short records). Guard: the deterministic CLI interleave tests
-  in `find_review.rs`.
+  `-exec` renames or replaces an ancestor here, what does this call reach? Seen
+  in four separate places across three review rounds (2026-10-03/04). Guard: the
+  `find_review.rs` mutation tests; a lint-style test that rejects pathname
+  `std::fs` calls in `find/walk.rs` and `find/action.rs` would retire this
+  check. Not applied yet.
+- **All output commits through one transaction.** A new output primitive, sink,
+  batch kind or size class must use the shared commit, through to the final
+  flush. Two rounds found records split by a path that bypassed it (batches,
+  then short records). Guard: the deterministic CLI interleave tests in
+  `find_review.rs`.
+- **A change that reverses an answered decision says so.** When a test's
+  expected behaviour flips (a renamed test, an inverted assertion), find the
+  DECISIONS.md entry that set the old behaviour. If Dave answered it, the change
+  needs his say, or the code must keep his answer. A design doc written by an
+  agent does not overrule an answered decision. Guard: briefs list the answered
+  decisions each slice touches. Reviewers grep the diff for test renames and
+  flipped assertions.
 
 ## Findings log
 
@@ -69,13 +76,13 @@ findings). Each should name the guard that will eventually retire it.
 - **What:** Astra round 2 asked for one observed-path policy. The shared
   `with_observed_path` rebuilt each operand from `name()`, which strips a
   trailing slash. So `find -I victim/ -delete` deleted a regular file that GNU
-  refuses with ENOTDIR. The unification fixed four bugs and introduced this
-  one, and none of its tests used an operand with a trailing slash.
+  refuses with ENOTDIR. The unification fixed four bugs and introduced this one,
+  and none of its tests used an operand with a trailing slash.
 - **Why missed:** reviewers checked that each folded path now behaved like the
   shared one, not that the shared one preserved each caller's input form.
 - **Guard:** when paths are folded into one helper, test the helper with every
-  input form a caller could pass. For find operands that means a trailing
-  slash, a repeated slash, `.`, `..`, and a dangling symlink. Applied as
+  input form a caller could pass. For find operands that means a trailing slash,
+  a repeated slash, `.`, `..`, and a dangling symlink. Applied as
   `find_review.rs` tests for the trailing-slash case.
 
 ### 2026-10-04 — a regression test that passed on the unfixed code
@@ -85,3 +92,44 @@ findings). Each should name the guard that will eventually retire it.
   made it fail before the fix.
 - **Guard:** every fix's test is run against the pre-fix tree. Briefs already
   ask for this; keep asking, because it caught this one.
+
+### 2026-10-04 — final-set validation rescanned its own records per inode
+
+- **What:** M4's root-liveness test scanned all changed records once per inode
+  whose name count changed, making large deletions quadratic in dirty rows.
+- **Guard:** derive the final root set once, then use membership during inode
+  retirement. Existing real-crawl root-retirement and materialised-checkpoint
+  oracle tests cover the resulting behavior. Applied in M4.
+
+### 2026-10-04 — an equal-row fast path can hide a later alias conflict
+
+- **What:** M4b can compact an equal single-link observation before a new alias
+  appears in another listing. Sorting only full observations would then miss the
+  version disagreement and publish Hashed instead of shared Fault.
+- **Guard:** expand compact observations of every inode appearing in the alias
+  residue before grouping. The real-crawl test
+  `compact_equal_observation_joins_a_new_alias_before_conflict_resolution` fails
+  Hashed vs Fault when expansion is disabled. Applied in M4b.
+
+### 2026-10-05 — retaining a moved scope also needs a live incoming path
+
+- **What:** protecting an old directory ID after it moved kept its incoming
+  edge, while the former parent could still be swept. Checking inode identity
+  alone did not prove that the old namespace occurrence stayed anchored.
+- **Guard:** check the complete old parent/name chain before selecting a scope;
+  a relocated occurrence protects its checked owner root. The real-crawl test
+  `a_fault_after_a_directory_move_retains_a_live_old_ancestor` covers surviving,
+  removed and newly created parents, plus disk replay and successful recovery.
+  Its pre-fix probe failed. Applied in S1+ M5.
+
+### 2026-10-05 — M5 silently reversed D26's EACCES amendment
+
+- **What:** S1PLUS's fault table put directory EACCES with the transient faults
+  that retain old children. M5 built it that way and rewrote two tests to match.
+  The D26 amendment (Dave, 2026-10-02) says EACCES on a directory is deliberate,
+  permanent state: publish it opaque, with no children. Under M5 a `chmod 000`'d
+  directory stayed searchable by its old contents.
+- **Why missed:** the design rounds reviewed S1PLUS against itself, not against
+  DECISIONS.md. The gates were green because the tests had been rewritten.
+- **Guard:** the new standing check above. M5c (80143ce) restored the amendment,
+  and the CLI repro checks `ferret search` before and after a `chmod 000`.

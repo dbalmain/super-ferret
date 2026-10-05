@@ -6,15 +6,15 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use ferret_catalog::{Catalog, ContentState, InoId, Kind, NameId, Target};
+use ferret_catalog::{Catalog, ContentState, Kind, NameId, Target};
 
 use crate::cli::{Context, Exit, error};
 use crate::index::bytes;
 
 /// `ferret stats`.
 pub fn run(context: &Context) -> Exit {
-    let catalog = match Catalog::open(&context.index) {
-        Ok(Some(catalog)) => catalog,
+    let published = match ferret_catalog::log::Published::open(&context.index) {
+        Ok(Some(published)) => published,
         Ok(None) => {
             error(&format!(
                 "no index in {}: run `ferret index DIR` first",
@@ -27,12 +27,35 @@ pub fn run(context: &Context) -> Exit {
             return Exit::Error;
         }
     };
+    let usage = match published.budget_usage() {
+        Ok(usage) => usage,
+        Err(e) => {
+            error(&e.to_string());
+            return Exit::Error;
+        }
+    };
+    let catalog = published.into_catalog();
     if let Err(e) = catalog.load_all() {
-        error(&format!("{}: {e}", context.index.display()));
+        error(&e.to_string());
         return Exit::Error;
     }
     let mut text = String::new();
     let _ = writeln!(text, "index {}", context.index.display());
+    let _ = writeln!(
+        text,
+        "log {} bytes / 67108864, {} records / 500000, {} transactions",
+        usage.log_bytes, usage.records, usage.transactions
+    );
+    let _ = writeln!(
+        text,
+        "dirty inodes {}/{}, names {}/{} (1%); dead base inodes {}, names {} (5%)",
+        usage.dirty_inodes,
+        usage.base_inodes,
+        usage.dirty_names,
+        usage.base_names,
+        usage.dead_inodes,
+        usage.dead_names
+    );
     report(&catalog, &mut Census::of(&catalog), &mut text);
     crate::cli::print("stats", text.as_bytes())
 }
@@ -119,20 +142,21 @@ struct Census {
 impl Census {
     fn of(catalog: &Catalog) -> Census {
         let mut census = Census::default();
-        let dirs = catalog.dir_count();
-        // A directory's parent has a lower id, so one pass in id order sees
-        // every parent before its children.
-        let mut depth = vec![0u32; dirs as usize];
-        for dir in 0..dirs {
-            if let Some(name) = catalog.dir_name(InoId(dir)) {
-                depth[dir as usize] = depth[catalog.name(name).parent.0 as usize] + 1;
-            }
-            census.traversed += u64::from(catalog.is_traversed(InoId(dir)));
+        let mut depth = HashMap::new();
+        let mut pending: Vec<_> = catalog.roots().map(|(id, _)| (id, 0u32)).collect();
+        while let Some((dir, d)) = pending.pop() {
+            depth.insert(dir, d);
+            census.traversed += u64::from(catalog.is_traversed(dir));
+            pending.extend(catalog.children(dir).filter_map(
+                |id| match catalog.name(id).target() {
+                    Target::Inode(child) if catalog.is_directory(child) => Some((child, d + 1)),
+                    _ => None,
+                },
+            ));
         }
 
-        let mut names_of = vec![0u32; catalog.inode_count() as usize];
-        for id in (0..catalog.name_count()).map(NameId) {
-            let name = catalog.name(id);
+        let mut names_of = vec![0u32; catalog.next_inode().0 as usize];
+        for (_, name) in catalog.name_reader().runs_from(NameId(0)) {
             let kind = match name.target() {
                 Target::Inode(inode) => {
                     names_of[inode.0 as usize] += 1;
@@ -144,7 +168,7 @@ impl Census {
                 }
             };
             census.names_by_kind[kind as usize] += 1;
-            census.depth.add_kept(depth[name.parent.0 as usize] + 1);
+            census.depth.add_kept(depth[&name.parent] + 1);
             census.name_len.add_kept(name.bytes.len() as u32);
             if kind == Kind::File && matches!(name.target(), Target::Inode(_)) {
                 let size = catalog.size(name.child);
@@ -158,7 +182,7 @@ impl Census {
         // sorting, not by an array indexed by DocId: ids are sparse after
         // churn, and nothing is sized by `next_doc` (D36 B).
         let mut held = Vec::new();
-        for id in (dirs..catalog.inode_count()).map(InoId) {
+        for id in catalog.inode_ids().filter(|&id| !catalog.is_directory(id)) {
             match catalog.kind(id) {
                 Kind::Symlink => {
                     census.symlinks += 1;

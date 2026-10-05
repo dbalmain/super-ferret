@@ -411,6 +411,12 @@ pub trait EventVisitor {
     /// Returns the token for a directory's [`Event::Decided`] (see the
     /// lifecycle above); ignored otherwise.
     fn visit(&mut self, event: Event<'_, Self::Dir>) -> Option<Self::Dir>;
+
+    /// Selects work before child stat/open. A false result deliberately keeps
+    /// this untouched scope; it is not an ignored or vanished observation.
+    fn consider(&mut self, _parent: Self::Dir, _name: &OsStr, _path: &Path) -> bool {
+        true
+    }
 }
 
 /// A closure sees every event, has no tokens (`()`), and enters every
@@ -641,6 +647,11 @@ impl<V: EventVisitor> Walker<'_, V> {
         global: Option<&str>,
         config: Config,
     ) -> Option<Job<V::Dir>> {
+        #[cfg(test)]
+        if let Some((op, error)) = inject(root, IoPoint::Root, Path::new("")) {
+            self.fail(op, FaultContext::Root, error);
+            return None;
+        }
         let fd = match open_path(root, root_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {
@@ -872,6 +883,33 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Shared, root-keyed syscall seam for coverage tests across real workers.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IoPoint {
+    Root,
+    Directory,
+    OpenDirectory,
+    Child,
+    Listing(usize),
+}
+#[cfg(test)]
+pub(crate) type IoHook =
+    std::sync::Arc<dyn Fn(IoPoint, &Path) -> Option<(IoOp, io::Error)> + Send + Sync>;
+#[cfg(test)]
+pub(crate) static IO_HOOKS: std::sync::Mutex<Vec<(PathBuf, IoHook)>> =
+    std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+fn inject(root: &Path, point: IoPoint, rel: &Path) -> Option<(IoOp, io::Error)> {
+    let hook = IO_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(r, _)| r == root)
+        .map(|(_, h)| h.clone());
+    hook.and_then(|h| h(point, rel))
+}
+
 #[cfg(test)]
 pub(crate) type FailReadlink = Box<dyn Fn(&OsStr) -> bool>;
 
@@ -1011,6 +1049,10 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             work_tree,
             entries,
         });
+        #[cfg(test)]
+        if let Some((op, error)) = inject(&self.root, IoPoint::Directory, bytes_path(&self.rel)) {
+            self.fail(op, FaultContext::Dir(dir), error);
+        }
     }
 
     fn emit(
@@ -1094,6 +1136,16 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                         end: children.names.len(),
                         kind: entry.file_type(),
                     });
+                    #[cfg(test)]
+                    if let Some((op, error)) = inject(
+                        &self.root,
+                        IoPoint::Listing(children.entries.len()),
+                        bytes_path(&self.rel),
+                    ) {
+                        self.fail(op, context, error);
+                        children.complete = false;
+                        break;
+                    }
                 }
                 Err(error) => {
                     self.fail(IoOp::List, context, io::Error::from(error));
@@ -1131,7 +1183,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             let name = job.children.name(child);
             job.next += 1;
             let length = self.push(name);
-            let descended = self.consider(&here, name, child.kind);
+            let descended = if self.visit.consider(here.token, name, bytes_path(&self.rel)) {
+                self.consider(&here, name, child.kind)
+            } else {
+                None
+            };
             self.pop(length);
             if let Some(descended) = descended {
                 return Some((job, descended));
@@ -1204,6 +1260,18 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         name: &OsStr,
         kind: FileType,
     ) -> Option<Job<V::Dir>> {
+        #[cfg(test)]
+        if let Some((op, error)) = inject(&self.root, IoPoint::Child, bytes_path(&self.rel)) {
+            self.fail(
+                op,
+                FaultContext::Child {
+                    parent: here.token,
+                    name,
+                },
+                error,
+            );
+            return None;
+        }
         match kind {
             FileType::RegularFile | FileType::Unknown => {
                 let stat = self.stat_child(here, name)?;
@@ -1448,6 +1516,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         name: &OsStr,
         expected: &rustix::fs::Stat,
     ) -> Option<OwnedFd> {
+        #[cfg(test)]
+        if let Some((op, error)) = inject(&self.root, IoPoint::OpenDirectory, bytes_path(&self.rel))
+        {
+            self.fail_child(op, here.token, name, error);
+            return None;
+        }
         let fd = match openat(here.fd, name, child_dir_flags(), Mode::empty()) {
             Ok(fd) => fd,
             Err(error) => {

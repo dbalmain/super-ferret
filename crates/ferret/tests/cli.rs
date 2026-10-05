@@ -277,7 +277,7 @@ fn bare_index_with_no_roots_and_no_terminal_fails() {
     assert_eq!(code(&output), 2);
     assert!(stderr(&output).contains("no roots"), "{}", stderr(&output));
     assert!(
-        !env.index().join("catalog").exists(),
+        !env.index().join("current").exists(),
         "nothing is published"
     );
 }
@@ -372,7 +372,9 @@ fn a_catalog_from_another_version_says_how_to_rebuild_and_index_replaces_it() {
 /// Overwrites the little-endian u32 at `at` in the published catalog, as a
 /// flipped bit or a long history would leave it.
 fn patch_catalog(env: &Env, at: usize, value: u32) {
-    let path = env.index().join("catalog");
+    let path = ferret_catalog::Catalog::snapshot_path(&env.index())
+        .unwrap()
+        .unwrap();
     let mut bytes = fs::read(&path).unwrap();
     bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
     fs::write(&path, bytes).unwrap();
@@ -401,7 +403,15 @@ fn stats_counts_documents_sparsely_and_survives_a_corrupt_reference() {
 
     // Two billion documents assigned in the past, three live: a dense
     // counter would be 8 GB, past this 1 GB address-space limit.
-    patch_catalog(&env, 16, 1 << 31);
+    let snapshot = ferret_catalog::Catalog::snapshot_path(&env.index())
+        .unwrap()
+        .unwrap();
+    fs::remove_file(snapshot).unwrap();
+    fs::remove_file(env.index().join("current")).unwrap();
+    let mut legacy = include_bytes!("../../ferret-catalog/src/tests/v3.catalog").to_vec();
+    legacy[16..20].copy_from_slice(&(1u32 << 31).to_le_bytes());
+    fs::write(env.index().join("catalog"), legacy).unwrap();
+    assert_eq!(code(&env.run(&[os("import-v3")])), 0);
     let limited = |env: &Env| {
         let mut command = Command::new("sh");
         command
@@ -418,19 +428,26 @@ fn stats_counts_documents_sparsely_and_survives_a_corrupt_reference() {
     };
     let sparse = limited(&env);
     assert_eq!(sparse.status.code(), Some(0), "{}", stderr(&sparse));
-    assert_eq!(duplicates(&sparse), before);
+    assert_eq!(
+        duplicates(&sparse).split(',').next(),
+        before.split(',').next()
+    );
 
     // Every file's DocId moved past `next_doc`, by the base of the doc
     // column's one block: the first word of the doc section (the 18th
     // section, whose offset is in the table after the 40 B header).
     // Decoding does not check an inode's DocId.
-    let bytes = fs::read(env.index().join("catalog")).unwrap();
-    let doc_section = u64::from_le_bytes(bytes[40 + 17 * 16..][..8].try_into().unwrap());
+    let bytes = fs::read(
+        ferret_catalog::Catalog::snapshot_path(&env.index())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let doc_section = u64::from_le_bytes(bytes[96 + 17 * 32..][..8].try_into().unwrap());
     patch_catalog(&env, doc_section as usize, u32::MAX - 2);
     let corrupt = limited(&env);
-    assert_eq!(corrupt.status.code(), Some(0), "{}", stderr(&corrupt));
-    let text = String::from_utf8_lossy(&corrupt.stdout);
-    assert!(text.contains("corrupt: 3 files"), "{text}");
+    assert_eq!(corrupt.status.code(), Some(3), "{}", stderr(&corrupt));
+    assert!(stderr(&corrupt).contains("corrupt: doc"));
 }
 
 #[test]
@@ -528,8 +545,8 @@ fn json_round_trips_a_path_that_is_not_utf8() {
 }
 
 #[test]
-// D26 amendment: a denied listing is permanent state, and publishes the
-// directory but no children. Other coverage faults still block publication.
+// D26: a denied directory is opaque and retires old children; trustworthy
+// siblings still publish.
 fn an_unreadable_directory_publishes_its_row_and_other_changes() {
     let env = Env::new("coverage");
     env.write("ok.txt", b"ok\n");
@@ -560,7 +577,12 @@ fn an_unreadable_ignore_file_publishes_nothing_and_fails() {
     fs::create_dir_all(env.ignore_file().parent().unwrap()).unwrap();
     fs::write(env.ignore_file(), "private/\n").unwrap();
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
-    let before = fs::read(env.index().join("catalog")).unwrap();
+    let before = fs::read(
+        ferret_catalog::Catalog::snapshot_path(&env.index())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
 
     env.write("new.txt", b"new\n");
     fs::set_permissions(env.ignore_file(), fs::Permissions::from_mode(0o000)).unwrap();
@@ -570,7 +592,15 @@ fn an_unreadable_ignore_file_publishes_nothing_and_fails() {
     assert_eq!(code(&output), 3);
     let message = stderr(&output);
     assert!(message.contains("nothing published"), "{message}");
-    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
+    assert_eq!(
+        fs::read(
+            ferret_catalog::Catalog::snapshot_path(&env.index())
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        before
+    );
     assert_eq!(code(&env.run(&[os("search"), os("new")])), 1);
     assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
 }
@@ -587,13 +617,26 @@ fn a_dangling_ignore_symlink_publishes_nothing_and_fails() {
     fs::create_dir_all(env.ignore_file().parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&rules, env.ignore_file()).unwrap();
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
-    let before = fs::read(env.index().join("catalog")).unwrap();
+    let before = fs::read(
+        ferret_catalog::Catalog::snapshot_path(&env.index())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
 
     fs::remove_file(&rules).unwrap();
     let output = env.run(&[os("index")]);
     assert_eq!(code(&output), 3, "{}", stderr(&output));
     assert!(stderr(&output).contains("nothing published"));
-    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
+    assert_eq!(
+        fs::read(
+            ferret_catalog::Catalog::snapshot_path(&env.index())
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        before
+    );
     assert_eq!(code(&env.run(&[os("search"), os("secret")])), 1);
 }
 
@@ -728,21 +771,21 @@ fn the_index_comes_from_the_flag_then_the_environment_then_xdg() {
         command
     };
     assert_eq!(code(&bare(&[]).output().unwrap()), 0);
-    assert!(home.join("data/ferret/catalog").exists(), "XDG default");
+    assert!(home.join("data/ferret/current").exists(), "XDG default");
 
     let from_env = env.base.join("from-env");
     assert_eq!(
         code(&bare(&[("FERRET_INDEX", &from_env)]).output().unwrap()),
         0
     );
-    assert!(from_env.join("catalog").exists(), "FERRET_INDEX");
+    assert!(from_env.join("current").exists(), "FERRET_INDEX");
 
     let from_flag = env.base.join("from-flag");
     let mut command = bare(&[("FERRET_INDEX", &from_env)]);
     command.arg("--index").arg(&from_flag);
     assert_eq!(code(&command.output().unwrap()), 0);
     assert!(
-        from_flag.join("catalog").exists(),
+        from_flag.join("current").exists(),
         "--index beats FERRET_INDEX"
     );
 }
@@ -924,7 +967,12 @@ fn an_index_run_while_another_holds_the_lock_fails_clearly() {
     let env = Env::new("locked");
     env.write("a/f.txt", b"f\n");
     assert_eq!(code(&env.run(&[os("index"), env.at("a").as_os_str()])), 0);
-    let before = fs::read(env.index().join("catalog")).unwrap();
+    let before = fs::read(
+        ferret_catalog::Catalog::snapshot_path(&env.index())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     let lock = File::open(env.index().join("lock")).unwrap();
     lock.lock().unwrap();
 
@@ -936,7 +984,15 @@ fn an_index_run_while_another_holds_the_lock_fails_clearly() {
         "{}",
         stderr(&output)
     );
-    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
+    assert_eq!(
+        fs::read(
+            ferret_catalog::Catalog::snapshot_path(&env.index())
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        before
+    );
     let lines = env.log_lines();
     assert!(lines[1].contains(r#""outcome":"error""#), "{}", lines[1]);
 
@@ -974,9 +1030,16 @@ fn find_probe_needs_no_index_config_home_or_log() {
     let other = env.base.join("other");
     fs::create_dir(&other).unwrap();
     assert_eq!(code(&env.run(&[os("index"), other.as_os_str()])), 0);
-    let before = fs::read(env.index().join("catalog")).unwrap();
+    let before = fs::read(
+        ferret_catalog::Catalog::snapshot_path(&env.index())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     fs::set_permissions(
-        env.index().join("catalog"),
+        ferret_catalog::Catalog::snapshot_path(&env.index())
+            .unwrap()
+            .unwrap(),
         fs::Permissions::from_mode(0o400),
     )
     .unwrap();
@@ -986,7 +1049,15 @@ fn find_probe_needs_no_index_config_home_or_log() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(output.stdout, [tree.as_os_str().as_bytes(), b"\n"].concat());
     assert!(output.stderr.is_empty());
-    assert_eq!(fs::read(env.index().join("catalog")).unwrap(), before);
+    assert_eq!(
+        fs::read(
+            ferret_catalog::Catalog::snapshot_path(&env.index())
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        before
+    );
     assert_eq!(env.log_lines().len(), 1, "only index logged");
 }
 
@@ -1930,4 +2001,199 @@ fn catalog_find_candidate_guards_preserve_earlier_effects_and_followed_directory
         );
         assert_eq!(catalog.stderr.is_empty(), live.stderr.is_empty());
     }
+}
+
+#[test]
+fn search_checks_only_the_sections_its_query_loads() {
+    // Value/padding corruption in an unloaded stat column must not make a
+    // name query fail. The first metadata load must reject the same file.
+    let env = Env::new("lazy-checksum-query");
+    env.write("checked.txt", b"content\n");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let before = env.run(&[os("search"), os("checked")]);
+    assert_eq!(code(&before), 0);
+    let catalog = ferret_catalog::Catalog::open(&env.index())
+        .unwrap()
+        .unwrap();
+    let mut offset = catalog.head_len() as usize;
+    for (section, len) in catalog.section_sizes() {
+        if section == ferret_catalog::Section::Size {
+            break;
+        }
+        offset += len as usize;
+    }
+    let path = ferret_catalog::Catalog::snapshot_path(&env.index())
+        .unwrap()
+        .unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[offset] ^= 1;
+    fs::write(path, bytes).unwrap();
+    let names = env.run(&[os("search"), os("checked")]);
+    assert_eq!(code(&names), 0, "{}", stderr(&names));
+    assert_eq!(names.stdout, before.stdout);
+    let metadata = env.run(&[os("search"), os("checked"), os("size:>0")]);
+    assert_eq!(code(&metadata), 3, "{}", stderr(&metadata));
+    assert!(stderr(&metadata).contains("corrupt: size"));
+}
+
+#[test]
+fn stats_effective_depth_census_matches_a_fresh_checkpoint() {
+    use ferret_catalog::log::{ChangeSet, Record, Writer};
+    use ferret_catalog::{Catalog, Content, Kind, Stat, Transaction};
+    let env = Env::new("stats-overlay-depth");
+    let oracle = Env::new("stats-oracle-depth");
+    let st = |ino, mode| Stat {
+        dev: 1,
+        ino,
+        mode,
+        nlink: 1,
+        size: 17,
+        ..Stat::default()
+    };
+    for (index, moved) in [(env.index(), false), (oracle.index(), true)] {
+        let mut tx = Transaction::begin(&index, 1).unwrap();
+        let mut b = tx.batch();
+        let r = b.root(b"/r", st(1, 0o040755));
+        b.entry_count(r, 1);
+        let parent = if moved {
+            let d = b.dir(r, b"later", st(4, 0o040755));
+            b.entry_count(d, 1);
+            d
+        } else {
+            r
+        };
+        let a = b.dir(parent, b"a", st(2, 0o040755));
+        b.entry_count(a, 1);
+        b.file(a, b"file.rs", st(3, 0o100644), Content::Hashed([1; 16]));
+        tx.add(b);
+        tx.commit().unwrap();
+    }
+    let c = Catalog::open(&env.index()).unwrap().unwrap();
+    c.load_all().unwrap();
+    let r = c.roots().next().unwrap().0;
+    let name = c.lookup(r, b"a").unwrap();
+    let a = c.name(name).child;
+    let id = c.next_inode().0;
+    let edge = c.next_name().0;
+    assert!(id > a.0);
+    let mut w = Writer::open(&env.index()).unwrap();
+    let p = ferret_catalog::log::Published::open(&env.index())
+        .unwrap()
+        .unwrap();
+    let mut counters = p.counters();
+    let mut counts = p.counts();
+    counters[0] += 1;
+    counters[1] += 1;
+    counts[0] += 1;
+    counts[1] += 1;
+    counts[2] += 1;
+    w.commit(
+        w.generation(),
+        &ChangeSet {
+            counters,
+            counts,
+            records: vec![
+                Record::LifePut {
+                    id,
+                    kind: Kind::Dir,
+                    flags: 0,
+                    names: 1,
+                },
+                Record::InodePut {
+                    id,
+                    kind: Kind::Dir,
+                    state: ferret_catalog::ContentState::Unindexed,
+                    doc: None,
+                    stat: st(4, 0o040755),
+                },
+                Record::NamePut {
+                    id: edge,
+                    parent: r.0,
+                    child: id,
+                    name: b"later".to_vec(),
+                },
+                Record::DirPut {
+                    id,
+                    name: Some(edge),
+                    entries: Some(1),
+                    flags: 4,
+                    retained_at: None,
+                },
+                Record::NamePut {
+                    id: name.0,
+                    parent: id,
+                    child: a.0,
+                    name: b"a".to_vec(),
+                },
+            ],
+        },
+    )
+    .unwrap();
+    drop(w);
+    let outputs = [env.run(&[os("stats")]), oracle.run(&[os("stats")])];
+    for output in &outputs {
+        assert_eq!(
+            code(output),
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let text: Vec<_> = outputs
+        .iter()
+        .map(|o| String::from_utf8(o.stdout.clone()).unwrap())
+        .collect();
+    assert_eq!(
+        text[0].split_once("\ncontent (file inodes)").unwrap().1,
+        text[1].split_once("\ncontent (file inodes)").unwrap().1
+    );
+}
+
+#[test]
+fn transient_root_fault_retains_searchable_subtree_and_find_uses_the_live_boundary() {
+    let env = Env::new("retained-find");
+    env.seed_ignore_file();
+    let old = env.write("locked/old.txt", b"old\n");
+    let locked = old.parent().unwrap().to_owned();
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let displaced = env.tree().with_extension("displaced");
+    fs::rename(env.tree(), &displaced).unwrap();
+    let recrawl = env.run(&[os("index")]);
+    fs::rename(&displaced, env.tree()).unwrap();
+    assert_eq!(code(&recrawl), 0, "{}", stderr(&recrawl));
+    assert!(stderr(&recrawl).contains("protected scope"));
+    assert_eq!(
+        paths(&env.run(&[os("search"), os("old.txt")])),
+        std::slice::from_ref(&old)
+    );
+    // The retained indexed listing cannot see this addition. Find must cross
+    // its unknown-count boundary live, including metadata through the handle.
+    let added = env.write("locked/new.txt", b"new content\n");
+    let found = env.run(&[
+        os("find"),
+        env.tree().as_os_str(),
+        os("-name"),
+        os("*.txt"),
+        os("-print"),
+    ]);
+    let mut actual = paths(&found);
+    actual.sort();
+    let mut expected = vec![old.clone(), added];
+    expected.sort();
+    assert_eq!(code(&found), 0, "{}", stderr(&found));
+    assert_eq!(actual, expected);
+    fs::write(&old, b"updated live content with a different length\n").unwrap();
+    let metadata = env.run(&[
+        os("find"),
+        locked.as_os_str(),
+        os("-name"),
+        os("old.txt"),
+        os("-printf"),
+        os("%s"),
+    ]);
+    assert_eq!(code(&metadata), 0, "{}", stderr(&metadata));
+    assert_eq!(
+        String::from_utf8_lossy(&metadata.stdout),
+        fs::metadata(&old).unwrap().len().to_string()
+    );
 }

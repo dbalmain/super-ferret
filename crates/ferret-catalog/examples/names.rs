@@ -182,7 +182,7 @@ fn build(dump: &Path, dir: &Path) -> Result<()> {
     let catalog = txn.commit()?;
     let committed = started.elapsed();
 
-    let size = std::fs::metadata(dir.join("catalog"))?.len();
+    let size = std::fs::metadata(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?.len();
     println!(
         "dirs {} (plus the root), indexed {indexed}, unindexed {unindexed}, symlinks {links}",
         dirs.len()
@@ -318,7 +318,8 @@ fn layout(dir: &Path, runs: usize) -> Result<()> {
     let heap = catalog.name_heap();
     let coded = front_code(&catalog);
     let names = catalog.name_count() as usize;
-    let size = std::fs::metadata(dir.join("catalog"))?.len() as usize;
+    let size =
+        std::fs::metadata(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?.len() as usize;
     let saved = heap.len() - coded.len();
     println!("names {names}; snapshot {size} B");
     println!(
@@ -356,7 +357,7 @@ fn layout(dir: &Path, runs: usize) -> Result<()> {
 /// prints `read_ns decode_ns`.
 fn open(dir: &Path) -> Result<()> {
     let started = Instant::now();
-    let bytes = std::fs::read(dir.join("catalog"))?;
+    let bytes = std::fs::read(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?;
     let read = started.elapsed();
     let catalog = Catalog::from_bytes(bytes)?;
     let decoded = started.elapsed() - read;
@@ -374,7 +375,7 @@ const NAME_SECTIONS: usize = 6;
 fn open_names(dir: &Path) -> Result<()> {
     use std::io::Read;
     let started = Instant::now();
-    let mut file = std::fs::File::open(dir.join("catalog"))?;
+    let mut file = std::fs::File::open(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?;
     let mut bytes = vec![0; 24 + NAME_SECTIONS * 16];
     file.read_exact(&mut bytes)?;
     let entry = 24 + (NAME_SECTIONS - 1) * 16;
@@ -393,7 +394,7 @@ fn open_names(dir: &Path) -> Result<()> {
 
 fn names_bench(dir: &Path, runs: usize) -> Result<()> {
     let exe = std::env::current_exe()?;
-    let file = dir.join("catalog");
+    let file = Catalog::snapshot_path(dir)?.ok_or("no snapshot")?;
     for cold in [true, false] {
         let mut read = Vec::new();
         for _ in 0..runs.max(1) {
@@ -429,7 +430,7 @@ fn evict(file: &Path) -> Result<()> {
 
 fn open_bench(dir: &Path, runs: usize, cold: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
-    let file = dir.join("catalog");
+    let file = Catalog::snapshot_path(dir)?.ok_or("no snapshot")?;
     let (mut wall, mut read, mut decode) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..runs.max(1) {
         if cold {

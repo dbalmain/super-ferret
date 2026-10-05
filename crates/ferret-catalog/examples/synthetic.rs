@@ -36,7 +36,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use ferret_catalog::{Content, DirToken, Hash, Kind, Stat, Transaction};
+use ferret_catalog::{Catalog, Content, DirToken, Hash, Kind, Stat, Transaction};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -370,7 +370,7 @@ fn run(
     }
     let catalog = txn.commit()?;
     let committed = started.elapsed();
-    let size = std::fs::metadata(dir.join("catalog"))?.len();
+    let size = std::fs::metadata(Catalog::snapshot_path(dir)?.ok_or("no snapshot")?)?.len();
     println!(
         "copies {copies}: {} names, {} inodes, {} docs; {total} non-dir entries, {carried} carried",
         catalog.name_count(),

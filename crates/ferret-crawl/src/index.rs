@@ -8,20 +8,20 @@
 //! walk + hash    per refreshed root, walk_parallel with a hashing visitor
 //! resolve        aliases that met an inode in flight take its observation:
 //!                drained during the walk, and the rest as each root ends
-//! add, keep      hand the batches over, copy the kept roots forward
-//! commit         unless a coverage fault was seen
+//! reconcile      resolve directory tokens; diff and sweep refreshed roots
+//!                promote a kept alias root if its shared inode needs a stat
+//! commit         append one final set; equal rows publish nothing
+//! retain         typed faults protect checked old boundaries across workers
+//! checkpoint     initial indexing or an explicit format migration
 //! ```
 //!
-//! A **coverage fault** is any [`Event::Io`] except an entry's `lstat`
-//! NotFound (a deletion), and EACCES from opening or listing a directory
-//! (a catalogued directory with unknown contents, D26 amendment). It means the
-//! walk may have missed entries or applied the wrong ignore rules, so nothing
-//! is published and the old generation stays. A **content fault** leaves the
-//! namespace intact: the file is published with
-//! [`ContentState::Fault`](ferret_catalog::ContentState) and no document, and
-//! the next run reads it again.
+//! A coverage fault protects a checked old edge or directory subtree. New
+//! observations in that scope are discarded after all workers finish; other
+//! trustworthy scopes can publish. Missing anchors, changed global versions
+//! and uncertain root boundaries block the transaction. Content faults publish
+//! valid namespace/stat observations as Fault/no-document and retry next run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::io;
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use ferret_catalog::{
     BeginError, Catalog, CommitError, Content, ContentState, DirToken, InoId, KeepError, NameId,
-    Stat, Transaction,
+    Stat, Transaction, WriterSession,
 };
 use ferret_policy::{Config, Decision, Reason};
 
@@ -41,8 +41,8 @@ use crate::walk::{
     walk_parallel,
 };
 
-/// Which configured roots to walk this run. The rest are copied forward from
-/// the previous generation where that is still valid.
+/// Which configured roots to walk this run. The rest stay in the effective
+/// view where keeping them is valid.
 #[derive(Clone, Copy, Debug)]
 pub enum Refresh<'a> {
     /// Walk every root.
@@ -76,7 +76,18 @@ impl Default for IndexOptions {
     }
 }
 
-/// A fault that stopped publication.
+/// Owned walker context retained until all workers have finished.
+#[derive(Clone, Debug)]
+pub enum CoverageContext {
+    /// Opening/statting/listing the configured root, possibly before a token.
+    Root,
+    /// A directory occurrence already observed by the walker.
+    Directory(DirToken),
+    /// A named entry of a checked directory occurrence.
+    Child { parent: DirToken, name: Vec<u8> },
+}
+
+/// A typed coverage fault retained in the report or blocking publication.
 #[derive(Debug)]
 pub struct CoverageFault {
     /// The root being walked.
@@ -87,6 +98,8 @@ pub struct CoverageFault {
     pub op: IoOp,
     /// Whether it was on the root itself.
     pub on_root: bool,
+    /// Checked directory/edge coordinates for retention, independent of paths.
+    pub context: CoverageContext,
     /// The OS error.
     pub error: io::Error,
 }
@@ -110,6 +123,10 @@ pub enum IndexError {
     BadRoot(PathBuf),
     /// A root to refresh that is not among the configured roots.
     NotConfigured(PathBuf),
+    /// A request names an inode that is not a live directory in its generation.
+    BadScope(InoId),
+    /// Entry scopes require a single nonempty basename, without NUL.
+    BadEntry(Vec<u8>),
     /// The catalog could not be opened for writing: another run holds it
     /// ([`BeginError::Locked`]) or the previous generation is unreadable.
     Begin(BeginError),
@@ -125,6 +142,11 @@ pub enum IndexError {
     /// Commit failed. [`CommitError::published`] says whether the new
     /// generation is visible anyway.
     Commit(CommitError),
+    /// Incremental reconciliation or publication failed.
+    Update(ferret_catalog::log::Error),
+    /// An incomplete observation has no typed protection result. An owned
+    /// caller can transfer its session to an explicit checkpoint fallback.
+    NeedsCheckpoint { report: Box<Report> },
 }
 
 impl fmt::Display for IndexError {
@@ -132,6 +154,10 @@ impl fmt::Display for IndexError {
         match self {
             Self::BadRoot(p) => write!(f, "root {} must be absolute, without `..`", p.display()),
             Self::NotConfigured(p) => write!(f, "{} is not a configured root", p.display()),
+            Self::BadEntry(name) => {
+                write!(f, "invalid entry basename {:?}", OsStr::from_bytes(name))
+            }
+            Self::BadScope(id) => write!(f, "inode {} is not a live directory scope", id.0),
             Self::Begin(e) => write!(f, "{e}"),
             Self::Keep(e) => write!(f, "{e}"),
             Self::Coverage { faults, .. } => {
@@ -146,6 +172,11 @@ impl fmt::Display for IndexError {
                 Ok(())
             }
             Self::Commit(e) => write!(f, "{e}"),
+            Self::Update(e) => write!(f, "{e}"),
+            Self::NeedsCheckpoint { .. } => write!(
+                f,
+                "incomplete directory coverage requires checkpoint fallback"
+            ),
         }
     }
 }
@@ -249,18 +280,33 @@ pub struct Report {
     pub content_faults: Vec<(PathBuf, ContentFault)>,
     /// Ignore-file problems, as text.
     pub pattern_errors: Vec<String>,
+    /// Typed faults retained by scoped reconciliation; stale counts are
+    /// unknown.
+    pub coverage_faults: Vec<CoverageFault>,
+    /// Outermost retained edges/subtrees and new opaque directory scopes.
+    pub protected_scopes: usize,
     /// Walking and hashing, over every refreshed root.
     pub walk_time: Duration,
     /// Of the walk, time the workers spent sniffing and hashing file
     /// content, summed over workers. Hashing runs on the walk's workers, so
     /// with several it overlaps the walk and can exceed `walk_time`.
     pub hash_time: Duration,
-    /// Keeping roots, building, encoding, writing and syncing.
+    /// Reconciliation, final-set encoding, writing and syncing. A checkpoint
+    /// fallback also includes copying kept roots and building packed columns.
     pub commit_time: Duration,
-    /// After the commit, listing every name the published generation holds
-    /// as Fault (`content_faults`): a check of every inode row, and a scan
-    /// of the names when one is Fault.
+    /// After commit, fault reporting. Log recrawls inspect changed fault inode
+    /// ids; a checkpoint fallback checks every inode. Live names are scanned
+    /// only when a fault needs its aliases reported.
     pub fault_time: Duration,
+    /// Sum of worker-local peak temporary file rows; changed final rows and
+    /// epoch-sized seen bits are reported separately from this bounded buffer.
+    pub observation_rows_peak: usize,
+    /// Conservative temporary row/name/target peak across worker buffers.
+    pub observation_bytes_peak: usize,
+    /// Guard high-water before publication; refused allocations are excluded.
+    pub input_usage: ferret_catalog::InputUsage,
+    /// The bounded attempt was discarded and every configured root rewalked.
+    pub input_fallback: bool,
     /// The published generation's shape, when one was published.
     pub published: Option<Published>,
 }
@@ -297,9 +343,10 @@ impl Published {
 /// - a root with another root added or removed strictly inside it is walked,
 ///   because its kept copy stopped at the old inner roots (D34).
 ///
-/// The writer lock is taken first and held until the commit. A coverage
-/// fault other than a directory listing/open EACCES publishes nothing
-/// ([`IndexError::Coverage`]).
+/// The writer lock is held through publication. Typed coverage faults retain
+/// checked old scopes while trustworthy observations elsewhere publish. An
+/// unresolvable scope or an incompatible version/root transition publishes
+/// nothing ([`IndexError::Coverage`]).
 pub fn index(
     catalog_dir: &Path,
     roots: &[PathBuf],
@@ -368,19 +415,423 @@ fn run(
     refresh: Refresh<'_>,
     options: &IndexOptions,
 ) -> Result<Report, IndexError> {
-    let mut txn = Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
-    let roots = roots(txn.previous())?;
-    let plan = Plan::new(txn.previous(), &roots, refresh, options.sniffer)?;
+    let session = WriterSession::open(catalog_dir);
+    match session {
+        Ok(mut session) => {
+            let previous = session.view();
+            let roots = roots(Some(&previous))?;
+            let mut plan = Plan::new(
+                Some(&previous),
+                &roots,
+                refresh,
+                options.sniffer,
+                fingerprint(options),
+            )?;
+            let Reconciled {
+                batches,
+                mut report,
+                changes,
+            } = match observe_reconcile(&session, &mut plan, options) {
+                Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
+                    return full_rewalk(&mut session, &plan.roots, options, usage);
+                }
+                result => result?,
+            };
+            let started = Instant::now();
+            let (catalog, changed, faulted, aliases) = match changes {
+                Some(changes) => {
+                    let changed = !changes.records.is_empty();
+                    let catalog = session
+                        .commit(&changes, options.sniffer)
+                        .map_err(IndexError::Update)?;
+                    let (faulted, aliases) =
+                        reporting_ids(&session, previous.generation(), &changes);
+                    (catalog, changed, faulted, aliases)
+                }
+                None => {
+                    let mut txn = session.into_checkpoint(options.sniffer);
+                    txn.set_policy(fingerprint(options));
+                    for batch in batches {
+                        txn.add(batch);
+                    }
+                    for root in &plan.keep {
+                        txn.keep(root.as_os_str().as_bytes())
+                            .map_err(IndexError::Keep)?;
+                    }
+                    (txn.commit().map_err(IndexError::Commit)?, true, None, None)
+                }
+            };
+            report.commit_time += started.elapsed();
+            finish_report(
+                &mut report,
+                &catalog,
+                &plan,
+                changed,
+                faulted.as_deref(),
+                aliases.as_deref(),
+            );
+            Ok(report)
+        }
+        Err(ferret_catalog::log::Error::MissingCheckpoint)
+        | Err(ferret_catalog::log::Error::Previous(ferret_catalog::OpenError::Decode(
+            ferret_catalog::DecodeError::Version(_),
+        ))) => {
+            let mut txn =
+                Transaction::begin(catalog_dir, options.sniffer).map_err(IndexError::Begin)?;
+            let roots = roots(txn.previous())?;
+            let plan = Plan::new(
+                txn.previous(),
+                &roots,
+                refresh,
+                options.sniffer,
+                fingerprint(options),
+            )?;
+            let (batches, mut report) = observe(Source::Checkpoint(&txn), &plan, options)?;
+            let started = Instant::now();
+            txn.set_policy(fingerprint(options));
+            for batch in batches {
+                txn.add(batch);
+            }
+            for root in &plan.keep {
+                txn.keep(root.as_os_str().as_bytes())
+                    .map_err(IndexError::Keep)?;
+            }
+            let catalog = txn.commit().map_err(IndexError::Commit)?;
+            report.commit_time += started.elapsed();
+            finish_report(&mut report, &catalog, &plan, true, None, None);
+            Ok(report)
+        }
+        Err(ferret_catalog::log::Error::Locked) => Err(IndexError::Begin(BeginError::Locked)),
+        Err(error) => Err(IndexError::Update(error)),
+    }
+}
+
+/// Recrawls using a resident session, retaining its lookups and writer lock.
+/// The complete configured root set and D34 widening have the same contract as
+/// `index`. Typed faults retain checked old scopes in the same log transaction
+/// as trustworthy updates, without rebuilding the checkpoint.
+pub fn recrawl(
+    session: &mut WriterSession,
+    roots: &[PathBuf],
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+) -> Result<Report, IndexError> {
+    recrawl_with_changes(session, roots, refresh, options).map(|(report, _)| report)
+}
+
+pub(crate) fn recrawl_with_changes(
+    session: &mut WriterSession,
+    roots: &[PathBuf],
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+) -> Result<(Report, ferret_catalog::log::ChangeSet), IndexError> {
+    recrawl_scoped(session, roots, refresh, options, BTreeMap::new())
+}
+
+pub(crate) fn recrawl_scoped(
+    session: &mut WriterSession,
+    roots: &[PathBuf],
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+    selections: BTreeMap<PathBuf, std::sync::Arc<crate::refresh::Selection>>,
+) -> Result<(Report, ferret_catalog::log::ChangeSet), IndexError> {
+    let previous = session.view();
+    let mut plan = Plan::new(
+        Some(&previous),
+        roots,
+        refresh,
+        options.sniffer,
+        fingerprint(options),
+    )?;
+    if previous.policy() == fingerprint(options) && previous.sniffer_version() == options.sniffer {
+        plan.selections = selections;
+    }
+    let Reconciled {
+        mut report,
+        changes,
+        ..
+    } = match observe_reconcile(session, &mut plan, options) {
+        Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
+            let report = full_rewalk(session, &plan.roots, options, usage)?;
+            let view = session.view();
+            return Ok((
+                report,
+                ferret_catalog::log::ChangeSet {
+                    records: Vec::new(),
+                    counters: [view.next_inode().0, view.next_name().0, view.next_doc().0],
+                    counts: [
+                        view.inode_count(),
+                        view.name_count(),
+                        view.dir_count(),
+                        view.doc_count(),
+                    ],
+                },
+            ));
+        }
+        result => result?,
+    };
+    let started = Instant::now();
+    let Some(changes) = changes else {
+        return Err(IndexError::NeedsCheckpoint {
+            report: Box::new(report),
+        });
+    };
+    let changed = !changes.records.is_empty();
+    let catalog = session
+        .commit(&changes, options.sniffer)
+        .map_err(IndexError::Update)?;
+    let (faulted, aliases) = reporting_ids(session, previous.generation(), &changes);
+    report.commit_time += started.elapsed();
+    finish_report(
+        &mut report,
+        &catalog,
+        &plan,
+        changed,
+        faulted.as_deref(),
+        aliases.as_deref(),
+    );
+    Ok((report, changes))
+}
+
+struct Reconciled {
+    batches: Vec<ferret_catalog::Batch>,
+    report: Report,
+    changes: Option<ferret_catalog::log::ChangeSet>,
+}
+
+fn observe_reconcile(
+    session: &WriterSession,
+    plan: &mut Plan,
+    options: &IndexOptions,
+) -> Result<Reconciled, IndexError> {
+    let budget = std::sync::Arc::new(ferret_catalog::InputBudget::new(session.input_limits()));
+    let source = Source::Bounded(session, options.sniffer, &budget);
+    let (mut batches, mut report) = observe(source, plan, options)?;
+    loop {
+        let started = Instant::now();
+        let Some(protection) =
+            crate::coverage::resolve(session, &batches, &report.coverage_faults, &plan.roots)
+        else {
+            return Err(IndexError::Coverage {
+                faults: std::mem::take(&mut report.coverage_faults),
+                report: Box::new(report),
+            });
+        };
+        if !protection.is_empty()
+            && (session.view().policy() != fingerprint(options)
+                || session.view().sniffer_version() != options.sniffer)
+        {
+            return Err(IndexError::Coverage {
+                faults: std::mem::take(&mut report.coverage_faults),
+                report: Box::new(report),
+            });
+        }
+        report.protected_scopes =
+            protection.directories.len() + protection.edges.len() + protection.opaque.len();
+        let changes = crate::reconcile::with_budget(
+            session,
+            &batches,
+            &plan.refresh,
+            &plan.dropped,
+            fingerprint(options),
+            options.sniffer,
+            (&protection, budget.clone()),
+        )
+        .map_err(IndexError::Update)?;
+        report.commit_time += started.elapsed();
+        report.input_usage = budget.usage();
+        let Some(ref final_changes) = changes else {
+            return Ok(Reconciled {
+                batches,
+                report,
+                changes: None,
+            });
+        };
+        let previous = session.view();
+        // A deleted last refreshed alias supplies no stat. Rewalk its kept
+        // root so nlink/ctime and content are observed, rather than publishing
+        // a stale shared row. M6 can narrow this to handle-relative alias
+        // scopes.
+        let observed: BTreeSet<_> = final_changes
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                ferret_catalog::log::Record::InodePut { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let missing: BTreeSet<_> = final_changes
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                ferret_catalog::log::Record::LifePut {
+                    id, names, kind, ..
+                } if *kind != ferret_catalog::Kind::Dir
+                    && previous.is_live_inode(InoId(*id))
+                    && *names > 0
+                    && *names < session.name_references(InoId(*id))
+                    && !observed.contains(id) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(Reconciled {
+                batches,
+                report,
+                changes,
+            });
+        }
+        let mut extra = BTreeSet::new();
+        let removed: BTreeSet<_> = final_changes
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                ferret_catalog::log::Record::NameDelete { id } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let mut expanded = false;
+        for id in &missing {
+            for name in session
+                .names_for(InoId(*id))
+                .filter(|n| !removed.contains(&n.0))
+            {
+                let edge = previous.name(name);
+                let mut root = edge.parent;
+                while let Some(name) = previous.dir_name(root) {
+                    root = previous.name(name).parent;
+                }
+                let Some(path) = previous
+                    .roots()
+                    .find(|(id, _)| *id == root)
+                    .map(|(_, p)| PathBuf::from(OsStr::from_bytes(p)))
+                else {
+                    continue;
+                };
+                if let Some(selection) = plan.selections.get(&path) {
+                    let mut alias = Vec::new();
+                    previous.path(name, &mut alias);
+                    if let Ok(relative) = Path::new(OsStr::from_bytes(&alias)).strip_prefix(&path)
+                        && !selection.includes(relative)
+                    {
+                        selection.promote(relative);
+                        expanded = true;
+                    }
+                } else if plan.keep.contains(&path) {
+                    extra.insert(path);
+                }
+            }
+        }
+        if expanded {
+            // Re-observe the expanded final scopes together: duplicate root
+            // token graphs from a second partial pass cannot be reconciled.
+            let (fresh, fresh_report) = observe(source, plan, options)?;
+            batches = fresh;
+            report = fresh_report;
+            continue;
+        }
+        if extra.is_empty() {
+            return Ok(Reconciled {
+                batches,
+                report,
+                changes,
+            });
+        }
+        let extra: Vec<_> = extra.into_iter().collect();
+        plan.keep.retain(|p| !extra.contains(p));
+        plan.refresh.extend(extra.iter().cloned());
+        plan.refresh.sort();
+        let added = Plan {
+            roots: plan.roots.clone(),
+            refresh: extra,
+            keep: Vec::new(),
+            dropped: Vec::new(),
+            selections: BTreeMap::new(),
+        };
+        let (more, mut extra_report) = observe(source, &added, options)?;
+        batches.extend(more);
+        report.counts.add(&extra_report.counts);
+        report.walk_time += extra_report.walk_time;
+        report.hash_time += extra_report.hash_time;
+        report
+            .content_faults
+            .append(&mut extra_report.content_faults);
+        report
+            .pattern_errors
+            .append(&mut extra_report.pattern_errors);
+        report
+            .coverage_faults
+            .append(&mut extra_report.coverage_faults);
+        report.refreshed.clone_from(&plan.refresh);
+        report.kept.clone_from(&plan.keep);
+    }
+}
+
+fn fingerprint(options: &IndexOptions) -> ferret_catalog::Hash {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"ferret-policy-v1\0");
+    hash.update(&options.config.size_cap.to_le_bytes());
+    hash.update(&[u8::from(options.global.is_some())]);
+    hash.update(options.global.as_deref().unwrap_or_default().as_bytes());
+    let mut fingerprint = [0; 16];
+    fingerprint.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+    fingerprint
+}
+
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Checkpoint(&'a Transaction),
+    Bounded(
+        &'a WriterSession,
+        u32,
+        &'a std::sync::Arc<ferret_catalog::InputBudget>,
+    ),
+    Rebuild(&'a WriterSession, u32, usize),
+}
+impl Source<'_> {
+    fn batch(self) -> ferret_catalog::Batch {
+        match self {
+            Self::Checkpoint(txn) => txn.batch(),
+            Self::Bounded(session, _, budget) => {
+                session.batch().with_input_budget((*budget).clone())
+            }
+            Self::Rebuild(session, _, hint) => session.checkpoint_batch(hint),
+        }
+    }
+    fn budget(self) -> Option<std::sync::Arc<ferret_catalog::InputBudget>> {
+        match self {
+            Self::Bounded(_, _, budget) => Some(budget.clone()),
+            _ => None,
+        }
+    }
+    fn carry(self, stat: &Stat) -> Option<Content> {
+        match self {
+            Self::Checkpoint(txn) => txn.carry(stat),
+            Self::Bounded(session, sniffer, _) | Self::Rebuild(session, sniffer, _) => {
+                session.carry(stat, sniffer)
+            }
+        }
+    }
+}
+
+fn observe(
+    source: Source<'_>,
+    plan: &Plan,
+    options: &IndexOptions,
+) -> Result<(Vec<ferret_catalog::Batch>, Report), IndexError> {
     let mut report = Report {
         refreshed: plan.refresh.clone(),
         kept: plan.keep.clone(),
         dropped: plan.dropped.clone(),
         ..Report::default()
     };
-
     let started = Instant::now();
     let cache = Cache::new();
     let mut faults = Vec::new();
+    let mut batches = Vec::new();
     for root in &plan.refresh {
         let walk_options = WalkOptions {
             workers: options.workers,
@@ -391,52 +842,159 @@ fn run(
             options.global.as_deref(),
             options.config,
             &walk_options,
-            || Hasher::new(&txn, &cache, root),
+            || {
+                let mut hasher = Hasher::with_source(source, &cache, root);
+                hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
+                hasher
+            },
         );
+        if let Source::Bounded(_, _, budget) = source
+            && budget.exceeded()
+        {
+            return Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(
+                budget.usage(),
+            )));
+        }
         let outputs: Vec<Output> = visitors
             .into_iter()
             .map(|v| v.finish(&mut faults))
             .collect();
-        // Every inode this root's workers claimed is finished now (roots are
-        // walked one at a time), so its deferred aliases resolve here rather
-        // than riding along through later roots.
+        let mut observation_rows = 0;
+        let mut observation_bytes = 0;
         for mut output in outputs {
             output.resolve(&cache);
+            output.batch.seal();
+            if let Source::Bounded(_, _, budget) = source
+                && budget.exceeded()
+            {
+                return Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(
+                    budget.usage(),
+                )));
+            }
+            let (rows, bytes) = output.batch.observation_peak();
+            observation_rows += rows;
+            observation_bytes += bytes;
             report.counts.add(&output.counts);
             report.hash_time += output.read_time;
             report.content_faults.append(&mut output.content_faults);
             report.pattern_errors.append(&mut output.pattern_errors);
-            txn.add(output.batch);
+            batches.push(output.batch);
         }
+        report.observation_rows_peak = report.observation_rows_peak.max(observation_rows);
+        report.observation_bytes_peak = report.observation_bytes_peak.max(observation_bytes);
     }
     report.counts.cached_inodes = cache.len() as u64;
     report.counts.deferred_peak = cache.deferred_peak();
-    drop(cache);
     report.content_faults.sort_by(|a, b| a.0.cmp(&b.0));
     report.counts.content_faults = report.content_faults.len() as u64;
     report.walk_time = started.elapsed();
-
-    if !faults.is_empty() {
+    if crate::coverage::discard_denied_prefix_faults(&batches, &mut faults).is_none() {
         return Err(IndexError::Coverage {
             faults,
             report: Box::new(report),
         });
     }
-
-    let started = Instant::now();
-    for root in &plan.keep {
-        txn.keep(root.as_os_str().as_bytes())
-            .map_err(IndexError::Keep)?;
+    if !faults.is_empty()
+        && let Source::Checkpoint(txn) = source
+    {
+        // D26 directory EACCES is opaque even for an initial root. Every
+        // other initial fault still lacks a trustworthy retention anchor.
+        if faults.iter().all(crate::coverage::directory_denied)
+            && let Some(opaque) = crate::coverage::opaque_checkpoint(txn, &batches, &faults)
+        {
+            batches = opaque;
+            faults.clear();
+        } else {
+            return Err(IndexError::Coverage {
+                faults,
+                report: Box::new(report),
+            });
+        }
     }
-    let catalog = txn.commit().map_err(IndexError::Commit)?;
-    report.commit_time = started.elapsed();
+    report.coverage_faults = faults;
+    Ok((batches, report))
+}
+
+// Changes contain epoch-scoped ids. A checkpoint remaps them; reporting must
+// scan the resulting catalog before looking up any numeric id from the diff.
+fn reporting_ids(
+    session: &WriterSession,
+    previous: ferret_catalog::Generation,
+    changes: &ferret_catalog::log::ChangeSet,
+) -> (Option<Vec<InoId>>, Option<Vec<NameId>>) {
+    if session.view().generation().checkpoint != previous.checkpoint {
+        return (None, None);
+    }
+    let faulted = faulted_inodes(changes);
+    let aliases = faulted
+        .iter()
+        .flat_map(|&id| session.names_for(id))
+        .collect();
+    (Some(faulted), Some(aliases))
+}
+
+fn faulted_inodes(changes: &ferret_catalog::log::ChangeSet) -> Vec<InoId> {
+    changes
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            ferret_catalog::log::Record::InodePut {
+                id,
+                state: ContentState::Fault,
+                ..
+            } => Some(InoId(*id)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn finish_report(
+    report: &mut Report,
+    catalog: &Catalog,
+    plan: &Plan,
+    changed: bool,
+    faulted: Option<&[InoId]>,
+    aliases: Option<&[NameId]>,
+) {
     let started = Instant::now();
-    let seen = std::mem::take(&mut report.content_faults);
-    report.content_faults = content_faults(&catalog, &plan.refresh, seen);
+    report
+        .coverage_faults
+        .retain(|f| !crate::coverage::directory_denied(f));
+    let seen = std::mem::take(&mut report.content_faults)
+        .into_iter()
+        .filter(|(path, _)| published_content_fault(catalog, path))
+        .collect();
+    report.content_faults = content_faults_with(catalog, &plan.refresh, seen, faulted, aliases);
     report.counts.content_faults = report.content_faults.len() as u64;
     report.fault_time = started.elapsed();
-    report.published = Some(Published::of(&catalog));
-    Ok(report)
+    report.published = changed.then(|| Published::of(catalog));
+}
+
+// Fault reports describe the effective indexed row, including retained data.
+// Resolve's live-fallback boundary is deliberately crossed through checked
+// child keys here; this is reporting, not permission to use a stale listing.
+fn published_content_fault(catalog: &Catalog, path: &Path) -> bool {
+    let Some(resolved) = catalog.resolve(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut target = resolved.target;
+    for component in resolved
+        .remainder
+        .split(|&b| b == b'/')
+        .filter(|part| !part.is_empty())
+    {
+        let ferret_catalog::Target::Inode(parent) = target else {
+            return false;
+        };
+        if !catalog.is_directory(parent) {
+            return false;
+        }
+        let Some(name) = catalog.lookup(parent, component) else {
+            return false;
+        };
+        target = catalog.name(name).target();
+    }
+    matches!(target, ferret_catalog::Target::Inode(id) if catalog.state(id) == ContentState::Fault)
 }
 
 /// Every name under a refreshed root whose inode the catalog published as
@@ -448,14 +1006,34 @@ fn run(
 ///
 /// Paths come from the catalog, so the walk holds none; the scan over the
 /// names runs only when some inode is Fault.
+#[cfg(test)]
 pub(crate) fn content_faults(
     catalog: &Catalog,
     refresh: &[PathBuf],
     seen: Vec<(PathBuf, ContentFault)>,
 ) -> Vec<(PathBuf, ContentFault)> {
+    content_faults_with(catalog, refresh, seen, None, None)
+}
+
+fn content_faults_with(
+    catalog: &Catalog,
+    refresh: &[PathBuf],
+    seen: Vec<(PathBuf, ContentFault)>,
+    faulted: Option<&[InoId]>,
+    aliases: Option<&[NameId]>,
+) -> Vec<(PathBuf, ContentFault)> {
     let fault = |id: InoId| catalog.state(id) == ContentState::Fault;
     let mut listed: BTreeMap<PathBuf, ContentFault> = seen.into_iter().collect();
-    if !(catalog.dir_count()..catalog.inode_count()).any(|i| fault(InoId(i))) {
+    let any = faulted.map_or_else(
+        || {
+            catalog
+                .inode_ids()
+                .filter(|&id| !catalog.is_directory(id))
+                .any(fault)
+        },
+        |ids| ids.iter().copied().any(fault),
+    );
+    if !any {
         return listed.into_iter().collect();
     }
     let refreshed: Vec<InoId> = catalog
@@ -470,18 +1048,23 @@ pub(crate) fn content_faults(
         dir
     };
     let mut buf = Vec::new();
-    for id in (0..catalog.name_count()).map(NameId) {
+    let report_alias = |id| {
         let name = catalog.name(id);
         if matches!(name.target(), ferret_catalog::Target::Ignored(_))
             || !fault(name.child)
             || !refreshed.contains(&root_of(name.parent))
         {
-            continue;
+            return;
         }
         buf.clear();
         catalog.path(id, &mut buf);
         let path = PathBuf::from(OsStr::from_bytes(&buf));
         listed.entry(path).or_insert(ContentFault::Alias);
+    };
+    if let Some(aliases) = aliases {
+        aliases.iter().copied().for_each(report_alias);
+    } else {
+        catalog.names().map(|(id, _)| id).for_each(report_alias);
     }
     listed.into_iter().collect()
 }
@@ -493,6 +1076,7 @@ struct Plan {
     refresh: Vec<PathBuf>,
     keep: Vec<PathBuf>,
     dropped: Vec<PathBuf>,
+    selections: BTreeMap<PathBuf, std::sync::Arc<crate::refresh::Selection>>,
 }
 
 impl Plan {
@@ -501,6 +1085,7 @@ impl Plan {
         roots: &[PathBuf],
         refresh: Refresh<'_>,
         sniffer: u32,
+        policy: ferret_catalog::Hash,
     ) -> Result<Plan, IndexError> {
         let mut configured = roots
             .iter()
@@ -516,7 +1101,7 @@ impl Plan {
             })
             .unwrap_or_default();
         let everything = matches!(refresh, Refresh::All)
-            || previous.is_some_and(|p| p.sniffer_version() != sniffer);
+            || previous.is_some_and(|p| p.sniffer_version() != sniffer || p.policy() != policy);
         let named = match refresh {
             Refresh::All => Vec::new(),
             Refresh::Only(paths) => {
@@ -559,6 +1144,7 @@ impl Plan {
             refresh,
             keep,
             dropped,
+            selections: BTreeMap::new(),
         })
     }
 
@@ -605,15 +1191,17 @@ pub(crate) struct Deferred {
 
 /// The per-worker visitor: fills one batch and reads the files it must.
 pub(crate) struct Hasher<'a> {
-    txn: &'a Transaction,
+    txn: Source<'a>,
     cache: &'a Cache,
     root: &'a Path,
     pub(crate) out: Output,
     reader: Reader,
+    selection: Option<&'a crate::refresh::Selection>,
 }
 
 /// What a worker leaves behind.
 pub(crate) struct Output {
+    budget: Option<std::sync::Arc<ferret_catalog::InputBudget>>,
     pub(crate) batch: ferret_catalog::Batch,
     pub(crate) counts: Counts,
     faults: Vec<CoverageFault>,
@@ -631,12 +1219,17 @@ pub(crate) struct Output {
 pub(crate) const DRAIN_MIN: usize = 64;
 
 impl<'a> Hasher<'a> {
+    #[cfg(test)]
     pub(crate) fn new(txn: &'a Transaction, cache: &'a Cache, root: &'a Path) -> Self {
+        Self::with_source(Source::Checkpoint(txn), cache, root)
+    }
+    fn with_source(txn: Source<'a>, cache: &'a Cache, root: &'a Path) -> Self {
         Self {
             txn,
             cache,
             root,
             out: Output {
+                budget: txn.budget(),
                 batch: txn.batch(),
                 counts: Counts::default(),
                 faults: Vec::new(),
@@ -647,6 +1240,7 @@ impl<'a> Hasher<'a> {
                 read_time: Duration::ZERO,
             },
             reader: Reader::new(),
+            selection: None,
         }
     }
 
@@ -656,6 +1250,23 @@ impl<'a> Hasher<'a> {
         self.out.read_time = self.reader.read_time;
         faults.append(&mut self.out.faults);
         self.out
+    }
+
+    fn promote_changed_parent(&self, token: DirToken, stat: &Stat, path: &Path) {
+        if let Some(selection) = self.selection {
+            let continuing = match (token.previous_directory(), self.txn) {
+                (Some(id), Source::Bounded(session, _, _) | Source::Rebuild(session, _, _)) => {
+                    session.view().inode(id).stat.same_version(stat)
+                }
+                _ => false,
+            };
+            if !continuing {
+                // Directory ctime can change for ordinary child edits too.
+                // Conservatively cover its subtree rather than trust a reused
+                // (dev, ino) as proof that the old parent still exists.
+                selection.promote(path);
+            }
+        }
     }
 
     /// A file the policy sends to the index: carried, taken from another
@@ -671,6 +1282,8 @@ impl<'a> Hasher<'a> {
                 out.counts.carried += 1;
                 out.batch
                     .file(decided.parent, decided.name.as_bytes(), stat, content);
+                #[cfg(test)]
+                hook(self.root, Probe::Carried(decided.path));
                 return;
             }
         }
@@ -686,6 +1299,13 @@ impl<'a> Hasher<'a> {
             match self.cache.claim(key) {
                 Lookup::Claimed => {}
                 Lookup::InFlight => {
+                    if !out.reserve(
+                        std::mem::size_of::<Deferred>()
+                            + decided.name.as_bytes().len()
+                            + joined_bytes(self.root, decided.path),
+                    ) {
+                        return;
+                    }
                     let alias = Deferred {
                         parent: decided.parent,
                         name: decided.name.as_bytes().to_vec(),
@@ -731,34 +1351,80 @@ impl<'a> Hasher<'a> {
         stat: Stat,
         content: Result<Content, ContentFault>,
     ) {
-        let content = self.out.outcome(|| self.root.join(decided.path), content);
+        let content = self.out.outcome(
+            joined_bytes(self.root, decided.path),
+            || self.root.join(decided.path),
+            content,
+        );
         self.out
             .batch
             .file(decided.parent, decided.name.as_bytes(), stat, content);
     }
 
-    fn fault(&mut self, path: &Path, op: IoOp, on_root: bool, error: io::Error) {
+    fn fault(
+        &mut self,
+        path: &Path,
+        op: IoOp,
+        context: FaultContext<'_, DirToken>,
+        error: io::Error,
+    ) {
+        let name_bytes = match context {
+            FaultContext::Child { name, .. } => name.as_bytes().len(),
+            _ => 0,
+        };
+        if !self.out.reserve(
+            std::mem::size_of::<CoverageFault>()
+                + self.root.as_os_str().len()
+                + path.as_os_str().len()
+                + name_bytes,
+        ) {
+            return;
+        }
         self.out.faults.push(CoverageFault {
             root: self.root.to_owned(),
             path: path.to_owned(),
             op,
-            on_root,
+            on_root: matches!(context, FaultContext::Root),
+            context: match context {
+                FaultContext::Root => CoverageContext::Root,
+                FaultContext::Dir(token) => CoverageContext::Directory(token),
+                FaultContext::Child { parent, name } => CoverageContext::Child {
+                    parent,
+                    name: name.as_bytes().to_vec(),
+                },
+            },
             error,
         });
     }
 }
 
+// Conservatively include a separator without allocating the joined path.
+fn joined_bytes(root: &Path, path: &Path) -> usize {
+    root.as_os_str().len() + 1 + path.as_os_str().len()
+}
+
 impl Output {
+    fn reserve(&self, bytes: usize) -> bool {
+        self.budget
+            .as_ref()
+            .is_none_or(|budget| budget.charge(1, bytes).is_ok())
+    }
     /// The content to publish for one name, listing a fault with its path.
     /// These are the faults a worker saw, with their errors; the build may
     /// fault more names, which `index` lists from the published catalog.
     fn outcome(
         &mut self,
+        path_bytes: usize,
         path: impl FnOnce() -> PathBuf,
         content: Result<Content, ContentFault>,
     ) -> Content {
         content.unwrap_or_else(|fault| {
-            self.content_faults.push((path(), fault));
+            if self.reserve(std::mem::size_of::<(PathBuf, ContentFault)>() + path_bytes) {
+                self.content_faults.push((path(), fault));
+            }
+            // A refused report marks the shared attempt exhausted. The caller
+            // discards all output and rewalks; this placeholder never
+            // publishes.
             Content::Fault
         })
     }
@@ -805,7 +1471,7 @@ impl Output {
             Some(stored) => observe::consume(stored, &alias.stat),
             None => (alias.stat, Err(ContentFault::Alias)),
         };
-        let content = self.outcome(|| alias.path, content);
+        let content = self.outcome(alias.path.as_os_str().len(), || alias.path, content);
         self.batch.file(alias.parent, &alias.name, stat, content);
     }
 }
@@ -815,12 +1481,37 @@ impl EventVisitor for Hasher<'_> {
 
     fn root(&mut self, stat: crate::Stat<'_>) -> DirToken {
         self.out.counts.dirs += 1;
-        self.out
-            .batch
-            .root(self.root.as_os_str().as_bytes(), observe::from_walk(&stat))
+        let stat = observe::from_walk(&stat);
+        let token = self.out.batch.root(self.root.as_os_str().as_bytes(), stat);
+        self.promote_changed_parent(token, &stat, Path::new(""));
+        token
+    }
+
+    fn consider(&mut self, parent: DirToken, name: &OsStr, path: &Path) -> bool {
+        if self.out.batch.input_exceeded() {
+            return false;
+        }
+        let Some(selection) = self.selection else {
+            return true;
+        };
+        if let Some(old) = parent.previous_directory()
+            && let Source::Bounded(session, _, _) | Source::Rebuild(session, _, _) = self.txn
+            && session.view().entry_count(old).is_none()
+        {
+            selection.promote(path.parent().unwrap_or_else(|| Path::new("")));
+        }
+        if selection.includes(path) {
+            true
+        } else {
+            self.out.batch.preserve(parent, name.as_bytes());
+            false
+        }
     }
 
     fn visit(&mut self, event: Event<'_, DirToken>) -> Option<DirToken> {
+        if self.out.batch.input_exceeded() {
+            return None;
+        }
         match event {
             Event::Decided(decided) => {
                 if decided.decision == Decision::Skip {
@@ -835,11 +1526,15 @@ impl EventVisitor for Hasher<'_> {
                     Decision::Skip => None,
                     Decision::Descend => {
                         self.out.counts.dirs += 1;
-                        Some(self.out.batch.dir(decided.parent, name, stat))
+                        let token = self.out.batch.dir(decided.parent, name, stat);
+                        self.promote_changed_parent(token, &stat, decided.path);
+                        Some(token)
                     }
                     Decision::Traverse => {
                         self.out.counts.traversed += 1;
-                        Some(self.out.batch.traversed_dir(decided.parent, name, stat))
+                        let token = self.out.batch.traversed_dir(decided.parent, name, stat);
+                        self.promote_changed_parent(token, &stat, decided.path);
+                        Some(token)
                     }
                     Decision::Catalog(Reason::Symlink) => {
                         let target = decided.stat.and_then(|s| s.link_target)?;
@@ -908,19 +1603,36 @@ impl EventVisitor for Hasher<'_> {
                 let on_root = matches!(context, FaultContext::Root);
                 if op == IoOp::Lstat && !on_root && error.kind() == io::ErrorKind::NotFound {
                     self.out.counts.vanished += 1;
-                } else if matches!(op, IoOp::OpenDir | IoOp::List)
-                    && error.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())
-                {
-                    // The directory row precedes its open/list. No Entered
-                    // event sets a count, so it remains unknown (D26).
                 } else {
-                    self.fault(path, op, on_root, error);
+                    self.fault(path, op, context, error);
                 }
                 None
             }
             Event::Pattern(error) => {
                 self.out.counts.pattern_errors += 1;
-                self.out.pattern_errors.push(error.to_string());
+                let ferret_policy::PatternError::Line {
+                    file,
+                    pattern,
+                    detail,
+                    ..
+                } = &error;
+                let path_bytes = match file {
+                    ferret_policy::IgnoreFile::Ferret(path)
+                    | ferret_policy::IgnoreFile::Git(path)
+                    | ferret_policy::IgnoreFile::GitExclude(path) => path.as_os_str().len(),
+                    ferret_policy::IgnoreFile::Global => 0,
+                };
+                // Lossy path display can expand each invalid byte to three;
+                // fixed overhead also covers the source label and line number.
+                if self.out.reserve(
+                    std::mem::size_of::<String>()
+                        + 64
+                        + path_bytes * 3
+                        + pattern.len()
+                        + detail.len(),
+                ) {
+                    self.out.pattern_errors.push(error.to_string());
+                }
                 None
             }
         }
@@ -932,6 +1644,8 @@ impl EventVisitor for Hasher<'_> {
 /// see only their own walks, on whichever worker the event happens.
 #[cfg(test)]
 pub(crate) enum Probe<'a> {
+    /// Carried content and recorded its observation, before the next entry.
+    Carried(&'a Path),
     /// A directory was listed; its children have not been statted.
     Entered,
     /// Claimed an inode in the cache, before reading it.
@@ -962,4 +1676,63 @@ fn hook(root: &Path, probe: Probe<'_>) {
     if let Some(hook) = found {
         hook(probe);
     }
+}
+
+// All configured roots are observed again: scoped batches cannot describe a
+// checkpoint. The abandoned attempt has dropped before this function starts.
+fn full_rewalk(
+    session: &mut WriterSession,
+    roots: &[PathBuf],
+    options: &IndexOptions,
+    usage: ferret_catalog::InputUsage,
+) -> Result<Report, IndexError> {
+    let old = session.view();
+    let plan = Plan::new(
+        Some(&old),
+        roots,
+        Refresh::All,
+        options.sniffer,
+        fingerprint(options),
+    )?;
+    let (batches, mut report) = observe(
+        Source::Rebuild(
+            session,
+            options.sniffer,
+            (old.name_count().saturating_sub(old.dir_count()) as usize).div_ceil(
+                options
+                    .workers
+                    .max(1)
+                    .saturating_mul(plan.roots.len().max(1)),
+            ),
+        ),
+        &plan,
+        options,
+    )?;
+    let (rebuilt, scopes) = crate::reconcile::checkpoint_batches(
+        session,
+        batches,
+        &report.coverage_faults,
+        &plan.roots,
+        options.sniffer,
+        fingerprint(options),
+    );
+    report.input_usage = usage;
+    report.input_fallback = true;
+    report.protected_scopes = scopes;
+    let Some(batches) = rebuilt else {
+        return Err(IndexError::Coverage {
+            faults: std::mem::take(&mut report.coverage_faults),
+            report: Box::new(report),
+        });
+    };
+    drop(old);
+    let started = Instant::now();
+    let catalog = session
+        .rebuild_checkpoint(batches, options.sniffer, fingerprint(options))
+        .map_err(IndexError::Update)?;
+    report.commit_time += started.elapsed();
+    report.input_usage = usage;
+    report.input_fallback = true;
+    finish_report(&mut report, &catalog, &plan, true, None, None);
+    Ok(report)
 }

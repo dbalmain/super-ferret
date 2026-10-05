@@ -46,6 +46,8 @@ pub enum Command {
     Find(Vec<OsString>),
     /// `stats`.
     Stats,
+    /// Explicit migration of the index directory's v3 snapshot.
+    ImportV3,
     /// `help`, `-h` or `--help`.
     Help,
     /// `--version`.
@@ -186,6 +188,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
                 b"index" => "index",
                 b"roots" => "roots",
                 b"stats" => "stats",
+                b"import-v3" => "import-v3",
                 b"help" => "help",
                 _ => return Err(UsageError::UnknownCommand(name)),
             };
@@ -198,6 +201,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             match other {
                 b"index" => Command::Index(paths(rest)),
                 b"stats" => none("stats", rest).map(|()| Command::Stats)?,
+                b"import-v3" => none("import-v3", rest).map(|()| Command::ImportV3)?,
                 b"help" => none("help", rest).map(|()| Command::Help)?,
                 _ => roots(rest)?,
             }

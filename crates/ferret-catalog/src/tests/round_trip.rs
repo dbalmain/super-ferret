@@ -182,12 +182,22 @@ fn batches_commit_and_reopen() {
 #[test]
 fn numbering_does_not_depend_on_which_worker_saw_what() {
     let scratch = Scratch::new("determinism");
-    let file = scratch.path.join("catalog");
     commit_tree(&scratch.path, [0, 1, 2]);
+    let file = super::snapshot(&scratch.path);
     let first = std::fs::read(&file).unwrap();
     let other = Scratch::new("determinism-2");
     commit_tree(&other.path, [2, 0, 1]);
-    assert_eq!(std::fs::read(other.path.join("catalog")).unwrap(), first);
+    let second = std::fs::read(super::snapshot(&other.path)).unwrap();
+    // Incarnations differ between independently created indexes. Section
+    // bytes and descriptors remain deterministic.
+    assert_eq!(
+        &second[crate::format::TABLE_END..],
+        &first[crate::format::TABLE_END..]
+    );
+    assert_eq!(
+        &second[crate::format::HEADER..crate::format::TABLE_END - 16],
+        &first[crate::format::HEADER..crate::format::TABLE_END - 16]
+    );
 }
 
 #[test]

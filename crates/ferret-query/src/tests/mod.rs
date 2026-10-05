@@ -2,6 +2,7 @@
 //! transaction and reopened lazily, as `ferret search` does.
 
 mod grammar;
+mod overlay;
 mod pattern;
 mod run;
 

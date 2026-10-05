@@ -1,13 +1,12 @@
 //! The snapshot file: one generation of the catalog.
 //!
 //! ```text
-//! header       magic "FERRETCT" | version u32 | sniffer u32 | next_doc u32 |
-//!              section count u32 | dirs u32 | inodes u32 | names u32 |
-//!              docs u32                                               (40 B)
-//! table        (offset u64, length u64) per section, in SECTIONS order (368 B)
-//! descriptors  (base u64, width u32, dictionary length u32) per column, in
-//!              COLUMNS order                                         (272 B)
-//! sections     contiguous from byte 680 to the end of the file, in order
+//! header       v3's 40 B fields, incarnation 16 B, checkpoint/sequence u64,
+//!              next inode/name u32, reserved zeros 16 B                 (96 B)
+//! table        (offset u64, length u64, checksum 16 B) per section      (832 B)
+//! descriptors  (base u64, width u32, dictionary length u32) per column (288 B)
+//! head digest  BLAKE3-128 of every preceding head byte                  (16 B)
+//! sections     contiguous from byte 1232 to the end, in SECTIONS order
 //! ```
 //!
 //! All integers are little-endian. The sections a name query reads come
@@ -22,7 +21,8 @@
 //! entries     column, per directory: the entries `getdents` returned, minus
 //!             `.` and `..`, before ignore rules; none if unknown (D47)
 //!             (nullable blocked)
-//! traversed   1 bit per directory: a structural row (D29), LSB first
+//! traversed   structural-directory bitset (D29), LSB first; optionally
+//!             followed by an independent search-suppression bitset
 //! roots       8 B rows: root InoId, offset of its path in strings
 //! strings     root paths, link targets, work-tree paths; NUL-terminated
 //! dev         column per inode, dictionary
@@ -44,12 +44,15 @@
 //!             dev, common ino, kind u8, 7 B zero
 //! docs        column per document: its DocId (sequence), then 16 B rows:
 //!             its hash; sorted by id, live documents only (D36 B)
+//! doc refs    u32 indexed-inode count per live document, in Docs order
+//! retained at nullable blocked u64 last trustworthy sequence per directory
+//! policy      BLAKE3-128 fingerprint of global rules and eligibility
 //! ```
 //!
 //! A column is its dictionary (`u64` values, present only in a dictionary
 //! column) and then one value per row of its table, bit-packed at the
 //! descriptor's width (`packed`), then 8 bytes of padding (written as zeros,
-//! not checked: reads never depend on it). Each column is sized to this
+//! checksummed along with all section bytes). Each column is sized to this
 //! catalog's values (D43), in one of five codings, each built on a frame of
 //! reference: a value is `base + packed`, and the width is that of the largest
 //! value less the smallest, which is the base. Signed times are stored with
@@ -98,8 +101,8 @@
 //! directory is the child of exactly its recorded name edge, so walking down
 //! from a root ends too. Field values that index nothing (times, sizes,
 //! nlink, entry counts, dictionary values, an inode's `DocId`) are not
-//! checked; a flipped bit there reads back as a different value, truncated to
-//! the field's type.
+//! structurally constrained; every byte is protected by a section checksum
+//! verified before any column is interpreted.
 //!
 //! Validation is split so that it can run per section: [`decode_table`]
 //! checks the header, the table, the descriptors and every count and length
@@ -113,12 +116,14 @@ use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::OnceLock;
 
+use crate::generation::{Generation, checksum};
 use crate::packed::{self, Blocked, Packed, RUN};
 
 pub(crate) const MAGIC: [u8; 8] = *b"FERRETCT";
 /// 1: fixed-width rows (S1). 2: bit-packed columns (S1a).
 /// 3: ignored type tags, collapsed opaque directories and visible specials.
-pub(crate) const VERSION: u32 = 3;
+/// 4: checked checkpoint, incarnation, allocation counters and writer sections.
+pub(crate) const VERSION: u32 = 4;
 /// "No id" in the builder's plan, and in the `u32` ids of fixed-width rows.
 pub(crate) const NONE: u32 = u32::MAX;
 
@@ -178,9 +183,15 @@ pub enum Section {
     WorkTrees,
     /// Live documents and their hashes.
     Docs,
+    /// Indexed inode references per live document, in Docs row order.
+    DocRefs,
+    /// Last trustworthy subtree sequence per directory, or none.
+    RetainedAt,
+    /// Writer policy fingerprint (BLAKE3-128).
+    Policy,
 }
 
-pub(crate) const SECTIONS: [Section; 23] = [
+pub(crate) const SECTIONS: [Section; 26] = [
     Section::Names,
     Section::NameHeap,
     Section::DirNames,
@@ -204,6 +215,9 @@ pub(crate) const SECTIONS: [Section; 23] = [
     Section::Specials,
     Section::WorkTrees,
     Section::Docs,
+    Section::DocRefs,
+    Section::RetainedAt,
+    Section::Policy,
 ];
 
 /// One bit-packed column. Each lies in one section, in this order; only the
@@ -228,9 +242,10 @@ pub(crate) enum Column {
     Nlink,
     Doc,
     DocId,
+    RetainedAt,
 }
 
-pub(crate) const COLUMNS: [Column; 17] = [
+pub(crate) const COLUMNS: [Column; 18] = [
     Column::NameParent,
     Column::NameChild,
     Column::NameOffset,
@@ -248,6 +263,7 @@ pub(crate) const COLUMNS: [Column; 17] = [
     Column::Nlink,
     Column::Doc,
     Column::DocId,
+    Column::RetainedAt,
 ];
 
 /// How a column's packed values become field values; see the module doc.
@@ -295,13 +311,14 @@ impl Column {
             Column::Nlink => Section::Nlink,
             Column::Doc => Section::Doc,
             Column::DocId => Section::Docs,
+            Column::RetainedAt => Section::RetainedAt,
         }
     }
 
     pub(crate) fn coding(self) -> Coding {
         match self {
             Column::DirName => Coding::Nullable,
-            Column::Entries | Column::Doc => Coding::NullableBlocked,
+            Column::Entries | Column::Doc | Column::RetainedAt => Coding::NullableBlocked,
             Column::Dev | Column::Mode | Column::Owner => Coding::Dictionary,
             Column::NameParent
             | Column::NameOffset
@@ -320,7 +337,7 @@ impl Column {
     pub(crate) fn rows(self) -> Rows {
         match self {
             Column::NameParent | Column::NameChild | Column::NameOffset => Rows::Names,
-            Column::DirName | Column::Entries => Rows::Dirs,
+            Column::DirName | Column::Entries | Column::RetainedAt => Rows::Dirs,
             Column::DocId => Rows::Docs,
             _ => Rows::Inodes,
         }
@@ -328,13 +345,13 @@ impl Column {
 }
 
 /// The header's bytes, before the section table.
-pub(crate) const HEADER: usize = 40;
-const TABLE: usize = SECTIONS.len() * 16;
+pub(crate) const HEADER: usize = 96;
+const TABLE: usize = SECTIONS.len() * 32;
 const DESCRIPTORS: usize = COLUMNS.len() * 16;
 
 /// The bytes of the header, section table and column descriptors: what
 /// opening a file reads.
-pub(crate) const TABLE_END: usize = HEADER + TABLE + DESCRIPTORS;
+pub(crate) const TABLE_END: usize = HEADER + TABLE + DESCRIPTORS + 16;
 
 /// Why a snapshot file could not be decoded.
 #[derive(Debug, PartialEq, Eq)]
@@ -457,6 +474,7 @@ impl Range {
 /// Everything the head of the file records, all known before any section is
 /// written.
 pub(crate) struct Head {
+    pub(crate) generation: Generation,
     pub(crate) sniffer: u32,
     pub(crate) next_doc: u32,
     pub(crate) dirs: u32,
@@ -506,10 +524,17 @@ impl Head {
         ] {
             out.extend_from_slice(&v.to_le_bytes());
         }
+        out.extend_from_slice(&self.generation.incarnation);
+        out.extend_from_slice(&self.generation.checkpoint.to_le_bytes());
+        out.extend_from_slice(&self.generation.sequence.to_le_bytes());
+        out.extend_from_slice(&self.inodes.to_le_bytes());
+        out.extend_from_slice(&self.names.to_le_bytes());
+        out.extend_from_slice(&[0; 16]);
         let mut offset = TABLE_END as u64;
         for len in self.section_lens() {
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&[0; 16]);
             offset += len;
         }
         for desc in self.columns {
@@ -517,6 +542,8 @@ impl Head {
             out.extend_from_slice(&desc.width.to_le_bytes());
             out.extend_from_slice(&desc.dict_len.to_le_bytes());
         }
+        let digest = checksum(&out);
+        out.extend_from_slice(&digest);
         let mut head = [0; TABLE_END];
         head.copy_from_slice(&out);
         (head, offset)
@@ -807,6 +834,30 @@ impl<'a> View<'a> {
         self.get(row).wrapping_add(row as u64)
     }
 
+    /// Finds a live sequence id, including sparse historical DocIds. The
+    /// zero-width representation permits subtraction instead of searching.
+    pub(crate) fn sequence_row(self, id: u64, count: usize) -> Option<usize> {
+        let at = match self.dense() {
+            Some(first) => id
+                .checked_sub(first)
+                .map_or(count, |row| row.min(count as u64) as usize),
+            None => {
+                let mut low = 0;
+                let mut high = count;
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    if self.sequence(mid) < id {
+                        low = mid + 1;
+                    } else {
+                        high = mid;
+                    }
+                }
+                low
+            }
+        };
+        (at < count && self.sequence(at) == id).then_some(at)
+    }
+
     /// For a sequence column that is `base + row` throughout, `base`: its
     /// row for a value is found by subtraction.
     pub(crate) fn dense(&self) -> Option<u64> {
@@ -847,9 +898,11 @@ impl<'a> View<'a> {
 /// is read.
 #[derive(Clone, Debug)]
 pub(crate) struct Layout {
+    pub(crate) generation: Generation,
     pub(crate) sniffer: u32,
     pub(crate) next_doc: u32,
     pub(crate) sections: [(usize, usize); SECTIONS.len()],
+    pub(crate) checksums: [[u8; 16]; SECTIONS.len()],
     pub(crate) columns: [Placed; COLUMNS.len()],
     pub(crate) dirs: usize,
     pub(crate) inodes: usize,
@@ -907,7 +960,7 @@ impl Layout {
 /// the file's first [`TABLE_END`] bytes, or all of it if shorter; `file_len`
 /// is the whole file's length, which the sections must tile exactly.
 pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeError> {
-    if head.len() < HEADER || head[..8] != MAGIC {
+    if head.len() < 12 || head[..8] != MAGIC {
         return Err(DecodeError::NotACatalog);
     }
     let version = u32_at(head, 8);
@@ -917,15 +970,39 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     if head.len() < TABLE_END || u32_at(head, 20) as usize != SECTIONS.len() {
         return Err(DecodeError::Layout);
     }
+    if checksum(&head[..TABLE_END - 16]) != head[TABLE_END - 16..TABLE_END] {
+        return Err(DecodeError::Corrupt("head"));
+    }
+    let mut incarnation = [0; 16];
+    incarnation.copy_from_slice(&head[40..56]);
+    let generation = Generation {
+        incarnation,
+        checkpoint: u64_at(head, 56),
+        sequence: u64_at(head, 64),
+    };
+    if incarnation == [0; 16]
+        || generation.checkpoint == u64::MAX
+        || generation.sequence == u64::MAX
+        || head[80..96] != [0; 16]
+        || u32_at(head, 72) != u32_at(head, 28)
+        || u32_at(head, 76) != u32_at(head, 32)
+    {
+        return Err(DecodeError::Corrupt("checkpoint header"));
+    }
     let mut sections = [(0, 0); SECTIONS.len()];
+    let mut checksums = [[0; 16]; SECTIONS.len()];
     let mut expect = TABLE_END as u64;
     for (i, slot) in sections.iter_mut().enumerate() {
-        let offset = u64_at(head, HEADER + i * 16);
-        let len = u64_at(head, HEADER + i * 16 + 8);
+        let offset = u64_at(head, HEADER + i * 32);
+        let len = u64_at(head, HEADER + i * 32 + 8);
         let end = offset.checked_add(len).ok_or(DecodeError::Layout)?;
         if offset != expect || end > file_len {
             return Err(DecodeError::Layout);
         }
+        if end > usize::MAX as u64 {
+            return Err(DecodeError::Layout);
+        }
+        checksums[i].copy_from_slice(&head[HEADER + i * 32 + 16..HEADER + i * 32 + 32]);
         *slot = (offset as usize, end as usize);
         expect = end;
     }
@@ -949,7 +1026,8 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
             return Err(DecodeError::Corrupt(section.label()));
         }
     }
-    if len(Section::Traversed) != u64::from(dirs).div_ceil(8) {
+    let bits = u64::from(dirs).div_ceil(8);
+    if len(Section::Traversed) != bits && len(Section::Traversed) != bits * 2 {
         return Err(DecodeError::Corrupt("traversed"));
     }
     if len(Section::States) != u64::from(inodes).div_ceil(4) {
@@ -957,6 +1035,10 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     }
     if (len(Section::NameHeap) == 0) != (names == 0) {
         return Err(DecodeError::Corrupt("name heap"));
+    }
+
+    if len(Section::DocRefs) != u64::from(docs) * 4 || len(Section::Policy) != 16 {
+        return Err(DecodeError::Corrupt("writer sections"));
     }
 
     // Each column starts after the columns before it in its section, and a
@@ -1000,6 +1082,8 @@ pub(crate) fn decode_table(head: &[u8], file_len: u64) -> Result<Layout, DecodeE
     }
 
     Ok(Layout {
+        generation,
+        checksums,
         sniffer: u32_at(head, 12),
         next_doc: u32_at(head, 16),
         sections,
@@ -1020,6 +1104,32 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Layout, DecodeError> {
         check(section, &layout, &facts, |s| layout.section(bytes, s))?;
     }
     Ok(layout)
+}
+
+/// Finalizes checksums after bounded positional section writes. Never holds a
+/// section in memory; callers must open the file for both reading and writing.
+pub(crate) fn seal(file: &File) -> io::Result<()> {
+    let len = file.metadata()?.len();
+    let mut head = vec![0; TABLE_END];
+    file.read_exact_at(&mut head, 0)?;
+    let layout = decode_table(&head, len).map_err(io::Error::other)?;
+    let mut buffer = vec![0; 1 << 20];
+    for section in SECTIONS {
+        let (start, end) = layout.range(section);
+        let mut position = start;
+        let mut hasher = blake3::Hasher::new();
+        while position < end {
+            let n = buffer.len().min(end - position);
+            file.read_exact_at(&mut buffer[..n], position as u64)?;
+            hasher.update(&buffer[..n]);
+            position += n;
+        }
+        let at = HEADER + section as usize * 32 + 16;
+        head[at..at + 16].copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    }
+    let digest = checksum(&head[..TABLE_END - 16]);
+    head[TABLE_END - 16..].copy_from_slice(&digest);
+    file.write_all_at(&head, 0)
 }
 
 /// What one section's check found that a later check reuses, so that no
@@ -1056,6 +1166,9 @@ const CHECK_ORDER: [Section; SECTIONS.len()] = [
     Section::Specials,
     Section::WorkTrees,
     Section::Docs,
+    Section::DocRefs,
+    Section::RetainedAt,
+    Section::Policy,
 ];
 
 impl Section {
@@ -1089,6 +1202,7 @@ impl Section {
             Section::Roots => &[Section::DirNames, Section::Strings],
             Section::Links => &[Section::Strings, Section::Specials],
             Section::WorkTrees => &[Section::Strings],
+            Section::DocRefs => &[Section::Docs, Section::Doc],
             _ => &[],
         }
     }
@@ -1119,6 +1233,9 @@ impl Section {
             Section::Specials => "specials",
             Section::WorkTrees => "work trees",
             Section::Docs => "docs",
+            Section::DocRefs => "document references",
+            Section::RetainedAt => "retained at",
+            Section::Policy => "policy",
         }
     }
 }
@@ -1133,6 +1250,9 @@ pub(crate) fn check<'a>(
     facts: &Facts,
     get: impl Fn(Section) -> &'a [u8],
 ) -> Result<(), DecodeError> {
+    if checksum(get(section)) != l.checksums[section as usize] {
+        return Err(DecodeError::Corrupt(section.label()));
+    }
     let terminated = |heap: &[u8]| heap.last().is_none_or(|&b| b == 0);
     let strings_len = l.len(Section::Strings);
     for column in COLUMNS {
@@ -1251,6 +1371,25 @@ pub(crate) fn check<'a>(
                 last = Some(id);
             }
         }
+        Section::DocRefs => {
+            let counts = document_references(l, get(Section::Docs), get(Section::Doc))?;
+            for (row, count) in counts.into_iter().enumerate() {
+                if count == 0 || count != u32_at(get(section), row * 4) {
+                    return Err(DecodeError::Corrupt("document references"));
+                }
+            }
+        }
+        Section::RetainedAt => {
+            let retained = l.blocked(Column::RetainedAt, get(section));
+            if (0..l.dirs).any(|row| {
+                retained
+                    .nullable(row)
+                    .is_some_and(|n| n > l.generation.sequence)
+            }) {
+                return Err(DecodeError::Corrupt("retained at"));
+            }
+        }
+        Section::Policy => {}
         Section::Entries
         | Section::Traversed
         | Section::Ino
@@ -1264,6 +1403,30 @@ pub(crate) fn check<'a>(
         | Section::States => {}
     }
     Ok(())
+}
+
+/// Counts indexed inode bindings in live document row order. Used by import
+/// and by the lazy DocRefs validator; hard-link name edges are never counted.
+pub(crate) fn document_references(
+    l: &Layout,
+    docs: &[u8],
+    bindings: &[u8],
+) -> Result<Vec<u32>, DecodeError> {
+    let ids = l.view(Column::DocId, docs);
+    let bindings = l.blocked(Column::Doc, bindings);
+    let mut counts = vec![0u32; l.docs];
+    for row in 0..l.inodes {
+        let Some(id) = bindings.nullable(row) else {
+            continue;
+        };
+        let at = ids
+            .sequence_row(id, l.docs)
+            .ok_or(DecodeError::Corrupt("document references"))?;
+        counts[at] = counts[at]
+            .checked_add(1)
+            .ok_or(DecodeError::Corrupt("document references"))?;
+    }
+    Ok(counts)
 }
 
 /// Every inode's dictionary index is inside the dictionary. Nothing is read

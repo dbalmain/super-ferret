@@ -1,9 +1,15 @@
+#[path = "../../../ferret-catalog/tests/support/listing.rs"]
+mod checkpoint_oracle;
+mod compact;
+mod coverage;
 mod gitfile;
 mod golden;
 mod index;
 mod lifecycle;
 mod parallel;
 mod race;
+mod reconcile;
+mod refresh;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -848,4 +854,20 @@ fn a_symlink_removed_before_lstat_is_a_fault_and_not_decided() {
         walked.io,
         vec![(PathBuf::from("victim"), io::ErrorKind::NotFound)]
     );
+}
+
+/// M4–M6 same-epoch discriminators explicitly exercise the log path. M7's
+/// compaction tests use production limits; tiny trees otherwise hit 1% on
+/// every change, where comparing bare numeric ids across epochs is invalid.
+fn log_session(
+    path: &std::path::Path,
+) -> Result<ferret_catalog::WriterSession, ferret_catalog::log::Error> {
+    let mut session = ferret_catalog::WriterSession::open(path)?;
+    session.set_compaction_limits(ferret_catalog::CompactionLimits {
+        log_bytes: u64::MAX,
+        records: u64::MAX,
+        dirty_percent: u32::MAX,
+        dead_percent: u32::MAX,
+    });
+    Ok(session)
 }

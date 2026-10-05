@@ -6,44 +6,61 @@
 //! this crate's tables and nothing else. Also owns the contiguous name heap
 //! that filename search scans (D14), and document liveness.
 //!
-//! Knows nothing about tokens, postings, the walker, or hashing: the crawler
-//! fills [`Batch`]es and hands over finished hashes.
+//! Knows nothing about tokens, postings, the walker, or content hashing: the
+//! crawler fills [`Batch`]es and hands over finished hashes.
 //!
 //! - [`batch`]: the rows a walk worker produces.
 //! - `build`: merges batches and carried roots into tables (D29, D30, D31).
 //! - `format`: the snapshot file, its encoder and its validating decoder.
 //! - [`read`]: [`Catalog`], one opened generation, and its accessors.
-//! - [`transaction`]: the single writer: lock, carry-over, commit (D26, D32).
+//! - [`transaction`]: checkpoint writer: lock, carry-over, commit (D26, D32).
+//! - [`log`]: durable changes, published prefixes and lazy family checks.
 
 pub mod batch;
+mod budget;
 mod build;
+mod compact;
 mod format;
+mod generation;
+mod input;
+mod lock;
+pub mod log;
+mod migrate;
+mod overlay;
 mod packed;
+mod publication;
 pub mod read;
+mod session;
 pub mod transaction;
 
 #[cfg(test)]
 mod tests;
 
 pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
+pub use budget::{BudgetUsage, CompactionLimits};
 pub use build::BuildError;
 pub use format::{DecodeError, Section};
+pub use generation::{Generation, Handle, RetryFromCurrent};
+pub use input::{InputBudget, InputLimits, InputUsage};
 pub use read::{
     Catalog, Contents, Entry, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN,
     Resolved, Target, WorkTree,
 };
+pub use session::WriterSession;
 pub use transaction::{BeginError, CommitError, KeepError, Transaction};
 
 /// A content hash: the first 128 bits of BLAKE3, computed by the crawler.
 pub type Hash = [u8; 16];
 
-/// An inode row. Dense in each generation, and renumbered by every commit
-/// (D27): never store one outside the catalog. Directories come first, so
-/// `0..Catalog::dir_count()` are exactly the directories (D30).
+/// An inode row in a checkpoint epoch. Dense at its base, renumbered by
+/// checkpoint publication (D52). Retained references use [`Handle`].
+/// Base directories form a prefix; log-created directories can follow files.
+/// Use the effective live iterators and kind checks (D52).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InoId(pub u32);
 
-/// A name edge. Dense in each generation, renumbered by every commit, and in
+/// A name edge in a checkpoint epoch. Retained references use [`Handle`].
+/// Dense at the base, renumbered by checkpoint publication, and in
 /// (parent, name) order, which is also name-heap order (D28).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NameId(pub u32);
@@ -78,4 +95,11 @@ impl ContentState {
             _ => Self::Fault,
         }
     }
+}
+
+/// BLAKE3-128 used by checkpoint heads, section payloads and manifests.
+/// Exposed for offline format tools and the benchmark driver; no third-party
+/// hash types cross the catalog boundary.
+pub fn checkpoint_checksum(bytes: &[u8]) -> Hash {
+    generation::checksum(bytes)
 }

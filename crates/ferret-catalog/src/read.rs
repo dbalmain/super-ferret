@@ -23,17 +23,22 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::batch::{Stat, WorkTreeKind};
 use crate::format::{
     self, COLUMNS, Column, Facts, HASH_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
     WORK_TREE_ROW, u32_at, u64_at,
 };
+use crate::generation::Manifest;
+use crate::log::{Family, Record};
+use crate::overlay::{self, Overlay};
 use crate::packed::{self, Blocked};
-use crate::{ContentState, DecodeError, DocId, Hash, InoId, NameId};
+use crate::{
+    ContentState, DecodeError, DocId, Generation, Handle, Hash, InoId, NameId, RetryFromCurrent,
+};
 
 /// Inodes in one run of [`Catalog::size_run`] and [`Catalog::mtime_run`]:
 /// a bitset word's worth.
@@ -50,6 +55,13 @@ pub enum OpenError {
     Io(io::Error),
     /// The file is not a valid catalog.
     Decode(DecodeError),
+    /// Damaged framing or payload, with the file and block to re-index.
+    Log {
+        checkpoint: u64,
+        sequence: Option<u64>,
+        family: Option<crate::log::Family>,
+        cause: Box<OpenError>,
+    },
 }
 
 impl fmt::Display for OpenError {
@@ -57,6 +69,15 @@ impl fmt::Display for OpenError {
         match self {
             Self::Io(e) => write!(f, "reading the catalog: {e}"),
             Self::Decode(e) => e.fmt(f),
+            Self::Log {
+                checkpoint,
+                sequence,
+                family,
+                cause,
+            } => write!(
+                f,
+                "changes.{checkpoint}, sequence {sequence:?}, family {family:?}: {cause}"
+            ),
         }
     }
 }
@@ -66,7 +87,7 @@ impl std::error::Error for OpenError {}
 /// What an inode row is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A directory; `InoId < dir_count()`.
+    /// A directory; only checkpoint base directories form an id prefix.
     Dir,
     /// A regular file.
     File,
@@ -211,10 +232,14 @@ pub struct WorkTree<'a> {
 
 /// One generation of the catalog. It stays valid however many commits
 /// follow: an opened catalog holds its file, not its path, so a generation
-/// replaced mid-query stays readable (D32).
+/// replaced mid-query stays readable (D32). Cloning shares the descriptor and
+/// checked buffers; it never copies checkpoint payloads.
+#[derive(Clone)]
 pub struct Catalog {
     layout: Layout,
-    source: Source,
+    source: Arc<Source>,
+    overlay: Option<Arc<Overlay>>,
+    name_references: Arc<OnceLock<Vec<u32>>>,
 }
 
 enum Source {
@@ -232,29 +257,324 @@ enum Source {
     },
 }
 
+pub(crate) fn read_manifest(dir: &Path) -> Result<Option<Manifest>, OpenError> {
+    let file = match File::open(dir.join("current")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Legacy snapshots remain explicitly refused; only import reads v3.
+            match File::open(dir.join(FILE)) {
+                Ok(file) => {
+                    let mut head = [0; 12];
+                    file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
+                    return Err(OpenError::Decode(DecodeError::Version(u32_at(&head, 8))));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(OpenError::Io(e)),
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(OpenError::Io(e)),
+    };
+    if file.metadata().map_err(OpenError::Io)?.len() != crate::generation::MANIFEST_LEN as u64 {
+        return Err(OpenError::Decode(DecodeError::Corrupt("manifest")));
+    }
+    let mut bytes = [0; crate::generation::MANIFEST_LEN];
+    file.read_exact_at(&mut bytes, 0).map_err(OpenError::Io)?;
+    Manifest::decode(&bytes)
+        .map(Some)
+        .map_err(OpenError::Decode)
+}
+
 impl Catalog {
     /// Opens the catalog in `dir`, reading and checking only the header and
     /// section table; no section is loaded. `Ok(None)` when nothing has been
     /// committed there yet.
     pub fn open(dir: &Path) -> Result<Option<Catalog>, OpenError> {
-        let file = match File::open(dir.join(FILE)) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(OpenError::Io(e)),
-        };
+        Ok(crate::log::Published::open(dir)?.map(crate::log::Published::into_catalog))
+    }
+
+    pub(crate) fn open_checkpoint(file: File, manifest: &Manifest) -> Result<Catalog, OpenError> {
         let len = file.metadata().map_err(OpenError::Io)?.len();
         let mut head = vec![0; (len as usize).min(TABLE_END)];
         file.read_exact_at(&mut head, 0).map_err(OpenError::Io)?;
         let layout = format::decode_table(&head, len).map_err(OpenError::Decode)?;
-        Ok(Some(Catalog {
+        manifest.check(&layout).map_err(OpenError::Decode)?;
+        Ok(Catalog {
             layout,
-            source: Source::File {
+            overlay: None,
+            name_references: Default::default(),
+            source: Arc::new(Source::File {
                 file,
                 sections: Default::default(),
                 read: AtomicU64::new(head.len() as u64),
                 facts: Facts::default(),
-            },
-        }))
+            }),
+        })
+    }
+
+    pub(crate) fn name_references(&self) -> &[u32] {
+        self.name_references.get_or_init(|| {
+            let mut refs = vec![0u32; self.base_inode_count() as usize];
+            for (_, child) in self.name_reader().child_ids() {
+                if let Some(n) = refs.get_mut(child.0 as usize) {
+                    *n += 1;
+                }
+            }
+            refs
+        })
+    }
+    pub(crate) fn with_log(mut self, manifest: Manifest, log: crate::log::Log) -> Self {
+        if log.transaction_count() != 0 {
+            self.overlay = Some(Arc::new(Overlay::new(self.clone(), manifest, log)));
+        }
+        self
+    }
+    /// Applies one checked same-epoch transaction without copying base buffers.
+    /// A mismatched generation is rejected before any supplied id is read.
+    pub fn advance(
+        &self,
+        expected: Generation,
+        changes: &crate::log::ChangeSet,
+    ) -> Result<Self, crate::log::Error> {
+        self.advance_with_sniffer(expected, changes, self.sniffer_version())
+    }
+    pub(crate) fn advance_with_sniffer(
+        &self,
+        expected: Generation,
+        changes: &crate::log::ChangeSet,
+        sniffer: u32,
+    ) -> Result<Self, crate::log::Error> {
+        use crate::log::Error;
+        self.generation().check(expected).map_err(Error::Stale)?;
+        self.load_all().map_err(Error::Previous)?;
+        let mut manifest = self
+            .overlay
+            .as_ref()
+            .map_or_else(|| self.manifest(), |o| o.manifest.clone());
+        if changes.records.is_empty() {
+            if changes.counters != manifest.counters || changes.counts != manifest.counts {
+                return Err(Error::Invalid(DecodeError::Corrupt(
+                    "empty change set counters",
+                )));
+            }
+            return Ok(self.clone());
+        }
+        manifest.generation.sequence = expected
+            .sequence
+            .checked_add(1)
+            .filter(|&n| n != u64::MAX)
+            .ok_or(Error::Invalid(DecodeError::Corrupt("sequence exhausted")))?;
+        if changes
+            .counters
+            .iter()
+            .zip(manifest.counters)
+            .any(|(&a, b)| a < b)
+        {
+            return Err(Error::Invalid(DecodeError::Corrupt(
+                "allocation counters decreased",
+            )));
+        }
+        manifest.sniffer = sniffer;
+        manifest.counters = changes.counters;
+        manifest.counts = changes.counts;
+        Manifest::decode(&manifest.encode()).map_err(Error::Invalid)?;
+        crate::log::checked_size(changes, manifest.generation.sequence).map_err(Error::Invalid)?;
+        let mut view = self.clone();
+        let parent = self
+            .overlay
+            .clone()
+            .unwrap_or_else(|| Arc::new(Overlay::empty(self.clone(), self.manifest())));
+        view.overlay = Some(Arc::new(parent.advance(
+            parent.clone(),
+            manifest,
+            &changes.records,
+        )));
+        view.load_all().map_err(Error::Previous)?;
+        if let Some(overlay) = view.overlay.as_mut().and_then(Arc::get_mut) {
+            overlay.detach();
+        } else {
+            unreachable!("new view has an unshared overlay");
+        }
+        Ok(view)
+    }
+    /// Number of immutable replacement runs, for carry measurements.
+    /// Requires all families loaded.
+    pub fn overlay_run_count(&self) -> usize {
+        self.overlay.as_ref().map_or(0, |o| {
+            [Family::Namespace, Family::Inodes, Family::Aux, Family::Docs]
+                .iter()
+                .map(|&f| o.projection(f).run_count())
+                .sum()
+        })
+    }
+    fn overlay_inode(&self, id: InoId) -> Option<&Record> {
+        self.overlay.as_ref().and_then(|o| o.inode(id.0))
+    }
+    /// Number of physical inode rows in the immutable checkpoint.
+    pub fn base_inode_count(&self) -> u32 {
+        self.layout.inodes as u32
+    }
+    /// Number of physical directory rows in the checkpoint prefix.
+    pub fn base_dir_count(&self) -> u32 {
+        self.layout.dirs as u32
+    }
+    /// Number of physical name rows, also the base heap scan bound.
+    pub fn base_name_count(&self) -> u32 {
+        self.layout.names as u32
+    }
+    /// Live inode ids; requires a section loading the Life projection.
+    pub fn inode_ids(&self) -> impl Iterator<Item = InoId> + '_ {
+        (0..self.next_inode().0)
+            .filter(|&id| self.is_live_inode(InoId(id)))
+            .map(InoId)
+    }
+    /// Live directories; requires Names (or Links for base kinds).
+    pub fn dir_ids(&self) -> impl Iterator<Item = InoId> + '_ {
+        self.inode_ids().filter(|&id| self.is_directory(id))
+    }
+    /// Whether an epoch inode is live. Requires Life when a log is present.
+    pub fn is_live_inode(&self, id: InoId) -> bool {
+        self.overlay
+            .as_ref()
+            .map_or(id.0 < self.base_inode_count(), |o| o.live_inode(id.0))
+    }
+    /// Indexed names referring to a live inode, independent of `st_nlink`.
+    /// Requires Names; the base inverse is cached and log LifePut replaces it.
+    pub fn indexed_name_count(&self, id: InoId) -> u32 {
+        if !self.is_live_inode(id) {
+            return 0;
+        }
+        if let Some(Record::LifePut { names, .. }) =
+            self.overlay.as_ref().and_then(|o| o.life(id.0))
+        {
+            return *names;
+        }
+        self.name_references()
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+    /// Base deaths, in id order; requires Life. Used to clear base bitsets.
+    pub fn deleted_base_inodes(&self) -> impl Iterator<Item = InoId> + '_ {
+        self.overlay
+            .iter()
+            .flat_map(|o| o.projection(Family::Namespace).records(overlay::LIFE))
+            .filter_map(|r| match r {
+                Record::InodeDelete { id } if *id < self.base_inode_count() => Some(InoId(*id)),
+                _ => None,
+            })
+    }
+    /// Directory membership, independent of live counts and allocation order.
+    pub fn is_directory(&self, id: InoId) -> bool {
+        self.overlay
+            .as_ref()
+            .and_then(|o| o.kind(id.0))
+            .map_or(id.0 < self.base_dir_count(), |k| k == Kind::Dir)
+    }
+    /// Whether a base heap span still supplies an effective name.
+    pub fn base_name_live(&self, id: NameId) -> bool {
+        id.0 < self.base_name_count()
+            && self
+                .overlay
+                .as_ref()
+                .is_none_or(|o| !o.namespace().suppresses(id.0))
+    }
+    /// Contiguous effective delta heap and explicit (offset, epoch id) spans.
+    /// Requires Names. The base heap is never copied here.
+    pub fn delta_names(&self) -> (&[u8], &[(usize, u32)]) {
+        self.overlay.as_ref().map_or((&[][..], &[][..]), |o| {
+            (&o.namespace().heap, &o.namespace().spans)
+        })
+    }
+    /// Next epoch inode id; deleted ids are never reused.
+    pub fn next_inode(&self) -> InoId {
+        InoId(
+            self.overlay
+                .as_ref()
+                .map_or(self.base_inode_count(), |o| o.manifest.counters[0]),
+        )
+    }
+
+    /// Next epoch name id; deleted edges leave holes.
+    pub fn next_name(&self) -> NameId {
+        NameId(
+            self.overlay
+                .as_ref()
+                .map_or(self.base_name_count(), |o| o.manifest.counters[1]),
+        )
+    }
+
+    /// This view's identity, including the inode/name epoch.
+    pub fn generation(&self) -> Generation {
+        self.overlay
+            .as_ref()
+            .map_or(self.layout.generation, |o| o.manifest.generation)
+    }
+
+    /// Resolves a checked inode handle only after validating its source view.
+    pub fn checked_inode(&self, handle: Handle<InoId>) -> Result<InoId, RetryFromCurrent> {
+        self.generation().check(handle.generation)?;
+        assert!(
+            handle.id.0 < self.next_inode().0,
+            "inode handle out of range"
+        );
+        Ok(handle.id)
+    }
+
+    /// Resolves a checked name handle only after validating its source view.
+    pub fn checked_name(&self, handle: Handle<NameId>) -> Result<NameId, RetryFromCurrent> {
+        self.generation().check(handle.generation)?;
+        assert!(handle.id.0 < self.next_name().0, "name handle out of range");
+        Ok(handle.id)
+    }
+
+    /// The published snapshot path, for diagnostics and benchmark I/O.
+    /// Readers retain a descriptor; reopening this path does not pin a view.
+    pub fn snapshot_path(dir: &Path) -> Result<Option<PathBuf>, OpenError> {
+        let Some(manifest) = read_manifest(dir)? else {
+            return Ok(None);
+        };
+        Ok(Some(dir.join(format!(
+            "snapshot.{}",
+            manifest.generation.checkpoint
+        ))))
+    }
+
+    /// Last trustworthy subtree sequence. Requires RetainedAt.
+    pub fn retained_at(&self, dir: InoId) -> Option<u64> {
+        if let Some(Record::DirPut { retained_at, .. }) = self.ns_record(overlay::DIR, dir.0) {
+            return *retained_at;
+        }
+        self.layout
+            .blocked(Column::RetainedAt, self.section(Section::RetainedAt))
+            .nullable(dir.0 as usize)
+    }
+
+    /// Writer policy fingerprint. Requires Policy.
+    pub fn policy(&self) -> Hash {
+        if let Some(Record::PolicyPut { hash }) = self.ns_record(overlay::POLICY, 0) {
+            return *hash;
+        }
+        let mut fingerprint = [0; 16];
+        fingerprint.copy_from_slice(self.section(Section::Policy));
+        fingerprint
+    }
+
+    /// Indexed inode reference count for a live document. Requires DocRefs
+    /// (which loads Docs and Doc for validation).
+    pub fn doc_references(&self, id: DocId) -> Option<u32> {
+        match self.family_record(Family::Docs, overlay::DOC, id.0) {
+            Some(Record::DocPut { references, .. }) => return Some(*references),
+            Some(Record::DocDelete { .. }) => return None,
+            _ => {}
+        }
+        self.column(Column::DocId)
+            .sequence_row(u64::from(id.0), self.layout.docs)
+            .map(|row| u32_at(self.section(Section::DocRefs), row * 4))
+    }
+
+    pub(crate) fn manifest(&self) -> Manifest {
+        Manifest::from_layout(&self.layout)
     }
 
     /// Validates `bytes` as a whole snapshot file. Every section is loaded.
@@ -262,7 +582,9 @@ impl Catalog {
         let layout = format::decode(&bytes)?;
         Ok(Catalog {
             layout,
-            source: Source::Whole(bytes),
+            overlay: None,
+            name_references: Default::default(),
+            source: Arc::new(Source::Whole(bytes)),
         })
     }
 
@@ -271,13 +593,60 @@ impl Catalog {
     /// succeeds, every accessor that reads only these sections is
     /// infallible. A failure leaves whatever loaded before it loaded.
     pub fn load(&self, sections: &[Section]) -> Result<(), OpenError> {
-        sections.iter().try_for_each(|&s| self.load_one(s))
+        for &section in sections {
+            self.load_one(section)?;
+            if let Some(o) = &self.overlay {
+                o.load(Family::Namespace)?;
+                match section {
+                    Section::Names
+                    | Section::NameHeap
+                    | Section::DirNames
+                    | Section::Roots
+                    | Section::Entries
+                    | Section::Traversed
+                    | Section::RetainedAt => o.load_namespace()?,
+                    Section::Links | Section::Specials => {
+                        o.load(Family::Aux)?;
+                        o.check_aux()?;
+                    }
+                    Section::WorkTrees => {
+                        o.load(Family::Aux)?;
+                        o.check_aux()?;
+                    }
+                    Section::Docs => o.load(Family::Docs)?,
+                    Section::DocRefs => {
+                        o.load(Family::Inodes)?;
+                        o.check_fields()?;
+                        o.load(Family::Docs)?;
+                    }
+                    Section::Strings | Section::Policy => {}
+                    _ => {
+                        o.load(Family::Inodes)?;
+                        o.check_fields()?;
+                    }
+                }
+                o.check_documents(self)?;
+            }
+        }
+        Ok(())
+    }
+    fn ns_record(&self, category: u64, id: u32) -> Option<&Record> {
+        self.family_record(Family::Namespace, category, id)
+    }
+    fn family_record(&self, family: Family, category: u64, id: u32) -> Option<&Record> {
+        self.overlay
+            .as_ref()
+            .and_then(|o| o.projection(family).get(category, id))
     }
 
     /// Loads every section: what a caller that reads the whole generation
     /// (the writer's previous generation, a test) needs.
     pub fn load_all(&self) -> Result<(), OpenError> {
-        self.load(&SECTIONS)
+        self.load(&SECTIONS)?;
+        if let Some(o) = &self.overlay {
+            o.validate_all(self)?;
+        }
+        Ok(())
     }
 
     fn load_one(&self, section: Section) -> Result<(), OpenError> {
@@ -286,7 +655,7 @@ impl Catalog {
             sections,
             read,
             facts,
-        } = &self.source
+        } = self.source.as_ref()
         else {
             return Ok(());
         };
@@ -294,7 +663,9 @@ impl Catalog {
         if slot.get().is_some() {
             return Ok(());
         }
-        self.load(section.needs())?;
+        for &need in section.needs() {
+            self.load_one(need)?;
+        }
         let (start, end) = self.layout.range(section);
         let mut bytes = vec![0; end - start].into_boxed_slice();
         file.read_exact_at(&mut bytes, start as u64)
@@ -316,19 +687,21 @@ impl Catalog {
     /// Whether `section` is loaded. A reader from [`Catalog::from_bytes`]
     /// has every section.
     pub fn is_loaded(&self, section: Section) -> bool {
-        match &self.source {
+        let base = match self.source.as_ref() {
             Source::Whole(_) => true,
             Source::File { sections, .. } => sections[section as usize].get().is_some(),
-        }
+        };
+        base && self.overlay.as_ref().is_none_or(|o| o.loaded(section))
     }
 
     /// Bytes read from the file so far: the head of the file and each loaded
     /// section. For a reader from [`Catalog::from_bytes`], the whole file.
     pub fn bytes_read(&self) -> u64 {
-        match &self.source {
+        let base = match self.source.as_ref() {
             Source::Whole(bytes) => bytes.len() as u64,
             Source::File { read, .. } => read.load(Ordering::Relaxed),
-        }
+        };
+        base + self.overlay.as_ref().map_or(0, |o| o.bytes_read())
     }
 
     fn column(&self, column: Column) -> View<'_> {
@@ -340,7 +713,7 @@ impl Catalog {
     }
 
     fn section(&self, section: Section) -> &[u8] {
-        match &self.source {
+        match self.source.as_ref() {
             Source::Whole(bytes) => self.layout.section(bytes, section),
             Source::File { sections, .. } => sections[section as usize]
                 .get()
@@ -353,32 +726,46 @@ impl Catalog {
     /// The sniffer version this generation's content states were found with
     /// (D37).
     pub fn sniffer_version(&self) -> u32 {
-        self.layout.sniffer
+        self.overlay
+            .as_ref()
+            .map_or(self.layout.sniffer, |o| o.manifest.sniffer)
     }
 
     /// The next `DocId` a new document will get. Never decreases (D36 B).
     pub fn next_doc(&self) -> DocId {
-        DocId(self.layout.next_doc)
+        DocId(
+            self.overlay
+                .as_ref()
+                .map_or(self.layout.next_doc, |o| o.manifest.counters[2]),
+        )
     }
 
-    /// Directories, which are inodes `0..dir_count()`.
+    /// Live directories; enumerate with `dir_ids`, not this count.
     pub fn dir_count(&self) -> u32 {
-        self.layout.dirs as u32
+        self.overlay
+            .as_ref()
+            .map_or(self.layout.dirs as u32, |o| o.manifest.counts[2])
     }
 
-    /// All inode rows: directories, then non-directory entries.
+    /// Live inode rows; physical scan bounds are `base_inode_count`.
     pub fn inode_count(&self) -> u32 {
-        self.layout.inodes as u32
+        self.overlay
+            .as_ref()
+            .map_or(self.layout.inodes as u32, |o| o.manifest.counts[0])
     }
 
     /// Name edges.
     pub fn name_count(&self) -> u32 {
-        self.layout.names as u32
+        self.overlay
+            .as_ref()
+            .map_or(self.layout.names as u32, |o| o.manifest.counts[1])
     }
 
     /// Live documents. Known from the head of the file; loads nothing.
     pub fn doc_count(&self) -> u32 {
-        self.layout.docs as u32
+        self.overlay
+            .as_ref()
+            .map_or(self.layout.docs as u32, |o| o.manifest.counts[3])
     }
 
     /// The bytes before the first section: header, section table and column
@@ -434,12 +821,23 @@ impl Catalog {
             parents: self.layout.blocked(Column::NameParent, rows),
             children: self.layout.blocked(Column::NameChild, rows),
             count: self.layout.names,
+            overlay: self.overlay.as_ref().map(|o| (o.namespace(), &o.base)),
         }
     }
 
     /// One name edge. Needs [`Section::Names`].
     pub fn name(&self, id: NameId) -> Name<'_> {
         self.name_reader().get(id)
+    }
+
+    /// Whether an epoch name remains live, including sparse births/deaths.
+    /// Requires Names. Check the generation before interpreting an external id.
+    pub fn is_live_name(&self, id: NameId) -> bool {
+        match self.ns_record(overlay::NAME, id.0) {
+            Some(Record::NamePut { .. }) => true,
+            Some(Record::NameDelete { .. }) => false,
+            _ => id.0 < self.base_name_count(),
+        }
     }
 
     /// Where a name's bytes start in [`Catalog::name_heap`]. Needs
@@ -453,7 +851,7 @@ impl Catalog {
     /// type tags, so use `Name::target()` before reading stat columns. Needs
     /// [`Section::Names`].
     pub fn child(&self, id: NameId) -> InoId {
-        InoId(self.blocked(Column::NameChild).get(id.0 as usize) as u32)
+        self.name_reader().get(id).child
     }
 
     /// The name whose bytes (or terminator) hold heap offset `offset`, or
@@ -469,9 +867,25 @@ impl Catalog {
 
     /// The names in directory `dir`, in name order. Needs
     /// [`Section::Names`].
-    pub fn children(&self, dir: InoId) -> impl Iterator<Item = NameId> + use<> {
+    pub fn children(&self, dir: InoId) -> impl Iterator<Item = NameId> + '_ {
         let (start, end) = self.child_range(dir);
-        (start as u32..end as u32).map(NameId)
+        // Checkpoint children are already sorted by basename. Effective
+        // overlays merge sparse names with their surviving base range.
+        let merged = self.overlay.as_ref().map(|o| {
+            let mut ids: Vec<_> = (start as u32..end as u32)
+                .map(NameId)
+                .filter(|&id| self.base_name_live(id))
+                .collect();
+            ids.extend(o.namespace().children(dir.0).map(NameId));
+            ids.sort_unstable_by(|&a, &b| self.name(a).bytes.cmp(self.name(b).bytes));
+            ids
+        });
+        let base = if merged.is_none() {
+            start as u32..end as u32
+        } else {
+            0..0
+        };
+        base.map(NameId).chain(merged.into_iter().flatten())
     }
 
     /// Children, visible and ignored, with raw names, kinds and optional stat
@@ -507,7 +921,7 @@ impl Catalog {
     pub fn contents(&self, target: Target) -> Option<Contents> {
         match target {
             Target::Ignored(Kind::Dir) => Some(Contents::Ignored),
-            Target::Inode(dir) if dir.0 < self.dir_count() => {
+            Target::Inode(dir) if self.is_directory(dir) => {
                 Some(if self.entry_count(dir).is_some() {
                     Contents::Catalogued
                 } else {
@@ -548,7 +962,7 @@ impl Catalog {
             }
             if separator
                 && !matches!(target, Target::Ignored(Kind::Dir))
-                && !matches!(target, Target::Inode(dir) if dir.0 < self.dir_count())
+                && !matches!(target, Target::Inode(dir) if self.is_directory(dir))
             {
                 return None;
             }
@@ -575,7 +989,7 @@ impl Catalog {
                         remainder: rest,
                     });
                 };
-                if dir.0 >= self.dir_count() {
+                if !self.is_directory(dir) {
                     return None;
                 }
                 if self.entry_count(dir).is_none() {
@@ -605,6 +1019,9 @@ impl Catalog {
 
     /// The entry called `name` in directory `dir`. Needs [`Section::Names`].
     pub fn lookup(&self, dir: InoId, name: &[u8]) -> Option<NameId> {
+        if let Some(o) = &self.overlay {
+            return o.namespace().lookup(&o.base, dir.0, name).map(NameId);
+        }
         let (start, end) = self.child_range(dir);
         let bytes = |i: usize| self.name(NameId((start + i) as u32)).bytes;
         let at = partition_point(end - start, |i| bytes(i) < name);
@@ -614,6 +1031,9 @@ impl Catalog {
     /// A directory's own name edge; `None` for a root (D30). Needs
     /// [`Section::DirNames`].
     pub fn dir_name(&self, dir: InoId) -> Option<NameId> {
+        if let Some(Record::DirPut { name, .. }) = self.ns_record(overlay::DIR, dir.0) {
+            return name.map(NameId);
+        }
         self.column(Column::DirName)
             .nullable(dir.0 as usize)
             .map(|name| NameId(name as u32))
@@ -623,10 +1043,26 @@ impl Catalog {
     /// (D29 compatibility). Find sees an ordinary directory inode. Needs
     /// [`Section::Traversed`].
     pub fn is_traversed(&self, dir: InoId) -> bool {
+        if let Some(Record::DirPut { flags, .. }) = self.ns_record(overlay::DIR, dir.0) {
+            return flags & 1 != 0;
+        }
         let bits = self.section(Section::Traversed);
         bits[dir.0 as usize / 8] >> (dir.0 % 8) & 1 == 1
     }
 
+    /// Search suppression is independent of traversal and retained coverage.
+    /// Requires Traversed (which loads namespace flags).
+    pub fn is_search_suppressed(&self, dir: InoId) -> bool {
+        if let Some(Record::DirPut { flags, .. }) = self.ns_record(overlay::DIR, dir.0) {
+            return flags & 2 != 0;
+        }
+        let bits = self.section(Section::Traversed);
+        let offset = self.layout.dirs.div_ceil(8);
+        if bits.len() == offset * 2 && offset != 0 {
+            return bits[offset + dir.0 as usize / 8] >> (dir.0 % 8) & 1 == 1;
+        }
+        self.is_traversed(dir)
+    }
     // ── paths ──
 
     /// Appends the path of the entry `name` names: its root's path, then each
@@ -640,11 +1076,11 @@ impl Catalog {
 
     /// Appends a directory's path. Needs [`Section::Roots`].
     pub fn dir_path(&self, dir: InoId, out: &mut Vec<u8>) {
-        let (names, dir_names) = (self.name_reader(), self.column(Column::DirName));
+        let names = self.name_reader();
         let mut up = Vec::new();
         let mut at = dir;
-        while let Some(name) = dir_names.nullable(at.0 as usize) {
-            let (parent, bytes) = names.edge(NameId(name as u32));
+        while let Some(name) = self.dir_name(at) {
+            let (parent, bytes) = names.edge(name);
             up.push(bytes);
             // Decoding checked that the parent's id is lower, so this ends.
             at = parent;
@@ -658,9 +1094,20 @@ impl Catalog {
     /// The configured roots, as `(top directory, path)`. Needs
     /// [`Section::Roots`].
     pub fn roots(&self) -> impl Iterator<Item = (InoId, &[u8])> + '_ {
-        self.section(Section::Roots)
+        let base = self
+            .section(Section::Roots)
             .chunks_exact(PAIR_ROW)
             .map(|pair| (InoId(u32_at(pair, 0)), self.string(u32_at(pair, 4))))
+            .filter(|(id, _)| self.ns_record(overlay::ROOT, id.0).is_none());
+        let delta = self
+            .overlay
+            .iter()
+            .flat_map(|o| o.projection(Family::Namespace).records(overlay::ROOT))
+            .filter_map(|r| match r {
+                Record::RootPut { id, path } => Some((InoId(*id), path.as_slice())),
+                _ => None,
+            });
+        base.chain(delta)
     }
 
     fn root_path(&self, dir: InoId) -> Option<&[u8]> {
@@ -678,6 +1125,21 @@ impl Catalog {
 
     /// One inode's whole row. Needs every section in [`Section::INODE`].
     pub fn inode(&self, id: InoId) -> Inode {
+        if let Some(Record::InodePut {
+            stat, state, doc, ..
+        }) = self.overlay_inode(id)
+        {
+            return Inode {
+                stat: *stat,
+                state: *state,
+                doc: doc.map(DocId),
+            };
+        }
+        if let Some(overlay) = &self.overlay {
+            // The row lookup already proved that all of its fields are
+            // inherited. Avoid repeating that lookup in every field getter.
+            return overlay.base.inode(id);
+        }
         let (owner, i) = (self.owner(id), id.0 as usize);
         let stat = Stat {
             dev: self.column(Column::Dev).lookup(i),
@@ -702,6 +1164,9 @@ impl Catalog {
     /// An inode's `(st_dev, st_ino)`. Needs [`Section::Dev`] and
     /// [`Section::Ino`].
     pub fn identity(&self, id: InoId) -> (u64, u64) {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return (stat.dev, stat.ino);
+        }
         let i = id.0 as usize;
         (
             self.column(Column::Dev).lookup(i),
@@ -711,11 +1176,17 @@ impl Catalog {
 
     /// An inode's `st_size`. Needs [`Section::Size`].
     pub fn size(&self, id: InoId) -> u64 {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return stat.size;
+        }
         self.blocked(Column::Size).get(id.0 as usize)
     }
 
     /// An inode's mtime, in whole seconds. Needs [`Section::Mtime`].
     pub fn mtime(&self, id: InoId) -> i64 {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return stat.mtime_sec;
+        }
         format::unorder(self.blocked(Column::Mtime).get(id.0 as usize))
     }
 
@@ -727,6 +1198,19 @@ impl Catalog {
         let out = &mut out[..self.run_len(run)];
         self.blocked(Column::Size)
             .decode(run.saturating_mul(RUN), out);
+        if let Some(o) = &self.overlay {
+            for r in o.projection(Family::Inodes).range(
+                overlay::INODE,
+                (run * RUN) as u32,
+                ((run + 1) * RUN) as u32,
+            ) {
+                if let Record::InodePut { id, stat, .. } = r
+                    && let Some(value) = out.get_mut((*id as usize).wrapping_sub(run * RUN))
+                {
+                    *value = stat.size;
+                }
+            }
+        }
         out
     }
 
@@ -740,39 +1224,68 @@ impl Catalog {
         for (time, &value) in out.iter_mut().zip(&*raw) {
             *time = format::unorder(value);
         }
+        if let Some(o) = &self.overlay {
+            for r in o.projection(Family::Inodes).range(
+                overlay::INODE,
+                (run * RUN) as u32,
+                ((run + 1) * RUN) as u32,
+            ) {
+                if let Record::InodePut { id, stat, .. } = r
+                    && let Some(value) =
+                        out[..raw.len()].get_mut((*id as usize).wrapping_sub(run * RUN))
+                {
+                    *value = stat.mtime_sec;
+                }
+            }
+        }
         &out[..raw.len()]
     }
 
     /// How many inodes run `run` of [`Catalog::size_run`] holds.
     fn run_len(&self, run: usize) -> usize {
-        (self.inode_count() as usize)
+        (self.base_inode_count() as usize)
             .saturating_sub(run.saturating_mul(RUN))
             .min(RUN)
     }
 
     /// An inode's ctime, in whole seconds. Needs [`Section::Ctime`].
     pub fn ctime(&self, id: InoId) -> i64 {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return stat.ctime_sec;
+        }
         format::unorder(self.blocked(Column::Ctime).get(id.0 as usize))
     }
 
     /// Subsecond modification time. Needs MtimeNs.
     pub fn mtime_nsec(&self, id: InoId) -> i64 {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return i64::from(stat.mtime_nsec);
+        }
         self.blocked(Column::MtimeNs).get(id.0 as usize) as i64
     }
 
     /// Subsecond change time. Needs CtimeNs.
     pub fn ctime_nsec(&self, id: InoId) -> i64 {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return i64::from(stat.ctime_nsec);
+        }
         self.blocked(Column::CtimeNs).get(id.0 as usize) as i64
     }
 
     /// An inode's `st_mode`: type and permission bits. Needs
     /// [`Section::Mode`].
     pub fn mode(&self, id: InoId) -> u32 {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return stat.mode;
+        }
         self.column(Column::Mode).lookup(id.0 as usize) as u32
     }
 
     /// An inode's `(st_uid, st_gid)`. Needs [`Section::Owner`].
     pub fn owner(&self, id: InoId) -> (u32, u32) {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return (stat.uid, stat.gid);
+        }
         let pair = self.column(Column::Owner).lookup(id.0 as usize);
         ((pair >> 32) as u32, pair as u32)
     }
@@ -780,12 +1293,18 @@ impl Catalog {
     /// An inode's `st_nlink`: for a directory, as the filesystem counts it,
     /// ignored children included (D47). Needs [`Section::Nlink`].
     pub fn nlink(&self, id: InoId) -> u64 {
+        if let Some(Record::InodePut { stat, .. }) = self.overlay_inode(id) {
+            return stat.nlink;
+        }
         self.blocked(Column::Nlink).get(id.0 as usize)
     }
 
     /// An inode's document, when its state is `Hashed`. Needs
     /// [`Section::Doc`].
     pub fn doc(&self, id: InoId) -> Option<DocId> {
+        if let Some(Record::InodePut { doc, .. }) = self.overlay_inode(id) {
+            return doc.map(DocId);
+        }
         self.blocked(Column::Doc)
             .nullable(id.0 as usize)
             .map(|doc| DocId(doc as u32))
@@ -794,6 +1313,9 @@ impl Catalog {
     /// What the last observation learnt about an inode's content (D37).
     /// Needs [`Section::States`].
     pub fn state(&self, id: InoId) -> ContentState {
+        if let Some(Record::InodePut { state, .. }) = self.overlay_inode(id) {
+            return *state;
+        }
         let byte = self.section(Section::States)[id.0 as usize / 4];
         ContentState::from_bits(byte >> (id.0 % 4 * 2))
     }
@@ -804,6 +1326,9 @@ impl Catalog {
     /// carried from a generation that did not know. Needs
     /// [`Section::Entries`].
     pub fn entry_count(&self, dir: InoId) -> Option<u32> {
+        if let Some(Record::DirPut { entries, flags, .. }) = self.ns_record(overlay::DIR, dir.0) {
+            return if flags & 8 != 0 { None } else { *entries };
+        }
         self.blocked(Column::Entries)
             .nullable(dir.0 as usize)
             .map(|count| count as u32)
@@ -812,7 +1337,13 @@ impl Catalog {
     /// The inode's file type. Needs [`Section::Links`] for a non-directory;
     /// it also loads the sparse Specials table. No stat column is read.
     pub fn kind(&self, id: InoId) -> Kind {
-        if id.0 < self.dir_count() {
+        if let Some(kind) = self.overlay.as_ref().and_then(|o| o.kind(id.0)) {
+            return kind;
+        }
+        if let Some(o) = &self.overlay {
+            return o.base.kind(id);
+        }
+        if id.0 < self.base_dir_count() {
             Kind::Dir
         } else if self.link_target(id).is_some() {
             Kind::Symlink
@@ -826,7 +1357,8 @@ impl Catalog {
     /// ended. Needs [`Section::Links`].
     pub fn kinds(&self) -> Kinds<'_> {
         Kinds {
-            dirs: self.dir_count(),
+            dirs: self.base_dir_count(),
+            overlay: self.overlay.as_deref(),
             links: self.section(Section::Links),
             specials: self.section(Section::Specials),
             at: 0,
@@ -836,6 +1368,11 @@ impl Catalog {
     /// A symlink's target, as `readlink` returned it. Needs
     /// [`Section::Links`], which loads [`Section::Strings`].
     pub fn link_target(&self, id: InoId) -> Option<&[u8]> {
+        match self.family_record(Family::Aux, overlay::LINK, id.0) {
+            Some(Record::LinkPut { target, .. }) => return Some(target),
+            Some(Record::LinkDelete { .. }) => return None,
+            _ => {}
+        }
         let links = self.section(Section::Links);
         let n = links.len() / PAIR_ROW;
         let at = partition_point(n, |i| u32_at(links, i * PAIR_ROW) < id.0);
@@ -848,14 +1385,57 @@ impl Catalog {
     /// Every work tree whose top is at or below a root, by top directory.
     /// Needs [`Section::WorkTrees`].
     pub fn work_trees(&self) -> impl Iterator<Item = WorkTree<'_>> + '_ {
-        self.section(Section::WorkTrees)
+        let base = self
+            .section(Section::WorkTrees)
             .chunks_exact(WORK_TREE_ROW)
             .map(|row| self.work_tree_row(row))
+            .filter(|w| {
+                self.is_live_inode(w.dir)
+                    && self
+                        .family_record(Family::Aux, overlay::WORKTREE, w.dir.0)
+                        .is_none()
+            });
+        let delta = self
+            .overlay
+            .iter()
+            .flat_map(|o| o.projection(Family::Aux).records(overlay::WORKTREE))
+            .filter_map(|r| match r {
+                Record::WorkTreePut {
+                    id,
+                    kind,
+                    common_id,
+                    path,
+                } => Some(WorkTree {
+                    dir: InoId(*id),
+                    kind: *kind,
+                    common_id: *common_id,
+                    common_dir: path,
+                }),
+                _ => None,
+            });
+        base.chain(delta)
     }
 
     /// The work tree whose top is `dir`, if it is one. Needs
     /// [`Section::WorkTrees`].
     pub fn work_tree(&self, dir: InoId) -> Option<WorkTree<'_>> {
+        match self.family_record(Family::Aux, overlay::WORKTREE, dir.0) {
+            Some(Record::WorkTreePut {
+                id,
+                kind,
+                common_id,
+                path,
+            }) => {
+                return Some(WorkTree {
+                    dir: InoId(*id),
+                    kind: *kind,
+                    common_id: *common_id,
+                    common_dir: path,
+                });
+            }
+            Some(Record::WorkTreeDelete { .. }) => return None,
+            _ => {}
+        }
         let rows = self.section(Section::WorkTrees);
         let n = rows.len() / WORK_TREE_ROW;
         let at = partition_point(n, |i| u32_at(rows, i * WORK_TREE_ROW) < dir.0);
@@ -874,28 +1454,58 @@ impl Catalog {
         }
     }
 
-    /// Every live document with its hash, by id. Needs [`Section::Docs`].
+    /// Writer lookup ordinals address immutable base rows, including deaths.
+    pub(crate) fn base_doc_count(&self) -> u32 {
+        self.layout.docs as u32
+    }
+    pub(crate) fn base_doc(&self, row: u32) -> DocId {
+        DocId(self.column(Column::DocId).sequence(row as usize) as u32)
+    }
+    pub(crate) fn base_hash(&self, row: u32) -> Hash {
+        self.hash(row as usize)
+    }
+    pub(crate) fn changed_docs(&self) -> impl Iterator<Item = &Record> {
+        self.overlay
+            .iter()
+            .flat_map(|o| o.projection(Family::Docs).records(overlay::DOC))
+    }
+    pub(crate) fn base_doc_hash(&self, doc: DocId) -> Option<Hash> {
+        self.column(Column::DocId)
+            .sequence_row(u64::from(doc.0), self.layout.docs)
+            .map(|row| self.hash(row))
+    }
+
+    /// Every live document with its hash: base then replacements, each by id.
+    /// Needs [`Section::Docs`].
     pub fn docs(&self) -> impl Iterator<Item = (DocId, Hash)> + '_ {
         let ids = self.column(Column::DocId);
-        (0..self.layout.docs).map(move |row| (DocId(ids.sequence(row) as u32), self.hash(row)))
+        let base = (0..self.layout.docs)
+            .map(move |row| (DocId(ids.sequence(row) as u32), self.hash(row)))
+            .filter(|(id, _)| {
+                self.family_record(Family::Docs, overlay::DOC, id.0)
+                    .is_none()
+            });
+        let delta = self
+            .overlay
+            .iter()
+            .flat_map(|o| o.projection(Family::Docs).records(overlay::DOC))
+            .filter_map(|r| match r {
+                Record::DocPut { id, hash, .. } => Some((DocId(*id), *hash)),
+                _ => None,
+            });
+        base.chain(delta)
     }
 
     /// A live document's hash; `None` if the id is dead or never assigned.
     /// Needs [`Section::Docs`]. Where the generation's ids have no holes, the
     /// row is the id less the first; otherwise a binary search.
     pub fn doc_hash(&self, doc: DocId) -> Option<Hash> {
-        let (ids, n, doc) = (
-            self.column(Column::DocId),
-            self.layout.docs,
-            u64::from(doc.0),
-        );
-        let at = match ids.dense() {
-            Some(first) => doc
-                .checked_sub(first)
-                .map_or(n, |row| row.min(n as u64) as usize),
-            None => partition_point(n, |i| ids.sequence(i) < doc),
-        };
-        (at < n && ids.sequence(at) == doc).then(|| self.hash(at))
+        match self.family_record(Family::Docs, overlay::DOC, doc.0) {
+            Some(Record::DocPut { hash, .. }) => return Some(*hash),
+            Some(Record::DocDelete { .. }) => return None,
+            _ => {}
+        }
+        self.base_doc_hash(doc)
     }
 
     /// Document row `row`'s hash.
@@ -917,11 +1527,18 @@ pub struct NameReader<'c> {
     parents: Blocked<'c>,
     children: Blocked<'c>,
     count: usize,
+    overlay: Option<(&'c overlay::Namespace, &'c Catalog)>,
 }
 
 impl<'c> NameReader<'c> {
     /// One name edge, read by itself: for a sparse hit.
     pub fn get(&self, id: NameId) -> Name<'c> {
+        if let Some((ns, base)) = self.overlay {
+            let Some(name) = ns.name(base, id.0) else {
+                panic!("dead name {}", id.0)
+            };
+            return name;
+        }
         let (parent, bytes) = self.edge(id);
         Name {
             parent,
@@ -933,6 +1550,10 @@ impl<'c> NameReader<'c> {
     /// A name's directory and bytes, without its child: what a path reads
     /// at each level.
     pub fn edge(&self, id: NameId) -> (InoId, &'c [u8]) {
+        if self.overlay.is_some() {
+            let n = self.get(id);
+            return (n.parent, n.bytes);
+        }
         let i = id.0 as usize;
         // A name runs to the next one's start, less its NUL: decoding checked
         // that the spans tile the heap. One decode is cheaper than a search.
@@ -956,15 +1577,45 @@ impl<'c> NameReader<'c> {
             offsets: [0; NAME_RUN + 1],
             parents: [0; NAME_RUN],
             children: [0; NAME_RUN],
+            delta: 0,
+            suppressed: 0,
         }
     }
 
     /// Every name's child, in name order: a pass over the child column
     /// alone.
     pub fn children(&self) -> impl Iterator<Item = InoId> + 'c {
+        self.child_ids().map(|(_, child)| child)
+    }
+    /// Live epoch NameIds and their targets, decoding only the base child
+    /// column.
+    pub fn child_ids(&self) -> impl Iterator<Item = (NameId, InoId)> + 'c {
         let children = self.children;
-        packed::runs(self.count, move |first, out| children.decode(first, out))
-            .map(|child| InoId(child as u32))
+        let overlay = self.overlay;
+        let base = packed::runs(self.count, move |first, out| children.decode(first, out))
+            .enumerate()
+            .scan(0usize, move |at, (id, child)| {
+                if let Some((ns, _)) = overlay {
+                    while *at < ns.suppressed.len() && ns.suppressed[*at] < id as u32 {
+                        *at += 1;
+                    }
+                    if ns.suppressed.get(*at) == Some(&(id as u32)) {
+                        *at += 1;
+                        return Some(None);
+                    }
+                }
+                Some(Some((NameId(id as u32), InoId(child as u32))))
+            })
+            .flatten();
+        let delta = overlay.into_iter().flat_map(|(ns, base)| {
+            ns.names.iter().map(move |&id| {
+                let Some(n) = ns.name(base, id) else {
+                    unreachable!("live delta name")
+                };
+                (NameId(id), n.child)
+            })
+        });
+        base.chain(delta)
     }
 }
 
@@ -984,6 +1635,8 @@ pub struct NameRuns<'c> {
     offsets: [u64; NAME_RUN + 1],
     parents: [u64; NAME_RUN],
     children: [u64; NAME_RUN],
+    delta: usize,
+    suppressed: usize,
 }
 
 impl NameRuns<'_> {
@@ -1009,9 +1662,25 @@ impl<'c> Iterator for NameRuns<'c> {
     type Item = (NameId, Name<'c>);
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some((ns, _)) = self.names.overlay {
+            while self.suppressed < ns.suppressed.len()
+                && ns.suppressed[self.suppressed] < self.next as u32
+            {
+                self.suppressed += 1;
+            }
+            while self.suppressed < ns.suppressed.len()
+                && ns.suppressed[self.suppressed] == self.next as u32
+            {
+                self.next += 1;
+                self.suppressed += 1;
+            }
+        }
         let i = self.next;
         if i >= self.names.count {
-            return None;
+            let (ns, _) = self.names.overlay?;
+            let id = NameId(*ns.names.get(self.delta)?);
+            self.delta += 1;
+            return Some((id, self.names.get(id)));
         }
         if i >= self.first + self.len || i < self.first {
             self.fill();
@@ -1036,6 +1705,7 @@ impl<'c> Iterator for NameRuns<'c> {
 /// files are numbered by their first name.
 pub struct Kinds<'c> {
     dirs: u32,
+    overlay: Option<&'c Overlay>,
     links: &'c [u8],
     specials: &'c [u8],
     /// The first link row whose inode is at or past the last id asked for.
@@ -1045,6 +1715,9 @@ pub struct Kinds<'c> {
 impl Kinds<'_> {
     /// An inode's file type, including FIFO, socket and device kinds.
     pub fn kind(&mut self, id: InoId) -> Kind {
+        if let Some(kind) = self.overlay.and_then(|o| o.kind(id.0)) {
+            return kind;
+        }
         if id.0 < self.dirs {
             return Kind::Dir;
         }

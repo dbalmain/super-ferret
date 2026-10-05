@@ -118,7 +118,7 @@ fn design_graph_parses() {
     // than compare against an empty graph.
     let designed = designed();
     assert!(designed["ferret-query"].contains("ferret-index"));
-    assert!(designed["ferret-catalog"].is_empty());
+    assert!(designed["ferret-catalog"].contains("blake3"));
 }
 
 #[test]

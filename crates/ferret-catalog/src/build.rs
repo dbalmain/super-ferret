@@ -65,6 +65,8 @@ pub enum BuildError {
     Unreachable,
     /// Two work-tree records for one directory.
     DuplicateWorkTree,
+    /// Retained coverage cannot refer to a future or reserved sequence.
+    FutureRetention { retained_at: u64, sequence: u64 },
     /// More rows, documents or heap bytes than 32-bit ids can address.
     TooLarge,
 }
@@ -80,6 +82,13 @@ impl fmt::Display for BuildError {
             Self::BadPath(p) => write!(f, "invalid path {:?}", show(p)),
             Self::Unreachable => write!(f, "directories not connected to any root"),
             Self::DuplicateWorkTree => write!(f, "two work-tree records for one directory"),
+            Self::FutureRetention {
+                retained_at,
+                sequence,
+            } => write!(
+                f,
+                "retained sequence {retained_at} exceeds checkpoint sequence {sequence}"
+            ),
             Self::TooLarge => write!(f, "catalog too large for 32-bit ids"),
         }
     }
@@ -289,6 +298,11 @@ impl Plan {
         for &dir in &self.order {
             let dir = dir as usize;
             push_known(&mut blocks[Column::Entries as usize], self.entry_count[dir]);
+            let (b, d) = self.index.dir(dir);
+            match batches[b].dirs[d].retained_at {
+                Some(n) => blocks[Column::RetainedAt as usize].push(n),
+                None => blocks[Column::RetainedAt as usize].push_null(),
+            }
         }
         // Ids are sized by what they index: the counts and the heap.
         ranges[Column::DirName as usize] = Range((names > 0).then(|| (0, names as u64 - 1)));
@@ -337,10 +351,17 @@ impl Plan {
             (Section::Specials, self.specials.len() * PAIR_ROW),
             (Section::WorkTrees, self.work_trees.len() * WORK_TREE_ROW),
             (Section::Docs, self.docs.len() * HASH_ROW),
+            (Section::DocRefs, self.docs.len() * 4),
+            (Section::Policy, 16),
         ] {
             lens[section as usize] = len as u64;
         }
         let head = Head {
+            generation: crate::Generation {
+                incarnation: [1; 16],
+                checkpoint: 0,
+                sequence: 0,
+            },
             sniffer: self.sniffer,
             next_doc: self.next_doc,
             dirs: dirs as u32,
@@ -355,7 +376,7 @@ impl Plan {
 }
 
 /// The inode columns read straight from a [`Stat`]: all but the `DocId`.
-const STAT_COLUMNS: [Column; 10] = [
+pub(crate) const STAT_COLUMNS: [Column; 10] = [
     Column::Dev,
     Column::Ino,
     Column::Size,
@@ -370,7 +391,7 @@ const STAT_COLUMNS: [Column; 10] = [
 
 /// One of [`STAT_COLUMNS`]' values, as the column stores it; the reader's
 /// accessors invert it.
-fn stat_field(column: Column, stat: &Stat) -> u64 {
+pub(crate) fn stat_field(column: Column, stat: &Stat) -> u64 {
     match column {
         Column::Dev => stat.dev,
         Column::Ino => stat.ino,
@@ -730,7 +751,10 @@ fn number_files(plan: &mut Plan, batches: &[Batch], file_pos: Vec<u32>) -> Resul
 /// whether it is a fault: the first fresh one if any, else the first carried
 /// one; a fault when another observation of the same kind disagrees with it.
 fn choose(index: &Index, batches: &[Batch], members: &[u32]) -> (u32, bool) {
-    let carried = |f: u32| batches[index.file(f as usize).0].carried;
+    let carried = |f: u32| {
+        let (batch, row) = index.file(f as usize);
+        batches[batch].file_carried(row)
+    };
     let winner = members
         .iter()
         .copied()
@@ -841,8 +865,15 @@ fn split_hash(hash: &Hash) -> (u64, u64) {
 /// rows, each column through its own bounded buffer (D40). Frees each batch's
 /// names once the name sections are written, and the batches once the inode
 /// sections are.
-pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::Result<()> {
-    let (head, dicts) = plan.head(&batches);
+pub(crate) fn write(
+    mut plan: Plan,
+    mut batches: Vec<Batch>,
+    out: &File,
+    generation: crate::Generation,
+    policy: crate::Hash,
+) -> io::Result<()> {
+    let (mut head, dicts) = plan.head(&batches);
+    head.generation = generation;
     let (bytes, len) = head.encode();
     out.write_all_at(&bytes, 0)?;
     // The reader's placement of every section and column, from the head just
@@ -877,14 +908,18 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
 
     let known = |id: u32| (id != NONE).then_some(u64::from(id));
     let (mut dir_names, mut entries) = (column(Column::DirName)?, column(Column::Entries)?);
+    let mut retained = column(Column::RetainedAt)?;
     let (mut traversed, mut bits) = (section(Section::Traversed), Bits::new(1));
     for &dir in &plan.order {
         dir_names.nullable(known(plan.name_of_dir[dir as usize]))?;
+        let (b, d) = plan.index.dir(dir as usize);
+        retained.nullable(batches[b].dirs[d].retained_at)?;
         entries.nullable(known(plan.entry_count[dir as usize]))?;
         let (b, d) = plan.index.dir(dir as usize);
         bits.push(&mut traversed, u8::from(batches[b].dirs[d].traversed))?;
     }
     dir_names.finish()?;
+    retained.finish()?;
     entries.finish()?;
     bits.finish(&mut traversed)?;
     traversed.finish()?;
@@ -912,7 +947,12 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
     let (mut live_columns, mut idle): (Vec<_>, Vec<_>) = stat_columns
         .into_iter()
         .partition(|&(field, _)| live(field));
+    let mut references = vec![0u32; plan.docs.len()];
     for (stat, doc_id, state) in plan.inode_rows(&batches) {
+        if doc_id != NONE {
+            let row = plan.docs.partition_point(|&(_, id)| id < doc_id);
+            references[row] += 1;
+        }
         for (field, column) in &mut live_columns {
             let value = stat_field(*field, stat);
             match field.coding() {
@@ -959,7 +999,15 @@ pub(crate) fn write(mut plan: Plan, mut batches: Vec<Batch>, out: &File) -> io::
     }
     ids.finish()?;
     hashes.finish()?;
-    Ok(())
+    let mut refs = section(Section::DocRefs);
+    for count in references {
+        format::put_u32(&mut refs, count)?;
+    }
+    refs.finish()?;
+    let mut fingerprint = section(Section::Policy);
+    fingerprint.write_all(&policy)?;
+    fingerprint.finish()?;
+    format::seal(out)
 }
 
 /// The largest name heap: its offsets, and the running offset [`write`]

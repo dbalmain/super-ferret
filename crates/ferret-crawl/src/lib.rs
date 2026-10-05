@@ -8,19 +8,25 @@
 //!
 //! [`index`] turns walks into a published catalog generation: it takes the
 //! writer lock, walks the roots that need it with a visitor that carries,
-//! sniffs and hashes content on the worker (D26, D31, D33), and commits
-//! unless the walk may have missed entries. This crate knows nothing about
-//! queries or index formats.
+//! sniffs and hashes content on the worker (D26, D31, D33), retains checked
+//! old scopes under typed coverage faults, and commits trustworthy changes.
+//! This crate knows nothing about queries or index formats.
 
+mod coverage;
 mod index;
 mod observe;
+pub mod reconcile;
+mod refresh;
 mod walk;
 
 pub use index::{
-    Counts, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report, RootChange, index,
-    index_change,
+    Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report,
+    RootChange, index, index_change, recrawl,
 };
 pub use observe::ContentFault;
+pub use refresh::{
+    RefreshOutcome, RefreshReason, RefreshReport, RefreshRequest, RefreshScope, RenameHint, refresh,
+};
 
 pub use walk::{
     Boundary, Decided, Event, EventVisitor, FaultContext, IoOp, Stat, WalkOptions, WorkTree,
