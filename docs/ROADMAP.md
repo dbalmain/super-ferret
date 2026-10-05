@@ -1450,6 +1450,61 @@ printing rows, as D46's common full opener requires. Low-level selective-load
 catalog/query APIs remain available. Gates: **571 passed / 4 ignored**, no Rust
 warnings; the real query log's size and nanosecond mtime remain unchanged.
 
+### S1b M2a and M3 — request reader and D54 names (2026-10-05/06)
+
+**M2a** (`b1f4f3b`) adds D58 B's hand-written batch request reader in
+`crates/ferret/src/protocol.rs`. It has the S1B limits and 27 tests,
+including a round trip through `json.rs`'s writer and a mutation fuzz loop
+(long version `#[ignore]`d). The batch host itself is M2b.
+
+**M3** (`a3b5d32`, fixes `55cc540`) builds D54 B:
+
+- interned base names with packed row keys and intpack PFor row postings in
+  catalog;
+- a lazy packed term dictionary (`name-term:`), shared within an epoch;
+- a counted planner that chooses postings or a scope walk;
+- a postings seam for `find ROOT -name X -print`.
+
+It was measured on the same 10.45M-name overlays as M1, 11 fresh processes
+each, on a host whose load (2–6) was higher than during M1's runs:
+
+| Overlay | Load / projection / index ms | Full open ms | RSS / peak MiB | B/name |
+| --- | --- | ---: | ---: | ---: |
+| Clean | 890 / 711 / 150 | 1,754 | 410 / 738 | 41.18 |
+| 1% | 1,183 / 712 / 195 | 2,090 | 508 / 836 | 50.95 |
+| 2% | 1,500 / 713 / 241 | 2,453 | 601 / 929 | 60.29 |
+
+Steady memory is about 19 B/name below M1. **Open is about 1.1 s slower
+than M1** because of the interning projection (~710 ms) and the scope counts.
+Every one-shot CLI query pays this until M4's daemon serves it, and the D49
+in-process fallback pays it afterwards.
+
+A raw path that skips the projection for single queries would be faster.
+It would also be a second query path to maintain. Revisit it in M7 with
+daemon numbers; don't build it now.
+
+The term dictionary costs about 450 ms on the first `name-term:` query of an
+epoch. The fixture has only 133k distinct basenames, about 78 copies of
+each, so real trees will have far larger dictionaries. M7 measures on a real
+tree.
+
+Memory after compaction: dropping the old view frees 324–370 MiB, and
+dropping the writer frees 105 MiB more. The remaining 590–740 MiB, against
+410–601 MiB after a fresh open, is allocator retention. No allocator change
+was made.
+
+Scoped plan choice, timed under both plans by the driver's `--plan`:
+
+- the planner picks the faster plan on the discriminating cases, a rare name
+  in a large scope and a common name in a small one;
+- for `case:package.json` in ~10⁵-row scopes it picks the walk at 17–24 ms,
+  while postings take 13 ms. The ×8 factor is provisional (S1B).
+
+The find-compat corpus on `ferret-b1f4f3b` has 0 errors and only the three
+accepted races. Gates at `55cc540`: **604 passed / 5 ignored**. The query
+log is unchanged. Measurements are in `.ai/s1b-m3-measure-done.md` and
+`.ai/s1b-m3fix-done.md` (local).
+
 ## S1c — `ferret find` in find(1) syntax
 
 POSIX.1-2024 `find` over the index, plus GNU extensions ranked by real use,
