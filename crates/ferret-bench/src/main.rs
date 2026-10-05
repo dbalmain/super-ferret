@@ -1187,7 +1187,9 @@ fn replay_churn(
     let mut batches: Vec<_> = (0..16)
         .map(|_| {
             if full {
-                session.checkpoint_batch()
+                session.checkpoint_batch(
+                    (old.name_count().saturating_sub(old.dir_count()) as usize).div_ceil(16),
+                )
             } else {
                 session.batch().with_input_budget(budget.clone())
             }

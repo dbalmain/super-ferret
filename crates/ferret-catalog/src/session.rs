@@ -147,8 +147,10 @@ impl WriterSession {
         Ok(self.view())
     }
     /// Mints a full-builder batch, without compacting equal file observations.
-    pub fn checkpoint_batch(&self) -> Batch {
-        self.batch().full_observations()
+    /// Reserves the estimated file rows on first use, avoiding geometric
+    /// capacity growth. Zero requests no estimate; estimates affect no ids.
+    pub fn checkpoint_batch(&self, file_capacity: usize) -> Batch {
+        self.batch().full_observations(file_capacity)
     }
 
     pub fn budget_usage(&self) -> crate::BudgetUsage {

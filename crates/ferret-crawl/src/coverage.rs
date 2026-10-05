@@ -582,7 +582,7 @@ pub(crate) fn checkpoint_observations(
         active: BTreeSet::new(),
         out: Protection::default(),
     };
-    let mut batch = session.checkpoint_batch();
+    let mut batch = session.checkpoint_batch(0);
     let mut mapped = BTreeMap::new();
     let mut overridden: BTreeSet<(DirToken, Vec<u8>)> = BTreeSet::new();
     let mut represented = BTreeSet::new();

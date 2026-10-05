@@ -789,7 +789,7 @@ enum Source<'a> {
         u32,
         &'a std::sync::Arc<ferret_catalog::InputBudget>,
     ),
-    Rebuild(&'a WriterSession, u32),
+    Rebuild(&'a WriterSession, u32, usize),
 }
 impl Source<'_> {
     fn batch(self) -> ferret_catalog::Batch {
@@ -798,13 +798,13 @@ impl Source<'_> {
             Self::Bounded(session, _, budget) => {
                 session.batch().with_input_budget((*budget).clone())
             }
-            Self::Rebuild(session, _) => session.checkpoint_batch(),
+            Self::Rebuild(session, _, hint) => session.checkpoint_batch(hint),
         }
     }
     fn carry(self, stat: &Stat) -> Option<Content> {
         match self {
             Self::Checkpoint(txn) => txn.carry(stat),
-            Self::Bounded(session, sniffer, _) | Self::Rebuild(session, sniffer) => {
+            Self::Bounded(session, sniffer, _) | Self::Rebuild(session, sniffer, _) => {
                 session.carry(stat, sniffer)
             }
         }
@@ -1247,7 +1247,7 @@ impl<'a> Hasher<'a> {
     fn promote_changed_parent(&self, token: DirToken, stat: &Stat, path: &Path) {
         if let Some(selection) = self.selection {
             let continuing = match (token.previous_directory(), self.txn) {
-                (Some(id), Source::Bounded(session, _, _) | Source::Rebuild(session, _)) => {
+                (Some(id), Source::Bounded(session, _, _) | Source::Rebuild(session, _, _)) => {
                     session.view().inode(id).stat.same_version(stat)
                 }
                 _ => false,
@@ -1448,7 +1448,7 @@ impl EventVisitor for Hasher<'_> {
             return true;
         };
         if let Some(old) = parent.previous_directory()
-            && let Source::Bounded(session, _, _) | Source::Rebuild(session, _) = self.txn
+            && let Source::Bounded(session, _, _) | Source::Rebuild(session, _, _) = self.txn
             && session.view().entry_count(old).is_none()
         {
             selection.promote(path.parent().unwrap_or_else(|| Path::new("")));
@@ -1625,23 +1625,40 @@ fn full_rewalk(
         options.sniffer,
         fingerprint(options),
     )?;
-    let (batches, mut report) = observe(Source::Rebuild(session, options.sniffer), &plan, options)?;
+    let (batches, mut report) = observe(
+        Source::Rebuild(
+            session,
+            options.sniffer,
+            (old.name_count().saturating_sub(old.dir_count()) as usize).div_ceil(
+                options
+                    .workers
+                    .max(1)
+                    .saturating_mul(plan.roots.len().max(1)),
+            ),
+        ),
+        &plan,
+        options,
+    )?;
     let protection =
         crate::coverage::resolve(session, &batches, &report.coverage_faults, &plan.roots);
-    let batches = protection
-        .and_then(|protection| {
-            if !protection.is_empty()
-                && (old.policy() != fingerprint(options)
-                    || old.sniffer_version() != options.sniffer)
-            {
-                return None;
-            }
-            crate::coverage::checkpoint_observations(session, batches, &protection, &plan.roots)
-        })
-        .ok_or_else(|| IndexError::Coverage {
+    let rebuilt = protection.and_then(|protection| {
+        report.protected_scopes =
+            protection.directories.len() + protection.edges.len() + protection.opaque.len();
+        if !protection.is_empty()
+            && (old.policy() != fingerprint(options) || old.sniffer_version() != options.sniffer)
+        {
+            return None;
+        }
+        crate::coverage::checkpoint_observations(session, batches, &protection, &plan.roots)
+    });
+    report.input_usage = usage;
+    report.input_fallback = true;
+    let Some(batches) = rebuilt else {
+        return Err(IndexError::Coverage {
             faults: std::mem::take(&mut report.coverage_faults),
-            report: Box::new(Report::default()),
-        })?;
+            report: Box::new(report),
+        });
+    };
     let started = Instant::now();
     let catalog = session
         .rebuild_checkpoint(batches, options.sniffer, fingerprint(options))

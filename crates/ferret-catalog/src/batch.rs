@@ -186,6 +186,7 @@ struct PendingFile {
 pub struct Batch {
     input_budget: Option<std::sync::Arc<crate::InputBudget>>,
     full: bool,
+    file_capacity: usize,
     previous: Option<Catalog>,
     pending: Vec<PendingFile>,
     pending_bytes: Vec<u8>,
@@ -225,6 +226,7 @@ impl Batch {
         Self {
             input_budget: None,
             full: false,
+            file_capacity: 0,
             previous: None,
             pending: Vec::new(),
             pending_bytes: Vec::new(),
@@ -316,8 +318,9 @@ impl Batch {
     }
     /// Collects complete checkpoint observations while retaining old parent
     /// hints for fault anchoring. No equal rows are replaced by seen bits.
-    pub(crate) fn full_observations(mut self) -> Self {
+    pub(crate) fn full_observations(mut self, file_capacity: usize) -> Self {
         self.full = true;
+        self.file_capacity = file_capacity;
         self
     }
     fn reserve_input(&self, records: usize, bytes: usize) -> bool {
@@ -380,6 +383,12 @@ impl Batch {
             std::mem::size_of::<Stat>() + 32 + name.len() + target.map_or(0, <[u8]>::len),
         ) {
             return;
+        }
+        if self.file_capacity > 0 {
+            self.files.reserve_exact(self.file_capacity);
+            self.file_stats.reserve_exact(self.file_capacity);
+            self.contents.reserve_exact(self.file_capacity);
+            self.file_capacity = 0;
         }
         let index = self.files.len() as u32;
         let name = push(&mut self.names, name, &mut self.overflow);

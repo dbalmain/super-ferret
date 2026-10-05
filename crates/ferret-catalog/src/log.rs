@@ -554,7 +554,13 @@ impl Writer {
             txn.add(batch);
         }
         self.poisoned = true;
-        let current = txn.commit().map_err(Error::Rebuild)?;
+        let current = match txn.commit() {
+            Ok(current) => current,
+            Err(error) => {
+                self.poisoned = error.published();
+                return Err(Error::Rebuild(error));
+            }
+        };
         self.manifest = current.manifest();
         self.manifest.log_end = HEADER;
         self.log = OpenOptions::new()
