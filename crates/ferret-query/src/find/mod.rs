@@ -376,6 +376,11 @@ impl Plan {
         self.unsupported.as_deref()
     }
 
+    /// Whether evaluation can run a command or write/delete outside stdout.
+    pub fn has_side_effects(&self) -> bool {
+        has_actions(&self.expression)
+    }
+
     /// Creates the sequential live source. It never opens a catalog.
     pub fn live_source(&self) -> LiveWalk {
         LiveWalk::new(self.paths.clone(), self.options.clone())

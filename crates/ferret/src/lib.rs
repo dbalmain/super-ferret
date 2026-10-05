@@ -29,6 +29,7 @@
 //! success (including no matches), 1 invalid syntax or execution error.
 
 pub mod args;
+pub(crate) mod batch;
 pub mod cli;
 pub mod engine;
 pub mod find;

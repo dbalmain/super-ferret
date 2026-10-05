@@ -61,6 +61,11 @@ impl Engine {
             .clone()
     }
 
+    /// Generation currently selected by this resident engine.
+    pub fn generation(&self) -> Generation {
+        self.pin().generation()
+    }
+
     /// Observes final disk state under the writer lock and adopts the checked
     /// successor directly. Stale requests are checked by crawl before ids.
     pub fn refresh(

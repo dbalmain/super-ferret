@@ -187,7 +187,7 @@ fn search(
 /// (a directory, a symlink, a binary or unread file). Document ids are
 /// stable across index runs (D4); inode and name ids are not (D27), so
 /// they are not printed.
-fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
+pub(crate) fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
     let kind = match row.kind {
         Kind::Dir => "dir",
         Kind::File => "file",
