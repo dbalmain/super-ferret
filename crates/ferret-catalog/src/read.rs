@@ -1135,6 +1135,11 @@ impl Catalog {
                 doc: doc.map(DocId),
             };
         }
+        if let Some(overlay) = &self.overlay {
+            // The row lookup already proved that all of its fields are
+            // inherited. Avoid repeating that lookup in every field getter.
+            return overlay.base.inode(id);
+        }
         let (owner, i) = (self.owner(id), id.0 as usize);
         let stat = Stat {
             dev: self.column(Column::Dev).lookup(i),
