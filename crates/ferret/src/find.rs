@@ -8,18 +8,24 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
-use crate::engine::Engine;
-
 use ferret_query::find::{Effects, OutputBuffer, Plan, WalkError};
 
 use crate::cli::{self, Exit};
+use crate::engine::Engine;
 use crate::xdg::Dirs;
 
 /// Runs a find command. Find errors and usage errors both exit 1; no matches
 /// is success. Explicit -I never reads config or opens an index; neither mode
 /// writes a query log.
 pub fn run(args: &[OsString], index: Option<&Path>) -> Exit {
-    let plan = match Plan::parse(args) {
+    let started = std::time::SystemTime::now();
+    let parsed = match std::env::current_dir() {
+        Ok(cwd) => Plan::parse_at(args, &cwd, started),
+        // Help and syntax still work in an unlinked cwd. The ordinary live
+        // source reports lookup failures if this is an actual traversal.
+        Err(_) => Plan::parse(args),
+    };
+    let plan = match parsed {
         Ok(plan) => plan,
         Err(error) => {
             cli::error(&format!("find: {error}"));

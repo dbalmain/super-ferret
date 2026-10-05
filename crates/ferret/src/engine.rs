@@ -63,10 +63,7 @@ impl Engine {
         request: RefreshRequest,
         options: &IndexOptions,
     ) -> Result<RefreshReport, Error> {
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
         let writer = writer.as_mut().ok_or(Error::ReadOnly)?;
         let report = ferret_crawl::refresh(writer, request, options).map_err(Error::Refresh)?;
         self.select(report.view.clone());
@@ -76,10 +73,7 @@ impl Engine {
     /// Services an explicit idle-boundary compaction. Old query pins continue
     /// to own the old buffers and descriptors after retired files are unlinked.
     pub fn compact(&self) -> Result<Generation, Error> {
-        let mut writer = self
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
         let view = writer
             .as_mut()
             .ok_or(Error::ReadOnly)?
@@ -99,6 +93,7 @@ impl Engine {
 }
 
 impl QuerySession {
+    /// Identifies the epoch and sequence in which this pin's ids are valid.
     pub fn generation(&self) -> Generation {
         self.catalog.generation()
     }
@@ -108,6 +103,7 @@ impl QuerySession {
         &self.catalog
     }
 
+    /// Streams search rows against this pin, stopping when the callback breaks.
     pub fn search(
         &self,
         query: &Query,
@@ -116,6 +112,8 @@ impl QuerySession {
         query.run(&self.catalog, emit)
     }
 
+    /// Runs find with the plan's captured cwd/time and the host's effects.
+    /// Live fallback and actions retain their ordinary find semantics.
     pub fn find<E: Effects + Clone + Send>(
         &self,
         plan: &Plan,
@@ -130,9 +128,13 @@ impl QuerySession {
     }
 }
 
+/// Failure to refresh or compact. Query pins remain independently readable.
 #[derive(Debug)]
 pub enum Error {
+    /// A query-only engine has no writer lock or writer caches.
     ReadOnly,
+    /// A writer panic may have interrupted mutation; reopen before writing.
+    WriterPanicked,
     Refresh(ferret_crawl::IndexError),
     Compact(ferret_catalog::log::Error),
 }
@@ -141,10 +143,19 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ReadOnly => f.write_str("the engine has no writer"),
+            Self::WriterPanicked => f.write_str("the engine writer panicked"),
             Self::Refresh(error) => error.fmt(f),
             Self::Compact(error) => error.fmt(f),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadOnly | Self::WriterPanicked => None,
+            Self::Refresh(error) => Some(error),
+            Self::Compact(error) => Some(error),
+        }
+    }
+}

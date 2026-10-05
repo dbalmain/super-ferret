@@ -1,8 +1,9 @@
 # S1b — One resident engine, batch mode and the daemon
 
 M0 design, 2026-10-05. Code baseline: `75dcd49`, after the S1+, find and main
-merges into `wt/s1b`. This is a build specification. There is no engine host,
-batch protocol or watcher in the current code.
+merges into `wt/s1b`. This is a build specification. M1 now implements the
+resident engine library and uses it for indexed one-shot search/find. Batch
+and daemon hosts, name indexes and watches remain later slices.
 
 [D46 C plus batch](DECISIONS.md#d46--is-the-daemon-the-only-mode-of-operation)
 and [D49 A](DECISIONS.md#d49--a-one-shot-query-with-no-daemon-running) bind the
@@ -45,7 +46,10 @@ output helpers. Writing a second general JSON parser is not the engine's job.
 
 One opener serves every host. It validates and reads all catalog sections
 once: names, inode columns, directory counts/coverage, roots, links, specials,
-worktrees, document bindings/hashes/refcounts and policy. Names and inode
+worktrees, document bindings/hashes/refcounts and policy.
+A name-only one-shot therefore also rejects corrupt metadata before emitting
+rows. This intentionally replaces the old CLI's selective-load corruption
+behavior; the low-level catalog/query APIs still support selective loading. Names and inode
 columns remain packed where random access benefits; “resident” does not mean
 expanding every stat into a Rust struct. D30's persisted directory own-name
 column remains. Do not eagerly build reader-only inverses until needed.

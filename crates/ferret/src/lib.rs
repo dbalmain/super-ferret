@@ -1,6 +1,7 @@
 //! The `ferret` command-line tool: argument parsing, the commands, human and
 //! JSON-lines output, and the local query log. Wiring only; behaviour lives
-//! in the library crates.
+//! in the library crates. [`engine`] coordinates resident query generations
+//! and writer adoption for this host and the future batch/daemon hosts.
 //!
 //! - [`cli`]: the entry point, exit statuses, where the index is, usage.
 //! - [`args`]: the command line, parsed; pure.
