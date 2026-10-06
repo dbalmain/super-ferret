@@ -123,7 +123,9 @@ dependencies = [
 name = "ferret-index"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "ferret-text",
+ "intpack",
 ]
 
 [[package]]

@@ -33,7 +33,7 @@ crate's `Cargo.toml` disagrees with it.
 ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify, ferret-policy
 ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text, rustix
 ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
-ferret-index   → ferret-text
+ferret-index   → ferret-text, intpack (git dependency pinned by rev — D59), blake3 (segment checksums)
 ferret-catalog → blake3 (checkpoint integrity), intpack (git dependency pinned by rev — D59)
 ferret-verify  → regex
 ferret-policy  → (std only)
