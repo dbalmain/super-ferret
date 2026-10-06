@@ -121,8 +121,14 @@ impl Writer {
         if self.sizes.terms == 0 || self.in_block == BLOCK {
             put(term.len() as u64, &mut self.index);
             self.index.extend_from_slice(term);
-            put((self.blocks.len() - self.block_start) as u64, &mut self.index);
-            put((self.postings.len() - self.postings_base) as u64, &mut self.index);
+            put(
+                (self.blocks.len() - self.block_start) as u64,
+                &mut self.index,
+            );
+            put(
+                (self.postings.len() - self.postings_base) as u64,
+                &mut self.index,
+            );
             self.block_start = self.blocks.len();
             self.postings_base = self.postings.len();
             self.in_block = 0;
