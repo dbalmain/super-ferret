@@ -512,8 +512,18 @@ fn an_unreadable_document_is_never_retried_and_leaves_when_the_catalog_drops_it(
     assert_eq!((followed.pruned, followed.docs), (1, 0));
     assert_eq!(writer.view().manifest().unreadable, [12]);
     // It survives a reopen too.
-    let writer = IndexWriter::open(&dir.0, &third.view()).unwrap();
+    let mut writer = IndexWriter::open(&dir.0, &third.view()).unwrap();
     assert_eq!(writer.view().manifest().unreadable, [12]);
+
+    // A merge counts what it keeps without the unreadable document, which
+    // sits in the range with no postings: 30 less dead 3 less unreadable
+    // 12. Indexed were 18 + 10, and 3 never was, so nothing is purged.
+    let merged = writer.merge_all(&third.view(), &Budget::unbounded()).unwrap().unwrap();
+    assert_eq!((merged.segment.unwrap().docs, merged.purged), (28, 0));
+    assert_eq!(writer.view().manifest().unreadable, [12]);
+    let mut third = third;
+    third.unreadable = BTreeSet::from([12]);
+    assert_eq!(raw(&writer.view()), third.truth(&corpus));
 }
 
 #[test]
