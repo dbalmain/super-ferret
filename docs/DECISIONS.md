@@ -80,6 +80,7 @@ Predecessors, carried forward where still open:
 | D62 | `ferret search` syntax for content and booleans          | open           | rec A: `text:` atoms; find-style `OR`, `NOT`, `(` `)` as whole arguments (S2 M0)                               |
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
 | D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
+| D65 | The term dictionary is 87% of the index                  | open           | rec A: keep front coding, measure merged size in M3; decide singleton-to-trigram routing in S3 (S2 M2b)        |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3516,3 +3517,69 @@ whose row emission costs milliseconds. Revisit with numbers, as D11 asks.
 **Fact that would change it:** M4 measuring `pread` and copying above about 20%
 of rare-term or phrase-intersection latency at 10M, with an `mmap` prototype
 removing most of it.
+
+## D65 — The term dictionary is 87% of the index
+
+**Status: open.** S2 M2b, 2026-10-07; [measurements](S2.md#m2--segment-writer-and-reader).
+
+**Question:** The first real build is 12.7% of text, not the 6.8% S2 M0
+estimated, and the term dictionary is 86.8% of it. What should S2 do about the
+dictionary?
+
+All figures are from one build over Dave's `$HOME`: 4.00 GB of text, 59 unmerged
+segments, `ferret-bench segment-build --breakdown` on `wt/s2` at `6d514e2`.
+Rows marked **derived** are arithmetic over measured sums.
+
+- **Index:** 509.5 MB (measured). The dictionary is 442.3 MB, the doc-id
+  postings 65.3 MB at 8.32 bits/posting, and the rest is head and sums.
+- **Distinct terms:** 18.46M (M1c). They become 34.5M dictionary entries,
+  because a term is repeated in every segment it appears in (h = 1.87).
+- **Singletons:** terms with df = 1 in their segment are 78% of entries and
+  **359.7 MB, 81% of the dictionary** (measured). By type:
+  - hash-like: 66.2 MB;
+  - `jsonl`: 114.1 MB;
+  - no extension: 155.5 MB.
+- **`jsonl` (agent transcripts):** 29% of text. Terms seen only in `jsonl`
+  account for 99.6 MB of the dictionary.
+
+What each lever leaves, in absolute bytes. M2b's S2.md block divides option
+(b) by the reduced text, which makes dropping `jsonl` look worse than doing
+nothing, so these figures use absolute bytes instead:
+
+| Lever | Index | vs 509.5 MB |
+| --- | ---: | ---: |
+| Drop hash-like singletons | 443.4 MB | −13% |
+| Drop `jsonl` documents | ≤ 409.9 MB | −20% or more (shared terms' postings not counted) |
+| Drop all per-segment singletons | 149.8 MB | −71%, before the fallback structure's own bytes |
+| Full merge to one segment (rough, **derived**: each term once at 12.8 B) | ≈ 303 MB | −40% |
+
+The singleton entries are long and share little with their neighbours: about
+8.35 B of string per term after front coding. An FST saves least on exactly
+those terms.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Keep front-coded blocks; let M3's merge policy cut duplication; re-measure the merged index | The index stays at roughly 7–8% of text after merging (derived, rough): about 2.3 GB at 30 GB of text. | No new structure. Every term stays exact in S2: a rare-term lookup reads one block. The format already carries a dictionary codec id, so C or B stays possible later without a format break. |
+| B. An FST dictionary | A new structure to build, merge and checksum, and slower lookups than one block decode. Expected saving is small, because 81% of the bytes are the least-shared terms. | Possibly 10–25% of the dictionary (guess, unmeasured). The textbook answer. |
+| C. Keep df = 1 entries out of the dictionary: a term missing from a segment's dictionary means "maybe", answered by S3's trigram structure and then verified | Couples S2 to S3, which isn't built or measured. Its trigram bytes add back an unknown share of the 71% saved. Every rare-term query, the most selective kind and common for agents (identifiers, error strings, hashes), becomes a trigram intersection plus a verify read instead of one block read. The dictionary can no longer say "absent" for any term. | The densest index by far: about 3.7% of text before trigram bytes. The structure that answers the dropped terms is one S3 must build anyway, because regex is a hard requirement. |
+| D. Drop hash-like whole-run terms only | −13%. Hash lookups (commit ids, UUIDs) are a real agent query; they would need C's fallback anyway. The tokenizer still emits their alphanumeric parts, so part of the noise stays. | A one-line rule. |
+
+Excluding `jsonl` transcripts is not listed as an option. It is a crawl policy
+(what to index), not a dictionary format. It is worth about 20% of the index by
+itself, and it could be added to any of A–D, so it should be its own question if
+you want it.
+
+**Recommendation: A for S2, with C re-decided in S3 using measured trigram
+bytes.**
+- **Simplest:** A is simplest, and B is ruled out on the numbers.
+- **Densest:** C is far denser, but its true cost depends on S3's trigram
+  postings, which nobody has measured. Choosing it now would put S2 to wait on
+  S3.
+- **Why A loses nothing:** the dictionary codec id makes C a codec change
+  later, not a format break.
+
+**Fact that would change it:** two possibilities.
+- M3 measuring the merged index above about 8% of text would make the A-only
+  path unattractive; then move C's experiment forward to the start of S3.
+- If index size must come down now regardless of query cost, choose C and
+  accept that S2's rare-term queries wait for S3.
