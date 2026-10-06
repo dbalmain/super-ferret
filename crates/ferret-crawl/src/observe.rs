@@ -387,10 +387,10 @@ pub(crate) fn from_walk(stat: &crate::Stat<'_>) -> Stat {
     }
 }
 
-struct BulkRead<'a> {
-    file: &'a mut File,
-    limiter: Option<&'a ferret_catalog::bulk::Limiter>,
-    remaining: u64,
+pub(crate) struct BulkRead<'a> {
+    pub(crate) file: &'a mut File,
+    pub(crate) limiter: Option<&'a ferret_catalog::bulk::Limiter>,
+    pub(crate) remaining: u64,
 }
 impl Read for BulkRead<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
