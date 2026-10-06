@@ -101,8 +101,10 @@ impl Writer {
 
     /// Adds `term`, which must sort strictly after the previous term, with
     /// its documents, strictly increasing and inside `[first, last]`. On an
-    /// error nothing is added.
-    pub fn push(&mut self, term: &[u8], docs: &[u32]) -> Result<(), WriteError> {
+    /// error nothing is added. Returns the entry's real encoded size: the
+    /// bytes this term's entry added to the blocks section (shared/suffix,
+    /// document frequency, and either the inlined doc or the list length).
+    pub fn push(&mut self, term: &[u8], docs: &[u32]) -> Result<u64, WriteError> {
         if self.sizes.terms > 0 && term <= self.previous.as_slice() {
             return Err(WriteError::TermOrder);
         }
@@ -166,7 +168,7 @@ impl Writer {
         self.in_block += 1;
         self.sizes.terms += 1;
         self.sizes.pairs += docs.len() as u64;
-        Ok(())
+        Ok((self.blocks.len() - entry) as u64)
     }
 
     /// Writes the segment to `out` and returns its sizes.

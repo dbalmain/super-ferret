@@ -72,13 +72,26 @@ impl Inverter {
     /// Drains everything added into a [`Writer`] over `[first, last]`, which
     /// must contain every document added, and leaves the inverter empty.
     pub fn drain_into(&mut self, first: u32, last: u32) -> Result<Writer, WriteError> {
+        self.drain_into_with(first, last, |_, _, _| {})
+    }
+
+    /// Same as [`Inverter::drain_into`], calling `on_entry` with each term,
+    /// its documents and the entry's real encoded size (`Writer::push`'s
+    /// return value) as it is written, in term order.
+    pub fn drain_into_with(
+        &mut self,
+        first: u32,
+        last: u32,
+        mut on_entry: impl FnMut(&[u8], &[u32], u64),
+    ) -> Result<Writer, WriteError> {
         let mut writer = Writer::new(first, last)?;
         let mut terms: Vec<_> = self.terms.drain().collect();
         self.memory = 0;
         self.last = None;
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (term, docs) in &terms {
-            writer.push(term, docs)?;
+            let bytes = writer.push(term, docs)?;
+            on_entry(term, docs, bytes);
         }
         Ok(writer)
     }

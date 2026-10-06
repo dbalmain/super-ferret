@@ -9,7 +9,7 @@
 //! ferret-bench corpus-sample <catalog-dir> <out-dir> <n>   copy a reproducible sample of ~n documents
 //! ferret-bench tokenize <corpus-dir>             tokenizer throughput and term counts
 //! ferret-bench terms <catalog-dir>               full-tree term census: df, hapax, pairs
-//! ferret-bench segment-build <catalog-dir> <out-dir>  real segments: bytes by section, CPU, RSS
+//! ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]  real segments: bytes by section, CPU, RSS
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
 //! ferret-bench name-index-once <catalog-dir> open phases and query timings
@@ -102,7 +102,12 @@ fn main() -> ExitCode {
             ("corpus-sample", [dir, out, n]) => corpus::run(Path::new(dir), Path::new(out), n),
             ("tokenize", [dir]) => tokenize::run(Path::new(dir)),
             ("terms", [dir]) => terms::run(Path::new(dir)),
-            ("segment-build", [dir, out]) => segment_build::run(Path::new(dir), Path::new(out)),
+            ("segment-build", [dir, out]) => {
+                segment_build::run(Path::new(dir), Path::new(out), false)
+            }
+            ("segment-build", [dir, out, flag]) if flag == "--breakdown" => {
+                segment_build::run(Path::new(dir), Path::new(out), true)
+            }
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
@@ -149,7 +154,7 @@ fn usage() -> ExitCode {
          ferret-bench corpus-sample <catalog-dir> <out-dir> <n>\n       \
          ferret-bench tokenize <corpus-dir>\n       \
          ferret-bench terms <catalog-dir>\n       \
-         ferret-bench segment-build <catalog-dir> <out-dir>\n       \
+         ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \
