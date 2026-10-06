@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 ferret-catalog.workspace = true
+ferret-index.workspace = true
 ferret-query.workspace = true
 ferret-text.workspace = true
 ferret-verify.workspace = true

@@ -121,28 +121,37 @@ fn subset(extension: &[u8]) -> Subset {
     }
 }
 
+/// Reads every document's file whole, in the order given (DocId order from
+/// [`hashed_documents`]), and hands its bytes to `visit`. Returns how many it
+/// skipped: a file that is unreadable, or whose size no longer matches the
+/// catalog's record. Shared with `segment-build`.
+pub(crate) fn read_documents(
+    catalog: &Catalog,
+    docs: &[HashedDoc],
+    mut visit: impl FnMut(&HashedDoc, &[u8]),
+) -> u64 {
+    let mut skipped = 0u64;
+    let mut path = Vec::new();
+    for doc in docs {
+        path.clear();
+        catalog.path(doc.name, &mut path);
+        match fs::read(Path::new(std::ffi::OsStr::from_bytes(&path))) {
+            Ok(bytes) if bytes.len() as u64 == doc.size => visit(doc, &bytes),
+            _ => skipped += 1,
+        }
+    }
+    skipped
+}
+
 /// Streams every live `Hashed` document's file through the tokenizer,
-/// counting into `total` and the one matching subset group. Skips and counts
-/// a document whose file is unreadable or whose size no longer matches the
-/// catalog's record.
+/// counting into `total` and the one matching subset group.
 fn count(catalog: &Catalog, docs: &[HashedDoc]) -> (Group, Group, Group, Group, u64) {
     let mut total = Group::default();
     let mut jsonl = Group::default();
     let mut no_extension = Group::default();
     let mut other = Group::default();
-    let mut skipped = 0u64;
     let mut scratch = Scratch::default();
-    let mut path = Vec::new();
-    for doc in docs {
-        path.clear();
-        catalog.path(doc.name, &mut path);
-        let bytes = match fs::read(Path::new(std::ffi::OsStr::from_bytes(&path))) {
-            Ok(bytes) if bytes.len() as u64 == doc.size => bytes,
-            _ => {
-                skipped += 1;
-                continue;
-            }
-        };
+    let skipped = read_documents(catalog, docs, |doc, bytes| {
         let group = match subset(&doc.extension) {
             Subset::Jsonl => &mut jsonl,
             Subset::NoExtension => &mut no_extension,
@@ -150,12 +159,12 @@ fn count(catalog: &Catalog, docs: &[HashedDoc]) -> (Group, Group, Group, Group, 
         };
         total.documents += 1;
         group.documents += 1;
-        tokenize(&bytes, &mut scratch, |token| {
+        tokenize(bytes, &mut scratch, |token| {
             let key = cap(token.bytes);
             total.record(key, doc.doc);
             group.record(key, doc.doc);
         });
-    }
+    });
     (total, jsonl, no_extension, other, skipped)
 }
 

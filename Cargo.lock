@@ -94,6 +94,7 @@ name = "ferret-bench"
 version = "0.0.0"
 dependencies = [
  "ferret-catalog",
+ "ferret-index",
  "ferret-query",
  "ferret-text",
  "ferret-verify",
