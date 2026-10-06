@@ -5,6 +5,9 @@
 //! ferret-bench open  <catalog-dir>               open and load, by section set
 //! ferret-bench sections <catalog-dir>            bytes per name, per section
 //! ferret-bench query <catalog-dir> [query...]    the D40 query mix
+//! ferret-bench census <catalog-dir>              Hashed documents: bytes, sizes, extensions
+//! ferret-bench corpus-sample <catalog-dir> <out-dir> <n>   copy a reproducible sample of ~n documents
+//! ferret-bench tokenize <corpus-dir>             tokenizer throughput and term counts
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
 //! ferret-bench name-index-once <catalog-dir> open phases and query timings
@@ -16,8 +19,8 @@
 //! ```
 //!
 //! Build it in release (`cargo build --release -p ferret-bench`). Every
-//! command prints a Markdown table on stdout. Run one at a time on the
-//! machine: the numbers are wall-clock.
+//! command prints a Markdown table or `key: value` lines on stdout. Run one at
+//! a time on the machine: the numbers are wall-clock.
 //!
 //! **Warm** means the catalog file is in the page cache: each case runs once
 //! unmeasured, then the median of several runs is reported. **Evicted**
@@ -47,6 +50,13 @@ use std::time::{Duration, Instant, SystemTime};
 use ferret_catalog::{Catalog, Section};
 use ferret_query::Query;
 use ferret_verify::{Arm, Finder};
+
+mod census;
+mod corpus;
+mod tokenize;
+
+#[cfg(test)]
+mod support;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -84,6 +94,9 @@ fn main() -> ExitCode {
             ("open", [dir]) => open(Path::new(dir)),
             ("open-once", [dir, set]) => open_once(Path::new(dir), set),
             ("checksum", [dir]) => checksum(Path::new(dir)),
+            ("census", [dir]) => census::run(Path::new(dir)),
+            ("corpus-sample", [dir, out, n]) => corpus::run(Path::new(dir), Path::new(out), n),
+            ("tokenize", [dir]) => tokenize::run(Path::new(dir)),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
@@ -126,6 +139,9 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: ferret-bench scan <catalog-dir> [needle...]\n       \
+         ferret-bench census <catalog-dir>\n       \
+         ferret-bench corpus-sample <catalog-dir> <out-dir> <n>\n       \
+         ferret-bench tokenize <corpus-dir>\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \

@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 ferret-catalog.workspace = true
 ferret-query.workspace = true
+ferret-text.workspace = true
 ferret-verify.workspace = true
 # The scanner's control (D41), measured here and never in a product crate.
 memchr = "2"

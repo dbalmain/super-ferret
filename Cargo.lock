@@ -95,6 +95,7 @@ version = "0.0.0"
 dependencies = [
  "ferret-catalog",
  "ferret-query",
+ "ferret-text",
  "ferret-verify",
  "memchr",
  "rustix",
