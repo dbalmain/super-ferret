@@ -1,8 +1,15 @@
-//! [`Writer`]: terms in order in, one segment's bytes out. Everything is
-//! buffered in memory and written once by [`Writer::finish`], because the
-//! head's checksums cover every section.
+//! [`Writer`]: terms in order in, one segment's bytes out. By default
+//! everything is buffered in memory and written once by [`Writer::finish`],
+//! because the head's checksums cover every section. A merge's output can be
+//! as large as the whole index, so [`Writer::spilling`] instead streams whole
+//! chunks of the blocks section to their final place in the segment file and
+//! of the postings section to a scratch file, taking each chunk's sum as it
+//! goes; [`Writer::finish_spilled`] copies the postings after the blocks and
+//! writes the small sections and the head last.
 
+use std::fs::File;
 use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
 
 use intpack::pfor128skip;
 
@@ -57,6 +64,9 @@ impl Sizes {
     }
 }
 
+/// Buffered bytes past which [`Writer::spill`] writes whole chunks out.
+const SPILL: usize = 1 << 20;
+
 /// Builds one segment over `[first, last]` from `(term, DocIds)` pushed in
 /// strictly increasing term order.
 #[derive(Debug)]
@@ -64,16 +74,32 @@ pub struct Writer {
     first: u32,
     last: u32,
     tokenizer: u32,
+    /// The unspilled tails of the two chunked sections.
     blocks: Vec<u8>,
     postings: Vec<u8>,
     index: Vec<u8>,
     previous: Vec<u8>,
     in_block: usize,
-    /// Where the current block began in `blocks` and `postings`.
-    block_start: usize,
-    postings_base: usize,
+    /// Where the current block began in the blocks and postings sections.
+    block_start: u64,
+    postings_base: u64,
     relative: Vec<u32>,
     sizes: Sizes,
+    spill: Option<Spill>,
+}
+
+/// A spilling writer's files and what has left memory so far.
+#[derive(Debug)]
+struct Spill {
+    /// The segment file: blocks are written at their final offsets.
+    out: File,
+    /// Scratch for the postings section, copied into `out` at the end.
+    postings: File,
+    blocks_written: u64,
+    postings_written: u64,
+    /// Chunk sums of the spilled bytes of each section.
+    blocks_sums: Vec<u8>,
+    postings_sums: Vec<u8>,
 }
 
 impl Writer {
@@ -96,7 +122,67 @@ impl Writer {
             postings_base: 0,
             relative: Vec::new(),
             sizes: Sizes::default(),
+            spill: None,
         })
+    }
+
+    /// A writer whose sections leave memory through [`Writer::spill`]:
+    /// blocks into `out` at their final offsets, postings into the scratch
+    /// file `postings`. Both must be empty, writable files.
+    /// [`Writer::finish_spilled`] completes `out`.
+    pub fn spilling(first: u32, last: u32, out: File, postings: File) -> Result<Self, WriteError> {
+        let mut writer = Self::new(first, last)?;
+        writer.spill = Some(Spill {
+            out,
+            postings,
+            blocks_written: 0,
+            postings_written: 0,
+            blocks_sums: Vec::new(),
+            postings_sums: Vec::new(),
+        });
+        Ok(writer)
+    }
+
+    /// Bytes of the blocks and postings sections so far, spilled or not.
+    fn lengths(&self) -> (u64, u64) {
+        let (blocks, postings) = self
+            .spill
+            .as_ref()
+            .map_or((0, 0), |s| (s.blocks_written, s.postings_written));
+        (
+            blocks + self.blocks.len() as u64,
+            postings + self.postings.len() as u64,
+        )
+    }
+
+    /// Writes whole chunks out of a spilling writer once its buffers pass
+    /// a threshold, calling `pace` with each write's size first. Does
+    /// nothing for an in-memory writer. Call it between pushes.
+    pub fn spill(&mut self, pace: &dyn Fn(usize)) -> io::Result<()> {
+        let Some(spill) = self.spill.as_mut() else {
+            return Ok(());
+        };
+        if self.blocks.len() >= SPILL {
+            let whole = self.blocks.len() / CHUNK * CHUNK;
+            chunk_sums(&self.blocks[..whole], &mut spill.blocks_sums);
+            pace(whole);
+            spill
+                .out
+                .write_all_at(&self.blocks[..whole], HEAD as u64 + spill.blocks_written)?;
+            spill.blocks_written += whole as u64;
+            self.blocks.drain(..whole);
+        }
+        if self.postings.len() >= SPILL {
+            let whole = self.postings.len() / CHUNK * CHUNK;
+            chunk_sums(&self.postings[..whole], &mut spill.postings_sums);
+            pace(whole);
+            spill
+                .postings
+                .write_all_at(&self.postings[..whole], spill.postings_written)?;
+            spill.postings_written += whole as u64;
+            self.postings.drain(..whole);
+        }
+        Ok(())
     }
 
     /// Adds `term`, which must sort strictly after the previous term, with
@@ -121,18 +207,13 @@ impl Writer {
         }
 
         if self.sizes.terms == 0 || self.in_block == BLOCK {
+            let (blocks, postings) = self.lengths();
             put(term.len() as u64, &mut self.index);
             self.index.extend_from_slice(term);
-            put(
-                (self.blocks.len() - self.block_start) as u64,
-                &mut self.index,
-            );
-            put(
-                (self.postings.len() - self.postings_base) as u64,
-                &mut self.index,
-            );
-            self.block_start = self.blocks.len();
-            self.postings_base = self.postings.len();
+            put(blocks - self.block_start, &mut self.index);
+            put(postings - self.postings_base, &mut self.index);
+            self.block_start = blocks;
+            self.postings_base = postings;
             self.in_block = 0;
             self.sizes.term_bytes += term.len() as u64;
         }
@@ -171,19 +252,92 @@ impl Writer {
         Ok((self.blocks.len() - entry) as u64)
     }
 
-    /// Writes the segment to `out` and returns its sizes.
+    /// Writes an in-memory writer's segment to `out` and returns its sizes.
+    /// A spilling writer is refused: use [`Writer::finish_spilled`].
     pub fn finish(self, out: &mut impl Write) -> io::Result<Sizes> {
+        if self.spill.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a spilling segment writer finishes with finish_spilled",
+            ));
+        }
         let mut sums = Vec::new();
         chunk_sums(&self.blocks, &mut sums);
         let blocks_sums = sums.len();
         chunk_sums(&self.postings, &mut sums);
-
-        let sections: [(&[u8], [u8; 16]); 4] = [
-            (&self.blocks, checksum(&sums[..blocks_sums])),
-            (&self.postings, checksum(&sums[blocks_sums..])),
-            (&self.index, checksum(&self.index)),
-            (&sums, checksum(&sums)),
+        let lengths = [
+            self.blocks.len() as u64,
+            self.postings.len() as u64,
+            self.index.len() as u64,
+            sums.len() as u64,
         ];
+        let digests = [
+            checksum(&sums[..blocks_sums]),
+            checksum(&sums[blocks_sums..]),
+            checksum(&self.index),
+            checksum(&sums),
+        ];
+        out.write_all(&self.head(lengths, digests))?;
+        for bytes in [&self.blocks, &self.postings, &self.index, &sums] {
+            out.write_all(bytes)?;
+        }
+        Ok(self.sizes_of(lengths))
+    }
+
+    /// Completes a spilling writer's segment file: the rest of the blocks,
+    /// the postings copied from scratch, then the index, the sums and, last,
+    /// the head. Does not sync. `pace` is called before each write.
+    pub fn finish_spilled(mut self, pace: &dyn Fn(usize)) -> io::Result<Sizes> {
+        let Some(mut spill) = self.spill.take() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an in-memory segment writer finishes with finish",
+            ));
+        };
+        chunk_sums(&self.blocks, &mut spill.blocks_sums);
+        chunk_sums(&self.postings, &mut spill.postings_sums);
+        let blocks_len = spill.blocks_written + self.blocks.len() as u64;
+        let postings_len = spill.postings_written + self.postings.len() as u64;
+        let mut at = HEAD as u64 + spill.blocks_written;
+        pace(self.blocks.len());
+        spill.out.write_all_at(&self.blocks, at)?;
+        at += self.blocks.len() as u64;
+        let mut copy = vec![0; SPILL];
+        let mut from = 0;
+        while from < spill.postings_written {
+            let n = (spill.postings_written - from).min(SPILL as u64) as usize;
+            spill.postings.read_exact_at(&mut copy[..n], from)?;
+            pace(n);
+            spill.out.write_all_at(&copy[..n], at)?;
+            (from, at) = (from + n as u64, at + n as u64);
+        }
+        let mut sums = spill.blocks_sums;
+        let blocks_sums = sums.len();
+        sums.extend_from_slice(&spill.postings_sums);
+        let tail: [&[u8]; 3] = [&self.postings, &self.index, &sums];
+        for bytes in tail {
+            pace(bytes.len());
+            spill.out.write_all_at(bytes, at)?;
+            at += bytes.len() as u64;
+        }
+        let lengths = [
+            blocks_len,
+            postings_len,
+            self.index.len() as u64,
+            sums.len() as u64,
+        ];
+        let digests = [
+            checksum(&sums[..blocks_sums]),
+            checksum(&sums[blocks_sums..]),
+            checksum(&self.index),
+            checksum(&sums),
+        ];
+        spill.out.write_all_at(&self.head(lengths, digests), 0)?;
+        Ok(self.sizes_of(lengths))
+    }
+
+    /// The head over sections of `lengths` with section checksums `digests`.
+    fn head(&self, lengths: [u64; 4], digests: [[u8; 16]; 4]) -> Vec<u8> {
         let mut head = Vec::with_capacity(HEAD);
         head.extend_from_slice(&MAGIC);
         for word in [
@@ -202,29 +356,29 @@ impl Writer {
         head.extend_from_slice(&(SECTIONS.len() as u32).to_le_bytes());
         head.resize(FIELDS, 0);
         let mut offset = HEAD as u64;
-        for (section, (bytes, sum)) in SECTIONS.iter().zip(&sections) {
-            debug_assert_eq!(head.len(), FIELDS + *section as usize * 32);
+        for &section in &SECTIONS {
+            debug_assert_eq!(head.len(), FIELDS + section as usize * 32);
+            let len = lengths[section as usize];
             head.extend_from_slice(&offset.to_le_bytes());
-            head.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            head.extend_from_slice(sum);
-            offset += bytes.len() as u64;
+            head.extend_from_slice(&len.to_le_bytes());
+            head.extend_from_slice(&digests[section as usize]);
+            offset += len;
         }
         let digest = checksum(&head);
         head.extend_from_slice(&digest);
         debug_assert_eq!(head.len(), HEAD);
+        head
+    }
 
-        out.write_all(&head)?;
-        for (bytes, _) in &sections {
-            out.write_all(bytes)?;
-        }
-        let section = |s: Section| sections[s as usize].0.len() as u64;
-        Ok(Sizes {
+    fn sizes_of(&self, lengths: [u64; 4]) -> Sizes {
+        let section = |s: Section| lengths[s as usize];
+        Sizes {
             head: HEAD as u64,
             blocks: section(Section::Blocks),
             postings: section(Section::Postings),
             index: section(Section::Index),
             sums: section(Section::Sums),
             ..self.sizes
-        })
+        }
     }
 }

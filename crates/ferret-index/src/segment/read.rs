@@ -189,6 +189,8 @@ impl PostingCursor<'_> {
 pub struct Segment<R> {
     source: R,
     info: Info,
+    /// The head's own BLAKE3-128, which the index manifest records.
+    digest: [u8; 16],
     /// `(offset, length)` of the blocks and postings sections in the file.
     blocks_at: (u64, u64),
     postings_at: (u64, u64),
@@ -281,9 +283,12 @@ impl<R: ReadAt> Segment<R> {
 
         let (firsts, index) = parse_index(&index, info.terms, blocks_len, postings_len)
             .ok_or(ReadError::Corrupt(Section::Index))?;
+        let mut digest = [0; 16];
+        digest.copy_from_slice(&head[HEAD - 16..]);
         Ok(Self {
             source,
             info,
+            digest,
             blocks_at: (table[0].0, blocks_len),
             postings_at: (table[1].0, postings_len),
             sums,
@@ -294,6 +299,16 @@ impl<R: ReadAt> Segment<R> {
 
     pub fn info(&self) -> Info {
         self.info
+    }
+
+    /// The head digest: names this exact segment.
+    pub fn digest(&self) -> [u8; 16] {
+        self.digest
+    }
+
+    /// Where the bytes come from.
+    pub fn source(&self) -> &R {
+        &self.source
     }
 
     /// Bytes resident for this segment: the block index and chunk sums.
