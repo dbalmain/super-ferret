@@ -72,9 +72,20 @@ impl SegmentEntry {
     }
 
     /// Whether an opened segment's head is the one this entry names.
-    pub(crate) fn matches(&self, info: &Info, digest: &[u8; 16], bytes: u64, tokenizer: u32) -> bool {
-        (info.first, info.last, info.terms, info.pairs, info.tokenizer_version)
-            == (self.first, self.last, self.terms, self.pairs, tokenizer)
+    pub(crate) fn matches(
+        &self,
+        info: &Info,
+        digest: &[u8; 16],
+        bytes: u64,
+        tokenizer: u32,
+    ) -> bool {
+        (
+            info.first,
+            info.last,
+            info.terms,
+            info.pairs,
+            info.tokenizer_version,
+        ) == (self.first, self.last, self.terms, self.pairs, tokenizer)
             && *digest == self.digest
             && bytes == self.bytes
     }
@@ -114,7 +125,8 @@ impl Manifest {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEAD + self.segments.len() * ENTRY + self.unreadable.len() * 4 + 16);
+        let mut out =
+            Vec::with_capacity(HEAD + self.segments.len() * ENTRY + self.unreadable.len() * 4 + 16);
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&self.tokenizer_version.to_le_bytes());
@@ -202,9 +214,10 @@ impl Manifest {
     /// `next_number`, unreadable ascending and below the frontier, and the
     /// frontier at most the high water.
     fn is_consistent(&self) -> bool {
-        let ranges = self.segments.iter().all(|s| {
-            s.first <= s.last && s.last < self.frontier && s.number < self.next_number
-        }) && self.segments.windows(2).all(|p| p[0].last < p[1].first);
+        let ranges =
+            self.segments.iter().all(|s| {
+                s.first <= s.last && s.last < self.frontier && s.number < self.next_number
+            }) && self.segments.windows(2).all(|p| p[0].last < p[1].first);
         let unreadable = self.unreadable.windows(2).all(|p| p[0] < p[1])
             && self.unreadable.last().is_none_or(|&d| d < self.frontier);
         ranges && unreadable && self.frontier <= self.high_water
@@ -309,11 +322,11 @@ mod tests {
     #[test]
     fn inconsistent_manifests_are_refused_even_with_a_good_digest() {
         let cases: [fn(&mut Manifest); 5] = [
-            |m| m.segments[1].first = 40,      // overlapping ranges
-            |m| m.segments[1].last = 90,       // a range reaching the frontier
-            |m| m.unreadable = vec![50, 3],    // unsorted unreadable set
-            |m| m.frontier = 101,              // frontier above the high water
-            |m| m.segments[1].number = 3,      // a number not yet issued
+            |m| m.segments[1].first = 40,   // overlapping ranges
+            |m| m.segments[1].last = 90,    // a range reaching the frontier
+            |m| m.unreadable = vec![50, 3], // unsorted unreadable set
+            |m| m.frontier = 101,           // frontier above the high water
+            |m| m.segments[1].number = 3,   // a number not yet issued
         ];
         for (i, break_it) in cases.iter().enumerate() {
             let mut manifest = sample();

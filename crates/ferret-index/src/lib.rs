@@ -4,8 +4,9 @@
 //!
 //! Knows doc ids and byte strings, never documents' files, paths or inodes,
 //! so it stays reusable outside desktop search. The only files it opens are
-//! its own: segments and the manifest, in a directory the host names. The planner sees these structures only
-//! through the candidate-source interface, never their formats.
+//! its own: segments and the manifest, in a directory the host names. The
+//! planner sees these structures only through the candidate-source interface,
+//! never their formats.
 //!
 //! S2 M2 adds the first structure, one immutable [`segment`] of term
 //! postings over a contiguous DocId range (docs/S2.md § Postings layout on
@@ -26,5 +27,5 @@ pub mod store;
 pub use live::DocSet;
 pub use manifest::{Manifest, SegmentEntry};
 pub use store::{
-    BUFFER, Budget, CatalogView, Error, Fault, Followed, IndexWriter, Merged, Stopped, View,
+    BUFFER, Budget, CatalogView, Error, Fault, Followed, IndexWriter, Merged, Reader, Stopped, View,
 };

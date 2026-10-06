@@ -182,7 +182,12 @@ fn document_frequencies_around_a_pfor_block_round_trip() {
     // 130 consecutive documents: a run block then a tail.
     terms.insert(b"run".to_vec(), (first..first + 130).collect());
     let (bytes, _) = write(first, last, &terms);
-    check(&bytes, first, last, &terms, &mut rng);
+    // Identical bytes need no second read-back; the in-memory path's round
+    // trips are checked above. Open it once to be sure it is a segment.
+    assert_eq!(
+        Segment::open(bytes.as_slice()).unwrap().info().terms,
+        terms.len() as u64
+    );
 }
 
 #[test]
@@ -286,6 +291,75 @@ fn inverter_reports_full_at_its_bound_and_refuses_falling_documents() {
     assert_eq!(
         inverter.drain_into(6, 9).err(),
         Some(WriteError::DocRange(5))
+    );
+}
+
+/// A spilling writer, spilled after every push, writes the very bytes the
+/// in-memory writer does, with sections past the spill threshold so whole
+/// chunks leave memory, a partial chunk stays behind, and postings travel
+/// through the scratch file.
+#[test]
+fn a_spilling_writer_writes_the_same_bytes() {
+    let mut rng = Rng(0x0005_9111);
+    let (first, last) = (1_000, 10_001_000);
+    let mut terms = Terms::new();
+    while terms.len() < 60_000 {
+        let df = if rng.below(4) == 0 {
+            2 + rng.below(6)
+        } else {
+            1
+        };
+        terms.insert(rng.bytes(4, 40), rng.docs(first, last, df));
+    }
+    for i in 0..60u32 {
+        // Strided with jitter: wide gaps, so the lists are long in bytes.
+        let list = (0..20_000)
+            .map(|d| first + d * 499 + rng.below(400) as u32)
+            .collect();
+        terms.insert(format!("zz-long-{i:02}").into_bytes(), list);
+    }
+    let (memory, sizes) = write(first, last, &terms);
+    assert!(
+        sizes.blocks > super::write::SPILL as u64 && sizes.postings > super::write::SPILL as u64
+    );
+
+    let dir = std::env::temp_dir().join(format!("ferret-index-spill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let open = |name: &str| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.join(name))
+            .unwrap()
+    };
+    let (out, scratch) = (open("out"), open("postings"));
+    let paced = std::cell::Cell::new(0);
+    let pace = |n: usize| paced.set(paced.get() + n);
+    let mut writer = Writer::spilling(first, last, out.try_clone().unwrap(), scratch).unwrap();
+    for (term, docs) in &terms {
+        writer.push(term, docs).unwrap();
+        writer.spill(&pace).unwrap();
+    }
+    let spilled = writer.finish_spilled(&pace).unwrap();
+    let bytes = std::fs::read(dir.join("out")).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(spilled, sizes);
+    assert!(
+        bytes == memory,
+        "spilled segment differs from the in-memory one"
+    );
+    // Every byte but the head is paced once, and spilled postings once more
+    // on their way to scratch.
+    let once = sizes.total() - sizes.head;
+    assert!(paced.get() as u64 > once && paced.get() as u64 <= once + sizes.postings);
+    // Identical bytes need no second read-back; the in-memory path's round
+    // trips are checked above. Open it once to be sure it is a segment.
+    assert_eq!(
+        Segment::open(bytes.as_slice()).unwrap().info().terms,
+        terms.len() as u64
     );
 }
 

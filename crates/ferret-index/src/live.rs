@@ -83,12 +83,23 @@ mod tests {
     fn ranges_and_counts_agree_with_a_sorted_list() {
         let docs = [0, 1, 63, 64, 65, 127, 128, 200, 255];
         let set = DocSet::new(256, docs.iter().copied().chain([300, 1]));
-        assert_eq!(set.len(), docs.len() as u32, "duplicates and ids past the bound are dropped");
+        assert_eq!(
+            set.len(),
+            docs.len() as u32,
+            "duplicates and ids past the bound are dropped"
+        );
         for from in 0..=257 {
             for to in [from, from + 1, from + 63, from + 64, from + 65, 400] {
-                let expected: Vec<u32> =
-                    docs.iter().copied().filter(|&d| d >= from && d < to).collect();
-                assert_eq!(set.range(from, to).collect::<Vec<_>>(), expected, "[{from}, {to})");
+                let expected: Vec<u32> = docs
+                    .iter()
+                    .copied()
+                    .filter(|&d| d >= from && d < to)
+                    .collect();
+                assert_eq!(
+                    set.range(from, to).collect::<Vec<_>>(),
+                    expected,
+                    "[{from}, {to})"
+                );
                 assert_eq!(set.count(from, to), expected.len() as u32);
             }
         }

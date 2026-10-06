@@ -65,7 +65,7 @@ impl Sizes {
 }
 
 /// Buffered bytes past which [`Writer::spill`] writes whole chunks out.
-const SPILL: usize = 1 << 20;
+pub(super) const SPILL: usize = 1 << 20;
 
 /// Builds one segment over `[first, last]` from `(term, DocIds)` pushed in
 /// strictly increasing term order.

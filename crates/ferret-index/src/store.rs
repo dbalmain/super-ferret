@@ -98,6 +98,10 @@ pub enum Fault {
     Stop,
 }
 
+/// The host's document reader: fills the buffer with document `doc`'s
+/// bytes, or says why it cannot.
+pub type Reader<'a> = dyn FnMut(u32, &mut Vec<u8>) -> Result<(), Fault> + 'a;
+
 /// Why a follow pass ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stopped {
@@ -141,7 +145,9 @@ pub struct Merged {
     pub written: u64,
     /// Indexed documents dropped because they are dead.
     pub purged: u64,
-    pub segment: SegmentEntry,
+    /// The merged segment; `None` when every input document was dead and
+    /// the inputs were simply dropped.
+    pub segment: Option<SegmentEntry>,
 }
 
 /// Why an index operation failed. After any error the writer is poisoned:
@@ -312,7 +318,7 @@ impl IndexWriter {
         &mut self,
         catalog: &CatalogView,
         budget: &Budget,
-        read: &mut dyn FnMut(u32, &mut Vec<u8>) -> Result<(), Fault>,
+        read: &mut Reader<'_>,
     ) -> Result<Followed, Error> {
         self.guard(|writer| writer.follow_inner(catalog, budget, read))
     }
@@ -375,7 +381,7 @@ impl IndexWriter {
         &mut self,
         catalog: &CatalogView,
         budget: &Budget,
-        read: &mut dyn FnMut(u32, &mut Vec<u8>) -> Result<(), Fault>,
+        read: &mut Reader<'_>,
     ) -> Result<Followed, Error> {
         self.reconcile(catalog)?;
         let live = catalog.live;
@@ -474,7 +480,9 @@ impl IndexWriter {
         run: std::ops::Range<usize>,
     ) -> Result<Option<Merged>, Error> {
         let mut manifest = self.current.manifest.clone();
-        manifest.unreadable.retain(|&doc| catalog.live.contains(doc));
+        manifest
+            .unreadable
+            .retain(|&doc| catalog.live.contains(doc));
         let entries = &self.current.manifest.segments[run.clone()];
         let read: u64 = entries.iter().map(|s| s.bytes).sum();
         if read > budget.bytes {
@@ -489,6 +497,22 @@ impl IndexWriter {
             .map(|s| alive(s, catalog.live, &manifest.unreadable))
             .sum();
         let purged = entries.iter().map(|s| u64::from(s.docs)).sum::<u64>() - u64::from(docs);
+        if docs == 0 {
+            // Nothing survives: drop the inputs without writing. Their
+            // range stays below the frontier, so it is not re-covered.
+            let retired: Vec<_> = manifest.segments.drain(run.clone()).collect();
+            let mut segments = self.current.segments.clone();
+            segments.drain(run);
+            self.publish(manifest, segments)?;
+            retire(&self.dir, &retired);
+            return Ok(Some(Merged {
+                inputs: retired.len(),
+                read,
+                written: 0,
+                purged,
+                segment: None,
+            }));
+        }
         let inputs = self.current.segments[run.clone()]
             .iter()
             .map(|segment| {
@@ -517,16 +541,13 @@ impl IndexWriter {
         let mut segments = self.current.segments.clone();
         segments.splice(run, [segment]);
         self.publish(manifest, segments)?;
-        for old in &retired {
-            // A crash before this leaves orphans the next open removes.
-            let _ = fs::remove_file(self.dir.join(old.file_name()));
-        }
+        retire(&self.dir, &retired);
         Ok(Some(Merged {
             inputs: retired.len(),
             read,
             written: entry.bytes,
             purged,
-            segment: entry,
+            segment: Some(entry),
         }))
     }
 
@@ -632,10 +653,22 @@ fn open_segments(dir: &Path, manifest: &Manifest) -> Result<Vec<Arc<Segment<File
         .collect()
 }
 
+/// Unlinks merged-away segments. Open views keep their descriptors (D32);
+/// a crash before this leaves orphans the next open removes.
+fn retire(dir: &Path, retired: &[SegmentEntry]) {
+    for old in retired {
+        let _ = fs::remove_file(dir.join(old.file_name()));
+    }
+}
+
 /// Removes segment and temporary files `manifest` does not name. Other
 /// files are left alone.
 fn remove_unnamed(dir: &Path, manifest: &Manifest) -> io::Result<()> {
-    let named: Vec<String> = manifest.segments.iter().map(SegmentEntry::file_name).collect();
+    let named: Vec<String> = manifest
+        .segments
+        .iter()
+        .map(SegmentEntry::file_name)
+        .collect();
     for entry in fs::read_dir(dir)? {
         let name = entry?.file_name();
         let Some(name) = name.to_str() else {
@@ -704,3 +737,6 @@ thread_local! {
     /// The next [`hit`] of this point fails, once.
     pub(crate) static STOP: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
 }
+
+#[cfg(test)]
+mod tests;

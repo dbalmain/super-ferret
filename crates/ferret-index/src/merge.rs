@@ -58,7 +58,11 @@ pub fn choose(
     let mut best: Option<(u32, usize)> = None;
     let mut start = 0;
     while start < tiers.len() {
-        let end = start + tiers[start..].iter().take_while(|&&t| t == tiers[start]).count();
+        let end = start
+            + tiers[start..]
+                .iter()
+                .take_while(|&&t| t == tiers[start])
+                .count();
         if end - start >= MERGE_FACTOR && best.is_none_or(|(tier, _)| tiers[start] < tier) {
             best = Some((tiers[start], start));
         }
@@ -108,7 +112,10 @@ pub fn stream<R: ReadAt>(
     while let Some(Reverse((term, i))) = heap.pop() {
         docs.clear();
         let mut taken = vec![i];
-        while heap.peek().is_some_and(|Reverse((other, _))| *other == term) {
+        while heap
+            .peek()
+            .is_some_and(|Reverse((other, _))| *other == term)
+        {
             if let Some(Reverse((_, j))) = heap.pop() {
                 taken.push(j);
             }
@@ -143,4 +150,77 @@ fn next<R: ReadAt>(cursor: &mut Terms<'_, R>) -> Result<Option<(Vec<u8>, TermEnt
     Ok(cursor
         .next_term()?
         .map(|(term, entry)| (term.to_vec(), entry)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segments(bytes: &[u64]) -> Vec<SegmentEntry> {
+        bytes
+            .iter()
+            .enumerate()
+            .map(|(i, &bytes)| SegmentEntry {
+                number: i as u64,
+                first: i as u32 * 10,
+                last: i as u32 * 10 + 9,
+                docs: 10,
+                terms: 1,
+                pairs: 1,
+                bytes,
+                digest: [0; 16],
+            })
+            .collect()
+    }
+
+    const MB: u64 = TIER_FLOOR;
+
+    #[test]
+    fn tiers_are_decades_above_the_floor() {
+        let cases = [
+            (0, 0),
+            (MB, 0),
+            (MB + 1, 1),
+            (10 * MB, 1),
+            (10 * MB + 1, 2),
+            (100 * MB + 1, 3),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(tier(bytes), want, "{bytes}");
+        }
+    }
+
+    #[test]
+    fn the_lowest_tier_with_a_full_adjacent_run_merges_first() {
+        let all_alive = |s: &SegmentEntry| s.docs;
+        // Nine small segments are not enough.
+        assert_eq!(choose(&segments(&[MB; 9]), &all_alive), None);
+        // Ten tier-1 segments, then ten tier-0: the tier-0 run wins.
+        let mut bytes = vec![5 * MB; 10];
+        bytes.extend([MB; 10]);
+        assert_eq!(choose(&segments(&bytes), &all_alive), Some(10..20));
+        // Twelve in a run: the leftmost ten.
+        assert_eq!(choose(&segments(&[MB; 12]), &all_alive), Some(0..10));
+        // A larger segment in the middle breaks adjacency: neither side has
+        // ten.
+        let mut bytes = vec![MB; 9];
+        bytes.push(50 * MB);
+        bytes.extend([MB; 9]);
+        assert_eq!(choose(&segments(&bytes), &all_alive), None);
+    }
+
+    #[test]
+    fn the_most_dead_segment_past_a_quarter_is_rewritten_alone() {
+        let segs = segments(&[MB, MB, MB, MB]);
+        // Dead: 2/10, 3/10, 10/10, 1/10.
+        let alive = |s: &SegmentEntry| [8, 7, 0, 9][s.number as usize];
+        assert_eq!(choose(&segs, &alive), Some(2..3));
+        let alive = |s: &SegmentEntry| [8, 7, 10, 9][s.number as usize];
+        assert_eq!(choose(&segs, &alive), Some(1..2));
+        // Exactly a quarter is not past it.
+        let mut segs = segments(&[MB]);
+        segs[0].docs = 8;
+        assert_eq!(choose(&segs, &|_| 6), None);
+        assert_eq!(choose(&segs, &|_| 5), Some(0..1));
+    }
 }
