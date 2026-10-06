@@ -1110,3 +1110,69 @@ fn host_cancellation_stops_search_before_the_next_candidate_is_evaluated() {
         assert_eq!(search(&engine.pin()).len(), 2);
     }
 }
+
+/// Live content matches for `word` in a pin: the index view's postings
+/// filtered by the pinned catalog view's liveness.
+fn content_docs(pin: &QuerySession, word: &[u8]) -> Vec<u32> {
+    let live = ferret::engine::live_documents(pin.catalog());
+    let view = pin.content().unwrap();
+    let mut docs = view.lookup(word).unwrap();
+    docs.retain(|&doc| live.contains(doc));
+    docs
+}
+
+#[test]
+fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
+    use ferret_index::Budget;
+    let tree = Tree::new();
+    let engine = writer_engine(&tree);
+    assert!(engine.pin().content().is_none());
+    assert!(matches!(
+        engine.follow_content(&Budget::unbounded(), None),
+        Err(ferret::engine::Error::NoContentIndex)
+    ));
+    engine.attach_content(&tree.index()).unwrap();
+    let empty = engine.pin();
+    let live = ferret::engine::live_documents(empty.catalog());
+    assert_eq!(empty.content().unwrap().uncovered(&live).len(), 2);
+
+    let followed = engine.follow_content(&Budget::unbounded(), None).unwrap();
+    assert_eq!((followed.docs, followed.unreadable), (2, 0));
+    let first = engine.pin();
+    let alpha = content_docs(&first, b"alpha");
+    assert_eq!((alpha.len(), content_docs(&first, b"beta").len()), (1, 1));
+
+    // The catalog moves on; the content view stays with it until a pass.
+    fs::remove_file(tree.root().join("a.txt")).unwrap();
+    fs::write(tree.root().join("new.txt"), b"gamma alpha").unwrap();
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
+    let refreshed = engine.pin();
+    let live = ferret::engine::live_documents(refreshed.catalog());
+    let uncovered = refreshed.content().unwrap().uncovered(&live);
+    assert_eq!(uncovered.len(), 1, "only the new document");
+    assert!(content_docs(&refreshed, b"alpha").is_empty(), "a.txt is dead");
+
+    let followed = engine.follow_content(&Budget::unbounded(), None).unwrap();
+    assert_eq!(followed.docs, 1);
+    let last = engine.pin();
+    assert_eq!(content_docs(&last, b"alpha"), uncovered);
+    assert_eq!(content_docs(&last, b"gamma"), uncovered);
+    // Older pins keep their own pairing.
+    assert_eq!(content_docs(&first, b"alpha"), alpha);
+    assert!(content_docs(&refreshed, b"gamma").is_empty());
+
+    // The first segment is half dead, past the trigger.
+    let merged = engine.merge_content(&Budget::unbounded()).unwrap().unwrap();
+    assert_eq!((merged.inputs, merged.purged), (1, 1));
+    assert_eq!(content_docs(&engine.pin(), b"alpha"), uncovered);
+    assert_eq!(content_docs(&engine.pin(), b"beta").len(), 1);
+    assert_eq!(content_docs(&first, b"alpha"), alpha, "the old view kept its files");
+
+    // A reopened writer finds the same index.
+    drop(engine);
+    let engine = writer_engine(&tree);
+    engine.attach_content(&tree.index()).unwrap();
+    assert_eq!(content_docs(&engine.pin(), b"gamma"), uncovered);
+    let live = ferret::engine::live_documents(engine.pin().catalog());
+    assert!(engine.pin().content().unwrap().uncovered(&live).is_empty());
+}

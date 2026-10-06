@@ -1,5 +1,10 @@
 //! One resident catalog, shared by immutable query pins and the optional
 //! writer. Output and live-tree actions run outside the publication locks.
+//!
+//! A writer engine may also own the content index (docs/S2.md § Manifest
+//! and commit): [`Engine::attach_content`] opens it under the catalog's
+//! writer lock, and a [`QuerySession`] then pins the index view published
+//! with its catalog view. A query-only engine does not open it in S2 M3.
 
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -8,6 +13,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use ferret_catalog::{Catalog, Generation, OpenError, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
+use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Merged};
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
 use ferret_query::{NameIndex, Query, Row, RunError, Stats};
 
@@ -18,14 +24,24 @@ static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 pub struct Engine {
     current: RwLock<QuerySession>,
     writer: Mutex<Option<WriterSession>>,
+    /// The content index, kept under `writer`'s lock: lock `writer` first.
+    content: Mutex<Option<IndexWriter>>,
     retired: Mutex<Vec<(u64, Weak<NameIndex>)>>,
 }
+
+/// The content index's directory inside the catalog's (docs/S2.md §
+/// Segment file).
+pub const CONTENT_DIR: &str = "index";
 
 /// A generation pinned for the whole query, including output callbacks.
 #[derive(Clone)]
 pub struct QuerySession {
     catalog: Catalog,
     names: Arc<NameIndex>,
+    /// The content index view published with or before this catalog view,
+    /// when the engine has one. Every DocId it holds is below the catalog
+    /// view's `next_doc`; liveness comes from the catalog.
+    content: Option<Arc<ferret_index::View>>,
 }
 
 impl Engine {
@@ -41,8 +57,10 @@ impl Engine {
             current: RwLock::new(QuerySession {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
+                content: None,
             }),
             writer: Mutex::new(None),
+            content: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
         }))
     }
@@ -60,8 +78,10 @@ impl Engine {
             current: RwLock::new(QuerySession {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
+                content: None,
             }),
             writer: Mutex::new(Some(writer)),
+            content: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
         }
     }
@@ -71,6 +91,10 @@ impl Engine {
     /// prevents a replacement host from winning the endpoint but losing the
     /// still-live old engine's writer lock.
     pub(crate) fn close_writer(&self) {
+        self.content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -192,6 +216,74 @@ impl Engine {
         epochs
     }
 
+    /// Opens the content index in `catalog_dir`'s [`CONTENT_DIR`] under the
+    /// writer lock this engine holds. An index that does not fit the current
+    /// catalog view is discarded, to be rebuilt by [`Engine::follow_content`].
+    pub fn attach_content(&self, catalog_dir: &Path) -> Result<(), Error> {
+        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
+        let live = live_documents(&view);
+        let opened = IndexWriter::open(&catalog_dir.join(CONTENT_DIR), &catalog_view(&view, &live))
+            .map_err(Error::Content)?;
+        let published = opened.view();
+        *self.content.lock().map_err(|_| Error::WriterPanicked)? = Some(opened);
+        self.select_content(published);
+        Ok(())
+    }
+
+    /// One follow pass over the current catalog view, reading documents
+    /// through the crawl's checked reader: paced by `limiter` when given,
+    /// unpaced for an explicit `ferret index`. Publishes the new index view
+    /// to later pins.
+    pub fn follow_content(
+        &self,
+        budget: &Budget,
+        limiter: Option<Arc<ferret_catalog::bulk::Limiter>>,
+    ) -> Result<Followed, Error> {
+        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
+        let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
+        let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+        let live = live_documents(&view);
+        let mut documents = ferret_crawl::Documents::new(&view).map_err(Error::Catalog)?;
+        if let Some(limiter) = limiter {
+            documents = documents.with_limiter(limiter);
+        }
+        let followed = index.follow(&catalog_view(&view, &live), budget, &mut |doc, bytes| {
+            documents
+                .read(&view, ferret_catalog::DocId(doc), bytes)
+                .map_err(|_| Fault::Unreadable)
+        });
+        let published = index.view();
+        drop(content);
+        drop(writer);
+        self.select_content(published);
+        followed.map_err(Error::Content)
+    }
+
+    /// One merge step of the content index, if its policy wants one.
+    pub fn merge_content(&self, budget: &Budget) -> Result<Option<Merged>, Error> {
+        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
+        let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
+        let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+        let live = live_documents(&view);
+        let merged = index.merge_if_needed(&catalog_view(&view, &live), budget);
+        let published = index.view();
+        drop(content);
+        drop(writer);
+        self.select_content(published);
+        merged.map_err(Error::Content)
+    }
+
+    /// Publishes a content view beside the current catalog view.
+    fn select_content(&self, content: Arc<ferret_index::View>) {
+        self.current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .content = Some(content);
+    }
+
     fn select(&self, view: Catalog) {
         let previous = self.pin();
         let names = Arc::new(NameIndex::adopt(&view, Some(&previous.names)));
@@ -211,7 +303,20 @@ impl Engine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = QuerySession {
             catalog: view,
             names,
+            content: previous.content,
         };
+    }
+}
+
+/// The live documents of one catalog view (docs/S2.md § Liveness).
+pub fn live_documents(view: &Catalog) -> DocSet {
+    DocSet::new(view.next_doc().0, view.docs().map(|(doc, _)| doc.0))
+}
+
+fn catalog_view<'a>(view: &Catalog, live: &'a DocSet) -> CatalogView<'a> {
+    CatalogView {
+        incarnation: view.generation().incarnation,
+        live,
     }
 }
 
@@ -223,6 +328,11 @@ impl QuerySession {
 
     pub fn name_index(&self) -> &NameIndex {
         &self.names
+    }
+
+    /// The pinned content index view, if the engine has a content index.
+    pub fn content(&self) -> Option<&ferret_index::View> {
+        self.content.as_deref()
     }
 
     /// A checked directory scope for hosts that already resolved a start.
@@ -290,6 +400,10 @@ pub enum Error {
     WriterPanicked,
     Refresh(ferret_crawl::IndexError),
     Compact(ferret_catalog::log::Error),
+    /// The engine has no content index attached.
+    NoContentIndex,
+    Content(ferret_index::Error),
+    Catalog(OpenError),
 }
 
 impl std::fmt::Display for Error {
@@ -299,6 +413,9 @@ impl std::fmt::Display for Error {
             Self::WriterPanicked => f.write_str("the engine writer panicked"),
             Self::Refresh(error) => error.fmt(f),
             Self::Compact(error) => error.fmt(f),
+            Self::NoContentIndex => f.write_str("the engine has no content index"),
+            Self::Content(error) => error.fmt(f),
+            Self::Catalog(error) => error.fmt(f),
         }
     }
 }
@@ -306,7 +423,9 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::ReadOnly | Self::WriterPanicked => None,
+            Self::ReadOnly | Self::WriterPanicked | Self::NoContentIndex => None,
+            Self::Content(error) => Some(error),
+            Self::Catalog(error) => Some(error),
             Self::Refresh(error) => Some(error),
             Self::Compact(error) => Some(error),
         }
