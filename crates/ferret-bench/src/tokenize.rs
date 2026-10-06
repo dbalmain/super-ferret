@@ -227,7 +227,7 @@ pub(crate) fn run(dir: &Path) -> crate::Result<()> {
 ///
 /// One-sided by design: a blob that slips past (a vowel pair, a short
 /// fragment) only lowers the share.
-fn is_hash_like(term: &[u8]) -> bool {
+pub(crate) fn is_hash_like(term: &[u8]) -> bool {
     let mixed = term.iter().any(u8::is_ascii_digit) && term.iter().any(u8::is_ascii_lowercase);
     let hex = term.len() >= 12 && term.iter().all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let base64 = term.len() >= 20

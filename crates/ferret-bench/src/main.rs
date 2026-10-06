@@ -8,6 +8,7 @@
 //! ferret-bench census <catalog-dir>              Hashed documents: bytes, sizes, extensions
 //! ferret-bench corpus-sample <catalog-dir> <out-dir> <n>   copy a reproducible sample of ~n documents
 //! ferret-bench tokenize <corpus-dir>             tokenizer throughput and term counts
+//! ferret-bench terms <catalog-dir>               full-tree term census: df, hapax, pairs
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
 //! ferret-bench name-index-once <catalog-dir> open phases and query timings
@@ -53,6 +54,7 @@ use ferret_verify::{Arm, Finder};
 
 mod census;
 mod corpus;
+mod terms;
 mod tokenize;
 
 #[cfg(test)]
@@ -97,6 +99,7 @@ fn main() -> ExitCode {
             ("census", [dir]) => census::run(Path::new(dir)),
             ("corpus-sample", [dir, out, n]) => corpus::run(Path::new(dir), Path::new(out), n),
             ("tokenize", [dir]) => tokenize::run(Path::new(dir)),
+            ("terms", [dir]) => terms::run(Path::new(dir)),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
@@ -142,6 +145,7 @@ fn usage() -> ExitCode {
          ferret-bench census <catalog-dir>\n       \
          ferret-bench corpus-sample <catalog-dir> <out-dir> <n>\n       \
          ferret-bench tokenize <corpus-dir>\n       \
+         ferret-bench terms <catalog-dir>\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \
