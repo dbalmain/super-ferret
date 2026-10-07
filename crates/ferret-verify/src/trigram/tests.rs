@@ -752,3 +752,126 @@ fn every_match_satisfies_the_derived_query_long() {
     assert_covers(&tally);
     println!("{tally:?}");
 }
+
+// ── coverage over the regex classes (M3's measurement) ──
+
+/// An identifier-like word: camelCase syllables, sometimes a digit or `_`.
+fn word(rng: &mut Rng, parts: usize) -> String {
+    const SYLLABLES: &[&str] = &[
+        "parse", "head", "er", "con", "fig", "load", "buf", "fer", "req", "uest", "han", "dle",
+        "tok", "en", "map", "set", "err", "or", "num", "ber", "len", "file", "node", "id",
+    ];
+    let mut out = String::new();
+    for i in 0..parts {
+        let s = *rng.pick(SYLLABLES);
+        if i > 0 && rng.below(2) == 0 {
+            out.push_str(&s[..1].to_ascii_uppercase());
+            out.push_str(&s[1..]);
+        } else {
+            out.push_str(s);
+        }
+    }
+    match rng.below(6) {
+        0 => out.push('_'),
+        1 => out.push(char::from(b'0' + rng.below(10) as u8)),
+        _ => {}
+    }
+    out
+}
+
+/// M5's regex classes (S3 § Bench plan), with synthetic words in place of
+/// dictionary terms.
+fn class_pattern(class: &str, rng: &mut Rng) -> String {
+    let parts = 1 + rng.below(3);
+    match class {
+        "rare literal" => word(rng, 1 + parts),
+        "identifier pattern" => format!(r"{}\w+{}", word(rng, 1), word(rng, 1)),
+        "alternation" => format!("({}|{}|{})", word(rng, 2), word(rng, 2), word(rng, 2)),
+        "broad" => format!(
+            r"{}\d+",
+            rng.pick(&["the", "ing", "ion", "ent", "and", "tio"])
+        ),
+        "code class" => format!("[A-Z_]+{}", word(rng, parts.min(2))),
+        _ => (*rng.pick(&[
+            r"\d{4}-\d{2}",
+            r"[0-9a-f]{8}",
+            r"\w+\.\w+",
+            r"\d+",
+            r"^\s*$",
+        ]))
+        .to_string(),
+    }
+}
+
+const CLASSES: &[&str] = &[
+    "rare literal",
+    "identifier pattern",
+    "alternation",
+    "broad",
+    "code class",
+    "refused",
+];
+
+#[derive(Default)]
+struct Coverage {
+    patterns: u32,
+    narrowed: u32,
+    keys: Vec<usize>,
+    trimmed: Trims,
+}
+
+fn coverage(class: &str, case_insensitive: bool) -> Coverage {
+    let mut rng = Rng(0xc0_7e2a_9e_u64.wrapping_add(class.len() as u64));
+    let mut out = Coverage::default();
+    for _ in 0..500 {
+        let pattern = class_pattern(class, &mut rng);
+        let (query, trims) = derive_with(&pattern, case_insensitive, &LIMITS);
+        out.patterns += 1;
+        out.narrowed += u32::from(query != Trigrams::All);
+        out.keys.push(query.keys().len());
+        out.trimmed.class += u32::from(trims.class > 0);
+        out.trimmed.exact += u32::from(trims.exact > 0);
+        out.trimmed.set += u32::from(trims.set > 0);
+        out.trimmed.keys += u32::from(trims.keys > 0);
+    }
+    out.keys.sort_unstable();
+    out
+}
+
+/// Prints the coverage table (`--nocapture`), and holds each class to the
+/// shape S3 expects of it: literals and alternations always narrow, the
+/// refused class never does. The other classes narrow unless a part is
+/// under three bytes (`er\w+id`).
+#[test]
+fn derivation_coverage_over_the_regex_classes() {
+    println!(
+        "| class | case | narrowed | keys median | keys p90 | keys max | class cap | exact cap | set cap | key cap |"
+    );
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    for class in CLASSES {
+        for ci in [true, false] {
+            let c = coverage(class, ci);
+            let pct = |n: u32| format!("{:.0}%", 100.0 * f64::from(n) / f64::from(c.patterns));
+            let at = |q: usize| c.keys[(c.keys.len() - 1) * q / 100];
+            println!(
+                "| {class} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                if ci { "insensitive" } else { "case:" },
+                pct(c.narrowed),
+                at(50),
+                at(90),
+                at(100),
+                pct(c.trimmed.class),
+                pct(c.trimmed.exact),
+                pct(c.trimmed.set),
+                pct(c.trimmed.keys),
+            );
+            match *class {
+                "rare literal" | "alternation" => {
+                    assert_eq!(c.narrowed, c.patterns, "{class} ci={ci}")
+                }
+                "refused" => assert_eq!(c.narrowed, 0, "{class} ci={ci}"),
+                _ => {}
+            }
+        }
+    }
+}

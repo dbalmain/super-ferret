@@ -624,23 +624,28 @@ fn last_two(s: &[u8]) -> &[u8] {
     &s[s.len().saturating_sub(2)..]
 }
 
-/// Cox's order: save before you discard. An exact set's trigrams go into
-/// `matches` before it is shrunk to two-byte ends, and a prefix or suffix
-/// set's before it is shortened.
+/// Cox's order: save before you discard. An exact set over the caps has its
+/// trigrams saved into `matches` before it is released.
+///
+/// Once `exact` is unknown, every prefix and suffix string's own trigrams are
+/// already in `matches`: each string came from a released exact set, or from
+/// a concatenation whose boundary trigrams were saved. Only the two bytes at
+/// the open end can still form a new key, across a later boundary, so the
+/// sets keep just those. Shortening a set to the cap then discards boundary
+/// keys only, which no saving could keep.
 fn simplify(mut info: Info, limits: &Limits, trims: &mut Trims) -> Info {
     if let Some(exact) = &info.exact {
         let shortest = exact.iter().map(Vec::len).min().unwrap_or(0);
         if exact.len() > limits.exact || shortest > limits.exact_len {
             trims.exact += 1;
             info = info.release();
-            info.prefix = info.prefix.iter().map(|s| first_two(s).to_vec()).collect();
-            info.suffix = info.suffix.iter().map(|s| last_two(s).to_vec()).collect();
         }
     }
     if info.exact.is_none() {
+        info.prefix = info.prefix.iter().map(|s| first_two(s).to_vec()).collect();
+        info.suffix = info.suffix.iter().map(|s| last_two(s).to_vec()).collect();
         if info.prefix.len() > limits.set {
             trims.set += 1;
-            info.matches = Trigrams::and([info.matches, set_trigrams(&info.prefix)]);
             info.prefix = shorten(
                 &info.prefix,
                 limits.set,
@@ -650,7 +655,6 @@ fn simplify(mut info: Info, limits: &Limits, trims: &mut Trims) -> Info {
         }
         if info.suffix.len() > limits.set {
             trims.set += 1;
-            info.matches = Trigrams::and([info.matches, set_trigrams(&info.suffix)]);
             info.suffix = shorten(&info.suffix, limits.set, |s| &s[1..], <[u8]>::ends_with);
         }
     }
