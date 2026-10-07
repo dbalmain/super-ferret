@@ -1461,16 +1461,12 @@ fn socket_search_handles_eight_thousand_flat_content_siblings() {
             args.push("text:absentsibling".to_owned());
         }
         args.extend([")", "OR", "text:absentouter"].map(str::to_owned));
-        let request = format!(
-            "{{\"id\":\"wide\",\"op\":\"search\",\"args\":{}}}\n",
-            format!(
-                "[{}]",
-                args.iter()
-                    .map(|a| format!("\"{a}\""))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        );
+        let quoted = args
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let request = format!("{{\"id\":\"wide\",\"op\":\"search\",\"args\":[{quoted}]}}\n");
         let (mut reader, _) = tree.connect();
         let reply = block(&mut reader, request.as_bytes());
         assert!(
