@@ -240,6 +240,40 @@ impl View {
         Ok(docs)
     }
 
+    /// Opens `dir`'s published index for reading only, without the writer
+    /// lock: a query host that does not own the writer. `None` when there
+    /// is no index, or it does not fit `catalog` (another incarnation or
+    /// tokenizer, or a high water past its `next_doc`), which a query
+    /// treats as nothing covered. Segments are immutable and a merge
+    /// unlinks a retired one only after publishing the manifest that drops
+    /// it, so a segment missing here means a newer manifest exists: the
+    /// open is retried, a few times, from the manifest.
+    pub fn open(dir: &Path, catalog: &CatalogView) -> Result<Option<Self>, Error> {
+        for _ in 0..3 {
+            let Some(manifest) = Manifest::read(dir)?.filter(|m| fits(m, catalog)) else {
+                return Ok(None);
+            };
+            match open_segments(dir, &manifest) {
+                Ok(segments) => return Ok(Some(Self { manifest, segments })),
+                Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    /// [`View::uncovered`] as a set, built without an intermediate list:
+    /// during a first build it holds every live document.
+    pub fn uncovered_set(&self, live: &DocSet) -> DocSet {
+        let unreadable = self.manifest.unreadable.iter().copied();
+        DocSet::new(
+            live.bound(),
+            unreadable
+                .filter(|&doc| live.contains(doc))
+                .chain(live.range(self.manifest.frontier, live.bound())),
+        )
+    }
+
     /// The live documents this view does not cover, ascending: the
     /// unreadable ones, and every live one at or above the frontier.
     pub fn uncovered(&self, live: &DocSet) -> Vec<u32> {

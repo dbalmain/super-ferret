@@ -60,6 +60,46 @@ impl TextAtom {
         Ok(Self { text, whole, units })
     }
 
+    /// The documents [`TextAtom::cursor`] may yield, uncovered ones
+    /// included, and whether every one it yields from the index is Yes:
+    /// read from the dictionaries alone, never a postings list, so that
+    /// the planner can choose before it reads one. Dead documents count;
+    /// it is an upper bound.
+    pub fn estimate(text: &Text, pinned: &Pinned<'_>) -> Result<(u64, Certainty), ReadError> {
+        let df = |term: &[u8]| -> Result<u64, ReadError> {
+            for source in pinned.sources() {
+                if let Some(found) = source.estimate(&Atom::Term(cap(term)))? {
+                    return Ok(found.docs);
+                }
+            }
+            Ok(u64::from(pinned.live().len()))
+        };
+        let whole = text.whole().map(df).transpose()?;
+        let term_only = text.units().len() == 1 && text.units().next() == text.whole();
+        let units = if term_only {
+            None
+        } else {
+            let mut least = None;
+            for unit in text.units() {
+                let n = df(unit)?;
+                least = Some(least.map_or(n, |m: u64| m.min(n)));
+            }
+            least
+        };
+        let docs = whole.unwrap_or(0) + units.unwrap_or(0);
+        let exact = term_only
+            && pinned.sources().next().is_some()
+            && text
+                .whole()
+                .is_some_and(|w| !text.is_case_sensitive() && exact_under_cap(w));
+        let certainty = if exact {
+            Certainty::Yes
+        } else {
+            Certainty::Maybe
+        };
+        Ok((docs + u64::from(pinned.uncovered().len()), certainty))
+    }
+
     /// What the verifier checks a Maybe document against.
     pub fn text(&self) -> &Text {
         &self.text

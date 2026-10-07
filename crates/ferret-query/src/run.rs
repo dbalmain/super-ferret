@@ -30,7 +30,7 @@ pub struct Row<'a> {
 }
 
 /// What a run did, for the query log and for tests.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Names tested: heap hits for a heap scan, names whose inode passed
     /// for an inode scan, every name otherwise.
@@ -39,13 +39,25 @@ pub struct Stats {
     pub rows: u64,
     /// The actual counted resident plan; None for raw-format execution.
     pub name_plan: Option<crate::NameEstimate>,
+    /// What the content side did, for a query with a content atom.
+    pub content: Option<crate::ContentReport>,
 }
 
-/// A run that could not read the catalog.
+/// A run that could not read the catalog or the content index, or would
+/// not run.
 #[derive(Debug)]
 pub enum RunError {
     Open(OpenError),
     Stale(ferret_catalog::RetryFromCurrent),
+    /// More live documents are uncovered than the bound allows: the query
+    /// would verify each by reading it (docs/S2.md § Coverage). The caller
+    /// may run it anyway with `scan_uncovered`.
+    IndexIncomplete { uncovered: u32, live: u32 },
+    /// The content index could not be read.
+    Index(ferret_index::ReadError),
+    /// A query with a content atom was run without the content index and a
+    /// reader ([`Query::run_content`] runs it).
+    NoContent,
 }
 
 impl fmt::Display for RunError {
@@ -53,6 +65,12 @@ impl fmt::Display for RunError {
         match self {
             Self::Open(error) => error.fmt(f),
             Self::Stale(error) => write!(f, "retry from {:?}", error.current),
+            Self::IndexIncomplete { uncovered, live } => write!(
+                f,
+                "the content index does not yet cover {uncovered} of {live} documents"
+            ),
+            Self::Index(error) => write!(f, "content index: {error}"),
+            Self::NoContent => f.write_str("a text: query needs the content index"),
         }
     }
 }
@@ -153,10 +171,25 @@ impl Query {
         scope: Option<ferret_catalog::Handle<InoId>>,
         forced: Option<crate::NamePlan>,
         cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        self.with_residual(catalog, emit, |emit| {
+            self.s1_indexed(catalog, index, scope, forced, cancelled, emit)
+        })
+    }
+
+    /// Runs S1's tests alone: the residual conjuncts are the caller's.
+    pub(crate) fn s1_indexed(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+        forced: Option<crate::NamePlan>,
+        cancelled: Option<&AtomicBool>,
         mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
         if scope.is_none() && self.names.is_empty() && self.driver.is_none() {
-            return self.run_until(catalog, cancelled, emit);
+            return self.s1_run_until(catalog, cancelled, emit);
         }
         let mut selection = self
             .name_selection(catalog, index, scope)
@@ -212,6 +245,49 @@ impl Query {
         &self,
         catalog: &Catalog,
         cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        self.with_residual(catalog, emit, |emit| {
+            self.s1_run_until(catalog, cancelled, emit)
+        })
+    }
+
+    /// Runs a name-only query's S1 tests through `run`, keeping the rows
+    /// its residual conjuncts (`OR`, `NOT`, groups) also hold for. A query
+    /// with a content atom cannot run here.
+    fn with_residual<E: FnMut(&Row<'_>) -> ControlFlow<()>>(
+        &self,
+        catalog: &Catalog,
+        mut emit: E,
+        run: impl FnOnce(&mut dyn FnMut(&Row<'_>) -> ControlFlow<()>) -> Result<Stats, RunError>,
+    ) -> Result<Stats, RunError> {
+        if self.residual.is_empty() {
+            return run(&mut emit);
+        }
+        if self.has_content() {
+            return Err(RunError::NoContent);
+        }
+        catalog.load(&self.residual_sections())?;
+        let mut rows = 0;
+        let mut stats = run(&mut |row: &Row<'_>| {
+            let holds = self.residual.iter().all(|tree| {
+                tree.eval(&mut |test| self.test_row(catalog, row, test))
+                    == crate::expr::Truth::Yes
+            });
+            if !holds {
+                return ControlFlow::Continue(());
+            }
+            rows += 1;
+            emit(row)
+        })?;
+        stats.rows = rows;
+        Ok(stats)
+    }
+
+    pub(crate) fn s1_run_until(
+        &self,
+        catalog: &Catalog,
+        cancelled: Option<&AtomicBool>,
         mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
         let mut run = Run {
@@ -228,6 +304,41 @@ impl Query {
             Strategy::HeapScan => run.heap_scan(&mut emit)?,
             Strategy::InodeScan => run.inode_scan(&mut emit)?,
             Strategy::AllNames => run.all_names(&mut emit)?,
+        }
+        Ok(run.stats)
+    }
+}
+
+impl Query {
+    /// Tests the names `ids`, in the order given, against S1's tests, and
+    /// emits each that passes: a content-driven plan's rows.
+    pub(crate) fn s1_ids(
+        &self,
+        catalog: &Catalog,
+        ids: &[NameId],
+        cancelled: Option<&AtomicBool>,
+        mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        catalog.load(&ROW_SECTIONS)?;
+        let mut run = Run {
+            query: self,
+            cancelled,
+            catalog,
+            meta_loaded: false,
+            stats: Stats::default(),
+            dir: None,
+            up: None,
+            path: Vec::new(),
+        };
+        let mut kinds = catalog.kinds();
+        for &id in ids {
+            run.stats.candidates += 1;
+            if run
+                .consider(&mut kinds, id, catalog.name(id), None, false, &mut emit)?
+                .is_break()
+            {
+                break;
+            }
         }
         Ok(run.stats)
     }
@@ -425,12 +536,11 @@ impl<'c> Run<'_, 'c> {
     /// Whether an inode passes every metadata test, read one field at a time
     /// from the sections [`Query::meta_sections`] names: for a sparse hit.
     fn meta_passes(&self, id: InoId) -> bool {
-        let catalog = self.catalog;
-        self.query.meta.iter().all(|test| match *test {
-            MetaTest::Size(cmp, n) => cmp.holds(catalog.size(id), n),
-            MetaTest::Age(cmp, secs) => self.age_holds(cmp, secs, catalog.mtime(id)),
-            MetaTest::Type(kind) => catalog.kind(id) == kind,
-        })
+        let query = self.query;
+        query
+            .meta
+            .iter()
+            .all(|test| query.meta_holds(self.catalog, id, test))
     }
 
     /// [`Run::meta_passes`] of every inode, as a bitset by `InoId`. Each test
@@ -460,14 +570,7 @@ impl<'c> Run<'_, 'c> {
                 pass[id.0 as usize / 64] &= !(1 << (id.0 % 64));
             }
             new.retain(|&id| {
-                catalog.is_live_inode(InoId(id))
-                    && match *test {
-                        MetaTest::Size(cmp, n) => cmp.holds(catalog.size(InoId(id)), n),
-                        MetaTest::Age(cmp, secs) => {
-                            self.age_holds(cmp, secs, catalog.mtime(InoId(id)))
-                        }
-                        MetaTest::Type(kind) => catalog.kind(InoId(id)) == kind,
-                    }
+                catalog.is_live_inode(InoId(id)) && self.query.meta_holds(catalog, InoId(id), test)
             });
             match *test {
                 MetaTest::Size(cmp, v) => and_runs(&mut pass, |run, _| {
@@ -501,14 +604,8 @@ impl<'c> Run<'_, 'c> {
         Ok((pass, new))
     }
 
-    /// Whether a file modified at `mtime` is `cmp` `secs` old. Widened: mtime
-    /// is whatever the file holds, and a corrupt or far-future value must not
-    /// overflow.
     fn age_holds(&self, cmp: Cmp, secs: i64, mtime: i64) -> bool {
-        cmp.holds(
-            i128::from(self.query.now) - i128::from(mtime),
-            i128::from(secs),
-        )
+        self.query.age_holds(cmp, secs, mtime)
     }
 
     /// Loads the sections the metadata tests read, once, before the first test.

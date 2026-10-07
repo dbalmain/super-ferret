@@ -68,10 +68,12 @@
 //! else tests every name ([`Strategy::AllNames`]).
 
 mod content;
+mod expr;
 pub mod find;
 
 pub mod name_index;
 mod pattern;
+mod plan;
 mod query;
 mod run;
 
@@ -80,5 +82,8 @@ mod tests;
 
 pub use content::TextAtom;
 pub use name_index::{NameEstimate, NameIndex, NamePlan};
+pub use plan::{
+    AtomReport, Content, ContentReport, DocNames, Reader, Side, UNCOVERED_BOUND,
+};
 pub use query::{ParseError, Query, Strategy};
 pub use run::{Row, RunError, Stats};

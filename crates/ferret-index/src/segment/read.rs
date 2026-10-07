@@ -331,6 +331,14 @@ impl<R: ReadAt> Segment<R> {
 
     /// `term`'s documents, or `None` when the segment does not hold it.
     pub fn lookup(&self, term: &[u8]) -> Result<Option<Hit>, ReadError> {
+        self.entry(term)?.map(|entry| self.read(&entry)).transpose()
+    }
+
+    /// `term`'s dictionary entry, whose `df` is its document count here,
+    /// or `None` when the segment does not hold it. Reads one dictionary
+    /// block and never the postings: what a planner estimates from before
+    /// it decides which lists to read.
+    pub fn entry(&self, term: &[u8]) -> Result<Option<TermEntry>, ReadError> {
         let found = self
             .index
             .partition_point(|b| &self.firsts[b.term_start..b.term_end] <= term);
@@ -341,7 +349,7 @@ impl<R: ReadAt> Segment<R> {
         while let Some((candidate, entry)) = entries.next_entry()? {
             match candidate.cmp(term) {
                 std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => return self.read(&entry).map(Some),
+                std::cmp::Ordering::Equal => return Ok(Some(entry)),
                 std::cmp::Ordering::Greater => break,
             }
         }

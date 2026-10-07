@@ -76,6 +76,21 @@ impl Documents {
         })
     }
 
+    /// A reader with no DocId map, for a host that already knows which name
+    /// to read a document through (a query verifying a row): it reads only
+    /// through [`Documents::read_name`], and skips the scan of every name.
+    pub fn by_name(catalog: &Catalog) -> Result<Self, OpenError> {
+        catalog.load(&Section::INODE)?;
+        catalog.load(&[Section::Names, Section::Roots, Section::Doc, Section::Docs])?;
+        Ok(Self {
+            names: Vec::new(),
+            dir: None,
+            limiter: None,
+            files_read: 0,
+            bytes_read: 0,
+        })
+    }
+
     /// Paces every read through the shared byte limiter: background work.
     /// An explicit `ferret index` reads unpaced.
     pub fn with_limiter(mut self, limiter: Arc<Limiter>) -> Self {
@@ -96,6 +111,18 @@ impl Documents {
             Some(&n) if n != 0 => NameId(n - 1),
             _ => return Err(ContentFault::Changed),
         };
+        self.read_name(catalog, name, out)
+    }
+
+    /// Replaces `out` with the bytes of the file `name` names, if it is still
+    /// the version `catalog` recorded.
+    pub fn read_name(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ContentFault> {
+        out.clear();
         let (parent, bytes) = catalog.name_reader().edge(name);
         let Target::Inode(inode) = catalog.name(name).target() else {
             return Err(ContentFault::Changed);

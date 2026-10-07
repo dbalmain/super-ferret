@@ -93,7 +93,7 @@ impl Fixture {
     }
 
     fn pinned(&self) -> Pinned<'_> {
-        Pinned::new(&self.view, &self.live)
+        Pinned::new(Some(&self.view), &self.live)
     }
 
     /// The atom's candidates over live documents.

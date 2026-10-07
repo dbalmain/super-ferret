@@ -51,6 +51,30 @@ pub enum Source<'v> {
 }
 
 impl Source<'_> {
+    /// What reading `atom` would yield, from the dictionaries alone: one
+    /// block per segment, and never a postings list, so a planner can
+    /// order atoms and choose its driver before it reads any list. `None`
+    /// when this source does not answer atoms of that kind.
+    pub fn estimate(&self, atom: &Atom) -> Result<Option<Estimate>, ReadError> {
+        match (self, atom) {
+            (Self::Postings(view), Atom::Term(term)) => {
+                let mut docs = 0;
+                for segment in view.segments() {
+                    if let Some(entry) = segment.entry(term)? {
+                        docs += u64::from(entry.df);
+                    }
+                }
+                Ok(Some(Estimate {
+                    docs,
+                    exact: true,
+                    enumerable: true,
+                    bytes: 0,
+                }))
+            }
+            (Self::Postings(_), Atom::Trigram(_)) => Ok(None),
+        }
+    }
+
     /// The source's answer for `atom`, read now; `None` when this source
     /// does not answer atoms of that kind.
     pub fn read(&self, atom: &Atom) -> Result<Option<Candidates>, ReadError> {
@@ -99,11 +123,13 @@ impl Candidates {
     }
 }
 
-/// One query's view of the index: a pinned [`View`] and the live set of
-/// the catalog view pinned with it (docs/S2.md § Liveness, coverage and the
-/// cursor tree a query sees).
+/// One query's view of the index: a pinned [`View`], if there is one, and
+/// the live set of the catalog view pinned with it (docs/S2.md § Liveness,
+/// coverage and the cursor tree a query sees). With no view every live
+/// document is uncovered, so a query without an index is the same query
+/// with nothing covered.
 pub struct Pinned<'a> {
-    view: &'a View,
+    view: Option<&'a View>,
     live: &'a DocSet,
     uncovered: DocSet,
 }
@@ -111,8 +137,11 @@ pub struct Pinned<'a> {
 impl<'a> Pinned<'a> {
     /// `live` is the catalog view's live documents; its bound is the view's
     /// `next_doc`.
-    pub fn new(view: &'a View, live: &'a DocSet) -> Self {
-        let uncovered = DocSet::new(live.bound(), view.uncovered(live));
+    pub fn new(view: Option<&'a View>, live: &'a DocSet) -> Self {
+        let uncovered = match view {
+            Some(view) => view.uncovered_set(live),
+            None => live.clone(),
+        };
         Self {
             view,
             live,
@@ -120,9 +149,9 @@ impl<'a> Pinned<'a> {
         }
     }
 
-    /// Every structure the view holds; S2 has one.
-    pub fn sources(&self) -> [Source<'a>; 1] {
-        [Source::Postings(self.view)]
+    /// Every structure the view holds; S2 has one, and no view has none.
+    pub fn sources(&self) -> impl Iterator<Item = Source<'a>> + use<'a> {
+        self.view.map(Source::Postings).into_iter()
     }
 
     pub fn live(&self) -> &'a DocSet {
