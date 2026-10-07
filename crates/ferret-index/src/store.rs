@@ -223,13 +223,19 @@ impl std::fmt::Debug for View {
 
 impl View {
     /// Resident manifest and segment metadata; postings remain on disk.
-    /// Shared segments are counted once in this view, also shared by older pins.
+    /// Shared segments are counted once in this view, also shared by older
+    /// pins.
     pub fn resident_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + std::mem::size_of::<Manifest>()
+        std::mem::size_of::<Self>()
+            + std::mem::size_of::<Manifest>()
             + self.manifest.segments.capacity() * std::mem::size_of::<SegmentEntry>()
             + self.manifest.unreadable.capacity() * std::mem::size_of::<u32>()
             + self.segments.capacity() * std::mem::size_of::<Arc<Segment<File>>>()
-            + self.segments.iter().map(|s| s.resident_bytes() + std::mem::size_of::<Segment<File>>()).sum::<usize>()
+            + self
+                .segments
+                .iter()
+                .map(|s| s.resident_bytes() + std::mem::size_of::<Segment<File>>())
+                .sum::<usize>()
     }
 
     pub fn manifest(&self) -> &Manifest {
@@ -388,7 +394,11 @@ impl IndexWriter {
                 return Ok(None);
             };
             match writer.merge_run(catalog, budget, run) {
-                Err(Error::Io(ref error) | Error::Segment(ReadError::Io(ref error))) if error.kind() == io::ErrorKind::Interrupted => Err(Error::Cancelled),
+                Err(Error::Io(ref error) | Error::Segment(ReadError::Io(ref error)))
+                    if error.kind() == io::ErrorKind::Interrupted =>
+                {
+                    Err(Error::Cancelled)
+                }
                 result => result,
             }
         })
@@ -602,12 +612,15 @@ impl IndexWriter {
                 .create_new(true)
                 .open(&scratch)?;
             let writer = Writer::spilling(first, last, file.try_clone()?, postings)?;
-            let result = merge::stream(&inputs, catalog.live, writer, &merge_pace, budget.cancelled);
+            let result =
+                merge::stream(&inputs, catalog.live, writer, &merge_pace, budget.cancelled);
             let _ = fs::remove_file(&scratch);
             Ok(result?.total())
         });
         let (entry, segment) = match result {
-            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::Interrupted => return Err(Error::Cancelled),
+            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::Interrupted => {
+                return Err(Error::Cancelled);
+            }
             other => other?,
         };
 
@@ -823,5 +836,8 @@ thread_local! {
 mod tests;
 
 fn timestamp() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

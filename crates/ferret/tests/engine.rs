@@ -1167,7 +1167,11 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
     let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
     let answer = |pin: &QuerySession| {
         let mut rows = Vec::new();
-        pin.search(&query, |row| { rows.push(row.path.to_vec()); ControlFlow::Continue(()) }).unwrap();
+        pin.search(&query, |row| {
+            rows.push(row.path.to_vec());
+            ControlFlow::Continue(())
+        })
+        .unwrap();
         rows
     };
     let before_merge = answer(&first);
@@ -1175,7 +1179,13 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
     // The first segment is half dead, past the trigger.
     let merged = engine.merge_content(&Budget::unbounded()).unwrap().unwrap();
     assert_eq!((merged.inputs, merged.purged), (1, 1));
-    assert!(!tree.index().join(ferret::engine::CONTENT_DIR).join(input).exists());
+    assert!(
+        !tree
+            .index()
+            .join(ferret::engine::CONTENT_DIR)
+            .join(input)
+            .exists()
+    );
     assert_eq!(answer(&first), before_merge);
     assert_eq!(content_docs(&engine.pin(), b"alpha"), uncovered);
     assert_eq!(content_docs(&engine.pin(), b"beta").len(), 1);

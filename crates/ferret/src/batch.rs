@@ -236,33 +236,39 @@ pub(crate) fn search_request(
             let result = if request.limit == Some(0) {
                 Ok(ferret_query::Stats::default())
             } else {
-                session.search_content(&query, (!request.capabilities.iter().any(|c| c == "scan-uncovered")).then_some(ferret_query::UNCOVERED_BOUND), destination.cancellation(), |row: &Row<'_>| {
-                    if destination.cancelled() {
-                        return ControlFlow::Break(());
-                    }
-                    #[cfg(debug_assertions)]
-                    if request.capabilities.iter().any(|c| c == "test-panic") {
-                        panic!("injected query panic");
-                    }
-                    let mut bytes = Vec::new();
-                    json_row(&mut bytes, catalog, row);
-                    let mut output = Vec::new();
-                    let mut object = Object::new(&mut output);
-                    object.str("id", &request.id).str("event", "row");
-                    object.raw_fields(&bytes[1..bytes.len() - 1]);
-                    object.end();
-                    if let Err(error) = destination.send(&output) {
-                        output_error = Some(error);
-                        return ControlFlow::Break(());
-                    }
-                    first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
-                    rows += 1;
-                    if request.limit.is_some_and(|limit| rows >= limit) {
-                        ControlFlow::Break(())
-                    } else {
-                        ControlFlow::Continue(())
-                    }
-                })
+                session.search_content(
+                    &query,
+                    (!request.capabilities.iter().any(|c| c == "scan-uncovered"))
+                        .then_some(ferret_query::UNCOVERED_BOUND),
+                    destination.cancellation(),
+                    |row: &Row<'_>| {
+                        if destination.cancelled() {
+                            return ControlFlow::Break(());
+                        }
+                        #[cfg(debug_assertions)]
+                        if request.capabilities.iter().any(|c| c == "test-panic") {
+                            panic!("injected query panic");
+                        }
+                        let mut bytes = Vec::new();
+                        json_row(&mut bytes, catalog, row);
+                        let mut output = Vec::new();
+                        let mut object = Object::new(&mut output);
+                        object.str("id", &request.id).str("event", "row");
+                        object.raw_fields(&bytes[1..bytes.len() - 1]);
+                        object.end();
+                        if let Err(error) = destination.send(&output) {
+                            output_error = Some(error);
+                            return ControlFlow::Break(());
+                        }
+                        first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
+                        rows += 1;
+                        if request.limit.is_some_and(|limit| rows >= limit) {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    },
+                )
             };
             if let Some(error) = output_error {
                 return Err(error);

@@ -279,10 +279,16 @@ impl Engine {
         let live = pin.live();
         let names = pin.doc_names().map_err(Error::Catalog)?;
         let mut documents = ferret_crawl::Documents::by_name(&view).map_err(Error::Catalog)?;
-        if let Some(limiter) = limiter { documents = documents.with_limiter(limiter); }
+        if let Some(limiter) = limiter {
+            documents = documents.with_limiter(limiter);
+        }
         let followed = index.follow(&catalog_view(&view, live), budget, &mut |doc, bytes| {
-            let Some(&name) = names.names(doc).first() else { return Err(Fault::Unreadable); };
-            documents.read_name(&view, name, bytes).map_err(|_| Fault::Unreadable)
+            let Some(&name) = names.names(doc).first() else {
+                return Err(Fault::Unreadable);
+            };
+            documents
+                .read_name(&view, name, bytes)
+                .map_err(|_| Fault::Unreadable)
         });
         let published = index.view();
         drop(content);
@@ -308,9 +314,14 @@ impl Engine {
 
     /// Publishes a content view beside the current catalog view.
     fn select_content(&self, content: Arc<ferret_index::View>) {
-        let mut current = self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let manifest = content.manifest();
-        if manifest.incarnation == current.generation().incarnation && manifest.high_water <= current.catalog.next_doc().0 {
+        if manifest.incarnation == current.generation().incarnation
+            && manifest.high_water <= current.catalog.next_doc().0
+        {
             current.content = Some(content);
         }
     }
@@ -335,9 +346,9 @@ impl Engine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = QuerySession {
             catalog: view,
             names,
-            content: previous.content.filter(|content| {
-                content.manifest().incarnation == incarnation
-            }),
+            content: previous
+                .content
+                .filter(|content| content.manifest().incarnation == incarnation),
             derived: Arc::default(),
         };
     }
@@ -426,7 +437,9 @@ impl QuerySession {
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
-        if !query.has_content() { return query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit); }
+        if !query.has_content() {
+            return query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit);
+        }
         let catalog = &self.catalog;
         let docs = self.doc_names()?;
         let pinned = Pinned::new(self.content.as_deref(), self.live());

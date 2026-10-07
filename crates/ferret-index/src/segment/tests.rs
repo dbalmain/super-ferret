@@ -336,7 +336,10 @@ fn a_spilling_writer_writes_the_same_bytes() {
     };
     let (out, scratch) = (open("out"), open("postings"));
     let paced = std::cell::Cell::new(0);
-    let pace = |n: usize| { paced.set(paced.get() + n); Ok(()) };
+    let pace = |n: usize| {
+        paced.set(paced.get() + n);
+        Ok(())
+    };
     let mut writer = Writer::spilling(first, last, out.try_clone().unwrap(), scratch).unwrap();
     for (term, docs) in &terms {
         writer.push(term, docs).unwrap();

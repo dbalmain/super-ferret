@@ -374,7 +374,14 @@ pub fn index(
     refresh: Refresh<'_>,
     options: &IndexOptions,
 ) -> Result<Report, IndexError> {
-    run(catalog_dir, |_| Ok(roots.to_vec()), refresh, options, |_| ()).map(|(report, ())| report)
+    run(
+        catalog_dir,
+        |_| Ok(roots.to_vec()),
+        refresh,
+        options,
+        |_| (),
+    )
+    .map(|(report, ())| report)
 }
 
 /// A change to the configured roots, made to the roots the previous
@@ -406,14 +413,27 @@ pub fn index_change(
         refresh,
         options,
         |_| (),
-    ).map(|(report, ())| report)
+    )
+    .map(|(report, ())| report)
 }
 
 /// Publishes a root change, then calls `after` under the same writer lock.
 /// The callback observes the committed catalog; its result is separate because
 /// it cannot undo that publication. Used by the one-shot host for content.
-pub fn index_change_then<T>(catalog_dir: &Path, change: RootChange<'_>, refresh: Refresh<'_>, options: &IndexOptions, after: impl FnOnce(&Catalog) -> T) -> Result<(Report, T), IndexError> {
-    run(catalog_dir, |previous| changed_roots(previous, change), refresh, options, after)
+pub fn index_change_then<T>(
+    catalog_dir: &Path,
+    change: RootChange<'_>,
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+    after: impl FnOnce(&Catalog) -> T,
+) -> Result<(Report, T), IndexError> {
+    run(
+        catalog_dir,
+        |previous| changed_roots(previous, change),
+        refresh,
+        options,
+        after,
+    )
 }
 
 /// Applies root edits under an already retained session lock, using the same

@@ -102,7 +102,8 @@ pub struct Manifest {
     /// Increased by every publication.
     pub sequence: u64,
     pub next_number: u64,
-    /// Unix seconds of the last committed follow/merge, absent on legacy manifests.
+    /// Unix seconds of the last committed follow/merge, absent on legacy
+    /// manifests.
     pub last_follow: Option<u64>,
     pub last_merge: Option<u64>,
     /// In DocId order; ranges never overlap.
@@ -190,8 +191,12 @@ impl Manifest {
             frontier: u32_at(bytes, 36),
             sequence: u64_at(bytes, 40),
             next_number: u64_at(bytes, 48),
-            last_follow: (head == HEAD).then(|| u64_at(bytes, 64)).filter(|&n| n != 0),
-            last_merge: (head == HEAD).then(|| u64_at(bytes, 72)).filter(|&n| n != 0),
+            last_follow: (head == HEAD)
+                .then(|| u64_at(bytes, 64))
+                .filter(|&n| n != 0),
+            last_merge: (head == HEAD)
+                .then(|| u64_at(bytes, 72))
+                .filter(|&n| n != 0),
             segments: Vec::with_capacity(count),
             unreadable: Vec::with_capacity(unreadable),
         };

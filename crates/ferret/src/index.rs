@@ -278,7 +278,9 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
         global: Some(global),
         ..IndexOptions::default()
     };
-    let completed = index_change_then(&context.index, change, refresh, &options, |catalog| follow_committed(catalog, &context.index));
+    let completed = index_change_then(&context.index, change, refresh, &options, |catalog| {
+        follow_committed(catalog, &context.index)
+    });
     let (result, content) = match completed {
         Ok((report, content)) => (Ok(report), content),
         Err(error) => (Err(error), Ok(())),
@@ -580,12 +582,29 @@ fn follow_committed(catalog: &Catalog, path: &Path) -> Result<(), String> {
     use ferret_index::{Budget, CatalogView, Fault, IndexWriter};
     catalog.load_all().map_err(|e| e.to_string())?;
     let live = crate::engine::live_documents(catalog);
-    let view = CatalogView { incarnation: catalog.generation().incarnation, live: &live };
-    let mut writer = IndexWriter::open(&path.join(crate::engine::CONTENT_DIR), &view).map_err(|e| e.to_string())?;
+    let view = CatalogView {
+        incarnation: catalog.generation().incarnation,
+        live: &live,
+    };
+    let mut writer = IndexWriter::open(&path.join(crate::engine::CONTENT_DIR), &view)
+        .map_err(|e| e.to_string())?;
     let mut documents = ferret_crawl::Documents::new(catalog).map_err(|e| e.to_string())?;
-    let mut read = |doc, bytes: &mut Vec<u8>| documents.read(catalog, ferret_catalog::DocId(doc), bytes).map_err(|_| Fault::Unreadable);
+    let mut read = |doc, bytes: &mut Vec<u8>| {
+        documents
+            .read(catalog, ferret_catalog::DocId(doc), bytes)
+            .map_err(|_| Fault::Unreadable)
+    };
     let budget = Budget::unbounded();
-    while writer.follow(&view, &budget, &mut read).map_err(|e| e.to_string())?.remaining > 0 {}
-    while writer.merge_if_needed(&view, &budget).map_err(|e| e.to_string())?.is_some() {}
+    while writer
+        .follow(&view, &budget, &mut read)
+        .map_err(|e| e.to_string())?
+        .remaining
+        > 0
+    {}
+    while writer
+        .merge_if_needed(&view, &budget)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {}
     Ok(())
 }

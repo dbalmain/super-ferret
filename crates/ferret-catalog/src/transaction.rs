@@ -429,7 +429,10 @@ impl Transaction {
 
     /// Publishes, then calls `after` while the writer lock is still held.
     /// Failure of the callback does not undo the durable catalog publication.
-    pub fn commit_then<T>(mut self, after: impl FnOnce(&Catalog) -> T) -> Result<(Catalog, T), CommitError> {
+    pub fn commit_then<T>(
+        mut self,
+        after: impl FnOnce(&Catalog) -> T,
+    ) -> Result<(Catalog, T), CommitError> {
         let catalog = self.publish(false)?;
         let result = after(&catalog);
         Ok((catalog, result))

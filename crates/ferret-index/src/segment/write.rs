@@ -165,14 +165,24 @@ impl Writer {
         if self.blocks.len() >= SPILL {
             let whole = self.blocks.len() / CHUNK * CHUNK;
             chunk_sums(&self.blocks[..whole], &mut spill.blocks_sums);
-            write_paced(&spill.out, &self.blocks[..whole], HEAD as u64 + spill.blocks_written, pace)?;
+            write_paced(
+                &spill.out,
+                &self.blocks[..whole],
+                HEAD as u64 + spill.blocks_written,
+                pace,
+            )?;
             spill.blocks_written += whole as u64;
             self.blocks.drain(..whole);
         }
         if self.postings.len() >= SPILL {
             let whole = self.postings.len() / CHUNK * CHUNK;
             chunk_sums(&self.postings[..whole], &mut spill.postings_sums);
-            write_paced(&spill.postings, &self.postings[..whole], spill.postings_written, pace)?;
+            write_paced(
+                &spill.postings,
+                &self.postings[..whole],
+                spill.postings_written,
+                pace,
+            )?;
             spill.postings_written += whole as u64;
             self.postings.drain(..whole);
         }
@@ -301,7 +311,9 @@ impl Writer {
             let n = (spill.postings_written - from).min(SPILL as u64) as usize;
             for (i, chunk) in copy[..n].chunks_mut(64 << 10).enumerate() {
                 pace(chunk.len())?;
-                spill.postings.read_exact_at(chunk, from + (i * (64 << 10)) as u64)?;
+                spill
+                    .postings
+                    .read_exact_at(chunk, from + (i * (64 << 10)) as u64)?;
             }
             write_paced(&spill.out, &copy[..n], at, pace)?;
             (from, at) = (from + n as u64, at + n as u64);
@@ -378,7 +390,12 @@ impl Writer {
 }
 
 // Bound each paced transfer, including a large singleton term or tail section.
-fn write_paced(file: &std::fs::File, bytes: &[u8], offset: u64, pace: &dyn Fn(usize) -> io::Result<()>) -> io::Result<()> {
+fn write_paced(
+    file: &std::fs::File,
+    bytes: &[u8],
+    offset: u64,
+    pace: &dyn Fn(usize) -> io::Result<()>,
+) -> io::Result<()> {
     for (i, chunk) in bytes.chunks(64 << 10).enumerate() {
         pace(chunk.len())?;
         file.write_all_at(chunk, offset + (i * (64 << 10)) as u64)?;

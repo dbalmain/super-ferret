@@ -34,7 +34,8 @@ struct Outcome {
 /// Runs `search` and returns its exit status: [`Exit::Ok`] when it printed a
 /// row, [`Exit::NoMatch`] when it printed none.
 ///
-/// Content queries use the daemon's paired pin, with a read-only local fallback.
+/// Content queries use the daemon's paired pin, with a read-only local
+/// fallback.
 pub fn run(
     context: &Context,
     atoms: &[OsString],
@@ -51,8 +52,7 @@ pub fn run(
             return Exit::Usage;
         }
     };
-    if let Some(exit) = crate::daemon::search(context, atoms, json, limit, now, scan_uncovered)
-    {
+    if let Some(exit) = crate::daemon::search(context, atoms, json, limit, now, scan_uncovered) {
         return exit;
     }
     let mut outcome = Outcome::default();
@@ -305,5 +305,7 @@ pub(crate) fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
 
 /// Shared native diagnostic for local and socket content queries.
 pub(crate) fn incomplete_message(uncovered: u32, live: u32) -> String {
-    format!("the content index does not yet cover {uncovered} of {live} documents, and reading that many is slow: pass --scan-uncovered to read them anyway")
+    format!(
+        "the content index does not yet cover {uncovered} of {live} documents, and reading that many is slow: pass --scan-uncovered to read them anyway"
+    )
 }

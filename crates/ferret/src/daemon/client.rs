@@ -33,7 +33,10 @@ pub(crate) fn search(
         atoms,
         "search",
         json,
-        Options { limit, scan_uncovered },
+        Options {
+            limit,
+            scan_uncovered,
+        },
         now,
         Some(context),
     )
@@ -328,7 +331,10 @@ fn query(
     now: SystemTime,
     context: Option<&Context>,
 ) -> Option<Exit> {
-    let Options { limit, scan_uncovered } = options;
+    let Options {
+        limit,
+        scan_uncovered,
+    } = options;
     let started = Instant::now();
     if std::env::var_os("FERRET_NO_DAEMON").is_some() {
         return None;
@@ -352,7 +358,10 @@ fn query(
             now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos() as u64,
         )
         .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
-    object.byte_strings("capabilities", scan_uncovered.then_some(b"scan-uncovered".as_slice()));
+    object.byte_strings(
+        "capabilities",
+        scan_uncovered.then_some(b"scan-uncovered".as_slice()),
+    );
     object.end();
     protocol::parse_request(&request).ok()?;
     request.push(b'\n');
@@ -480,7 +489,9 @@ fn query(
                         field_number(&value, "exit")
                             .ok_or_else(|| io::Error::other("missing native status"))?,
                     )?;
-                    if (op == "search" || !json) && let Some(error) = field_text(&value, "error") {
+                    if (op == "search" || !json)
+                        && let Some(error) = field_text(&value, "error")
+                    {
                         let message = field_text(&value, "message").unwrap_or(error);
                         if op == "find" {
                             cli::error(&format!("find: {message}"));

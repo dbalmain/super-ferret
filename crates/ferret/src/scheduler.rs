@@ -165,7 +165,14 @@ impl Control for Scheduler {
     }
 }
 impl Scheduler {
-    fn admit_policy(&self, kind: Kind, view: &Catalog, polite: bool, memory: u64, disk_bytes: u64) -> Result<(), Blocked> {
+    fn admit_policy(
+        &self,
+        kind: Kind,
+        view: &Catalog,
+        polite: bool,
+        memory: u64,
+        disk_bytes: u64,
+    ) -> Result<(), Blocked> {
         let disk = ferret_crawl::available_disk(&self.index).ok();
         let watch = self
             .machine
@@ -189,8 +196,9 @@ impl Scheduler {
             .max(self.config.memory_floor)
             .saturating_add(self.config.additional_memory)
             .saturating_add(watch_bytes);
-        let required_disk =
-            scaled(self.config.disk, view.name_count()).max(self.config.disk.min(16 << 20)).max(disk_bytes);
+        let required_disk = scaled(self.config.disk, view.name_count())
+            .max(self.config.disk.min(16 << 20))
+            .max(disk_bytes);
         let result = if polite && let Some(reason) = m.status.paused {
             Err(reason)
         } else if m.status.sample.memory.is_none_or(|n| n < required_memory) {

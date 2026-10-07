@@ -43,7 +43,10 @@ pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
     o.int("protected_scopes", protected as u64)
         .int("opaque_directories", opaque as u64)
         .int("catalog_bytes", catalog.bytes_read())
-        .int("index_resident_bytes", session.content().map_or(0, |v| v.resident_bytes()) as u64)
+        .int(
+            "index_resident_bytes",
+            session.content().map_or(0, |v| v.resident_bytes()) as u64,
+        )
         .int("planner_bytes", session.name_index().bytes() as u64)
         .int(
             "name_postings_bytes",
@@ -60,7 +63,8 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
         }
     };
     if let Some(engine) = &engine
-        && let Err(error) = engine.open_content(&context.index) {
+        && let Err(error) = engine.open_content(&context.index)
+    {
         crate::cli::error(&error.to_string());
         return Exit::Error;
     }
@@ -127,13 +131,29 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
 fn index_fields(o: &mut Object<'_>, session: &QuerySession) {
     let live = session.live();
     let view = session.content();
-    let uncovered = view.map_or(u64::from(live.len()), |v| v.uncovered_set(live).len().into());
+    let uncovered = view.map_or(u64::from(live.len()), |v| {
+        v.uncovered_set(live).len().into()
+    });
     o.object("index", |o| {
         o.int("covered", u64::from(live.len()) - uncovered)
             .int("uncovered", uncovered)
-            .int("unreadable", view.map_or(0, |v| v.manifest().unreadable.iter().filter(|&&d| live.contains(d)).count() as u64))
+            .int(
+                "unreadable",
+                view.map_or(0, |v| {
+                    v.manifest()
+                        .unreadable
+                        .iter()
+                        .filter(|&&d| live.contains(d))
+                        .count() as u64
+                }),
+            )
             .int("segments", view.map_or(0, |v| v.segments().len() as u64))
-            .int("bytes", view.map_or(0, |v| v.manifest().segments.iter().map(|s| s.bytes).sum::<u64>()))
+            .int(
+                "bytes",
+                view.map_or(0, |v| {
+                    v.manifest().segments.iter().map(|s| s.bytes).sum::<u64>()
+                }),
+            )
             .opt_int("last_follow", view.and_then(|v| v.manifest().last_follow))
             .opt_int("last_merge", view.and_then(|v| v.manifest().last_merge));
     });
