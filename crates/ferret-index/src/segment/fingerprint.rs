@@ -14,7 +14,7 @@ pub const RECORD_BLOCK: usize = 128;
 /// Fixed by the segment format: a writer and every later reader must agree.
 pub fn fingerprint(term: &[u8]) -> u32 {
     #[cfg(test)]
-    if let Some(forced) = FORCED.get() {
+    if let Some(forced) = FORCED.with(std::cell::Cell::get) {
         return forced(term);
     }
     u32_at(blake3::hash(term).as_bytes(), 0)
@@ -57,7 +57,7 @@ impl Encoder {
         if self.records == 0 || self.in_block == RECORD_BLOCK {
             let start = self.len();
             self.index.extend_from_slice(&fp.to_le_bytes());
-            put(start - self.block_start, &mut self.index);
+            self.index.extend_from_slice(&(start as u32).to_le_bytes());
             self.block_start = start;
             self.in_block = 0;
             self.bytes.extend_from_slice(&fp.to_le_bytes());
@@ -134,7 +134,9 @@ impl Index {
         for b in 0..blocks as usize {
             let fp = u32_at(bytes.get(at..at + 4)?, 0);
             at += 4;
-            let step = take(bytes, &mut at)?;
+            let next_start = u64::from(u32_at(bytes.get(at..at + 4)?, 0));
+            at += 4;
+            let step = next_start.checked_sub(start)?;
             // A block holds at least its 8-byte first record.
             if b == 0 && step != 0 || b > 0 && step < 8 {
                 return None;

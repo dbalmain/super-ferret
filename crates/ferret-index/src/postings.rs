@@ -9,6 +9,7 @@
 //! fail. A [`crate::Cursor`] borrows the `Term` it walks, which is why a
 //! query reads its atoms before it builds its cursor tree.
 
+use crate::cursor::Certainty;
 use crate::segment::{Hit, PostingCursor, ReadAt, ReadError, Segment};
 
 /// One term's documents in every segment that holds it, in range order.
@@ -18,6 +19,7 @@ pub struct Term {
     parts: Vec<Part>,
     docs: u64,
     bytes: u64,
+    records: u64,
 }
 
 /// The term's documents in one segment.
@@ -25,7 +27,8 @@ pub struct Term {
 struct Part {
     /// The segment's last DocId, inclusive.
     last: u32,
-    hit: Hit,
+    hit: Option<Hit>,
+    maybe: Vec<u32>,
 }
 
 impl Term {
@@ -50,6 +53,7 @@ impl Term {
             parts: Vec::new(),
             docs: 0,
             bytes: 0,
+            records: 0,
         };
         let mut floor = 0u64;
         for segment in segments {
@@ -61,23 +65,25 @@ impl Term {
                 return Err(ReadError::Layout);
             }
             floor = u64::from(info.last) + 1;
-            let Some(entry) = segment.entry(term)? else {
-                continue;
-            };
-            if cancelled() {
-                return Err(ReadError::Cancelled);
-            }
-            let hit = segment.read(&entry)?;
+            let entry = segment.entry(term)?;
+            if cancelled() { return Err(ReadError::Cancelled); }
+            let hit = entry.map(|entry| segment.read(&entry)).transpose()?;
+            let maybe = segment.fingerprint_docs(term)?;
+            found.records += maybe.len() as u64;
+            found.docs += maybe.len() as u64;
             match &hit {
-                Hit::Single(_) => found.docs += 1,
-                Hit::Postings(list) => {
+                Some(Hit::Single(_)) => found.docs += 1,
+                Some(Hit::Postings(list)) => {
                     found.docs += u64::from(list.len());
                     found.bytes += list.bytes();
                 }
+                None => {}
             }
+            if hit.is_none() && maybe.is_empty() { continue; }
             found.parts.push(Part {
                 last: info.last,
                 hit,
+                maybe,
             });
         }
         Ok(found)
@@ -87,6 +93,12 @@ impl Term {
     pub fn docs(&self) -> u64 {
         self.docs
     }
+
+    /// Fingerprint records found, before unioning dictionary documents.
+    pub fn records(&self) -> u64 { self.records }
+
+    /// Whether all candidates are known dictionary occurrences.
+    pub fn exact(&self) -> bool { self.records == 0 }
 
     /// Bytes of postings lists read for it; inlined singletons cost none.
     pub fn bytes(&self) -> u64 {
@@ -126,6 +138,12 @@ impl Cursor<'_> {
         target: u32,
         checkpoint: &mut impl FnMut() -> bool,
     ) -> Option<u32> {
+        self.next_geq_certainty_with(target, checkpoint).map(|(doc, _)| doc)
+    }
+
+    pub(crate) fn next_geq_certainty_with(
+        &mut self, target: u32, checkpoint: &mut impl FnMut() -> bool,
+    ) -> Option<(u32, Certainty)> {
         if checkpoint() {
             return None;
         }
@@ -136,14 +154,19 @@ impl Cursor<'_> {
             }
             if target <= part.last {
                 let found = match &part.hit {
-                    Hit::Single(doc) => (*doc >= target).then_some(*doc),
-                    Hit::Postings(list) => self
+                    Some(Hit::Single(doc)) => (*doc >= target).then_some(*doc),
+                    Some(Hit::Postings(list)) => self
                         .inner
                         .get_or_insert_with(|| list.cursor())
                         .next_geq(target),
+                    None => None,
                 };
-                if found.is_some() {
-                    return found;
+                let maybe = part.maybe.get(part.maybe.partition_point(|&doc| doc < target)).copied();
+                match (found, maybe) {
+                    (Some(yes), Some(maybe)) if maybe < yes => return Some((maybe, Certainty::Maybe)),
+                    (Some(yes), _) => return Some((yes, Certainty::Yes)),
+                    (None, Some(maybe)) => return Some((maybe, Certainty::Maybe)),
+                    (None, None) => {}
                 }
             }
             self.at += 1;

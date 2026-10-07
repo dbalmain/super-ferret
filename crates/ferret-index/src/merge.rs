@@ -155,6 +155,21 @@ pub fn stream<R: ReadAt>(
             }
         }
     }
+    let mut records: Vec<_> = inputs.iter().map(Segment::records).collect();
+    let mut heap = BinaryHeap::new();
+    for (i, cursor) in records.iter_mut().enumerate() {
+        if let Some(record) = cursor.next_record()? { heap.push(Reverse((record, i))); }
+    }
+    let mut previous = None;
+    while let Some(Reverse((record, i))) = heap.pop() {
+        if cancelled() { return Err(Error::Cancelled); }
+        if live.contains(record.1) && previous != Some(record) {
+            writer.push_record(record.0, record.1)?;
+            writer.spill(pace)?;
+            previous = Some(record);
+        }
+        if let Some(record) = records[i].next_record()? { heap.push(Reverse((record, i))); }
+    }
     Ok(writer.finish_spilled(pace)?)
 }
 

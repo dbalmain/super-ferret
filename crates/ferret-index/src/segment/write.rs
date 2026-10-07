@@ -105,6 +105,7 @@ pub struct Writer {
     postings: Vec<u8>,
     index: Vec<u8>,
     previous: Vec<u8>,
+    last_term: Vec<u8>,
     in_block: usize,
     /// Where the current block began in the blocks and postings sections.
     block_start: u64,
@@ -209,6 +210,7 @@ impl Writer {
             postings: Vec::new(),
             index: Vec::new(),
             previous: Vec::new(),
+            last_term: Vec::new(),
             in_block: 0,
             block_start: 0,
             postings_base: 0,
@@ -378,7 +380,7 @@ impl Writer {
     /// record instead, and the entry's size is 0. Terms may not follow
     /// [`Writer::push_record`].
     pub fn push(&mut self, term: &[u8], docs: &[u32]) -> Result<u64, WriteError> {
-        if self.pushed > 0 && term <= self.previous.as_slice() {
+        if self.pushed > 0 && term <= self.last_term.as_slice() {
             return Err(WriteError::TermOrder);
         }
         let (Some(&low), Some(&high)) = (docs.first(), docs.last()) else {
@@ -399,8 +401,8 @@ impl Writer {
             if let [doc] = docs {
                 singles.pending.push((fingerprint(term), doc - self.first));
                 self.sizes.singletons += 1;
-                self.previous.clear();
-                self.previous.extend_from_slice(term);
+                self.last_term.clear();
+                self.last_term.extend_from_slice(term);
                 self.pushed += 1;
                 return Ok(0);
             }
@@ -446,6 +448,8 @@ impl Writer {
 
         self.previous.clear();
         self.previous.extend_from_slice(term);
+        self.last_term.clear();
+        self.last_term.extend_from_slice(term);
         self.pushed += 1;
         self.in_block += 1;
         self.sizes.terms += 1;
@@ -486,137 +490,125 @@ impl Writer {
 
     /// Writes an in-memory writer's segment to `out` and returns its sizes.
     /// A spilling writer is refused: use [`Writer::finish_spilled`].
-    pub fn finish(self, out: &mut impl Write) -> io::Result<Sizes> {
+    pub fn finish(mut self, out: &mut impl Write) -> io::Result<Sizes> {
         if self.spill.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a spilling segment writer finishes with finish_spilled",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "use finish_spilled"));
         }
-        let mut sums = Vec::with_capacity(
-            (self.blocks.len().div_ceil(CHUNK) + self.postings.len().div_ceil(CHUNK)) * 16,
-        );
+        self.seal_records();
+        let mut sums = Vec::new();
         chunk_sums(&self.blocks, &mut sums);
-        let blocks_sums = sums.len();
         chunk_sums(&self.postings, &mut sums);
-        let lengths = [
-            self.blocks.len() as u64,
-            self.postings.len() as u64,
-            self.index.len() as u64,
-            sums.len() as u64,
-        ];
-        let digests = [
-            checksum(&sums[..blocks_sums]),
-            checksum(&sums[blocks_sums..]),
-            checksum(&self.index),
-            checksum(&sums),
-        ];
+        let records = self.singles.as_ref().map_or(&[][..], |s| s.encoder.bytes());
+        chunk_sums(records, &mut sums);
+        let record_index = self.singles.as_ref().map_or_else(Vec::new, |s| s.encoder.index());
+        let bytes: [&[u8]; ALL] = [&self.blocks, &self.postings, &self.index, &sums, records, &record_index];
+        let lengths = bytes.map(|b| b.len() as u64);
+        let mut digests = bytes.map(checksum);
+        self.chunk_digests(lengths, &sums, &mut digests);
         out.write_all(&self.head(lengths, digests))?;
-        for bytes in [&self.blocks, &self.postings, &self.index, &sums] {
-            out.write_all(bytes)?;
+        for &section in self.sections() {
+            out.write_all(bytes[section as usize])?;
         }
         Ok(self.sizes_of(lengths))
     }
 
-    /// Completes a spilling writer's segment file: the rest of the blocks,
-    /// the postings copied from scratch, then the index, the sums and, last,
-    /// the head. Does not sync. `pace` is called before each write.
+    /// Completes a spilling writer without retaining carried records in memory.
     pub fn finish_spilled(mut self, pace: &dyn Fn(usize) -> io::Result<()>) -> io::Result<Sizes> {
+        self.seal_records();
+        self.spill(pace)?;
         let Some(mut spill) = self.spill.take() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "an in-memory segment writer finishes with finish",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "use finish"));
         };
         chunk_sums(&self.blocks, &mut spill.blocks_sums);
         chunk_sums(&self.postings, &mut spill.postings_sums);
         let blocks_len = spill.blocks_written + self.blocks.len() as u64;
         let postings_len = spill.postings_written + self.postings.len() as u64;
-        let mut at = HEAD as u64 + spill.blocks_written;
-        write_paced(&spill.out, &self.blocks, at, pace)?;
-        at += self.blocks.len() as u64;
+        write_paced(&spill.out, &self.blocks, self.head_len() + spill.blocks_written, pace)?;
+        let mut at = self.head_len() + blocks_len;
         let mut copy = vec![0; SPILL];
         let mut from = 0;
         while from < spill.postings_written {
             let n = (spill.postings_written - from).min(SPILL as u64) as usize;
-            for (i, chunk) in copy[..n].chunks_mut(64 << 10).enumerate() {
-                pace(chunk.len())?;
-                spill
-                    .postings
-                    .read_exact_at(chunk, from + (i * (64 << 10)) as u64)?;
-            }
+            pace(n)?;
+            spill.postings.read_exact_at(&mut copy[..n], from)?;
             write_paced(&spill.out, &copy[..n], at, pace)?;
-            (from, at) = (from + n as u64, at + n as u64);
+            from += n as u64;
+            at += n as u64;
         }
+        write_paced(&spill.out, &self.postings, at, pace)?;
+        at += self.postings.len() as u64;
         let mut sums = spill.blocks_sums;
-        let blocks_sums = sums.len();
         sums.extend_from_slice(&spill.postings_sums);
-        let tail: [&[u8]; 3] = [&self.postings, &self.index, &sums];
-        for bytes in tail {
-            write_paced(&spill.out, bytes, at, pace)?;
-            at += bytes.len() as u64;
+        let record_index = self.singles.as_ref().map_or_else(Vec::new, |s| s.encoder.index());
+        let mut lengths = [0; ALL];
+        lengths[0] = blocks_len;
+        lengths[1] = postings_len;
+        if let Some(singles) = &mut self.singles {
+            chunk_sums(singles.encoder.bytes(), &mut singles.sums);
+            sums.extend_from_slice(&singles.sums);
+            let drained = singles.encoder.len() - singles.encoder.bytes().len() as u64;
+            write_paced(&spill.out, singles.encoder.bytes(), at + drained, pace)?;
+            lengths[Section::Fingerprints as usize] = singles.encoder.len();
+            at += singles.encoder.len();
         }
-        let lengths = [
-            blocks_len,
-            postings_len,
-            self.index.len() as u64,
-            sums.len() as u64,
-        ];
-        let digests = [
-            checksum(&sums[..blocks_sums]),
-            checksum(&sums[blocks_sums..]),
-            checksum(&self.index),
-            checksum(&sums),
-        ];
+        for (section, bytes) in [(Section::Index, &self.index), (Section::FingerprintIndex, &record_index), (Section::Sums, &sums)] {
+            if self.sections().contains(&section) {
+                write_paced(&spill.out, bytes, at, pace)?;
+                lengths[section as usize] = bytes.len() as u64;
+                at += bytes.len() as u64;
+            }
+        }
+        let mut digests = [[0; 16]; ALL];
+        digests[Section::Index as usize] = checksum(&self.index);
+        digests[Section::FingerprintIndex as usize] = checksum(&record_index);
+        digests[Section::Sums as usize] = checksum(&sums);
+        self.chunk_digests(lengths, &sums, &mut digests);
         spill.out.write_all_at(&self.head(lengths, digests), 0)?;
         Ok(self.sizes_of(lengths))
     }
 
-    /// The head over sections of `lengths` with section checksums `digests`.
-    fn head(&self, lengths: [u64; 4], digests: [[u8; 16]; 4]) -> Vec<u8> {
-        let mut head = Vec::with_capacity(HEAD);
+    fn chunk_digests(&self, lengths: [u64; ALL], sums: &[u8], digests: &mut [[u8; 16]; ALL]) {
+        let mut at = 0;
+        for section in [Section::Blocks, Section::Postings, Section::Fingerprints] {
+            let end = at + lengths[section as usize].div_ceil(CHUNK as u64) as usize * 16;
+            digests[section as usize] = checksum(&sums[at..end]);
+            at = end;
+        }
+    }
+
+    fn head(&self, lengths: [u64; ALL], digests: [[u8; 16]; ALL]) -> Vec<u8> {
+        let mut head = Vec::with_capacity(self.head_len() as usize);
         head.extend_from_slice(&MAGIC);
-        for word in [
-            FORMAT_VERSION,
-            self.tokenizer,
-            DICTIONARY_CODEC,
-            POSTINGS_CODEC,
-            self.first,
-            self.last,
-        ] {
+        for word in [FORMAT_VERSION, self.tokenizer, self.codec, POSTINGS_CODEC, self.first, self.last] {
             head.extend_from_slice(&word.to_le_bytes());
         }
         head.extend_from_slice(&self.sizes.terms.to_le_bytes());
-        head.extend_from_slice(&self.sizes.pairs.to_le_bytes());
+        let records = self.singles.as_ref().map_or(0, |s| s.encoder.records());
+        head.extend_from_slice(&(self.sizes.pairs + records).to_le_bytes());
         head.extend_from_slice(&(CHUNK as u32).to_le_bytes());
-        head.extend_from_slice(&(SECTIONS.len() as u32).to_le_bytes());
+        head.extend_from_slice(&(self.sections().len() as u32).to_le_bytes());
         head.resize(FIELDS, 0);
-        let mut offset = HEAD as u64;
-        for &section in &SECTIONS {
-            debug_assert_eq!(head.len(), FIELDS + section as usize * 32);
-            let len = lengths[section as usize];
+        let mut offset = self.head_len();
+        for &section in self.sections() {
+            let i = section as usize;
             head.extend_from_slice(&offset.to_le_bytes());
-            head.extend_from_slice(&len.to_le_bytes());
-            head.extend_from_slice(&digests[section as usize]);
-            offset += len;
+            head.extend_from_slice(&lengths[i].to_le_bytes());
+            head.extend_from_slice(&digests[i]);
+            offset += lengths[i];
         }
-        let digest = checksum(&head);
-        head.extend_from_slice(&digest);
-        debug_assert_eq!(head.len(), HEAD);
+        head.extend_from_slice(&checksum(&head));
         head
     }
 
-    fn sizes_of(&self, lengths: [u64; 4]) -> Sizes {
-        let section = |s: Section| lengths[s as usize];
+    fn sizes_of(&self, lengths: [u64; ALL]) -> Sizes {
+        let records = self.singles.as_ref().map_or(0, |s| s.encoder.records());
         Sizes {
-            head: HEAD as u64,
-            blocks: section(Section::Blocks),
-            postings: section(Section::Postings),
-            index: section(Section::Index),
-            sums: section(Section::Sums),
-            ..self.sizes
+            head: self.head_len(), blocks: lengths[0], postings: lengths[1], index: lengths[2], sums: lengths[3],
+            fingerprints: lengths[4], fingerprint_index: lengths[5], records,
+            pairs: self.sizes.pairs + records, ..self.sizes
         }
     }
+
 }
 
 // Bound each paced transfer, including a large singleton term or tail section.

@@ -302,11 +302,12 @@ impl View {
     pub fn lookup(&self, term: &[u8]) -> Result<Vec<u32>, ReadError> {
         let mut docs = Vec::new();
         for segment in &self.segments {
+            let mut part = segment.fingerprint_docs(term)?;
             match segment.lookup(term)? {
-                None => {}
-                Some(Hit::Single(doc)) => docs.push(doc),
-                Some(Hit::Postings(list)) => list.decode(&mut docs),
+                None => {}, Some(Hit::Single(doc)) => part.push(doc),
+                Some(Hit::Postings(list)) => list.decode(&mut part),
             }
+            part.sort_unstable(); part.dedup(); docs.extend(part);
         }
         Ok(docs)
     }
@@ -386,6 +387,7 @@ pub struct IndexWriter {
     dir: PathBuf,
     current: Arc<View>,
     poisoned: bool,
+    codec: u32,
 }
 
 impl IndexWriter {
@@ -396,11 +398,18 @@ impl IndexWriter {
     /// whose manifest or segments do not read back. Files no manifest names
     /// are removed.
     pub fn open(dir: &Path, catalog: &CatalogView) -> Result<Self, Error> {
+        Self::open_with_codec(dir, catalog, crate::segment::DICTIONARY_CODEC)
+    }
+
+    /// Opens an index with the requested term dictionary codec. Existing
+    /// segments of another codec are rebuilt through coverage.
+    pub fn open_with_codec(dir: &Path, catalog: &CatalogView, codec: u32) -> Result<Self, Error> {
+        Writer::with_codec(0, 0, codec)?;
         fs::create_dir_all(dir)?;
         let usable = Manifest::read(dir)?.filter(|m| fits(m, catalog));
         let opened = match usable {
             Some(manifest) => match open_segments(dir, &manifest) {
-                Ok(segments) => Some(View {
+                Ok(segments) if segments.iter().all(|s| s.codec() == codec) => Some(View {
                     manifest,
                     segments,
                     pending_merge: OnceLock::new(),
@@ -408,7 +417,7 @@ impl IndexWriter {
                 Err(Error::Io(error)) if error.kind() != io::ErrorKind::NotFound => {
                     return Err(Error::Io(error));
                 }
-                Err(_) => None,
+                Ok(_) | Err(_) => None,
             },
             None => None,
         };
@@ -420,6 +429,7 @@ impl IndexWriter {
                 pending_merge: OnceLock::new(),
             }),
             poisoned: false,
+            codec,
         };
         match opened {
             Some(view) => writer.current = Arc::new(view),
@@ -594,7 +604,7 @@ impl IndexWriter {
 
         let mut opened = None;
         if let Some((first, last)) = range {
-            let writer = inverter.drain_into(first, last)?;
+            let writer = inverter.drain_into_codec(first, last, self.codec)?;
             let (entry, segment) =
                 self.write_segment(&mut manifest, followed.docs as u32, |file| {
                     let mut out = BufWriter::new(Paced {
@@ -691,13 +701,14 @@ impl IndexWriter {
 
         let number = manifest.next_number;
         let scratch = self.dir.join(format!("tmp-{number}.postings"));
+        let codec = self.codec;
         let result = self.write_segment(&mut manifest, docs, |file| {
             let postings = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
                 .open(&scratch)?;
-            let writer = Writer::spilling(first, last, file.try_clone()?, postings)?;
+            let writer = Writer::spilling_with_codec(first, last, codec, file.try_clone()?, postings)?;
             let result =
                 merge::stream(&inputs, catalog.live, writer, &merge_pace, budget.cancelled);
             let _ = fs::remove_file(&scratch);

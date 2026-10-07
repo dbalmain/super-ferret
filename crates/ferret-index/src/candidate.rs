@@ -71,17 +71,21 @@ impl Source<'_> {
         match (self, atom) {
             (Self::Postings(view), Atom::Term(term)) => {
                 let mut docs = 0;
+                let mut exact = true;
                 for segment in view.segments() {
                     if cancelled() {
                         return Err(ReadError::Cancelled);
                     }
+                    let records = segment.fingerprint_docs(term)?.len() as u64;
+                    docs += records;
+                    exact &= records == 0;
                     if let Some(entry) = segment.entry(term)? {
                         docs += u64::from(entry.df);
                     }
                 }
                 Ok(Some(Estimate {
                     docs,
-                    exact: true,
+                    exact,
                     enumerable: true,
                     bytes: 0,
                 }))
@@ -128,7 +132,7 @@ impl Candidates {
         match self {
             Self::Postings(term) => Estimate {
                 docs: term.docs(),
-                exact: true,
+                exact: term.exact(),
                 enumerable: true,
                 bytes: term.bytes(),
             },

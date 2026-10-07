@@ -108,7 +108,7 @@ impl Inverter {
         last: u32,
         on_entry: impl FnMut(&[u8], &[u32], u64),
     ) -> Result<Writer, WriteError> {
-        self.drain(first, last, on_entry, |_| {})
+        self.drain(Writer::new(first, last)?, on_entry, |_| {})
     }
 
     /// Like [`Self::drain_into`], reporting simultaneous capacities of the
@@ -119,17 +119,20 @@ impl Inverter {
         last: u32,
         observe: impl FnMut(usize),
     ) -> Result<Writer, WriteError> {
-        self.drain(first, last, |_, _, _| {}, observe)
+        self.drain(Writer::new(first, last)?, |_, _, _| {}, observe)
+    }
+
+    /// Drains through the selected dictionary codec.
+    pub fn drain_into_codec(&mut self, first: u32, last: u32, codec: u32) -> Result<Writer, WriteError> {
+        self.drain(Writer::with_codec(first, last, codec)?, |_, _, _| {}, |_| {})
     }
 
     fn drain(
         &mut self,
-        first: u32,
-        last: u32,
+        mut writer: Writer,
         mut on_entry: impl FnMut(&[u8], &[u32], u64),
         mut observe: impl FnMut(usize),
     ) -> Result<Writer, WriteError> {
-        let mut writer = Writer::new(first, last)?;
         let payload = self.payload_capacity;
         let mut terms: Vec<_> = self.terms.drain().collect();
         let allocated =

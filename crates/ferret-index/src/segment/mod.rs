@@ -66,8 +66,7 @@
 //!                    fingerprint delta (0 inside a run) and vbyte
 //!                    doc - first
 //! fingerprint index  vbyte record count, then per block its first
-//!                    fingerprint u32 and vbyte previous block's byte
-//!                    length (0 for block 0)
+//!                    fingerprint u32 and absolute byte offset u32
 //! sums               chunk sums of blocks, postings, then fingerprints
 //! ```
 //!
@@ -90,6 +89,8 @@ mod write;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod h_tests;
 
 pub use fingerprint::{RECORD_BLOCK, fingerprint};
 pub use invert::Inverter;
