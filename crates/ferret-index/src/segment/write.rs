@@ -290,6 +290,7 @@ impl Writer {
             + self.postings.capacity()
             + self.index.capacity()
             + self.previous.capacity()
+            + self.last_term.capacity()
             + self.relative.capacity() * size_of::<u32>()
             + self.spill.as_ref().map_or(0, |spill| {
                 spill.blocks_sums.capacity() + spill.postings_sums.capacity()

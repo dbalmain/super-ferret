@@ -20,6 +20,11 @@
 //! with a bracketed version check, as `index-build` reads them (`ferret-bench`
 //! has no `ferret-crawl` edge). Rows are counted, not printed.
 //!
+//! `--corpus` verifies against the same frozen DocId bytes both codecs
+//! indexed. `--covered` limits the live set to the captured readable DocIds
+//! for a diagnostic without the historical catalog's unreadable fallback.
+//! `--compare` checks every warm query's actual row identities.
+//!
 //! Nothing here prints a term or a byte of content: only classes, counts
 //! and times.
 
@@ -106,9 +111,11 @@ struct Sample {
 pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Result<()> {
     let mut classes_only = Vec::new();
     let (mut terms_dir, mut compare_dir, mut corpus_dir) = (None, None, None);
+    let mut covered = false;
     let mut options = only.iter();
     while let Some(option) = options.next() {
         match option.as_str() {
+            "--covered" => covered = true,
             "--corpus" => corpus_dir = Some(options.next().ok_or("missing corpus snapshot")?),
             "--terms" => terms_dir = Some(options.next().ok_or("missing terms index")?),
             "--compare" => compare_dir = Some(options.next().ok_or("missing comparison index")?),
@@ -121,8 +128,21 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     let catalog = crate::open_catalog(dir)?;
     catalog.load_all()?;
     let catalog = catalog.into_resident()?;
-    let snapshot = corpus_dir.map(|dir| crate::content_snapshot::Snapshot::open(Path::new(dir), &catalog)).transpose()?;
-    let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
+    let snapshot = corpus_dir
+        .map(|dir| crate::content_snapshot::Snapshot::open(Path::new(dir), &catalog))
+        .transpose()?;
+    if covered && snapshot.is_none() {
+        return Err("--covered requires --corpus".into());
+    }
+    let live = DocSet::new(
+        catalog.next_doc().0,
+        catalog.docs().map(|(doc, _)| doc.0).filter(|&doc| {
+            !covered
+                || snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.contains(doc))
+        }),
+    );
     let view = View::open(
         index_dir,
         &CatalogView {
@@ -294,6 +314,9 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
         }
     }
 
+    if phrase_samples.is_empty() {
+        return Ok(());
+    }
     println!();
     println!(
         "phrase candidates and verification (warm), over {} queries:",
@@ -390,9 +413,13 @@ fn once(
             // reader. These bytes are exactly the version both arms indexed.
             let path = snapshot.path(doc.0);
             let version = match request {
-                ferret_query::ReadRequest::Stat => fs::metadata(path).ok().map(|_| ferret_query::ReadVersion::Catalogued),
+                ferret_query::ReadRequest::Stat => fs::metadata(path)
+                    .ok()
+                    .map(|_| ferret_query::ReadVersion::Catalogued),
                 ferret_query::ReadRequest::Bytes(out) => fs::read(path).ok().map(|bytes| {
-                    read_bytes += bytes.len() as u64; *out = bytes; ferret_query::ReadVersion::Catalogued
+                    read_bytes += bytes.len() as u64;
+                    *out = bytes;
+                    ferret_query::ReadVersion::Catalogued
                 }),
             };
             read += start.elapsed();
