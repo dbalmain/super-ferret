@@ -29,4 +29,4 @@ mod tests;
 pub use dialect::{Dialect, FindRegex, MatchLimit};
 pub use matcher::{Matcher, Regex, RegexError};
 pub use scan::{Arm, Finder};
-pub use text::{Text, TextMatcher};
+pub use text::{MatchStats, Text, TextMatcher};

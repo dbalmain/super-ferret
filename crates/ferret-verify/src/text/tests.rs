@@ -3,6 +3,8 @@
 //! builds each document's unit list whole and slides a window over it,
 //! which is obviously right and allocates freely, where the matcher streams.
 
+use std::ops::Range;
+
 use ferret_text::{Kind, MAX_TOKEN_BYTES, Scratch, tokenize};
 
 use super::*;
@@ -247,4 +249,180 @@ fn the_matcher_agrees_with_the_reference() {
         if expected { hits += 1 } else { misses += 1 }
     }
     assert!(hits > 1000 && misses > 1000, "{hits} hits, {misses} misses");
+}
+
+// ── Windows and needles ──
+
+/// Lowercasing can turn a non-ASCII character into ASCII, which an
+/// ASCII-case-insensitive byte search cannot see. The set the matcher
+/// handles must be exactly the characters that do so through the
+/// tokenizer, found by lowercasing every `char`.
+#[test]
+fn the_ascii_producing_characters_are_derived_by_enumeration() {
+    let mut found = Vec::new();
+    for c in (char::MIN..=char::MAX).filter(|c| !c.is_ascii()) {
+        let mut ascii = false;
+        ferret_text::tokens(c.to_string().as_bytes(), |token| {
+            ascii |= token.iter().any(u8::is_ascii);
+        });
+        if ascii {
+            found.push(c);
+        }
+    }
+    assert_eq!(found, super::ASCII_FROM_NON_ASCII);
+}
+
+/// What `find` and a whole-document tokenize disagree on, if anything.
+fn agrees(matcher: &mut TextMatcher, text: &Text, doc: &[u8]) -> Option<Range<usize>> {
+    let found = matcher.find(text, doc);
+    assert_eq!(found, matcher.find_whole(text, doc), "{text:?} in {doc:?}");
+    found
+}
+
+#[test]
+fn a_character_lowercasing_to_ascii_is_never_rejected() {
+    let mut matcher = TextMatcher::new();
+    // The Kelvin sign lowercases to `k`: the document emits `kb`, though
+    // no byte of it is `k` or `K`.
+    let kelvin = Text::new(b"kb", false).unwrap();
+    let doc = "x \u{212A}B y".as_bytes();
+    assert!(!doc.iter().any(|b| b.eq_ignore_ascii_case(&b'k')));
+    assert_eq!(agrees(&mut matcher, &kelvin, doc), Some(2..6));
+    // `İ` lowercases to `i` and U+0307: the needle `i` is not in its bytes.
+    let dotted = Text::new("İ".as_bytes(), false).unwrap();
+    let doc = "a İ".as_bytes();
+    assert!(!doc.iter().any(|b| b.eq_ignore_ascii_case(&b'i')));
+    assert_eq!(agrees(&mut matcher, &dotted, doc), Some(2..4));
+    assert_eq!(matcher.stats().whole, 2);
+    assert_eq!(matcher.stats().rejected, 0);
+    // Case-sensitive needles are exact bytes, so no character is special.
+    let exact = Text::new("\u{212A}B".as_bytes(), true).unwrap();
+    assert_eq!(agrees(&mut matcher, &exact, b"kb KB"), None);
+    assert_eq!(matcher.stats().rejected, 1);
+}
+
+#[test]
+fn a_document_lacking_a_needle_is_rejected_untokenized() {
+    let mut matcher = TextMatcher::new();
+    let text = Text::new(b"request handler", false).unwrap();
+    assert_eq!(agrees(&mut matcher, &text, b"a request for help"), None);
+    let stats = matcher.stats();
+    assert_eq!((stats.documents, stats.rejected, stats.whole), (1, 1, 0));
+    // `find_whole` tokenized it; `find` did not.
+    assert_eq!(stats.tokenized, 18);
+}
+
+#[test]
+fn separators_of_any_length_stay_inside_the_window() {
+    let mut matcher = TextMatcher::new();
+    let text = Text::new(b"alpha beta gamma", false).unwrap();
+    for gap in [" ", "—", "\u{3000}", "\u{a7}", "!?—\u{3000}"] {
+        let gap = gap.repeat(100_000);
+        let doc = format!("x alpha{gap}beta{gap}gamma y");
+        let found = agrees(&mut matcher, &text, doc.as_bytes()).unwrap();
+        assert_eq!(found, 2..doc.len() - 2);
+    }
+    // Invalid UTF-8 separates runs and is no ASCII separator.
+    let doc = b"alpha\xffbeta\xff\xfegamma";
+    assert_eq!(agrees(&mut matcher, &text, doc), Some(0..doc.len()));
+    // Several runs in one segment, the anchor's neighbours beyond it.
+    let doc = "zz—alpha—beta qq gamma—zz".as_bytes();
+    assert_eq!(agrees(&mut matcher, &text, doc), None);
+    let doc = "zz—alpha—beta gamma—zz".as_bytes();
+    assert!(agrees(&mut matcher, &text, doc).is_some());
+}
+
+#[test]
+fn the_walk_stops_at_the_first_match() {
+    let mut matcher = TextMatcher::new();
+    let text = Text::new(b"one two", false).unwrap();
+    let tail = " one two".repeat(50_000);
+    let doc = format!("x oneTwo{tail}");
+    assert_eq!(agrees(&mut matcher, &text, doc.as_bytes()), Some(2..8));
+    // The two walks stopped at the same token, 8 bytes in.
+    assert_eq!(matcher.stats().tokenized, 16);
+    // A whole-token argument, too.
+    let whole = Text::new(b"OneTwo", false).unwrap();
+    assert_eq!(agrees(&mut matcher, &whole, doc.as_bytes()), Some(2..8));
+}
+
+impl Rng {
+    /// Pieces chosen to break byte searches: characters lowercasing to
+    /// ASCII, a sigma whose lowercase depends on its neighbours, CJK, long
+    /// and non-ASCII separators, and invalid UTF-8.
+    fn bytes(&mut self, pieces: usize) -> Vec<u8> {
+        const WORDS: [&str; 16] = [
+            "a",
+            "ab",
+            "B",
+            "kb",
+            "\u{212A}b",
+            "\u{212A}",
+            "İ",
+            "i",
+            "ΑΣ",
+            "ας",
+            "Σx",
+            "漢字",
+            "größe",
+            "x1",
+            "FooBar",
+            "foo",
+        ];
+        const JOINS: [&[u8]; 11] = [
+            b" ",
+            " — ".as_bytes(),
+            b"_",
+            b"",
+            b"-",
+            b".\n",
+            "—".as_bytes(),
+            "\u{3000}".as_bytes(),
+            b"\xff",
+            b"\xe2\x84",
+            b"                                                                ",
+        ];
+        let mut out = Vec::new();
+        for i in 0..pieces {
+            if i > 0 {
+                out.extend_from_slice(JOINS[self.below(JOINS.len())]);
+            }
+            let word = WORDS[self.below(WORDS.len())];
+            match self.below(3) {
+                0 => out.extend_from_slice(word.as_bytes()),
+                1 => out.extend_from_slice(word.to_uppercase().as_bytes()),
+                _ => out.extend_from_slice(word.to_lowercase().as_bytes()),
+            }
+        }
+        out
+    }
+}
+
+/// The property the windows rest on: with needles and windows, the answer
+/// and its span are the whole-document walk's, for both case modes, and
+/// the reference agrees on the case-insensitive one.
+#[test]
+fn windows_never_change_the_answer() {
+    let mut rng = Rng(0x5eed_0c4c);
+    let mut matcher = TextMatcher::new();
+    let (mut hits, mut misses) = (0, 0);
+    for _ in 0..30_000 {
+        let (arg_pieces, doc_pieces) = (1 + rng.below(3), rng.below(40));
+        let (arg, doc) = (rng.bytes(arg_pieces), rng.bytes(doc_pieces));
+        let case = rng.below(4) == 0;
+        let Some(text) = Text::new(&arg, case) else {
+            continue;
+        };
+        let found = agrees(&mut matcher, &text, &doc);
+        if !case {
+            assert_eq!(found.is_some(), reference(&arg, &doc), "{arg:?} in {doc:?}");
+        }
+        if found.is_some() { hits += 1 } else { misses += 1 }
+    }
+    let stats = matcher.stats();
+    assert!(hits > 1000 && misses > 1000, "{hits} hits, {misses} misses");
+    // Every path was taken: rejected untokenized, windowed, and whole.
+    assert!(stats.rejected > 1000, "{stats:?}");
+    assert!(stats.whole > 1000, "{stats:?}");
+    assert!(stats.documents - stats.rejected - stats.whole > 1000, "{stats:?}");
 }
