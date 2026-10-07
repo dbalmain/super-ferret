@@ -363,6 +363,7 @@ pub(crate) fn build(dir: &Path, out: &Path, policy: Policy) -> crate::Result<()>
     let (mut pairs, mut range) = (Vec::new(), None);
     let (mut content, mut readable, mut unreadable, mut segment_docs) = (0u64, 0u64, 0u64, 0u32);
     let (mut capacity_peak, mut flush_charge_peak) = (0usize, 0usize);
+    let (mut term_flushes, mut trigram_flushes) = (0usize, 0usize);
     for doc in &docs {
         let term_charge = if paired { term.flush_bytes() } else { 0 };
         let tri_charge = tri.flush_bytes();
@@ -375,6 +376,10 @@ pub(crate) fn build(dir: &Path, out: &Path, policy: Policy) -> crate::Result<()>
             }
         };
         if full && let Some((first, last)) = range.take() {
+            if let Policy::Own { trigram_bound } = policy {
+                term_flushes += usize::from(term_charge >= BUFFER);
+                trigram_flushes += usize::from(tri_charge >= trigram_bound);
+            }
             pairs.push(
                 Flush {
                     out,
@@ -393,8 +398,16 @@ pub(crate) fn build(dir: &Path, out: &Path, policy: Policy) -> crate::Result<()>
             segment_docs = 0;
             // Follow creates fresh buffers for every segment. Dropping
             // retained capacity prevents empty segments after a flush.
+            drop(term);
             term = Inverter::new(BUFFER);
+            drop(tri);
             tri = TrigramInverter::new();
+            if paired {
+                // Production follow starts a new tokenizer scratch and
+                // document buffer for each segment, not just inverters.
+                scratch = Scratch::default();
+                bytes = Vec::new();
+            }
         }
         if let Some(read) = read(&catalog, doc, &mut path) {
             capacity_peak = capacity_peak.max(
@@ -447,6 +460,9 @@ pub(crate) fn build(dir: &Path, out: &Path, policy: Policy) -> crate::Result<()>
         );
     }
     drop((term, tri, scratch, bytes));
+    if matches!(policy, Policy::Own { .. }) {
+        println!("own_flushes term={term_flushes} trigram={trigram_flushes}");
+    }
     println!(
         "build documents={readable} unreadable={unreadable} content_bytes={content} cpu_seconds={:.2} wall_seconds={:.2} peak_rss={} capacity_peak={capacity_peak} flush_charge_peak={flush_charge_peak}",
         cpu_seconds()? - cpu,
