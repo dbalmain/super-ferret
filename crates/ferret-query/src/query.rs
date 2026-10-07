@@ -203,7 +203,9 @@ impl Query {
                 Node::Leaf((fold, atom)) if !matches!(atom, Atom::Text(_)) => (fold, atom),
                 tree => {
                     let texts = &mut query.texts;
-                    query.residual.push(tree.map(&mut |(_, atom)| atom.test(texts)));
+                    query
+                        .residual
+                        .push(tree.map(&mut |(_, atom)| atom.test(texts)));
                     continue;
                 }
             };
@@ -290,7 +292,11 @@ impl Query {
             tests.extend(self.meta.iter().map(MetaTest::describe));
         }
         tests.extend(self.paths.iter().map(PathTest::describe));
-        tests.extend(self.residual.iter().map(|tree| tree.describe(&|t| self.describe_test(t))));
+        tests.extend(
+            self.residual
+                .iter()
+                .map(|tree| tree.describe(&|t| self.describe_test(t))),
+        );
         if !tests.is_empty() {
             out.push_str("; then ");
             out.push_str(&tests.join(", "));
@@ -305,14 +311,16 @@ impl Query {
             Test::Meta(t) => t.describe(),
             Test::Content(i) => {
                 let text = &self.texts[*i];
-                let units: Vec<String> = text
-                    .units()
-                    .map(|u| u.escape_ascii().to_string())
-                    .collect();
+                let units: Vec<String> =
+                    text.units().map(|u| u.escape_ascii().to_string()).collect();
                 format!(
                     "text \"{}\"{}",
                     units.join(" "),
-                    if text.is_case_sensitive() { "" } else { " (folded)" }
+                    if text.is_case_sensitive() {
+                        " (exact case, verified)"
+                    } else {
+                        " (folded)"
+                    }
                 )
             }
         }

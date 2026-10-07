@@ -410,7 +410,9 @@ impl Query {
             }
         }
         let mut sections = Vec::new();
-        self.residual.iter().for_each(|tree| walk(tree, &mut sections));
+        self.residual
+            .iter()
+            .for_each(|tree| walk(tree, &mut sections));
         sections
     }
 }
@@ -449,12 +451,7 @@ fn compile<'a>(tree: &Node<Test>, atoms: &'a [TextAtom], pinned: &'a Pinned<'_>)
             let mut cursor = if positive.is_empty() {
                 Cursor::bits(pinned.live(), Certainty::Yes)
             } else {
-                Cursor::and(
-                    positive
-                        .iter()
-                        .map(|n| compile(n, atoms, pinned))
-                        .collect(),
-                )
+                Cursor::and(positive.iter().map(|n| compile(n, atoms, pinned)).collect())
             };
             for node in negated {
                 if let Node::Not(inner) = node {

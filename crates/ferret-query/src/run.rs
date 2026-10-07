@@ -52,7 +52,10 @@ pub enum RunError {
     /// More live documents are uncovered than the bound allows: the query
     /// would verify each by reading it (docs/S2.md § Coverage). The caller
     /// may run it anyway with `scan_uncovered`.
-    IndexIncomplete { uncovered: u32, live: u32 },
+    IndexIncomplete {
+        uncovered: u32,
+        live: u32,
+    },
     /// The content index could not be read.
     Index(ferret_index::ReadError),
     /// A query with a content atom was run without the content index and a
@@ -271,8 +274,7 @@ impl Query {
         let mut rows = 0;
         let mut stats = run(&mut |row: &Row<'_>| {
             let holds = self.residual.iter().all(|tree| {
-                tree.eval(&mut |test| self.test_row(catalog, row, test))
-                    == crate::expr::Truth::Yes
+                tree.eval(&mut |test| self.test_row(catalog, row, test)) == crate::expr::Truth::Yes
             });
             if !holds {
                 return ControlFlow::Continue(());

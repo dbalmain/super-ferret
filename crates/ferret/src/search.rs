@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ferret_catalog::{Catalog, Kind};
 use ferret_index::Certainty;
-use ferret_query::{ContentReport, Query, Row, RunError, Side, Stats};
+use ferret_query::{ContentReport, Query, Row, RunError, Side, Stats, UNCOVERED_BOUND};
 
 use crate::cli::{Context, Exit, error};
 use crate::engine::Engine;
@@ -79,10 +79,14 @@ pub fn run(
         .str("plan", &plan_text(&query, outcome.stats.as_ref()))
         .str(
             "strategy",
-            &outcome.stats.as_ref().and_then(|stats| stats.name_plan).map_or_else(
-                || format!("{:?}", query.strategy()),
-                |estimate| format!("{:?}", estimate.plan),
-            ),
+            &outcome
+                .stats
+                .as_ref()
+                .and_then(|stats| stats.name_plan)
+                .map_or_else(
+                    || format!("{:?}", query.strategy()),
+                    |estimate| format!("{:?}", estimate.plan),
+                ),
         )
         .opt_int("limit", limit)
         .int("exit", exit as u8)
@@ -214,29 +218,34 @@ fn search(
     let mut out = BufWriter::with_capacity(64 << 10, stdout.lock());
     let mut line = Vec::new();
     let mut failed: Option<io::Error> = None;
-    let result = session.search_content(query, scan_uncovered, None, |row| {
-        line.clear();
-        if json {
-            json_row(&mut line, catalog, row);
-        } else {
-            line.extend_from_slice(row.path);
-        }
-        line.push(b'\n');
-        outcome.first_row.get_or_insert_with(|| started.elapsed());
-        outcome.rows += 1;
-        let written = out.write_all(&line).and_then(|()| match tty {
-            true => out.flush(),
-            false => Ok(()),
-        });
-        if let Err(e) = written {
-            failed = Some(e);
-            return ControlFlow::Break(());
-        }
-        match limit {
-            Some(limit) if outcome.rows >= limit => ControlFlow::Break(()),
-            _ => ControlFlow::Continue(()),
-        }
-    });
+    let result = session.search_content(
+        query,
+        (!scan_uncovered).then_some(UNCOVERED_BOUND),
+        None,
+        |row| {
+            line.clear();
+            if json {
+                json_row(&mut line, catalog, row);
+            } else {
+                line.extend_from_slice(row.path);
+            }
+            line.push(b'\n');
+            outcome.first_row.get_or_insert_with(|| started.elapsed());
+            outcome.rows += 1;
+            let written = out.write_all(&line).and_then(|()| match tty {
+                true => out.flush(),
+                false => Ok(()),
+            });
+            if let Err(e) = written {
+                failed = Some(e);
+                return ControlFlow::Break(());
+            }
+            match limit {
+                Some(limit) if outcome.rows >= limit => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        },
+    );
     if failed.is_none() {
         failed = out.flush().err();
     }
@@ -246,8 +255,7 @@ fn search(
         Err(RunError::IndexIncomplete { uncovered, live }) => {
             error(&format!(
                 "the content index does not yet cover {uncovered} of {live} documents, \
-                 and reading them is slow: run `ferret index` to cover them, \
-                 or pass --scan-uncovered to read them"
+                 and reading that many is slow: pass --scan-uncovered to read them anyway"
             ));
             outcome.error = Some("index incomplete");
             return Exit::Error;

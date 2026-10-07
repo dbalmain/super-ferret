@@ -2202,3 +2202,106 @@ fn transient_root_fault_retains_searchable_subtree_and_find_uses_the_live_bounda
         fs::metadata(&old).unwrap().len().to_string()
     );
 }
+
+/// With no content index, `text:` reads every document (each is
+/// uncovered), and the log records the content plan as it ran.
+#[test]
+fn text_search_reads_uncovered_documents_and_logs_the_content_plan() {
+    let env = Env::new("text");
+    let alpha = env.write("a.txt", b"alpha beta\n");
+    let gamma = env.write("sub/b.txt", b"gamma requestHandler\n");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let found = env.run(&[os("search"), os("text:alpha")]);
+    assert_eq!(
+        paths(&found),
+        std::slice::from_ref(&alpha),
+        "{}",
+        stderr(&found)
+    );
+    let phrase = env.run(&[os("search"), os("text:request handler")]);
+    assert_eq!(paths(&phrase), std::slice::from_ref(&gamma));
+    let either = env.run(&[
+        os("search"),
+        os("("),
+        os("text:alpha"),
+        os("OR"),
+        os("text:gamma"),
+        os(")"),
+        os("ext:txt"),
+    ]);
+    assert_eq!(paths(&either), [alpha.clone(), gamma.clone()]);
+    // NOT holds on rows with no document: the directory. (The root is not
+    // a row.)
+    let not = env.run(&[os("search"), os("NOT"), os("text:alpha")]);
+    let mut expected = vec![env.at("sub"), gamma];
+    expected.sort();
+    let mut got = paths(&not);
+    got.sort();
+    assert_eq!(got, expected);
+
+    let lines = env.log_lines();
+    let line = lines.iter().find(|l| l.contains("text:alpha")).unwrap();
+    for part in [
+        r#""content":{"driver":"#,
+        r#""atoms":[{"estimate":"#,
+        r#""uncovered":2,"live":2,"#,
+        r#""verified":"#,
+        "content: ",
+    ] {
+        assert!(line.contains(part), "{part} in {line}");
+    }
+}
+
+/// A file named `OR` is reached through `name:` (folded) or `case:`
+/// (exact); the bare operator is a usage error.
+#[test]
+fn a_file_named_like_an_operator_is_reached_through_a_prefix() {
+    let env = Env::new("or-file");
+    let or = env.write("OR", b"x\n");
+    let color = env.write("color.txt", b"x\n");
+    env.write("other.txt", b"x\n");
+    env.run(&[os("index"), env.tree().as_os_str()]);
+    let folded = env.run(&[os("search"), os("name:OR")]);
+    let mut got = paths(&folded);
+    got.sort();
+    assert_eq!(got, [or.clone(), color]);
+    assert_eq!(paths(&env.run(&[os("search"), os("case:OR")])), [or]);
+    let bare = env.run(&[os("search"), os("OR")]);
+    assert_eq!(code(&bare), 2);
+    assert!(stderr(&bare).contains("`OR` needs a query on each side"));
+    let help = env.run(&[os("help")]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("name:OR"), "{help}");
+}
+
+/// More uncovered documents than the bound refuse a `text:` query, saying
+/// how to proceed; `--scan-uncovered` reads them.
+#[test]
+fn too_many_uncovered_documents_need_scan_uncovered() {
+    let env = Env::new("incomplete");
+    let count = ferret_query::UNCOVERED_BOUND as usize + 1;
+    for i in 0..count {
+        // Distinct content: equal bytes would be one document.
+        env.write(&format!("d{}/f{i}", i % 64), format!("x{i}\n").as_bytes());
+    }
+    let hit = env.write("hit.txt", b"needle\n");
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let refused = env.run(&[os("search"), os("text:needle")]);
+    assert_eq!(code(&refused), 3, "{}", stderr(&refused));
+    let message = stderr(&refused);
+    let total = count + 1;
+    assert!(
+        message.contains(&format!("{total} of {total}")) && message.contains("--scan-uncovered"),
+        "{message}"
+    );
+    assert!(
+        env.log_lines()
+            .last()
+            .unwrap()
+            .contains(r#""error":"index incomplete""#)
+    );
+    // A name-only query is unaffected.
+    assert_eq!(code(&env.run(&[os("search"), os("hit")])), 0);
+    let scanned = env.run(&[os("search"), os("--scan-uncovered"), os("text:needle")]);
+    assert_eq!(paths(&scanned), [hit], "{}", stderr(&scanned));
+}

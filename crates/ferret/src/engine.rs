@@ -406,18 +406,20 @@ impl QuerySession {
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
         if query.has_content() {
-            return self.search_content(query, false, cancelled, emit);
+            return self.search_content(query, Some(UNCOVERED_BOUND), cancelled, emit);
         }
         query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit)
     }
 
     /// Streams a content query's rows over this pin's content view, or
     /// over none, verifying Maybe documents through the crawl's checked
-    /// reader. `scan_uncovered` lifts the bound on uncovered documents.
+    /// reader. More than `bound` uncovered documents is
+    /// [`RunError::IndexIncomplete`]; `None` (`--scan-uncovered`) reads
+    /// however many there are.
     pub fn search_content(
         &self,
         query: &Query,
-        scan_uncovered: bool,
+        bound: Option<u32>,
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
@@ -433,11 +435,10 @@ impl QuerySession {
         let content = Content {
             pinned: &pinned,
             docs,
-            bound: (!scan_uncovered).then_some(UNCOVERED_BOUND),
+            bound,
         };
         let mut reader = ferret_crawl::Documents::by_name(catalog)?;
-        let mut read =
-            |name, out: &mut Vec<u8>| reader.read_name(catalog, name, out).is_ok();
+        let mut read = |name, out: &mut Vec<u8>| reader.read_name(catalog, name, out).is_ok();
         query.run_content(catalog, &self.names, &content, &mut read, cancelled, emit)
     }
 

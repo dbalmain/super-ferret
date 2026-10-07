@@ -214,7 +214,10 @@ fn read_all(
     };
     loop {
         let start = out.len();
-        out.resize(start + (256 << 10), 0);
+        // Zero only what the read can fill: a small file's verification
+        // read once cleared 512 KiB, which dominated it.
+        let want = source.remaining.clamp(1, 256 << 10) as usize;
+        out.resize(start + want, 0);
         match source.read(&mut out[start..]) {
             Ok(0) => {
                 out.truncate(start);
