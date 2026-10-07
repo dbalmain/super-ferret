@@ -31,7 +31,7 @@ crate's `Cargo.toml` disagrees with it.
 
 ```text
 ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify, ferret-policy
-ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text, rustix
+ferret-query   → ferret-index (the candidate seam only), ferret-catalog, ferret-verify, ferret-text, rustix
 ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
 ferret-index   → ferret-text, intpack (git dependency pinned by rev — D59), blake3 (segment checksums)
 ferret-catalog → blake3 (checkpoint integrity), intpack (git dependency pinned by rev — D59)
@@ -47,7 +47,7 @@ ferret-bench   → anything; nothing depends on it
 | `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing                                                          | query, index formats           |
 | `ferret-catalog` | names, inodes, documents, storage, name dictionary and catalog row postings (D54, S1b)                                        | content tokens and document postings |
 | `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                                         | files, ids                     |
-| `ferret-index`   | segments over doc ids; each structure implements `CandidateSource`                                                             | files, paths, inodes           |
+| `ferret-index`   | segments over doc ids; each structure is a `Source` of the candidate seam                                                      | files, paths, inodes           |
 | `ferret-verify`  | re-reading a file and matching a query atom against its bytes                                                                  | how candidates were found      |
 | `ferret-query`   | query syntax, planning, execution, result rows                                                                                 | any structure's on-disk format |
 | `ferret`         | CLI, config, XDG, JSON output, query log; shared engine coordination and batch/daemon hosts (S1b)                              | —                              |
@@ -57,39 +57,33 @@ Two boundaries carry the design, and both are where D1 said the thought goes:
 - **`ferret-index` knows doc ids and byte strings, not files.** It is the part
   reusable for a VictoriaLogs-style embeddable store (D6). Anything with a path
   in it lives in the catalog.
-- **The planner sees `CandidateSource`, never a format.** Adding a structure (a
-  trigram filter, positions) is a new implementor plus a registration line; the
-  planner does not change. That is the orthogonality test for this crate: a new
-  structure must not require reading `ferret-query`.
+- **The planner sees the candidate seam, never a format.** Adding a
+  structure (a trigram filter, positions) is a new `Source` variant and its
+  arms; the planner does not change. That is the orthogonality test for this
+  crate: a new structure must not require reading `ferret-query`.
+
+As built in S2 M4a (`ferret-index`'s `candidate` and `cursor` modules; the
+reasoning is [S2.md § The candidate seam](S2.md#the-candidate-seam)), the seam
+is two enums rather than a trait, and a certainty on every candidate rather
+than one exact flag per source:
 
 ```rust
-/// One query atom's candidate documents, from one structure.
-pub trait CandidateSource {
-    /// Which atoms this source can answer, and at what cost.
-    fn estimate(&self, atom: &Atom) -> Option<Estimate>;
-    /// Doc ids that may match, ascending. `Estimate::exact` says whether a
-    /// verifier must still check them.
-    fn candidates(&self, atom: &Atom) -> Box<dyn DocCursor + '_>;
-}
+pub enum Atom<'q> { Term(&'q [u8]), Trigram([u8; 3]) }
+pub enum Certainty { Maybe, Yes }           // absence is No
 
-pub struct Estimate {
-    pub docs: u64,     // upper bound on candidates
-    pub cost: Cost,    // bytes to read, roughly
-    pub exact: bool,   // true: every candidate matches
+impl Source<'_> {                           // one variant per structure
+    /// Reads the answer now; None: this source does not answer such atoms.
+    fn read(&self, atom: &Atom) -> Result<Option<Candidates>, ReadError>;
 }
-
-/// intpack's cursor shape: next_geq drives leapfrog intersection.
-pub trait DocCursor {
-    fn next_geq(&mut self, target: DocId) -> Option<DocId>;
+impl Candidates {                           // owned; cursors borrow it
+    fn estimate(&self) -> Estimate;         // docs, exact, enumerable, bytes
+    fn cursor(&self) -> Cursor<'_>;
+    fn probe(&self) -> Probe<'_>;
+}
+impl Cursor<'_> {                           // And, Or, AndNot, Filter, Maybe, Bits
+    fn next_geq(&mut self, target: u32) -> Option<(u32, Certainty)>;
 }
 ```
-
-The interface is the first thing written in the index slice and the thing most
-worth reviewing. The style guide prefers a plain `enum` + `match` over trait
-objects until a second caller needs them, so the likely shape is an enum of the
-known structures with one arm each — "adding a structure" is then a variant plus
-its arms, still without reading the planner. Settled there, against intpack's
-cursor, along with the cost units.
 
 ## The catalog (D4, D5)
 
@@ -422,7 +416,7 @@ boundaries (`parseHTTPRequest2` → `parsehttprequest2`, `parse`, `http`,
 `request`, `2`). The tokenizer has a version; segments record the version that
 wrote them. Query terms go through the same function.
 
-**Structures**, each a `CandidateSource` over doc ids, and each a row in the
+**Structures**, each a candidate `Source` over doc ids, and each a row in the
 experiments:
 
 | Structure                        | Atom             | Exact?                 | First built |
@@ -470,7 +464,7 @@ differences from GNU — is specified in [FIND.md](FIND.md).
    `mtime:`, `type:`, `path:` — growing toward `find`'s full set).
 2. **Plan.** Each content atom asks the registered sources for estimates and
    takes the cheapest; name and metadata atoms go to the catalog.
-3. **Execute** in doc space (leapfrog intersection over `DocCursor`s), map live
+3. **Execute** in doc space (leapfrog intersection over `Cursor`s), map live
    docs to inodes to names, apply name and metadata atoms per name.
 4. **Verify** non-exact atoms: re-read the file, check `(size, mtime)` against
    the catalog (a changed file is dropped and queued, never reported from stale
@@ -502,7 +496,7 @@ it was a sibling, which breadth-first numbering makes the common case. Measured 
 ## Experiments and metrics
 
 An experiment is a comparison of two or more implementations of one role —
-usually two `CandidateSource`s for the same atom — on bytes, build CPU, and
+usually two `Source`s for the same atom — on bytes, build CPU, and
 query latency by atom class. It lives in `ferret-bench` and writes results to
 `experiments/<name>/` (JSON rows, a `report.md`, the machine description), the
 way [intpack-bench](https://github.com/dbalmain/intpack-bench) does. Codec-level

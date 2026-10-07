@@ -19,8 +19,7 @@
 //! Reading and building are two steps because cursors borrow what was read:
 //! [`TextAtom::read`] does the I/O, [`TextAtom::cursor`] none.
 
-use ferret_index::segment::ReadError;
-use ferret_index::{Atom, Candidates, Certainty, Cursor, Pinned};
+use ferret_index::{Atom, Candidates, Certainty, Cursor, Pinned, ReadError};
 use ferret_text::{cap, exact_under_cap};
 use ferret_verify::Text;
 
