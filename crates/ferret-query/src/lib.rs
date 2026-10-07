@@ -7,6 +7,8 @@
 //! Knows nothing about any structure's on-disk format — adding a structure
 //! must not require reading this crate.
 //!
+//! - `content`: [`TextAtom`], a `text:ARG` compiled into the index's cursor
+//!   tree (S2).
 //! - `query`: [`Query`], parsing and the plan ([`Strategy`],
 //!   [`Query::explain`]).
 //! - `pattern`: globs lowered to regexes; the literal a glob or regex
@@ -65,6 +67,7 @@
 //! literal tests the inode rows first ([`Strategy::InodeScan`]); anything
 //! else tests every name ([`Strategy::AllNames`]).
 
+mod content;
 pub mod find;
 
 pub mod name_index;
@@ -75,6 +78,7 @@ mod run;
 #[cfg(test)]
 mod tests;
 
+pub use content::TextAtom;
 pub use name_index::{NameEstimate, NameIndex, NamePlan};
 pub use query::{ParseError, Query, Strategy};
 pub use run::{Row, RunError, Stats};
