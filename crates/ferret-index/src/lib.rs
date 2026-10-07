@@ -16,7 +16,7 @@
 //! S2 M3 makes segments an index that follows the catalog: [`store`]'s
 //! [`IndexWriter`] appends segments by DocId range under a [`manifest`],
 //! with liveness supplied by the host as a [`live::DocSet`], and merges
-//! adjacent segments by tier.
+//! adjacent segments by size level.
 
 pub mod live;
 pub mod manifest;

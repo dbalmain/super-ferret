@@ -8,15 +8,23 @@
 //! sort. Terms come out of a k-way merge of the inputs' dictionaries, one
 //! list in memory at a time, and the output spills to disk as it grows.
 //!
-//! **Policy.** Adjacent tiers, the shape of Lucene's `LogMergePolicy`, not
-//! its `TieredMergePolicy`, whose non-adjacent merges would break range
-//! order. A segment's tier is the decade of its file bytes above
-//! [`TIER_FLOOR`]. The leftmost run of [`MERGE_FACTOR`] adjacent segments of
-//! the lowest tier that has one merges first. Failing that, the segment
-//! with the largest dead fraction above [`DEAD_FRACTION`] is rewritten
-//! alone. Tiers go by whole-file bytes, not postings bytes as S2.md first
-//! said: the dictionary is 87% of a segment (M2), so postings bytes would
-//! misjudge both what a merge costs and what it saves.
+//! **Policy.** Adjacent levels, the shape of Lucene's `LogMergePolicy`,
+//! not its `TieredMergePolicy`, whose non-adjacent merges would break range
+//! order. A segment's level is `log10` of its file bytes over
+//! [`TIER_FLOOR`] (0 at or below the floor). Walking from the left, each
+//! group is every segment up to the last one within [`LEVEL_SPAN`] of the
+//! largest level remaining; a group of [`MERGE_FACTOR`] or more merges its
+//! first ten, the group with the lowest top level first. Failing that, the
+//! segment with the largest dead fraction above [`DEAD_FRACTION`] is
+//! rewritten alone. Levels go by whole-file bytes, not postings bytes as
+//! S2.md first said: the dictionary is 87% of a segment (M2), so postings
+//! bytes would misjudge both what a merge costs and what it saves.
+//!
+//! A first draft used whole decades (`floor(level)`) and required ten
+//! adjacent segments of one decade. M3's measurement showed why Lucene uses
+//! a span instead: a first build's 49 segments of about 10 MB straddled the
+//! 10 MiB boundary, so no run of ten shared a decade and steady state kept
+//! 31 segments.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -37,15 +45,13 @@ pub const TIER_FLOOR: u64 = 1 << 20;
 /// was written with is rewritten alone: 1/4.
 pub const DEAD_FRACTION: (u32, u32) = (1, 4);
 
-/// The decade of `bytes` above [`TIER_FLOOR`]: 0 up to the floor, 1 up to
-/// ten times it, and so on.
-pub fn tier(bytes: u64) -> u32 {
-    let (mut tier, mut ceiling) = (0, TIER_FLOOR);
-    while bytes > ceiling {
-        tier += 1;
-        ceiling = ceiling.saturating_mul(10);
-    }
-    tier
+/// Levels within this much of a group's top level merge together:
+/// Lucene's `LEVEL_LOG_SPAN`.
+pub const LEVEL_SPAN: f64 = 0.75;
+
+/// `log10(bytes / TIER_FLOOR)`, and 0 at or below the floor.
+pub fn level(bytes: u64) -> f64 {
+    (bytes.max(TIER_FLOOR) as f64 / TIER_FLOOR as f64).log10()
 }
 
 /// The segments to merge next, by index into `segments`, or `None`.
@@ -54,17 +60,19 @@ pub fn choose(
     segments: &[SegmentEntry],
     alive: &dyn Fn(&SegmentEntry) -> u32,
 ) -> Option<Range<usize>> {
-    let tiers: Vec<u32> = segments.iter().map(|s| tier(s.bytes)).collect();
-    let mut best: Option<(u32, usize)> = None;
+    let levels: Vec<f64> = segments.iter().map(|s| level(s.bytes)).collect();
+    let mut best: Option<(f64, usize)> = None;
     let mut start = 0;
-    while start < tiers.len() {
-        let end = start
-            + tiers[start..]
-                .iter()
-                .take_while(|&&t| t == tiers[start])
-                .count();
-        if end - start >= MERGE_FACTOR && best.is_none_or(|(tier, _)| tiers[start] < tier) {
-            best = Some((tiers[start], start));
+    while start < levels.len() {
+        let top = levels[start..].iter().copied().fold(0.0, f64::max);
+        let lower = top - LEVEL_SPAN;
+        let end = 1
+            + (start..levels.len())
+                .rev()
+                .find(|&i| levels[i] >= lower)
+                .unwrap_or(start);
+        if end - start >= MERGE_FACTOR && best.is_none_or(|(best_top, _)| top < best_top) {
+            best = Some((top, start));
         }
         start = end;
     }
@@ -176,37 +184,38 @@ mod tests {
     const MB: u64 = TIER_FLOOR;
 
     #[test]
-    fn tiers_are_decades_above_the_floor() {
-        let cases = [
-            (0, 0),
-            (MB, 0),
-            (MB + 1, 1),
-            (10 * MB, 1),
-            (10 * MB + 1, 2),
-            (100 * MB + 1, 3),
-        ];
+    fn levels_are_log10_above_the_floor() {
+        let cases = [(0, 0.0), (MB, 0.0), (10 * MB, 1.0), (100 * MB, 2.0)];
         for (bytes, want) in cases {
-            assert_eq!(tier(bytes), want, "{bytes}");
+            assert!((level(bytes) - want).abs() < 1e-9, "{bytes}");
         }
     }
 
     #[test]
-    fn the_lowest_tier_with_a_full_adjacent_run_merges_first() {
+    fn groups_span_three_quarters_of_a_level_and_the_lowest_merges_first() {
         let all_alive = |s: &SegmentEntry| s.docs;
         // Nine small segments are not enough.
         assert_eq!(choose(&segments(&[MB; 9]), &all_alive), None);
-        // Ten tier-1 segments, then ten tier-0: the tier-0 run wins.
-        let mut bytes = vec![5 * MB; 10];
+        // Ten around a decade boundary are one group: the case whole
+        // decades missed.
+        let straddling: Vec<u64> = (0..10).map(|i| [9 * MB, 11 * MB][i % 2]).collect();
+        assert_eq!(choose(&segments(&straddling), &all_alive), Some(0..10));
+        // A large segment, then ten small: the small group merges.
+        let mut bytes = vec![100 * MB];
         bytes.extend([MB; 10]);
+        assert_eq!(choose(&segments(&bytes), &all_alive), Some(1..11));
+        // Two full groups: the lower one first.
+        let mut bytes = vec![100 * MB; 10];
+        bytes.extend([MB; 12]);
         assert_eq!(choose(&segments(&bytes), &all_alive), Some(10..20));
-        // Twelve in a run: the leftmost ten.
-        assert_eq!(choose(&segments(&[MB; 12]), &all_alive), Some(0..10));
-        // A larger segment in the middle breaks adjacency: neither side has
-        // ten.
-        let mut bytes = vec![MB; 9];
-        bytes.push(50 * MB);
+        // A large segment then nine small: the small wait for a tenth.
+        let mut bytes = vec![100 * MB];
         bytes.extend([MB; 9]);
         assert_eq!(choose(&segments(&bytes), &all_alive), None);
+        // Small segments left of a larger one join its group, as in Lucene.
+        let mut bytes = vec![MB; 9];
+        bytes.push(5 * MB);
+        assert_eq!(choose(&segments(&bytes), &all_alive), Some(0..10));
     }
 
     #[test]

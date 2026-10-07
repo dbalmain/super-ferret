@@ -323,7 +323,7 @@ impl IndexWriter {
         self.guard(|writer| writer.follow_inner(catalog, budget, read))
     }
 
-    /// One merge step if the policy wants one (adjacent tiers, or a segment
+    /// One merge step if the policy wants one (adjacent levels, or a segment
     /// past the dead-fraction trigger) and it fits `budget.bytes`.
     pub fn merge_if_needed(
         &mut self,
