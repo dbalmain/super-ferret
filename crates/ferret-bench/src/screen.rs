@@ -247,11 +247,23 @@ pub(crate) fn write_filters(
     Ok((offsets, bytes))
 }
 
-/// Probes a filter file by positional reads.
+/// Probes a filter file by positional reads, or, once made resident, from
+/// memory: the floor a warm mapped file could reach.
 pub(crate) struct FilterReader {
     file: File,
     offsets: Vec<u64>,
     buffer: Vec<u8>,
+    memory: Option<Vec<u8>>,
+}
+
+/// Whether one serialized filter admits `need`.
+fn probe_bytes(filter: &[u8], need: &Need) -> crate::Result<bool> {
+    let header = Header::parse(filter[..HEADER].try_into()?);
+    let fingerprints = &filter[HEADER..];
+    Ok(need.eval(&mut |key| {
+        let (f, [a, b, c]) = header.locate(key);
+        f ^ fingerprints[a] ^ fingerprints[b] ^ fingerprints[c] == 0
+    }))
 }
 
 impl FilterReader {
@@ -260,7 +272,16 @@ impl FilterReader {
             file,
             offsets,
             buffer: Vec::new(),
+            memory: None,
         }
+    }
+
+    /// Reads the whole file into memory; later probes never touch it.
+    pub(crate) fn resident(path: &Path, offsets: Vec<u64>) -> crate::Result<Self> {
+        Ok(Self {
+            memory: Some(fs::read(path)?),
+            ..Self::new(File::open(path)?, offsets)
+        })
     }
 
     /// Whether `doc`'s filter admits `need`.
@@ -270,15 +291,13 @@ impl FilterReader {
             // No filter: the document holds no key.
             return Ok(need.eval(&mut |_| false));
         }
+        if let Some(memory) = &self.memory {
+            return probe_bytes(&memory[start as usize..end as usize], need);
+        }
         if end - start <= WHOLE_READ {
             self.buffer.resize((end - start) as usize, 0);
             self.file.read_exact_at(&mut self.buffer, start)?;
-            let header = Header::parse(self.buffer[..HEADER].try_into()?);
-            let fingerprints = &self.buffer[HEADER..];
-            return Ok(need.eval(&mut |key| {
-                let (f, [a, b, c]) = header.locate(key);
-                f ^ fingerprints[a] ^ fingerprints[b] ^ fingerprints[c] == 0
-            }));
+            return probe_bytes(&self.buffer, need);
         }
         let mut head = [0u8; HEADER];
         self.file.read_exact_at(&mut head, start)?;
@@ -759,6 +778,8 @@ pub(crate) const CONFIG: Config = Config {
 pub(crate) struct Row {
     pub(crate) postings_warm: Vec<f64>,
     pub(crate) filters_warm: Vec<f64>,
+    /// Probed from memory, as a warm mapped file at best.
+    pub(crate) filters_resident: Vec<f64>,
     pub(crate) postings_evicted: Vec<f64>,
     pub(crate) filters_evicted: Vec<f64>,
     pub(crate) probed: Vec<f64>,
@@ -857,6 +878,7 @@ pub(crate) fn run(
             bytes.grown,
             bytes.build_seconds
         );
+        let mut resident = FilterReader::resident(&filter_path, offsets.clone())?;
         let mut filters = FilterReader::new(File::open(&filter_path)?, offsets);
         let index = Index {
             live: &live,
@@ -922,7 +944,7 @@ pub(crate) fn run(
 
         println!();
         println!(
-            "| structure | class | workload | queries | probed median | postings candidates median | filter candidates median | postings warm median ms | postings warm p90 ms | filters warm median ms | filters warm p90 ms | filters/postings warm | postings evicted median ms | filters evicted median ms | filters/postings evicted | evicted queries | false-positive rate |"
+            "| structure | class | workload | queries | probed median | postings candidates median | filter candidates median | postings warm median ms | postings warm p90 ms | filters warm median ms | filters warm p90 ms | filters/postings warm | filters resident median ms | resident/postings warm | postings evicted median ms | filters evicted median ms | filters/postings evicted | evicted queries | false-positive rate |"
         );
         println!(
             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
@@ -954,6 +976,9 @@ pub(crate) fn run(
                     let (posting, exact) = run_postings(&index, &case)?;
                     run_filters(&index, &mut filters, &case)?;
                     let (filter, admitted) = run_filters(&index, &mut filters, &case)?;
+                    run_filters(&index, &mut resident, &case)?;
+                    let (in_memory, _) = run_filters(&index, &mut resident, &case)?;
+                    row.filters_resident.push(ms(in_memory.time));
                     if !subset(&exact, &admitted) {
                         return Err(format!(
                             "a {structure} filter missed a document its postings hold ({class})"
@@ -973,12 +998,13 @@ pub(crate) fn run(
                     q(&mut row.postings_warm, 0.5),
                     q(&mut row.filters_warm, 0.5),
                 );
+                let fr = q(&mut row.filters_resident, 0.5);
                 let (pe, fe) = (
                     q(&mut row.postings_evicted, 0.5),
                     q(&mut row.filters_evicted, 0.5),
                 );
                 println!(
-                    "| {structure} | {class} | {} | {} | {:.0} | {:.0} | {:.0} | {pw:.3} | {:.3} | {fw:.3} | {:.3} | {:.2} | {pe:.3} | {fe:.3} | {:.2} | {} | {:.5} |",
+                    "| {structure} | {class} | {} | {} | {:.0} | {:.0} | {:.0} | {pw:.3} | {:.3} | {fw:.3} | {:.3} | {:.2} | {fr:.3} | {:.2} | {pe:.3} | {fe:.3} | {:.2} | {} | {:.5} |",
                     narrow.label(),
                     cases.len(),
                     q(&mut row.probed, 0.5),
@@ -987,6 +1013,7 @@ pub(crate) fn run(
                     q(&mut row.postings_warm, 0.9),
                     q(&mut row.filters_warm, 0.9),
                     fw / pw,
+                    fr / pw,
                     fe / pe,
                     row.postings_evicted.len(),
                     row.false_positives as f64 / row.negatives.max(1) as f64,
@@ -1003,7 +1030,7 @@ pub(crate) fn run(
         } else {
             screen.term_bytes = layout;
         }
-        drop(filters);
+        drop((filters, resident));
         fs::remove_file(&filter_path)?;
     }
     fs::remove_file(&term_copy)?;
