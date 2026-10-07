@@ -666,12 +666,27 @@ fn every_name_of_a_matching_document_is_a_row() {
         &["text:shared"][..],
         &["text:shared", "txt"],
         &["text:shared words"],
+        &["case:text:shared"],
     ] {
-        let (rows, _) = search(&pin, &query(args), None).unwrap();
+        let (rows, report) = search(&pin, &query(args), None).unwrap();
         assert_eq!(rows, paths(&[&one, &two]), "{args:?}");
+        if args[0].starts_with("case:") || args[0].contains(' ') {
+            assert_eq!(
+                report.unwrap().verified,
+                1,
+                "one read, each copy has its own stat"
+            );
+        }
     }
     let (rows, _) = search(&pin, &query(&["text:shared", "two"]), None).unwrap();
     assert_eq!(rows, paths(&[&two]));
+    let (rows, report) = search(&pin, &query(&["case:text:Shared"]), None).unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(
+        report.unwrap().verified,
+        1,
+        "a verified negative is a cacheable content fact too"
+    );
 }
 
 /// Truncate a segment after its dictionaries are pinned: any postings read
@@ -819,5 +834,47 @@ fn measure_verification_on_a_hundred_thousand_files() {
     assert_eq!(changed, 40 * 8 * (64 << 10));
     println!(
         "FOLLOW_100K refreshes=40 changed_bytes={changed} cpu_ns={follow_cpu} wall_ns={follow_wall}"
+    );
+}
+
+/// An IO failure through one name is not a negative content fact for its
+/// DocId. The independent unchanged copy must still be verified.
+#[test]
+fn a_failed_copy_does_not_suppress_an_unchanged_copy() {
+    let tree = Tree::new();
+    let a = tree.write("a.txt", b"alpha beta");
+    let b = tree.write("b.txt", b"alpha beta");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    fs::remove_file(a).unwrap();
+    let pin = engine.pin();
+    assert_eq!(
+        search(&pin, &query(&["case:text:alpha"]), None).unwrap().0,
+        paths(&[&b])
+    );
+    assert_eq!(
+        search(&pin, &query(&["case:text:alpha", "name:b.txt"]), None)
+            .unwrap()
+            .0,
+        paths(&[&b])
+    );
+}
+
+/// A verified match through one copy must not vouch for a changed sibling.
+#[test]
+fn a_matching_copy_does_not_vouch_for_a_changed_copy() {
+    let tree = Tree::new();
+    let a = tree.write("a.txt", b"alpha beta");
+    tree.write("b.txt", b"alpha beta");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    tree.write("b.txt", b"zeta other longer");
+    assert_eq!(
+        search(&engine.pin(), &query(&["case:text:alpha"]), None)
+            .unwrap()
+            .0,
+        paths(&[&a])
     );
 }

@@ -354,7 +354,7 @@ pub(crate) fn bracket(
 }
 
 /// The catalog's fields of a raw `fstat`.
-fn catalog_stat(stat: &rustix::fs::Stat) -> Stat {
+pub(crate) fn catalog_stat(stat: &rustix::fs::Stat) -> Stat {
     Stat {
         dev: stat.st_dev,
         ino: stat.st_ino,

@@ -21,10 +21,10 @@ use std::sync::Arc;
 
 use ferret_catalog::bulk::Limiter;
 use ferret_catalog::{Catalog, DocId, InoId, NameId, OpenError, Section, Target};
-use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
 
 use crate::ContentFault;
-use crate::observe::{BulkRead, Opened, Reader, bracket};
+use crate::observe::{BulkRead, Opened, Reader, bracket, catalog_stat};
 
 /// One catalog view's documents, each with one of its names.
 pub struct Documents {
@@ -138,6 +138,30 @@ impl Documents {
         bracket(&file, &recorded, ferret_catalog::Content::Binary)?;
         self.files_read += 1;
         self.bytes_read += out.len() as u64;
+        Ok(())
+    }
+
+    /// Checks the file's version through its own fresh directory walk, with
+    /// one no-follow stat and no content read. A read through another copy
+    /// cannot establish this path's freshness.
+    pub fn check_name(&mut self, catalog: &Catalog, name: NameId) -> Result<(), ContentFault> {
+        let (parent, bytes) = catalog.name_reader().edge(name);
+        let Target::Inode(inode) = catalog.name(name).target() else {
+            return Err(ContentFault::Changed);
+        };
+        let recorded = catalog.inode(inode).stat;
+        let dir = self.directory(catalog, parent)?;
+        let stat = statat(
+            dir,
+            std::ffi::OsStr::from_bytes(bytes),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|e| ContentFault::Stat(e.into()))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            || !recorded.same_version(&catalog_stat(&stat))
+        {
+            return Err(ContentFault::Changed);
+        }
         Ok(())
     }
 

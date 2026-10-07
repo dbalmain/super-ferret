@@ -105,6 +105,9 @@ mod tests;
 
 pub use content::TextAtom;
 pub use name_index::{NameEstimate, NameIndex, NamePlan};
-pub use plan::{AtomReport, Content, ContentReport, DocNames, Reader, Side, UNCOVERED_BOUND};
+pub use plan::{
+    AtomReport, Content, ContentReport, DocNames, ReadRequest, ReadVersion, Reader, Side,
+    UNCOVERED_BOUND,
+};
 pub use query::{ParseError, Query, Strategy};
 pub use run::{Row, RunError, Stats};

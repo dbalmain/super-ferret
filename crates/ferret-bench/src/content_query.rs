@@ -17,15 +17,17 @@
 //! Each query runs once after its index files were dropped from the page
 //! cache (`posix_fadvise` `DONTNEED`: **evicted**), then again (**warm**).
 //! The catalog stays warm, and documents a phrase verifies are read by path
-//! with a size check, as `index-build` reads them (`ferret-bench` has no
-//! `ferret-crawl` edge). Rows are counted, not printed.
+//! with a bracketed version check, as `index-build` reads them (`ferret-bench`
+//! has no `ferret-crawl` edge). Rows are counted, not printed.
 //!
 //! Nothing here prints a term or a byte of content: only classes, counts
 //! and times.
 
 use std::fs::{self, File};
+use std::io::Read;
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -306,14 +308,25 @@ fn once(
 ) -> crate::Result<Once> {
     let (mut read, mut read_bytes) = (Duration::ZERO, 0u64);
     let mut path = Vec::new();
-    let mut reader = |name: NameId, out: &mut Vec<u8>| {
+    let mut reader = |name: NameId, request: ferret_query::ReadRequest<'_>| {
         let start = Instant::now();
-        let ok = read_name(catalog, name, &mut path, out);
+        let ok = match request {
+            ferret_query::ReadRequest::Stat => {
+                path.clear();
+                catalog.path(name, &mut path);
+                fs::symlink_metadata(Path::new(std::ffi::OsStr::from_bytes(&path)))
+                    .is_ok_and(|meta| same_version(catalog, name, &meta))
+            }
+            ferret_query::ReadRequest::Bytes(out) => {
+                let ok = read_name(catalog, name, &mut path, out);
+                if ok {
+                    read_bytes += out.len() as u64;
+                }
+                ok
+            }
+        };
         read += start.elapsed();
-        if ok {
-            read_bytes += out.len() as u64;
-        }
-        ok
+        ok.then_some(ferret_query::ReadVersion::Catalogued)
     };
     let mut rows = 0u64;
     let start = Instant::now();
@@ -334,21 +347,36 @@ fn once(
     })
 }
 
-/// Reads `name`'s file by path, refusing a size the catalog did not record.
-fn read_name(catalog: &Catalog, name: NameId, path: &mut Vec<u8>, out: &mut Vec<u8>) -> bool {
+fn same_version(catalog: &Catalog, name: NameId, meta: &fs::Metadata) -> bool {
     let Target::Inode(inode) = catalog.name(name).target() else {
         return false;
     };
-    let size = catalog.inode(inode).stat.size;
+    let stat = catalog.inode(inode).stat;
+    meta.is_file()
+        && (meta.dev(), meta.ino(), meta.len()) == (stat.dev, stat.ino, stat.size)
+        && (meta.mtime(), meta.mtime_nsec()) == (stat.mtime_sec, i64::from(stat.mtime_nsec))
+        && (meta.ctime(), meta.ctime_nsec()) == (stat.ctime_sec, i64::from(stat.ctime_nsec))
+}
+
+/// The benchmark uses fixed trees and a path reader, without crawl's checked
+/// directory walk. Bracket the file descriptor against the full catalog key.
+fn read_name(catalog: &Catalog, name: NameId, path: &mut Vec<u8>, out: &mut Vec<u8>) -> bool {
     path.clear();
     catalog.path(name, path);
-    match fs::read(Path::new(std::ffi::OsStr::from_bytes(path))) {
-        Ok(read) if read.len() as u64 == size => {
-            *out = read;
-            true
-        }
-        _ => false,
+    let Ok(mut file) = File::open(Path::new(std::ffi::OsStr::from_bytes(path))) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|meta| same_version(catalog, name, &meta))
+    {
+        return false;
     }
+    out.clear();
+    file.read_to_end(out).is_ok()
+        && file
+            .metadata()
+            .is_ok_and(|meta| same_version(catalog, name, &meta))
 }
 
 struct Classes {

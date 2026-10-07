@@ -21,7 +21,7 @@
 //! inverse ([`DocNames`], built once per catalog generation) and the
 //! checked reader; this crate opens no file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,10 +41,24 @@ pub const UNCOVERED_BOUND: u32 = 10_000;
 /// content estimate to rows for comparison with the name side's.
 const INODES_PER_DOC: (u64, u64) = (6, 5);
 
-/// Reads the document of the file `name` names into `out`, replacing it;
-/// false when the file is no longer the version the catalog recorded, or
-/// cannot be read.
-pub type Reader<'a> = dyn FnMut(NameId, &mut Vec<u8>) -> bool + 'a;
+/// Work the host performs through this path's checked directory walk.
+pub enum ReadRequest<'a> {
+    /// A cheap stat against the catalog key; never reads content bytes.
+    Stat,
+    /// A stable, bracketed read, replacing the output buffer.
+    Bytes(&'a mut Vec<u8>),
+}
+
+/// The version established by a successful stat or bracketed read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadVersion {
+    Catalogued,
+    Current,
+}
+
+/// None means a path-specific read/stat failure, never a document fact.
+/// Only bytes verified as Catalogued may be cached against the DocId.
+pub type Reader<'a> = dyn FnMut(NameId, ReadRequest<'_>) -> Option<ReadVersion> + 'a;
 
 /// What a content query needs from its host, besides the reader.
 pub struct Content<'a> {
@@ -337,9 +351,9 @@ impl Query {
         catalog.load(&self.residual_sections())?;
         let mut matcher = TextMatcher::new();
         let mut bytes = Vec::new();
-        // Per verified document, each atom's exact answer; `None` when it
-        // changed.
-        let mut exact: HashMap<u32, Option<Vec<bool>>> = HashMap::new();
+        // Only content facts established by a bracketed catalog-version read.
+        // Path failures never enter this map; every path has its own stat.
+        let mut exact: HashMap<u32, Vec<bool>> = HashMap::new();
         let mut rows = 0;
         let mut stats = self.s1_ids(catalog, &ids, cancelled, |row| {
             let doc = catalog.doc(row.inode).map(|d| d.0);
@@ -356,27 +370,34 @@ impl Query {
             if truth == Truth::Maybe
                 && let Some(doc) = doc
             {
-                let answers = exact.entry(doc).or_insert_with(|| {
-                    report.verified += 1;
-                    if read(row.name, &mut bytes) {
-                        Some(
+                let answers = match exact.entry(doc) {
+                    Entry::Occupied(entry) => {
+                        if read(row.name, ReadRequest::Stat) != Some(ReadVersion::Catalogued) {
+                            report.changed += 1;
+                            return ControlFlow::Continue(());
+                        }
+                        entry.into_mut()
+                    }
+                    Entry::Vacant(entry) => {
+                        report.verified += 1;
+                        if read(row.name, ReadRequest::Bytes(&mut bytes))
+                            != Some(ReadVersion::Catalogued)
+                        {
+                            report.changed += 1;
+                            return ControlFlow::Continue(());
+                        }
+                        entry.insert(
                             self.texts
                                 .iter()
                                 .map(|text| matcher.is_match(text, &bytes))
                                 .collect(),
                         )
-                    } else {
-                        report.changed += 1;
-                        None
                     }
-                });
-                truth = match answers {
-                    None => Truth::No,
-                    Some(answers) => self.eval_residual(&mut |test| match test {
-                        Test::Content(i) => answers[*i].into(),
-                        other => self.test_row(catalog, row, other),
-                    }),
                 };
+                truth = self.eval_residual(&mut |test| match test {
+                    Test::Content(i) => answers[*i].into(),
+                    other => self.test_row(catalog, row, other),
+                });
             }
             if truth != Truth::Yes {
                 return ControlFlow::Continue(());

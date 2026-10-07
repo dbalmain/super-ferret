@@ -453,7 +453,14 @@ impl QuerySession {
             bound,
         };
         let mut reader = ferret_crawl::Documents::by_name(catalog)?;
-        let mut read = |name, out: &mut Vec<u8>| reader.read_name(catalog, name, out).is_ok();
+        let mut read = |name, request: ferret_query::ReadRequest<'_>| {
+            match request {
+                ferret_query::ReadRequest::Stat => reader.check_name(catalog, name),
+                ferret_query::ReadRequest::Bytes(out) => reader.read_name(catalog, name, out),
+            }
+            .ok()
+            .map(|()| ferret_query::ReadVersion::Catalogued)
+        };
         query.run_content(catalog, &self.names, &content, &mut read, cancelled, emit)
     }
 
