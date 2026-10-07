@@ -36,7 +36,7 @@ pub struct Sizes {
     pub index: u64,
     pub sums: u64,
     pub terms: u64,
-    /// Postings, the sum of every term's document frequency.
+    /// Dictionary document occurrences plus unique fingerprint records.
     pub pairs: u64,
     /// Terms pushed with document frequency 1: dictionary entries in codec
     /// 1, pending fingerprint demotions in codec 2.

@@ -80,8 +80,11 @@ pub struct Info {
     pub first: u32,
     /// Inclusive.
     pub last: u32,
+    /// Terms retained in the dictionary; fingerprint strings are not stored.
     pub terms: u64,
-    /// The sum of every term's document frequency.
+    /// Dictionary document occurrences plus unique fingerprint records.
+    /// Codec 2 can collapse colliding terms in the same document, so this
+    /// need not equal the original sum of term document frequencies.
     pub pairs: u64,
 }
 
