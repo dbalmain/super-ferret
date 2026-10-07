@@ -867,11 +867,18 @@ fn legacy_v2_and_changed_trigram_version_rebuild_both_structures() {
         let mut manifest = writer.view().manifest().clone();
         drop(writer);
         if legacy {
-            let mut bytes = manifest.encode();
+            // A genuine v2 layout: 80-byte head and 64-byte term entries,
+            // without the v3 extractor field or per-entry trigram facts.
+            let current = manifest.encode();
+            let end = 88 + manifest.segments.len() * 104;
+            let mut bytes = current[..80].to_vec();
             bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
-            let end = bytes.len() - 16;
-            let digest = blake3::hash(&bytes[..end]);
-            bytes[end..].copy_from_slice(&digest.as_bytes()[..16]);
+            for entry in current[88..end].chunks_exact(104) {
+                bytes.extend_from_slice(&entry[..64]);
+            }
+            bytes.extend_from_slice(&current[end..current.len() - 16]);
+            let digest = blake3::hash(&bytes);
+            bytes.extend_from_slice(&digest.as_bytes()[..16]);
             fs::write(dir.0.join(manifest::FILE), bytes).unwrap();
         } else {
             manifest.trigram_version = TRIGRAM_VERSION + 1;
@@ -1106,5 +1113,28 @@ fn follow_pause_commits_the_completed_pair() {
     assert_eq!(writer.view().manifest().frontier, 1);
     assert_eq!(writer.view().segments().len(), 1);
     assert_eq!(writer.view().trigrams().len(), 1);
+    assert_eq!(dir.files(), named(&writer.view()));
+}
+
+#[test]
+fn error_after_successful_reconcile_cleans_unpublished_outputs() {
+    let dir = Dir::new("pair-reconcile-error");
+    let corpus = Corpus::new(908, 40);
+    let mut writer = four_segments(&dir, &corpus);
+    let mut catalog = Catalog::new(40, &[]);
+    catalog.incarnation = [8; 16];
+    let budget = Budget {
+        pace: &|_| Err(io::Error::other("injected output failure")),
+        ..Budget::unbounded()
+    };
+    assert!(
+        writer
+            .follow(&catalog.view(), &budget, &mut |doc, out| {
+                out.extend_from_slice(&corpus.text(doc));
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(writer.view().segments().is_empty());
     assert_eq!(dir.files(), named(&writer.view()));
 }

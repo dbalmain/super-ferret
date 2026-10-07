@@ -156,6 +156,9 @@ impl TrigramInverter {
             self.pairs.copy_from_slice(&self.scratch[..count]);
         }
         observe(self.allocated_bytes() + writer.allocated_bytes());
+        // D70 charges radix scratch by this flush's length. Retaining its
+        // capacity would instead charge the largest previous segment.
+        self.scratch = Vec::new();
         let mut start = 0;
         while start < count {
             let number = (self.pairs[start] >> 32) as u32;
@@ -186,6 +189,18 @@ mod tests {
 
     use super::*;
     use crate::segment::{Hit, Segment};
+
+    #[test]
+    fn drains_keep_the_reservation_and_release_length_charged_radix_scratch() {
+        let mut inverter = TrigramInverter::with_capacity(1000);
+        for (doc, bytes) in [(0, b"abcxyz".as_slice()), (1, b"aaa".as_slice())] {
+            inverter.add(doc, bytes).unwrap();
+            inverter.drain_into(doc, doc).unwrap();
+            assert_eq!(inverter.pairs.capacity(), 1000);
+            assert_eq!(inverter.scratch.capacity(), 0);
+            assert!(inverter.is_empty());
+        }
+    }
 
     #[test]
     fn raw_bytes_match_per_document_sets_and_round_trip() {

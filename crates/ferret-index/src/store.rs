@@ -986,6 +986,7 @@ impl IndexWriter {
             trigrams,
             pending_merge,
         });
+        self.publishing = false;
         Ok(())
     }
 
