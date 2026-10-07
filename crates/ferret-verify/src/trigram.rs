@@ -28,8 +28,8 @@ mod tests;
 // ── flags ──
 
 /// The one place a content regex's flags are set (D67). Both the verifier's
-/// builder and the derivation's parser are built from [`Settings`], so the
-/// two parses see the same HIR.
+/// builder and the derivation's parser are built from one settings table, so
+/// the two parses see the same HIR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrepFlags {
     /// Default true; false under `case:`.
@@ -265,39 +265,46 @@ impl Trigrams {
         }
     }
 
-    /// The tree with `key` replaced by `All`: admits a superset.
-    fn without(self, key: [u8; 3]) -> Trigrams {
+    /// The tree weakened to at most `budget` keys (counted with
+    /// repeats, so distinct keys are fewer still) by replacing subtrees with
+    /// `All`, which only admits more documents. An `And` keeps what fits:
+    /// its bare keys first, the largest first (M5 orders by df instead),
+    /// then its other children, smallest first, each fitted to what is left.
+    /// An `Or` must keep every alternative, so each is fitted to an equal
+    /// share; a share of zero makes that alternative, and so the `Or`, `All`.
+    /// An alternative is never deleted.
+    fn fit(self, budget: usize) -> Trigrams {
         match self {
-            Trigrams::Key(k) if k == key => Trigrams::All,
-            Trigrams::And(parts) => Trigrams::and(parts.into_iter().map(|p| p.without(key))),
-            Trigrams::Or(parts) => Trigrams::or(parts.into_iter().map(|p| p.without(key))),
-            other => other,
+            Trigrams::Key(_) if budget == 0 => Trigrams::All,
+            Trigrams::And(mut parts) => {
+                parts.sort_by_cached_key(|p| match p {
+                    Trigrams::Key(key) => (0, std::cmp::Reverse(*key), 0),
+                    other => (1, std::cmp::Reverse([0; 3]), other.weight()),
+                });
+                let mut left = budget;
+                let mut kept = Vec::new();
+                for part in parts {
+                    let part = part.fit(left);
+                    left -= part.weight();
+                    kept.push(part);
+                }
+                Trigrams::and(kept)
+            }
+            Trigrams::Or(parts) => {
+                let share = budget / parts.len();
+                Trigrams::or(parts.into_iter().map(|p| p.fit(share)))
+            }
+            other if other.weight() <= budget => other,
+            _ => Trigrams::All,
         }
     }
 
-    /// Keys that some `And` constrains directly and no `Or` holds anywhere
-    /// below it: replacing one of these with `All` never collapses an `Or`.
-    fn and_only_keys(
-        &self,
-        under_or: bool,
-        and_keys: &mut BTreeSet<[u8; 3]>,
-        or_keys: &mut BTreeSet<[u8; 3]>,
-    ) {
+    /// Keys counted with repeats: an upper bound on distinct keys.
+    fn weight(&self) -> usize {
         match self {
-            Trigrams::All | Trigrams::None => {}
-            Trigrams::Key(key) => {
-                if under_or {
-                    or_keys.insert(*key);
-                } else {
-                    and_keys.insert(*key);
-                }
-            }
-            Trigrams::And(parts) => parts
-                .iter()
-                .for_each(|p| p.and_only_keys(under_or, and_keys, or_keys)),
-            Trigrams::Or(parts) => parts
-                .iter()
-                .for_each(|p| p.and_only_keys(true, and_keys, or_keys)),
+            Trigrams::All | Trigrams::None => 0,
+            Trigrams::Key(_) => 1,
+            Trigrams::And(parts) | Trigrams::Or(parts) => parts.iter().map(Trigrams::weight).sum(),
         }
     }
 }
@@ -460,11 +467,18 @@ fn fold_node(hir: &Hir, limits: &Limits, trims: &mut Trims) -> Info {
             }
         },
         HirKind::Concat(parts) => {
+            // Along a concatenation `matches` only gains conjuncts, so they
+            // are joined once at the end: joining at every step is quadratic
+            // in the pattern's length.
             let mut info = empty();
+            let mut conjuncts = Vec::new();
             for part in parts {
+                conjuncts.push(std::mem::replace(&mut info.matches, Trigrams::All));
                 let next = fold_node(part, limits, trims);
                 info = concat(info, next, limits, trims);
             }
+            conjuncts.push(info.matches);
+            info.matches = Trigrams::and(conjuncts);
             info
         }
         HirKind::Alternation(parts) => {
@@ -691,25 +705,13 @@ fn shorten(
     set
 }
 
-/// Weakens `query` until it holds at most `max` distinct keys, replacing one
-/// key at a time with `All`. Each replacement only admits more documents;
-/// an `Or` alternative is never deleted, only made `All`, which makes the
-/// whole `Or` `All`. Keys outside any `Or` go first, so no alternative
-/// collapses while an `And` can still shed a key; within each group, the
-/// smallest key first (M5 orders by df instead).
-fn cap_keys(mut query: Trigrams, max: usize, trims: &mut Trims) -> Trigrams {
-    while query.keys().len() > max {
-        let (mut and_keys, mut or_keys) = (BTreeSet::new(), BTreeSet::new());
-        query.and_only_keys(false, &mut and_keys, &mut or_keys);
-        let Some(&key) = and_keys
-            .difference(&or_keys)
-            .next()
-            .or_else(|| or_keys.first())
-        else {
-            break;
-        };
-        trims.keys += 1;
-        query = query.without(key);
+/// Weakens `query` until it holds at most `max` distinct keys.
+fn cap_keys(query: Trigrams, max: usize, trims: &mut Trims) -> Trigrams {
+    let before = query.keys().len();
+    if before <= max {
+        return query;
     }
+    let query = query.fit(max);
+    trims.keys += u32::try_from(before - query.keys().len()).unwrap_or(u32::MAX);
     query
 }

@@ -274,6 +274,18 @@ fn the_key_cap_shrinks_an_and_only_literal() {
     let mut doc = b"\xff\n".to_vec();
     doc.extend_from_slice(&literal.to_ascii_uppercase());
     assert_sound(&pattern, true, &doc);
+
+    // A long literal stays linear to derive, and keeps a full cap of keys
+    // case-insensitively too, where `k` and `s` add `Or`s: dropping keys in
+    // one batch once collapsed every `Or` and left no key at all.
+    let long: String = (0..8_000)
+        .map(|_| char::from(b'a' + rng.below(26) as u8))
+        .collect();
+    for ci in [false, true] {
+        let (query, _) = derive_with(&long, ci, &LIMITS);
+        assert_eq!(query.keys().len(), LIMITS.keys, "ci={ci}");
+        assert_sound(&long, ci, long.to_ascii_uppercase().as_bytes());
+    }
 }
 
 /// Deleting an alternative to fit the cap would exclude the documents that
@@ -459,6 +471,7 @@ const BYTE_CLASSES: &[(&str, &[&[u8]])] = &[
     (r"[^\x00-\x7F]", &[b"\x80", b"\xff", b"\xe2"]),
     ("[kK]", &[b"k"]),
 ];
+const LOOKS: &[&str] = &["^", "$", r"\b", r"\B"];
 const RAW_BYTES: &[u8] = &[0x80, 0x81, 0xAA, 0xE2, 0xFF, 0xC3];
 
 fn gen_node(rng: &mut Rng, depth: u32, ctx: Context) -> Node {
@@ -519,7 +532,7 @@ fn gen_leaf(rng: &mut Rng, ctx: Context) -> Node {
             Node::Class(text, members)
         }
         7 => Node::Dot,
-        8 => Node::Look(*rng.pick(&["^", "$", r"\b", r"\B"])),
+        8 => Node::Look(LOOKS[rng.below(LOOKS.len())]),
         // A literal run, long enough to reach the exact-set caps.
         _ => {
             let letters: &[char] = if ctx.unicode {
@@ -821,7 +834,7 @@ struct Coverage {
 }
 
 fn coverage(class: &str, case_insensitive: bool) -> Coverage {
-    let mut rng = Rng(0xc0_7e2a_9e_u64.wrapping_add(class.len() as u64));
+    let mut rng = Rng(0xc07e_2a9e_u64.wrapping_add(class.len() as u64));
     let mut out = Coverage::default();
     for _ in 0..500 {
         let pattern = class_pattern(class, &mut rng);
