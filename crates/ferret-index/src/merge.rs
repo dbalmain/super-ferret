@@ -158,19 +158,33 @@ pub fn stream<R: ReadAt>(
     let mut records: Vec<_> = inputs.iter().map(Segment::records).collect();
     let mut heap = BinaryHeap::new();
     for (i, cursor) in records.iter_mut().enumerate() {
-        if let Some(record) = cursor.next_record()? { heap.push(Reverse((record, i))); }
+        if let Some(record) = cursor.next_record()? {
+            heap.push(Reverse((record, i)));
+        }
     }
     let mut previous = None;
+    let (mut carried, mut removed) = (0, 0);
     while let Some(Reverse((record, i))) = heap.pop() {
-        if cancelled() { return Err(Error::Cancelled); }
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         if live.contains(record.1) && previous != Some(record) {
+            carried += 1;
             writer.push_record(record.0, record.1)?;
             writer.spill(pace)?;
             previous = Some(record);
         }
-        if let Some(record) = records[i].next_record()? { heap.push(Reverse((record, i))); }
+        if !live.contains(record.1) {
+            removed += 1;
+        }
+        if let Some(record) = records[i].next_record()? {
+            heap.push(Reverse((record, i)));
+        }
     }
-    Ok(writer.finish_spilled(pace)?)
+    let mut sizes = writer.finish_spilled(pace)?;
+    sizes.records_added = sizes.records.saturating_sub(carried);
+    sizes.records_removed = removed;
+    Ok(sizes)
 }
 
 fn next<R: ReadAt>(cursor: &mut Terms<'_, R>) -> Result<Option<(Vec<u8>, TermEntry)>, ReadError> {

@@ -123,8 +123,17 @@ impl Inverter {
     }
 
     /// Drains through the selected dictionary codec.
-    pub fn drain_into_codec(&mut self, first: u32, last: u32, codec: u32) -> Result<Writer, WriteError> {
-        self.drain(Writer::with_codec(first, last, codec)?, |_, _, _| {}, |_| {})
+    pub fn drain_into_codec(
+        &mut self,
+        first: u32,
+        last: u32,
+        codec: u32,
+    ) -> Result<Writer, WriteError> {
+        self.drain(
+            Writer::with_codec(first, last, codec)?,
+            |_, _, _| {},
+            |_| {},
+        )
     }
 
     fn drain(

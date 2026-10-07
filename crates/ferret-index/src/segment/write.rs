@@ -38,7 +38,8 @@ pub struct Sizes {
     pub terms: u64,
     /// Postings, the sum of every term's document frequency.
     pub pairs: u64,
-    /// Terms with document frequency 1, inlined in the dictionary.
+    /// Terms pushed with document frequency 1: dictionary entries in codec
+    /// 1, pending fingerprint demotions in codec 2.
     pub singletons: u64,
     /// Bytes the singletons' dictionary entries take in `blocks`.
     pub singleton_bytes: u64,
@@ -50,6 +51,9 @@ pub struct Sizes {
     pub fingerprint_index: u64,
     /// Codec 2: records written. Each is also counted in `pairs`.
     pub records: u64,
+    /// Merge-only population changes after collision deduplication.
+    pub records_added: u64,
+    pub records_removed: u64,
 }
 
 impl Sizes {
@@ -84,6 +88,8 @@ impl Sizes {
         self.fingerprints += other.fingerprints;
         self.fingerprint_index += other.fingerprint_index;
         self.records += other.records;
+        self.records_added += other.records_added;
+        self.records_removed += other.records_removed;
     }
 }
 
@@ -492,16 +498,30 @@ impl Writer {
     /// A spilling writer is refused: use [`Writer::finish_spilled`].
     pub fn finish(mut self, out: &mut impl Write) -> io::Result<Sizes> {
         if self.spill.is_some() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "use finish_spilled"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "use finish_spilled",
+            ));
         }
         self.seal_records();
+        self.check_record_length()?;
         let mut sums = Vec::new();
         chunk_sums(&self.blocks, &mut sums);
         chunk_sums(&self.postings, &mut sums);
         let records = self.singles.as_ref().map_or(&[][..], |s| s.encoder.bytes());
         chunk_sums(records, &mut sums);
-        let record_index = self.singles.as_ref().map_or_else(Vec::new, |s| s.encoder.index());
-        let bytes: [&[u8]; ALL] = [&self.blocks, &self.postings, &self.index, &sums, records, &record_index];
+        let record_index = self
+            .singles
+            .as_ref()
+            .map_or_else(Vec::new, |s| s.encoder.index());
+        let bytes: [&[u8]; ALL] = [
+            &self.blocks,
+            &self.postings,
+            &self.index,
+            &sums,
+            records,
+            &record_index,
+        ];
         let lengths = bytes.map(|b| b.len() as u64);
         let mut digests = bytes.map(checksum);
         self.chunk_digests(lengths, &sums, &mut digests);
@@ -515,6 +535,7 @@ impl Writer {
     /// Completes a spilling writer without retaining carried records in memory.
     pub fn finish_spilled(mut self, pace: &dyn Fn(usize) -> io::Result<()>) -> io::Result<Sizes> {
         self.seal_records();
+        self.check_record_length()?;
         self.spill(pace)?;
         let Some(mut spill) = self.spill.take() else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "use finish"));
@@ -523,7 +544,12 @@ impl Writer {
         chunk_sums(&self.postings, &mut spill.postings_sums);
         let blocks_len = spill.blocks_written + self.blocks.len() as u64;
         let postings_len = spill.postings_written + self.postings.len() as u64;
-        write_paced(&spill.out, &self.blocks, self.head_len() + spill.blocks_written, pace)?;
+        write_paced(
+            &spill.out,
+            &self.blocks,
+            self.head_len() + spill.blocks_written,
+            pace,
+        )?;
         let mut at = self.head_len() + blocks_len;
         let mut copy = vec![0; SPILL];
         let mut from = 0;
@@ -539,7 +565,10 @@ impl Writer {
         at += self.postings.len() as u64;
         let mut sums = spill.blocks_sums;
         sums.extend_from_slice(&spill.postings_sums);
-        let record_index = self.singles.as_ref().map_or_else(Vec::new, |s| s.encoder.index());
+        let record_index = self
+            .singles
+            .as_ref()
+            .map_or_else(Vec::new, |s| s.encoder.index());
         let mut lengths = [0; ALL];
         lengths[0] = blocks_len;
         lengths[1] = postings_len;
@@ -551,7 +580,11 @@ impl Writer {
             lengths[Section::Fingerprints as usize] = singles.encoder.len();
             at += singles.encoder.len();
         }
-        for (section, bytes) in [(Section::Index, &self.index), (Section::FingerprintIndex, &record_index), (Section::Sums, &sums)] {
+        for (section, bytes) in [
+            (Section::Index, &self.index),
+            (Section::FingerprintIndex, &record_index),
+            (Section::Sums, &sums),
+        ] {
             if self.sections().contains(&section) {
                 write_paced(&spill.out, bytes, at, pace)?;
                 lengths[section as usize] = bytes.len() as u64;
@@ -567,6 +600,22 @@ impl Writer {
         Ok(self.sizes_of(lengths))
     }
 
+    // The resident index uses fixed u32 offsets. Reject an oversized section
+    // before its head can publish wrapped offsets.
+    fn check_record_length(&self) -> io::Result<()> {
+        if self
+            .singles
+            .as_ref()
+            .is_some_and(|s| s.encoder.len() > u64::from(u32::MAX))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fingerprint section exceeds u32 offsets",
+            ));
+        }
+        Ok(())
+    }
+
     fn chunk_digests(&self, lengths: [u64; ALL], sums: &[u8], digests: &mut [[u8; 16]; ALL]) {
         let mut at = 0;
         for section in [Section::Blocks, Section::Postings, Section::Fingerprints] {
@@ -579,7 +628,14 @@ impl Writer {
     fn head(&self, lengths: [u64; ALL], digests: [[u8; 16]; ALL]) -> Vec<u8> {
         let mut head = Vec::with_capacity(self.head_len() as usize);
         head.extend_from_slice(&MAGIC);
-        for word in [FORMAT_VERSION, self.tokenizer, self.codec, POSTINGS_CODEC, self.first, self.last] {
+        for word in [
+            FORMAT_VERSION,
+            self.tokenizer,
+            self.codec,
+            POSTINGS_CODEC,
+            self.first,
+            self.last,
+        ] {
             head.extend_from_slice(&word.to_le_bytes());
         }
         head.extend_from_slice(&self.sizes.terms.to_le_bytes());
@@ -603,12 +659,18 @@ impl Writer {
     fn sizes_of(&self, lengths: [u64; ALL]) -> Sizes {
         let records = self.singles.as_ref().map_or(0, |s| s.encoder.records());
         Sizes {
-            head: self.head_len(), blocks: lengths[0], postings: lengths[1], index: lengths[2], sums: lengths[3],
-            fingerprints: lengths[4], fingerprint_index: lengths[5], records,
-            pairs: self.sizes.pairs + records, ..self.sizes
+            head: self.head_len(),
+            blocks: lengths[0],
+            postings: lengths[1],
+            index: lengths[2],
+            sums: lengths[3],
+            fingerprints: lengths[4],
+            fingerprint_index: lengths[5],
+            records,
+            pairs: self.sizes.pairs + records,
+            ..self.sizes
         }
     }
-
 }
 
 // Bound each paced transfer, including a large singleton term or tail section.

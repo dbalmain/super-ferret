@@ -148,6 +148,10 @@ pub struct Merged {
     pub written: u64,
     /// Indexed documents dropped because they are dead.
     pub purged: u64,
+    /// Unique fingerprint records introduced by dictionary demotion.
+    pub records_added: u64,
+    /// Fingerprint records removed because their documents died.
+    pub records_removed: u64,
     /// The merged segment; `None` when every input document was dead and
     /// the inputs were simply dropped.
     pub segment: Option<SegmentEntry>,
@@ -304,10 +308,13 @@ impl View {
         for segment in &self.segments {
             let mut part = segment.fingerprint_docs(term)?;
             match segment.lookup(term)? {
-                None => {}, Some(Hit::Single(doc)) => part.push(doc),
+                None => {}
+                Some(Hit::Single(doc)) => part.push(doc),
                 Some(Hit::Postings(list)) => list.decode(&mut part),
             }
-            part.sort_unstable(); part.dedup(); docs.extend(part);
+            part.sort_unstable();
+            part.dedup();
+            docs.extend(part);
         }
         Ok(docs)
     }
@@ -667,6 +674,10 @@ impl IndexWriter {
             .map(|s| alive(s, catalog.live, &manifest.unreadable))
             .sum();
         let purged = entries.iter().map(|s| u64::from(s.docs)).sum::<u64>() - u64::from(docs);
+        let input_records: u64 = self.current.segments[run.clone()]
+            .iter()
+            .map(|s| s.fingerprint_records())
+            .sum();
         if docs == 0 {
             // Nothing survives: drop the inputs without writing. Their
             // range stays below the frontier, so it is not re-covered.
@@ -680,6 +691,8 @@ impl IndexWriter {
                 read,
                 written: 0,
                 purged,
+                records_added: 0,
+                records_removed: input_records,
                 segment: None,
             }));
         }
@@ -702,17 +715,21 @@ impl IndexWriter {
         let number = manifest.next_number;
         let scratch = self.dir.join(format!("tmp-{number}.postings"));
         let codec = self.codec;
+        let mut changes = (0, 0);
         let result = self.write_segment(&mut manifest, docs, |file| {
             let postings = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
                 .open(&scratch)?;
-            let writer = Writer::spilling_with_codec(first, last, codec, file.try_clone()?, postings)?;
+            let writer =
+                Writer::spilling_with_codec(first, last, codec, file.try_clone()?, postings)?;
             let result =
                 merge::stream(&inputs, catalog.live, writer, &merge_pace, budget.cancelled);
             let _ = fs::remove_file(&scratch);
-            Ok(result?.total())
+            let sizes = result?;
+            changes = (sizes.records_added, sizes.records_removed);
+            Ok(sizes.total())
         });
         let (entry, segment) = result?;
 
@@ -729,6 +746,8 @@ impl IndexWriter {
             read,
             written: entry.bytes,
             purged,
+            records_added: changes.0,
+            records_removed: changes.1,
             segment: Some(entry),
         }))
     }

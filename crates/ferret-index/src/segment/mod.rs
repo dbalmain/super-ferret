@@ -88,9 +88,9 @@ mod trigram;
 mod write;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod h_tests;
+#[cfg(test)]
+mod tests;
 
 pub use fingerprint::{RECORD_BLOCK, fingerprint};
 pub use invert::Inverter;

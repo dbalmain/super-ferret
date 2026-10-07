@@ -122,7 +122,9 @@ fn main() -> ExitCode {
             ("segment-build", [dir, out, flag]) if flag == "--breakdown" => {
                 segment_build::run(Path::new(dir), Path::new(out), true)
             }
-            ("index-build", [dir, out]) => index_build::run(Path::new(dir), Path::new(out)),
+            ("index-build", [dir, out, options @ ..]) => {
+                index_build::run(Path::new(dir), Path::new(out), options)
+            }
             ("trigram-build", [dir, out]) => {
                 trigram::build(Path::new(dir), Path::new(out), trigram::Policy::M3)
             }
@@ -159,7 +161,9 @@ fn main() -> ExitCode {
                 &saturation::config(),
             )
             .map(drop),
-            ("index-churn", [out, rounds]) => index_build::churn(Path::new(out), rounds),
+            ("index-churn", [out, rounds, options @ ..]) => {
+                index_build::churn(Path::new(out), rounds, options)
+            }
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)
             }
@@ -210,14 +214,14 @@ fn usage() -> ExitCode {
          ferret-bench tokenize <corpus-dir>\n       \
          ferret-bench terms <catalog-dir>\n       \
          ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]\n       \
-         ferret-bench index-build <catalog-dir> <index-dir>\n       \
+         ferret-bench index-build <catalog-dir> <index-dir> [--codec 1|h] [--snapshots] [--control-bytes N]\n       \
          ferret-bench trigram-build <catalog-dir> <out-dir>\n       \
          ferret-bench trigram-census <catalog-dir>\n       \
          ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b\n       \
          ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
-         ferret-bench index-churn <index-dir> <rounds>\n       \
-         ferret-bench content-query <catalog-dir> <index-dir> [class...]\n       \
+         ferret-bench index-churn <index-dir> <rounds> [--codec 1|h]\n       \
+         ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [class...]\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \

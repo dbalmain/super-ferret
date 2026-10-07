@@ -21,10 +21,13 @@ pub fn fingerprint(term: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
+type ForcedFingerprint = fn(&[u8]) -> u32;
+
+#[cfg(test)]
 thread_local! {
     /// A test's fingerprint function in place of BLAKE3's, on this thread:
     /// it forces collisions through the real writer, merge and lookup.
-    pub(crate) static FORCED: std::cell::Cell<Option<fn(&[u8]) -> u32>> =
+    pub(crate) static FORCED: std::cell::Cell<Option<ForcedFingerprint>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -111,7 +114,7 @@ impl Encoder {
 pub(super) struct Index {
     pub(super) records: u64,
     pub(super) firsts: Vec<u32>,
-    pub(super) starts: Vec<u64>,
+    pub(super) starts: Vec<u32>,
 }
 
 impl Index {
@@ -121,8 +124,8 @@ impl Index {
         let mut at = 0;
         let records = take(bytes, &mut at)?;
         let blocks = records.div_ceil(RECORD_BLOCK as u64);
-        // Each entry is at least five bytes.
-        if blocks > bytes.len() as u64 / 5 + 1 {
+        // Each block has exactly eight index bytes after the record count.
+        if blocks > bytes.len().saturating_sub(at) as u64 / 8 {
             return None;
         }
         let mut index = Self {
@@ -149,7 +152,7 @@ impl Index {
                 return None;
             }
             index.firsts.push(fp);
-            index.starts.push(start);
+            index.starts.push(u32::try_from(start).ok()?);
         }
         (at == bytes.len() && (blocks > 0 || len == 0)).then_some(index)
     }
@@ -161,7 +164,7 @@ impl Index {
     }
 
     pub(super) fn allocated_bytes(&self) -> usize {
-        self.firsts.capacity() * size_of::<u32>() + self.starts.capacity() * size_of::<u64>()
+        self.firsts.capacity() * size_of::<u32>() + self.starts.capacity() * size_of::<u32>()
     }
 }
 

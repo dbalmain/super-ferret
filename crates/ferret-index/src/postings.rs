@@ -66,7 +66,9 @@ impl Term {
             }
             floor = u64::from(info.last) + 1;
             let entry = segment.entry(term)?;
-            if cancelled() { return Err(ReadError::Cancelled); }
+            if cancelled() {
+                return Err(ReadError::Cancelled);
+            }
             let hit = entry.map(|entry| segment.read(&entry)).transpose()?;
             let maybe = segment.fingerprint_docs(term)?;
             found.records += maybe.len() as u64;
@@ -79,7 +81,9 @@ impl Term {
                 }
                 None => {}
             }
-            if hit.is_none() && maybe.is_empty() { continue; }
+            if hit.is_none() && maybe.is_empty() {
+                continue;
+            }
             found.parts.push(Part {
                 last: info.last,
                 hit,
@@ -89,16 +93,21 @@ impl Term {
         Ok(found)
     }
 
-    /// Documents in the term's postings: an exact count, dead ones included.
+    /// Candidate count upper bound, including dead documents and possible
+    /// overlap between dictionary and fingerprint occurrences.
     pub fn docs(&self) -> u64 {
         self.docs
     }
 
     /// Fingerprint records found, before unioning dictionary documents.
-    pub fn records(&self) -> u64 { self.records }
+    pub fn records(&self) -> u64 {
+        self.records
+    }
 
     /// Whether all candidates are known dictionary occurrences.
-    pub fn exact(&self) -> bool { self.records == 0 }
+    pub fn exact(&self) -> bool {
+        self.records == 0
+    }
 
     /// Bytes of postings lists read for it; inlined singletons cost none.
     pub fn bytes(&self) -> u64 {
@@ -138,11 +147,14 @@ impl Cursor<'_> {
         target: u32,
         checkpoint: &mut impl FnMut() -> bool,
     ) -> Option<u32> {
-        self.next_geq_certainty_with(target, checkpoint).map(|(doc, _)| doc)
+        self.next_geq_certainty_with(target, checkpoint)
+            .map(|(doc, _)| doc)
     }
 
     pub(crate) fn next_geq_certainty_with(
-        &mut self, target: u32, checkpoint: &mut impl FnMut() -> bool,
+        &mut self,
+        target: u32,
+        checkpoint: &mut impl FnMut() -> bool,
     ) -> Option<(u32, Certainty)> {
         if checkpoint() {
             return None;
@@ -161,9 +173,14 @@ impl Cursor<'_> {
                         .next_geq(target),
                     None => None,
                 };
-                let maybe = part.maybe.get(part.maybe.partition_point(|&doc| doc < target)).copied();
+                let maybe = part
+                    .maybe
+                    .get(part.maybe.partition_point(|&doc| doc < target))
+                    .copied();
                 match (found, maybe) {
-                    (Some(yes), Some(maybe)) if maybe < yes => return Some((maybe, Certainty::Maybe)),
+                    (Some(yes), Some(maybe)) if maybe < yes => {
+                        return Some((maybe, Certainty::Maybe));
+                    }
                     (Some(yes), _) => return Some((yes, Certainty::Yes)),
                     (None, Some(maybe)) => return Some((maybe, Certainty::Maybe)),
                     (None, None) => {}

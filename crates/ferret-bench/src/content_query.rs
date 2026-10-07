@@ -7,10 +7,10 @@
 //! queries in each class through [`Query::run_content`], the planner
 //! `ferret search` runs:
 //!
-//! - **rare**: a term with df ≤ 100; **mid**: df 1,000–100,000; **common**: df
-//!   ≥ 1,000,000, or the largest dfs present when no term reaches it. Terms are
-//!   drawn from the index's own dictionary, seeded, and only single-unit terms
-//!   (a term query, certainty Yes) qualify.
+//! - **df1**, **df2-100**, **mid** (df 1,000–100,000), **common** (top 50), and
+//!   **absent** (one-character mutations checked absent in the control). Seeded
+//!   terms come from a fully merged codec-1 reference (`--terms`), so every
+//!   lifecycle state and codec measures the same single-unit queries.
 //! - **phrase**: two adjacent units of a sampled document, as one argument.
 //! - **not**: `NOT text:t` for a rare term: every name but a few.
 //!
@@ -99,10 +99,23 @@ struct Sample {
     read: Duration,
     /// Bytes the verification reader returned.
     read_bytes: u64,
+    records: u64,
 }
 
 /// `only`, when not empty, names the classes to run.
 pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Result<()> {
+    let mut classes_only = Vec::new();
+    let (mut terms_dir, mut compare_dir) = (None, None);
+    let mut options = only.iter();
+    while let Some(option) = options.next() {
+        match option.as_str() {
+            "--terms" => terms_dir = Some(options.next().ok_or("missing terms index")?),
+            "--compare" => compare_dir = Some(options.next().ok_or("missing comparison index")?),
+            "rare" => classes_only.push("df2-100".to_owned()),
+            _ => classes_only.push(option.clone()),
+        }
+    }
+    let only = &classes_only;
     // Resident, as the engine holds it.
     let catalog = crate::open_catalog(dir)?;
     catalog.load_all()?;
@@ -130,7 +143,27 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     println!("docnames_bytes: {}", docs.bytes());
     println!("setup_ms (name index + DocNames): {:.1}", ms(setup));
 
-    let classes = pick_terms(&view)?;
+    let open = |dir: &Path| -> crate::Result<View> {
+        View::open(
+            dir,
+            &CatalogView {
+                incarnation: catalog.generation().incarnation,
+                live: &live,
+            },
+        )?
+        .ok_or_else(|| "no fitting comparison index".into())
+    };
+    let terms_view = terms_dir.map(|dir| open(Path::new(dir))).transpose()?;
+    let classes = pick_terms(terms_view.as_ref().unwrap_or(&view))?;
+    let compare_view = compare_dir.map(|dir| open(Path::new(dir))).transpose()?;
+    let compare_pinned = compare_view
+        .as_ref()
+        .map(|view| Pinned::new(Some(view), &live));
+    let compare = compare_pinned.as_ref().map(|pinned| Content {
+        pinned,
+        docs: &docs,
+        bound: None,
+    });
     let phrases = pick_phrases(&catalog, &live)?;
     let files: Vec<_> = fs::read_dir(index_dir)?
         .map(|e| e.map(|e| e.path()))
@@ -150,13 +183,15 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
 
     println!();
     println!(
-        "| class | queries | df/candidates median | warm median ms | warm p95 ms | evicted median ms | evicted p95 ms | rows median | content-driven |"
+        "| class | queries | df/candidates median | warm median ms | warm p90 ms | warm p95 ms | evicted median ms | evicted p90 ms | evicted p95 ms | rows median | content-driven |"
     );
-    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     let mut phrase_samples = Vec::new();
     let mut runs: Vec<(&str, Vec<Vec<String>>)> = Vec::new();
     for (class, terms) in [
-        ("rare", &classes.rare),
+        ("df1", &classes.singleton),
+        ("df2-100", &classes.rare),
+        ("absent", &classes.absent),
         ("mid", &classes.mid),
         ("common", &classes.common),
     ] {
@@ -187,8 +222,25 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
             evict()?;
             let evicted = once(&catalog, &names, &content, &query)?.wall;
             let warm = once(&catalog, &names, &content, &query)?;
+            if let Some(compare) = &compare {
+                let control = once(&catalog, &names, compare, &query)?;
+                if warm.identities != control.identities {
+                    return Err("verified rows differ from control".into());
+                }
+            }
+            let records = if matches!(class, "df1" | "df2-100" | "absent" | "mid" | "common") {
+                let term = args[0].strip_prefix("text:").ok_or("missing term prefix")?;
+                ferret_index::postings::Term::read(
+                    view.segments().iter().map(|s| &**s),
+                    term.as_bytes(),
+                )?
+                .records()
+            } else {
+                0
+            };
             samples.push(Sample {
                 evicted,
+                records,
                 warm: warm.wall,
                 rows: warm.rows,
                 report: warm.report,
@@ -211,14 +263,29 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
             .filter(|s| s.report.driver == Side::Content)
             .count();
         println!(
-            "| {class} | {} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {:.0} | {driven} |",
+            "| {class} | {} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.0} | {driven} |",
             samples.len(),
             quantile(&mut estimate, 0.5),
             quantile(&mut warm, 0.5),
+            quantile(&mut warm, 0.9),
             quantile(&mut warm, 0.95),
             quantile(&mut evicted, 0.5),
+            quantile(&mut evicted, 0.9),
             quantile(&mut evicted, 0.95),
             quantile(&mut rows, 0.5),
+        );
+        let mut records: Vec<f64> = samples.iter().map(|s| s.records as f64).collect();
+        let mut verified: Vec<f64> = samples.iter().map(|s| s.report.verified as f64).collect();
+        let mut bytes: Vec<f64> = samples.iter().map(|s| s.read_bytes as f64).collect();
+        println!(
+            "{class}_records_per_term: median {:.0} p90 {:.0} max {:.0}; verified_documents: median {:.0} p90 {:.0}; read_bytes: median {:.0} p90 {:.0}",
+            quantile(&mut records, 0.5),
+            quantile(&mut records, 0.9),
+            quantile(&mut records, 1.0),
+            quantile(&mut verified, 0.5),
+            quantile(&mut verified, 0.9),
+            quantile(&mut bytes, 0.5),
+            quantile(&mut bytes, 0.9)
         );
         if class == "phrase" {
             phrase_samples = samples;
@@ -292,6 +359,7 @@ fn arg(prefix: &str, bytes: &[u8]) -> String {
 
 /// One run of a query.
 struct Once {
+    identities: Vec<u32>,
     wall: Duration,
     rows: u64,
     report: ContentReport,
@@ -331,8 +399,10 @@ fn once(
         version
     };
     let mut rows = 0u64;
+    let mut identities = Vec::new();
     let start = Instant::now();
-    let stats = query.run_content(catalog, names, content, &mut reader, None, |_| {
+    let stats = query.run_content(catalog, names, content, &mut reader, None, |row| {
+        identities.push(row.name.0);
         rows += 1;
         ControlFlow::Continue(())
     })?;
@@ -340,7 +410,9 @@ fn once(
     let report = stats
         .content
         .ok_or("a content query reported no content plan")?;
+    identities.sort_unstable();
     Ok(Once {
+        identities,
         wall,
         rows,
         report,
@@ -414,6 +486,8 @@ fn read_name(catalog: &Catalog, name: NameId, path: &mut Vec<u8>, out: &mut Vec<
 }
 
 struct Classes {
+    singleton: Vec<Vec<u8>>,
+    absent: Vec<Vec<u8>>,
     rare: Vec<Vec<u8>>,
     mid: Vec<Vec<u8>>,
     common: Vec<Vec<u8>>,
@@ -425,7 +499,11 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
     let [segment] = view.segments() else {
         return Err("content-query wants a fully merged, single-segment index".into());
     };
+    if segment.codec() != ferret_index::segment::DICTIONARY_CODEC {
+        return Err("term classes require a codec-1 control; use --terms".into());
+    }
     let mut rng = Rng(0x5eed_0001);
+    let mut singleton = Reservoir::new();
     let (mut rare, mut mid, mut million) = (Reservoir::new(), Reservoir::new(), Reservoir::new());
     // The largest dfs, in case no term reaches a million documents.
     let mut top: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -436,7 +514,8 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
         }
         let df = entry.df;
         match df {
-            0..=100 => rare.offer(&mut rng, term),
+            1 => singleton.offer(&mut rng, term),
+            2..=100 => rare.offer(&mut rng, term),
             1_000..=100_000 => mid.offer(&mut rng, term),
             1_000_000.. => million.offer(&mut rng, term),
             _ => {}
@@ -447,11 +526,25 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
             top.truncate(PER_CLASS);
         }
     }
-    let common = if million.items.len() >= PER_CLASS {
-        million.items
-    } else {
-        top.into_iter().map(|(_, t)| t).collect()
-    };
+    let common: Vec<Vec<u8>> = top.into_iter().map(|(_, t)| t).collect();
+    let mut absent = Vec::new();
+    for original in singleton.items.iter().chain(&rare.items) {
+        let original = std::str::from_utf8(original)?;
+        let suffix = &original[original.chars().next().ok_or("empty term")?.len_utf8()..];
+        for replacement in 'a'..='z' {
+            let mutation = format!("{replacement}{suffix}").into_bytes();
+            if term_query(&mutation)
+                && !absent.contains(&mutation)
+                && view.lookup(&mutation)?.is_empty()
+            {
+                absent.push(mutation);
+                break;
+            }
+        }
+        if absent.len() == PER_CLASS {
+            break;
+        }
+    }
     println!(
         "term_classes: rare {} of {} eligible, mid {} of {}, common {} (df >= 1M eligible: {})",
         rare.items.len(),
@@ -462,6 +555,8 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
         million.seen
     );
     Ok(Classes {
+        singleton: singleton.items,
+        absent,
         rare: rare.items,
         mid: mid.items,
         common,
