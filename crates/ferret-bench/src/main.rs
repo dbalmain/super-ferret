@@ -10,6 +10,8 @@
 //! ferret-bench tokenize <corpus-dir>             tokenizer throughput and term counts
 //! ferret-bench terms <catalog-dir>               full-tree term census: df, hapax, pairs
 //! ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]  real segments: bytes by section, CPU, RSS
+//! ferret-bench index-build <catalog-dir> <index-dir>  follow, merge to steady state, full merge (S2 M3)
+//! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
 //! ferret-bench name-index-once <catalog-dir> open phases and query timings
@@ -55,6 +57,7 @@ use ferret_verify::{Arm, Finder};
 
 mod census;
 mod corpus;
+mod index_build;
 mod segment_build;
 mod terms;
 mod tokenize;
@@ -108,6 +111,8 @@ fn main() -> ExitCode {
             ("segment-build", [dir, out, flag]) if flag == "--breakdown" => {
                 segment_build::run(Path::new(dir), Path::new(out), true)
             }
+            ("index-build", [dir, out]) => index_build::run(Path::new(dir), Path::new(out)),
+            ("index-churn", [out, rounds]) => index_build::churn(Path::new(out), rounds),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
@@ -155,6 +160,8 @@ fn usage() -> ExitCode {
          ferret-bench tokenize <corpus-dir>\n       \
          ferret-bench terms <catalog-dir>\n       \
          ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]\n       \
+         ferret-bench index-build <catalog-dir> <index-dir>\n       \
+         ferret-bench index-churn <index-dir> <rounds>\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \

@@ -21,11 +21,11 @@ mod refresh;
 mod walk;
 pub mod watch;
 
+pub use content::Documents;
 pub use index::{
     Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report,
     RootChange, index, index_change, recrawl, session_change,
 };
-pub use content::Documents;
 pub use observe::ContentFault;
 pub use refresh::{
     RefreshOutcome, RefreshReason, RefreshReport, RefreshRequest, RefreshScope, RenameHint, refresh,

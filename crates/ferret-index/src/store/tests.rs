@@ -518,7 +518,10 @@ fn an_unreadable_document_is_never_retried_and_leaves_when_the_catalog_drops_it(
     // A merge counts what it keeps without the unreadable document, which
     // sits in the range with no postings: 30 less dead 3 less unreadable
     // 12. Indexed were 18 + 10, and 3 never was, so nothing is purged.
-    let merged = writer.merge_all(&third.view(), &Budget::unbounded()).unwrap().unwrap();
+    let merged = writer
+        .merge_all(&third.view(), &Budget::unbounded())
+        .unwrap()
+        .unwrap();
     assert_eq!((merged.segment.unwrap().docs, merged.purged), (28, 0));
     assert_eq!(writer.view().manifest().unreadable, [12]);
     let mut third = third;

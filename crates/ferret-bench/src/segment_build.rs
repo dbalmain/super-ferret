@@ -337,7 +337,7 @@ fn verify(files: &[PathBuf]) -> crate::Result<(u64, u64)> {
 
 /// User plus system CPU seconds of this process so far, from
 /// `/proc/self/stat` at Linux's fixed 100 ticks per second.
-fn cpu_seconds() -> io::Result<f64> {
+pub(crate) fn cpu_seconds() -> io::Result<f64> {
     let stat = fs::read_to_string("/proc/self/stat")?;
     let fields: Vec<&str> = stat
         .rsplit_once(") ")

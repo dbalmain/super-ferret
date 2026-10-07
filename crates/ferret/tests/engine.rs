@@ -1150,7 +1150,10 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
     let live = ferret::engine::live_documents(refreshed.catalog());
     let uncovered = refreshed.content().unwrap().uncovered(&live);
     assert_eq!(uncovered.len(), 1, "only the new document");
-    assert!(content_docs(&refreshed, b"alpha").is_empty(), "a.txt is dead");
+    assert!(
+        content_docs(&refreshed, b"alpha").is_empty(),
+        "a.txt is dead"
+    );
 
     let followed = engine.follow_content(&Budget::unbounded(), None).unwrap();
     assert_eq!(followed.docs, 1);
@@ -1166,7 +1169,11 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
     assert_eq!((merged.inputs, merged.purged), (1, 1));
     assert_eq!(content_docs(&engine.pin(), b"alpha"), uncovered);
     assert_eq!(content_docs(&engine.pin(), b"beta").len(), 1);
-    assert_eq!(content_docs(&first, b"alpha"), alpha, "the old view kept its files");
+    assert_eq!(
+        content_docs(&first, b"alpha"),
+        alpha,
+        "the old view kept its files"
+    );
 
     // A reopened writer finds the same index.
     drop(engine);

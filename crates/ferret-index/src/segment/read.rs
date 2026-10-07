@@ -194,6 +194,8 @@ pub struct Segment<R> {
     /// `(offset, length)` of the blocks and postings sections in the file.
     blocks_at: (u64, u64),
     postings_at: (u64, u64),
+    /// Each section's length, in [`Section`] order.
+    lengths: [u64; 4],
     /// Chunk sums: the blocks section's, then the postings section's.
     sums: Vec<u8>,
     firsts: Vec<u8>,
@@ -291,10 +293,16 @@ impl<R: ReadAt> Segment<R> {
             digest,
             blocks_at: (table[0].0, blocks_len),
             postings_at: (table[1].0, postings_len),
+            lengths: table.map(|(_, len, _)| len),
             sums,
             firsts,
             index,
         })
+    }
+
+    /// Bytes of `section`.
+    pub fn section_bytes(&self, section: Section) -> u64 {
+        self.lengths[section as usize]
     }
 
     pub fn info(&self) -> Info {
