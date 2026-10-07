@@ -311,7 +311,8 @@ enum Q {
 }
 
 fn atom(rng: &mut Rng) -> Q {
-    match rng.below(8) {
+    match rng.below(9) {
+        8 => Q::Text("onlyonce".to_owned(), rng.one_in(3)),
         6 | 7 => Q::Grep(
             rng.pick(&[
                 "alpha",
@@ -1180,7 +1181,7 @@ fn conservative_bounds_cover_quarters_whole_tokens_caps_fingerprints_and_aliases
     let cap = "a".repeat(61);
     for i in 0..20 {
         let mut bytes = format!(
-            "httprequest Foo {} singleton{i} {cap}tail 123 ",
+            "httprequest Foo {} singleton{i} {cap}𠀀tail 123 ",
             if i == 0 { "onlyonce" } else { "" }
         );
         for (quarter, term) in ["first", "second", "third", "fourth"].iter().enumerate() {
@@ -1250,6 +1251,11 @@ fn conservative_bounds_cover_quarters_whole_tokens_caps_fingerprints_and_aliases
             assert_eq!(report.bounds.maybe, 1);
             assert_eq!(report.verified, 1);
         }
+        if args == [format!("text:{cap}").as_str()] {
+            assert_eq!(report.bounds.maybe, 20);
+            assert_eq!(report.snapshot_maybe, 20);
+            assert_eq!(report.verified, 20);
+        }
         if args == ["text:HttpRequest"] {
             assert_eq!(report.bounds.possible, 20);
             assert_eq!(report.snapshot_possible, 20);
@@ -1272,4 +1278,81 @@ fn not_grep_verifies_the_only_match_past_the_frontier() {
     assert_eq!(report.uncovered, 1);
     assert_eq!(report.snapshot_maybe, 1);
     assert_eq!(report.verified, 1);
+}
+
+/// H's uncertain singleton records must obey the same snapshot bounds under
+/// partial coverage, unreadable entries and dictionary frequencies of dead
+/// documents. The oracle remains brute-force verification of every path.
+#[test]
+fn mixed_queries_and_bounds_equal_the_oracle_with_h_records() {
+    for seed in 10..13 {
+        let mut rng = Rng(seed);
+        let tree = Tree::new();
+        let written = corpus(&tree, &mut rng, 20);
+        tree.write("singleton-marker", b"onlyonce\n");
+        let engine = tree.engine();
+        let pin = engine.pin();
+        let catalog = pin.catalog();
+        let live = ferret::engine::live_documents(catalog);
+        let catalog_view = ferret_index::CatalogView {
+            incarnation: catalog.generation().incarnation,
+            live: &live,
+        };
+        let mut writer = ferret_index::IndexWriter::open_with_codec(
+            &tree.index().join("index"),
+            &catalog_view,
+            ferret_index::segment::FINGERPRINT_CODEC,
+        )
+        .unwrap();
+        engine.open_content(&tree.index()).unwrap();
+        check(&engine.pin(), &mut rng, 40, "H empty");
+        let marker = catalog.names().find_map(|(id, bytes)| {
+            if bytes != b"singleton-marker" { return None; }
+            if let ferret_catalog::Target::Inode(inode) = catalog.name(id).target() { catalog.doc(inode).map(|doc| doc.0) } else { None }
+        }).unwrap();
+        let unreadable: Vec<_> = live
+            .range(0, live.bound())
+            .filter(|&doc| doc != marker && rng.one_in(5))
+            .collect();
+        let mut reader = ferret_crawl::Documents::new(catalog).unwrap();
+        for partial in [true, false] {
+            let budget = if partial {
+                Budget {
+                    bytes: 30 + rng.below(100) as u64,
+                    ..Budget::unbounded()
+                }
+            } else {
+                Budget::unbounded()
+            };
+            writer
+                .follow(&catalog_view, &budget, &mut |doc, out| {
+                    if unreadable.contains(&doc) {
+                        return Err(ferret_index::Fault::Unreadable);
+                    }
+                    reader
+                        .read(catalog, ferret_catalog::DocId(doc), out)
+                        .map_err(|_| ferret_index::Fault::Unreadable)
+                })
+                .unwrap();
+            engine.open_content(&tree.index()).unwrap();
+            check(
+                &engine.pin(),
+                &mut rng,
+                40,
+                if partial {
+                    "H partial"
+                } else {
+                    "H full with unreadable"
+                },
+            );
+        }
+        assert!(writer.view().segments().iter().map(|segment| segment.fingerprint_records()).sum::<u64>() > 0);
+        let retired = fs::read(tree.root().join(&written[0])).unwrap();
+        for rel in &written {
+            if fs::read(tree.root().join(rel)).unwrap() == retired { fs::remove_file(tree.root().join(rel)).unwrap(); }
+        }
+        tree.refresh(&engine);
+        engine.open_content(&tree.index()).unwrap();
+        check(&engine.pin(), &mut rng, 40, "H dead postings");
+    }
 }
