@@ -271,3 +271,28 @@ fn misplaced_operators_are_errors_that_say_what_is_missing() {
         assert_eq!(error(query).to_string(), message, "{query}");
     }
 }
+
+/// Parentheses and NOT share one bound; rejected trees must be shallow even
+/// while unwinding a partly built expression.
+#[test]
+fn boolean_nesting_is_bounded_on_a_two_mib_stack() {
+    std::thread::Builder::new().stack_size(2 << 20).spawn(|| {
+        for (nots, groups) in [(33, 0), (0, 33), (17, 16)] {
+            let args: Vec<_> = std::iter::repeat_n("NOT", nots)
+                .chain(std::iter::repeat_n("(", groups))
+                .chain(["text:x", "OR", "text:y"])
+                .chain(std::iter::repeat_n(")", groups)).collect();
+            assert_eq!(Query::from_args(&args, now()).err().map(|e| e.to_string()),
+                Some("query nesting exceeds 32 NOT/parenthesis levels".into()));
+        }
+        for (nots, groups) in [(32, 0), (0, 32), (16, 16)] {
+            let args: Vec<_> = std::iter::repeat_n("NOT", nots)
+                .chain(std::iter::repeat_n("(", groups))
+                .chain(["text:x", "OR", "text:y"])
+                .chain(std::iter::repeat_n(")", groups)).collect();
+            let query = Query::from_args(&args, now()).unwrap();
+            assert!(!query.explain().is_empty());
+            drop(query);
+        }
+    }).unwrap().join().unwrap();
+}

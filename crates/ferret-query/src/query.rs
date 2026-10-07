@@ -119,6 +119,8 @@ pub enum ParseError {
     Unopened,
     /// `( )`, a group with nothing in it.
     EmptyGroup,
+    /// Combined NOT and parenthesis nesting exceeds the safe tree depth.
+    Nesting { limit: usize },
 }
 
 impl fmt::Display for ParseError {
@@ -142,6 +144,7 @@ impl fmt::Display for ParseError {
             Self::Unclosed => write!(f, "a `(` is not closed by a `)`"),
             Self::Unopened => write!(f, "a `)` has no `(` before it"),
             Self::EmptyGroup => write!(f, "`( )` holds no query"),
+            Self::Nesting { limit } => write!(f, "query nesting exceeds {limit} NOT/parenthesis levels"),
         }
     }
 }

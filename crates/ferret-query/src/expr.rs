@@ -16,6 +16,11 @@
 
 use crate::query::{MetaTest, NameTest, ParseError, PathTest};
 
+/// Bound NOT and parentheses together before constructing a recursive tree.
+/// Each group can add AND and OR frames, so leave ample room on the daemon
+/// request thread's 2 MiB stack for evaluation, cursor compilation and Drop.
+const NESTING_LIMIT: usize = 32;
+
 /// A boolean tree over leaves `L`: lexed atoms while parsing, [`Test`]s
 /// once the query is built.
 #[derive(Debug)]
@@ -69,7 +74,7 @@ pub(crate) fn parse<A>(tokens: Vec<Token<A>>) -> Result<Node<A>, ParseError> {
     if parser.tokens.peek().is_none() {
         return Ok(Node::And(Vec::new()));
     }
-    let tree = parser.expr(After::Start)?;
+    let tree = parser.expr(After::Start, 0)?;
     match parser.tokens.next() {
         None => Ok(tree),
         // `and` stops only at the end, `OR` or `)`, and `expr` takes every
@@ -92,19 +97,19 @@ struct Parser<A> {
 }
 
 impl<A> Parser<A> {
-    fn expr(&mut self, after: After) -> Result<Node<A>, ParseError> {
-        let mut any = vec![self.and(after)?];
+    fn expr(&mut self, after: After, depth: usize) -> Result<Node<A>, ParseError> {
+        let mut any = vec![self.and(after, depth)?];
         while matches!(self.tokens.peek(), Some(Token::Or)) {
             self.tokens.next();
-            any.push(self.and(After::Or)?);
+            any.push(self.and(After::Or, depth)?);
         }
         Ok(one_or(any, Node::Or))
     }
 
-    fn and(&mut self, after: After) -> Result<Node<A>, ParseError> {
+    fn and(&mut self, after: After, depth: usize) -> Result<Node<A>, ParseError> {
         let mut all = Vec::new();
         while !matches!(self.tokens.peek(), None | Some(Token::Or | Token::Close)) {
-            all.push(self.unary()?);
+            all.push(self.unary(depth)?);
         }
         if all.is_empty() {
             return Err(match (self.tokens.peek(), after) {
@@ -116,16 +121,22 @@ impl<A> Parser<A> {
         Ok(one_or(all, Node::And))
     }
 
-    fn unary(&mut self) -> Result<Node<A>, ParseError> {
+    fn unary(&mut self, depth: usize) -> Result<Node<A>, ParseError> {
         match self.tokens.next() {
             Some(Token::Not) => {
+                if depth >= NESTING_LIMIT {
+                    return Err(ParseError::Nesting { limit: NESTING_LIMIT });
+                }
                 if matches!(self.tokens.peek(), None | Some(Token::Or | Token::Close)) {
                     return Err(ParseError::Dangling("NOT"));
                 }
-                Ok(Node::Not(Box::new(self.unary()?)))
+                Ok(Node::Not(Box::new(self.unary(depth + 1)?)))
             }
             Some(Token::Open) => {
-                let inner = self.expr(After::Open)?;
+                if depth >= NESTING_LIMIT {
+                    return Err(ParseError::Nesting { limit: NESTING_LIMIT });
+                }
+                let inner = self.expr(After::Open, depth + 1)?;
                 match self.tokens.next() {
                     Some(Token::Close) => Ok(inner),
                     _ => Err(ParseError::Unclosed),
