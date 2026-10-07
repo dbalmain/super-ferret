@@ -23,6 +23,7 @@ use ferret::engine::{Engine, QuerySession};
 use ferret_crawl::{IndexOptions, Refresh, index};
 use ferret_index::Budget;
 use ferret_query::{ContentReport, Query, RunError};
+use ferret_verify::{GrepFlags, Matcher};
 
 // ---------------------------------------------------------------- fixture
 
@@ -138,7 +139,7 @@ fn tok(raw: &str) -> Tok {
 /// S2 § Tokenizer, ASCII only: runs of alphanumerics and `_`; parts split
 /// at `_`, lower → upper, `UPPER` → `Upper`-lower and letter ↔ digit.
 fn runs(text: &[u8]) -> Vec<Run> {
-    let text = std::str::from_utf8(text).unwrap();
+    let text = String::from_utf8_lossy(text);
     let mut out = Vec::new();
     for run in text
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -275,13 +276,21 @@ fn corpus(tree: &Tree, rng: &mut Rng, files: usize) -> Vec<String> {
     for i in 0..files {
         let rel = format!("{}{}{i}", rng.pick(DIRS), rng.pick(NAMES));
         let text = match written.len() {
-            n if n > 0 && rng.one_in(6) => {
-                fs::read_to_string(tree.root().join(&written[rng.below(n)])).unwrap()
-            }
+            n if n > 0 && rng.one_in(6) => String::from_utf8_lossy(
+                &fs::read(tree.root().join(&written[rng.below(n)])).unwrap(),
+            )
+            .into_owned(),
             _ if rng.one_in(10) => String::new(),
             _ => content(rng),
         };
-        tree.write(&rel, text.as_bytes());
+        let mut bytes = text.into_bytes();
+        if rng.one_in(3) {
+            bytes.extend_from_slice(b" \xff \x80ab ");
+        }
+        if rng.one_in(3) {
+            bytes.extend_from_slice(" Kelvin foo\n".as_bytes());
+        }
+        tree.write(&rel, &bytes);
         written.push(rel);
     }
     written
@@ -291,6 +300,7 @@ fn corpus(tree: &Tree, rng: &mut Rng, files: usize) -> Vec<String> {
 #[derive(Clone, Debug)]
 enum Q {
     Text(String, bool),
+    Grep(String, bool),
     /// A bare word: a folded name substring.
     Word(String),
     /// `name:OR` (folded) or `case:OR` (exact).
@@ -301,7 +311,24 @@ enum Q {
 }
 
 fn atom(rng: &mut Rng) -> Q {
-    match rng.below(6) {
+    match rng.below(8) {
+        6 | 7 => Q::Grep(
+            rng.pick(&[
+                "alpha",
+                "a.*beta",
+                "(?-u:\\xFF)",
+                "^foo",
+                "(?-m)^foo",
+                "(?i)kelvin",
+                "(?-u:[\\x80-\\x81])ab",
+                "x*",
+                "\\d+",
+                "(alpha|req|foo)",
+                "\\bbar\\b",
+            ])
+            .to_owned(),
+            rng.one_in(3),
+        ),
         0 => Q::Word(rng.pick(NAMES).to_ascii_lowercase()),
         1 => Q::Prefixed("OR".to_owned(), rng.one_in(2)),
         2 => {
@@ -347,6 +374,9 @@ impl Q {
     /// at random, where it does not.
     fn args(&self, rng: &mut Rng, out: &mut Vec<String>) {
         match self {
+            Q::Grep(arg, case) => {
+                out.push(format!("{}grep:{arg}", if *case { "case:" } else { "" }))
+            }
             Q::Text(arg, case) => {
                 out.push(format!("{}text:{arg}", if *case { "case:" } else { "" }))
             }
@@ -389,6 +419,14 @@ impl Q {
     /// its bytes, `None` for a directory.
     fn eval(&self, name: &str, doc: Option<&[u8]>) -> bool {
         match self {
+            Q::Grep(arg, case) => doc.is_some_and(|doc| {
+                GrepFlags {
+                    case_insensitive: !case,
+                }
+                .compile(arg)
+                .unwrap()
+                .is_match(doc)
+            }),
             Q::Text(arg, case) => doc.is_some_and(|doc| holds(arg, *case, doc)),
             Q::Word(word) => name.to_ascii_lowercase().contains(word.as_str()),
             Q::Prefixed(word, true) => name.contains(word.as_str()),
@@ -437,6 +475,16 @@ fn check(pin: &QuerySession, rng: &mut Rng, queries: usize, stage: &str) {
         let parsed = query(&args);
         let (got, report) = search(pin, &parsed, None).unwrap();
         assert_eq!(got, expected(pin, &q), "{stage}: {args:?}\n{report:?}");
+        if let Some(report) = &report {
+            assert!(
+                report.bounds.maybe >= report.snapshot_maybe,
+                "{stage}: M invariant {args:?} {report:?}"
+            );
+            assert!(
+                report.bounds.possible >= report.snapshot_possible,
+                "{stage}: P invariant {args:?} {report:?}"
+            );
+        }
         if report.is_some_and(|r| r.verified > 0) {
             verifying += 1;
         }
@@ -652,7 +700,10 @@ fn the_uncovered_bound_refuses_and_none_lifts_it() {
                 live: 3
             })
         ));
-        assert_eq!(search(&pin, &text, Some(3)).unwrap().0, paths(&[&a]));
+        assert!(matches!(
+            search(&pin, &text, Some(3)),
+            Err(RunError::ScanRequired { maybe: 3, live: 3 })
+        ));
         assert_eq!(search(&pin, &text, None).unwrap().0, paths(&[&a]));
         assert_eq!(
             search(&pin, &query(&["alpha"]), Some(0)).unwrap().0.len(),
@@ -1029,4 +1080,196 @@ fn oversized_current_replacements_are_unverifiable_in_both_polarities() {
             "refused bytes cannot be evaluated"
         );
     }
+}
+
+/// Every row of S3's refusal table, with bounds from the real dictionary
+/// planner and actual certainty counts from the real cursors.
+#[test]
+fn grep_refusal_table_and_scan_override() {
+    let tree = Tree::new();
+    for i in 0..20 {
+        tree.write(
+            &format!("file{i}.{}", if i == 0 { "rs" } else { "txt" }),
+            format!(
+                "common the {} {} unique{i} 123\n",
+                if i < 12 { "Foo" } else { "other" },
+                if i == 0 { "serde rareliteral" } else { "" }
+            )
+            .as_bytes(),
+        );
+    }
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let pin = engine.pin();
+    let cases: &[(&[&str], bool)] = &[
+        (&[r"grep:\d+"], true),
+        (&["NOT", r"grep:\d+"], true),
+        (&[r"grep:\d+", "OR", "text:rare"], true),
+        (&["NOT", "text:common", r"grep:\d+"], true),
+        (&["NOT", "grep:rareliteral"], false),
+        (&["ext:rs", r"grep:\d+"], false),
+        (&["ext:txt", r"grep:\d+"], true),
+        (&["text:serde", r"grep:v\d+"], false),
+        (&["case:text:Foo"], true),
+        (&["grep:the"], true),
+    ];
+    for &(args, refused) in cases {
+        let q = query(args);
+        let checked = search(&pin, &q, Some(10_000));
+        assert_eq!(
+            matches!(checked, Err(RunError::ScanRequired { .. })),
+            refused,
+            "{args:?}: {checked:?}"
+        );
+        let (_, report) = search(&pin, &q, None).unwrap();
+        let report = report.unwrap();
+        assert_eq!(report.bounds.maybe > u64::from(report.live) / 4, refused);
+        assert!(report.bounds.maybe >= report.snapshot_maybe);
+        assert!(report.bounds.possible >= report.snapshot_possible);
+        assert!(report.plan.describe().contains("M="));
+    }
+}
+
+#[test]
+fn grep_unicode_raw_bytes_anchors_and_uncovered_negation() {
+    let tree = Tree::new();
+    let kelvin = tree.write("kelvin.txt", "before\nKelvin\nafter\n".as_bytes());
+    let raw = tree.write("raw.txt", b"\x80ab\n");
+    let substring = tree.write("substring.txt", b"xHttpRequestx\n");
+    let other = tree.write("other.txt", b"http_request\n");
+    let engine = tree.engine();
+    for covered in [false, true] {
+        if covered {
+            engine.attach_content(&tree.index()).unwrap();
+            engine.follow_content(&Budget::unbounded(), None).unwrap();
+        }
+        let pin = engine.pin();
+        for (args, expected) in [
+            (vec!["grep:(?i)kelvin"], paths(&[&kelvin])),
+            (vec![r"grep:(?-u:[\x80-\x81])ab"], paths(&[&raw])),
+            (vec!["grep:^kelvin$"], paths(&[&kelvin])),
+            (vec!["grep:(?-m)^kelvin$"], paths(&[])),
+            (vec!["case:grep:kelvin"], paths(&[])),
+            (vec!["grep:HttpRequest"], paths(&[&substring])),
+            (
+                vec!["NOT", "grep:HttpRequest"],
+                paths(&[&kelvin, &raw, &other]),
+            ),
+        ] {
+            let (got, report) = search(&pin, &query(&args), None).unwrap();
+            assert_eq!(got, expected, "{covered} {args:?}");
+            let report = report.unwrap();
+            assert!(report.bounds.maybe >= report.snapshot_maybe);
+        }
+    }
+    for pattern in ["grep:(", "grep:a{100000000}"] {
+        assert!(matches!(
+            Query::parse(pattern, SystemTime::now()),
+            Err(ferret_query::ParseError::Grep(
+                _,
+                ferret_verify::GrepError::Pattern(_)
+            ))
+        ));
+    }
+}
+
+#[test]
+fn conservative_bounds_cover_quarters_whole_tokens_caps_fingerprints_and_aliases() {
+    let tree = Tree::new();
+    let cap = "a".repeat(61);
+    for i in 0..20 {
+        let mut bytes = format!(
+            "httprequest Foo {} singleton{i} {cap}tail 123 ",
+            if i == 0 { "onlyonce" } else { "" }
+        );
+        for (quarter, term) in ["first", "second", "third", "fourth"].iter().enumerate() {
+            if i / 5 != quarter {
+                bytes.push_str(term);
+                bytes.push(' ');
+            }
+        }
+        tree.write(&format!("file{i}.txt"), bytes.as_bytes());
+    }
+    // One DocId has two differently named copies: NOT ext:rs may hold for
+    // the txt copy, even though its rs copy matches the negated predicate.
+    let bytes = fs::read(tree.root().join("file0.txt")).unwrap();
+    tree.write("alias.rs", &bytes);
+    let engine = tree.engine();
+    let pin = engine.pin();
+    let catalog = pin.catalog();
+    let live = ferret::engine::live_documents(catalog);
+    let catalog_view = ferret_index::CatalogView {
+        incarnation: catalog.generation().incarnation,
+        live: &live,
+    };
+    let mut writer = ferret_index::IndexWriter::open_with_codec(
+        &tree.index().join("index"),
+        &catalog_view,
+        ferret_index::segment::FINGERPRINT_CODEC,
+    )
+    .unwrap();
+    let mut reader = ferret_crawl::Documents::new(catalog).unwrap();
+    writer
+        .follow(&catalog_view, &Budget::unbounded(), &mut |doc, out| {
+            reader
+                .read(catalog, ferret_catalog::DocId(doc), out)
+                .map_err(|_| ferret_index::Fault::Unreadable)
+        })
+        .unwrap();
+    engine.open_content(&tree.index()).unwrap();
+    let pin = engine.pin();
+    for args in [
+        vec![
+            "NOT",
+            "(",
+            "text:first",
+            "text:second",
+            "text:third",
+            "text:fourth",
+            ")",
+            r"grep:\d+",
+        ],
+        vec!["case:text:Foo"],
+        vec!["text:HttpRequest"],
+        vec!["text:onlyonce"],
+        vec!["NOT", "ext:rs", r"grep:\d+"],
+        vec![&format!("text:{cap}")],
+    ] {
+        let (_, report) = search(&pin, &query(&args), None).unwrap();
+        let report = report.unwrap();
+        assert!(
+            report.bounds.maybe >= report.snapshot_maybe,
+            "{args:?} {report:?}"
+        );
+        assert!(report.bounds.possible >= report.snapshot_possible);
+        if args == ["case:text:Foo"] {
+            assert_eq!(report.bounds.maybe, report.bounds.possible);
+        }
+        if args == ["text:onlyonce"] {
+            assert_eq!(report.bounds.maybe, 1);
+            assert_eq!(report.verified, 1);
+        }
+        if args == ["text:HttpRequest"] {
+            assert_eq!(report.bounds.possible, 20);
+            assert_eq!(report.snapshot_possible, 20);
+        }
+    }
+}
+
+#[test]
+fn not_grep_verifies_the_only_match_past_the_frontier() {
+    let tree = Tree::new();
+    let old = tree.write("old.txt", b"unrelated content\n");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    tree.write("new.txt", b"rareliteral\n");
+    tree.refresh(&engine);
+    let (got, report) = search(&engine.pin(), &query(&["NOT", "grep:rareliteral"]), None).unwrap();
+    assert_eq!(got, paths(&[&old]));
+    let report = report.unwrap();
+    assert_eq!(report.uncovered, 1);
+    assert_eq!(report.snapshot_maybe, 1);
+    assert_eq!(report.verified, 1);
 }

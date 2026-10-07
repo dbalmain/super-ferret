@@ -249,7 +249,7 @@ impl Tree {
                 .output()
                 .unwrap_or_else(|error| panic!("oracle query: {error:?}"))
         };
-        let content = content_answers(|q| query(&["search", q]));
+        let content = content_answers(|q| query(&["search", "--scan", q]));
         (
             records(query(&["search", "*"]), b'\n'),
             records(
@@ -281,7 +281,7 @@ impl Tree {
                     ),
                     0,
                 ),
-                content_answers(|q| self.run(&["search", q])),
+                content_answers(|q| self.run(&["search", "--scan", q])),
             );
             let s = self.status();
             if actual == expected

@@ -300,6 +300,10 @@ pub struct TextMatcher {
 /// What a [`TextMatcher`] has done, summed over its calls.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MatchStats {
+    /// Whole documents checked by content regexes.
+    pub regex_documents: u64,
+    pub regex_bytes: u64,
+    pub regex_rejected: u64,
     /// Documents matched against.
     pub documents: u64,
     /// Documents rejected by the byte search, without tokenizing.

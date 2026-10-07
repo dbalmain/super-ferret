@@ -2212,17 +2212,18 @@ fn text_search_reads_uncovered_documents_and_logs_the_content_plan() {
     let gamma = env.write("sub/b.txt", b"gamma requestHandler\n");
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
     fs::remove_dir_all(env.base.join("index/index")).unwrap();
-    let found = env.run(&[os("search"), os("text:alpha")]);
+    let found = env.run(&[os("search"), os("--scan"), os("text:alpha")]);
     assert_eq!(
         paths(&found),
         std::slice::from_ref(&alpha),
         "{}",
         stderr(&found)
     );
-    let phrase = env.run(&[os("search"), os("text:request handler")]);
+    let phrase = env.run(&[os("search"), os("--scan"), os("text:request handler")]);
     assert_eq!(paths(&phrase), std::slice::from_ref(&gamma));
     let either = env.run(&[
         os("search"),
+        os("--scan"),
         os("("),
         os("text:alpha"),
         os("OR"),
@@ -2233,7 +2234,7 @@ fn text_search_reads_uncovered_documents_and_logs_the_content_plan() {
     assert_eq!(paths(&either), [alpha.clone(), gamma.clone()]);
     // NOT holds on rows with no document: the directory. (The root is not
     // a row.)
-    let not = env.run(&[os("search"), os("NOT"), os("text:alpha")]);
+    let not = env.run(&[os("search"), os("--scan"), os("NOT"), os("text:alpha")]);
     let mut expected = vec![env.at("sub"), gamma];
     expected.sort();
     let mut got = paths(&not);
@@ -2313,4 +2314,31 @@ fn too_many_uncovered_documents_need_scan_uncovered() {
     assert_eq!(code(&env.run(&[os("search"), os("hit")])), 0);
     let scanned = env.run(&[os("search"), os("--scan-uncovered"), os("text:needle")]);
     assert_eq!(paths(&scanned), [hit], "{}", stderr(&scanned));
+}
+
+#[test]
+fn grep_search_reaches_verified_rows_from_argv() {
+    let env = Env::new("grep-reachability");
+    let hit = env.write("hit.txt", b"before\nNeedle123\nafter\n");
+    env.write("false-positive.txt", b"needle xxx 123\n");
+    for i in 0..8 {
+        env.write(
+            &format!("other{i}.txt"),
+            format!("unrelated{i}\n").as_bytes(),
+        );
+    }
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let found = env.run(&[os("search"), os("grep:^needle[0-9]+$"), os("--json")]);
+    assert_eq!(code(&found), 0, "{}", stderr(&found));
+    let output = String::from_utf8(found.stdout).unwrap();
+    assert_eq!(output.lines().count(), 1);
+    assert!(output.contains(hit.to_str().unwrap()));
+    assert!(output.contains("\"offset\":7"));
+    let refused = env.run(&[os("search"), os(r"grep:\d+")]);
+    assert_eq!(code(&refused), 3);
+    assert!(stderr(&refused).contains("--scan"));
+    assert_eq!(
+        code(&env.run(&[os("search"), os("--scan"), os(r"grep:\d+")])),
+        0
+    );
 }

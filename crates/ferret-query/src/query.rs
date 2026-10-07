@@ -5,7 +5,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferret_catalog::{Kind, Section};
-use ferret_verify::{Finder, Regex, RegexError, Text, GrepFlags, GrepError};
+use ferret_verify::{Finder, GrepError, GrepFlags, Regex, RegexError, Text};
 
 use crate::content::ContentAtom;
 use crate::expr::{self, Node, Test, Token};
@@ -30,7 +30,7 @@ pub struct Query {
     /// evaluated per row, after the tests above. Empty for an S1 query.
     pub(crate) residual: Vec<Node<Test>>,
     /// The content atoms `Test::Content` indexes.
-    pub(crate) texts: Vec<ContentAtom>,
+    pub(crate) atoms: Vec<ContentAtom>,
 }
 
 /// How [`Query::run`](crate::Query::run) finds its candidates.
@@ -204,7 +204,7 @@ impl Query {
             driver: None,
             now,
             residual: Vec::new(),
-            texts: Vec::new(),
+            atoms: Vec::new(),
         };
         // Candidate drivers: (literal, fold, name test index).
         let mut literals: Vec<(Vec<u8>, bool, usize)> = Vec::new();
@@ -212,10 +212,10 @@ impl Query {
             let (fold, atom) = match conjunct {
                 Node::Leaf((fold, atom)) if !matches!(atom, Atom::Content(_)) => (fold, atom),
                 tree => {
-                    let texts = &mut query.texts;
+                    let atoms = &mut query.atoms;
                     query
                         .residual
-                        .push(tree.map(&mut |(_, atom)| atom.test(texts)));
+                        .push(tree.map(&mut |(_, atom)| atom.test(atoms)));
                     continue;
                 }
             };
@@ -257,7 +257,7 @@ impl Query {
     /// Whether the query has a content atom, and so needs the content index
     /// and a reader to run ([`Query::run_content`](crate::Query::run_content)).
     pub fn has_content(&self) -> bool {
-        !self.texts.is_empty()
+        !self.atoms.is_empty()
     }
 
     /// How [`Query::run`](crate::Query::run) will find candidates.
@@ -320,9 +320,11 @@ impl Query {
             Test::Path(t) => t.describe(),
             Test::Meta(t) => t.describe(),
             Test::Content(i) => {
-                let text = match &self.texts[*i] {
+                let text = match &self.atoms[*i] {
                     ContentAtom::Text(text) => text,
-                    ContentAtom::Grep(grep) => return format!("content regex {:?}", grep.trigrams()),
+                    ContentAtom::Grep(grep) => {
+                        return format!("content regex {:?}", grep.trigrams());
+                    }
                 };
                 let units: Vec<String> =
                     text.units().map(|u| u.escape_ascii().to_string()).collect();
@@ -341,7 +343,7 @@ impl Query {
 }
 
 /// D67 spelling policy; the parser and help use this same value.
-pub const GREP_PREFIX: &[u8] = b"grep:";
+pub const GREP_PREFIX: &str = "grep:";
 
 enum Atom {
     /// A name test, and the literal every matching name contains.
@@ -356,16 +358,16 @@ enum Atom {
 }
 
 impl Atom {
-    /// The per-row test for this atom; a content atom is added to `texts`.
-    fn test(self, texts: &mut Vec<ContentAtom>) -> Test {
+    /// The per-row test for this atom; a content atom is added to `atoms`.
+    fn test(self, atoms: &mut Vec<ContentAtom>) -> Test {
         match self {
             Atom::Name(test, _) => Test::Name(test),
             Atom::PathGlob(regex, glob) => Test::Path(PathTest::Glob(regex, glob)),
             Atom::Path(test) => Test::Path(test),
             Atom::Meta(test) => Test::Meta(test),
             Atom::Content(text) => {
-                texts.push(text);
-                Test::Content(texts.len() - 1)
+                atoms.push(text);
+                Test::Content(atoms.len() - 1)
             }
         }
     }
@@ -425,11 +427,14 @@ fn parse_atom(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
         };
         return Ok(Atom::Meta(MetaTest::Type(kind)));
     }
-    if let Some(v) = value(GREP_PREFIX)? {
+    if let Some(v) = value(GREP_PREFIX.as_bytes())? {
         let pattern = std::str::from_utf8(v).map_err(|_| ParseError::NotUtf8(arg.to_vec()))?;
-        return GrepFlags { case_insensitive: fold }.compile(pattern)
-            .map(|grep| Atom::Content(ContentAtom::Grep(grep)))
-            .map_err(|e| ParseError::Grep(text(), e));
+        return GrepFlags {
+            case_insensitive: fold,
+        }
+        .compile(pattern)
+        .map(|grep| Atom::Content(ContentAtom::Grep(grep)))
+        .map_err(|e| ParseError::Grep(text(), e));
     }
     if let Some(v) = value(b"text:")? {
         return Text::new(v, !fold)

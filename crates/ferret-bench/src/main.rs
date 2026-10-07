@@ -170,6 +170,9 @@ fn main() -> ExitCode {
             ("index-churn", [out, rounds, options @ ..]) => {
                 index_build::churn(Path::new(out), rounds, options)
             }
+            ("regex-query", [dir, index, snapshot]) => {
+                content_query::run_regex(Path::new(dir), Path::new(index), Path::new(snapshot))
+            }
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)
             }
@@ -229,6 +232,7 @@ fn usage() -> ExitCode {
          ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench index-churn <index-dir> <rounds> [--codec 1|h]\n       \
+         ferret-bench regex-query <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [--corpus snapshot-dir] [--covered] [class...]\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \

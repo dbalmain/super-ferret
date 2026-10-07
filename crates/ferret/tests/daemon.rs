@@ -1485,3 +1485,37 @@ fn socket_search_handles_eight_thousand_flat_content_siblings() {
         .contains("\"event\":\"row\"")
     );
 }
+
+#[test]
+fn grep_argv_through_socket_returns_verified_rows_and_offsets() {
+    let tree = Tree::new();
+    fs::write(tree.base.join("src/main.rs"), b"before\nNeedle123\nafter\n").unwrap();
+    fs::write(
+        tree.base.join("src/false-positive.txt"),
+        b"needle xxx 123\n",
+    )
+    .unwrap();
+    for i in 0..8 {
+        fs::write(
+            tree.base.join(format!("src/other{i}.txt")),
+            format!("other{i}\n"),
+        )
+        .unwrap();
+    }
+    assert!(tree.local(&["index", "src"]).status.success());
+    tree.start(&[]);
+    let got = tree.run(&["search", "--json", "grep:^needle[0-9]+$"]);
+    assert!(
+        got.status.success(),
+        "{}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    let output = String::from_utf8(got.stdout).unwrap();
+    assert_eq!(output.lines().count(), 1);
+    assert!(output.contains("main.rs"));
+    assert!(output.contains("\"offset\":7"));
+    let refused = tree.run(&["search", r"grep:\d+"]);
+    assert_eq!(refused.status.code(), Some(3));
+    let scanned = tree.run(&["search", "--scan", r"grep:\d+"]);
+    assert!(scanned.status.success());
+}

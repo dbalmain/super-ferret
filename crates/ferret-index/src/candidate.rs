@@ -33,6 +33,8 @@ pub enum Atom<'q> {
 pub struct Estimate {
     /// Upper bound on documents the cursor yields (Lucene's `cost()`).
     pub docs: u64,
+    /// Upper bound on candidates that require verification (H records).
+    pub maybe_docs: u64,
     /// Whether every yielded document is Yes.
     pub exact: bool,
     /// Whether the answer can enumerate its documents. A per-document
@@ -72,6 +74,7 @@ impl Source<'_> {
         match (self, atom) {
             (Self::Postings(view), Atom::Term(term)) => {
                 let mut docs = 0;
+                let mut maybe_docs = 0;
                 let mut exact = true;
                 for segment in view.segments() {
                     if cancelled() {
@@ -79,6 +82,7 @@ impl Source<'_> {
                     }
                     let records = segment.fingerprint_docs(term)?.len() as u64;
                     docs += records;
+                    maybe_docs += records;
                     exact &= records == 0;
                     if let Some(entry) = segment.entry(term)? {
                         docs += u64::from(entry.df);
@@ -86,6 +90,7 @@ impl Source<'_> {
                 }
                 Ok(Some(Estimate {
                     docs,
+                    maybe_docs,
                     exact,
                     enumerable: true,
                     bytes: 0,
@@ -103,6 +108,7 @@ impl Source<'_> {
                 }
                 Ok(Some(Estimate {
                     docs,
+                    maybe_docs: 0,
                     exact: true,
                     enumerable: true,
                     bytes: 0,
@@ -153,6 +159,7 @@ impl Candidates {
         match self {
             Self::Postings(term) => Estimate {
                 docs: term.docs(),
+                maybe_docs: term.records(),
                 exact: term.exact(),
                 enumerable: true,
                 bytes: term.bytes(),

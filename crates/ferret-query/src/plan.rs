@@ -22,18 +22,19 @@
 //! inverse ([`DocNames`], built once per catalog generation) and the
 //! checked reader; this crate opens no file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use ferret_catalog::{Catalog, NameId, OpenError, Section, Target};
 use ferret_index::{Advance, Certainty, Cursor, DocSet, Pinned};
 use ferret_verify::{MatchStats, TextMatcher};
 
+use crate::content::ReadAtom;
 use crate::expr::{Node, Test, Truth};
 use crate::query::{Cmp, MetaTest, Query};
 use crate::{NameIndex, Row, RunError, Stats};
-use crate::content::ReadAtom;
 
 /// The default bound on uncovered documents a query verifies rather than
 /// refusing (docs/S2.md § Coverage): a judgement, not a measurement.
@@ -94,8 +95,14 @@ pub struct AtomReport {
 pub struct ContentReport {
     pub driver: Side,
     pub bounds: Bounds,
+    pub plan: ContentPlan,
     /// Documents left Maybe by the snapshot before verification.
     pub snapshot_maybe: u64,
+    pub snapshot_possible: u64,
+    /// Reader plus engine time for bracketed Maybe verification.
+    pub verification_time: Duration,
+    /// Time in regex engines, excluding reading and text matching.
+    pub regex_time: Duration,
     /// In the order the atoms appear in the query.
     pub atoms: Vec<AtomReport>,
     pub uncovered: u32,
@@ -124,14 +131,15 @@ impl ContentReport {
             .map(|a| format!("{} {:?}", a.estimate, a.certainty))
             .collect();
         format!(
-            "{:?} drives; atoms [{}]; uncovered {} of {}; documents {}; verified {} ({} changed)",
+            "{:?} drives; atoms [{}]; uncovered {} of {}; documents {}; verified {} ({} changed); {}",
             self.driver,
             atoms.join(", "),
             self.uncovered,
             self.live,
             self.documents,
             self.verified,
-            self.changed
+            self.changed,
+            self.plan.describe()
         )
     }
 }
@@ -279,7 +287,7 @@ impl Query {
             return Err(RunError::IndexIncomplete { uncovered, live });
         }
         let atoms = self
-            .texts
+            .atoms
             .iter()
             .map(|text| {
                 if stopped() {
@@ -290,9 +298,13 @@ impl Query {
             .collect::<Result<Vec<_>, _>>()
             .map_err(RunError::Index)?;
 
-        let bounds = self.content_bounds(catalog, index, pinned, &atoms)?;
+        let plan = self.plan_from_estimates(catalog, index, pinned, &atoms, &stopped)?;
+        let bounds = plan.root;
         if content.bound.is_some() && bounds.maybe > u64::from(live) / 4 {
-            return Err(RunError::ScanRequired { maybe: bounds.maybe, live });
+            return Err(RunError::ScanRequired {
+                maybe: bounds.maybe,
+                live,
+            });
         }
 
         // The cheapest content conjunct that no document-less row holds.
@@ -314,10 +326,18 @@ impl Query {
             None => Side::Names,
         };
 
+        let mut grep_plans = plan.greps.iter();
         let read_atoms = self
-            .texts
+            .atoms
             .iter()
-            .map(|text| text.read_until(pinned, &stopped))
+            .map(|atom| {
+                let grep_plan = if matches!(atom, crate::ContentAtom::Grep(_)) {
+                    grep_plans.next()
+                } else {
+                    None
+                };
+                atom.read_until(pinned, &stopped, grep_plan)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(RunError::Index)?;
         catalog.load(&[Section::Doc])?;
@@ -401,10 +421,14 @@ impl Query {
         let mut report = ContentReport {
             driver: side,
             bounds,
+            plan,
             snapshot_maybe: 0,
+            snapshot_possible: 0,
+            verification_time: Duration::ZERO,
+            regex_time: Duration::ZERO,
             atoms: atoms
                 .iter()
-                .map(|&(estimate, certainty)| AtomReport {
+                .map(|&(estimate, certainty, _)| AtomReport {
                     estimate,
                     certainty,
                 })
@@ -421,7 +445,9 @@ impl Query {
         let mut bytes = Vec::new();
         // Only content facts established by a bracketed catalog-version read.
         // Path failures never enter this map; every path has its own stat.
-        let mut exact: HashMap<u32, Vec<bool>> = HashMap::new();
+        let mut exact: HashMap<u32, Vec<Option<usize>>> = HashMap::new();
+        let mut maybe_docs = HashSet::new();
+        let mut possible_docs = HashSet::new();
         let mut rows = 0;
         let mut stats = self.s1_ids(catalog, &ids, cancelled, |row| {
             let doc = catalog.doc(row.inode).map(|d| d.0);
@@ -435,7 +461,15 @@ impl Query {
                 Test::Content(i) => indexed(*i),
                 other => self.test_row(catalog, row, other),
             });
-            if truth == Truth::Maybe { report.snapshot_maybe += 1; }
+            if let Some(doc) = doc {
+                if truth != Truth::No {
+                    possible_docs.insert(doc);
+                }
+                if truth == Truth::Maybe {
+                    maybe_docs.insert(doc);
+                }
+            }
+            let mut offset = None;
             if truth == Truth::Maybe
                 && let Some(doc) = doc
             {
@@ -455,25 +489,36 @@ impl Query {
                 let answers = if reusable {
                     &exact[&doc]
                 } else {
+                    let verification_start = Instant::now();
                     report.verified += 1;
                     let Some(version) = read(row.name, ReadRequest::Bytes(&mut bytes)) else {
+                        report.verification_time += verification_start.elapsed();
                         report.changed += 1;
                         return ControlFlow::Continue(());
                     };
-                    let answers: Option<Vec<bool>> = self
-                        .texts
+                    let answers: Option<Vec<Option<usize>>> = self
+                        .atoms
                         .iter()
                         .map(|text| {
                             if stopped() {
                                 return None;
                             }
-                            let answer = text.is_match(&mut matcher, &bytes);
+                            let engine_start = Instant::now();
+                            let answer = text.find(&mut matcher, &bytes);
+                            if matches!(text, crate::ContentAtom::Grep(_)) {
+                                report.regex_time += engine_start.elapsed();
+                                report.matching.regex_documents += 1;
+                                report.matching.regex_bytes += bytes.len() as u64;
+                                report.matching.regex_rejected += u64::from(answer.is_none());
+                            }
                             (!stopped()).then_some(answer)
                         })
                         .collect();
                     let Some(answers) = answers else {
+                        report.verification_time += verification_start.elapsed();
                         return ControlFlow::Break(());
                     };
+                    report.verification_time += verification_start.elapsed();
                     match version {
                         ReadVersion::Catalogued => exact.entry(doc).or_insert(answers),
                         ReadVersion::Current => {
@@ -483,8 +528,19 @@ impl Query {
                         }
                     }
                 };
+                offset = answers
+                    .iter()
+                    .zip(&self.atoms)
+                    .filter_map(|(answer, atom)| {
+                        if matches!(atom, crate::ContentAtom::Grep(_)) {
+                            *answer
+                        } else {
+                            None
+                        }
+                    })
+                    .min();
                 truth = self.eval_residual(&mut |test| match test {
-                    Test::Content(i) => answers[*i].into(),
+                    Test::Content(i) => answers[*i].is_some().into(),
                     other => self.test_row(catalog, row, other),
                 });
             }
@@ -492,10 +548,17 @@ impl Query {
                 return ControlFlow::Continue(());
             }
             rows += 1;
-            emit(row)
+            let row = Row { offset, ..*row };
+            emit(&row)
         })?;
         stats.rows = rows;
-        report.matching = matcher.stats();
+        report.snapshot_maybe = maybe_docs.len() as u64;
+        report.snapshot_possible = possible_docs.len() as u64;
+        let text_stats = matcher.stats();
+        report.matching.documents = text_stats.documents;
+        report.matching.rejected = text_stats.rejected;
+        report.matching.whole = text_stats.whole;
+        report.matching.tokenized = text_stats.tokenized;
         stats.content = Some(report);
         Ok(stats)
     }
@@ -584,7 +647,7 @@ impl Query {
 /// An upper bound on the documents a content-only tree can yield, from the
 /// atoms' estimates: an AND by its smallest positive child, an OR by its
 /// sum, a NOT by every live document.
-fn estimate(tree: &Node<Test>, atoms: &[(u64, Certainty)], live: u64) -> u64 {
+fn estimate(tree: &Node<Test>, atoms: &[(u64, Certainty, u64)], live: u64) -> u64 {
     match tree {
         Node::Leaf(Test::Content(i)) => atoms[*i].0,
         Node::Leaf(_) | Node::Not(_) => live,
@@ -667,41 +730,182 @@ pub struct Bounds {
 impl Bounds {
     fn and(self, other: Self) -> Self {
         let possible = self.possible.min(other.possible);
-        Self { possible, maybe: possible.min(self.maybe.saturating_add(other.maybe)) }
+        Self {
+            possible,
+            maybe: possible.min(self.maybe.saturating_add(other.maybe)),
+        }
     }
 }
 
 impl Query {
-    fn content_bounds(&self, catalog: &Catalog, index: &NameIndex, pinned: &Pinned<'_>, atoms: &[(u64, Certainty)]) -> Result<Bounds, RunError> {
-        fn node(tree: &Node<Test>, catalog: &Catalog, index: &NameIndex, atoms: &[(u64, Certainty)], live: u64, uncovered: u64) -> Result<Bounds, RunError> {
-            Ok(match tree {
+    /// Explains the dictionary-only plan, including refused expressions.
+    /// No postings are read. Execution records candidate counts separately.
+    pub fn explain_content(
+        &self,
+        catalog: &Catalog,
+        index: &NameIndex,
+        pinned: &Pinned<'_>,
+    ) -> Result<ContentPlan, RunError> {
+        let atoms = self
+            .atoms
+            .iter()
+            .map(|atom| atom.estimate_until(pinned, &|| false))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RunError::Index)?;
+        self.plan_from_estimates(catalog, index, pinned, &atoms, &|| false)
+    }
+
+    fn plan_from_estimates(
+        &self,
+        catalog: &Catalog,
+        index: &NameIndex,
+        pinned: &Pinned<'_>,
+        atoms: &[(u64, Certainty, u64)],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ContentPlan, RunError> {
+        fn node(
+            tree: &Node<Test>,
+            catalog: &Catalog,
+            index: &NameIndex,
+            atoms: &[(u64, Certainty, u64)],
+            live: u64,
+            reports: &mut Vec<NodeReport>,
+        ) -> Result<Bounds, RunError> {
+            let bounds = match tree {
                 Node::Leaf(Test::Content(i)) => {
                     let possible = atoms[*i].0.min(live);
-                    Bounds { possible, maybe: if atoms[*i].1 == Certainty::Yes { uncovered.min(possible) } else { possible } }
+                    Bounds {
+                        possible,
+                        maybe: atoms[*i].2.min(possible),
+                    }
                 }
-                Node::Leaf(Test::Name(test)) => Bounds { possible: index.select(catalog, None, &[], |name| test.matches(name)).map_err(RunError::Stale)?.estimate.hits.min(live), maybe: 0 },
-                Node::Leaf(_) => Bounds { possible: live, maybe: 0 },
-                Node::Not(inner) => Bounds { possible: live, maybe: node(inner, catalog, index, atoms, live, uncovered)?.maybe },
+                Node::Leaf(Test::Name(test)) => Bounds {
+                    possible: index
+                        .select(catalog, None, &[], |name| test.matches(name))
+                        .map_err(RunError::Stale)?
+                        .estimate
+                        .hits
+                        .min(live),
+                    maybe: 0,
+                },
+                Node::Leaf(_) => Bounds {
+                    possible: live,
+                    maybe: 0,
+                },
+                Node::Not(inner) => Bounds {
+                    possible: live,
+                    maybe: node(inner, catalog, index, atoms, live, reports)?.maybe,
+                },
                 Node::And(all) => {
-                    let mut bounds = Bounds { possible: live, maybe: 0 };
-                    for child in all { bounds = bounds.and(node(child, catalog, index, atoms, live, uncovered)?); }
+                    let mut bounds = Bounds {
+                        possible: live,
+                        maybe: 0,
+                    };
+                    for child in all {
+                        bounds = bounds.and(node(child, catalog, index, atoms, live, reports)?);
+                    }
                     bounds
                 }
                 Node::Or(any) => {
-                    let mut bounds = Bounds { possible: 0, maybe: 0 };
+                    let mut bounds = Bounds {
+                        possible: 0,
+                        maybe: 0,
+                    };
                     for child in any {
-                        let b = node(child, catalog, index, atoms, live, uncovered)?;
+                        let b = node(child, catalog, index, atoms, live, reports)?;
                         bounds.possible = bounds.possible.saturating_add(b.possible).min(live);
                         bounds.maybe = bounds.maybe.saturating_add(b.maybe).min(live);
                     }
                     bounds
                 }
-            })
+            };
+            reports.push(NodeReport {
+                bounds,
+                expression: tree.describe(&|test| match test {
+                    Test::Content(i) => format!("content[{i}]"),
+                    Test::Name(_) => "name".into(),
+                    Test::Path(_) => "path".into(),
+                    Test::Meta(_) => "metadata".into(),
+                }),
+            });
+            Ok(bounds)
         }
         let live = u64::from(pinned.live().len());
-        let uncovered = u64::from(pinned.uncovered().len());
-        let mut bounds = Bounds { possible: self.name_estimate(catalog, index)?.min(live), maybe: 0 };
-        for tree in &self.residual { bounds = bounds.and(node(tree, catalog, index, atoms, live, uncovered)?); }
-        Ok(bounds)
+        let mut reports = Vec::new();
+        for test in &self.names {
+            reports.push(NodeReport {
+                expression: "name".into(),
+                bounds: Bounds {
+                    possible: index
+                        .select(catalog, None, &[], |name| test.matches(name))
+                        .map_err(RunError::Stale)?
+                        .estimate
+                        .hits
+                        .min(live),
+                    maybe: 0,
+                },
+            });
+        }
+        for _ in &self.paths {
+            reports.push(NodeReport {
+                expression: "path".into(),
+                bounds: Bounds {
+                    possible: live,
+                    maybe: 0,
+                },
+            });
+        }
+        for _ in &self.meta {
+            reports.push(NodeReport {
+                expression: "metadata".into(),
+                bounds: Bounds {
+                    possible: live,
+                    maybe: 0,
+                },
+            });
+        }
+        let mut bounds = Bounds {
+            possible: self.name_estimate(catalog, index)?.min(live),
+            maybe: 0,
+        };
+        for tree in &self.residual {
+            bounds = bounds.and(node(tree, catalog, index, atoms, live, &mut reports)?);
+        }
+        let mut greps = Vec::new();
+        for atom in &self.atoms {
+            if let crate::ContentAtom::Grep(grep) = atom {
+                greps.push(crate::grep::explain(grep, pinned, cancelled).map_err(RunError::Index)?);
+            }
+        }
+        Ok(ContentPlan {
+            root: bounds,
+            nodes: reports,
+            greps,
+        })
+    }
+}
+
+/// One expression node's P/M bounds, in postorder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeReport {
+    pub expression: String,
+    pub bounds: Bounds,
+}
+
+/// The pre-read content plan, available even when execution refuses a scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentPlan {
+    pub root: Bounds,
+    pub nodes: Vec<NodeReport>,
+    pub greps: Vec<crate::grep::GrepReport>,
+}
+
+impl ContentPlan {
+    /// Includes every node, derived tree, selected keys and dictionary df.
+    pub fn describe(&self) -> String {
+        format!(
+            "P={} M={}; nodes {:?}; regex plans {:?}",
+            self.root.possible, self.root.maybe, self.nodes, self.greps
+        )
     }
 }

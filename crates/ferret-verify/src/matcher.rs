@@ -35,6 +35,11 @@ impl Regex {
         Regex::build(regex::bytes::RegexBuilder::new(pattern).case_insensitive(fold))
     }
 
+    /// The pattern that compiled into this matcher.
+    pub fn pattern(&self) -> &str {
+        self.0.as_str()
+    }
+
     /// Byte span of the first match, over the whole supplied document.
     pub fn find(&self, bytes: &[u8]) -> Option<std::ops::Range<usize>> {
         self.0.find(bytes).map(|m| m.range())

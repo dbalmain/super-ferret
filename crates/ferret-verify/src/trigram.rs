@@ -124,8 +124,17 @@ impl GrepFlags {
     /// [`GrepError::Derivation`]: a bug, never a silent [`Trigrams::All`].
     pub fn compile(&self, pattern: &str) -> Result<Grep, GrepError> {
         let regex = Regex::build(&self.regex(pattern)).map_err(GrepError::Pattern)?;
-        let trigrams = self.derive(pattern, &LIMITS, &mut Trims::default())?;
-        Ok(Grep { regex, trigrams })
+        let limits = Limits {
+            keys: usize::MAX,
+            ..LIMITS
+        };
+        let planning = self.derive(pattern, &limits, &mut Trims::default())?;
+        let trigrams = cap_keys(planning.clone(), LIMITS.keys, &mut Trims::default());
+        Ok(Grep {
+            regex,
+            trigrams,
+            planning,
+        })
     }
 
     fn derive(
@@ -148,6 +157,7 @@ impl GrepFlags {
 pub struct Grep {
     regex: Regex,
     trigrams: Trigrams,
+    planning: Trigrams,
 }
 
 impl crate::Matcher for Grep {
@@ -165,6 +175,30 @@ impl Grep {
     /// The verifier: the only judge of a match.
     pub fn regex(&self) -> &Regex {
         &self.regex
+    }
+
+    /// Original pattern, for query construction without exposing engine types.
+    pub fn pattern(&self) -> &str {
+        self.regex.pattern()
+    }
+
+    /// The uncapped derivation, so a planner can rank keys before weakening.
+    pub fn planning_trigrams(&self) -> &Trigrams {
+        &self.planning
+    }
+
+    /// Applies the 64-key cap using dictionary frequencies; common bare keys
+    /// are discarded first. Alternatives are weakened, never deleted.
+    pub fn trigrams_by_frequency(
+        &self,
+        frequencies: &std::collections::BTreeMap<[u8; 3], u64>,
+    ) -> Trigrams {
+        if self.planning.keys().len() <= LIMITS.keys {
+            return self.planning.clone();
+        }
+        self.planning.clone().fit_by(LIMITS.keys, &|key| {
+            frequencies.get(&key).copied().unwrap_or(u64::MAX)
+        })
     }
 
     /// What every match contains.
@@ -286,17 +320,21 @@ impl Trigrams {
     /// share; a share of zero makes that alternative, and so the `Or`, `All`.
     /// An alternative is never deleted.
     fn fit(self, budget: usize) -> Trigrams {
+        self.fit_by(budget, &|_| 0)
+    }
+
+    fn fit_by(self, budget: usize, frequency: &dyn Fn([u8; 3]) -> u64) -> Trigrams {
         match self {
             Trigrams::Key(_) if budget == 0 => Trigrams::All,
             Trigrams::And(mut parts) => {
                 parts.sort_by_cached_key(|p| match p {
-                    Trigrams::Key(key) => (0, std::cmp::Reverse(*key), 0),
-                    other => (1, std::cmp::Reverse([0; 3]), other.weight()),
+                    Trigrams::Key(key) => (0, frequency(*key), std::cmp::Reverse(*key), 0),
+                    other => (1, 0, std::cmp::Reverse([0; 3]), other.weight()),
                 });
                 let mut left = budget;
                 let mut kept = Vec::new();
                 for part in parts {
-                    let part = part.fit(left);
+                    let part = part.fit_by(left, frequency);
                     left -= part.weight();
                     kept.push(part);
                 }
@@ -304,7 +342,7 @@ impl Trigrams {
             }
             Trigrams::Or(parts) => {
                 let share = budget / parts.len();
-                Trigrams::or(parts.into_iter().map(|p| p.fit(share)))
+                Trigrams::or(parts.into_iter().map(|p| p.fit_by(share, frequency)))
             }
             other if other.weight() <= budget => other,
             _ => Trigrams::All,

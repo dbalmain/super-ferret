@@ -19,11 +19,11 @@
 //! Reading and building are two steps because cursors borrow what was read:
 //! [`TextAtom::read`] does the I/O, [`TextAtom::cursor`] none.
 
+use crate::GrepAtom;
 use ferret_index::{Atom, Candidates, Certainty, Cursor, Pinned, ReadError};
 use ferret_text::{cap, exact_under_cap};
-use crate::GrepAtom;
 
-use ferret_verify::{Grep, Matcher, Text, TextMatcher};
+use ferret_verify::{Grep, Text, TextMatcher};
 
 /// A `text:ARG` atom with every term it needs read from the index.
 #[derive(Debug)]
@@ -89,10 +89,20 @@ impl TextAtom {
         pinned: &Pinned<'_>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(u64, Certainty), ReadError> {
+        let (docs, certainty, _) = Self::bounds_until(text, pinned, cancelled)?;
+        Ok((docs, certainty))
+    }
+
+    pub(crate) fn bounds_until(
+        text: &Text,
+        pinned: &Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(u64, Certainty, u64), ReadError> {
         if cancelled() {
             return Err(ReadError::Cancelled);
         }
         let mut sources_exact = true;
+        let mut fingerprints = 0;
         let mut df = |term: &[u8]| -> Result<u64, ReadError> {
             if cancelled() {
                 return Err(ReadError::Cancelled);
@@ -100,9 +110,12 @@ impl TextAtom {
             for source in pinned.sources() {
                 if let Some(found) = source.estimate_until(&Atom::Term(cap(term)), cancelled)? {
                     sources_exact &= found.exact;
+                    fingerprints += found.maybe_docs;
                     return Ok(found.docs);
                 }
             }
+            fingerprints += u64::from(pinned.live().len());
+            sources_exact = false;
             Ok(u64::from(pinned.live().len()))
         };
         let whole = text.whole().map(&mut df).transpose()?;
@@ -118,7 +131,8 @@ impl TextAtom {
             least
         };
         let docs = whole.unwrap_or(0) + units.unwrap_or(0);
-        let exact = sources_exact && term_only
+        let exact = sources_exact
+            && term_only
             && pinned.sources().next().is_some()
             && text
                 .whole()
@@ -128,7 +142,17 @@ impl TextAtom {
         } else {
             Certainty::Maybe
         };
-        Ok((docs + u64::from(pinned.uncovered().len()), certainty))
+        let possible = docs.saturating_add(u64::from(pinned.uncovered().len()));
+        let maybe = if term_only
+            && text
+                .whole()
+                .is_some_and(|w| !text.is_case_sensitive() && exact_under_cap(w))
+        {
+            fingerprints + u64::from(pinned.uncovered().len())
+        } else {
+            possible
+        };
+        Ok((possible, certainty, maybe))
     }
 
     /// What the verifier checks a Maybe document against.
@@ -187,35 +211,56 @@ pub enum ContentAtom {
 }
 
 impl ContentAtom {
-    pub(crate) fn estimate_until(&self, pinned: &Pinned<'_>, cancelled: &dyn Fn() -> bool) -> Result<(u64, Certainty), ReadError> {
+    pub(crate) fn estimate_until(
+        &self,
+        pinned: &Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(u64, Certainty, u64), ReadError> {
         match self {
-            Self::Text(text) => TextAtom::estimate_until(text, pinned, cancelled),
-            Self::Grep(grep) => Ok((GrepAtom::estimate_until(grep, pinned, cancelled)?, Certainty::Maybe)),
+            Self::Text(text) => TextAtom::bounds_until(text, pinned, cancelled),
+            Self::Grep(grep) => {
+                let possible = GrepAtom::estimate_until(grep, pinned, cancelled)?;
+                Ok((possible, Certainty::Maybe, possible))
+            }
         }
     }
 
-    pub(crate) fn read_until(&self, pinned: &Pinned<'_>, cancelled: &dyn Fn() -> bool) -> Result<ReadAtom, ReadError> {
+    pub(crate) fn read_until(
+        &self,
+        pinned: &Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+        grep_plan: Option<&crate::GrepReport>,
+    ) -> Result<ReadAtom, ReadError> {
         match self {
-            Self::Text(text) => TextAtom::read_until(text.clone(), pinned, cancelled).map(ReadAtom::Text),
-            Self::Grep(grep) => GrepAtom::read_until(grep.clone(), pinned, cancelled).map(ReadAtom::Grep),
+            Self::Text(text) => TextAtom::read_until(text.clone(), pinned, cancelled)
+                .map(|atom| ReadAtom::Text(Box::new(atom))),
+            Self::Grep(grep) => match grep_plan {
+                Some(plan) => GrepAtom::read_selected_until(&plan.selected, pinned, cancelled)
+                    .map(ReadAtom::Grep),
+                None => GrepAtom::read_until(grep.clone(), pinned, cancelled).map(ReadAtom::Grep),
+            },
         }
     }
 
-    pub(crate) fn is_match(&self, matcher: &mut TextMatcher, bytes: &[u8]) -> bool {
+    pub(crate) fn find(&self, matcher: &mut TextMatcher, bytes: &[u8]) -> Option<usize> {
         match self {
-            Self::Text(text) => matcher.is_match(text, bytes),
-            Self::Grep(grep) => grep.is_match(bytes),
+            Self::Text(text) => matcher.find(text, bytes).map(|span| span.start),
+            Self::Grep(grep) => grep.find(bytes).map(|span| span.start),
         }
     }
 }
 
 pub(crate) enum ReadAtom {
-    Text(TextAtom),
+    Text(Box<TextAtom>),
     Grep(GrepAtom),
 }
 
 impl ReadAtom {
-    pub(crate) fn cursor_until<'a>(&'a self, pinned: &'a Pinned<'_>, cancelled: &dyn Fn() -> bool) -> Result<Cursor<'a>, ReadError> {
+    pub(crate) fn cursor_until<'a>(
+        &'a self,
+        pinned: &'a Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Cursor<'a>, ReadError> {
         match self {
             Self::Text(atom) => atom.cursor_until(pinned, cancelled),
             Self::Grep(atom) => atom.cursor_until(pinned, cancelled),

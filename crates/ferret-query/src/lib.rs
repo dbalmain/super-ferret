@@ -91,9 +91,9 @@
 //! document.
 
 mod content;
-mod grep;
 mod expr;
 pub mod find;
+mod grep;
 
 pub mod name_index;
 mod pattern;
@@ -105,11 +105,11 @@ mod run;
 mod tests;
 
 pub use content::{ContentAtom, TextAtom};
-pub use grep::GrepAtom;
+pub use grep::{GrepAtom, GrepReport};
 pub use name_index::{NameEstimate, NameIndex, NamePlan};
 pub use plan::{
-    AtomReport, Content, ContentReport, DocNames, ReadRequest, ReadVersion, Reader, Side,
-    UNCOVERED_BOUND,
+    AtomReport, Bounds, Content, ContentPlan, ContentReport, DocNames, NodeReport, ReadRequest,
+    ReadVersion, Reader, Side, UNCOVERED_BOUND,
 };
-pub use query::{ParseError, Query, Strategy};
+pub use query::{GREP_PREFIX, ParseError, Query, Strategy};
 pub use run::{Row, RunError, Stats};

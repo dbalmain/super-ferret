@@ -696,3 +696,328 @@ pub(crate) fn quantile(values: &mut [f64], q: f64) -> f64 {
     let rank = ((values.len() - 1) as f64 * q).round() as usize;
     values[rank]
 }
+
+/// S3 M5 through the real planner and verifier. Definitions remain in memory;
+/// output contains only class labels, counts, bytes and timings.
+pub(crate) fn run_regex(dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::Result<()> {
+    let catalog = crate::open_catalog(dir)?;
+    catalog.load_all()?;
+    let catalog = catalog.into_resident()?;
+    let snapshot = crate::content_snapshot::Snapshot::open(snapshot_dir, &catalog)?;
+    let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
+    let view = View::open(
+        index_dir,
+        &CatalogView {
+            incarnation: catalog.generation().incarnation,
+            live: &live,
+        },
+    )?
+    .ok_or("no paired index")?;
+    let names = NameIndex::new(&catalog);
+    let docs = DocNames::new(&catalog)?;
+    let pinned = Pinned::new(Some(&view), &live);
+    let [segment] = view.segments() else {
+        return Err("regex-query requires full merge".into());
+    };
+    let term_classes = crate::screen::term_classes(segment, PER_CLASS)?;
+    // The shared class generator takes owned segment handles; open a second
+    // read-only set rather than teaching it about the paired store.
+    let trigrams = view
+        .manifest()
+        .segments
+        .iter()
+        .map(|entry| {
+            ferret_index::segment::Segment::open(File::open(
+                index_dir.join(entry.trigram_file_name()),
+            )?)
+        })
+        .collect::<Result<Vec<_>, ferret_index::ReadError>>()?;
+    let classes = crate::screen::regex_classes(&term_classes, &trigrams, PER_CLASS)?;
+    let prefix = ferret_query::GREP_PREFIX;
+    let mut queries: Vec<(&str, Vec<Vec<String>>)> = classes
+        .into_iter()
+        .filter(|(class, _)| *class != "code class")
+        .map(|(class, greps)| {
+            (
+                class,
+                greps
+                    .into_iter()
+                    .map(|grep| {
+                        let mut args = vec![format!("{prefix}{}", grep.pattern())];
+                        if class == "broad" {
+                            args.insert(0, "ext:rs".to_owned());
+                        }
+                        args
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut refused = Vec::new();
+    let common = term_classes.common.first().ok_or("no common seed")?;
+    for i in 0..PER_CLASS {
+        refused.push(match i % 3 {
+            0 => vec![format!(r"{prefix}\d{{4}}-\d{{2}}")],
+            1 => vec![
+                "NOT".into(),
+                format!("{prefix}{}", String::from_utf8_lossy(common)),
+            ],
+            _ => vec!["NOT".into(), arg("text:", common), format!(r"{prefix}\d+")],
+        });
+    }
+    for (class, queries) in &mut queries {
+        if *class == "identifier pattern" {
+            *queries = regex_identifiers(&snapshot, &live)?
+                .into_iter()
+                .map(|pattern| vec![format!("{prefix}{pattern}")])
+                .collect();
+        }
+    }
+    queries.push(("refused", refused));
+    println!(
+        "regex_live={} readable={} uncovered={} paired_segments={}",
+        live.len(),
+        catalog
+            .docs()
+            .filter(|(d, _)| snapshot.contains(d.0))
+            .count(),
+        pinned.uncovered().len(),
+        view.segments().len()
+    );
+    println!(
+        "| class | n | refused | cold median/p90 ms | warm median/p90 ms | candidates median/p90 | verified B median/p90 | cold verification share median/p90 % | warm verification share median/p90 % | engine/verification median/p90 % | M over-estimates | M median/p90 | actual Maybe median/p90 |"
+    );
+    for (class, args) in queries {
+        let (
+            mut cold,
+            mut warm,
+            mut candidates,
+            mut bytes,
+            mut cold_share,
+            mut warm_share,
+            mut engine_share,
+            mut estimates,
+            mut actual,
+        ) = (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let (mut over, mut refusals) = (0, 0);
+        let mut p90_samples = Vec::new();
+        let mut refusal_ms = Vec::new();
+        for args in &args {
+            crate::trigram::check_disk()?;
+            let query = Query::from_args(args, std::time::SystemTime::now())?;
+            let refusal_start = Instant::now();
+            let checked = query.run_content(
+                &catalog,
+                &names,
+                &Content {
+                    pinned: &pinned,
+                    docs: &docs,
+                    bound: Some(ferret_query::UNCOVERED_BOUND),
+                },
+                &mut |_, _| None,
+                None,
+                |_| ControlFlow::Continue(()),
+            );
+            match checked {
+                Err(ferret_query::RunError::ScanRequired { .. }) => {
+                    refusals += 1;
+                    refusal_ms.push(ms(refusal_start.elapsed()));
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) => {}
+            }
+            let content = Content {
+                pinned: &pinned,
+                docs: &docs,
+                bound: None,
+            };
+            // Drive the real cursor/evaluator to discover Maybe read paths,
+            // then evict those files before the timed run. This pass never
+            // reads content and does not warm its bytes.
+            let mut evict_docs = std::collections::BTreeSet::new();
+            query.run_content(
+                &catalog,
+                &names,
+                &content,
+                &mut |name, request| {
+                    if matches!(request, ferret_query::ReadRequest::Bytes(_))
+                        && let Target::Inode(inode) = catalog.name(name).target()
+                        && let Some(doc) = catalog.doc(inode)
+                    {
+                        evict_docs.insert(doc.0);
+                    }
+                    None
+                },
+                None,
+                |_| ControlFlow::Continue(()),
+            )?;
+            for doc in evict_docs {
+                if let Ok(file) = File::open(snapshot.path(doc)) {
+                    rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)?;
+                }
+            }
+            for entry in fs::read_dir(index_dir)? {
+                let file = File::open(entry?.path())?;
+                rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)?;
+            }
+            let c = once(&catalog, &names, &content, &query, Some(&snapshot))?;
+            let w = once(&catalog, &names, &content, &query, Some(&snapshot))?;
+            if c.identities != w.identities {
+                return Err("cold/warm rows differ".into());
+            }
+            if w.report.bounds.maybe < w.report.snapshot_maybe {
+                return Err("M bound violated".into());
+            }
+            over += usize::from(w.report.bounds.maybe > w.report.snapshot_maybe);
+            p90_samples.push((
+                c.wall,
+                c.report.verification_time,
+                c.report.regex_time,
+                w.wall,
+                w.report.verification_time,
+                w.report.regex_time,
+            ));
+            cold.push(ms(c.wall));
+            warm.push(ms(w.wall));
+            candidates.push(w.report.documents as f64);
+            bytes.push(w.read_bytes as f64);
+            cold_share
+                .push(c.report.verification_time.as_secs_f64() / c.wall.as_secs_f64() * 100.0);
+            warm_share
+                .push(w.report.verification_time.as_secs_f64() / w.wall.as_secs_f64() * 100.0);
+            engine_share.push(if w.report.verification_time.is_zero() {
+                0.0
+            } else {
+                w.report.regex_time.as_secs_f64() / w.report.verification_time.as_secs_f64() * 100.0
+            });
+            estimates.push(w.report.bounds.maybe as f64);
+            actual.push(w.report.snapshot_maybe as f64);
+        }
+        if !p90_samples.is_empty() {
+            let at = ((p90_samples.len() as f64 * 0.9).ceil() as usize).saturating_sub(1);
+            p90_samples.sort_by_key(|sample| sample.0);
+            let c = p90_samples[at];
+            p90_samples.sort_by_key(|sample| sample.3);
+            let w = p90_samples[at];
+            let share = |part: Duration, whole: Duration| {
+                if whole.is_zero() {
+                    0.0
+                } else {
+                    part.as_secs_f64() / whole.as_secs_f64() * 100.0
+                }
+            };
+            println!(
+                "d17 class={class} cold_p90_verify_pct={:.2} cold_p90_engine_of_verify_pct={:.2} warm_p90_verify_pct={:.2} warm_p90_engine_of_verify_pct={:.2}",
+                share(c.1, c.0),
+                share(c.2, c.1),
+                share(w.4, w.3),
+                share(w.5, w.4)
+            );
+        }
+        if !refusal_ms.is_empty() {
+            println!(
+                "refusal class={class} median_ms={:.2} p90_ms={:.2}",
+                quantile(&mut refusal_ms, 0.5),
+                quantile(&mut refusal_ms, 0.9)
+            );
+        }
+        let pair = |values: &mut Vec<f64>| {
+            format!("{:.2}/{:.2}", quantile(values, 0.5), quantile(values, 0.9))
+        };
+        println!(
+            "| {class} | {} | {refusals} | {} | {} | {} | {} | {} | {} | {} | {over}/{} | {} | {} |",
+            args.len(),
+            pair(&mut cold),
+            pair(&mut warm),
+            pair(&mut candidates),
+            pair(&mut bytes),
+            pair(&mut cold_share),
+            pair(&mut warm_share),
+            pair(&mut engine_share),
+            args.len(),
+            pair(&mut estimates),
+            pair(&mut actual)
+        );
+    }
+    Ok(())
+}
+
+/// Real identifier runs, with two tokenizer parts and at least one byte
+/// between their chosen ends. The regex uses raw ASCII spans, not normalized
+/// term bytes: its meaning is a substring of the captured document.
+fn regex_identifiers(
+    snapshot: &crate::content_snapshot::Snapshot,
+    live: &DocSet,
+) -> crate::Result<Vec<String>> {
+    let ids: Vec<_> = live
+        .range(0, live.bound())
+        .filter(|&doc| snapshot.contains(doc))
+        .collect();
+    if ids.is_empty() {
+        return Err("no readable identifier population".into());
+    }
+    let mut rng = Rng(0x5eed_0505);
+    let mut reservoir = Reservoir::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut scratch = Scratch::default();
+    for attempt in 0..PER_CLASS * PHRASE_TRIES {
+        let bytes = fs::read(snapshot.path(ids[rng.below(ids.len() as u64) as usize]))?;
+        let mut runs: Vec<(std::ops::Range<usize>, Vec<std::ops::Range<usize>>)> = Vec::new();
+        tokenize(&bytes, &mut scratch, |token| match token.kind {
+            Kind::Whole => runs.push((token.run, Vec::new())),
+            Kind::Part => {
+                if let Some((_, parts)) = runs.last_mut() {
+                    parts.push(token.run);
+                }
+            }
+        });
+        for (run, parts) in runs {
+            if !(10..=40).contains(&run.len())
+                || !bytes[run.clone()]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                || parts.len() < 2
+            {
+                continue;
+            }
+            let (first, last) = (&parts[0], &parts[parts.len() - 1]);
+            if first.len() < 3 || last.len() < 3 {
+                continue;
+            }
+            let head = &bytes[first.start..(first.start + 4).min(first.end)];
+            let tail = &bytes[(last.end - 4.min(last.len()))..last.end];
+            if head.len() + tail.len() >= run.len() {
+                continue;
+            }
+            let pattern = format!(
+                r"{}\w+{}",
+                std::str::from_utf8(head)?,
+                std::str::from_utf8(tail)?
+            );
+            if seen.insert(pattern.clone()) {
+                reservoir.offer(&mut rng, pattern.as_bytes());
+            }
+        }
+        if attempt >= 99 && reservoir.items.len() == PER_CLASS {
+            break;
+        }
+    }
+    if reservoir.items.len() != PER_CLASS {
+        return Err("insufficient real identifier seeds".into());
+    }
+    reservoir
+        .items
+        .into_iter()
+        .map(|bytes| String::from_utf8(bytes).map_err(Into::into))
+        .collect()
+}
