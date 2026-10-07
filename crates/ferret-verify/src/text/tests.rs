@@ -417,12 +417,19 @@ fn windows_never_change_the_answer() {
         if !case {
             assert_eq!(found.is_some(), reference(&arg, &doc), "{arg:?} in {doc:?}");
         }
-        if found.is_some() { hits += 1 } else { misses += 1 }
+        if found.is_some() {
+            hits += 1
+        } else {
+            misses += 1
+        }
     }
     let stats = matcher.stats();
     assert!(hits > 1000 && misses > 1000, "{hits} hits, {misses} misses");
     // Every path was taken: rejected untokenized, windowed, and whole.
     assert!(stats.rejected > 1000, "{stats:?}");
     assert!(stats.whole > 1000, "{stats:?}");
-    assert!(stats.documents - stats.rejected - stats.whole > 1000, "{stats:?}");
+    assert!(
+        stats.documents - stats.rejected - stats.whole > 1000,
+        "{stats:?}"
+    );
 }

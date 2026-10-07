@@ -31,42 +31,41 @@
 //! Its answer is exactly [`TextMatcher::find`]'s over the whole document
 //! (tested against it), by this argument:
 //!
-//! 1. **Every match contains each unit's needle in its bytes.** A
-//!    `case:text:` needle is the unit's original bytes, which the matching
-//!    token's span equals. Otherwise the needle is the longest run of ASCII
-//!    bytes in the unit's lowercase, searched ASCII-case-insensitively.
-//!    Each character of a token's span lowercases on its own (Σ, the one
-//!    exception, lowercases to σ or ς either way), to at least one
-//!    character. An ASCII character lowercases to one ASCII byte, and no
-//!    non-ASCII character outside [`ASCII_FROM_NON_ASCII`] lowercases to
-//!    anything holding an ASCII byte. So in a document holding none of
-//!    those, a run of ASCII bytes in a token comes from a run of ASCII
-//!    characters in its span, equal up to ASCII case. A document holding
-//!    one is tokenized whole. A unit with no ASCII has no needle; an
-//!    argument whose units have none is verified by tokenizing whole.
-//!    A single-run argument's whole token holds every unit's needle too:
+//! 1. **Every match contains each unit's needle in its bytes.** A `case:text:`
+//!    needle is the unit's original bytes, which the matching token's span
+//!    equals. Otherwise the needle is the longest run of ASCII bytes in the
+//!    unit's lowercase, searched ASCII-case-insensitively. Each character of a
+//!    token's span lowercases on its own (Σ, the one exception, lowercases to σ
+//!    or ς either way), to at least one character. An ASCII character
+//!    lowercases to one ASCII byte, and no non-ASCII character outside
+//!    [`ASCII_FROM_NON_ASCII`] lowercases to anything holding an ASCII byte. So
+//!    in a document holding none of those, a run of ASCII bytes in a token
+//!    comes from a run of ASCII characters in its span, equal up to ASCII case.
+//!    A document holding one is tokenized whole. A unit with no ASCII has no
+//!    needle; an argument whose units have none is verified by tokenizing
+//!    whole. A single-run argument's whole token holds every unit's needle too:
 //!    its parts' lowercases differ from the slices of its whole only at Σ.
-//! 2. **A window holds every match touching its anchor.** A needle is
-//!    word bytes only (`[A-Za-z0-9_]` and non-ASCII), so an occurrence lies
-//!    inside one **segment**: a maximal stretch with no ASCII separator byte
-//!    (an ASCII byte outside `[A-Za-z0-9_]`). A match of `n` units spans at
-//!    most `n` runs, consecutive in the document, one of them in the
-//!    anchor's segment. So the window is the anchor's segment widened by
-//!    the `n - 1` nearest segments holding a run on each side, however much
-//!    separator lies between: whatever the gap, it is walked, not guessed.
-//! 3. **A window tokenizes as the document does.** Its edges are the
-//!    document's edges or sit next to an ASCII separator byte. An ASCII
-//!    byte always decodes as itself, so UTF-8 decoding resynchronises there,
-//!    no run crosses it, and Final_Sigma looks only within a run. The
-//!    window's units are therefore a contiguous stretch of the document's,
-//!    and a match the window holds is a match of the document.
+//! 2. **A window holds every match touching its anchor.** A needle is word
+//!    bytes only (`[A-Za-z0-9_]` and non-ASCII), so an occurrence lies inside
+//!    one **segment**: a maximal stretch with no ASCII separator byte (an ASCII
+//!    byte outside `[A-Za-z0-9_]`). A match of `n` units spans at most `n`
+//!    runs, consecutive in the document, one of them in the anchor's segment.
+//!    So the window is the anchor's segment widened by the `n - 1` nearest
+//!    segments holding a run on each side, however much separator lies between:
+//!    whatever the gap, it is walked, not guessed.
+//! 3. **A window tokenizes as the document does.** Its edges are the document's
+//!    edges or sit next to an ASCII separator byte. An ASCII byte always
+//!    decodes as itself, so UTF-8 decoding resynchronises there, no run crosses
+//!    it, and Final_Sigma looks only within a run. The window's units are
+//!    therefore a contiguous stretch of the document's, and a match the window
+//!    holds is a match of the document.
 //!
 //! Windows are tokenized in document order, merged where they overlap, and
 //! the walk stops at its first match, which is therefore the document's
 //! first.
 
 use std::ops::{ControlFlow, Range};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use ferret_text::{Kind, Scratch, Token, tokenize, tokenize_until};
 use regex::bytes::Regex;
@@ -78,7 +77,9 @@ use regex::bytes::Regex;
 pub(crate) const ASCII_FROM_NON_ASCII: [char; 2] = ['\u{130}', '\u{212A}'];
 
 /// Matches the UTF-8 encoding of any [`ASCII_FROM_NON_ASCII`] character.
-static UNSAFE: LazyLock<Regex> = LazyLock::new(|| {
+/// `None` only if the fixed pattern failed to compile, when every document
+/// counts as holding one: tokenizing whole is always sound.
+static UNSAFE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     let alternatives: Vec<String> = ASCII_FROM_NON_ASCII
         .iter()
         .map(|c| {
@@ -88,7 +89,7 @@ static UNSAFE: LazyLock<Regex> = LazyLock::new(|| {
                 .collect()
         })
         .collect();
-    Regex::new(&format!("(?-u){}", alternatives.join("|"))).expect("a fixed pattern")
+    Regex::new(&format!("(?-u){}", alternatives.join("|"))).ok()
 });
 
 /// A parsed `text:ARG`.
@@ -105,27 +106,27 @@ pub struct Text {
     ids: Vec<usize>,
     /// The Knuth–Morris–Pratt failure function over `ids`.
     fail: Vec<usize>,
-    /// The needles; `None` when some unit has none to offer as the anchor
-    /// (no ASCII, case-insensitive).
+    /// The needles; `None` when no unit has one (case-insensitive, no
+    /// ASCII), and the document is tokenized whole.
     needles: Option<Needles>,
 }
 
 /// Byte searches every match must satisfy (the module's point 1).
 #[derive(Clone, Debug)]
 struct Needles {
-    /// The longest needle: every occurrence is a window's anchor.
-    anchor: Regex,
-    /// The other units' needles: a document lacking one cannot match.
-    others: Vec<Regex>,
+    /// Regex patterns, the anchor first: the longest needle, every
+    /// occurrence of which anchors a window. A document lacking any of
+    /// the others cannot match.
+    patterns: Vec<String>,
+    /// `patterns`, compiled on first use, so a `Text` parsed and never
+    /// verified (the planner parses every atom) costs no compilation.
+    /// `None` if one failed to compile, and the document is tokenized whole.
+    compiled: OnceLock<Option<Vec<Regex>>>,
 }
 
-/// Compiled from the needles, so equal patterns are equal needles.
 impl PartialEq for Needles {
     fn eq(&self, other: &Self) -> bool {
-        fn patterns(n: &Needles) -> impl Iterator<Item = &str> {
-            std::iter::once(n.anchor.as_str()).chain(n.others.iter().map(Regex::as_str))
-        }
-        patterns(self).eq(patterns(other))
+        self.patterns == other.patterns
     }
 }
 
@@ -152,18 +153,33 @@ impl Needles {
                 needles.push(needle);
             }
         }
+        if needles.is_empty() {
+            return None;
+        }
         // Longest first: the anchor, likely the rarest.
         needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
-        let compile = |needle: &[u8]| {
-            let text = std::str::from_utf8(needle).expect("a token span is UTF-8");
-            let flags = if case { "" } else { "(?i-u)" };
-            Regex::new(&format!("{flags}{}", regex::escape(text))).expect("an escaped literal")
-        };
-        let (anchor, others) = needles.split_first()?;
+        let flags = if case { "" } else { "(?i-u)" };
+        let patterns = needles
+            .iter()
+            // A token span is UTF-8; were one not, the match would still
+            // be settled by tokenizing whole, so failing here is sound.
+            .map(|needle| {
+                std::str::from_utf8(needle).map(|text| format!("{flags}{}", regex::escape(text)))
+            })
+            .collect::<Result<_, _>>()
+            .ok()?;
         Some(Self {
-            anchor: compile(anchor),
-            others: others.iter().map(|n| compile(n)).collect(),
+            patterns,
+            compiled: OnceLock::new(),
         })
+    }
+
+    /// The anchor, then the others.
+    fn regexes(&self) -> Option<(&Regex, &[Regex])> {
+        self.compiled
+            .get_or_init(|| self.patterns.iter().map(|p| Regex::new(p).ok()).collect())
+            .as_deref()?
+            .split_first()
     }
 }
 
@@ -304,26 +320,29 @@ impl TextMatcher {
     /// Tokenizes only windows around needle occurrences (module docs).
     pub fn find(&mut self, text: &Text, doc: &[u8]) -> Option<Range<usize>> {
         self.stats.documents += 1;
-        let Some(needles) = &text.needles else {
+        let needles = text.needles.as_ref().and_then(Needles::regexes);
+        let Some((anchor, others)) = needles else {
             self.stats.whole += 1;
             return self.walk(text, doc, 0..doc.len());
         };
-        if !text.case && UNSAFE.is_match(doc) {
+        if !text.case && UNSAFE.as_ref().is_none_or(|unsafe_| unsafe_.is_match(doc)) {
             self.stats.whole += 1;
             return self.walk(text, doc, 0..doc.len());
         }
-        if needles.others.iter().any(|n| !n.is_match(doc)) {
+        if others.iter().any(|n| !n.is_match(doc)) {
             self.stats.rejected += 1;
             return None;
         }
         let margin = text.units.len() - 1;
         let (mut from, mut window): (usize, Option<Range<usize>>) = (0, None);
-        while let Some(hit) = needles.anchor.find_at(doc, from) {
+        while let Some(hit) = anchor.find_at(doc, from) {
             let segment = segment(doc, hit.start());
             from = segment.end;
             let next = widen(doc, segment, margin);
             match &mut window {
-                Some(current) if next.start <= current.end => current.end = current.end.max(next.end),
+                Some(current) if next.start <= current.end => {
+                    current.end = current.end.max(next.end)
+                }
                 _ => {
                     if let Some(done) = window.replace(next)
                         && let Some(found) = self.walk(text, doc, done)
@@ -389,15 +408,23 @@ fn separator(b: u8) -> bool {
 
 /// The segment holding `at`: the maximal range around it with no separator.
 fn segment(doc: &[u8], at: usize) -> Range<usize> {
-    let start = doc[..at].iter().rposition(|&b| separator(b)).map_or(0, |i| i + 1);
-    let end = doc[at..].iter().position(|&b| separator(b)).map_or(doc.len(), |i| at + i);
+    let start = doc[..at]
+        .iter()
+        .rposition(|&b| separator(b))
+        .map_or(0, |i| i + 1);
+    let end = doc[at..]
+        .iter()
+        .position(|&b| separator(b))
+        .map_or(doc.len(), |i| at + i);
     start..end
 }
 
 /// Whether a segment holds a run: a word byte, or an alphanumeric
 /// character. A segment decodes alone as it does in place (module point 3).
 fn holds_run(segment: &[u8]) -> bool {
-    segment.iter().any(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    segment
+        .iter()
+        .any(|&b| b.is_ascii_alphanumeric() || b == b'_')
         || segment
             .utf8_chunks()
             .any(|chunk| chunk.valid().chars().any(char::is_alphanumeric))
@@ -409,16 +436,28 @@ fn holds_run(segment: &[u8]) -> bool {
 fn widen(doc: &[u8], segment: Range<usize>, margin: usize) -> Range<usize> {
     let (mut start, mut need) = (segment.start, margin);
     while need > 0 && start > 0 {
-        let end = doc[..start].iter().rposition(|&b| !separator(b)).map_or(0, |i| i + 1);
-        start = doc[..end].iter().rposition(|&b| separator(b)).map_or(0, |i| i + 1);
+        let end = doc[..start]
+            .iter()
+            .rposition(|&b| !separator(b))
+            .map_or(0, |i| i + 1);
+        start = doc[..end]
+            .iter()
+            .rposition(|&b| separator(b))
+            .map_or(0, |i| i + 1);
         if start < end && holds_run(&doc[start..end]) {
             need -= 1;
         }
     }
     let (mut end, mut need) = (segment.end, margin);
     while need > 0 && end < doc.len() {
-        let start = doc[end..].iter().position(|&b| !separator(b)).map_or(doc.len(), |i| end + i);
-        end = doc[start..].iter().position(|&b| separator(b)).map_or(doc.len(), |i| start + i);
+        let start = doc[end..]
+            .iter()
+            .position(|&b| !separator(b))
+            .map_or(doc.len(), |i| end + i);
+        end = doc[start..]
+            .iter()
+            .position(|&b| separator(b))
+            .map_or(doc.len(), |i| start + i);
         if start < end && holds_run(&doc[start..end]) {
             need -= 1;
         }

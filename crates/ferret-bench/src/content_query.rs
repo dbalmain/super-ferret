@@ -244,7 +244,9 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
         ("rejected by byte search (documents)", |s| {
             s.report.matching.rejected as f64
         }),
-        ("tokenized whole (documents)", |s| s.report.matching.whole as f64),
+        ("tokenized whole (documents)", |s| {
+            s.report.matching.whole as f64
+        }),
         ("MiB tokenized", |s| {
             s.report.matching.tokenized as f64 / 1048576.0
         }),
