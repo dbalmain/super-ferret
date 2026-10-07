@@ -136,6 +136,14 @@ fn find_reports_the_span_of_the_match() {
 }
 
 #[test]
+fn a_pending_unit_match_precedes_the_next_whole_match() {
+    let text = Text::new(b"FooBar", false).unwrap();
+    let mut matcher = TextMatcher::new();
+    assert_eq!(matcher.find(&text, b"foo bar FooBar"), Some(0..7));
+    assert_eq!(matcher.find_whole(&text, b"foo bar FooBar"), Some(0..7));
+}
+
+#[test]
 fn an_argument_without_tokens_is_refused() {
     assert_eq!(Text::new(b"", false), None);
     assert_eq!(Text::new(b" -- ...", false), None);
@@ -187,6 +195,64 @@ fn reference(arg: &[u8], doc: &[u8]) -> bool {
     }
     let (want, have) = (units(&query), units(&document));
     have.windows(want.len()).any(|w| w == want.as_slice())
+}
+
+/// Independent earliest-span oracle: collect all tokens, form each run's
+/// units, then enumerate whole-token and adjacent-unit matches. No Walk,
+/// KMP state or window selection is shared with the matcher.
+fn earliest(arg: &[u8], doc: &[u8], case: bool) -> Option<Range<usize>> {
+    #[derive(Clone)]
+    struct Unit {
+        key: Vec<u8>,
+        span: Range<usize>,
+    }
+    let runs = |bytes: &[u8]| {
+        let mut runs: Vec<(Unit, Vec<Unit>)> = Vec::new();
+        tokenize(bytes, &mut Scratch::default(), |t| {
+            let unit = Unit {
+                key: if case {
+                    bytes[t.run.clone()].to_vec()
+                } else {
+                    t.bytes.to_vec()
+                },
+                span: t.run,
+            };
+            match t.kind {
+                Kind::Whole => runs.push((unit, Vec::new())),
+                Kind::Part => runs.last_mut().unwrap().1.push(unit),
+            }
+        });
+        runs
+    };
+    let units = |runs: &[(Unit, Vec<Unit>)]| -> Vec<Unit> {
+        runs.iter()
+            .flat_map(|(whole, parts)| {
+                if parts.is_empty() {
+                    vec![whole.clone()]
+                } else {
+                    parts.clone()
+                }
+            })
+            .collect()
+    };
+    let (query, document) = (runs(arg), runs(doc));
+    let mut spans = Vec::new();
+    if let [(whole, _)] = query.as_slice() {
+        for (run, parts) in &document {
+            for token in std::iter::once(run).chain(parts) {
+                if token.key == whole.key {
+                    spans.push(token.span.clone());
+                }
+            }
+        }
+    }
+    let (want, have) = (units(&query), units(&document));
+    for window in have.windows(want.len()) {
+        if window.iter().zip(&want).all(|(a, b)| a.key == b.key) {
+            spans.push(window[0].span.start..window[window.len() - 1].span.end);
+        }
+    }
+    spans.into_iter().min_by_key(|span| (span.start, span.end))
 }
 
 struct Rng(u64);
@@ -241,6 +307,11 @@ fn the_matcher_agrees_with_the_reference() {
             continue;
         };
         let expected = reference(arg.as_bytes(), doc.as_bytes());
+        assert_eq!(
+            matcher.find(&text, doc.as_bytes()),
+            earliest(arg.as_bytes(), doc.as_bytes(), false),
+            "{arg:?} in {doc:?}"
+        );
         assert_eq!(
             matcher.is_match(&text, doc.as_bytes()),
             expected,
@@ -414,6 +485,7 @@ fn windows_never_change_the_answer() {
             continue;
         };
         let found = agrees(&mut matcher, &text, &doc);
+        assert_eq!(found, earliest(&arg, &doc, case), "{arg:?} in {doc:?}");
         if !case {
             assert_eq!(found.is_some(), reference(&arg, &doc), "{arg:?} in {doc:?}");
         }

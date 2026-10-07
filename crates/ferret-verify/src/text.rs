@@ -382,6 +382,7 @@ impl TextMatcher {
             doc,
             starts: &mut self.starts,
             pending: None,
+            whole_match: None,
             matched: 0,
             fed: 0,
         };
@@ -473,6 +474,8 @@ struct Walk<'t, 'd, 's> {
     /// A whole run's unit, held until it is known whether parts follow; it
     /// is a unit only when none do.
     pending: Option<(Option<usize>, Range<usize>)>,
+    /// A whole-token match waiting for an earlier unit prefix to settle.
+    whole_match: Option<Range<usize>>,
     /// Units of the argument matched so far, the KMP state.
     matched: usize,
     /// Document units fed so far.
@@ -482,14 +485,19 @@ struct Walk<'t, 'd, 's> {
 impl Walk<'_, '_, '_> {
     /// Breaks with the match's span when `token` completes one.
     fn token(&mut self, token: &Token<'_>) -> ControlFlow<Range<usize>> {
+        if token.kind == Kind::Whole {
+            self.flush()?;
+        }
         if let Some(whole) = &self.text.whole
             && self.text.is(whole, self.doc, token)
         {
-            return ControlFlow::Break(token.run.clone());
+            if self.matched == 0 {
+                return ControlFlow::Break(token.run.clone());
+            }
+            self.whole_match = Some(token.run.clone());
         }
         match token.kind {
             Kind::Whole => {
-                self.flush()?;
                 self.pending = Some((self.text.id(self.doc, token), token.run.clone()));
                 ControlFlow::Continue(())
             }
@@ -515,7 +523,10 @@ impl Walk<'_, '_, '_> {
         self.fed += 1;
         let Some(id) = id else {
             self.matched = 0;
-            return ControlFlow::Continue(());
+            return self
+                .whole_match
+                .take()
+                .map_or(ControlFlow::Continue(()), ControlFlow::Break);
         };
         while self.matched > 0 && ids[self.matched] != id {
             self.matched = fail[self.matched - 1];
@@ -524,7 +535,21 @@ impl Walk<'_, '_, '_> {
             self.matched += 1;
         }
         if self.matched == width {
-            return ControlFlow::Break(self.starts[(self.fed - width) % width]..run.end);
+            let units = self.starts[(self.fed - width) % width]..run.end;
+            let first = self.whole_match.take().map_or(units.clone(), |whole| {
+                if (whole.start, whole.end) < (units.start, units.end) {
+                    whole
+                } else {
+                    units
+                }
+            });
+            return ControlFlow::Break(first);
+        }
+        if self.whole_match.as_ref().is_some_and(|whole| {
+            self.matched == 0 || self.starts[(self.fed - self.matched) % width] >= whole.start
+        }) && let Some(whole) = self.whole_match.take()
+        {
+            return ControlFlow::Break(whole);
         }
         ControlFlow::Continue(())
     }
