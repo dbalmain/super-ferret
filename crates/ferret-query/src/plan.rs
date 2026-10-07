@@ -151,10 +151,11 @@ impl DocNames {
         }
     }
 
-    /// As [`DocNames::new`], asking `cancelled` before each allocation and
-    /// after every [`DocSet::CHECK_EVERY`] names of both passes: `Ok(None)`
-    /// once it answers true. A host that caches the result publishes it
-    /// only when this returns one.
+    /// As [`DocNames::new`], `Ok(None)` once `cancelled` answers true. It is
+    /// asked at entry, after loading, after every [`DocSet::CHECK_EVERY`]
+    /// names each name pass reads, every [`DocSet::CHECK_EVERY`] ids of the
+    /// prefix pass, and on each side of copying the offsets. A host that
+    /// caches the result publishes it only when this returns one.
     pub fn new_until(
         catalog: &Catalog,
         cancelled: impl Fn() -> bool,
@@ -173,7 +174,7 @@ impl DocNames {
         let each = |f: &mut dyn FnMut(usize, NameId)| {
             let names = catalog.name_reader().runs_from(NameId(0));
             for (seen, (id, name)) in names.enumerate() {
-                if (seen + 1) % DocSet::CHECK_EVERY == 0 && cancelled() {
+                if (seen + 1).is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
                     return false;
                 }
                 if let Target::Inode(inode) = name.target()
@@ -187,13 +188,22 @@ impl DocNames {
             }
             true
         };
-        if !each(&mut |doc, _| starts[doc + 1] += 1) || cancelled() {
+        if !each(&mut |doc, _| starts[doc + 1] += 1) {
             return Ok(None);
         }
         for d in 0..bound {
+            if d.is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
+                return Ok(None);
+            }
             starts[d + 1] += starts[d];
         }
+        if cancelled() {
+            return Ok(None);
+        }
         let mut fill = starts.clone();
+        if cancelled() {
+            return Ok(None);
+        }
         let mut names = vec![NameId(0); starts[bound] as usize];
         let filled = each(&mut |doc, id| {
             names[fill[doc] as usize] = id;

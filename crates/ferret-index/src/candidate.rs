@@ -172,7 +172,7 @@ impl<'a> Pinned<'a> {
     }
 
     /// As [`Pinned::new`], `None` once `cancelled` answers true while the
-    /// uncovered set is built (asked as [`DocSet::new_until`] asks it).
+    /// uncovered set is built (asked as [`DocSet::tail_until`] asks it).
     pub fn new_until(
         view: Option<&'a View>,
         live: &'a DocSet,

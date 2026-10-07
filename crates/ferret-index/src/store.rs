@@ -349,18 +349,15 @@ impl View {
     }
 
     /// As [`View::uncovered_set`], `None` once `cancelled` answers true
-    /// (asked as [`DocSet::new_until`] asks it).
+    /// (asked as [`DocSet::tail_until`] asks it).
     pub fn uncovered_set_until(
         &self,
         live: &DocSet,
         cancelled: impl Fn() -> bool,
     ) -> Option<DocSet> {
-        let unreadable = self.manifest.unreadable.iter().copied();
-        DocSet::new_until(
-            live.bound(),
-            unreadable
-                .filter(|&doc| live.contains(doc))
-                .chain(live.range(self.manifest.frontier, live.bound())),
+        live.tail_until(
+            self.manifest.frontier,
+            self.manifest.unreadable.iter().copied(),
             cancelled,
         )
     }

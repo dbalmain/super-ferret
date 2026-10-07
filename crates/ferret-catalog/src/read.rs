@@ -1601,6 +1601,48 @@ impl Catalog {
         base.chain(delta)
     }
 
+    /// Calls `f` with each live document id [`Catalog::docs`] yields, in its
+    /// order, asking `stop` before every base row and overlay record read,
+    /// dead and superseded ones included, so a caller can bound the work
+    /// between asks. False once `stop` answers true, the scan unfinished.
+    /// Needs [`Section::Docs`].
+    pub fn for_each_doc_until(
+        &self,
+        mut stop: impl FnMut() -> bool,
+        mut f: impl FnMut(DocId),
+    ) -> bool {
+        let ids = self.column(Column::DocId);
+        for row in 0..self.layout.docs {
+            if stop() {
+                return false;
+            }
+            let id = DocId(ids.sequence(row) as u32);
+            if self
+                .family_record(Family::Docs, overlay::DOC, id.0)
+                .is_none()
+            {
+                f(id);
+            }
+        }
+        if let Some(o) = &self.overlay {
+            let Some(records) = o
+                .projection(Family::Docs)
+                .records_until(overlay::DOC, &mut stop)
+            else {
+                return false;
+            };
+            for r in records {
+                if stop() {
+                    return false;
+                }
+                if let Record::DocPut { id, .. } = r {
+                    f(DocId(*id));
+                }
+            }
+        }
+        true
+    }
+
     /// A live document's hash; `None` if the id is dead or never assigned.
     /// Needs [`Section::Docs`]. Where the generation's ids have no holes, the
     /// row is the id less the first; otherwise a binary search.

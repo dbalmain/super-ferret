@@ -16,41 +16,74 @@ impl DocSet {
     /// above `bound` is ignored, so a caller cannot widen the set past the
     /// view it describes.
     pub fn new(bound: u32, docs: impl IntoIterator<Item = u32>) -> Self {
-        match Self::new_until(bound, docs, || false) {
-            Some(set) => set,
-            None => unreachable!("a build that is never cancelled completes"),
+        let mut set = Self::empty(bound);
+        for doc in docs {
+            set.insert(doc);
         }
+        set
     }
 
-    /// Ids a cancellable build reads between asks.
+    /// Ids a cancellable build reads or copies between asks.
     pub const CHECK_EVERY: usize = 4096;
 
-    /// As [`DocSet::new`], asking `cancelled` before allocating and after
-    /// every [`DocSet::CHECK_EVERY`] ids: `None` once it answers true. A
-    /// caller that caches the set publishes it only when this returns one.
-    pub fn new_until(
-        bound: u32,
-        docs: impl IntoIterator<Item = u32>,
-        cancelled: impl Fn() -> bool,
-    ) -> Option<Self> {
-        if cancelled() {
-            return None;
-        }
-        let mut set = Self {
+    /// No members, with room for ids below `bound`.
+    pub fn empty(bound: u32) -> Self {
+        Self {
             words: vec![0; (bound as usize).div_ceil(64)],
             bound,
             len: 0,
-        };
-        for (seen, doc) in docs.into_iter().enumerate() {
-            if (seen + 1) % Self::CHECK_EVERY == 0 && cancelled() {
+        }
+    }
+
+    /// Adds `doc`; an id at or above the bound is ignored, as in
+    /// [`DocSet::new`].
+    pub fn insert(&mut self, doc: u32) {
+        if doc < self.bound {
+            let (word, bit) = (doc as usize / 64, 1u64 << (doc % 64));
+            if self.words[word] & bit == 0 {
+                self.words[word] |= bit;
+                self.len += 1;
+            }
+        }
+    }
+
+    /// This set's members at or above `from`, and those of `extra` that
+    /// are members: a view's uncovered set, with the same bound. Asks
+    /// `cancelled` before allocating, after every [`DocSet::CHECK_EVERY`]
+    /// ids of bitmap copied, empty words included, and after every
+    /// [`DocSet::CHECK_EVERY`] ids of `extra` read, members or not: `None`
+    /// once it answers true.
+    pub fn tail_until(
+        &self,
+        from: u32,
+        extra: impl IntoIterator<Item = u32>,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Self> {
+        const WORDS: usize = DocSet::CHECK_EVERY / 64;
+        if cancelled() {
+            return None;
+        }
+        let mut set = Self::empty(self.bound);
+        let from = from.min(self.bound);
+        let first = from as usize / 64;
+        for (i, &word) in self.words.iter().enumerate().skip(first) {
+            if (i - first + 1).is_multiple_of(WORDS) && cancelled() {
                 return None;
             }
-            if doc < bound {
-                let (word, bit) = (doc as usize / 64, 1u64 << (doc % 64));
-                if set.words[word] & bit == 0 {
-                    set.words[word] |= bit;
-                    set.len += 1;
-                }
+            let word = if i == first {
+                word & (!0u64 << (from % 64))
+            } else {
+                word
+            };
+            set.words[i] = word;
+            set.len += word.count_ones();
+        }
+        for (seen, doc) in extra.into_iter().enumerate() {
+            if (seen + 1).is_multiple_of(Self::CHECK_EVERY) && cancelled() {
+                return None;
+            }
+            if self.contains(doc) {
+                set.insert(doc);
             }
         }
         Some(set)
@@ -161,5 +194,31 @@ mod tests {
             }
         }
         assert!(set.contains(64) && !set.contains(66) && !set.contains(300));
+    }
+
+    /// `tail_until` agrees with its definition: members at or above `from`,
+    /// plus `extra`'s members, at word edges and past the bound.
+    #[test]
+    fn tail_is_the_members_from_a_point_plus_the_extra_members() {
+        let docs = [0, 1, 63, 64, 65, 127, 128, 200, 255, 4200, 9000];
+        let set = DocSet::new(9001, docs);
+        let extra = [0, 2, 64, 300, 9000, 9001, 20000];
+        for from in [
+            0, 1, 63, 64, 65, 128, 129, 4096, 4200, 8999, 9000, 9001, 10000,
+        ] {
+            let expected = DocSet::new(
+                set.bound(),
+                docs.iter()
+                    .copied()
+                    .filter(|&d| d >= from)
+                    .chain(extra.iter().copied().filter(|&d| set.contains(d))),
+            );
+            assert_eq!(
+                set.tail_until(from, extra, || false),
+                Some(expected),
+                "{from}"
+            );
+        }
+        assert_eq!(set.tail_until(0, extra, || true), None);
     }
 }

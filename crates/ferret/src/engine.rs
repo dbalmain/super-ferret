@@ -363,14 +363,23 @@ pub fn live_documents(view: &Catalog) -> DocSet {
     DocSet::new(view.next_doc().0, view.docs().map(|(doc, _)| doc.0))
 }
 
-/// As [`live_documents`], `None` once `cancelled` answers true (asked as
-/// [`DocSet::new_until`] asks it).
+/// As [`live_documents`], `None` once `cancelled` answers true. It is asked
+/// before allocating and after every [`DocSet::CHECK_EVERY`] document rows
+/// and overlay records scanned, dead ones included.
 fn live_documents_until(view: &Catalog, cancelled: impl Fn() -> bool) -> Option<DocSet> {
-    DocSet::new_until(
-        view.next_doc().0,
-        view.docs().map(|(doc, _)| doc.0),
-        cancelled,
-    )
+    if cancelled() {
+        return None;
+    }
+    let mut live = DocSet::empty(view.next_doc().0);
+    let mut scanned = 0usize;
+    let finished = view.for_each_doc_until(
+        || {
+            scanned += 1;
+            scanned.is_multiple_of(DocSet::CHECK_EVERY) && cancelled()
+        },
+        |doc| live.insert(doc.0),
+    );
+    finished.then_some(live)
 }
 
 fn catalog_view<'a>(view: &Catalog, live: &'a DocSet) -> CatalogView<'a> {
