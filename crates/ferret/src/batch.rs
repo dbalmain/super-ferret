@@ -169,8 +169,10 @@ fn handle(
                     .is_none_or(|current| current.generation() != peek.generation())
                 && let Ok(Some(reloaded)) = Engine::open(path)
             {
-                reloaded.open_content(path).map_err(io::Error::other)?;
                 *engine = Some(reloaded);
+            }
+            if let (Some(path), Some(current)) = (next.as_deref(), engine.as_ref()) {
+                current.open_content(path).map_err(io::Error::other)?;
             }
             event(request, "reload", |o| {
                 if let Some(engine) = engine {

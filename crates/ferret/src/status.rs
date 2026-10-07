@@ -30,7 +30,7 @@ pub(crate) fn resources(o: &mut Object<'_>) {
 }
 
 pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
-    index_fields(o, session);
+    index_fields(o, Some(session));
     let catalog = session.catalog();
     let protected = catalog
         .dir_ids()
@@ -114,10 +114,12 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
             crate::stats::json_fields(&mut o, &session);
         }
     } else {
+        index_fields(&mut o, None);
         o.null("generation")
             .int("protected_scopes", 0)
             .int("opaque_directories", 0)
             .int("catalog_bytes", 0)
+            .int("index_resident_bytes", 0)
             .int("planner_bytes", 0)
             .int("name_postings_bytes", 0)
             .bool("fault_retained", false)
@@ -128,14 +130,16 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
     crate::cli::print("status", &out)
 }
 
-fn index_fields(o: &mut Object<'_>, session: &QuerySession) {
-    let live = session.live();
-    let view = session.content();
-    let uncovered = view.map_or(u64::from(live.len()), |v| {
-        v.uncovered_set(live).len().into()
-    });
+fn index_fields(o: &mut Object<'_>, session: Option<&QuerySession>) {
+    let live = session.map(QuerySession::live);
+    let live_count = live.map_or(0, |l| u64::from(l.len()));
+    let view = session.and_then(QuerySession::content);
+    let uncovered = match (view, live) {
+        (Some(view), Some(live)) => u64::from(view.uncovered_set(live).len()),
+        _ => live_count,
+    };
     o.object("index", |o| {
-        o.int("covered", u64::from(live.len()) - uncovered)
+        o.int("covered", live_count - uncovered)
             .int("uncovered", uncovered)
             .int(
                 "unreadable",
@@ -143,7 +147,7 @@ fn index_fields(o: &mut Object<'_>, session: &QuerySession) {
                     v.manifest()
                         .unreadable
                         .iter()
-                        .filter(|&&d| live.contains(d))
+                        .filter(|&&d| live.is_some_and(|l| l.contains(d)))
                         .count() as u64
                 }),
             )

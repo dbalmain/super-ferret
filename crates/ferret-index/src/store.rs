@@ -60,11 +60,11 @@ pub struct Budget<'a> {
     pub bytes: u64,
     /// Follow's postings buffer, [`BUFFER`] by default.
     pub buffer: usize,
-    /// Called with each index-file transfer's size before it happens: the
-    /// host's shared byte pacer for background work, a no-op for an explicit
-    /// `ferret index`. Document reads are paced by the host's callback.
     /// Cooperative pause checked between documents and merge terms.
     pub cancelled: &'a dyn Fn() -> bool,
+    /// Called before each bounded index-file transfer: the shared background
+    /// pacer, or a no-op for explicit commands. An error aborts the transfer.
+    /// Document reads are paced separately by the host's reader.
     pub pace: &'a dyn Fn(usize) -> io::Result<()>,
 }
 
@@ -153,8 +153,8 @@ pub struct Merged {
     pub segment: Option<SegmentEntry>,
 }
 
-/// Why an index operation failed. After any error the writer is poisoned:
-/// reopen it, which removes whatever the failed operation left behind.
+/// Why an index operation failed. Except for cooperative cancellation, an
+/// error poisons the writer: reopen to remove the failed operation's files.
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -414,14 +414,7 @@ impl IndexWriter {
             let Some(run) = writer.current.merge_run(catalog.live) else {
                 return Ok(None);
             };
-            match writer.merge_run(catalog, budget, run) {
-                Err(Error::Io(ref error) | Error::Segment(ReadError::Io(ref error)))
-                    if error.kind() == io::ErrorKind::Interrupted =>
-                {
-                    Err(Error::Cancelled)
-                }
-                result => result,
-            }
+            writer.merge_run(catalog, budget, run)
         })
     }
 
@@ -446,9 +439,22 @@ impl IndexWriter {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
-        let result = run(self);
+        let result = match run(self) {
+            Err(Error::Io(ref error) | Error::Segment(ReadError::Io(ref error)))
+                if matches!(
+                    error.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+                    Some(Error::Cancelled)
+                ) =>
+            {
+                Err(Error::Cancelled)
+            }
+            result => result,
+        };
         if matches!(result, Err(Error::Cancelled)) {
-            remove_unnamed(&self.dir, &self.current.manifest)?;
+            if let Err(error) = remove_unnamed(&self.dir, &self.current.manifest) {
+                self.poisoned = true;
+                return Err(error.into());
+            }
         } else {
             self.poisoned = result.is_err();
         }
@@ -573,6 +579,9 @@ impl IndexWriter {
         budget: &Budget,
         run: std::ops::Range<usize>,
     ) -> Result<Option<Merged>, Error> {
+        if (budget.cancelled)() {
+            return Err(Error::Cancelled);
+        }
         let mut manifest = self.current.manifest.clone();
         manifest.last_merge = Some(timestamp());
         manifest
@@ -610,7 +619,7 @@ impl IndexWriter {
         }
         let merge_pace = |bytes| {
             if (budget.cancelled)() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "merge paused"));
+                return Err(io::Error::new(io::ErrorKind::Interrupted, Error::Cancelled));
             }
             (budget.pace)(bytes)
         };
@@ -638,12 +647,7 @@ impl IndexWriter {
             let _ = fs::remove_file(&scratch);
             Ok(result?.total())
         });
-        let (entry, segment) = match result {
-            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::Interrupted => {
-                return Err(Error::Cancelled);
-            }
-            other => other?,
-        };
+        let (entry, segment) = result?;
 
         if (budget.cancelled)() {
             return Err(Error::Cancelled);

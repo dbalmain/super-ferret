@@ -88,11 +88,12 @@ def main():
                         connection.close()
                 assert time.monotonic() < deadline, "daemon startup timed out"
                 time.sleep(.01)
-            wire = connection.makefile("rwb", buffering=0)
+            wire = connection.makefile("rwb", buffering=65536)
             while json.loads(wire.readline())["state"] != "ready":
                 pass
             while True:
                 wire.write(b'{"id":"s","op":"status"}\n')
+                wire.flush()
                 status = json.loads(wire.readline())
                 if (status["last_complete_backstop"] is not None
                         and not status["writer_busy"] and status["index"]["uncovered"] == 0):
@@ -100,7 +101,7 @@ def main():
                 assert time.monotonic() < deadline, status
                 time.sleep(.01)
             local_env = dict(env, FERRET_NO_DAEMON="1")
-            batch = subprocess.Popen([BIN / "ferret-batch"], env=local_env,
+            batch = subprocess.Popen([BIN / "ferret", "batch"], env=local_env,
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
             result = {"files": 2000, "content_bytes": 2000 * 8192,

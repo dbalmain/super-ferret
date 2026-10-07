@@ -256,8 +256,12 @@ impl Engine {
             &catalog_view(pin.catalog(), pin.live()),
         )
         .map_err(Error::Content)?;
-        if let Some(view) = view {
-            self.select_content(Arc::new(view));
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.generation() == pin.generation() {
+            current.content = view.map(Arc::new);
         }
         Ok(())
     }

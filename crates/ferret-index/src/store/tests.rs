@@ -652,3 +652,66 @@ fn a_long_churn_stays_correct() {
         churn(150, seed);
     }
 }
+
+#[test]
+fn a_cooperatively_cancelled_merge_can_retry_without_reopening() {
+    let dir = Dir::new("cooperative-retry");
+    let catalog = Catalog::new(20, &[]);
+    let corpus = Corpus::new(42, 20);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+    let before = writer.view();
+    let paused = std::cell::Cell::new(false);
+    let pace = |_: usize| {
+        paused.set(true);
+        Ok(())
+    };
+    let cancelled = || paused.get();
+    let budget = Budget {
+        pace: &pace,
+        cancelled: &cancelled,
+        ..Budget::unbounded()
+    };
+    assert!(matches!(
+        writer.merge_all(&catalog.view(), &budget),
+        Err(Error::Cancelled)
+    ));
+    assert!(Arc::ptr_eq(&writer.view(), &before));
+    assert_eq!(dir.files(), named(&before));
+    assert!(
+        writer
+            .merge_all(&catalog.view(), &Budget::unbounded())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        answers(&writer.view(), &catalog),
+        rebuild("cooperative-retry", &catalog, &corpus)
+    );
+}
+
+#[test]
+fn an_interrupted_io_error_is_not_a_cooperative_pause() {
+    let dir = Dir::new("interrupted-io");
+    let catalog = Catalog::new(20, &[]);
+    let corpus = Corpus::new(42, 20);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+    let pace = |_: usize| {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "real I/O failure",
+        ))
+    };
+    let budget = Budget {
+        pace: &pace,
+        ..Budget::unbounded()
+    };
+    assert!(
+        matches!(writer.merge_all(&catalog.view(), &budget), Err(Error::Segment(ReadError::Io(error))) if error.kind() == io::ErrorKind::Interrupted)
+    );
+    assert!(matches!(
+        writer.merge_all(&catalog.view(), &Budget::unbounded()),
+        Err(Error::Poisoned)
+    ));
+}

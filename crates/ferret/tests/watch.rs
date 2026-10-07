@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
 const DAEMON: &str = env!("CARGO_BIN_EXE_ferretd");
-const CONTENT: [&str; 8] = [
+const CONTENT: [&str; 14] = [
     "text:original",
     "text:modified",
     "text:create",
@@ -23,6 +23,12 @@ const CONTENT: [&str; 8] = [
     "text:1",
     "NOT text:original",
     "text:absent OR text:modified",
+    "text:needle",
+    "text:unique7777",
+    "text:word",
+    "text:word17part3",
+    "text:word500part3",
+    "case:text:word500part3",
 ];
 type ContentAnswers = Vec<(Vec<Vec<u8>>, Vec<u8>, Option<i32>)>;
 
@@ -1434,4 +1440,50 @@ fn battery_pauses_follow_and_socket_incomplete_matches_local() {
     assert_eq!(number(&tree.status(), "covered"), 0);
     write(power.join("status"), "Charging");
     tree.converges();
+}
+
+#[test]
+fn covered_socket_content_rows_and_diagnostics_are_native_byte_identical() {
+    let mut tree = Tree::new();
+    write(tree.path("src/right/a.txt"), "alpha requestHandler");
+    write(tree.path("src/right/b.txt"), "beta request handler");
+    tree.success(tree.local(&["index", "src"]));
+    tree.start(&[]);
+    for args in [
+        vec!["search", "text:alpha"],
+        vec!["search", "text:request handler"],
+        vec!["search", "NOT", "text:alpha"],
+        vec!["search", "case:text:requestHandler"],
+        vec!["search", "text:missing"],
+        vec!["search", "text:alpha", "OR", "text:beta"],
+        vec!["--json", "search", "text:request handler"],
+        vec!["search", "--limit", "1", "text:request handler"],
+    ] {
+        let daemon = tree.run(&args);
+        let local = tree.local(&args);
+        assert_eq!(
+            (daemon.stdout, daemon.stderr, daemon.status.code()),
+            (local.stdout, local.stderr, local.status.code()),
+            "{args:?}"
+        );
+    }
+    let stats = tree.run(&["stats", "--json"]);
+    let status = tree.run(&["status", "--json"]);
+    for output in [stats, status] {
+        let json = String::from_utf8(output.stdout).unwrap_or_else(|e| panic!("JSON: {e}"));
+        assert!(json.contains("\"index\":{"), "{json}");
+        for field in [
+            "covered",
+            "uncovered",
+            "unreadable",
+            "segments",
+            "bytes",
+            "last_follow",
+            "last_merge",
+        ] {
+            assert!(json.contains(&format!("\"{field}\":")), "{json}");
+        }
+        assert_eq!(number(&json, "uncovered"), 0);
+        assert!(!json.contains("\"last_follow\":null"), "{json}");
+    }
 }
