@@ -22,7 +22,7 @@ use ferret_text::{Scratch, TOKENIZER_VERSION, TRIGRAM_VERSION, cap, tokenize};
 use crate::census::{HashedDoc, hashed_documents};
 use crate::segment_build::cpu_seconds;
 
-fn check_disk() -> crate::Result<()> {
+pub(crate) fn check_disk() -> crate::Result<()> {
     let output = Command::new("df")
         .args(["-B1", "--output=avail", "."])
         .output()?;

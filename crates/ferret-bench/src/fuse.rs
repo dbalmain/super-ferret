@@ -55,7 +55,8 @@ impl Shape {
         let segment_count = if segments <= 2 { 1 } else { segments - 2 };
         Self {
             segment_length_log2: length.trailing_zeros() as u8,
-            segment_count: u32::try_from(segment_count).expect("a document's keys fit u32 segments"),
+            // A document has far fewer than 2^32 × 4 keys.
+            segment_count: u32::try_from(segment_count).unwrap_or(u32::MAX),
         }
     }
 
@@ -183,7 +184,8 @@ impl Fuse {
     }
 
     /// Whether `key` may be in the set: always for a member, about 1/256 of
-    /// the time otherwise.
+    /// the time otherwise. The bench probes serialized filters by [`Header`].
+    #[cfg(test)]
     pub(crate) fn contains(&self, key: u64) -> bool {
         if self.is_empty() {
             return false;
@@ -195,6 +197,7 @@ impl Fuse {
 
     /// Serialized bytes: [`HEADER`] plus the fingerprints. An empty set
     /// serializes to nothing.
+    #[cfg(test)]
     pub(crate) fn serialized_len(&self) -> usize {
         if self.is_empty() {
             0
@@ -244,6 +247,7 @@ impl Header {
     }
 
     /// The fingerprint length the header implies.
+    #[cfg(test)]
     pub(crate) fn array_length(self) -> usize {
         self.shape.array_length()
     }

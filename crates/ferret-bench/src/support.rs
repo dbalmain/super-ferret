@@ -25,6 +25,11 @@ impl Fixture {
         Self { base }
     }
 
+    /// The catalog directory [`Fixture::commit`] writes.
+    pub(crate) fn catalog_dir(&self) -> PathBuf {
+        self.base.join("cat")
+    }
+
     /// A fresh output directory under the fixture.
     pub(crate) fn out(&self, name: &str) -> PathBuf {
         let path = self.base.join(name);

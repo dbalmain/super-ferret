@@ -14,6 +14,8 @@
 //! ferret-bench trigram-build <catalog-dir> <out-dir>  offline trigrams at M3 boundaries
 //! ferret-bench trigram-census <catalog-dir>  distinct-key histogram and D69 counts
 //! ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b  D70 paired buffers
+//! ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>  D68: fuse filters against postings
+//! ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>  D69: saturated large documents
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
@@ -64,6 +66,8 @@ mod content_query;
 mod corpus;
 mod fuse;
 mod index_build;
+mod saturation;
+mod screen;
 mod segment_build;
 mod terms;
 mod tokenize;
@@ -139,6 +143,22 @@ fn main() -> ExitCode {
                     )
                 })
             }
+            ("filter-screen", [dir, terms, tri, out]) => screen::run(
+                Path::new(dir),
+                Path::new(terms),
+                Path::new(tri),
+                Path::new(out),
+                &screen::CONFIG,
+            )
+            .map(drop),
+            ("saturation", [dir, terms, tri, out]) => saturation::run(
+                Path::new(dir),
+                Path::new(terms),
+                Path::new(tri),
+                Path::new(out),
+                &saturation::config(),
+            )
+            .map(drop),
             ("index-churn", [out, rounds]) => index_build::churn(Path::new(out), rounds),
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)
@@ -194,6 +214,8 @@ fn usage() -> ExitCode {
          ferret-bench trigram-build <catalog-dir> <out-dir>\n       \
          ferret-bench trigram-census <catalog-dir>\n       \
          ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b\n       \
+         ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
+         ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench index-churn <index-dir> <rounds>\n       \
          ferret-bench content-query <catalog-dir> <index-dir> [class...]\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \

@@ -43,7 +43,7 @@ const PER_CLASS: usize = 50;
 const PHRASE_TRIES: usize = 20;
 
 /// Seeded xorshift64*.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -53,7 +53,7 @@ impl Rng {
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
-    fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 }
@@ -546,7 +546,7 @@ fn ms(d: Duration) -> f64 {
 }
 
 /// The `q` quantile, nearest rank.
-fn quantile(values: &mut [f64], q: f64) -> f64 {
+pub(crate) fn quantile(values: &mut [f64], q: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
