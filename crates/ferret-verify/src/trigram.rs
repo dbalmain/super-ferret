@@ -190,9 +190,10 @@ impl std::error::Error for GrepError {}
 
 /// What every match of a regex contains: necessary, never sufficient.
 ///
-/// Built only through [`Trigrams::and`] and [`Trigrams::or`], which flatten,
-/// sort, deduplicate and apply the identities, so `And` and `Or` always hold
-/// at least two distinct children and never `All` or `None`.
+/// The derivation builds it through constructors that flatten, sort,
+/// deduplicate and apply the identities, so in a derived tree `And` and `Or`
+/// hold at least two distinct children, never `All` or `None`, and the root
+/// holds at most 64 distinct keys.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Trigrams {
     /// No constraint: every document is a candidate.

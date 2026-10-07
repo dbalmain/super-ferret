@@ -284,7 +284,12 @@ fn the_key_cap_shrinks_an_and_only_literal() {
     for ci in [false, true] {
         let (query, _) = derive_with(&long, ci, &LIMITS);
         assert_eq!(query.keys().len(), LIMITS.keys, "ci={ci}");
-        assert_sound(&long, ci, long.to_ascii_uppercase().as_bytes());
+        let doc = if ci {
+            long.to_ascii_uppercase()
+        } else {
+            long.clone()
+        };
+        assert_sound(&long, ci, doc.as_bytes());
     }
 }
 
