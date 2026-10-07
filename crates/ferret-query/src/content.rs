@@ -78,9 +78,24 @@ impl TextAtom {
     /// the planner can choose before it reads one. Dead documents count;
     /// it is an upper bound.
     pub fn estimate(text: &Text, pinned: &Pinned<'_>) -> Result<(u64, Certainty), ReadError> {
+        Self::estimate_until(text, pinned, &|| false)
+    }
+
+    /// Like `estimate`, checking cancellation for every unit and segment.
+    pub fn estimate_until(
+        text: &Text,
+        pinned: &Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(u64, Certainty), ReadError> {
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
         let df = |term: &[u8]| -> Result<u64, ReadError> {
+            if cancelled() {
+                return Err(ReadError::Cancelled);
+            }
             for source in pinned.sources() {
-                if let Some(found) = source.estimate(&Atom::Term(cap(term)))? {
+                if let Some(found) = source.estimate_until(&Atom::Term(cap(term)), cancelled)? {
                     return Ok(found.docs);
                 }
             }

@@ -944,3 +944,47 @@ fn vanished_maybe_paths_are_dropped_in_both_polarities() {
         assert!(search(&pin, &query(args), None).unwrap().0.is_empty());
     }
 }
+
+/// Use the kernel's thread-local rchar counter to catch actual postings I/O,
+/// without replacing the production reader or relying on a corrupt dictionary.
+#[test]
+fn an_already_cancelled_query_performs_no_index_io() {
+    fn rchar() -> (u64, u64) {
+        let counters = fs::read_to_string("/proc/thread-self/io").unwrap();
+        let value = counters
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("rchar:")
+                    .and_then(|s| s.trim().parse().ok())
+            })
+            .unwrap();
+        (value, counters.len() as u64)
+    }
+    let tree = Tree::new();
+    for i in 0..100 {
+        tree.write(
+            &format!("f{i}.txt"),
+            format!("alpha beta unique{i}").as_bytes(),
+        );
+    }
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let pin = engine.pin();
+    let terms = query(&["text:alpha"; 16]);
+    assert_eq!(search(&pin, &terms, None).unwrap().0.len(), 100);
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let (before, counter_bytes) = rchar();
+    assert_eq!(
+        pin.search_content(&terms, None, Some(&cancelled), |_| panic!("cancelled row"))
+            .unwrap()
+            .rows,
+        0
+    );
+    let (after, _) = rchar();
+    assert_eq!(
+        after - before,
+        counter_bytes,
+        "only reading the counter itself may add rchar"
+    );
+}

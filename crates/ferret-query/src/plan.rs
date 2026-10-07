@@ -241,7 +241,7 @@ impl Query {
                 if stopped() {
                     return Err(ferret_index::ReadError::Cancelled);
                 }
-                TextAtom::estimate(text, pinned)
+                TextAtom::estimate_until(text, pinned, &stopped)
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(RunError::Index)?;
@@ -305,8 +305,11 @@ impl Query {
                     }
                     ControlFlow::Continue(())
                 })?;
+                check()?;
                 docs.sort_unstable();
+                check()?;
                 docs.dedup();
+                check()?;
             }
         }
 

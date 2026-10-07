@@ -56,10 +56,25 @@ impl Source<'_> {
     /// order atoms and choose its driver before it reads any list. `None`
     /// when this source does not answer atoms of that kind.
     pub fn estimate(&self, atom: &Atom) -> Result<Option<Estimate>, ReadError> {
+        self.estimate_until(atom, &|| false)
+    }
+
+    /// Like `estimate`, checking cancellation between dictionary reads.
+    pub fn estimate_until(
+        &self,
+        atom: &Atom,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Estimate>, ReadError> {
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
         match (self, atom) {
             (Self::Postings(view), Atom::Term(term)) => {
                 let mut docs = 0;
                 for segment in view.segments() {
+                    if cancelled() {
+                        return Err(ReadError::Cancelled);
+                    }
                     if let Some(entry) = segment.entry(term)? {
                         docs += u64::from(entry.df);
                     }
