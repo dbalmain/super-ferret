@@ -125,7 +125,9 @@ impl<A> Parser<A> {
         match self.tokens.next() {
             Some(Token::Not) => {
                 if depth >= NESTING_LIMIT {
-                    return Err(ParseError::Nesting { limit: NESTING_LIMIT });
+                    return Err(ParseError::Nesting {
+                        limit: NESTING_LIMIT,
+                    });
                 }
                 if matches!(self.tokens.peek(), None | Some(Token::Or | Token::Close)) {
                     return Err(ParseError::Dangling("NOT"));
@@ -134,7 +136,9 @@ impl<A> Parser<A> {
             }
             Some(Token::Open) => {
                 if depth >= NESTING_LIMIT {
-                    return Err(ParseError::Nesting { limit: NESTING_LIMIT });
+                    return Err(ParseError::Nesting {
+                        limit: NESTING_LIMIT,
+                    });
                 }
                 let inner = self.expr(After::Open, depth + 1)?;
                 match self.tokens.next() {

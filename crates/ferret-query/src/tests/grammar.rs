@@ -276,23 +276,73 @@ fn misplaced_operators_are_errors_that_say_what_is_missing() {
 /// while unwinding a partly built expression.
 #[test]
 fn boolean_nesting_is_bounded_on_a_two_mib_stack() {
-    std::thread::Builder::new().stack_size(2 << 20).spawn(|| {
-        for (nots, groups) in [(33, 0), (0, 33), (17, 16)] {
-            let args: Vec<_> = std::iter::repeat_n("NOT", nots)
-                .chain(std::iter::repeat_n("(", groups))
-                .chain(["text:x", "OR", "text:y"])
-                .chain(std::iter::repeat_n(")", groups)).collect();
-            assert_eq!(Query::from_args(&args, now()).err().map(|e| e.to_string()),
-                Some("query nesting exceeds 32 NOT/parenthesis levels".into()));
-        }
-        for (nots, groups) in [(32, 0), (0, 32), (16, 16)] {
-            let args: Vec<_> = std::iter::repeat_n("NOT", nots)
-                .chain(std::iter::repeat_n("(", groups))
-                .chain(["text:x", "OR", "text:y"])
-                .chain(std::iter::repeat_n(")", groups)).collect();
-            let query = Query::from_args(&args, now()).unwrap();
-            assert!(!query.explain().is_empty());
-            drop(query);
-        }
-    }).unwrap().join().unwrap();
+    for stack in [512 << 10, 2 << 20] {
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(|| {
+                for (nots, groups) in [(33, 0), (0, 33), (17, 16)] {
+                    let args: Vec<_> = std::iter::repeat_n("NOT", nots)
+                        .chain(std::iter::repeat_n("(", groups))
+                        .chain(["text:x", "OR", "text:y"])
+                        .chain(std::iter::repeat_n(")", groups))
+                        .collect();
+                    assert_eq!(
+                        Query::from_args(&args, now()).err().map(|e| e.to_string()),
+                        Some("query nesting exceeds 32 NOT/parenthesis levels".into())
+                    );
+                }
+                for (nots, groups) in [(32, 0), (0, 32), (16, 16)] {
+                    let args: Vec<_> = std::iter::repeat_n("NOT", nots)
+                        .chain(std::iter::repeat_n("(", groups))
+                        .chain(["text:x", "OR", "text:y"])
+                        .chain(std::iter::repeat_n(")", groups))
+                        .collect();
+                    let query = Query::from_args(&args, now()).unwrap();
+                    assert!(!query.explain().is_empty());
+                    drop(query);
+                }
+                // Every group adds both OR and AND nodes; later recursive
+                // passes must survive the deepest tree, not
+                // just parentheses erased at parse.
+                let mut args = vec!["("; 32];
+                args.push("text:x");
+                for _ in 0..32 {
+                    args.extend(["OR", "text:y", "text:z", ")"]);
+                }
+                let query = Query::from_args(&args, now()).unwrap();
+                assert!(!query.explain().is_empty());
+                let scratch = super::Scratch::new("nesting");
+                let catalog = super::sample(&scratch).into_resident().unwrap();
+                let names = crate::NameIndex::new(&catalog);
+                let docs = crate::DocNames::new(&catalog).unwrap();
+                let live = ferret_index::DocSet::new(catalog.next_doc().0, 0..catalog.next_doc().0);
+                let pinned = ferret_index::Pinned::new(None, &live);
+                query
+                    .run_content(
+                        &catalog,
+                        &names,
+                        &crate::Content {
+                            pinned: &pinned,
+                            docs: &docs,
+                            bound: None,
+                        },
+                        &mut |_, bytes| {
+                            bytes.extend_from_slice(b"x y z");
+                            true
+                        },
+                        None,
+                        |_| std::ops::ControlFlow::Continue(()),
+                    )
+                    .unwrap();
+                drop(query);
+                assert_eq!(
+                    Query::from_args(std::iter::repeat_n("NOT", 100_000).chain(["name:x"]), now())
+                        .unwrap_err(),
+                    ParseError::Nesting { limit: 32 }
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }

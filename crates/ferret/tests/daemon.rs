@@ -1415,16 +1415,29 @@ fn a_reader_exit_with_a_queued_bad_line_never_strands_its_handler() {
 fn socket_search_rejects_excessive_boolean_nesting_and_stays_alive() {
     let tree = Tree::new();
     tree.start(&[]);
-    for (nots, groups) in [(33, 0), (0, 33), (17, 16)] {
+    for (nots, groups) in [(33, 0), (0, 33), (17, 16), (4096, 0)] {
         let args: Vec<_> = std::iter::repeat_n("\"NOT\"", nots)
             .chain(std::iter::repeat_n("\"(\"", groups))
             .chain(["\"text:x\""])
-            .chain(std::iter::repeat_n("\")\"", groups)).collect();
-        let request = format!("{{\"op\":\"search\",\"args\":[{}]}}\n", args.join(","));
+            .chain(std::iter::repeat_n("\")\"", groups))
+            .collect();
+        let request = format!(
+            "{{\"id\":\"nest\",\"op\":\"search\",\"args\":[{}]}}\n",
+            args.join(",")
+        );
         let (mut reader, _) = tree.connect();
         let reply = block(&mut reader, request.as_bytes());
-        assert!(reply.contains("query nesting exceeds 32 NOT/parenthesis levels"), "{reply}");
+        assert!(
+            reply.contains("query nesting exceeds 32 NOT/parenthesis levels"),
+            "{reply}"
+        );
     }
     let (mut reader, _) = tree.connect();
-    assert!(block(&mut reader, b"{\"op\":\"search\",\"args\":[\"main\"]}\n").contains("\"event\":\"row\""));
+    assert!(
+        block(
+            &mut reader,
+            b"{\"id\":\"nest\",\"op\":\"search\",\"args\":[\"main\"]}\n"
+        )
+        .contains("\"event\":\"row\"")
+    );
 }
