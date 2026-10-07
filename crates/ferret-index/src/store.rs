@@ -13,7 +13,8 @@
 //! module does open are the index's own: segments and the manifest, all
 //! inside the directory the host names.
 //!
-//! **Commit.** A segment is written to a temporary file, synced and renamed
+//! **Commit.** Both files of a pair are written to temporaries, synced,
+//! checked against their intended heads and renamed
 //! into place, and only then named by a new manifest (write, fsync, rename,
 //! directory fsync). A crash at any point leaves the old manifest or the
 //! new one, never a manifest naming a missing file; files no manifest names
@@ -31,16 +32,35 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use ferret_text::{Scratch, TOKENIZER_VERSION, cap, tokenize};
+use ferret_text::{Scratch, TOKENIZER_VERSION, TRIGRAM_VERSION, cap, tokenize};
 
 use crate::live::DocSet;
 use crate::manifest::{Manifest, SegmentEntry};
 use crate::merge;
-use crate::segment::{Hit, Inverter, ReadAt, ReadError, Segment, WriteError, Writer};
+use crate::segment::{
+    Hit, Inverter, ReadAt, ReadError, Segment, Sizes, TrigramInverter, WriteError, Writer,
+};
 
-/// S2.md's follow buffer: a pass flushes its segment once its buffered
-/// postings are estimated at this many bytes.
+/// Follow flush charge for terms plus 16 bytes per buffered trigram pair.
+/// The fixed trigram allocation is separate from this charge (D70).
 pub const BUFFER: usize = 64 << 20;
+
+/// D70 revision 5 B. This seam owns admission and the fixed reservation.
+struct PairBuffer;
+impl PairBuffer {
+    const CAPACITY: usize = 3_145_728;
+
+    fn full(terms: &Inverter, trigrams: &TrigramInverter, bound: usize) -> bool {
+        terms
+            .memory()
+            .saturating_add(trigrams.len().saturating_mul(16))
+            >= bound
+    }
+
+    fn fits(trigrams: &TrigramInverter, bytes: usize) -> bool {
+        trigrams.len().saturating_add(bytes.saturating_sub(2)) <= Self::CAPACITY
+    }
+}
 
 /// What a pass needs from one published catalog view.
 #[derive(Clone, Copy, Debug)]
@@ -215,6 +235,7 @@ impl From<WriteError> for Error {
 pub struct View {
     manifest: Manifest,
     segments: Vec<Arc<Segment<File>>>,
+    trigrams: Vec<Arc<Segment<File>>>,
     /// Transient retry selection; no partial output is retained. Append-only
     /// follow work must not let another policy choice reset a large retry.
     pending_merge: OnceLock<Vec<u64>>,
@@ -239,10 +260,12 @@ impl View {
             })
             + self.manifest.segments.capacity() * std::mem::size_of::<SegmentEntry>()
             + self.manifest.unreadable.capacity() * std::mem::size_of::<u32>()
+            + self.trigrams.capacity() * std::mem::size_of::<Arc<Segment<File>>>()
             + self.segments.capacity() * std::mem::size_of::<Arc<Segment<File>>>()
             + self
                 .segments
                 .iter()
+                .chain(&self.trigrams)
                 .map(|s| s.resident_bytes() + std::mem::size_of::<Segment<File>>())
                 .sum::<usize>()
     }
@@ -260,7 +283,7 @@ impl View {
     /// inputs still exist.
     pub fn merge_resources(&self, live: &DocSet) -> Option<(u64, u64)> {
         let entries = self.merge_selection(live)?;
-        let bytes = entries.iter().map(|s| s.bytes).sum::<u64>();
+        let bytes = entries.iter().map(SegmentEntry::total_bytes).sum::<u64>();
         let docs = entries.iter().map(|s| u64::from(s.docs)).sum::<u64>();
         Some((
             docs.saturating_mul(24)
@@ -300,6 +323,11 @@ impl View {
         &self.segments
     }
 
+    /// Trigram segments in the same order and ranges as `segments()`.
+    pub fn trigrams(&self) -> &[Arc<Segment<File>>] {
+        &self.trigrams
+    }
+
     /// Every document whose postings hold `term`, ascending, across the
     /// segments. Dead documents are included: the caller filters by its
     /// view's liveness.
@@ -332,11 +360,12 @@ impl View {
             let Some(manifest) = Manifest::read(dir)?.filter(|m| fits(m, catalog)) else {
                 return Ok(None);
             };
-            match open_segments(dir, &manifest) {
-                Ok(segments) => {
+            match open_pairs(dir, &manifest) {
+                Ok((segments, trigrams)) => {
                     return Ok(Some(Self {
                         manifest,
                         segments,
+                        trigrams,
                         pending_merge: OnceLock::new(),
                     }));
                 }
@@ -382,7 +411,11 @@ impl View {
 
     /// Bytes of every segment file.
     pub fn bytes(&self) -> u64 {
-        self.manifest.segments.iter().map(|s| s.bytes).sum()
+        self.manifest
+            .segments
+            .iter()
+            .map(SegmentEntry::total_bytes)
+            .sum()
     }
 }
 
@@ -395,6 +428,8 @@ pub struct IndexWriter {
     current: Arc<View>,
     poisoned: bool,
     codec: u32,
+    trigrams: TrigramInverter,
+    publishing: bool,
 }
 
 impl IndexWriter {
@@ -415,12 +450,15 @@ impl IndexWriter {
         fs::create_dir_all(dir)?;
         let usable = Manifest::read(dir)?.filter(|m| fits(m, catalog));
         let opened = match usable {
-            Some(manifest) => match open_segments(dir, &manifest) {
-                Ok(segments) if segments.iter().all(|s| s.codec() == codec) => Some(View {
-                    manifest,
-                    segments,
-                    pending_merge: OnceLock::new(),
-                }),
+            Some(manifest) => match open_pairs(dir, &manifest) {
+                Ok((segments, trigrams)) if segments.iter().all(|s| s.codec() == codec) => {
+                    Some(View {
+                        manifest,
+                        segments,
+                        trigrams,
+                        pending_merge: OnceLock::new(),
+                    })
+                }
                 Err(Error::Io(error)) if error.kind() != io::ErrorKind::NotFound => {
                     return Err(Error::Io(error));
                 }
@@ -433,10 +471,13 @@ impl IndexWriter {
             current: Arc::new(View {
                 manifest: Manifest::empty(catalog.incarnation),
                 segments: Vec::new(),
+                trigrams: Vec::new(),
                 pending_merge: OnceLock::new(),
             }),
             poisoned: false,
             codec,
+            trigrams: TrigramInverter::with_capacity(PairBuffer::CAPACITY),
+            publishing: false,
         };
         match opened {
             Some(view) => writer.current = Arc::new(view),
@@ -504,6 +545,7 @@ impl IndexWriter {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
+        self.publishing = false;
         let result = match run(self) {
             Err(Error::Io(ref error) | Error::Segment(ReadError::Io(ref error)))
                 if matches!(
@@ -515,13 +557,18 @@ impl IndexWriter {
             }
             result => result,
         };
-        if matches!(result, Err(Error::Cancelled)) {
-            if let Err(error) = remove_unnamed(&self.dir, &self.current.manifest) {
-                self.poisoned = true;
-                return Err(error.into());
-            }
-        } else {
-            self.poisoned = result.is_err();
+        if result.is_err()
+            && !self.publishing
+            && !result.as_ref().err().is_some_and(injected_crash)
+            && let Err(error) = remove_unnamed(&self.dir, &self.current.manifest)
+        {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        self.poisoned = result.is_err() && !matches!(result, Err(Error::Cancelled));
+        self.trigrams.clear();
+        if self.trigrams.capacity() > PairBuffer::CAPACITY {
+            self.trigrams = TrigramInverter::with_capacity(PairBuffer::CAPACITY);
         }
         result
     }
@@ -563,8 +610,11 @@ impl IndexWriter {
         let mut range: Option<(u32, u32)> = None;
         let mut frontier = live.bound();
         for doc in live.range(manifest.frontier, live.bound()) {
-            if followed.bytes >= budget.bytes || inverter.is_full() {
-                followed.stopped = if inverter.is_full() {
+            if followed.docs != 0
+                && (followed.bytes >= budget.bytes
+                    || PairBuffer::full(&inverter, &self.trigrams, budget.buffer))
+            {
+                followed.stopped = if PairBuffer::full(&inverter, &self.trigrams, budget.buffer) {
                     Stopped::Buffer
                 } else {
                     Stopped::Bytes
@@ -580,6 +630,12 @@ impl IndexWriter {
             bytes.clear();
             match read(doc, &mut bytes) {
                 Ok(()) => {
+                    if followed.docs != 0 && !PairBuffer::fits(&self.trigrams, bytes.len()) {
+                        followed.stopped = Stopped::Buffer;
+                        frontier = doc;
+                        break;
+                    }
+                    self.trigrams.add(doc, &bytes)?;
                     let mut failed = None;
                     tokenize(&bytes, &mut scratch, |token| {
                         if let Err(error) = inverter.add(doc, cap(token.bytes)) {
@@ -603,36 +659,68 @@ impl IndexWriter {
                 }
             }
             range = Some((range.map_or(doc, |(first, _)| first), doc));
+            if bytes.len().saturating_sub(2) > PairBuffer::CAPACITY {
+                followed.stopped = Stopped::Buffer;
+                frontier = doc + 1;
+                break;
+            }
         }
         if range.is_none() && frontier == manifest.frontier && followed.pruned == 0 {
             followed.remaining = live.count(frontier, live.bound()).into();
             return Ok(followed);
         }
 
+        let oversized = followed.docs == 1 && bytes.len().saturating_sub(2) > PairBuffer::CAPACITY;
         let mut opened = None;
         if let Some((first, last)) = range {
-            let writer = inverter.drain_into_codec(first, last, self.codec)?;
-            let (entry, segment) =
-                self.write_segment(&mut manifest, followed.docs as u32, |file| {
+            let terms = inverter.drain_into_codec(first, last, self.codec)?;
+            drop(inverter);
+            let mut terms = Some(terms);
+            let (entry, segment, trigram) = Self::write_pair(
+                &self.dir,
+                &mut manifest,
+                followed.docs as u32,
+                first,
+                last,
+                // Follow checks pause between documents and publishes the
+                // completed range, as its Stopped::Asked contract requires.
+                // Merge checks cancellation while writing its output pair.
+                &|| false,
+                |file, tri| {
+                    let writer = if tri {
+                        self.trigrams.drain_into(first, last)?
+                    } else {
+                        terms
+                            .take()
+                            .ok_or_else(|| io::Error::other("pair output already consumed"))?
+                    };
                     let mut out = BufWriter::new(Paced {
                         file,
                         pace: budget.pace,
                     });
                     let sizes = writer.finish(&mut out)?;
                     out.flush()?;
-                    Ok(sizes.total())
-                })?;
+                    Ok(sizes)
+                },
+            )?;
             followed.segment = Some(entry);
-            followed.written = entry.bytes;
+            followed.written = entry.total_bytes();
             manifest.segments.push(entry);
-            opened = Some(segment);
+            opened = Some((segment, trigram));
+        }
+        if oversized {
+            self.trigrams = TrigramInverter::with_capacity(PairBuffer::CAPACITY);
         }
         manifest.last_follow = Some(timestamp());
         manifest.frontier = frontier;
         manifest.high_water = manifest.high_water.max(live.bound());
         let mut segments = self.current.segments.clone();
-        segments.extend(opened);
-        self.publish(manifest, segments)?;
+        let mut trigrams = self.current.trigrams.clone();
+        if let Some((segment, trigram)) = opened {
+            segments.push(segment);
+            trigrams.push(trigram);
+        }
+        self.publish(manifest, segments, trigrams)?;
         followed.remaining = live.count(frontier, live.bound()).into();
         Ok(followed)
     }
@@ -661,7 +749,7 @@ impl IndexWriter {
             .unreadable
             .retain(|&doc| catalog.live.contains(doc));
         let entries = &self.current.manifest.segments[run.clone()];
-        let read: u64 = entries.iter().map(|s| s.bytes).sum();
+        let read: u64 = entries.iter().map(SegmentEntry::total_bytes).sum();
         if read > budget.bytes {
             return Ok(None);
         }
@@ -683,8 +771,10 @@ impl IndexWriter {
             // range stays below the frontier, so it is not re-covered.
             let retired: Vec<_> = manifest.segments.drain(run.clone()).collect();
             let mut segments = self.current.segments.clone();
-            segments.drain(run);
-            self.publish(manifest, segments)?;
+            segments.drain(run.clone());
+            let mut trigrams = self.current.trigrams.clone();
+            trigrams.drain(run);
+            self.publish(manifest, segments, trigrams)?;
             retire(&self.dir, &retired);
             return Ok(Some(Merged {
                 inputs: retired.len(),
@@ -712,39 +802,74 @@ impl IndexWriter {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let trigram_inputs = self.current.trigrams[run.clone()]
+            .iter()
+            .map(|segment| {
+                Segment::open(Paced {
+                    file: segment.source(),
+                    pace: &merge_pace,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let number = manifest.next_number;
         let scratch = self.dir.join(format!("tmp-{number}.postings"));
         let codec = self.codec;
         let mut changes = (0, 0);
-        let result = self.write_segment(&mut manifest, docs, |file| {
-            let postings = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&scratch)?;
-            let writer =
-                Writer::spilling_with_codec(first, last, codec, file.try_clone()?, postings)?;
-            let result =
-                merge::stream(&inputs, catalog.live, writer, &merge_pace, budget.cancelled);
-            let _ = fs::remove_file(&scratch);
-            let sizes = result?;
-            changes = (sizes.records_added, sizes.records_removed);
-            Ok(sizes.total())
-        });
-        let (entry, segment) = result?;
+        let result = Self::write_pair(
+            &self.dir,
+            &mut manifest,
+            docs,
+            first,
+            last,
+            budget.cancelled,
+            |file, tri| {
+                let postings = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&scratch)?;
+                let writer = if tri {
+                    Writer::keyed_spilling(
+                        first,
+                        last,
+                        TRIGRAM_VERSION,
+                        file.try_clone()?,
+                        postings,
+                    )?
+                } else {
+                    Writer::spilling_with_codec(first, last, codec, file.try_clone()?, postings)?
+                };
+                let result = merge::stream(
+                    if tri { &trigram_inputs } else { &inputs },
+                    catalog.live,
+                    writer,
+                    &merge_pace,
+                    budget.cancelled,
+                );
+                let _ = fs::remove_file(&scratch);
+                let sizes = result?;
+                if !tri {
+                    changes = (sizes.records_added, sizes.records_removed);
+                }
+                Ok(sizes)
+            },
+        );
+        let (entry, segment, trigram) = result?;
 
         if (budget.cancelled)() {
             return Err(Error::Cancelled);
         }
         let retired: Vec<_> = manifest.segments.splice(run.clone(), [entry]).collect();
         let mut segments = self.current.segments.clone();
-        segments.splice(run, [segment]);
-        self.publish(manifest, segments)?;
+        segments.splice(run.clone(), [segment]);
+        let mut trigrams = self.current.trigrams.clone();
+        trigrams.splice(run, [trigram]);
+        self.publish(manifest, segments, trigrams)?;
         retire(&self.dir, &retired);
         Ok(Some(Merged {
             inputs: retired.len(),
             read,
-            written: entry.bytes,
+            written: entry.total_bytes(),
             purged,
             records_added: changes.0,
             records_removed: changes.1,
@@ -752,49 +877,93 @@ impl IndexWriter {
         }))
     }
 
-    /// Writes one segment through `fill`, which writes the whole file and
-    /// returns its length, then syncs it, renames it into place and syncs
-    /// the directory. Takes the next segment number from `manifest`.
-    fn write_segment(
-        &self,
+    /// Writes, checks and installs both outputs before manifest publication.
+    fn write_pair(
+        dir: &Path,
         manifest: &mut Manifest,
         docs: u32,
-        fill: impl FnOnce(&File) -> Result<u64, Error>,
-    ) -> Result<(SegmentEntry, Arc<Segment<File>>), Error> {
+        first: u32,
+        last: u32,
+        cancelled: &dyn Fn() -> bool,
+        mut fill: impl FnMut(&File, bool) -> Result<Sizes, Error>,
+    ) -> Result<WrittenPair, Error> {
         let number = manifest.next_number;
         manifest.next_number += 1;
-        let temp = self.dir.join(format!("tmp-{number}.seg"));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        let bytes = fill(&file)?;
-        file.sync_all()?;
-        let segment = Segment::open(file)?;
-        let info = segment.info();
+        let write = |tri: bool,
+                     fill: &mut dyn FnMut(&File, bool) -> Result<Sizes, Error>|
+         -> Result<_, Error> {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let extension = if tri { "tri" } else { "seg" };
+            let temp = dir.join(format!("tmp-{number}.{extension}"));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            let sizes = fill(&file, tri)?;
+            file.sync_all()?;
+            let segment = Segment::open(file)?;
+            let info = segment.info();
+            let version = if tri {
+                TRIGRAM_VERSION
+            } else {
+                TOKENIZER_VERSION
+            };
+            if (
+                info.first,
+                info.last,
+                info.terms,
+                info.pairs,
+                info.tokenizer_version,
+            ) != (first, last, sizes.terms, sizes.pairs, version)
+                || segment.source().metadata()?.len() != sizes.total()
+            {
+                return Err(ReadError::Head.into());
+            }
+            Ok((temp, sizes, Arc::new(segment)))
+        };
+        let (temp, sizes, segment) = write(false, &mut fill)?;
+        hit(Point::TermSynced)?;
+        let (trigram_temp, trigram_sizes, trigram) = write(true, &mut fill)?;
         let entry = SegmentEntry {
             number,
-            first: info.first,
-            last: info.last,
+            first,
+            last,
             docs,
-            terms: info.terms,
-            pairs: info.pairs,
-            bytes,
+            terms: sizes.terms,
+            pairs: sizes.pairs,
+            bytes: sizes.total(),
             digest: segment.digest(),
+            trigram_bytes: trigram_sizes.total(),
+            trigram_keys: trigram_sizes.terms,
+            trigram_pairs: trigram_sizes.pairs,
+            trigram_digest: trigram.digest(),
         };
-        fs::rename(&temp, self.dir.join(entry.file_name()))?;
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        fs::rename(temp, dir.join(entry.file_name()))?;
+        hit(Point::TermRenamed)?;
+        fs::rename(trigram_temp, dir.join(entry.trigram_file_name()))?;
+        hit(Point::PairRenamed)?;
+        File::open(dir)?.sync_all()?;
         hit(Point::SegmentWritten)?;
-        File::open(&self.dir)?.sync_all()?;
-        Ok((entry, Arc::new(segment)))
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        Ok((entry, segment, trigram))
     }
 
     fn publish(
         &mut self,
         mut manifest: Manifest,
         segments: Vec<Arc<Segment<File>>>,
+        trigrams: Vec<Arc<Segment<File>>>,
     ) -> Result<(), Error> {
         manifest.sequence += 1;
+        self.publishing = true;
         manifest.publish(&self.dir)?;
         let pending_merge = self
             .current
@@ -814,6 +983,7 @@ impl IndexWriter {
         self.current = Arc::new(View {
             manifest,
             segments,
+            trigrams,
             pending_merge,
         });
         Ok(())
@@ -828,6 +998,7 @@ impl IndexWriter {
                 ..manifest
             },
             Vec::new(),
+            Vec::new(),
         )
     }
 }
@@ -837,6 +1008,7 @@ impl IndexWriter {
 fn fits(manifest: &Manifest, catalog: &CatalogView) -> bool {
     manifest.incarnation == catalog.incarnation
         && manifest.tokenizer_version == TOKENIZER_VERSION
+        && manifest.trigram_version == TRIGRAM_VERSION
         && manifest.high_water <= catalog.live.bound()
 }
 
@@ -852,25 +1024,48 @@ fn alive(segment: &SegmentEntry, live: &DocSet, unreadable: &[u32]) -> u32 {
     live.count(segment.first, end) - skipped
 }
 
-fn open_segments(dir: &Path, manifest: &Manifest) -> Result<Vec<Arc<Segment<File>>>, Error> {
+type OpenPair = (Arc<Segment<File>>, Arc<Segment<File>>);
+type WrittenPair = (SegmentEntry, Arc<Segment<File>>, Arc<Segment<File>>);
+type PairedSegments = (Vec<Arc<Segment<File>>>, Vec<Arc<Segment<File>>>);
+
+fn open_pairs(dir: &Path, manifest: &Manifest) -> Result<PairedSegments, Error> {
     manifest
         .segments
         .iter()
-        .map(|entry| {
-            let file = File::open(dir.join(entry.file_name()))?;
-            let bytes = file.metadata()?.len();
-            let segment = Segment::open(file)?;
-            if !entry.matches(
-                &segment.info(),
-                &segment.digest(),
-                bytes,
-                manifest.tokenizer_version,
-            ) {
-                return Err(Error::Segment(ReadError::Head));
-            }
-            Ok(Arc::new(segment))
+        .map(|entry| -> Result<OpenPair, Error> {
+            let open = |tri: bool| -> Result<_, Error> {
+                let name = if tri {
+                    entry.trigram_file_name()
+                } else {
+                    entry.file_name()
+                };
+                let file = File::open(dir.join(name))?;
+                let bytes = file.metadata()?.len();
+                let segment = Segment::open(file)?;
+                let matches = if tri {
+                    entry.matches_trigrams(
+                        &segment.info(),
+                        &segment.digest(),
+                        bytes,
+                        manifest.trigram_version,
+                    ) && segment.codec() == crate::segment::DICTIONARY_CODEC
+                } else {
+                    entry.matches(
+                        &segment.info(),
+                        &segment.digest(),
+                        bytes,
+                        manifest.tokenizer_version,
+                    )
+                };
+                if !matches {
+                    return Err(ReadError::Head.into());
+                }
+                Ok(Arc::new(segment))
+            };
+            Ok((open(false)?, open(true)?))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(|pairs| pairs.into_iter().unzip())
 }
 
 /// Unlinks merged-away segments. Open views keep their descriptors (D32);
@@ -878,6 +1073,7 @@ fn open_segments(dir: &Path, manifest: &Manifest) -> Result<Vec<Arc<Segment<File
 fn retire(dir: &Path, retired: &[SegmentEntry]) {
     for old in retired {
         let _ = fs::remove_file(dir.join(old.file_name()));
+        let _ = fs::remove_file(dir.join(old.trigram_file_name()));
     }
 }
 
@@ -887,7 +1083,7 @@ fn remove_unnamed(dir: &Path, manifest: &Manifest) -> io::Result<()> {
     let named: Vec<String> = manifest
         .segments
         .iter()
-        .map(SegmentEntry::file_name)
+        .flat_map(|entry| [entry.file_name(), entry.trigram_file_name()])
         .collect();
     for entry in fs::read_dir(dir)? {
         let name = entry?.file_name();
@@ -939,8 +1135,13 @@ impl Write for Paced<'_> {
 pub(crate) enum Point {
     /// A segment is synced and renamed into place; no manifest names it.
     SegmentWritten,
+    TermSynced,
+    TermRenamed,
+    PairRenamed,
     /// The new manifest is renamed into place, before the directory sync.
     ManifestRenamed,
+    /// Publication has synced its temporary but has not renamed it yet.
+    ManifestSynced,
     /// A merge has written part of its output.
     MergeMidway,
 }
@@ -949,7 +1150,12 @@ pub(crate) fn hit(point: Point) -> io::Result<()> {
     #[cfg(test)]
     if STOP.get() == Some(point) {
         STOP.set(None);
-        return Err(io::Error::other(format!("injected stop at {point:?}")));
+        return Err(io::Error::other(InjectedStop(point)));
+    }
+    #[cfg(test)]
+    if CANCEL_AT.get() == Some(point) {
+        CANCEL_AT.set(None);
+        CANCELLED.set(true);
     }
     #[cfg(not(test))]
     let _ = point;
@@ -959,6 +1165,8 @@ pub(crate) fn hit(point: Point) -> io::Result<()> {
 #[cfg(test)]
 thread_local! {
     /// The next [`hit`] of this point fails, once.
+    static CANCEL_AT: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
+    static CANCELLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static STOP: std::cell::Cell<Option<Point>> = const { std::cell::Cell::new(None) };
 }
 
@@ -970,4 +1178,27 @@ fn timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// Crash injection leaves files as a terminated process would. Ordinary errors
+// still exercise eager cleanup through the same operation and publication path.
+#[cfg(test)]
+#[derive(Debug)]
+struct InjectedStop(Point);
+#[cfg(test)]
+impl std::fmt::Display for InjectedStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "injected crash at {:?}", self.0)
+    }
+}
+#[cfg(test)]
+impl std::error::Error for InjectedStop {}
+
+fn injected_crash(error: &Error) -> bool {
+    #[cfg(test)]
+    if let Error::Io(io) = error {
+        return io.get_ref().is_some_and(|e| e.is::<InjectedStop>());
+    }
+    let _ = error;
+    false
 }

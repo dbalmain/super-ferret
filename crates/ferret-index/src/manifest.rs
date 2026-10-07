@@ -7,10 +7,12 @@
 //! head        magic "ferretix", format version u32, tokenizer version u32,
 //!             catalog incarnation 16 B, high water u32, frontier u32,
 //!             sequence u64, next segment number u64, segment count u32,
-//!             unreadable count u32, last follow u64, last merge u64     80 B
-//! segments    per segment, in DocId order, 64 B: number u64, first u32,
+//!             unreadable count u32, last follow u64, last merge u64,
+//!             trigram version u32, 4 B zero                         88 B
+//! segments    per pair, in DocId order, 104 B: number u64, first u32,
 //!             last u32, docs u32, 4 B zero, terms u64, pairs u64,
-//!             bytes u64, the segment's head digest 16 B
+//!             bytes u64, the term head digest 16 B, trigram bytes u64,
+//!             keys u64, pairs u64, trigram head digest 16 B
 //! unreadable  u32 per document, strictly ascending
 //! digest      BLAKE3-128 of every preceding byte
 //! ```
@@ -36,10 +38,10 @@ use crate::segment::Info;
 const MAGIC: [u8; 8] = *b"ferretix";
 
 /// Bumped when this layout changes.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
-const HEAD: usize = 80;
-const ENTRY: usize = 64;
+const HEAD: usize = 88;
+const ENTRY: usize = 104;
 
 /// The manifest's file name inside the index directory.
 pub const FILE: &str = "manifest";
@@ -63,12 +65,50 @@ pub struct SegmentEntry {
     /// The segment head's own digest, so a file swapped in under the name
     /// is refused.
     pub digest: [u8; 16],
+    pub trigram_bytes: u64,
+    pub trigram_keys: u64,
+    pub trigram_pairs: u64,
+    pub trigram_digest: [u8; 16],
 }
 
 impl SegmentEntry {
     /// `seg-<first>-<last>-<number>.seg` (docs/S2.md § Segment file).
     pub fn file_name(&self) -> String {
         format!("seg-{}-{}-{}.seg", self.first, self.last, self.number)
+    }
+
+    /// The trigram file of this pair.
+    pub fn trigram_file_name(&self) -> String {
+        format!("seg-{}-{}-{}.tri", self.first, self.last, self.number)
+    }
+
+    /// Combined bytes used by resource accounting and merge selection.
+    pub fn total_bytes(&self) -> u64 {
+        self.bytes + self.trigram_bytes
+    }
+
+    /// Whether the trigram head agrees with its own manifest facts.
+    pub fn matches_trigrams(
+        &self,
+        info: &Info,
+        digest: &[u8; 16],
+        bytes: u64,
+        version: u32,
+    ) -> bool {
+        (
+            info.first,
+            info.last,
+            info.terms,
+            info.pairs,
+            info.tokenizer_version,
+        ) == (
+            self.first,
+            self.last,
+            self.trigram_keys,
+            self.trigram_pairs,
+            version,
+        ) && *digest == self.trigram_digest
+            && bytes == self.trigram_bytes
     }
 
     /// Whether an opened segment's head is the one this entry names.
@@ -89,6 +129,7 @@ impl SegmentEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub tokenizer_version: u32,
+    pub trigram_version: u32,
     /// The catalog incarnation the index belongs to.
     pub incarnation: [u8; 16],
     pub high_water: u32,
@@ -96,8 +137,7 @@ pub struct Manifest {
     /// Increased by every publication.
     pub sequence: u64,
     pub next_number: u64,
-    /// Unix seconds of the last committed follow/merge, absent on legacy
-    /// manifests.
+    /// Unix seconds of the last committed follow/merge, absent until run.
     pub last_follow: Option<u64>,
     pub last_merge: Option<u64>,
     /// In DocId order; ranges never overlap.
@@ -112,6 +152,7 @@ impl Manifest {
     pub fn empty(incarnation: [u8; 16]) -> Self {
         Self {
             tokenizer_version: ferret_text::TOKENIZER_VERSION,
+            trigram_version: ferret_text::TRIGRAM_VERSION,
             incarnation,
             high_water: 0,
             frontier: 0,
@@ -139,6 +180,8 @@ impl Manifest {
         out.extend_from_slice(&(self.unreadable.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.last_follow.unwrap_or(0).to_le_bytes());
         out.extend_from_slice(&self.last_merge.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&self.trigram_version.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
         debug_assert_eq!(out.len(), HEAD);
         for s in &self.segments {
             out.extend_from_slice(&s.number.to_le_bytes());
@@ -150,6 +193,10 @@ impl Manifest {
             out.extend_from_slice(&s.pairs.to_le_bytes());
             out.extend_from_slice(&s.bytes.to_le_bytes());
             out.extend_from_slice(&s.digest);
+            out.extend_from_slice(&s.trigram_bytes.to_le_bytes());
+            out.extend_from_slice(&s.trigram_keys.to_le_bytes());
+            out.extend_from_slice(&s.trigram_pairs.to_le_bytes());
+            out.extend_from_slice(&s.trigram_digest);
         }
         for doc in &self.unreadable {
             out.extend_from_slice(&doc.to_le_bytes());
@@ -164,22 +211,24 @@ impl Manifest {
     /// coverage, since every byte of it is derived from the catalog.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let body = bytes.len().checked_sub(16)?;
-        if bytes.len() < 64 + 16
+        if bytes.len() < HEAD + 16
             || bytes[..8] != MAGIC
             || checksum(&bytes[..body]) != bytes[body..]
-            || !matches!(u32_at(bytes, 8), 1 | FORMAT_VERSION)
+            || u32_at(bytes, 8) != FORMAT_VERSION
+            || bytes[84..88] != [0; 4]
         {
             return None;
         }
         let mut incarnation = [0; 16];
         incarnation.copy_from_slice(&bytes[16..32]);
         let (count, unreadable) = (u32_at(bytes, 56) as usize, u32_at(bytes, 60) as usize);
-        let head = if u32_at(bytes, 8) == 1 { 64 } else { HEAD };
+        let head = HEAD;
         if body != head + count.checked_mul(ENTRY)? + unreadable.checked_mul(4)? {
             return None;
         }
         let mut manifest = Self {
             tokenizer_version: u32_at(bytes, 12),
+            trigram_version: u32_at(bytes, 80),
             incarnation,
             high_water: u32_at(bytes, 32),
             frontier: u32_at(bytes, 36),
@@ -210,6 +259,10 @@ impl Manifest {
                 pairs: u64_at(bytes, at + 32),
                 bytes: u64_at(bytes, at + 40),
                 digest,
+                trigram_bytes: u64_at(bytes, at + 64),
+                trigram_keys: u64_at(bytes, at + 72),
+                trigram_pairs: u64_at(bytes, at + 80),
+                trigram_digest: bytes[at + 88..at + 104].try_into().ok()?,
             });
         }
         let at = head + count * ENTRY;
@@ -253,6 +306,7 @@ impl Manifest {
             .open(&temp)?;
         file.write_all(&self.encode())?;
         file.sync_all()?;
+        crate::store::hit(crate::store::Point::ManifestSynced)?;
         fs::rename(&temp, dir.join(FILE))?;
         crate::store::hit(crate::store::Point::ManifestRenamed)?;
         File::open(dir)?.sync_all()
@@ -282,23 +336,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_manifest_keeps_segments_and_has_unknown_timestamps() {
-        let mut manifest = sample();
-        let mut bytes = manifest.encode();
-        bytes.drain(64..80);
-        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
-        let body = bytes.len() - 16;
-        let sum = checksum(&bytes[..body]);
-        bytes[body..].copy_from_slice(&sum);
-        manifest.last_follow = None;
-        manifest.last_merge = None;
-        assert_eq!(Manifest::decode(&bytes), Some(manifest.clone()));
-        assert_eq!(Manifest::decode(&manifest.encode()), Some(manifest));
+    fn legacy_manifests_require_rebuild() {
+        for version in [1u32, 2] {
+            let mut bytes = sample().encode();
+            bytes[8..12].copy_from_slice(&version.to_le_bytes());
+            let body = bytes.len() - 16;
+            let sum = checksum(&bytes[..body]);
+            bytes[body..].copy_from_slice(&sum);
+            assert_eq!(Manifest::decode(&bytes), None);
+        }
     }
 
     fn sample() -> Manifest {
         Manifest {
             tokenizer_version: 1,
+            trigram_version: 2,
             incarnation: [7; 16],
             high_water: 100,
             frontier: 90,
@@ -316,6 +368,10 @@ mod tests {
                     pairs: 900,
                     bytes: 8000,
                     digest: [1; 16],
+                    trigram_bytes: 100,
+                    trigram_keys: 10,
+                    trigram_pairs: 20,
+                    trigram_digest: [3; 16],
                 },
                 SegmentEntry {
                     number: 2,
@@ -326,6 +382,10 @@ mod tests {
                     pairs: 1000,
                     bytes: 9000,
                     digest: [2; 16],
+                    trigram_bytes: 200,
+                    trigram_keys: 20,
+                    trigram_pairs: 40,
+                    trigram_digest: [4; 16],
                 },
             ],
             unreadable: vec![3, 50],

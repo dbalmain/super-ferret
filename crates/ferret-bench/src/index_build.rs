@@ -44,6 +44,7 @@ const M1C_DISTINCT_TERMS: u64 = 18_456_581;
 struct Shape {
     segments: usize,
     bytes: u64,
+    trigram_bytes: u64,
     dictionary: u64,
     postings: u64,
     entries: u64,
@@ -59,7 +60,13 @@ struct Shape {
 fn shape(view: &View) -> crate::Result<Shape> {
     let mut shape = Shape {
         segments: view.segments().len(),
-        bytes: view.bytes(),
+        bytes: view.manifest().segments.iter().map(|s| s.bytes).sum(),
+        trigram_bytes: view
+            .manifest()
+            .segments
+            .iter()
+            .map(|s| s.trigram_bytes)
+            .sum(),
         ..Shape::default()
     };
     let mut cursors = Vec::new();
@@ -109,6 +116,12 @@ fn shape_lines(out: &mut String, prefix: &str, s: &Shape, content_bytes: u64) {
     };
     line("segments", s.segments.to_string());
     line("total_bytes", s.bytes.to_string());
+    line("trigram_bytes", s.trigram_bytes.to_string());
+    line("paired_bytes", (s.bytes + s.trigram_bytes).to_string());
+    line(
+        "trigram_bytes_per_content_byte",
+        ratio(s.trigram_bytes, content_bytes),
+    );
     line("bytes_per_content_byte", ratio(s.bytes, content_bytes));
     line("dictionary_bytes", s.dictionary.to_string());
     line("dictionary_share", ratio(s.dictionary, s.bytes));

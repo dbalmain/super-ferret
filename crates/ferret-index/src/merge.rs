@@ -60,7 +60,7 @@ pub fn choose(
     segments: &[SegmentEntry],
     alive: &dyn Fn(&SegmentEntry) -> u32,
 ) -> Option<Range<usize>> {
-    let levels: Vec<f64> = segments.iter().map(|s| level(s.bytes)).collect();
+    let levels: Vec<f64> = segments.iter().map(|s| level(s.total_bytes())).collect();
     let mut best: Option<(f64, usize)> = None;
     let mut start = 0;
     while start < levels.len() {
@@ -294,6 +294,10 @@ mod tests {
             pairs: info.pairs,
             bytes,
             digest: segment.digest(),
+            trigram_bytes: 0,
+            trigram_keys: 0,
+            trigram_pairs: 0,
+            trigram_digest: [0; 16],
         };
         assert!(entry.matches(&info, &segment.digest(), bytes, version));
         assert!(!entry.matches(&info, &segment.digest(), bytes, version ^ 1));
@@ -312,6 +316,10 @@ mod tests {
                 pairs: 1,
                 bytes,
                 digest: [0; 16],
+                trigram_bytes: 0,
+                trigram_keys: 0,
+                trigram_pairs: 0,
+                trigram_digest: [0; 16],
             })
             .collect()
     }

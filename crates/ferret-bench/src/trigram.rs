@@ -202,6 +202,10 @@ fn artifact(path: PathBuf, number: u64, docs: u32, version: u32) -> crate::Resul
         pairs: info.pairs,
         bytes,
         digest: segment.digest(),
+        trigram_bytes: 0,
+        trigram_keys: 0,
+        trigram_pairs: 0,
+        trigram_digest: [0; 16],
     };
     if !entry.matches(&info, &segment.digest(), bytes, version) {
         return Err("offline segment extractor mismatch".into());

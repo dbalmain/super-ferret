@@ -36,6 +36,27 @@ impl TrigramInverter {
         }
     }
 
+    /// Reserves pair slots once; admission must bound the next document.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            pairs: Vec::with_capacity(capacity),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.pairs.capacity().max(self.scratch.capacity())
+    }
+
+    /// Buffered distinct key/document pairs.
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
     /// Adds raw document bytes and returns its distinct-key count.
     pub fn add(&mut self, doc: u32, bytes: &[u8]) -> Result<usize, WriteError> {
         self.add_with(doc, bytes, |_| {})
@@ -111,8 +132,11 @@ impl TrigramInverter {
         });
         self.documents.clear();
         self.documents.reserve_exact(docs);
-        self.scratch.resize(self.pairs.capacity(), 0);
         let count = self.pairs.len();
+        if self.scratch.capacity() < count {
+            self.scratch.reserve_exact(count - self.scratch.len());
+        }
+        self.scratch.resize(count, 0);
         for shift in [32, 40, 48] {
             let mut offsets = [0usize; 256];
             for pair in &self.pairs {
@@ -129,9 +153,7 @@ impl TrigramInverter {
                 self.scratch[offsets[bucket]] = pair;
                 offsets[bucket] += 1;
             }
-            std::mem::swap(&mut self.pairs, &mut self.scratch);
-            self.pairs.truncate(count);
-            self.scratch.resize(self.scratch.capacity(), 0);
+            self.pairs.copy_from_slice(&self.scratch[..count]);
         }
         observe(self.allocated_bytes() + writer.allocated_bytes());
         let mut start = 0;
