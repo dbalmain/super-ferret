@@ -64,6 +64,7 @@ impl<'a> Cursor<'a> {
         Self::Bits(Bits {
             docs: Cow::Borrowed(docs),
             certainty,
+            floor: 0,
         })
     }
 
@@ -227,6 +228,7 @@ fn materialise<'a>(children: Vec<Cursor<'a>>, bound: u32) -> Cursor<'a> {
         Cursor::Bits(Bits {
             docs: Cow::Owned(DocSet::new(bound, docs)),
             certainty,
+            floor: 0,
         })
     };
     Cursor::Or(Or::new(vec![
@@ -239,13 +241,15 @@ fn materialise<'a>(children: Vec<Cursor<'a>>, bound: u32) -> Cursor<'a> {
 pub struct Bits<'a> {
     docs: Cow<'a, DocSet>,
     certainty: Certainty,
+    /// The document last returned: a lower target returns it again.
+    floor: u32,
 }
 
 impl Bits<'_> {
-    fn next_geq(&self, target: u32) -> Option<(u32, Certainty)> {
-        self.docs
-            .next_geq(target)
-            .map(|doc| (doc, self.certainty))
+    fn next_geq(&mut self, target: u32) -> Option<(u32, Certainty)> {
+        let doc = self.docs.next_geq(target.max(self.floor))?;
+        self.floor = doc;
+        Some((doc, self.certainty))
     }
 }
 
@@ -318,3 +322,6 @@ impl Probe<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
