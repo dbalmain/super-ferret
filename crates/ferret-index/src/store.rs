@@ -29,7 +29,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ferret_text::{Scratch, TOKENIZER_VERSION, cap, tokenize};
 
@@ -211,6 +211,9 @@ impl From<WriteError> for Error {
 pub struct View {
     manifest: Manifest,
     segments: Vec<Arc<Segment<File>>>,
+    /// Transient retry selection; no partial output is retained. Append-only
+    /// follow work must not let another policy choice reset a large retry.
+    pending_merge: OnceLock<Vec<u64>>,
 }
 
 impl std::fmt::Debug for View {
@@ -227,6 +230,9 @@ impl View {
     /// pins.
     pub fn resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + self.pending_merge.get().map_or(0, |selection| {
+                selection.capacity() * std::mem::size_of::<u64>()
+            })
             + self.manifest.segments.capacity() * std::mem::size_of::<SegmentEntry>()
             + self.manifest.unreadable.capacity() * std::mem::size_of::<u32>()
             + self.segments.capacity() * std::mem::size_of::<Arc<Segment<File>>>()
@@ -237,13 +243,19 @@ impl View {
                 .sum::<usize>()
     }
 
+    /// Immutable input identities for the next policy-selected merge. The
+    /// host can retain these across cancelled attempts even as unrelated
+    /// follow publications append segments to the manifest.
+    pub fn merge_selection(&self, live: &DocSet) -> Option<&[SegmentEntry]> {
+        Some(&self.manifest.segments[self.merge_run(live)?])
+    }
+
     /// Headroom for the next policy-selected merge, absent when no merge is
     /// due. Memory includes growable decoded lists and spilling scratch;
     /// disk includes output plus postings scratch while the committed
     /// inputs still exist.
     pub fn merge_resources(&self, live: &DocSet) -> Option<(u64, u64)> {
-        let run = self.merge_run(live)?;
-        let entries = &self.manifest.segments[run];
+        let entries = self.merge_selection(live)?;
         let bytes = entries.iter().map(|s| s.bytes).sum::<u64>();
         let docs = entries.iter().map(|s| u64::from(s.docs)).sum::<u64>();
         Some((
@@ -255,6 +267,21 @@ impl View {
     }
 
     fn merge_run(&self, live: &DocSet) -> Option<std::ops::Range<usize>> {
+        if let Some(selection) = self.pending_merge.get()
+            && let Some(&first) = selection.first()
+            && let Some(start) = self
+                .manifest
+                .segments
+                .iter()
+                .position(|s| s.number == first)
+            && let Some(entries) = self.manifest.segments.get(start..start + selection.len())
+            && entries
+                .iter()
+                .map(|s| s.number)
+                .eq(selection.iter().copied())
+        {
+            return Some(start..start + selection.len());
+        }
         merge::choose(&self.manifest.segments, &|s| {
             alive(s, live, &self.manifest.unreadable)
         })
@@ -298,7 +325,13 @@ impl View {
                 return Ok(None);
             };
             match open_segments(dir, &manifest) {
-                Ok(segments) => return Ok(Some(Self { manifest, segments })),
+                Ok(segments) => {
+                    return Ok(Some(Self {
+                        manifest,
+                        segments,
+                        pending_merge: OnceLock::new(),
+                    }));
+                }
                 Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             }
@@ -356,7 +389,11 @@ impl IndexWriter {
         let usable = Manifest::read(dir)?.filter(|m| fits(m, catalog));
         let opened = match usable {
             Some(manifest) => match open_segments(dir, &manifest) {
-                Ok(segments) => Some(View { manifest, segments }),
+                Ok(segments) => Some(View {
+                    manifest,
+                    segments,
+                    pending_merge: OnceLock::new(),
+                }),
                 Err(Error::Io(error)) if error.kind() != io::ErrorKind::NotFound => {
                     return Err(Error::Io(error));
                 }
@@ -369,6 +406,7 @@ impl IndexWriter {
             current: Arc::new(View {
                 manifest: Manifest::empty(catalog.incarnation),
                 segments: Vec::new(),
+                pending_merge: OnceLock::new(),
             }),
             poisoned: false,
         };
@@ -578,6 +616,14 @@ impl IndexWriter {
         budget: &Budget,
         run: std::ops::Range<usize>,
     ) -> Result<Option<Merged>, Error> {
+        // Remember identities without replacing the published content view:
+        // cancellation preserves its manifest, descriptors and pin identity.
+        self.current.pending_merge.get_or_init(|| {
+            self.current.manifest.segments[run.clone()]
+                .iter()
+                .map(|s| s.number)
+                .collect()
+        });
         if (budget.cancelled)() {
             return Err(Error::Cancelled);
         }
@@ -709,7 +755,26 @@ impl IndexWriter {
     ) -> Result<(), Error> {
         manifest.sequence += 1;
         manifest.publish(&self.dir)?;
-        self.current = Arc::new(View { manifest, segments });
+        let pending_merge = self
+            .current
+            .pending_merge
+            .get()
+            .filter(|selection| {
+                manifest.incarnation == self.current.manifest.incarnation
+                    && selection.iter().all(|number| {
+                        manifest
+                            .segments
+                            .iter()
+                            .any(|entry| entry.number == *number)
+                    })
+            })
+            .cloned()
+            .map_or_else(OnceLock::new, OnceLock::from);
+        self.current = Arc::new(View {
+            manifest,
+            segments,
+            pending_merge,
+        });
         Ok(())
     }
 

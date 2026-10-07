@@ -199,6 +199,7 @@ fn serve(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .fallback_backstop = initial;
     let mut content_due = Instant::now();
+    let mut content_state = content::State::default();
     loop {
         if host.stop.load(Ordering::Acquire) {
             break;
@@ -433,7 +434,8 @@ fn serve(
         }
         if burst.is_none() && !initial {
             if Instant::now() >= content_due {
-                content_due = Instant::now() + content::turn(host, &engine, &scheduler)?;
+                content_due =
+                    Instant::now() + content::turn(host, &engine, &scheduler, &mut content_state)?;
             }
             continue;
         }

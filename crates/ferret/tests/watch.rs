@@ -1529,3 +1529,157 @@ fn deferred_catalog_retry_does_not_spin_on_an_expired_content_deadline() {
     let used = ticks() - before;
     assert!(used < 10, "deferred writer spun for {used} CPU ticks");
 }
+
+/// Real admitted watch work cancelled and discarded every streaming attempt.
+/// After two cancellations of these inputs, a third attempt must finish while
+/// unrelated watch traffic waits behind it.
+#[test]
+fn watch_traffic_cannot_restart_the_same_merge_forever() {
+    fn counters(tree: &Tree) -> (u64, u64, u64) {
+        let pid = tree
+            .daemon
+            .as_ref()
+            .unwrap_or_else(|| panic!("daemon"))
+            .id();
+        let stat =
+            fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_else(|e| panic!("stat: {e}"));
+        let fields: Vec<_> = stat
+            .rsplit_once(") ")
+            .unwrap_or_else(|| panic!("stat fields"))
+            .1
+            .split_whitespace()
+            .collect();
+        let ticks = fields[11]
+            .parse::<u64>()
+            .unwrap_or_else(|e| panic!("utime: {e}"))
+            + fields[12]
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("stime: {e}"));
+        let io =
+            fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_else(|e| panic!("io: {e}"));
+        let count = |key| {
+            io.lines()
+                .find_map(|line| {
+                    line.strip_prefix(key)
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                })
+                .unwrap_or_else(|| panic!("io field {key}"))
+        };
+        (ticks, count("rchar:"), count("wchar:"))
+    }
+    let mut tree = Tree::new();
+    for i in 0..600 {
+        let text = (0..400)
+            .map(|j| format!("word{i}part{j} "))
+            .collect::<String>();
+        write(tree.path(&format!("src/merge-{i}.txt")), &text);
+    }
+    tree.success(tree.local(&["index", "src"]));
+    let input = ferret_index::Manifest::read(&tree.path("index/index"))
+        .unwrap_or_else(|e| panic!("manifest: {e}"))
+        .unwrap_or_else(|| panic!("manifest missing"))
+        .segments
+        .into_iter()
+        .max_by_key(|entry| entry.bytes)
+        .unwrap_or_else(|| panic!("merge input"));
+    let input_path = tree.path("index/index").join(input.file_name());
+    let gate = gate(&tree, "merge");
+    let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
+    tree.start(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    for i in 0..240 {
+        fs::remove_file(tree.path(&format!("src/merge-{i}.txt")))
+            .unwrap_or_else(|e| panic!("delete: {e}"));
+    }
+    wait(|| gate.join("merge.reached").exists());
+    let retry_before = counters(&tree);
+    let mut third_setup = None;
+    let mut discarded_bytes = 0;
+    for round in 0..2 {
+        assert!(input_path.exists(), "the selection must remain the same");
+        discarded_bytes += fs::read_dir(tree.path("index/index"))
+            .unwrap_or_else(|e| panic!("index: {e}"))
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("tmp-"))
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum::<u64>();
+        let before = number(&tree.status(), "refreshes");
+        fs::remove_file(gate.join("merge.reached")).unwrap_or_else(|e| panic!("checkpoint: {e}"));
+        write(
+            tree.path("src/right/traffic.txt"),
+            &format!("traffic round{round}"),
+        );
+        wait(|| number(&tree.status(), "refreshes") > before);
+        if round == 1 {
+            third_setup = Some((counters(&tree), Instant::now()));
+        }
+        wait(|| gate.join("merge.reached").exists());
+    }
+    let (third_before, third_started) = third_setup.unwrap_or_else(|| panic!("third attempt"));
+    let prefix_wall = third_started.elapsed();
+    let retry_after = counters(&tree);
+    println!(
+        "MERGE_RETRIES cpu_ticks={} rchar={} wchar={}",
+        retry_after.0 - retry_before.0,
+        retry_after.1 - retry_before.1,
+        retry_after.2 - retry_before.2
+    );
+    let before = number(&tree.status(), "refreshes");
+    write(tree.path("src/right/traffic.txt"), "traffic third round");
+    wait(|| {
+        let status = tree.status();
+        number(&status, "refreshes") > before
+            || (number(&status, "pending_scopes") > 0
+                && number(&status, "oldest_pending_ms") >= 400)
+    });
+    let status = tree.status();
+    println!(
+        "MERGE_PROGRESS input_bytes={} cancellations=2 discarded_partial_bytes={discarded_bytes}",
+        input.bytes
+    );
+    assert_eq!(
+        number(&status, "refreshes"),
+        before,
+        "watch work cancelled the protected third attempt: {status}"
+    );
+    assert!(input_path.exists());
+    let protected_before = counters(&tree);
+    let started = Instant::now();
+    fs::remove_file(gate.join("merge")).unwrap_or_else(|e| panic!("release: {e}"));
+    let mut bursts = 0;
+    let until = Instant::now() + BOUND;
+    let mut next_burst = Instant::now();
+    while input_path.exists() {
+        if Instant::now() >= next_burst {
+            write(
+                tree.path("src/right/traffic.txt"),
+                &format!("steady traffic {bursts}"),
+            );
+            bursts += 1;
+            next_burst = Instant::now() + Duration::from_millis(10);
+        }
+        assert!(Instant::now() < until, "steady traffic starved merge");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let completion = started.elapsed();
+    let protected_after = counters(&tree);
+    println!(
+        "MERGE_PROTECTED_FULL cpu_ticks={} rchar={} wchar={} active_wall_ms={} (excludes_held_gate)",
+        protected_after.0 - third_before.0,
+        protected_after.1 - third_before.1,
+        protected_after.2 - third_before.2,
+        (prefix_wall + completion).as_millis()
+    );
+    println!(
+        "MERGE_PROTECTED cpu_ticks={} rchar={} wchar={}",
+        protected_after.0 - protected_before.0,
+        protected_after.1 - protected_before.1,
+        protected_after.2 - protected_before.2
+    );
+    wait(|| number(&tree.status(), "refreshes") > before);
+    println!(
+        "MERGE_PROGRESS protected_completion_wall_ms={} queued_watch_wait_wall_ms={} bursts={bursts}",
+        completion.as_millis(),
+        started.elapsed().as_millis()
+    );
+    tree.converges();
+}

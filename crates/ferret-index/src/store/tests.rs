@@ -715,3 +715,36 @@ fn an_interrupted_io_error_is_not_a_cooperative_pause() {
         Err(Error::Poisoned)
     ));
 }
+
+/// A follow can make a tiny newly appended segment 100% dead. That new policy
+/// preference must not displace the inputs of a cancelled large merge.
+#[test]
+fn cancelled_merge_selection_survives_unrelated_follow() {
+    let dir = Dir::new("retry-selection");
+    let corpus = Corpus::new(0x5eed, 1001);
+    let mut catalog = Catalog::new(1000, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+    catalog.live = DocSet::new(1000, 0..500);
+    let resources = writer.view().merge_resources(&catalog.live).unwrap();
+    let cancelled = Budget {
+        cancelled: &|| true,
+        ..Budget::unbounded()
+    };
+    assert!(matches!(
+        writer.merge_if_needed(&catalog.view(), &cancelled),
+        Err(Error::Cancelled)
+    ));
+    catalog.live = DocSet::new(1001, (0..500).chain([1000]));
+    follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+    catalog.live = DocSet::new(1001, 0..500);
+    assert_eq!(
+        writer.view().merge_resources(&catalog.live).unwrap(),
+        resources
+    );
+    let merged = writer
+        .merge_if_needed(&catalog.view(), &Budget::unbounded())
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.purged, 500, "retry the large half-dead input first");
+}
