@@ -32,8 +32,12 @@ impl std::error::Error for RegexError {}
 impl Regex {
     /// Compiles `pattern`; `fold` makes it case-insensitive.
     pub fn new(pattern: &str, fold: bool) -> Result<Regex, RegexError> {
-        regex::bytes::RegexBuilder::new(pattern)
-            .case_insensitive(fold)
+        Regex::build(regex::bytes::RegexBuilder::new(pattern).case_insensitive(fold))
+    }
+
+    /// Compiles with every setting already chosen (`GrepFlags`).
+    pub(crate) fn build(builder: &regex::bytes::RegexBuilder) -> Result<Regex, RegexError> {
+        builder
             .build()
             .map(Regex)
             .map_err(|e| RegexError(e.to_string()))

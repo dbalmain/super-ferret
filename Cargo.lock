@@ -154,6 +154,7 @@ version = "0.0.0"
 dependencies = [
  "ferret-text",
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]
