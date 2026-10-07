@@ -80,7 +80,7 @@ Predecessors, carried forward where still open:
 | D62 | `ferret search` syntax for content and booleans          | open           | rec A: `text:` atoms; find-style `OR`, `NOT`, `(` `)` as whole arguments (S2 M0)                               |
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
 | D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
-| D65 | The term dictionary is 87% of the index                  | open           | rec A for S2; S3 M2 tests H (singleton fingerprints) in place of C, decided at steady state: ≥15% term-index saving (S2 M2b, M3; S3 amendment) |
+| D65 | The term dictionary is 87% of the index                  | open           | S3 M2 measured H: 53% smaller at steady state; rule fails on a stale-catalog floor that also fails the control; churn +10%; rec C: run codec, then re-measure |
 | D66 | Phrase queries read too much: positions, or not         | open           | rec A: no positions; ship windowed verify; coarse chunk map for big files is an S3 experiment beside D65 C (S2 M4c) |
 | D67 | How `ferret search` spells a content regex, and when it refuses | open | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0) |
 | D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b) |
@@ -3670,6 +3670,58 @@ at full merge, which is what the estimate predicts. That matters only if the
 index spends its life near full merge. If S2's merge policy keeps `$HOME` near
 13 segments, take H. If long-running daemons drift toward one segment, H's
 advantage erodes, and A is the simpler choice.
+
+### D65 update — M2 measured H (S3 M2, 2026-10-08)
+
+**Measured on a frozen snapshot**: 107,354 readable documents, 3.51 GB.
+The home tree had changed since S2. The two arms are fresh real follows
+and real merges. Every H query returned exactly the control's rows
+(750/750).
+
+| State     | Segments | Control bytes | H bytes | Saving |
+| --------- | -------: | ------------: | ------: | -----: |
+| first     |       45 |      471.3 MB | 202.9 MB |  56.9% |
+| steady    |        9 |      409.7 MB | 192.5 MB |  53.0% |
+| full      |        1 |      368.6 MB | 193.2 MB |  47.6% |
+
+The saving is roughly twice the estimate. The estimate missed 2.49M terms:
+each of them occurs in more than one document overall, but only ever as a
+singleton within a segment, so H never stores their strings. Records cost
+about 4.06 B each, against an estimated 5.1 B. Build CPU is 1.03× (follow plus
+steady merges). Peak RSS is 266 MB against 290 MB.
+
+**The rule as written fails, and the control fails it too.** Steady warm p90 for
+df1, df2–100 and absent is 24.3 / 33.7 / 23.7 ms; the control's is 23.4 / 24.8 / 22.9 ms.
+Both sit on a ~23 ms floor that is not the index. The isolated catalog is stale:
+5,656 of its 113,010 live documents are unreadable, so every query tries 22,708
+fallback name aliases. With that floor removed and nothing else changed, the
+control is 0.08 ms everywhere. H is 1.44 / 10.99 / 0.18 ms p90, and mid and common medians
+are 1.30× and 0.99×, so **every gate passes**. That diagnostic still needs a
+refreshed catalog before it counts as evidence. df2–100's p95 is 46 ms: the
+p90 rule does not bound large-file tails.
+
+**A cost the estimate did not foresee.** On S2's synthetic 5% churn trace, H ends
+**10.4% larger** than the control (13.07 MB against 11.84 MB), with write
+amplification 3.47 against 3.00. Records never return to the dictionary, and
+for recurring short vocabulary a 4-byte record costs more than a compact
+posting. Sol names two fixes, neither built: delta-code the DocIds within an
+equal-fingerprint run, or compress long runs as postings. Either keeps every
+hit Maybe.
+
+**Question: should H replace codec 1?**
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. Keep codec 1 and drop H | Nothing more to build. | The index stays roughly twice the size H measured: 410 MB against 192 MB at steady state. |
+| B. Adopt H as it stands | The 10% churn penalty on long-lived daemons. Every rare-term hit costs a verification read. | 53% off the term index on `$HOME` now. |
+| C. Adopt H after a run-codec fix, re-measured on a refreshed catalog | One more slice: the run codec, plus re-running M2's bench and churn trace. | B's saving without the churn penalty. The latency verdict is taken without the stale-catalog floor. |
+
+**Recommendation: C.** S3 keeps building on codec 1, with codec 2 opt-in, so
+nothing blocks. H's density win is the largest S3 has measured. The
+churn result is the only thing against it, and a run codec is a direct answer
+to it. **The fact that would change it:** on a refreshed catalog, small-class
+p90 stays over 20 ms with full coverage. Then H's verification reads are the
+cost, and A stands.
 
 ## D66 — Phrase queries read too much: positions, or not
 
