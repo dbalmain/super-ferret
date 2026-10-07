@@ -108,3 +108,28 @@ fn a_directory_swapped_for_a_symlink_or_a_copy_is_refused() {
         Err(ContentFault::Changed)
     ));
 }
+
+/// Warm the sibling cache before moving its parent or a higher ancestor.
+/// A descriptor for the moved tree must not verify its former path.
+#[test]
+fn a_cached_directory_is_revalidated_after_replacement() {
+    for ancestor in ["a/b", "a"] {
+        for link in [false, true] {
+            let tmp = Tmp::new(if link { "cached-link" } else { "cached-copy" });
+            let (catalog, docs) = indexed(&tmp, &FILES);
+            let mut documents = Documents::new(&catalog).unwrap();
+            assert_eq!(read(&mut documents, &catalog, docs[0]).unwrap(), FILES[0].1);
+            fs::rename(tmp.at(ancestor), tmp.base.join("moved")).unwrap();
+            if link {
+                symlink(tmp.base.join("moved"), tmp.at(ancestor)).unwrap();
+            } else {
+                fs::create_dir(tmp.at(ancestor)).unwrap();
+            }
+            assert!(
+                read(&mut documents, &catalog, docs[1]).is_err(),
+                "{ancestor}, link={link}"
+            );
+            assert_eq!(read(&mut documents, &catalog, docs[2]).unwrap(), FILES[2].1);
+        }
+    }
+}

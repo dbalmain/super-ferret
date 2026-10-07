@@ -707,3 +707,117 @@ fn an_already_cancelled_content_query_reads_no_postings() {
         "without cancellation it must attempt the broken postings"
     );
 }
+
+/// The first result callback can change the directory before the next read.
+#[test]
+fn a_result_callback_cannot_redirect_later_directory_reads() {
+    let tree = Tree::new();
+    let a = tree.write("d/a.txt", b"alpha beta one");
+    tree.write("d/b.txt", b"alpha beta two");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let mut rows = Vec::new();
+    engine
+        .pin()
+        .search_content(&query(&["text:alpha beta"]), None, None, |row| {
+            rows.push(row.path.to_vec());
+            if rows.len() == 1 {
+                fs::rename(tree.root().join("d"), tree.0.join("moved")).unwrap();
+                std::os::unix::fs::symlink(tree.0.join("moved"), tree.root().join("d")).unwrap();
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(rows, vec![a.as_os_str().as_bytes().to_vec()]);
+}
+
+/// Serial warm checked-read throughput on a real 100k-file synthetic tree.
+#[test]
+#[ignore = "S2 directory revalidation measurement; run release with --ignored --nocapture"]
+fn measure_verification_on_a_hundred_thousand_files() {
+    fn cpu() -> u64 {
+        fs::read_to_string("/proc/thread-self/schedstat")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let tree = Tree::new();
+    for dir in 0..100 {
+        for file in 0..1000 {
+            tree.write(
+                &format!("d{dir}/inner/f{file}.txt"),
+                format!("alpha beta unique{dir}file{file}\n").as_bytes(),
+            );
+        }
+    }
+    let engine = tree.engine();
+    let pin = engine.pin();
+    let catalog = pin.catalog();
+    let names: Vec<_> = catalog
+        .name_reader()
+        .runs_from(ferret_catalog::NameId(0))
+        .filter_map(|(name, edge)| match edge.target() {
+            ferret_catalog::Target::Inode(inode) if catalog.doc(inode).is_some() => Some(name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names.len(), 100_000);
+    let text = ferret_verify::Text::new(b"alpha beta", false).unwrap();
+    for pass in 0..3 {
+        let mut documents = ferret_crawl::Documents::by_name(catalog).unwrap();
+        let mut matcher = ferret_verify::TextMatcher::new();
+        let mut bytes = Vec::new();
+        let cpu_before = cpu();
+        let started = std::time::Instant::now();
+        for &name in &names {
+            documents.read_name(catalog, name, &mut bytes).unwrap();
+            assert!(matcher.is_match(&text, &bytes));
+        }
+        let wall = started.elapsed();
+        let cpu_ns = cpu() - cpu_before;
+        println!(
+            "VERIFY_100K pass={pass} files={} bytes={} cpu_ns={cpu_ns} wall_ns={} files_per_second={:.0}",
+            documents.files_read,
+            documents.bytes_read,
+            wall.as_nanos(),
+            names.len() as f64 / wall.as_secs_f64()
+        );
+    }
+
+    engine.attach_content(&tree.index()).unwrap();
+    while engine
+        .follow_content(&Budget::unbounded(), None)
+        .unwrap()
+        .remaining
+        > 0
+    {}
+    let (mut follow_cpu, mut follow_wall, mut changed) = (0u64, 0u128, 0u64);
+    for round in 1..=40 {
+        for file in 0..8 {
+            let mut bytes = format!("document{file} revision{round} alpha beta ").into_bytes();
+            bytes.extend_from_slice(&b"alpha beta requestHandler ".repeat(3000));
+            bytes.truncate(64 << 10);
+            tree.write(&format!("d0/inner/f{file}.txt"), &bytes);
+        }
+        tree.refresh(&engine);
+        let before_cpu = cpu();
+        let started = std::time::Instant::now();
+        loop {
+            let followed = engine.follow_content(&Budget::unbounded(), None).unwrap();
+            changed += followed.bytes;
+            if followed.remaining == 0 {
+                break;
+            }
+        }
+        follow_wall += started.elapsed().as_nanos();
+        follow_cpu += cpu() - before_cpu;
+    }
+    assert_eq!(changed, 40 * 8 * (64 << 10));
+    println!(
+        "FOLLOW_100K refreshes=40 changed_bytes={changed} cpu_ns={follow_cpu} wall_ns={follow_wall}"
+    );
+}

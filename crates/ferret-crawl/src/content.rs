@@ -30,7 +30,7 @@ use crate::observe::{BulkRead, Opened, Reader, bracket};
 pub struct Documents {
     /// `name[doc]` is the name to read `doc` through, plus one; 0 for none.
     names: Vec<u32>,
-    /// The last parent directory opened and checked, reused by siblings.
+    /// The parent directory held for the current checked walk.
     dir: Option<(InoId, OwnedFd)>,
     limiter: Option<Arc<Limiter>>,
     /// Documents read whole and checked.
@@ -141,14 +141,12 @@ impl Documents {
         Ok(())
     }
 
-    /// A checked descriptor for directory `dir`: the cached one, or a fresh
-    /// walk from its root.
+    /// Re-walk from the root for each path. A retained descriptor alone cannot
+    /// establish that its original path still names it after a rename.
     fn directory(&mut self, catalog: &Catalog, dir: InoId) -> Result<&OwnedFd, ContentFault> {
-        if self.dir.as_ref().is_none_or(|(cached, _)| *cached != dir) {
-            self.dir = None;
-            let fd = open_directory(catalog, dir)?;
-            self.dir = Some((dir, fd));
-        }
+        self.dir = None;
+        let fd = open_directory(catalog, dir)?;
+        self.dir = Some((dir, fd));
         match &self.dir {
             Some((_, fd)) => Ok(fd),
             None => Err(ContentFault::Changed),
