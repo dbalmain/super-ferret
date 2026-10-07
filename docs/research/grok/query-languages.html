@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Query languages — Super Ferret</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .wide { overflow-x: auto; margin: 0.8rem 0 1.2rem; }
+    .wide table { min-width: 78rem; font-size: 12.5px; }
+    .wide th { position: sticky; top: 0; }
+    td.tool { font-weight: 650; white-space: nowrap; }
+    .tag {
+      font-family: var(--sans);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--faint);
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+<nav class="toc">
+  <a class="home" href="index.html">← Super Ferret survey</a>
+  <strong>Report</strong>
+  <a href="#ferret">Ferret today</a>
+  <a href="#table">Comparison</a>
+  <a href="#habits">What an agent types</a>
+  <strong>Engines</strong>
+  <a href="#lucene">Lucene / ES / OpenSearch</a>
+  <a href="#kql">Kibana KQL</a>
+  <a href="#kusto">Kusto</a>
+  <strong>Logs and tickets</strong>
+  <a href="#splunk">Splunk</a>
+  <a href="#jira">Jira JQL</a>
+  <a href="#datadog">Datadog</a>
+  <a href="#dynatrace">Dynatrace DQL</a>
+  <a href="#logql">Loki LogQL</a>
+  <strong>Code</strong>
+  <a href="#github">GitHub code search</a>
+  <a href="#sourcegraph">Sourcegraph</a>
+  <a href="#zoekt">Zoekt</a>
+  <a href="#rg">ripgrep and fd</a>
+  <strong>Web and desktop</strong>
+  <a href="#google">Google</a>
+  <a href="#everything">Everything</a>
+  <a href="#spotlight">Spotlight / mdfind</a>
+  <a href="#aqs">Windows AQS</a>
+  <a href="#recoll">Recoll</a>
+  <strong>For ferret</strong>
+  <a href="#implications">Implications</a>
+  <a href="#sources">Sources</a>
+</nav>
+<main>
+<header class="page">
+  <div class="kicker">Side investigation · D62 and D67</div>
+  <h1>Query languages, read for <code>ferret search</code></h1>
+  <p class="lede">How other search tools spell a field, a boolean, a phrase and a regex, and which of those spellings an agent will type without looking the grammar up. Written so D62’s <code>text:</code> plus whole-argument <code>OR</code>/<code>NOT</code>, and D67’s <code>grep:</code>, stay a choice rather than an accident.</p>
+  <p class="meta">Research date 2026-10-08. Every syntax claim is cited to the vendor’s current documentation. A detail that could not be checked is marked unverified. “What an agent types” is analysis of those docs and of training-corpus habit, not a vendor claim.</p>
+</header>
+
+<div class="callout">
+  <div class="label">Reading this against D62 / D67</div>
+  <p>Dave agreed with D62 A (<code>text:</code> for content; <code>OR</code>, <code>NOT</code>, <code>(</code> and <code>)</code> as whole arguments) and asked for this survey. D67 recommends <code>grep:REGEX</code> for a content regex, case-insensitive and multi-line, with <code>re:</code> left as a name regex. The recommendations at the end may disagree with either. They are recommendations with a tradeoff, not a change to the decisions.</p>
+</div>
+
+<h2 id="ferret">Ferret today</h2>
+<p>The live grammar is <code>crates/ferret-query/src/lib.rs</code> and the help in <code>crates/ferret/src/cli.rs</code>. <code>Query::from_args</code> takes one atom per shell argument. <code>OR</code>, <code>NOT</code>, <code>(</code> and <code>)</code> are operators only as a whole argument. Adjacent atoms AND. AND binds tighter than OR; NOT is tightest. <code>a b OR c</code> is <code>(a b) OR c</code>. A quoted argument with spaces is one atom, so <code>ferret search "text:foo OR text:bar"</code> is a single <code>text:</code> phrase, not a boolean.</p>
+<p>A bare word is a substring of the file name. A word containing <code>/</code>, and <code>path:</code>, are substrings of the path. <code>name:</code> forces the name reading, which is how a file named <code>OR</code> is spelled (<code>name:OR</code>, or <code>case:OR</code>). <code>text:</code> is content: one token is a term (a whole word or an identifier part), several tokens are a phrase in order. <code>ext:</code> is a name ending in <code>.EXT</code>. A glob (<code>*</code>, <code>?</code>, <code>[</code>) matches the whole name, or the path’s trailing components when it contains <code>/</code>, or the whole path when it starts with <code>/</code>. <code>*</code> and <code>?</code> stop at <code>/</code>; <code>**</code> spans components. <code>re:</code> is an unanchored name regex (the <code>regex</code> crate). <code>size:</code> and <code>mtime:</code> and <code>type:</code> are metadata. <code>case:</code> makes the next atom exact. Otherwise words, globs and <code>ext:</code> fold ASCII case, <code>re:</code> folds Unicode case, and <code>text:</code> folds as the content index does. There is no smart-case rule.</p>
+<p>An atom that starts with <code>-</code> is an unknown flag unless it follows <code>--</code> (<code>crates/ferret/src/args.rs</code>). A row with no document (a directory, a binary, a file over the size cap) never holds a <code>text:</code> atom, so <code>NOT text:x</code> is true there. D67, still open, recommends <code>grep:REGEX</code> for a content regex: case-insensitive, <code>^</code> and <code>$</code> at line boundaries, <code>(?-m)</code> for whole-document anchors, <code>.</code> not matching <code>\n</code>. DESIGN.md § Query still sketches <code>/regex/</code>, which D67 rejects because <code>/usr/</code> is already a path substring.</p>
+
+<h2 id="table">Comparison</h2>
+<p>Cells are the spelling an agent has to get right. “Agent habit” is the shape this survey expects an LLM to emit before it reads <code>ferret help</code>. A blank that the vendor page does not settle is marked in the tool section, not papered over here.</p>
+<div class="wide">
+<table>
+  <thead>
+    <tr>
+      <th>Tool</th>
+      <th>Fields</th>
+      <th>Booleans</th>
+      <th>Phrases / escape</th>
+      <th>Regex</th>
+      <th>Wildcards</th>
+      <th>Case</th>
+      <th>Negation pitfall</th>
+      <th>Agent habit</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="tool">ferret search</td>
+      <td><code>text:</code> <code>re:</code> <code>ext:</code> <code>name:</code> <code>path:</code>. Bare word is a name.</td>
+      <td>Juxtaposition AND. <code>OR</code> <code>NOT</code> whole args, exact case. AND tighter than OR.</td>
+      <td>Quote <code>text:"a b"</code> as one argv. Operators are not inside that string.</td>
+      <td><code>re:</code> names, unanchored. Content regex proposed as <code>grep:</code> (D67, not shipped).</td>
+      <td><code>*</code> <code>?</code> <code>[</code> <code>**</code>. <code>*</code> stops at <code>/</code>.</td>
+      <td>Fold by default. <code>case:</code> on the next atom. No smart-case.</td>
+      <td><code>-term</code> is a flag error. Pure <code>NOT</code> is meaningful, and expensive for content.</td>
+      <td>One atom per argument. <code>text:</code> for content.</td>
+    </tr>
+    <tr>
+      <td class="tool">Lucene / ES</td>
+      <td><code>field:term</code>. Field applies to the next term only. Default field is the implementation’s; ES <code>default_field</code> is <code>*</code>.</td>
+      <td>Default OR. <code>AND</code> <code>OR</code> <code>NOT</code> must be ALL CAPS, also <code>&amp;&amp;</code> <code>||</code> <code>!</code>. No usual precedence. Prefer <code>+</code> / <code>-</code>.</td>
+      <td><code>"phrase"</code>, <code>"phrase"~n</code>. Escape <code>\</code>. <code>&lt;</code> <code>&gt;</code> cannot be escaped.</td>
+      <td><code>/regex/</code>. Lucene engine. Must match the entire string. No <code>^</code> <code>$</code>. ES <code>flags</code> default ALL.</td>
+      <td><code>?</code> one, <code>*</code> many, inside a term. Lucene classic forbids a leading <code>*</code> or <code>?</code>. ES allows it (<code>allow_leading_wildcard</code> true).</td>
+      <td>Follows the field analyzer. Wildcard terms are normalized (lowercased) unless analysis says otherwise.</td>
+      <td>A query that is only <code>NOT term</code> returns nothing.</td>
+      <td><code>field:value</code>, <code>+must -not</code>, <code>/regex/</code>, uppercase <code>AND</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Kibana KQL</td>
+      <td><code>field:value</code>. Bare term searches all fields. <code>and</code> <code>or</code> <code>not</code> not case-sensitive.</td>
+      <td>Operators are explicit in the examples. Parentheses set precedence. Current page does not say whether <code>and</code> binds tighter than <code>or</code>.</td>
+      <td>Quotes force order on a <code>text</code> field. Escape <code>\():&lt;&gt;"*</code>.</td>
+      <td>None. Lucene mode is the opt-out that has regex.</td>
+      <td><code>*</code> only, including a leading <code>*</code> by default. No <code>?</code>.</td>
+      <td>Keyword, numeric, date, boolean: exact, including case. <code>text</code> fields are analyzed.</td>
+      <td><code>not field:value</code> is a complete query.</td>
+      <td><code>field:value and other:value</code>, lowercase operators, <code>*</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Kusto</td>
+      <td><code>column has "term"</code>, <code>==</code>, <code>contains</code>. No <code>field:value</code>.</td>
+      <td><code>and</code> binds tighter than <code>or</code>. Keywords are lowercase in the docs.</td>
+      <td>String literals in quotes. <code>has</code> is a term; <code>contains</code> is a subsequence.</td>
+      <td><code>matches regex</code>, case-sensitive. The left side contains a match (unanchored containment).</td>
+      <td>No glob. Term operators (<code>hasprefix</code>, <code>hassuffix</code>) cover the usual prefix/suffix need.</td>
+      <td><code>==</code> and <code>matches regex</code> sensitive. <code>=~</code>, <code>has</code>, <code>contains</code> insensitive. <code>_cs</code> makes the insensitive family sensitive.</td>
+      <td><code>!has</code> / <code>!contains</code> are the negations. A where-clause of only a negation is ordinary.</td>
+      <td><code>field has "foo" and field has "bar"</code>. Agents who say “KQL” often mean this.</td>
+    </tr>
+    <tr>
+      <td class="tool">Splunk <code>search</code></td>
+      <td><code>field=value</code>, comparisons <code>!=</code> <code>&lt;</code> <code>&lt;=</code> <code>&gt;</code> <code>&gt;=</code>.</td>
+      <td>Implicit AND. Operators uppercase. Order: parens, NOT, OR, AND. OR is tighter than AND. <code>eval</code>/<code>where</code> are the other way around.</td>
+      <td><code>CASE()</code> and <code>TERM()</code> for exact term and phrase. Quoting details live on that page.</td>
+      <td>Not in the <code>search</code> command. A separate <code>regex</code> pipeline command exists; its flags were not re-read here.</td>
+      <td><code>*</code> in values, and in <code>IN</code>.</td>
+      <td>Default search is case-insensitive. <code>CASE(error)</code> is sensitive.</td>
+      <td><code>NOT</code> applies to the next expression. <code>NOT</code> versus <code>!=</code> is a separate manual page, not restated here.</td>
+      <td><code>index=main error NOT debug</code>, <code>field=value*</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Jira JQL</td>
+      <td><code>field = value</code>, <code>~</code> for contains, <code>!=</code> <code>!~</code> <code>IN</code> <code>IS</code>.</td>
+      <td>Clause keywords are lowercase in the keyword reference. Precedence: parens, comparison, NOT, AND, OR. No juxtaposition of two clauses.</td>
+      <td>Inside <code>~</code>, quotes are phrases, and the text syntax is Lucene’s: <code>AND</code> <code>OR</code> <code>NOT</code> ALL CAPS, default OR between terms.</td>
+      <td>No regex on the pages read. Wildcards inside <code>~</code>.</td>
+      <td><code>win*</code>, <code>*WIN-1*</code>. A leading or very broad wildcard can error.</td>
+      <td>The <code>~</code> text syntax follows Lucene analysis (stemming in the examples: <code>win</code> matches <code>wins</code>).</td>
+      <td>Two layers. <code>not</code> on a clause is JQL. <code>NOT</code> inside the quoted <code>~</code> value is Lucene, and a lone Lucene <code>NOT</code> is the Lucene pitfall.</td>
+      <td><code>project = FOO and text ~ "words"</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Datadog</td>
+      <td><code>service:web</code> for reserved tags. <code>@url:value</code> for attributes. <code>*:hello</code> is full text.</td>
+      <td><code>AND</code> <code>OR</code> <code>-</code> are case-sensitive. Nothing between terms means AND. A later example also uses <code>NOT(...)</code>. Precedence of <code>AND</code> vs <code>OR</code> is not stated.</td>
+      <td><code>"hello dolly"</code>. Escape <code>-</code> <code>!</code> <code>&amp;&amp;</code> <code>||</code> and the usual set. <code>/</code> is not special.</td>
+      <td>No regex operator on the log search syntax page. Regex exists in ingest Grok and in calculated fields, which are not the search bar.</td>
+      <td><code>*</code> outside quotes. Inside quotes <code>*</code> is literal. <code>?</code> is one special character or space in an attribute value.</td>
+      <td>Attribute search is case-sensitive. The page says to use full-text search for case-insensitive results.</td>
+      <td><code>-@http.status_code:*</code> is a documented lone exclusion. A bare <code>-password</code> with no positive term is not shown.</td>
+      <td><code>service:web status:error -debug</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Dynatrace DQL</td>
+      <td>Pipe language. <code>filter field == "ERROR"</code>. Logs UI also writes <code>content ~ "phrase"</code> and <code>* ~ "phrase"</code>.</td>
+      <td>Successive filters are AND. <code>and</code> / <code>or</code> / <code>not</code> exist; the logs page does not state their precedence.</td>
+      <td><code>~</code> is a phrase (<code>matchesPhrase</code>). <code>= "*card*"</code> is a value wildcard (<code>matchesValue</code>).</td>
+      <td>Not on the logs filter page. Pattern matching is a separate command family; treat regex spelling as unverified here.</td>
+      <td><code>*</code> inside a <code>=</code> value, as in <code>content = "*card*"</code>.</td>
+      <td><code>matchesPhrase</code> is ASCII case-insensitive. <code>==</code> on the filter examples is written as an exact compare.</td>
+      <td><code>filterOut</code> drops matches. A filter of two contradictory equalities returns nothing, because filters AND.</td>
+      <td><code>fetch logs | filter content ~ "error"</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Loki LogQL</td>
+      <td>No <code>field:value</code>. Stream selector <code>{app="api"}</code>, then <code>|</code> filters. Label matchers <code>=</code> <code>!=</code> <code>=~</code> <code>!~</code>.</td>
+      <td>Chained line filters are AND. Label-filter predicates bind left to right, so <code>a or b and c</code> is <code>(a or b) and c</code>.</td>
+      <td>Double quotes, or backticks to avoid backslash escapes.</td>
+      <td>RE2. Selector regex is fully anchored and <code>.</code> does not match newline. Line-filter <code>|~</code> is unanchored and <code>.</code> does match newline. <code>(?i)</code> for insensitive.</td>
+      <td>None in the line filter. Regex is the wildcard.</td>
+      <td>Line filters are case-sensitive unless the regex says <code>(?i)</code>.</td>
+      <td><code>!=</code> and <code>!~</code> are “does not contain”, and they still require the stream to be selected. An empty selector is not a query.</td>
+      <td><code>{job="app"} |= "error" != "timeout"</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">GitHub code</td>
+      <td><code>repo:</code> <code>path:</code> <code>language:</code> <code>content:</code> <code>symbol:</code>. Bare term matches content or path.</td>
+      <td>Whitespace is AND, written as equivalent to <code>AND</code>. <code>OR</code> <code>NOT</code> documented in uppercase. Precedence of mixed <code>AND</code>/<code>OR</code> is not stated. Parentheses work.</td>
+      <td>Quotes are an exact string, including whitespace. Escape <code>\"</code> and <code>\\</code> only, outside a regex.</td>
+      <td><code>/regex/</code>, RE2-like, no lookaround. <code>\n</code> <code>\t</code> <code>\x{hhhh}</code> inside. Whether the match is unanchored is not stated.</td>
+      <td><code>path:</code> globs: <code>*</code> does not match <code>/</code>, <code>**</code> does, <code>?</code> one character. Leading <code>/</code> anchors. Quotes disable globs.</td>
+      <td>Case-insensitive. Sensitive is <code>/(?-i)True/</code>.</td>
+      <td><code>NOT</code> is documented next to a positive term. Parts not separated by spaces often fall back to a literal search.</td>
+      <td><code>repo:org/name path:*.rs content:foo OR bar</code>, and <code>/regex/</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Sourcegraph</td>
+      <td><code>repo:</code> <code>file:</code> <code>content:</code> <code>lang:</code>. Keyword mode is the default. <code>repo:</code> and <code>file:</code> are unanchored regex; <code>^</code> <code>$</code> anchor them.</td>
+      <td><code>and</code>/<code>AND</code>, <code>or</code>/<code>OR</code>, <code>not</code>/<code>NOT</code>. <code>and</code> binds tighter than <code>or</code>. Space in keyword mode means both terms.</td>
+      <td><code>"phrase"</code>. <code>content:"..."</code> to search for the word <code>OR</code>. Backslash escapes inside quotes.</td>
+      <td><code>/regex/</code> is RE2 in keyword mode. In regexp mode a space becomes <code>.*?</code>.</td>
+      <td>Regex, plus <code>*</code> in revision selectors. No separate glob language for the pattern.</td>
+      <td>Case-insensitive unless <code>case:yes</code>.</td>
+      <td><code>NOT</code> can replace <code>-</code> on filters. <code>NOT</code> on a pattern excludes documents containing the term.</td>
+      <td><code>file:foo.go bar OR baz case:yes</code>, and <code>/re/</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Zoekt</td>
+      <td><code>content:</code>/<code>c:</code>, <code>file:</code>/<code>f:</code>, <code>repo:</code>/<code>r:</code>, <code>lang:</code>, <code>sym:</code>, <code>regex:</code>. Values are Go regex. No <code>/</code> delimiters; a slash is literal.</td>
+      <td>Space is AND. Lowercase <code>or</code> only. <code>and</code> is a search term, not an operator. Negation is <code>-</code>.</td>
+      <td>Double quotes group spaces. Backslash escapes the next character.</td>
+      <td>The bare pattern is a Go regexp. A pattern with no regexp operators is optimized to a substring. Anchors are the regexp’s own <code>^</code> <code>$</code>.</td>
+      <td>None besides the regexp.</td>
+      <td><code>case:auto</code> is the default (sensitive if the pattern has an uppercase letter). <code>case:yes</code> / <code>case:no</code>.</td>
+      <td><code>-</code> negates the next expression. <code>and</code> will not conjoin; it searches for the word.</td>
+      <td><code>file:.*\.go$ content:foo or bar</code>, lowercase <code>or</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">ripgrep</td>
+      <td>No query language. The pattern is a positional argument. <code>-g</code> globs, <code>-t</code>/<code>-T</code> types.</td>
+      <td>None. Boolean is a second <code>rg</code> or a regexp <code>|</code>.</td>
+      <td><code>-F</code> fixed string. Shell quoting is the escape.</td>
+      <td>Rust <code>regex</code> syntax. Unanchored in a line; <code>^</code> <code>$</code> are line anchors. <code>-U</code> allows a match to span lines.</td>
+      <td><code>-g</code> gitignore-style globs, <code>!</code> to blacklist.</td>
+      <td><code>-i</code> ignores case. <code>-S</code> is smart-case, described as something usually put in an alias or a config file. The bare command does not fold.</td>
+      <td>A pattern starting with <code>-</code> needs <code>-e</code> or <code>--</code>. Invert is a flag, not a query operator; the flag was not on the common-options list re-read here.</td>
+      <td><code>rg -i -g '*.rs' pattern</code>. This is the shape of <code>ferret grep</code>, not of <code>ferret search</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">fd</td>
+      <td>One pattern, optional paths. <code>-e</code> extension, <code>-t</code> type. No content search.</td>
+      <td>None. One pattern.</td>
+      <td>Shell quoting. <code>-F</code> was not in the <code>-h</code> summary re-read; <code>--glob</code> / <code>-g</code> switches off regex.</td>
+      <td>Default. Rust <code>regex</code> syntax (<code>docs.rs/regex</code>). Unanchored substring of the file name (<code>netfl</code> matches a name containing it). <code>^</code> <code>$</code> anchor.</td>
+      <td><code>-g</code> globs. Default is regex, so <code>*</code> is a quantifier.</td>
+      <td>Smart case: insensitive until the pattern contains an uppercase letter. <code>-s</code> sensitive, <code>-i</code> ignore.</td>
+      <td>A pattern starting with <code>-</code> needs <code>--</code>. Hidden files and gitignore matches are skipped by default, which looks like a missed query.</td>
+      <td><code>fd -e rs pattern</code>, smart case, regex by default.</td>
+    </tr>
+    <tr>
+      <td class="tool">Google</td>
+      <td><code>site:</code> <code>filetype:</code> <code>before:</code> <code>after:</code>. No space after the colon.</td>
+      <td>The current help page documents no <code>AND</code>, <code>OR</code>, or <code>|</code>.</td>
+      <td>Quotes for an exact word or phrase.</td>
+      <td>Not documented.</td>
+      <td>Not documented.</td>
+      <td>Not stated on the operators page.</td>
+      <td><code>-</code> excludes the next word, with no space after the minus.</td>
+      <td><code>site:example.com "exact" -word filetype:pdf</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Everything</td>
+      <td>Bare text matches the file name. <code>content:</code> <code>ext:</code> <code>size:</code> <code>dm:</code> are functions. A <code>\</code> searches the path.</td>
+      <td>Space is AND. <code>|</code> is OR. <code>!</code> is NOT. <code>&lt; &gt;</code> group. Order of mixed space and <code>|</code> is not stated on the Searching page.</td>
+      <td>Quotes make operators literal text, and quote paths with spaces.</td>
+      <td><code>regex:</code> is PCRE. <code>^</code> <code>$</code> are the start and end of the filename. Full regex mode disables the rest of the syntax.</td>
+      <td><code>*</code> and <code>?</code> except <code>\</code>. <code>**</code> includes <code>\</code>. A wildcard matches the whole filename.</td>
+      <td><code>case:</code> modifier, or the Match Case option. Default match is not case-sensitive in the examples (<code>case:</code> is how you turn sensitivity on).</td>
+      <td><code>!</code> excludes the next term. Quoting is how you search for a name that starts with <code>!</code>.</td>
+      <td><code>*.rs path:\src content:foo</code>, <code>!</code> and <code>|</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">mdfind</td>
+      <td>Predicate form <code>attribute == value</code>, from Apple’s archived query format. Finder keyword shorthand (<code>kind:pdf</code>) was not on an Apple page re-read here.</td>
+      <td><code>&amp;&amp;</code> and <code>||</code>, with parentheses. No <code>AND</code> keyword on that page.</td>
+      <td>Quotes around values. Escape <code>"</code> and <code>'</code> with <code>\</code>.</td>
+      <td>Not on the query-format page.</td>
+      <td><code>*</code> and <code>?</code> inside the value. An unquoted exact value matches the whole attribute.</td>
+      <td>Default <code>==</code> is case-sensitive. <code>==[c]</code> is insensitive, <code>[d]</code> ignores diacritics. One example on the page puts <code>[c]</code> on the attribute instead of the operator.</td>
+      <td>No pure-negative discussion on the page. A value of <code>"*"</code> is the way to say “has a value”.</td>
+      <td><code>kMDItemTextContent ==[c] '*foo*'</code> for agents who have seen the Apple page; <code>kind:pdf</code> for agents who have used Finder. The second is unverified against Apple.</td>
+    </tr>
+    <tr>
+      <td class="tool">Windows AQS</td>
+      <td><code>prop:value</code>, or a bare restriction that searches all properties. Programmatic use wants canonical names (<code>System.FileName</code>).</td>
+      <td>Juxtaposition is AND. <code>AND</code> <code>OR</code> <code>NOT</code> must be uppercase. Mixed <code>AND</code>/<code>OR</code> bind left to right, regardless of which operator.</td>
+      <td>Quotes are phrases. A doubled <code>""</code> embeds a quote.</td>
+      <td>None on the syntax page.</td>
+      <td><code>~</code> introduces DOS wildcards: <code>?</code> one, <code>*</code> many. Also <code>~&lt;</code> starts-with, <code>~&gt;</code> ends-with, <code>~=</code> contains.</td>
+      <td>The operators are not case-sensitive. The keywords <code>AND</code> <code>OR</code> <code>NOT</code> must be uppercase.</td>
+      <td>Canonical names are required for programmatic queries on Windows 7 and later. UI keywords follow the UI language. Mixed <code>AND</code>/<code>OR</code> need parentheses; the page says so.</td>
+      <td><code>System.FileName:report AND System.Size:&gt;1kb</code>, uppercase <code>AND</code>.</td>
+    </tr>
+    <tr>
+      <td class="tool">Recoll</td>
+      <td><code>field:value</code> means contains. <code>ext:</code>, <code>filename:</code>/<code>fn:</code>, <code>title:</code>, and <code>text:</code> for the body.</td>
+      <td>Implicit AND. <code>OR</code> must be capitals and binds tighter than AND: <code>word1 word2 OR word3</code> is <code>word1 AND (word2 OR word3)</code>. <code>-</code> negates.</td>
+      <td>Quotes are a phrase. Capitals, and words inside phrases, are not stemmed. <code>author:a,b</code> is AND and <code>author:a/b</code> is OR, only with a field prefix.</td>
+      <td>No regex operator on the general syntax page.</td>
+      <td><code>*</code> <code>?</code> <code>[]</code> anywhere in a term. A left wildcard is slow, and can be truncated.</td>
+      <td>Stemming is the default expansion. A capitalized word suppresses it. A separate case-fold switch is not on the syntax page.</td>
+      <td><code>-</code> is the negation. A term of only a negation is written <code>-potatoes</code> in the sample, beside positive terms.</td>
+      <td><code>ext:pdf "phrase" OR other -nope</code>. Closest desktop cousin, and the boolean is the opposite of ferret’s.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="habits">What an agent types</h2>
+<p>Before it reads a help page, an agent reaches for one of about six shapes. Which one depends on the last tool in its training mix, and code-search and log-search outweigh desktop search.</p>
+<ul>
+  <li><code>field:value</code> with a space meaning AND, from GitHub, Sourcegraph, Kibana, Datadog, Recoll, Everything. The field name it will guess for content is <code>content:</code>, then <code>text:</code>.</li>
+  <li>A bare word meaning the body, or the body and the path. GitHub does both. Sourcegraph keyword, Recoll, KQL, Splunk, Datadog free text, and a Lucene default field all search text. Everything, <code>fd</code>, and ferret search names.</li>
+  <li><code>/regex/</code> for a content pattern, from GitHub and Sourcegraph. Zoekt omits the slashes and treats the bare pattern as a Go regexp. Lucene uses the slashes and anchors to the whole term.</li>
+  <li>Uppercase <code>AND</code>/<code>OR</code>/<code>NOT</code> from Lucene, Splunk, GitHub’s examples, Recoll’s <code>OR</code>, and Windows AQS. Lowercase <code>and</code>/<code>or</code>/<code>not</code> from KQL, Sourcegraph, JQL clauses, and Kusto. Zoekt accepts only lowercase <code>or</code>, and <code>and</code> is not an operator there.</li>
+  <li><code>-term</code> or <code>!term</code> for negation, from Lucene, Google, Datadog, Everything, Recoll, Zoekt, and Sourcegraph filters. Parentheses for grouping, except Everything, which uses <code>&lt; &gt;</code>.</li>
+  <li>The whole query in one pair of shell quotes. Every tool above except ferret, <code>rg</code>, and <code>fd</code> is a single string. Ferret’s operators are separate arguments.</li>
+</ul>
+<p>Precedence is the quiet disagreement. Sourcegraph, JQL, and Kusto bind <code>and</code> tighter than <code>or</code>, which is also ferret and ordinary programming. Lucene’s <code>AND</code>/<code>OR</code> do not follow that rule, and the manual tells you to parenthesize. Splunk’s <code>search</code> command and Recoll bind <code>OR</code> tighter. LogQL label filters and Windows AQS bind left to right, so <code>a OR b AND c</code> is <code>(a OR b) AND c</code>. GitHub and the current Kibana KQL page show parentheses and do not state a binding. An agent that parenthesizes is safe everywhere. An agent that writes <code>a b OR c</code> and expects “a, plus either b or c” is reading Recoll, Splunk, and Everything’s likely habit, and it is wrong in ferret.</p>
+
+<h2 id="lucene">Lucene, Elasticsearch, OpenSearch</h2>
+<p>Lucene classic and Elasticsearch’s <code>query_string</code> are the same idea with two defaults that matter. OpenSearch’s <code>query_string</code> is that family; this section cites the Lucene 9.12 classic package summary and the current Elasticsearch pages, and does not re-read OpenSearch for deltas.</p>
+<p>A field is <code>status:active</code>, and it applies only to the term it precedes. <code>title:The Right Way</code> searches <code>title</code> for <code>The</code> and the default field for <code>Right</code> and <code>Way</code>. Group with <code>title:(quick OR brown)</code>. Elasticsearch’s <code>default_field</code> defaults to <code>*</code>, every eligible field. The default operator is <code>OR</code>, so <code>capital of Hungary</code> is three optional terms. <code>AND</code>, <code>OR</code> and <code>NOT</code> must be all capitals (Lucene), and Elasticsearch also accepts <code>&amp;&amp;</code>, <code>||</code> and <code>!</code>. Elasticsearch says those words do not honor the usual precedence, so parentheses are required. The preferred operators are <code>+</code> (must) and <code>-</code> (must not); other terms are optional and only affect score. A query that is only <code>NOT "jakarta apache"</code> returns no results.</p>
+<p>Quotes are a phrase. <code>"fox quick"~5</code> is proximity. Reserved characters include <code>+ - = &amp;&amp; || &gt; &lt; ! ( ) { } [ ] ^ " ~ * ? : \ /</code>. <code>&lt;</code> and <code>&gt;</code> cannot be escaped at all in <code>query_string</code>. Whitespace is not an operator.</p>
+<p>Wildcards are <code>?</code> and <code>*</code> inside a single term, not inside a phrase. Lucene classic rejects a leading <code>*</code> or <code>?</code>. Elasticsearch allows it, and <code>allow_leading_wildcard</code> defaults to true. A regex is wrapped in slashes, <code>name:/joh?n(ath[oa]n)/</code>. The engine is Lucene’s, not PCRE. It has no <code>^</code> or <code>$</code>: the expression must match the entire string. The <code>regexp</code> query’s <code>flags</code> default to <code>ALL</code>, which turns on complement <code>~</code>, interval <code>&lt;&gt;</code>, intersection <code>&amp;</code>, any-string <code>@</code> and empty <code>#</code>. <code>allow_leading_wildcard</code> does not apply to regexes, so <code>/.*n/</code> walks every term. Case follows the field’s analyzer; wildcard terms are only normalized (lowercasing, ASCII folding) unless <code>analyze_wildcard</code> is set.</p>
+<p>An agent types <code>+required -excluded</code>, uppercase <code>AND</code>, and <code>/regex/</code>, and it parenthesizes if it has been burned. It will also type lowercase <code>and</code>, which Lucene parses as a term.</p>
+<p class="refs">Sources: <a href="https://lucene.apache.org/core/9_12_0/queryparser/org/apache/lucene/queryparser/classic/package-summary.html">Lucene 9.12 classic query parser</a>, <a href="https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-query-string-query">Elasticsearch query_string</a>, <a href="https://www.elastic.co/docs/reference/query-languages/query-dsl/regexp-syntax">Elasticsearch regular expression syntax</a>.</p>
+
+<h2 id="kql">Kibana KQL</h2>
+<p>KQL is Kibana’s filter language. It is not Lucene, and the current reference says so. A bare term searches every field. A field is <code>http.request.method: GET</code>. On keyword, numeric, date and boolean fields the value must match exactly, including case. On a <code>text</code> field the terms are analyzed and order does not matter, so <code>null pointer</code> also matches <code>pointer null</code>. Quotes restore order. Escape <code>\():&lt;&gt;"*</code>, or quote the value.</p>
+<p><code>and</code>, <code>or</code> and <code>not</code> are not case-sensitive. The current page’s boolean examples all use an explicit operator, and it says to use parentheses to set precedence. It does not say whether <code>and</code> binds tighter than <code>or</code>, and it does not show two bare terms side by side as an implicit <code>AND</code> or <code>OR</code>. <code>not http.request.method: GET</code> is a complete query. The only wildcard is <code>*</code>, and a leading <code>*</code> is allowed unless <code>query:allowLeadingWildcards</code> is off. That setting is unavailable on Elastic Cloud Serverless. There is no <code>?</code> and no regex. Regex is why people switch the Kibana language picker to Lucene.</p>
+<p>An agent that has used Discover types <code>field:value and other:value</code> in whatever case, with <code>*</code> and no slashes. When it says “KQL” without Kibana in the sentence, it often means Kusto, below.</p>
+<p class="refs">Source: <a href="https://www.elastic.co/docs/explore-analyze/query-filter/languages/kql">Kibana KQL</a>.</p>
+
+<h2 id="kusto">Kusto (Azure Data Explorer, Log Analytics)</h2>
+<p>Included because an agent that says “KQL” in a logs conversation means this language, used by Azure Data Explorer, Log Analytics, Microsoft Sentinel and Fabric. It is a pipe language. There is no <code>field:value</code>.</p>
+<p>A filter is <code>where Column has "term"</code> or <code>Column == "term"</code>. <code>has</code> matches a term and is case-insensitive; <code>has_cs</code> is the sensitive form. <code>contains</code> is a case-insensitive subsequence. <code>==</code> is case-sensitive; <code>=~</code> is not. The operator pages’ performance notes prefer a case-sensitive operator when one exists (<code>hasprefix_cs</code> is the page re-checked). <code>matches regex</code> is case-sensitive. Its example, <code>State matches regex "K.*S"</code>, returns <code>KANSAS</code>, <code>ARKANSAS</code> and <code>LAKE SUPERIOR</code>, which only works as a containment match. The page does not say “unanchored” in words. <code>hasprefix</code> says the term index covers terms of three or more characters; a shorter term scans.</p>
+<p><code>and</code> has higher precedence than <code>or</code>. Both keywords are written in lowercase on the logical-operators page. Negation of a string test is <code>!has</code>, <code>!contains</code>, <code>!=</code>. A <code>where</code> that is only a negation is an ordinary predicate. There is no glob; <code>hasprefix</code> and <code>hassuffix</code> are the prefix and suffix operators.</p>
+<p>An agent types <code>Field has "error" and Field !has "timeout"</code>, or <code>Field matches regex "foo.*bar"</code>, inside a <code>| where</code>. It does not type <code>field:value</code> once it has decided this is Kusto. Before it decides, it types Kibana.</p>
+<p class="refs">Sources: <a href="https://learn.microsoft.com/en-us/kusto/query/datatypes-string-operators?view=microsoft-fabric">Kusto string operators</a>, <a href="https://learn.microsoft.com/en-us/kusto/query/matches-regex-operator?view=microsoft-fabric">matches regex</a>, <a href="https://learn.microsoft.com/en-us/kusto/query/logical-operators?view=microsoft-fabric">logical operators</a>.</p>
+
+<h2 id="splunk">Splunk SPL</h2>
+<p>The <code>search</code> command is the part an agent pastes. It is not the whole of SPL. Terms and expressions have an implied <code>AND</code>: <code>web error</code> is <code>web AND error</code>. Field constraints are comparisons, <code>clientip=192.0.2.255</code>, with <code>!=</code> <code>&lt;</code> <code>&lt;=</code> <code>&gt;</code> <code>&gt;=</code>. When a command’s syntax includes a logical operator, the operator is written in uppercase.</p>
+<p>Evaluation order for <code>search</code> is parentheses, then <code>NOT</code>, then <code>OR</code>, then <code>AND</code>. <code>eval</code> and <code>where</code> evaluate <code>AND</code> before <code>OR</code>. The search reference says this outright, and the predicate-expressions page repeats it. <code>A=1 AND B=2 OR C=3</code> is processed as the search command’s order, which is OR before AND. <code>NOT</code> applies to the term or expression immediately following it. The manual points at a separate page for the difference between <code>NOT</code> and <code>!=</code>; that page was not re-read, so the missing-field behaviour is not stated here. Wildcards are <code>*</code> in values and inside <code>IN</code>.</p>
+<p>Searches are case-insensitive. <code>Error</code> matches <code>error</code> and <code>ERROR</code>. <code>CASE(error)</code> matches that case only, and <code>CASE()</code> can hold a wildcard. <code>TERM()</code> matches the parenthesized text as one indexed term, including minor breakers such as periods. The <code>search</code> command page does not document an inline regex. A <code>regex</code> pipeline command exists; its engine, flags and anchoring were not re-read for this report.</p>
+<p>An agent types <code>index=main sourcetype=app error NOT debug status=500</code>, with uppercase <code>OR</code> when it wants a union, and it does not expect <code>OR</code> to bind tighter than <code>AND</code> unless it has hit this specific footgun. The footgun is real, and it is the opposite of <code>eval</code>.</p>
+<p class="refs">Sources: <a href="https://help.splunk.com/en/splunk-enterprise/spl-search-reference/10.4/search-commands/search">search command</a>, <a href="https://help.splunk.com/en/splunk-enterprise/search/search-manual/10.2/expressions-and-predicates/predicate-expressions">predicate expressions</a>, <a href="https://help.splunk.com/en/splunk-cloud-platform/spl-search-reference/10.4.2604/introduction/understanding-spl-syntax">SPL syntax</a> (uppercase operators), <a href="https://help.splunk.com/ja-jp/splunk-cloud-platform/search/search-manual/9.3.2408/search-primer/use-case-and-term-to-match-phrases">CASE() and TERM()</a> (English body served under a <code>/ja-jp/</code> path).</p>
+
+<h2 id="jira">Jira JQL</h2>
+<p>JQL has two layers, and mixing them up is the usual bug. The outer layer is clauses: <code>project = FOO and status = Open</code>. The keyword reference writes <code>and</code>, <code>or</code> and <code>not</code> in lowercase. There is no juxtaposition of two clauses; each pair needs an operator. Precedence, from strongest to weakest, is parentheses, then comparison (<code>=</code> <code>!=</code> <code>~</code> <code>IN</code> <code>IS</code> and the rest), then <code>NOT</code>, then <code>AND</code>, then <code>OR</code>. So <code>AND</code> binds tighter than <code>OR</code>, as in ferret.</p>
+<p>Contains is <code>~</code>. <code>text ~ "some words"</code> searches summary, description, environment, comments and text custom fields. The value on the right of <code>~</code> is a second language, and that page is Lucene’s: <code>AND</code>, <code>OR</code>, <code>NOT</code>, <code>+</code> and <code>-</code> must be all capitals, <code>OR</code> is the default between terms, <code>||</code> works, and the page shows parentheses to force <code>bugs AND (atlassian OR jira)</code>. Phrases are quoted. Wildcards are <code>summary ~ "win*"</code> and <code>issueKey ~ "*WIN-1*"</code>. A leading or very broad wildcard can fail because it expands to too many terms. No regex dialect is documented on the operators page or the text-search page. <code>summary ~ win</code> also stems: the example says it matches derivatives such as <code>wins</code>.</p>
+<p>An agent types the outer layer in lowercase (<code>project = X and text ~ "foo bar"</code>) and, if it has used Lucene, puts capitals inside the quotes. A pure <code>NOT</code> inside the quoted value is the Lucene “matches nothing” trap. A JQL <code>not</code> on a clause is ordinary negation.</p>
+<p class="refs">Sources: <a href="https://support.atlassian.com/jira-software-cloud/docs/jql-operators/">JQL operators</a>, <a href="https://support.atlassian.com/jira-core-cloud/docs/advanced-search-reference-jql-keywords/">JQL keywords</a>, <a href="https://support.atlassian.com/jira/kb/jira-cloud-jql-order-of-operations/">order of operations</a>, <a href="https://support.atlassian.com/jira-software-cloud/docs/search-for-work-items-using-the-text-field/">text-field search syntax</a>.</p>
+
+<h2 id="datadog">Datadog log search</h2>
+<p>A term is a word, or a quoted sequence (<code>"hello dolly"</code>). The boolean operators on the syntax table are case-sensitive: <code>AND</code> (the default when nothing is written), <code>OR</code>, and <code>-</code> for exclusion. The table’s example is <code>authentication AND -password</code>. A later CIDR example uses <code>NOT(CIDR(...))</code>, so <code>NOT</code> occurs, but it is not in the operator table. The page does not state whether <code>AND</code> or <code>OR</code> binds tighter. Parentheses appear in the examples.</p>
+<p>Reserved attributes are bare: <code>service:web-app</code>, <code>status:error</code>, <code>host:...</code>. Other attributes take <code>@</code>: <code>@url:www.datadoghq.com</code>. <code>*:hello</code> searches every attribute, including the message. A bare <code>hello</code> searches the message and a few error attributes, not every attribute. Attribute search is case-sensitive. The page says to use full-text search to get case-insensitive results; the same page also describes <code>*:hello</code> as an exact string, and it does not spell out how those two sentences interact. Wildcards are <code>*</code>, and only outside quotes: <code>"*test*"</code> is the literal characters. <code>?</code> matches one special character or a space inside an attribute value (<code>@my_attribute:hello?world</code>). Escape <code>-</code> <code>!</code> <code>&amp;&amp;</code> <code>||</code> <code>&gt;</code> <code>&lt;</code> the brackets, quotes, <code>*</code> <code>?</code> <code>:</code> <code>\</code> <code>#</code> and spaces. <code>/</code> is not special. <code>@</code> cannot appear as a search character in the explorer; it introduces an attribute.</p>
+<p>There is no regex operator on this page. Grok regex is an ingest parser, and calculated-field <code>regexp_like</code> is a different surface. Do not teach an agent that <code>/foo/</code> works in the log search bar. <code>-@http.status_code:*</code> is a documented query with no positive term. A bare <code>-password</code> alone is not shown.</p>
+<p>An agent types <code>service:web @http.status_code:500 -healthcheck</code>, uppercase <code>AND</code> if it writes the operator, and <code>*</code> for a wildcard. It reaches for <code>/regex/</code> and gets a literal or a syntax error.</p>
+<p class="refs">Source: <a href="https://docs.datadoghq.com/logs/explorer/search_syntax/">Log search syntax</a>.</p>
+
+<h2 id="dynatrace">Dynatrace DQL</h2>
+<p>DQL is a pipe of commands: <code>fetch logs | filter … | search …</code>. The logs app documents the filter form an agent actually writes. Successive filter statements are connected with <code>AND</code>, so <code>status = ERROR</code> followed by <code>status = WARN</code> matches nothing. <code>filterOut</code> removes rows that match.</p>
+<p>A phrase across every field is <code>* ~ "failed to charge card"</code>, which the page says is the <code>search</code> command. The same phrase restricted to the body is <code>content ~ "failed to charge card"</code>, equivalent to <code>matchesPhrase</code>. A wildcard value is <code>content = "*card*"</code>, equivalent to <code>matchesValue</code>. <code>matchesPhrase</code>, on the matcher page, is case-insensitive for ASCII, treats <code>*</code> as one term rather than a mid-string wildcard, and checks word boundaries unless the phrase itself starts or ends with <code>*</code>. Field names outside <code>[A-Za-z0-9_.]</code> need backticks; that detail is from the DQL language reference and was not on the logs page re-read here, so treat the backtick rule as unverified against the current commands page. Boolean <code>and</code> / <code>or</code> / <code>not</code> appear in DQL filters. The logs page does not state their precedence, and this pass did not re-read a logical-operators page, so precedence is unverified. A regex spelling was not on the logs filter page. Leave it unverified rather than inventing <code>matchesPattern</code> syntax.</p>
+<p>An agent types <code>fetch logs | filter loglevel == "ERROR" | search "timeout"</code>, or the shorter <code>content ~ "timeout"</code>. It does not type <code>loglevel:ERROR</code> once it knows this is DQL. The <code>==</code> and the pipe are the habit.</p>
+<p class="refs">Sources: <a href="https://docs.dynatrace.com/docs/analyze-explore-automate/logs/lma-analysis/logs-app/query-and-filter">Query and filter logs</a>, <a href="https://docs.dynatrace.com/docs/platform/grail/dynatrace-query-language/commands">DQL commands</a>, <a href="https://docs.dynatrace.com/docs/analyze-explore-automate/logs/lma-classic-log-processing/lma-log-processing-matcher">DQL matcher</a> (<code>matchesPhrase</code>).</p>
+
+<h2 id="logql">Grafana Loki LogQL</h2>
+<p>Included because it is the log query an agent meets next to Datadog and Splunk, and its anchoring rules are the ones people get wrong. Every query starts with a stream selector, <code>{app="api", env="prod"}</code>, then an optional pipeline of <code>|</code> stages. There is no <code>field:value</code>. Label matchers are <code>=</code> and <code>!=</code> for exact strings, <code>=~</code> and <code>!~</code> for regex. A selector regex is fully anchored: it must match the entire label value, newlines included, and <code>.</code> does not match a newline unless the pattern uses <code>(?s)</code> or <code>[\S\s]</code>.</p>
+<p>Line filters are a distributed grep and are case-sensitive. <code>|= "error"</code> means the line contains the string, <code>!= "timeout"</code> means it does not, <code>|~</code> and <code>!~</code> are the regex forms. A line-filter regex is not anchored, and <code>.</code> does match newlines. The engine is RE2. <code>(?i)</code> at the start of the pattern is the case fold. Chained filters are sequential AND: <code>|= "error" != "timeout"</code>. Backticks quote a string so that backslashes stay literal. After a parser stage (<code>json</code>, <code>logfmt</code>, <code>regexp</code>), label filters reuse <code>=</code> <code>!=</code> <code>=~</code> <code>!~</code> and combine with <code>and</code>, <code>or</code>, or with a comma, a space or a pipe meaning AND. Those predicates bind left to right, not AND-tighter: <code>duration &gt;= 20ms or method="GET" and size &lt;= 20KB</code> is <code>((duration &gt;= 20ms or method="GET") and size &lt;= 20KB)</code>. Parentheses force AND first.</p>
+<p>An agent types <code>{namespace="prod"} |= "error" != "timeout"</code> or <code>|~ "(?i)error.*timeout"</code>. A pure-negative line filter still needs a selector. The two anchoring rules (selector versus line) are the detail it will get backwards.</p>
+<p class="refs">Source: <a href="https://grafana.com/docs/loki/latest/query/log_queries/">LogQL log queries</a>. The anchoring and precedence sentences above were checked against that page in this research; the page tail past the label-filter section was truncated in the fetch.</p>
+
+<h2 id="github">GitHub code search</h2>
+<p>This is the syntax an agent has typed most often. A bare term matches file content or the path. Whitespace means both terms, and the page says that is the same as <code>AND</code>. <code>OR</code> and <code>NOT</code> are written in uppercase in the examples. The page does not say whether <code>AND</code> binds tighter than <code>OR</code>. It does show parentheses: <code>(language:ruby OR language:python) AND NOT path:"/tests/"</code>. Qualifiers, operators, quotes and regexes must be separated by spaces, or that piece of the query falls back to a literal search. <code>printf("hello world\n");</code> is searched as that exact text.</p>
+<p>Qualifiers include <code>repo:</code>, <code>org:</code>, <code>user:</code>, <code>language:</code>, <code>path:</code>, <code>symbol:</code>, <code>content:</code> and <code>is:</code>. <code>content:</code> restricts a term to file content, because the bare term also hits paths. Quotes are an exact string, whitespace included. Outside a regex the only escapes are <code>\"</code> and <code>\\</code>. A regex is <code>/sparse.*index/</code>, and a slash inside it is escaped. The engine is described as most common features, without lookaround, plus <code>\n</code>, <code>\t</code> and <code>\x{hhhh}</code>. The page does not say whether <code>/regex/</code> is unanchored; <code>path:/(^|\/)README\.md$/</code> shows the user adding anchors when they want them. Default search is case-insensitive. Case-sensitive is <code>/(?-i)True/</code>, a regex flag, not a query-wide switch.</p>
+<p><code>path:</code> accepts a small glob. <code>*</code> does not match <code>/</code>, <code>**</code> does, <code>?</code> is one character, a leading <code>/</code> anchors at the start of the path, and quotes turn the glob off so <code>path:"file?"</code> is literal. <code>repo:</code> is not a regex and not a partial match; the owner and name must be complete.</p>
+<p>An agent types <code>repo:org/name path:*.rs foo OR bar</code>, quotes a phrase, and reaches for <code>/regex/</code> and <code>content:</code>. It writes <code>-path:tests</code> less often than <code>NOT path:tests</code>, because that is the operator the page teaches. It will be surprised that ferret’s bare word ignores content, and that <code>re:</code> is a name.</p>
+<p class="refs">Source: <a href="https://docs.github.com/en/search-github/github-code-search/understanding-github-code-search-syntax">Understanding GitHub code search syntax</a>.</p>
+
+<h2 id="sourcegraph">Sourcegraph</h2>
+<p>Keyword search is the default. A space means both terms anywhere in the document. <code>"foo bar"</code> is that string, quotes not included. <code>/foo.*bar/</code> is RE2. <code>foo OR bar</code> is either term. <code>repo:</code> and <code>file:</code> values are regexes and are not anchored; <code>^</code> and <code>$</code> anchor them, and two <code>repo:</code> filters intersect unless you write <code>repo:foo|bar</code> or <code>or</code>. <code>content:"..."</code> is how you search for a reserved word such as <code>OR</code>. <code>case:yes</code> turns on case sensitivity; without it every match is case-insensitive. <code>patternType:keyword</code> and <code>patternType:regexp</code> select the mode. In regexp mode a space between patterns becomes <code>.*?</code>.</p>
+<p>The boolean section accepts <code>and</code> and <code>AND</code>, <code>or</code> and <code>OR</code>, <code>not</code> and <code>NOT</code>. <code>and</code> binds tighter than <code>or</code>, so <code>a and b or c and d</code> is <code>(a and b) or (c and d)</code>. <code>NOT</code> can stand where <code>-</code> stands on a filter. On a pattern, <code>NOT</code> excludes documents that contain the following term. Without parentheses, operators split the query into groups: <code>file:main.c char c or (int i and int j)</code> is read as <code>(file:main.c char c) or (int i and int j)</code>.</p>
+<p>An agent types <code>file:\.go$ foo OR bar case:yes</code> and <code>/regex/</code>. <code>content:</code> is the field name it will try on ferret. <code>case:yes</code> is the case switch it will try, and ferret’s <code>case:</code> does not take <code>yes</code>.</p>
+<p class="refs">Source: <a href="https://sourcegraph.com/docs/code-search/queries">Sourcegraph query reference</a>.</p>
+
+<h2 id="zoekt">Zoekt</h2>
+<p>Zoekt is the engine under Sourcegraph’s older regexp path, and its own query language is stricter and easier to misread. A bare pattern is a Go regular expression. There are no slash delimiters; a slash is a literal character. A pattern with no regexp operators is optimized to a substring search. Space is AND. The only boolean word is lowercase <code>or</code>. The word <code>and</code> is a search term. Negation is <code>-</code>. Parentheses group, and parentheses around a field keep the field: <code>(sym:MyFunction)</code> is not a content search for the text <code>sym:MyFunction</code>.</p>
+<p>Fields take a regex value: <code>content:</code> (<code>c:</code>), <code>regex:</code>, <code>file:</code> (<code>f:</code>), <code>repo:</code> (<code>r:</code>), <code>lang:</code>, <code>sym:</code>. Double quotes group spaces. A backslash escapes the next character, and a regex backslash is two of them. <code>case:yes</code>, <code>case:no</code>, and <code>case:auto</code>. Auto is the default: an uppercase letter makes the pattern sensitive. <code>file:README\.md$</code> uses the regexp’s own anchors.</p>
+<p>An agent that knows Zoekt types <code>file:.*\.rs$ foo or bar</code> with a lowercase <code>or</code>, a leading <code>-</code>, and no slashes. It will type <code>and</code> and search for the word. Ferret’s uppercase <code>OR</code> and its refusal of <code>-term</code> both miss this habit. Ferret’s fold-by-default is <code>case:no</code>, not <code>case:auto</code>.</p>
+<p class="refs">Source: <a href="https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md">Zoekt query syntax</a>.</p>
+
+<h2 id="rg">ripgrep and fd</h2>
+<p>Neither is a query language. They are the shell baseline, and Dave has already separated them from this grammar: <code>ferret grep</code> is a ripgrep-shaped verb, tracked on its own. The search grammar should not grow <code>-i</code> and <code>-g</code> to look like them.</p>
+<p>ripgrep’s pattern is a Rust <code>regex</code>, unanchored within a line, so <code>^</code> and <code>$</code> are line anchors. <code>-U</code> / <code>--multiline</code> lets a match span lines. <code>-F</code> is a fixed string. <code>-i</code> ignores case. <code>-S</code> / <code>--smart-case</code> ignores case until the pattern contains an uppercase letter, and the guide says that flag is usually put in an alias or a config file. The bare command does not fold. <code>-g</code> is a gitignore-style glob, with <code>!</code> as a blacklist. <code>-t</code> and <code>-T</code> are file types. There is no <code>AND</code> of two patterns; the boolean is the regexp or a second invocation. A pattern that starts with <code>-</code> is a flag unless it follows <code>-e</code> or <code>--</code>. The common-options list re-read here does not include an invert flag; do not cite one from memory.</p>
+<p><code>fd</code> takes one pattern. The default is a Rust regex (<code>docs.rs/regex</code>), matched as an unanchored substring of the file name: <code>fd netfl</code> finds a name containing <code>netfl</code>, and <code>fd '^x.*rc$'</code> is how you anchor. Smart case is the default: insensitive until the pattern contains an uppercase letter. <code>-s</code> forces sensitive, <code>-i</code> forces ignore. <code>-g</code> switches to globs. <code>-e</code> is an extension, repeatable in the examples (<code>-e h -e cpp</code>). <code>-t</code> is a type. Hidden files and gitignore matches are skipped unless <code>-H</code>, <code>-I</code> or <code>-u</code>. There is no second pattern and no content search. The <code>-h</code> summary re-read here has no <code>-F</code>; literal mode is unverified against the current man page.</p>
+<p>An agent reaches for <code>rg -i -g '*.rs' pattern</code> and <code>fd -e rs pattern</code>. Those belong to <code>ferret grep</code> and to ferret’s name atoms (<code>ext:rs</code>, a glob), not to a boolean inside <code>text:</code>.</p>
+<p class="refs">Sources: <a href="https://github.com/BurntSushi/ripgrep/blob/master/GUIDE.md">ripgrep GUIDE</a>, <a href="https://github.com/sharkdp/fd">fd README</a>.</p>
+
+<h2 id="google">Google</h2>
+<p>The current Search Help page is narrower than the cheat sheets agents have memorized. It documents quotes for an exact word or phrase, <code>site:</code>, <code>-</code> to exclude a word, <code>before:</code>, <code>after:</code>, and <code>filetype:</code>. There must be no space between the operator and the term: <code>site:nytimes.com</code> works, <code>site: nytimes.com</code> does not. The same rule is stated for the minus. The page does not document <code>OR</code>, <code>|</code>, <code>AND</code>, <code>*</code>, <code>intitle:</code> or <code>ext:</code>. Those spellings are not cited here. Implicit AND of bare words is how the product behaves in ordinary use; the operators page does not list an <code>AND</code> keyword, so this report does not claim one.</p>
+<p>An agent still types <code>site:</code>, quotes, and <code>-word</code> with no space. The <code>-</code> habit is the one that hits ferret’s flag parser.</p>
+<p class="refs">Source: <a href="https://support.google.com/websearch/answer/2466433">Refine Google searches</a>.</p>
+
+<h2 id="everything">Everything (voidtools)</h2>
+<p>Everything is the desktop filename search agents have actually used, on Windows. A bare word is a substring of the file name. A backslash searches the path: <code>\downloads</code>. A trailing backslash means a folder. Space is AND. <code>|</code> is OR, and spaces around the bar are ignored. <code>!</code> is NOT. <code>&lt;</code> and <code>&gt;</code> group. Quotes make operator characters literal, and they quote a path that contains a space: without them, <code>C:\Program Files</code> is the path <code>C:\Program</code> AND the name <code>Files</code>. The Searching page does not state whether <code>|</code> binds tighter than space. Do not copy a precedence claim from a forum post.</p>
+<p>Wildcards are <code>*</code> and <code>?</code>, which do not match <code>\</code>, and <code>**</code>, which does. Using a wildcard matches the whole filename, so <code>*.pdf</code> is every PDF, not a name containing that string. <code>regex:</code> enables PCRE for that term. <code>^</code> and <code>$</code> are the start and end of the filename. Turning regular expressions on for the whole query disables operators, wildcards, macros, modifiers and functions. <code>case:</code> is a modifier that matches case, stacked in front of the term (<code>case:README</code>, <code>case:regex:content:^FOO</code>). Match Case is also a menu option. Content is a function, <code>content:invoice</code>, and it is not indexed: the page says it can be extremely slow and should be narrowed with an extension, a path or a date. <code>ext:cpp;h;cs</code>, <code>size:&gt;100mb</code> and <code>dm:today</code> are the other functions an agent will try. Semicolons in <code>ext:</code> are a list; ferret’s <code>ext:</code> is one extension.</p>
+<p>An agent types <code>*.rs \src content:foo !draft</code>. The bare word, the glob, <code>ext:</code> and <code>size:</code> all rhyme with ferret. <code>content:</code>, <code>!</code>, <code>|</code> and <code>&lt; &gt;</code> do not. <code>regex:</code> on a name is ferret’s <code>re:</code>; <code>regex:content:</code> is the content-regex spelling Everything uses, which is D67’s <code>grep:</code> in two prefixes.</p>
+<p class="refs">Sources: <a href="https://www.voidtools.com/support/everything/searching/">Searching in Everything</a>, <a href="https://www.voidtools.com/support/everything/search_syntax/">search syntax</a>, <a href="https://www.voidtools.com/support/everything/search_modifiers/">search modifiers</a>.</p>
+
+<h2 id="spotlight">Spotlight and <code>mdfind</code></h2>
+<p>Apple’s archived File Metadata Query Expression Syntax is the page that still describes the predicate language <code>mdfind</code> evaluates. A clause is <code>attribute == value</code>. Operators are <code>==</code> <code>!=</code> <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code>, plus <code>InRange(attribute, min, max)</code>. Modifiers sit in brackets immediately after the operator: <code>c</code> case-insensitive, <code>d</code> diacritic-insensitive. <code>kMDItemAuthors ==[c] "Steve"</code> and <code>kMDItemTextContent ==[c] "*Paris*"</code> are the documented forms. Without <code>[c]</code>, <code>==</code> is case-sensitive: <code>== "Paris"</code> does not match <code>paris</code>. Wildcards are <code>*</code> (many) and <code>?</code> (one) inside the value. An exact value with no wildcard matches the whole attribute. Booleans are <code>&amp;&amp;</code> and <code>||</code>, with parentheses. Escape <code>"</code> and <code>'</code> with a backslash. Dates are seconds since 2001-01-01, or <code>$time.now</code>, <code>$time.today</code>, <code>$time.this_week(-1)</code>, <code>$time.iso(...)</code>. The page has no regex.</p>
+<p>One example on that page is malformed: <code>kMDItemAuthors[c] == "Steve"</code> puts <code>[c]</code> on the attribute. The same page shows the correct <code>==[c]</code> form. The page does not document Finder’s keyword shorthand (<code>kind:pdf</code>, <code>mdfind -name</code>, a <code>|</code> OR, a <code>-string</code> NOT). That shorthand is what an agent who has used the Finder will type. It is unverified against an Apple-hosted page in this pass. Third-party reports that <code>==[c]</code> fails on current macOS, and that a suffix form <code>'*foo*'cd</code> works, are also unverified here. Cite the bracket form as what Apple’s page shows.</p>
+<p>An agent types either <code>kMDItemDisplayName == '*report*'c</code> or <code>kind:pdf</code>. Neither is ferret. The predicate shape is the same family as Kusto and DQL (<code>field == value</code>), not <code>field:value</code>.</p>
+<p class="refs">Source: <a href="https://developer.apple.com/library/archive/documentation/Carbon/Conceptual/SpotlightQuery/Concepts/QueryFormat.html">File Metadata Query Expression Syntax</a> (archived, updated 2011-09-28).</p>
+
+<h2 id="aqs">Windows Advanced Query Syntax</h2>
+<p>AQS is the third desktop grammar, the one Windows Search and Explorer use. A restriction is <code>prop:value</code>, or a bare word that searches every property. Juxtaposition is AND. <code>AND</code>, <code>OR</code> and <code>NOT</code> must be uppercase; the rest of the language is not case-sensitive. Mixed <code>AND</code> and <code>OR</code> bind left to right no matter which operator it is: <code>apple AND pear OR plum</code> is <code>(apple AND pear) OR plum</code>, and <code>apple OR pear AND plum</code> is <code>(apple OR pear) AND plum</code>. The page recommends parentheses. The default string operator is word-starts-with; other types default to equal.</p>
+<p>Quotes are phrases. A quote inside a phrase is doubled. Comparison operators include <code>=</code>, <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code>, and a family of <code>~</code> operators: <code>~&lt;</code> starts with, <code>~&gt;</code> ends with, <code>~=</code> contains, <code>~!</code> does not contain, and <code>~</code> alone is DOS wildcards (<code>?</code> one character, <code>*</code> many), as in <code>System.FileName:~"Mic?osoft W*d"</code>. <code>$&lt;</code> is word-starts-with and <code>$=</code> is word-equals. A range is <code>5kb..10kb</code>. Empty <code>[]</code> means no value. There is no regex on the syntax page. For programmatic queries on Windows 7 and later the page requires canonical property names (<code>System.Size:&gt;1kb</code>). The short keywords follow the Windows UI language, so they are the wrong spelling to put in a script. A double <code>NOT</code> on the same property is described, on the same page, as not cancelling (<code>System.Kind:--picture</code> stays “not a picture”). That sentence was read off the page earlier in this research and did not come back in a later search, so treat the double-negation example as checked once, not twice.</p>
+<p>An agent on Windows types <code>System.FileName:report AND ext:pdf</code> or the localized keyword, uppercase <code>AND</code>, and a <code>*</code> glob. Left-to-right binding means <code>a OR b AND c</code> is not ferret’s reading and not JQL’s.</p>
+<p class="refs">Source: <a href="https://learn.microsoft.com/en-us/windows/win32/search/-search-3x-advancedquerysyntax">Advanced Query Syntax</a>.</p>
+
+<h2 id="recoll">Recoll</h2>
+<p>Recoll is the Linux desktop tool with a real query language, and it is the one ferret is closest to. The manual’s general syntax is Xesam-descended. <code>field:value</code> means contains. A bare word searches the document. Elements combine with an implicit AND. <code>OR</code> must be capitals, and it has priority over AND: <code>word1 word2 OR word3</code> means <code>word1 AND (word2 OR word3)</code>, not <code>(word1 AND word2) OR word3</code>. That is the opposite of ferret, of Sourcegraph, of JQL and of Kusto. Parentheses group. A <code>-</code> in front of an element excludes it. The sample query is <code>author:"john doe" Beatles OR Lennon Live OR Unplugged -potatoes</code>.</p>
+<p>Quotes are a phrase, and order matters: <code>title:"prejudice pride"</code> is not <code>title:prejudice title:pride</code>. Words inside quotes, and capitalized words, are not stem-expanded. Wildcards are <code>*</code>, <code>?</code> and <code>[]</code>, anywhere in a term, including the left side. A left wildcard scans the term list and can be truncated if the expansion is too large. Stemming is preferred to a trailing <code>*</code> for natural-language terms, and any wildcard in a term turns stemming off. With a field prefix, <code>author:john,lennon</code> is AND and <code>author:john/ringo</code> is OR, with no spaces. Without a field prefix, a comma or a slash produces a phrase. <code>text:</code> is the explicit name of the main body, so <code>text:napoleon/bonaparte</code> is an OR in the body. Default fields include <code>title</code>, <code>author</code>, <code>filename</code> (alias <code>fn</code>), <code>ext</code>. The general syntax page does not document a regex operator or a <code>case:</code> modifier. Case control on that page is the stemming rule: capitalize a word to keep it literal. Modifiers such as <code>"two one"po10</code> are a proximity syntax, not a case switch.</p>
+<p>An agent that has used Recoll types <code>ext:pdf filename:invoice "exact phrase" OR other -draft</code>, and it reads <code>a b OR c</code> as <code>a AND (b OR c)</code>. That reading is also Splunk’s <code>search</code> command. It is wrong in ferret. <code>text:</code> as the body field is the one spelling ferret already shares, which is why <code>text:</code> is less alien than it looks from the code-search side, where the word is <code>content:</code>.</p>
+<p class="refs">Sources: <a href="https://www.recoll.org/usermanual/webhelp/docs/RCL.SEARCH.LANG.SYNTAX.html">Recoll general syntax</a>, <a href="https://www.recoll.org/usermanual/webhelp/docs/RCL.SEARCH.WILDCARDS.html">wildcards</a>.</p>
+
+<h2 id="implications">Implications for ferret</h2>
+<p>D62 A is the right grammar: content is prefixed, operators are whole arguments, AND is juxtaposition. D67 A is the right content-regex spelling: <code>grep:</code>, with <code>re:</code> left on names. The survey does not overturn either. It does say where an agent will be silently wrong, and which two small changes would catch the most of that without giving up what the grammar buys.</p>
+
+<h3>Least predictable</h3>
+<p>Ordered by how often the agent gets a wrong answer rather than an error.</p>
+<ol>
+  <li><strong>A bare word is a name.</strong> GitHub’s bare term is content or path. Sourcegraph keyword, Recoll, KQL, Splunk, Datadog free text and a Lucene default field all search text. Everything, <code>fd</code> and ferret search names. <code>ferret search serde</code> returns files whose names contain <code>serde</code> and says nothing about the miss on content. That is the expensive failure, because the exit status is success.</li>
+  <li><strong>The query is one string.</strong> Every tool in this report except <code>rg</code> and <code>fd</code> takes the query as one string. Agents quote it. <code>ferret search "text:foo OR text:bar"</code> is one <code>text:</code> atom whose tokens are <code>foo</code>, <code>or</code>, <code>text</code>, <code>bar</code>, a phrase, and it can succeed. The separate-argument form <code>ferret search text:foo OR text:bar</code> is the boolean.</li>
+  <li><strong><code>re:</code> is a name, and the content regex is not <code>/…/</code>.</strong> GitHub and Sourcegraph spell a content regex as <code>/regex/</code>. Zoekt treats the bare pattern as a Go regexp. Lucene’s <code>/regex/</code> matches the whole term and has no <code>^</code> <code>$</code>. An agent types <code>ferret search /fn.*handler/</code> and gets a path substring, which is exactly why D67 rejected bare slashes. It types <code>re:fn.*handler</code> and searches names. <code>grep:</code> is the right spelling once the agent has read the help. It will not guess it.</li>
+  <li><strong>Operators are the exact bytes <code>OR</code> and <code>NOT</code>, and <code>and</code> is a name.</strong> Lucene, Splunk, GitHub’s examples, Recoll’s <code>OR</code> and Windows AQS want capitals, so the exact-case match is half the habit. KQL, Sourcegraph, JQL clauses, Kusto and Zoekt’s <code>or</code> want lowercase. <code>ferret search text:foo or text:bar</code> searches for a file named something with <code>or</code> in it, AND both text atoms. <code>and</code> is the same kind of miss. <code>-term</code> is a different miss: Google, Datadog, Lucene, Everything, Recoll, Zoekt and Sourcegraph negate that way, and ferret reports an unknown flag. The error is recoverable. The lowercase-<code>or</code> success is not.</li>
+  <li><strong><code>content:</code> and <code>case:yes</code>.</strong> GitHub, Sourcegraph and Everything call the body <code>content:</code>. Recoll and ferret call it <code>text:</code>. Sourcegraph and Zoekt write <code>case:yes</code>. Ferret’s <code>case:</code> consumes the next atom, so <code>case:yes</code> is a case-sensitive search for the name <code>yes</code>.</li>
+</ol>
+<p>AND-tighter-than-OR is predictable to anyone who parenthesizes, and it matches Sourcegraph, JQL, Kusto and the way the help already glosses <code>a b OR c</code>. It does not match Recoll or Splunk’s <code>search</code> command, both of which bind <code>OR</code> tighter, or Windows AQS and LogQL label filters, which bind left to right. GitHub and the current KQL page never say. This is a real disagreement. It is not one of the silent failures above, because the agent who writes <code>a b OR c</code> without parentheses is already wrong in Lucene, and the agent who has read ferret’s help has been told the binding in the first boolean line.</p>
+
+<div class="decision">
+  <h3>Change 1. Accept <code>and</code> / <code>or</code> / <code>not</code> in any case, as the operators.</h3>
+  <p><code>AND</code> is explicit juxtaposition. <code>OR</code> and <code>NOT</code> stay the operators they are, matched case-insensitively. A file named <code>or</code>, <code>and</code> or <code>not</code> is spelled <code>name:or</code>, which is already how a file named <code>OR</code> is spelled.</p>
+  <p><strong>Buys.</strong> The lowercase habit from KQL, Sourcegraph, JQL, Kusto and Zoekt, and the uppercase habit ferret already accepts, become one rule. <code>text:foo or text:bar</code> stops returning a successful name search.</p>
+  <p><strong>Costs.</strong> Three bare words stop being name substrings. They are common English words and uncommon filenames. The grammar comment and the help line change. No existing query that used uppercase <code>OR</code> or <code>NOT</code> changes meaning.</p>
+  <p><strong>Not this.</strong> Do not also accept <code>-</code> or <code>|</code> or <code>!</code>. <code>-</code> is a flag, which <code>args.rs</code> already rejects, and D62 recorded why. <code>|</code> and <code>!</code> need shell quoting and collide with globs and history. The error on <code>-term</code> is the right behaviour; the help already has a place to say “negation is <code>NOT</code>, and a name that starts with <code>-</code> goes after <code>--</code>”.</p>
+</div>
+
+<div class="decision">
+  <h3>Change 2. Alias <code>content:</code> to <code>text:</code>. Keep <code>text:</code> as the documented spelling.</h3>
+  <p><strong>Buys.</strong> GitHub, Sourcegraph and Everything’s field name works. <code>content:"request handler"</code> is the phrase agents already know how to quote.</p>
+  <p><strong>Costs.</strong> Two names for one atom. Help text has to say <code>text:</code> first and mention the alias once, or agents will document both and the grammar grows a third synonym later. A file whose name is the literal string <code>content:foo</code> is already unreachable as a bare word, because of the prefix scan; <code>name:content:foo</code> remains the escape, as it is for <code>text:</code>.</p>
+  <p><strong>Not this.</strong> Do not rename <code>text:</code> to <code>content:</code>. D62 has shipped the shorter spelling, Recoll uses <code>text:</code> for the body, and a rename breaks every S2 query and the help. Do not make a bare word search content. That is D62 B, and it changes every S1 query. The fact that would change it is still the query log, not this survey. The survey says the failure is silent; the mitigation that does not rewrite history is the first line of the help and of the agent skill: a bare word is a name, <code>text:</code> is content.</p>
+</div>
+
+<p>A third, smaller, parse change is worth doing in the same patch if the two above land. If a single argument contains <code> OR </code> or <code> NOT </code> or <code> AND </code> as a separated word, reject it and print the unquoted form. Today that argument is a phrase or a name, and it succeeds. The cost is that a filename containing the letters “ OR ” has to be <code>name:</code>. That name is rare. This is the quoted-whole-query habit, and an error beats a wrong hit list.</p>
+
+<h3>Keep, including where it is unusual</h3>
+
+<div class="decision">
+  <h3>Whole-argument operators, and AND by juxtaposition.</h3>
+  <p>This is find’s shape and it is shell-safe. One atom per argument means a path with spaces is one atom and a parenthesis is one atom, quoted for the shell as the help already says. The cost is change 1’s leftover: agents quote the whole query. The parse error above is the patch. Switching to a single query string would match every other tool in this report and would give the shell’s quoting rules to the user twice. D62 already declined that.</p>
+</div>
+
+<div class="decision">
+  <h3>AND tighter than OR.</h3>
+  <p>Keep it. It matches Sourcegraph, JQL, Kusto, programming languages, and the reading the help states: <code>a b OR c</code> is <code>(a AND b) OR c</code>. Recoll and Splunk <code>search</code> bind <code>OR</code> tighter. Lucene refuses to choose and tells you to parenthesize. Windows AQS and LogQL label filters go left to right, so their second example is OR-then-AND. Following Recoll would make ferret’s help line a lie and would surprise every agent that writes code. The tradeoff is that a Recoll user, and a Splunk user who has learned that one footgun, misreads an unparenthesized mix. Parentheses already work. State the binding in the help, which it does, and do not switch.</p>
+</div>
+
+<div class="decision">
+  <h3><code>grep:</code> for a content regex. <code>re:</code> stays a name. No <code>/regex/</code>.</h3>
+  <p>Agree with D67 A, and with the rejection of bare slashes. <code>/usr/</code> is a path substring today. <code>text:/usr/</code> is a content term today. Overloading either is a silent change of the kind D62 refused. <code>grep:</code> is one more prefix, and agents know the word from ripgrep. They will not invent the prefix; change 1 and change 2 do not fix that. The help line is the fix, next to <code>re:</code>: <code>re:</code> is the name, <code>grep:</code> is the content. D67’s own escape hatch is right: if S4’s traces show agents sending <code>/…/</code> or <code>re:</code> for content, alias the winner. Do not alias it now, before those traces, because a slash alias reintroduces the <code>/usr/</code> collision unless the rule is fiddly (slashes plus a metacharacter), and a fiddly rule is a second grammar.</p>
+  <p>The semantics D67 already picked also match the tools agents compare against. Case-insensitive by default matches GitHub, Sourcegraph, ferret’s <code>text:</code>, and Recoll’s fold-and-stem world. <code>^</code> and <code>$</code> at line boundaries match ripgrep and LogQL’s line filter, and they do not match Lucene, which has no anchors and matches the whole term. <code>(?-m)</code> is the escape for the whole-document reading. <code>.</code> not matching <code>\n</code> is the <code>regex</code> crate’s default and ripgrep’s default without <code>-U</code>. Keep that set. The pure-<code>NOT</code> cost is a planner problem, which D67 (b) already answers by refusing when the Maybe bound exceeds a quarter of live documents. Do not copy Lucene’s “<code>NOT</code> alone matches nothing”. In ferret a directory has no document, so <code>NOT text:x</code> is true there, and that result is load-bearing.</p>
+</div>
+
+<div class="decision">
+  <h3>Fold by default, <code>case:</code> on the next atom, no smart-case.</h3>
+  <p>Keep it. GitHub folds and uses <code>(?-i)</code> inside a regex. Sourcegraph folds unless <code>case:yes</code>. Datadog’s attribute search is sensitive and its full text is the insensitive path. ripgrep is sensitive until <code>-i</code>, and smart-case is an opt-in the guide expects you to alias. <code>fd</code> and Zoekt <code>case:auto</code> flip to sensitive when the pattern contains an uppercase letter. An agent capitalises identifiers. Under smart-case, <code>Request</code> and <code>request</code> are different queries, and the agent does not know which one it typed. Ferret’s rule, already in the grammar comment, is that a query means the same whatever letters it is typed in. <code>case:text:Foo</code> and, once D67 lands, <code>case:grep:</code> are the explicit sensitive forms. The tradeoff is that <code>case:yes</code> does not work, which is item 5 above. Document <code>case:</code> as a prefix in the same breath as <code>text:</code>. Do not add <code>case:yes</code> as a query-wide toggle: two case mechanisms is how Zoekt’s <code>case:</code> and ferret’s <code>case:</code> get confused with each other. <code>ferret grep</code> should stay ripgrep-shaped, sensitive by default, with <code>-i</code> and <code>-S</code>. The two verbs should not converge.</p>
+</div>
+
+<div class="decision">
+  <h3><code>ext:</code>, the glob, and the leading <code>/</code> anchor.</h3>
+  <p>Keep them. <code>ext:</code> is Recoll’s field and Everything’s function. The glob matches GitHub’s <code>path:</code> rules closely enough that an agent who writes <code>src/**/*.rs</code> or <code>/home/*/x</code> gets the same shape: <code>*</code> does not cross <code>/</code>, <code>**</code> does, a leading <code>/</code> anchors. Everything’s wildcard matches the whole filename once a wildcard is present, which ferret’s no-slash glob also does (<code>*.rs</code> is the whole name). The difference to teach is Everything’s <code>ext:cpp;h;cs</code> list, which ferret does not have; <code>ext:rs OR ext:toml</code> is the spelling.</p>
+</div>
+
+<h2 id="sources">Sources</h2>
+<p>Vendor pages checked for this report. Ferret’s own behaviour is cited from the repo, not from a URL. A claim the page did not settle is marked unverified in the section above rather than listed here as fact.</p>
+<ul class="refs">
+  <li>Ferret grammar: <code>crates/ferret-query/src/lib.rs</code>, <code>crates/ferret-query/src/query.rs</code> (<code>from_args</code>), <code>crates/ferret/src/cli.rs</code> (help), <code>crates/ferret/src/args.rs</code> (<code>--</code>). Decisions: <code>docs/DECISIONS.md</code> D62, D67. <code>docs/DESIGN.md</code> § Query still sketches <code>/regex/</code>.</li>
+  <li><a href="https://lucene.apache.org/core/9_12_0/queryparser/org/apache/lucene/queryparser/classic/package-summary.html">Lucene 9.12 classic query parser</a></li>
+  <li><a href="https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-query-string-query">Elasticsearch query_string</a></li>
+  <li><a href="https://www.elastic.co/docs/reference/query-languages/query-dsl/regexp-syntax">Elasticsearch regular expression syntax</a></li>
+  <li><a href="https://www.elastic.co/docs/explore-analyze/query-filter/languages/kql">Kibana KQL</a></li>
+  <li><a href="https://learn.microsoft.com/en-us/kusto/query/datatypes-string-operators?view=microsoft-fabric">Kusto string operators</a>, <a href="https://learn.microsoft.com/en-us/kusto/query/matches-regex-operator?view=microsoft-fabric">matches regex</a>, <a href="https://learn.microsoft.com/en-us/kusto/query/logical-operators?view=microsoft-fabric">logical operators</a></li>
+  <li><a href="https://help.splunk.com/en/splunk-enterprise/spl-search-reference/10.4/search-commands/search">Splunk search</a>, <a href="https://help.splunk.com/en/splunk-enterprise/search/search-manual/10.2/expressions-and-predicates/predicate-expressions">predicate expressions</a>, <a href="https://help.splunk.com/en/splunk-cloud-platform/spl-search-reference/10.4.2604/introduction/understanding-spl-syntax">SPL syntax</a>, <a href="https://help.splunk.com/ja-jp/splunk-cloud-platform/search/search-manual/9.3.2408/search-primer/use-case-and-term-to-match-phrases">CASE() and TERM()</a></li>
+  <li><a href="https://support.atlassian.com/jira-software-cloud/docs/jql-operators/">JQL operators</a>, <a href="https://support.atlassian.com/jira-core-cloud/docs/advanced-search-reference-jql-keywords/">JQL keywords</a>, <a href="https://support.atlassian.com/jira/kb/jira-cloud-jql-order-of-operations/">JQL order of operations</a>, <a href="https://support.atlassian.com/jira-software-cloud/docs/search-for-work-items-using-the-text-field/">Jira text search</a></li>
+  <li><a href="https://docs.datadoghq.com/logs/explorer/search_syntax/">Datadog log search syntax</a></li>
+  <li><a href="https://docs.dynatrace.com/docs/analyze-explore-automate/logs/lma-analysis/logs-app/query-and-filter">Dynatrace query and filter logs</a>, <a href="https://docs.dynatrace.com/docs/platform/grail/dynatrace-query-language/commands">DQL commands</a>, <a href="https://docs.dynatrace.com/docs/analyze-explore-automate/logs/lma-classic-log-processing/lma-log-processing-matcher">DQL matcher</a></li>
+  <li><a href="https://grafana.com/docs/loki/latest/query/log_queries/">Grafana Loki LogQL</a></li>
+  <li><a href="https://docs.github.com/en/search-github/github-code-search/understanding-github-code-search-syntax">GitHub code search syntax</a></li>
+  <li><a href="https://sourcegraph.com/docs/code-search/queries">Sourcegraph queries</a></li>
+  <li><a href="https://github.com/sourcegraph/zoekt/blob/main/doc/query_syntax.md">Zoekt query syntax</a></li>
+  <li><a href="https://github.com/BurntSushi/ripgrep/blob/master/GUIDE.md">ripgrep GUIDE</a>, <a href="https://github.com/sharkdp/fd">fd README</a></li>
+  <li><a href="https://support.google.com/websearch/answer/2466433">Google Search operators</a></li>
+  <li><a href="https://www.voidtools.com/support/everything/searching/">Everything searching</a>, <a href="https://www.voidtools.com/support/everything/search_syntax/">syntax</a>, <a href="https://www.voidtools.com/support/everything/search_modifiers/">modifiers</a></li>
+  <li><a href="https://developer.apple.com/library/archive/documentation/Carbon/Conceptual/SpotlightQuery/Concepts/QueryFormat.html">Apple File Metadata Query Expression Syntax</a></li>
+  <li><a href="https://learn.microsoft.com/en-us/windows/win32/search/-search-3x-advancedquerysyntax">Windows Advanced Query Syntax</a></li>
+  <li><a href="https://www.recoll.org/usermanual/webhelp/docs/RCL.SEARCH.LANG.SYNTAX.html">Recoll general syntax</a>, <a href="https://www.recoll.org/usermanual/webhelp/docs/RCL.SEARCH.WILDCARDS.html">Recoll wildcards</a></li>
+</ul>
+
+<footer class="page">
+  Super Ferret · query-language survey for D62 and D67 · 2026-10-08 · not a decision, a brief beside the open ones.
+</footer>
+</main>
+</div>
+</body>
+</html>
