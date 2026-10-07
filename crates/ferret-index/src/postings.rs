@@ -118,8 +118,22 @@ pub struct Cursor<'a> {
 impl Cursor<'_> {
     /// The smallest document `>= target` at or after the current one.
     pub fn next_geq(&mut self, target: u32) -> Option<u32> {
+        self.next_geq_with(target, &mut || false)
+    }
+
+    pub(crate) fn next_geq_with(
+        &mut self,
+        target: u32,
+        checkpoint: &mut impl FnMut() -> bool,
+    ) -> Option<u32> {
+        if checkpoint() {
+            return None;
+        }
         let parts = self.parts;
         while let Some(part) = parts.get(self.at) {
+            if checkpoint() {
+                return None;
+            }
             if target <= part.last {
                 let found = match &part.hit {
                     Hit::Single(doc) => (*doc >= target).then_some(*doc),

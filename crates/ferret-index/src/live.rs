@@ -52,6 +52,17 @@ impl DocSet {
 
     /// The smallest member `>= from`.
     pub fn next_geq(&self, from: u32) -> Option<u32> {
+        self.next_geq_with(from, &mut || false)
+    }
+
+    pub(crate) fn next_geq_with(
+        &self,
+        from: u32,
+        checkpoint: &mut impl FnMut() -> bool,
+    ) -> Option<u32> {
+        if checkpoint() {
+            return None;
+        }
         if from >= self.bound {
             return None;
         }
@@ -59,6 +70,9 @@ impl DocSet {
         // Bits at or past `bound` are never set, so no end mask is needed.
         let mut bits = self.words[word] & (!0u64 << (from % 64));
         while bits == 0 {
+            if checkpoint() {
+                return None;
+            }
             word += 1;
             bits = *self.words.get(word)?;
         }

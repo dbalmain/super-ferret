@@ -42,6 +42,35 @@ pub const OR_WIDTH: usize = 64;
 /// cheaper than merging the children on every step.
 pub const OR_DENSITY: u32 = 32;
 
+/// Cancellation shared by every internal step of a cursor tree.
+pub struct Advance<'a> {
+    cancelled: &'a dyn Fn() -> bool,
+    remaining: u32,
+    stopped: bool,
+}
+
+impl<'a> Advance<'a> {
+    pub fn new(cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            cancelled,
+            remaining: 0,
+            stopped: false,
+        }
+    }
+
+    fn step(&mut self) -> bool {
+        if self.stopped {
+            return true;
+        }
+        if self.remaining == 0 {
+            self.stopped = (self.cancelled)();
+            self.remaining = 1024;
+        }
+        self.remaining -= 1;
+        self.stopped
+    }
+}
+
 /// Ascending DocIds, each with a certainty.
 pub enum Cursor<'a> {
     /// One term's postings, concatenated across segments: always Yes.
@@ -149,17 +178,50 @@ impl<'a> Cursor<'a> {
     /// The smallest document `>= target` at or after the current one, and
     /// its certainty.
     pub fn next_geq(&mut self, target: u32) -> Option<(u32, Certainty)> {
+        self.advance(target, &mut || false)
+    }
+
+    /// Advances with cancellation every 1024 internal steps, including loops
+    /// yielding no result. Reuse `advance` across candidate boundaries.
+    pub fn next_geq_until(
+        &mut self,
+        target: u32,
+        advance: &mut Advance<'_>,
+    ) -> Result<Option<(u32, Certainty)>, ReadError> {
+        let found = self.advance(target, &mut || advance.step());
+        if advance.stopped {
+            Err(ReadError::Cancelled)
+        } else {
+            Ok(found)
+        }
+    }
+
+    // The unchecked caller specialises the no-op checkpoint away; checked
+    // recursion shares one budget across every child and loop iteration.
+    fn advance(
+        &mut self,
+        target: u32,
+        checkpoint: &mut impl FnMut() -> bool,
+    ) -> Option<(u32, Certainty)> {
+        if checkpoint() {
+            return None;
+        }
         match self {
-            Self::Postings(cursor) => cursor.next_geq(target).map(|doc| (doc, Certainty::Yes)),
-            Self::Bits(bits) => bits.next_geq(target),
-            Self::And(children) => leapfrog(children, target),
-            Self::Or(or) => or.next_geq(target),
+            Self::Postings(cursor) => cursor
+                .next_geq_with(target, checkpoint)
+                .map(|doc| (doc, Certainty::Yes)),
+            Self::Bits(bits) => bits.next_geq(target, checkpoint),
+            Self::And(children) => leapfrog(children, target, checkpoint),
+            Self::Or(or) => or.next_geq(target, checkpoint),
             Self::AndNot(pair) => {
                 let (positive, negated) = &mut **pair;
                 let mut target = target;
                 loop {
-                    let (doc, certainty) = positive.next_geq(target)?;
-                    match negated.test(doc) {
+                    if checkpoint() {
+                        return None;
+                    }
+                    let (doc, certainty) = positive.advance(target, checkpoint)?;
+                    match negated.test_with(doc, checkpoint) {
                         None => return Some((doc, certainty)),
                         Some(Certainty::Maybe) => return Some((doc, Certainty::Maybe)),
                         Some(Certainty::Yes) => target = doc.checked_add(1)?,
@@ -170,15 +232,18 @@ impl<'a> Cursor<'a> {
                 let (driver, probe) = &mut **pair;
                 let mut target = target;
                 loop {
-                    let (doc, certainty) = driver.next_geq(target)?;
-                    match probe.test(doc) {
+                    if checkpoint() {
+                        return None;
+                    }
+                    let (doc, certainty) = driver.advance(target, checkpoint)?;
+                    match probe.test_with(doc, checkpoint) {
                         Some(other) => return Some((doc, certainty.min(other))),
                         None => target = doc.checked_add(1)?,
                     }
                 }
             }
             Self::Maybe(child) => child
-                .next_geq(target)
+                .advance(target, checkpoint)
                 .map(|(doc, _)| (doc, Certainty::Maybe)),
             Self::Empty => None,
         }
@@ -205,13 +270,20 @@ impl<'a> Cursor<'a> {
 
 /// Leapfrog: the first child drives, every other must land on its
 /// document, and any that overshoots becomes the new target.
-fn leapfrog(children: &mut [Cursor<'_>], target: u32) -> Option<(u32, Certainty)> {
+fn leapfrog(
+    children: &mut [Cursor<'_>],
+    target: u32,
+    checkpoint: &mut impl FnMut() -> bool,
+) -> Option<(u32, Certainty)> {
     let (driver, rest) = children.split_first_mut()?;
     let mut target = target;
     'driver: loop {
-        let (doc, mut certainty) = driver.next_geq(target)?;
+        if checkpoint() {
+            return None;
+        }
+        let (doc, mut certainty) = driver.advance(target, checkpoint)?;
         for child in rest.iter_mut() {
-            let (other, other_certainty) = child.next_geq(doc)?;
+            let (other, other_certainty) = child.advance(doc, checkpoint)?;
             if other > doc {
                 target = other;
                 continue 'driver;
@@ -229,13 +301,14 @@ fn materialise<'a>(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Cursor<'a>, ReadError> {
     let (mut yes, mut maybe) = (Vec::new(), Vec::new());
+    let mut advance = Advance::new(cancelled);
     for mut child in children {
         let mut target = 0;
         loop {
             if cancelled() {
                 return Err(ReadError::Cancelled);
             }
-            let Some((doc, certainty)) = child.next_geq(target) else {
+            let Some((doc, certainty)) = child.next_geq_until(target, &mut advance)? else {
                 break;
             };
             match certainty {
@@ -277,8 +350,14 @@ pub struct Bits<'a> {
 }
 
 impl Bits<'_> {
-    fn next_geq(&mut self, target: u32) -> Option<(u32, Certainty)> {
-        let doc = self.docs.next_geq(target.max(self.floor))?;
+    fn next_geq(
+        &mut self,
+        target: u32,
+        checkpoint: &mut impl FnMut() -> bool,
+    ) -> Option<(u32, Certainty)> {
+        let doc = self
+            .docs
+            .next_geq_with(target.max(self.floor), checkpoint)?;
         self.floor = doc;
         Some((doc, self.certainty))
     }
@@ -310,9 +389,16 @@ impl<'a> Or<'a> {
         }
     }
 
-    fn next_geq(&mut self, target: u32) -> Option<(u32, Certainty)> {
+    fn next_geq(
+        &mut self,
+        target: u32,
+        checkpoint: &mut impl FnMut() -> bool,
+    ) -> Option<(u32, Certainty)> {
         let mut best: Option<(u32, Certainty)> = None;
         for (child, head) in self.children.iter_mut().zip(self.heads.iter_mut()) {
+            if checkpoint() {
+                return None;
+            }
             let behind = match *head {
                 Head::Fresh => true,
                 Head::At(doc, _) => doc < target,
@@ -320,7 +406,7 @@ impl<'a> Or<'a> {
             };
             if behind {
                 *head = child
-                    .next_geq(target)
+                    .advance(target, checkpoint)
                     .map_or(Head::Exhausted, |(doc, certainty)| Head::At(doc, certainty));
             }
             if let Head::At(doc, certainty) = *head {
@@ -345,8 +431,12 @@ pub enum Probe<'a> {
 
 impl Probe<'_> {
     pub fn test(&mut self, doc: u32) -> Option<Certainty> {
+        self.test_with(doc, &mut || false)
+    }
+
+    fn test_with(&mut self, doc: u32, checkpoint: &mut impl FnMut() -> bool) -> Option<Certainty> {
         match self {
-            Self::Cursor(cursor) => match cursor.next_geq(doc)? {
+            Self::Cursor(cursor) => match cursor.advance(doc, checkpoint)? {
                 (found, certainty) if found == doc => Some(certainty),
                 _ => None,
             },

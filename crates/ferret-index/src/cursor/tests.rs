@@ -277,11 +277,12 @@ fn check(seed: u64) {
 
     let mut cursor = world.compile(&terms, &tree);
     let mut target = 0;
+    let mut advance = Advance::new(&|| false);
     loop {
         let want = (target as usize..expected.len())
             .find(|&d| expected[d] != Truth::No)
             .map(|d| (d as u32, expected[d]));
-        let got = cursor.next_geq(target);
+        let got = cursor.next_geq_until(target, &mut advance).unwrap();
         assert_eq!(
             got.map(|(d, c)| (d, truth(Some(c)))),
             want,
@@ -289,7 +290,13 @@ fn check(seed: u64) {
         );
         let Some((doc, _)) = got else { break };
         // Stays on its document for a repeated or lower target.
-        assert_eq!(cursor.next_geq(target).map(|(d, _)| d), Some(doc));
+        assert_eq!(
+            cursor
+                .next_geq_until(target, &mut advance)
+                .unwrap()
+                .map(|(d, _)| d),
+            Some(doc)
+        );
         target = doc + 1 + rng.below(6) as u32;
     }
 }
@@ -410,4 +417,39 @@ fn materialisation_checks_cancellation_between_documents() {
         Err(crate::ReadError::Cancelled)
     ));
     assert_eq!(checks.get(), 10);
+}
+
+/// A single advance can reject the entire corpus without returning a candidate.
+/// All internal composite scan loops must share cancellation checkpoints.
+#[test]
+fn cancellation_interrupts_zero_result_subtraction_leapfrog_and_filter() {
+    use std::cell::Cell;
+    let bound = 1_000_000;
+    let all = DocSet::new(bound, 0..bound);
+    let even = DocSet::new(bound, (0..bound).step_by(2));
+    let odd = DocSet::new(bound, (1..bound).step_by(2));
+    let empty = DocSet::new(bound, []);
+    let bits = |docs| Cursor::bits(docs, Certainty::Yes);
+    let cursors = [
+        Cursor::and_not(bits(&all), bits(&all)),
+        Cursor::and(vec![bits(&even), bits(&odd)]),
+        Cursor::filter(bits(&all), Probe::Cursor(bits(&empty))),
+    ];
+    for mut cursor in cursors {
+        let calls = Cell::new(0);
+        let cancelled = || {
+            calls.set(calls.get() + 1);
+            calls.get() >= 2
+        };
+        let mut advance = Advance::new(&cancelled);
+        assert!(
+            matches!(
+                cursor.next_geq_until(0, &mut advance),
+                Err(ReadError::Cancelled)
+            ),
+            "the zero-result branch ran to exhaustion with {} cancellation checks",
+            calls.get()
+        );
+        assert_eq!(calls.get(), 2);
+    }
 }

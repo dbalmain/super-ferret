@@ -27,7 +27,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferret_catalog::{Catalog, NameId, OpenError, Section, Target};
-use ferret_index::{Certainty, Cursor, Pinned};
+use ferret_index::{Advance, Certainty, Cursor, Pinned};
 use ferret_verify::{MatchStats, TextMatcher};
 
 use crate::expr::{Node, Test, Truth};
@@ -218,6 +218,7 @@ impl Query {
         mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
         let stopped = || cancelled.is_some_and(|flag| flag.load(Ordering::Acquire));
+        let mut advance = Advance::new(&stopped);
         let check = || {
             if stopped() {
                 Err(RunError::Index(ferret_index::ReadError::Cancelled))
@@ -281,7 +282,13 @@ impl Query {
                 let mut target = 0;
                 loop {
                     check()?;
-                    let Some((doc, _)) = top.next_geq(target) else {
+                    let next = if cancelled.is_some() {
+                        top.next_geq_until(target, &mut advance)
+                            .map_err(RunError::Index)?
+                    } else {
+                        top.next_geq(target)
+                    };
+                    let Some((doc, _)) = next else {
                         break;
                     };
                     docs.push(doc);
@@ -330,7 +337,14 @@ impl Query {
                 .map_err(RunError::Index)?;
             for (j, &doc) in docs.iter().enumerate() {
                 check()?;
-                table[j * width + i] = match cursor.next_geq(doc) {
+                let next = if cancelled.is_some() {
+                    cursor
+                        .next_geq_until(doc, &mut advance)
+                        .map_err(RunError::Index)?
+                } else {
+                    cursor.next_geq(doc)
+                };
+                table[j * width + i] = match next {
                     Some((found, certainty)) if found == doc => Some(certainty),
                     _ => None,
                 };

@@ -32,7 +32,7 @@ pub mod segment;
 pub mod store;
 
 pub use candidate::{Atom, Candidates, Estimate, Pinned, Source};
-pub use cursor::{Certainty, Cursor, Probe};
+pub use cursor::{Advance, Certainty, Cursor, Probe};
 pub use live::DocSet;
 pub use manifest::{Manifest, SegmentEntry};
 pub use segment::ReadError;
