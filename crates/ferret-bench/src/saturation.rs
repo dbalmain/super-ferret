@@ -12,8 +12,9 @@
 //!   postings candidates do not already hold. Queries are `filter-screen`'s,
 //!   from M3's derivation, unnarrowed.
 //! - **Verification** of the added documents with the compiled verifier: read
-//!   each and run `is_match`. The documents are copied once into `<out-dir>`
-//!   and read from the copies, so that evicting them
+//!   each and run `is_match`. An added document lacks a key the query needs, so
+//!   it cannot match: verifying it is pure cost. The documents are copied once
+//!   into `<out-dir>` and read from the copies, so that evicting them
 //!   (`posix_fadvise(DONTNEED)`) touches only files the bench wrote. A copy is
 //!   freshly and contiguously laid out, so its evicted read is a lower bound on
 //!   the original's.
