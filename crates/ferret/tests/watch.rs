@@ -1487,3 +1487,45 @@ fn covered_socket_content_rows_and_diagnostics_are_native_byte_identical() {
         assert!(!json.contains("\"last_follow\":null"), "{json}");
     }
 }
+
+#[test]
+fn deferred_catalog_retry_does_not_spin_on_an_expired_content_deadline() {
+    let mut tree = Tree::new();
+    let proc = tree.path("low-memory-proc");
+    fs::create_dir_all(proc.join("pressure")).unwrap_or_else(|e| panic!("signals: {e}"));
+    for (path, value) in [
+        ("pressure/cpu", "some avg10=0.00 avg60=0.00\n"),
+        ("pressure/io", "some avg10=0.00 avg60=0.00\n"),
+        ("meminfo", "MemAvailable: 1 kB\n"),
+        ("loadavg", "0.00 0.00 0.00 1/100 1\n"),
+    ] {
+        write(proc.join(path), value);
+    }
+    let proc_text = proc.to_str().unwrap_or_else(|| panic!("proc path"));
+    tree.spawn(&[("FERRET_SIGNAL_PROC", proc_text)]);
+    wait(|| tree.status().contains("memory-blocked"));
+    let pid = tree
+        .daemon
+        .as_ref()
+        .unwrap_or_else(|| panic!("daemon"))
+        .id();
+    let ticks = || {
+        let stat =
+            fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_else(|e| panic!("stat: {e}"));
+        stat.rsplit_once(')')
+            .unwrap_or_else(|| panic!("stat layout"))
+            .1
+            .split_whitespace()
+            .skip(11)
+            .take(2)
+            .map(|n| n.parse::<u64>().unwrap_or_else(|e| panic!("ticks: {e}")))
+            .sum::<u64>()
+    };
+    let before = ticks();
+    let until = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let used = ticks() - before;
+    assert!(used < 10, "deferred writer spun for {used} CPU ticks");
+}

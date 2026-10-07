@@ -86,6 +86,10 @@ pub(super) fn turn(
             .blocked = Some(reason);
         return Ok(Duration::from_secs(1));
     }
+    host.writer_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .blocked = None;
     let _operation = Operation::start(host, "merge");
     // Merge input size is admitted separately; cooperative cancellation is
     // checked during streaming and before cutover, never during publication.

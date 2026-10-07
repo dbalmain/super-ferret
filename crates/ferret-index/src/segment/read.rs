@@ -324,9 +324,10 @@ impl<R: ReadAt> Segment<R> {
         &self.source
     }
 
-    /// Bytes resident for this segment: the block index and chunk sums.
+    /// Allocated bytes resident for this segment: block index and chunk sums,
+    /// including unused buffer capacity but excluding allocator overhead.
     pub fn resident_bytes(&self) -> usize {
-        self.firsts.len() + self.index.len() * size_of::<Block>() + self.sums.len()
+        self.firsts.capacity() + self.index.capacity() * size_of::<Block>() + self.sums.capacity()
     }
 
     /// `term`'s documents, or `None` when the segment does not hold it.

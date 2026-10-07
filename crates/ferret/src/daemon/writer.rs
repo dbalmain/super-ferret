@@ -204,7 +204,12 @@ fn serve(
             break;
         }
         let now = Instant::now();
-        let mut deadline = full_due.min(poll_due).min(content_due);
+        let mut deadline = full_due.min(poll_due);
+        // A catalog retry owns this boundary. An expired content deadline
+        // must not wake repeatedly while that retry is cooling down.
+        if retry_due.is_none() {
+            deadline = deadline.min(content_due);
+        }
         if let Some(retry) = retry_due {
             deadline = deadline.min(now + retry.saturating_sub(scheduler.now()));
         }
