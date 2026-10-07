@@ -11,22 +11,21 @@
 //! ([`content_query::pick_phrases`]), not a copy of its output, and for
 //! each one:
 //!
-//! 1. **Map selectivity.** Tokenizes each 1 MiB+ candidate document once
-//!    with the real tokenizer, marks every chunk each token overlaps at
-//!    1 MiB, 256 KiB and 64 KiB ([`chunk_span`]), and counts the chunks
-//!    holding the query's anchor term plus one neighbour each side
+//! 1. **Map selectivity.** Tokenizes each 1 MiB+ candidate document once with
+//!    the real tokenizer, marks every chunk each token overlaps at 1 MiB, 256
+//!    KiB and 64 KiB ([`chunk_span`]), and counts the chunks holding the
+//!    query's anchor term plus one neighbour each side
 //!    ([`widen_to_neighbours`]).
-//! 2. **Forced whole reads.** A candidate whose current stat differs from
-//!    the catalogued version, or that fails the real İ/Kelvin check
-//!    ([`ferret_verify::forces_whole`]), counts once at its whole size
-//!    instead of being chunk-mapped.
-//! 3. **Opportunity.** Per query, (1) + (2) is reported against the real
-//!    bytes [`content_query::once`] measures reading for that query (M4c's
-//!    code path), median and p90.
-//! 4. **Map size.** Separately, over every live document of 1 MiB or more
-//!    (not only the 50 queries' candidates), counts distinct (term,
-//!    document, chunk) triples at each chunk size, from the same
-//!    whole-document token spans.
+//! 2. **Forced whole reads.** A candidate whose current stat differs from the
+//!    catalogued version, or that fails the real İ/Kelvin check
+//!    ([`ferret_verify::forces_whole`]), counts once at its whole size instead
+//!    of being chunk-mapped.
+//! 3. **Opportunity.** Per query, (1) + (2) is reported against the real bytes
+//!    [`content_query::once`] measures reading for that query (M4c's code
+//!    path), median and p90.
+//! 4. **Map size.** Separately, over every live document of 1 MiB or more (not
+//!    only the 50 queries' candidates), counts distinct (term, document, chunk)
+//!    triples at each chunk size, from the same whole-document token spans.
 //!
 //! Nothing here prints a term, a path or document bytes: only classes,
 //! counts, byte sizes and the decision-rule verdict.
@@ -35,7 +34,7 @@ use std::collections::BTreeSet;
 use std::ops::{ControlFlow, Range};
 use std::path::Path;
 
-use ferret_catalog::{Catalog, NameId, Target};
+use ferret_catalog::{NameId, Target};
 use ferret_index::{CatalogView, DocSet, Pinned, View};
 use ferret_query::{Content, DocNames, NameIndex, Query, ReadVersion};
 use ferret_text::{Scratch, tokenize};
@@ -47,8 +46,11 @@ use crate::content_query::{self, quantile};
 const LARGE: u64 = 1 << 20;
 
 /// (label, chunk size in bytes), in the order S3.md's spec lists them.
-const CHUNK_SIZES: [(&str, usize); 3] =
-    [("1 MiB", 1 << 20), ("256 KiB", 256 * 1024), ("64 KiB", 64 * 1024)];
+const CHUNK_SIZES: [(&str, usize); 3] = [
+    ("1 MiB", 1 << 20),
+    ("256 KiB", 256 * 1024),
+    ("64 KiB", 64 * 1024),
+];
 
 /// M2c's measured merged content index size (S2 M4c done-note), the
 /// baseline the map-bytes estimate is compared against for the decision
@@ -104,7 +106,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
         // needle (ferret-verify Needles::new).
         let anchor: &[u8] = if a.len() >= b.len() { a } else { b };
 
-        let args = vec![content_query::arg("text:", phrase)];
+        let args = [content_query::arg("text:", phrase)];
         let query = Query::from_args(
             args.iter().map(String::as_bytes),
             std::time::SystemTime::now(),
@@ -177,9 +179,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
         }
     }
 
-    println!(
-        "forced_whole_reads (changed stat or ikelvin, large candidates): {forced_whole_docs}"
-    );
+    println!("forced_whole_reads (changed stat or ikelvin, large candidates): {forced_whole_docs}");
     println!();
     let mut actual_p50 = actual_bytes.clone();
     let actual_p50 = quantile(&mut actual_p50, 0.5);
@@ -213,7 +213,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
     let doc_list = content_query::live_doc_names(&catalog, &live);
     let mut doc_scratch = Scratch::default();
     let (mut dpath, mut dbytes) = (Vec::new(), Vec::new());
-    for (doc, name) in doc_list {
+    for (_doc, name) in doc_list {
         let Target::Inode(inode) = catalog.name(name).target() else {
             continue;
         };
@@ -223,9 +223,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
         if !content_query::read_name(&catalog, name, &mut dpath, &mut dbytes) {
             continue;
         }
-        let _ = doc;
         large_docs += 1;
-        let doc_len = dbytes.len();
         let mut sets: [BTreeSet<(Vec<u8>, usize)>; 3] = Default::default();
         tokenize(&dbytes, &mut doc_scratch, |token| {
             for (slot, &(_, chunk_size)) in CHUNK_SIZES.iter().enumerate() {
@@ -235,7 +233,6 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
                 }
             }
         });
-        let _ = doc_len;
         for (slot, set) in sets.iter().enumerate() {
             triples[slot] += set.len() as u64;
         }
@@ -260,7 +257,8 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
     println!();
     let mut started = Vec::new();
     for (slot, &(label, _)) in CHUNK_SIZES.iter().enumerate() {
-        let passes = cuts[slot] >= CUT_THRESHOLD * 100.0 && map_pct[slot] <= MAP_GROWTH_THRESHOLD * 100.0;
+        let passes =
+            cuts[slot] >= CUT_THRESHOLD * 100.0 && map_pct[slot] <= MAP_GROWTH_THRESHOLD * 100.0;
         println!(
             "decision_rule chunk_size={label} cut_pct={:.1} map_growth_pct={:.1} passes={passes}",
             cuts[slot], map_pct[slot]
@@ -308,7 +306,11 @@ fn last_chunk(doc_len: usize, chunk_size: usize) -> usize {
 
 /// `hits`, each widened by one neighbouring chunk on either side, clamped
 /// so expansion stops at the document's ends.
-fn widen_to_neighbours(hits: &BTreeSet<usize>, doc_len: usize, chunk_size: usize) -> BTreeSet<usize> {
+fn widen_to_neighbours(
+    hits: &BTreeSet<usize>,
+    doc_len: usize,
+    chunk_size: usize,
+) -> BTreeSet<usize> {
     let last = last_chunk(doc_len, chunk_size);
     let mut out = BTreeSet::new();
     for &c in hits {
@@ -357,10 +359,7 @@ mod tests {
         let mut hits = BTreeSet::new();
         hits.insert(5);
         // doc_len 600 at chunk_size 100: last chunk is 5, no chunk 6.
-        assert_eq!(
-            widen_to_neighbours(&hits, 600, 100),
-            BTreeSet::from([4, 5])
-        );
+        assert_eq!(widen_to_neighbours(&hits, 600, 100), BTreeSet::from([4, 5]));
     }
 
     #[test]

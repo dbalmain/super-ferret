@@ -178,9 +178,7 @@ fn main() -> ExitCode {
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)
             }
-            ("chunk-census", [dir, index]) => {
-                chunk_census::run(Path::new(dir), Path::new(index))
-            }
+            ("chunk-census", [dir, index]) => chunk_census::run(Path::new(dir), Path::new(index)),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
