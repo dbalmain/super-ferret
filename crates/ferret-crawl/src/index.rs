@@ -63,6 +63,10 @@ pub struct IndexOptions {
     pub workers: usize,
     /// The sniffer's version. A change refreshes every root (D37).
     pub sniffer: u32,
+    /// Optional daemon intake, armed before directory listing.
+    pub watch: Option<std::sync::Arc<crate::watch::Watch>>,
+    /// Host bulk admission and pacing; absent for direct foreground indexing.
+    pub bulk: Option<std::sync::Arc<dyn ferret_catalog::bulk::Control>>,
 }
 
 impl Default for IndexOptions {
@@ -72,6 +76,8 @@ impl Default for IndexOptions {
             config: Config::default(),
             workers: crate::default_workers(),
             sniffer: ferret_policy::SNIFFER_VERSION,
+            watch: None,
+            bulk: None,
         }
     }
 }
@@ -119,6 +125,12 @@ impl fmt::Display for CoverageFault {
 /// Why [`index`] published nothing, or published with a caveat.
 #[derive(Debug)]
 pub enum IndexError {
+    /// No publication or cache mutation; retry a complete backstop later.
+    DeferredBulk(ferret_catalog::bulk::Blocked),
+    /// A command's full rebuild was refused by memory admission.
+    DeferredMemory { required: u64, available: u64 },
+    /// Lowering an index thread priority failed.
+    Priority(io::Error),
     /// A root that is not absolute, or has a `..` component.
     BadRoot(PathBuf),
     /// A root to refresh that is not among the configured roots.
@@ -152,6 +164,15 @@ pub enum IndexError {
 impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DeferredBulk(reason) => reason.fmt(f),
+            Self::DeferredMemory {
+                required,
+                available,
+            } => write!(
+                f,
+                "insufficient memory for a full rebuild: need {required} bytes, have {available}"
+            ),
+            Self::Priority(error) => write!(f, "index thread priority: {error}"),
             Self::BadRoot(p) => write!(f, "root {} must be absolute, without `..`", p.display()),
             Self::NotConfigured(p) => write!(f, "{} is not a configured root", p.display()),
             Self::BadEntry(name) => {
@@ -381,30 +402,47 @@ pub fn index_change(
 ) -> Result<Report, IndexError> {
     run(
         catalog_dir,
-        |previous| {
-            let mut roots: Vec<PathBuf> = previous
-                .map(|p| {
-                    p.roots()
-                        .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for gone in change.remove {
-                let gone = normalise(gone)?;
-                let before = roots.len();
-                roots.retain(|r| *r != gone);
-                if roots.len() == before {
-                    return Err(IndexError::NotConfigured(gone));
-                }
-            }
-            for added in change.add {
-                roots.push(normalise(added)?);
-            }
-            Ok(roots)
-        },
+        |previous| changed_roots(previous, change),
         refresh,
         options,
     )
+}
+
+/// Applies root edits under an already retained session lock, using the same
+/// D34 widening and publication producer as the foreground index command.
+pub fn session_change(
+    session: &mut WriterSession,
+    change: RootChange<'_>,
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+) -> Result<Report, IndexError> {
+    let roots = changed_roots(Some(&session.view()), change)?;
+    recrawl(session, &roots, refresh, options)
+}
+
+fn changed_roots(
+    previous: Option<&Catalog>,
+    change: RootChange<'_>,
+) -> Result<Vec<PathBuf>, IndexError> {
+    let mut roots: Vec<PathBuf> = previous
+        .map(|p| {
+            p.roots()
+                .map(|(_, path)| PathBuf::from(OsStr::from_bytes(path)))
+                .collect()
+        })
+        .unwrap_or_default();
+    for gone in change.remove {
+        let gone = normalise(gone)?;
+        let before = roots.len();
+        roots.retain(|r| *r != gone);
+        if roots.len() == before {
+            return Err(IndexError::NotConfigured(gone));
+        }
+    }
+    for added in change.add {
+        roots.push(normalise(added)?);
+    }
+    Ok(roots)
 }
 
 /// One run, with the configured roots decided by `roots` from the previous
@@ -418,6 +456,7 @@ fn run(
     let session = WriterSession::open(catalog_dir);
     match session {
         Ok(mut session) => {
+            session.set_bulk_control(options.bulk.clone());
             let previous = session.view();
             let roots = roots(Some(&previous))?;
             let mut plan = Plan::new(
@@ -443,7 +482,7 @@ fn run(
                     let changed = !changes.records.is_empty();
                     let catalog = session
                         .commit(&changes, options.sniffer)
-                        .map_err(IndexError::Update)?;
+                        .map_err(update_error)?;
                     let (faulted, aliases) =
                         reporting_ids(&session, previous.generation(), &changes);
                     (catalog, changed, faulted, aliases)
@@ -535,6 +574,7 @@ pub(crate) fn recrawl_scoped(
     options: &IndexOptions,
     selections: BTreeMap<PathBuf, std::sync::Arc<crate::refresh::Selection>>,
 ) -> Result<(Report, ferret_catalog::log::ChangeSet), IndexError> {
+    session.set_bulk_control(options.bulk.clone());
     let previous = session.view();
     let mut plan = Plan::new(
         Some(&previous),
@@ -579,7 +619,7 @@ pub(crate) fn recrawl_scoped(
     let changed = !changes.records.is_empty();
     let catalog = session
         .commit(&changes, options.sniffer)
-        .map_err(IndexError::Update)?;
+        .map_err(update_error)?;
     let (faulted, aliases) = reporting_ids(session, previous.generation(), &changes);
     report.commit_time += started.elapsed();
     finish_report(
@@ -637,7 +677,7 @@ fn observe_reconcile(
             options.sniffer,
             (&protection, budget.clone()),
         )
-        .map_err(IndexError::Update)?;
+        .map_err(update_error)?;
         report.commit_time += started.elapsed();
         report.input_usage = budget.usage();
         let Some(ref final_changes) = changes else {
@@ -833,21 +873,53 @@ fn observe(
     let mut faults = Vec::new();
     let mut batches = Vec::new();
     for root in &plan.refresh {
+        let bulk_read = matches!(source, Source::Rebuild(..))
+            || plan.selections.is_empty()
+            || plan.selections.get(root).is_some_and(|s| s.whole_root());
+        if bulk_read
+            && let Source::Bounded(session, ..) = source
+            && let Some(control) = &options.bulk
+        {
+            // Between roots is a safe phase boundary. A refusal drops all
+            // unpublished batches; no partial listing is published or
+            // cancelled.
+            control
+                .admit(ferret_catalog::bulk::Kind::FullRewalk, &session.view())
+                .map_err(IndexError::DeferredBulk)?;
+        }
+        if !plan.selections.contains_key(root)
+            && let Some(watch) = &options.watch
+        {
+            watch.begin_policy_root(root);
+        }
         let walk_options = WalkOptions {
-            workers: options.workers,
+            workers: options.bulk.as_ref().map_or(options.workers, |control| {
+                control.workers().min(options.workers.max(1))
+            }),
             boundaries: plan.boundaries(root),
         };
-        let visitors = walk_parallel(
+        let mut visitors = walk_parallel(
             root,
             options.global.as_deref(),
             options.config,
             &walk_options,
             || {
                 let mut hasher = Hasher::with_source(source, &cache, root);
+                hasher.watch = options.watch.as_deref();
+                if bulk_read {
+                    hasher.reader.limiter = options
+                        .bulk
+                        .as_ref()
+                        .filter(|control| control.paced())
+                        .map(|control| control.limiter());
+                }
                 hasher.selection = plan.selections.get(root).map(std::convert::AsRef::as_ref);
                 hasher
             },
         );
+        if let Some(error) = visitors.iter_mut().find_map(|v| v.priority_error.take()) {
+            return Err(IndexError::Priority(error));
+        }
         if let Source::Bounded(_, _, budget) = source
             && budget.exceeded()
         {
@@ -1197,6 +1269,8 @@ pub(crate) struct Hasher<'a> {
     pub(crate) out: Output,
     reader: Reader,
     selection: Option<&'a crate::refresh::Selection>,
+    watch: Option<&'a crate::watch::Watch>,
+    priority_error: Option<io::Error>,
 }
 
 /// What a worker leaves behind.
@@ -1241,6 +1315,8 @@ impl<'a> Hasher<'a> {
             },
             reader: Reader::new(),
             selection: None,
+            watch: None,
+            priority_error: None,
         }
     }
 
@@ -1328,7 +1404,7 @@ impl<'a> Hasher<'a> {
             hook(self.root, Probe::Claimed);
         }
         let mut file = file;
-        let content = self.reader.read(&mut file);
+        let content = self.reader.read(&mut file, stat.size);
         #[cfg(test)]
         hook(self.root, Probe::Hashed(decided.path));
         let content = content.and_then(|c| observe::bracket(&file, &stat, c));
@@ -1477,7 +1553,31 @@ impl Output {
 }
 
 impl EventVisitor for Hasher<'_> {
+    fn dedicated_worker(&self) -> bool {
+        true
+    }
+    fn worker_started(&mut self) {
+        self.priority_error = crate::lower_index_priority().err();
+    }
     type Dir = DirToken;
+
+    fn policy_path(&mut self, path: &Path) {
+        if let Some(watch) = self.watch {
+            watch.policy_path(self.root, path);
+        }
+    }
+
+    fn policy_input(&mut self, fd: std::os::fd::BorrowedFd<'_>, name: &OsStr) {
+        if let Some(watch) = self.watch {
+            watch.policy_input(self.root, fd, name);
+        }
+    }
+
+    fn observing(&mut self, fd: std::os::fd::BorrowedFd<'_>, path: &Path) {
+        if let Some(watch) = self.watch {
+            watch.arm(self.root, path, fd);
+        }
+    }
 
     fn root(&mut self, stat: crate::Stat<'_>) -> DirToken {
         self.out.counts.dirs += 1;
@@ -1514,11 +1614,19 @@ impl EventVisitor for Hasher<'_> {
         }
         match event {
             Event::Decided(decided) => {
+                if let Some(watch) = self.watch {
+                    watch.file(self.root, &decided);
+                }
                 if decided.decision == Decision::Skip {
                     self.out
                         .batch
                         .ignored(decided.parent, decided.name.as_bytes(), decided.kind);
                     return None;
+                }
+                if matches!(decided.decision, Decision::Descend | Decision::Traverse)
+                    && let Some(watch) = self.watch
+                {
+                    watch.arm_entry(self.root, &decided);
                 }
                 let stat = decided.stat.as_ref().map(observe::from_walk)?;
                 let name = decided.name.as_bytes();
@@ -1686,6 +1794,7 @@ fn full_rewalk(
     options: &IndexOptions,
     usage: ferret_catalog::InputUsage,
 ) -> Result<Report, IndexError> {
+    session.admit_full_rewalk().map_err(update_error)?;
     let old = session.view();
     let plan = Plan::new(
         Some(&old),
@@ -1729,10 +1838,17 @@ fn full_rewalk(
     let started = Instant::now();
     let catalog = session
         .rebuild_checkpoint(batches, options.sniffer, fingerprint(options))
-        .map_err(IndexError::Update)?;
+        .map_err(update_error)?;
     report.commit_time += started.elapsed();
     report.input_usage = usage;
     report.input_fallback = true;
     finish_report(&mut report, &catalog, &plan, true, None, None);
     Ok(report)
+}
+
+fn update_error(error: ferret_catalog::log::Error) -> IndexError {
+    match error {
+        ferret_catalog::log::Error::Deferred(reason) => IndexError::DeferredBulk(reason),
+        error => IndexError::Update(error),
+    }
 }

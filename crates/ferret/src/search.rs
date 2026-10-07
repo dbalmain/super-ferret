@@ -11,7 +11,9 @@ use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, Instant, SystemTime};
 
-use ferret_catalog::{Catalog, Kind, Section};
+use ferret_catalog::{Catalog, Kind};
+
+use crate::engine::Engine;
 use ferret_query::{Query, Row, Stats};
 
 use crate::cli::{Context, Exit, error};
@@ -41,6 +43,9 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
             return Exit::Usage;
         }
     };
+    if let Some(exit) = crate::daemon::search(context, atoms, json, limit, now) {
+        return exit;
+    }
     let mut outcome = Outcome::default();
     let exit = search(context, &query, json, limit, started, &mut outcome);
     let total = started.elapsed();
@@ -49,8 +54,25 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
     let mut object = crate::log::line(&mut line, "search", now);
     object
         .byte_strings("query", atoms.iter().map(|a| a.as_bytes()))
-        .str("plan", &query.explain())
-        .str("strategy", &format!("{:?}", query.strategy()))
+        .str(
+            "plan",
+            &outcome.stats.and_then(|stats| stats.name_plan).map_or_else(
+                || query.explain(),
+                |estimate| {
+                    format!(
+                        "{:?}: {} global name candidates, scope rows {:?}; exact evaluation",
+                        estimate.plan, estimate.hits, estimate.scope_rows
+                    )
+                },
+            ),
+        )
+        .str(
+            "strategy",
+            &outcome.stats.and_then(|stats| stats.name_plan).map_or_else(
+                || format!("{:?}", query.strategy()),
+                |estimate| format!("{:?}", estimate.plan),
+            ),
+        )
         .opt_int("limit", limit)
         .int("exit", exit as u8)
         .int("rows", outcome.rows)
@@ -85,8 +107,8 @@ fn search(
     started: Instant,
     outcome: &mut Outcome,
 ) -> Exit {
-    let catalog = match Catalog::open(&context.index) {
-        Ok(Some(catalog)) => catalog,
+    let engine = match Engine::open(&context.index) {
+        Ok(Some(engine)) => engine,
         Ok(None) => {
             error(&format!(
                 "no index in {}: run `ferret index DIR` first",
@@ -101,23 +123,19 @@ fn search(
             return Exit::Error;
         }
     };
+    let session = engine.pin();
+    let catalog = session.catalog();
     outcome.size = Some((catalog.name_count(), catalog.inode_count()));
-    // A plain listing prints only paths, so it reads no inode column.
-    if json && let Err(e) = catalog.load(&JSON_SECTIONS) {
-        error(&format!("{}: {e}", context.index.display()));
-        outcome.error = Some("read");
-        return Exit::Error;
-    }
 
     let stdout = io::stdout();
     let tty = stdout.is_terminal();
     let mut out = BufWriter::with_capacity(64 << 10, stdout.lock());
     let mut line = Vec::new();
     let mut failed: Option<io::Error> = None;
-    let result = query.run(&catalog, |row| {
+    let result = session.search(query, |row| {
         line.clear();
         if json {
-            json_row(&mut line, &catalog, row);
+            json_row(&mut line, catalog, row);
         } else {
             line.extend_from_slice(row.path);
         }
@@ -166,16 +184,13 @@ fn search(
     }
 }
 
-/// What [`json_row`] reads beyond the row itself.
-const JSON_SECTIONS: [Section; 3] = [Section::Size, Section::Mtime, Section::Doc];
-
 /// One `--json` row: `path` (and `path_base64` when it is not UTF-8; see
 /// [`crate::json`]), `type`, `size` in bytes, `mtime` in Unix seconds, and
 /// `doc`, the content's document id, or null when the file has none
 /// (a directory, a symlink, a binary or unread file). Document ids are
 /// stable across index runs (D4); inode and name ids are not (D27), so
 /// they are not printed.
-fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
+pub(crate) fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
     let kind = match row.kind {
         Kind::Dir => "dir",
         Kind::File => "file",

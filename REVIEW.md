@@ -133,3 +133,13 @@ findings). Each should name the guard that will eventually retire it.
   DECISIONS.md. The gates were green because the tests had been rewritten.
 - **Guard:** the new standing check above. M5c (80143ce) restored the amendment,
   and the CLI repro checks `ferret search` before and after a `chmod 000`.
+
+### 2026-10-06 — an outer panic catcher cannot finish a stranded worker pool
+
+- **What:** a find worker unwind could leave `queue.active` nonzero while
+  siblings waited on its condvar. The outer socket query catcher would never
+  regain control through the scoped join.
+- **Guard:** each worker's unwind guard takes the queue lock, latches quit and
+  wakes all siblings, closing the check/wait lost-wakeup window. The real-binary
+  daemon test injects a panic from the production find Effects entry-boundary
+  hook after the first committed record, then verifies another query succeeds.

@@ -74,8 +74,13 @@ usage:
                                 pasted find ... -delete skips ignored files and still exits 0
                                 -empty sees this walk's -delete removals, not -exec removals;
                                 use -delete or -I for deletion-aware emptiness
+  ferret --json find ...        same walk, as tagged JSON-lines events
+                                (begin/stdout/stderr/diagnostic/end, id \"find\");
+                                --json here is a host flag before `find` and
+                                never reaches find's own argument parser
   ferret search [--json] [--limit N] [--] ATOM...
                                 print each path that matches every ATOM
+  ferret batch [--input FILE]   process sequential JSON-lines requests
   ferret import-v3              import the legacy snapshot, preserving roots and DocIds
   ferret stats                  counts, sizes and a census of the index
   ferret help | --version
@@ -118,6 +123,9 @@ find exit status: 0 success, 1 error (including invalid syntax).
   In default mode -empty sees this walk's -delete removals, not removals by
   -exec commands; use -delete or -I for deletion-aware emptiness.
 
+status [--json]     Show writer/watch status or the local catalog without a host.
+stats [--json]      Show the catalog census; JSON adds status and planner counters.
+
 search exit status: 0 success (search printed a row), 1 search matched nothing,
   2 usage error, 3 runtime error (no index, I/O, lock held, walk faults).
 
@@ -129,6 +137,10 @@ the query text may itself contain a path (search path:/some/dir).
 
 /// Runs `ferret` with the process's arguments and environment.
 pub fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|arg| arg == "batch") {
+        return crate::batch::main(args).into();
+    }
     run(std::env::args_os().skip(1)).into()
 }
 
@@ -141,7 +153,17 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         }
     };
     match args.command {
-        Command::Find(ref find_args) => return crate::find::run(find_args, args.index.as_deref()),
+        Command::Find {
+            args: ref find_args,
+            json,
+        } => {
+            let index = args.index.as_deref();
+            return if json {
+                crate::find::run_json(find_args, index)
+            } else {
+                crate::find::run(find_args, index)
+            };
+        }
         Command::Help => return print("usage", USAGE.as_bytes()),
         Command::Version => {
             let version = format!("ferret {}\n", env!("CARGO_PKG_VERSION"));
@@ -174,7 +196,9 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         Command::Index(roots) => crate::index::index(&context, &roots),
         Command::RootsList => crate::index::list(&context),
         Command::RootsRemove(roots) => crate::index::remove(&context, &roots),
+        Command::Status => crate::daemon::status(&context),
         Command::Stats => crate::stats::run(&context),
+        Command::StatsJson => crate::daemon::stats_json(&context),
         Command::ImportV3 => {
             match ferret_catalog::Transaction::import_v3(&context.index, [0; 16]) {
                 Ok(_) => Exit::Ok,
@@ -184,7 +208,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
                 }
             }
         }
-        Command::Help | Command::Version | Command::Find(_) => Exit::Ok,
+        Command::Help | Command::Version | Command::Find { .. } => Exit::Ok,
     }
 }
 

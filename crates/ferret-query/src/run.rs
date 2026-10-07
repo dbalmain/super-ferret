@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferret_catalog::{Catalog, InoId, Kind, Kinds, Name, NameId, OpenError, RUN, Section};
 
@@ -36,15 +37,23 @@ pub struct Stats {
     pub candidates: u64,
     /// Rows emitted.
     pub rows: u64,
+    /// The actual counted resident plan; None for raw-format execution.
+    pub name_plan: Option<crate::NameEstimate>,
 }
 
 /// A run that could not read the catalog.
 #[derive(Debug)]
-pub struct RunError(pub OpenError);
+pub enum RunError {
+    Open(OpenError),
+    Stale(ferret_catalog::RetryFromCurrent),
+}
 
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        match self {
+            Self::Open(error) => error.fmt(f),
+            Self::Stale(error) => write!(f, "retry from {:?}", error.current),
+        }
     }
 }
 
@@ -52,7 +61,7 @@ impl std::error::Error for RunError {}
 
 impl From<OpenError> for RunError {
     fn from(e: OpenError) -> Self {
-        RunError(e)
+        RunError::Open(e)
     }
 }
 
@@ -75,6 +84,115 @@ const ROW_SECTIONS: [Section; 6] = [
 ];
 
 impl Query {
+    /// Plans this query's name candidates against a checked resident view.
+    pub fn name_selection(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+    ) -> Result<crate::name_index::NameSelection, ferret_catalog::RetryFromCurrent> {
+        let terms: Vec<_> = self
+            .names
+            .iter()
+            .filter_map(|test| match test {
+                NameTest::Term(token) => Some(token.as_slice()),
+                _ => None,
+            })
+            .collect();
+        index.select(catalog, scope, &terms, |name| {
+            self.names.iter().all(|test| test.matches(name))
+                && self
+                    .driver
+                    .as_ref()
+                    .is_none_or(|driver| driver.from != usize::MAX || driver.finder.is_match(name))
+        })
+    }
+
+    /// Resident execution: term/dictionary matching and counted row candidates,
+    /// followed by the same exact evaluator as the raw-format API.
+    pub fn run_indexed(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        self.run_indexed_until(catalog, index, scope, None, emit)
+    }
+
+    /// Resident execution with cancellation checked before each candidate,
+    /// including candidates rejected by the exact evaluator.
+    pub fn run_indexed_until(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+        cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        self.indexed(catalog, index, scope, None, cancelled, emit)
+    }
+
+    /// Runs the measured name path with an optional forced candidate plan.
+    /// Intended for the benchmark driver to compare both strategies.
+    pub fn run_indexed_plan(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+        forced: Option<crate::NamePlan>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        self.indexed(catalog, index, scope, forced, None, emit)
+    }
+
+    fn indexed(
+        &self,
+        catalog: &Catalog,
+        index: &crate::NameIndex,
+        scope: Option<ferret_catalog::Handle<InoId>>,
+        forced: Option<crate::NamePlan>,
+        cancelled: Option<&AtomicBool>,
+        mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        if scope.is_none() && self.names.is_empty() && self.driver.is_none() {
+            return self.run_until(catalog, cancelled, emit);
+        }
+        let mut selection = self
+            .name_selection(catalog, index, scope)
+            .map_err(RunError::Stale)?;
+        if let Some(plan) = forced {
+            selection.estimate.plan = plan;
+        }
+        let mut run = Run {
+            query: self,
+            cancelled,
+            catalog,
+            meta_loaded: false,
+            stats: Stats::default(),
+            dir: None,
+            up: None,
+            path: Vec::new(),
+        };
+        run.stats.name_plan = Some(selection.estimate);
+        if selection.estimate.plan == crate::NamePlan::ScopeWalk && scope.is_none() {
+            run.all_names(&mut emit)?;
+            return Ok(run.stats);
+        }
+        let rows = selection.rows(catalog).map_err(RunError::Stale)?;
+        let mut kinds = catalog.kinds();
+        for id in rows {
+            run.stats.candidates += 1;
+            if run
+                .consider(&mut kinds, id, catalog.name(id), None, false, &mut emit)?
+                .is_break()
+            {
+                break;
+            }
+        }
+        Ok(run.stats)
+    }
+
     /// Runs the query, calling `emit` with each row, in name order (parent
     /// directory, then name). `emit` returns `Break` to stop early; the path
     /// it is lent is valid only for the call.
@@ -86,10 +204,19 @@ impl Query {
     pub fn run(
         &self,
         catalog: &Catalog,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        self.run_until(catalog, None, emit)
+    }
+    fn run_until(
+        &self,
+        catalog: &Catalog,
+        cancelled: Option<&AtomicBool>,
         mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
         let mut run = Run {
             query: self,
+            cancelled,
             catalog,
             meta_loaded: false,
             stats: Stats::default(),
@@ -108,6 +235,7 @@ impl Query {
 
 struct Run<'q, 'c> {
     query: &'q Query,
+    cancelled: Option<&'q AtomicBool>,
     catalog: &'c Catalog,
     /// Whether [`Run::load_meta`] has loaded the metadata tests' sections.
     meta_loaded: bool,
@@ -192,6 +320,12 @@ impl<'c> Run<'_, 'c> {
         catalog.load(&ROW_SECTIONS)?;
         let (names, mut kinds) = (catalog.name_reader(), catalog.kinds());
         for (id, child) in names.child_ids() {
+            if self
+                .cancelled
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                break;
+            }
             let child = child.0;
             if (child < catalog.base_inode_count()
                 && pass[child as usize / 64] >> (child % 64) & 1 == 1)
@@ -241,6 +375,12 @@ impl<'c> Run<'_, 'c> {
         tested: bool,
         emit: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> RunResult {
+        if self
+            .cancelled
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Ok(ControlFlow::Break(()));
+        }
         let catalog = self.catalog;
         // Validated children are either real inode ids or ignored type tags.
         if !catalog.is_live_inode(name.child) {

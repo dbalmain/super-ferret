@@ -388,3 +388,88 @@ fn histogram(out: &mut String, histogram: &Histogram, sizes: bool) {
         out.push('\n');
     }
 }
+
+/// The same census as human stats, against the daemon's selected query pin.
+pub(crate) fn json_fields(o: &mut crate::json::Object<'_>, session: &crate::engine::QuerySession) {
+    let catalog = session.catalog();
+    let c = Census::of(catalog);
+    let mut extensions = c.extensions.iter().collect::<Vec<_>>();
+    extensions.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut raw_entries = 0u64;
+    let mut unknown = 0u64;
+    for dir in catalog.dir_ids() {
+        match catalog.entry_count(dir) {
+            Some(n) => raw_entries += u64::from(n),
+            None => unknown += 1,
+        }
+    }
+    o.object("census", |o| {
+        o.int("names", catalog.name_count())
+            .int("inodes", catalog.inode_count())
+            .int("directories", catalog.dir_count())
+            .int("files", c.files)
+            .int("symlinks", c.symlinks)
+            .int("traversed", c.traversed)
+            .int("ignored", c.ignored)
+            .int("specials", c.specials)
+            .int("documents", catalog.doc_count())
+            .int("next_document", catalog.next_doc().0)
+            .int("raw_entries", raw_entries)
+            .int("unknown_entry_counts", unknown)
+            .integers("names_by_kind", c.names_by_kind)
+            .integers("depth", c.depth.counts.iter().copied())
+            .integers("name_length", c.name_len.counts.iter().copied())
+            .integers("file_size", c.file_size.counts.iter().copied())
+            .integers("file_size_bytes", c.file_size.sums.iter().copied())
+            .int("linked_inodes", c.linked.0)
+            .int("extra_links", c.linked.1)
+            .int("duplicate_documents", c.duplicates.0)
+            .int("duplicate_inodes", c.duplicates.1)
+            .int("duplicate_bytes", c.duplicates.2)
+            .int("dangling_documents", c.dangling)
+            .objects(
+                "extensions",
+                extensions,
+                |o, (extension, (names, bytes))| {
+                    o.bytes("extension", extension)
+                        .int("names", *names)
+                        .int("bytes", *bytes);
+                },
+            )
+            .object("content_states", |o| {
+                for (key, (n, b)) in ["unindexed", "binary", "hashed", "fault"]
+                    .into_iter()
+                    .zip(c.states)
+                {
+                    o.object(key, |o| {
+                        o.int("inodes", n).int("bytes", b);
+                    });
+                }
+            });
+    });
+    let names = session.name_index();
+    let (postings, scopes, delta) = names.byte_counts();
+    let (postings_plans, scope_walks, candidates) = names.counters();
+    o.object("d54", |o| {
+        o.int("catalog_bytes", catalog.bytes_read())
+            .int("planner_bytes", names.bytes() as u64)
+            .int(
+                "name_postings_bytes",
+                catalog.resident_names().map_or(0, |n| n.bytes()) as u64,
+            )
+            .int("term_postings_bytes", postings as u64)
+            .int("scope_counts_bytes", scopes as u64)
+            .int("delta_name_bytes", delta as u64)
+            .int("postings_plans", postings_plans)
+            .int("scope_walk_plans", scope_walks)
+            .int("estimated_candidates", candidates)
+            .int(
+                "scope_build_us",
+                names.scope_build_time().as_micros() as i128,
+            )
+            .opt_int(
+                "term_build_us",
+                names.term_build_time().map(|d| d.as_micros() as i128),
+            );
+    });
+}

@@ -105,6 +105,7 @@ name = "ferret-catalog"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "intpack",
 ]
 
 [[package]]
@@ -155,6 +156,11 @@ name = "find-msvc-tools"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
+
+[[package]]
+name = "intpack"
+version = "0.1.0"
+source = "git+https://github.com/dbalmain/intpack?rev=6423815d18176e6ac9f76bacd3466d6638e47976#6423815d18176e6ac9f76bacd3466d6638e47976"
 
 [[package]]
 name = "libc"

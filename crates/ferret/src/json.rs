@@ -42,6 +42,18 @@ impl<'a> Object<'a> {
         self
     }
 
+    /// A finite numeric signal, or null if the source supplied a nonfinite
+    /// value.
+    pub fn number(&mut self, key: &str, value: f64) -> &mut Self {
+        self.key(key);
+        if value.is_finite() {
+            self.out.extend_from_slice(value.to_string().as_bytes());
+        } else {
+            self.out.extend_from_slice(b"null");
+        }
+        self
+    }
+
     /// `"key":"text"`, plus `"key_base64":"…"` when `value` is not UTF-8;
     /// see the module doc.
     pub fn bytes(&mut self, key: &str, value: &[u8]) -> &mut Self {
@@ -50,7 +62,7 @@ impl<'a> Object<'a> {
         if std::str::from_utf8(value).is_err() {
             self.key(&format!("{key}_base64"));
             self.out.push(b'"');
-            base64(self.out, value);
+            encode_base64(self.out, value);
             self.out.push(b'"');
         }
         self
@@ -73,10 +85,70 @@ impl<'a> Object<'a> {
                 Ok(text) => string(self.out, text),
                 Err(_) => {
                     self.out.extend_from_slice(b"{\"base64\":\"");
-                    base64(self.out, item);
+                    encode_base64(self.out, item);
                     self.out.extend_from_slice(b"\"}");
                 }
             }
+        }
+        self.out.push(b']');
+        self
+    }
+
+    /// `"key":null`, `"key":"text"`, or `"key":{"base64":"..."}` — the
+    /// scalar counterpart of [`Object::byte_strings`]'s per-item encoding,
+    /// used by the batch protocol's optional byte-valued fields (`cwd`; see
+    /// `protocol.rs`). Not [`Object::bytes`]'s two-key output convention,
+    /// which a scalar protocol field doesn't use.
+    pub fn opt_byte_value(&mut self, key: &str, value: Option<&[u8]>) -> &mut Self {
+        self.key(key);
+        match value {
+            None => self.out.extend_from_slice(b"null"),
+            Some(v) => match std::str::from_utf8(v) {
+                Ok(text) => string(self.out, text),
+                Err(_) => {
+                    self.out.extend_from_slice(b"{\"base64\":\"");
+                    encode_base64(self.out, v);
+                    self.out.extend_from_slice(b"\"}");
+                }
+            },
+        }
+        self
+    }
+
+    /// An array of integer counters or epoch ids.
+    pub(crate) fn integers(
+        &mut self,
+        key: &str,
+        values: impl IntoIterator<Item = u64>,
+    ) -> &mut Self {
+        self.key(key);
+        self.out.push(b'[');
+        for (i, value) in values.into_iter().enumerate() {
+            if i != 0 {
+                self.out.push(b',');
+            }
+            let _ = write!(Utf8(self.out), "{value}");
+        }
+        self.out.push(b']');
+        self
+    }
+
+    /// An array of structured census rows.
+    pub(crate) fn objects<T>(
+        &mut self,
+        key: &str,
+        items: impl IntoIterator<Item = T>,
+        mut fill: impl FnMut(&mut Object<'_>, T),
+    ) -> &mut Self {
+        self.key(key);
+        self.out.push(b'[');
+        for (i, item) in items.into_iter().enumerate() {
+            if i != 0 {
+                self.out.push(b',');
+            }
+            let mut object = Object::new(self.out);
+            fill(&mut object, item);
+            object.end();
         }
         self.out.push(b']');
         self
@@ -87,6 +159,33 @@ impl<'a> Object<'a> {
         self.key(key);
         let _ = write!(Utf8(self.out), "{}", value.into());
         self
+    }
+
+    /// `"key":true` or `"key":false`.
+    pub fn bool(&mut self, key: &str, value: bool) -> &mut Self {
+        self.key(key);
+        self.out
+            .extend_from_slice(if value { b"true" } else { b"false" });
+        self
+    }
+
+    /// `"key":null`.
+    pub fn null(&mut self, key: &str) -> &mut Self {
+        self.key(key);
+        self.out.extend_from_slice(b"null");
+        self
+    }
+
+    /// Appends fields produced by this module's writer to the open object.
+    pub(crate) fn raw_fields(&mut self, fields: &[u8]) {
+        if fields.is_empty() {
+            return;
+        }
+        if !self.empty {
+            self.out.push(b',');
+        }
+        self.empty = false;
+        self.out.extend_from_slice(fields);
     }
 
     /// `"key":null`, or the number.
@@ -146,7 +245,7 @@ fn string(out: &mut Vec<u8>, text: &str) {
 }
 
 /// Standard base64 with padding.
-fn base64(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn encode_base64(out: &mut Vec<u8>, bytes: &[u8]) {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for chunk in bytes.chunks(3) {
         let n = chunk
@@ -187,11 +286,11 @@ mod tests {
             ("foobar", "Zm9vYmFy"),
         ] {
             let mut out = Vec::new();
-            base64(&mut out, input.as_bytes());
+            encode_base64(&mut out, input.as_bytes());
             assert_eq!(out, expected.as_bytes(), "{input:?}");
         }
         let mut out = Vec::new();
-        base64(&mut out, &[0xff, 0xfe, 0x00]);
+        encode_base64(&mut out, &[0xff, 0xfe, 0x00]);
         assert_eq!(out, b"//4A");
     }
 

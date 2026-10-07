@@ -19,6 +19,7 @@
 pub mod batch;
 mod budget;
 mod build;
+pub mod bulk;
 mod compact;
 mod format;
 mod generation;
@@ -30,6 +31,7 @@ mod overlay;
 mod packed;
 mod publication;
 pub mod read;
+mod resident_names;
 mod session;
 pub mod transaction;
 
@@ -40,12 +42,17 @@ pub use batch::{Batch, Content, DirToken, Stat, WorkTreeKind};
 pub use budget::{BudgetUsage, CompactionLimits};
 pub use build::BuildError;
 pub use format::{DecodeError, Section};
+
+/// Checkpoint format understood by this reader, for host compatibility hello.
+pub const FORMAT_VERSION: u32 = format::VERSION;
+
 pub use generation::{Generation, Handle, RetryFromCurrent};
 pub use input::{InputBudget, InputLimits, InputUsage};
 pub use read::{
     Catalog, Contents, Entry, Inode, Kind, Kinds, Name, NameReader, NameRuns, OpenError, RUN,
     Resolved, Target, WorkTree,
 };
+pub use resident_names::{PackedNameLists, PackedStrings, ResidentNames};
 pub use session::WriterSession;
 pub use transaction::{BeginError, CommitError, KeepError, Transaction};
 

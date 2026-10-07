@@ -4,7 +4,9 @@ M0 design, 2026-10-03. Implementation baseline: `4e38e77`, format v3.
 M1–M3 implement the checked version-4 checkpoint, durable log and effective
 reader. M4/M4b implement the batch recrawl producer; M5 implements typed coverage
 retention. M6 implements resident scoped refresh and bounded file observations;
-M7 compaction remains a design.
+M7 implements compaction and budgets; R1–R3 bound changed-input attempts and
+fix recovery, reporting and faulted fallback ownership. S1+ is closed for
+S1b to consume; current measurements and known limits are in ROADMAP.
 The build is split into slices below. Dave answered D51 A, D52 B and D53 A on
 2026-10-05: idle-boundary compaction under the writer lock, epoch-scoped
 InoId/NameId with stable DocId, and semantic validation on cold open. M7 measures
@@ -26,11 +28,11 @@ replay and occasional full compaction. An unchanged full recrawl still visits
 every entry; M4b sorts directory listings and only the changed/alias residue.
 S1+ cannot turn filesystem enumeration into a small update.
 
-## What the code does today
+## Baseline constraints and implemented seams
 
 These are constraints found in the code, rather than inferred from DESIGN:
 
-- `format.rs` writes v3: a 40 B header, 23 section entries of 16 B and 17
+- Before S1+, `format.rs` wrote v3: a 40 B header, 23 section entries of 16 B and 17
   column descriptors of 16 B, then contiguous sections. The head is 680 B.
   The three name columns and most inode fields have 128-row blocks; dev,
   mode and owner use dictionaries. Document ids are a sequence column.
@@ -629,7 +631,7 @@ WriterSession::commit(changes, sniffer) -> checked Catalog view
 These describe the implemented Rust seam; scopes and reasons are `RefreshScope`
 and `RefreshReason`, and move endpoints are `RenameHint`. `base_generation`
 belongs to the refresh result, so delta adoption can check its source before
-using ids. Checkpointed refresh publication remains M7 work. Expected-generation
+using ids. Checkpointed refresh publication is implemented by M7. Expected-generation
 mismatch returns RetryFromCurrent before dereferencing any request id or
 doing writes; expected_generation includes incarnation, checkpoint and sequence.
 A refreshed scope must resolve to the same root and inode identity under the lock; a changed or
@@ -658,7 +660,8 @@ git-exclude changes expand to the affected subtree, global rules/size-cap or
 sniffer changes expand to the required roots, and overflow invalidates hints
 and requests a complete backstop recrawl. A sniffer-version change cannot
 advance the global header while roots retain old classifications (D37).
-Watcher setup, watch limits, burst timers and socket protocol remain S1b work.
+Watcher setup, watch limits, burst timers and socket protocol are specified in
+[S1B.md](S1B.md).
 
 A ctime-only change is not proof that bytes stayed the same. A recrawl chmod
 therefore may reread/hash the file; equal hashes retain the DocId and produce

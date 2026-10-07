@@ -42,10 +42,18 @@ pub enum Command {
         limit: Option<u64>,
     },
     /// `find [OPTIONS] [PATH...] [EXPRESSION]`, passed intact to the find
-    /// parser.
-    Find(Vec<OsString>),
+    /// parser. `--json`, given before the `find` operand, requests the
+    /// structured-event host instead of find's raw stdout/stderr; it is not
+    /// passed to find's own parser, so a `--json` operand after `find` (or
+    /// after `--`) is unaffected and reaches find intact.
+    Find {
+        args: Vec<OsString>,
+        json: bool,
+    },
     /// `stats`.
     Stats,
+    StatsJson,
+    Status,
     /// Explicit migration of the index directory's v3 snapshot.
     ImportV3,
     /// `help`, `-h` or `--help`.
@@ -113,15 +121,15 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if operands.is_empty() && arg == "find" {
-            if json {
-                return Err(UsageError::NotFor("--json", "find"));
-            }
             if limit.is_some() {
                 return Err(UsageError::NotFor("--limit", "find"));
             }
             return Ok(Args {
                 index,
-                command: Command::Find(args.collect()),
+                command: Command::Find {
+                    args: args.collect(),
+                    json,
+                },
             });
         }
         let bytes = arg.as_bytes();
@@ -187,12 +195,13 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             let command = match other {
                 b"index" => "index",
                 b"roots" => "roots",
+                b"status" => "status",
                 b"stats" => "stats",
                 b"import-v3" => "import-v3",
                 b"help" => "help",
                 _ => return Err(UsageError::UnknownCommand(name)),
             };
-            if json {
+            if json && !matches!(other, b"status" | b"stats") {
                 return Err(UsageError::NotFor("--json", command));
             }
             if limit.is_some() {
@@ -200,7 +209,20 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             }
             match other {
                 b"index" => Command::Index(paths(rest)),
-                b"stats" => none("stats", rest).map(|()| Command::Stats)?,
+                b"status" => {
+                    if rest.len() == 1 && rest[0] == "--json" {
+                        Command::Status
+                    } else {
+                        none("status", rest).map(|()| Command::Status)?
+                    }
+                }
+                b"stats" => {
+                    if rest == [OsString::from("--json")] || (json && rest.is_empty()) {
+                        Command::StatsJson
+                    } else {
+                        none("stats", rest).map(|()| Command::Stats)?
+                    }
+                }
                 b"import-v3" => none("import-v3", rest).map(|()| Command::ImportV3)?,
                 b"help" => none("help", rest).map(|()| Command::Help)?,
                 _ => roots(rest)?,
@@ -256,6 +278,8 @@ mod tests {
                 Command::RootsRemove(vec!["x".into()]),
             ),
             (&["stats"], Command::Stats),
+            (&["stats", "--json"], Command::StatsJson),
+            (&["--json", "stats"], Command::StatsJson),
             (&["help"], Command::Help),
             (&["search", "--help"], Command::Help),
             (&["--version"], Command::Version),
@@ -290,6 +314,22 @@ mod tests {
                     atoms: vec!["-".into()],
                     json: false,
                     limit: None,
+                },
+            ),
+            (
+                &["find", "a", "-print"],
+                Command::Find {
+                    args: vec!["a".into(), "-print".into()],
+                    json: false,
+                },
+            ),
+            // --json before `find` selects the structured host; find's own
+            // argv, including a later --json, passes through untouched.
+            (
+                &["--json", "find", "a", "-name", "--json", "-print"],
+                Command::Find {
+                    args: vec!["a".into(), "-name".into(), "--json".into(), "-print".into()],
+                    json: true,
                 },
             ),
         ];
@@ -336,7 +376,6 @@ mod tests {
                 &["search", "--limit", "x"],
                 UsageError::BadValue("--limit", "x".into()),
             ),
-            (&["stats", "--json"], UsageError::NotFor("--json", "stats")),
             (
                 &["index", "--limit", "2"],
                 UsageError::NotFor("--limit", "index"),

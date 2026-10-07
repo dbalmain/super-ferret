@@ -1,0 +1,11 @@
+[Unit]
+Description=Ferret resident query engine
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ferretd --idle-ms 0
+Restart=on-failure
+UMask=0077
+
+[Install]
+WantedBy=default.target

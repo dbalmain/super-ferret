@@ -62,7 +62,7 @@ impl Target {
     /// expression order, during `prepare` (#6) - never at parse time, so
     /// expression order (not argument-parse order) decides its position
     /// relative to any reference observation sharing the same path.
-    pub(super) fn open(&mut self) -> io::Result<()> {
+    pub(super) fn open(&mut self, options: &super::Options) -> io::Result<()> {
         let Self::File(path, file) = self else {
             return Ok(());
         };
@@ -72,7 +72,7 @@ impl Target {
         if guard.is_some() {
             return Ok(());
         }
-        let opened = File::create(path)?;
+        let opened = File::create(options.observed_path(path).as_ref())?;
         *guard = Some(BufWriter::with_capacity(4096, opened));
         Ok(())
     }
@@ -230,13 +230,16 @@ impl Batch {
             let mut batches = shared
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let batch = batches
-                .entry(self.exec.id)
-                .or_insert_with(|| Self::new(&self.exec, None, None));
+            let batch = batches.entry(self.exec.id).or_insert_with(|| {
+                Self::new(&self.exec, self.directory.clone(), self.handle.clone())
+            });
             for path in self.paths.drain(..) {
                 let bytes = path.as_bytes().len() + 1;
                 if batch.full(bytes, limit) {
-                    ready.push(std::mem::replace(batch, Self::new(&self.exec, None, None)));
+                    ready.push(std::mem::replace(
+                        batch,
+                        Self::new(&self.exec, self.directory.clone(), self.handle.clone()),
+                    ));
                 }
                 batch.paths.push(path);
                 batch.bytes += bytes;
@@ -417,7 +420,10 @@ fn execute(
         let (directory, path) = exec_path(entry.path());
         (Some(directory), path)
     } else {
-        (None, entry.path().as_os_str().to_owned())
+        (
+            entry.cwd().map(Path::to_owned),
+            entry.path().as_os_str().to_owned(),
+        )
     };
     let handle = if exec.directory {
         Some(
@@ -426,7 +432,7 @@ fn execute(
                 .ok_or_else(|| io::Error::other("missing execution directory handle"))?,
         )
     } else {
-        None
+        entry.command_cwd()
     };
     if exec.batch {
         let limit = *state.limit.get_or_insert_with(batch_limit);
@@ -434,7 +440,7 @@ fn execute(
             let batch = state
                 .staged
                 .entry(exec.id)
-                .or_insert_with(|| Batch::new(exec, None, None));
+                .or_insert_with(|| Batch::new(exec, directory.clone(), handle.clone()));
             batch.bytes += path.as_bytes().len() + 1;
             batch.paths.push(path);
             // Bound worker staging by count and bytes. A single oversized path

@@ -1387,6 +1387,15 @@ met and was not held as a requirement.
 
 ## S1b — The engine, batch mode and the daemon
 
+Design and build slices: [S1B.md](S1B.md) (M0, 2026-10-05).
+
+M0 specifies the shared library engine in `ferret`, batch JSON lines first,
+D54's interned BFS names/postings/terms, then socket clients, watches/backstops
+and scheduling/budget validation. D55 remains open; D56 (find action hosting)
+and D57 (socket encoding and the proposed JSON-parser edge) are open briefs.
+The cost model distinguishes query resident bytes from writer caches, kernel
+watches and the measured 2.57–2.78 GiB oversized-rebuild path.
+
 One engine: open the catalog resident (names and inodes read in full, indexes
 mapped) and answer from memory (D46). Hosts: `ferret batch` (many queries in one
 run: CI and the test suites) and `ferretd` (inotify with a re-crawl backstop,
@@ -1396,6 +1405,268 @@ engine in process when it cannot (D49).
 
 **Measure:** open time and resident bytes per name at 10M, against D48's 1 GB
 line.
+
+
+### S1b M4 — Socket host and ordinary clients (2026-10-06)
+
+`ferretd` serves search and read-only indexed find through the existing batch
+JSON-lines executor and encoders. Ordinary clients attach or start the sibling
+binary, check ready/context/version, and render native bytes/status. Private
+runtime endpoints use index dev/ino, singleton locking, bounded admission,
+entry-boundary cancellation, panic isolation, graceful version drain and idle
+cleanup. Unchanged generations do not reopen; direct index/root publications
+are adopted through the checked opener before queries. Effects, live and
+information-only find, and batch remain local. No timing runs in this slice.
+
+M4's historical query-only gate was **647 passed / 5 ignored**, zero Rust
+warnings (+22 over 625/5). Its 21 daemon tests remain; M5a updates adoption checks
+for the retained writer, and rebuild recovery explicitly drains/restarts the host.
+Existing parallel find record order remains schedule-dependent, so byte parity
+uses deterministic traversal scopes. The user service is a template only.
+
+### S1b M5a — Writer ownership, intake and backstops (2026-10-06)
+
+M5a retains one writer lock, routes index/root edits to an existing compatible
+host without spawning from index, and returns the real producer report after
+publication. One writer queue serializes commands and debounced inotify refreshes;
+queries keep the last checked view. Uncertain publication recovers under the
+same lock. Crawl arms watches through observed directory handles before listing;
+a separate intake thread drains during crawl and compaction. Physical parent/name
+locators survive catalog epochs, unique cookies become rename hints, and bounded
+intake/kernel/lifetime loss requests a complete all-roots backstop.
+
+The default watch cap reserves one eighth of the kernel limit for other tools;
+failures report uncovered coverage. Startup and hourly full-root backstops run
+alongside five-minute polling for uncovered, fault-retained, relocated or
+possibly aliased roots; an empty polling set does no refresh. Until M5b adds
+outside-tree policy watches, their changes are an interim gap caught by the
+hourly full-root backstop. Status exposes M5a's
+watch counts, pending age/count, backstop reason and refresh/completion timestamps.
+Real temporary-tree daemon tests compare search/find against fresh production
+indexes, including generated bursts and crash restart. No timing runs.
+
+M5b has landed the remaining occurrence, input and status work below. M6 owns
+pacing, battery/load and resource admission. M5a gates: **675 passed / 6 ignored**, +28 passing tests over the 647/5
+baseline. The default real-daemon watch addition reports about 4.2 seconds (including four deliberately delayed writer commands); the
+long generated run is ignored and takes an environment-variable round count.
+
+### S1b M5b — Occurrences, policy dependencies and census (2026-10-06)
+
+Physical directory watches now retain every proven rooted namespace occurrence.
+Bind aliases and D34 nested/overlapping roots refresh through all relevant
+locators; S1+ promotion refreshes shared hard links across kept roots. Sparse
+physical parent/name proofs remove blanket alias polling when they cover `nlink`;
+links outside observed roots retain polling. Unknown descriptor lifetime/boundary
+changes still widen observation.
+
+Actual crawl consultations register policy inputs and absent-input parents,
+including `.gitignore`, `.ferretignore`, git `info/exclude`, gitdir/commondir
+indirection and the global ferret ignore file. `ferret-policy` remains pure;
+full unprotected observations retire old dependencies. Symlink targets/ancestors,
+global ferret rules and the reserved config entry use parent watches; unwatchable
+inputs poll. There is no ferret config-file parser. `core.excludesFile` is
+deliberately not honoured: it costs git subprocesses per repository per crawl,
+and the global ferret ignore file covers the need.
+Statfs magic puts NFS, CIFS/SMB/SMB2, 9P and FUSE roots into polling regardless of
+successful watches, because remote/userspace writes may lack local events.
+
+Entry refresh already enumerated complete raw parent counts; the census oracle
+now checks ignored-name churn too. Complete status/stat JSON reports local no-host
+state, separates checked opacity/protection from watch coverage and queued
+freshness, and includes budgets, RSS, pinned epochs and D54/census counters.
+Real isolated daemon tests assert watched policy changes publish for Burst, D37
+still blocks global transitions under protection, and bind tests use `unshare -rm`
+with real mount --bind (available in this sandbox). No timing runs.
+Workspace gates: **690 passed / 6 ignored**, +13 passing tests over the
+**677/6** starting baseline. Final verification also runs from a clean commit.
+
+### S1b M6 — Controller, politeness and bulk admission (2026-10-06)
+
+The daemon samples CPU/I/O PSI, battery, memory and diagnostic load at one Hz.
+The real scheduler uses one worker for unknown desktop idle or missing CPU PSI,
+idle steps capped by configured concurrency, ten-second one-worker increases
+and immediate drops. A known discharging battery pauses background bulk work;
+intake continues to coalesce within M5a's bounds. All crawl index workers use
+per-thread nice 19, including a dedicated thread for single-worker indexing;
+query/socket/intake threads retain normal priority.
+
+M7c removed the I/O-pressure pause (2026-10-06). On the development desktop,
+system I/O PSI sat at `some avg10` ~66% (avg300 68.6%) with load 0.6, no task
+in D state and about 25 NVMe writes in 5 s; per-cgroup `io.pressure` placed it
+in a terminal scope, not in disk contention. Under the 10% gate a real
+`ferretd` made zero refreshes in 120 s. Every earlier test injected calm
+signals. Background work stays bounded by the 32 MiB/s limiter and per-thread
+nice 19, and M7b measured no foreground impact. I/O PSI remains in status as
+information. Unreadable PSI or battery state no longer pauses work, since it
+would otherwise pause it forever.
+
+End-of-sprint review (2026-10-06). Astra's round 1 found five defects:
+
+- a battery-paused daemon could neither idle-exit nor drain;
+- a writer that timed out on a loading daemon fell back to direct indexing;
+- one idle connection blocked drain;
+- `--json find` exited 0 after losing its output;
+- find warnings were rendered as walk errors.
+
+Sol fixed the first three in `aec0319` and Luna the last two in `12b117b`. Each
+fix has a test that fails without it. Astra's round 2 was cut off by a codex
+usage limit after naming three leads, and all three were real:
+
+- `17bacf1`: a request the protocol rejects now answers in-process instead of
+  reaching or spawning a daemon;
+- `902746e`: a draining writer blocks on a message instead of spinning on an
+  expired deadline;
+- `f2139d8`: a reader exit releases its drain-registry sender, so the handler
+  can't strand.
+
+An Opus subagent made those fixes, and an independent Opus review then closed
+the round. `9c0a507` adds one line of hardening: an expired `retry_due` is
+cleared. The suite stands at 725 passed / 6 ignored. On `f046f26` the full
+find-compat corpus scored 135,693 rows with 0 errors and 3 noignore differences.
+All three are order races: the two known `-L` ones and an unseparated
+`-printf %s` that agreed on 2 of 3 reruns.
+
+Follow-ups, none blocking:
+
+- an oversized `index`/`roots-remove` reports a catalog-lock error rather
+  than "request too large";
+- `run_intake` (`watch.rs`) has no back-off on a repeating read error, which
+  nothing produces today;
+- paced compaction at 10M is unmeasured, because no command forces or routes
+  compaction;
+- the event kind could be passed into `Destination::send`;
+- a daemon-level test of the checkpoint limiter's reservations.
+
+Compaction and full rewalk/fallback admission stay under the one writer lock.
+Reserves scale linearly from 3 GiB full-build memory and 700 MB checkpoint
+RAM/disk at 10M live names, with small-catalog floors and sparse watch/alias/
+dependency estimates. Refusal returns typed deferred work, preserves the current
+planner/generation and retries a complete marker. D51 checkpoints do not wait
+for an empty arrival queue; an unchanged-sequence epoch retry does not advance
+freshness. Full rebuild adoption now makes names resident before rebuilding the
+engine planner.
+
+A shared default 32 MiB/s limiter paces actual bulk read/checkpoint write calls,
+with bounded chunks and no post-publication sleep. Query reads and small burst
+appends are excluded. Sequential source advice is applied; no-reuse is off and
+unmeasured. Status exposes signals, worker target, blocked/admission decisions,
+headroom and byte/wait counters. Private proc/sys fixtures use the production
+signal trait and parser; scheduler, fallback and seam tests use fake clocks.
+
+The revised priority decision omits idle I/O class and SCHED_IDLE: rustix lacks
+those wrappers. Nice 19 derives best-effort I/O level 7 on BFQ, but Dave's nine
+`none` devices ignore I/O priority, leaving pacing as the I/O protection.
+SCHED_IDLE's small CFS/EEVDF weight difference does not warrant an unsafe D11
+exception absent M7 evidence of foreground harm.
+
+M6 gates: **708 passed / 6 ignored**, +19 passing tests over 689/6;
+formatter and strict workspace/all-target Clippy pass with zero warnings.
+Deferred retries preserve oldest pending age, including complete markers;
+no-watch hosts retain an explicit pending backstop. The original single-thread
+fault probes now use the existing root-keyed syscall seam across dedicated
+index threads, preserving their assertions and test count.
+M7 must measure paced/unpaced full compaction, controller reaction between
+phases, foreground/query latency, queue freshness/drainage, pinned/faulted
+fallback peaks, reserve calibration and source page-cache effects. No timing
+run is part of M6.
+
+### S1b M1 — Resident engine library (2026-10-05)
+
+Production **`c57be70`** implements the common resident engine in `ferret`.
+Search and indexed find pin one fully loaded, checked catalog generation;
+refresh/compaction adopt the writer's returned checked view without reopening.
+A query pin survives append, remapping and retired-file cleanup. Explicit find
+contexts hold a cwd descriptor as well as the logical path and start time.
+Names/inodes remain packed buffers; no D54 index or daemon is included yet.
+
+Measurements use the existing M3 clean/1%/2% synthetic catalogs, each with
+**10,448,739 names**, release `engine_open`, five fresh processes per case after
+one excluded warmup. OS cache is warm, not flushed. Current RSS is the median
+immediately after full open; peak is the maximum process VmHWM across those
+five samples. B/name divides whole-process resident bytes by live names.
+`case:Flamegraph` matches 92 rows; first-row time is its first callback after
+open, without output I/O. The last latency column is open plus first callback,
+excluding parsing and the harness's RSS sample. These are query-only engine
+costs, without writer lookup caches, concurrent old pins, D54 indexes or watches.
+
+| Overlay | Full open median (range), ms | Current / highest peak RSS, MiB | Resident B/name | First callback, ms | Open + callback, ms | Command | Commit | Load ranges (1 / 5 / 15 min) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| Clean | 672.05 (668.10–685.74) | 603.38 / 635.31 | 60.55 | 7.93 | 679.89 | `$B "$I/p0" case:Flamegraph` | `c57be70` | 1.61–1.67 / 1.49–1.50 / 1.25 |
+| 1% | 960.21 (953.73–965.70) | 699.49 / 729.97 | 70.20 | 8.71 | 968.91 | `$B "$I/p1" case:Flamegraph` | `c57be70` | 1.56–1.61 / 1.48–1.49 / 1.25 |
+| 2% | 1285.06 (1271.17–1297.79) | 796.20 / 823.87 | 79.90 | 8.34 | 1293.19 | `$B "$I/p2" case:Flamegraph` | `c57be70` | 1.48–1.52 / 1.46–1.47 / 1.25 |
+
+Build: `nix develop --command cargo build -p ferret --release --example engine_open`.
+`$I=/tmp/s1plus-m3-overlays`; `$B=/tmp/s1b-m1-ferret-bench` is a symlink to
+`/home/dave/w/super-ferret-wt/s1b/target/release/examples/engine_open`, so other
+agents' benchmark guards see it. The serial runner is
+`python3 /tmp/s1b_m1_measure.py`; raw samples and every pre-run uptime/pgrep
+check are in `/tmp/s1b-m1-measure/{samples,guards}.jsonl`. Each process isolates
+HOME, every XDG directory, runtime and FERRET_INDEX. No active benchmark,
+including time-index-bench, was present during the samples.
+
+The resident baseline remains below D48's decimal 1 GB line even at 2%.
+These results broadly match M0's 60.56/70.21/79.91 B/name; the lower open times
+than M3's 709/1012/1351 ms are different revision/load measurements, not an
+engine optimization claim. D53 semantic validation remains in every open.
+The old name-only CLI now also rejects corruption in unused metadata before
+printing rows, as D46's common full opener requires. Low-level selective-load
+catalog/query APIs remain available. Gates: **571 passed / 4 ignored**, no Rust
+warnings; the real query log's size and nanosecond mtime remain unchanged.
+
+### S1b M2a and M3 — request reader and D54 names (2026-10-05/06)
+
+**M2a** (`b1f4f3b`) adds D58 B's hand-written batch request reader in
+`crates/ferret/src/protocol.rs`. It has the S1B limits and 27 tests,
+including a round trip through `json.rs`'s writer and a mutation fuzz loop
+(long version `#[ignore]`d). The batch host itself is M2b.
+
+**M3** (`a3b5d32`, fixes `55cc540`) builds D54 B:
+
+- interned base names with packed row keys and intpack PFor row postings in
+  catalog;
+- a lazy packed term dictionary (`name-term:`), shared within an epoch;
+- a counted planner that chooses postings or a scope walk;
+- a postings seam for `find ROOT -name X -print`.
+
+It was measured on the same 10.45M-name overlays as M1, 11 fresh processes
+each, on a host whose load (2–6) was higher than during M1's runs:
+
+| Overlay | Load / projection / index ms | Full open ms | RSS / peak MiB | B/name |
+| --- | --- | ---: | ---: | ---: |
+| Clean | 890 / 711 / 150 | 1,754 | 410 / 738 | 41.18 |
+| 1% | 1,183 / 712 / 195 | 2,090 | 508 / 836 | 50.95 |
+| 2% | 1,500 / 713 / 241 | 2,453 | 601 / 929 | 60.29 |
+
+Steady memory is about 19 B/name below M1. **Open is about 1.1 s slower
+than M1** because of the interning projection (~710 ms) and the scope counts.
+Every one-shot CLI query pays this until M4's daemon serves it, and the D49
+in-process fallback pays it afterwards.
+
+A raw path that skips the projection for single queries would be faster.
+It would also be a second query path to maintain. Revisit it in M7 with
+daemon numbers; don't build it now.
+
+The term dictionary costs about 450 ms on the first `name-term:` query of an
+epoch. The fixture has only 133k distinct basenames, about 78 copies of
+each, so real trees will have far larger dictionaries. M7 measures on a real
+tree.
+
+Memory after compaction: dropping the old view frees 324–370 MiB, and
+dropping the writer frees 105 MiB more. The remaining 590–740 MiB, against
+410–601 MiB after a fresh open, is allocator retention. No allocator change
+was made.
+
+Scoped plan choice, timed under both plans by the driver's `--plan`:
+
+- the planner picks the faster plan on the discriminating cases, a rare name
+  in a large scope and a common name in a small one;
+- for `case:package.json` in ~10⁵-row scopes it picks the walk at 17–24 ms,
+  while postings take 13 ms. The ×8 factor is provisional (S1B).
+
+The find-compat corpus on `ferret-b1f4f3b` has 0 errors and only the three
+accepted races. Gates at `55cc540`: **604 passed / 5 ignored**. The query
+log is unchanged. Measurements are in `.ai/s1b-m3-measure-done.md` and
+`.ai/s1b-m3fix-done.md` (local).
 
 ## S1c — `ferret find` in find(1) syntax
 
@@ -1408,6 +1679,10 @@ bfs and fd.
 **Measure:** the 10M catalog's resident size with full `find` support. Under 1
 GB, with scan latency acceptable, means no name index (D48); otherwise a name
 index experiment (suffix array, terms, trigrams) comes before S2.
+
+D54 B subsequently answers the name-index choice: S1b builds interning, row
+postings and a term index in BFS order. The older conditional above records
+the S1c measurement gate, rather than overruling that later answer.
 
 **Built** (2026-10-02 to 2026-10-03, branch `wt/find`, milestones M1–M5c). The
 contract is [FIND.md](FIND.md); the decisions are D47 and D50.

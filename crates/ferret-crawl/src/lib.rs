@@ -18,10 +18,11 @@ mod observe;
 pub mod reconcile;
 mod refresh;
 mod walk;
+pub mod watch;
 
 pub use index::{
     Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report,
-    RootChange, index, index_change, recrawl,
+    RootChange, index, index_change, recrawl, session_change,
 };
 pub use observe::ContentFault;
 pub use refresh::{
@@ -35,3 +36,15 @@ pub use walk::{
 
 #[cfg(test)]
 mod tests;
+
+/// Lowers the calling Linux index thread alone. Intake must be spawned before
+/// lowering its parent; query and socket threads retain their normal priority.
+pub fn lower_index_priority() -> std::io::Result<()> {
+    rustix::process::setpriority_process(Some(rustix::thread::gettid()), 19).map_err(Into::into)
+}
+/// Additional checkpoint space available to this uid, excluding reserved
+/// blocks.
+pub fn available_disk(path: &std::path::Path) -> std::io::Result<u64> {
+    let stat = rustix::fs::statvfs(path)?;
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}

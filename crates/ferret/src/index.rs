@@ -211,7 +211,7 @@ fn ask_for_root() -> Option<Result<PathBuf, String>> {
 /// have written. A file that exists and cannot be read, or a symlink whose
 /// target is gone, is an error: the
 /// user's rules are unknown, so the run must not publish (D26 A′).
-fn global_ignore(context: &Context) -> Result<String, String> {
+pub(crate) fn global_ignore(context: &Context) -> Result<String, String> {
     let Some(dirs) = &context.dirs else {
         warn("no config directory; using the default ignore rules");
         return Ok(DEFAULT_IGNORE.to_owned());
@@ -271,6 +271,9 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
             return Exit::Error;
         }
     };
+    if let Some(exit) = crate::daemon::write(context, command, change, &global) {
+        return exit;
+    }
     let options = IndexOptions {
         global: Some(global),
         ..IndexOptions::default()
@@ -278,57 +281,14 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
     let result = index_change(&context.index, change, refresh, &options);
     let total = started.elapsed();
 
-    // The outcome is decided before anything is printed, and printing
-    // cannot panic: a published generation is logged even when the reader
-    // of the report has gone away.
-    let (exit, outcome) = match &result {
-        Ok(report) => {
-            print_content_faults(report);
-            print_coverage_faults(report);
-            (
-                print("the report", report_text(report).as_bytes()),
-                if report.published.is_some() {
-                    "published"
-                } else {
-                    "unchanged"
-                },
-            )
-        }
-        Err(IndexError::Coverage { faults, report }) => {
-            print_content_faults(report);
-            error(&format!(
-                "nothing published: {} directory or entry could not be read, so the walk may \
-                 have missed entries; the previous index is unchanged",
-                faults.len()
-            ));
-            let mut text = String::new();
-            for fault in faults.iter().take(SHOWN) {
-                let _ = writeln!(text, "  {fault}");
-            }
-            if faults.len() > SHOWN {
-                let _ = writeln!(text, "  … and {} more", faults.len() - SHOWN);
-            }
-            if faults.iter().any(|f| f.on_root) {
-                text.push_str(
-                    "  a root that is gone can be dropped with `ferret roots remove DIR`\n",
-                );
-            }
-            note(&text);
-            (Exit::Error, "coverage")
-        }
-        Err(IndexError::Update(e)) if e.published() => {
-            warn(&e.to_string());
-            (Exit::Ok, "undurable")
-        }
-        Err(IndexError::Commit(e)) if e.published() => {
-            warn(&e.to_string());
-            (Exit::Ok, "undurable")
-        }
-        Err(e) => {
-            error(&e.to_string());
-            (Exit::Error, "error")
-        }
+    let rendered = render(&result);
+    note(&rendered.diagnostics);
+    let exit = if rendered.exit == Exit::Ok {
+        print("the report", rendered.stdout.as_bytes())
+    } else {
+        rendered.exit
     };
+    let outcome = rendered.outcome;
 
     let mut line = Vec::new();
     let mut object = crate::log::line(&mut line, command, now);
@@ -353,7 +313,101 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
     exit
 }
 
-fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
+pub(crate) struct Rendered {
+    pub exit: Exit,
+    pub outcome: &'static str,
+    pub stdout: String,
+    pub diagnostics: String,
+}
+
+pub(crate) fn render(result: &Result<Report, IndexError>) -> Rendered {
+    let mut stdout = String::new();
+    let mut diagnostics = String::new();
+    let (exit, outcome) = match result {
+        Ok(report) => {
+            content_faults(report, &mut diagnostics);
+            coverage_faults(report, &mut diagnostics);
+            (
+                {
+                    stdout = report_text(report);
+                    Exit::Ok
+                },
+                if report.published.is_some() {
+                    "published"
+                } else {
+                    "unchanged"
+                },
+            )
+        }
+        Err(IndexError::Coverage { faults, report }) => {
+            content_faults(report, &mut diagnostics);
+            append_error(
+                &mut diagnostics,
+                &format!(
+                    "nothing published: {} directory or entry could not be read, so the walk may \
+                 have missed entries; the previous index is unchanged",
+                    faults.len()
+                ),
+            );
+            let mut text = String::new();
+            for fault in faults.iter().take(SHOWN) {
+                let _ = writeln!(text, "  {fault}");
+            }
+            if faults.len() > SHOWN {
+                let _ = writeln!(text, "  … and {} more", faults.len() - SHOWN);
+            }
+            if faults.iter().any(|f| f.on_root) {
+                text.push_str(
+                    "  a root that is gone can be dropped with `ferret roots remove DIR`\n",
+                );
+            }
+            diagnostics.push_str(&text);
+            (Exit::Error, "coverage")
+        }
+        Err(IndexError::Update(e)) if e.published() => {
+            append_warning(&mut diagnostics, &e.to_string());
+            (Exit::Ok, "undurable")
+        }
+        Err(IndexError::Commit(e)) if e.published() => {
+            append_warning(&mut diagnostics, &e.to_string());
+            (Exit::Ok, "undurable")
+        }
+        Err(IndexError::Begin(ferret_catalog::BeginError::Locked)) => {
+            append_error(
+                &mut diagnostics,
+                "another `ferret index` holds the catalog lock (or a running ferretd owns it); use ferret status --json, and run ferret index without FERRET_NO_DAEMON to route to its owner",
+            );
+            (Exit::Error, "error")
+        }
+        Err(e) => {
+            append_error(&mut diagnostics, &e.to_string());
+            (Exit::Error, "error")
+        }
+    };
+
+    if let Ok(report) = result {
+        for pattern in &report.pattern_errors {
+            append_warning(
+                &mut diagnostics,
+                &format!("ignore pattern skipped: {pattern}"),
+            );
+        }
+    }
+    Rendered {
+        exit,
+        outcome,
+        stdout,
+        diagnostics,
+    }
+}
+fn append_error(output: &mut String, message: &str) {
+    let _ = writeln!(output, "ferret: {message}");
+}
+fn append_warning(output: &mut String, message: &str) {
+    let _ = writeln!(output, "ferret: warning: {message}");
+}
+
+pub(crate) fn log_report(object: &mut crate::json::Object<'_>, report: &Report) {
     let c = &report.counts;
     object
         .int("refreshed", report.refreshed.len() as u64)
@@ -432,21 +486,21 @@ fn report_text(report: &Report) -> String {
             report.commit_time.as_secs_f64(),
         );
     }
-    for pattern in &report.pattern_errors {
-        warn(&format!("ignore pattern skipped: {pattern}"));
-    }
     text
 }
 
 /// A retained scope remains searchable, but its live count/listing is unknown.
-fn print_coverage_faults(report: &Report) {
+fn coverage_faults(report: &Report, diagnostics: &mut String) {
     if report.coverage_faults.is_empty() {
         return;
     }
-    warn(&format!(
-        "{} protected scope(s): old indexed data retained; directory counts and listings are stale",
-        report.protected_scopes
-    ));
+    append_warning(
+        diagnostics,
+        &format!(
+            "{} protected scope(s): old indexed data retained; directory counts and listings are stale",
+            report.protected_scopes
+        ),
+    );
     let mut text = String::new();
     for fault in report.coverage_faults.iter().take(SHOWN) {
         let _ = writeln!(text, "  {fault}");
@@ -458,20 +512,23 @@ fn print_coverage_faults(report: &Report) {
             report.coverage_faults.len() - SHOWN
         );
     }
-    note(&text);
+    diagnostics.push_str(&text);
 }
 
 /// Content faults are warnings: the file is indexed without its content and
 /// read again next run.
-fn print_content_faults(report: &Report) {
+fn content_faults(report: &Report, diagnostics: &mut String) {
     let faults = &report.content_faults;
     if faults.is_empty() {
         return;
     }
-    warn(&format!(
-        "{} file(s) indexed without their content, to be read again next run:",
-        faults.len()
-    ));
+    append_warning(
+        diagnostics,
+        &format!(
+            "{} file(s) indexed without their content, to be read again next run:",
+            faults.len()
+        ),
+    );
     let mut text = String::new();
     for (path, fault) in faults.iter().take(SHOWN) {
         let _ = writeln!(text, "  {}: {fault}", path.display());
@@ -479,7 +536,7 @@ fn print_content_faults(report: &Report) {
     if faults.len() > SHOWN {
         let _ = writeln!(text, "  … and {} more", faults.len() - SHOWN);
     }
-    note(&text);
+    diagnostics.push_str(&text);
 }
 
 /// `n` bytes, in the largest unit that keeps it at least 1.

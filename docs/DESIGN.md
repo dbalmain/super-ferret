@@ -20,6 +20,11 @@ when content changes.
 
 ## Crates
 
+`ferret` also builds `ferretd`, the socket host and retained serial writer. std supplies
+Unix sockets, file locking and Linux no-follow opens through OpenOptionsExt.
+Retained directory handles anchor endpoint operations through /proc/self/fd.
+S1b M5a routes index/root commands to an existing compatible host; index never spawns it.
+
 One cargo workspace (D1). Each line lists a crate's dependencies; there are no
 cycles. This block is enforced: `crates/ferret/tests/layering.rs` fails when a
 crate's `Cargo.toml` disagrees with it.
@@ -28,25 +33,24 @@ crate's `Cargo.toml` disagrees with it.
 ferret         → ferret-query, ferret-crawl, ferret-catalog, ferret-index, ferret-verify, ferret-policy
 ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog, ferret-verify, ferret-text, rustix
 ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
-ferret-index   → ferret-text, intpack (git dependency, may be vendored — D11)
-ferret-catalog → blake3 (checkpoint integrity)
+ferret-index   → ferret-text
+ferret-catalog → blake3 (checkpoint integrity), intpack (git dependency pinned by rev — D59)
 ferret-verify  → regex
 ferret-policy  → (std only)
 ferret-text    → (std only)
 ferret-bench   → anything; nothing depends on it
-ferret-daemon  → later
 ```
 
 | Crate            | Owns                                                                                                                           | Knows nothing about            |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------ |
 | `ferret-policy`  | `DirRules::decide(path, entry) -> Decision`, `sniff`; `.ferretignore` / `.gitignore` / global (D13); the defaults setup writes | the catalog, the index         |
 | `ferret-crawl`   | walking roots, `statx`, change detection against the catalog, hashing                                                          | query, index formats           |
-| `ferret-catalog` | names, inodes, documents, the snapshot, name scan (D14)                                                                        | tokens, postings               |
+| `ferret-catalog` | names, inodes, documents, storage, name dictionary and catalog row postings (D54, S1b)                                        | content tokens and document postings |
 | `ferret-text`    | the tokenizer and identifier splitting (D9); versioned                                                                         | files, ids                     |
 | `ferret-index`   | segments over doc ids; each structure implements `CandidateSource`                                                             | files, paths, inodes           |
 | `ferret-verify`  | re-reading a file and matching a query atom against its bytes                                                                  | how candidates were found      |
 | `ferret-query`   | query syntax, planning, execution, result rows                                                                                 | any structure's on-disk format |
-| `ferret`         | the CLI, config, XDG directories, setup, JSON lines output, the query log                                                      | —                              |
+| `ferret`         | CLI, config, XDG, JSON output, query log; shared engine coordination and batch/daemon hosts (S1b)                              | —                              |
 
 Two boundaries carry the design, and both are where D1 said the thought goes:
 
@@ -147,8 +151,12 @@ Liveness is catalog state: a doc is live while some inode points at it. The
 index reads a live-docs bitset from the catalog rather than keeping its own
 tombstones, so there is one source of truth.
 
-**Storage.** One snapshot file per catalog directory, rebuilt by every run
-(D26): a versioned header (magic, format version, sniffer version, next
+**Storage.** S1+ now publishes a checked v4 snapshot plus a bounded transaction
+log under a manifest, with epoch-scoped inode/name ids and stable DocIds.
+[S1PLUS.md](S1PLUS.md) defines the implemented publication, recovery and
+effective-reader contract. The column-layout description below records the
+S1a/find baseline; its per-run snapshot replacement is superseded by S1+.
+The snapshot contains a versioned header (magic, format version, sniffer version, next
 `DocId`, the directory, inode, name and document counts), a table of 23 sections by
 offset and length, a descriptor per packed column, and the sections themselves.
 Every id and inode field is a bit-packed column (S1a): `count` values of
@@ -307,7 +315,7 @@ allocate a joined path per entry. Re-inclusion pruning discards negations that a
 later exclusion provably supersedes; uncertain overlaps still permit traversal.
 
 Each directory's rules are one list (D19). Concatenating the files lowest
-precedence first — global, `info/exclude`, `.gitignore` root to here,
+precedence first — global ferret rules, `info/exclude`, `.gitignore` root to here,
 `.ferretignore` root to here — and taking the last matching line gives the
 precedence above. Every rule in the list matches an entry's name alone. A
 pattern with no slash before its last character applies unchanged in every
@@ -532,14 +540,76 @@ cannot be written is a warning, never a failed command.
 The CLI's JSON lines write a path that is not UTF-8 as `path` (lossy text) plus
 `path_base64` (the exact bytes). The `ferret` crate doc states this contract.
 
-## Resident daemon (later, optional — D14)
+## Resident engine, batch and daemon (S1b — D46, D49, D54)
 
-`ferretd` watches the roots (inotify, with the re-crawl as the backstop), keeps
-the catalog and hot index files resident so queries never start cold, and runs
-indexing at idle priority. The CLI works identically with or without it: it
-opens the catalog and index read-only. The research's politeness design
-([architecture.html § Change detection](research/claude/architecture.html))
-applies when this slice starts.
+[S1B.md](S1B.md) defines one library engine in `ferret`, with `ferret batch`
+and a `ferretd` binary in that package as hosts. The current dependency graph
+already permits that coordination. There is no separate daemon crate. D57 A and D58 B select the shared bounded
+JSON-lines reader and event writer; no external parser dependency is needed.
+
+Both hosts open checked catalog buffers resident, validate the effective
+snapshot-plus-overlay view (D53 A), and pin generations per query. Future
+content indexes are mapped by their owning crate in S2; none exists today.
+D54 adds resident interned names and row postings in catalog, and a name-term
+index/planner in query using text's tokenizer, retaining BFS. These catalog
+row postings do not change the content-index boundary. D55 remains open.
+
+Ordinary queries connect to the daemon, spawning it on first use; unavailable
+background operation or `FERRET_NO_DAEMON` uses the same engine in process.
+D56 A keeps effectful find in the local client; live/information-only find
+and batch remain local too. M5a retains one WriterSession and its lock;
+explicit index/root commands are ordering barriers in one writer queue. Commands
+use the real session producer and return the ordinary report after publication.
+No-daemon indexing stays direct and fails promptly against a daemon-held lock.
+Queries pin the last checked view while refresh/recovery runs. Recovery retains
+the same lock and revalidates the durable prefix before rebuilding writer lookups.
+
+Crawl owns one nonblocking rustix inotify instance and compact physical-identity,
+parent/name locators, independent of catalog ids. It arms through observed handles
+before listing; a separate thread drains during refresh/compaction. A 200 ms
+trailing/1 s maximum debounce pairs unique move cookies, bounded at 100,000 scopes
+and 16 MiB; loss/reuse becomes all-root Overflow. Notifications never delete rows.
+Known directory endpoints observe subtrees; self/unknown locators and policy
+boundaries conservatively refresh roots. Watch failures
+and a configurable cap (default seven eighths of the kernel limit) report gaps.
+Startup/hourly backstops and five-minute polling of the actual uncovered,
+retained, relocated, unproven-link and network/FUSE roots use the same serial
+producer. M5b maps every proven rooted occurrence onto a shared physical watch;
+notifications refresh every locator, and S1+ promotes kept shared aliases. Sparse
+hard-link proofs count physical parent/name pairs against `nlink`, preserving
+polling for names outside observed roots. Watches and policy inputs share the
+physical identity map and cap.
+
+Crawl's actual policy-read callbacks supply dependencies, including absent files,
+gitdir/commondir metadata and the global ferret ignore file. Input-parent watches
+catch saves, creation, replacement and ancestor symlink changes. Only complete
+unprotected root observations retire old inputs. Global ferret rules and the
+reserved config entry share those parent watches. Unwatchable inputs poll.
+`fstatfs` classifies NFS, CIFS/SMB/SMB2, 9P and FUSE as
+polling-dependent, even after watch installation; classification failure also
+polls. Remote/userspace writes may not emit local notifications.
+
+D51 A pauses the writer at idle boundaries while queries keep old views. M5a
+provides the serial writer and real-inotify full-index oracle tests. M5b provides
+multi-occurrence watches, external policy dependencies and typed status/stat JSON,
+including local no-host state, checked protection/opacity, queued freshness,
+coverage, budgets, RSS, old pinned epochs, census and D54 planner counters; M6 supplies a one-Hz procfs/sysfs signal source, the worker ratchet, bulk gates
+and configurable admission under the writer lock. Full-build memory scales
+from 3 GiB at 10M live names; checkpoint RAM/disk from 700 MB, with fixed floors
+and watch/alias/dependency estimates. Deferred bulk work keeps the current
+planner and generation and becomes a complete backstop. Already admitted
+publication completes. Shared byte pacing covers bulk source reads and
+checkpoint writes, excluding query reads and small log commits. Sequential
+source advice is enabled; no-reuse is disabled and unmeasured. S1B records
+configuration, status and the required M7 reserve/cache measurements.
+
+M6's revised priority decision uses per-thread nice 19 only, via rustix's
+`process`/`thread` features. No idle I/O class or SCHED_IDLE is applied.
+Default Linux best-effort I/O priority derives level 7 from nice 19 where the
+scheduler honours it (BFQ); Dave's nine devices use `none` and ignore I/O
+priority, so bulk byte pacing supplies the I/O protection. SCHED_IDLE offers
+only a small CFS/EEVDF weight difference. Consider unsafe under D11 only if M7
+finds foreground harm with nice 19 plus the limiter.
 
 ## Not yet designed
 

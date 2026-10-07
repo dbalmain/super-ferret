@@ -8,6 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+intpack.workspace = true
 blake3 = "1" # checkpoint integrity; matches crawl
 
 [lints]

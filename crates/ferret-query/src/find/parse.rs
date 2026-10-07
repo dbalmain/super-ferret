@@ -65,11 +65,18 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
+pub(super) fn parse(
+    args: &[OsString],
+    cwd: Option<Arc<PathBuf>>,
+    now: std::time::SystemTime,
+) -> Result<Plan, ParseError> {
     let mut parser = Parser {
         args,
         at: 0,
-        options: Options::default(),
+        options: Options {
+            cwd,
+            ..Options::default()
+        },
         action: false,
         unsupported: None,
         warnings: Vec::new(),
@@ -81,7 +88,7 @@ pub(super) fn parse(args: &[OsString]) -> Result<Plan, ParseError> {
         prune: false,
         explicit_depth: false,
         daystart: false,
-        now: std::time::SystemTime::now(),
+        now,
         permission_warning: false,
         combinators: 0,
         nesting: 0,
@@ -225,7 +232,7 @@ const MAX_COMBINATORS: usize = 2000;
 // share this budget so alternating parentheses and negations cannot evade it.
 const MAX_NESTING: usize = 128;
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn nest(&mut self) -> Result<(), ParseError> {
         self.nesting += 1;
         if self.nesting > MAX_NESTING {
@@ -528,7 +535,7 @@ impl Parser<'_> {
                 let value = self.argument(&primary)?;
                 let test = super::test::Test::reference(
                     primary.as_bytes(),
-                    std::path::PathBuf::from(value),
+                    PathBuf::from(value),
                     follow_references,
                 );
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
@@ -563,13 +570,7 @@ impl Parser<'_> {
                         stamp,
                     })
                 } else {
-                    super::test::Test::newer_xy(
-                        x,
-                        y,
-                        std::path::PathBuf::from(value),
-                        now,
-                        follow_references,
-                    )
+                    super::test::Test::newer_xy(x, y, PathBuf::from(value), now, follow_references)
                 };
                 Expression::Test(test.ok_or_else(|| invalid(&primary, value))?)
             }
@@ -582,7 +583,7 @@ impl Parser<'_> {
         Ok(expression)
     }
 
-    fn argument(&mut self, primary: &OsStr) -> Result<&OsStr, ParseError> {
+    fn argument(&mut self, primary: &OsStr) -> Result<&'a OsStr, ParseError> {
         let value = self
             .args
             .get(self.at)
@@ -599,7 +600,8 @@ impl Parser<'_> {
     }
 
     fn target(&mut self, primary: &OsStr) -> Result<Target, ParseError> {
-        let path = PathBuf::from(self.argument(primary)?);
+        let value = self.argument(primary)?;
+        let path = PathBuf::from(value);
         if path == std::path::Path::new("/dev/stdout") {
             return Ok(Target::Stdout);
         }

@@ -10,6 +10,7 @@ repository = "https://github.com/dbalmain/super-ferret"
 publish = false
 
 [workspace.dependencies]
+intpack = { git = "https://github.com/dbalmain/intpack", rev = "6423815d18176e6ac9f76bacd3466d6638e47976" }
 ferret-catalog = { path = "crates/ferret-catalog" }
 ferret-crawl = { path = "crates/ferret-crawl" }
 ferret-index = { path = "crates/ferret-index" }
@@ -19,7 +20,7 @@ ferret-text = { path = "crates/ferret-text" }
 ferret-verify = { path = "crates/ferret-verify" }
 # Directory handles for the walker (D21). `fs` is the `*at` calls; `std`
 # is `std::io::Error` conversion. Nothing here needs `unsafe`.
-rustix = { version = "1.1.5", features = ["fs", "std"] }
+rustix = { version = "1.1.5", features = ["fs", "std", "process", "thread"] }
 
 # `unsafe` is allowed where a measurement justifies it (D11), but never by
 # default: a crate that needs it allows it on the item, with a comment, and

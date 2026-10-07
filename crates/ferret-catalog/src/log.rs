@@ -380,11 +380,13 @@ pub struct Writer {
     poisoned: bool,
     current: Catalog,
     budget: crate::budget::Budget,
+    bulk: Option<std::sync::Arc<dyn crate::bulk::Control>>,
 }
 
 #[derive(Debug)]
 pub enum Error {
     InputLimit(crate::InputUsage),
+    Deferred(crate::bulk::Blocked),
     Rebuild(crate::CommitError),
     Locked,
     MissingCheckpoint,
@@ -404,6 +406,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Deferred(reason) => reason.fmt(f),
             Self::InputLimit(usage) => write!(f, "unpublished input budget exceeded: {usage:?}"),
             Self::Rebuild(error) => error.fmt(f),
             Self::Locked => write!(f, "another writer holds the catalog lock"),
@@ -426,6 +429,9 @@ impl Writer {
             crate::lock::Error::Locked => Error::Locked,
             crate::lock::Error::Io(e) => Error::Io(e),
         })?;
+        Self::open_locked(dir, lock)
+    }
+    fn open_locked(dir: &Path, lock: crate::lock::Lock) -> Result<Self, Error> {
         let result: Result<(File, Manifest, Catalog, crate::budget::Budget), Error> = (|| {
             let pinned = Published::open(dir)
                 .map_err(Error::Previous)?
@@ -434,7 +440,7 @@ impl Writer {
             let mut manifest = pinned.manifest.clone();
             let mut budget = crate::budget::Budget::open(&pinned).map_err(Error::Previous)?;
             let current = pinned.into_catalog();
-            current.load_all().map_err(Error::Previous)?;
+            let current = current.into_resident().map_err(Error::Previous)?;
             current.name_references();
             let path = dir.join(format!("changes.{}", manifest.generation.checkpoint));
             if manifest.log_end == 0 {
@@ -470,13 +476,44 @@ impl Writer {
             poisoned: false,
             current,
             budget,
+            bulk: None,
         })
+    }
+    /// Revalidates the published prefix and retires an uncertain tail while
+    /// retaining the same writer lock. A failed recovery leaves this writer
+    /// poisoned; its last checked view remains readable.
+    pub(crate) fn recover(&mut self) -> Result<(), Error> {
+        self.poisoned = true;
+        let recovered = Self::open_locked(&self.dir, self._lock.share())?;
+        let bulk = self.bulk.take();
+        *self = recovered;
+        self.bulk = bulk;
+        Ok(())
+    }
+    pub(crate) fn set_bulk_control(
+        &mut self,
+        control: Option<std::sync::Arc<dyn crate::bulk::Control>>,
+    ) {
+        self.bulk = control;
+    }
+    pub(crate) fn admit_bulk(&self, kind: crate::bulk::Kind) -> Result<(), Error> {
+        if let Some(control) = &self.bulk {
+            control
+                .admit(kind, &self.current)
+                .map_err(Error::Deferred)?;
+        }
+        Ok(())
     }
     /// Publishes the effective view at an idle boundary under this writer lock.
     /// A preflighted diff has already been checked by `Catalog::advance`.
     pub(crate) fn checkpoint_view(&mut self, view: Catalog) -> Result<Generation, Error> {
         if self.poisoned {
             return Err(Error::Poisoned);
+        }
+        if let Some(control) = &self.bulk {
+            control
+                .admit(crate::bulk::Kind::Checkpoint, &view)
+                .map_err(Error::Deferred)?;
         }
         let mut generation = view.generation();
         generation.checkpoint = generation
@@ -503,7 +540,14 @@ impl Writer {
             .truncate(true)
             .open(&temp)
             .map_err(Error::Io)?;
-        crate::compact::write(&view, &file, generation).map_err(Error::Io)?;
+        crate::bulk::writes(
+            self.bulk
+                .as_ref()
+                .filter(|control| control.paced())
+                .map(|control| control.limiter()),
+            || crate::compact::write(&view, &file, generation),
+        )
+        .map_err(Error::Io)?;
         publication::sync(&file, Point::SnapshotSync).map_err(Error::Io)?;
         // Planning buffers have gone before readback. The checked sections are
         // the new resident view, rather than a second whole-file allocation.
@@ -527,7 +571,7 @@ impl Writer {
             .open(self.dir.join(format!("changes.{}", generation.checkpoint)))
             .map_err(Error::Undurable)?;
         self.manifest = manifest;
-        self.current = current;
+        self.current = current.into_resident().map_err(Error::Previous)?;
         self.budget =
             crate::budget::Budget::empty(self.current.inode_count(), self.current.name_count());
         self.poisoned = false;
@@ -554,7 +598,13 @@ impl Writer {
             txn.add(batch);
         }
         self.poisoned = true;
-        let current = match txn.commit() {
+        let current = match crate::bulk::writes(
+            self.bulk
+                .as_ref()
+                .filter(|control| control.paced())
+                .map(|control| control.limiter()),
+            || txn.commit(),
+        ) {
             Ok(current) => current,
             Err(error) => {
                 self.poisoned = error.published();
@@ -572,7 +622,7 @@ impl Writer {
             )
             .map_err(Error::Undurable)?;
         self.budget = crate::budget::Budget::empty(current.inode_count(), current.name_count());
-        self.current = current;
+        self.current = current.into_resident().map_err(Error::Previous)?;
         self.poisoned = false;
         Ok(())
     }
@@ -701,7 +751,7 @@ impl Writer {
         publication::sync(&self.log, Point::LogSync).map_err(Error::Io)?;
         publish_manifest(&self.dir, &next)?;
         self.manifest = next;
-        self.current = current;
+        self.current = current.into_resident().map_err(Error::Previous)?;
         self.budget = budget;
         self.poisoned = false;
         Ok(self.manifest.generation)

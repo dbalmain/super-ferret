@@ -237,6 +237,7 @@ impl Test {
     pub(super) fn resolve_reference(
         &mut self,
         catalog: Option<&ferret_catalog::Catalog>,
+        options: &super::Options,
     ) -> std::io::Result<()> {
         let Self::Reference {
             path,
@@ -248,9 +249,17 @@ impl Test {
         else {
             return Ok(());
         };
-        let entry = Entry::new(path.clone(), 0, FileKind::File);
+        let logical = options.logical_path(path);
+        let observed = options.observed_path(path);
+        let entry = Entry::new(observed.to_path_buf(), 0, FileKind::File);
         if let Some(catalog) = catalog {
-            let resolved = super::walk::resolve(catalog, path, *follow)?.ok_or_else(|| {
+            let resolved = super::walk::resolve_observed(
+                catalog,
+                logical.as_ref(),
+                *follow,
+                observed.as_ref(),
+            )?
+            .ok_or_else(|| {
                 std::io::Error::other(
                     "reference is outside the catalog or the index is stale; re-index or use -I",
                 )
@@ -264,7 +273,7 @@ impl Test {
                         TimeField::Modify => timestamp(catalog.mtime(id), catalog.mtime_nsec(id)),
                         TimeField::Change => timestamp(catalog.ctime(id), catalog.ctime_nsec(id)),
                         TimeField::Access => {
-                            let stat = super::walk::metadata(path, *follow)?;
+                            let stat = super::walk::metadata(observed.as_ref(), *follow)?;
                             stat_stamp(&stat, TimeField::Access)
                         }
                         TimeField::Birth => birth_stamp(entry.path())
@@ -278,7 +287,7 @@ impl Test {
                 return Ok(());
             }
         }
-        let stat = super::walk::metadata(path, *follow)?;
+        let stat = super::walk::metadata(observed.as_ref(), *follow)?;
         *self = if *same_file {
             Self::SameFile {
                 dev: stat.dev(),
@@ -309,7 +318,7 @@ impl Test {
             Self::Xtype(kinds) => kinds.contains(&entry.opposite_kind()?),
             Self::Reference { .. } => {
                 let mut test = self.clone();
-                test.resolve_reference(None)?;
+                test.resolve_reference(None, &super::Options::default())?;
                 return test.evaluate(entry);
             }
             Self::Perm {

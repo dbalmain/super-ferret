@@ -177,6 +177,7 @@ pub(crate) fn consume(stored: Observation, own: &Stat) -> (Stat, Result<Content,
 /// A worker's reusable read buffer and counters.
 pub(crate) struct Reader {
     buffer: Vec<u8>,
+    pub(crate) limiter: Option<std::sync::Arc<ferret_catalog::bulk::Limiter>>,
     pub(crate) files_read: u64,
     pub(crate) bytes_read: u64,
     /// Time spent in [`Reader::read`]: sniffing and hashing.
@@ -219,6 +220,7 @@ impl Reader {
     pub(crate) fn new() -> Self {
         Self {
             buffer: vec![0; CHUNK],
+            limiter: None,
             files_read: 0,
             bytes_read: 0,
             read_time: Duration::ZERO,
@@ -258,7 +260,7 @@ impl Reader {
 
     /// Sniffs and hashes an open file. The caller then checks the result
     /// with [`bracket`].
-    pub(crate) fn read(&mut self, file: &mut File) -> Result<Content, ContentFault> {
+    pub(crate) fn read(&mut self, file: &mut File, size: u64) -> Result<Content, ContentFault> {
         #[cfg(test)]
         {
             let stat = fstat(file.as_fd()).map_err(|e| ContentFault::Stat(e.into()))?;
@@ -268,35 +270,56 @@ impl Reader {
             }
         }
         let started = Instant::now();
-        let content = self.sniff_and_hash(file);
+        if let Some(limiter) = &self.limiter {
+            // No DONTNEED or NOREUSE: foreground readers may share these pages.
+            if rustix::fs::fadvise(&*file, 0, None, rustix::fs::Advice::Sequential).is_err() {
+                limiter.advice_failed();
+            }
+        }
+        let mut source = BulkRead {
+            file,
+            limiter: self.limiter.as_deref(),
+            remaining: size,
+        };
+        let content = Self::sniff_and_hash(
+            &mut self.buffer,
+            &mut self.files_read,
+            &mut self.bytes_read,
+            &mut source,
+        );
         self.read_time += started.elapsed();
         content
     }
 
-    fn sniff_and_hash(&mut self, file: &mut File) -> Result<Content, ContentFault> {
-        self.files_read += 1;
+    fn sniff_and_hash(
+        buffer: &mut [u8],
+        files_read: &mut u64,
+        bytes_read: &mut u64,
+        file: &mut impl Read,
+    ) -> Result<Content, ContentFault> {
+        *files_read += 1;
         let mut head = 0;
         while head < ferret_policy::SNIFF_LEN {
-            match file.read(&mut self.buffer[head..]) {
+            match file.read(&mut buffer[head..]) {
                 Ok(0) => break,
                 Ok(n) => head += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(ContentFault::Read(e)),
             }
         }
-        self.bytes_read += head as u64;
-        let sniffed = ferret_policy::sniff(&self.buffer[..head.min(ferret_policy::SNIFF_LEN)]);
+        *bytes_read += head as u64;
+        let sniffed = ferret_policy::sniff(&buffer[..head.min(ferret_policy::SNIFF_LEN)]);
         let content = match sniffed {
             ferret_policy::Content::Binary => Content::Binary,
             ferret_policy::Content::Text => {
                 let mut hasher = blake3::Hasher::new();
-                hasher.update(&self.buffer[..head]);
+                hasher.update(&buffer[..head]);
                 loop {
-                    match file.read(&mut self.buffer) {
+                    match file.read(buffer) {
                         Ok(0) => break,
                         Ok(n) => {
-                            self.bytes_read += n as u64;
-                            hasher.update(&self.buffer[..n]);
+                            *bytes_read += n as u64;
+                            hasher.update(&buffer[..n]);
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                         Err(e) => return Err(ContentFault::Read(e)),
@@ -361,5 +384,77 @@ pub(crate) fn from_walk(stat: &crate::Stat<'_>) -> Stat {
         uid: stat.uid,
         gid: stat.gid,
         nlink: stat.nlink,
+    }
+}
+
+struct BulkRead<'a> {
+    file: &'a mut File,
+    limiter: Option<&'a ferret_catalog::bulk::Limiter>,
+    remaining: u64,
+}
+impl Read for BulkRead<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        // The opened handle already matched this size; the final stat bracket
+        // detects growth/shrinkage. EOF needs no transfer allowance or syscall.
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let len = bytes.len().min(self.remaining.min(CHUNK as u64) as usize);
+        let n = if let Some(limiter) = self.limiter {
+            limiter.transfer(len, || self.file.read(&mut bytes[..len]))?
+        } else {
+            self.file.read(&mut bytes[..len])?
+        };
+        self.remaining = self.remaining.saturating_sub(n as u64);
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+    use ferret_catalog::bulk::{Clock, Limiter};
+    use std::sync::Arc;
+    #[derive(Debug, Default)]
+    struct Time(Mutex<Duration>);
+    impl Clock for Time {
+        fn now(&self) -> Duration {
+            *self.0.lock().unwrap_or_else(|e| panic!("fixture: {e:?}"))
+        }
+        fn sleep(&self, duration: Duration) {
+            *self.0.lock().unwrap_or_else(|e| panic!("fixture: {e:?}")) += duration;
+        }
+    }
+    #[test]
+    fn bulk_content_read_seam_is_paced_and_foreground_reads_are_excluded() {
+        let path = std::env::temp_dir().join(format!("ferret-bulk-read-{}", std::process::id()));
+        let bytes = vec![b'a'; CHUNK * 4];
+        std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("fixture: {e:?}"));
+        let clock = Arc::new(Time::default());
+        let limiter = Arc::new(Limiter::new(CHUNK as u64, clock.clone()));
+        let mut reader = Reader::new();
+        reader.limiter = Some(limiter.clone());
+        let content = reader
+            .read(
+                &mut File::open(&path).unwrap_or_else(|e| panic!("fixture: {e:?}")),
+                bytes.len() as u64,
+            )
+            .unwrap_or_else(|e| panic!("fixture: {e:?}"));
+        assert_eq!(reader.bytes_read, bytes.len() as u64);
+        assert!(matches!(content, Content::Hashed(_)));
+        let state = limiter.status();
+        assert!(
+            reader.bytes_read as f64 <= CHUNK as f64 * clock.now().as_secs_f64() + CHUNK as f64
+        );
+        assert!(state.waits >= 3);
+        let mut foreground = Reader::new();
+        foreground
+            .read(
+                &mut File::open(&path).unwrap_or_else(|e| panic!("fixture: {e:?}")),
+                bytes.len() as u64,
+            )
+            .unwrap_or_else(|e| panic!("fixture: {e:?}"));
+        assert_eq!(limiter.status().reserved_bytes, state.reserved_bytes);
+        std::fs::remove_file(path).unwrap_or_else(|e| panic!("fixture: {e:?}"));
     }
 }

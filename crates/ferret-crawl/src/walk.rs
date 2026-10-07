@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -412,6 +412,25 @@ pub trait EventVisitor {
     /// lifecycle above); ignored otherwise.
     fn visit(&mut self, event: Event<'_, Self::Dir>) -> Option<Self::Dir>;
 
+    /// Observed directory handle, before its complete listing. A watch host
+    /// arms here so notifications during observation survive into its next run.
+    /// Policy input consulted relative to the held parent, before reading.
+    /// A path-valued policy dependency outside the observed directory handle.
+    fn policy_path(&mut self, _path: &Path) {}
+
+    /// Requires a separate thread even for one worker, so lowering an index
+    /// worker's priority cannot affect the caller's query or intake work.
+    fn dedicated_worker(&self) -> bool {
+        false
+    }
+
+    /// Called on the executing worker, including a single-worker walk.
+    fn worker_started(&mut self) {}
+
+    fn policy_input(&mut self, _parent: BorrowedFd<'_>, _name: &OsStr) {}
+
+    fn observing(&mut self, _fd: BorrowedFd<'_>, _path: &Path) {}
+
     /// Selects work before child stat/open. A false result deliberately keeps
     /// this untouched scope; it is not an ignored or vanished observation.
     fn consider(&mut self, _parent: Self::Dir, _name: &OsStr, _path: &Path) -> bool {
@@ -466,7 +485,7 @@ pub fn walk_parallel<V: EventVisitor + Send>(
     };
     let root_id = first.root_id;
     let shared = Shared::new(root_job);
-    if count == 1 {
+    if count == 1 && !first.visit.dedicated_worker() {
         return vec![run_worker(first, &shared)];
     }
     thread::scope(|scope| {
@@ -606,6 +625,7 @@ fn run_guarded<V: EventVisitor>(walker: Walker<'_, V>, shared: &Shared<V::Dir>) 
 }
 
 fn run_worker<V: EventVisitor>(mut walker: Walker<'_, V>, shared: &Shared<V::Dir>) -> V {
+    walker.visit.worker_started();
     let mut local = VecDeque::new();
     let Some(mut current) = shared.take() else {
         return walker.visit;
@@ -658,7 +678,17 @@ impl<V: EventVisitor> Walker<'_, V> {
                 if error == Errno::ACCESS {
                     // A root denied at open still has a catalog row, just as
                     // a denied child does. Follow the user's root symlink.
-                    match statat(rustix::fs::CWD, root, AtFlags::empty()) {
+                    let observed = match open_path(
+                        root,
+                        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        Ok(fd) => {
+                            fstat(&fd).inspect(|_| self.visit.observing(fd.as_fd(), Path::new("")))
+                        }
+                        Err(_) => statat(rustix::fs::CWD, root, AtFlags::empty()),
+                    };
+                    match observed {
                         Ok(stat) if file_type(&stat) == FileType::Directory => {
                             self.visit.root(public_stat(&stat, None));
                         }
@@ -891,6 +921,7 @@ pub(crate) enum IoPoint {
     Directory,
     OpenDirectory,
     Child,
+    Readlink,
     Listing(usize),
 }
 #[cfg(test)]
@@ -908,25 +939,6 @@ fn inject(root: &Path, point: IoPoint, rel: &Path) -> Option<(IoOp, io::Error)> 
         .find(|(r, _)| r == root)
         .map(|(_, h)| h.clone());
     hook.and_then(|h| h(point, rel))
-}
-
-#[cfg(test)]
-pub(crate) type FailReadlink = Box<dyn Fn(&OsStr) -> bool>;
-
-#[cfg(test)]
-pub(crate) type FailList = Box<dyn Fn(&Path) -> Option<io::Error>>;
-
-#[cfg(test)]
-thread_local! {
-    /// Injects a listing error into the real walker on the calling thread.
-    pub(crate) static FAIL_LIST: std::cell::RefCell<Option<FailList>> =
-        const { std::cell::RefCell::new(None) };
-    /// Test seam: makes `readlink` fail for the names it accepts. The walker
-    /// reads a link through the `O_PATH` descriptor it just statted, which no
-    /// unprivileged test can make fail. Like [`AFTER_OPEN`], it reaches only
-    /// walks on the calling thread (one worker).
-    pub(crate) static FAIL_READLINK: std::cell::RefCell<Option<FailReadlink>> =
-        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1108,11 +1120,10 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// it as uncertain coverage like any other listing fault (D26 A′): it says
     /// the opened directory is gone, not that its path is.
     fn list(&mut self, dir: BorrowedFd<'_>, context: FaultContext<'_, V::Dir>) -> Option<Children> {
+        self.visit.observing(dir, bytes_path(&self.rel));
         #[cfg(test)]
-        if let Some(error) =
-            FAIL_LIST.with_borrow(|hook| hook.as_ref().and_then(|hook| hook(bytes_path(&self.rel))))
-        {
-            self.fail(IoOp::List, context, error);
+        if let Some((op, error)) = inject(&self.root, IoPoint::Listing(0), bytes_path(&self.rel)) {
+            self.fail(op, context, error);
             return None;
         }
         let mut children = Children {
@@ -1362,7 +1373,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         name: &OsStr,
         decision: Decision,
     ) -> Option<Job<V::Dir>> {
-        let (stat, target) = match observe_link(here.fd, name) {
+        let (stat, target) = match observe_link(here.fd, name, &self.root, bytes_path(&self.rel)) {
             Ok(pair) => pair,
             Err((op, error)) => {
                 self.fail_child(op, here.token, name, error);
@@ -1567,6 +1578,11 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         in_work_tree: bool,
         token: V::Dir,
     ) -> Ignores {
+        self.visit.policy_input(dir, OsStr::new(".ferretignore"));
+        self.visit.policy_input(dir, OsStr::new(DOT_GIT));
+        if in_work_tree {
+            self.visit.policy_input(dir, OsStr::new(".gitignore"));
+        }
         let listed = |name: &str| children.contains(name);
         let ferretignore = listed(".ferretignore")
             .then(|| self.read_named(dir, ".ferretignore", token))
@@ -1579,6 +1595,9 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         // A `.gitignore` outside a work tree cannot affect decisions, so it is
         // not opened. A FIFO of that name must not stall a walk that is not in
         // a repository.
+        if git.is_root() {
+            self.visit.policy_input(dir, OsStr::new(".gitignore"));
+        }
         let gitignore = if (in_work_tree || git.is_root()) && listed(".gitignore") {
             self.read_named(dir, ".gitignore", token)
         } else {
@@ -1603,8 +1622,9 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     }
 
     fn read_named(&mut self, dir: BorrowedFd<'_>, name: &str, token: V::Dir) -> Option<String> {
+        self.visit.policy_input(dir, OsStr::new(name));
         let length = self.push(name);
-        let text = match open_ignore(dir, name) {
+        let text = match open_ignore(dir, OsStr::new(name)) {
             Ok(Opened::Bytes(bytes)) => Some(decode_lossy(bytes)),
             Ok(Opened::Missing | Opened::NotRegular) => None,
             Err(error) => {
@@ -1620,6 +1640,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     /// common directory). `exclude` is an ordinary ignore file: a symlink of
     /// that name is followed.
     fn read_exclude(&mut self, git: OwnedFd, token: V::Dir) -> Option<String> {
+        self.visit.policy_input(git.as_fd(), OsStr::new("info"));
         let git_length = self.push(DOT_GIT);
         let info_length = self.push("info");
         let info = match openat(git.as_fd(), "info", child_dir_flags(), Mode::empty()) {
@@ -1641,6 +1662,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
             }
         };
         drop(git);
+        self.visit.policy_input(info.as_fd(), OsStr::new("exclude"));
         self.push("exclude");
         let opened = match openat(info.as_fd(), "exclude", ignore_flags(), Mode::empty()) {
             Ok(fd) => {
@@ -1804,6 +1826,17 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         token: V::Dir,
     ) -> Option<OwnedFd> {
         let path = Path::new(raw);
+        let dependency = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                base.as_raw_fd()
+            ))
+            .join(path)
+        };
+        self.visit.policy_path(&dependency);
         let opened = if path.is_absolute() {
             open_path(path, root_dir_flags(), Mode::empty())
         } else {
@@ -1833,6 +1866,8 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         gitdir: OwnedFd,
         token: V::Dir,
     ) -> Option<(OwnedFd, Option<OsString>)> {
+        self.visit
+            .policy_input(gitdir.as_fd(), OsStr::new("commondir"));
         let opened = match openat(
             gitdir.as_fd(),
             "commondir",
@@ -1864,6 +1899,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
                     return None;
                 };
                 let common = self.open_git_directory(gitdir.as_fd(), raw, token)?;
+                drop(gitdir);
                 Some((common, Some(raw.to_os_string())))
             }
             Err(error) => {
@@ -1907,6 +1943,8 @@ fn normalize(path: &Path) -> PathBuf {
 fn observe_link(
     dir: BorrowedFd<'_>,
     name: &OsStr,
+    _root: &Path,
+    _relative: &Path,
 ) -> Result<(rustix::fs::Stat, Option<OsString>), (IoOp, io::Error)> {
     let lstat = |error: Errno| (IoOp::Lstat, io::Error::from(error));
     let fd = openat(dir, name, link_flags(), Mode::empty()).map_err(lstat)?;
@@ -1918,11 +1956,8 @@ fn observe_link(
     // to (Linux 2.6.39), so the target cannot be a different inode from
     // `stat`.
     #[cfg(test)]
-    if FAIL_READLINK.with_borrow(|fail| fail.as_ref().is_some_and(|fail| fail(name))) {
-        return Err((
-            IoOp::Readlink,
-            io::Error::other("injected readlink failure"),
-        ));
+    if let Some(error) = inject(_root, IoPoint::Readlink, _relative) {
+        return Err(error);
     }
     let raw = readlinkat(&fd, "", Vec::new())
         .map_err(|error| (IoOp::Readlink, io::Error::from(error)))?;
@@ -1931,7 +1966,7 @@ fn observe_link(
 
 /// Opens ignore file `name`: `.gitignore` without following a symlink, which
 /// then reads as absent; any other name through one.
-fn open_ignore(dir: BorrowedFd<'_>, name: &str) -> io::Result<Opened> {
+fn open_ignore(dir: BorrowedFd<'_>, name: &OsStr) -> io::Result<Opened> {
     let flags = if name == ".gitignore" {
         gitignore_flags()
     } else {

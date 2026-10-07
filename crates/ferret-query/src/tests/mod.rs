@@ -137,6 +137,45 @@ fn sample(scratch: &Scratch) -> Catalog {
     lazy(scratch)
 }
 
+#[test]
+fn lazy_term_table_matches_eager_terms_on_generated_names() {
+    use ferret_catalog::NameId;
+    use std::collections::BTreeMap;
+
+    let scratch = Scratch::new("lazy-terms");
+    let catalog = sample(&scratch).into_resident().unwrap();
+    let names = catalog.resident_names().unwrap();
+    let mut eager: BTreeMap<Vec<u8>, Vec<u32>> = BTreeMap::new();
+    for key in 0..names.distinct_count() {
+        let mut tokens = Vec::new();
+        ferret_text::tokens(names.distinct_name(key), |token| {
+            tokens.push(token.to_vec())
+        });
+        tokens.sort_unstable();
+        tokens.dedup();
+        for token in tokens {
+            eager.entry(token).or_default().push(key);
+        }
+    }
+    let index = crate::NameIndex::new(&catalog);
+    let before_terms = index.bytes();
+    for (term, keys) in eager {
+        let selection = index.select(&catalog, None, &[&term], |_| true).unwrap();
+        let actual = selection.rows(&catalog).unwrap();
+        let mut expected = Vec::new();
+        for key in keys {
+            names.postings(key, &mut expected);
+        }
+        expected.sort_unstable();
+        assert_eq!(
+            actual,
+            expected.into_iter().map(NameId).collect::<Vec<_>>(),
+            "{term:?}"
+        );
+        assert!(index.bytes() > before_terms);
+    }
+}
+
 /// Reopens the catalog in `scratch` with nothing loaded.
 fn lazy(scratch: &Scratch) -> Catalog {
     Catalog::open(&scratch.0).unwrap().unwrap()

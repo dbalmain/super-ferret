@@ -70,6 +70,8 @@ impl Env {
             .arg(self.index())
             .args(args)
             .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("FERRET_NO_DAEMON", "1")
             .env("XDG_CONFIG_HOME", home.join("config"))
             .env("XDG_DATA_HOME", home.join("data"))
             .env("XDG_STATE_HOME", self.state())
@@ -760,6 +762,8 @@ fn the_index_comes_from_the_flag_then_the_environment_then_xdg() {
         command
             .args(["index", &*env.tree().to_string_lossy()])
             .env("HOME", &home)
+            .env("XDG_RUNTIME_DIR", home.join("runtime"))
+            .env("FERRET_NO_DAEMON", "1")
             .env("XDG_DATA_HOME", home.join("data"))
             .env("XDG_STATE_HOME", env.state())
             .env("XDG_CONFIG_HOME", home.join("config"))
@@ -2004,9 +2008,9 @@ fn catalog_find_candidate_guards_preserve_earlier_effects_and_followed_directory
 }
 
 #[test]
-fn search_checks_only_the_sections_its_query_loads() {
-    // Value/padding corruption in an unloaded stat column must not make a
-    // name query fail. The first metadata load must reject the same file.
+fn resident_search_checks_every_section_before_emitting_rows() {
+    // D46's common engine warms and checks every section, including fields
+    // a name-only query will not use. Corruption fails before any output.
     let env = Env::new("lazy-checksum-query");
     env.write("checked.txt", b"content\n");
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
@@ -2029,8 +2033,9 @@ fn search_checks_only_the_sections_its_query_loads() {
     bytes[offset] ^= 1;
     fs::write(path, bytes).unwrap();
     let names = env.run(&[os("search"), os("checked")]);
-    assert_eq!(code(&names), 0, "{}", stderr(&names));
-    assert_eq!(names.stdout, before.stdout);
+    assert_eq!(code(&names), 3, "{}", stderr(&names));
+    assert!(names.stdout.is_empty());
+    assert!(stderr(&names).contains("corrupt: size"));
     let metadata = env.run(&[os("search"), os("checked"), os("size:>0")]);
     assert_eq!(code(&metadata), 3, "{}", stderr(&metadata));
     assert!(stderr(&metadata).contains("corrupt: size"));

@@ -593,7 +593,7 @@ impl Write for At<'_> {
         self.buf.extend_from_slice(fill);
         self.flush()?;
         if rest.len() >= AT_BUFFER {
-            self.file.write_all_at(rest, self.pos)?;
+            crate::bulk::write_at(self.file, rest, self.pos)?;
             self.pos += rest.len() as u64;
         } else {
             self.buf.extend_from_slice(rest);
@@ -602,7 +602,7 @@ impl Write for At<'_> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.write_all_at(&self.buf, self.pos)?;
+        crate::bulk::write_at(self.file, &self.buf, self.pos)?;
         self.pos += self.buf.len() as u64;
         self.buf.clear();
         Ok(())
@@ -1129,7 +1129,7 @@ pub(crate) fn seal(file: &File) -> io::Result<()> {
     }
     let digest = checksum(&head[..TABLE_END - 16]);
     head[TABLE_END - 16..].copy_from_slice(&digest);
-    file.write_all_at(&head, 0)
+    crate::bulk::write_at(file, &head, 0)
 }
 
 /// What one section's check found that a later check reuses, so that no

@@ -67,6 +67,9 @@ impl Expression {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Options {
+    cwd: Option<std::sync::Arc<std::path::PathBuf>>,
+    cwd_handle: Option<std::sync::Arc<std::fs::File>>,
+    inherit_cwd: bool,
     pub max_depth: Option<usize>,
     pub min_depth: usize,
     pub depth_first: bool,
@@ -76,6 +79,26 @@ pub(crate) struct Options {
     pub retain_parent: bool,
     pub delete: bool,
     guard: Option<CandidateGuard>,
+}
+
+impl Options {
+    fn logical_path<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+        match &self.cwd {
+            Some(cwd) => std::borrow::Cow::Owned(cwd.join(path)),
+            None => std::borrow::Cow::Borrowed(path),
+        }
+    }
+
+    fn observed_path<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+        use std::os::fd::AsRawFd;
+        match &self.cwd_handle {
+            Some(handle) if path.is_relative() => std::borrow::Cow::Owned(
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+                    .join(path),
+            ),
+            _ => self.logical_path(path),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -131,6 +154,11 @@ pub(super) fn unmark_output_failure(error: io::Error) -> io::Error {
 /// The host supplies process output. A failed print stops the walk and is
 /// reported through `error`, like any other I/O failure.
 pub trait Effects {
+    /// Checked before taking the next entry. Already started commits finish.
+    fn cancelled(&self) -> bool {
+        false
+    }
+
     /// Writes the path's exact bytes, followed by a newline or NUL.
     fn print(&mut self, path: &Path, nul: bool) -> io::Result<()>;
     /// Reports an I/O error. Execution continues after traversal errors.
@@ -263,9 +291,73 @@ struct Control {
 }
 
 impl Plan {
-    /// Parses a GNU find argument list, including leading ferret `-I`.
+    /// Parses a GNU find argument list for the current process, including `-I`.
+    /// Relative lookups capture its cwd; ordinary exec inherits its cwd.
     pub fn parse(args: &[OsString]) -> Result<Self, ParseError> {
-        let mut plan = parse::parse(args)?;
+        Self::parse_started(args, std::time::SystemTime::now())
+    }
+
+    /// Parses in the current process with a time captured by its query host.
+    /// Keeps ordinary exec's inherited cwd, including for local effects.
+    pub fn parse_started(
+        args: &[OsString],
+        started: std::time::SystemTime,
+    ) -> Result<Self, ParseError> {
+        Self::parse_context(
+            args,
+            std::env::current_dir().ok().map(std::sync::Arc::new),
+            started,
+            true,
+        )
+    }
+
+    /// Parses against an explicit absolute cwd and a captured query start time.
+    /// Captures an open cwd capability for relative lookup and actions while
+    /// retaining operand spelling. It remains valid if that directory moves.
+    /// Help and unsupported expressions need no cwd descriptor.
+    pub fn parse_at(
+        args: &[OsString],
+        cwd: &Path,
+        started: std::time::SystemTime,
+    ) -> Result<Self, ParseError> {
+        if !cwd.is_absolute() {
+            return Err(ParseError::Feature("query cwd must be absolute".into()));
+        }
+        Self::parse_context(
+            args,
+            Some(std::sync::Arc::new(cwd.to_owned())),
+            started,
+            false,
+        )
+    }
+
+    fn parse_context(
+        args: &[OsString],
+        cwd: Option<std::sync::Arc<std::path::PathBuf>>,
+        started: std::time::SystemTime,
+        inherit_cwd: bool,
+    ) -> Result<Self, ParseError> {
+        let mut plan = parse::parse(args, cwd, started)?;
+        if let Some(cwd) = &plan.options.cwd
+            && !plan.is_information()
+            && plan.unsupported().is_none()
+        {
+            plan.options.inherit_cwd = inherit_cwd;
+            let path = if plan.options.inherit_cwd {
+                Path::new(".")
+            } else {
+                cwd.as_path()
+            };
+            let handle = rustix::fs::open(
+                path,
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| ParseError::Feature(format!("cannot open query cwd: {error}")))?;
+            plan.options.cwd_handle = Some(std::sync::Arc::new(std::fs::File::from(handle)));
+        }
         plan.options.live_checks = has_actions(&plan.expression);
         plan.expression.visit(&mut |leaf| {
             plan.options.retain_parent |= matches!(leaf,
@@ -298,6 +390,36 @@ impl Plan {
         self.unsupported.as_deref()
     }
 
+    /// Whether evaluation can run a command or write/delete outside stdout.
+    pub fn has_side_effects(&self) -> bool {
+        has_actions(&self.expression)
+    }
+
+    /// Whether the expression includes an interactive command action.
+    /// Hosts must validate prompt input before preparing any file or action.
+    pub fn requires_interactive(&self) -> bool {
+        let mut interactive = false;
+        self.expression.visit(&mut |leaf| {
+            interactive |= matches!(
+                leaf,
+                Expression::Action(action::Action::Exec(action::Exec { prompt: true, .. }))
+            );
+        });
+        interactive
+    }
+
+    /// Whether evaluation spawns a child process (`-exec`, `-execdir`, `-ok`
+    /// or `-okdir`). Only these actions inspect the host's child stdin;
+    /// `-delete` and the file-writing actions spawn nothing and need no
+    /// stdin policy.
+    pub fn runs_commands(&self) -> bool {
+        let mut runs = false;
+        self.expression.visit(&mut |leaf| {
+            runs |= matches!(leaf, Expression::Action(action::Action::Exec(_)));
+        });
+        runs
+    }
+
     /// Creates the sequential live source. It never opens a catalog.
     pub fn live_source(&self) -> LiveWalk {
         LiveWalk::new(self.paths.clone(), self.options.clone())
@@ -324,6 +446,102 @@ impl Plan {
     /// Creates the shared DFS engine for parallel catalog execution.
     pub fn parallel_catalog_source(&self, catalog: ferret_catalog::Catalog) -> LiveWalk {
         self.catalog_source(catalog).walk
+    }
+
+    /// Counted postings are safe only for a name test followed by printing,
+    /// without traversal controls, effects, symlink following or live scopes.
+    /// Candidates still use the ordinary entry evaluator and output commit.
+    pub fn indexed_catalog_source(
+        &self,
+        catalog: ferret_catalog::Catalog,
+        index: &crate::NameIndex,
+    ) -> LiveWalk {
+        use ferret_catalog::{Handle, Target};
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let fallback = || self.parallel_catalog_source(catalog.clone());
+        let Expression::And(left, right) = &self.expression else {
+            return fallback();
+        };
+        let (Expression::Name(pattern), Expression::Print(_)) = (&**left, &**right) else {
+            return fallback();
+        };
+        if self.no_ignore
+            || !index.can_accelerate_find()
+            || self.options.max_depth.is_some()
+            || self.options.min_depth != 0
+            || self.options.depth_first
+            || self.options.xdev
+            || self.options.follow != Follow::Physical
+            || self.unsupported.is_some()
+        {
+            return fallback();
+        }
+        // Nested configured roots are separate catalog graph roots but the
+        // find walker attaches them at physical boundaries. Keep that walker.
+        let roots: Vec<_> = catalog
+            .roots()
+            .map(|(_, path)| Path::new(std::ffi::OsStr::from_bytes(path)))
+            .collect();
+        if roots.iter().enumerate().any(|(i, path)| {
+            roots
+                .iter()
+                .enumerate()
+                .any(|(j, other)| i != j && path.starts_with(other))
+        }) {
+            return fallback();
+        }
+        let mut paths = Vec::new();
+        for start in &self.paths {
+            let logical = self.options.logical_path(start);
+            let Some(resolved) = catalog.resolve(logical.as_os_str().as_bytes()) else {
+                return fallback();
+            };
+            let Target::Inode(dir) = resolved.target else {
+                return fallback();
+            };
+            if !resolved.remainder.is_empty() || !catalog.is_directory(dir) {
+                return fallback();
+            }
+            let Ok(selection) = index.select(
+                &catalog,
+                Some(Handle {
+                    generation: catalog.generation(),
+                    id: dir,
+                }),
+                &[],
+                |name| pattern.matches(name),
+            ) else {
+                return fallback();
+            };
+            if selection.estimate.plan != crate::NamePlan::Postings {
+                return fallback();
+            }
+            let Ok(rows) = selection.rows(&catalog) else {
+                return fallback();
+            };
+            // Include the starting entry even when its own basename matches.
+            paths.push(start.clone());
+            let mut prefix = Vec::new();
+            catalog.dir_path(dir, &mut prefix);
+            let mut full = Vec::new();
+            for row in rows {
+                if !matches!(catalog.name(row).target(), Target::Inode(_)) {
+                    continue;
+                }
+                full.clear();
+                catalog.path(row, &mut full);
+                let Some(suffix) = full
+                    .strip_prefix(prefix.as_slice())
+                    .and_then(|suffix| suffix.strip_prefix(b"/"))
+                else {
+                    return fallback();
+                };
+                paths.push(start.join(OsString::from_vec(suffix.to_vec())));
+            }
+        }
+        let mut options = self.options.clone();
+        options.max_depth = Some(0);
+        CatalogSource::new(catalog, paths, options).walk
     }
 
     /// Creates a catalog walk. Load `catalog_sections()` before construction.
@@ -370,7 +588,7 @@ impl Plan {
             return Ok(None);
         }
         let mut expression = self.expression.clone();
-        if let Err(error) = prepare_expression(&mut expression, source.catalog()) {
+        if let Err(error) = prepare_expression(&mut expression, source.catalog(), &self.options) {
             effects.error(&WalkError {
                 path: ".".into(),
                 error,
@@ -474,11 +692,12 @@ fn expression_sections(expression: &Expression, out: &mut Vec<ferret_catalog::Se
 fn prepare_expression(
     expression: &mut Expression,
     catalog: Option<&ferret_catalog::Catalog>,
+    options: &Options,
 ) -> io::Result<()> {
     expression.try_visit_mut(&mut |leaf| match leaf {
-        Expression::Test(test) => test.resolve_reference(catalog),
+        Expression::Test(test) => test.resolve_reference(catalog, options),
         Expression::Action(action::Action::Output(target, _) | action::Action::List(target)) => {
-            target.open()
+            target.open(options)
         }
         _ => Ok(()),
     })

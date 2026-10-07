@@ -1,8 +1,13 @@
 //! The `ferret` command-line tool: argument parsing, the commands, human and
 //! JSON-lines output, and the local query log. Wiring only; behaviour lives
-//! in the library crates.
+//! in the library crates. [`engine`] coordinates resident query generations
+//! and writer adoption for the CLI, batch and daemon hosts.
 //!
 //! - [`cli`]: the entry point, exit statuses, where the index is, usage.
+//! - [`batch`]: resident query executor and the sequential S1B JSON-lines host.
+//! - [`daemon`]: query-only socket host, endpoint lifecycle and ordinary
+//!   clients.
+//! - `transport`: shared event destinations; no parallel socket encoder.
 //! - [`args`]: the command line, parsed; pure.
 //! - [`find`], [`search`], [`index`] (with `roots`), [`stats`]: one module per
 //!   command.
@@ -11,6 +16,8 @@
 //!   path or an id, but query text is logged as typed and may contain a path.
 //! - [`xdg`] resolves directories from the environment and touches no files;
 //!   [`setup`] writes the files a new install starts with.
+//! - [`protocol`]: the shared bounded reader for batch requests, socket
+//!   envelopes and events.
 //!
 //! **Paths that are not UTF-8.** Human output writes a path's raw bytes. In
 //! JSON lines, `path` is always a string: the path's text, with each invalid
@@ -26,12 +33,22 @@
 //! success (including no matches), 1 invalid syntax or execution error.
 
 pub mod args;
+pub(crate) mod batch;
 pub mod cli;
+mod config;
+pub mod daemon;
+pub mod engine;
 pub mod find;
+mod find_json;
 pub mod index;
 pub mod json;
 pub mod log;
+mod politeness;
+pub(crate) mod protocol;
+mod scheduler;
 pub mod search;
 pub mod setup;
 pub mod stats;
+mod status;
+mod transport;
 pub mod xdg;
