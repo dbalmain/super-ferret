@@ -6,6 +6,14 @@
 //! of the postings section to a scratch file, taking each chunk's sum as it
 //! goes; [`Writer::finish_spilled`] copies the postings after the blocks and
 //! writes the small sections and the head last.
+//!
+//! A codec 2 writer ([`Writer::with_codec`]) sends each single-document term
+//! to the fingerprint section rather than the dictionary. Those records
+//! arrive in term order, so they wait in memory, sorted once, until the
+//! segment finishes or a merge starts pushing the records it carries
+//! ([`Writer::push_record`]), which it does after its last term. From then
+//! on the section's offset is final, so a spilling writer streams it
+//! straight to its place in the file.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -13,9 +21,10 @@ use std::os::unix::fs::FileExt;
 
 use intpack::pfor128skip;
 
+use super::fingerprint::{Encoder, fingerprint};
 use super::{
-    BLOCK, CHUNK, DICTIONARY_CODEC, FIELDS, FORMAT_VERSION, HEAD, MAGIC, POSTINGS_CODEC, SECTIONS,
-    Section, WriteError, checksum, chunk_sums, put,
+    ALL, BLOCK, CHUNK, DICTIONARY_CODEC, FIELDS, FINGERPRINT_CODEC, FORMAT_VERSION, MAGIC,
+    POSTINGS_CODEC, Section, WriteError, checksum, chunk_sums, head_len, put, sections,
 };
 
 /// What a finished segment holds, in bytes and counts, for measurement.
@@ -36,12 +45,23 @@ pub struct Sizes {
     /// Term bytes stored: suffixes in `blocks` plus first terms in `index`.
     /// The rest of the dictionary is lengths, frequencies and pointers.
     pub term_bytes: u64,
+    /// Codec 2: the fingerprint records section and its block index.
+    pub fingerprints: u64,
+    pub fingerprint_index: u64,
+    /// Codec 2: records written. Each is also counted in `pairs`.
+    pub records: u64,
 }
 
 impl Sizes {
     /// The whole file.
     pub fn total(&self) -> u64 {
-        self.head + self.blocks + self.postings + self.index + self.sums
+        self.head
+            + self.blocks
+            + self.postings
+            + self.index
+            + self.sums
+            + self.fingerprints
+            + self.fingerprint_index
     }
 
     /// The term dictionary: its blocks and its block index.
@@ -61,6 +81,9 @@ impl Sizes {
         self.singletons += other.singletons;
         self.singleton_bytes += other.singleton_bytes;
         self.term_bytes += other.term_bytes;
+        self.fingerprints += other.fingerprints;
+        self.fingerprint_index += other.fingerprint_index;
+        self.records += other.records;
     }
 }
 
@@ -74,6 +97,9 @@ pub struct Writer {
     first: u32,
     last: u32,
     tokenizer: u32,
+    codec: u32,
+    /// Terms pushed, in the dictionary or not.
+    pushed: u64,
     /// The unspilled tails of the two chunked sections.
     blocks: Vec<u8>,
     postings: Vec<u8>,
@@ -86,6 +112,52 @@ pub struct Writer {
     relative: Vec<u32>,
     sizes: Sizes,
     spill: Option<Spill>,
+    /// Codec 2's fingerprint records.
+    singles: Option<Singles>,
+}
+
+/// A codec 2 writer's fingerprint records.
+#[derive(Debug, Default)]
+struct Singles {
+    /// `(fingerprint, doc - first)` of each single-document term pushed,
+    /// in term order until sealed, then sorted and deduplicated.
+    pending: Vec<(u32, u32)>,
+    /// Whether the dictionary is closed and `pending` sorted.
+    sealed: bool,
+    /// The first record of `pending` not yet encoded.
+    next: usize,
+    encoder: Encoder,
+    /// The last record [`Writer::push_record`] took.
+    carried: Option<(u32, u32)>,
+    /// Chunk sums of the section's spilled bytes.
+    sums: Vec<u8>,
+}
+
+impl Singles {
+    /// Closes the dictionary: sorts the pending records, once.
+    fn seal(&mut self) {
+        if !self.sealed {
+            self.pending.sort_unstable();
+            self.pending.dedup();
+            self.sealed = true;
+        }
+    }
+
+    /// Encodes pending records below `bound`, or all of them.
+    fn flush_below(&mut self, bound: Option<(u32, u32)>) {
+        while let Some(&record) = self.pending.get(self.next)
+            && bound.is_none_or(|bound| record < bound)
+        {
+            // An equal record is a collision of two terms in one document:
+            // one record already says the document may hold both.
+            self.encoder.push(record.0, record.1);
+            self.next += 1;
+        }
+        if self.next == self.pending.len() {
+            self.pending = Vec::new();
+            self.next = 0;
+        }
+    }
 }
 
 /// A spilling writer's files and what has left memory so far.
@@ -111,13 +183,28 @@ impl Writer {
 
     /// A writer for opaque byte keys, stamped with their extractor version.
     pub fn keyed(first: u32, last: u32, version: u32) -> Result<Self, WriteError> {
+        Self::build(first, last, version, DICTIONARY_CODEC)
+    }
+
+    /// A writer for documents `first..=last` with dictionary codec `codec`:
+    /// [`DICTIONARY_CODEC`] or [`FINGERPRINT_CODEC`].
+    pub fn with_codec(first: u32, last: u32, codec: u32) -> Result<Self, WriteError> {
+        Self::build(first, last, ferret_text::TOKENIZER_VERSION, codec)
+    }
+
+    fn build(first: u32, last: u32, version: u32, codec: u32) -> Result<Self, WriteError> {
         if first > last {
             return Err(WriteError::Range { first, last });
+        }
+        if sections(codec).is_none() {
+            return Err(WriteError::Codec(codec));
         }
         Ok(Self {
             first,
             last,
             tokenizer: version,
+            codec,
+            pushed: 0,
             blocks: Vec::new(),
             postings: Vec::new(),
             index: Vec::new(),
@@ -128,7 +215,22 @@ impl Writer {
             relative: Vec::new(),
             sizes: Sizes::default(),
             spill: None,
+            singles: (codec == FINGERPRINT_CODEC).then(Singles::default),
         })
+    }
+
+    /// The dictionary codec this writer writes.
+    pub fn codec(&self) -> u32 {
+        self.codec
+    }
+
+    /// Bytes of this writer's head.
+    fn head_len(&self) -> u64 {
+        head_len(self.sections().len()) as u64
+    }
+
+    fn sections(&self) -> &'static [Section] {
+        sections(self.codec).unwrap_or(&[])
     }
 
     /// A writer whose sections leave memory through [`Writer::spill`]:
@@ -147,7 +249,21 @@ impl Writer {
         out: File,
         postings: File,
     ) -> Result<Self, WriteError> {
-        let mut writer = Self::keyed(first, last, version)?;
+        Self::spilling_from(Self::keyed(first, last, version)?, out, postings)
+    }
+
+    /// [`Writer::spilling`] with dictionary codec `codec`.
+    pub fn spilling_with_codec(
+        first: u32,
+        last: u32,
+        codec: u32,
+        out: File,
+        postings: File,
+    ) -> Result<Self, WriteError> {
+        Self::spilling_from(Self::with_codec(first, last, codec)?, out, postings)
+    }
+
+    fn spilling_from(mut writer: Self, out: File, postings: File) -> Result<Self, WriteError> {
         writer.spill = Some(Spill {
             out,
             postings,
@@ -170,14 +286,26 @@ impl Writer {
             + self.spill.as_ref().map_or(0, |spill| {
                 spill.blocks_sums.capacity() + spill.postings_sums.capacity()
             })
+            + self.singles.as_ref().map_or(0, |singles| {
+                singles.pending.capacity() * size_of::<(u32, u32)>()
+                    + singles.encoder.allocated_bytes()
+                    + singles.sums.capacity()
+            })
     }
 
     /// Capacity needed while finishing an in-memory writer, including the
     /// exactly reserved chunk checksums and the head buffer.
     pub fn finishing_bytes(&self) -> usize {
+        let records = self
+            .singles
+            .as_ref()
+            .map_or(0, |s| s.encoder.bytes().len() + s.pending.len() * 10);
         self.allocated_bytes()
-            + HEAD
-            + (self.blocks.len().div_ceil(CHUNK) + self.postings.len().div_ceil(CHUNK)) * 16
+            + self.head_len() as usize
+            + (self.blocks.len().div_ceil(CHUNK)
+                + self.postings.len().div_ceil(CHUNK)
+                + records.div_ceil(CHUNK))
+                * 16
     }
 
     /// Bytes of the blocks and postings sections so far, spilled or not.
@@ -196,16 +324,30 @@ impl Writer {
     /// a threshold, calling `pace` with each write's size first. Does
     /// nothing for an in-memory writer. Call it between pushes.
     pub fn spill(&mut self, pace: &dyn Fn(usize) -> io::Result<()>) -> io::Result<()> {
+        let head = self.head_len();
+        let (blocks_len, postings_len) = self.lengths();
         let Some(spill) = self.spill.as_mut() else {
             return Ok(());
         };
+        if let Some(singles) = self.singles.as_mut().filter(|s| s.sealed)
+            && singles.encoder.bytes().len() >= SPILL
+        {
+            // Sealed: no term follows, so the section's offset is final.
+            let whole = singles.encoder.bytes().len() / CHUNK * CHUNK;
+            let bytes = &singles.encoder.bytes()[..whole];
+            chunk_sums(bytes, &mut singles.sums);
+            let at = head + blocks_len + postings_len + singles.encoder.len()
+                - singles.encoder.bytes().len() as u64;
+            write_paced(&spill.out, bytes, at, pace)?;
+            singles.encoder.drain(whole);
+        }
         if self.blocks.len() >= SPILL {
             let whole = self.blocks.len() / CHUNK * CHUNK;
             chunk_sums(&self.blocks[..whole], &mut spill.blocks_sums);
             write_paced(
                 &spill.out,
                 &self.blocks[..whole],
-                HEAD as u64 + spill.blocks_written,
+                head + spill.blocks_written,
                 pace,
             )?;
             spill.blocks_written += whole as u64;
@@ -231,8 +373,12 @@ impl Writer {
     /// error nothing is added. Returns the entry's real encoded size: the
     /// bytes this term's entry added to the blocks section (shared/suffix,
     /// document frequency, and either the inlined doc or the list length).
+    ///
+    /// On a codec 2 writer a term with one document becomes a fingerprint
+    /// record instead, and the entry's size is 0. Terms may not follow
+    /// [`Writer::push_record`].
     pub fn push(&mut self, term: &[u8], docs: &[u32]) -> Result<u64, WriteError> {
-        if self.sizes.terms > 0 && term <= self.previous.as_slice() {
+        if self.pushed > 0 && term <= self.previous.as_slice() {
             return Err(WriteError::TermOrder);
         }
         let (Some(&low), Some(&high)) = (docs.first(), docs.last()) else {
@@ -244,6 +390,19 @@ impl Writer {
         for doc in [low, high] {
             if !(self.first..=self.last).contains(&doc) {
                 return Err(WriteError::DocRange(doc));
+            }
+        }
+        if let Some(singles) = self.singles.as_mut() {
+            if singles.sealed {
+                return Err(WriteError::RecordOrder);
+            }
+            if let [doc] = docs {
+                singles.pending.push((fingerprint(term), doc - self.first));
+                self.sizes.singletons += 1;
+                self.previous.clear();
+                self.previous.extend_from_slice(term);
+                self.pushed += 1;
+                return Ok(0);
             }
         }
 
@@ -287,10 +446,42 @@ impl Writer {
 
         self.previous.clear();
         self.previous.extend_from_slice(term);
+        self.pushed += 1;
         self.in_block += 1;
         self.sizes.terms += 1;
         self.sizes.pairs += docs.len() as u64;
         Ok((self.blocks.len() - entry) as u64)
+    }
+
+    /// Adds a fingerprint record a merge carries from an input: document
+    /// `doc`, inside `[first, last]`, may hold a term whose fingerprint is
+    /// `fp`. Records must come in strictly increasing `(fp, doc)` order,
+    /// after the last term: the first one closes the dictionary. A codec 1
+    /// writer has no records and refuses it.
+    pub fn push_record(&mut self, fp: u32, doc: u32) -> Result<(), WriteError> {
+        let Some(singles) = self.singles.as_mut() else {
+            return Err(WriteError::RecordOrder);
+        };
+        if !(self.first..=self.last).contains(&doc) {
+            return Err(WriteError::DocRange(doc));
+        }
+        let record = (fp, doc - self.first);
+        if singles.carried.is_some_and(|carried| record <= carried) {
+            return Err(WriteError::RecordOrder);
+        }
+        singles.seal();
+        singles.flush_below(Some(record));
+        singles.encoder.push(record.0, record.1);
+        singles.carried = Some(record);
+        Ok(())
+    }
+
+    /// Closes the dictionary and encodes every pending record.
+    fn seal_records(&mut self) {
+        if let Some(singles) = self.singles.as_mut() {
+            singles.seal();
+            singles.flush_below(None);
+        }
     }
 
     /// Writes an in-memory writer's segment to `out` and returns its sizes.
