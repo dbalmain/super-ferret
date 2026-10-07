@@ -64,7 +64,10 @@ fn one_run_matches_its_whole_token_anywhere_the_tokenizer_emits_it() {
 
 #[test]
 fn units_repeat_and_overlap() {
-    assert!(holds("a a b", "a a a b"), "KMP falls back to a shorter prefix");
+    assert!(
+        holds("a a b", "a a a b"),
+        "KMP falls back to a shorter prefix"
+    );
     assert!(holds("a b a b c", "a b a b a b c"));
     assert!(!holds("a b a b c", "a b a b a c"));
     assert!(holds("x_x_x", "x x x"));

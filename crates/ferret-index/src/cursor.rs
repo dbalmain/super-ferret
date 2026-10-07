@@ -44,7 +44,8 @@ pub const OR_DENSITY: u32 = 32;
 /// Ascending DocIds, each with a certainty.
 pub enum Cursor<'a> {
     /// One term's postings, concatenated across segments: always Yes.
-    Postings(postings::Cursor<'a>),
+    /// Boxed because intpack's cursor carries a decoded 128-id block.
+    Postings(Box<postings::Cursor<'a>>),
     /// A bitmap: liveness, uncovered documents, a materialised union.
     Bits(Bits<'a>),
     /// Leapfrog over the children, cheapest first; it drives.

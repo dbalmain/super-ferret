@@ -87,7 +87,7 @@ impl Candidates {
     /// Ascending DocIds. Only for an enumerable estimate.
     pub fn cursor(&self) -> Cursor<'_> {
         match self {
-            Self::Postings(term) => Cursor::Postings(term.cursor()),
+            Self::Postings(term) => Cursor::Postings(Box::new(term.cursor())),
         }
     }
 
@@ -167,9 +167,6 @@ impl<'a> Pinned<'a> {
     where
         'a: 'c,
     {
-        Cursor::filter(
-            tree,
-            Probe::Cursor(Cursor::bits(self.live, Certainty::Yes)),
-        )
+        Cursor::filter(tree, Probe::Cursor(Cursor::bits(self.live, Certainty::Yes)))
     }
 }

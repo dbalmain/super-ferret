@@ -188,7 +188,7 @@ impl World {
     fn leaf<'a>(&'a self, terms: &'a [Term], i: usize) -> Cursor<'a> {
         Cursor::or(
             vec![
-                Cursor::Postings(terms[i].cursor()),
+                Cursor::Postings(Box::new(terms[i].cursor())),
                 Cursor::bits(&self.gaps[i], Certainty::Yes),
                 Cursor::bits(&self.maybes[i], Certainty::Maybe),
             ],
@@ -377,11 +377,13 @@ fn a_wide_or_materialises_and_keeps_certainties() {
     let Cursor::Or(or) = &cursor else {
         panic!("expected the materialised pair")
     };
-    assert!(
-        or.children
-            .iter()
-            .all(|c| matches!(c, Cursor::Bits(Bits { docs: Cow::Owned(_), .. })))
-    );
+    assert!(or.children.iter().all(|c| matches!(
+        c,
+        Cursor::Bits(Bits {
+            docs: Cow::Owned(_),
+            ..
+        })
+    )));
     let got = walk(cursor);
     assert_eq!(got.len(), 2 * (OR_WIDTH + 1));
     assert_eq!(got[0], (0, Certainty::Yes));

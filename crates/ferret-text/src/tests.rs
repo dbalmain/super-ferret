@@ -5,9 +5,7 @@
 
 use std::ops::Range;
 
-use crate::{
-    Kind, MAX_TOKEN_BYTES, Scratch, Token, cap, exact_under_cap, has_token, tokenize,
-};
+use crate::{Kind, MAX_TOKEN_BYTES, Scratch, Token, cap, exact_under_cap, has_token, tokenize};
 
 // ── The oracle: `tokens()` as it was at TOKENIZER_VERSION 1, unchanged ──
 
@@ -428,6 +426,10 @@ fn exact_under_cap_is_the_shortest_cap_of_a_longer_token() {
             let longer = format!("{token}{}", c.repeat(MAX_TOKEN_BYTES));
             cap(longer.as_bytes()) == token.as_bytes()
         });
-        assert_eq!(exact_under_cap(token.as_bytes()), !capped_from_longer, "len {len}");
+        assert_eq!(
+            exact_under_cap(token.as_bytes()),
+            !capped_from_longer,
+            "len {len}"
+        );
     }
 }

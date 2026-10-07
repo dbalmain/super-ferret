@@ -230,7 +230,10 @@ fn not_of_a_term_only_an_uncovered_document_holds_is_maybe() {
     let pinned = fixture.pinned();
     // `größe` is in documents 6, 19 and 32; 38 is uncovered and holds
     // nothing at all.
-    for (arg, maybe, no) in [("absent", vec![38], vec![]), ("größe", vec![38], vec![6, 19, 32])] {
+    for (arg, maybe, no) in [
+        ("absent", vec![38], vec![]),
+        ("größe", vec![38], vec![6, 19, 32]),
+    ] {
         let atom = TextAtom::read(Text::new(arg.as_bytes(), false).unwrap(), &pinned).unwrap();
         let found = walk(pinned.top(pinned.not(atom.cursor(&pinned))));
         for d in 0..39 {
