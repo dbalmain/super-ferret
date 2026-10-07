@@ -21,7 +21,9 @@
 
 use ferret_index::{Atom, Candidates, Certainty, Cursor, Pinned, ReadError};
 use ferret_text::{cap, exact_under_cap};
-use ferret_verify::Text;
+use crate::GrepAtom;
+
+use ferret_verify::{Grep, Matcher, Text, TextMatcher};
 
 /// A `text:ARG` atom with every term it needs read from the index.
 #[derive(Debug)]
@@ -90,18 +92,20 @@ impl TextAtom {
         if cancelled() {
             return Err(ReadError::Cancelled);
         }
-        let df = |term: &[u8]| -> Result<u64, ReadError> {
+        let mut sources_exact = true;
+        let mut df = |term: &[u8]| -> Result<u64, ReadError> {
             if cancelled() {
                 return Err(ReadError::Cancelled);
             }
             for source in pinned.sources() {
                 if let Some(found) = source.estimate_until(&Atom::Term(cap(term)), cancelled)? {
+                    sources_exact &= found.exact;
                     return Ok(found.docs);
                 }
             }
             Ok(u64::from(pinned.live().len()))
         };
-        let whole = text.whole().map(df).transpose()?;
+        let whole = text.whole().map(&mut df).transpose()?;
         let term_only = text.units().len() == 1 && text.units().next() == text.whole();
         let units = if term_only {
             None
@@ -114,7 +118,7 @@ impl TextAtom {
             least
         };
         let docs = whole.unwrap_or(0) + units.unwrap_or(0);
-        let exact = term_only
+        let exact = sources_exact && term_only
             && pinned.sources().next().is_some()
             && text
                 .whole()
@@ -172,5 +176,49 @@ impl TextAtom {
             None => units(),
         };
         Ok(pinned.atom(tree))
+    }
+}
+
+/// A compiled content predicate. The verifier owns each predicate's meaning.
+#[derive(Clone, Debug)]
+pub enum ContentAtom {
+    Text(Text),
+    Grep(Grep),
+}
+
+impl ContentAtom {
+    pub(crate) fn estimate_until(&self, pinned: &Pinned<'_>, cancelled: &dyn Fn() -> bool) -> Result<(u64, Certainty), ReadError> {
+        match self {
+            Self::Text(text) => TextAtom::estimate_until(text, pinned, cancelled),
+            Self::Grep(grep) => Ok((GrepAtom::estimate_until(grep, pinned, cancelled)?, Certainty::Maybe)),
+        }
+    }
+
+    pub(crate) fn read_until(&self, pinned: &Pinned<'_>, cancelled: &dyn Fn() -> bool) -> Result<ReadAtom, ReadError> {
+        match self {
+            Self::Text(text) => TextAtom::read_until(text.clone(), pinned, cancelled).map(ReadAtom::Text),
+            Self::Grep(grep) => GrepAtom::read_until(grep.clone(), pinned, cancelled).map(ReadAtom::Grep),
+        }
+    }
+
+    pub(crate) fn is_match(&self, matcher: &mut TextMatcher, bytes: &[u8]) -> bool {
+        match self {
+            Self::Text(text) => matcher.is_match(text, bytes),
+            Self::Grep(grep) => grep.is_match(bytes),
+        }
+    }
+}
+
+pub(crate) enum ReadAtom {
+    Text(TextAtom),
+    Grep(GrepAtom),
+}
+
+impl ReadAtom {
+    pub(crate) fn cursor_until<'a>(&'a self, pinned: &'a Pinned<'_>, cancelled: &dyn Fn() -> bool) -> Result<Cursor<'a>, ReadError> {
+        match self {
+            Self::Text(atom) => atom.cursor_until(pinned, cancelled),
+            Self::Grep(atom) => atom.cursor_until(pinned, cancelled),
+        }
     }
 }

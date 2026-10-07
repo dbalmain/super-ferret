@@ -35,6 +35,11 @@ impl Regex {
         Regex::build(regex::bytes::RegexBuilder::new(pattern).case_insensitive(fold))
     }
 
+    /// Byte span of the first match, over the whole supplied document.
+    pub fn find(&self, bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+        self.0.find(bytes).map(|m| m.range())
+    }
+
     /// Compiles with every setting already chosen (`GrepFlags`).
     pub(crate) fn build(builder: &regex::bytes::RegexBuilder) -> Result<Regex, RegexError> {
         builder

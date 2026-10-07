@@ -32,7 +32,8 @@ use ferret_verify::{MatchStats, TextMatcher};
 
 use crate::expr::{Node, Test, Truth};
 use crate::query::{Cmp, MetaTest, Query};
-use crate::{NameIndex, Row, RunError, Stats, TextAtom};
+use crate::{NameIndex, Row, RunError, Stats};
+use crate::content::ReadAtom;
 
 /// The default bound on uncovered documents a query verifies rather than
 /// refusing (docs/S2.md § Coverage): a judgement, not a measurement.
@@ -92,6 +93,9 @@ pub struct AtomReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentReport {
     pub driver: Side,
+    pub bounds: Bounds,
+    /// Documents left Maybe by the snapshot before verification.
+    pub snapshot_maybe: u64,
     /// In the order the atoms appear in the query.
     pub atoms: Vec<AtomReport>,
     pub uncovered: u32,
@@ -281,10 +285,15 @@ impl Query {
                 if stopped() {
                     return Err(ferret_index::ReadError::Cancelled);
                 }
-                TextAtom::estimate_until(text, pinned, &stopped)
+                text.estimate_until(pinned, &stopped)
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(RunError::Index)?;
+
+        let bounds = self.content_bounds(catalog, index, pinned, &atoms)?;
+        if content.bound.is_some() && bounds.maybe > u64::from(live) / 4 {
+            return Err(RunError::ScanRequired { maybe: bounds.maybe, live });
+        }
 
         // The cheapest content conjunct that no document-less row holds.
         let driver = self
@@ -308,7 +317,7 @@ impl Query {
         let read_atoms = self
             .texts
             .iter()
-            .map(|text| TextAtom::read_until(text.clone(), pinned, &stopped))
+            .map(|text| text.read_until(pinned, &stopped))
             .collect::<Result<Vec<_>, _>>()
             .map_err(RunError::Index)?;
         catalog.load(&[Section::Doc])?;
@@ -391,6 +400,8 @@ impl Query {
 
         let mut report = ContentReport {
             driver: side,
+            bounds,
+            snapshot_maybe: 0,
             atoms: atoms
                 .iter()
                 .map(|&(estimate, certainty)| AtomReport {
@@ -424,6 +435,7 @@ impl Query {
                 Test::Content(i) => indexed(*i),
                 other => self.test_row(catalog, row, other),
             });
+            if truth == Truth::Maybe { report.snapshot_maybe += 1; }
             if truth == Truth::Maybe
                 && let Some(doc) = doc
             {
@@ -455,7 +467,7 @@ impl Query {
                             if stopped() {
                                 return None;
                             }
-                            let answer = matcher.is_match(text, &bytes);
+                            let answer = text.is_match(&mut matcher, &bytes);
                             (!stopped()).then_some(answer)
                         })
                         .collect();
@@ -594,7 +606,7 @@ fn estimate(tree: &Node<Test>, atoms: &[(u64, Certainty)], live: u64) -> u64 {
 /// it subtracts from the live set.
 fn compile<'a>(
     tree: &Node<Test>,
-    atoms: &'a [TextAtom],
+    atoms: &'a [ReadAtom],
     pinned: &'a Pinned<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Cursor<'a>, ferret_index::ReadError> {
@@ -642,4 +654,54 @@ fn compile<'a>(
         )?,
         Node::Not(inner) => pinned.not(compile(inner, atoms, pinned, cancelled)?),
     })
+}
+
+/// Dictionary-only upper bounds in the document domain. Neither bound may
+/// be subtracted: dead documents and aliases can inflate them independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bounds {
+    pub possible: u64,
+    pub maybe: u64,
+}
+
+impl Bounds {
+    fn and(self, other: Self) -> Self {
+        let possible = self.possible.min(other.possible);
+        Self { possible, maybe: possible.min(self.maybe.saturating_add(other.maybe)) }
+    }
+}
+
+impl Query {
+    fn content_bounds(&self, catalog: &Catalog, index: &NameIndex, pinned: &Pinned<'_>, atoms: &[(u64, Certainty)]) -> Result<Bounds, RunError> {
+        fn node(tree: &Node<Test>, catalog: &Catalog, index: &NameIndex, atoms: &[(u64, Certainty)], live: u64, uncovered: u64) -> Result<Bounds, RunError> {
+            Ok(match tree {
+                Node::Leaf(Test::Content(i)) => {
+                    let possible = atoms[*i].0.min(live);
+                    Bounds { possible, maybe: if atoms[*i].1 == Certainty::Yes { uncovered.min(possible) } else { possible } }
+                }
+                Node::Leaf(Test::Name(test)) => Bounds { possible: index.select(catalog, None, &[], |name| test.matches(name)).map_err(RunError::Stale)?.estimate.hits.min(live), maybe: 0 },
+                Node::Leaf(_) => Bounds { possible: live, maybe: 0 },
+                Node::Not(inner) => Bounds { possible: live, maybe: node(inner, catalog, index, atoms, live, uncovered)?.maybe },
+                Node::And(all) => {
+                    let mut bounds = Bounds { possible: live, maybe: 0 };
+                    for child in all { bounds = bounds.and(node(child, catalog, index, atoms, live, uncovered)?); }
+                    bounds
+                }
+                Node::Or(any) => {
+                    let mut bounds = Bounds { possible: 0, maybe: 0 };
+                    for child in any {
+                        let b = node(child, catalog, index, atoms, live, uncovered)?;
+                        bounds.possible = bounds.possible.saturating_add(b.possible).min(live);
+                        bounds.maybe = bounds.maybe.saturating_add(b.maybe).min(live);
+                    }
+                    bounds
+                }
+            })
+        }
+        let live = u64::from(pinned.live().len());
+        let uncovered = u64::from(pinned.uncovered().len());
+        let mut bounds = Bounds { possible: self.name_estimate(catalog, index)?.min(live), maybe: 0 };
+        for tree in &self.residual { bounds = bounds.and(node(tree, catalog, index, atoms, live, uncovered)?); }
+        Ok(bounds)
+    }
 }

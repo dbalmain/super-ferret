@@ -91,6 +91,7 @@
 //! document.
 
 mod content;
+mod grep;
 mod expr;
 pub mod find;
 
@@ -103,7 +104,8 @@ mod run;
 #[cfg(test)]
 mod tests;
 
-pub use content::TextAtom;
+pub use content::{ContentAtom, TextAtom};
+pub use grep::GrepAtom;
 pub use name_index::{NameEstimate, NameIndex, NamePlan};
 pub use plan::{
     AtomReport, Content, ContentReport, DocNames, ReadRequest, ReadVersion, Reader, Side,

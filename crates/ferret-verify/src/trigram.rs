@@ -150,7 +150,18 @@ pub struct Grep {
     trigrams: Trigrams,
 }
 
+impl crate::Matcher for Grep {
+    fn is_match(&self, bytes: &[u8]) -> bool {
+        crate::Matcher::is_match(&self.regex, bytes)
+    }
+}
+
 impl Grep {
+    /// First match's byte span in the whole document.
+    pub fn find(&self, bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+        self.regex.find(bytes)
+    }
+
     /// The verifier: the only judge of a match.
     pub fn regex(&self) -> &Regex {
         &self.regex

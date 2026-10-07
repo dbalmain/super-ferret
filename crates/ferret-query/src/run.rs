@@ -56,6 +56,8 @@ pub enum RunError {
         uncovered: u32,
         live: u32,
     },
+    /// Conservative Maybe estimate exceeds a quarter of live documents.
+    ScanRequired { maybe: u64, live: u32 },
     /// The content index could not be read.
     Index(ferret_index::ReadError),
     /// A query with a content atom was run without the content index and a
@@ -72,6 +74,7 @@ impl fmt::Display for RunError {
                 f,
                 "the content index does not yet cover {uncovered} of {live} documents"
             ),
+            Self::ScanRequired { maybe, live } => write!(f, "query may read {maybe} of {live} documents: pass --scan to read them"),
             Self::Index(error) => write!(f, "content index: {error}"),
             Self::NoContent => f.write_str("a text: query needs the content index"),
         }
