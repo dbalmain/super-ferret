@@ -1177,7 +1177,54 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
     let before_merge = answer(&first);
     let input = first.content().unwrap().manifest().segments[0].file_name();
     // The first segment is half dead, past the trigger.
-    let merged = engine.merge_content(&Budget::unbounded()).unwrap().unwrap();
+    let merged = std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let (reply, replies) = std::sync::mpsc::channel();
+        let old = first.clone();
+        scope.spawn(move || {
+            while receive.recv().is_ok() {
+                reply.send(answer(&old)).unwrap();
+            }
+        });
+        let queried = std::cell::Cell::new(false);
+        let merged = {
+            let pace = |_: usize| {
+                if !queried.replace(true) {
+                    send.send(()).unwrap();
+                    assert_eq!(
+                        replies.recv_timeout(Duration::from_secs(5)).unwrap(),
+                        before_merge
+                    );
+                }
+                Ok(())
+            };
+            engine
+                .merge_content(&Budget {
+                    pace: &pace,
+                    ..Budget::unbounded()
+                })
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            queried.get(),
+            "old pin must answer while the merge owns the writer"
+        );
+        assert!(
+            !tree
+                .index()
+                .join(ferret::engine::CONTENT_DIR)
+                .join(&input)
+                .exists()
+        );
+        send.send(()).unwrap();
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            before_merge
+        );
+        drop(send);
+        merged
+    });
     assert_eq!((merged.inputs, merged.purged), (1, 1));
     assert!(
         !tree
