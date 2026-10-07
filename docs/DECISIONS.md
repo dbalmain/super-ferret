@@ -80,7 +80,7 @@ Predecessors, carried forward where still open:
 | D62 | `ferret search` syntax for content and booleans          | open           | rec A: `text:` atoms; find-style `OR`, `NOT`, `(` `)` as whole arguments (S2 M0)                               |
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
 | D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
-| D65 | The term dictionary is 87% of the index                  | open           | rec A: keep front coding, measure merged size in M3; decide singleton-to-trigram routing in S3 (S2 M2b)        |
+| D65 | The term dictionary is 87% of the index                  | open           | rec A for S2; M3 merged 11.1% (full 9.8%) > 8%, so C's trigram experiment opens S3 (S2 M2b, M3)            |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3583,3 +3583,23 @@ bytes.**
   path unattractive; then move C's experiment forward to the start of S3.
 - If index size must come down now regardless of query cost, choose C and
   accept that S2's rare-term queries wait for S3.
+
+**Update, S2 M3 (2026-10-07, `wt/s2` at `b4a04e1`): the fact that would change
+it has happened.** Measured with `ferret-bench index-build` over the same 4.0 GB:
+
+- **First build:** 49 segments, 0.1254 B per content byte. 99 s wall and 94
+  CPU-s unpaced, peak RSS 282 MiB.
+- **After the merge policy settles:** 13 segments and **0.1108 B/B**. The
+  dictionary is 81.9% of the index; h = 1.39; singletons are 72.9% of entries.
+- **Forced full merge:** 1 segment and **0.0981 B/B**. The dictionary is 74.5%
+  and singletons are 68.3%.
+
+Both are above the ~8% line, so merging alone does not bring A down to it.
+
+The revised recommendation is still A for S2, because S2 should not wait on
+S3, but C's experiment now moves to the **first** slice of S3. That slice
+measures trigram bytes for the singleton terms and the latency of a rare-term
+query routed through them, then reopens D65 with C costed.
+
+If you want the size down before S3, say C now, and S2's rare-term queries will
+go through a verify scan until S3 lands.
