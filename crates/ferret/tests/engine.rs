@@ -1203,3 +1203,104 @@ fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
     let live = ferret::engine::live_documents(engine.pin().catalog());
     assert!(engine.pin().content().unwrap().uncovered(&live).is_empty());
 }
+
+/// Reproducible D63 measurement: production refresh warms each edited document,
+/// then the real follow reads it a second time. No log or daemon is involved.
+#[test]
+#[ignore = "S2 M5 scratch-tree measurement; run release with --ignored --nocapture"]
+fn measure_steady_content_follow() {
+    use ferret_index::Budget;
+    fn counter(path: &str, key: &str) -> u64 {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(key)
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap()
+    }
+    fn cpu() -> u64 {
+        fs::read_to_string("/proc/thread-self/schedstat")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let tree = Tree::new();
+    let document = |file, round| {
+        let head = format!("document{file} revision{round} common requestHandler ");
+        let mut bytes = head.into_bytes();
+        bytes.extend_from_slice(&b"common requestHandler alpha beta ".repeat(2048));
+        bytes.truncate(64 << 10);
+        bytes
+    };
+    for file in 0..512 {
+        fs::write(
+            tree.root().join(format!("measure-{file}.txt")),
+            document(file, 0),
+        )
+        .unwrap();
+    }
+    let engine = writer_engine(&tree);
+    engine.attach_content(&tree.index()).unwrap();
+    while engine
+        .follow_content(&Budget::unbounded(), None)
+        .unwrap()
+        .remaining
+        > 0
+    {}
+    while engine
+        .merge_content(&Budget::unbounded())
+        .unwrap()
+        .is_some()
+    {}
+    let (mut nanos, mut chars, mut device, mut changed, mut wall) =
+        (0u64, 0u64, 0u64, 0u64, Duration::ZERO);
+    for round in 1..=40 {
+        for offset in 0..8 {
+            let file = (round * 8 + offset) % 512;
+            fs::write(
+                tree.root().join(format!("measure-{file}.txt")),
+                document(file, round),
+            )
+            .unwrap();
+        }
+        engine.refresh(request(&engine, &tree), &options()).unwrap();
+        let before_chars = counter("/proc/self/io", "rchar:");
+        let before_device = counter("/proc/self/io", "read_bytes:");
+        let before_cpu = cpu();
+        let started = std::time::Instant::now();
+        loop {
+            let followed = engine.follow_content(&Budget::unbounded(), None).unwrap();
+            changed += followed.bytes;
+            if followed.remaining == 0 {
+                break;
+            }
+        }
+        wall += started.elapsed();
+        nanos += cpu() - before_cpu;
+        chars += counter("/proc/self/io", "rchar:") - before_chars;
+        device += counter("/proc/self/io", "read_bytes:") - before_device;
+        while engine
+            .merge_content(&Budget::unbounded())
+            .unwrap()
+            .is_some()
+        {}
+    }
+    let before_rss = counter("/proc/self/status", "VmRSS:");
+    let pins: Vec<_> = (0..128).map(|_| engine.pin()).collect();
+    let after_rss = counter("/proc/self/status", "VmRSS:");
+    println!(
+        "M5_FOLLOW refreshes=40 changed_bytes={changed} rchar={chars} read_bytes={device} cpu_ns={nanos} wall_ns={} view_bytes={} pin_count={} pin_size={} rss_delta_kib={}",
+        wall.as_nanos(),
+        pins[0].content().unwrap().resident_bytes(),
+        pins.len(),
+        std::mem::size_of::<QuerySession>(),
+        after_rss.saturating_sub(before_rss)
+    );
+    assert_eq!(changed, 40 * 8 * (64 << 10));
+}
