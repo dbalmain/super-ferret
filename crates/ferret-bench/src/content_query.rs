@@ -230,7 +230,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     );
     println!("| measure | min | median | p90 | p95 | max |");
     println!("| --- | --- | --- | --- | --- | --- |");
-    let rows: [(&str, Measure); 7] = [
+    let rows: [(&str, Measure); 10] = [
         ("candidates (documents probed)", |s| {
             s.report.documents as f64
         }),
@@ -240,6 +240,13 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
         ("wall ms", |s| ms(s.warm)),
         ("derived match ms (wall - read)", |s| {
             ms(s.warm.saturating_sub(s.read))
+        }),
+        ("rejected by byte search (documents)", |s| {
+            s.report.matching.rejected as f64
+        }),
+        ("tokenized whole (documents)", |s| s.report.matching.whole as f64),
+        ("MiB tokenized", |s| {
+            s.report.matching.tokenized as f64 / 1048576.0
         }),
         ("rows", |s| s.rows as f64),
     ];

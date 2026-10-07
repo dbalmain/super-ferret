@@ -27,7 +27,7 @@ use std::sync::atomic::AtomicBool;
 
 use ferret_catalog::{Catalog, NameId, OpenError, Section, Target};
 use ferret_index::{Certainty, Cursor, Pinned};
-use ferret_verify::TextMatcher;
+use ferret_verify::{MatchStats, TextMatcher};
 
 use crate::expr::{Node, Test, Truth};
 use crate::query::{Cmp, MetaTest, Query};
@@ -90,6 +90,9 @@ pub struct ContentReport {
     /// could not be read: their rows are dropped, never reported from
     /// stale data.
     pub changed: u64,
+    /// The matcher's work over the documents read: atoms checked, rejected
+    /// by byte search alone, tokenized whole, bytes tokenized.
+    pub matching: MatchStats,
 }
 
 impl ContentReport {
@@ -280,6 +283,7 @@ impl Query {
             documents: docs.len() as u64,
             verified: 0,
             changed: 0,
+            matching: MatchStats::default(),
         };
         catalog.load(&self.residual_sections())?;
         let mut matcher = TextMatcher::new();
@@ -332,6 +336,7 @@ impl Query {
             emit(row)
         })?;
         stats.rows = rows;
+        report.matching = matcher.stats();
         stats.content = Some(report);
         Ok(stats)
     }
