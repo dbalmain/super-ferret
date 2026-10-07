@@ -190,7 +190,7 @@ fn h_forced_collisions_use_real_lookup_merge_and_verification_oracle() {
 }
 
 #[test]
-fn h_random_corpora_and_repeated_merges_match_brute_force() {
+fn h_random_corpora_and_merge_sequences_match_brute_force() {
     for seed in 1..=32u64 {
         let _forced =
             (seed % 2 == 0).then(|| Forced::new(|term| u32::from(term[term.len() - 1] % 7)));
@@ -217,41 +217,57 @@ fn h_random_corpora_and_repeated_merges_match_brute_force() {
             segments.push(build(first as u32, first as u32 + 7, &terms));
         }
         let mut alive: Vec<u32> = (0..96).collect();
-        for round in 0..4 {
+        for round in 0..12 {
             alive.retain(|&doc| round == 0 || doc % (round + 2) != 0);
             let live = DocSet::new(96, alive.iter().copied());
-            for term in 0..=40 {
-                let term = format!("term{term}");
-                let expected: Vec<_> = corpus
-                    .iter()
-                    .enumerate()
-                    .filter(|(doc, content)| {
-                        live.contains(*doc as u32) && content.contains(term.as_bytes())
-                    })
-                    .map(|(doc, _)| doc as u32)
-                    .collect();
-                let found = candidates(&segments, term.as_bytes());
-                assert!(
-                    expected
+            let check = |segments: &[Segment<Vec<u8>>]| {
+                for term in 0..=40 {
+                    let term = format!("term{term}");
+                    let expected: Vec<_> = corpus
                         .iter()
-                        .all(|doc| found.iter().any(|(candidate, _)| candidate == doc))
-                );
-                // Real verification rejects hash collisions and dead records.
-                let verified: Vec<_> = found
-                    .iter()
-                    .filter(|(doc, _)| {
-                        live.contains(*doc) && corpus[*doc as usize].contains(term.as_bytes())
-                    })
-                    .map(|(doc, _)| *doc)
-                    .collect();
-                assert_eq!(verified, expected);
-                for (doc, certainty) in found {
-                    if certainty == Certainty::Yes {
-                        assert!(corpus[doc as usize].contains(term.as_bytes()));
+                        .enumerate()
+                        .filter(|(doc, content)| {
+                            live.contains(*doc as u32) && content.contains(term.as_bytes())
+                        })
+                        .map(|(doc, _)| doc as u32)
+                        .collect();
+                    let found = candidates(segments, term.as_bytes());
+                    assert!(
+                        expected
+                            .iter()
+                            .all(|doc| found.iter().any(|(candidate, _)| candidate == doc))
+                    );
+                    // Real verification rejects hash collisions and dead
+                    // records.
+                    let verified: Vec<_> = found
+                        .iter()
+                        .filter(|(doc, _)| {
+                            live.contains(*doc) && corpus[*doc as usize].contains(term.as_bytes())
+                        })
+                        .map(|(doc, _)| *doc)
+                        .collect();
+                    assert_eq!(verified, expected);
+                    for (doc, certainty) in found {
+                        if certainty == Certainty::Yes {
+                            assert!(corpus[doc as usize].contains(term.as_bytes()));
+                        }
                     }
                 }
-            }
-            segments = vec![merged(&segments, &live)];
+            };
+            check(&segments);
+            // Partial adjacent merges leave mixed representations in other
+            // segments; full-only merges cannot exercise that sequence.
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let start = rng as usize % segments.len();
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let end = start + 1 + rng as usize % (segments.len() - start);
+            let output = merged(&segments[start..end], &live);
+            segments.splice(start..end, [output]);
+            check(&segments);
         }
     }
 }

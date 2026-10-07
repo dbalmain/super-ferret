@@ -44,8 +44,6 @@ pub(super) struct Encoder {
     index: Vec<u8>,
     records: u64,
     in_block: usize,
-    /// Where the current block began in the section.
-    block_start: u64,
     last: Option<(u32, u32)>,
 }
 
@@ -61,7 +59,6 @@ impl Encoder {
             let start = self.len();
             self.index.extend_from_slice(&fp.to_le_bytes());
             self.index.extend_from_slice(&(start as u32).to_le_bytes());
-            self.block_start = start;
             self.in_block = 0;
             self.bytes.extend_from_slice(&fp.to_le_bytes());
             self.bytes.extend_from_slice(&offset.to_le_bytes());
