@@ -280,7 +280,7 @@ pub(crate) fn search_request(
             query_error = Some(error.to_string());
         }
     }
-    if let Some(estimate) = stats.and_then(|stats| stats.name_plan) {
+    if let Some(estimate) = stats.as_ref().and_then(|stats| stats.name_plan) {
         plan_text = format!(
             "{:?}: {} global name candidates, scope rows {:?}; exact evaluation",
             estimate.plan, estimate.hits, estimate.scope_rows
@@ -296,7 +296,7 @@ pub(crate) fn search_request(
         bytes_read,
         plan: &plan_text,
         strategy: &strategy,
-        stats,
+        stats: stats.clone(),
         error: query_error.as_deref(),
     };
     log_search(dirs, request, now, &log);
@@ -313,7 +313,7 @@ pub(crate) fn search_request(
             o.int("names", session.catalog().name_count())
                 .int("inodes", session.catalog().inode_count());
         }
-        if let Some(stats) = stats {
+        if let Some(stats) = &stats {
             o.object("stats", |o| {
                 o.int("candidates", stats.candidates)
                     .int("rows", stats.rows);

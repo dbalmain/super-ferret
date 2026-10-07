@@ -9,13 +9,13 @@
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use ferret_catalog::{Catalog, Generation, OpenError, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
-use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Merged};
+use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Merged, Pinned};
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
-use ferret_query::{NameIndex, Query, Row, RunError, Stats};
+use ferret_query::{Content, DocNames, NameIndex, Query, Row, RunError, Stats, UNCOVERED_BOUND};
 
 static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -42,6 +42,17 @@ pub struct QuerySession {
     /// when the engine has one. Every DocId it holds is below the catalog
     /// view's `next_doc`; liveness comes from the catalog.
     content: Option<Arc<ferret_index::View>>,
+    /// What content queries derive from this catalog view, built by the
+    /// first that needs it and shared by every pin of the view.
+    derived: Arc<Derived>,
+}
+
+/// Structures derived from one catalog view for content queries (docs/S2.md
+/// § Liveness; D30 C, built when a query first needs them).
+#[derive(Default)]
+struct Derived {
+    live: OnceLock<DocSet>,
+    docs: OnceLock<DocNames>,
 }
 
 impl Engine {
@@ -58,6 +69,7 @@ impl Engine {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
                 content: None,
+                derived: Arc::default(),
             }),
             writer: Mutex::new(None),
             content: Mutex::new(None),
@@ -79,6 +91,7 @@ impl Engine {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
                 content: None,
+                derived: Arc::default(),
             }),
             writer: Mutex::new(Some(writer)),
             content: Mutex::new(None),
@@ -231,6 +244,24 @@ impl Engine {
         Ok(())
     }
 
+    /// Opens the content index in `catalog_dir`'s [`CONTENT_DIR`] for
+    /// reading, for a query-only engine: no writer lock, nothing repaired
+    /// or removed. An index that is absent or does not fit the catalog view
+    /// leaves the engine without one, which content queries treat as
+    /// nothing covered.
+    pub fn open_content(&self, catalog_dir: &Path) -> Result<(), Error> {
+        let pin = self.pin();
+        let view = ferret_index::View::open(
+            &catalog_dir.join(CONTENT_DIR),
+            &catalog_view(pin.catalog(), pin.live()),
+        )
+        .map_err(Error::Content)?;
+        if let Some(view) = view {
+            self.select_content(Arc::new(view));
+        }
+        Ok(())
+    }
+
     /// One follow pass over the current catalog view, reading documents
     /// through the crawl's checked reader: paced by `limiter` when given,
     /// unpaced for an explicit `ferret index`. Publishes the new index view
@@ -304,6 +335,7 @@ impl Engine {
             catalog: view,
             names,
             content: previous.content,
+            derived: Arc::default(),
         };
     }
 }
@@ -365,13 +397,55 @@ impl QuerySession {
     }
 
     /// Streams rows, checking host cancellation at every candidate boundary.
+    /// A content query refuses an index with more than
+    /// [`UNCOVERED_BOUND`] uncovered documents.
     pub fn search_until(
         &self,
         query: &Query,
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
+        if query.has_content() {
+            return self.search_content(query, false, cancelled, emit);
+        }
         query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit)
+    }
+
+    /// Streams a content query's rows over this pin's content view, or
+    /// over none, verifying Maybe documents through the crawl's checked
+    /// reader. `scan_uncovered` lifts the bound on uncovered documents.
+    pub fn search_content(
+        &self,
+        query: &Query,
+        scan_uncovered: bool,
+        cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        let catalog = &self.catalog;
+        let docs = match self.derived.docs.get() {
+            Some(docs) => docs,
+            None => {
+                let built = DocNames::new(catalog)?;
+                self.derived.docs.get_or_init(|| built)
+            }
+        };
+        let pinned = Pinned::new(self.content.as_deref(), self.live());
+        let content = Content {
+            pinned: &pinned,
+            docs,
+            bound: (!scan_uncovered).then_some(UNCOVERED_BOUND),
+        };
+        let mut reader = ferret_crawl::Documents::by_name(catalog)?;
+        let mut read =
+            |name, out: &mut Vec<u8>| reader.read_name(catalog, name, out).is_ok();
+        query.run_content(catalog, &self.names, &content, &mut read, cancelled, emit)
+    }
+
+    /// The catalog view's live documents, built once per view.
+    pub fn live(&self) -> &DocSet {
+        self.derived
+            .live
+            .get_or_init(|| live_documents(&self.catalog))
     }
 
     /// Runs find with the plan's captured cwd/time and the host's effects.
