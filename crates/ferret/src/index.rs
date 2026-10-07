@@ -279,11 +279,17 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
         ..IndexOptions::default()
     };
     let result = index_change(&context.index, change, refresh, &options);
+    let content = if result.is_ok() {
+        follow_committed(&context.index)
+    } else { Ok(()) };
     let total = started.elapsed();
 
     let rendered = render(&result);
     note(&rendered.diagnostics);
-    let exit = if rendered.exit == Exit::Ok {
+    let exit = if let Err(error) = content {
+        crate::cli::error(&format!("content index: {error}"));
+        Exit::Error
+    } else if rendered.exit == Exit::Ok {
         print("the report", rendered.stdout.as_bytes())
     } else {
         rendered.exit
@@ -565,4 +571,16 @@ fn peak_rss_kb() -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Completes the currently committed catalog's content, with explicit-command
+/// pacing disabled. The retained session excludes other publishers throughout.
+fn follow_committed(path: &Path) -> Result<(), String> {
+    let writer = ferret_catalog::WriterSession::open(path).map_err(|e| e.to_string())?;
+    let engine = crate::engine::Engine::from_writer(writer);
+    engine.attach_content(path).map_err(|e| e.to_string())?;
+    let budget = ferret_index::Budget::unbounded();
+    while engine.follow_content(&budget, None).map_err(|e| e.to_string())?.remaining > 0 {}
+    while engine.merge_content(&budget).map_err(|e| e.to_string())?.is_some() {}
+    Ok(())
 }

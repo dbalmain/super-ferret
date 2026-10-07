@@ -233,7 +233,7 @@ pub(crate) fn search_request(
             let result = if request.limit == Some(0) {
                 Ok(ferret_query::Stats::default())
             } else {
-                session.search_until(&query, destination.cancellation(), |row: &Row<'_>| {
+                session.search_content(&query, (!request.capabilities.iter().any(|c| c == "scan-uncovered")).then_some(ferret_query::UNCOVERED_BOUND), destination.cancellation(), |row: &Row<'_>| {
                     if destination.cancelled() {
                         return ControlFlow::Break(());
                     }
@@ -268,6 +268,9 @@ pub(crate) fn search_request(
                 Ok(result) => {
                     stats = Some(result);
                     status = if rows == 0 { 1 } else { 0 };
+                }
+                Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
+                    query_error = Some(crate::search::incomplete_message(uncovered, live));
                 }
                 Err(error) => query_error = Some(error.to_string()),
             }

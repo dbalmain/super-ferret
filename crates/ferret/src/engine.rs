@@ -42,6 +42,8 @@ pub struct QuerySession {
     /// when the engine has one. Every DocId it holds is below the catalog
     /// view's `next_doc`; liveness comes from the catalog.
     content: Option<Arc<ferret_index::View>>,
+    pub(crate) last_follow: Option<u64>,
+    pub(crate) last_merge: Option<u64>,
     /// What content queries derive from this catalog view, built by the
     /// first that needs it and shared by every pin of the view.
     derived: Arc<Derived>,
@@ -69,6 +71,8 @@ impl Engine {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
                 content: None,
+                last_follow: None,
+                last_merge: None,
                 derived: Arc::default(),
             }),
             writer: Mutex::new(None),
@@ -91,6 +95,8 @@ impl Engine {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
                 content: None,
+                last_follow: None,
+                last_merge: None,
                 derived: Arc::default(),
             }),
             writer: Mutex::new(Some(writer)),
@@ -287,8 +293,11 @@ impl Engine {
         });
         let published = index.view();
         drop(content);
-        drop(writer);
         self.select_content(published);
+        drop(writer);
+        if followed.as_ref().is_ok_and(|f| f.segment.is_some() || f.pruned > 0) {
+            self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner).last_follow = Some(timestamp());
+        }
         followed.map_err(Error::Content)
     }
 
@@ -302,8 +311,11 @@ impl Engine {
         let merged = index.merge_if_needed(&catalog_view(&view, &live), budget);
         let published = index.view();
         drop(content);
-        drop(writer);
         self.select_content(published);
+        drop(writer);
+        if merged.as_ref().is_ok_and(|m| m.is_some()) {
+            self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner).last_merge = Some(timestamp());
+        }
         merged.map_err(Error::Content)
     }
 
@@ -332,10 +344,14 @@ impl Engine {
             .current
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = QuerySession {
-            catalog: view,
+            catalog: view.clone(),
             names,
-            content: previous.content,
+            content: previous.content.filter(|content| {
+                content.manifest().incarnation == view.generation().incarnation
+            }),
             derived: Arc::default(),
+            last_follow: previous.last_follow,
+            last_merge: previous.last_merge,
         };
     }
 }
@@ -505,4 +521,8 @@ impl std::error::Error for Error {
             Self::Compact(error) => Some(error),
         }
     }
+}
+
+fn timestamp() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }

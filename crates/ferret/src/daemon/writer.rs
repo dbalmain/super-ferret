@@ -131,6 +131,7 @@ fn serve(
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
     let session = WriterSession::open(&host.index).map_err(io::Error::other)?;
     let engine = Arc::new(Engine::from_writer(session));
+    engine.attach_content(&host.index).map_err(io::Error::other)?;
     let watch = Limits::read().ok().and_then(|limits| {
         let mut config = Config::from_limits(&limits);
         if let Ok(cap) = std::env::var("FERRET_WATCH_CAP")
@@ -193,12 +194,13 @@ fn serve(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .fallback_backstop = initial;
+    let mut content_due = Instant::now();
     loop {
         if host.stop.load(Ordering::Acquire) {
             break;
         }
         let now = Instant::now();
-        let mut deadline = full_due.min(poll_due);
+        let mut deadline = full_due.min(poll_due).min(content_due);
         if let Some(retry) = retry_due {
             deadline = deadline.min(now + retry.saturating_sub(scheduler.now()));
         }
@@ -347,6 +349,7 @@ fn serve(
                 // and watch adoption finish before the next command begins.
                 let _ = command.reply.send(result);
                 host.writer_pending.fetch_sub(1, Ordering::AcqRel);
+                content_due = Instant::now();
                 continue;
             }
             Ok(Message::Intake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -409,6 +412,7 @@ fn serve(
             .as_ref()
             .and_then(|w| w.take_admitted(paused.is_none()));
         if paused.is_some() && burst.is_none() {
+            content_due = Instant::now() + Duration::from_secs(1);
             if initial
                 || watch
                     .as_ref()
@@ -419,6 +423,9 @@ fn serve(
             continue;
         }
         if burst.is_none() && !initial {
+            if Instant::now() >= content_due {
+                content_due = Instant::now() + content_turn(host, &engine, &scheduler)?;
+            }
             continue;
         }
         if paused.is_none() {
@@ -515,6 +522,7 @@ fn serve(
                 }
                 initial = false;
                 retry_due = None;
+                content_due = Instant::now();
             }
             Err(error) => {
                 host.writer_status
@@ -535,6 +543,53 @@ fn serve(
         }
     }
     Ok(())
+}
+// Each idle turn is bounded by bytes, postings scratch and elapsed time. A queued
+// explicit command or admitted watch burst interrupts at the next document/term.
+fn content_turn(host: &Host, engine: &Engine, scheduler: &crate::scheduler::Scheduler) -> io::Result<Duration> {
+    use ferret_catalog::bulk::Control;
+    let started = Instant::now();
+    let interrupted = || {
+        host.stop.load(Ordering::Acquire)
+            || host.writer_pending.load(Ordering::Acquire) != 0
+            || scheduler.status().paused.is_some()
+            || host.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).draining
+    };
+    let cancelled = || interrupted() || started.elapsed() >= Duration::from_millis(100);
+    if cancelled() { return Ok(Duration::from_secs(1)); }
+    let limiter = scheduler.limiter();
+    let pace = |bytes: usize| {
+        for chunk in (0..bytes).step_by(64 << 10) {
+            let _ = limiter.transfer((bytes - chunk).min(64 << 10), || Ok(()));
+        }
+    };
+    let budget = ferret_index::Budget {
+        bytes: 256 << 10,
+        buffer: 1 << 20,
+        pace: &pace,
+        cancelled: &cancelled,
+    };
+    let operation = Operation::start(host, "follow");
+    let followed = engine.follow_content(&budget, Some(limiter.clone())).map_err(io::Error::other)?;
+    drop(operation);
+    if cancelled() || followed.remaining > 0 {
+        return Ok(Duration::ZERO);
+    }
+    let pin = engine.pin();
+    if let Err(reason) = scheduler.admit(ferret_catalog::bulk::Kind::Checkpoint, pin.catalog()) {
+        host.writer_status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).blocked = Some(reason);
+        return Ok(Duration::from_secs(1));
+    }
+    let _operation = Operation::start(host, "merge");
+    // Merge input size is admitted separately; cooperative cancellation is
+    // checked during streaming and before cutover, never during publication.
+    let budget = ferret_index::Budget { bytes: u64::MAX, cancelled: &interrupted, ..budget };
+    match engine.merge_content(&budget) {
+        Ok(Some(_)) => Ok(Duration::ZERO),
+        Ok(None) => Ok(Duration::from_secs(3600)),
+        Err(crate::engine::Error::Content(ferret_index::Error::Cancelled)) => Ok(Duration::ZERO),
+        Err(error) => Err(io::Error::other(error)),
+    }
 }
 fn global_inputs(watch: Option<&Arc<Watch>>, engine: &Engine, context: &crate::cli::Context) {
     if let (Some(w), Some(dirs)) = (watch, &context.dirs) {

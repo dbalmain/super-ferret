@@ -26,6 +26,7 @@ pub(crate) fn search(
     json: bool,
     limit: Option<u64>,
     now: SystemTime,
+    scan_uncovered: bool,
 ) -> Option<Exit> {
     query(
         &context.index,
@@ -35,10 +36,11 @@ pub(crate) fn search(
         limit,
         now,
         Some(context),
+        scan_uncovered,
     )
 }
 pub(crate) fn find(index: &Path, args: &[OsString], json: bool, now: SystemTime) -> Option<Exit> {
-    query(index, args, "find", json, None, now, None)
+    query(index, args, "find", json, None, now, None, false)
 }
 
 pub(crate) fn writer_command(
@@ -63,6 +65,7 @@ pub(crate) fn writer_command(
         None,
         SystemTime::now(),
         Some(context),
+        false,
     )
 }
 pub(crate) fn daemon_status(context: &Context) -> Exit {
@@ -74,6 +77,7 @@ pub(crate) fn daemon_status(context: &Context) -> Exit {
         None,
         SystemTime::now(),
         None,
+        false,
     )
     .unwrap_or_else(|| crate::status::local(context, false))
 }
@@ -87,6 +91,7 @@ pub(crate) fn daemon_stats(context: &Context) -> Exit {
         None,
         SystemTime::now(),
         None,
+        false,
     )
     .unwrap_or_else(|| crate::status::local(context, true))
 }
@@ -321,6 +326,7 @@ fn query(
     limit: Option<u64>,
     now: SystemTime,
     context: Option<&Context>,
+    scan_uncovered: bool,
 ) -> Option<Exit> {
     let started = Instant::now();
     if std::env::var_os("FERRET_NO_DAEMON").is_some() {
@@ -345,6 +351,7 @@ fn query(
             now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos() as u64,
         )
         .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
+    object.byte_strings("capabilities", scan_uncovered.then_some(b"scan-uncovered".as_slice()));
     object.end();
     protocol::parse_request(&request).ok()?;
     request.push(b'\n');

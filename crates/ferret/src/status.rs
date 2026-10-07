@@ -30,6 +30,7 @@ pub(crate) fn resources(o: &mut Object<'_>) {
 }
 
 pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
+    index_fields(o, session);
     let catalog = session.catalog();
     let protected = catalog
         .dir_ids()
@@ -57,6 +58,11 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
             return Exit::Error;
         }
     };
+    if let Some(engine) = &engine
+        && let Err(error) = engine.open_content(&context.index) {
+        crate::cli::error(&error.to_string());
+        return Exit::Error;
+    }
     if census && engine.is_none() {
         crate::cli::error(&format!(
             "no index in {}: run `ferret index DIR` first",
@@ -115,4 +121,19 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
     o.end();
     out.push(b'\n');
     crate::cli::print("status", &out)
+}
+
+fn index_fields(o: &mut Object<'_>, session: &QuerySession) {
+    let live = session.live();
+    let view = session.content();
+    let uncovered = view.map_or(u64::from(live.len()), |v| v.uncovered_set(live).len().into());
+    o.object("index", |o| {
+        o.int("covered", u64::from(live.len()) - uncovered)
+            .int("uncovered", uncovered)
+            .int("unreadable", view.map_or(0, |v| v.manifest().unreadable.iter().filter(|&&d| live.contains(d)).count() as u64))
+            .int("segments", view.map_or(0, |v| v.segments().len() as u64))
+            .int("bytes", view.map_or(0, |v| v.manifest().segments.iter().map(|s| s.bytes).sum::<u64>()))
+            .opt_int("last_follow", session.last_follow)
+            .opt_int("last_merge", session.last_merge);
+    });
 }

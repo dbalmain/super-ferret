@@ -63,6 +63,8 @@ pub struct Budget<'a> {
     /// Called with each index-file transfer's size before it happens: the
     /// host's shared byte pacer for background work, a no-op for an explicit
     /// `ferret index`. Document reads are paced by the host's callback.
+    /// Cooperative pause checked between documents and merge terms.
+    pub cancelled: &'a dyn Fn() -> bool,
     pub pace: &'a dyn Fn(usize),
 }
 
@@ -73,6 +75,7 @@ impl Budget<'static> {
             bytes: u64::MAX,
             buffer: BUFFER,
             pace: &|_| {},
+            cancelled: &|| false,
         }
     }
 }
@@ -159,6 +162,8 @@ pub enum Error {
     Segment(ReadError),
     /// A previous operation failed; reopen the writer.
     Poisoned,
+    /// A cooperative merge pause; the old manifest remains selected.
+    Cancelled,
 }
 
 impl std::fmt::Display for Error {
@@ -166,6 +171,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::Io(error) => write!(f, "index I/O failed: {error}"),
             Self::Segment(error) => error.fmt(f),
+            Self::Cancelled => f.write_str("content merge paused"),
             Self::Poisoned => f.write_str("an earlier index write failed; reopen the index"),
         }
     }
@@ -176,7 +182,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Segment(error) => Some(error),
-            Self::Poisoned => None,
+            Self::Poisoned | Self::Cancelled => None,
         }
     }
 }
@@ -397,7 +403,11 @@ impl IndexWriter {
             return Err(Error::Poisoned);
         }
         let result = run(self);
-        self.poisoned = result.is_err();
+        if matches!(result, Err(Error::Cancelled)) {
+            remove_unnamed(&self.dir, &self.current.manifest)?;
+        } else {
+            self.poisoned = result.is_err();
+        }
         result
     }
 
@@ -444,6 +454,11 @@ impl IndexWriter {
                 } else {
                     Stopped::Bytes
                 };
+                frontier = doc;
+                break;
+            }
+            if (budget.cancelled)() {
+                followed.stopped = Stopped::Asked;
                 frontier = doc;
                 break;
             }
@@ -566,11 +581,14 @@ impl IndexWriter {
                 .create_new(true)
                 .open(&scratch)?;
             let writer = Writer::spilling(first, last, file.try_clone()?, postings)?;
-            let result = merge::stream(&inputs, catalog.live, writer, budget.pace);
+            let result = merge::stream(&inputs, catalog.live, writer, budget.pace, budget.cancelled);
             let _ = fs::remove_file(&scratch);
             Ok(result?.total())
         })?;
 
+        if (budget.cancelled)() {
+            return Err(Error::Cancelled);
+        }
         let retired: Vec<_> = manifest.segments.splice(run.clone(), [entry]).collect();
         let mut segments = self.current.segments.clone();
         segments.splice(run, [segment]);

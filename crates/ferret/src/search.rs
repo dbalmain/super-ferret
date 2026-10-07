@@ -34,9 +34,7 @@ struct Outcome {
 /// Runs `search` and returns its exit status: [`Exit::Ok`] when it printed a
 /// row, [`Exit::NoMatch`] when it printed none.
 ///
-/// A query with a `text:` atom runs in this process, against the content
-/// index opened read-only beside the catalog: the daemon does not serve
-/// one yet (S2 M5).
+/// Content queries use the daemon's paired pin, with a read-only local fallback.
 pub fn run(
     context: &Context,
     atoms: &[OsString],
@@ -53,8 +51,7 @@ pub fn run(
             return Exit::Usage;
         }
     };
-    if !query.has_content()
-        && let Some(exit) = crate::daemon::search(context, atoms, json, limit, now)
+    if let Some(exit) = crate::daemon::search(context, atoms, json, limit, now, scan_uncovered)
     {
         return exit;
     }
@@ -253,10 +250,7 @@ fn search(
     match result {
         Ok(stats) => outcome.stats = Some(stats),
         Err(RunError::IndexIncomplete { uncovered, live }) => {
-            error(&format!(
-                "the content index does not yet cover {uncovered} of {live} documents, \
-                 and reading that many is slow: pass --scan-uncovered to read them anyway"
-            ));
+            error(&incomplete_message(uncovered, live));
             outcome.error = Some("index incomplete");
             return Exit::Error;
         }
@@ -307,4 +301,9 @@ pub(crate) fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
         .int("mtime", catalog.mtime(row.inode))
         .opt_int("doc", catalog.doc(row.inode).map(|d| d.0));
     object.end();
+}
+
+/// Shared native diagnostic for local and socket content queries.
+pub(crate) fn incomplete_message(uncovered: u32, live: u32) -> String {
+    format!("the content index does not yet cover {uncovered} of {live} documents, and reading that many is slow: pass --scan-uncovered to read them anyway")
 }

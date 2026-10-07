@@ -103,6 +103,7 @@ pub fn stream<R: ReadAt>(
     live: &DocSet,
     mut writer: Writer,
     pace: &dyn Fn(usize),
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Sizes, Error> {
     let mut cursors: Vec<Terms<'_, R>> = inputs.iter().map(Segment::terms).collect();
     // Each input's current entry; the heap orders (term, input), so equal
@@ -118,6 +119,9 @@ pub fn stream<R: ReadAt>(
     let (mut docs, mut list) = (Vec::new(), Vec::new());
     let mut midway = false;
     while let Some(Reverse((term, i))) = heap.pop() {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         docs.clear();
         let mut taken = vec![i];
         while heap
