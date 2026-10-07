@@ -102,7 +102,7 @@ pub fn stream<R: ReadAt>(
     inputs: &[Segment<R>],
     live: &DocSet,
     mut writer: Writer,
-    pace: &dyn Fn(usize),
+    pace: &dyn Fn(usize) -> std::io::Result<()>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Sizes, Error> {
     let mut cursors: Vec<Terms<'_, R>> = inputs.iter().map(Segment::terms).collect();

@@ -42,8 +42,6 @@ pub struct QuerySession {
     /// when the engine has one. Every DocId it holds is below the catalog
     /// view's `next_doc`; liveness comes from the catalog.
     content: Option<Arc<ferret_index::View>>,
-    pub(crate) last_follow: Option<u64>,
-    pub(crate) last_merge: Option<u64>,
     /// What content queries derive from this catalog view, built by the
     /// first that needs it and shared by every pin of the view.
     derived: Arc<Derived>,
@@ -71,8 +69,6 @@ impl Engine {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
                 content: None,
-                last_follow: None,
-                last_merge: None,
                 derived: Arc::default(),
             }),
             writer: Mutex::new(None),
@@ -95,8 +91,6 @@ impl Engine {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
                 content: None,
-                last_follow: None,
-                last_merge: None,
                 derived: Arc::default(),
             }),
             writer: Mutex::new(Some(writer)),
@@ -281,23 +275,19 @@ impl Engine {
         let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
         let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
         let index = content.as_mut().ok_or(Error::NoContentIndex)?;
-        let live = live_documents(&view);
-        let mut documents = ferret_crawl::Documents::new(&view).map_err(Error::Catalog)?;
-        if let Some(limiter) = limiter {
-            documents = documents.with_limiter(limiter);
-        }
-        let followed = index.follow(&catalog_view(&view, &live), budget, &mut |doc, bytes| {
-            documents
-                .read(&view, ferret_catalog::DocId(doc), bytes)
-                .map_err(|_| Fault::Unreadable)
+        let pin = self.pin();
+        let live = pin.live();
+        let names = pin.doc_names().map_err(Error::Catalog)?;
+        let mut documents = ferret_crawl::Documents::by_name(&view).map_err(Error::Catalog)?;
+        if let Some(limiter) = limiter { documents = documents.with_limiter(limiter); }
+        let followed = index.follow(&catalog_view(&view, live), budget, &mut |doc, bytes| {
+            let Some(&name) = names.names(doc).first() else { return Err(Fault::Unreadable); };
+            documents.read_name(&view, name, bytes).map_err(|_| Fault::Unreadable)
         });
         let published = index.view();
         drop(content);
         self.select_content(published);
         drop(writer);
-        if followed.as_ref().is_ok_and(|f| f.segment.is_some() || f.pruned > 0) {
-            self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner).last_follow = Some(timestamp());
-        }
         followed.map_err(Error::Content)
     }
 
@@ -307,24 +297,22 @@ impl Engine {
         let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
         let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
         let index = content.as_mut().ok_or(Error::NoContentIndex)?;
-        let live = live_documents(&view);
-        let merged = index.merge_if_needed(&catalog_view(&view, &live), budget);
+        let pin = self.pin();
+        let merged = index.merge_if_needed(&catalog_view(&view, pin.live()), budget);
         let published = index.view();
         drop(content);
         self.select_content(published);
         drop(writer);
-        if merged.as_ref().is_ok_and(|m| m.is_some()) {
-            self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner).last_merge = Some(timestamp());
-        }
         merged.map_err(Error::Content)
     }
 
     /// Publishes a content view beside the current catalog view.
     fn select_content(&self, content: Arc<ferret_index::View>) {
-        self.current
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .content = Some(content);
+        let mut current = self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let manifest = content.manifest();
+        if manifest.incarnation == current.generation().incarnation && manifest.high_water <= current.catalog.next_doc().0 {
+            current.content = Some(content);
+        }
     }
 
     fn select(&self, view: Catalog) {
@@ -340,18 +328,17 @@ impl Engine {
             Arc::downgrade(&previous.names),
         ));
         drop(retired);
+        let incarnation = view.generation().incarnation;
         *self
             .current
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = QuerySession {
-            catalog: view.clone(),
+            catalog: view,
             names,
             content: previous.content.filter(|content| {
-                content.manifest().incarnation == view.generation().incarnation
+                content.manifest().incarnation == incarnation
             }),
             derived: Arc::default(),
-            last_follow: previous.last_follow,
-            last_merge: previous.last_merge,
         };
     }
 }
@@ -439,14 +426,9 @@ impl QuerySession {
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
+        if !query.has_content() { return query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit); }
         let catalog = &self.catalog;
-        let docs = match self.derived.docs.get() {
-            Some(docs) => docs,
-            None => {
-                let built = DocNames::new(catalog)?;
-                self.derived.docs.get_or_init(|| built)
-            }
-        };
+        let docs = self.doc_names()?;
         let pinned = Pinned::new(self.content.as_deref(), self.live());
         let content = Content {
             pinned: &pinned,
@@ -523,6 +505,14 @@ impl std::error::Error for Error {
     }
 }
 
-fn timestamp() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+impl QuerySession {
+    fn doc_names(&self) -> Result<&DocNames, OpenError> {
+        match self.derived.docs.get() {
+            Some(docs) => Ok(docs),
+            None => {
+                let built = DocNames::new(&self.catalog)?;
+                Ok(self.derived.docs.get_or_init(|| built))
+            }
+        }
+    }
 }

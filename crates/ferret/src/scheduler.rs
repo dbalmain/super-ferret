@@ -139,8 +139,11 @@ impl Scheduler {
     pub fn configured_workers(&self) -> usize {
         self.config.concurrency.max(1)
     }
+    pub fn admit_merge(&self, view: &Catalog, memory: u64, disk: u64) -> Result<(), Blocked> {
+        self.admit_policy(Kind::Checkpoint, view, true, memory, disk)
+    }
     fn admit_command(&self, kind: Kind, view: &Catalog) -> Result<(), Blocked> {
-        self.admit_policy(kind, view, false)
+        self.admit_policy(kind, view, false, 0, 0)
     }
 }
 fn scaled(bytes: u64, names: u32) -> u64 {
@@ -152,7 +155,7 @@ fn scaled(bytes: u64, names: u32) -> u64 {
 }
 impl Control for Scheduler {
     fn admit(&self, kind: Kind, view: &Catalog) -> Result<(), Blocked> {
-        self.admit_policy(kind, view, true)
+        self.admit_policy(kind, view, true, 0, 0)
     }
     fn limiter(&self) -> Arc<Limiter> {
         self.limiter.clone()
@@ -162,7 +165,7 @@ impl Control for Scheduler {
     }
 }
 impl Scheduler {
-    fn admit_policy(&self, kind: Kind, view: &Catalog, polite: bool) -> Result<(), Blocked> {
+    fn admit_policy(&self, kind: Kind, view: &Catalog, polite: bool, memory: u64, disk_bytes: u64) -> Result<(), Blocked> {
         let disk = ferret_crawl::available_disk(&self.index).ok();
         let watch = self
             .machine
@@ -177,16 +180,17 @@ impl Scheduler {
             .machine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let memory = match kind {
+        let configured_memory = match kind {
             Kind::FullRewalk => self.config.full_memory,
             Kind::Checkpoint => self.config.checkpoint_memory,
         };
-        let required_memory = scaled(memory, view.name_count())
+        let required_memory = scaled(configured_memory, view.name_count())
+            .max(memory)
             .max(self.config.memory_floor)
             .saturating_add(self.config.additional_memory)
             .saturating_add(watch_bytes);
         let required_disk =
-            scaled(self.config.disk, view.name_count()).max(self.config.disk.min(16 << 20));
+            scaled(self.config.disk, view.name_count()).max(self.config.disk.min(16 << 20)).max(disk_bytes);
         let result = if polite && let Some(reason) = m.status.paused {
             Err(reason)
         } else if m.status.sample.memory.is_none_or(|n| n < required_memory) {

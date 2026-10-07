@@ -7,7 +7,7 @@
 //! head        magic "ferretix", format version u32, tokenizer version u32,
 //!             catalog incarnation 16 B, high water u32, frontier u32,
 //!             sequence u64, next segment number u64, segment count u32,
-//!             unreadable count u32                                    64 B
+//!             unreadable count u32, last follow u64, last merge u64     80 B
 //! segments    per segment, in DocId order, 64 B: number u64, first u32,
 //!             last u32, docs u32, 4 B zero, terms u64, pairs u64,
 //!             bytes u64, the segment's head digest 16 B
@@ -36,9 +36,9 @@ use crate::segment::Info;
 const MAGIC: [u8; 8] = *b"ferretix";
 
 /// Bumped when this layout changes.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
-const HEAD: usize = 64;
+const HEAD: usize = 80;
 const ENTRY: usize = 64;
 
 /// The manifest's file name inside the index directory.
@@ -102,6 +102,9 @@ pub struct Manifest {
     /// Increased by every publication.
     pub sequence: u64,
     pub next_number: u64,
+    /// Unix seconds of the last committed follow/merge, absent on legacy manifests.
+    pub last_follow: Option<u64>,
+    pub last_merge: Option<u64>,
     /// In DocId order; ranges never overlap.
     pub segments: Vec<SegmentEntry>,
     /// Live documents a follow pass could not read with their catalog key
@@ -119,6 +122,8 @@ impl Manifest {
             frontier: 0,
             sequence: 0,
             next_number: 0,
+            last_follow: None,
+            last_merge: None,
             segments: Vec::new(),
             unreadable: Vec::new(),
         }
@@ -137,6 +142,8 @@ impl Manifest {
         out.extend_from_slice(&self.next_number.to_le_bytes());
         out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.unreadable.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.last_follow.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&self.last_merge.unwrap_or(0).to_le_bytes());
         debug_assert_eq!(out.len(), HEAD);
         for s in &self.segments {
             out.extend_from_slice(&s.number.to_le_bytes());
@@ -162,17 +169,18 @@ impl Manifest {
     /// coverage, since every byte of it is derived from the catalog.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let body = bytes.len().checked_sub(16)?;
-        if bytes.len() < HEAD + 16
+        if bytes.len() < 64 + 16
             || bytes[..8] != MAGIC
             || checksum(&bytes[..body]) != bytes[body..]
-            || u32_at(bytes, 8) != FORMAT_VERSION
+            || !matches!(u32_at(bytes, 8), 1 | FORMAT_VERSION)
         {
             return None;
         }
         let mut incarnation = [0; 16];
         incarnation.copy_from_slice(&bytes[16..32]);
         let (count, unreadable) = (u32_at(bytes, 56) as usize, u32_at(bytes, 60) as usize);
-        if body != HEAD + count.checked_mul(ENTRY)? + unreadable.checked_mul(4)? {
+        let head = if u32_at(bytes, 8) == 1 { 64 } else { HEAD };
+        if body != head + count.checked_mul(ENTRY)? + unreadable.checked_mul(4)? {
             return None;
         }
         let mut manifest = Self {
@@ -182,11 +190,13 @@ impl Manifest {
             frontier: u32_at(bytes, 36),
             sequence: u64_at(bytes, 40),
             next_number: u64_at(bytes, 48),
+            last_follow: (head == HEAD).then(|| u64_at(bytes, 64)).filter(|&n| n != 0),
+            last_merge: (head == HEAD).then(|| u64_at(bytes, 72)).filter(|&n| n != 0),
             segments: Vec::with_capacity(count),
             unreadable: Vec::with_capacity(unreadable),
         };
         for i in 0..count {
-            let at = HEAD + i * ENTRY;
+            let at = head + i * ENTRY;
             let mut digest = [0; 16];
             digest.copy_from_slice(&bytes[at + 48..at + 64]);
             if bytes[at + 20..at + 24] != [0; 4] {
@@ -203,7 +213,7 @@ impl Manifest {
                 digest,
             });
         }
-        let at = HEAD + count * ENTRY;
+        let at = head + count * ENTRY;
         manifest
             .unreadable
             .extend((0..unreadable).map(|i| u32_at(bytes, at + i * 4)));
@@ -272,6 +282,21 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_manifest_keeps_segments_and_has_unknown_timestamps() {
+        let mut manifest = sample();
+        let mut bytes = manifest.encode();
+        bytes.drain(64..80);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let body = bytes.len() - 16;
+        let sum = checksum(&bytes[..body]);
+        bytes[body..].copy_from_slice(&sum);
+        manifest.last_follow = None;
+        manifest.last_merge = None;
+        assert_eq!(Manifest::decode(&bytes), Some(manifest.clone()));
+        assert_eq!(Manifest::decode(&manifest.encode()), Some(manifest));
+    }
+
     fn sample() -> Manifest {
         Manifest {
             tokenizer_version: 1,
@@ -280,6 +305,8 @@ mod tests {
             frontier: 90,
             sequence: 4,
             next_number: 3,
+            last_follow: Some(100),
+            last_merge: Some(90),
             segments: vec![
                 SegmentEntry {
                     number: 0,

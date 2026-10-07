@@ -43,6 +43,7 @@ pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
     o.int("protected_scopes", protected as u64)
         .int("opaque_directories", opaque as u64)
         .int("catalog_bytes", catalog.bytes_read())
+        .int("index_resident_bytes", session.content().map_or(0, |v| v.resident_bytes()) as u64)
         .int("planner_bytes", session.name_index().bytes() as u64)
         .int(
             "name_postings_bytes",
@@ -133,7 +134,7 @@ fn index_fields(o: &mut Object<'_>, session: &QuerySession) {
             .int("unreadable", view.map_or(0, |v| v.manifest().unreadable.iter().filter(|&&d| live.contains(d)).count() as u64))
             .int("segments", view.map_or(0, |v| v.segments().len() as u64))
             .int("bytes", view.map_or(0, |v| v.manifest().segments.iter().map(|s| s.bytes).sum::<u64>()))
-            .opt_int("last_follow", session.last_follow)
-            .opt_int("last_merge", session.last_merge);
+            .opt_int("last_follow", view.and_then(|v| v.manifest().last_follow))
+            .opt_int("last_merge", view.and_then(|v| v.manifest().last_merge));
     });
 }

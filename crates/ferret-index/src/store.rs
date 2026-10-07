@@ -65,7 +65,7 @@ pub struct Budget<'a> {
     /// `ferret index`. Document reads are paced by the host's callback.
     /// Cooperative pause checked between documents and merge terms.
     pub cancelled: &'a dyn Fn() -> bool,
-    pub pace: &'a dyn Fn(usize),
+    pub pace: &'a dyn Fn(usize) -> io::Result<()>,
 }
 
 impl Budget<'static> {
@@ -74,7 +74,7 @@ impl Budget<'static> {
         Self {
             bytes: u64::MAX,
             buffer: BUFFER,
-            pace: &|_| {},
+            pace: &|_| Ok(()),
             cancelled: &|| false,
         }
     }
@@ -222,6 +222,16 @@ impl std::fmt::Debug for View {
 }
 
 impl View {
+    /// Resident manifest and segment metadata; postings remain on disk.
+    /// Shared segments are counted once in this view, also shared by older pins.
+    pub fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + std::mem::size_of::<Manifest>()
+            + self.manifest.segments.capacity() * std::mem::size_of::<SegmentEntry>()
+            + self.manifest.unreadable.capacity() * std::mem::size_of::<u32>()
+            + self.segments.capacity() * std::mem::size_of::<Arc<Segment<File>>>()
+            + self.segments.iter().map(|s| s.resident_bytes() + std::mem::size_of::<Segment<File>>()).sum::<usize>()
+    }
+
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -377,7 +387,10 @@ impl IndexWriter {
             let Some(run) = merge::choose(&writer.current.manifest.segments, &alive) else {
                 return Ok(None);
             };
-            writer.merge_run(catalog, budget, run)
+            match writer.merge_run(catalog, budget, run) {
+                Err(Error::Io(ref error) | Error::Segment(ReadError::Io(ref error))) if error.kind() == io::ErrorKind::Interrupted => Err(Error::Cancelled),
+                result => result,
+            }
         })
     }
 
@@ -512,6 +525,7 @@ impl IndexWriter {
             manifest.segments.push(entry);
             opened = Some(segment);
         }
+        manifest.last_follow = Some(timestamp());
         manifest.frontier = frontier;
         manifest.high_water = manifest.high_water.max(live.bound());
         let mut segments = self.current.segments.clone();
@@ -529,6 +543,7 @@ impl IndexWriter {
         run: std::ops::Range<usize>,
     ) -> Result<Option<Merged>, Error> {
         let mut manifest = self.current.manifest.clone();
+        manifest.last_merge = Some(timestamp());
         manifest
             .unreadable
             .retain(|&doc| catalog.live.contains(doc));
@@ -562,29 +577,39 @@ impl IndexWriter {
                 segment: None,
             }));
         }
+        let merge_pace = |bytes| {
+            if (budget.cancelled)() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "merge paused"));
+            }
+            (budget.pace)(bytes)
+        };
         let inputs = self.current.segments[run.clone()]
             .iter()
             .map(|segment| {
                 Segment::open(Paced {
                     file: segment.source(),
-                    pace: budget.pace,
+                    pace: &merge_pace,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         let number = manifest.next_number;
         let scratch = self.dir.join(format!("tmp-{number}.postings"));
-        let (entry, segment) = self.write_segment(&mut manifest, docs, |file| {
+        let result = self.write_segment(&mut manifest, docs, |file| {
             let postings = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
                 .open(&scratch)?;
             let writer = Writer::spilling(first, last, file.try_clone()?, postings)?;
-            let result = merge::stream(&inputs, catalog.live, writer, budget.pace, budget.cancelled);
+            let result = merge::stream(&inputs, catalog.live, writer, &merge_pace, budget.cancelled);
             let _ = fs::remove_file(&scratch);
             Ok(result?.total())
-        })?;
+        });
+        let (entry, segment) = match result {
+            Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::Interrupted => return Err(Error::Cancelled),
+            other => other?,
+        };
 
         if (budget.cancelled)() {
             return Err(Error::Cancelled);
@@ -737,7 +762,7 @@ fn remove_unnamed(dir: &Path, manifest: &Manifest) -> io::Result<()> {
 /// A segment file with the host's pacer in front of every transfer.
 struct Paced<'a> {
     file: &'a File,
-    pace: &'a dyn Fn(usize),
+    pace: &'a dyn Fn(usize) -> io::Result<()>,
 }
 
 impl ReadAt for Paced<'_> {
@@ -746,15 +771,19 @@ impl ReadAt for Paced<'_> {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        (self.pace)(buf.len());
-        ReadAt::read_exact_at(self.file, buf, offset)
+        for (i, chunk) in buf.chunks_mut(64 << 10).enumerate() {
+            (self.pace)(chunk.len())?;
+            ReadAt::read_exact_at(self.file, chunk, offset + (i * (64 << 10)) as u64)?;
+        }
+        Ok(())
     }
 }
 
 impl Write for Paced<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (self.pace)(buf.len());
-        self.file.write(buf)
+        let chunk = &buf[..buf.len().min(64 << 10)];
+        (self.pace)(chunk.len())?;
+        self.file.write(chunk)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -792,3 +821,7 @@ thread_local! {
 
 #[cfg(test)]
 mod tests;
+
+fn timestamp() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}

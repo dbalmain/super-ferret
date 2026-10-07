@@ -549,19 +549,31 @@ fn serve(
 fn content_turn(host: &Host, engine: &Engine, scheduler: &crate::scheduler::Scheduler) -> io::Result<Duration> {
     use ferret_catalog::bulk::Control;
     let started = Instant::now();
-    let interrupted = || {
+    let should_interrupt = || {
         host.stop.load(Ordering::Acquire)
             || host.writer_pending.load(Ordering::Acquire) != 0
             || scheduler.status().paused.is_some()
+            || host.writer_status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).watch.as_ref().and_then(|w| w.next_due()).is_some_and(|due| due <= Instant::now())
             || host.lifecycle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).draining
+    };
+    #[cfg(debug_assertions)]
+    let checks = std::cell::Cell::new(0u64);
+    let interrupted = || {
+        #[cfg(debug_assertions)]
+        {
+            checks.set(checks.get() + 1);
+            content_checkpoint(host, checks.get(), &should_interrupt);
+        }
+        should_interrupt()
     };
     let cancelled = || interrupted() || started.elapsed() >= Duration::from_millis(100);
     if cancelled() { return Ok(Duration::from_secs(1)); }
     let limiter = scheduler.limiter();
     let pace = |bytes: usize| {
         for chunk in (0..bytes).step_by(64 << 10) {
-            let _ = limiter.transfer((bytes - chunk).min(64 << 10), || Ok(()));
+            limiter.transfer((bytes - chunk).min(64 << 10), || Ok(()))?;
         }
+        Ok(())
     };
     let budget = ferret_index::Budget {
         bytes: 256 << 10,
@@ -576,7 +588,14 @@ fn content_turn(host: &Host, engine: &Engine, scheduler: &crate::scheduler::Sche
         return Ok(Duration::ZERO);
     }
     let pin = engine.pin();
-    if let Err(reason) = scheduler.admit(ferret_catalog::bulk::Kind::Checkpoint, pin.catalog()) {
+    let manifest = pin.content().map(|v| v.manifest());
+    let input_bytes = manifest.map_or(0, |m| m.segments.iter().map(|s| s.bytes).sum::<u64>());
+    let docs = manifest.map_or(0, |m| m.segments.iter().map(|s| u64::from(s.docs)).sum::<u64>());
+    // Conservative headroom for a decoded common list (two growable vectors),
+    // spilling scratch, reopened dictionaries, and output plus postings scratch.
+    let memory = docs.saturating_mul(24).saturating_add(64 << 20).saturating_add(input_bytes / 8);
+    let disk = input_bytes.saturating_mul(3).saturating_add(16 << 20);
+    if let Err(reason) = scheduler.admit_merge(pin.catalog(), memory, disk) {
         host.writer_status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).blocked = Some(reason);
         return Ok(Duration::from_secs(1));
     }
@@ -846,3 +865,22 @@ pub(super) fn fields(host: &Host, o: &mut crate::json::Object<'_>) {
 
 #[cfg(test)]
 mod tests;
+
+/// Deterministic integration barrier on production cancellation checkpoints.
+/// A command, battery transition or drain releases it through the real predicate.
+#[cfg(debug_assertions)]
+fn content_checkpoint(host: &Host, checks: u64, interrupted: &dyn Fn() -> bool) {
+    let Some(gate) = std::env::var_os("FERRET_CONTENT_TEST_GATE").map(PathBuf::from) else { return; };
+    let phase = host.writer_status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).operation;
+    let Some(phase @ ("follow" | "merge")) = phase else { return; };
+    let held = gate.join(phase);
+    if !held.exists() || checks < 10 { return; }
+    if phase == "merge" {
+        let written = std::fs::read_dir(host.index.join(crate::engine::CONTENT_DIR)).ok().is_some_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| entry.file_name().to_string_lossy().starts_with("tmp-") && entry.path().extension().is_some_and(|e| e == "seg") && entry.metadata().is_ok_and(|m| m.len() > 0))
+        });
+        if !written { return; }
+    }
+    let _ = std::fs::write(gate.join(format!("{phase}.reached")), b"checkpoint");
+    while held.exists() && !interrupted() { std::thread::sleep(Duration::from_millis(1)); }
+}

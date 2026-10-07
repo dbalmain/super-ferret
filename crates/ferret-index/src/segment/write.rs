@@ -158,27 +158,21 @@ impl Writer {
     /// Writes whole chunks out of a spilling writer once its buffers pass
     /// a threshold, calling `pace` with each write's size first. Does
     /// nothing for an in-memory writer. Call it between pushes.
-    pub fn spill(&mut self, pace: &dyn Fn(usize)) -> io::Result<()> {
+    pub fn spill(&mut self, pace: &dyn Fn(usize) -> io::Result<()>) -> io::Result<()> {
         let Some(spill) = self.spill.as_mut() else {
             return Ok(());
         };
         if self.blocks.len() >= SPILL {
             let whole = self.blocks.len() / CHUNK * CHUNK;
             chunk_sums(&self.blocks[..whole], &mut spill.blocks_sums);
-            pace(whole);
-            spill
-                .out
-                .write_all_at(&self.blocks[..whole], HEAD as u64 + spill.blocks_written)?;
+            write_paced(&spill.out, &self.blocks[..whole], HEAD as u64 + spill.blocks_written, pace)?;
             spill.blocks_written += whole as u64;
             self.blocks.drain(..whole);
         }
         if self.postings.len() >= SPILL {
             let whole = self.postings.len() / CHUNK * CHUNK;
             chunk_sums(&self.postings[..whole], &mut spill.postings_sums);
-            pace(whole);
-            spill
-                .postings
-                .write_all_at(&self.postings[..whole], spill.postings_written)?;
+            write_paced(&spill.postings, &self.postings[..whole], spill.postings_written, pace)?;
             spill.postings_written += whole as u64;
             self.postings.drain(..whole);
         }
@@ -287,7 +281,7 @@ impl Writer {
     /// Completes a spilling writer's segment file: the rest of the blocks,
     /// the postings copied from scratch, then the index, the sums and, last,
     /// the head. Does not sync. `pace` is called before each write.
-    pub fn finish_spilled(mut self, pace: &dyn Fn(usize)) -> io::Result<Sizes> {
+    pub fn finish_spilled(mut self, pace: &dyn Fn(usize) -> io::Result<()>) -> io::Result<Sizes> {
         let Some(mut spill) = self.spill.take() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -299,16 +293,17 @@ impl Writer {
         let blocks_len = spill.blocks_written + self.blocks.len() as u64;
         let postings_len = spill.postings_written + self.postings.len() as u64;
         let mut at = HEAD as u64 + spill.blocks_written;
-        pace(self.blocks.len());
-        spill.out.write_all_at(&self.blocks, at)?;
+        write_paced(&spill.out, &self.blocks, at, pace)?;
         at += self.blocks.len() as u64;
         let mut copy = vec![0; SPILL];
         let mut from = 0;
         while from < spill.postings_written {
             let n = (spill.postings_written - from).min(SPILL as u64) as usize;
-            spill.postings.read_exact_at(&mut copy[..n], from)?;
-            pace(n);
-            spill.out.write_all_at(&copy[..n], at)?;
+            for (i, chunk) in copy[..n].chunks_mut(64 << 10).enumerate() {
+                pace(chunk.len())?;
+                spill.postings.read_exact_at(chunk, from + (i * (64 << 10)) as u64)?;
+            }
+            write_paced(&spill.out, &copy[..n], at, pace)?;
             (from, at) = (from + n as u64, at + n as u64);
         }
         let mut sums = spill.blocks_sums;
@@ -316,8 +311,7 @@ impl Writer {
         sums.extend_from_slice(&spill.postings_sums);
         let tail: [&[u8]; 3] = [&self.postings, &self.index, &sums];
         for bytes in tail {
-            pace(bytes.len());
-            spill.out.write_all_at(bytes, at)?;
+            write_paced(&spill.out, bytes, at, pace)?;
             at += bytes.len() as u64;
         }
         let lengths = [
@@ -381,4 +375,13 @@ impl Writer {
             ..self.sizes
         }
     }
+}
+
+// Bound each paced transfer, including a large singleton term or tail section.
+fn write_paced(file: &std::fs::File, bytes: &[u8], offset: u64, pace: &dyn Fn(usize) -> io::Result<()>) -> io::Result<()> {
+    for (i, chunk) in bytes.chunks(64 << 10).enumerate() {
+        pace(chunk.len())?;
+        file.write_all_at(chunk, offset + (i * (64 << 10)) as u64)?;
+    }
+    Ok(())
 }

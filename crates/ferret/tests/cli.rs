@@ -2211,6 +2211,7 @@ fn text_search_reads_uncovered_documents_and_logs_the_content_plan() {
     let alpha = env.write("a.txt", b"alpha beta\n");
     let gamma = env.write("sub/b.txt", b"gamma requestHandler\n");
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    fs::remove_dir_all(env.base.join("index/index")).unwrap();
     let found = env.run(&[os("search"), os("text:alpha")]);
     assert_eq!(
         paths(&found),
@@ -2286,6 +2287,9 @@ fn too_many_uncovered_documents_need_scan_uncovered() {
     }
     let hit = env.write("hit.txt", b"needle\n");
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    let covered = env.run(&[os("search"), os("text:needle")]);
+    assert_eq!(paths(&covered), [hit.clone()], "{}", stderr(&covered));
+    fs::remove_dir_all(env.base.join("index/index")).unwrap();
     let refused = env.run(&[os("search"), os("text:needle")]);
     assert_eq!(code(&refused), 3, "{}", stderr(&refused));
     let message = stderr(&refused);

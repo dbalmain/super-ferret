@@ -94,7 +94,9 @@ fn process(reader: impl BufRead, protocol_stdin: bool) -> io::Result<()> {
 }
 
 fn open_engine(index: &Path) -> Option<Engine> {
-    Engine::open(index).ok().flatten()
+    let engine = Engine::open(index).ok().flatten()?;
+    engine.open_content(index).ok()?;
+    Some(engine)
 }
 
 pub(crate) fn read_line_bounded(
@@ -167,6 +169,7 @@ fn handle(
                     .is_none_or(|current| current.generation() != peek.generation())
                 && let Ok(Some(reloaded)) = Engine::open(path)
             {
+                reloaded.open_content(path).map_err(io::Error::other)?;
                 *engine = Some(reloaded);
             }
             event(request, "reload", |o| {
