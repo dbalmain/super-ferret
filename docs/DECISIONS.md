@@ -80,11 +80,12 @@ Predecessors, carried forward where still open:
 | D62 | `ferret search` syntax for content and booleans          | open           | rec A: `text:` atoms; find-style `OR`, `NOT`, `(` `)` as whole arguments (S2 M0)                               |
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
 | D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
-| D65 | The term dictionary is 87% of the index                  | open           | rec A for S2; M3 merged 11.1% (full 9.8%) > 8%, so C's trigram experiment opens S3 (S2 M2b, M3)            |
+| D65 | The term dictionary is 87% of the index                  | open           | rec A for S2; S3 M2 tests H (singleton fingerprints) in place of C, decided at steady state: ≥15% term-index saving (S2 M2b, M3; S3 amendment) |
 | D66 | Phrase queries read too much: positions, or not         | open           | rec A: no positions; ship windowed verify; coarse chunk map for big files is an S3 experiment beside D65 C (S2 M4c) |
-| D67 | How `ferret search` spells a content regex            | open           | rec A: `grep:REGEX`, case-insensitive, multi-line `^`/`$`; `re:` stays names (S3 M0) |
-| D68 | Per-document filters: build them, or cost them on paper | open           | rec B: price filters from M1 key counts + probe microbench; build postings only (S3 M0) |
+| D67 | How `ferret search` spells a content regex, and when it refuses | open | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0) |
+| D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B: screen filters on paper from M1 key counts + probe microbench before building any (S3 M0) |
 | D69 | Saturated large documents in trigram postings           | open           | rec A: index every document's trigrams; saturated bitmap only if M1/M4 measure it cheap (S3 M0) |
+| D70 | How large the trigram follow buffer may grow           | open           | rec A: separate bounds, if M1a measures follow peak RSS < 512 MiB; B (shared flush charge) if not (S3 M0) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3608,6 +3609,68 @@ query routed through them, then reopens D65 with C costed.
 If you want the size down before S3, say C now, and S2's rare-term queries will
 go through a verify scan until S3 lands.
 
+### D65 amendment — H replaces C as the singleton experiment
+
+**For the existing D65 brief, to append.** S3 M0, revision 5, 2026-10-08;
+[design](S3.md#experiment-d65-rare-terms-without-dictionary-strings).
+
+**C as written is unsound, and so is C′.** Three problems, the first two from
+Astra and confirmed against the code:
+
+- **False negatives.** The trigram fallback checks a normalised term against
+  the document's raw bytes. A document whose `Kelvin` is written with the
+  Kelvin sign emits the term `kelvin`, but its bytes hold no `kel` trigram, so
+  C misses it.
+- **Merging loses documents.** Merging a dropped singleton into a segment that
+  keeps the term means a dictionary hit no longer lists every document.
+- **Every lookup pays.** A dictionary miss stops meaning absent, so every term
+  lookup pays the trigram fallback.
+
+**The replacement option, H.** Singletons move to a searchable section of
+(32-bit fingerprint, DocId) records, and every lookup unions that section with
+the dictionary. It is sound by construction, and it needs no trigrams.
+
+Records never return to the dictionary, so the section starts with every
+**first-build** singleton: about 26.3M records on `$HOME` (derived from M3),
+about 134 MB. A record persists while its document remains live. A purge
+removes records of dead documents, and demotes into the section dictionary
+terms left with live df 1. Its saving therefore shrinks as merging removes the
+control's own singletons. The figures below are lifecycle **estimates, not
+bounds**. Removing an entry can lengthen its front-coded successor, so M2's
+real encoding at each state decides the saving.
+
+| State       | Control (measured, M3) | H (estimate) | Change |
+| ----------- | ---------------------- | ------------ | ------ |
+| first build | 500.7 MB               | ≈ 283 MB     | −43%   |
+| steady (13) | 442.3 MB               | ≈ 326 MB     | −26%   |
+| full merge  | 391.9 MB               | ≈ 357 MB     | −9%    |
+
+An idealised conversion of only the merged index's singletons would save about
+105 MB, but H does not build that.
+
+**Latency.** Every fingerprint hit is Maybe and costs one verification read. A
+term carries one record per first-build segment in which it was a singleton
+(up to 49 on `$HOME`), plus one per later purge that left it with live df 1.
+Each lookup also pays one or two extra block reads per segment.
+
+**Proposed rule.** M2 builds H through its own lifecycle, encodes each state
+for real, and runs S2's churn trace to report records added by demotion,
+records removed by purge, and the net population. H replaces
+dictionary codec 1 if, **at steady state**, all of these hold:
+
+- term-index bytes fall by at least 15%;
+- warm p90 for df = 1, df 2–100 and absent terms stays under 20 ms;
+- the mid and common medians stay within 1.5× the control's;
+- build CPU stays within 1.2×.
+
+Otherwise A stands. The full-merge figure is reported beside it.
+
+**Fact that would change it:** H passing at steady state but saving under 15%
+at full merge, which is what the estimate predicts. That matters only if the
+index spends its life near full merge. If S2's merge policy keeps `$HOME` near
+13 segments, take H. If long-running daemons drift toward one segment, H's
+advantage erodes, and A is the simpler choice.
+
 ## D66 — Phrase queries read too much: positions, or not
 
 **Status: open.** S2 M4c, 2026-10-07;
@@ -3666,106 +3729,205 @@ covering verification time above about 100 ms. Measured with
   make a `jsonl` policy (D65's side question) the cheaper fix than any
   structure.
 
-## D67 — How `ferret search` spells a content regex
+## D67 — How `ferret search` spells a content regex, and when it refuses
 
-**Status: open.** S3 M0, 2026-10-07; [design](S3.md#query-surface-d67).
+**Status: open.** S3 M0, revision 3, 2026-10-08;
+[design](S3.md#query-surface-d67).
 
-**Question:** What prefix makes an argument a regex over file content, and what
-line and case semantics does it have?
+**Question (a):** What prefix makes an argument a regex over file content, and
+with what line and case semantics?
 
-`re:` already means a regex over **names** (S1). D62 A gave content `text:`.
-DESIGN's query section sketched `/regex/`. Agents call `ferret search` from
-shells, so quoting cost matters.
+**Question (b):** When the planned expression could verify most of the tree,
+does the query refuse, at what threshold, and through which flag?
 
-| Option                                               | Costs                                                                                                                                                              | Buys                                                                                                                      |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| A. `grep:REGEX`                                      | One more prefix to learn.                                                                                                                                          | It reads as what it does, and agents know grep. `case:grep:` composes as `case:` does elsewhere. `re:` keeps its meaning. |
-| B. `text:/REGEX/`                                    | It changes `text:`'s meaning for an argument that starts and ends with `/`, which today is a term (`text:/usr/` finds `usr`). A regex containing `/` needs a rule. | No new prefix: `text:` covers all content.                                                                                |
-| C. Bare `/REGEX/`, as DESIGN sketched                | `/` already makes a bare word a path substring (S1), so `/usr/` changes meaning.                                                                                   | The shortest spelling.                                                                                                    |
-| D. `re:` searches content as well as names (a union) | It changes every existing `re:` query's meaning and cost (D62's argument against its B).                                                                           | One regex prefix.                                                                                                         |
+`re:` already means a regex over **names** (S1), and D62 A gave content the
+`text:` prefix. DESIGN's query section sketched `/regex/`. Agents call
+`ferret search` from shells, so quoting cost matters.
 
-Semantics, under any option:
+**(a) Spelling.**
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. `grep:REGEX` | One more prefix to learn. | It reads as what it does, and agents know grep. `case:grep:` composes as `case:` does elsewhere. `re:` keeps its meaning. |
+| B. `text:/REGEX/` | It changes `text:` for an argument that starts and ends with `/`, which today is a term (`text:/usr/` finds `usr`). A regex containing `/` needs a rule. | No new prefix: `text:` covers all content. |
+| C. Bare `/REGEX/`, as DESIGN sketched | `/` already makes a bare word a path substring (S1), so `/usr/` would change meaning. | The shortest spelling. |
+| D. `re:` searches content as well as names | It changes every existing `re:` query's meaning and cost, which is D62's argument against its B. | One regex prefix. |
+
+Semantics under any option:
 
 - **case-insensitive by default**, as `text:` and `re:` are, with `case:` for
   exact case;
-- **multi-line**: `^` and `$` match at line boundaries, as grep users expect.
-  `(?-m)` restores whole-document anchors;
-- `.` does not match `\n` (the `regex` default).
+- **multi-line:** `^` and `$` match at line boundaries, as grep users expect,
+  and `(?-m)` restores whole-document anchors;
+- `.` does not match `\n`, the `regex` default.
 
-The alternative is the `regex` defaults: whole-document `^`/`$`. Those are
-surprising for content, though right for names.
+The alternative is the `regex` defaults, with whole-document `^` and `$`. Those
+are right for names but surprising for content. A pattern the verifier cannot
+compile, whether from a syntax error or from the regex crate's compiled-size
+limit, is reported as a pattern error.
 
-**Recommendation: A, with multi-line on.** Fastest and simplest are indifferent;
-this is interface taste and compatibility, as D62 was.
+**(b) Refusal.** Before reading any list, the planner computes M, an **upper
+bound** on the live documents the whole expression leaves Maybe. It is taken
+from dictionaries only, and follows each atom's real certainty rules:
+`case:text:`, capped terms and phrases are Maybe, as are H's fingerprint
+records. It covers `NOT` and `OR`: `NOT grep:\d+` and `grep:\d+ OR text:rare`
+both leave every document Maybe.
 
-**Fact that would change it:** S4's agent traces showing agents reaching for
-`/…/` or for `re:` on content. Then make B or D the spelling, with the old one
-as an alias.
+To stay an upper bound, `NOT e` is assumed to admit every live document
+(P = live). That has a cost. An unindexed regex narrowed **only** by a `NOT`,
+such as `NOT text:common grep:'\d+'`, is estimated at every live document and
+refused, even when few documents actually lack `common`. A query with any
+positive narrowing atom (`ext:rs`, `text:serde`) is not affected.
 
-## D68 — Per-document filters: build them, or cost them on paper
+S2 already refuses when uncovered documents exceed 10,000, with the flag
+`--scan-uncovered`.
 
-**Status: open.** S3 M0, 2026-10-07;
+| Option | Costs | Buys |
+| --- | --- | --- |
+| i. Refuse when M > live / 4 with `ScanRequired`; one flag `--scan` overrides both this and S2's uncovered refusal, with `--scan-uncovered` kept as an alias | Some broad but legitimate queries need the flag. `grep:the` likely does on `$HOME`, and so does a regex narrowed only by `NOT`. M is an upper bound, so it sometimes refuses a query that would have been cheaper. | No accidental 4 GB read, with a bound that is proved, not hoped for. One rule an agent can learn, and one flag. |
+| ii. As i, but with a tighter `NOT` that uses an exact count of e's Yes documents, which needs reading e's lists before deciding | A list read before every refusal decision on a `NOT` query, and a second estimate path to keep correct. | Fewer refusals of `NOT`-narrowed regexes. |
+| iii. Never refuse; report M in `explain()` and the JSON stats | Agents pay the full read before learning the cost. | Nothing to learn. |
+
+**Recommendation: (a) A, with multi-line on; (b) i.** On (a), fastest and
+simplest are indifferent: this is interface taste and compatibility, as D62
+was. On (b), i is the simplest sound rule, and it follows S2's precedent. The
+`NOT`-only over-refusal is narrow, and `--scan` answers it.
+
+**Fact that would change it:** S4's agent traces. If agents reach for `/…/` or
+for `re:` on content, make B or D the spelling, with the old one as an alias.
+If agents hit `ScanRequired` on `NOT`-narrowed queries they meant, take ii. If
+they hit it on broad positive queries, raise the fraction.
+
+## D68 — Per-document filters: a screening stage, terms and trigrams separately
+
+**Status: open.** S3 M0, revision 3, 2026-10-08;
 [design](S3.md#per-document-trigram-filters).
 
-**Question:** ROADMAP says S3 builds per-document trigram filters beside trigram
-postings, and benches per-document term filters against postings (D6, D8).
-Should both filters be built and benched, or priced from exact key counts and a
-microbenchmark, with only postings built?
+**Question:** ROADMAP says S3 builds per-document trigram filters beside
+trigram postings, and benches per-document term filters against postings (D6,
+D8). Should either filter go into the index, or is a screening measurement
+enough to decide?
 
-A binary fuse filter's size is determined by its key count, and each key is
-exactly one posting. So filter bytes are `pairs × ~9 bits / 8`, plus overhead
-for small documents. Figures are **estimates** unless marked:
+A binary fuse filter's size follows from its key count, and each key is one
+posting, so its bytes can be computed exactly from the documents' key sets.
+Figures are **estimates** unless marked:
 
-- **Trigrams:** about 500 MB of filters against about 333 MB of postings at the
-  central estimate. Filters are smaller only if postings average more than 9
-  bits per pair; term lists measured 8.32 (M2), and trigram lists are denser.
-- **Terms:** 89.7M pairs (**measured**, M1c) give 101 MB of filters against S2's
-  392 MB merged index (**measured**, M3), so 3.9× smaller.
-- **Latency:** either filter makes every query probe every live document. At 10M
-  that is about 0.13–2.7 s warm, against a rare term's measured 1.94 ms warm
-  median (M4b).
+- **Trigrams:** about 500 MB of filters against about 351 MB of complete
+  trigram files at the central estimate. The comparison flips if postings
+  average much above 9 bits per pair. Term lists measured 8.32 (M2), and
+  trigram lists should be denser.
+- **Terms:** 89.7M pairs (**measured**, M1c) give about 101 MB of filters,
+  against S2's 392 MB merged index (**measured**, M3). That is 3.9× smaller,
+  so term filters are a real density option.
+- **Latency:** a filter is probed once per candidate document. Unnarrowed, that
+  is every live document: 0.13–2.7 s warm at 10M, against a rare term's
+  measured 1.94 ms warm median (M4b). Narrowed by a selective name atom or a
+  rare term, the probe cost shrinks with the narrowing.
 - **D8's premise** that filters cost 12% of postings is an arithmetic error in
   the research budget: 248 Mbit should have been 248 MB.
 
-| Option                                                                                                                                           | Costs                                                                                                                                                 | Buys                                                                                     |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| A. Build both filters and bench them, as ROADMAP says                                                                                            | A filter builder, a `Probe::DocFilter` arm, filter merging, and their tests: about one slice of work for structures the arithmetic already rules out. | Measured rather than computed numbers; D6's experiment as written.                       |
-| B. Compute filter bytes from M1's exact per-document key counts; microbench the probe over synthetic filters of those sizes; build postings only | The numbers are a calculation plus a microbenchmark, not a shipped structure, so the cold page-cache behaviour of real filter files is not measured.  | A slice saved. D6/D8 still get an answer with numbers: bytes exact, probe cost measured. |
-| C. Build the term filter only, as a density option behind the opt-in                                                                             | A second term structure to keep correct, and rare-term queries 100–1000× slower when it is chosen.                                                    | The smallest term index by far, for users who value bytes over everything.               |
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Build both filters into the index and bench them, as ROADMAP says | A filter builder in follow and merge, a probe arm, coverage and tests: about one slice of work before knowing whether either survives. | Measured end-to-end numbers, including cold page-cache behaviour of real filter files. |
+| B. Screen first: layout bytes from exact key sets in M1a; real filters on matched workloads in M1b, after M3 (unnarrowed; narrowed by 1%, 10%, 50% name atoms; narrowed by a rare term), terms and trigrams separately; integrate only a layout that survives | A layout that survives screening still needs the integration slice later. Screening does not measure follow or merge cost. | Each structure is decided on measured bytes and probe cost, before any index code. A surviving density/latency trade comes back here with its numbers. |
+| C. Build term filters only, as a density opt-in, without screening | A second term structure to keep correct; unnarrowed rare-term queries 100–1000× slower when chosen. | The smallest term index, for users who value bytes over everything. |
 
-**Recommendation: B.** Fastest and simplest agree: postings are smaller or
-equal, faster by orders of magnitude, and already built.
+**Recommendation: B.** Fastest and simplest agree on screening first: it costs
+bench commands, and it can only remove work. I expect trigram filters to fail
+screening, being larger and slower than postings. Term filters will likely
+survive as a trade, and come back here as a question about the opt-in.
 
-**Fact that would change it:** M1 measuring trigram postings above 9 bits per
-pair (filters would then be smaller, so A for trigrams), or Dave wanting C's
-density option, accepting second-scale term queries at 10M.
+**Fact that would change it:** screening showing a filter layout within about
+1.2× of postings on the narrowed workloads, and smaller on bytes. Then build it
+(A), for that structure only.
 
 ## D69 — Saturated large documents in trigram postings
 
-**Status: open.** S3 M0, 2026-10-07;
+**Status: open.** S3 M0, revision 3, 2026-10-08;
 [design](S3.md#bytes-per-content-byte-estimate).
 
-**Question:** Large documents hold most of the bytes and nearly every common
-trigram. Should their trigrams be indexed like any document's, or should a
-document past a key-count line be marked "Maybe for every trigram" and skip
-trigram postings?
+**Question:** Large documents hold most of the bytes and many of the common
+trigrams. Should every document's trigrams be indexed? Or should a document
+above some distinct-key threshold be marked "Maybe for every trigram atom"
+instead, and skip trigram postings?
 
-Figures are **estimates** until M1. 53% of `$HOME`'s text is in files of 1 MiB
-or more (**measured**, S2 M1), perhaps 800 files. At about 200k distinct keys
-each, they contribute about 160M of an estimated 444M trigram pairs, roughly 120
-MB of the trigram files. A selective regex likely excludes most of them, but a
-common one includes them all.
+Figures are **estimates** until M1a and M1b. On `$HOME`, 53% of the text is in
+files of 1 MiB or more (**measured**, S2 M1), perhaps 800 files. At the central
+estimate they contribute about 160M of 444M trigram pairs, about 120 MB. A
+selective regex likely excludes most of them, but a broad one includes them
+all. A high distinct-key count does not prove that a document holds the keys
+queries actually use, so the threshold is swept against real regex candidates,
+not guessed. M1b's sweep takes its candidate queries from M3's derivation.
 
-| Option                                                                                                                       | Costs                                                                                                                                                                                                   | Buys                                               |
-| ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| A. Index every document's trigrams                                                                                           | The full ~350 MB, about 36% of it from large documents. Bytes grow with text past a few GB, since keys saturate and pairs do not.                                                                       | Every regex narrows over every document. One rule. |
-| B. Past a line (say 64k distinct keys), store the document in a per-segment "saturated" bitmap, Maybe for every trigram atom | Every regex query verifies every saturated document, about 800 files and 2.1 GB on `$HOME`. That is roughly the broad-phrase cost, 0.2–0.3 s of reading warm (M4c), on _every_ regex, and minutes cold. | Up to about a third of trigram bytes saved.        |
-| C. A, plus D66 C's chunk map for regex as well, keyed by trigram at 1 MiB                                                    | The largest structure of the three (estimate: more pairs than the trigram postings themselves).                                                                                                         | Large documents both narrowed and partly read.     |
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Index every document's trigrams | The full trigram files: about 351 MB central, about 36% of it from large documents. Bytes grow with text past a few GB. | Every regex narrows over every document. One rule. |
+| B. Above a threshold chosen from M1b's sweep (16k–256k distinct keys), put the document in a per-segment "saturated" bitmap, Maybe for every trigram atom | Every regex verifies every saturated document: up to about 800 files and 2.1 GB on `$HOME` at a low threshold. Warm, that is a few hundred ms of reading (M4c) on every regex; cold, much more. | Up to about a third of trigram bytes, at the threshold the sweep picks. |
+| C. A, plus a trigram chunk map | Likely larger than the trigram postings themselves (estimate). | Large documents both narrowed and partly read. Not costed further this sprint. |
 
-**Recommendation: A.** Fastest, and the simplest. B is denser but makes every
-regex pay the cost the phrase work just removed, so the two disagree and this is
-a brief. C is costed only by M5's single census row.
+**Recommendation: A**, the fastest and the simplest. B is denser but makes every
+regex pay a cost that the phrase work just removed. Fast and dense disagree,
+and that is why this is a brief.
 
-**Fact that would change it:** M1 measuring large-document pairs above about
-half of all trigram pairs, _and_ M4 measuring verification of saturated
-documents under 100 ms warm. Then B's cost is small enough to buy its bytes.
+**Fact that would change it:** M1b's sweep finding a threshold where the
+saturated documents hold more than about half of all trigram pairs, *and*
+verifying them measures under 100 ms warm, with the cold figure reported, on
+the M5 regex classes. B's cost is then small enough to buy its bytes.
+
+## D70 — How large the trigram follow buffer may grow
+
+**Status: open.** S3 M0, revision 5, 2026-10-08;
+[design](S3.md#memory-live-structures-not-serialized-bytes).
+
+**Question:** During a follow pass, should trigram pairs count against S2's
+64 MiB flush budget, ending segments sooner? Or should they get their own
+bound, so that segment size is still set by terms alone?
+
+**Accounting.**
+
+- **Terms** use S2's `Inverter::memory()`, a capacity estimate.
+- **Trigrams** use a pair buffer allocated once at a fixed capacity: 8 B per
+  pair, plus 8 B of radix scratch per buffered pair during a flush, plus a
+  2 MiB bitmap. A document is admitted only if `len + (doc_bytes − 2)` fits,
+  so the buffer never reallocates.
+
+Two rules hold under every option:
+
+- an empty segment always accepts the next document, so follow always makes
+  progress;
+- a document larger than the whole capacity grows the buffer for itself, is
+  flushed alone, and the buffer is then reset to its capacity.
+
+Allocated bytes follow the capacity formula under every option:
+`term.memory()` + 8 B × trigram capacity + 8 B × len of scratch during a flush
++ 2 MiB. The buffer is reused, so its whole capacity counts once touched.
+Neither A nor B is an RSS limit. Encode buffers and allocator overhead are not
+reserved for, and M1a measures combined peak RSS separately.
+
+Figures are **estimates** until M1a, unless marked measured:
+
+- **Pairs per segment.** At S2's 49 build segments (**measured**, M3), a
+  segment holds about 9.1M trigram pairs (central), with a range of 4.1–28.2M.
+- **S2's own build peak** was **288,616 KiB** RSS (**measured**, M3).
+- **What M1a measures.** It feeds both inverters from each read under A and
+  B, and measures combined peak RSS, both structures' bytes, segment counts and
+  merge work.
+
+| Option | Flush condition, checked before each document | Costs | Buys |
+| --- | --- | --- | --- |
+| A. Separate bounds | `term.memory() ≥ 64 MiB`, or the document may not fit the trigram capacity, which M1a sizes so that the term rule fires first | Follow's allocated memory is about 145 MB higher (central), 66–451 MB across the envelope, plus encode buffers. It is held while follow runs, though follow is paced. | Segment count and term-dictionary duplication (h) unchanged from S2's measured figures. |
+| B. One shared 64 MiB flush charge, with a fixed trigram reservation of 48 MiB at 16 B per pair (capacity 3,145,728 pairs, a 24 MiB buffer) | Flush charge `term.memory() + 16 B × len ≥ 64 MiB`, or the document may not fit the capacity | About 3.2× as many segments at the central estimate: the charge fires at about 2.87M pairs, against 9.1M per S2-sized segment. More term-dictionary entries are duplicated across segments, so the term index grows (by an amount M1a measures), and there is more merge work to reach steady state. The charge is not the allocation: a flush allocates about 68 MiB (central), 82 MiB in Astra's example of 48 MiB terms and 1M pairs, and at most about 90 MiB plus one document, before encode buffers. | A smaller, fixed trigram buffer: at most about 50 MiB on the trigram side (24 MiB buffer, 24 MiB scratch, 2 MiB bitmap), against A's buffer sized to a whole S2 segment, about 145 MB central. |
+| C. Spill sorted trigram runs to a scratch file within a range, merged at flush | Either of the above, with spilled runs not counted | New code, and a scratch file in the index directory to clean up. | Both: S2's segment sizes and S2's memory. |
+
+B's reservation is 48 MiB so that the flush charge, not the capacity,
+decides when a segment ends. A 16 MiB reservation, about 1M pairs, would end
+segments on capacity at roughly 9× S2's count, which is a different policy.
+
+**Recommendation: A**, if M1a measures follow's combined peak RSS under
+512 MiB on `$HOME`. It is the fastest and the simplest. B is the most frugal
+with memory, about 90 MiB at most against A's roughly 200 MiB central, but
+costs density, which outranks memory here. C is the most code.
+
+**Fact that would change it:** M1a measuring A's combined peak above 512 MiB,
+or B's term index growing by less than 3% at steady state. Then take B. If
+neither A's memory nor B's density is acceptable, take C.
