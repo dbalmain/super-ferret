@@ -1441,3 +1441,51 @@ fn socket_search_rejects_excessive_boolean_nesting_and_stays_alive() {
         .contains("\"event\":\"row\"")
     );
 }
+
+/// Flat siblings must not become recursive cursor wrappers on the real daemon
+/// stack, including materialisation, cost estimation and destruction.
+#[test]
+fn socket_search_handles_eight_thousand_flat_content_siblings() {
+    let tree = Tree::new();
+    // Explicit indexing also follows content, so absent terms have exact empty
+    // postings rather than an uncovered bitmap that hides the cursor shape.
+    tree.start(&[]);
+    for shape in ["exclusions", "and", "or"] {
+        let mut args = vec!["(".to_owned(), "text:absentpositive".to_owned()];
+        for _ in 0..8000 {
+            match shape {
+                "exclusions" => args.push("NOT".to_owned()),
+                "or" => args.push("OR".to_owned()),
+                _ => {}
+            }
+            args.push("text:absentsibling".to_owned());
+        }
+        args.extend([")", "OR", "text:absentouter"].map(str::to_owned));
+        let request = format!(
+            "{{\"id\":\"wide\",\"op\":\"search\",\"args\":{}}}\n",
+            format!(
+                "[{}]",
+                args.iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        );
+        let (mut reader, _) = tree.connect();
+        let reply = block(&mut reader, request.as_bytes());
+        assert!(
+            reply.contains("\"exit\":1"),
+            "{shape}: {}",
+            &reply[..reply.len().min(400)]
+        );
+        assert!(!reply.contains("\"event\":\"row\""), "{shape}: {reply}");
+    }
+    let (mut reader, _) = tree.connect();
+    assert!(
+        block(
+            &mut reader,
+            b"{\"id\":\"alive\",\"op\":\"search\",\"args\":[\"main\"]}\n"
+        )
+        .contains("\"event\":\"row\"")
+    );
+}

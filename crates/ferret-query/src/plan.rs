@@ -546,7 +546,7 @@ fn compile<'a>(
         Node::And(all) => {
             let (negated, positive): (Vec<_>, Vec<_>) =
                 all.iter().partition(|n| matches!(n, Node::Not(_)));
-            let mut cursor = if positive.is_empty() {
+            let cursor = if positive.is_empty() {
                 Cursor::bits(pinned.live(), Certainty::Yes)
             } else {
                 Cursor::and(
@@ -556,12 +556,20 @@ fn compile<'a>(
                         .collect::<Result<_, _>>()?,
                 )
             };
-            for node in negated {
-                if let Node::Not(inner) = node {
-                    cursor = Cursor::and_not(cursor, compile(inner, atoms, pinned, cancelled)?);
-                }
-            }
-            cursor
+            // Sibling exclusions add two layers (union and subtraction),
+            // irrespective of width. Traversal, cost and Drop therefore stay
+            // bounded by the parser's AST depth, not its number of siblings.
+            let exclusions = negated
+                .into_iter()
+                .filter_map(|node| match node {
+                    Node::Not(inner) => Some(compile(inner, atoms, pinned, cancelled)),
+                    _ => None,
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Cursor::and_not(
+                cursor,
+                Cursor::or_until(exclusions, pinned.live().bound(), cancelled)?,
+            )
         }
         Node::Or(any) => Cursor::or_until(
             any.iter()
