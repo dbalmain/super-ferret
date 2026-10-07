@@ -11,7 +11,7 @@
 //! Knows nothing about files or ids.
 
 use std::collections::BTreeMap;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 
 /// Change when the token contract changes; indexes must rebuild on a change.
 pub const TOKENIZER_VERSION: u32 = 1;
@@ -58,12 +58,26 @@ pub struct Scratch {
 /// indexer applies [`cap`] itself, because D54's name terms must match whole
 /// runs of any length.
 pub fn tokenize(bytes: &[u8], scratch: &mut Scratch, mut emit: impl FnMut(Token<'_>)) {
+    let ControlFlow::Continue(()) = tokenize_until(bytes, scratch, |token| {
+        emit(token);
+        ControlFlow::<std::convert::Infallible>::Continue(())
+    });
+}
+
+/// [`tokenize`], stopping as soon as `emit` breaks, with its value. The
+/// tokens before the break are exactly [`tokenize`]'s first ones.
+pub fn tokenize_until<B>(
+    bytes: &[u8],
+    scratch: &mut Scratch,
+    mut emit: impl FnMut(Token<'_>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
     let mut base = 0;
     for chunk in bytes.utf8_chunks() {
         let text = chunk.valid();
-        tokenize_valid(text, base, scratch, &mut emit);
+        tokenize_valid(text, base, scratch, &mut emit)?;
         base += text.len() + chunk.invalid().len();
     }
+    ControlFlow::Continue(())
 }
 
 /// [`tokenize`]'s token bytes alone, with a scratch of its own.
@@ -166,12 +180,12 @@ fn push_part(parts: &mut Vec<Range<usize>>, start: usize, end: usize, len: usize
 
 // ── Runs ──
 
-fn tokenize_valid(
+fn tokenize_valid<B>(
     text: &str,
     base: usize,
     scratch: &mut Scratch,
-    emit: &mut impl FnMut(Token<'_>),
-) {
+    emit: &mut impl FnMut(Token<'_>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
     let bytes = text.as_bytes();
     let mut at = 0;
     while let Some(&b) = bytes.get(at) {
@@ -190,7 +204,7 @@ fn tokenize_valid(
         }
         at = match ascii_run(text, at, scratch) {
             Some(end) => {
-                emit_ascii(scratch, base + at, end - at, emit);
+                emit_ascii(scratch, base + at, end - at, emit)?;
                 end
             }
             None => {
@@ -198,11 +212,12 @@ fn tokenize_valid(
                     .char_indices()
                     .find(|&(_, c)| !c.is_alphanumeric() && c != '_')
                     .map_or(text.len(), |(len, _)| at + len);
-                char_run(&text[at..end], base + at, scratch, emit);
+                char_run(&text[at..end], base + at, scratch, emit)?;
                 end
             }
         };
     }
+    ControlFlow::Continue(())
 }
 
 /// Lowercases the ASCII run starting at `start` into `scratch.whole` and
@@ -243,26 +258,37 @@ fn ascii_run(text: &str, start: usize, scratch: &mut Scratch) -> Option<usize> {
     Some(at)
 }
 
-fn emit_ascii(scratch: &Scratch, at: usize, len: usize, emit: &mut impl FnMut(Token<'_>)) {
+fn emit_ascii<B>(
+    scratch: &Scratch,
+    at: usize,
+    len: usize,
+    emit: &mut impl FnMut(Token<'_>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
     let whole = scratch.whole.as_bytes();
     emit(Token {
         bytes: whole,
         run: at..at + len,
         kind: Kind::Whole,
-    });
+    })?;
     for part in &scratch.parts {
         emit(Token {
             bytes: &whole[part.clone()],
             run: at + part.start..at + part.end,
             kind: Kind::Part,
-        });
+        })?;
     }
+    ControlFlow::Continue(())
 }
 
 /// A run containing a non-ASCII alphanumeric. Each part is lowercased on its
 /// own rather than sliced from the whole, because a final sigma depends on the
 /// text around it: `ΑΣΒc` lowercases to `ασβc`, but its part `ΑΣ` to `ας`.
-fn char_run(run: &str, at: usize, scratch: &mut Scratch, emit: &mut impl FnMut(Token<'_>)) {
+fn char_run<B>(
+    run: &str,
+    at: usize,
+    scratch: &mut Scratch,
+    emit: &mut impl FnMut(Token<'_>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
     let Scratch {
         whole,
         part,
@@ -292,7 +318,7 @@ fn char_run(run: &str, at: usize, scratch: &mut Scratch, emit: &mut impl FnMut(T
         bytes: whole.as_bytes(),
         run: at..at + run.len(),
         kind: Kind::Whole,
-    });
+    })?;
     for range in parts.iter() {
         part.clear();
         lowercase_into(&run[range.clone()], part, casing);
@@ -300,8 +326,9 @@ fn char_run(run: &str, at: usize, scratch: &mut Scratch, emit: &mut impl FnMut(T
             bytes: part.as_bytes(),
             run: at + range.start..at + range.end,
             kind: Kind::Part,
-        });
+        })?;
     }
+    ControlFlow::Continue(())
 }
 
 // ── Lowercasing ──
