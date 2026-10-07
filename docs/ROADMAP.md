@@ -1866,9 +1866,16 @@ Follow-ups, none blocking:
   into one.
 - D65 C, the trigram experiment, opens S3.
 - D66 C, a chunk map for large files, is an S3 experiment.
+- **D60's experiment, which Dave asked to run (2026-10-08):** reactivating a
+  dead DocId when its content returns. The metrics must capture the cost of
+  branch switches. Explore using the git index to avoid the hashing read:
+  detect a branch switch, decide which files changed by the rule git itself
+  uses against its index, and keep a map from git blob hashes to DocIds.
+  Per D63's answer, this may also remove the re-hash on branch switches for
+  files inside a git repository.
 
-Gates: **856 passed / 12 ignored**, zero Rust warnings. `wt/s2` awaits Dave's
-merge; its base, `wt/s1b`, also awaits merge.
+Gates: **856 passed / 12 ignored**, zero Rust warnings. Merged to main with
+`wt/s1b` on 2026-10-08 (`702d5bd`).
 
 ## S3 — Regex
 
@@ -1881,6 +1888,23 @@ merge; its base, `wt/s1b`, also awaits merge.
 **Measure:** bytes, build CPU, cold and warm regex latency on `$HOME`.
 **Decides:** which structure ships as default, and which ship behind the opt-in
 comparison.
+
+## `ferret grep` — a ripgrep-compatible drop-in (Dave, 2026-10-08)
+
+Dave's answer to D62: `ferret grep` is a must, as a drop-in replacement for
+grep, the way `ferret find` is for find(1).
+
+- It matches **ripgrep's syntax** for compatibility, and follows the same
+  rules as find on how closely to match: match where cheap, err towards
+  performance, and ignored paths don't exist.
+- The private differential harness is `~/w/grep-compat` (bootstrapping,
+  modelled on `~/w/find-compat`).
+- It answers from S2's and S3's indexes; `grep:` in `ferret search` is the same
+  engine.
+
+Also from D62: a side investigation compares query languages across search
+tools (Elasticsearch/KQL, Splunk, JQL, Datadog, Dynatrace and others) to test
+`ferret search`'s grammar against agent habits.
 
 ## S4 — Agent skill
 
