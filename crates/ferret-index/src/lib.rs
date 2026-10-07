@@ -17,13 +17,22 @@
 //! [`IndexWriter`] appends segments by DocId range under a [`manifest`],
 //! with liveness supplied by the host as a [`live::DocSet`], and merges
 //! adjacent segments by size level.
+//!
+//! S2 M4a adds the read side: [`candidate`]'s seam ([`Atom`], [`Source`],
+//! [`Candidates`], [`Pinned`]), [`postings`]' term cursor across segments,
+//! and [`cursor`]'s certainty algebra.
 
+pub mod candidate;
+pub mod cursor;
 pub mod live;
 pub mod manifest;
 mod merge;
+pub mod postings;
 pub mod segment;
 pub mod store;
 
+pub use candidate::{Atom, Candidates, Estimate, Pinned, Source};
+pub use cursor::{Certainty, Cursor, Probe};
 pub use live::DocSet;
 pub use manifest::{Manifest, SegmentEntry};
 pub use store::{

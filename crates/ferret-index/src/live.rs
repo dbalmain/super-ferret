@@ -50,6 +50,21 @@ impl DocSet {
         doc < self.bound && self.words[doc as usize / 64] >> (doc % 64) & 1 == 1
     }
 
+    /// The smallest member `>= from`.
+    pub fn next_geq(&self, from: u32) -> Option<u32> {
+        if from >= self.bound {
+            return None;
+        }
+        let mut word = from as usize / 64;
+        // Bits at or past `bound` are never set, so no end mask is needed.
+        let mut bits = self.words[word] & (!0u64 << (from % 64));
+        while bits == 0 {
+            word += 1;
+            bits = *self.words.get(word)?;
+        }
+        Some(word as u32 * 64 + bits.trailing_zeros())
+    }
+
     /// Members in `[from, to)`, ascending.
     pub fn range(&self, from: u32, to: u32) -> impl Iterator<Item = u32> + '_ {
         let to = to.min(self.bound);
@@ -101,6 +116,11 @@ mod tests {
                     "[{from}, {to})"
                 );
                 assert_eq!(set.count(from, to), expected.len() as u32);
+                assert_eq!(
+                    set.next_geq(from),
+                    docs.iter().copied().find(|&d| d >= from),
+                    "next_geq({from})"
+                );
             }
         }
         assert!(set.contains(64) && !set.contains(66) && !set.contains(300));

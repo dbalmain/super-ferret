@@ -142,6 +142,11 @@ impl Postings {
         self.df == 0
     }
 
+    /// Bytes read for the list: its verified chunks, whole.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
     /// A cursor before the first document.
     pub fn cursor(&self) -> PostingCursor<'_> {
         PostingCursor {
