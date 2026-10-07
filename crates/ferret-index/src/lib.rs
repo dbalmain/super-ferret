@@ -26,7 +26,7 @@ pub mod candidate;
 pub mod cursor;
 pub mod live;
 pub mod manifest;
-mod merge;
+pub mod merge;
 pub mod postings;
 pub mod segment;
 pub mod store;

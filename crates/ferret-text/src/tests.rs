@@ -433,3 +433,18 @@ fn exact_under_cap_is_the_shortest_cap_of_a_longer_token() {
         );
     }
 }
+#[test]
+fn trigram_keys_fold_only_ascii_over_raw_bytes() {
+    for byte in 0..=255u8 {
+        let expected = if byte.is_ascii_uppercase() {
+            byte + 32
+        } else {
+            byte
+        };
+        assert_eq!(
+            super::trigram_key([b'A', byte, b'a']),
+            [b'a', expected, b'a']
+        );
+    }
+    assert_eq!(super::TRIGRAM_VERSION, 0x7472_0001);
+}

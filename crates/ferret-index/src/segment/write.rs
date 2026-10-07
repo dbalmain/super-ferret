@@ -106,13 +106,18 @@ impl Writer {
     /// A writer for documents `first..=last`, stamped with the current
     /// tokenizer version.
     pub fn new(first: u32, last: u32) -> Result<Self, WriteError> {
+        Self::keyed(first, last, ferret_text::TOKENIZER_VERSION)
+    }
+
+    /// A writer for opaque byte keys, stamped with their extractor version.
+    pub fn keyed(first: u32, last: u32, version: u32) -> Result<Self, WriteError> {
         if first > last {
             return Err(WriteError::Range { first, last });
         }
         Ok(Self {
             first,
             last,
-            tokenizer: ferret_text::TOKENIZER_VERSION,
+            tokenizer: version,
             blocks: Vec::new(),
             postings: Vec::new(),
             index: Vec::new(),
@@ -131,7 +136,18 @@ impl Writer {
     /// file `postings`. Both must be empty, writable files.
     /// [`Writer::finish_spilled`] completes `out`.
     pub fn spilling(first: u32, last: u32, out: File, postings: File) -> Result<Self, WriteError> {
-        let mut writer = Self::new(first, last)?;
+        Self::keyed_spilling(first, last, ferret_text::TOKENIZER_VERSION, out, postings)
+    }
+
+    /// [`Writer::spilling`] with an explicit key extractor version.
+    pub fn keyed_spilling(
+        first: u32,
+        last: u32,
+        version: u32,
+        out: File,
+        postings: File,
+    ) -> Result<Self, WriteError> {
+        let mut writer = Self::keyed(first, last, version)?;
         writer.spill = Some(Spill {
             out,
             postings,
@@ -141,6 +157,27 @@ impl Writer {
             postings_sums: Vec::new(),
         });
         Ok(writer)
+    }
+
+    /// Allocated buffer capacities, including encoding scratch and spilled
+    /// checksums. Excludes file handles and allocator metadata.
+    pub fn allocated_bytes(&self) -> usize {
+        self.blocks.capacity()
+            + self.postings.capacity()
+            + self.index.capacity()
+            + self.previous.capacity()
+            + self.relative.capacity() * size_of::<u32>()
+            + self.spill.as_ref().map_or(0, |spill| {
+                spill.blocks_sums.capacity() + spill.postings_sums.capacity()
+            })
+    }
+
+    /// Capacity needed while finishing an in-memory writer, including the
+    /// exactly reserved chunk checksums and the head buffer.
+    pub fn finishing_bytes(&self) -> usize {
+        self.allocated_bytes()
+            + HEAD
+            + (self.blocks.len().div_ceil(CHUNK) + self.postings.len().div_ceil(CHUNK)) * 16
     }
 
     /// Bytes of the blocks and postings sections so far, spilled or not.
@@ -265,7 +302,9 @@ impl Writer {
                 "a spilling segment writer finishes with finish_spilled",
             ));
         }
-        let mut sums = Vec::new();
+        let mut sums = Vec::with_capacity(
+            (self.blocks.len().div_ceil(CHUNK) + self.postings.len().div_ceil(CHUNK)) * 16,
+        );
         chunk_sums(&self.blocks, &mut sums);
         let blocks_sums = sums.len();
         chunk_sums(&self.postings, &mut sums);

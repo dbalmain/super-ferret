@@ -11,6 +11,9 @@
 //! ferret-bench terms <catalog-dir>               full-tree term census: df, hapax, pairs
 //! ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]  real segments: bytes by section, CPU, RSS
 //! ferret-bench index-build <catalog-dir> <index-dir>  follow, merge to steady state, full merge (S2 M3)
+//! ferret-bench trigram-build <catalog-dir> <out-dir>  offline trigrams at M3 boundaries
+//! ferret-bench trigram-census <catalog-dir>  distinct-key histogram and D69 counts
+//! ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b  D70 paired buffers
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
@@ -63,6 +66,7 @@ mod index_build;
 mod segment_build;
 mod terms;
 mod tokenize;
+mod trigram;
 
 #[cfg(test)]
 mod support;
@@ -114,6 +118,26 @@ fn main() -> ExitCode {
                 segment_build::run(Path::new(dir), Path::new(out), true)
             }
             ("index-build", [dir, out]) => index_build::run(Path::new(dir), Path::new(out)),
+            ("trigram-build", [dir, out]) => {
+                trigram::build(Path::new(dir), Path::new(out), trigram::Policy::M3)
+            }
+            ("trigram-boundaries", [dir, out]) => {
+                trigram::boundaries(Path::new(dir), Path::new(out))
+            }
+            ("trigram-census", [dir]) => trigram::census(Path::new(dir)),
+            ("trigram-memory", [dir, out, policy]) if policy == "b" => {
+                trigram::build(Path::new(dir), Path::new(out), trigram::Policy::Shared)
+            }
+            ("trigram-memory", [dir, out, policy, mib]) if policy == "a" => {
+                mib.parse::<usize>().map_err(Into::into).and_then(|mib| {
+                    let trigram_bound = mib.checked_mul(1 << 20).ok_or("bound overflow")?;
+                    trigram::build(
+                        Path::new(dir),
+                        Path::new(out),
+                        trigram::Policy::Own { trigram_bound },
+                    )
+                })
+            }
             ("index-churn", [out, rounds]) => index_build::churn(Path::new(out), rounds),
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)
@@ -166,6 +190,9 @@ fn usage() -> ExitCode {
          ferret-bench terms <catalog-dir>\n       \
          ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]\n       \
          ferret-bench index-build <catalog-dir> <index-dir>\n       \
+         ferret-bench trigram-build <catalog-dir> <out-dir>\n       \
+         ferret-bench trigram-census <catalog-dir>\n       \
+         ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b\n       \
          ferret-bench index-churn <index-dir> <rounds>\n       \
          ferret-bench content-query <catalog-dir> <index-dir> [class...]\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \

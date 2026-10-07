@@ -19,6 +19,7 @@ pub struct Inverter {
     memory: usize,
     bound: usize,
     last: Option<u32>,
+    payload_capacity: usize,
 }
 
 impl Inverter {
@@ -30,6 +31,7 @@ impl Inverter {
             memory: 0,
             bound,
             last: None,
+            payload_capacity: 0,
         }
     }
 
@@ -44,6 +46,7 @@ impl Inverter {
             Some(docs) => docs,
             None => {
                 self.memory += term.len() + PER_TERM;
+                self.payload_capacity += term.len();
                 self.terms.entry(term.into()).or_default()
             }
         };
@@ -51,6 +54,7 @@ impl Inverter {
             let capacity = docs.capacity();
             docs.push(doc);
             self.memory += (docs.capacity() - capacity) * size_of::<u32>();
+            self.payload_capacity += (docs.capacity() - capacity) * size_of::<u32>();
         }
         Ok(())
     }
@@ -58,6 +62,26 @@ impl Inverter {
     /// Estimated bytes held.
     pub fn memory(&self) -> usize {
         self.memory
+    }
+
+    /// Capacity charge for keys, posting vectors and the hash table. The
+    /// table charge includes empty buckets and control bytes, rounded up to
+    /// a power-of-two bucket count; excludes allocator metadata.
+    pub fn allocated_bytes(&self) -> usize {
+        self.payload_capacity + self.table_bytes()
+    }
+
+    fn table_bytes(&self) -> usize {
+        if self.terms.capacity() == 0 {
+            return 0;
+        }
+        let buckets = (self.terms.capacity() + 1).next_power_of_two();
+        buckets * (size_of::<(Box<[u8]>, Vec<u32>)>() + 1) + 16
+    }
+
+    /// Capacity charge including the vector of entries needed at drain.
+    pub fn flush_bytes(&self) -> usize {
+        self.allocated_bytes() + self.terms.len() * size_of::<(Box<[u8]>, Vec<u32>)>()
     }
 
     /// Whether the estimate has reached the bound.
@@ -82,16 +106,42 @@ impl Inverter {
         &mut self,
         first: u32,
         last: u32,
+        on_entry: impl FnMut(&[u8], &[u32], u64),
+    ) -> Result<Writer, WriteError> {
+        self.drain(first, last, on_entry, |_| {})
+    }
+
+    /// Like [`Self::drain_into`], reporting simultaneous capacities of the
+    /// table, sorted entries, postings and writer after each encoded entry.
+    pub fn drain_into_measured(
+        &mut self,
+        first: u32,
+        last: u32,
+        observe: impl FnMut(usize),
+    ) -> Result<Writer, WriteError> {
+        self.drain(first, last, |_, _, _| {}, observe)
+    }
+
+    fn drain(
+        &mut self,
+        first: u32,
+        last: u32,
         mut on_entry: impl FnMut(&[u8], &[u32], u64),
+        mut observe: impl FnMut(usize),
     ) -> Result<Writer, WriteError> {
         let mut writer = Writer::new(first, last)?;
+        let payload = self.payload_capacity;
         let mut terms: Vec<_> = self.terms.drain().collect();
+        let allocated =
+            payload + self.table_bytes() + terms.capacity() * size_of::<(Box<[u8]>, Vec<u32>)>();
         self.memory = 0;
+        self.payload_capacity = 0;
         self.last = None;
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (term, docs) in &terms {
             let bytes = writer.push(term, docs)?;
             on_entry(term, docs, bytes);
+            observe(allocated + writer.allocated_bytes());
         }
         Ok(writer)
     }

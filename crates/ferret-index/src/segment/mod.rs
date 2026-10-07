@@ -58,6 +58,7 @@ use std::io;
 
 mod invert;
 mod read;
+mod trigram;
 mod write;
 
 #[cfg(test)]
@@ -65,6 +66,7 @@ mod tests;
 
 pub use invert::Inverter;
 pub use read::{Hit, Info, PostingCursor, Postings, ReadAt, Segment, TermEntry, Terms};
+pub use trigram::TrigramInverter;
 pub use write::{Sizes, Writer};
 
 const MAGIC: [u8; 8] = *b"ferretsg";

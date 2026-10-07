@@ -72,13 +72,7 @@ impl SegmentEntry {
     }
 
     /// Whether an opened segment's head is the one this entry names.
-    pub(crate) fn matches(
-        &self,
-        info: &Info,
-        digest: &[u8; 16],
-        bytes: u64,
-        tokenizer: u32,
-    ) -> bool {
+    pub fn matches(&self, info: &Info, digest: &[u8; 16], bytes: u64, tokenizer: u32) -> bool {
         (
             info.first,
             info.last,
