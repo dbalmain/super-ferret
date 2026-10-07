@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ferret::engine::{Engine, QuerySession};
 use ferret_catalog::Catalog;
@@ -1246,6 +1246,7 @@ fn measure_steady_content_follow() {
         .unwrap();
     }
     let engine = writer_engine(&tree);
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
     engine.attach_content(&tree.index()).unwrap();
     while engine
         .follow_content(&Budget::unbounded(), None)
