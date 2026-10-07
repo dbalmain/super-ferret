@@ -95,6 +95,17 @@ pub fn cap(token: &[u8]) -> &[u8] {
     &token[..end]
 }
 
+/// Whether a stored term equal to `cap(token)` can only have come from
+/// `token` itself, so a postings hit on it is exact. A token longer than
+/// [`MAX_TOKEN_BYTES`] caps to at least `MAX_TOKEN_BYTES - 3` bytes (the cut
+/// backs off at most three bytes of a four-byte character), so a token of
+/// that length or more may be the cap of a longer one: `a`×61 is also the
+/// cap of `a`×61 followed by `𝄞`. Such a query term is answered as Maybe and
+/// verified.
+pub fn exact_under_cap(token: &[u8]) -> bool {
+    token.len() < MAX_TOKEN_BYTES - 3
+}
+
 // ── Character shapes ──
 
 // What the part rule asks of a character, as bit flags so that one `splits`
