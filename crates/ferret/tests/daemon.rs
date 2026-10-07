@@ -436,7 +436,9 @@ fn stale_socket_is_replaced_and_index_identities_are_isolated() {
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("main.rs"));
     assert_eq!(tree.run(&["search", "unique"]).status.code(), Some(1));
-    assert_eq!(tree.sockets().len(), 2);
+    // A cold query may answer locally before its asynchronously spawned host
+    // has bound the socket. Both identities must converge within the bound.
+    wait(|| tree.sockets().len() == 2);
 }
 
 #[test]
