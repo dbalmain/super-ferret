@@ -102,8 +102,9 @@ pub struct ContentReport {
     /// Bracketed byte reads attempted to settle Maybe rows.
     pub verified: u64,
     /// Paths whose current version differs from the catalog, or whose
-    /// read/stat failed. Stable changed bytes are evaluated for this path
-    /// alone; vanished or unreadable paths are dropped.
+    /// read/stat failed (including size/allocation refusal). Stable changed
+    /// bytes are evaluated for this path alone; vanished or unreadable
+    /// paths are dropped.
     pub changed: u64,
     /// The matcher's work over the documents read: atoms checked, rejected
     /// by byte search alone, tokenized whole, bytes tokenized.
@@ -395,11 +396,20 @@ impl Query {
                         report.changed += 1;
                         return ControlFlow::Continue(());
                     };
-                    let answers: Vec<bool> = self
+                    let answers: Option<Vec<bool>> = self
                         .texts
                         .iter()
-                        .map(|text| matcher.is_match(text, &bytes))
+                        .map(|text| {
+                            if stopped() {
+                                return None;
+                            }
+                            let answer = matcher.is_match(text, &bytes);
+                            (!stopped()).then_some(answer)
+                        })
                         .collect();
+                    let Some(answers) = answers else {
+                        return ControlFlow::Break(());
+                    };
                     match version {
                         ReadVersion::Catalogued => exact.entry(doc).or_insert(answers),
                         ReadVersion::Current => {

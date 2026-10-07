@@ -133,3 +133,38 @@ fn a_cached_directory_is_revalidated_after_replacement() {
         }
     }
 }
+
+/// Cancellation after chunks have been read must interrupt the same checked
+/// reader production queries use, rather than waiting for the complete file.
+#[test]
+fn current_reads_check_cancellation_between_chunks() {
+    use std::cell::Cell;
+    let tmp = Tmp::new("content-cancel-chunks");
+    let (catalog, _) = indexed(&tmp, &[("a.txt", b"alpha")]);
+    let path = tmp.at("a.txt");
+    fs::File::create(&path).unwrap().set_len(8 << 20).unwrap();
+    let name = catalog
+        .resolve(path.as_os_str().as_encoded_bytes())
+        .unwrap()
+        .name
+        .unwrap();
+    let calls = Cell::new(0);
+    let cancelled = || {
+        calls.set(calls.get() + 1);
+        calls.get() >= 4
+    };
+    let mut reader = Documents::by_name(&catalog).unwrap();
+    let mut bytes = Vec::new();
+    let result = reader.read_current_name_until(&catalog, name, &mut bytes, &cancelled);
+    assert!(
+        result.is_err(),
+        "completed {} bytes despite cancellation",
+        bytes.len()
+    );
+    assert!(
+        bytes.len() >= 256 << 10,
+        "cancel during, not before, the read"
+    );
+    assert!(bytes.len() < 8 << 20);
+    assert_eq!(reader.files_read, 0);
+}

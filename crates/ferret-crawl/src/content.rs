@@ -38,6 +38,7 @@ pub struct Documents {
     /// The parent directory held for the current checked walk.
     dir: Option<(InoId, OwnedFd)>,
     limiter: Option<Arc<Limiter>>,
+    config: ferret_policy::Config,
     /// Documents read whole and checked.
     pub files_read: u64,
     /// Their bytes.
@@ -76,6 +77,7 @@ impl Documents {
             names,
             dir: None,
             limiter: None,
+            config: ferret_policy::Config::default(),
             files_read: 0,
             bytes_read: 0,
         })
@@ -91,9 +93,17 @@ impl Documents {
             names: Vec::new(),
             dir: None,
             limiter: None,
+            config: ferret_policy::Config::default(),
             files_read: 0,
             bytes_read: 0,
         })
+    }
+
+    /// Uses the same size cap as a crawl configured with this policy. Product
+    /// indexing and querying both use the default policy (8 MiB).
+    pub fn with_config(mut self, config: ferret_policy::Config) -> Self {
+        self.config = config;
+        self
     }
 
     /// Paces every read through the shared byte limiter: background work.
@@ -139,7 +149,14 @@ impl Documents {
             Opened::Ready { file, .. } => file,
             Opened::Fault(fault) => return Err(fault),
         };
-        read_all(&mut file, recorded.size, self.limiter.as_deref(), out)?;
+        read_all(
+            &mut file,
+            recorded.size,
+            self.config.size_cap,
+            self.limiter.as_deref(),
+            out,
+            &|| false,
+        )?;
         bracket(&file, &recorded, ferret_catalog::Content::Binary)?;
         self.files_read += 1;
         self.bytes_read += out.len() as u64;
@@ -188,7 +205,22 @@ impl Documents {
         name: NameId,
         out: &mut Vec<u8>,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
+        self.read_current_name_until(catalog, name, out, &|| false)
+    }
+
+    /// Like `read_current_name`, bounded by the policy size cap, with fallible
+    /// allocation and host cancellation between 256 KiB read chunks.
+    pub fn read_current_name_until(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        out: &mut Vec<u8>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
         out.clear();
+        if cancelled() {
+            return Err(ContentFault::Cancelled);
+        }
         let (parent, bytes) = catalog.name_reader().edge(name);
         let dir = self.directory(catalog, parent)?;
         let fd = openat(
@@ -204,7 +236,14 @@ impl Documents {
         }
         let current = catalog_stat(&stat);
         let mut file = File::from(fd);
-        read_all(&mut file, current.size, self.limiter.as_deref(), out)?;
+        read_all(
+            &mut file,
+            current.size,
+            self.config.size_cap,
+            self.limiter.as_deref(),
+            out,
+            cancelled,
+        )?;
         bracket(&file, &current, ferret_catalog::Content::Binary)?;
         self.files_read += 1;
         self.bytes_read += out.len() as u64;
@@ -271,20 +310,36 @@ fn check_directory(fd: &OwnedFd, catalog: &Catalog, id: InoId) -> Result<(), Con
 fn read_all(
     file: &mut File,
     size: u64,
+    cap: u64,
     limiter: Option<&Limiter>,
     out: &mut Vec<u8>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), ContentFault> {
-    out.reserve(usize::try_from(size).unwrap_or(0));
+    if cancelled() {
+        return Err(ContentFault::Cancelled);
+    }
+    if size > cap {
+        return Err(ContentFault::TooLarge { size, cap });
+    }
+    let size_usize = usize::try_from(size).map_err(|_| ContentFault::TooLarge { size, cap })?;
+    out.try_reserve_exact(size_usize)
+        .map_err(ContentFault::Allocation)?;
     let mut source = BulkRead {
         file,
         limiter,
         remaining: size,
     };
     loop {
+        if cancelled() {
+            return Err(ContentFault::Cancelled);
+        }
+        if source.remaining == 0 {
+            return Ok(());
+        }
         let start = out.len();
         // Zero only what the read can fill: a small file's verification
         // read once cleared 512 KiB, which dominated it.
-        let want = source.remaining.clamp(1, 256 << 10) as usize;
+        let want = source.remaining.min(256 << 10) as usize;
         out.resize(start + want, 0);
         match source.read(&mut out[start..]) {
             Ok(0) => {

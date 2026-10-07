@@ -988,3 +988,45 @@ fn an_already_cancelled_query_performs_no_index_io() {
         "only reading the counter itself may add rchar"
     );
 }
+
+/// A sparse current replacement must be refused, never accepted as either a
+/// positive match or a negative content fact. Both rows remain unverifiable.
+#[test]
+fn oversized_current_replacements_are_unverifiable_in_both_polarities() {
+    use std::io::Write;
+    let tree = Tree::new();
+    let path = tree.write("a.txt", b"alpha");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let mut replacement = fs::File::create(&path).unwrap();
+    replacement.write_all(b"ALPHA").unwrap();
+    // Large enough to exceed the shared 8 MiB policy cap, but safe even when
+    // running the regression against the old unbounded reader.
+    replacement.set_len(256 << 20).unwrap();
+    let pin = engine.pin();
+    let positive = search(&pin, &query(&["case:text:ALPHA"]), None).unwrap();
+    let negative = search(&pin, &query(&["NOT", "case:text:alpha"]), None).unwrap();
+    assert!(
+        positive.0.is_empty(),
+        "oversized positive: {:?}",
+        positive.0
+    );
+    assert!(
+        negative.0.is_empty(),
+        "oversized negative: {:?}",
+        negative.0
+    );
+    for (_, report) in [positive, negative] {
+        let report = report.unwrap();
+        assert_eq!(report.verified, 1);
+        assert_eq!(
+            report.changed, 1,
+            "refusal must use the existing failure signal"
+        );
+        assert_eq!(
+            report.matching.documents, 0,
+            "refused bytes cannot be evaluated"
+        );
+    }
+}

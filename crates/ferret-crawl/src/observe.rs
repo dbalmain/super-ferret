@@ -31,6 +31,12 @@ pub enum ContentFault {
     Stat(io::Error),
     /// Reading the file failed.
     Read(io::Error),
+    /// A checked content read exceeds the configured policy cap.
+    TooLarge { size: u64, cap: u64 },
+    /// A checked read could not allocate its bounded buffer.
+    Allocation(std::collections::TryReserveError),
+    /// The host cancelled a checked content read.
+    Cancelled,
     /// The open file was not the version the walk statted, or changed while
     /// it was read (the D33 bracket).
     Changed,
@@ -48,6 +54,9 @@ impl std::fmt::Display for ContentFault {
             Self::Open(e) => write!(f, "open: {e}"),
             Self::Stat(e) => write!(f, "fstat: {e}"),
             Self::Read(e) => write!(f, "read: {e}"),
+            Self::TooLarge { size, cap } => write!(f, "content size {size} exceeds cap {cap}"),
+            Self::Allocation(e) => write!(f, "content allocation: {e}"),
+            Self::Cancelled => f.write_str("content read cancelled"),
             Self::Changed => f.write_str("changed while it was read"),
             Self::Alias => f.write_str("another name of this inode saw a different version"),
         }

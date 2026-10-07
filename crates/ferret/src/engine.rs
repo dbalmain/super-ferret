@@ -457,7 +457,9 @@ impl QuerySession {
             let observed = match request {
                 ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
                 ferret_query::ReadRequest::Bytes(out) => {
-                    reader.read_current_name(catalog, name, out)
+                    reader.read_current_name_until(catalog, name, out, &|| {
+                        cancelled.is_some_and(|flag| flag.load(Ordering::Acquire))
+                    })
                 }
             }
             .ok()?;
