@@ -62,6 +62,7 @@ use ferret_verify::{Arm, Finder};
 mod census;
 mod content_query;
 mod corpus;
+mod fuse;
 mod index_build;
 mod segment_build;
 mod terms;
