@@ -2,12 +2,17 @@
 //! follow pass (docs/S2.md § The content flow, § Coverage). `ferret-index`
 //! never opens a file; its host hands it these bytes.
 //!
-//! A document is read only if it is still the version the catalog recorded
+//! Follow reads a document only if it is still the version the catalog recorded
 //! (D21, D33): every directory on its path is opened `O_NOFOLLOW` and must
 //! have the catalogued `(dev, ino)`, the file is opened `O_NOFOLLOW` beneath
 //! its parent's descriptor and must match the catalog's stat, and a second
 //! `fstat` after the read must still match. Anything else is a
 //! [`ContentFault`], which the index records as unreadable and never retries.
+//!
+//! Query verification uses [`Documents::read_current_name`] instead: the same
+//! checked directory walk, with the file bracketed against its current stat.
+//! It returns that stat so the host can keep current path answers separate
+//! from cacheable catalog-version content facts.
 //!
 //! [`Documents`] maps each DocId to one name by a single scan of the names,
 //! built per pass. M5's daemon will want D30's lazy inverse instead; a full
@@ -142,14 +147,24 @@ impl Documents {
     }
 
     /// Checks the file's version through its own fresh directory walk, with
-    /// one no-follow stat and no content read. A read through another copy
-    /// cannot establish this path's freshness.
+    /// one no-follow stat and no content read.
     pub fn check_name(&mut self, catalog: &Catalog, name: NameId) -> Result<(), ContentFault> {
+        let stat = self.stat_name(catalog, name)?;
+        let recorded = catalog.inode(catalog.name(name).child).stat;
+        recorded
+            .same_version(&stat)
+            .then_some(())
+            .ok_or(ContentFault::Changed)
+    }
+
+    /// The current regular file's stat through a fresh checked directory walk.
+    /// A changed file is observed; missing/replaced directory chains fail.
+    pub fn stat_name(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
         let (parent, bytes) = catalog.name_reader().edge(name);
-        let Target::Inode(inode) = catalog.name(name).target() else {
-            return Err(ContentFault::Changed);
-        };
-        let recorded = catalog.inode(inode).stat;
         let dir = self.directory(catalog, parent)?;
         let stat = statat(
             dir,
@@ -157,12 +172,43 @@ impl Documents {
             AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(|e| ContentFault::Stat(e.into()))?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
-            || !recorded.same_version(&catalog_stat(&stat))
-        {
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             return Err(ContentFault::Changed);
         }
-        Ok(())
+        Ok(catalog_stat(&stat))
+    }
+
+    /// A stable current-byte read for a query's Maybe candidate, bracketed
+    /// against the opened file's current stat rather than the catalog key.
+    /// Returns that stat so the host can distinguish cacheable catalog bytes
+    /// from a path-specific changed version. Follow still uses `read_name`.
+    pub fn read_current_name(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        out: &mut Vec<u8>,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
+        out.clear();
+        let (parent, bytes) = catalog.name_reader().edge(name);
+        let dir = self.directory(catalog, parent)?;
+        let fd = openat(
+            dir,
+            std::ffi::OsStr::from_bytes(bytes),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| ContentFault::Open(e.into()))?;
+        let stat = fstat(&fd).map_err(|e| ContentFault::Stat(e.into()))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(ContentFault::Changed);
+        }
+        let current = catalog_stat(&stat);
+        let mut file = File::from(fd);
+        read_all(&mut file, current.size, self.limiter.as_deref(), out)?;
+        bracket(&file, &current, ferret_catalog::Content::Binary)?;
+        self.files_read += 1;
+        self.bytes_read += out.len() as u64;
+        Ok(current)
     }
 
     /// Re-walk from the root for each path. A retained descriptor alone cannot

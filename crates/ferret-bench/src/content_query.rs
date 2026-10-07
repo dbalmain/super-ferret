@@ -310,23 +310,25 @@ fn once(
     let mut path = Vec::new();
     let mut reader = |name: NameId, request: ferret_query::ReadRequest<'_>| {
         let start = Instant::now();
-        let ok = match request {
+        let version = match request {
             ferret_query::ReadRequest::Stat => {
                 path.clear();
                 catalog.path(name, &mut path);
                 fs::symlink_metadata(Path::new(std::ffi::OsStr::from_bytes(&path)))
-                    .is_ok_and(|meta| same_version(catalog, name, &meta))
+                    .ok()
+                    .filter(fs::Metadata::is_file)
+                    .map(|meta| version(catalog, name, &meta))
             }
             ferret_query::ReadRequest::Bytes(out) => {
-                let ok = read_name(catalog, name, &mut path, out);
-                if ok {
+                let version = read_current_name(catalog, name, &mut path, out);
+                if version.is_some() {
                     read_bytes += out.len() as u64;
                 }
-                ok
+                version
             }
         };
         read += start.elapsed();
-        ok.then_some(ferret_query::ReadVersion::Catalogued)
+        version
     };
     let mut rows = 0u64;
     let start = Instant::now();
@@ -358,25 +360,57 @@ fn same_version(catalog: &Catalog, name: NameId, meta: &fs::Metadata) -> bool {
         && (meta.ctime(), meta.ctime_nsec()) == (stat.ctime_sec, i64::from(stat.ctime_nsec))
 }
 
+fn version(catalog: &Catalog, name: NameId, meta: &fs::Metadata) -> ferret_query::ReadVersion {
+    if same_version(catalog, name, meta) {
+        ferret_query::ReadVersion::Catalogued
+    } else {
+        ferret_query::ReadVersion::Current
+    }
+}
+
 /// The benchmark uses fixed trees and a path reader, without crawl's checked
-/// directory walk. Bracket the file descriptor against the full catalog key.
-fn read_name(catalog: &Catalog, name: NameId, path: &mut Vec<u8>, out: &mut Vec<u8>) -> bool {
+/// directory walk. Bracket the file descriptor against its current key.
+fn read_current_name(
+    catalog: &Catalog,
+    name: NameId,
+    path: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> Option<ferret_query::ReadVersion> {
     path.clear();
     catalog.path(name, path);
-    let Ok(mut file) = File::open(Path::new(std::ffi::OsStr::from_bytes(path))) else {
-        return false;
-    };
-    if !file
-        .metadata()
-        .is_ok_and(|meta| same_version(catalog, name, &meta))
-    {
-        return false;
+    let mut file = File::open(Path::new(std::ffi::OsStr::from_bytes(path))).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.is_file() {
+        return None;
     }
     out.clear();
-    file.read_to_end(out).is_ok()
-        && file
-            .metadata()
-            .is_ok_and(|meta| same_version(catalog, name, &meta))
+    file.read_to_end(out).ok()?;
+    let after = file.metadata().ok()?;
+    if (
+        before.dev(),
+        before.ino(),
+        before.len(),
+        before.mtime(),
+        before.mtime_nsec(),
+        before.ctime(),
+        before.ctime_nsec(),
+    ) != (
+        after.dev(),
+        after.ino(),
+        after.len(),
+        after.mtime(),
+        after.mtime_nsec(),
+        after.ctime(),
+        after.ctime_nsec(),
+    ) {
+        return None;
+    }
+    Some(version(catalog, name, &after))
+}
+
+/// Phrase sampling still uses only bytes from the catalogued version.
+fn read_name(catalog: &Catalog, name: NameId, path: &mut Vec<u8>, out: &mut Vec<u8>) -> bool {
+    read_current_name(catalog, name, path, out) == Some(ferret_query::ReadVersion::Catalogued)
 }
 
 struct Classes {

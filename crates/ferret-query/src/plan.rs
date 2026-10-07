@@ -14,14 +14,15 @@
 //! emit        S1's tests per name, then the residual conjuncts in Kleene
 //!             logic; a Maybe row reads its document once, through its own
 //!             name, checked against the catalog, and evaluates every
-//!             content atom exactly; a changed document drops its rows
+//!             content atom against current bytes. Content facts from the
+//!             catalogued version may be reused, with a fresh stat per copy.
 //! ```
 //!
 //! The host supplies the pinned index, the live set, the DocId → names
 //! inverse ([`DocNames`], built once per catalog generation) and the
 //! checked reader; this crate opens no file.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -98,11 +99,11 @@ pub struct ContentReport {
     /// Documents whose atoms were probed: the content driver's, or those of
     /// the rows the name side gave.
     pub documents: u64,
-    /// Documents read to settle a Maybe.
+    /// Bracketed byte reads attempted to settle Maybe rows.
     pub verified: u64,
-    /// Of those, the ones that had changed since the catalog saw them, or
-    /// could not be read: their rows are dropped, never reported from
-    /// stale data.
+    /// Paths whose current version differs from the catalog, or whose
+    /// read/stat failed. Stable changed bytes are evaluated for this path
+    /// alone; vanished or unreadable paths are dropped.
     pub changed: u64,
     /// The matcher's work over the documents read: atoms checked, rejected
     /// by byte search alone, tokenized whole, bytes tokenized.
@@ -370,28 +371,39 @@ impl Query {
             if truth == Truth::Maybe
                 && let Some(doc) = doc
             {
-                let answers = match exact.entry(doc) {
-                    Entry::Occupied(entry) => {
-                        if read(row.name, ReadRequest::Stat) != Some(ReadVersion::Catalogued) {
+                let reusable = if exact.contains_key(&doc) {
+                    match read(row.name, ReadRequest::Stat) {
+                        Some(ReadVersion::Catalogued) => true,
+                        Some(ReadVersion::Current) => false,
+                        None => {
                             report.changed += 1;
                             return ControlFlow::Continue(());
                         }
-                        entry.into_mut()
                     }
-                    Entry::Vacant(entry) => {
-                        report.verified += 1;
-                        if read(row.name, ReadRequest::Bytes(&mut bytes))
-                            != Some(ReadVersion::Catalogued)
-                        {
+                } else {
+                    false
+                };
+                let current;
+                let answers = if reusable {
+                    &exact[&doc]
+                } else {
+                    report.verified += 1;
+                    let Some(version) = read(row.name, ReadRequest::Bytes(&mut bytes)) else {
+                        report.changed += 1;
+                        return ControlFlow::Continue(());
+                    };
+                    let answers: Vec<bool> = self
+                        .texts
+                        .iter()
+                        .map(|text| matcher.is_match(text, &bytes))
+                        .collect();
+                    match version {
+                        ReadVersion::Catalogued => exact.entry(doc).or_insert(answers),
+                        ReadVersion::Current => {
                             report.changed += 1;
-                            return ControlFlow::Continue(());
+                            current = answers;
+                            &current
                         }
-                        entry.insert(
-                            self.texts
-                                .iter()
-                                .map(|text| matcher.is_match(text, &bytes))
-                                .collect(),
-                        )
                     }
                 };
                 truth = self.eval_residual(&mut |test| match test {

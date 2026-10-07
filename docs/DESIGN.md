@@ -466,9 +466,11 @@ differences from GNU — is specified in [FIND.md](FIND.md).
    takes the cheapest; name and metadata atoms go to the catalog.
 3. **Execute** in doc space (leapfrog intersection over `Cursor`s), map live
    docs to inodes to names, apply name and metadata atoms per name.
-4. **Verify** non-exact atoms: re-read the file, check `(size, mtime)` against
-   the catalog (a changed file is dropped and queued, never reported from stale
-   data), run the matcher.
+4. **Verify** Maybe rows against bracketed current bytes. Cache content facts
+   only when the read matches the catalog's full version key; every other copy
+   gets its own checked stat before reuse. Changed paths use their own current
+   bytes; vanished paths are dropped. Exact answers remain snapshots of the
+   last follow (S2.md § Coverage).
 5. **Emit** one row per path (D15): path, doc id, and match offsets. Human
    output by default; JSON lines behind a flag.
 

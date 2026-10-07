@@ -125,6 +125,14 @@ query atoms:
                   ext: fold ASCII case only, re: folds Unicode case, and
                   text: folds as the content index does (case:text:Foo).
 
+search freshness:
+  Content answers are as of the index's last follow; names are as of the
+  catalog's last refresh. The daemon normally keeps both within about a
+  second of change. Exact Yes rows are not re-read. A Maybe candidate that
+  changed is checked against its current bytes; a vanished file is dropped.
+  A new term absent from the snapshot can be missed until the next follow:
+  after alpha becomes zeta, text:zeta may miss it while text:alpha still hits.
+
   --scan-uncovered  a text: query is refused while more than 10000 live
                   documents are not yet in the content index, because each
                   would be read; this reads them instead.

@@ -570,11 +570,11 @@ fn not_text_on_an_uncovered_document_is_settled_by_verification() {
 
 /// A file rewritten after indexing, before the catalog sees it. An exact
 /// posting answers for the catalog's version, as name search does for a
-/// stale catalog; a Maybe needs a read, the read finds the file changed,
-/// and its rows are dropped whatever the polarity. Once the catalog catches
+/// stale catalog; a Maybe reads the current bytes even after a change.
+/// A posting miss stays a snapshot miss. Once the catalog catches
 /// up the new version is uncovered and verified like any other.
 #[test]
-fn a_file_changed_after_indexing_is_dropped_by_verification() {
+fn changed_files_use_current_bytes_only_when_the_snapshot_yields_maybe() {
     let tree = Tree::new();
     let a = tree.write("a.txt", b"alpha beta\n");
     let b = tree.write("b.txt", b"gamma delta\n");
@@ -595,8 +595,30 @@ fn a_file_changed_after_indexing_is_dropped_by_verification() {
 
     let not = query(&["NOT", "text:alpha beta", "ext:txt"]);
     let (rows, report) = search(&pin, &not, None).unwrap();
-    assert_eq!(rows, paths(&[&b]), "dropped, not negated");
+    assert_eq!(
+        rows,
+        paths(&[&a, &b]),
+        "current bytes settle the negative phrase"
+    );
     assert_eq!(report.unwrap().changed, 1);
+
+    let (rows, report) = search(&pin, &query(&["case:text:beta"]), None).unwrap();
+    assert_eq!(
+        rows,
+        paths(&[&a]),
+        "a changed candidate still matching current bytes"
+    );
+    let report = report.unwrap();
+    assert_eq!((report.verified, report.changed), (1, 1));
+    let (rows, report) = search(&pin, &query(&["text:zeta"]), None).unwrap();
+    assert!(
+        rows.is_empty(),
+        "new term absent from the index is a snapshot miss"
+    );
+    assert_eq!(report.unwrap().verified, 0);
+    let (rows, report) = search(&pin, &query(&["NOT", "text:zeta", "ext:txt"]), None).unwrap();
+    assert_eq!(rows, paths(&[&a, &b]), "snapshot absence is exact too");
+    assert_eq!(report.unwrap().verified, 0);
 
     tree.refresh(&engine);
     let pin = engine.pin();
@@ -877,4 +899,48 @@ fn a_matching_copy_does_not_vouch_for_a_changed_copy() {
             .0,
         paths(&[&a])
     );
+}
+
+/// Current-byte answers belong to the changed path, never its old DocId.
+#[test]
+fn current_copy_answers_do_not_enter_the_document_cache() {
+    let tree = Tree::new();
+    let a = tree.write("a.txt", b"alpha beta");
+    let b = tree.write("b.txt", b"alpha beta");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    tree.write("a.txt", b"Alpha beta longer");
+    let pin = engine.pin();
+    assert_eq!(
+        search(&pin, &query(&["case:text:Alpha"]), None).unwrap().0,
+        paths(&[&a])
+    );
+    assert_eq!(
+        search(&pin, &query(&["case:text:alpha"]), None).unwrap().0,
+        paths(&[&b])
+    );
+    assert_eq!(
+        search(&pin, &query(&["NOT", "case:text:alpha", "ext:txt"]), None)
+            .unwrap()
+            .0,
+        paths(&[&a])
+    );
+}
+
+#[test]
+fn vanished_maybe_paths_are_dropped_in_both_polarities() {
+    let tree = Tree::new();
+    let a = tree.write("a.txt", b"alpha beta");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    fs::remove_file(a).unwrap();
+    let pin = engine.pin();
+    for args in [
+        &["case:text:alpha"][..],
+        &["NOT", "case:text:alpha", "ext:txt"],
+    ] {
+        assert!(search(&pin, &query(args), None).unwrap().0.is_empty());
+    }
 }

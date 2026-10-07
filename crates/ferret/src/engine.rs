@@ -454,12 +454,19 @@ impl QuerySession {
         };
         let mut reader = ferret_crawl::Documents::by_name(catalog)?;
         let mut read = |name, request: ferret_query::ReadRequest<'_>| {
-            match request {
-                ferret_query::ReadRequest::Stat => reader.check_name(catalog, name),
-                ferret_query::ReadRequest::Bytes(out) => reader.read_name(catalog, name, out),
+            let observed = match request {
+                ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
+                ferret_query::ReadRequest::Bytes(out) => {
+                    reader.read_current_name(catalog, name, out)
+                }
             }
-            .ok()
-            .map(|()| ferret_query::ReadVersion::Catalogued)
+            .ok()?;
+            let recorded = catalog.inode(catalog.name(name).child).stat;
+            Some(if recorded.same_version(&observed) {
+                ferret_query::ReadVersion::Catalogued
+            } else {
+                ferret_query::ReadVersion::Current
+            })
         };
         query.run_content(catalog, &self.names, &content, &mut read, cancelled, emit)
     }
