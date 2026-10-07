@@ -85,7 +85,7 @@ Predecessors, carried forward where still open:
 | D67 | How `ferret search` spells a content regex, and when it refuses | open | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0) |
 | D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B: screen filters on paper from M1 key counts + probe microbench before building any (S3 M0) |
 | D69 | Saturated large documents in trigram postings           | open           | rec A: index every document's trigrams; saturated bitmap only if M1/M4 measure it cheap (S3 M0) |
-| D70 | How large the trigram follow buffer may grow           | open           | rec A: separate bounds, if M1a measures follow peak RSS < 512 MiB; B (shared flush charge) if not (S3 M0) |
+| D70 | How large the trigram follow buffer may grow           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3931,3 +3931,32 @@ costs density, which outranks memory here. C is the most code.
 **Fact that would change it:** M1a measuring A's combined peak above 512 MiB,
 or B's term index growing by less than 3% at steady state. Then take B. If
 neither A's memory nor B's density is acceptable, take C.
+
+**Update after M1a (measured, `wt/s3-m1` `6d63c27`).**
+
+Both inverters were fed from each read over the `$HOME` catalog (112,898
+readable documents, 3.97 GB). Each policy ran as its own process. Both
+segments were bounded by allocated capacity, not by S2's legacy estimate. B
+was built as one shared 64 MiB capacity bound, which is stricter than
+revision 5's 48 MiB-reservation flush charge.
+
+| | A (term 64 MiB, trigram own bound) | B (shared 64 MiB) |
+| --- | --- | --- |
+| Follow peak RSS | 458.3 MiB | 247.5 MiB |
+| Build segments | 73 | 177 |
+| Steady segments | 10 | 15 |
+| Steady term index | 449.3 MB | 454.3 MB (+1.1%) |
+| Steady trigram index | 323.2 MB | 329.2 MB (+1.9%) |
+| Full-merge term + trigram | 688.1 MB | 688.1 MB |
+| Steady merge work | 86.9 CPU-s, 7 merges | 182.9 CPU-s, 18 merges |
+
+A is under 512 MiB, and B's term index grows by less than 3%. Both of the
+recommendation's conditions hold, so the stated rule picks **B**: half the
+memory for 1.1% term density at steady state. B also pays 96 more CPU-s of
+merging while the index settles. The trigram index is 7.9% of text at steady
+state and 7.5% fully merged, inside the 20% gate.
+
+**Revised recommendation: B**, with revision 5's 48 MiB reservation, which
+ends fewer segments than the variant measured here. **Fact that would change
+it:** treating merge CPU during settling as more costly than 210 MiB of
+follow memory. Then A.
