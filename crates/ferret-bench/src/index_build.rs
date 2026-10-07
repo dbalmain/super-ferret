@@ -163,6 +163,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
         return Err(format!("{} exists; the build wants a fresh index", out.display()).into());
     }
     let catalog = crate::open_catalog(dir)?;
+    let snapshot = options.corpus.as_ref().map(|dir| crate::content_snapshot::Snapshot::open(dir, &catalog)).transpose()?;
     let (live, named) = documents(&catalog)?;
     let view = CatalogView {
         incarnation: catalog.generation().incarnation,
@@ -188,6 +189,11 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
             let Some(&(name, size)) = named.get(&doc) else {
                 return Err(Fault::Unreadable);
             };
+            if let Some(snapshot) = &snapshot {
+                if !snapshot.contains(doc) { return Err(Fault::Unreadable); }
+                *bytes = fs::read(snapshot.path(doc)).map_err(|_| Fault::Unreadable)?;
+                return Ok(());
+            }
             path.clear();
             catalog.path(name, &mut path);
             match fs::read(Path::new(std::ffi::OsStr::from_bytes(&path))) {
@@ -239,7 +245,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     report.clear();
 
     if options.snapshots {
-        snapshot(out, "first")?;
+        save_state(out, "first")?;
     }
     if options
         .control_bytes
@@ -286,7 +292,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     report.clear();
 
     if options.snapshots {
-        snapshot(out, "steady")?;
+        save_state(out, "steady")?;
     }
     crate::trigram::check_disk()?;
     // 3. One forced full merge.
@@ -323,6 +329,7 @@ struct Options {
     codec: u32,
     snapshots: bool,
     control_bytes: Option<u64>,
+    corpus: Option<std::path::PathBuf>,
 }
 impl Options {
     fn parse(args: &[String]) -> crate::Result<Self> {
@@ -330,6 +337,7 @@ impl Options {
             codec: DICTIONARY_CODEC,
             snapshots: false,
             control_bytes: None,
+            corpus: None,
         };
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -341,6 +349,7 @@ impl Options {
                         _ => return Err("codec must be 1 or h".into()),
                     }
                 }
+                "--corpus" => result.corpus = Some(args.next().ok_or("missing corpus snapshot")?.into()),
                 "--snapshots" => result.snapshots = true,
                 "--control-bytes" => {
                     result.control_bytes =
@@ -353,7 +362,7 @@ impl Options {
     }
 }
 
-fn snapshot(index: &Path, state: &str) -> crate::Result<()> {
+fn save_state(index: &Path, state: &str) -> crate::Result<()> {
     let out = index.with_extension(state);
     fs::create_dir(&out)?;
     for entry in fs::read_dir(index)? {
@@ -408,6 +417,7 @@ fn generated(doc: u32, vocabulary: &[Vec<u8>], out: &mut Vec<u8>) {
 
 pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Result<()> {
     let options = Options::parse(options)?;
+    if options.snapshots || options.control_bytes.is_some() || options.corpus.is_some() { return Err("index-churn only supports --codec".into()); }
     let rounds: u32 = rounds.parse()?;
     if out.exists() {
         return Err(format!("{} exists; the trace wants a fresh index", out.display()).into());

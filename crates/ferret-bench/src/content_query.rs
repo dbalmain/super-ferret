@@ -105,10 +105,11 @@ struct Sample {
 /// `only`, when not empty, names the classes to run.
 pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Result<()> {
     let mut classes_only = Vec::new();
-    let (mut terms_dir, mut compare_dir) = (None, None);
+    let (mut terms_dir, mut compare_dir, mut corpus_dir) = (None, None, None);
     let mut options = only.iter();
     while let Some(option) = options.next() {
         match option.as_str() {
+            "--corpus" => corpus_dir = Some(options.next().ok_or("missing corpus snapshot")?),
             "--terms" => terms_dir = Some(options.next().ok_or("missing terms index")?),
             "--compare" => compare_dir = Some(options.next().ok_or("missing comparison index")?),
             "rare" => classes_only.push("df2-100".to_owned()),
@@ -120,6 +121,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     let catalog = crate::open_catalog(dir)?;
     catalog.load_all()?;
     let catalog = catalog.into_resident()?;
+    let snapshot = corpus_dir.map(|dir| crate::content_snapshot::Snapshot::open(Path::new(dir), &catalog)).transpose()?;
     let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
     let view = View::open(
         index_dir,
@@ -220,10 +222,10 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                 std::time::SystemTime::now(),
             )?;
             evict()?;
-            let evicted = once(&catalog, &names, &content, &query)?.wall;
-            let warm = once(&catalog, &names, &content, &query)?;
+            let evicted = once(&catalog, &names, &content, &query, snapshot.as_ref())?.wall;
+            let warm = once(&catalog, &names, &content, &query, snapshot.as_ref())?;
             if let Some(compare) = &compare {
-                let control = once(&catalog, &names, compare, &query)?;
+                let control = once(&catalog, &names, compare, &query, snapshot.as_ref())?;
                 if warm.identities != control.identities {
                     return Err("verified rows differ from control".into());
                 }
@@ -373,11 +375,29 @@ fn once(
     names: &NameIndex,
     content: &Content<'_>,
     query: &Query,
+    snapshot: Option<&crate::content_snapshot::Snapshot>,
 ) -> crate::Result<Once> {
     let (mut read, mut read_bytes) = (Duration::ZERO, 0u64);
     let mut path = Vec::new();
     let mut reader = |name: NameId, request: ferret_query::ReadRequest<'_>| {
         let start = Instant::now();
+        if let Some(snapshot) = snapshot {
+            let doc = match catalog.name(name).target() {
+                Target::Inode(inode) => catalog.doc(inode)?,
+                _ => return None,
+            };
+            // A stat still costs a filesystem operation, as in the ordinary
+            // reader. These bytes are exactly the version both arms indexed.
+            let path = snapshot.path(doc.0);
+            let version = match request {
+                ferret_query::ReadRequest::Stat => fs::metadata(path).ok().map(|_| ferret_query::ReadVersion::Catalogued),
+                ferret_query::ReadRequest::Bytes(out) => fs::read(path).ok().map(|bytes| {
+                    read_bytes += bytes.len() as u64; *out = bytes; ferret_query::ReadVersion::Catalogued
+                }),
+            };
+            read += start.elapsed();
+            return version;
+        }
         let version = match request {
             ferret_query::ReadRequest::Stat => {
                 path.clear();

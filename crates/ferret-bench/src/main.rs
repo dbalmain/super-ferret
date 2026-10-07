@@ -63,6 +63,7 @@ use ferret_verify::{Arm, Finder};
 
 mod census;
 mod content_query;
+mod content_snapshot;
 mod corpus;
 mod fuse;
 mod index_build;
@@ -122,6 +123,7 @@ fn main() -> ExitCode {
             ("segment-build", [dir, out, flag]) if flag == "--breakdown" => {
                 segment_build::run(Path::new(dir), Path::new(out), true)
             }
+            ("index-freeze", [dir, out]) => content_snapshot::capture(Path::new(dir), Path::new(out)),
             ("index-build", [dir, out, options @ ..]) => {
                 index_build::run(Path::new(dir), Path::new(out), options)
             }
@@ -214,14 +216,15 @@ fn usage() -> ExitCode {
          ferret-bench tokenize <corpus-dir>\n       \
          ferret-bench terms <catalog-dir>\n       \
          ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]\n       \
-         ferret-bench index-build <catalog-dir> <index-dir> [--codec 1|h] [--snapshots] [--control-bytes N]\n       \
+         ferret-bench index-freeze <catalog-dir> <snapshot-dir>\n       \
+         ferret-bench index-build <catalog-dir> <index-dir> [--codec 1|h] [--snapshots] [--control-bytes N] [--corpus snapshot-dir]\n       \
          ferret-bench trigram-build <catalog-dir> <out-dir>\n       \
          ferret-bench trigram-census <catalog-dir>\n       \
          ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b\n       \
          ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench index-churn <index-dir> <rounds> [--codec 1|h]\n       \
-         ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [class...]\n       \
+         ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [--corpus snapshot-dir] [class...]\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \
