@@ -82,6 +82,9 @@ Predecessors, carried forward where still open:
 | D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
 | D65 | The term dictionary is 87% of the index                  | open           | rec A for S2; M3 merged 11.1% (full 9.8%) > 8%, so C's trigram experiment opens S3 (S2 M2b, M3)            |
 | D66 | Phrase queries read too much: positions, or not         | open           | rec A: no positions; ship windowed verify; coarse chunk map for big files is an S3 experiment beside D65 C (S2 M4c) |
+| D67 | How `ferret search` spells a content regex            | open           | rec A: `grep:REGEX`, case-insensitive, multi-line `^`/`$`; `re:` stays names (S3 M0) |
+| D68 | Per-document filters: build them, or cost them on paper | open           | rec B: price filters from M1 key counts + probe microbench; build postings only (S3 M0) |
+| D69 | Saturated large documents in trigram postings           | open           | rec A: index every document's trigrams; saturated bitmap only if M1/M4 measure it cheap (S3 M0) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3662,3 +3665,107 @@ covering verification time above about 100 ms. Measured with
 - A measurement that most verified bytes come from `jsonl` transcripts would
   make a `jsonl` policy (D65's side question) the cheaper fix than any
   structure.
+
+## D67 — How `ferret search` spells a content regex
+
+**Status: open.** S3 M0, 2026-10-07; [design](S3.md#query-surface-d67).
+
+**Question:** What prefix makes an argument a regex over file content, and what
+line and case semantics does it have?
+
+`re:` already means a regex over **names** (S1). D62 A gave content `text:`.
+DESIGN's query section sketched `/regex/`. Agents call `ferret search` from
+shells, so quoting cost matters.
+
+| Option                                               | Costs                                                                                                                                                              | Buys                                                                                                                      |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| A. `grep:REGEX`                                      | One more prefix to learn.                                                                                                                                          | It reads as what it does, and agents know grep. `case:grep:` composes as `case:` does elsewhere. `re:` keeps its meaning. |
+| B. `text:/REGEX/`                                    | It changes `text:`'s meaning for an argument that starts and ends with `/`, which today is a term (`text:/usr/` finds `usr`). A regex containing `/` needs a rule. | No new prefix: `text:` covers all content.                                                                                |
+| C. Bare `/REGEX/`, as DESIGN sketched                | `/` already makes a bare word a path substring (S1), so `/usr/` changes meaning.                                                                                   | The shortest spelling.                                                                                                    |
+| D. `re:` searches content as well as names (a union) | It changes every existing `re:` query's meaning and cost (D62's argument against its B).                                                                           | One regex prefix.                                                                                                         |
+
+Semantics, under any option:
+
+- **case-insensitive by default**, as `text:` and `re:` are, with `case:` for
+  exact case;
+- **multi-line**: `^` and `$` match at line boundaries, as grep users expect.
+  `(?-m)` restores whole-document anchors;
+- `.` does not match `\n` (the `regex` default).
+
+The alternative is the `regex` defaults: whole-document `^`/`$`. Those are
+surprising for content, though right for names.
+
+**Recommendation: A, with multi-line on.** Fastest and simplest are indifferent;
+this is interface taste and compatibility, as D62 was.
+
+**Fact that would change it:** S4's agent traces showing agents reaching for
+`/…/` or for `re:` on content. Then make B or D the spelling, with the old one
+as an alias.
+
+## D68 — Per-document filters: build them, or cost them on paper
+
+**Status: open.** S3 M0, 2026-10-07;
+[design](S3.md#per-document-trigram-filters).
+
+**Question:** ROADMAP says S3 builds per-document trigram filters beside trigram
+postings, and benches per-document term filters against postings (D6, D8).
+Should both filters be built and benched, or priced from exact key counts and a
+microbenchmark, with only postings built?
+
+A binary fuse filter's size is determined by its key count, and each key is
+exactly one posting. So filter bytes are `pairs × ~9 bits / 8`, plus overhead
+for small documents. Figures are **estimates** unless marked:
+
+- **Trigrams:** about 500 MB of filters against about 333 MB of postings at the
+  central estimate. Filters are smaller only if postings average more than 9
+  bits per pair; term lists measured 8.32 (M2), and trigram lists are denser.
+- **Terms:** 89.7M pairs (**measured**, M1c) give 101 MB of filters against S2's
+  392 MB merged index (**measured**, M3), so 3.9× smaller.
+- **Latency:** either filter makes every query probe every live document. At 10M
+  that is about 0.13–2.7 s warm, against a rare term's measured 1.94 ms warm
+  median (M4b).
+- **D8's premise** that filters cost 12% of postings is an arithmetic error in
+  the research budget: 248 Mbit should have been 248 MB.
+
+| Option                                                                                                                                           | Costs                                                                                                                                                 | Buys                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| A. Build both filters and bench them, as ROADMAP says                                                                                            | A filter builder, a `Probe::DocFilter` arm, filter merging, and their tests: about one slice of work for structures the arithmetic already rules out. | Measured rather than computed numbers; D6's experiment as written.                       |
+| B. Compute filter bytes from M1's exact per-document key counts; microbench the probe over synthetic filters of those sizes; build postings only | The numbers are a calculation plus a microbenchmark, not a shipped structure, so the cold page-cache behaviour of real filter files is not measured.  | A slice saved. D6/D8 still get an answer with numbers: bytes exact, probe cost measured. |
+| C. Build the term filter only, as a density option behind the opt-in                                                                             | A second term structure to keep correct, and rare-term queries 100–1000× slower when it is chosen.                                                    | The smallest term index by far, for users who value bytes over everything.               |
+
+**Recommendation: B.** Fastest and simplest agree: postings are smaller or
+equal, faster by orders of magnitude, and already built.
+
+**Fact that would change it:** M1 measuring trigram postings above 9 bits per
+pair (filters would then be smaller, so A for trigrams), or Dave wanting C's
+density option, accepting second-scale term queries at 10M.
+
+## D69 — Saturated large documents in trigram postings
+
+**Status: open.** S3 M0, 2026-10-07;
+[design](S3.md#bytes-per-content-byte-estimate).
+
+**Question:** Large documents hold most of the bytes and nearly every common
+trigram. Should their trigrams be indexed like any document's, or should a
+document past a key-count line be marked "Maybe for every trigram" and skip
+trigram postings?
+
+Figures are **estimates** until M1. 53% of `$HOME`'s text is in files of 1 MiB
+or more (**measured**, S2 M1), perhaps 800 files. At about 200k distinct keys
+each, they contribute about 160M of an estimated 444M trigram pairs, roughly 120
+MB of the trigram files. A selective regex likely excludes most of them, but a
+common one includes them all.
+
+| Option                                                                                                                       | Costs                                                                                                                                                                                                   | Buys                                               |
+| ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| A. Index every document's trigrams                                                                                           | The full ~350 MB, about 36% of it from large documents. Bytes grow with text past a few GB, since keys saturate and pairs do not.                                                                       | Every regex narrows over every document. One rule. |
+| B. Past a line (say 64k distinct keys), store the document in a per-segment "saturated" bitmap, Maybe for every trigram atom | Every regex query verifies every saturated document, about 800 files and 2.1 GB on `$HOME`. That is roughly the broad-phrase cost, 0.2–0.3 s of reading warm (M4c), on _every_ regex, and minutes cold. | Up to about a third of trigram bytes saved.        |
+| C. A, plus D66 C's chunk map for regex as well, keyed by trigram at 1 MiB                                                    | The largest structure of the three (estimate: more pairs than the trigram postings themselves).                                                                                                         | Large documents both narrowed and partly read.     |
+
+**Recommendation: A.** Fastest, and the simplest. B is denser but makes every
+regex pay the cost the phrase work just removed, so the two disagree and this is
+a brief. C is costed only by M5's single census row.
+
+**Fact that would change it:** M1 measuring large-document pairs above about
+half of all trigram pairs, _and_ M4 measuring verification of saturated
+documents under 100 ms warm. Then B's cost is small enough to buy its bytes.
