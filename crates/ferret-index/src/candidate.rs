@@ -165,15 +165,28 @@ impl<'a> Pinned<'a> {
     /// `live` is the catalog view's live documents; its bound is the view's
     /// `next_doc`.
     pub fn new(view: Option<&'a View>, live: &'a DocSet) -> Self {
+        match Self::new_until(view, live, || false) {
+            Some(pinned) => pinned,
+            None => unreachable!("a build that is never cancelled completes"),
+        }
+    }
+
+    /// As [`Pinned::new`], `None` once `cancelled` answers true while the
+    /// uncovered set is built (asked as [`DocSet::new_until`] asks it).
+    pub fn new_until(
+        view: Option<&'a View>,
+        live: &'a DocSet,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Self> {
         let uncovered = match view {
-            Some(view) => view.uncovered_set(live),
+            Some(view) => view.uncovered_set_until(live, cancelled)?,
             None => live.clone(),
         };
-        Self {
+        Some(Self {
             view,
             live,
             uncovered,
-        }
+        })
     }
 
     /// Every structure the view holds; S2 has one, and no view has none.

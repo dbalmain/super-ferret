@@ -363,6 +363,16 @@ pub fn live_documents(view: &Catalog) -> DocSet {
     DocSet::new(view.next_doc().0, view.docs().map(|(doc, _)| doc.0))
 }
 
+/// As [`live_documents`], `None` once `cancelled` answers true (asked as
+/// [`DocSet::new_until`] asks it).
+fn live_documents_until(view: &Catalog, cancelled: impl Fn() -> bool) -> Option<DocSet> {
+    DocSet::new_until(
+        view.next_doc().0,
+        view.docs().map(|(doc, _)| doc.0),
+        cancelled,
+    )
+}
+
 fn catalog_view<'a>(view: &Catalog, live: &'a DocSet) -> CatalogView<'a> {
     CatalogView {
         incarnation: view.generation().incarnation,
@@ -414,7 +424,8 @@ impl QuerySession {
         self.search_until(query, None, emit)
     }
 
-    /// Streams rows, checking host cancellation at every candidate boundary.
+    /// Streams rows, checking host cancellation at entry and at every
+    /// candidate boundary.
     /// A content query refuses an index with more than
     /// [`UNCOVERED_BOUND`] uncovered documents.
     pub fn search_until(
@@ -423,6 +434,9 @@ impl QuerySession {
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
+        if is_cancelled(cancelled) {
+            return Ok(Stats::default());
+        }
         if query.has_content() {
             return self.search_content(query, Some(UNCOVERED_BOUND), cancelled, emit);
         }
@@ -434,6 +448,10 @@ impl QuerySession {
     /// reader. More than `bound` uncovered documents is
     /// [`RunError::IndexIncomplete`]; `None` (`--scan-uncovered`) reads
     /// however many there are.
+    ///
+    /// A cancelled query returns no rows and default stats, as the checked
+    /// runner does, including while the catalog view's derived state is
+    /// first built: a cancelled build leaves nothing cached.
     pub fn search_content(
         &self,
         query: &Query,
@@ -441,12 +459,23 @@ impl QuerySession {
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
+        let stopped = || is_cancelled(cancelled);
+        if stopped() {
+            return Ok(Stats::default());
+        }
         if !query.has_content() {
             return query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit);
         }
         let catalog = &self.catalog;
-        let docs = self.doc_names()?;
-        let pinned = Pinned::new(self.content.as_deref(), self.live());
+        let Some(docs) = self.doc_names_until(stopped)? else {
+            return Ok(Stats::default());
+        };
+        let Some(pinned) = self
+            .live_until(stopped)
+            .and_then(|live| Pinned::new_until(self.content.as_deref(), live, stopped))
+        else {
+            return Ok(Stats::default());
+        };
         let content = Content {
             pinned: &pinned,
             docs,
@@ -457,9 +486,7 @@ impl QuerySession {
             let observed = match request {
                 ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
                 ferret_query::ReadRequest::Bytes(out) => {
-                    reader.read_current_name_until(catalog, name, out, &|| {
-                        cancelled.is_some_and(|flag| flag.load(Ordering::Acquire))
-                    })
+                    reader.read_current_name_until(catalog, name, out, &stopped)
                 }
             }
             .ok()?;
@@ -478,6 +505,17 @@ impl QuerySession {
         self.derived
             .live
             .get_or_init(|| live_documents(&self.catalog))
+    }
+
+    /// As [`QuerySession::live`], publishing only a completed build: `None`
+    /// once `cancelled` answers true, leaving the next caller to build it.
+    /// Two concurrent builders may both build; the first to finish wins.
+    fn live_until(&self, cancelled: impl Fn() -> bool) -> Option<&DocSet> {
+        if let Some(live) = self.derived.live.get() {
+            return Some(live);
+        }
+        let built = live_documents_until(&self.catalog, cancelled)?;
+        Some(self.derived.live.get_or_init(|| built))
     }
 
     /// Runs find with the plan's captured cwd/time and the host's effects.
@@ -540,12 +578,32 @@ impl std::error::Error for Error {
 
 impl QuerySession {
     fn doc_names(&self) -> Result<&DocNames, OpenError> {
-        match self.derived.docs.get() {
+        match self.doc_names_until(|| false)? {
             Some(docs) => Ok(docs),
-            None => {
-                let built = DocNames::new(&self.catalog)?;
-                Ok(self.derived.docs.get_or_init(|| built))
-            }
+            None => unreachable!("a build that is never cancelled completes"),
         }
     }
+
+    /// As `doc_names`, publishing only a completed build: `Ok(None)` once
+    /// `cancelled` answers true, leaving the next caller to build it. Two
+    /// concurrent builders may both build; the first to finish wins.
+    fn doc_names_until(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<&DocNames>, OpenError> {
+        if let Some(docs) = self.derived.docs.get() {
+            return Ok(Some(docs));
+        }
+        let Some(built) = DocNames::new_until(&self.catalog, cancelled)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.derived.docs.get_or_init(|| built)))
+    }
 }
+
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Ordering::Acquire))
+}
+
+#[cfg(test)]
+mod tests;

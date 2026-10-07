@@ -342,12 +342,26 @@ impl View {
     /// [`View::uncovered`] as a set, built without an intermediate list:
     /// during a first build it holds every live document.
     pub fn uncovered_set(&self, live: &DocSet) -> DocSet {
+        match self.uncovered_set_until(live, || false) {
+            Some(set) => set,
+            None => unreachable!("a build that is never cancelled completes"),
+        }
+    }
+
+    /// As [`View::uncovered_set`], `None` once `cancelled` answers true
+    /// (asked as [`DocSet::new_until`] asks it).
+    pub fn uncovered_set_until(
+        &self,
+        live: &DocSet,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<DocSet> {
         let unreadable = self.manifest.unreadable.iter().copied();
-        DocSet::new(
+        DocSet::new_until(
             live.bound(),
             unreadable
                 .filter(|&doc| live.contains(doc))
                 .chain(live.range(self.manifest.frontier, live.bound())),
+            cancelled,
         )
     }
 

@@ -16,12 +16,35 @@ impl DocSet {
     /// above `bound` is ignored, so a caller cannot widen the set past the
     /// view it describes.
     pub fn new(bound: u32, docs: impl IntoIterator<Item = u32>) -> Self {
+        match Self::new_until(bound, docs, || false) {
+            Some(set) => set,
+            None => unreachable!("a build that is never cancelled completes"),
+        }
+    }
+
+    /// Ids a cancellable build reads between asks.
+    pub const CHECK_EVERY: usize = 4096;
+
+    /// As [`DocSet::new`], asking `cancelled` before allocating and after
+    /// every [`DocSet::CHECK_EVERY`] ids: `None` once it answers true. A
+    /// caller that caches the set publishes it only when this returns one.
+    pub fn new_until(
+        bound: u32,
+        docs: impl IntoIterator<Item = u32>,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Self> {
+        if cancelled() {
+            return None;
+        }
         let mut set = Self {
             words: vec![0; (bound as usize).div_ceil(64)],
             bound,
             len: 0,
         };
-        for doc in docs {
+        for (seen, doc) in docs.into_iter().enumerate() {
+            if (seen + 1) % Self::CHECK_EVERY == 0 && cancelled() {
+                return None;
+            }
             if doc < bound {
                 let (word, bit) = (doc as usize / 64, 1u64 << (doc % 64));
                 if set.words[word] & bit == 0 {
@@ -30,7 +53,7 @@ impl DocSet {
                 }
             }
         }
-        set
+        Some(set)
     }
 
     /// One past the largest id the set can hold: the view's `next_doc`.

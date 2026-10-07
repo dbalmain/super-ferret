@@ -27,7 +27,7 @@ use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferret_catalog::{Catalog, NameId, OpenError, Section, Target};
-use ferret_index::{Advance, Certainty, Cursor, Pinned};
+use ferret_index::{Advance, Certainty, Cursor, DocSet, Pinned};
 use ferret_verify::{MatchStats, TextMatcher};
 
 use crate::expr::{Node, Test, Truth};
@@ -145,12 +145,37 @@ pub struct DocNames {
 
 impl DocNames {
     pub fn new(catalog: &Catalog) -> Result<Self, OpenError> {
+        match Self::new_until(catalog, || false)? {
+            Some(docs) => Ok(docs),
+            None => unreachable!("a build that is never cancelled completes"),
+        }
+    }
+
+    /// As [`DocNames::new`], asking `cancelled` before each allocation and
+    /// after every [`DocSet::CHECK_EVERY`] names of both passes: `Ok(None)`
+    /// once it answers true. A host that caches the result publishes it
+    /// only when this returns one.
+    pub fn new_until(
+        catalog: &Catalog,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<Self>, OpenError> {
+        if cancelled() {
+            return Ok(None);
+        }
         catalog.load(&Section::INODE)?;
         catalog.load(&[Section::Names, Section::Doc])?;
+        if cancelled() {
+            return Ok(None);
+        }
         let bound = catalog.next_doc().0 as usize;
         let mut starts = vec![0u32; bound + 1];
+        // False when cancelled before every name was seen.
         let each = |f: &mut dyn FnMut(usize, NameId)| {
-            for (id, name) in catalog.name_reader().runs_from(NameId(0)) {
+            let names = catalog.name_reader().runs_from(NameId(0));
+            for (seen, (id, name)) in names.enumerate() {
+                if (seen + 1) % DocSet::CHECK_EVERY == 0 && cancelled() {
+                    return false;
+                }
                 if let Target::Inode(inode) = name.target()
                     && catalog.is_live_name(id)
                     && catalog.is_live_inode(inode)
@@ -160,18 +185,21 @@ impl DocNames {
                     f(doc.0 as usize, id);
                 }
             }
+            true
         };
-        each(&mut |doc, _| starts[doc + 1] += 1);
+        if !each(&mut |doc, _| starts[doc + 1] += 1) || cancelled() {
+            return Ok(None);
+        }
         for d in 0..bound {
             starts[d + 1] += starts[d];
         }
         let mut fill = starts.clone();
         let mut names = vec![NameId(0); starts[bound] as usize];
-        each(&mut |doc, id| {
+        let filled = each(&mut |doc, id| {
             names[fill[doc] as usize] = id;
             fill[doc] += 1;
         });
-        Ok(Self { starts, names })
+        Ok(filled.then_some(Self { starts, names }))
     }
 
     /// The document's live names, ascending; empty for an id it never saw.
