@@ -223,6 +223,7 @@ pub(crate) fn search_request(
     let mut rows = 0u64;
     let mut status = 3u8;
     let mut query_error = None;
+    let mut read_error = false;
     let mut first_row = None;
     let mut stats = None;
     let mut bytes_read = 0u64;
@@ -283,7 +284,10 @@ pub(crate) fn search_request(
                 Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
                     query_error = Some(crate::search::incomplete_message(uncovered, live));
                 }
-                Err(error) => query_error = Some(error.to_string()),
+                Err(error) => {
+                    read_error = true;
+                    query_error = Some(error.to_string());
+                }
             }
         } else {
             query_error = Some("cannot open index".to_owned());
@@ -317,6 +321,7 @@ pub(crate) fn search_request(
     event_to(destination, request, "end", |o| {
         o.int("exit", status)
             .int("rows", rows)
+            .bool("read_error", read_error)
             .bool("cancelled", destination.cancelled())
             .int("elapsed_us", elapsed)
             .str("plan", &plan_text)

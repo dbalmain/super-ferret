@@ -493,7 +493,12 @@ fn query(
                         && let Some(error) = field_text(&value, "error")
                     {
                         let message = field_text(&value, "message").unwrap_or(error);
-                        if op == "find" {
+                        if op == "search"
+                            && matches!(value.field("read_error"), Some(Value::Bool(true)))
+                            && let Some(context) = context
+                        {
+                            cli::error(&format!("{}: {message}", context.index.display()));
+                        } else if op == "find" {
                             cli::error(&format!("find: {message}"));
                         } else {
                             cli::error(message);
