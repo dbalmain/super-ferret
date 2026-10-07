@@ -12,7 +12,7 @@
 //! ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]  real segments: bytes by section, CPU, RSS
 //! ferret-bench index-build <catalog-dir> <index-dir>  follow, merge to steady state, full merge (S2 M3)
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
-//! ferret-bench content-query <catalog-dir> <index-dir>  text: latency by class, phrase verification (S2 M4b)
+//! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
 //! ferret-bench name-index-once <catalog-dir> open phases and query timings
@@ -115,7 +115,9 @@ fn main() -> ExitCode {
             }
             ("index-build", [dir, out]) => index_build::run(Path::new(dir), Path::new(out)),
             ("index-churn", [out, rounds]) => index_build::churn(Path::new(out), rounds),
-            ("content-query", [dir, index]) => content_query::run(Path::new(dir), Path::new(index)),
+            ("content-query", [dir, index, only @ ..]) => {
+                content_query::run(Path::new(dir), Path::new(index), only)
+            }
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
@@ -165,7 +167,7 @@ fn usage() -> ExitCode {
          ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]\n       \
          ferret-bench index-build <catalog-dir> <index-dir>\n       \
          ferret-bench index-churn <index-dir> <rounds>\n       \
-         ferret-bench content-query <catalog-dir> <index-dir>\n       \
+         ferret-bench content-query <catalog-dir> <index-dir> [class...]\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \

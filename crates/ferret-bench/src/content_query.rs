@@ -29,7 +29,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ferret_catalog::{Catalog, NameId, Section, Target};
+use ferret_catalog::{Catalog, NameId, Target};
 use ferret_index::{CatalogView, DocSet, Pinned, View};
 use ferret_query::{Content, ContentReport, DocNames, NameIndex, Query, Side};
 use ferret_text::{Kind, Scratch, tokenize};
@@ -92,14 +92,19 @@ struct Sample {
     warm: Duration,
     rows: u64,
     report: ContentReport,
-    /// Time inside the verification reader and matcher's reads, warm run.
-    verify: Duration,
+    /// Time inside the verification reader, warm run: reads only; the
+    /// matcher runs after each read returns.
+    read: Duration,
+    /// Bytes the verification reader returned.
+    read_bytes: u64,
 }
 
-pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
+/// `only`, when not empty, names the classes to run.
+pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Result<()> {
+    // Resident, as the engine holds it.
     let catalog = crate::open_catalog(dir)?;
-    catalog.load(&Section::INODE)?;
-    catalog.load(&[Section::Names, Section::Roots, Section::Doc, Section::Docs])?;
+    catalog.load_all()?;
+    let catalog = catalog.into_resident()?;
     let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
     let view = View::open(
         index_dir,
@@ -168,6 +173,9 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
             .collect(),
     ));
     for (class, queries) in runs {
+        if !only.is_empty() && !only.iter().any(|c| c == class) {
+            continue;
+        }
         let mut samples = Vec::new();
         for args in &queries {
             let query = Query::from_args(
@@ -175,14 +183,15 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
                 std::time::SystemTime::now(),
             )?;
             evict()?;
-            let (evicted, _, _, _) = once(&catalog, &names, &content, &query)?;
-            let (warm, rows, report, verify) = once(&catalog, &names, &content, &query)?;
+            let evicted = once(&catalog, &names, &content, &query)?.wall;
+            let warm = once(&catalog, &names, &content, &query)?;
             samples.push(Sample {
                 evicted,
-                warm,
-                rows,
-                report,
-                verify,
+                warm: warm.wall,
+                rows: warm.rows,
+                report: warm.report,
+                read: warm.read,
+                read_bytes: warm.read_bytes,
             });
         }
         let mut warm: Vec<f64> = samples.iter().map(|s| ms(s.warm)).collect();
@@ -221,12 +230,17 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
     );
     println!("| measure | min | median | p90 | p95 | max |");
     println!("| --- | --- | --- | --- | --- | --- |");
-    let rows: [(&str, Measure); 4] = [
+    let rows: [(&str, Measure); 7] = [
         ("candidates (documents probed)", |s| {
             s.report.documents as f64
         }),
         ("verified (documents read)", |s| s.report.verified as f64),
-        ("verification ms", |s| ms(s.verify)),
+        ("verification read ms", |s| ms(s.read)),
+        ("verification read MiB", |s| s.read_bytes as f64 / 1048576.0),
+        ("wall ms", |s| ms(s.warm)),
+        ("derived match ms (wall - read)", |s| {
+            ms(s.warm.saturating_sub(s.read))
+        }),
         ("rows", |s| s.rows as f64),
     ];
     for (name, f) in rows {
@@ -244,10 +258,12 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
         .iter()
         .map(|s| s.report.verified as f64)
         .collect();
-    let mut verify_ms: Vec<f64> = phrase_samples.iter().map(|s| ms(s.verify)).collect();
+    // Verification is the read plus the matcher's tokenize; the planning
+    // and row emission around it are what the mid class costs, a few ms.
+    let mut verify_ms: Vec<f64> = phrase_samples.iter().map(|s| ms(s.warm)).collect();
     let (p90_docs, p90_ms) = (quantile(&mut verified, 0.9), quantile(&mut verify_ms, 0.9));
     println!(
-        "d7_positions_trigger: {} (p90 verified {p90_docs:.0} vs 10000; p90 verification {p90_ms:.1} ms vs 100)",
+        "d7_positions_trigger: {} (p90 verified {p90_docs:.0} vs 10000; p90 wall, nearly all verification, {p90_ms:.1} ms vs 100)",
         if p90_docs > 10_000.0 || p90_ms > 100.0 {
             "fires"
         } else {
@@ -263,25 +279,36 @@ fn arg(prefix: &str, bytes: &[u8]) -> String {
     format!("{prefix}{}", String::from_utf8_lossy(bytes))
 }
 
-/// One run of `query`: wall time, rows, the content report and the time
-/// spent reading documents for verification.
+/// One run of a query.
+struct Once {
+    wall: Duration,
+    rows: u64,
+    report: ContentReport,
+    read: Duration,
+    read_bytes: u64,
+}
+
+/// One run of `query`, rows counted.
 fn once(
     catalog: &Catalog,
     names: &NameIndex,
     content: &Content<'_>,
     query: &Query,
-) -> crate::Result<(Duration, u64, ContentReport, Duration)> {
-    let mut verify = Duration::ZERO;
+) -> crate::Result<Once> {
+    let (mut read, mut read_bytes) = (Duration::ZERO, 0u64);
     let mut path = Vec::new();
-    let mut read = |name: NameId, out: &mut Vec<u8>| {
+    let mut reader = |name: NameId, out: &mut Vec<u8>| {
         let start = Instant::now();
         let ok = read_name(catalog, name, &mut path, out);
-        verify += start.elapsed();
+        read += start.elapsed();
+        if ok {
+            read_bytes += out.len() as u64;
+        }
         ok
     };
     let mut rows = 0u64;
     let start = Instant::now();
-    let stats = query.run_content(catalog, names, content, &mut read, None, |_| {
+    let stats = query.run_content(catalog, names, content, &mut reader, None, |_| {
         rows += 1;
         ControlFlow::Continue(())
     })?;
@@ -289,7 +316,13 @@ fn once(
     let report = stats
         .content
         .ok_or("a content query reported no content plan")?;
-    Ok((wall, rows, report, verify))
+    Ok(Once {
+        wall,
+        rows,
+        report,
+        read,
+        read_bytes,
+    })
 }
 
 /// Reads `name`'s file by path, refusing a size the catalog did not record.
