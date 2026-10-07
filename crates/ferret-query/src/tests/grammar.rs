@@ -163,3 +163,188 @@ fn a_nul_in_any_atom_is_refused() {
         );
     }
 }
+
+/// D62 A's operators. Adjacent atoms AND, which binds tighter than `OR`;
+/// `NOT` binds tightest; a parenthesised group is one operand. The plain
+/// name atoms of the top-level AND still plan as S1's, so the S1 driver
+/// shows through; everything else is evaluated per row as a tree.
+#[test]
+fn operators_parse_with_and_tighter_than_or_and_not_tightest() {
+    let a = r#"name has "a" (folded)"#;
+    let b = r#"name has "b" (folded)"#;
+    let c = r#"name has "c" (folded)"#;
+    let d = r#"name has "d" (folded)"#;
+    let cases = [
+        (
+            "a b OR c",
+            format!("all names; then (({a} AND {b}) OR {c})"),
+        ),
+        (
+            "a OR b c",
+            format!("all names; then ({a} OR ({b} AND {c}))"),
+        ),
+        (
+            "NOT a b",
+            format!(r#"heap scan for "b" (folded); then NOT {a}"#),
+        ),
+        ("NOT NOT a", format!("all names; then NOT NOT {a}")),
+        (
+            "( a OR b ) c",
+            format!(r#"heap scan for "c" (folded); then ({a} OR {b})"#),
+        ),
+        // A group in the top-level AND joins it: its conjuncts are the
+        // query's.
+        (
+            "( ( a OR b ) ( c OR NOT d ) )",
+            format!("all names; then ({a} OR {b}), ({c} OR NOT {d})"),
+        ),
+        (
+            "a OR NOT ( b OR c )",
+            format!("all names; then ({a} OR NOT ({b} OR {c}))"),
+        ),
+        ("( a )", r#"heap scan for "a" (folded)"#.to_string()),
+        ("text:x", r#"all names; then text "x" (folded)"#.to_string()),
+        (
+            "NOT text:x",
+            r#"all names; then NOT text "x" (folded)"#.to_string(),
+        ),
+        (
+            "case:text:X a",
+            r#"heap scan for "a" (folded); then text "x" (exact case, verified)"#.to_string(),
+        ),
+        (
+            "text:x-y OR b",
+            format!(r#"all names; then (text "x y" (folded) OR {b})"#),
+        ),
+    ];
+    for (query, explain) in cases {
+        assert_eq!(plan(query).1, explain, "{query}");
+    }
+}
+
+/// A file named `OR`, `NOT`, `(` or `)` is reached through an atom prefix:
+/// `name:` takes the rest as a bare word, `case:` as an exact one.
+#[test]
+fn an_operator_spelled_with_a_prefix_is_a_name_atom() {
+    for (query, explain) in [
+        ("name:OR", r#"heap scan for "or" (folded)"#),
+        ("case:OR", r#"heap scan for "OR""#),
+        ("name:NOT", r#"heap scan for "not" (folded)"#),
+        ("name:(", r#"heap scan for "(" (folded)"#),
+        ("case:)", r#"heap scan for ")""#),
+        ("or", r#"heap scan for "or" (folded)"#),
+    ] {
+        assert_eq!(plan(query).1, explain, "{query}");
+    }
+}
+
+#[test]
+fn misplaced_operators_are_errors_that_say_what_is_missing() {
+    let cases = [
+        ("OR", ParseError::Dangling("OR")),
+        ("OR a", ParseError::Dangling("OR")),
+        ("a OR", ParseError::Dangling("OR")),
+        ("a OR OR b", ParseError::Dangling("OR")),
+        ("( a OR )", ParseError::Dangling("OR")),
+        ("NOT", ParseError::Dangling("NOT")),
+        ("a NOT", ParseError::Dangling("NOT")),
+        ("NOT )", ParseError::Dangling("NOT")),
+        ("( a", ParseError::Unclosed),
+        ("( ( a ) b", ParseError::Unclosed),
+        ("a )", ParseError::Unopened),
+        (") a", ParseError::Unopened),
+        ("( a ) )", ParseError::Unopened),
+        ("( )", ParseError::EmptyGroup),
+        ("text:-", ParseError::Text("text:-".into())),
+    ];
+    for (query, expected) in cases {
+        assert_eq!(error(query), expected, "{query}");
+    }
+    let messages = [
+        ("a OR", "`OR` needs a query on each side"),
+        ("NOT", "`NOT` needs a query after it"),
+        ("( a", "a `(` is not closed by a `)`"),
+        ("a )", "a `)` has no `(` before it"),
+        ("( )", "`( )` holds no query"),
+    ];
+    for (query, message) in messages {
+        assert_eq!(error(query).to_string(), message, "{query}");
+    }
+}
+
+/// Parentheses and NOT share one bound; rejected trees must be shallow even
+/// while unwinding a partly built expression.
+#[test]
+fn boolean_nesting_is_bounded_on_a_two_mib_stack() {
+    for stack in [512 << 10, 2 << 20] {
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(|| {
+                for (nots, groups) in [(33, 0), (0, 33), (17, 16)] {
+                    let args: Vec<_> = std::iter::repeat_n("NOT", nots)
+                        .chain(std::iter::repeat_n("(", groups))
+                        .chain(["text:x", "OR", "text:y"])
+                        .chain(std::iter::repeat_n(")", groups))
+                        .collect();
+                    assert_eq!(
+                        Query::from_args(&args, now()).err().map(|e| e.to_string()),
+                        Some("query nesting exceeds 32 NOT/parenthesis levels".into())
+                    );
+                }
+                for (nots, groups) in [(32, 0), (0, 32), (16, 16)] {
+                    let args: Vec<_> = std::iter::repeat_n("NOT", nots)
+                        .chain(std::iter::repeat_n("(", groups))
+                        .chain(["text:x", "OR", "text:y"])
+                        .chain(std::iter::repeat_n(")", groups))
+                        .collect();
+                    let query = Query::from_args(&args, now()).unwrap();
+                    assert!(!query.explain().is_empty());
+                    drop(query);
+                }
+                // Every group adds both OR and AND nodes; later recursive
+                // passes must survive the deepest tree, not
+                // just parentheses erased at parse.
+                let mut args = vec!["("; 32];
+                args.push("text:x");
+                for _ in 0..32 {
+                    args.extend(["OR", "text:y", "text:z", ")"]);
+                }
+                let query = Query::from_args(&args, now()).unwrap();
+                assert!(!query.explain().is_empty());
+                let scratch = super::Scratch::new("nesting");
+                let catalog = super::sample(&scratch).into_resident().unwrap();
+                let names = crate::NameIndex::new(&catalog);
+                let docs = crate::DocNames::new(&catalog).unwrap();
+                let live = ferret_index::DocSet::new(catalog.next_doc().0, 0..catalog.next_doc().0);
+                let pinned = ferret_index::Pinned::new(None, &live);
+                query
+                    .run_content(
+                        &catalog,
+                        &names,
+                        &crate::Content {
+                            pinned: &pinned,
+                            docs: &docs,
+                            bound: None,
+                        },
+                        &mut |_, request| {
+                            if let crate::ReadRequest::Bytes(bytes) = request {
+                                bytes.extend_from_slice(b"x y z");
+                            }
+                            Some(crate::ReadVersion::Catalogued)
+                        },
+                        None,
+                        |_| std::ops::ControlFlow::Continue(()),
+                    )
+                    .unwrap();
+                drop(query);
+                assert_eq!(
+                    Query::from_args(std::iter::repeat_n("NOT", 100_000).chain(["name:x"]), now())
+                        .unwrap_err(),
+                    ParseError::Nesting { limit: 32 }
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}

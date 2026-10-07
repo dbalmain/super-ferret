@@ -26,19 +26,23 @@ pub(crate) fn search(
     json: bool,
     limit: Option<u64>,
     now: SystemTime,
+    scan_uncovered: bool,
 ) -> Option<Exit> {
     query(
         &context.index,
         atoms,
         "search",
         json,
-        limit,
+        Options {
+            limit,
+            scan_uncovered,
+        },
         now,
         Some(context),
     )
 }
 pub(crate) fn find(index: &Path, args: &[OsString], json: bool, now: SystemTime) -> Option<Exit> {
-    query(index, args, "find", json, None, now, None)
+    query(index, args, "find", json, Options::default(), now, None)
 }
 
 pub(crate) fn writer_command(
@@ -60,7 +64,7 @@ pub(crate) fn writer_command(
         &args,
         command,
         false,
-        None,
+        Options::default(),
         SystemTime::now(),
         Some(context),
     )
@@ -71,7 +75,7 @@ pub(crate) fn daemon_status(context: &Context) -> Exit {
         &[],
         "status",
         false,
-        None,
+        Options::default(),
         SystemTime::now(),
         None,
     )
@@ -84,7 +88,7 @@ pub(crate) fn daemon_stats(context: &Context) -> Exit {
         &["--stats".into()],
         "status",
         false,
-        None,
+        Options::default(),
         SystemTime::now(),
         None,
     )
@@ -313,15 +317,24 @@ fn bytes(value: &Value, plain: &str, base64: &str) -> io::Result<Vec<u8>> {
             .ok_or_else(|| io::Error::other("missing byte field in daemon event"))
     }
 }
+#[derive(Default)]
+struct Options {
+    limit: Option<u64>,
+    scan_uncovered: bool,
+}
 fn query(
     index: &Path,
     args: &[OsString],
     op: &str,
     json: bool,
-    limit: Option<u64>,
+    options: Options,
     now: SystemTime,
     context: Option<&Context>,
 ) -> Option<Exit> {
+    let Options {
+        limit,
+        scan_uncovered,
+    } = options;
     let started = Instant::now();
     if std::env::var_os("FERRET_NO_DAEMON").is_some() {
         return None;
@@ -345,6 +358,10 @@ fn query(
             now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos() as u64,
         )
         .opt_byte_value("cwd", Some(cwd.as_os_str().as_bytes()));
+    object.byte_strings(
+        "capabilities",
+        scan_uncovered.then_some(b"scan-uncovered".as_slice()),
+    );
     object.end();
     protocol::parse_request(&request).ok()?;
     request.push(b'\n');
@@ -472,9 +489,16 @@ fn query(
                         field_number(&value, "exit")
                             .ok_or_else(|| io::Error::other("missing native status"))?,
                     )?;
-                    if !json && let Some(error) = field_text(&value, "error") {
+                    if (op == "search" || !json)
+                        && let Some(error) = field_text(&value, "error")
+                    {
                         let message = field_text(&value, "message").unwrap_or(error);
-                        if op == "find" {
+                        if op == "search"
+                            && matches!(value.field("read_error"), Some(Value::Bool(true)))
+                            && let Some(context) = context
+                        {
+                            cli::error(&format!("{}: {message}", context.index.display()));
+                        } else if op == "find" {
                             cli::error(&format!("find: {message}"));
                         } else {
                             cli::error(message);

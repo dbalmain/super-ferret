@@ -12,11 +12,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, Instant, SystemTime};
 
 use ferret_catalog::{Catalog, Kind};
-
-use crate::engine::Engine;
-use ferret_query::{Query, Row, Stats};
+use ferret_index::Certainty;
+use ferret_query::{ContentReport, Query, Row, RunError, Side, Stats, UNCOVERED_BOUND};
 
 use crate::cli::{Context, Exit, error};
+use crate::engine::Engine;
 use crate::json::Object;
 
 /// What one run did, for the log.
@@ -33,7 +33,16 @@ struct Outcome {
 
 /// Runs `search` and returns its exit status: [`Exit::Ok`] when it printed a
 /// row, [`Exit::NoMatch`] when it printed none.
-pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>) -> Exit {
+///
+/// Content queries use the daemon's paired pin, with a read-only local
+/// fallback.
+pub fn run(
+    context: &Context,
+    atoms: &[OsString],
+    json: bool,
+    limit: Option<u64>,
+    scan_uncovered: bool,
+) -> Exit {
     let started = Instant::now();
     let now = SystemTime::now();
     let query = match Query::from_args(atoms.iter().map(|a| a.as_bytes()), now) {
@@ -43,35 +52,38 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
             return Exit::Usage;
         }
     };
-    if let Some(exit) = crate::daemon::search(context, atoms, json, limit, now) {
+    if let Some(exit) = crate::daemon::search(context, atoms, json, limit, now, scan_uncovered) {
         return exit;
     }
     let mut outcome = Outcome::default();
-    let exit = search(context, &query, json, limit, started, &mut outcome);
+    let exit = search(
+        context,
+        &query,
+        Options {
+            json,
+            limit,
+            scan_uncovered,
+        },
+        started,
+        &mut outcome,
+    );
     let total = started.elapsed();
 
     let mut line = Vec::new();
     let mut object = crate::log::line(&mut line, "search", now);
     object
         .byte_strings("query", atoms.iter().map(|a| a.as_bytes()))
-        .str(
-            "plan",
-            &outcome.stats.and_then(|stats| stats.name_plan).map_or_else(
-                || query.explain(),
-                |estimate| {
-                    format!(
-                        "{:?}: {} global name candidates, scope rows {:?}; exact evaluation",
-                        estimate.plan, estimate.hits, estimate.scope_rows
-                    )
-                },
-            ),
-        )
+        .str("plan", &plan_text(&query, outcome.stats.as_ref()))
         .str(
             "strategy",
-            &outcome.stats.and_then(|stats| stats.name_plan).map_or_else(
-                || format!("{:?}", query.strategy()),
-                |estimate| format!("{:?}", estimate.plan),
-            ),
+            &outcome
+                .stats
+                .as_ref()
+                .and_then(|stats| stats.name_plan)
+                .map_or_else(
+                    || format!("{:?}", query.strategy()),
+                    |estimate| format!("{:?}", estimate.plan),
+                ),
         )
         .opt_int("limit", limit)
         .int("exit", exit as u8)
@@ -82,11 +94,14 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
         )
         .int("total_us", total.as_micros() as i128)
         .int("bytes_read", outcome.bytes_read);
-    if let Some(stats) = outcome.stats {
+    if let Some(stats) = &outcome.stats {
         object.object("stats", |o| {
             o.int("candidates", stats.candidates)
                 .int("rows", stats.rows);
         });
+        if let Some(content) = &stats.content {
+            log_content(&mut object, content);
+        }
     }
     if let Some((names, inodes)) = outcome.size {
         object.int("names", names).int("inodes", inodes);
@@ -99,14 +114,75 @@ pub fn run(context: &Context, atoms: &[OsString], json: bool, limit: Option<u64>
     exit
 }
 
+/// The query log's `content` object: the driver side, each `text:` atom's
+/// estimate and certainty in query order, the uncovered and live counts, and
+/// how many documents were probed, verified, and found changed. Counts only:
+/// no term, path or id.
+fn log_content(object: &mut Object<'_>, content: &ContentReport) {
+    object.object("content", |o| {
+        o.str(
+            "driver",
+            match content.driver {
+                Side::Content => "content",
+                Side::Names => "names",
+            },
+        )
+        .objects("atoms", &content.atoms, |o, atom| {
+            o.int("estimate", atom.estimate).str(
+                "certainty",
+                match atom.certainty {
+                    Certainty::Yes => "yes",
+                    Certainty::Maybe => "maybe",
+                },
+            );
+        })
+        .int("uncovered", content.uncovered)
+        .int("live", content.live)
+        .int("documents", content.documents)
+        .int("verified", content.verified)
+        .int("changed", content.changed);
+    });
+}
+
+/// The query log's `plan`: S1's name plan when one ran, else the static
+/// [`Query::explain`], then the content plan as it ran (driver, estimates,
+/// coverage, verification) when the query had a `text:` atom.
+fn plan_text(query: &Query, stats: Option<&Stats>) -> String {
+    let mut text = stats.and_then(|stats| stats.name_plan).map_or_else(
+        || query.explain(),
+        |estimate| {
+            format!(
+                "{:?}: {} global name candidates, scope rows {:?}; exact evaluation",
+                estimate.plan, estimate.hits, estimate.scope_rows
+            )
+        },
+    );
+    if let Some(content) = stats.and_then(|stats| stats.content.as_ref()) {
+        text.push_str("; content: ");
+        text.push_str(&content.describe());
+    }
+    text
+}
+
+/// `search`'s flags.
+struct Options {
+    json: bool,
+    limit: Option<u64>,
+    scan_uncovered: bool,
+}
+
 fn search(
     context: &Context,
     query: &Query,
-    json: bool,
-    limit: Option<u64>,
+    options: Options,
     started: Instant,
     outcome: &mut Outcome,
 ) -> Exit {
+    let Options {
+        json,
+        limit,
+        scan_uncovered,
+    } = options;
     let engine = match Engine::open(&context.index) {
         Ok(Some(engine)) => engine,
         Ok(None) => {
@@ -123,6 +199,13 @@ fn search(
             return Exit::Error;
         }
     };
+    if query.has_content()
+        && let Err(e) = engine.open_content(&context.index)
+    {
+        error(&format!("{}: content index: {e}", context.index.display()));
+        outcome.error = Some("content index");
+        return Exit::Error;
+    }
     let session = engine.pin();
     let catalog = session.catalog();
     outcome.size = Some((catalog.name_count(), catalog.inode_count()));
@@ -132,35 +215,45 @@ fn search(
     let mut out = BufWriter::with_capacity(64 << 10, stdout.lock());
     let mut line = Vec::new();
     let mut failed: Option<io::Error> = None;
-    let result = session.search(query, |row| {
-        line.clear();
-        if json {
-            json_row(&mut line, catalog, row);
-        } else {
-            line.extend_from_slice(row.path);
-        }
-        line.push(b'\n');
-        outcome.first_row.get_or_insert_with(|| started.elapsed());
-        outcome.rows += 1;
-        let written = out.write_all(&line).and_then(|()| match tty {
-            true => out.flush(),
-            false => Ok(()),
-        });
-        if let Err(e) = written {
-            failed = Some(e);
-            return ControlFlow::Break(());
-        }
-        match limit {
-            Some(limit) if outcome.rows >= limit => ControlFlow::Break(()),
-            _ => ControlFlow::Continue(()),
-        }
-    });
+    let result = session.search_content(
+        query,
+        (!scan_uncovered).then_some(UNCOVERED_BOUND),
+        None,
+        |row| {
+            line.clear();
+            if json {
+                json_row(&mut line, catalog, row);
+            } else {
+                line.extend_from_slice(row.path);
+            }
+            line.push(b'\n');
+            outcome.first_row.get_or_insert_with(|| started.elapsed());
+            outcome.rows += 1;
+            let written = out.write_all(&line).and_then(|()| match tty {
+                true => out.flush(),
+                false => Ok(()),
+            });
+            if let Err(e) = written {
+                failed = Some(e);
+                return ControlFlow::Break(());
+            }
+            match limit {
+                Some(limit) if outcome.rows >= limit => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        },
+    );
     if failed.is_none() {
         failed = out.flush().err();
     }
     outcome.bytes_read = catalog.bytes_read();
     match result {
         Ok(stats) => outcome.stats = Some(stats),
+        Err(RunError::IndexIncomplete { uncovered, live }) => {
+            error(&incomplete_message(uncovered, live));
+            outcome.error = Some("index incomplete");
+            return Exit::Error;
+        }
         Err(e) => {
             error(&format!("{}: {e}", context.index.display()));
             outcome.error = Some("read");
@@ -208,4 +301,11 @@ pub(crate) fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
         .int("mtime", catalog.mtime(row.inode))
         .opt_int("doc", catalog.doc(row.inode).map(|d| d.0));
     object.end();
+}
+
+/// Shared native diagnostic for local and socket content queries.
+pub(crate) fn incomplete_message(uncovered: u32, live: u32) -> String {
+    format!(
+        "the content index does not yet cover {uncovered} of {live} documents, and reading that many is slow: pass --scan-uncovered to read them anyway"
+    )
 }

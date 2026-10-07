@@ -30,6 +30,7 @@ pub(crate) fn resources(o: &mut Object<'_>) {
 }
 
 pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
+    index_fields(o, Some(session));
     let catalog = session.catalog();
     let protected = catalog
         .dir_ids()
@@ -42,6 +43,10 @@ pub(crate) fn catalog_fields(o: &mut Object<'_>, session: &QuerySession) {
     o.int("protected_scopes", protected as u64)
         .int("opaque_directories", opaque as u64)
         .int("catalog_bytes", catalog.bytes_read())
+        .int(
+            "index_resident_bytes",
+            session.content().map_or(0, |v| v.resident_bytes()) as u64,
+        )
         .int("planner_bytes", session.name_index().bytes() as u64)
         .int(
             "name_postings_bytes",
@@ -57,6 +62,12 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
             return Exit::Error;
         }
     };
+    if let Some(engine) = &engine
+        && let Err(error) = engine.open_content(&context.index)
+    {
+        crate::cli::error(&error.to_string());
+        return Exit::Error;
+    }
     if census && engine.is_none() {
         crate::cli::error(&format!(
             "no index in {}: run `ferret index DIR` first",
@@ -103,10 +114,12 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
             crate::stats::json_fields(&mut o, &session);
         }
     } else {
+        index_fields(&mut o, None);
         o.null("generation")
             .int("protected_scopes", 0)
             .int("opaque_directories", 0)
             .int("catalog_bytes", 0)
+            .int("index_resident_bytes", 0)
             .int("planner_bytes", 0)
             .int("name_postings_bytes", 0)
             .bool("fault_retained", false)
@@ -115,4 +128,37 @@ pub(crate) fn local(context: &Context, census: bool) -> Exit {
     o.end();
     out.push(b'\n');
     crate::cli::print("status", &out)
+}
+
+fn index_fields(o: &mut Object<'_>, session: Option<&QuerySession>) {
+    let live = session.map(QuerySession::live);
+    let live_count = live.map_or(0, |l| u64::from(l.len()));
+    let view = session.and_then(QuerySession::content);
+    let uncovered = match (view, live) {
+        (Some(view), Some(live)) => u64::from(view.uncovered_set(live).len()),
+        _ => live_count,
+    };
+    o.object("index", |o| {
+        o.int("covered", live_count - uncovered)
+            .int("uncovered", uncovered)
+            .int(
+                "unreadable",
+                view.map_or(0, |v| {
+                    v.manifest()
+                        .unreadable
+                        .iter()
+                        .filter(|&&d| live.is_some_and(|l| l.contains(d)))
+                        .count() as u64
+                }),
+            )
+            .int("segments", view.map_or(0, |v| v.segments().len() as u64))
+            .int(
+                "bytes",
+                view.map_or(0, |v| {
+                    v.manifest().segments.iter().map(|s| s.bytes).sum::<u64>()
+                }),
+            )
+            .opt_int("last_follow", view.and_then(|v| v.manifest().last_follow))
+            .opt_int("last_merge", view.and_then(|v| v.manifest().last_merge));
+    });
 }

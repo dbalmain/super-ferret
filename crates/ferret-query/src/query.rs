@@ -5,8 +5,9 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferret_catalog::{Kind, Section};
-use ferret_verify::{Finder, Regex, RegexError};
+use ferret_verify::{Finder, Regex, RegexError, Text};
 
+use crate::expr::{self, Node, Test, Token};
 use crate::pattern::{glob_literal, glob_regex, regex_literal};
 
 /// A parsed and compiled query. Build one with [`Query::parse`] or
@@ -23,6 +24,12 @@ pub struct Query {
     pub(crate) driver: Option<Driver>,
     /// Seconds since the epoch that `mtime:` ages count back from.
     pub(crate) now: i64,
+    /// Top-level conjuncts that are not plain name or metadata atoms: a
+    /// content atom, `OR`, `NOT` or a group. Each must hold; they are
+    /// evaluated per row, after the tests above. Empty for an S1 query.
+    pub(crate) residual: Vec<Node<Test>>,
+    /// The content atoms `Test::Content` indexes.
+    pub(crate) texts: Vec<Text>,
 }
 
 /// How [`Query::run`](crate::Query::run) finds its candidates.
@@ -102,6 +109,20 @@ pub enum ParseError {
     /// An argument containing a NUL byte. No name contains one (it ends a
     /// name in the heap), so the atom could only match name boundaries.
     Nul(Vec<u8>),
+    /// `text:` whose argument holds no token: nothing to search for.
+    Text(String),
+    /// `OR` or `NOT` (the operator) without a query on a side it needs.
+    Dangling(&'static str),
+    /// A `(` that no `)` closes.
+    Unclosed,
+    /// A `)` that no `(` opened.
+    Unopened,
+    /// `( )`, a group with nothing in it.
+    EmptyGroup,
+    /// Combined NOT and parenthesis nesting exceeds the safe tree depth.
+    Nesting {
+        limit: usize,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -119,6 +140,15 @@ impl fmt::Display for ParseError {
             Self::Regex(a, e) => write!(f, "`{a}`: {e}"),
             Self::NotUtf8(a) => write!(f, "`{}`: a regex must be UTF-8", a.escape_ascii()),
             Self::Nul(a) => write!(f, "`{}`: a query cannot contain NUL", a.escape_ascii()),
+            Self::Text(a) => write!(f, "`{a}`: text: needs a letter or digit to search for"),
+            Self::Dangling("NOT") => write!(f, "`NOT` needs a query after it"),
+            Self::Dangling(op) => write!(f, "`{op}` needs a query on each side"),
+            Self::Unclosed => write!(f, "a `(` is not closed by a `)`"),
+            Self::Unopened => write!(f, "a `)` has no `(` before it"),
+            Self::EmptyGroup => write!(f, "`( )` holds no query"),
+            Self::Nesting { limit } => {
+                write!(f, "query nesting exceeds {limit} NOT/parenthesis levels")
+            }
         }
     }
 }
@@ -144,42 +174,67 @@ impl Query {
             Ok(d) => d.as_secs() as i64,
             Err(e) => -(e.duration().as_secs() as i64),
         };
+        let mut tokens = Vec::new();
+        for arg in args {
+            let arg = arg.as_ref();
+            if arg.contains(&0) {
+                return Err(ParseError::Nul(arg.to_vec()));
+            }
+            tokens.push(match arg {
+                b"OR" => Token::Or,
+                b"NOT" => Token::Not,
+                b"(" => Token::Open,
+                b")" => Token::Close,
+                _ => {
+                    let (fold, atom) = match arg.strip_prefix(b"case:") {
+                        Some(rest) => (false, rest),
+                        None => (true, arg),
+                    };
+                    Token::Atom((fold, parse_atom(atom, fold, arg)?))
+                }
+            });
+        }
         let mut query = Query {
             names: Vec::new(),
             paths: Vec::new(),
             meta: Vec::new(),
             driver: None,
             now,
+            residual: Vec::new(),
+            texts: Vec::new(),
         };
         // Candidate drivers: (literal, fold, name test index).
         let mut literals: Vec<(Vec<u8>, bool, usize)> = Vec::new();
-        for arg in args {
-            let arg = arg.as_ref();
-            if arg.contains(&0) {
-                return Err(ParseError::Nul(arg.to_vec()));
-            }
-            let (fold, atom) = match arg.strip_prefix(b"case:") {
-                Some(rest) => (false, rest),
-                None => (true, arg),
+        for conjunct in expr::parse(tokens)?.into_conjuncts() {
+            let (fold, atom) = match conjunct {
+                Node::Leaf((fold, atom)) if !matches!(atom, Atom::Text(_)) => (fold, atom),
+                tree => {
+                    let texts = &mut query.texts;
+                    query
+                        .residual
+                        .push(tree.map(&mut |(_, atom)| atom.test(texts)));
+                    continue;
+                }
             };
             let name_index = query.names.len();
-            match parse_atom(atom, fold, arg)? {
+            match atom {
                 Atom::Name(test, literal) => {
                     if let Some(literal) = literal {
                         literals.push((literal, fold, name_index));
                     }
                     query.names.push(test);
                 }
-                Atom::PathGlob(regex, literal) => {
+                Atom::PathGlob(regex, glob) => {
                     // The last component matches the name, so its literal
                     // can still drive the scan; the path test does the rest.
-                    if let Some(literal) = glob_literal(&literal) {
+                    if let Some(literal) = glob_literal(&glob) {
                         literals.push((literal, fold, usize::MAX));
                     }
-                    query.paths.push(PathTest::Glob(regex, atom.to_vec()));
+                    query.paths.push(PathTest::Glob(regex, glob));
                 }
                 Atom::Path(test) => query.paths.push(test),
                 Atom::Meta(test) => query.meta.push(test),
+                Atom::Text(_) => unreachable!("content atoms are residual"),
             }
         }
         // The longest literal drives; a longer needle has fewer candidates
@@ -194,6 +249,12 @@ impl Query {
             });
         }
         Ok(query)
+    }
+
+    /// Whether the query has a content atom, and so needs the content index
+    /// and a reader to run ([`Query::run_content`](crate::Query::run_content)).
+    pub fn has_content(&self) -> bool {
+        !self.texts.is_empty()
     }
 
     /// How [`Query::run`](crate::Query::run) will find candidates.
@@ -238,11 +299,38 @@ impl Query {
             tests.extend(self.meta.iter().map(MetaTest::describe));
         }
         tests.extend(self.paths.iter().map(PathTest::describe));
+        tests.extend(
+            self.residual
+                .iter()
+                .map(|tree| tree.describe(&|t| self.describe_test(t))),
+        );
         if !tests.is_empty() {
             out.push_str("; then ");
             out.push_str(&tests.join(", "));
         }
         out
+    }
+
+    fn describe_test(&self, test: &Test) -> String {
+        match test {
+            Test::Name(t) => t.describe(),
+            Test::Path(t) => t.describe(),
+            Test::Meta(t) => t.describe(),
+            Test::Content(i) => {
+                let text = &self.texts[*i];
+                let units: Vec<String> =
+                    text.units().map(|u| u.escape_ascii().to_string()).collect();
+                format!(
+                    "text \"{}\"{}",
+                    units.join(" "),
+                    if text.is_case_sensitive() {
+                        " (exact case, verified)"
+                    } else {
+                        " (folded)"
+                    }
+                )
+            }
+        }
     }
 }
 
@@ -254,6 +342,24 @@ enum Atom {
     PathGlob(Regex, Vec<u8>),
     Path(PathTest),
     Meta(MetaTest),
+    /// `text:ARG`, a content atom.
+    Text(Text),
+}
+
+impl Atom {
+    /// The per-row test for this atom; a content atom is added to `texts`.
+    fn test(self, texts: &mut Vec<Text>) -> Test {
+        match self {
+            Atom::Name(test, _) => Test::Name(test),
+            Atom::PathGlob(regex, glob) => Test::Path(PathTest::Glob(regex, glob)),
+            Atom::Path(test) => Test::Path(test),
+            Atom::Meta(test) => Test::Meta(test),
+            Atom::Text(text) => {
+                texts.push(text);
+                Test::Content(texts.len() - 1)
+            }
+        }
+    }
 }
 
 fn parse_atom(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
@@ -310,6 +416,22 @@ fn parse_atom(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
         };
         return Ok(Atom::Meta(MetaTest::Type(kind)));
     }
+    if let Some(v) = value(b"text:")? {
+        return Text::new(v, !fold)
+            .map(Atom::Text)
+            .ok_or_else(|| ParseError::Text(text()));
+    }
+    if let Some(v) = value(b"name:")? {
+        return word(v, fold, arg);
+    }
+    word(atom, fold, arg)
+}
+
+/// A word or glob: the meaning of an argument with no prefix, and of
+/// `name:`'s value, which is never an operator or a prefix (`name:OR`,
+/// `name:text:x`).
+fn word(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
+    let text = || String::from_utf8_lossy(arg).into_owned();
     let is_glob = atom.iter().any(|b| matches!(b, b'*' | b'?' | b'['));
     let has_slash = atom.contains(&b'/');
     if is_glob {

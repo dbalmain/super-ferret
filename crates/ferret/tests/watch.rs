@@ -14,6 +14,24 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FERRET: &str = env!("CARGO_BIN_EXE_ferret");
 const DAEMON: &str = env!("CARGO_BIN_EXE_ferretd");
+const CONTENT: [&str; 14] = [
+    "text:original",
+    "text:modified",
+    "text:create",
+    "text:atomic save",
+    "text:0",
+    "text:1",
+    "NOT text:original",
+    "text:absent OR text:modified",
+    "text:needle",
+    "text:unique7777",
+    "text:word",
+    "text:word17part3",
+    "text:word500part3",
+    "case:text:word500part3",
+];
+type ContentAnswers = Vec<(Vec<Vec<u8>>, Vec<u8>, Option<i32>)>;
+
 const BOUND: Duration = Duration::from_secs(8);
 
 struct Tree {
@@ -209,7 +227,7 @@ impl Tree {
         args.extend(["-printf".to_owned(), "%y %p %s %T@\\0".to_owned()]);
         args
     }
-    fn oracle(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    fn oracle(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, ContentAnswers) {
         let oracle = self.base.join("oracle");
         if oracle.exists() {
             fs::remove_dir_all(&oracle)
@@ -231,6 +249,7 @@ impl Tree {
                 .output()
                 .unwrap_or_else(|error| panic!("oracle query: {error:?}"))
         };
+        let content = content_answers(|q| query(&["search", q]));
         (
             records(query(&["search", "*"]), b'\n'),
             records(
@@ -243,6 +262,7 @@ impl Tree {
                 ),
                 0,
             ),
+            content,
         )
     }
     fn converges(&self) {
@@ -261,11 +281,13 @@ impl Tree {
                     ),
                     0,
                 ),
+                content_answers(|q| self.run(&["search", q])),
             );
             let s = self.status();
             if actual == expected
                 && s.contains("\"pending_scopes\":0")
                 && s.contains("\"writer_busy\":false")
+                && number(&s, "uncovered") == 0
             {
                 return;
             }
@@ -1252,4 +1274,412 @@ fn a_slow_query_socket_keeps_its_old_epoch_without_blocking_publication() {
     );
     tree.success(tree.run(&["search", "original.txt"]));
     drop(reader);
+}
+
+fn content_answers(mut query: impl FnMut(&str) -> Output) -> ContentAnswers {
+    CONTENT
+        .iter()
+        .map(|q| {
+            let output = query(q);
+            let mut rows: Vec<_> = output
+                .stdout
+                .split(|&b| b == b'\n')
+                .filter(|r| !r.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect();
+            rows.sort();
+            (rows, output.stderr, output.status.code())
+        })
+        .collect()
+}
+
+fn gate(tree: &Tree, phase: &str) -> PathBuf {
+    let path = tree.path("content-gate");
+    fs::create_dir_all(&path).unwrap_or_else(|e| panic!("gate: {e}"));
+    fs::write(path.join(phase), b"hold").unwrap_or_else(|e| panic!("gate: {e}"));
+    path
+}
+fn unfollowed_burst(tree: &Tree) {
+    for i in 0..10_001 {
+        write(
+            tree.path(&format!("src/burst-{i}.txt")),
+            &format!("needle unique{i} words"),
+        );
+    }
+    tree.success(tree.local(&["index", "src"]));
+    fs::remove_dir_all(tree.path("index/index")).unwrap_or_else(|e| panic!("remove content: {e}"));
+}
+fn drain_content(tree: &mut Tree) {
+    let _ = tree.event("{\"op\":\"drain\"}\n");
+    let until = Instant::now() + BOUND;
+    loop {
+        let done = tree
+            .daemon
+            .as_mut()
+            .unwrap_or_else(|| panic!("daemon"))
+            .try_wait()
+            .unwrap_or_else(|e| panic!("wait: {e}"));
+        if let Some(status) = done {
+            assert!(status.success(), "drain: {status}");
+            break;
+        }
+        assert!(Instant::now() < until, "drain exceeded bound");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    tree.daemon.take();
+}
+fn manifest_equals_clean(tree: &Tree) {
+    let expected = tree.oracle().2;
+    let actual = content_answers(|q| tree.local(&["search", "--scan-uncovered", q]));
+    assert_eq!(actual, expected);
+}
+#[test]
+fn queued_command_interrupts_a_ten_thousand_document_follow() {
+    let mut tree = Tree::new();
+    unfollowed_burst(&tree);
+    let gate = gate(&tree, "follow");
+    let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
+    tree.spawn(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    wait(|| gate.join("follow.reached").exists());
+    write(tree.path("src/urgent.txt"), "urgent");
+    let started = Instant::now();
+    tree.success(tree.run(&["index", "src"]));
+    assert!(
+        started.elapsed() < BOUND,
+        "writer command exceeded budget bound"
+    );
+    assert!(
+        gate.join("follow").exists(),
+        "command must complete while first build is held"
+    );
+    assert!(
+        number(&tree.status(), "uncovered") > 0,
+        "whole first build completed before command"
+    );
+    fs::remove_file(gate.join("follow")).unwrap_or_else(|e| panic!("release: {e}"));
+    tree.converges();
+}
+#[test]
+fn drain_during_follow_keeps_a_queryable_manifest_and_restart_finishes_it() {
+    let mut tree = Tree::new();
+    unfollowed_burst(&tree);
+    let gate = gate(&tree, "follow");
+    let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
+    tree.spawn(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    wait(|| gate.join("follow.reached").exists());
+    drain_content(&mut tree);
+    assert!(
+        number(
+            &String::from_utf8(tree.local(&["status", "--json"]).stdout).unwrap_or_default(),
+            "covered"
+        ) > 0
+    );
+    manifest_equals_clean(&tree);
+    fs::remove_file(gate.join("follow")).unwrap_or_else(|e| panic!("release: {e}"));
+    tree.start(&[]);
+    tree.converges();
+}
+#[test]
+fn drain_during_streaming_merge_keeps_inputs_and_restart_finishes_it() {
+    let mut tree = Tree::new();
+    // Distinct dictionary entries force spilled output, so the barrier is
+    // inside the streaming merge after it has written temporary bytes.
+    for i in 0..600 {
+        let text = (0..400)
+            .map(|j| format!("word{i}part{j} "))
+            .collect::<String>();
+        write(tree.path(&format!("src/merge-{i}.txt")), &text);
+    }
+    tree.success(tree.local(&["index", "src"]));
+    let gate = gate(&tree, "merge");
+    let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
+    tree.start(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    for i in 0..240 {
+        fs::remove_file(tree.path(&format!("src/merge-{i}.txt")))
+            .unwrap_or_else(|e| panic!("delete: {e}"));
+    }
+    wait(|| gate.join("merge.reached").exists());
+    drain_content(&mut tree);
+    assert!(
+        !fs::read_dir(tree.path("index/index"))
+            .unwrap_or_else(|e| panic!("index: {e}"))
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with("tmp-"))
+    );
+    manifest_equals_clean(&tree);
+    fs::remove_file(gate.join("merge")).unwrap_or_else(|e| panic!("release: {e}"));
+    tree.start(&[]);
+    tree.converges();
+}
+#[test]
+fn battery_pauses_follow_and_socket_incomplete_matches_local() {
+    let mut tree = Tree::new();
+    unfollowed_burst(&tree);
+    let power = tree.path("power/BAT0");
+    fs::create_dir_all(&power).unwrap_or_else(|e| panic!("power: {e}"));
+    write(power.join("type"), "Battery");
+    write(power.join("status"), "Discharging");
+    let root = tree.path("power");
+    let root_text = root.to_str().unwrap_or_else(|| panic!("power path"));
+    tree.spawn(&[("FERRET_SIGNAL_POWER", root_text)]);
+    let status = tree.status();
+    assert!(status.contains("battery-paused"), "{status}");
+    assert_eq!(number(&status, "covered"), 0);
+    for args in [
+        vec!["search", "text:needle"],
+        vec!["search", "--scan-uncovered", "text:needle"],
+        vec!["--json", "search", "text:needle"],
+    ] {
+        let daemon = tree.run(&args);
+        let local = tree.local(&args);
+        assert_eq!(
+            (daemon.stdout, daemon.stderr, daemon.status.code()),
+            (local.stdout, local.stderr, local.status.code())
+        );
+    }
+    assert_eq!(number(&tree.status(), "covered"), 0);
+    write(power.join("status"), "Charging");
+    tree.converges();
+}
+
+#[test]
+fn covered_socket_content_rows_and_diagnostics_are_native_byte_identical() {
+    let mut tree = Tree::new();
+    write(tree.path("src/right/a.txt"), "alpha requestHandler");
+    write(tree.path("src/right/b.txt"), "beta request handler");
+    tree.success(tree.local(&["index", "src"]));
+    tree.start(&[]);
+    for args in [
+        vec!["search", "text:alpha"],
+        vec!["search", "text:request handler"],
+        vec!["search", "NOT", "text:alpha"],
+        vec!["search", "case:text:requestHandler"],
+        vec!["search", "text:missing"],
+        vec!["search", "text:alpha", "OR", "text:beta"],
+        vec!["--json", "search", "text:request handler"],
+        vec!["search", "--limit", "1", "text:request handler"],
+    ] {
+        let daemon = tree.run(&args);
+        let local = tree.local(&args);
+        assert_eq!(
+            (daemon.stdout, daemon.stderr, daemon.status.code()),
+            (local.stdout, local.stderr, local.status.code()),
+            "{args:?}"
+        );
+    }
+    let stats = tree.run(&["stats", "--json"]);
+    let status = tree.run(&["status", "--json"]);
+    for output in [stats, status] {
+        let json = String::from_utf8(output.stdout).unwrap_or_else(|e| panic!("JSON: {e}"));
+        assert!(json.contains("\"index\":{"), "{json}");
+        for field in [
+            "covered",
+            "uncovered",
+            "unreadable",
+            "segments",
+            "bytes",
+            "last_follow",
+            "last_merge",
+        ] {
+            assert!(json.contains(&format!("\"{field}\":")), "{json}");
+        }
+        assert_eq!(number(&json, "uncovered"), 0);
+        assert!(!json.contains("\"last_follow\":null"), "{json}");
+    }
+}
+
+#[test]
+fn deferred_catalog_retry_does_not_spin_on_an_expired_content_deadline() {
+    let mut tree = Tree::new();
+    let proc = tree.path("low-memory-proc");
+    fs::create_dir_all(proc.join("pressure")).unwrap_or_else(|e| panic!("signals: {e}"));
+    for (path, value) in [
+        ("pressure/cpu", "some avg10=0.00 avg60=0.00\n"),
+        ("pressure/io", "some avg10=0.00 avg60=0.00\n"),
+        ("meminfo", "MemAvailable: 1 kB\n"),
+        ("loadavg", "0.00 0.00 0.00 1/100 1\n"),
+    ] {
+        write(proc.join(path), value);
+    }
+    let proc_text = proc.to_str().unwrap_or_else(|| panic!("proc path"));
+    tree.spawn(&[("FERRET_SIGNAL_PROC", proc_text)]);
+    wait(|| tree.status().contains("memory-blocked"));
+    let pid = tree
+        .daemon
+        .as_ref()
+        .unwrap_or_else(|| panic!("daemon"))
+        .id();
+    let ticks = || {
+        let stat =
+            fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_else(|e| panic!("stat: {e}"));
+        stat.rsplit_once(')')
+            .unwrap_or_else(|| panic!("stat layout"))
+            .1
+            .split_whitespace()
+            .skip(11)
+            .take(2)
+            .map(|n| n.parse::<u64>().unwrap_or_else(|e| panic!("ticks: {e}")))
+            .sum::<u64>()
+    };
+    let before = ticks();
+    let until = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let used = ticks() - before;
+    assert!(used < 10, "deferred writer spun for {used} CPU ticks");
+}
+
+/// Real admitted watch work cancelled and discarded every streaming attempt.
+/// After two cancellations of these inputs, a third attempt must finish while
+/// unrelated watch traffic waits behind it.
+#[test]
+fn watch_traffic_cannot_restart_the_same_merge_forever() {
+    fn counters(tree: &Tree) -> (u64, u64, u64) {
+        let pid = tree
+            .daemon
+            .as_ref()
+            .unwrap_or_else(|| panic!("daemon"))
+            .id();
+        let stat =
+            fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_else(|e| panic!("stat: {e}"));
+        let fields: Vec<_> = stat
+            .rsplit_once(") ")
+            .unwrap_or_else(|| panic!("stat fields"))
+            .1
+            .split_whitespace()
+            .collect();
+        let ticks = fields[11]
+            .parse::<u64>()
+            .unwrap_or_else(|e| panic!("utime: {e}"))
+            + fields[12]
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("stime: {e}"));
+        let io =
+            fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_else(|e| panic!("io: {e}"));
+        let count = |key| {
+            io.lines()
+                .find_map(|line| {
+                    line.strip_prefix(key)
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                })
+                .unwrap_or_else(|| panic!("io field {key}"))
+        };
+        (ticks, count("rchar:"), count("wchar:"))
+    }
+    let mut tree = Tree::new();
+    for i in 0..600 {
+        let text = (0..400)
+            .map(|j| format!("word{i}part{j} "))
+            .collect::<String>();
+        write(tree.path(&format!("src/merge-{i}.txt")), &text);
+    }
+    tree.success(tree.local(&["index", "src"]));
+    let input = ferret_index::Manifest::read(&tree.path("index/index"))
+        .unwrap_or_else(|e| panic!("manifest: {e}"))
+        .unwrap_or_else(|| panic!("manifest missing"))
+        .segments
+        .into_iter()
+        .max_by_key(|entry| entry.bytes)
+        .unwrap_or_else(|| panic!("merge input"));
+    let input_path = tree.path("index/index").join(input.file_name());
+    let gate = gate(&tree, "merge");
+    let gate_text = gate.to_str().unwrap_or_else(|| panic!("gate path"));
+    tree.start(&[("FERRET_CONTENT_TEST_GATE", gate_text)]);
+    for i in 0..240 {
+        fs::remove_file(tree.path(&format!("src/merge-{i}.txt")))
+            .unwrap_or_else(|e| panic!("delete: {e}"));
+    }
+    wait(|| gate.join("merge.reached").exists());
+    let retry_before = counters(&tree);
+    let mut third_setup = None;
+    let mut discarded_bytes = 0;
+    for round in 0..2 {
+        assert!(input_path.exists(), "the selection must remain the same");
+        discarded_bytes += fs::read_dir(tree.path("index/index"))
+            .unwrap_or_else(|e| panic!("index: {e}"))
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("tmp-"))
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum::<u64>();
+        let before = number(&tree.status(), "refreshes");
+        fs::remove_file(gate.join("merge.reached")).unwrap_or_else(|e| panic!("checkpoint: {e}"));
+        write(
+            tree.path("src/right/traffic.txt"),
+            &format!("traffic round{round}"),
+        );
+        wait(|| number(&tree.status(), "refreshes") > before);
+        if round == 1 {
+            third_setup = Some((counters(&tree), Instant::now()));
+        }
+        wait(|| gate.join("merge.reached").exists());
+    }
+    let (third_before, third_started) = third_setup.unwrap_or_else(|| panic!("third attempt"));
+    let prefix_wall = third_started.elapsed();
+    let retry_after = counters(&tree);
+    println!(
+        "MERGE_RETRIES cpu_ticks={} rchar={} wchar={}",
+        retry_after.0 - retry_before.0,
+        retry_after.1 - retry_before.1,
+        retry_after.2 - retry_before.2
+    );
+    let before = number(&tree.status(), "refreshes");
+    write(tree.path("src/right/traffic.txt"), "traffic third round");
+    wait(|| {
+        let status = tree.status();
+        number(&status, "refreshes") > before
+            || (number(&status, "pending_scopes") > 0
+                && number(&status, "oldest_pending_ms") >= 400)
+    });
+    let status = tree.status();
+    println!(
+        "MERGE_PROGRESS input_bytes={} cancellations=2 discarded_partial_bytes={discarded_bytes}",
+        input.bytes
+    );
+    assert_eq!(
+        number(&status, "refreshes"),
+        before,
+        "watch work cancelled the protected third attempt: {status}"
+    );
+    assert!(input_path.exists());
+    let protected_before = counters(&tree);
+    let started = Instant::now();
+    fs::remove_file(gate.join("merge")).unwrap_or_else(|e| panic!("release: {e}"));
+    let mut bursts = 0;
+    let until = Instant::now() + BOUND;
+    let mut next_burst = Instant::now();
+    while input_path.exists() {
+        if Instant::now() >= next_burst {
+            write(
+                tree.path("src/right/traffic.txt"),
+                &format!("steady traffic {bursts}"),
+            );
+            bursts += 1;
+            next_burst = Instant::now() + Duration::from_millis(10);
+        }
+        assert!(Instant::now() < until, "steady traffic starved merge");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let completion = started.elapsed();
+    let protected_after = counters(&tree);
+    println!(
+        "MERGE_PROTECTED_FULL cpu_ticks={} rchar={} wchar={} active_wall_ms={} (excludes_held_gate)",
+        protected_after.0 - third_before.0,
+        protected_after.1 - third_before.1,
+        protected_after.2 - third_before.2,
+        (prefix_wall + completion).as_millis()
+    );
+    println!(
+        "MERGE_PROTECTED cpu_ticks={} rchar={} wchar={}",
+        protected_after.0 - protected_before.0,
+        protected_after.1 - protected_before.1,
+        protected_after.2 - protected_before.2
+    );
+    wait(|| number(&tree.status(), "refreshes") > before);
+    println!(
+        "MERGE_PROGRESS protected_completion_wall_ms={} queued_watch_wait_wall_ms={} bursts={bursts}",
+        completion.as_millis(),
+        started.elapsed().as_millis()
+    );
+    tree.converges();
 }

@@ -12,6 +12,7 @@
 //! old scopes under typed coverage faults, and commits trustworthy changes.
 //! This crate knows nothing about queries or index formats.
 
+pub mod content;
 mod coverage;
 mod index;
 mod observe;
@@ -20,9 +21,10 @@ mod refresh;
 mod walk;
 pub mod watch;
 
+pub use content::Documents;
 pub use index::{
     Counts, CoverageContext, CoverageFault, IndexError, IndexOptions, Published, Refresh, Report,
-    RootChange, index, index_change, recrawl, session_change,
+    RootChange, index, index_change, index_change_then, recrawl, session_change,
 };
 pub use observe::ContentFault;
 pub use refresh::{

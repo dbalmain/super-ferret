@@ -56,6 +56,23 @@ impl Projection {
             .filter(move |r| r.key >> 32 == category)
             .map(|r| r.value.as_ref())
     }
+    /// As `records`, `None` once `stop` answers true; it is asked before
+    /// each row read, superseded ones included.
+    pub(crate) fn records_until(
+        &self,
+        category: u64,
+        stop: &mut impl FnMut() -> bool,
+    ) -> Option<Vec<&Record>> {
+        let rows = self
+            .rows
+            .latest_range_until(key(category, 0), key(category + 1, 0), stop)?;
+        Some(
+            rows.into_iter()
+                .filter(|r| r.key >> 32 == category)
+                .map(|r| r.value.as_ref())
+                .collect(),
+        )
+    }
     pub(crate) fn range(
         &self,
         category: u64,

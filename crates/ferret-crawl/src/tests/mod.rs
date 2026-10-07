@@ -1,6 +1,7 @@
 #[path = "../../../ferret-catalog/tests/support/listing.rs"]
 mod checkpoint_oracle;
 mod compact;
+mod content;
 mod coverage;
 mod gitfile;
 mod golden;

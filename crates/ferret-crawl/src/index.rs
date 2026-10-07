@@ -374,7 +374,14 @@ pub fn index(
     refresh: Refresh<'_>,
     options: &IndexOptions,
 ) -> Result<Report, IndexError> {
-    run(catalog_dir, |_| Ok(roots.to_vec()), refresh, options)
+    run(
+        catalog_dir,
+        |_| Ok(roots.to_vec()),
+        refresh,
+        options,
+        |_| (),
+    )
+    .map(|(report, ())| report)
 }
 
 /// A change to the configured roots, made to the roots the previous
@@ -405,6 +412,27 @@ pub fn index_change(
         |previous| changed_roots(previous, change),
         refresh,
         options,
+        |_| (),
+    )
+    .map(|(report, ())| report)
+}
+
+/// Publishes a root change, then calls `after` under the same writer lock.
+/// The callback observes the committed catalog; its result is separate because
+/// it cannot undo that publication. Used by the one-shot host for content.
+pub fn index_change_then<T>(
+    catalog_dir: &Path,
+    change: RootChange<'_>,
+    refresh: Refresh<'_>,
+    options: &IndexOptions,
+    after: impl FnOnce(&Catalog) -> T,
+) -> Result<(Report, T), IndexError> {
+    run(
+        catalog_dir,
+        |previous| changed_roots(previous, change),
+        refresh,
+        options,
+        after,
     )
 }
 
@@ -447,12 +475,20 @@ fn changed_roots(
 
 /// One run, with the configured roots decided by `roots` from the previous
 /// generation once the lock is held.
-fn run(
+fn run<T>(
     catalog_dir: &Path,
     roots: impl FnOnce(Option<&Catalog>) -> Result<Vec<PathBuf>, IndexError>,
     refresh: Refresh<'_>,
     options: &IndexOptions,
-) -> Result<Report, IndexError> {
+    after: impl FnOnce(&Catalog) -> T,
+) -> Result<(Report, T), IndexError> {
+    let after_time = std::cell::Cell::new(Duration::ZERO);
+    let after = |catalog: &Catalog| {
+        let started = Instant::now();
+        let result = after(catalog);
+        after_time.set(started.elapsed());
+        result
+    };
     let session = WriterSession::open(catalog_dir);
     match session {
         Ok(mut session) => {
@@ -472,12 +508,13 @@ fn run(
                 changes,
             } = match observe_reconcile(&session, &mut plan, options) {
                 Err(IndexError::Update(ferret_catalog::log::Error::InputLimit(usage))) => {
-                    return full_rewalk(&mut session, &plan.roots, options, usage);
+                    let report = full_rewalk(&mut session, &plan.roots, options, usage)?;
+                    return Ok((report, after(&session.view())));
                 }
                 result => result?,
             };
             let started = Instant::now();
-            let (catalog, changed, faulted, aliases) = match changes {
+            let (catalog, changed, faulted, aliases, result) = match changes {
                 Some(changes) => {
                     let changed = !changes.records.is_empty();
                     let catalog = session
@@ -485,7 +522,8 @@ fn run(
                         .map_err(update_error)?;
                     let (faulted, aliases) =
                         reporting_ids(&session, previous.generation(), &changes);
-                    (catalog, changed, faulted, aliases)
+                    let result = after(&catalog);
+                    (catalog, changed, faulted, aliases, result)
                 }
                 None => {
                     let mut txn = session.into_checkpoint(options.sniffer);
@@ -497,10 +535,11 @@ fn run(
                         txn.keep(root.as_os_str().as_bytes())
                             .map_err(IndexError::Keep)?;
                     }
-                    (txn.commit().map_err(IndexError::Commit)?, true, None, None)
+                    let (catalog, result) = txn.commit_then(after).map_err(IndexError::Commit)?;
+                    (catalog, true, None, None, result)
                 }
             };
-            report.commit_time += started.elapsed();
+            report.commit_time += started.elapsed().saturating_sub(after_time.get());
             finish_report(
                 &mut report,
                 &catalog,
@@ -509,7 +548,7 @@ fn run(
                 faulted.as_deref(),
                 aliases.as_deref(),
             );
-            Ok(report)
+            Ok((report, result))
         }
         Err(ferret_catalog::log::Error::MissingCheckpoint)
         | Err(ferret_catalog::log::Error::Previous(ferret_catalog::OpenError::Decode(
@@ -535,10 +574,10 @@ fn run(
                 txn.keep(root.as_os_str().as_bytes())
                     .map_err(IndexError::Keep)?;
             }
-            let catalog = txn.commit().map_err(IndexError::Commit)?;
-            report.commit_time += started.elapsed();
+            let (catalog, result) = txn.commit_then(after).map_err(IndexError::Commit)?;
+            report.commit_time += started.elapsed().saturating_sub(after_time.get());
             finish_report(&mut report, &catalog, &plan, true, None, None);
-            Ok(report)
+            Ok((report, result))
         }
         Err(ferret_catalog::log::Error::Locked) => Err(IndexError::Begin(BeginError::Locked)),
         Err(error) => Err(IndexError::Update(error)),

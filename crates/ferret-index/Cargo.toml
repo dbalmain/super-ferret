@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 ferret-text.workspace = true
+intpack.workspace = true
+blake3 = "1" # segment section and chunk checksums; matches catalog
 
 [lints]
 workspace = true

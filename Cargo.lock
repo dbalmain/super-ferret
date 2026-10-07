@@ -94,7 +94,9 @@ name = "ferret-bench"
 version = "0.0.0"
 dependencies = [
  "ferret-catalog",
+ "ferret-index",
  "ferret-query",
+ "ferret-text",
  "ferret-verify",
  "memchr",
  "rustix",
@@ -122,7 +124,9 @@ dependencies = [
 name = "ferret-index"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "ferret-text",
+ "intpack",
 ]
 
 [[package]]
@@ -148,6 +152,7 @@ version = "0.0.0"
 name = "ferret-verify"
 version = "0.0.0"
 dependencies = [
+ "ferret-text",
  "regex",
 ]
 

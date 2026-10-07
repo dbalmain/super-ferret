@@ -436,7 +436,9 @@ fn stale_socket_is_replaced_and_index_identities_are_isolated() {
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("main.rs"));
     assert_eq!(tree.run(&["search", "unique"]).status.code(), Some(1));
-    assert_eq!(tree.sockets().len(), 2);
+    // A cold query may answer locally before its asynchronously spawned host
+    // has bound the socket. Both identities must converge within the bound.
+    wait(|| tree.sockets().len() == 2);
 }
 
 #[test]
@@ -1406,4 +1408,80 @@ fn a_reader_exit_with_a_queued_bad_line_never_strands_its_handler() {
     std::thread::sleep(Duration::from_millis(500));
     drop(client);
     wait(|| !socket.exists() && exited(&tree, pid));
+}
+
+/// Exercise the parser on the daemon's request thread, not CLI parsing.
+#[test]
+fn socket_search_rejects_excessive_boolean_nesting_and_stays_alive() {
+    let tree = Tree::new();
+    tree.start(&[]);
+    for (nots, groups) in [(33, 0), (0, 33), (17, 16), (4096, 0)] {
+        let args: Vec<_> = std::iter::repeat_n("\"NOT\"", nots)
+            .chain(std::iter::repeat_n("\"(\"", groups))
+            .chain(["\"text:x\""])
+            .chain(std::iter::repeat_n("\")\"", groups))
+            .collect();
+        let request = format!(
+            "{{\"id\":\"nest\",\"op\":\"search\",\"args\":[{}]}}\n",
+            args.join(",")
+        );
+        let (mut reader, _) = tree.connect();
+        let reply = block(&mut reader, request.as_bytes());
+        assert!(
+            reply.contains("query nesting exceeds 32 NOT/parenthesis levels"),
+            "{reply}"
+        );
+    }
+    let (mut reader, _) = tree.connect();
+    assert!(
+        block(
+            &mut reader,
+            b"{\"id\":\"nest\",\"op\":\"search\",\"args\":[\"main\"]}\n"
+        )
+        .contains("\"event\":\"row\"")
+    );
+}
+
+/// Flat siblings must not become recursive cursor wrappers on the real daemon
+/// stack, including materialisation, cost estimation and destruction.
+#[test]
+fn socket_search_handles_eight_thousand_flat_content_siblings() {
+    let tree = Tree::new();
+    // Explicit indexing also follows content, so absent terms have exact empty
+    // postings rather than an uncovered bitmap that hides the cursor shape.
+    tree.start(&[]);
+    for shape in ["exclusions", "and", "or"] {
+        let mut args = vec!["(".to_owned(), "text:absentpositive".to_owned()];
+        for _ in 0..8000 {
+            match shape {
+                "exclusions" => args.push("NOT".to_owned()),
+                "or" => args.push("OR".to_owned()),
+                _ => {}
+            }
+            args.push("text:absentsibling".to_owned());
+        }
+        args.extend([")", "OR", "text:absentouter"].map(str::to_owned));
+        let quoted = args
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let request = format!("{{\"id\":\"wide\",\"op\":\"search\",\"args\":[{quoted}]}}\n");
+        let (mut reader, _) = tree.connect();
+        let reply = block(&mut reader, request.as_bytes());
+        assert!(
+            reply.contains("\"exit\":1"),
+            "{shape}: {}",
+            &reply[..reply.len().min(400)]
+        );
+        assert!(!reply.contains("\"event\":\"row\""), "{shape}: {reply}");
+    }
+    let (mut reader, _) = tree.connect();
+    assert!(
+        block(
+            &mut reader,
+            b"{\"id\":\"alive\",\"op\":\"search\",\"args\":[\"main\"]}\n"
+        )
+        .contains("\"event\":\"row\"")
+    );
 }

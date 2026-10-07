@@ -20,6 +20,8 @@ use crate::find_json::{emit_to, generation};
 use crate::protocol::{Op, Request};
 use crate::transport::Destination;
 
+mod content;
+
 pub(super) struct Command {
     request: Request,
     reply: mpsc::SyncSender<Result<ferret_crawl::Report, ferret_crawl::IndexError>>,
@@ -131,6 +133,9 @@ fn serve(
     std::thread::sleep(duration("FERRET_DAEMON_LOAD_DELAY_MS", 0));
     let session = WriterSession::open(&host.index).map_err(io::Error::other)?;
     let engine = Arc::new(Engine::from_writer(session));
+    engine
+        .attach_content(&host.index)
+        .map_err(io::Error::other)?;
     let watch = Limits::read().ok().and_then(|limits| {
         let mut config = Config::from_limits(&limits);
         if let Ok(cap) = std::env::var("FERRET_WATCH_CAP")
@@ -193,12 +198,19 @@ fn serve(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .fallback_backstop = initial;
+    let mut content_due = Instant::now();
+    let mut content_state = content::State::default();
     loop {
         if host.stop.load(Ordering::Acquire) {
             break;
         }
         let now = Instant::now();
         let mut deadline = full_due.min(poll_due);
+        // A catalog retry owns this boundary. An expired content deadline
+        // must not wake repeatedly while that retry is cooling down.
+        if retry_due.is_none() {
+            deadline = deadline.min(content_due);
+        }
         if let Some(retry) = retry_due {
             deadline = deadline.min(now + retry.saturating_sub(scheduler.now()));
         }
@@ -347,6 +359,7 @@ fn serve(
                 // and watch adoption finish before the next command begins.
                 let _ = command.reply.send(result);
                 host.writer_pending.fetch_sub(1, Ordering::AcqRel);
+                content_due = Instant::now();
                 continue;
             }
             Ok(Message::Intake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -409,6 +422,7 @@ fn serve(
             .as_ref()
             .and_then(|w| w.take_admitted(paused.is_none()));
         if paused.is_some() && burst.is_none() {
+            content_due = Instant::now() + Duration::from_secs(1);
             if initial
                 || watch
                     .as_ref()
@@ -419,6 +433,10 @@ fn serve(
             continue;
         }
         if burst.is_none() && !initial {
+            if Instant::now() >= content_due {
+                content_due =
+                    Instant::now() + content::turn(host, &engine, &scheduler, &mut content_state)?;
+            }
             continue;
         }
         if paused.is_none() {
@@ -515,6 +533,7 @@ fn serve(
                 }
                 initial = false;
                 retry_due = None;
+                content_due = Instant::now();
             }
             Err(error) => {
                 host.writer_status

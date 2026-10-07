@@ -61,7 +61,7 @@ impl Context {
 
 /// The usage text, printed by `ferret help`.
 pub const USAGE: &str = "\
-ferret: search files by name and metadata.
+ferret: search files by name, metadata and content.
 
 usage:
   ferret index [DIR...]         add each DIR as a root and index it;
@@ -78,8 +78,8 @@ usage:
                                 (begin/stdout/stderr/diagnostic/end, id \"find\");
                                 --json here is a host flag before `find` and
                                 never reaches find's own argument parser
-  ferret search [--json] [--limit N] [--] ATOM...
-                                print each path that matches every ATOM
+  ferret search [--json] [--limit N] [--scan-uncovered] [--] ATOM...
+                                print each path that matches the query
   ferret batch [--input FILE]   process sequential JSON-lines requests
   ferret import-v3              import the legacy snapshot, preserving roots and DocIds
   ferret stats                  counts, sizes and a census of the index
@@ -96,8 +96,23 @@ find expressions:
   ( EXPR ), !/-not, -a/-and, -o/-or, comma; adjacent tests imply AND
   No action adds -print to the entire expression. Stars match dots and slashes.
 
-query atoms (all must match; one atom per argument):
+query (one atom or operator per argument; adjacent atoms must all match):
+  A B             both A and B
+  A OR B          either; AND binds tighter: a b OR c is (a b) OR c
+  NOT A           A does not match
+  ( ... )         grouping; quote the parentheses for the shell: \\( a OR b \\)
+  OR, NOT, ( and ) are operators only as whole arguments. A file named OR
+  is name:OR (or case:OR).
+
+query atoms:
   WORD            the name contains WORD; with a '/', the path does
+  name:WORD       WORD or GLOB as above, even when it is an operator
+                  (name:OR) or starts like a prefix (name:text:x)
+  text:WORDS      the content holds WORDS: one word matches a whole word
+                  or an identifier part (text:request finds requestHandler);
+                  several (quote them: text:\"request handler\") match in
+                  order, whatever separates them. A file with no indexed
+                  content (directory, binary, too large) never matches.
   GLOB            *.rs matches the name; src/**/*.rs the path's end,
                   /home/*/x the whole path
   re:REGEX        a regex over the name
@@ -107,7 +122,20 @@ query atoms (all must match; one atom per argument):
   mtime:(<|>)N(s|m|h|d|w|y)     age: mtime:<1d changed within a day
   type:(f|d|l)                  file, directory or symlink
   case:ATOM       match ATOM case-sensitively. Otherwise words, globs and
-                  ext: fold ASCII case only, and re: folds Unicode case.
+                  ext: fold ASCII case only, re: folds Unicode case, and
+                  text: folds as the content index does (case:text:Foo).
+
+search freshness:
+  Content answers are as of the index's last follow; names are as of the
+  catalog's last refresh. The daemon normally keeps both within about a
+  second of change. Exact Yes rows are not re-read. A Maybe candidate that
+  changed is checked against its current bytes; a vanished file is dropped.
+  A new term absent from the snapshot can be missed until the next follow:
+  after alpha becomes zeta, text:zeta may miss it while text:alpha still hits.
+
+  --scan-uncovered  a text: query is refused while more than 10000 live
+                  documents are not yet in the content index, because each
+                  would be read; this reads them instead.
 
 output: one path per line, raw bytes, in index order (unsorted);
   --json prints one object per line:
@@ -192,7 +220,12 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         dirs: dirs.ok(),
     };
     match args.command {
-        Command::Search { atoms, json, limit } => crate::search::run(&context, &atoms, json, limit),
+        Command::Search {
+            atoms,
+            json,
+            limit,
+            scan_uncovered,
+        } => crate::search::run(&context, &atoms, json, limit, scan_uncovered),
         Command::Index(roots) => crate::index::index(&context, &roots),
         Command::RootsList => crate::index::list(&context),
         Command::RootsRemove(roots) => crate::index::remove(&context, &roots),

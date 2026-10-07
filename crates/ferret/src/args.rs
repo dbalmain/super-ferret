@@ -32,7 +32,7 @@ pub enum Command {
     RootsList,
     /// `roots remove DIR...`.
     RootsRemove(Vec<PathBuf>),
-    /// `search [--json] [--limit N] ATOM...`.
+    /// `search [--json] [--limit N] [--scan-uncovered] ATOM...`.
     Search {
         /// One query atom per argument, as bytes: a name need not be UTF-8.
         atoms: Vec<OsString>,
@@ -40,6 +40,9 @@ pub enum Command {
         json: bool,
         /// Stop after this many rows.
         limit: Option<u64>,
+        /// Run a content query however many documents the content index
+        /// has not covered yet, reading each of them.
+        scan_uncovered: bool,
     },
     /// `find [OPTIONS] [PATH...] [EXPRESSION]`, passed intact to the find
     /// parser. `--json`, given before the `find` operand, requests the
@@ -115,6 +118,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
     let mut index = None;
     let mut json = false;
     let mut limit = None;
+    let mut scan_uncovered = false;
     let (mut help, mut version) = (false, false);
     let mut operands = Vec::new();
     let mut flags_done = false;
@@ -123,6 +127,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
         if operands.is_empty() && arg == "find" {
             if limit.is_some() {
                 return Err(UsageError::NotFor("--limit", "find"));
+            }
+            if scan_uncovered {
+                return Err(UsageError::NotFor("--scan-uncovered", "find"));
             }
             return Ok(Args {
                 index,
@@ -159,6 +166,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
                 limit = Some(n);
             }
             b"--json" if inline.is_none() => json = true,
+            b"--scan-uncovered" if inline.is_none() => scan_uncovered = true,
             b"-h" | b"--help" if inline.is_none() => help = true,
             b"--version" if inline.is_none() => version = true,
             _ => return Err(UsageError::UnknownFlag(arg)),
@@ -190,6 +198,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             atoms: rest,
             json,
             limit,
+            scan_uncovered,
         },
         other => {
             let command = match other {
@@ -206,6 +215,9 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
             }
             if limit.is_some() {
                 return Err(UsageError::NotFor("--limit", command));
+            }
+            if scan_uncovered {
+                return Err(UsageError::NotFor("--scan-uncovered", command));
             }
             match other {
                 b"index" => Command::Index(paths(rest)),
@@ -289,6 +301,7 @@ mod tests {
                     atoms: vec!["a".into(), "size:>1k".into()],
                     json: false,
                     limit: None,
+                    scan_uncovered: false,
                 },
             ),
             (
@@ -297,6 +310,7 @@ mod tests {
                     atoms: vec!["a".into()],
                     json: true,
                     limit: Some(3),
+                    scan_uncovered: false,
                 },
             ),
             (
@@ -305,6 +319,16 @@ mod tests {
                     atoms: vec!["-a".into(), "--json".into()],
                     json: false,
                     limit: Some(7),
+                    scan_uncovered: false,
+                },
+            ),
+            (
+                &["search", "text:serde", "--scan-uncovered"],
+                Command::Search {
+                    atoms: vec!["text:serde".into()],
+                    json: false,
+                    limit: None,
+                    scan_uncovered: true,
                 },
             ),
             // A lone `-` is an operand, as it is to most tools.
@@ -314,6 +338,7 @@ mod tests {
                     atoms: vec!["-".into()],
                     json: false,
                     limit: None,
+                    scan_uncovered: false,
                 },
             ),
             (
@@ -380,6 +405,14 @@ mod tests {
                 &["index", "--limit", "2"],
                 UsageError::NotFor("--limit", "index"),
             ),
+            (
+                &["stats", "--scan-uncovered"],
+                UsageError::NotFor("--scan-uncovered", "stats"),
+            ),
+            (
+                &["--scan-uncovered", "find", "."],
+                UsageError::NotFor("--scan-uncovered", "find"),
+            ),
             (&["stats", "x"], UsageError::Unexpected("stats", "x".into())),
             (
                 &["help", "typo"],
@@ -413,6 +446,7 @@ mod tests {
                 atoms: vec![atom],
                 json: false,
                 limit: None,
+                scan_uncovered: false,
             }
         );
     }

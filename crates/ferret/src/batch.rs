@@ -94,7 +94,9 @@ fn process(reader: impl BufRead, protocol_stdin: bool) -> io::Result<()> {
 }
 
 fn open_engine(index: &Path) -> Option<Engine> {
-    Engine::open(index).ok().flatten()
+    let engine = Engine::open(index).ok().flatten()?;
+    engine.open_content(index).ok()?;
+    Some(engine)
 }
 
 pub(crate) fn read_line_bounded(
@@ -169,6 +171,9 @@ fn handle(
             {
                 *engine = Some(reloaded);
             }
+            if let (Some(path), Some(current)) = (next.as_deref(), engine.as_ref()) {
+                current.open_content(path).map_err(io::Error::other)?;
+            }
             event(request, "reload", |o| {
                 if let Some(engine) = engine {
                     generation(o, Some(engine.generation()));
@@ -218,6 +223,7 @@ pub(crate) fn search_request(
     let mut rows = 0u64;
     let mut status = 3u8;
     let mut query_error = None;
+    let mut read_error = false;
     let mut first_row = None;
     let mut stats = None;
     let mut bytes_read = 0u64;
@@ -233,33 +239,39 @@ pub(crate) fn search_request(
             let result = if request.limit == Some(0) {
                 Ok(ferret_query::Stats::default())
             } else {
-                session.search_until(&query, destination.cancellation(), |row: &Row<'_>| {
-                    if destination.cancelled() {
-                        return ControlFlow::Break(());
-                    }
-                    #[cfg(debug_assertions)]
-                    if request.capabilities.iter().any(|c| c == "test-panic") {
-                        panic!("injected query panic");
-                    }
-                    let mut bytes = Vec::new();
-                    json_row(&mut bytes, catalog, row);
-                    let mut output = Vec::new();
-                    let mut object = Object::new(&mut output);
-                    object.str("id", &request.id).str("event", "row");
-                    object.raw_fields(&bytes[1..bytes.len() - 1]);
-                    object.end();
-                    if let Err(error) = destination.send(&output) {
-                        output_error = Some(error);
-                        return ControlFlow::Break(());
-                    }
-                    first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
-                    rows += 1;
-                    if request.limit.is_some_and(|limit| rows >= limit) {
-                        ControlFlow::Break(())
-                    } else {
-                        ControlFlow::Continue(())
-                    }
-                })
+                session.search_content(
+                    &query,
+                    (!request.capabilities.iter().any(|c| c == "scan-uncovered"))
+                        .then_some(ferret_query::UNCOVERED_BOUND),
+                    destination.cancellation(),
+                    |row: &Row<'_>| {
+                        if destination.cancelled() {
+                            return ControlFlow::Break(());
+                        }
+                        #[cfg(debug_assertions)]
+                        if request.capabilities.iter().any(|c| c == "test-panic") {
+                            panic!("injected query panic");
+                        }
+                        let mut bytes = Vec::new();
+                        json_row(&mut bytes, catalog, row);
+                        let mut output = Vec::new();
+                        let mut object = Object::new(&mut output);
+                        object.str("id", &request.id).str("event", "row");
+                        object.raw_fields(&bytes[1..bytes.len() - 1]);
+                        object.end();
+                        if let Err(error) = destination.send(&output) {
+                            output_error = Some(error);
+                            return ControlFlow::Break(());
+                        }
+                        first_row.get_or_insert_with(|| started.elapsed().as_micros() as i128);
+                        rows += 1;
+                        if request.limit.is_some_and(|limit| rows >= limit) {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    },
+                )
             };
             if let Some(error) = output_error {
                 return Err(error);
@@ -269,7 +281,13 @@ pub(crate) fn search_request(
                     stats = Some(result);
                     status = if rows == 0 { 1 } else { 0 };
                 }
-                Err(error) => query_error = Some(error.to_string()),
+                Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
+                    query_error = Some(crate::search::incomplete_message(uncovered, live));
+                }
+                Err(error) => {
+                    read_error = true;
+                    query_error = Some(error.to_string());
+                }
             }
         } else {
             query_error = Some("cannot open index".to_owned());
@@ -280,7 +298,7 @@ pub(crate) fn search_request(
             query_error = Some(error.to_string());
         }
     }
-    if let Some(estimate) = stats.and_then(|stats| stats.name_plan) {
+    if let Some(estimate) = stats.as_ref().and_then(|stats| stats.name_plan) {
         plan_text = format!(
             "{:?}: {} global name candidates, scope rows {:?}; exact evaluation",
             estimate.plan, estimate.hits, estimate.scope_rows
@@ -296,13 +314,14 @@ pub(crate) fn search_request(
         bytes_read,
         plan: &plan_text,
         strategy: &strategy,
-        stats,
+        stats: stats.clone(),
         error: query_error.as_deref(),
     };
     log_search(dirs, request, now, &log);
     event_to(destination, request, "end", |o| {
         o.int("exit", status)
             .int("rows", rows)
+            .bool("read_error", read_error)
             .bool("cancelled", destination.cancelled())
             .int("elapsed_us", elapsed)
             .str("plan", &plan_text)
@@ -313,7 +332,7 @@ pub(crate) fn search_request(
             o.int("names", session.catalog().name_count())
                 .int("inodes", session.catalog().inode_count());
         }
-        if let Some(stats) = stats {
+        if let Some(stats) = &stats {
             o.object("stats", |o| {
                 o.int("candidates", stats.candidates)
                     .int("rows", stats.rows);

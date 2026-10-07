@@ -1,15 +1,21 @@
 //! One resident catalog, shared by immutable query pins and the optional
 //! writer. Output and live-tree actions run outside the publication locks.
+//!
+//! A writer engine may also own the content index (docs/S2.md § Manifest
+//! and commit): [`Engine::attach_content`] opens it under the catalog's
+//! writer lock, and a [`QuerySession`] then pins the index view published
+//! with its catalog view. A query-only engine does not open it in S2 M3.
 
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use ferret_catalog::{Catalog, Generation, OpenError, WriterSession};
 use ferret_crawl::{IndexOptions, RefreshReport, RefreshRequest};
+use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Merged, Pinned};
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
-use ferret_query::{NameIndex, Query, Row, RunError, Stats};
+use ferret_query::{Content, DocNames, NameIndex, Query, Row, RunError, Stats, UNCOVERED_BOUND};
 
 static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -18,14 +24,35 @@ static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 pub struct Engine {
     current: RwLock<QuerySession>,
     writer: Mutex<Option<WriterSession>>,
+    /// The content index, kept under `writer`'s lock: lock `writer` first.
+    content: Mutex<Option<IndexWriter>>,
     retired: Mutex<Vec<(u64, Weak<NameIndex>)>>,
 }
+
+/// The content index's directory inside the catalog's (docs/S2.md §
+/// Segment file).
+pub const CONTENT_DIR: &str = "index";
 
 /// A generation pinned for the whole query, including output callbacks.
 #[derive(Clone)]
 pub struct QuerySession {
     catalog: Catalog,
     names: Arc<NameIndex>,
+    /// The content index view published with or before this catalog view,
+    /// when the engine has one. Every DocId it holds is below the catalog
+    /// view's `next_doc`; liveness comes from the catalog.
+    content: Option<Arc<ferret_index::View>>,
+    /// What content queries derive from this catalog view, built by the
+    /// first that needs it and shared by every pin of the view.
+    derived: Arc<Derived>,
+}
+
+/// Structures derived from one catalog view for content queries (docs/S2.md
+/// § Liveness; D30 C, built when a query first needs them).
+#[derive(Default)]
+struct Derived {
+    live: OnceLock<DocSet>,
+    docs: OnceLock<DocNames>,
 }
 
 impl Engine {
@@ -41,8 +68,11 @@ impl Engine {
             current: RwLock::new(QuerySession {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
+                content: None,
+                derived: Arc::default(),
             }),
             writer: Mutex::new(None),
+            content: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
         }))
     }
@@ -60,8 +90,11 @@ impl Engine {
             current: RwLock::new(QuerySession {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
+                content: None,
+                derived: Arc::default(),
             }),
             writer: Mutex::new(Some(writer)),
+            content: Mutex::new(None),
             retired: Mutex::new(Vec::new()),
         }
     }
@@ -71,6 +104,10 @@ impl Engine {
     /// prevents a replacement host from winning the endpoint but losing the
     /// still-live old engine's writer lock.
     pub(crate) fn close_writer(&self) {
+        self.content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.writer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -192,6 +229,107 @@ impl Engine {
         epochs
     }
 
+    /// Opens the content index in `catalog_dir`'s [`CONTENT_DIR`] under the
+    /// writer lock this engine holds. An index that does not fit the current
+    /// catalog view is discarded, to be rebuilt by [`Engine::follow_content`].
+    pub fn attach_content(&self, catalog_dir: &Path) -> Result<(), Error> {
+        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
+        let live = live_documents(&view);
+        let opened = IndexWriter::open(&catalog_dir.join(CONTENT_DIR), &catalog_view(&view, &live))
+            .map_err(Error::Content)?;
+        let published = opened.view();
+        *self.content.lock().map_err(|_| Error::WriterPanicked)? = Some(opened);
+        self.select_content(published);
+        Ok(())
+    }
+
+    /// Opens the content index in `catalog_dir`'s [`CONTENT_DIR`] for
+    /// reading, for a query-only engine: no writer lock, nothing repaired
+    /// or removed. An index that is absent or does not fit the catalog view
+    /// leaves the engine without one, which content queries treat as
+    /// nothing covered.
+    pub fn open_content(&self, catalog_dir: &Path) -> Result<(), Error> {
+        let pin = self.pin();
+        let view = ferret_index::View::open(
+            &catalog_dir.join(CONTENT_DIR),
+            &catalog_view(pin.catalog(), pin.live()),
+        )
+        .map_err(Error::Content)?;
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.generation() == pin.generation() {
+            current.content = view.map(Arc::new);
+        }
+        Ok(())
+    }
+
+    /// One follow pass over the current catalog view, reading documents
+    /// through the crawl's checked reader: paced by `limiter` when given,
+    /// unpaced for an explicit `ferret index`. Publishes the new index view
+    /// to later pins.
+    pub fn follow_content(
+        &self,
+        budget: &Budget,
+        limiter: Option<Arc<ferret_catalog::bulk::Limiter>>,
+    ) -> Result<Followed, Error> {
+        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
+        let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
+        let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+        let pin = self.pin();
+        let live = pin.live();
+        let names = pin.doc_names().map_err(Error::Catalog)?;
+        let mut documents = ferret_crawl::Documents::by_name(&view).map_err(Error::Catalog)?;
+        if let Some(limiter) = limiter {
+            documents = documents.with_limiter(limiter);
+        }
+        let followed = index.follow(&catalog_view(&view, live), budget, &mut |doc, bytes| {
+            let Some(&name) = names.names(doc).first() else {
+                return Err(Fault::Unreadable);
+            };
+            documents
+                .read_name(&view, name, bytes)
+                .map_err(|_| Fault::Unreadable)
+        });
+        let published = index.view();
+        drop(content);
+        self.select_content(published);
+        drop(writer);
+        followed.map_err(Error::Content)
+    }
+
+    /// One merge step of the content index, if its policy wants one.
+    pub fn merge_content(&self, budget: &Budget) -> Result<Option<Merged>, Error> {
+        let writer = self.writer.lock().map_err(|_| Error::WriterPanicked)?;
+        let view = writer.as_ref().ok_or(Error::ReadOnly)?.view();
+        let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
+        let index = content.as_mut().ok_or(Error::NoContentIndex)?;
+        let pin = self.pin();
+        let merged = index.merge_if_needed(&catalog_view(&view, pin.live()), budget);
+        let published = index.view();
+        drop(content);
+        self.select_content(published);
+        drop(writer);
+        merged.map_err(Error::Content)
+    }
+
+    /// Publishes a content view beside the current catalog view.
+    fn select_content(&self, content: Arc<ferret_index::View>) {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let manifest = content.manifest();
+        if manifest.incarnation == current.generation().incarnation
+            && manifest.high_water <= current.catalog.next_doc().0
+        {
+            current.content = Some(content);
+        }
+    }
+
     fn select(&self, view: Catalog) {
         let previous = self.pin();
         let names = Arc::new(NameIndex::adopt(&view, Some(&previous.names)));
@@ -205,13 +343,49 @@ impl Engine {
             Arc::downgrade(&previous.names),
         ));
         drop(retired);
+        let incarnation = view.generation().incarnation;
         *self
             .current
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = QuerySession {
             catalog: view,
             names,
+            content: previous
+                .content
+                .filter(|content| content.manifest().incarnation == incarnation),
+            derived: Arc::default(),
         };
+    }
+}
+
+/// The live documents of one catalog view (docs/S2.md § Liveness).
+pub fn live_documents(view: &Catalog) -> DocSet {
+    DocSet::new(view.next_doc().0, view.docs().map(|(doc, _)| doc.0))
+}
+
+/// As [`live_documents`], `None` once `cancelled` answers true. It is asked
+/// before allocating and after every [`DocSet::CHECK_EVERY`] document rows
+/// and overlay records scanned, dead ones included.
+fn live_documents_until(view: &Catalog, cancelled: impl Fn() -> bool) -> Option<DocSet> {
+    if cancelled() {
+        return None;
+    }
+    let mut live = DocSet::empty(view.next_doc().0);
+    let mut scanned = 0usize;
+    let finished = view.for_each_doc_until(
+        || {
+            scanned += 1;
+            scanned.is_multiple_of(DocSet::CHECK_EVERY) && cancelled()
+        },
+        |doc| live.insert(doc.0),
+    );
+    finished.then_some(live)
+}
+
+fn catalog_view<'a>(view: &Catalog, live: &'a DocSet) -> CatalogView<'a> {
+    CatalogView {
+        incarnation: view.generation().incarnation,
+        live,
     }
 }
 
@@ -223,6 +397,11 @@ impl QuerySession {
 
     pub fn name_index(&self) -> &NameIndex {
         &self.names
+    }
+
+    /// The pinned content index view, if the engine has a content index.
+    pub fn content(&self) -> Option<&ferret_index::View> {
+        self.content.as_deref()
     }
 
     /// A checked directory scope for hosts that already resolved a start.
@@ -254,14 +433,98 @@ impl QuerySession {
         self.search_until(query, None, emit)
     }
 
-    /// Streams rows, checking host cancellation at every candidate boundary.
+    /// Streams rows, checking host cancellation at entry and at every
+    /// candidate boundary.
+    /// A content query refuses an index with more than
+    /// [`UNCOVERED_BOUND`] uncovered documents.
     pub fn search_until(
         &self,
         query: &Query,
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
+        if is_cancelled(cancelled) {
+            return Ok(Stats::default());
+        }
+        if query.has_content() {
+            return self.search_content(query, Some(UNCOVERED_BOUND), cancelled, emit);
+        }
         query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit)
+    }
+
+    /// Streams a content query's rows over this pin's content view, or
+    /// over none, verifying Maybe documents through the crawl's checked
+    /// reader. More than `bound` uncovered documents is
+    /// [`RunError::IndexIncomplete`]; `None` (`--scan-uncovered`) reads
+    /// however many there are.
+    ///
+    /// A cancelled query returns no rows and default stats, as the checked
+    /// runner does, including while the catalog view's derived state is
+    /// first built: a cancelled build leaves nothing cached.
+    pub fn search_content(
+        &self,
+        query: &Query,
+        bound: Option<u32>,
+        cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        let stopped = || is_cancelled(cancelled);
+        if stopped() {
+            return Ok(Stats::default());
+        }
+        if !query.has_content() {
+            return query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit);
+        }
+        let catalog = &self.catalog;
+        let Some(docs) = self.doc_names_until(stopped)? else {
+            return Ok(Stats::default());
+        };
+        let Some(pinned) = self
+            .live_until(stopped)
+            .and_then(|live| Pinned::new_until(self.content.as_deref(), live, stopped))
+        else {
+            return Ok(Stats::default());
+        };
+        let content = Content {
+            pinned: &pinned,
+            docs,
+            bound,
+        };
+        let mut reader = ferret_crawl::Documents::by_name(catalog)?;
+        let mut read = |name, request: ferret_query::ReadRequest<'_>| {
+            let observed = match request {
+                ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
+                ferret_query::ReadRequest::Bytes(out) => {
+                    reader.read_current_name_until(catalog, name, out, &stopped)
+                }
+            }
+            .ok()?;
+            let recorded = catalog.inode(catalog.name(name).child).stat;
+            Some(if recorded.same_version(&observed) {
+                ferret_query::ReadVersion::Catalogued
+            } else {
+                ferret_query::ReadVersion::Current
+            })
+        };
+        query.run_content(catalog, &self.names, &content, &mut read, cancelled, emit)
+    }
+
+    /// The catalog view's live documents, built once per view.
+    pub fn live(&self) -> &DocSet {
+        self.derived
+            .live
+            .get_or_init(|| live_documents(&self.catalog))
+    }
+
+    /// As [`QuerySession::live`], publishing only a completed build: `None`
+    /// once `cancelled` answers true, leaving the next caller to build it.
+    /// Two concurrent builders may both build; the first to finish wins.
+    fn live_until(&self, cancelled: impl Fn() -> bool) -> Option<&DocSet> {
+        if let Some(live) = self.derived.live.get() {
+            return Some(live);
+        }
+        let built = live_documents_until(&self.catalog, cancelled)?;
+        Some(self.derived.live.get_or_init(|| built))
     }
 
     /// Runs find with the plan's captured cwd/time and the host's effects.
@@ -290,6 +553,10 @@ pub enum Error {
     WriterPanicked,
     Refresh(ferret_crawl::IndexError),
     Compact(ferret_catalog::log::Error),
+    /// The engine has no content index attached.
+    NoContentIndex,
+    Content(ferret_index::Error),
+    Catalog(OpenError),
 }
 
 impl std::fmt::Display for Error {
@@ -299,6 +566,9 @@ impl std::fmt::Display for Error {
             Self::WriterPanicked => f.write_str("the engine writer panicked"),
             Self::Refresh(error) => error.fmt(f),
             Self::Compact(error) => error.fmt(f),
+            Self::NoContentIndex => f.write_str("the engine has no content index"),
+            Self::Content(error) => error.fmt(f),
+            Self::Catalog(error) => error.fmt(f),
         }
     }
 }
@@ -306,9 +576,43 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::ReadOnly | Self::WriterPanicked => None,
+            Self::ReadOnly | Self::WriterPanicked | Self::NoContentIndex => None,
+            Self::Content(error) => Some(error),
+            Self::Catalog(error) => Some(error),
             Self::Refresh(error) => Some(error),
             Self::Compact(error) => Some(error),
         }
     }
 }
+
+impl QuerySession {
+    fn doc_names(&self) -> Result<&DocNames, OpenError> {
+        match self.doc_names_until(|| false)? {
+            Some(docs) => Ok(docs),
+            None => unreachable!("a build that is never cancelled completes"),
+        }
+    }
+
+    /// As `doc_names`, publishing only a completed build: `Ok(None)` once
+    /// `cancelled` answers true, leaving the next caller to build it. Two
+    /// concurrent builders may both build; the first to finish wins.
+    fn doc_names_until(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<&DocNames>, OpenError> {
+        if let Some(docs) = self.derived.docs.get() {
+            return Ok(Some(docs));
+        }
+        let Some(built) = DocNames::new_until(&self.catalog, cancelled)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.derived.docs.get_or_init(|| built)))
+    }
+}
+
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Ordering::Acquire))
+}
+
+#[cfg(test)]
+mod tests;

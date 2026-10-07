@@ -423,8 +423,19 @@ impl Transaction {
     /// Every [`BuildError`] is found before the temp file is created. The
     /// batches are freed while the file is written, before it is read back,
     /// so the batches and the encoded file are never held at once (D40).
-    pub fn commit(self) -> Result<Catalog, CommitError> {
+    pub fn commit(mut self) -> Result<Catalog, CommitError> {
         self.publish(false)
+    }
+
+    /// Publishes, then calls `after` while the writer lock is still held.
+    /// Failure of the callback does not undo the durable catalog publication.
+    pub fn commit_then<T>(
+        mut self,
+        after: impl FnOnce(&Catalog) -> T,
+    ) -> Result<(Catalog, T), CommitError> {
+        let catalog = self.publish(false)?;
+        let result = after(&catalog);
+        Ok((catalog, result))
     }
 
     /// Publishes a fresh id epoch containing only the unchanged current roots.
@@ -432,7 +443,7 @@ impl Transaction {
     /// only roots copied with `keep`, with unchanged policy/sniffer and no
     /// fresh batches; it is the correctness backstop, not M7's streaming
     /// compactor.
-    pub fn checkpoint(self) -> Result<Catalog, CommitError> {
+    pub fn checkpoint(mut self) -> Result<Catalog, CommitError> {
         let Some(old) = &self.previous else {
             return Err(CommitError::Encode(DecodeError::Corrupt(
                 "checkpoint requires current view",
@@ -452,7 +463,7 @@ impl Transaction {
         self.publish(true)
     }
 
-    fn publish(mut self, checkpoint: bool) -> Result<Catalog, CommitError> {
+    fn publish(&mut self, checkpoint: bool) -> Result<Catalog, CommitError> {
         if self.batches.iter().any(|batch| batch.scoped) {
             return Err(CommitError::ScopedObservations);
         }

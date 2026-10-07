@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ferret::engine::{Engine, QuerySession};
 use ferret_catalog::Catalog;
@@ -1109,4 +1109,246 @@ fn host_cancellation_stops_search_before_the_next_candidate_is_evaluated() {
         assert!(result.candidates <= full.candidates);
         assert_eq!(search(&engine.pin()).len(), 2);
     }
+}
+
+/// Live content matches for `word` in a pin: the index view's postings
+/// filtered by the pinned catalog view's liveness.
+fn content_docs(pin: &QuerySession, word: &[u8]) -> Vec<u32> {
+    let live = ferret::engine::live_documents(pin.catalog());
+    let view = pin.content().unwrap();
+    let mut docs = view.lookup(word).unwrap();
+    docs.retain(|&doc| live.contains(doc));
+    docs
+}
+
+#[test]
+fn a_pin_pairs_its_catalog_view_with_the_content_view_published_beside_it() {
+    use ferret_index::Budget;
+    let tree = Tree::new();
+    let engine = writer_engine(&tree);
+    assert!(engine.pin().content().is_none());
+    assert!(matches!(
+        engine.follow_content(&Budget::unbounded(), None),
+        Err(ferret::engine::Error::NoContentIndex)
+    ));
+    engine.attach_content(&tree.index()).unwrap();
+    let empty = engine.pin();
+    let live = ferret::engine::live_documents(empty.catalog());
+    assert_eq!(empty.content().unwrap().uncovered(&live).len(), 2);
+
+    let followed = engine.follow_content(&Budget::unbounded(), None).unwrap();
+    assert_eq!((followed.docs, followed.unreadable), (2, 0));
+    let first = engine.pin();
+    let alpha = content_docs(&first, b"alpha");
+    assert_eq!((alpha.len(), content_docs(&first, b"beta").len()), (1, 1));
+
+    // The catalog moves on; the content view stays with it until a pass.
+    fs::remove_file(tree.root().join("a.txt")).unwrap();
+    fs::write(tree.root().join("new.txt"), b"gamma alpha").unwrap();
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
+    let refreshed = engine.pin();
+    let live = ferret::engine::live_documents(refreshed.catalog());
+    let uncovered = refreshed.content().unwrap().uncovered(&live);
+    assert_eq!(uncovered.len(), 1, "only the new document");
+    assert!(
+        content_docs(&refreshed, b"alpha").is_empty(),
+        "a.txt is dead"
+    );
+
+    let followed = engine.follow_content(&Budget::unbounded(), None).unwrap();
+    assert_eq!(followed.docs, 1);
+    let last = engine.pin();
+    assert_eq!(content_docs(&last, b"alpha"), uncovered);
+    assert_eq!(content_docs(&last, b"gamma"), uncovered);
+    // Older pins keep their own pairing.
+    assert_eq!(content_docs(&first, b"alpha"), alpha);
+    assert!(content_docs(&refreshed, b"gamma").is_empty());
+
+    let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
+    let answer = |pin: &QuerySession| {
+        let mut rows = Vec::new();
+        pin.search(&query, |row| {
+            rows.push(row.path.to_vec());
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        rows
+    };
+    let before_merge = answer(&first);
+    let input = first.content().unwrap().manifest().segments[0].file_name();
+    // The first segment is half dead, past the trigger.
+    let merged = std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let (reply, replies) = std::sync::mpsc::channel();
+        let old = first.clone();
+        scope.spawn(move || {
+            while receive.recv().is_ok() {
+                reply.send(answer(&old)).unwrap();
+            }
+        });
+        let queried = std::cell::Cell::new(false);
+        let merged = {
+            let pace = |_: usize| {
+                if !queried.replace(true) {
+                    send.send(()).unwrap();
+                    assert_eq!(
+                        replies.recv_timeout(Duration::from_secs(5)).unwrap(),
+                        before_merge
+                    );
+                }
+                Ok(())
+            };
+            engine
+                .merge_content(&Budget {
+                    pace: &pace,
+                    ..Budget::unbounded()
+                })
+                .unwrap()
+                .unwrap()
+        };
+        assert!(
+            queried.get(),
+            "old pin must answer while the merge owns the writer"
+        );
+        assert!(
+            !tree
+                .index()
+                .join(ferret::engine::CONTENT_DIR)
+                .join(&input)
+                .exists()
+        );
+        send.send(()).unwrap();
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(5)).unwrap(),
+            before_merge
+        );
+        drop(send);
+        merged
+    });
+    assert_eq!((merged.inputs, merged.purged), (1, 1));
+    assert!(
+        !tree
+            .index()
+            .join(ferret::engine::CONTENT_DIR)
+            .join(input)
+            .exists()
+    );
+    assert_eq!(answer(&first), before_merge);
+    assert_eq!(content_docs(&engine.pin(), b"alpha"), uncovered);
+    assert_eq!(content_docs(&engine.pin(), b"beta").len(), 1);
+    assert_eq!(
+        content_docs(&first, b"alpha"),
+        alpha,
+        "the old view kept its files"
+    );
+
+    // A reopened writer finds the same index.
+    drop(engine);
+    let engine = writer_engine(&tree);
+    engine.attach_content(&tree.index()).unwrap();
+    assert_eq!(content_docs(&engine.pin(), b"gamma"), uncovered);
+    let live = ferret::engine::live_documents(engine.pin().catalog());
+    assert!(engine.pin().content().unwrap().uncovered(&live).is_empty());
+}
+
+/// Reproducible D63 measurement: production refresh warms each edited document,
+/// then the real follow reads it a second time. No log or daemon is involved.
+#[test]
+#[ignore = "S2 M5 scratch-tree measurement; run release with --ignored --nocapture"]
+fn measure_steady_content_follow() {
+    use ferret_index::Budget;
+    fn counter(path: &str, key: &str) -> u64 {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(key)
+                    .and_then(|s| s.split_whitespace().next())
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap()
+    }
+    fn cpu() -> u64 {
+        fs::read_to_string("/proc/thread-self/schedstat")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    let tree = Tree::new();
+    let document = |file, round| {
+        let head = format!("document{file} revision{round} common requestHandler ");
+        let mut bytes = head.into_bytes();
+        bytes.extend_from_slice(&b"common requestHandler alpha beta ".repeat(2048));
+        bytes.truncate(64 << 10);
+        bytes
+    };
+    for file in 0..512 {
+        fs::write(
+            tree.root().join(format!("measure-{file}.txt")),
+            document(file, 0),
+        )
+        .unwrap();
+    }
+    let engine = writer_engine(&tree);
+    engine.refresh(request(&engine, &tree), &options()).unwrap();
+    engine.attach_content(&tree.index()).unwrap();
+    while engine
+        .follow_content(&Budget::unbounded(), None)
+        .unwrap()
+        .remaining
+        > 0
+    {}
+    while engine
+        .merge_content(&Budget::unbounded())
+        .unwrap()
+        .is_some()
+    {}
+    let (mut nanos, mut chars, mut device, mut changed, mut wall) =
+        (0u64, 0u64, 0u64, 0u64, Duration::ZERO);
+    for round in 1..=40 {
+        for offset in 0..8 {
+            let file = (round * 8 + offset) % 512;
+            fs::write(
+                tree.root().join(format!("measure-{file}.txt")),
+                document(file, round),
+            )
+            .unwrap();
+        }
+        engine.refresh(request(&engine, &tree), &options()).unwrap();
+        let before_chars = counter("/proc/self/io", "rchar:");
+        let before_device = counter("/proc/self/io", "read_bytes:");
+        let before_cpu = cpu();
+        let started = std::time::Instant::now();
+        loop {
+            let followed = engine.follow_content(&Budget::unbounded(), None).unwrap();
+            changed += followed.bytes;
+            if followed.remaining == 0 {
+                break;
+            }
+        }
+        wall += started.elapsed();
+        nanos += cpu() - before_cpu;
+        chars += counter("/proc/self/io", "rchar:") - before_chars;
+        device += counter("/proc/self/io", "read_bytes:") - before_device;
+        while engine
+            .merge_content(&Budget::unbounded())
+            .unwrap()
+            .is_some()
+        {}
+    }
+    let before_rss = counter("/proc/self/status", "VmRSS:");
+    let pins: Vec<_> = (0..128).map(|_| engine.pin()).collect();
+    let after_rss = counter("/proc/self/status", "VmRSS:");
+    println!(
+        "M5_FOLLOW refreshes=40 changed_bytes={changed} rchar={chars} read_bytes={device} cpu_ns={nanos} wall_ns={} view_bytes={} pin_count={} pin_size={} rss_delta_kib={}",
+        wall.as_nanos(),
+        pins[0].content().unwrap().resident_bytes(),
+        pins.len(),
+        std::mem::size_of::<QuerySession>(),
+        after_rss.saturating_sub(before_rss)
+    );
+    assert_eq!(changed, 40 * 8 * (64 << 10));
 }

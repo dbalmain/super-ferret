@@ -1788,20 +1788,87 @@ both sides timed out, which sit outside the gate (F2).
 Review fixes from the main-thread review (`REVIEW.md`) are in flight as R1. An
 Astra review of the whole stretch follows, before `wt/find` merges to main.
 
-## S2 — Content index
+## S2 — Content index (done 2026-10-07)
 
-`ferret-text`, `ferret-index`, `ferret-verify`, `ferret-query`:
+Design: [S2.md](S2.md) (M0, 2026-10-06). `ferret-text`, `ferret-index`,
+`ferret-verify`, `ferret-query`, and the daemon writer/socket host built the
+candidate seam and the first content index:
 
-- The `CandidateSource` trait, reviewed before any structure is built on it.
-- Tokenizer with identifier splitting (D9).
-- Term postings on intpack; segments, manifest commit, merge; liveness from the
-  catalog.
-- `ferret search`: terms, boolean, phrase (postings + verify), composed with
-  every S1 predicate.
+- **M1** — the allocation-free tokenizer (old `tokens()` kept as the test
+  oracle), a content census and a full-tree term count on `$HOME`.
+- **M2** — immutable segments on intpack: front-coded dictionary with singleton
+  inlining, `pfor128skip` postings, and a breakdown of what the dictionary is
+  made of.
+- **M3** — the manifest, follow pass and a Lucene-style level-span merge policy.
+- **M4** — the cursor tree, certainty algebra and `text:` compiled and planned
+  (M4a); measured against the real corpus (M4b); then a needle prefilter and
+  windowed verification that cut phrase cost (M4c).
+- **M5** — daemon integration: paced follow and merge under the existing writer
+  lock and 32 MiB/s limiter, content-aware `status`/`stats`, socket and batch
+  content queries.
 
-**Measure:** index bytes per content byte; build CPU; query latency by term
-class; phrase candidate counts (the positions question, D6). **Decides:** term
-dictionary structure; whether positions become an experiment row.
+**Measured** (2026-10-07, isolated catalog of `$HOME`, 113,010 live documents,
+4.03 GB of text, release builds, one run at a time):
+
+| Stage                                 | Index bytes/content byte | Dictionary share |
+| ------------------------------------- | -----------------------: | ---------------: |
+| M2 first build (59 unmerged segments) |                    0.127 |            86.8% |
+| M3 steady state (13 segments)         |                    0.111 |            81.9% |
+| M3 forced full merge (1 segment)      |                    0.098 |            74.5% |
+
+Tokenizer throughput: 164–166 MB/s (short of the 300 target, but build time is
+I/O-bound regardless: tokenizing 4.03 GB costs ~24 core-s against ~120 s to read
+it under the pacer). First build: 99.3 s wall / 94.0 CPU s. Synthetic churn:
+merge write amplification 3.00. Phrase query, warm median: 12.1 s at M4b
+(tokenizing every candidate byte), **0.72 s** after M4c's needle prefilter and
+windowed verification (p90 21.9 s → 1.73 s; median bytes tokenized 1,254 MiB →
+32 MiB). Daemon follow: 4.717 CPU ms / 7.400 wall ms per refresh on a 512-file
+scratch trace, ~100% cache-hit by D63's rule. Resident daemon query latency
+tracks the in-process figures within noise, except `common` and bare `NOT`,
+where the daemon's streaming path beats the batch path (2.3 ms against 5.8 ms
+median).
+
+D60–D66 are unanswered; the build follows each one's stated recommendation (no
+positions, D61's doc-ids-only postings, D63's follow-pass tokenization, D64's positional reads).
+D65 (the dictionary is 74.5–87% of the index) and D66 (phrases: median 0.72 s,
+p90 1.73 s after M4c) carry these measurements and stay open for Dave.
+
+**Review** (2026-10-07): four Astra rounds against `wt/s2`, closing the sprint
+before merge. Round 1 found seven defects: cross-document verification caching
+(one path's failed read suppressed its unchanged siblings), stale cached
+directory descriptors surviving a rename, an undocumented freshness asymmetry
+between exact and Maybe answers, merge starvation under steady watch traffic,
+missing cancellation through query preparation, unbounded recursion on nested
+negations (a reproduced stack overflow), and a phrase matcher returning a later
+span than the earliest. All seven fixed (`.ai/s2-a1-fix-done.md`). Round 2 found
+four more: wide sibling exclusions still nested the cursor tree (a second
+route to round 1's stack overflow); current-version verification, new with
+the freshness contract, allocated and read unbounded sizes with no
+cancellation; and two narrowed the
+round-1 cancellation fix (one cursor advance could still scan a whole
+zero-result branch; cold per-generation builders ran unchecked on their first
+call). All four fixed (`.ai/s2-a2-fix-done.md`). Round 3 found the round-2
+cold-builder fix too narrow — it checkpointed yielded items, not scanned ones,
+so a mostly-deleted or sparse catalog could still scan unboundedly between
+checks — fixed by counting scanned rows instead (`e7fea75`). Round 4 closed the
+review with no new findings; three remaining uninterrupted operations
+(`DocNames`' zero-filled allocations and offset copy, the overlay sort, and
+suppressed-name skipping) were accepted as size-bounded exceptions to
+cooperative cancellation, not a strict deadline.
+
+Follow-ups, none blocking:
+
+- directory revalidation drops throughput 58.9% on tiny files; the faster
+  alternative is a revalidated descriptor chain using `fstatat`.
+- `ContentReport.changed` mixes changed-version reads with refusals; a distinct
+  "unverifiable" count would separate them.
+- M4c's two regex scans (the İ/Kelvin check and the anchor scan) could merge
+  into one.
+- D65 C, the trigram experiment, opens S3.
+- D66 C, a chunk map for large files, is an S3 experiment.
+
+Gates: **856 passed / 12 ignored**, zero Rust warnings. `wt/s2` awaits Dave's
+merge; its base, `wt/s1b`, also awaits merge.
 
 ## S3 — Regex
 

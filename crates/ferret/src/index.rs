@@ -18,7 +18,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use ferret_catalog::{Catalog, DecodeError, OpenError, Section};
-use ferret_crawl::{IndexError, IndexOptions, Refresh, Report, RootChange, index_change};
+use ferret_crawl::{IndexError, IndexOptions, Refresh, Report, RootChange, index_change_then};
 use ferret_policy::DEFAULT_IGNORE;
 
 use crate::cli::{Context, Exit, error, note, print, warn};
@@ -278,12 +278,21 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
         global: Some(global),
         ..IndexOptions::default()
     };
-    let result = index_change(&context.index, change, refresh, &options);
+    let completed = index_change_then(&context.index, change, refresh, &options, |catalog| {
+        follow_committed(catalog, &context.index)
+    });
+    let (result, content) = match completed {
+        Ok((report, content)) => (Ok(report), content),
+        Err(error) => (Err(error), Ok(())),
+    };
     let total = started.elapsed();
 
     let rendered = render(&result);
     note(&rendered.diagnostics);
-    let exit = if rendered.exit == Exit::Ok {
+    let exit = if let Err(error) = content {
+        crate::cli::error(&format!("content index: {error}"));
+        Exit::Error
+    } else if rendered.exit == Exit::Ok {
         print("the report", rendered.stdout.as_bytes())
     } else {
         rendered.exit
@@ -565,4 +574,37 @@ fn peak_rss_kb() -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Completes content while crawl retains the publication's writer lock.
+/// Explicit commands use the real checked reader and no byte pacing.
+fn follow_committed(catalog: &Catalog, path: &Path) -> Result<(), String> {
+    use ferret_index::{Budget, CatalogView, Fault, IndexWriter};
+    catalog.load_all().map_err(|e| e.to_string())?;
+    let live = crate::engine::live_documents(catalog);
+    let view = CatalogView {
+        incarnation: catalog.generation().incarnation,
+        live: &live,
+    };
+    let mut writer = IndexWriter::open(&path.join(crate::engine::CONTENT_DIR), &view)
+        .map_err(|e| e.to_string())?;
+    let mut documents = ferret_crawl::Documents::new(catalog).map_err(|e| e.to_string())?;
+    let mut read = |doc, bytes: &mut Vec<u8>| {
+        documents
+            .read(catalog, ferret_catalog::DocId(doc), bytes)
+            .map_err(|_| Fault::Unreadable)
+    };
+    let budget = Budget::unbounded();
+    while writer
+        .follow(&view, &budget, &mut read)
+        .map_err(|e| e.to_string())?
+        .remaining
+        > 0
+    {}
+    while writer
+        .merge_if_needed(&view, &budget)
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {}
+    Ok(())
 }

@@ -117,6 +117,35 @@ impl<K: Ord + Clone, V: Clone> Runs<K, V> {
         rows.dedup_by(|a, b| a.key == b.key);
         rows
     }
+    /// As [`Runs::latest_range`], asking `stop` before each row it reads,
+    /// superseded ones included, and before sorting: `None` once it answers
+    /// true.
+    pub(super) fn latest_range_until(
+        &self,
+        start: K,
+        end: K,
+        stop: &mut impl FnMut() -> bool,
+    ) -> Option<Vec<&Row<K, V>>> {
+        let mut rows = Vec::new();
+        for run in self.levels.iter().flatten() {
+            let first = run.rows.partition_point(|r| r.key < start);
+            let last = run.rows.partition_point(|r| r.key < end);
+            for row in &run.rows[first..last] {
+                if stop() {
+                    return None;
+                }
+                if self.is_latest(row) {
+                    rows.push(row);
+                }
+            }
+        }
+        if stop() {
+            return None;
+        }
+        rows.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| b.sequence.cmp(&a.sequence)));
+        rows.dedup_by(|a, b| a.key == b.key);
+        Some(rows)
+    }
     pub(super) fn range(&self, start: K, end: K) -> impl Iterator<Item = &Row<K, V>> {
         self.levels
             .iter()
@@ -126,13 +155,15 @@ impl<K: Ord + Clone, V: Clone> Runs<K, V> {
                 let last = run.rows.partition_point(|r| r.key < end);
                 run.rows[first..last].iter()
             })
-            .filter(|row| {
-                self.levels.iter().flatten().all(|run| {
-                    run.rows
-                        .binary_search_by(|r| r.key.cmp(&row.key))
-                        .map_or(true, |i| run.rows[i].sequence <= row.sequence)
-                })
-            })
+            .filter(|row| self.is_latest(row))
+    }
+    /// No run holds a newer row for the key.
+    fn is_latest(&self, row: &Row<K, V>) -> bool {
+        self.levels.iter().flatten().all(|run| {
+            run.rows
+                .binary_search_by(|r| r.key.cmp(&row.key))
+                .map_or(true, |i| run.rows[i].sequence <= row.sequence)
+        })
     }
     pub(super) fn run_count(&self) -> usize {
         self.levels.iter().flatten().count()

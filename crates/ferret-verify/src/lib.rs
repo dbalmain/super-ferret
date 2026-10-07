@@ -6,6 +6,8 @@
 //!   content will reuse.
 //! - [`matcher`]: [`Matcher`], the narrow interface to the regex engine (D17),
 //!   and [`Regex`].
+//! - [`text`]: [`Text`], a `text:ARG` content atom, and [`TextMatcher`], the
+//!   part-sequence phrase matcher over a document's tokens (S2).
 //! - `dialect`: [`FindRegex`], GNU find syntax over whole-path bytes, with
 //!   bounded backreference matching and fallible budget reporting.
 //! - [`toolchain`]: the ledger for the scanner's AVX2 arm (D11).
@@ -18,6 +20,7 @@
 mod dialect;
 pub mod matcher;
 pub mod scan;
+pub mod text;
 pub mod toolchain;
 
 #[cfg(test)]
@@ -26,3 +29,4 @@ mod tests;
 pub use dialect::{Dialect, FindRegex, MatchLimit};
 pub use matcher::{Matcher, Regex, RegexError};
 pub use scan::{Arm, Finder};
+pub use text::{MatchStats, Text, TextMatcher};
