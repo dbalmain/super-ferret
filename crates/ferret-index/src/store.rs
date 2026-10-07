@@ -227,7 +227,6 @@ impl View {
     /// pins.
     pub fn resident_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + std::mem::size_of::<Manifest>()
             + self.manifest.segments.capacity() * std::mem::size_of::<SegmentEntry>()
             + self.manifest.unreadable.capacity() * std::mem::size_of::<u32>()
             + self.segments.capacity() * std::mem::size_of::<Arc<Segment<File>>>()
