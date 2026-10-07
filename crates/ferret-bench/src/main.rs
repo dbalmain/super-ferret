@@ -11,6 +11,7 @@
 //! ferret-bench terms <catalog-dir>               full-tree term census: df, hapax, pairs
 //! ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]  real segments: bytes by section, CPU, RSS
 //! ferret-bench index-build <catalog-dir> <index-dir>  follow, merge to steady state, full merge (S2 M3)
+//! ferret-bench index-refresh <index-dir>   512 × 64 KiB, 40 paired follow refreshes
 //! ferret-bench trigram-build <catalog-dir> <out-dir>  offline trigrams at M3 boundaries
 //! ferret-bench trigram-census <catalog-dir>  distinct-key histogram and D69 counts
 //! ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b  D70 paired buffers
@@ -129,6 +130,7 @@ fn main() -> ExitCode {
             ("index-build", [dir, out, options @ ..]) => {
                 index_build::run(Path::new(dir), Path::new(out), options)
             }
+            ("index-refresh", [out]) => index_build::refresh_trace(Path::new(out)),
             ("trigram-build", [dir, out]) => {
                 trigram::build(Path::new(dir), Path::new(out), trigram::Policy::M3)
             }
@@ -220,6 +222,7 @@ fn usage() -> ExitCode {
          ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]\n       \
          ferret-bench index-freeze <catalog-dir> <snapshot-dir>\n       \
          ferret-bench index-build <catalog-dir> <index-dir> [--codec 1|h] [--snapshots] [--control-bytes N] [--corpus snapshot-dir]\n       \
+         ferret-bench index-refresh <index-dir>\n       \
          ferret-bench trigram-build <catalog-dir> <out-dir>\n       \
          ferret-bench trigram-census <catalog-dir>\n       \
          ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b\n       \

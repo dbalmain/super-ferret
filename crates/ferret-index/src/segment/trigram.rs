@@ -13,6 +13,7 @@ pub struct TrigramInverter {
     pairs: Vec<u64>,
     scratch: Vec<u64>,
     seen: Vec<u64>,
+    dirty_words: Vec<u64>,
     documents: Vec<u32>,
     first: Option<u32>,
     last: Option<u32>,
@@ -30,6 +31,7 @@ impl TrigramInverter {
             pairs: Vec::new(),
             scratch: Vec::new(),
             seen: vec![0; (1 << 24) / 64],
+            dirty_words: vec![0; (1 << 24) / 64 / 64],
             documents: Vec::new(),
             first: None,
             last: None,
@@ -57,6 +59,38 @@ impl TrigramInverter {
         self.pairs.is_empty()
     }
 
+    /// Counts this document's distinct folded keys using the inverter's
+    /// bitmap, without adding postings to the segment.
+    pub fn distinct_count(&mut self, bytes: &[u8]) -> usize {
+        let mut count = 0;
+        for window in bytes.windows(3) {
+            let key = trigram_key([window[0], window[1], window[2]]);
+            let number = u32::from_be_bytes([0, key[0], key[1], key[2]]) as usize;
+            let word = &mut self.seen[number / 64];
+            let bit = 1u64 << (number % 64);
+            if *word & bit == 0 {
+                if *word == 0 {
+                    let dirty = number / 64;
+                    self.dirty_words[dirty / 64] |= 1u64 << (dirty % 64);
+                }
+                *word |= bit;
+                count += 1;
+            }
+        }
+        for (dirty_index, dirty) in self.dirty_words.iter_mut().enumerate() {
+            while *dirty != 0 {
+                let bit = dirty.trailing_zeros() as usize;
+                let index = dirty_index * 64 + bit;
+                let word = &mut self.seen[index];
+                while *word != 0 {
+                    *word &= *word - 1;
+                }
+                *dirty &= *dirty - 1;
+            }
+        }
+        count
+    }
+
     /// Adds raw document bytes and returns its distinct-key count.
     pub fn add(&mut self, doc: u32, bytes: &[u8]) -> Result<usize, WriteError> {
         self.add_with(doc, bytes, |_| {})
@@ -67,14 +101,35 @@ impl TrigramInverter {
         &mut self,
         doc: u32,
         bytes: &[u8],
-        mut emit: impl FnMut([u8; 3]),
+        emit: impl FnMut([u8; 3]),
     ) -> Result<usize, WriteError> {
+        self.add_inner(doc, bytes, usize::MAX, emit)?
+            .ok_or(WriteError::DocOrder)
+    }
+
+    /// Adds a document if its distinct keys fit the caller's remaining
+    /// capacity. A rejected document leaves ordering and postings unchanged.
+    pub(crate) fn add_limited(
+        &mut self,
+        doc: u32,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<Option<usize>, WriteError> {
+        self.add_inner(doc, bytes, limit, |_| {})
+    }
+
+    fn add_inner(
+        &mut self,
+        doc: u32,
+        bytes: &[u8],
+        limit: usize,
+        mut emit: impl FnMut([u8; 3]),
+    ) -> Result<Option<usize>, WriteError> {
         if self.last.is_some_and(|last| doc <= last) {
             return Err(WriteError::DocOrder);
         }
-        self.first.get_or_insert(doc);
-        self.last = Some(doc);
         let start = self.pairs.len();
+        let mut count = 0;
         for window in bytes.windows(3) {
             let key = trigram_key([window[0], window[1], window[2]]);
             let number = u32::from_be_bytes([0, key[0], key[1], key[2]]) as usize;
@@ -83,19 +138,30 @@ impl TrigramInverter {
                 self.seen[number / 64] |= bit;
                 self.pairs.push((number as u64) << 32 | u64::from(doc));
                 emit(key);
+                count += 1;
+                if count > limit {
+                    break;
+                }
             }
         }
         for pair in &self.pairs[start..] {
             let number = (pair >> 32) as usize;
             self.seen[number / 64] &= !(1u64 << (number % 64));
         }
-        Ok(self.pairs.len() - start)
+        if count > limit {
+            self.pairs.truncate(start);
+            return Ok(None);
+        }
+        self.first.get_or_insert(doc);
+        self.last = Some(doc);
+        Ok(Some(count))
     }
 
     /// Buffer capacities, including bitmap, radix and document-list scratch.
     pub fn allocated_bytes(&self) -> usize {
         (self.pairs.capacity() + self.scratch.capacity() + self.seen.capacity()) * size_of::<u64>()
             + self.documents.capacity() * size_of::<u32>()
+            + self.dirty_words.capacity() * size_of::<u64>()
     }
 
     /// Capacity charge at the next flush, reserving radix scratch for every
@@ -109,6 +175,7 @@ impl TrigramInverter {
             + self.seen.capacity())
             * size_of::<u64>()
             + self.documents.capacity().max(docs) * size_of::<u32>()
+            + self.dirty_words.capacity() * size_of::<u64>()
     }
 
     /// Discards pairs and ordering state, retaining allocated buffers.
@@ -185,10 +252,33 @@ impl TrigramInverter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
 
     use super::*;
     use crate::segment::{Hit, Segment};
+
+    #[test]
+    fn distinct_count_matches_a_brute_force_set_on_random_bytes() {
+        let mut inverter = TrigramInverter::new();
+        let mut seed = 0x8f37_2a91_6c04_d5ebu64;
+        for len in 0..512 {
+            let bytes: Vec<_> = (0..len * 17)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed as u8
+                })
+                .collect();
+            let expected = bytes
+                .windows(3)
+                .map(|window| trigram_key([window[0], window[1], window[2]]))
+                .collect::<HashSet<_>>()
+                .len();
+            assert_eq!(inverter.distinct_count(&bytes), expected, "length {len}");
+            assert!(inverter.is_empty());
+        }
+    }
 
     #[test]
     fn drains_keep_the_reservation_and_release_length_charged_radix_scratch() {

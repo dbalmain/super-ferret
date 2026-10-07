@@ -343,6 +343,86 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     Ok(())
 }
 
+/// Repeats S2's real-engine 512 × 64 KiB, 40-refresh trace. Each refresh
+/// replaces eight documents and follows their new DocIds into paired storage.
+pub(crate) fn refresh_trace(out: &Path) -> crate::Result<()> {
+    const INITIAL: u32 = 512;
+    const REPLACED: usize = 8;
+    const REFRESHES: usize = 40;
+    const DOC_BYTES: usize = 64 << 10;
+    if out.exists() {
+        return Err("index-refresh wants a fresh index directory".into());
+    }
+    let words: Vec<Vec<u8>> = (0..256)
+        .map(|n| format!("word{n:03}").into_bytes())
+        .collect();
+    let mut alive: Vec<u32> = (0..INITIAL).collect();
+    let incarnation = [91; 16];
+    let initial = DocSet::new(INITIAL, alive.iter().copied());
+    let mut writer = IndexWriter::open(
+        out,
+        &CatalogView {
+            incarnation,
+            live: &initial,
+        },
+    )?;
+    let read = |doc: u32, bytes: &mut Vec<u8>| -> std::io::Result<()> {
+        bytes.clear();
+        let mut seed = u64::from(doc).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        while bytes.len() < DOC_BYTES {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            bytes.extend_from_slice(&words[(seed as usize) & (words.len() - 1)]);
+            bytes.push(b' ');
+        }
+        bytes.truncate(DOC_BYTES);
+        Ok(())
+    };
+    writer.follow(
+        &CatalogView {
+            incarnation,
+            live: &initial,
+        },
+        &Budget::unbounded(),
+        &mut |doc, bytes| read(doc, bytes).map_err(|_| Fault::Unreadable),
+    )?;
+
+    let (cpu_start, wall_start) = (crate::segment_build::cpu_seconds()?, Instant::now());
+    let (mut next_doc, mut followed_docs, mut followed_bytes) = (INITIAL, 0u64, 0u64);
+    for _ in 0..REFRESHES {
+        alive.drain(..REPLACED);
+        alive.extend(next_doc..next_doc + REPLACED as u32);
+        next_doc += REPLACED as u32;
+        let live = DocSet::new(next_doc, alive.iter().copied());
+        let followed = writer.follow(
+            &CatalogView {
+                incarnation,
+                live: &live,
+            },
+            &Budget::unbounded(),
+            &mut |doc, bytes| read(doc, bytes).map_err(|_| Fault::Unreadable),
+        )?;
+        followed_docs += followed.docs;
+        followed_bytes += followed.bytes;
+    }
+    let wall = wall_start.elapsed().as_secs_f64();
+    let cpu = crate::segment_build::cpu_seconds()? - cpu_start;
+    let (_, peak) = crate::memory()?;
+    println!("refreshes: {REFRESHES}");
+    println!("replaced_documents: {followed_docs}");
+    println!("changed_bytes: {followed_bytes}");
+    println!("follow_cpu_seconds: {cpu:.6}");
+    println!("follow_wall_seconds: {wall:.6}");
+    println!("cpu_ms_per_refresh: {:.3}", cpu * 1000.0 / REFRESHES as f64);
+    println!(
+        "wall_ms_per_refresh: {:.3}",
+        wall * 1000.0 / REFRESHES as f64
+    );
+    println!("peak_rss: {peak}");
+    Ok(())
+}
+
 /// H remains opt-in; snapshots preserve the real encoded lifecycle states.
 struct Options {
     codec: u32,

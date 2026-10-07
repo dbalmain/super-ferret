@@ -57,8 +57,22 @@ impl PairBuffer {
             >= bound
     }
 
-    fn fits(trigrams: &TrigramInverter, bytes: usize) -> bool {
-        trigrams.len().saturating_add(bytes.saturating_sub(2)) <= Self::CAPACITY
+    fn fits(buffered: usize, distinct: usize) -> bool {
+        buffered.saturating_add(distinct) <= Self::CAPACITY
+    }
+
+    fn admit(
+        trigrams: &mut TrigramInverter,
+        doc: u32,
+        bytes: &[u8],
+    ) -> Result<Option<usize>, WriteError> {
+        let buffered = trigrams.len();
+        let remaining = Self::CAPACITY.saturating_sub(buffered);
+        let admitted = trigrams.add_limited(doc, bytes, remaining)?;
+        if let Some(distinct) = admitted {
+            debug_assert!(Self::fits(buffered, distinct));
+        }
+        Ok(admitted)
     }
 }
 
@@ -609,6 +623,7 @@ impl IndexWriter {
         let (mut scratch, mut bytes) = (Scratch::default(), Vec::new());
         let mut range: Option<(u32, u32)> = None;
         let mut frontier = live.bound();
+        let mut oversized = false;
         for doc in live.range(manifest.frontier, live.bound()) {
             if followed.docs != 0
                 && (followed.bytes >= budget.bytes
@@ -630,12 +645,18 @@ impl IndexWriter {
             bytes.clear();
             match read(doc, &mut bytes) {
                 Ok(()) => {
-                    if followed.docs != 0 && !PairBuffer::fits(&self.trigrams, bytes.len()) {
-                        followed.stopped = Stopped::Buffer;
-                        frontier = doc;
-                        break;
+                    match PairBuffer::admit(&mut self.trigrams, doc, &bytes)? {
+                        Some(_) => {}
+                        None if followed.docs != 0 => {
+                            followed.stopped = Stopped::Buffer;
+                            frontier = doc;
+                            break;
+                        }
+                        None => {
+                            self.trigrams.add(doc, &bytes)?;
+                            oversized = true;
+                        }
                     }
-                    self.trigrams.add(doc, &bytes)?;
                     let mut failed = None;
                     tokenize(&bytes, &mut scratch, |token| {
                         if let Err(error) = inverter.add(doc, cap(token.bytes)) {
@@ -659,7 +680,7 @@ impl IndexWriter {
                 }
             }
             range = Some((range.map_or(doc, |(first, _)| first), doc));
-            if bytes.len().saturating_sub(2) > PairBuffer::CAPACITY {
+            if oversized {
                 followed.stopped = Stopped::Buffer;
                 frontier = doc + 1;
                 break;
@@ -670,7 +691,6 @@ impl IndexWriter {
             return Ok(followed);
         }
 
-        let oversized = followed.docs == 1 && bytes.len().saturating_sub(2) > PairBuffer::CAPACITY;
         let mut opened = None;
         if let Some((first, last)) = range {
             let terms = inverter.drain_into_codec(first, last, self.codec)?;

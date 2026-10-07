@@ -967,12 +967,11 @@ fn every_head_fact_is_checked_for_each_file() {
 }
 
 #[test]
-fn revision_five_charge_and_capacity_admission_make_progress() {
+fn revision_five_charge_and_exact_admission_make_progress() {
     let mut terms = Inverter::new(BUFFER);
     let mut trigrams = TrigramInverter::with_capacity(PairBuffer::CAPACITY);
     assert!(!PairBuffer::full(&terms, &trigrams, BUFFER));
-    assert!(PairBuffer::fits(&trigrams, PairBuffer::CAPACITY + 2));
-    assert!(!PairBuffer::fits(&trigrams, PairBuffer::CAPACITY + 3));
+    assert!(PairBuffer::fits(trigrams.len(), 1));
     terms.add(0, b"word").unwrap();
     trigrams.add(0, b"abcabc").unwrap();
     assert!(PairBuffer::full(
@@ -991,22 +990,46 @@ fn revision_five_charge_and_capacity_admission_make_progress() {
     let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
     let bytes = vec![b'a'; PairBuffer::CAPACITY + 3];
     let budget = Budget {
+        bytes: u64::MAX,
+        ..Budget::unbounded()
+    };
+    let followed = writer
+        .follow(&catalog.view(), &budget, &mut |doc, out| {
+            out.extend_from_slice(if doc == 0 { &bytes[..] } else { b"abc" });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((followed.docs, followed.remaining), (2, 0));
+    assert_eq!(followed.segment.unwrap().docs, 2);
+    assert_eq!(writer.trigrams.len(), 0);
+    assert!(writer.trigrams.allocated_bytes() >= PairBuffer::CAPACITY * 8 + (2 << 20));
+
+    let dir = Dir::new("pair-distinct-oversized");
+    let catalog = Catalog::new(2, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let mut seed = 0x4b17_9a2d_03e5_c681u64;
+    let bytes: Vec<_> = (0..(4 << 20))
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 32) as u8
+        })
+        .collect();
+    let distinct = writer.trigrams.distinct_count(&bytes);
+    assert!(distinct > PairBuffer::CAPACITY, "distinct keys: {distinct}");
+    let budget = Budget {
         buffer: 0,
         bytes: 0,
         ..Budget::unbounded()
     };
     let first = writer
-        .follow(&catalog.view(), &budget, &mut |_, out| {
-            out.extend_from_slice(&bytes);
+        .follow(&catalog.view(), &budget, &mut |doc, out| {
+            out.extend_from_slice(if doc == 0 { &bytes[..] } else { b"abc" });
             Ok(())
         })
         .unwrap();
     assert_eq!((first.docs, first.remaining), (1, 1));
-    assert_eq!(writer.trigrams.len(), 0);
-    assert_eq!(
-        writer.trigrams.allocated_bytes(),
-        PairBuffer::CAPACITY * 8 + (2 << 20)
-    );
     let next = writer
         .follow(&catalog.view(), &budget, &mut |_, out| {
             out.extend_from_slice(b"abc");
