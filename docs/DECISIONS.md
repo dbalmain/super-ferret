@@ -81,6 +81,7 @@ Predecessors, carried forward where still open:
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
 | D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
 | D65 | The term dictionary is 87% of the index                  | open           | rec A for S2; M3 merged 11.1% (full 9.8%) > 8%, so C's trigram experiment opens S3 (S2 M2b, M3)            |
+| D66 | Phrase queries read too much: positions, or not         | open           | rec A: no positions; ship windowed verify; coarse chunk map for big files is an S3 experiment beside D65 C (S2 M4c) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -3603,3 +3604,61 @@ query routed through them, then reopens D65 with C costed.
 
 If you want the size down before S3, say C now, and S2's rare-term queries will
 go through a verify scan until S3 lands.
+
+## D66 — Phrase queries read too much: positions, or not
+
+**Status: open.** S2 M4c, 2026-10-07;
+[measurements](S2.md#m4--cursors-planner-and-ferret-search-text).
+
+**Question:** Two-word phrase queries on your `$HOME` take 0.7 s at the median
+and 1.7 s at p90. Should S2 store word positions to answer them from the index,
+or accept the cost of verification?
+
+D6, which absorbed D7, rejected positions with a trigger: "post-intersection
+candidate sets in the tens of thousands on phrase queries", read as also
+covering verification time above about 100 ms. Measured with
+`ferret-bench content-query` on the fully merged `$HOME` index (113k documents,
+4.0 GB of text), 50 two-term phrases picked automatically from adjacent parts:
+
+- **Candidates per query:** median 2,510, p90 9,059. The count half of the
+  trigger **does not fire**.
+- **Latency.** M4b tokenized every candidate byte. M4c tokenizes only windows
+  around the rarest unit's matches, with a soundness proof and a
+  30,000-case property test.
+
+  | Latency | M4b | M4c |
+  | --- | ---: | ---: |
+  | median | 12.1 s | **0.72 s** |
+  | p90 | 21.9 s | **1.73 s** |
+  | bytes tokenized, median | 1,254 MiB | 32 MiB |
+
+  The time half **fires**.
+- **Reading alone:** the candidate files average 1.25 GB per query, which is
+  126 ms at the median and 250 ms at p90. No matcher change can bring p90
+  under 100 ms; only reading fewer bytes can. Of the remaining ~585 ms, about
+  190 ms is tokenizing and the rest is two whole-document regex scans. One
+  combined scan would cut part of that; that is a cheap fix, not a question.
+- **Which files the bytes come from** is not measured. Large documents
+  dominate; whether those are the `jsonl` transcripts is a guess.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. No positions. Keep windowed verification; merge its two scans into one | Phrases stay around 0.3–0.7 s median and 1–2 s p90 on this tree (derived from M4c, after the merged scan). Cold cache adds whatever reading 1.25 GB costs from disk. | The index stays as it is, against D65's size problem. One code path. Every phrase answer is checked against the current bytes. |
+| B. Full positions: a delta-coded position stream per posting | 889.8M occurrences (M1c, measured) at ~1–1.5 B each comes to **0.9–1.3 GB** against a 392 MB merged index, about 3–4× the index and 33–43% of text (**estimate**). Positions must be merged, checked and kept current. | Phrase queries never read files: milliseconds. Highlighting comes from the index. |
+| C. A coarse chunk map for large documents only. For each (term, document) over a size line, say 1 MiB, a bitmap of which 64 KiB chunks contain the term. Verification reads only chunks where every unit appears, plus their neighbours | A second postings stream for large documents. Size unmeasured: bounded by (large documents × distinct terms in each × a few bytes). Reads become `pread`s of chunks rather than whole files. | Reads shrink in proportion to how concentrated a phrase is inside big files, which is where the bytes are. Small files stay as A. The same "read fewer bytes" shape as D65 C, so S3 can measure both together. |
+
+**Recommendation: A for S2, with C as an S3 experiment beside D65's C.**
+- **Fastest and simplest disagree.** B is fastest, but it roughly quadruples
+  an index that D65 already finds too big, against your "density over speed".
+  A is simplest.
+- **C** targets the measured cost, large files, at a fraction of B's bytes,
+  but its size is unknown.
+- **The 100 ms line** was mine, not yours. If 1–2 s at p90 for a phrase is
+  acceptable to you and the agents, A is simply done.
+
+**Fact that would change it:** two possibilities.
+- Agent traces showing phrase queries are frequent, and latency-sensitive in
+  a loop, would move C forward into S2.
+- A measurement that most verified bytes come from `jsonl` transcripts would
+  make a `jsonl` policy (D65's side question) the cheaper fix than any
+  structure.
