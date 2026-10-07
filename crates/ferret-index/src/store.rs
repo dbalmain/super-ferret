@@ -238,6 +238,29 @@ impl View {
                 .sum::<usize>()
     }
 
+    /// Headroom for the next policy-selected merge, absent when no merge is
+    /// due. Memory includes growable decoded lists and spilling scratch;
+    /// disk includes output plus postings scratch while the committed
+    /// inputs still exist.
+    pub fn merge_resources(&self, live: &DocSet) -> Option<(u64, u64)> {
+        let run = self.merge_run(live)?;
+        let entries = &self.manifest.segments[run];
+        let bytes = entries.iter().map(|s| s.bytes).sum::<u64>();
+        let docs = entries.iter().map(|s| u64::from(s.docs)).sum::<u64>();
+        Some((
+            docs.saturating_mul(24)
+                .saturating_add(64 << 20)
+                .saturating_add(bytes / 8),
+            bytes.saturating_mul(3).saturating_add(16 << 20),
+        ))
+    }
+
+    fn merge_run(&self, live: &DocSet) -> Option<std::ops::Range<usize>> {
+        merge::choose(&self.manifest.segments, &|s| {
+            alive(s, live, &self.manifest.unreadable)
+        })
+    }
+
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -388,9 +411,7 @@ impl IndexWriter {
     ) -> Result<Option<Merged>, Error> {
         self.guard(|writer| {
             writer.reconcile(catalog)?;
-            let unreadable = &writer.current.manifest.unreadable;
-            let alive = |s: &SegmentEntry| alive(s, catalog.live, unreadable);
-            let Some(run) = merge::choose(&writer.current.manifest.segments, &alive) else {
+            let Some(run) = writer.current.merge_run(catalog.live) else {
                 return Ok(None);
             };
             match writer.merge_run(catalog, budget, run) {

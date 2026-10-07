@@ -541,3 +541,32 @@ fn paused_intake_is_bounded_and_sustained_arrivals_do_not_postpone_d51() {
     watch.finish(pending, true);
     assert_eq!(query(&engine), 22);
 }
+
+#[test]
+fn content_merge_headroom_applies_memory_disk_and_battery_admission() {
+    let tree = Tree::new();
+    let view = tree.writer().view();
+    let (scheduler, source, _) = scheduler(
+        Config {
+            rate: 0,
+            ..Config::default()
+        },
+        tree.index(),
+    );
+    assert_eq!(scheduler.admit_merge(&view, 0, 0), Ok(()));
+    assert_eq!(
+        scheduler.admit_merge(&view, u64::MAX, 0),
+        Err(Blocked::Memory)
+    );
+    assert_eq!(
+        scheduler.admit_merge(&view, 0, u64::MAX),
+        Err(Blocked::Disk)
+    );
+    source
+        .0
+        .lock()
+        .unwrap_or_else(|e| panic!("signals: {e}"))
+        .battery = Some(true);
+    scheduler.sample();
+    assert_eq!(scheduler.admit_merge(&view, 0, 0), Err(Blocked::Battery));
+}

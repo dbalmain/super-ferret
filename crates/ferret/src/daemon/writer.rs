@@ -610,19 +610,9 @@ fn content_turn(
         return Ok(Duration::ZERO);
     }
     let pin = engine.pin();
-    let manifest = pin.content().map(|v| v.manifest());
-    let input_bytes = manifest.map_or(0, |m| m.segments.iter().map(|s| s.bytes).sum::<u64>());
-    let docs = manifest.map_or(0, |m| {
-        m.segments.iter().map(|s| u64::from(s.docs)).sum::<u64>()
-    });
-    // Conservative headroom for a decoded common list (two growable vectors),
-    // spilling scratch, reopened dictionaries, and output plus postings
-    // scratch.
-    let memory = docs
-        .saturating_mul(24)
-        .saturating_add(64 << 20)
-        .saturating_add(input_bytes / 8);
-    let disk = input_bytes.saturating_mul(3).saturating_add(16 << 20);
+    let Some((memory, disk)) = pin.content().and_then(|v| v.merge_resources(pin.live())) else {
+        return Ok(Duration::from_secs(3600));
+    };
     if let Err(reason) = scheduler.admit_merge(pin.catalog(), memory, disk) {
         host.writer_status
             .lock()

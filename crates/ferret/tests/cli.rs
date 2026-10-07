@@ -2288,7 +2288,12 @@ fn too_many_uncovered_documents_need_scan_uncovered() {
     let hit = env.write("hit.txt", b"needle\n");
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
     let covered = env.run(&[os("search"), os("text:needle")]);
-    assert_eq!(paths(&covered), [hit.clone()], "{}", stderr(&covered));
+    assert_eq!(
+        paths(&covered),
+        std::slice::from_ref(&hit),
+        "{}",
+        stderr(&covered)
+    );
     fs::remove_dir_all(env.base.join("index/index")).unwrap();
     let refused = env.run(&[os("search"), os("text:needle")]);
     assert_eq!(code(&refused), 3, "{}", stderr(&refused));
