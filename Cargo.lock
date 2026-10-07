@@ -152,6 +152,7 @@ version = "0.0.0"
 name = "ferret-verify"
 version = "0.0.0"
 dependencies = [
+ "ferret-text",
  "regex",
 ]
 

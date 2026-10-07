@@ -35,7 +35,7 @@ ferret-query   → ferret-index (the CandidateSource trait only), ferret-catalog
 ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
 ferret-index   → ferret-text, intpack (git dependency pinned by rev — D59), blake3 (segment checksums)
 ferret-catalog → blake3 (checkpoint integrity), intpack (git dependency pinned by rev — D59)
-ferret-verify  → regex
+ferret-verify  → ferret-text (the phrase matcher tokenizes documents — S2), regex
 ferret-policy  → (std only)
 ferret-text    → (std only)
 ferret-bench   → anything; nothing depends on it
