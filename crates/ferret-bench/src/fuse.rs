@@ -12,10 +12,21 @@
 //! changes speed, not the result's shape.
 //!
 //! Keys must be distinct: the caller passes a set. Duplicate keys never
-//! peel, and construction reports failure after [`ATTEMPTS`] seeds.
+//! peel, and construction reports failure after [`ATTEMPTS`] seeds at each
+//! of [`GROWTH`] + 1 shapes.
+//!
+//! **One divergence.** At some sizes the reference geometry does not peel
+//! for a large share of key sets, whatever the seed: 11,513 random keys get
+//! 1,024-slot segments but only 12 of them, and 64 of 200 random sets failed
+//! all 100 seeds, stalling with about 60% of keys peeled. So when a shape
+//! fails every seed, construction adds one segment and tries again, and
+//! [`Fuse::grown`] reports how many it added, which the screen counts.
 
-/// Seeds tried before construction gives up.
+/// Seeds tried per shape.
 const ATTEMPTS: u32 = 100;
+
+/// Segments construction may add to the reference shape.
+const GROWTH: u32 = 8;
 
 /// The serialized header: seed (8), log2 segment length (1), segment count
 /// (4). The array length follows from the last two.
@@ -27,6 +38,7 @@ pub(crate) struct Fuse {
     seed: u64,
     shape: Shape,
     fingerprints: Vec<u8>,
+    grown: u32,
 }
 
 /// The geometry a filter's size determines.
@@ -115,17 +127,33 @@ impl Fuse {
                 seed: 0,
                 shape,
                 fingerprints: Vec::new(),
+                grown: 0,
             });
         }
+        let mut state = seed_state;
+        (0..=GROWTH).find_map(|grown| {
+            let shape = Shape {
+                segment_count: shape.segment_count + grown,
+                ..shape
+            };
+            Self::build_shape(keys, shape, &mut state).map(|filter| Self { grown, ..filter })
+        })
+    }
+
+    /// Segments added to the reference shape.
+    pub(crate) fn grown(&self) -> u32 {
+        self.grown
+    }
+
+    fn build_shape(keys: &[u64], shape: Shape, state: &mut u64) -> Option<Self> {
         let length = shape.array_length();
         let mut fingerprints = vec![0u8; length];
-        let mut state = seed_state;
         let mut count = vec![0u8; length];
         let mut xor = vec![0u64; length];
         let mut alone = Vec::with_capacity(length);
         let mut order: Vec<(u64, u8)> = Vec::with_capacity(keys.len());
         for _ in 0..ATTEMPTS {
-            let seed = next_seed(&mut state);
+            let seed = next_seed(state);
             count.fill(0);
             xor.fill(0);
             order.clear();
@@ -178,6 +206,7 @@ impl Fuse {
                 seed,
                 shape,
                 fingerprints,
+                grown: 0,
             });
         }
         None
@@ -321,6 +350,23 @@ mod tests {
         let rate = hits as f64 / probes as f64;
         println!("fuse8 false-positive rate {rate:.6} over {probes} probes (1/256 = 0.003906)");
         assert!((0.7 / 256.0..1.3 / 256.0).contains(&rate), "rate {rate}");
+    }
+
+    /// The size where the reference shape stalls: every set builds, with
+    /// no false negatives, some by growing a segment, and the rest at the
+    /// reference shape.
+    #[test]
+    fn a_stalling_size_builds_by_growing() {
+        let mut state = 99;
+        let mut grown = 0;
+        for t in 0..40 {
+            let set = keys(&mut state, 11_513);
+            let filter = Fuse::build(&set, t).expect("growth peels");
+            assert!(set.iter().all(|&key| filter.contains(key)));
+            assert!(filter.grown() <= 1);
+            grown += filter.grown();
+        }
+        assert!((1..40).contains(&grown), "{grown} of 40 grew");
     }
 
     /// Large sets cost about 9 bits a key, as S3.md sizes them.

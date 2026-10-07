@@ -195,6 +195,8 @@ pub(crate) struct FilterBytes {
     pub(crate) fingerprints: u64,
     pub(crate) headers: u64,
     pub(crate) offsets: u64,
+    /// Filters that needed more segments than the reference shape.
+    pub(crate) grown: u64,
     pub(crate) build_seconds: f64,
 }
 
@@ -224,13 +226,15 @@ pub(crate) fn write_filters(
             continue;
         }
         let set = keys.of(doc);
-        let filter = Fuse::build(set, u64::from(doc)).ok_or("a filter did not peel")?;
+        let filter = Fuse::build(set, u64::from(doc))
+            .ok_or_else(|| format!("a filter of {} keys did not peel", set.len()))?;
         buffer.clear();
         filter.write(&mut buffer);
         out.write_all(&buffer)?;
         at += buffer.len() as u64;
         bytes.documents += 1;
         bytes.keys += set.len() as u64;
+        bytes.grown += u64::from(filter.grown() > 0);
         if !buffer.is_empty() {
             bytes.headers += HEADER as u64;
             bytes.fingerprints += (buffer.len() - HEADER) as u64;
@@ -841,7 +845,7 @@ pub(crate) fn run(
         let (offsets, bytes) = write_filters(&keys, &live, &filter_path)?;
         drop(keys);
         println!(
-            "{structure}_filters documents={} keys={} fingerprints={} headers={} offsets={} total={} bits_per_key={:.4} postings_file_bytes={postings_bytes} filters_over_postings={:.4} invert_seconds={invert_seconds:.2} build_seconds={:.2}",
+            "{structure}_filters documents={} keys={} fingerprints={} headers={} offsets={} total={} bits_per_key={:.4} postings_file_bytes={postings_bytes} filters_over_postings={:.4} grown_filters={} invert_seconds={invert_seconds:.2} build_seconds={:.2}",
             bytes.documents,
             bytes.keys,
             bytes.fingerprints,
@@ -850,6 +854,7 @@ pub(crate) fn run(
             bytes.total(),
             bytes.total() as f64 * 8.0 / bytes.keys as f64,
             bytes.total() as f64 / postings_bytes as f64,
+            bytes.grown,
             bytes.build_seconds
         );
         let mut filters = FilterReader::new(File::open(&filter_path)?, offsets);
