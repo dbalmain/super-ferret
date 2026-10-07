@@ -78,11 +78,23 @@ impl Source<'_> {
     /// The source's answer for `atom`, read now; `None` when this source
     /// does not answer atoms of that kind.
     pub fn read(&self, atom: &Atom) -> Result<Option<Candidates>, ReadError> {
+        self.read_until(atom, &|| false)
+    }
+
+    /// Like `read`, checking cancellation between segment reads.
+    pub fn read_until(
+        &self,
+        atom: &Atom,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<Candidates>, ReadError> {
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
         match (self, atom) {
             (Self::Postings(view), Atom::Term(term)) => {
                 let segments = view.segments().iter().map(|s| &**s);
-                Ok(Some(Candidates::Postings(postings::Term::read(
-                    segments, term,
+                Ok(Some(Candidates::Postings(postings::Term::read_until(
+                    segments, term, cancelled,
                 )?)))
             }
             (Self::Postings(_), Atom::Trigram(_)) => Ok(None),

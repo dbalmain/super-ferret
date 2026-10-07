@@ -21,6 +21,7 @@ use std::borrow::Cow;
 
 use crate::live::DocSet;
 use crate::postings;
+use crate::segment::ReadError;
 
 /// How sure a source is that a yielded document holds the atom. Absence
 /// from a cursor is No. Ordered so that AND is `min` and OR is `max`.
@@ -88,13 +89,25 @@ impl<'a> Cursor<'a> {
     /// sizes a materialised union; a document at or past it is dropped
     /// there, as it cannot be live.
     pub fn or(children: Vec<Cursor<'a>>, bound: u32) -> Self {
+        Self::or_until(children, bound, &|| false).unwrap_or(Self::Empty)
+    }
+
+    /// Like `or`, checking cancellation while materialising a wide/dense union.
+    pub fn or_until(
+        children: Vec<Cursor<'a>>,
+        bound: u32,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadError> {
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
         let mut children: Vec<_> = children
             .into_iter()
             .filter(|c| !matches!(c, Self::Empty))
             .collect();
         match children.len() {
-            0 => return Self::Empty,
-            1 => return children.swap_remove(0),
+            0 => return Ok(Self::Empty),
+            1 => return Ok(children.swap_remove(0)),
             _ => {}
         }
         let cost = children
@@ -102,9 +115,9 @@ impl<'a> Cursor<'a> {
             .map(Cursor::cost)
             .fold(0u64, u64::saturating_add);
         if children.len() > OR_WIDTH || cost > u64::from(bound / OR_DENSITY) {
-            return materialise(children, bound);
+            return materialise(children, bound, cancelled);
         }
-        Self::Or(Or::new(children))
+        Ok(Self::Or(Or::new(children)))
     }
 
     /// Documents `positive` yields whose `negated` is not Yes.
@@ -210,11 +223,21 @@ fn leapfrog(children: &mut [Cursor<'_>], target: u32) -> Option<(u32, Certainty)
 }
 
 /// Drains `children` into two bitmaps, Yes and Maybe, under one `Or`.
-fn materialise<'a>(children: Vec<Cursor<'a>>, bound: u32) -> Cursor<'a> {
+fn materialise<'a>(
+    children: Vec<Cursor<'a>>,
+    bound: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Cursor<'a>, ReadError> {
     let (mut yes, mut maybe) = (Vec::new(), Vec::new());
     for mut child in children {
         let mut target = 0;
-        while let Some((doc, certainty)) = child.next_geq(target) {
+        loop {
+            if cancelled() {
+                return Err(ReadError::Cancelled);
+            }
+            let Some((doc, certainty)) = child.next_geq(target) else {
+                break;
+            };
             match certainty {
                 Certainty::Yes => yes.push(doc),
                 Certainty::Maybe => maybe.push(doc),
@@ -226,16 +249,23 @@ fn materialise<'a>(children: Vec<Cursor<'a>>, bound: u32) -> Cursor<'a> {
         }
     }
     let owned = |docs: Vec<u32>, certainty| {
-        Cursor::Bits(Bits {
-            docs: Cow::Owned(DocSet::new(bound, docs)),
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
+        let docs = DocSet::new(bound, docs.into_iter().take_while(|_| !cancelled()));
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
+        Ok(Cursor::Bits(Bits {
+            docs: Cow::Owned(docs),
             certainty,
             floor: 0,
-        })
+        }))
     };
-    Cursor::Or(Or::new(vec![
-        owned(yes, Certainty::Yes),
-        owned(maybe, Certainty::Maybe),
-    ]))
+    Ok(Cursor::Or(Or::new(vec![
+        owned(yes, Certainty::Yes)?,
+        owned(maybe, Certainty::Maybe)?,
+    ])))
 }
 
 /// A bitmap's members, all with one certainty.

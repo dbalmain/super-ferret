@@ -111,6 +111,8 @@ pub const HEAD: usize = FIELDS + SECTIONS.len() * TABLE_ENTRY + 16;
 /// Why a segment could not be read.
 #[derive(Debug)]
 pub enum ReadError {
+    /// The caller stopped a cooperative candidate read.
+    Cancelled,
     /// The byte source failed.
     Io(io::Error),
     /// Too short for a head, or the wrong magic.
@@ -132,6 +134,7 @@ pub enum ReadError {
 impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => write!(f, "candidate read cancelled"),
             Self::Io(error) => write!(f, "segment read failed: {error}"),
             Self::NotASegment => write!(f, "not a segment file"),
             Self::Version(v) => write!(f, "segment format version {v}, expected {FORMAT_VERSION}"),

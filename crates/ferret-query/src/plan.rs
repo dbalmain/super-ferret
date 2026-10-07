@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferret_catalog::{Catalog, NameId, OpenError, Section, Target};
 use ferret_index::{Certainty, Cursor, Pinned};
@@ -184,8 +184,32 @@ impl Query {
         content: &Content<'_>,
         read: &mut Reader<'_>,
         cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        match self.content_until(catalog, index, content, read, cancelled, emit) {
+            Err(RunError::Index(ferret_index::ReadError::Cancelled)) => Ok(Stats::default()),
+            result => result,
+        }
+    }
+
+    fn content_until(
+        &self,
+        catalog: &Catalog,
+        index: &NameIndex,
+        content: &Content<'_>,
+        read: &mut Reader<'_>,
+        cancelled: Option<&AtomicBool>,
         mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
+        let stopped = || cancelled.is_some_and(|flag| flag.load(Ordering::Acquire));
+        let check = || {
+            if stopped() {
+                Err(RunError::Index(ferret_index::ReadError::Cancelled))
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
         if !self.has_content() {
             return self.run_indexed_until(catalog, index, None, cancelled, emit);
         }
@@ -198,7 +222,12 @@ impl Query {
         let atoms = self
             .texts
             .iter()
-            .map(|text| TextAtom::estimate(text, pinned))
+            .map(|text| {
+                if stopped() {
+                    return Err(ferret_index::ReadError::Cancelled);
+                }
+                TextAtom::estimate(text, pinned)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(RunError::Index)?;
 
@@ -224,24 +253,34 @@ impl Query {
         let read_atoms = self
             .texts
             .iter()
-            .map(|text| TextAtom::read(text.clone(), pinned))
+            .map(|text| TextAtom::read_until(text.clone(), pinned, &stopped))
             .collect::<Result<Vec<_>, _>>()
             .map_err(RunError::Index)?;
         catalog.load(&[Section::Doc])?;
         let (mut ids, mut docs) = (Vec::new(), Vec::new());
         match (side, driver) {
             (Side::Content, Some((tree, _))) => {
-                let mut top = pinned.top(compile(tree, &read_atoms, pinned));
+                let mut top = pinned
+                    .top(compile(tree, &read_atoms, pinned, &stopped).map_err(RunError::Index)?);
                 let mut target = 0;
-                while let Some((doc, _)) = top.next_geq(target) {
+                loop {
+                    check()?;
+                    let Some((doc, _)) = top.next_geq(target) else {
+                        break;
+                    };
                     docs.push(doc);
-                    ids.extend_from_slice(content.docs.names(doc));
+                    for chunk in content.docs.names(doc).chunks(1024) {
+                        check()?;
+                        ids.extend_from_slice(chunk);
+                    }
                     let Some(next) = doc.checked_add(1) else {
                         break;
                     };
                     target = next;
                 }
+                check()?;
                 ids.sort_unstable();
+                check()?;
             }
             _ => {
                 self.s1_indexed(catalog, index, None, None, cancelled, |row| {
@@ -258,10 +297,20 @@ impl Query {
 
         // Each atom's certainty on each document, probed in DocId order.
         let width = read_atoms.len();
-        let mut table = vec![None; docs.len() * width];
+        check()?;
+        let cells = docs.len() * width;
+        let mut table = Vec::new();
+        while table.len() < cells {
+            check()?;
+            table.resize((table.len() + 4096).min(cells), None);
+        }
         for (i, atom) in read_atoms.iter().enumerate() {
-            let mut cursor = atom.cursor(pinned);
+            check()?;
+            let mut cursor = atom
+                .cursor_until(pinned, &stopped)
+                .map_err(RunError::Index)?;
             for (j, &doc) in docs.iter().enumerate() {
+                check()?;
                 table[j * width + i] = match cursor.next_geq(doc) {
                     Some((found, certainty)) if found == doc => Some(certainty),
                     _ => None,
@@ -445,9 +494,17 @@ fn estimate(tree: &Node<Test>, atoms: &[(u64, Certainty)], live: u64) -> u64 {
 /// A content-only tree's cursor: AND's positive children leapfrog, its
 /// negated ones subtract (`AndNot`), and a NOT with nothing positive beside
 /// it subtracts from the live set.
-fn compile<'a>(tree: &Node<Test>, atoms: &'a [TextAtom], pinned: &'a Pinned<'_>) -> Cursor<'a> {
-    match tree {
-        Node::Leaf(Test::Content(i)) => atoms[*i].cursor(pinned),
+fn compile<'a>(
+    tree: &Node<Test>,
+    atoms: &'a [TextAtom],
+    pinned: &'a Pinned<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Cursor<'a>, ferret_index::ReadError> {
+    if cancelled() {
+        return Err(ferret_index::ReadError::Cancelled);
+    }
+    Ok(match tree {
+        Node::Leaf(Test::Content(i)) => atoms[*i].cursor_until(pinned, cancelled)?,
         // A driving tree is content-only; a name test never gets here.
         Node::Leaf(_) => Cursor::bits(pinned.live(), Certainty::Maybe),
         Node::And(all) => {
@@ -456,19 +513,27 @@ fn compile<'a>(tree: &Node<Test>, atoms: &'a [TextAtom], pinned: &'a Pinned<'_>)
             let mut cursor = if positive.is_empty() {
                 Cursor::bits(pinned.live(), Certainty::Yes)
             } else {
-                Cursor::and(positive.iter().map(|n| compile(n, atoms, pinned)).collect())
+                Cursor::and(
+                    positive
+                        .iter()
+                        .map(|n| compile(n, atoms, pinned, cancelled))
+                        .collect::<Result<_, _>>()?,
+                )
             };
             for node in negated {
                 if let Node::Not(inner) = node {
-                    cursor = Cursor::and_not(cursor, compile(inner, atoms, pinned));
+                    cursor = Cursor::and_not(cursor, compile(inner, atoms, pinned, cancelled)?);
                 }
             }
             cursor
         }
-        Node::Or(any) => Cursor::or(
-            any.iter().map(|n| compile(n, atoms, pinned)).collect(),
+        Node::Or(any) => Cursor::or_until(
+            any.iter()
+                .map(|n| compile(n, atoms, pinned, cancelled))
+                .collect::<Result<_, _>>()?,
             pinned.live().bound(),
-        ),
-        Node::Not(inner) => pinned.not(compile(inner, atoms, pinned)),
-    }
+            cancelled,
+        )?,
+        Node::Not(inner) => pinned.not(compile(inner, atoms, pinned, cancelled)?),
+    })
 }

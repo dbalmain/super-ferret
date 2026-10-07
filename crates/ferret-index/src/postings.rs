@@ -37,6 +37,15 @@ impl Term {
         segments: impl IntoIterator<Item = &'s Segment<R>>,
         term: &[u8],
     ) -> Result<Self, ReadError> {
+        Self::read_until(segments, term, &|| false)
+    }
+
+    /// Like `read`, checking cancellation before each dictionary and list.
+    pub fn read_until<'s, R: ReadAt + 's>(
+        segments: impl IntoIterator<Item = &'s Segment<R>>,
+        term: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadError> {
         let mut found = Self {
             parts: Vec::new(),
             docs: 0,
@@ -44,14 +53,21 @@ impl Term {
         };
         let mut floor = 0u64;
         for segment in segments {
+            if cancelled() {
+                return Err(ReadError::Cancelled);
+            }
             let info = segment.info();
             if u64::from(info.first) < floor {
                 return Err(ReadError::Layout);
             }
             floor = u64::from(info.last) + 1;
-            let Some(hit) = segment.lookup(term)? else {
+            let Some(entry) = segment.entry(term)? else {
                 continue;
             };
+            if cancelled() {
+                return Err(ReadError::Cancelled);
+            }
+            let hit = segment.read(&entry)?;
             match &hit {
                 Hit::Single(_) => found.docs += 1,
                 Hit::Postings(list) => {

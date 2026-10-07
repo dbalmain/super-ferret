@@ -389,3 +389,25 @@ fn a_wide_or_materialises_and_keeps_certainties() {
     assert_eq!(got[0], (0, Certainty::Yes));
     assert_eq!(got[1], (1, Certainty::Maybe));
 }
+
+#[test]
+fn materialisation_checks_cancellation_between_documents() {
+    let set = DocSet::new(100_000, 0..100_000);
+    let checks = std::cell::Cell::new(0);
+    let cancelled = || {
+        checks.set(checks.get() + 1);
+        checks.get() == 10
+    };
+    assert!(matches!(
+        Cursor::or_until(
+            vec![
+                Cursor::bits(&set, Certainty::Yes),
+                Cursor::bits(&set, Certainty::Maybe)
+            ],
+            set.bound(),
+            &cancelled
+        ),
+        Err(crate::ReadError::Cancelled)
+    ));
+    assert_eq!(checks.get(), 10);
+}

@@ -38,9 +38,21 @@ impl TextAtom {
     /// Reads the atom's terms from the first of `pinned`'s sources that
     /// answers terms (S2 has one).
     pub fn read(text: Text, pinned: &Pinned<'_>) -> Result<Self, ReadError> {
+        Self::read_until(text, pinned, &|| false)
+    }
+
+    /// Like `read`, checking host cancellation at every term and segment.
+    pub fn read_until(
+        text: Text,
+        pinned: &Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadError> {
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
         let lookup = |term: &[u8]| -> Result<Option<Candidates>, ReadError> {
             for source in pinned.sources() {
-                if let Some(found) = source.read(&Atom::Term(cap(term)))? {
+                if let Some(found) = source.read_until(&Atom::Term(cap(term)), cancelled)? {
                     return Ok(Some(found));
                 }
             }
@@ -109,6 +121,19 @@ impl TextAtom {
     /// as Maybe. Liveness is not applied: the planner filters the whole
     /// content tree once ([`Pinned::top`]).
     pub fn cursor<'a>(&'a self, pinned: &'a Pinned<'_>) -> Cursor<'a> {
+        self.cursor_until(pinned, &|| false)
+            .unwrap_or(Cursor::Empty)
+    }
+
+    /// Like `cursor`, checking cancellation during union materialisation.
+    pub fn cursor_until<'a>(
+        &'a self,
+        pinned: &'a Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Cursor<'a>, ReadError> {
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
         // A term no source answers could hold anywhere.
         let term = |found: &'a Option<Candidates>| match found {
             Some(candidates) => candidates.cursor(),
@@ -126,9 +151,11 @@ impl TextAtom {
         let units = || Cursor::maybe(Cursor::and(self.units.iter().map(term).collect()));
         let tree = match whole {
             Some(whole) if self.units.is_empty() => whole,
-            Some(whole) => Cursor::or(vec![whole, units()], pinned.live().bound()),
+            Some(whole) => {
+                Cursor::or_until(vec![whole, units()], pinned.live().bound(), cancelled)?
+            }
             None => units(),
         };
-        pinned.atom(tree)
+        Ok(pinned.atom(tree))
     }
 }

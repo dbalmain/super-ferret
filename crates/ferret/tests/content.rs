@@ -673,3 +673,37 @@ fn every_name_of_a_matching_document_is_a_row() {
     let (rows, _) = search(&pin, &query(&["text:shared", "two"]), None).unwrap();
     assert_eq!(rows, paths(&[&two]));
 }
+
+/// Truncate a segment after its dictionaries are pinned: any postings read
+/// now fails. An already-cancelled query must return without touching it.
+#[test]
+fn an_already_cancelled_content_query_reads_no_postings() {
+    let tree = Tree::new();
+    tree.write("a.txt", b"alpha beta");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let pin = engine.pin();
+    for segment in &pin.content().unwrap().manifest().segments {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(tree.index().join("index").join(segment.file_name()))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+    }
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let stats = pin
+        .search_content(&query(&["text:alpha"]), None, Some(&cancelled), |_| {
+            panic!("cancelled query emitted a row")
+        })
+        .unwrap();
+    assert_eq!(stats.rows, 0);
+    assert!(
+        matches!(
+            search(&pin, &query(&["text:alpha"]), None),
+            Err(RunError::Index(_))
+        ),
+        "without cancellation it must attempt the broken postings"
+    );
+}
