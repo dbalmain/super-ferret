@@ -83,8 +83,8 @@ Predecessors, carried forward where still open:
 | D65 | The term dictionary is 87% of the index                  | open           | rec A for S2; S3 M2 tests H (singleton fingerprints) in place of C, decided at steady state: ≥15% term-index saving (S2 M2b, M3; S3 amendment) |
 | D66 | Phrase queries read too much: positions, or not         | open           | rec A: no positions; ship windowed verify; coarse chunk map for big files is an S3 experiment beside D65 C (S2 M4c) |
 | D67 | How `ferret search` spells a content regex, and when it refuses | open | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0) |
-| D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B: screen filters on paper from M1 key counts + probe microbench before building any (S3 M0) |
-| D69 | Saturated large documents in trigram postings           | open           | rec A: index every document's trigrams; saturated bitmap only if M1/M4 measure it cheap (S3 M0) |
+| D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b) |
+| D69 | Saturated large documents in trigram postings           | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b) |
 | D70 | How large the trigram follow buffer may grow           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
@@ -3841,6 +3841,28 @@ survive as a trade, and come back here as a question about the opt-in.
 1.2× of postings on the narrowed workloads, and smaller on bytes. Then build it
 (A), for that structure only.
 
+**Update after M1b (measured, `wt/s3-m1` `98b6fa9`).** Real binary fuse
+filters were built from exact per-document key sets over the `$HOME` catalog.
+
+- **Bytes:**
+  - trigram filters are 354.3 MB, against 296.4 MB of `.tri` (**1.20×**,
+    10.4 bits per key);
+  - term filters are 122.7 MB, against S2's 391.8 MB merged index
+    (**0.31×**, 11.0 bits per key).
+- **Latency,** filters against postings, by median:
+  - **Unnarrowed,** trigram filters are 25–267× slower warm. Term filters
+    are 38× slower for common terms and up to 6,343× for rare terms.
+  - **Narrowed to 1% of documents,** term filters stay 5–15× slower when
+    probed from a file. They come within 1.2× only when held in memory, for
+    mid and common terms.
+  - **Evicted,** filters lose by 11–482× everywhere.
+  - Filters win only when a rare term with its own postings narrows the
+    query first, which is a hybrid, not a filter layout.
+
+No layout passes the screen. **Recommendation unchanged: B**, and neither
+filter is built. Term filters could return only as a density opt-in, under a
+new brief.
+
 ## D69 — Saturated large documents in trigram postings
 
 **Status: open.** S3 M0, revision 3, 2026-10-08;
@@ -3873,6 +3895,17 @@ and that is why this is a brief.
 saturated documents hold more than about half of all trigram pairs, *and*
 verifying them measures under 100 ms warm, with the cold figure reported, on
 the M5 regex classes. B's cost is then small enough to buy its bytes.
+
+**Update after M1b (measured, `wt/s3-m1` `98b6fa9`).** Documents above 16k
+distinct keys hold **54%** of trigram pairs (2,852 documents), but verifying
+the candidates they add costs 154–437 ms warm for three regex classes, and
+0.7–1.5 s evicted. At 64k and above, verification stays under 100 ms warm,
+but those documents hold only 13–17% of pairs. No threshold meets both
+conditions.
+
+**Recommendation unchanged: A.** Measured in bytes rather than pairs, a 64k
+threshold would save 38% of `.tri` bytes (113 MB) for at most 84 ms warm. If
+you would rather judge D69 in bytes, that is the case for B at 64k.
 
 ## D70 — How large the trigram follow buffer may grow
 
