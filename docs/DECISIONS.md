@@ -86,6 +86,7 @@ Predecessors, carried forward where still open:
 | D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b) |
 | D69 | Saturated large documents in trigram postings           | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b) |
 | D70 | How large the trigram follow buffer may grow           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a) |
+| D71 | Agent habits `ferret search` silently gets wrong     | open           | rec A: `and`/`or`/`not` any case; `content:` aliases `text:`; error on an operator inside one argument (grok survey) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -4045,3 +4046,38 @@ state and 7.5% fully merged, inside the 20% gate.
 ends fewer segments than the variant measured here. **Fact that would change
 it:** treating merge CPU during settling as more costly than 210 MiB of
 follow memory. Then A.
+
+## D71 — Agent habits `ferret search` silently gets wrong
+
+**Raised 2026-10-08** by the D62 side investigation:
+[query languages](research/grok/query-languages.html), a survey by grok. It
+upholds D62 A and D67 A. It also finds three spellings agents use that
+`ferret search` accepts and quietly answers wrongly, with exit status 0:
+
+- **Lowercase operators.** `text:foo or text:bar` is a name search for `or`,
+  ANDed with both text atoms. KQL, Sourcegraph, JQL, Kusto and Zoekt use
+  lowercase operators.
+- **The whole query in quotes.** `"text:foo OR text:bar"` is one `text:`
+  phrase of four tokens. Nearly every surveyed tool takes the query as one
+  string.
+- **`content:`.** GitHub, Sourcegraph and Everything call the body
+  `content:`, which `ferret search` reads as a name substring.
+
+`-term` for negation already errors, which is the right failure.
+
+**Question: should the grammar catch these?**
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. Accept `and`/`or`/`not` in any case as operators. Alias `content:` to `text:`. Error when one argument contains a space-separated `OR`/`NOT` | `and`, `or` and `not` stop being bare name words; `name:or` is the escape, as for `OR` today. Two names for one atom. One help line and the grammar comment change. | All three silent misses become correct answers or errors. No query that works today changes meaning. |
+| B. Only the error on an embedded operator | Smallest change. | Catches the quoted-query habit. Lowercase `or` and `content:` stay silent misses. |
+| C. No change; document it in the help | Nothing. | Agents that read the help are right. Those that guess get wrong answers with exit 0. |
+
+**Recommendation: A.** It fits "optimise for agents", and every change
+either turns a silent miss into a right answer or turns it into an error.
+The survey also recommends keeping AND tighter than OR, fold-by-default
+with `case:` (no smart-case), and the GitHub-shaped glob. A says nothing
+new about any of them.
+
+**The fact that would change it:** the query log showing real searches for
+files named `and`, `or` or `not`. Then B.
