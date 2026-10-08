@@ -92,6 +92,15 @@ static UNSAFE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(&format!("(?-u){}", alternatives.join("|"))).ok()
 });
 
+/// Whether `doc` holds a character whose lowercase (as `ferret-text`
+/// computes it) adds an ASCII byte: the İ/Kelvin check that forces
+/// [`TextMatcher::find`] to tokenize `doc` whole for a case-insensitive
+/// argument. Exposed so S3 M6's chunk census drives the real check instead
+/// of restating it (docs/S3.md § Experiment: D66 C, reduced to a census).
+pub fn forces_whole(doc: &[u8]) -> bool {
+    UNSAFE.as_ref().is_none_or(|unsafe_| unsafe_.is_match(doc))
+}
+
 /// A parsed `text:ARG`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Text {

@@ -384,22 +384,22 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     Ok(())
 }
 
-fn arg(prefix: &str, bytes: &[u8]) -> String {
+pub(crate) fn arg(prefix: &str, bytes: &[u8]) -> String {
     format!("{prefix}{}", String::from_utf8_lossy(bytes))
 }
 
 /// One run of a query.
-struct Once {
-    identities: Vec<u32>,
-    wall: Duration,
-    rows: u64,
-    report: ContentReport,
-    read: Duration,
-    read_bytes: u64,
+pub(crate) struct Once {
+    pub(crate) identities: Vec<u32>,
+    pub(crate) wall: Duration,
+    pub(crate) rows: u64,
+    pub(crate) report: ContentReport,
+    pub(crate) read: Duration,
+    pub(crate) read_bytes: u64,
 }
 
 /// One run of `query`, rows counted.
-fn once(
+pub(crate) fn once(
     catalog: &Catalog,
     names: &NameIndex,
     content: &Content<'_>,
@@ -495,7 +495,7 @@ fn version(catalog: &Catalog, name: NameId, meta: &fs::Metadata) -> ferret_query
 
 /// The benchmark uses fixed trees and a path reader, without crawl's checked
 /// directory walk. Bracket the file descriptor against its current key.
-fn read_current_name(
+pub(crate) fn read_current_name(
     catalog: &Catalog,
     name: NameId,
     path: &mut Vec<u8>,
@@ -534,7 +534,12 @@ fn read_current_name(
 }
 
 /// Phrase sampling still uses only bytes from the catalogued version.
-fn read_name(catalog: &Catalog, name: NameId, path: &mut Vec<u8>, out: &mut Vec<u8>) -> bool {
+pub(crate) fn read_name(
+    catalog: &Catalog,
+    name: NameId,
+    path: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> bool {
     read_current_name(catalog, name, path, out) == Some(ferret_query::ReadVersion::Catalogued)
 }
 
@@ -624,28 +629,33 @@ fn term_query(term: &[u8]) -> bool {
             .is_some_and(|text| text.whole() == Some(term) && text.units().len() == 1)
 }
 
+/// One live name per live document (the first one `name_reader` visits).
+/// Shared by phrase sampling and the chunk census's global map pass (S3 M6),
+/// which both need every live document exactly once.
+pub(crate) fn live_doc_names(catalog: &Catalog, live: &DocSet) -> Vec<(u32, NameId)> {
+    let mut first = vec![None; catalog.next_doc().0 as usize];
+    for (id, name) in catalog.name_reader().runs_from(NameId(0)) {
+        if let Target::Inode(inode) = name.target()
+            && catalog.is_live_name(id)
+            && let Some(doc) = catalog.doc(inode)
+            && live.contains(doc.0)
+            && first[doc.0 as usize].is_none()
+        {
+            first[doc.0 as usize] = Some(id);
+        }
+    }
+    first
+        .into_iter()
+        .enumerate()
+        .filter_map(|(d, n)| n.map(|n| (d as u32, n)))
+        .collect()
+}
+
 /// Phrase arguments: two adjacent units of a randomly chosen live
 /// document, each a term query on its own.
-fn pick_phrases(catalog: &Catalog, live: &DocSet) -> crate::Result<Vec<Vec<u8>>> {
+pub(crate) fn pick_phrases(catalog: &Catalog, live: &DocSet) -> crate::Result<Vec<Vec<u8>>> {
     let mut rng = Rng(0x5eed_0002);
-    let docs: Vec<(u32, NameId)> = {
-        let mut first = vec![None; catalog.next_doc().0 as usize];
-        for (id, name) in catalog.name_reader().runs_from(NameId(0)) {
-            if let Target::Inode(inode) = name.target()
-                && catalog.is_live_name(id)
-                && let Some(doc) = catalog.doc(inode)
-                && live.contains(doc.0)
-                && first[doc.0 as usize].is_none()
-            {
-                first[doc.0 as usize] = Some(id);
-            }
-        }
-        first
-            .into_iter()
-            .enumerate()
-            .filter_map(|(d, n)| n.map(|n| (d as u32, n)))
-            .collect()
-    };
+    let docs = live_doc_names(catalog, live);
     let (mut path, mut bytes, mut scratch) = (Vec::new(), Vec::new(), Scratch::default());
     let mut phrases = Vec::new();
     let mut tries = 0;
