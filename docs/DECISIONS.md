@@ -32,7 +32,7 @@ Predecessors, carried forward where still open:
 | D14 | Filename search: scan the names, or index them           | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
 | D15 | Result unit: per path or per document                    | answered       | per path; a view may group (e.g. image search, once per content)                                               |
 | D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
-| D17 | Whose regex engine, and when                             | answered       | A: `regex` executes behind a narrow trait; choose A/B/C at S3 on verification share of latency                 |
+| D17 | Whose regex engine, and when                             | reopened       | S3: trigger fired (warm rare-literal verify 97% of wall, engine 57%); rec keep A until stronger screening is measured |
 | D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
 | D19 | Ignore matching: whole paths, or per-directory rule sets | answered       | B-flat-indexed: one shared, indexed rule list per directory; last match wins                                   |
 | D20 | Walk across mount points, or stay on the root's device   | answered       | A: cross mount points below a root, as now                                                                     |
@@ -690,6 +690,22 @@ dependency of D16.
 **Answer (2026-09-24): A.** `regex` executes, behind a narrow verifier trait;
 revisit at S3 with the verification-share measurement. D16's matcher proceeds
 without a regex engine.
+
+**S3 measurement (2026-10-08): the trigger fires, but screening comes first.**
+M5's rule was to reopen D17 if verification exceeds half of regex wall time and
+the engine exceeds half of verification. Warm rare literals cross both lines at
+p90: verification is 97% of wall and the engine is 57% of verification. Warm
+identifiers sit at 90% and 47%. Cold rare literals are 99.5% and 5%, so reading
+dominates there. The regex-volume diagnostic says why so much is verified. A
+rare literal reads about 1.38 GB per query, against 8 MB that actually matches.
+Over 99% of that is documents that hold every required trigram but not the
+literal. A faster engine would only speed up rejecting those documents; better
+screening would avoid reading them at all.
+**Recommendation:** keep `regex` (A) for now. Measure stronger in-document
+screening first, then re-time whatever verification survives, and choose A, B
+or C on that number. **Fact that would change it:** if screening cannot cut
+warm verified bytes by more than half, the engine share decides, and B or C
+comes back.
 
 ## D18 — Symlinks: catalogue as links, and what they match
 
