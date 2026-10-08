@@ -81,7 +81,7 @@ Predecessors, carried forward where still open:
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
 | D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
 | D65 | The term dictionary is 87% of the index                  | open           | S3 M2 measured H: 53% smaller at steady state; rule fails on a stale-catalog floor that also fails the control; churn +10%; rec C: run codec, then re-measure |
-| D66 | Phrase queries read too much: positions, or not         | open           | rec A: no positions; ship windowed verify; coarse chunk map for big files is an S3 experiment beside D65 C (S2 M4c) |
+| D66 | Phrase queries read too much: positions, or not         | open           | rec A: no positions; ship windowed verify. S3 M6 chunk census (heuristic): no chunk size cuts p90 ≥50% within +10% index, so C is parked |
 | D67 | How `ferret search` spells a content regex, and when it refuses | open | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0) |
 | D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b) |
 | D69 | Saturated large documents in trigram postings           | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b) |
@@ -3781,6 +3781,31 @@ covering verification time above about 100 ms. Measured with
 - A measurement that most verified bytes come from `jsonl` transcripts would
   make a `jsonl` policy (D65's side question) the cheaper fix than any
   structure.
+
+### D66 update — the chunk-map census (S3 M6, 2026-10-08)
+
+**Heuristic estimate, not a bound** (S3.md § Experiment: D66 C). M4c's 50
+phrase queries were regenerated with the same seed, against a fresh index of
+the S2 bench catalog. Map bytes assume **1 B per (term, document, chunk)**,
+S3.md's cheapest guess; its own table expects 1.5–4 B at 256 KiB.
+
+| Chunk | Estimated p90 read | Actual p90 read | p90 cut | Map bytes (1 B/triple) | vs index |
+| ------- | ---------: | ---------: | ----: | ------: | -----: |
+| 1 MiB   | 1.23 GB | 2.16 GB | 43% | 32.6 MB | +8.3% |
+| 256 KiB | 0.98 GB | 2.16 GB | 55% | 41.9 MB | +10.7% |
+| 64 KiB  | 0.85 GB | 2.16 GB | 61% | 58.2 MB | +14.9% |
+
+The rule is a p90 cut of at least 50% for at most 10% more index. **No chunk
+size meets both halves, so D66 C is parked, not closed.** 256 KiB misses by
+0.7 points, and only at the optimistic 1 B/triple. Two caveats:
+- 1,220 forced whole reads include files whose stat differs from the stale
+  bench catalog. That understates the cut, so a fresh catalog could move
+  1 MiB across 50%.
+- The anchor term is the one the real matcher picks: the longer unit.
+
+Recommendation A stands. **Fact that would change it:** a refreshed-catalog
+census in which 1 MiB cuts p90 by 50% or more. Then D66 C becomes a design
+task.
 
 ## D67 — How `ferret search` spells a content regex, and when it refuses
 
