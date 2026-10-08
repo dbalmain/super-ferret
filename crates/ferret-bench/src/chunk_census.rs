@@ -185,9 +185,14 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
             }
         }
         actual_large_bytes.push(query_actual_large as f64);
-        for (slot, &value) in query_estimate.iter().enumerate() {
-            estimate[slot].push(value as f64);
-            estimate_large[slot].push(query_estimate_large[slot] as f64);
+        for (slot, &large_value) in query_estimate_large.iter().enumerate() {
+            // The "all candidates" projection must cover the same reads as
+            // `actual_bytes` (real.read_bytes, which counts every candidate):
+            // the unchanged small-document bytes already staged above, plus
+            // this chunk size's large-document estimate.
+            query_estimate[slot] += large_value;
+            estimate[slot].push(query_estimate[slot] as f64);
+            estimate_large[slot].push(large_value as f64);
         }
     }
 
@@ -417,7 +422,35 @@ mod tests {
     }
 
     #[test]
-    fn shared_capped_prefix_deduplicates_keys_but_keeps_each_span() {
+    fn shared_capped_prefix_deduplicates_keys_within_a_chunk() {
+        // Two distinct tokens (65 bytes each, differing only in their last
+        // byte) whose first 64 bytes are identical. `cap` truncates each to
+        // that shared 64-byte prefix, so keying on `cap(token)` must collapse
+        // them to one triple in the chunk both tokens fall in. Keying on the
+        // raw, uncapped bytes instead (the bug fix 5 corrects) would keep
+        // them as two triples, so this discriminates the two implementations.
+        let mut bytes = vec![b'a'; 64];
+        bytes.push(b'x');
+        bytes.push(b' ');
+        bytes.extend(vec![b'a'; 64]);
+        bytes.push(b'y');
+
+        let mut scratch = Scratch::default();
+        let mut triples = BTreeSet::new();
+        tokenize(&bytes, &mut scratch, |token| {
+            // A chunk size larger than the whole buffer keeps both tokens in
+            // chunk 0, isolating key deduplication from span placement.
+            insert_term_chunks(&mut triples, token.bytes, &token.run, 1000);
+        });
+
+        assert_eq!(triples.len(), 1);
+        assert!(triples.contains(&(vec![b'a'; 64], 0)));
+    }
+
+    #[test]
+    fn distinct_capped_tokens_keep_separate_chunks() {
+        // Sanity check alongside the dedup test: tokens landing in different
+        // chunks are never merged, regardless of their capped key.
         let mut bytes = vec![b'a'; 64];
         bytes.push(b'x');
         bytes.resize(100, b' ');
