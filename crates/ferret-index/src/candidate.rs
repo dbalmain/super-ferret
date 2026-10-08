@@ -80,7 +80,7 @@ impl Source<'_> {
                     if cancelled() {
                         return Err(ReadError::Cancelled);
                     }
-                    let records = segment.fingerprint_docs(term)?.len() as u64;
+                    let records = segment.fingerprint_bound(term);
                     docs += records;
                     maybe_docs += records;
                     exact &= records == 0;

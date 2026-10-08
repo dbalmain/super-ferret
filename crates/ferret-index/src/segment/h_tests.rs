@@ -94,7 +94,12 @@ fn h_run_starts_at_previous_blocks_last_record_and_spans_four_blocks() {
     let mut bytes = Vec::new();
     writer.finish(&mut bytes).unwrap();
     let segment = Segment::open(bytes).unwrap();
+    // The count includes both partial boundary blocks without reading them.
+    fingerprint::BLOCK_READS.with(|reads| reads.set(0));
+    assert_eq!(segment.fingerprint_bound(b"0127"), 551);
+    fingerprint::BLOCK_READS.with(|reads| assert_eq!(reads.get(), 0));
     let found = candidates(&[segment], b"0127");
+    fingerprint::BLOCK_READS.with(|reads| assert_eq!(reads.get(), 5));
     assert_eq!(
         found,
         (127..550)
@@ -388,5 +393,71 @@ fn h_real_follow_purge_and_codec_change_rebuild_coverage() {
     let writer = IndexWriter::open(&dir, &catalog).unwrap();
     assert!(writer.view().segments().is_empty());
     assert_eq!(writer.view().uncovered(&live), [0, 3]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn h_long_candidate_run_cancels_before_reading_the_next_block() {
+    let _forced = Forced::new(|_| 7);
+    let mut writer = Writer::with_codec(0, 1023, FINGERPRINT_CODEC).unwrap();
+    for doc in 0..1024 {
+        writer.push_record(7, doc).unwrap();
+    }
+    let mut bytes = Vec::new();
+    writer.finish(&mut bytes).unwrap();
+    let segment = Segment::open(bytes).unwrap();
+    fingerprint::BLOCK_READS.with(|reads| reads.set(0));
+    let cancelled = || fingerprint::BLOCK_READS.with(|reads| reads.get() >= 2);
+    assert!(matches!(
+        Term::read_until([&segment], b"term", &cancelled),
+        Err(ReadError::Cancelled)
+    ));
+    fingerprint::BLOCK_READS.with(|reads| assert_eq!(reads.get(), 2));
+}
+
+#[test]
+fn h_source_estimate_bounds_snapshot_maybe_without_fingerprint_reads() {
+    use crate::{Atom, Budget, CatalogView, IndexWriter, Pinned, Source, Stopped};
+    let _forced = Forced::new(|_| 7);
+    let dir = std::env::temp_dir().join(format!("ferret-h-estimate-{}", std::process::id()));
+    let live = DocSet::new(301, 0..301);
+    let catalog = CatalogView {
+        incarnation: [19; 16],
+        live: &live,
+    };
+    let mut writer = IndexWriter::open_with_codec(&dir, &catalog, FINGERPRINT_CODEC).unwrap();
+    let budget = Budget {
+        buffer: 1,
+        ..Budget::unbounded()
+    };
+    loop {
+        let result = writer
+            .follow(&catalog, &budget, &mut |_, bytes| {
+                bytes.extend_from_slice(b"term");
+                Ok(())
+            })
+            .unwrap();
+        if result.stopped == Stopped::Covered {
+            break;
+        }
+    }
+    writer.merge_all(&catalog, &Budget::unbounded()).unwrap();
+    let view = writer.view();
+    let pinned = Pinned::new(Some(&view), &live);
+    let source = Source::Postings(&view);
+    fingerprint::BLOCK_READS.with(|reads| reads.set(0));
+    let estimate = source.estimate(&Atom::Term(b"term")).unwrap().unwrap();
+    fingerprint::BLOCK_READS.with(|reads| assert_eq!(reads.get(), 0));
+    let answer = source.read(&Atom::Term(b"term")).unwrap().unwrap();
+    fingerprint::BLOCK_READS.with(|reads| assert!(reads.get() > 0));
+    let mut cursor = pinned.top(pinned.atom(answer.cursor()));
+    let (mut target, mut maybe) = (0, 0);
+    while let Some((doc, certainty)) = cursor.next_geq(target) {
+        maybe += u64::from(certainty == Certainty::Maybe);
+        target = doc + 1;
+    }
+    assert_eq!(maybe, 301);
+    assert!(estimate.maybe_docs >= maybe);
+    assert!(estimate.docs >= maybe);
     fs::remove_dir_all(dir).unwrap();
 }

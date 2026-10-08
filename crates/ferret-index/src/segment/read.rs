@@ -371,20 +371,49 @@ impl<R: ReadAt> Segment<R> {
         self.fingerprints.records
     }
 
+    /// Conservative record-count bound from the resident restart index.
+    /// Includes the predecessor block and every block starting with this
+    /// fingerprint: either boundary can contain unrelated records.
+    pub fn fingerprint_bound(&self, term: &[u8]) -> u64 {
+        let range = self.fingerprint_blocks(term);
+        let before = range.start as u64 * fingerprint::RECORD_BLOCK as u64;
+        let after =
+            (range.end as u64 * fingerprint::RECORD_BLOCK as u64).min(self.fingerprints.records);
+        after.saturating_sub(before)
+    }
+
+    fn fingerprint_blocks(&self, term: &[u8]) -> std::ops::Range<usize> {
+        let fp = fingerprint::fingerprint(term);
+        let firsts = &self.fingerprints.firsts;
+        if firsts.first().is_none_or(|&first| fp < first) {
+            return 0..0;
+        }
+        let lower = firsts.partition_point(|&first| first < fp);
+        let upper = firsts.partition_point(|&first| first <= fp);
+        lower.saturating_sub(1)..upper
+    }
+
     /// All documents with the fingerprint of `term`. Every hit is Maybe.
-    /// The predecessor of the lower bound covers runs beginning mid-block;
-    /// scanning forward covers equal first fingerprints in subsequent blocks.
     pub fn fingerprint_docs(&self, term: &[u8]) -> Result<Vec<u32>, ReadError> {
-        if self.fingerprints.records == 0 {
-            return Ok(Vec::new());
+        self.fingerprint_docs_until(term, &|| false)
+    }
+
+    /// As `fingerprint_docs`, checking cancellation before each restart
+    /// block, including within a run spanning many blocks.
+    pub fn fingerprint_docs_until(
+        &self,
+        term: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u32>, ReadError> {
+        if cancelled() {
+            return Err(ReadError::Cancelled);
         }
         let fp = fingerprint::fingerprint(term);
-        let bound = self
-            .fingerprints
-            .firsts
-            .partition_point(|&first| first < fp);
         let mut docs = Vec::new();
-        for b in bound.saturating_sub(1)..self.fingerprints.firsts.len() {
+        for b in self.fingerprint_blocks(term) {
+            if cancelled() {
+                return Err(ReadError::Cancelled);
+            }
             let mut done = false;
             self.record_block(b, |key, doc| {
                 if key == fp {
@@ -413,6 +442,8 @@ impl<R: ReadAt> Segment<R> {
             .copied()
             .map(u64::from)
             .unwrap_or(self.fingerprints_at.1);
+        #[cfg(test)]
+        fingerprint::BLOCK_READS.with(|reads| reads.set(reads.get() + 1));
         let (bytes, at) = self.read_checked(Section::Fingerprints, start, end)?;
         fingerprint::decode_block(
             &bytes[at..at + (end - start) as usize],

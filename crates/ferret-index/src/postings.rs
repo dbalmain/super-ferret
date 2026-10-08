@@ -70,7 +70,7 @@ impl Term {
                 return Err(ReadError::Cancelled);
             }
             let hit = entry.map(|entry| segment.read(&entry)).transpose()?;
-            let maybe = segment.fingerprint_docs(term)?;
+            let maybe = segment.fingerprint_docs_until(term, cancelled)?;
             found.records += maybe.len() as u64;
             found.docs += maybe.len() as u64;
             match &hit {

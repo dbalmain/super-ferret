@@ -130,25 +130,27 @@ impl TrigramInverter {
         }
         let start = self.pairs.len();
         let mut count = 0;
+        let mut rejected = false;
         for window in bytes.windows(3) {
             let key = trigram_key([window[0], window[1], window[2]]);
             let number = u32::from_be_bytes([0, key[0], key[1], key[2]]) as usize;
             let bit = 1u64 << (number % 64);
             if self.seen[number / 64] & bit == 0 {
+                if count == limit {
+                    rejected = true;
+                    break;
+                }
                 self.seen[number / 64] |= bit;
                 self.pairs.push((number as u64) << 32 | u64::from(doc));
                 emit(key);
                 count += 1;
-                if count > limit {
-                    break;
-                }
             }
         }
         for pair in &self.pairs[start..] {
             let number = (pair >> 32) as usize;
             self.seen[number / 64] &= !(1u64 << (number % 64));
         }
-        if count > limit {
+        if rejected {
             self.pairs.truncate(start);
             return Ok(None);
         }
@@ -165,11 +167,9 @@ impl TrigramInverter {
     }
 
     /// Capacity charge at the next flush, reserving radix scratch for every
-    /// allocated pair slot and a document list spanning the segment range.
+    /// allocated pair slot and a document list bounded by buffered pairs.
     pub fn flush_bytes(&self) -> usize {
-        let docs = self.first.zip(self.last).map_or(0, |(first, last)| {
-            (u64::from(last) - u64::from(first) + 1) as usize
-        });
+        let docs = self.pairs.len();
         (self.pairs.capacity()
             + self.scratch.capacity().max(self.pairs.capacity())
             + self.seen.capacity())
@@ -194,11 +194,6 @@ impl TrigramInverter {
         mut observe: impl FnMut(usize),
     ) -> Result<Writer, WriteError> {
         let mut writer = Writer::keyed(first, last, TRIGRAM_VERSION)?;
-        let docs = self.first.zip(self.last).map_or(0, |(first, last)| {
-            (u64::from(last) - u64::from(first) + 1) as usize
-        });
-        self.documents.clear();
-        self.documents.reserve_exact(docs);
         let count = self.pairs.len();
         if self.scratch.capacity() < count {
             self.scratch.reserve_exact(count - self.scratch.len());
@@ -234,6 +229,7 @@ impl TrigramInverter {
                 end += 1;
             }
             self.documents.clear();
+            self.documents.reserve_exact(end - start);
             self.documents
                 .extend(self.pairs[start..end].iter().map(|pair| *pair as u32));
             writer.push(&number.to_be_bytes()[1..], &self.documents)?;
@@ -290,6 +286,56 @@ mod tests {
             assert_eq!(inverter.scratch.capacity(), 0);
             assert!(inverter.is_empty());
         }
+    }
+
+    #[test]
+    fn sparse_doc_ids_reserve_only_the_real_posting_group() {
+        // Historical DocId gaps must not turn two postings into GB of scratch.
+        let mut inverter = TrigramInverter::with_capacity(2);
+        let baseline = inverter.allocated_bytes();
+        inverter.add(0, b"abc").unwrap();
+        inverter.add(1_000_000_000, b"abc").unwrap();
+        assert_eq!(inverter.flush_bytes(), baseline + 2 * (8 + 4));
+        let mut peak = 0;
+        let writer = inverter
+            .drain_into_with(0, 1_000_000_000, |bytes| {
+                peak = peak.max(bytes);
+            })
+            .unwrap();
+        assert_eq!(inverter.documents.capacity(), 2);
+        assert_eq!(inverter.allocated_bytes(), baseline + 8);
+        assert!(peak < baseline + 4096);
+        let mut bytes = Vec::new();
+        writer.finish(&mut bytes).unwrap();
+        let segment = Segment::open(bytes).unwrap();
+        let Some(Hit::Postings(list)) = segment.lookup(b"abc").unwrap() else {
+            panic!("two real postings");
+        };
+        let mut docs = Vec::new();
+        list.decode(&mut docs);
+        assert_eq!(docs, [0, 1_000_000_000]);
+    }
+
+    #[test]
+    fn rejected_admission_preserves_capacity_order_and_contents() {
+        // Rejection at capacity used to grow the fixed pair reservation.
+        let mut inverter = TrigramInverter::with_capacity(4);
+        inverter.add(7, b"abcde").unwrap();
+        let pairs = inverter.pairs.clone();
+        let capacity = inverter.allocated_bytes();
+        assert_eq!(inverter.add_limited(9, b"xyzab", 1).unwrap(), None);
+        assert_eq!(inverter.allocated_bytes(), capacity);
+        assert_eq!(inverter.pairs, pairs);
+        assert_eq!(inverter.first, Some(7));
+        assert_eq!(inverter.last, Some(7));
+        assert!(inverter.seen.iter().all(|word| *word == 0));
+        assert_eq!(inverter.add_limited(8, b"yza", 1).unwrap(), Some(1));
+        let pairs = inverter.pairs.clone();
+        assert_eq!(inverter.add_limited(9, b"xyz", 0).unwrap(), None);
+        assert_eq!(inverter.allocated_bytes(), capacity);
+        assert_eq!(inverter.pairs, pairs);
+        assert_eq!(inverter.last, Some(8));
+        assert!(inverter.seen.iter().all(|word| *word == 0));
     }
 
     #[test]

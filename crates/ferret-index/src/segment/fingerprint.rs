@@ -27,6 +27,7 @@ type ForcedFingerprint = fn(&[u8]) -> u32;
 thread_local! {
     /// A test's fingerprint function in place of BLAKE3's, on this thread:
     /// it forces collisions through the real writer, merge and lookup.
+    pub(crate) static BLOCK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static FORCED: std::cell::Cell<Option<ForcedFingerprint>> =
         const { std::cell::Cell::new(None) };
 }
