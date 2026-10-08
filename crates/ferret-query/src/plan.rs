@@ -4,6 +4,7 @@
 //! ```text
 //! refuse      uncovered > bound, unless the caller scans them
 //! estimate    every content atom, from the dictionaries alone (no list)
+//! refuse      M(root) > live / 4, unless the caller opts into scanning
 //! drive       content: a top-level content-only conjunct false on rows
 //!                      with no document, smallest estimate, when it is
 //!                      below the name side's × 1.2 inodes per document;
@@ -69,8 +70,8 @@ pub struct Content<'a> {
     pub pinned: &'a Pinned<'a>,
     /// The catalog view's DocId → names inverse.
     pub docs: &'a DocNames,
-    /// The most uncovered documents to verify; `None` verifies any number
-    /// (`--scan-uncovered`).
+    /// The most uncovered documents to verify. `None` permits any number
+    /// and overrides the quarter-of-live Maybe refusal (`--scan`).
     pub bound: Option<u32>,
 }
 

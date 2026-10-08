@@ -27,6 +27,12 @@
 //!
 //! Nothing here prints a term or a byte of content: only classes, counts
 //! and times.
+//!
+//! S3 M5's `regex-query <catalog-dir> <index-dir> <snapshot-dir>` uses the
+//! same real planner and frozen reader for the five regex classes. Cold
+//! runs also evict candidate documents; warm runs reuse the compiled query.
+//! The reports split verification and engine time and compare the planner's
+//! M bound with its actual snapshot-Maybe count.
 
 use std::fs::{self, File};
 use std::io::Read;
