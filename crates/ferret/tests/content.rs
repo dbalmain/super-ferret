@@ -1306,10 +1306,19 @@ fn mixed_queries_and_bounds_equal_the_oracle_with_h_records() {
         .unwrap();
         engine.open_content(&tree.index()).unwrap();
         check(&engine.pin(), &mut rng, 40, "H empty");
-        let marker = catalog.names().find_map(|(id, bytes)| {
-            if bytes != b"singleton-marker" { return None; }
-            if let ferret_catalog::Target::Inode(inode) = catalog.name(id).target() { catalog.doc(inode).map(|doc| doc.0) } else { None }
-        }).unwrap();
+        let marker = catalog
+            .names()
+            .find_map(|(id, bytes)| {
+                if bytes != b"singleton-marker" {
+                    return None;
+                }
+                if let ferret_catalog::Target::Inode(inode) = catalog.name(id).target() {
+                    catalog.doc(inode).map(|doc| doc.0)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
         let unreadable: Vec<_> = live
             .range(0, live.bound())
             .filter(|&doc| doc != marker && rng.one_in(5))
@@ -1346,10 +1355,20 @@ fn mixed_queries_and_bounds_equal_the_oracle_with_h_records() {
                 },
             );
         }
-        assert!(writer.view().segments().iter().map(|segment| segment.fingerprint_records()).sum::<u64>() > 0);
+        assert!(
+            writer
+                .view()
+                .segments()
+                .iter()
+                .map(|segment| segment.fingerprint_records())
+                .sum::<u64>()
+                > 0
+        );
         let retired = fs::read(tree.root().join(&written[0])).unwrap();
         for rel in &written {
-            if fs::read(tree.root().join(rel)).unwrap() == retired { fs::remove_file(tree.root().join(rel)).unwrap(); }
+            if fs::read(tree.root().join(rel)).unwrap() == retired {
+                fs::remove_file(tree.root().join(rel)).unwrap();
+            }
         }
         tree.refresh(&engine);
         engine.open_content(&tree.index()).unwrap();
