@@ -90,7 +90,7 @@ Predecessors, carried forward where still open:
 | D72 | `ferret grep`: scan broad queries automatically?          | open           | rec A: grep scans when the index can't narrow; `search` keeps S3's refusal (GREP.md, Sol) |
 | D73 | `ferret grep`: what freshness does indexed grep promise?   | open           | rec A+D: snapshot by default like find, plus opt-in `--live` that keeps ferret's ignore rules (GREP.md, Sol) |
 | D74 | `ferret grep`: may `-g`/`--hidden` recover excluded paths? | open           | rec A: intersect with D47 visibility; `--no-ignore`/`-u` use find's live walk (GREP.md, Sol) |
-| D75 | `ferret grep`: BOMs and UTF-16, or raw bytes only?        | open           | rec A (raw bytes) only if you accept missing BOM/UTF-16 matches; else B, rg's BOM detection (GREP.md, Sol) |
+| D75 | `ferret grep`: BOMs and UTF-16, or raw bytes only?        | open           | rec D: strip a leading UTF-8 BOM for every input; UTF-16 stays a known miss (else B) (GREP.md, Luna/Astra round 2) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -4226,21 +4226,25 @@ its binary observations cannot settle encoding compatibility.
 | A. Raw input everywhere, as initially proposed | Anchored matches can miss behind a UTF-8 BOM; UTF-16 matches can miss or become binary skips even on explicit files. Dave must accept that divergence. | One original-byte profile for matching, offsets and trigram soundness; no transcoding or extra enumeration. |
 | B. rg's BOM-only auto detection everywhere; arbitrary named encodings remain deferred | Strip UTF-8 BOMs; decode UTF-16 LE/BE before NUL detection. Need malformed-input rules, byte-offset mapping and bounded conversion. Indexed UTF-16 lacks ordinary text postings: include catalog-visible BOM text through enumeration/live verification, never negative raw-trigram shortcuts. Measure resulting binary-head reads; no numeric cost measured yet. | Fixes default encoding misses on both explicit and recursive input; closer drop-in behavior without a general encoding dependency. |
 | C. BOM handling only for direct files/stdin and policy-preserving live mode | Matching profiles and offsets differ by source; indexed UTF-16 still misses, and switching modes changes answers. Later B must unify those rules. | Addresses explicit-current-file failures without probing every catalogued binary file in indexed mode. |
+| D. Strip an initial UTF-8 BOM consistently for all inputs; defer UTF-16 | UTF-16 still misses. | Removing the prefix keeps the needed substring trigrams in the original bytes, so it needs no binary enumeration. It is cheap and separable from B. |
 
-**Recommendation: A, provisionally pending Dave's explicit acceptance.** It is
-fastest and simplest for the existing raw-byte index but sacrifices match
-correctness versus rg; documenting the miss is not approval. Prefer B over C
-if that cost is unacceptable: C leaves an input-source-dependent dialect that
+**Recommendation: D.** Apply UTF-8 BOM stripping consistently to all inputs
+and defer UTF-16. D fixes the cheap UTF-8 prefix miss while retaining original
+bytes and trigram soundness without binary enumeration. It keeps UTF-16 as an
+explicit known miss and remains separable from B. If that remaining miss is
+unacceptable, prefer B over C: C leaves an input-source-dependent dialect that
 builders and agents must remember. Under B, transformed matches must satisfy
 the necessary query over original indexed bytes; where unproved (notably
-UTF-16), bypass raw postings and enumerate the relevant selected names. A
-BOM-aware implementation changes the planned reader/profile scope and M1/M6
-positive fixtures; schedule that before authorizing builders. No extra crate
-edge or index-format change is presumed here.
+UTF-16), bypass raw postings and enumerate the relevant selected names. If B is
+chosen, specify offset semantics before implementation, along with malformed
+decoding rules, bounded conversion and the selected-name universe. D/B changes
+the planned reader/profile scope and M1/M6 positive fixtures; schedule the
+chosen option before authorizing builders. No extra crate edge or index-format
+change is presumed here.
 
-**Fact that would change it:** ordinary agent commands encountering BOM text,
-especially explicit-file misses, or measured BOM-head reads/conversion proving
-B cheap enough. Then choose B and specify malformed decoding, original-byte
-versus decoded offsets and the selected-name universe before building. With A,
-keep positive BOM/UTF-16 oracle fixtures and label only the approved encoding
+**Fact that would change it:** ordinary agent commands encountering UTF-16 BOM
+text, or measurements proving B's indexed UTF-16 enumeration and conversion
+cost acceptable. Then choose B and specify original-byte versus decoded offset
+semantics before building. With D, keep positive UTF-8 BOM fixtures and
+UTF-16 oracle fixtures; label the UTF-16 miss as the approved encoding
 disagreement, never freshness or binary as a substitute cause.
