@@ -88,8 +88,9 @@ Predecessors, carried forward where still open:
 | D70 | How large the trigram follow buffer may grow           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a) |
 | D71 | Agent habits `ferret search` silently gets wrong     | open           | rec A: `and`/`or`/`not` any case; `content:` aliases `text:`; error on an operator inside one argument (grok survey) |
 | D72 | `ferret grep`: scan broad queries automatically?          | open           | rec A: grep scans when the index can't narrow; `search` keeps S3's refusal (GREP.md, Sol) |
-| D73 | `ferret grep`: what freshness does indexed grep promise?   | open           | rec A: snapshot membership like find; verify candidates' current bytes (GREP.md, Sol) |
+| D73 | `ferret grep`: what freshness does indexed grep promise?   | open           | rec A+D: snapshot by default like find, plus opt-in `--live` that keeps ferret's ignore rules (GREP.md, Sol) |
 | D74 | `ferret grep`: may `-g`/`--hidden` recover excluded paths? | open           | rec A: intersect with D47 visibility; `--no-ignore`/`-u` use find's live walk (GREP.md, Sol) |
+| D75 | `ferret grep`: BOMs and UTF-16, or raw bytes only?        | open           | rec A (raw bytes) only if you accept missing BOM/UTF-16 matches; else B, rg's BOM detection (GREP.md, Sol) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -4162,18 +4163,27 @@ current candidate bytes, or must every invocation search the current tree?
 | A. Snapshot membership and posting absence; verify candidates now | A new file or a changed file newly containing the needle can be missed until refresh/follow. This is not exact over the current tree. | Matches find/S2's existing model, generation pins and caches. Selective queries avoid checking every file. |
 | B. Live enumerate and stat all selected files; add changed/new files to candidates | O(selected entries) metadata work on every query; at 10M entries this may dominate a rare lookup. Needs sound detection of replacements and policy changes. | Current-tree completeness for observed stable files, while postings can still skip unchanged contents. |
 | C. Refresh and follow to a query barrier first | Refresh/follow can read the entire tree and block on writer backlog; S3 measured refresh 24 ms versus S2's 7.4 ms on its small trace. A barrier still is not an atomic filesystem snapshot. | Stronger freshness with one writer model; useful once the daemon has a proved barrier. |
+| D. Opt-in current-tree search retaining ferret ignore policy | The opt-in walks selected names, loads current policy rules and reads selected bytes; latency includes that work. Host must apply policy/pruning over find's existing live source. | Separates freshness from visibility: new files/matches are found without searching ferret-excluded trees. Default selective queries keep A's low metadata cost. |
 
-**Recommendation: A (provisional).** It is fastest and simplest but trades
-correctness for freshness, outside the fastest/simplest rule. Say the limitation
-plainly. Explicit files and stdin scan current bytes directly; unrestricted
-live mode gives a current recursive walk. A disappeared candidate is dropped;
-a changed candidate is searched under its path, never cached under its old
-DocId. Checking emitted hits cannot repair a snapshot No.
+**Recommendation: A+D (provisional, rechecked after round 1).** Retain A as
+indexed default, add `ferret grep --live` in M6. This is a real correctness
+tradeoff for Dave to accept, not something the fastest/simplest rule settles.
+D is the missing alternative: `--no-ignore` changes visibility and cannot
+serve as the policy-preserving freshness switch. `--live` loads covering
+catalog roots only as policy anchors, reads current rules from those roots,
+and walks current names with D13 size/binary/ignore policy plus grep filters.
+No stale name/posting exclusion; outside-root directories still need indexing
+or the separately chosen unrestricted mode. Explicit starts retain their
+existing exceptions. It is not an atomic filesystem snapshot.
 
-**Fact that would change it:** agents demonstrably missing newly introduced
-matches despite a running daemon, or a proved low-cost change barrier; measure
-B or C then. If current-tree completeness is required now, B is the honest
-shape and latency must include its walk.
+A disappeared candidate is dropped; changed bytes stay path-local, never
+cached under the old DocId. Checking emitted hits cannot repair snapshot No.
+
+**Fact that would change it:** if agent traces require current-tree completeness
+by default, promote D or measure B/C and include enumeration/barrier latency.
+If `--live` is rarely used and a proved change barrier eliminates misses at low
+cost, C may replace it. Unrestricted live mode is no longer presented as the
+only way to request freshness.
 
 ## D74 — May visibility flags recover ferret-excluded paths?
 
@@ -4197,3 +4207,40 @@ starts use find's live fallback. No fallback to an external rg executable.
 commands accounting for most real misses; B would need a separate policy
 review and measurements before implementation. This slice does not authorize
 that change to D13/D47.
+
+## D75 — Raw bytes or BOM-aware input?
+
+**Question:** May grep keep UTF-8 BOM bytes and decline UTF-16 BOM detection,
+including on explicit current files where freshness does not explain a miss?
+
+rg 15.2.0 defaults to BOM detection. Untimed synthetic probes: `^needle$`
+matches UTF-8-BOM and UTF-16 LE/BE BOM inputs with auto encoding (exit 0/count
+1), and misses all three with `--encoding=none` (exit 1). Corpus rank 42 is
+`--encoding`, used by 20 rg repositories / 34 occurrences; six rendered
+commands carry its feature label. These counts do **not** measure implicit
+BOM/UTF-16 usage. The invalid-byte fixture deliberately avoids a UTF-16 BOM;
+its binary observations cannot settle encoding compatibility.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Raw input everywhere, as initially proposed | Anchored matches can miss behind a UTF-8 BOM; UTF-16 matches can miss or become binary skips even on explicit files. Dave must accept that divergence. | One original-byte profile for matching, offsets and trigram soundness; no transcoding or extra enumeration. |
+| B. rg's BOM-only auto detection everywhere; arbitrary named encodings remain deferred | Strip UTF-8 BOMs; decode UTF-16 LE/BE before NUL detection. Need malformed-input rules, byte-offset mapping and bounded conversion. Indexed UTF-16 lacks ordinary text postings: include catalog-visible BOM text through enumeration/live verification, never negative raw-trigram shortcuts. Measure resulting binary-head reads; no numeric cost measured yet. | Fixes default encoding misses on both explicit and recursive input; closer drop-in behavior without a general encoding dependency. |
+| C. BOM handling only for direct files/stdin and policy-preserving live mode | Matching profiles and offsets differ by source; indexed UTF-16 still misses, and switching modes changes answers. Later B must unify those rules. | Addresses explicit-current-file failures without probing every catalogued binary file in indexed mode. |
+
+**Recommendation: A, provisionally pending Dave's explicit acceptance.** It is
+fastest and simplest for the existing raw-byte index but sacrifices match
+correctness versus rg; documenting the miss is not approval. Prefer B over C
+if that cost is unacceptable: C leaves an input-source-dependent dialect that
+builders and agents must remember. Under B, transformed matches must satisfy
+the necessary query over original indexed bytes; where unproved (notably
+UTF-16), bypass raw postings and enumerate the relevant selected names. A
+BOM-aware implementation changes the planned reader/profile scope and M1/M6
+positive fixtures; schedule that before authorizing builders. No extra crate
+edge or index-format change is presumed here.
+
+**Fact that would change it:** ordinary agent commands encountering BOM text,
+especially explicit-file misses, or measured BOM-head reads/conversion proving
+B cheap enough. Then choose B and specify malformed decoding, original-byte
+versus decoded offsets and the selected-name universe before building. With A,
+keep positive BOM/UTF-16 oracle fixtures and label only the approved encoding
+disagreement, never freshness or binary as a substitute cause.
