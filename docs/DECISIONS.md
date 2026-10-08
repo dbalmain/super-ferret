@@ -75,7 +75,7 @@ Predecessors, carried forward where still open:
 | D57 | Socket codec: shared JSON lines or binary framing       | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                          |
 | D58 | Batch input: serde_json or a hand-written reader         | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                 |
 | D59 | How intpack enters the workspace                         | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                     |
-| D60 | Reactivate a dead DocId when its content returns        | open           | rec B: no; reverted content gets a new DocId and is tokenized again (S2 M0)                                    |
+| D60 | Reactivate a dead DocId when its content returns        | open           | experiment run: git index saves ~3% (follow is 85–90%); rec B now, A′ (reactivate by content hash, no git) if wanted |
 | D61 | Term frequencies in S2's postings                       | open           | rec B: doc ids only; frequencies arrive with ranking, by reindex (S2 M0)                                       |
 | D62 | `ferret search` syntax for content and booleans          | open           | rec A: `text:` atoms; find-style `OR`, `NOT`, `(` `)` as whole arguments (S2 M0)                               |
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
@@ -3427,6 +3427,69 @@ brief exists only because D36 deferred it by name.
 passes after branch switches costing seconds of CPU or noticeable postings
 churn on Dave's real repositories, for example a monorepo whose switches touch
 tens of thousands of large files.
+
+### Measured update: the git-index experiment (2026-10-08)
+
+**Status: open, revised 2026-10-08** after the branch-switch experiment
+(`ferret-bench git-switch`, branch `wt/d60`). The figures below are
+**measured** unless marked otherwise.
+
+**Question:** When content that died comes back (a revert, a branch switched
+away and back), should it get its old DocId back? And should the crawl use
+git's index to recognise that content without reading it?
+
+**What the experiment found.** The original brief said "the read dominates and
+is paid either way". That was wrong, and so is the premise behind the git-index
+idea. A checkout has just written the returning files, so they sit in the page
+cache, and the crawl's read plus BLAKE3 runs at about 1.1 GB/s. The expensive
+part of a switch is the follow pass, which tokenizes and builds a segment for
+every new DocId. On a 5,139-file, 60 MB return (synthetic, A → B → A):
+
+| Part of the returning switch               | Cost                                     |
+| ------------------------------------------ | ---------------------------------------- |
+| Crawl read + hash                          | 50 ms wall, 57 ms CPU (4% of the switch) |
+| Rest of the crawl refresh                  | about 100 ms wall                        |
+| Follow pass (tokenize 0.39 s + segment build) | 1.17 s CPU, 1.20 s wall               |
+| New segment bytes                          | 3.35 MB                                  |
+| Dead postings until merge                  | +7.1 M (7.95 M → 15.0 M)                 |
+
+Dave's largest real repository has only 1,897 tracked files. No repository
+under `~/w` is larger, so the synthetic one stands in for a big switch. Its
+1,479-file real return costs 16 ms of read+hash against 324 ms of follow CPU
+and 2.15 MB of segment.
+
+The git index does recognise returning content correctly. Every returning
+eligible file was skippable: 1,479 of 1,479 real and 5,139 of 5,139
+synthetic. The check found **0 BLAKE3 mismatches across 6,739 skips**. One
+condition applies: that holds only under a **nanosecond** racy-clean rule. Git's
+own default compares whole seconds, and under that rule **zero** files are
+skippable immediately after a switch, because the checkout writes them in the
+same second as the index. Once a later git command such as `git status`
+rewrites the index, they all become clean.
+
+| Option                                                                         | Costs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Buys                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B. Never reactivate (D36 B carried into S2; today)                             | Each returning file is tokenized again under a new DocId: 1.17 s CPU, 3.35 MB of segment and +7.1 M dead postings per 5,139-file return (synthetic). The large real repository's return costs 0.32 s and 2.15 MB. The 25% dead-fraction merge rule bounds the dead postings.                                                                                                                                                                                                                                                        | No code and no new state. Liveness stays one-way, and the catalog stays ignorant of postings.                                                                                                                                                                                       |
+| C. Git-assisted identity, no reactivation: skip the crawl's read, still tokenize | A `.git/index` reader in `ferret-crawl`, written from the format docs; it is std-only, so no new crate edge. It has fallbacks for filters, attributes, sparse checkout, split index, submodules and SHA-256. A persistent `blob id → DocId` catalog section at 24 B/entry (SHA-1 plus DocId; 36 B under SHA-256), about 240 MB at 10M git-tracked entries before table overhead. A nanosecond racy rule that is less conservative than git's default and depends on 1 ns filesystem timestamps. Switch detection costs one stat per repository per burst (0.6 µs), plus a parse at about 0.45 µs/entry. | Saves 57 ms of read+hash per 5,139-file return (net about 44 ms after the 2.8 ms parse and 9.7 ms decision), about **3%** of the switch. The follow pass, which is 85–90% of the cost, is untouched. D63's re-hash saving for git repositories is real but just as small. |
+| A. Git-assisted identity plus reactivation (the original D60 A, keyed by git)  | C's costs, plus the original A's: dead catalog rows retained until a merge purges their postings (16 B hash + 4 B DocId per dead document), and a purge list that the index hands back to the catalog. That is a new flow of index state into catalog state against DESIGN's ownership table, though no new `Cargo.toml` edge, since `ferret` relays it. Merges keep their purge list until the catalog applies it.                                                                                       | Skips the read **and** the follow pass for returning content while its postings exist: 1.24 s of the switch's 1.35 s, 3.35 MB of segment and 7.1 M postings per 5,139-file return. 1,405 of the large real repository's 1,479 returning files mapped to a dead DocId.                |
+| A′. Reactivation keyed by content hash, no git                                 | The original A's retention and purge-list costs, with no git reader, no blob map and no switch detection. The crawl still reads and hashes the returning files (57 ms per 5,139). The catalog build looks the hash up among retained dead rows, in the sort it already does to assign DocIds.                                                                                                                                                                          | **96%** of A's saving: the follow pass, the segment and the dead postings. It also works for every way content returns, not only git: editor undo, `stash pop`, rsync, a restored backup. It adds no git surface for correctness to depend on.                                                         |
+
+**Recommendation: B now; A′, not A, when reactivation is wanted.** Drop the
+git-index idea: it is sound, but it buys about 3% of a switch for a format
+reader, a 24 B/entry map and a racy rule that is stricter in what it assumes
+than git's own default. Fastest and simplest disagree only between B and A′.
+On Dave's real repositories a returning switch costs at most about 0.33 s of
+follow CPU, which is under the original brief's "seconds of CPU" trigger. So B
+stays, with A′ as the named upgrade. D63 A also stands: git does not remove the
+re-hash in any way that matters.
+
+**Fact that would change it:** follow passes after real switches costing
+seconds of CPU, at the measured 51–64 MB/s per core. That means switches of
+about 100 MB or 10,000+ files on a repository Dave works in; then A′. For the
+git half: a working tree where the read is genuinely expensive, such as a
+switch larger than free memory, a network filesystem, or a cold cache that
+was not measured here. Even then A′ comes first, and C goes on top only if the
+read is measured to dominate.
 
 ## D61 — Term frequencies in S2's postings
 
