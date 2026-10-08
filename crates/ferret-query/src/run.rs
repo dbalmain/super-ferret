@@ -27,6 +27,8 @@ pub struct Row<'a> {
     pub inode: InoId,
     /// Directory, file or symlink.
     pub kind: Kind,
+    /// First content-regex match established by verification, in bytes.
+    pub offset: Option<usize>,
 }
 
 /// What a run did, for the query log and for tests.
@@ -56,6 +58,11 @@ pub enum RunError {
         uncovered: u32,
         live: u32,
     },
+    /// Conservative Maybe estimate exceeds a quarter of live documents.
+    ScanRequired {
+        maybe: u64,
+        live: u32,
+    },
     /// The content index could not be read.
     Index(ferret_index::ReadError),
     /// A query with a content atom was run without the content index and a
@@ -71,6 +78,10 @@ impl fmt::Display for RunError {
             Self::IndexIncomplete { uncovered, live } => write!(
                 f,
                 "the content index does not yet cover {uncovered} of {live} documents"
+            ),
+            Self::ScanRequired { maybe, live } => write!(
+                f,
+                "query may read {maybe} of {live} documents: pass --scan to read them"
             ),
             Self::Index(error) => write!(f, "content index: {error}"),
             Self::NoContent => f.write_str("a text: query needs the content index"),
@@ -528,6 +539,7 @@ impl<'c> Run<'_, 'c> {
         }
         self.stats.rows += 1;
         Ok(emit(&Row {
+            offset: None,
             path: &self.path,
             name: id,
             inode: name.child,

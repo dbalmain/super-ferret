@@ -452,6 +452,13 @@ impl QuerySession {
         query.run_indexed_until(&self.catalog, &self.names, None, cancelled, emit)
     }
 
+    /// Dictionary-only plan for a content query, including one refused by
+    /// search. This borrows the same catalog/content pin as execution.
+    pub fn explain_content(&self, query: &Query) -> Result<ferret_query::ContentPlan, RunError> {
+        let pinned = ferret_index::Pinned::new(self.content.as_deref(), self.live());
+        query.explain_content(&self.catalog, &self.names, &pinned)
+    }
+
     /// Streams a content query's rows over this pin's content view, or
     /// over none, verifying Maybe documents through the crawl's checked
     /// reader. More than `bound` uncovered documents is

@@ -33,6 +33,8 @@ pub enum Atom<'q> {
 pub struct Estimate {
     /// Upper bound on documents the cursor yields (Lucene's `cost()`).
     pub docs: u64,
+    /// Upper bound on candidates that require verification (H records).
+    pub maybe_docs: u64,
     /// Whether every yielded document is Yes.
     pub exact: bool,
     /// Whether the answer can enumerate its documents. A per-document
@@ -47,7 +49,8 @@ pub struct Estimate {
 pub enum Source<'v> {
     /// S2: term postings over one manifest's segments.
     Postings(&'v View),
-    // S3: TrigramPostings(..), DocFilter(..)
+    /// ASCII-folded raw-byte trigram postings over the paired files.
+    Trigrams(&'v View),
 }
 
 impl Source<'_> {
@@ -71,22 +74,47 @@ impl Source<'_> {
         match (self, atom) {
             (Self::Postings(view), Atom::Term(term)) => {
                 let mut docs = 0;
+                let mut maybe_docs = 0;
+                let mut exact = true;
                 for segment in view.segments() {
                     if cancelled() {
                         return Err(ReadError::Cancelled);
                     }
+                    let records = segment.fingerprint_bound(term);
+                    docs += records;
+                    maybe_docs += records;
+                    exact &= records == 0;
                     if let Some(entry) = segment.entry(term)? {
                         docs += u64::from(entry.df);
                     }
                 }
                 Ok(Some(Estimate {
                     docs,
+                    maybe_docs,
+                    exact,
+                    enumerable: true,
+                    bytes: 0,
+                }))
+            }
+            (Self::Trigrams(view), Atom::Trigram(key)) => {
+                let mut docs = 0;
+                for segment in view.trigrams() {
+                    if cancelled() {
+                        return Err(ReadError::Cancelled);
+                    }
+                    if let Some(entry) = segment.entry(key)? {
+                        docs += u64::from(entry.df);
+                    }
+                }
+                Ok(Some(Estimate {
+                    docs,
+                    maybe_docs: 0,
                     exact: true,
                     enumerable: true,
                     bytes: 0,
                 }))
             }
-            (Self::Postings(_), Atom::Trigram(_)) => Ok(None),
+            (Self::Postings(_), Atom::Trigram(_)) | (Self::Trigrams(_), Atom::Term(_)) => Ok(None),
         }
     }
 
@@ -112,7 +140,10 @@ impl Source<'_> {
                     segments, term, cancelled,
                 )?)))
             }
-            (Self::Postings(_), Atom::Trigram(_)) => Ok(None),
+            (Self::Trigrams(view), Atom::Trigram(key)) => Ok(Some(Candidates::Postings(
+                postings::Term::read_until(view.trigrams().iter().map(|s| &**s), key, cancelled)?,
+            ))),
+            (Self::Postings(_), Atom::Trigram(_)) | (Self::Trigrams(_), Atom::Term(_)) => Ok(None),
         }
     }
 }
@@ -128,7 +159,8 @@ impl Candidates {
         match self {
             Self::Postings(term) => Estimate {
                 docs: term.docs(),
-                exact: true,
+                maybe_docs: term.records(),
+                exact: term.exact(),
                 enumerable: true,
                 bytes: term.bytes(),
             },
@@ -191,7 +223,9 @@ impl<'a> Pinned<'a> {
 
     /// Every structure the view holds; S2 has one, and no view has none.
     pub fn sources(&self) -> impl Iterator<Item = Source<'a>> + use<'a> {
-        self.view.map(Source::Postings).into_iter()
+        self.view
+            .into_iter()
+            .flat_map(|view| [Source::Postings(view), Source::Trigrams(view)])
     }
 
     pub fn live(&self) -> &'a DocSet {

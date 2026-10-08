@@ -241,8 +241,11 @@ pub(crate) fn search_request(
             } else {
                 session.search_content(
                     &query,
-                    (!request.capabilities.iter().any(|c| c == "scan-uncovered"))
-                        .then_some(ferret_query::UNCOVERED_BOUND),
+                    (!request
+                        .capabilities
+                        .iter()
+                        .any(|c| c == "scan" || c == "scan-uncovered"))
+                    .then_some(ferret_query::UNCOVERED_BOUND),
                     destination.cancellation(),
                     |row: &Row<'_>| {
                         if destination.cancelled() {
@@ -281,6 +284,12 @@ pub(crate) fn search_request(
                     stats = Some(result);
                     status = if rows == 0 { 1 } else { 0 };
                 }
+                Err(error @ ferret_query::RunError::ScanRequired { .. }) => {
+                    if let Ok(plan) = session.explain_content(&query) {
+                        plan_text.push_str(&format!("; content: {}", plan.describe()));
+                    }
+                    query_error = Some(error.to_string());
+                }
                 Err(ferret_query::RunError::IndexIncomplete { uncovered, live }) => {
                     query_error = Some(crate::search::incomplete_message(uncovered, live));
                 }
@@ -304,6 +313,9 @@ pub(crate) fn search_request(
             estimate.plan, estimate.hits, estimate.scope_rows
         );
         strategy = format!("{:?}", estimate.plan);
+    }
+    if let Some(content) = stats.as_ref().and_then(|stats| stats.content.as_ref()) {
+        plan_text.push_str(&format!("; content: {}", content.describe()));
     }
     let elapsed = started.elapsed().as_micros() as i128;
     let log = SearchLog {
@@ -337,6 +349,9 @@ pub(crate) fn search_request(
                 o.int("candidates", stats.candidates)
                     .int("rows", stats.rows);
             });
+            if let Some(content) = &stats.content {
+                crate::search::log_content(o, content);
+            }
         }
         if let Some(error) = query_error.as_deref() {
             o.str("error", error);
@@ -522,6 +537,9 @@ fn log_search(dirs: Option<&Dirs>, request: &Request, at: SystemTime, log: &Sear
                 o.int("candidates", stats.candidates)
                     .int("rows", stats.rows);
             });
+            if let Some(content) = &stats.content {
+                crate::search::log_content(&mut o, content);
+            }
         }
         if let Some(error) = error {
             o.str("error", error);

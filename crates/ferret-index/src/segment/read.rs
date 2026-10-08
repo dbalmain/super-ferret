@@ -12,8 +12,10 @@ use intpack::Cursor as _;
 use intpack::pfor128skip::{self, SortedCursor};
 
 use super::{
-    BLOCK, CHUNK, DICTIONARY_CODEC, FIELDS, FORMAT_VERSION, HEAD, MAGIC, POSTINGS_CODEC, ReadError,
-    SECTIONS, Section, TABLE_ENTRY, checksum, chunks, take, u32_at, u64_at,
+    ALL, BLOCK, CHUNK, DICTIONARY_CODEC, FIELDS, FORMAT_VERSION, HEAD, HEAD_MAX, MAGIC,
+    POSTINGS_CODEC, ReadError, Section, TABLE_ENTRY, checksum, chunks,
+    fingerprint::{self, Index as FingerprintIndex},
+    head_len, sections, take, u32_at, u64_at,
 };
 
 /// Positional reads from wherever a segment's bytes live. Implemented for
@@ -78,8 +80,11 @@ pub struct Info {
     pub first: u32,
     /// Inclusive.
     pub last: u32,
+    /// Terms retained in the dictionary; fingerprint strings are not stored.
     pub terms: u64,
-    /// The sum of every term's document frequency.
+    /// Dictionary document occurrences plus unique fingerprint records.
+    /// Codec 2 can collapse colliding terms in the same document, so this
+    /// need not equal the original sum of term document frequencies.
     pub pairs: u64,
 }
 
@@ -200,7 +205,10 @@ pub struct Segment<R> {
     blocks_at: (u64, u64),
     postings_at: (u64, u64),
     /// Each section's length, in [`Section`] order.
-    lengths: [u64; 4],
+    lengths: [u64; ALL],
+    codec: u32,
+    fingerprints_at: (u64, u64),
+    fingerprints: FingerprintIndex,
     /// Chunk sums: the blocks section's, then the postings section's.
     sums: Vec<u8>,
     firsts: Vec<u8>,
@@ -211,7 +219,7 @@ impl<R: ReadAt> Segment<R> {
     /// Reads and checks the head, the block index and the chunk sums.
     pub fn open(source: R) -> Result<Self, ReadError> {
         let size = source.size()?;
-        let mut head = vec![0; size.min(HEAD as u64) as usize];
+        let mut head = vec![0; size.min(HEAD_MAX as u64) as usize];
         source.read_exact_at(&mut head, 0)?;
         if head.len() < 12 || head[..8] != MAGIC {
             return Err(ReadError::NotASegment);
@@ -223,15 +231,20 @@ impl<R: ReadAt> Segment<R> {
         if head.len() < HEAD {
             return Err(ReadError::Layout);
         }
-        if checksum(&head[..HEAD - 16]) != head[HEAD - 16..] {
-            return Err(ReadError::Head);
-        }
         let (dictionary, postings) = (u32_at(&head, 16), u32_at(&head, 20));
-        if (dictionary, postings) != (DICTIONARY_CODEC, POSTINGS_CODEC) {
+        let Some(sections) = sections(dictionary).filter(|_| postings == POSTINGS_CODEC) else {
             return Err(ReadError::Codec {
                 dictionary,
                 postings,
             });
+        };
+        let head_len = head_len(sections.len());
+        if head.len() < head_len {
+            return Err(ReadError::Layout);
+        }
+        head.truncate(head_len);
+        if checksum(&head[..head_len - 16]) != head[head_len - 16..] {
+            return Err(ReadError::Head);
         }
         let info = Info {
             tokenizer_version: u32_at(&head, 12),
@@ -242,15 +255,16 @@ impl<R: ReadAt> Segment<R> {
         };
         if info.first > info.last
             || u32_at(&head, 48) as usize != CHUNK
-            || u32_at(&head, 52) as usize != SECTIONS.len()
+            || u32_at(&head, 52) as usize != sections.len()
             || head[56..FIELDS] != [0; 8]
         {
             return Err(ReadError::Head);
         }
 
-        let mut table = [(0u64, 0u64, [0u8; 16]); 4];
-        let mut expect = HEAD as u64;
-        for (i, slot) in table.iter_mut().enumerate() {
+        let mut table = [(0u64, 0u64, [0u8; 16]); ALL];
+        let mut expect = head_len as u64;
+        for (i, &section) in sections.iter().enumerate() {
+            let slot = &mut table[section as usize];
             let at = FIELDS + i * TABLE_ENTRY;
             let (offset, len) = (u64_at(&head, at), u64_at(&head, at + 8));
             let end = offset.checked_add(len).ok_or(ReadError::Layout)?;
@@ -277,24 +291,38 @@ impl<R: ReadAt> Segment<R> {
         let index = read_whole(Section::Index)?;
         let sums = read_whole(Section::Sums)?;
         let (blocks_len, postings_len) = (table[0].1, table[1].1);
-        let blocks_sums = chunks(blocks_len) as usize * 16;
-        if sums.len() as u64 != (chunks(blocks_len) + chunks(postings_len)) * 16 {
+        let fingerprint_len = table[Section::Fingerprints as usize].1;
+        if sums.len() as u64
+            != (chunks(blocks_len) + chunks(postings_len) + chunks(fingerprint_len)) * 16
+        {
             return Err(ReadError::Corrupt(Section::Sums));
         }
-        if checksum(&sums[..blocks_sums]) != table[0].2 {
-            return Err(ReadError::Corrupt(Section::Blocks));
+        let mut at = 0;
+        for section in [Section::Blocks, Section::Postings, Section::Fingerprints] {
+            let end = at + chunks(table[section as usize].1) as usize * 16;
+            if sections.contains(&section) && checksum(&sums[at..end]) != table[section as usize].2
+            {
+                return Err(ReadError::Corrupt(section));
+            }
+            at = end;
         }
-        if checksum(&sums[blocks_sums..]) != table[1].2 {
-            return Err(ReadError::Corrupt(Section::Postings));
-        }
+        let fingerprints = if dictionary == DICTIONARY_CODEC {
+            FingerprintIndex::default()
+        } else {
+            FingerprintIndex::parse(&read_whole(Section::FingerprintIndex)?, fingerprint_len)
+                .ok_or(ReadError::Corrupt(Section::FingerprintIndex))?
+        };
 
         let (firsts, index) = parse_index(&index, info.terms, blocks_len, postings_len)
             .ok_or(ReadError::Corrupt(Section::Index))?;
         let mut digest = [0; 16];
-        digest.copy_from_slice(&head[HEAD - 16..]);
+        digest.copy_from_slice(&head[head_len - 16..]);
         Ok(Self {
             source,
             info,
+            codec: dictionary,
+            fingerprints_at: (table[4].0, fingerprint_len),
+            fingerprints,
             digest,
             blocks_at: (table[0].0, blocks_len),
             postings_at: (table[1].0, postings_len),
@@ -327,10 +355,124 @@ impl<R: ReadAt> Segment<R> {
     /// Allocated bytes resident for this segment: block index and chunk sums,
     /// including unused buffer capacity but excluding allocator overhead.
     pub fn resident_bytes(&self) -> usize {
-        self.firsts.capacity() + self.index.capacity() * size_of::<Block>() + self.sums.capacity()
+        self.firsts.capacity()
+            + self.index.capacity() * size_of::<Block>()
+            + self.sums.capacity()
+            + self.fingerprints.allocated_bytes()
     }
 
-    /// `term`'s documents, or `None` when the segment does not hold it.
+    /// The dictionary codec stored in this segment.
+    pub fn codec(&self) -> u32 {
+        self.codec
+    }
+
+    /// Number of fingerprint records, including dead documents until purge.
+    pub fn fingerprint_records(&self) -> u64 {
+        self.fingerprints.records
+    }
+
+    /// Conservative record-count bound from the resident restart index.
+    /// Includes the predecessor block and every block starting with this
+    /// fingerprint: either boundary can contain unrelated records.
+    pub fn fingerprint_bound(&self, term: &[u8]) -> u64 {
+        if self.fingerprints.records == 0 {
+            return 0;
+        }
+        let range = self.fingerprint_blocks(fingerprint::fingerprint(term));
+        let before = range.start as u64 * fingerprint::RECORD_BLOCK as u64;
+        let after =
+            (range.end as u64 * fingerprint::RECORD_BLOCK as u64).min(self.fingerprints.records);
+        after.saturating_sub(before)
+    }
+
+    fn fingerprint_blocks(&self, fp: u32) -> std::ops::Range<usize> {
+        let firsts = &self.fingerprints.firsts;
+        if firsts.first().is_none_or(|&first| fp < first) {
+            return 0..0;
+        }
+        let lower = firsts.partition_point(|&first| first < fp);
+        let upper = firsts.partition_point(|&first| first <= fp);
+        lower.saturating_sub(1)..upper
+    }
+
+    /// All documents with the fingerprint of `term`. Every hit is Maybe.
+    pub fn fingerprint_docs(&self, term: &[u8]) -> Result<Vec<u32>, ReadError> {
+        self.fingerprint_docs_until(term, &|| false)
+    }
+
+    /// As `fingerprint_docs`, checking cancellation before each restart
+    /// block, including within a run spanning many blocks.
+    pub fn fingerprint_docs_until(
+        &self,
+        term: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<u32>, ReadError> {
+        if cancelled() {
+            return Err(ReadError::Cancelled);
+        }
+        if self.fingerprints.records == 0 {
+            return Ok(Vec::new());
+        }
+        let fp = fingerprint::fingerprint(term);
+        let mut docs = Vec::new();
+        for b in self.fingerprint_blocks(fp) {
+            if cancelled() {
+                return Err(ReadError::Cancelled);
+            }
+            let mut done = false;
+            self.record_block(b, |key, doc| {
+                if key == fp {
+                    docs.push(doc);
+                }
+                done = key > fp;
+                !done
+            })?;
+            if done {
+                break;
+            }
+        }
+        Ok(docs)
+    }
+
+    fn record_block(
+        &self,
+        b: usize,
+        mut each: impl FnMut(u32, u32) -> bool,
+    ) -> Result<(), ReadError> {
+        let start = u64::from(self.fingerprints.starts[b]);
+        let end = self
+            .fingerprints
+            .starts
+            .get(b + 1)
+            .copied()
+            .map(u64::from)
+            .unwrap_or(self.fingerprints_at.1);
+        #[cfg(test)]
+        fingerprint::BLOCK_READS.with(|reads| reads.set(reads.get() + 1));
+        let (bytes, at) = self.read_checked(Section::Fingerprints, start, end)?;
+        fingerprint::decode_block(
+            &bytes[at..at + (end - start) as usize],
+            self.fingerprints.firsts[b],
+            self.fingerprints.count(b),
+            self.info.last - self.info.first,
+            |fp, doc| each(fp, self.info.first + doc),
+        )
+        .ok_or(ReadError::Corrupt(Section::Fingerprints))
+    }
+
+    /// Ordered fingerprint records for a streaming merge.
+    pub fn records(&self) -> Records<'_, R> {
+        Records {
+            segment: self,
+            block: 0,
+            records: Vec::new(),
+            at: 0,
+        }
+    }
+
+    /// `term`'s dictionary documents, or `None` on a dictionary miss.
+    /// Codec 2 callers must also consult `fingerprint_docs`; the query
+    /// candidate path and `View::lookup` union both representations.
     pub fn lookup(&self, term: &[u8]) -> Result<Option<Hit>, ReadError> {
         self.entry(term)?.map(|entry| self.read(&entry)).transpose()
     }
@@ -416,12 +558,19 @@ impl<R: ReadAt> Segment<R> {
         start: u64,
         end: u64,
     ) -> Result<(Vec<u8>, usize), ReadError> {
+        let blocks_sums = chunks(self.blocks_at.1) as usize * 16;
+        let postings_sums = chunks(self.postings_at.1) as usize * 16;
         let ((offset, len), sums) = match section {
-            Section::Blocks => (self.blocks_at, &self.sums[..]),
-            _ => (
+            Section::Blocks => (self.blocks_at, &self.sums[..blocks_sums]),
+            Section::Postings => (
                 self.postings_at,
-                &self.sums[chunks(self.blocks_at.1) as usize * 16..],
+                &self.sums[blocks_sums..blocks_sums + postings_sums],
             ),
+            Section::Fingerprints => (
+                self.fingerprints_at,
+                &self.sums[blocks_sums + postings_sums..],
+            ),
+            _ => return Err(ReadError::Corrupt(section)),
         };
         if start > end || end > len {
             return Err(ReadError::Corrupt(section));
@@ -595,5 +744,34 @@ impl<R: ReadAt> Terms<'_, R> {
             };
             return entries.next_entry();
         }
+    }
+}
+
+/// A segment's fingerprint records in `(fingerprint, DocId)` order.
+/// Holds at most one restart block at a time.
+pub struct Records<'a, R> {
+    segment: &'a Segment<R>,
+    block: usize,
+    records: Vec<(u32, u32)>,
+    at: usize,
+}
+impl<R: ReadAt> Records<'_, R> {
+    /// Advances the stream, checking the next block before decoding it.
+    pub fn next_record(&mut self) -> Result<Option<(u32, u32)>, ReadError> {
+        if self.at == self.records.len() {
+            if self.block == self.segment.fingerprints.firsts.len() {
+                return Ok(None);
+            }
+            self.records.clear();
+            self.segment.record_block(self.block, |fp, doc| {
+                self.records.push((fp, doc));
+                true
+            })?;
+            self.block += 1;
+            self.at = 0;
+        }
+        let record = self.records[self.at];
+        self.at += 1;
+        Ok(Some(record))
     }
 }

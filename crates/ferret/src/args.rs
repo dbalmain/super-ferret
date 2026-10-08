@@ -166,7 +166,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
                 limit = Some(n);
             }
             b"--json" if inline.is_none() => json = true,
-            b"--scan-uncovered" if inline.is_none() => scan_uncovered = true,
+            b"--scan" | b"--scan-uncovered" if inline.is_none() => scan_uncovered = true,
             b"-h" | b"--help" if inline.is_none() => help = true,
             b"--version" if inline.is_none() => version = true,
             _ => return Err(UsageError::UnknownFlag(arg)),

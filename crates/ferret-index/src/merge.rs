@@ -60,7 +60,7 @@ pub fn choose(
     segments: &[SegmentEntry],
     alive: &dyn Fn(&SegmentEntry) -> u32,
 ) -> Option<Range<usize>> {
-    let levels: Vec<f64> = segments.iter().map(|s| level(s.bytes)).collect();
+    let levels: Vec<f64> = segments.iter().map(|s| level(s.total_bytes())).collect();
     let mut best: Option<(f64, usize)> = None;
     let mut start = 0;
     while start < levels.len() {
@@ -155,7 +155,36 @@ pub fn stream<R: ReadAt>(
             }
         }
     }
-    Ok(writer.finish_spilled(pace)?)
+    let mut records: Vec<_> = inputs.iter().map(Segment::records).collect();
+    let mut heap = BinaryHeap::new();
+    for (i, cursor) in records.iter_mut().enumerate() {
+        if let Some(record) = cursor.next_record()? {
+            heap.push(Reverse((record, i)));
+        }
+    }
+    let mut previous = None;
+    let (mut carried, mut removed) = (0, 0);
+    while let Some(Reverse((record, i))) = heap.pop() {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if live.contains(record.1) && previous != Some(record) {
+            carried += 1;
+            writer.push_record(record.0, record.1)?;
+            writer.spill(pace)?;
+            previous = Some(record);
+        }
+        if !live.contains(record.1) {
+            removed += 1;
+        }
+        if let Some(record) = records[i].next_record()? {
+            heap.push(Reverse((record, i)));
+        }
+    }
+    let mut sizes = writer.finish_spilled(pace)?;
+    sizes.records_added = sizes.records.saturating_sub(carried);
+    sizes.records_removed = removed;
+    Ok(sizes)
 }
 
 fn next<R: ReadAt>(cursor: &mut Terms<'_, R>) -> Result<Option<(Vec<u8>, TermEntry)>, ReadError> {
@@ -167,6 +196,112 @@ fn next<R: ReadAt>(cursor: &mut Terms<'_, R>) -> Result<Option<(Vec<u8>, TermEnt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyed_versions_survive_ordinary_and_full_spilling_merges() {
+        use ferret_text::{TOKENIZER_VERSION, TRIGRAM_VERSION};
+        use std::fs::{self, File};
+
+        let dir = std::env::temp_dir().join(format!("ferret-keyed-merge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        for version in [TOKENIZER_VERSION, TRIGRAM_VERSION] {
+            let mut inputs = Vec::new();
+            for doc in 0..11 {
+                let path = dir.join(format!("{version}-{doc}"));
+                if doc % 2 == 0 {
+                    let mut writer = Writer::keyed(doc, doc, version).unwrap();
+                    writer.push(b"aaa", &[doc]).unwrap();
+                    writer.finish(&mut File::create(&path).unwrap()).unwrap();
+                } else {
+                    let scratch = File::options()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(dir.join("scratch"))
+                        .unwrap();
+                    let mut writer = Writer::keyed_spilling(
+                        doc,
+                        doc,
+                        version,
+                        File::create(&path).unwrap(),
+                        scratch,
+                    )
+                    .unwrap();
+                    writer.push(b"aaa", &[doc]).unwrap();
+                    writer.spill(&|_| Ok(())).unwrap();
+                    writer.finish_spilled(&|_| Ok(())).unwrap();
+                }
+                let segment = Segment::open(File::open(path).unwrap()).unwrap();
+                assert_version(&segment, version);
+                inputs.push(segment);
+            }
+            let live = DocSet::new(11, 0..11);
+            let entries = segments(&[MB; 11]);
+            assert_eq!(choose(&entries, &|s| s.docs), Some(0..10));
+            {
+                let path = dir.join("ordinary");
+                let scratch = File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dir.join("scratch"))
+                    .unwrap();
+                let writer =
+                    Writer::keyed_spilling(0, 9, version, File::create(&path).unwrap(), scratch)
+                        .unwrap();
+                stream(&inputs[..10], &live, writer, &|_| Ok(()), &|| false).unwrap();
+                let ordinary = Segment::open(File::open(path).unwrap()).unwrap();
+                assert_version(&ordinary, version);
+                let tail = inputs.pop().unwrap();
+                let selected = [ordinary, tail];
+                let path = dir.join("full");
+                let scratch = File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(dir.join("scratch"))
+                    .unwrap();
+                let writer =
+                    Writer::keyed_spilling(0, 10, version, File::create(&path).unwrap(), scratch)
+                        .unwrap();
+                stream(&selected, &live, writer, &|_| Ok(()), &|| false).unwrap();
+                let full = Segment::open(File::open(path).unwrap()).unwrap();
+                assert_version(&full, version);
+                let Hit::Postings(postings) = full.lookup(b"aaa").unwrap().unwrap() else {
+                    panic!("all eleven documents must survive both merges");
+                };
+                let mut docs = Vec::new();
+                postings.decode(&mut docs);
+                assert_eq!(docs, (0..11).collect::<Vec<_>>());
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn assert_version(segment: &Segment<std::fs::File>, version: u32) {
+        let info = segment.info();
+        let bytes = segment.source().metadata().unwrap().len();
+        let entry = SegmentEntry {
+            number: 0,
+            first: info.first,
+            last: info.last,
+            docs: 1,
+            terms: info.terms,
+            pairs: info.pairs,
+            bytes,
+            digest: segment.digest(),
+            trigram_bytes: 0,
+            trigram_keys: 0,
+            trigram_pairs: 0,
+            trigram_digest: [0; 16],
+        };
+        assert!(entry.matches(&info, &segment.digest(), bytes, version));
+        assert!(!entry.matches(&info, &segment.digest(), bytes, version ^ 1));
+    }
 
     fn segments(bytes: &[u64]) -> Vec<SegmentEntry> {
         bytes
@@ -181,6 +316,10 @@ mod tests {
                 pairs: 1,
                 bytes,
                 digest: [0; 16],
+                trigram_bytes: 0,
+                trigram_keys: 0,
+                trigram_pairs: 0,
+                trigram_digest: [0; 16],
             })
             .collect()
     }

@@ -8,6 +8,8 @@
 //!   and [`Regex`].
 //! - [`text`]: [`Text`], a `text:ARG` content atom, and [`TextMatcher`], the
 //!   part-sequence phrase matcher over a document's tokens (S2).
+//! - [`trigram`]: [`GrepFlags`], which compiles a content regex into its
+//!   verifier and the [`Trigrams`] query every match satisfies (S3).
 //! - `dialect`: [`FindRegex`], GNU find syntax over whole-path bytes, with
 //!   bounded backreference matching and fallible budget reporting.
 //! - [`toolchain`]: the ledger for the scanner's AVX2 arm (D11).
@@ -22,6 +24,7 @@ pub mod matcher;
 pub mod scan;
 pub mod text;
 pub mod toolchain;
+pub mod trigram;
 
 #[cfg(test)]
 mod tests;
@@ -29,4 +32,5 @@ mod tests;
 pub use dialect::{Dialect, FindRegex, MatchLimit};
 pub use matcher::{Matcher, Regex, RegexError};
 pub use scan::{Arm, Finder};
-pub use text::{MatchStats, Text, TextMatcher};
+pub use text::{MatchStats, Text, TextMatcher, forces_whole};
+pub use trigram::{Grep, GrepError, GrepFlags, Trigrams};

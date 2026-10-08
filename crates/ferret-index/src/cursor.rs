@@ -207,9 +207,7 @@ impl<'a> Cursor<'a> {
             return None;
         }
         match self {
-            Self::Postings(cursor) => cursor
-                .next_geq_with(target, checkpoint)
-                .map(|doc| (doc, Certainty::Yes)),
+            Self::Postings(cursor) => cursor.next_geq_certainty_with(target, checkpoint),
             Self::Bits(bits) => bits.next_geq(target, checkpoint),
             Self::And(children) => leapfrog(children, target, checkpoint),
             Self::Or(or) => or.next_geq(target, checkpoint),

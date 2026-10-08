@@ -11,8 +11,16 @@
 //! ferret-bench terms <catalog-dir>               full-tree term census: df, hapax, pairs
 //! ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]  real segments: bytes by section, CPU, RSS
 //! ferret-bench index-build <catalog-dir> <index-dir>  follow, merge to steady state, full merge (S2 M3)
+//! ferret-bench index-refresh <index-dir>   512 × 64 KiB, 40 paired follow refreshes
+//! ferret-bench trigram-build <catalog-dir> <out-dir>  offline trigrams at M3 boundaries
+//! ferret-bench trigram-census <catalog-dir>  distinct-key histogram and D69 counts
+//! ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b  D70 paired buffers
+//! ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>  D68: fuse filters against postings
+//! ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>  D69: saturated large documents
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
+//! ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>  M5 candidate-byte diagnostic
+//! ferret-bench chunk-census <catalog-dir> <index-dir>   D66 heuristic chunk map census (S3 M6)
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
 //! ferret-bench name-index-once <catalog-dir> open phases and query timings
@@ -57,12 +65,19 @@ use ferret_query::Query;
 use ferret_verify::{Arm, Finder};
 
 mod census;
+mod chunk_census;
 mod content_query;
+mod content_snapshot;
 mod corpus;
+mod fuse;
 mod index_build;
+mod regex_volume;
+mod saturation;
+mod screen;
 mod segment_build;
 mod terms;
 mod tokenize;
+mod trigram;
 
 #[cfg(test)]
 mod support;
@@ -113,11 +128,62 @@ fn main() -> ExitCode {
             ("segment-build", [dir, out, flag]) if flag == "--breakdown" => {
                 segment_build::run(Path::new(dir), Path::new(out), true)
             }
-            ("index-build", [dir, out]) => index_build::run(Path::new(dir), Path::new(out)),
-            ("index-churn", [out, rounds]) => index_build::churn(Path::new(out), rounds),
+            ("index-freeze", [dir, out]) => {
+                content_snapshot::capture(Path::new(dir), Path::new(out))
+            }
+            ("index-build", [dir, out, options @ ..]) => {
+                index_build::run(Path::new(dir), Path::new(out), options)
+            }
+            ("index-refresh", [out]) => index_build::refresh_trace(Path::new(out)),
+            ("trigram-build", [dir, out]) => {
+                trigram::build(Path::new(dir), Path::new(out), trigram::Policy::M3)
+            }
+            ("trigram-boundaries", [dir, out]) => {
+                trigram::boundaries(Path::new(dir), Path::new(out))
+            }
+            ("trigram-census", [dir]) => trigram::census(Path::new(dir)),
+            ("trigram-memory", [dir, out, policy]) if policy == "b" => {
+                trigram::build(Path::new(dir), Path::new(out), trigram::Policy::Shared)
+            }
+            ("trigram-memory", [dir, out, policy, mib]) if policy == "a" => {
+                mib.parse::<usize>().map_err(Into::into).and_then(|mib| {
+                    let trigram_bound = mib.checked_mul(1 << 20).ok_or("bound overflow")?;
+                    trigram::build(
+                        Path::new(dir),
+                        Path::new(out),
+                        trigram::Policy::Own { trigram_bound },
+                    )
+                })
+            }
+            ("filter-screen", [dir, terms, tri, out]) => screen::run(
+                Path::new(dir),
+                Path::new(terms),
+                Path::new(tri),
+                Path::new(out),
+                &screen::CONFIG,
+            )
+            .map(drop),
+            ("saturation", [dir, terms, tri, out]) => saturation::run(
+                Path::new(dir),
+                Path::new(terms),
+                Path::new(tri),
+                Path::new(out),
+                &saturation::config(),
+            )
+            .map(drop),
+            ("index-churn", [out, rounds, options @ ..]) => {
+                index_build::churn(Path::new(out), rounds, options)
+            }
+            ("regex-volume", [dir, index, snapshot]) => {
+                regex_volume::run(Path::new(dir), Path::new(index), Path::new(snapshot))
+            }
+            ("regex-query", [dir, index, snapshot]) => {
+                content_query::run_regex(Path::new(dir), Path::new(index), Path::new(snapshot))
+            }
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)
             }
+            ("chunk-census", [dir, index]) => chunk_census::run(Path::new(dir), Path::new(index)),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
             ("log-open-once", [dir]) => log_open_once(Path::new(dir)),
@@ -165,9 +231,19 @@ fn usage() -> ExitCode {
          ferret-bench tokenize <corpus-dir>\n       \
          ferret-bench terms <catalog-dir>\n       \
          ferret-bench segment-build <catalog-dir> <out-dir> [--breakdown]\n       \
-         ferret-bench index-build <catalog-dir> <index-dir>\n       \
-         ferret-bench index-churn <index-dir> <rounds>\n       \
-         ferret-bench content-query <catalog-dir> <index-dir> [class...]\n       \
+         ferret-bench index-freeze <catalog-dir> <snapshot-dir>\n       \
+         ferret-bench index-build <catalog-dir> <index-dir> [--codec 1|h] [--snapshots] [--control-bytes N] [--corpus snapshot-dir]\n       \
+         ferret-bench index-refresh <index-dir>\n       \
+         ferret-bench trigram-build <catalog-dir> <out-dir>\n       \
+         ferret-bench trigram-census <catalog-dir>\n       \
+         ferret-bench trigram-memory <catalog-dir> <out-dir> a <tri-MiB> | b\n       \
+         ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
+         ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
+         ferret-bench index-churn <index-dir> <rounds> [--codec 1|h]\n       \
+         ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>\n       \
+         ferret-bench regex-query <catalog-dir> <index-dir> <snapshot-dir>\n       \
+         ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [--corpus snapshot-dir] [--covered] [class...]\n       \
+         ferret-bench chunk-census <catalog-dir> <index-dir>\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
          ferret-bench open-once <catalog-dir> names|metadata|full|legacy-full\n       \

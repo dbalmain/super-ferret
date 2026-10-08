@@ -46,7 +46,7 @@ pub(crate) enum Test {
     Name(NameTest),
     Path(PathTest),
     Meta(MetaTest),
-    /// The query's `texts[i]`, a content atom.
+    /// The query's `atoms[i]`, a content atom.
     Content(usize),
 }
 

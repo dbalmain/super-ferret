@@ -52,19 +52,50 @@
 //! with valid checksums and an inconsistent list could still panic inside
 //! intpack; that is outside the contract, as for the catalog's packed
 //! columns.
+//!
+//! **Dictionary codec 2: fingerprints (S3 D65 H).** The same dictionary,
+//! except that a term with df = 1 is not in it: its one occurrence is a
+//! record `(fingerprint(term), doc)` in two more sections, and the head's
+//! section count is 6. File order is blocks, postings, fingerprints, index,
+//! fingerprint index, sums.
+//!
+//! ```text
+//! fingerprints       records sorted by (fingerprint, doc), in blocks of
+//!                    RECORD_BLOCK; a block's first record is fingerprint
+//!                    u32 and doc - first u32, each later one vbyte
+//!                    fingerprint delta (0 inside a run) and vbyte
+//!                    doc - first
+//! fingerprint index  vbyte record count, then per block its first
+//!                    fingerprint u32 and absolute byte offset u32
+//! sums               chunk sums of blocks, postings, then fingerprints
+//! ```
+//!
+//! A fingerprint is 32 bits of BLAKE3 over the term, so a record says only
+//! that its document may hold the term: every fingerprint hit is Maybe.
+//! A lookup unions both sections whether or not the dictionary hits; see
+//! [`Segment::fingerprint_docs`] for the run lookup. Records never return
+//! to the dictionary: a merge carries them, purged of dead documents, and
+//! moves into them every dictionary term its purge leaves with one live
+//! document.
 
 use std::fmt;
 use std::io;
 
+mod fingerprint;
 mod invert;
 mod read;
+mod trigram;
 mod write;
 
 #[cfg(test)]
+mod h_tests;
+#[cfg(test)]
 mod tests;
 
+pub use fingerprint::{RECORD_BLOCK, fingerprint};
 pub use invert::Inverter;
 pub use read::{Hit, Info, PostingCursor, Postings, ReadAt, Segment, TermEntry, Terms};
+pub use trigram::TrigramInverter;
 pub use write::{Sizes, Writer};
 
 const MAGIC: [u8; 8] = *b"ferretsg";
@@ -72,8 +103,13 @@ const MAGIC: [u8; 8] = *b"ferretsg";
 /// Bumped when the container (head, sections, checksums) changes.
 pub const FORMAT_VERSION: u32 = 1;
 
-/// Front-coded blocks of [`BLOCK`] terms with singletons inlined.
+/// Front-coded blocks of [`BLOCK`] terms with singletons inlined: the
+/// default.
 pub const DICTIONARY_CODEC: u32 = 1;
+
+/// Codec 1's dictionary without singletons, which become fingerprint
+/// records (D65 H). Opt-in until D65 is answered.
+pub const FINGERPRINT_CODEC: u32 = 2;
 
 /// `pfor128skip` doc ids relative to the segment's first DocId, no
 /// frequencies (D61 B).
@@ -86,15 +122,24 @@ pub const BLOCK: usize = 32;
 /// page, so a rare term's read costs one page plus its hash.
 pub const CHUNK: usize = 4096;
 
-/// Sections, in file order.
+/// A segment's sections. The discriminant indexes per-section arrays; file
+/// order is the codec's ([`sections`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Blocks = 0,
     Postings = 1,
     Index = 2,
     Sums = 3,
+    /// Codec 2: `(fingerprint, doc)` records.
+    Fingerprints = 4,
+    /// Codec 2: the records' resident block index.
+    FingerprintIndex = 5,
 }
 
+/// Every section, by discriminant.
+const ALL: usize = 6;
+
+/// Codec 1's sections, in file order.
 const SECTIONS: [Section; 4] = [
     Section::Blocks,
     Section::Postings,
@@ -102,11 +147,39 @@ const SECTIONS: [Section; 4] = [
     Section::Sums,
 ];
 
+/// Codec 2's sections, in file order: the three chunked sections first.
+const SECTIONS_H: [Section; 6] = [
+    Section::Blocks,
+    Section::Postings,
+    Section::Fingerprints,
+    Section::Index,
+    Section::FingerprintIndex,
+    Section::Sums,
+];
+
+/// `codec`'s sections in file order, or `None` for a codec this build does
+/// not write or read.
+fn sections(codec: u32) -> Option<&'static [Section]> {
+    match codec {
+        DICTIONARY_CODEC => Some(&SECTIONS),
+        FINGERPRINT_CODEC => Some(&SECTIONS_H),
+        _ => None,
+    }
+}
+
 const FIELDS: usize = 64;
 const TABLE_ENTRY: usize = 32;
 
-/// Bytes of the head: fixed fields, section table and head digest.
-pub const HEAD: usize = FIELDS + SECTIONS.len() * TABLE_ENTRY + 16;
+/// Bytes of a codec 1 head: fixed fields, section table and head digest.
+pub const HEAD: usize = head_len(SECTIONS.len());
+
+/// Bytes of a head whose table has `sections` entries.
+const fn head_len(sections: usize) -> usize {
+    FIELDS + sections * TABLE_ENTRY + 16
+}
+
+/// The largest head of any codec.
+const HEAD_MAX: usize = head_len(SECTIONS_H.len());
 
 /// Why a segment could not be read.
 #[derive(Debug)]
@@ -143,7 +216,8 @@ impl fmt::Display for ReadError {
                 postings,
             } => write!(
                 f,
-                "segment codecs {dictionary}/{postings}, expected {DICTIONARY_CODEC}/{POSTINGS_CODEC}"
+                "segment codecs {dictionary}/{postings}, expected {DICTIONARY_CODEC} or \
+                 {FINGERPRINT_CODEC}/{POSTINGS_CODEC}"
             ),
             Self::Head => write!(f, "segment head corrupt"),
             Self::Layout => write!(f, "segment truncated or corrupt: bad section table"),
@@ -181,6 +255,11 @@ pub enum WriteError {
     DocOrder,
     /// A document outside `[first, last]`.
     DocRange(u32),
+    /// A dictionary codec this build does not write.
+    Codec(u32),
+    /// A fingerprint record on a codec 1 writer, a record not strictly
+    /// after the one before it, or a term pushed after records began.
+    RecordOrder,
 }
 
 impl fmt::Display for WriteError {
@@ -191,6 +270,8 @@ impl fmt::Display for WriteError {
             Self::NoDocuments => write!(f, "a term with no documents"),
             Self::DocOrder => write!(f, "documents not in strictly increasing order"),
             Self::DocRange(doc) => write!(f, "document {doc} outside the segment range"),
+            Self::Codec(codec) => write!(f, "dictionary codec {codec} is not written"),
+            Self::RecordOrder => write!(f, "fingerprint records out of order or out of place"),
         }
     }
 }

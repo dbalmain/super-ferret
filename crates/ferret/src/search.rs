@@ -23,6 +23,7 @@ use crate::json::Object;
 #[derive(Default)]
 struct Outcome {
     stats: Option<Stats>,
+    refused_plan: Option<String>,
     rows: u64,
     first_row: Option<Duration>,
     /// Name and inode counts of the catalog searched.
@@ -73,7 +74,13 @@ pub fn run(
     let mut object = crate::log::line(&mut line, "search", now);
     object
         .byte_strings("query", atoms.iter().map(|a| a.as_bytes()))
-        .str("plan", &plan_text(&query, outcome.stats.as_ref()))
+        .str(
+            "plan",
+            &outcome
+                .refused_plan
+                .clone()
+                .unwrap_or_else(|| plan_text(&query, outcome.stats.as_ref())),
+        )
         .str(
             "strategy",
             &outcome
@@ -118,7 +125,7 @@ pub fn run(
 /// estimate and certainty in query order, the uncovered and live counts, and
 /// how many documents were probed, verified, and found changed. Counts only:
 /// no term, path or id.
-fn log_content(object: &mut Object<'_>, content: &ContentReport) {
+pub(crate) fn log_content(object: &mut Object<'_>, content: &ContentReport) {
     object.object("content", |o| {
         o.str(
             "driver",
@@ -140,7 +147,18 @@ fn log_content(object: &mut Object<'_>, content: &ContentReport) {
         .int("live", content.live)
         .int("documents", content.documents)
         .int("verified", content.verified)
-        .int("changed", content.changed);
+        .int("changed", content.changed)
+        .int("possible", content.bounds.possible)
+        .int("maybe", content.bounds.maybe)
+        .int("snapshot_maybe", content.snapshot_maybe)
+        .int("regex_documents", content.matching.regex_documents)
+        .int("regex_bytes", content.matching.regex_bytes)
+        .int("regex_rejected", content.matching.regex_rejected)
+        .int(
+            "verification_us",
+            content.verification_time.as_micros() as i128,
+        )
+        .int("regex_us", content.regex_time.as_micros() as i128);
     });
 }
 
@@ -249,6 +267,15 @@ fn search(
     outcome.bytes_read = catalog.bytes_read();
     match result {
         Ok(stats) => outcome.stats = Some(stats),
+        Err(scan_error @ RunError::ScanRequired { .. }) => {
+            outcome.refused_plan = session
+                .explain_content(query)
+                .ok()
+                .map(|plan| format!("{}; content: {}", query.explain(), plan.describe()));
+            error(&scan_error.to_string());
+            outcome.error = Some("scan required");
+            return Exit::Error;
+        }
         Err(RunError::IndexIncomplete { uncovered, live }) => {
             error(&incomplete_message(uncovered, live));
             outcome.error = Some("index incomplete");
@@ -300,6 +327,9 @@ pub(crate) fn json_row(out: &mut Vec<u8>, catalog: &Catalog, row: &Row<'_>) {
         .int("size", catalog.size(row.inode))
         .int("mtime", catalog.mtime(row.inode))
         .opt_int("doc", catalog.doc(row.inode).map(|d| d.0));
+    if let Some(offset) = row.offset {
+        object.int("offset", offset as u64);
+    }
     object.end();
 }
 

@@ -5,8 +5,9 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferret_catalog::{Kind, Section};
-use ferret_verify::{Finder, Regex, RegexError, Text};
+use ferret_verify::{Finder, GrepError, GrepFlags, Regex, RegexError, Text};
 
+use crate::content::ContentAtom;
 use crate::expr::{self, Node, Test, Token};
 use crate::pattern::{glob_literal, glob_regex, regex_literal};
 
@@ -29,7 +30,7 @@ pub struct Query {
     /// evaluated per row, after the tests above. Empty for an S1 query.
     pub(crate) residual: Vec<Node<Test>>,
     /// The content atoms `Test::Content` indexes.
-    pub(crate) texts: Vec<Text>,
+    pub(crate) atoms: Vec<ContentAtom>,
 }
 
 /// How [`Query::run`](crate::Query::run) finds its candidates.
@@ -104,6 +105,7 @@ pub enum ParseError {
     Empty(String),
     /// A `re:` pattern that does not compile.
     Regex(String, RegexError),
+    Grep(String, GrepError),
     /// An argument that is not UTF-8 where a pattern must be (`re:`).
     NotUtf8(Vec<u8>),
     /// An argument containing a NUL byte. No name contains one (it ends a
@@ -137,6 +139,7 @@ impl fmt::Display for ParseError {
             Self::Type(a) => write!(f, "`{a}`: type is f, d or l"),
             Self::Empty(a) if a.is_empty() => write!(f, "an empty argument is not a query"),
             Self::Empty(a) => write!(f, "`{a}` needs a value"),
+            Self::Grep(a, e) => write!(f, "`{a}`: {e}"),
             Self::Regex(a, e) => write!(f, "`{a}`: {e}"),
             Self::NotUtf8(a) => write!(f, "`{}`: a regex must be UTF-8", a.escape_ascii()),
             Self::Nul(a) => write!(f, "`{}`: a query cannot contain NUL", a.escape_ascii()),
@@ -201,18 +204,18 @@ impl Query {
             driver: None,
             now,
             residual: Vec::new(),
-            texts: Vec::new(),
+            atoms: Vec::new(),
         };
         // Candidate drivers: (literal, fold, name test index).
         let mut literals: Vec<(Vec<u8>, bool, usize)> = Vec::new();
         for conjunct in expr::parse(tokens)?.into_conjuncts() {
             let (fold, atom) = match conjunct {
-                Node::Leaf((fold, atom)) if !matches!(atom, Atom::Text(_)) => (fold, atom),
+                Node::Leaf((fold, atom)) if !matches!(atom, Atom::Content(_)) => (fold, atom),
                 tree => {
-                    let texts = &mut query.texts;
+                    let atoms = &mut query.atoms;
                     query
                         .residual
-                        .push(tree.map(&mut |(_, atom)| atom.test(texts)));
+                        .push(tree.map(&mut |(_, atom)| atom.test(atoms)));
                     continue;
                 }
             };
@@ -234,7 +237,7 @@ impl Query {
                 }
                 Atom::Path(test) => query.paths.push(test),
                 Atom::Meta(test) => query.meta.push(test),
-                Atom::Text(_) => unreachable!("content atoms are residual"),
+                Atom::Content(_) => unreachable!("content atoms are residual"),
             }
         }
         // The longest literal drives; a longer needle has fewer candidates
@@ -254,7 +257,7 @@ impl Query {
     /// Whether the query has a content atom, and so needs the content index
     /// and a reader to run ([`Query::run_content`](crate::Query::run_content)).
     pub fn has_content(&self) -> bool {
-        !self.texts.is_empty()
+        !self.atoms.is_empty()
     }
 
     /// How [`Query::run`](crate::Query::run) will find candidates.
@@ -317,7 +320,12 @@ impl Query {
             Test::Path(t) => t.describe(),
             Test::Meta(t) => t.describe(),
             Test::Content(i) => {
-                let text = &self.texts[*i];
+                let text = match &self.atoms[*i] {
+                    ContentAtom::Text(text) => text,
+                    ContentAtom::Grep(grep) => {
+                        return format!("content regex {:?}", grep.trigrams());
+                    }
+                };
                 let units: Vec<String> =
                     text.units().map(|u| u.escape_ascii().to_string()).collect();
                 format!(
@@ -334,6 +342,9 @@ impl Query {
     }
 }
 
+/// D67 spelling policy; the parser and help use this same value.
+pub const GREP_PREFIX: &str = "grep:";
+
 enum Atom {
     /// A name test, and the literal every matching name contains.
     Name(NameTest, Option<Vec<u8>>),
@@ -343,20 +354,20 @@ enum Atom {
     Path(PathTest),
     Meta(MetaTest),
     /// `text:ARG`, a content atom.
-    Text(Text),
+    Content(ContentAtom),
 }
 
 impl Atom {
-    /// The per-row test for this atom; a content atom is added to `texts`.
-    fn test(self, texts: &mut Vec<Text>) -> Test {
+    /// The per-row test for this atom; a content atom is added to `atoms`.
+    fn test(self, atoms: &mut Vec<ContentAtom>) -> Test {
         match self {
             Atom::Name(test, _) => Test::Name(test),
             Atom::PathGlob(regex, glob) => Test::Path(PathTest::Glob(regex, glob)),
             Atom::Path(test) => Test::Path(test),
             Atom::Meta(test) => Test::Meta(test),
-            Atom::Text(text) => {
-                texts.push(text);
-                Test::Content(texts.len() - 1)
+            Atom::Content(text) => {
+                atoms.push(text);
+                Test::Content(atoms.len() - 1)
             }
         }
     }
@@ -416,9 +427,18 @@ fn parse_atom(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
         };
         return Ok(Atom::Meta(MetaTest::Type(kind)));
     }
+    if let Some(v) = value(GREP_PREFIX.as_bytes())? {
+        let pattern = std::str::from_utf8(v).map_err(|_| ParseError::NotUtf8(arg.to_vec()))?;
+        return GrepFlags {
+            case_insensitive: fold,
+        }
+        .compile(pattern)
+        .map(|grep| Atom::Content(ContentAtom::Grep(grep)))
+        .map_err(|e| ParseError::Grep(text(), e));
+    }
     if let Some(v) = value(b"text:")? {
         return Text::new(v, !fold)
-            .map(Atom::Text)
+            .map(|text| Atom::Content(ContentAtom::Text(text)))
             .ok_or_else(|| ParseError::Text(text()));
     }
     if let Some(v) = value(b"name:")? {

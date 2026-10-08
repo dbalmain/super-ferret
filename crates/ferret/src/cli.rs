@@ -78,7 +78,7 @@ usage:
                                 (begin/stdout/stderr/diagnostic/end, id \"find\");
                                 --json here is a host flag before `find` and
                                 never reaches find's own argument parser
-  ferret search [--json] [--limit N] [--scan-uncovered] [--] ATOM...
+  ferret search [--json] [--limit N] [--scan] [--] ATOM...
                                 print each path that matches the query
   ferret batch [--input FILE]   process sequential JSON-lines requests
   ferret import-v3              import the legacy snapshot, preserving roots and DocIds
@@ -115,6 +115,8 @@ query atoms:
                   content (directory, binary, too large) never matches.
   GLOB            *.rs matches the name; src/**/*.rs the path's end,
                   /home/*/x the whole path
+  {grep_prefix}REGEX     a regex over content; folds Unicode case; ^/$ match lines
+                  (?-m) restores whole-document anchors; dot excludes newline
   re:REGEX        a regex over the name
   path:TEXT       the path contains TEXT
   ext:EXT         the name ends in .EXT
@@ -122,7 +124,7 @@ query atoms:
   mtime:(<|>)N(s|m|h|d|w|y)     age: mtime:<1d changed within a day
   type:(f|d|l)                  file, directory or symlink
   case:ATOM       match ATOM case-sensitively. Otherwise words, globs and
-                  ext: fold ASCII case only, re: folds Unicode case, and
+                  ext: fold ASCII case only, re: and {grep_prefix} fold Unicode case;
                   text: folds as the content index does (case:text:Foo).
 
 search freshness:
@@ -133,14 +135,14 @@ search freshness:
   A new term absent from the snapshot can be missed until the next follow:
   after alpha becomes zeta, text:zeta may miss it while text:alpha still hits.
 
-  --scan-uncovered  a text: query is refused while more than 10000 live
-                  documents are not yet in the content index, because each
-                  would be read; this reads them instead.
+  --scan          permit verification above a quarter of live documents and
+                  more than 10000 uncovered documents. --scan-uncovered is an alias.
 
 output: one path per line, raw bytes, in index order (unsorted);
   --json prints one object per line:
   {\"path\":…,\"type\":\"file\"|\"dir\"|\"symlink\",\"size\":N,\"mtime\":SECONDS,\"doc\":N|null}
-  and \"path_base64\" with the exact bytes when the path is not UTF-8.
+  verified content rows also carry \"offset\", the first match in bytes.
+  And \"path_base64\" with the exact bytes when the path is not UTF-8.
 
 find exit status: 0 success, 1 error (including invalid syntax).
   Default mode needs an index covering each start. Missing/incompatible indexes
@@ -192,7 +194,14 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
                 crate::find::run(find_args, index)
             };
         }
-        Command::Help => return print("usage", USAGE.as_bytes()),
+        Command::Help => {
+            return print(
+                "usage",
+                USAGE
+                    .replace("{grep_prefix}", ferret_query::GREP_PREFIX)
+                    .as_bytes(),
+            );
+        }
         Command::Version => {
             let version = format!("ferret {}\n", env!("CARGO_PKG_VERSION"));
             return print("the version", version.as_bytes());

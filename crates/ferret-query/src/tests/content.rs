@@ -249,3 +249,86 @@ fn not_of_a_term_only_an_uncovered_document_holds_is_maybe() {
         }
     }
 }
+
+/// Frequency ordering must weaken before the bound is calculated; a bound
+/// on a discarded constraint could otherwise silently admit a broad scan.
+#[test]
+fn grep_reads_four_rarest_children_and_bounds_the_selected_cursor() {
+    let dir = Scratch::new("grep-four-rarest");
+    let docs: Vec<Vec<u8>> = (0..20)
+        .map(|i| {
+            if i == 0 {
+                b"abcdefgh".to_vec()
+            } else {
+                format!("abc bcd cde def filler{i}").into_bytes()
+            }
+        })
+        .collect();
+    let live = DocSet::new(20, 0..20);
+    let catalog = CatalogView {
+        incarnation: [7; 16],
+        live: &live,
+    };
+    let mut writer = IndexWriter::open(&dir.0, &catalog).unwrap();
+    writer
+        .follow(&catalog, &Budget::unbounded(), &mut |doc, out| {
+            out.extend_from_slice(&docs[doc as usize]);
+            Ok(())
+        })
+        .unwrap();
+    let view = writer.view();
+    let pinned = Pinned::new(Some(&view), &live);
+    let grep = ferret_verify::GrepFlags::default()
+        .compile("abcdefgh")
+        .unwrap();
+    let plan = crate::grep::explain(&grep, &pinned, &|| false).unwrap();
+    assert_eq!(plan.read_keys.len(), 4);
+    assert!(plan.read_keys.contains(b"efg"));
+    assert!(plan.read_keys.contains(b"fgh"));
+    let bound = crate::GrepAtom::estimate_until(&grep, &pinned, &|| false).unwrap();
+    let atom = crate::GrepAtom::read_until(grep, &pinned, &|| false).unwrap();
+    let found = walk(pinned.top(atom.cursor_until(&pinned, &|| false).unwrap()));
+    assert_eq!(bound, found.len() as u64);
+    assert_eq!(found, vec![(0, Certainty::Maybe)]);
+}
+
+#[test]
+fn grep_key_cap_retains_a_rare_key_the_default_order_discards() {
+    let dir = Scratch::new("grep-frequency-cap");
+    let literal: String = (0..100).map(|i| format!("{i:03}")).collect();
+    let grep = ferret_verify::GrepFlags {
+        case_insensitive: false,
+    }
+    .compile(&literal)
+    .unwrap();
+    assert!(grep.planning_trigrams().keys().len() > 64);
+    assert!(!grep.trigrams().keys().contains(b"000"));
+    let live = DocSet::new(20, 0..20);
+    let catalog = CatalogView {
+        incarnation: [7; 16],
+        live: &live,
+    };
+    let mut writer = IndexWriter::open(&dir.0, &catalog).unwrap();
+    writer
+        .follow(&catalog, &Budget::unbounded(), &mut |doc, out| {
+            if doc == 0 {
+                out.extend_from_slice(literal.as_bytes());
+            } else {
+                out.extend_from_slice(literal.replace("000", "---").as_bytes());
+            }
+            Ok(())
+        })
+        .unwrap();
+    let view = writer.view();
+    let pinned = Pinned::new(Some(&view), &live);
+    let plan = crate::grep::explain(&grep, &pinned, &|| false).unwrap();
+    assert!(plan.read_keys.contains(b"000"));
+    assert_eq!(
+        crate::GrepAtom::estimate_until(&grep, &pinned, &|| false).unwrap(),
+        1
+    );
+    let atom = crate::GrepAtom::read_until(grep.clone(), &pinned, &|| false).unwrap();
+    let candidates = walk(pinned.top(atom.cursor_until(&pinned, &|| false).unwrap()));
+    assert_eq!(candidates, vec![(0, Certainty::Maybe)]);
+    assert!(grep.find(literal.as_bytes()).is_some());
+}

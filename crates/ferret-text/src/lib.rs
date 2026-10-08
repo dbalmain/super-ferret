@@ -16,6 +16,14 @@ use std::ops::{ControlFlow, Range};
 /// Change when the token contract changes; indexes must rebuild on a change.
 pub const TOKENIZER_VERSION: u32 = 1;
 
+/// Change when the raw-byte trigram extraction contract changes.
+pub const TRIGRAM_VERSION: u32 = 0x7472_0001;
+
+/// ASCII A–Z to a–z; every other byte unchanged, including invalid UTF-8.
+pub fn trigram_key(bytes: [u8; 3]) -> [u8; 3] {
+    bytes.map(|byte| byte.to_ascii_lowercase())
+}
+
 /// The longest term the content index stores; see [`cap`].
 pub const MAX_TOKEN_BYTES: usize = 64;
 
@@ -47,6 +55,19 @@ pub struct Scratch {
     part: String,
     parts: Vec<Range<usize>>,
     casing: BTreeMap<char, Casing>,
+}
+
+impl Scratch {
+    /// Capacity charge for tokenizer buffers. `BTreeMap` hides node
+    /// capacities, so the casing cache is conservatively charged one full
+    /// 11-entry node with 12 child pointers per cached character. Excludes
+    /// allocator metadata, as the index inverters' accounting does.
+    pub fn allocated_bytes(&self) -> usize {
+        self.whole.capacity()
+            + self.part.capacity()
+            + self.parts.capacity() * size_of::<Range<usize>>()
+            + self.casing.len() * (11 * size_of::<(char, Casing)>() + 12 * size_of::<usize>() + 32)
+    }
 }
 
 /// D9: whole alphanumeric/underscore runs, then identifier parts, lowercased.

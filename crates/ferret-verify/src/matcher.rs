@@ -32,8 +32,22 @@ impl std::error::Error for RegexError {}
 impl Regex {
     /// Compiles `pattern`; `fold` makes it case-insensitive.
     pub fn new(pattern: &str, fold: bool) -> Result<Regex, RegexError> {
-        regex::bytes::RegexBuilder::new(pattern)
-            .case_insensitive(fold)
+        Regex::build(regex::bytes::RegexBuilder::new(pattern).case_insensitive(fold))
+    }
+
+    /// The pattern that compiled into this matcher.
+    pub fn pattern(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Byte span of the first match, over the whole supplied document.
+    pub fn find(&self, bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+        self.0.find(bytes).map(|m| m.range())
+    }
+
+    /// Compiles with every setting already chosen (`GrepFlags`).
+    pub(crate) fn build(builder: &regex::bytes::RegexBuilder) -> Result<Regex, RegexError> {
+        builder
             .build()
             .map(Regex)
             .map_err(|e| RegexError(e.to_string()))

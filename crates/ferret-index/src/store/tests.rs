@@ -182,7 +182,7 @@ fn named(view: &View) -> BTreeSet<String> {
         .manifest()
         .segments
         .iter()
-        .map(SegmentEntry::file_name)
+        .flat_map(|entry| [entry.file_name(), entry.trigram_file_name()])
         .collect();
     files.insert(manifest::FILE.to_owned());
     files
@@ -243,6 +243,7 @@ fn crash_while_following(name: &str, point: Point) -> (Manifest, Manifest) {
     let clean = rebuild(name, &second, &corpus);
     assert_eq!(answers(&writer.view(), &second), clean);
     assert_eq!(clean, second.truth(&corpus));
+    assert_trigrams(&writer.view(), &second, &corpus);
     (before, after)
 }
 
@@ -285,7 +286,7 @@ fn a_crash_mid_merge_keeps_the_inputs() {
     );
     assert!(
         dir.files().iter().any(|f| f.starts_with("tmp-")),
-        "the crash left a partial merge"
+        "a crash left partial output for recovery"
     );
     drop(writer);
 
@@ -747,4 +748,416 @@ fn cancelled_merge_selection_survives_unrelated_follow() {
         .unwrap()
         .unwrap();
     assert_eq!(merged.purged, 500, "retry the large half-dead input first");
+}
+
+#[test]
+fn pair_crashes_recover_the_previous_manifest_and_sweep_both_files() {
+    for point in [Point::TermSynced, Point::TermRenamed, Point::PairRenamed] {
+        let (before, after) = crash_while_following(&format!("pair-{point:?}"), point);
+        assert_eq!(before, after);
+    }
+}
+
+#[test]
+fn cancellation_after_the_first_output_removes_outputs_and_can_retry() {
+    let dir = Dir::new("pair-cancel");
+    let catalog = Catalog::new(40, &[]);
+    let corpus = Corpus::new(901, 40);
+    let mut writer = four_segments(&dir, &corpus);
+    let before = writer.view();
+    CANCELLED.set(false);
+    CANCEL_AT.set(Some(Point::TermSynced));
+    let budget = Budget {
+        cancelled: &|| CANCELLED.get(),
+        ..Budget::unbounded()
+    };
+    assert!(matches!(
+        writer.merge_all(&catalog.view(), &budget),
+        Err(Error::Cancelled)
+    ));
+    CANCELLED.set(false);
+    assert!(Arc::ptr_eq(&before, &writer.view()));
+    assert_eq!(dir.files(), named(&before));
+    writer
+        .merge_all(&catalog.view(), &Budget::unbounded())
+        .unwrap();
+    assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+}
+
+#[test]
+fn publication_failure_keeps_outputs_and_reopen_selects_the_new_pair() {
+    let dir = Dir::new("pair-publication");
+    let catalog = Catalog::new(40, &[]);
+    let corpus = Corpus::new(902, 40);
+    let mut writer = four_segments(&dir, &corpus);
+    let before = writer.view();
+    stop_at(Point::ManifestRenamed);
+    assert!(
+        writer
+            .merge_all(&catalog.view(), &Budget::unbounded())
+            .is_err()
+    );
+    let published = Manifest::read(&dir.0).unwrap().unwrap();
+    assert_eq!(published.segments.len(), 1);
+    let output = published.segments[0];
+    assert!(dir.0.join(output.file_name()).exists());
+    assert!(dir.0.join(output.trigram_file_name()).exists());
+    assert!(dir.files().is_superset(&named(&before)));
+    drop(writer);
+    let writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    assert_eq!(writer.view().manifest(), &published);
+    assert_eq!(dir.files(), named(&writer.view()));
+    assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+    assert_trigrams(&writer.view(), &catalog, &corpus);
+}
+
+fn assert_trigrams(view: &View, catalog: &Catalog, corpus: &Corpus) {
+    use std::collections::BTreeMap;
+    let mut truth = BTreeMap::<Vec<u8>, Vec<u32>>::new();
+    for doc in catalog.live.range(0, catalog.live.bound()) {
+        if catalog.unreadable.contains(&doc) {
+            continue;
+        }
+        let keys: BTreeSet<_> = corpus
+            .text(doc)
+            .windows(3)
+            .map(|w| w.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>())
+            .collect();
+        for key in keys {
+            truth.entry(key).or_default().push(doc);
+        }
+    }
+    let mut actual = BTreeMap::<Vec<u8>, Vec<u32>>::new();
+    for segment in view.trigrams() {
+        let mut cursor = segment.terms();
+        while let Some((key, entry)) = cursor.next_term().unwrap() {
+            let docs = actual.entry(key.to_vec()).or_default();
+            match segment.read(&entry).unwrap() {
+                Hit::Single(doc) => docs.push(doc),
+                Hit::Postings(list) => list.decode(docs),
+            }
+        }
+    }
+    assert_eq!(actual, truth);
+}
+
+#[test]
+fn pair_merge_purges_both_files_and_old_pins_remain_readable() {
+    let dir = Dir::new("pair-purge");
+    let corpus = Corpus::new(903, 40);
+    let mut writer = four_segments(&dir, &corpus);
+    let old = writer.view();
+    let catalog = Catalog::new(40, &[0, 7, 10, 19, 20, 29, 39]);
+    writer
+        .merge_all(&catalog.view(), &Budget::unbounded())
+        .unwrap();
+    assert_eq!(raw(&writer.view()), catalog.truth(&corpus));
+    assert_trigrams(&writer.view(), &catalog, &corpus);
+    assert_trigrams(&old, &Catalog::new(40, &[]), &corpus);
+    assert_eq!(dir.files(), named(&writer.view()));
+}
+
+#[test]
+fn legacy_v2_and_changed_trigram_version_rebuild_both_structures() {
+    for legacy in [true, false] {
+        let dir = Dir::new(if legacy { "pair-v2" } else { "pair-version" });
+        let corpus = Corpus::new(904, 40);
+        let catalog = Catalog::new(40, &[]);
+        let writer = four_segments(&dir, &corpus);
+        let mut manifest = writer.view().manifest().clone();
+        drop(writer);
+        if legacy {
+            // A genuine v2 layout: 80-byte head and 64-byte term entries,
+            // without the v3 extractor field or per-entry trigram facts.
+            let current = manifest.encode();
+            let end = 88 + manifest.segments.len() * 104;
+            let mut bytes = current[..80].to_vec();
+            bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+            for entry in current[88..end].chunks_exact(104) {
+                bytes.extend_from_slice(&entry[..64]);
+            }
+            bytes.extend_from_slice(&current[end..current.len() - 16]);
+            let digest = blake3::hash(&bytes);
+            bytes.extend_from_slice(&digest.as_bytes()[..16]);
+            fs::write(dir.0.join(manifest::FILE), bytes).unwrap();
+        } else {
+            manifest.trigram_version = TRIGRAM_VERSION + 1;
+            manifest.publish(&dir.0).unwrap();
+        }
+        assert!(View::open(&dir.0, &catalog.view()).unwrap().is_none());
+        let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+        assert!(writer.view().segments().is_empty());
+        assert!(writer.view().trigrams().is_empty());
+        assert_eq!(writer.view().uncovered(&catalog.live).len(), 40);
+        assert_eq!(dir.files(), named(&writer.view()));
+        follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+        assert_trigrams(&writer.view(), &catalog, &corpus);
+    }
+}
+
+#[test]
+fn every_head_fact_is_checked_for_each_file() {
+    for tri in [false, true] {
+        for field in 0..7 {
+            let dir = Dir::new(&format!("pair-head-{tri}-{field}"));
+            let corpus = Corpus::new(905, 40);
+            let writer = four_segments(&dir, &corpus);
+            let catalog = Catalog::new(40, &[]);
+            let mut manifest = writer.view().manifest().clone();
+            drop(writer);
+            let entry = &mut manifest.segments[1];
+            match field {
+                2 if tri => entry.trigram_keys += 1,
+                2 => entry.terms += 1,
+                3 if tri => entry.trigram_pairs += 1,
+                3 => entry.pairs += 1,
+                4 if tri => entry.trigram_bytes += 1,
+                4 => entry.bytes += 1,
+                5 if tri => entry.trigram_digest[0] ^= 1,
+                5 => entry.digest[0] ^= 1,
+                0 | 1 | 6 => {
+                    // Rewrite a valid head with the wrong extractor version,
+                    // preserving its digest in the manifest to isolate version.
+                    let name = if tri {
+                        entry.trigram_file_name()
+                    } else {
+                        entry.file_name()
+                    };
+                    let version = if tri {
+                        TRIGRAM_VERSION
+                    } else {
+                        TOKENIZER_VERSION
+                    };
+                    let mut out = File::create(dir.0.join(&name)).unwrap();
+                    let first = entry.first + u32::from(field == 0);
+                    let last = entry.last - u32::from(field == 1);
+                    let sizes = Writer::keyed(first, last, version + u32::from(field == 6))
+                        .unwrap()
+                        .finish(&mut out)
+                        .unwrap();
+                    let segment = Segment::open(File::open(dir.0.join(name)).unwrap()).unwrap();
+                    if tri {
+                        entry.trigram_keys = 0;
+                        entry.trigram_pairs = 0;
+                        entry.trigram_bytes = sizes.total();
+                        entry.trigram_digest = segment.digest();
+                    } else {
+                        entry.terms = 0;
+                        entry.pairs = 0;
+                        entry.bytes = sizes.total();
+                        entry.digest = segment.digest();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            // Direct pair opening also isolates a bad version from fits().
+            assert!(matches!(
+                open_pairs(&dir.0, &manifest),
+                Err(Error::Segment(ReadError::Head))
+            ));
+            {
+                manifest.publish(&dir.0).unwrap();
+                assert!(matches!(
+                    View::open(&dir.0, &catalog.view()),
+                    Err(Error::Segment(ReadError::Head))
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn revision_five_charge_and_exact_admission_make_progress() {
+    let mut terms = Inverter::new(BUFFER);
+    let mut trigrams = TrigramInverter::with_capacity(PairBuffer::CAPACITY);
+    assert!(!PairBuffer::full(&terms, &trigrams, BUFFER));
+    assert!(PairBuffer::fits(trigrams.len(), 1));
+    terms.add(0, b"word").unwrap();
+    trigrams.add(0, b"abcabc").unwrap();
+    assert!(PairBuffer::full(
+        &terms,
+        &trigrams,
+        terms.memory() + 16 * trigrams.len()
+    ));
+    assert!(!PairBuffer::full(
+        &terms,
+        &trigrams,
+        terms.memory() + 16 * trigrams.len() + 1
+    ));
+
+    let dir = Dir::new("pair-progress");
+    let catalog = Catalog::new(2, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let bytes = vec![b'a'; PairBuffer::CAPACITY + 3];
+    let budget = Budget {
+        bytes: u64::MAX,
+        ..Budget::unbounded()
+    };
+    let followed = writer
+        .follow(&catalog.view(), &budget, &mut |doc, out| {
+            out.extend_from_slice(if doc == 0 { &bytes[..] } else { b"abc" });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((followed.docs, followed.remaining), (2, 0));
+    assert_eq!(followed.segment.unwrap().docs, 2);
+    assert_eq!(writer.trigrams.len(), 0);
+    assert!(writer.trigrams.allocated_bytes() >= PairBuffer::CAPACITY * 8 + (2 << 20));
+
+    let dir = Dir::new("pair-distinct-oversized");
+    let catalog = Catalog::new(2, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    let mut seed = 0x4b17_9a2d_03e5_c681u64;
+    let bytes: Vec<_> = (0..(4 << 20))
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 32) as u8
+        })
+        .collect();
+    let distinct = writer.trigrams.distinct_count(&bytes);
+    assert!(distinct > PairBuffer::CAPACITY, "distinct keys: {distinct}");
+    let budget = Budget {
+        buffer: 0,
+        bytes: 0,
+        ..Budget::unbounded()
+    };
+    let first = writer
+        .follow(&catalog.view(), &budget, &mut |doc, out| {
+            out.extend_from_slice(if doc == 0 { &bytes[..] } else { b"abc" });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((first.docs, first.remaining), (1, 1));
+    let next = writer
+        .follow(&catalog.view(), &budget, &mut |_, out| {
+            out.extend_from_slice(b"abc");
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(next.docs, 1);
+    assert_eq!(next.remaining, 0);
+}
+
+#[test]
+fn trigram_sources_estimate_read_and_share_coverage() {
+    use crate::candidate::{Atom, Pinned, Source};
+    let dir = Dir::new("pair-source");
+    let corpus = Corpus::new(906, 40);
+    let writer = four_segments(&dir, &corpus);
+    let view = writer.view();
+    let live = DocSet::new(42, 0..42);
+    let pinned = Pinned::new(Some(&view), &live);
+    assert_eq!(pinned.sources().count(), 2);
+    assert_eq!(
+        pinned.uncovered().range(0, 42).collect::<Vec<_>>(),
+        [40, 41]
+    );
+    assert_eq!(Pinned::new(None, &live).sources().count(), 0);
+    let source = Source::Trigrams(&view);
+    assert!(source.read(&Atom::Term(b"amber")).unwrap().is_none());
+    assert!(source.estimate(&Atom::Term(b"amber")).unwrap().is_none());
+    for key in [*b"amb", *b"ber", [0xff; 3]] {
+        let atom = Atom::Trigram(key);
+        let expected: Vec<_> = (0..40)
+            .filter(|&doc| corpus.text(doc).windows(3).any(|w| w == key))
+            .collect();
+        let estimate = source.estimate(&atom).unwrap().unwrap();
+        assert_eq!(estimate.docs, expected.len() as u64);
+        let candidates = source.read(&atom).unwrap().unwrap();
+        assert_eq!(candidates.estimate().docs, estimate.docs);
+        let mut cursor = candidates.cursor();
+        let mut actual = Vec::new();
+        let mut target = 0;
+        while let Some((doc, _)) = cursor.next_geq(target) {
+            actual.push(doc);
+            target = doc + 1;
+        }
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            source.estimate_until(&atom, &|| true),
+            Err(ReadError::Cancelled)
+        ));
+        assert!(matches!(
+            source.read_until(&atom, &|| true),
+            Err(ReadError::Cancelled)
+        ));
+    }
+}
+
+#[test]
+fn publication_error_before_rename_keeps_outputs_until_recovery() {
+    let dir = Dir::new("pair-publication-old");
+    let corpus = Corpus::new(907, 40);
+    let mut writer = four_segments(&dir, &corpus);
+    let catalog = Catalog::new(40, &[]);
+    let before = writer.view();
+    stop_at(Point::ManifestSynced);
+    assert!(
+        writer
+            .merge_all(&catalog.view(), &Budget::unbounded())
+            .is_err()
+    );
+    assert_eq!(Manifest::read(&dir.0).unwrap().unwrap(), *before.manifest());
+    assert_eq!(dir.files().len(), named(&before).len() + 3);
+    drop(writer);
+    let writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    assert_eq!(writer.view().manifest(), before.manifest());
+    assert_eq!(dir.files(), named(&before));
+    assert_trigrams(&writer.view(), &catalog, &corpus);
+}
+
+#[test]
+fn follow_pause_commits_the_completed_pair() {
+    let dir = Dir::new("pair-follow-pause");
+    let live = DocSet::new(2, 0..2);
+    let catalog = CatalogView {
+        incarnation: [9; 16],
+        live: &live,
+    };
+    let mut writer = IndexWriter::open(&dir.0, &catalog).unwrap();
+    let paused = std::cell::Cell::new(false);
+    let budget = Budget {
+        cancelled: &|| paused.get(),
+        ..Budget::unbounded()
+    };
+    let followed = writer
+        .follow(&catalog, &budget, &mut |_, bytes| {
+            bytes.extend_from_slice(b"amber");
+            paused.set(true);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        (followed.docs, followed.remaining, followed.stopped),
+        (1, 1, Stopped::Asked)
+    );
+    assert_eq!(writer.view().manifest().frontier, 1);
+    assert_eq!(writer.view().segments().len(), 1);
+    assert_eq!(writer.view().trigrams().len(), 1);
+    assert_eq!(dir.files(), named(&writer.view()));
+}
+
+#[test]
+fn error_after_successful_reconcile_cleans_unpublished_outputs() {
+    let dir = Dir::new("pair-reconcile-error");
+    let corpus = Corpus::new(908, 40);
+    let mut writer = four_segments(&dir, &corpus);
+    let mut catalog = Catalog::new(40, &[]);
+    catalog.incarnation = [8; 16];
+    let budget = Budget {
+        pace: &|_| Err(io::Error::other("injected output failure")),
+        ..Budget::unbounded()
+    };
+    assert!(
+        writer
+            .follow(&catalog.view(), &budget, &mut |doc, out| {
+                out.extend_from_slice(&corpus.text(doc));
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(writer.view().segments().is_empty());
+    assert_eq!(dir.files(), named(&writer.view()));
 }
