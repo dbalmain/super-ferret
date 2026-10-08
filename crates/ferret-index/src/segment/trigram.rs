@@ -15,7 +15,6 @@ pub struct TrigramInverter {
     seen: Vec<u64>,
     dirty_words: Vec<u64>,
     documents: Vec<u32>,
-    first: Option<u32>,
     last: Option<u32>,
 }
 
@@ -33,7 +32,6 @@ impl TrigramInverter {
             seen: vec![0; (1 << 24) / 64],
             dirty_words: vec![0; (1 << 24) / 64 / 64],
             documents: Vec::new(),
-            first: None,
             last: None,
         }
     }
@@ -154,7 +152,6 @@ impl TrigramInverter {
             self.pairs.truncate(start);
             return Ok(None);
         }
-        self.first.get_or_insert(doc);
         self.last = Some(doc);
         Ok(Some(count))
     }
@@ -181,7 +178,6 @@ impl TrigramInverter {
     /// Discards pairs and ordering state, retaining allocated buffers.
     pub fn clear(&mut self) {
         self.pairs.clear();
-        self.first = None;
         self.last = None;
     }
 
@@ -325,14 +321,15 @@ mod tests {
         let capacity = inverter.allocated_bytes();
         assert_eq!(inverter.add_limited(9, b"xyzab", 1).unwrap(), None);
         assert_eq!(inverter.allocated_bytes(), capacity);
+        assert_eq!(inverter.pairs.capacity(), 4);
         assert_eq!(inverter.pairs, pairs);
-        assert_eq!(inverter.first, Some(7));
         assert_eq!(inverter.last, Some(7));
         assert!(inverter.seen.iter().all(|word| *word == 0));
         assert_eq!(inverter.add_limited(8, b"yza", 1).unwrap(), Some(1));
         let pairs = inverter.pairs.clone();
         assert_eq!(inverter.add_limited(9, b"xyz", 0).unwrap(), None);
         assert_eq!(inverter.allocated_bytes(), capacity);
+        assert_eq!(inverter.pairs.capacity(), 4);
         assert_eq!(inverter.pairs, pairs);
         assert_eq!(inverter.last, Some(8));
         assert!(inverter.seen.iter().all(|word| *word == 0));

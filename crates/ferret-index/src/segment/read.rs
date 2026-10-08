@@ -375,15 +375,17 @@ impl<R: ReadAt> Segment<R> {
     /// Includes the predecessor block and every block starting with this
     /// fingerprint: either boundary can contain unrelated records.
     pub fn fingerprint_bound(&self, term: &[u8]) -> u64 {
-        let range = self.fingerprint_blocks(term);
+        if self.fingerprints.records == 0 {
+            return 0;
+        }
+        let range = self.fingerprint_blocks(fingerprint::fingerprint(term));
         let before = range.start as u64 * fingerprint::RECORD_BLOCK as u64;
         let after =
             (range.end as u64 * fingerprint::RECORD_BLOCK as u64).min(self.fingerprints.records);
         after.saturating_sub(before)
     }
 
-    fn fingerprint_blocks(&self, term: &[u8]) -> std::ops::Range<usize> {
-        let fp = fingerprint::fingerprint(term);
+    fn fingerprint_blocks(&self, fp: u32) -> std::ops::Range<usize> {
         let firsts = &self.fingerprints.firsts;
         if firsts.first().is_none_or(|&first| fp < first) {
             return 0..0;
@@ -408,9 +410,12 @@ impl<R: ReadAt> Segment<R> {
         if cancelled() {
             return Err(ReadError::Cancelled);
         }
+        if self.fingerprints.records == 0 {
+            return Ok(Vec::new());
+        }
         let fp = fingerprint::fingerprint(term);
         let mut docs = Vec::new();
-        for b in self.fingerprint_blocks(term) {
+        for b in self.fingerprint_blocks(fp) {
             if cancelled() {
                 return Err(ReadError::Cancelled);
             }
