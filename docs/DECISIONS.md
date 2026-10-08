@@ -87,6 +87,9 @@ Predecessors, carried forward where still open:
 | D69 | Saturated large documents in trigram postings           | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b) |
 | D70 | How large the trigram follow buffer may grow           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a) |
 | D71 | Agent habits `ferret search` silently gets wrong     | open           | rec A: `and`/`or`/`not` any case; `content:` aliases `text:`; error on an operator inside one argument (grok survey) |
+| D72 | `ferret grep`: scan broad queries automatically?          | open           | rec A: grep scans when the index can't narrow; `search` keeps S3's refusal (GREP.md, Sol) |
+| D73 | `ferret grep`: what freshness does indexed grep promise?   | open           | rec A: snapshot membership like find; verify candidates' current bytes (GREP.md, Sol) |
+| D74 | `ferret grep`: may `-g`/`--hidden` recover excluded paths? | open           | rec A: intersect with D47 visibility; `--no-ignore`/`-u` use find's live walk (GREP.md, Sol) |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -4127,3 +4130,70 @@ new about any of them.
 
 **The fact that would change it:** the query log showing real searches for
 files named `and`, `or` or `not`. Then B.
+
+## D72 — Does the grep CLI automatically scan broad queries?
+
+**Question:** Should a valid `ferret grep` command ever need `--scan` merely
+because its regex cannot narrow the indexed files?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Automatically scan the selected visible files; keep refusal in `search` | At 10M entries, a broad command can read the entire searchable tree. D8's historical cold full-tree scan was 234 s. `-v` is used by 433 rg repositories. | A habitual `rg -v foo`, short pattern or `\d+` gets an answer. One grep interface; no threshold-dependent errors. |
+| B. Keep S3's M > live/4 and uncovered > 10,000 refusals; require `--scan` | Legitimate rg commands fail based on index statistics. H's estimate can over-refuse small catalogs by up to 255 records per segment. | Prevents an accidental full content read. The existing planner's refusal policy can be reused unchanged. |
+| C. Automatically scan only below a byte/file budget | Another default and estimator; known size is not reliable for stdin or changed files. Above the budget, the same command still fails. | Protects whole-root queries while retaining convenient small-directory use. |
+
+**Recommendation: A (provisional).** Fastest favors B; compatibility and the
+simplest enduring grep interface favor A. Automatic scan is permission to
+read, not permission to change visibility, size policy or snapshot freshness.
+Use postings only when useful; broad/inverted commands enumerate through the
+existing catalog walk. No extra index structure or stored positions.
+
+**Fact that would change it:** measured automatic scans dominating agent query
+time on broad accidental commands, together with traces showing agents can
+reliably retry with `--scan`; then B. Measure before introducing C's budget.
+
+## D73 — What freshness does indexed grep promise?
+
+**Question:** May indexed grep retain S2/S3's snapshot exclusions while reading
+current candidate bytes, or must every invocation search the current tree?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Snapshot membership and posting absence; verify candidates now | A new file or a changed file newly containing the needle can be missed until refresh/follow. This is not exact over the current tree. | Matches find/S2's existing model, generation pins and caches. Selective queries avoid checking every file. |
+| B. Live enumerate and stat all selected files; add changed/new files to candidates | O(selected entries) metadata work on every query; at 10M entries this may dominate a rare lookup. Needs sound detection of replacements and policy changes. | Current-tree completeness for observed stable files, while postings can still skip unchanged contents. |
+| C. Refresh and follow to a query barrier first | Refresh/follow can read the entire tree and block on writer backlog; S3 measured refresh 24 ms versus S2's 7.4 ms on its small trace. A barrier still is not an atomic filesystem snapshot. | Stronger freshness with one writer model; useful once the daemon has a proved barrier. |
+
+**Recommendation: A (provisional).** It is fastest and simplest but trades
+correctness for freshness, outside the fastest/simplest rule. Say the limitation
+plainly. Explicit files and stdin scan current bytes directly; unrestricted
+live mode gives a current recursive walk. A disappeared candidate is dropped;
+a changed candidate is searched under its path, never cached under its old
+DocId. Checking emitted hits cannot repair a snapshot No.
+
+**Fact that would change it:** agents demonstrably missing newly introduced
+matches despite a running daemon, or a proved low-cost change barrier; measure
+B or C then. If current-tree completeness is required now, B is the honest
+shape and latency must include its walk.
+
+## D74 — May visibility flags recover ferret-excluded paths?
+
+**Question:** Should rg's positive globs and visibility switches reconstruct
+paths absent from the ferret catalog's visible universe?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Intersect indexed mode with D47 visibility; explicit starts and unrestricted live mode bypass it | `-g` cannot resurrect ignored trees. `--hidden` reveals only hidden paths ferret holds. `.ignore`/`.rgignore` are not part of the indexed policy. | One catalog universe shared with find; no query-time policy walk. `--no-ignore` reuses find's unrestricted live source. |
+| B. Apply full rg policy live, merging missing paths with indexed candidates | Extra policy inputs, walking and precedence logic on queries; a second policy universe to maintain. May search ferret's excluded build trees. | Closer answers for the 1,031 rg repositories using `-g` and 362 using `--hidden`. |
+| C. Make indexed grep refuse every widening flag | Even `--hidden` fails although ferret ordinarily catalogs hidden files. | A very small surface with explicit failures rather than partial widening. |
+
+**Recommendation: A (provisional).** It follows Dave's ignored-path contract;
+the user-visible meaning of rg's overrides deserves confirmation. `--no-ignore`
+(and `-u`, `-uu`) chooses the unrestricted live walk, like find's `-I`;
+`-uuu` refuses until its binary-search semantics are supported;
+`-I` in grep means no filename, never live mode. Explicit ignored directory
+starts use find's live fallback. No fallback to an external rg executable.
+
+**Fact that would change it:** visibility disagreements on ordinary agent
+commands accounting for most real misses; B would need a separate policy
+review and measurements before implementation. This slice does not authorize
+that change to D13/D47.
