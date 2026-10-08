@@ -1248,7 +1248,10 @@ fn conservative_bounds_cover_quarters_whole_tokens_caps_fingerprints_and_aliases
             assert_eq!(report.bounds.maybe, report.bounds.possible);
         }
         if args == ["text:onlyonce"] {
-            assert_eq!(report.bounds.maybe, 1);
+            // H planning counts boundary records conservatively without
+            // reading the fingerprint block; the actual run is still one.
+            assert!(report.bounds.maybe >= 1);
+            assert_eq!(report.snapshot_maybe, 1);
             assert_eq!(report.verified, 1);
         }
         if args == [format!("text:{cap}").as_str()] {

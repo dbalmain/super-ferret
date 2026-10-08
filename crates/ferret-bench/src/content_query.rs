@@ -971,7 +971,7 @@ pub(crate) fn run_regex(dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> cr
 /// Real identifier runs, with two tokenizer parts and at least one byte
 /// between their chosen ends. The regex uses raw ASCII spans, not normalized
 /// term bytes: its meaning is a substring of the captured document.
-fn regex_identifiers(
+pub(crate) fn regex_identifiers(
     snapshot: &crate::content_snapshot::Snapshot,
     live: &DocSet,
 ) -> crate::Result<Vec<String>> {

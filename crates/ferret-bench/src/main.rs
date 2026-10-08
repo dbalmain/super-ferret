@@ -19,6 +19,7 @@
 //! ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>  D69: saturated large documents
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
+//! ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>  M5 candidate-byte diagnostic
 //! ferret-bench chunk-census <catalog-dir> <index-dir>   D66 heuristic chunk map census (S3 M6)
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
 //! ferret-bench resident-once <catalog-dir> <query> resident query time and RSS
@@ -70,6 +71,7 @@ mod content_snapshot;
 mod corpus;
 mod fuse;
 mod index_build;
+mod regex_volume;
 mod saturation;
 mod screen;
 mod segment_build;
@@ -172,6 +174,9 @@ fn main() -> ExitCode {
             ("index-churn", [out, rounds, options @ ..]) => {
                 index_build::churn(Path::new(out), rounds, options)
             }
+            ("regex-volume", [dir, index, snapshot]) => {
+                regex_volume::run(Path::new(dir), Path::new(index), Path::new(snapshot))
+            }
             ("regex-query", [dir, index, snapshot]) => {
                 content_query::run_regex(Path::new(dir), Path::new(index), Path::new(snapshot))
             }
@@ -235,6 +240,7 @@ fn usage() -> ExitCode {
          ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench index-churn <index-dir> <rounds> [--codec 1|h]\n       \
+         ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench regex-query <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [--corpus snapshot-dir] [--covered] [class...]\n       \
          ferret-bench chunk-census <catalog-dir> <index-dir>\n       \
