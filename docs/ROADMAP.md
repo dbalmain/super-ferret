@@ -1889,6 +1889,31 @@ Gates: **856 passed / 12 ignored**, zero Rust warnings. Merged to main with
 **Decides:** which structure ships as default, and which ship behind the opt-in
 comparison.
 
+**First cut merged to main 2026-10-08.** M1–M6 on `wt/s3-m1`: paired
+term/trigram segments under manifest v3, D70 B's fixed pair buffer with exact
+distinct-key admission, `grep:REGEX` with P/M refusal and `--scan`, and D65
+H's singleton fingerprints (opt-in codec 2). Sprint review: Sol built, Astra
+closed it at round 2 after five round-1 fixes (two allocation defects, H
+planning reads, two census errors). Gates **927 passed / 13 ignored**.
+
+Follow-ups the review left open, none blocking:
+
+- **Regex verification volume.** Rare literals read about 1.38 GB per query
+  against 8 MB that actually matches; 99% is documents holding every required
+  trigram without the literal. Dropping to four children costs only 2.4%
+  (`ferret-bench regex-volume`). Stronger in-document screening comes before
+  engine work.
+- **D17 reopened** by M5's own rule: warm rare-literal verification is 97% of
+  wall and the engine 57% of that. Keep `regex` until better screening is
+  measured and the surviving verification re-timed.
+- **D66 C parked:** the corrected chunk census cuts p90 phrase reads 8–22%,
+  far below the 50% bar.
+- Refresh costs 24 ms wall against S2's 7.4 ms, all in required fsyncs;
+  batching refreshes is the candidate fix.
+- H's estimate counts whole boundary blocks (up to 255 extra records per
+  segment), which can mis-pick a driving conjunct or refuse with `--scan` on
+  small catalogs. Never a missed match.
+
 ## `ferret grep` — a ripgrep-compatible drop-in (Dave, 2026-10-08)
 
 Dave's answer to D62: `ferret grep` is a must, as a drop-in replacement for
