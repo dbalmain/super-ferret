@@ -37,7 +37,7 @@ use std::path::Path;
 use ferret_catalog::{NameId, Target};
 use ferret_index::{CatalogView, DocSet, Pinned, View};
 use ferret_query::{Content, DocNames, NameIndex, Query, ReadVersion};
-use ferret_text::{Scratch, tokenize};
+use ferret_text::{Scratch, cap, tokenize};
 use ferret_verify::forces_whole;
 
 use crate::content_query::{self, quantile};
@@ -91,7 +91,9 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
     let phrases = content_query::pick_phrases(&catalog, &live)?;
 
     let mut actual_bytes: Vec<f64> = Vec::new();
+    let mut actual_large_bytes: Vec<f64> = Vec::new();
     let mut estimate: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut estimate_large: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut forced_whole_docs = 0u64;
     let mut scratch = Scratch::default();
     let (mut path, mut bytes) = (Vec::new(), Vec::new());
@@ -138,22 +140,30 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
         actual_bytes.push(real.read_bytes as f64);
 
         let mut query_estimate = [0u64; 3];
+        let mut query_estimate_large = [0u64; 3];
+        let mut query_actual_large = 0u64;
         for name in candidates {
-            let Target::Inode(inode) = catalog.name(name).target() else {
+            let Target::Inode(_) = catalog.name(name).target() else {
                 continue;
             };
-            if catalog.inode(inode).stat.size < LARGE {
-                continue;
-            }
             let Some(version) =
                 content_query::read_current_name(&catalog, name, &mut path, &mut bytes)
             else {
                 continue;
             };
             let doc_len = bytes.len();
+            if doc_len < LARGE as usize {
+                // Small documents are still read whole in every chunk-map
+                // design, so include their unchanged cost in each projection.
+                for slot in &mut query_estimate {
+                    *slot += doc_len as u64;
+                }
+                continue;
+            }
+            query_actual_large += doc_len as u64;
             if version != ReadVersion::Catalogued || forces_whole(&bytes) {
                 forced_whole_docs += 1;
-                for slot in &mut query_estimate {
+                for slot in &mut query_estimate_large {
                     *slot += doc_len as u64;
                 }
                 continue;
@@ -168,14 +178,16 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
                     }
                 });
                 let marked = widen_to_neighbours(&hits, doc_len, chunk_size);
-                query_estimate[slot] += marked
+                query_estimate_large[slot] += marked
                     .iter()
                     .map(|&c| chunk_bytes(c, chunk_size, doc_len))
                     .sum::<u64>();
             }
         }
+        actual_large_bytes.push(query_actual_large as f64);
         for (slot, &value) in query_estimate.iter().enumerate() {
             estimate[slot].push(value as f64);
+            estimate_large[slot].push(query_estimate_large[slot] as f64);
         }
     }
 
@@ -185,8 +197,12 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
     let actual_p50 = quantile(&mut actual_p50, 0.5);
     let mut actual_p90 = actual_bytes.clone();
     let actual_p90 = quantile(&mut actual_p90, 0.9);
+    let mut actual_large_p50 = actual_large_bytes.clone();
+    let actual_large_p50 = quantile(&mut actual_large_p50, 0.5);
+    let mut actual_large_p90 = actual_large_bytes.clone();
+    let actual_large_p90 = quantile(&mut actual_large_p90, 0.9);
     println!(
-        "heuristic estimate | chunk size | p50 bytes | p90 bytes | actual p50 bytes | actual p90 bytes | p90 cut % |"
+        "heuristic estimate, all candidate documents | chunk size | projected p50 B | projected p90 B | actual p50 B | actual p90 B | p90 cut % |"
     );
     println!("| --- | --- | --- | --- | --- | --- | --- |");
     let mut cuts = [0.0; 3];
@@ -203,6 +219,25 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
         cuts[slot] = cut;
         println!(
             "| heuristic estimate | {label} | {p50:.0} | {p90:.0} | {actual_p50:.0} | {actual_p90:.0} | {cut:.1} |"
+        );
+    }
+    println!();
+    println!(
+        "heuristic estimate, large documents only (>= 1 MiB) | chunk size | projected p50 B | projected p90 B | actual p50 B | actual p90 B | p90 cut % |"
+    );
+    println!("| --- | --- | --- | --- | --- | --- | --- |");
+    for (slot, &(label, _)) in CHUNK_SIZES.iter().enumerate() {
+        let mut p50 = estimate_large[slot].clone();
+        let p50 = quantile(&mut p50, 0.5);
+        let mut p90 = estimate_large[slot].clone();
+        let p90 = quantile(&mut p90, 0.9);
+        let cut = if actual_large_p90 > 0.0 {
+            (1.0 - p90 / actual_large_p90) * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "| heuristic estimate | {label} | {p50:.0} | {p90:.0} | {actual_large_p50:.0} | {actual_large_p90:.0} | {cut:.1} |"
         );
     }
 
@@ -227,10 +262,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
         let mut sets: [BTreeSet<(Vec<u8>, usize)>; 3] = Default::default();
         tokenize(&dbytes, &mut doc_scratch, |token| {
             for (slot, &(_, chunk_size)) in CHUNK_SIZES.iter().enumerate() {
-                let (start, end) = chunk_span(&token.run, chunk_size);
-                for chunk in start..=end {
-                    sets[slot].insert((token.bytes.to_vec(), chunk));
-                }
+                insert_term_chunks(&mut sets[slot], token.bytes, &token.run, chunk_size);
             }
         });
         for (slot, set) in sets.iter().enumerate() {
@@ -293,6 +325,21 @@ fn chunk_span(run: &Range<usize>, chunk_size: usize) -> (usize, usize) {
         (run.end - 1) / chunk_size
     };
     (start, end)
+}
+
+/// Insert the stored term key at every chunk overlapped by this token's span.
+/// Long tokens may share a capped key, but retain their own independent spans.
+fn insert_term_chunks(
+    set: &mut BTreeSet<(Vec<u8>, usize)>,
+    token: &[u8],
+    run: &Range<usize>,
+    chunk_size: usize,
+) {
+    let key = cap(token).to_vec();
+    let (start, end) = chunk_span(run, chunk_size);
+    for chunk in start..=end {
+        set.insert((key.clone(), chunk));
+    }
 }
 
 /// The last chunk index of a document of `doc_len` bytes at `chunk_size`.
@@ -367,5 +414,24 @@ mod tests {
         assert_eq!(chunk_bytes(0, 100, 50), 50);
         assert_eq!(chunk_bytes(0, 100, 250), 100);
         assert_eq!(chunk_bytes(2, 100, 250), 50);
+    }
+
+    #[test]
+    fn shared_capped_prefix_deduplicates_keys_but_keeps_each_span() {
+        let mut bytes = vec![b'a'; 64];
+        bytes.push(b'x');
+        bytes.resize(100, b' ');
+        bytes.extend(vec![b'a'; 64]);
+        bytes.push(b'y');
+
+        let mut scratch = Scratch::default();
+        let mut triples = BTreeSet::new();
+        tokenize(&bytes, &mut scratch, |token| {
+            insert_term_chunks(&mut triples, token.bytes, &token.run, 100);
+        });
+
+        assert_eq!(triples.len(), 2);
+        assert!(triples.contains(&(vec![b'a'; 64], 0)));
+        assert!(triples.contains(&(vec![b'a'; 64], 1)));
     }
 }
