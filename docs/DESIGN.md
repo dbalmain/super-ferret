@@ -434,8 +434,37 @@ in [architecture.html § The size budget](research/claude/architecture.html); th
 experiments replace it with measurements.
 
 **Segments.** Immutable files per structure over a doc-id range, committed by a
-manifest rename. The term dictionary's structure (sorted front-coded blocks, an
-FST, …) is decided in S2 and is itself an experiment row.
+manifest rename. S2 ships front-coded dictionary blocks (codec 1).
+
+**Static term dictionary (D65, decided 2026-10-10).** The fully merged index
+keeps terms with df ≥ 2 in an **FST mapping each term to its postings offset**.
+A list's range ends at the next term's output. Rare terms (df = 1) are 32-bit
+fingerprint records, not FST keys. The FST is read whole at open and stays
+resident: about 75 MB against codec 1's 10 MB on `$HOME`, and a 60–140 ms cold
+open. In exchange, lookups are 5–14× faster, and prefix, regex and Levenshtein
+expansion over terms comes from automaton intersection. That expansion is best
+effort, because rare terms are not in the FST. Measured in
+`dbalmain/term-dict-bench` (`results/msa2-home-2026-10-10.txt`, reviewed in
+`results/review-1-astra.md`).
+
+**Alternative kept open: term ordinals.** The FST could map each term to its
+position in the sorted sequence instead, with an Elias–Fano array from ordinal
+to postings offset (bench arm 2). That costs 2.9 MB more on `$HOME` (+1.3% of
+the index) and one more structure to build, checksum and merge. It buys a dense,
+exact 23-bit id per dictionary term, ordinal → term in about 2 µs, and a home
+for per-term columns indexed by ordinal. It was not chosen because no consumer
+needs it yet. Ordinals are renumbered by every merge, the rare terms have none,
+and the phrase-pair filter is keyed by fingerprints, which avoid both problems.
+**Switch to ordinals when a design needs either of these:**
+
+- a per-term value resident for query planning, such as exact df, where a list's
+  byte length is not a good enough proxy;
+- a structure rebuilt with each merge anyway that benefits from small exact term
+  ids, such as a per-segment filter over dictionary terms only.
+
+The switch is a dictionary codec change, not a format break. The reasoning, with
+diagrams:
+[Term Ordinals for D65](https://claude.ai/artifact/EeBPfDj46NVpnGNW6Ub4h9).
 
 ## Find syntax
 
@@ -610,7 +639,7 @@ finds foreground harm with nice 19 plus the limiter.
 ## Not yet designed
 
 Decided inside the slice that needs them, recorded in DECISIONS.md if they
-become Dave's call: term dictionary structure; segment file layout and merge
-policy; catalog snapshot layout detail; multiple devices and bind mounts under
-one root; extraction for PDFs and media metadata (after the agent skill); TUI
-and GUI (much later).
+become Dave's call: the live (unmerged) term dictionary's structure; segment
+file layout and merge policy; catalog snapshot layout detail; multiple devices
+and bind mounts under one root; extraction for PDFs and media metadata (after
+the agent skill); TUI and GUI (much later).
