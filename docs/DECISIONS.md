@@ -85,7 +85,7 @@ Predecessors, carried forward where still open:
 | D67 | How `ferret search` spells a content regex, and when it refuses        | answered       | (a) A2: `grep:REGEX`, case-sensitive, `(?i)` inline, line anchors; (b) i: refuse past live/4 Maybe, `--scan`                                                  |
 | D68 | Per-document filters: a screening stage, terms and trigrams separately | open           | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b)                      |
 | D69 | Saturated large documents in trigram postings                          | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b)                                      |
-| D70 | How large the trigram follow buffer may grow                           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a)                                                       |
+| D70 | How large the trigram follow buffer may grow                           | answered       | B: one shared 64 MiB budget (follow RSS 458→248 MiB, +1.1% steady term index); budget to become configurable                                                  |
 | D71 | Agent habits `ferret search` silently gets wrong                       | answered       | A: operators in any case; `content:` aliases `text:`; operator-in-argument error only when another prefix follows                                             |
 | D72 | `ferret grep`: scan broad queries automatically?                       | answered       | A: grep scans when the index can't narrow; works without trigrams, documented as no faster than rg                                                            |
 | D73 | `ferret grep`: what freshness does indexed grep promise?               | answered       | A+D: snapshot by default, plus `--live` keeping ferret's ignore rules                                                                                         |
@@ -4275,7 +4275,10 @@ would rather judge D69 in bytes, that is the case for B at 64k.
 
 ## D70 — How large the trigram follow buffer may grow
 
-**Status: open.** S3 M0, revision 5, 2026-10-08;
+**Status: answered, B (Dave, 2026-10-11).** The shared budget should become
+configurable, so a user who wants A's segment sizes can raise it. Fully merged,
+A and B are the same size (688.1 MB), so B's extra 1–2% at steady state comes
+only from having more segments. S3 M0, revision 5, 2026-10-08;
 [design](S3.md#memory-live-structures-not-serialized-bytes).
 
 **Question:** During a follow pass, should trigram pairs count against S2's 64
