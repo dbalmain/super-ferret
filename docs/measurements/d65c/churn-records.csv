@@ -1,1 +1,7 @@
-
+arm,state,class,n,raw_median,raw_p90,raw_max,live_median,live_p90,live_max
+c2,ordinary,df1,50,1,1,1,1,1,1
+c2,ordinary,df2-100,50,4,6,9,3,5,9
+c2,ordinary,absent,50,0,0,0,0,0,0
+c2,full,df1,50,1,1,1,1,1,1
+c2,full,df2-100,50,0,4,9,0,4,9
+c2,full,absent,50,0,0,0,0,0,0
