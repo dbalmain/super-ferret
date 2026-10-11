@@ -3929,6 +3929,49 @@ ordinal arm's apparent saving was mostly the df it left out: a fair saving is
 0.7% (Astra). Codec-1 postings lists carry no document count, so any layout that
 drops the entry's df must store it somewhere else.
 
+### D65 update — slice C
+
+2026-10-12, refreshed catalog; [measurements and soundness](D65C.md).
+112,382 live documents, 112,376 readable frozen representatives (3.98 GB),
+six changed/unreadable representatives. The codec-1 control's steady rare-term
+warm p90 is **0.12 ms**, so the stale-catalog floor is gone. All arms are real
+follows and merges. All 7,500 experimental queries agree with the control.
+
+**Question: which measured arm should replace codec 1?** The original rule
+requires ≥15% steady saving, rare/absent warm p90 <20 ms, mid/common medians
+≤1.5× control, and follow-plus-steady CPU ≤1.2×.
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. Keep codec 1 | 450.28 MB steady term index. | Passes latency; no graduation reads. Existing default. |
+| B. H0, codec 2 | df2 p90 23.83 ms; mid 4.07×; full churn +10.8%; CPU 1.152×. | 52.6% steady saving. |
+| C1. Run codec, codec 3 | df2 p90 25.88 ms; mid 4.48×; full churn +0.9%; CPU 1.162×. | 50.3% steady saving; nearly removes compact churn penalty. |
+| C2. Runs + verified graduation, codec 4 | CPU 2.896×; steady merge reads 9.57 GB; peak RSS 815 MiB. | 51.7% steady saving; full churn −2.5%; df2 p90 17.15 ms and all latency gates pass. |
+| C3. Runs + first offsets + graduation, codec 5 | CPU 3.698×; steady merge reads 9.33 GB across 2.22M reads; peak RSS 743 MiB; full churn +1.3%. | 36.1% steady saving; rare warm p90 0.09 / 0.14 ms; all latency gates pass. |
+
+**Recommendation: A for the default; keep C1–C3 opt-in.** C1 answers most
+of the compact churn cost, but verification latency still fails the rule.
+C2 and C3 solve enough latency to pass, but graduation exceeds the CPU budget.
+Offsets make typical queries cheap; they do not make graduation cheap on this
+corpus. C3's df2 p95 is still 32.91 ms, and its steady state has three segments
+versus twelve for the other arms under today's paired merge policy.
+
+The one-way-record diagnosis is confirmed. Today's ordinary paired churn
+state makes H0 10.3% smaller; the 10.8% penalty appears at full merge. C1's
+run headers add 30.42 MB at first build despite adding no offset payload.
+C3's first-build increment is 94.39 MB (3.12 B/record), above the derived
+80 MB because this refreshed corpus contains more records.
+
+**Fact that would change it:** a measured C3 implementation with bounded
+graduation buffers and coalesced/budgeted reads that meets the original
+≤1.2× CPU rule while retaining these size, latency and soundness results; or
+Dave explicitly choosing a higher CPU budget for the measured density gain.
+Any skipped or failed verification must leave a record intact. The current
+buffers grow with the merge input. All required collision, changed-file,
+offset-fallback and repeated-merge soundness tests pass; all eleven original
+H tests exercise every arm. Workspace gates pass **938 tests**, versus 928
+on main, with zero warnings.
+
 ## D66 — Phrase queries read too much: positions, or not
 
 **Status: answered, D: a per-document Bloom 8 pair filter (Dave, 2026-10-11).**
