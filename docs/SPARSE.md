@@ -1,6 +1,6 @@
 # Sparse grams: regex candidate experiment
 
-Measurement running: sparse and fixed-4 are complete; fixed-8 and word controls remain.
+Measurement running: eight experimental layouts are complete; word 4+5 remains.
 Bench-only indexes; no product index or query changes. No network sources used.
 
 ## Question and design
@@ -133,6 +133,8 @@ Only aggregate counts, bytes and timings are tracked.
 | sparse-frequency-8 | 1527.20 / 794.63 | 114965290 | 726.480 | 300.14/1464.51 | 2319.50/2867.31 | 2637.91/3096.23 | 3405.53/3558.59 | 1723.12/2739.59 | 98.24% |
 | sparse-frequency-32 | 3615.68 / 1150.22 | 278334955 | 1149.070 | 300.14/1464.51 | 2319.50/2867.31 | 2637.91/3096.23 | 3405.53/3558.59 | 1723.12/2739.59 | 98.24% |
 | fixed-4 | 1103.88 / 853.59 | 42441594 | 591.330 | 69.14/164.90 | 1933.45/2607.16 | 2275.54/2830.22 | 3405.53/3558.59 | 1431.50/2242.83 | 92.67% |
+| fixed-8 | 4939.70 / 1446.62 | 448754825 | 1400.400 | 1441.54/1568.56 | 2654.28/2954.09 | 2915.27/3175.76 | 3405.53/3558.59 | 2320.21/2910.63 | 99.30% |
+| word-fixed-4 | 656.92 / 588.11 | 12225432 | 336.810 | 69.14/164.90 | 1933.45/2607.16 | 2275.54/2830.22 | 3405.53/3558.59 | 1431.50/2242.83 | 92.67% |
 
 Oracle document median/p90 and byte median/p90 are common to every layout:
 
@@ -163,11 +165,14 @@ Options, with costs and buys:
   headline median/p90. The four-child budget can change chosen constraints,
   so larger caps need not monotonically reduce every individual candidate set.
 - **Fixed literal screens:** fixed-4 uses fewer keys and less storage than
-  either sparse cap-8 index, with a much better rare p90 (165 MiB). Fixed-8 and
-  word-only controls are being measured to test whether selective local key
-  coverage is cheaper still.
+  either sparse cap-8 index, with a much better rare p90 (165 MiB). Fixed-8 costs 4,940 MiB yet rare median/p90 remain 1,442/1,569 MiB: it
+  needs 8-byte literal facts and supplies no 4–7-byte coverage. Word-only
+  four-grams reproduce all headline fixed-4 volumes at 657 MiB instead of
+  1,104 MiB (40.5% less storage), with 336.81 CPU s instead of 591.33. The
+  word 4+5 control is still running.
 
-Recommendation is pending the three remaining controls. Sparse cap 32 already
+Recommendation is pending the final word 4+5 control. Word-four already
+improves fixed-four's storage tradeoff without losing headline selectivity. Sparse cap 32 already
 fails its storage tradeoff on this corpus. Broad-class candidate bytes are
 identical across completed layouts: their usable literal facts are only three
 bytes, so longer-key screening cannot help those queries. Class caps and
