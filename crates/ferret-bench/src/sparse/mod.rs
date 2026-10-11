@@ -293,6 +293,9 @@ pub(crate) fn run(
     snapshot_dir: &Path,
     only: Option<&str>,
 ) -> crate::Result<()> {
+    if only.is_some_and(|labels| labels.split(',').any(|label| !Variant::ALL.iter().any(|variant| variant.label() == label))) {
+        return Err("unknown sparse variant".into());
+    }
     let variants: Vec<_> = Variant::ALL
         .into_iter()
         .filter(|v| only.is_none_or(|labels| labels.split(',').any(|label| v.label() == label)))

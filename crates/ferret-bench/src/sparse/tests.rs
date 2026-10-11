@@ -303,20 +303,23 @@ fn word_four_keeps_case_alternatives_and_falls_back_across_punctuation() {
 fn repeated_pair_ties_leave_false_candidates_that_fixed_five_rejects() {
     // Substring-local ranks cannot break repeated pairs by document offset.
     // Fixed coverage can therefore buy selectivity unavailable at any cap.
-    let documents: [&[u8]; 2] = [b"aaa", b"aaaaa"];
+    let documents: [&[u8]; 3] = [b"aaa", b"aaaa", b"aaaaa"];
     let flags = GrepFlags::default();
     let grep = flags.compile("aaaaa").unwrap();
     assert!(!grep.regex().is_match(documents[0]));
-    assert!(grep.regex().is_match(documents[1]));
+    assert!(!grep.regex().is_match(documents[1]));
+    assert!(grep.regex().is_match(documents[2]));
     let facts = flags.required_literals("aaaaa").unwrap();
     for frequency in [false, true] {
         let weights = weights(&vec![0; 1 << 16], frequency);
         for cap in [8, 32] {
             let variant = Variant::Sparse { frequency, cap };
             let index = lists(&documents, variant, &weights);
-            assert_eq!(Need::literals(&facts, variant, &weights).candidates(&index, &[0, 1]), [0, 1]);
+            assert_eq!(Need::literals(&facts, variant, &weights).candidates(&index, &[0, 1, 2]), [0, 1, 2]);
         }
     }
+    let index = lists(&documents, Variant::Word4, &[]);
+    assert_eq!(Need::literals(&facts, Variant::Word4, &[]).candidates(&index, &[0, 1, 2]), [1, 2]);
     let index = lists(&documents, Variant::Word45, &[]);
-    assert_eq!(Need::literals(&facts, Variant::Word45, &[]).candidates(&index, &[0, 1]), [1]);
+    assert_eq!(Need::literals(&facts, Variant::Word45, &[]).candidates(&index, &[0, 1, 2]), [2]);
 }

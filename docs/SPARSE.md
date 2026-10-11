@@ -173,3 +173,9 @@ a document containing just `aaa`. The word 4+5 control rejects that false
 candidate through the real extractor and required-literal derivation. Repeated
 pairs cannot use absolute-offset tie breaks without invalidating soundness.
 The new word/tie tests await final gates (expected 941 passed / 13 ignored).
+
+Frequency cap 32 passes all 250 checks, with **278,334,955 keys**, **3,615.68
+MiB total index**, **1,150.22 MiB postings**, and **1,149.07 CPU s**. Its headline
+candidate medians/p90s equal frequency cap 8 in every class. Both weight
+functions therefore pay more than twice the cap-8 storage for no headline
+gain at cap 32. Raw fixed-4 and fixed-8 controls remain in progress.
