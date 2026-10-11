@@ -132,3 +132,17 @@ Rare candidate bytes median/p90 fall to **28,488,102 / 1,391,555,674**;
 identifier to **2,673,273,947 / 3,056,592,693**. Every oracle match survives.
 The 54.1× rare median reduction does not remove the tail; total storage rises
 5.82× and the sum-based rare false-readable share remains 97.62%.
+
+The resumed oracle reproduces all 20 shipped rows exactly. Its CPU/wall cost is
+518.00/672.81 s; the wall difference follows cold reads after the aborted build.
+The optimized trigram replay is byte-identical (22.72 CPU s), and frequency
+training is 3.99 CPU s. The bounded cap-32 build has completed 12/32 ranges
+without the former memory pressure.
+
+An additional cheaper control is being added: all trigrams plus fixed 4-grams
+whose bytes form valid UTF-8 alphanumeric/underscore characters. Both index
+and query use that substring-local predicate, and every rejected long gram
+falls back to trigrams. It is therefore sound for punctuation, partial UTF-8,
+and Unicode case alternatives. It measures whether concentrating long keys
+on word literals removes much of the full raw-byte dictionary cost. The new
+control's regression and measurements are pending; checkpoint is WIP.

@@ -8,10 +8,11 @@ pub(super) enum Variant {
     Trigram,
     Sparse { frequency: bool, cap: usize },
     Fixed(usize),
+    Word4,
 }
 
 impl Variant {
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::Trigram,
         Self::Sparse {
             frequency: false,
@@ -31,6 +32,7 @@ impl Variant {
         },
         Self::Fixed(4),
         Self::Fixed(8),
+        Self::Word4,
     ];
 
     pub(super) fn label(self) -> String {
@@ -43,6 +45,7 @@ impl Variant {
                 )
             }
             Self::Fixed(length) => format!("fixed-{length}"),
+            Self::Word4 => "word-fixed-4".into(),
         }
     }
 }
@@ -91,6 +94,11 @@ pub(super) fn extract<'a>(
             bytes.windows(length).for_each(emit);
             return;
         }
+        Variant::Word4 => {
+            bytes.windows(3).for_each(&mut emit);
+            bytes.windows(4).filter(|gram| word(gram)).for_each(emit);
+            return;
+        }
         Variant::Sparse { cap, .. } => cap,
     };
     let mut stack: Vec<(usize, (u64, u16))> = Vec::new();
@@ -115,6 +123,13 @@ pub(super) fn extract<'a>(
         }
         stack.push((right, rank));
     }
+}
+
+/// Only a selection predicate: keys still fold ASCII raw bytes. Partial UTF-8
+/// grams and punctuation fall back to trigrams on both sides, preserving
+/// matches even when a literal starts or ends inside a larger document run.
+fn word(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok_and(|s| s.chars().all(|c| c.is_alphanumeric() || c == '_'))
 }
 
 /// Bounded maps need only starts in one first-byte range. Scanning forward
@@ -143,6 +158,11 @@ pub(super) fn extract_partition<'a>(
             {
                 emit(gram);
             }
+            return;
+        }
+        Variant::Word4 => {
+            for gram in bytes.windows(3).chain(bytes.windows(4).filter(|gram| word(gram)))
+                .filter(|gram| gram[0] >> 3 == partition) { emit(gram); }
             return;
         }
         Variant::Sparse { cap, .. } => cap,

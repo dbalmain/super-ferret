@@ -456,7 +456,7 @@ pub(crate) fn run(
         let (cpu, wall) = (cpu_seconds()?, Instant::now());
         let (lists, encoded) = if !matches!(
             variant,
-            Variant::Trigram
+            Variant::Trigram | Variant::Word4
                 | Variant::Sparse {
                     frequency: false,
                     cap: 8

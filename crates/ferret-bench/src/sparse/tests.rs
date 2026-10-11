@@ -281,3 +281,20 @@ fn partitioned_maps_produce_byte_identical_segments_and_query_lists() {
         }
     }
 }
+
+#[test]
+fn word_four_keeps_case_alternatives_and_falls_back_across_punctuation() {
+    // Dropping long non-word or partial UTF-8 keys must weaken the query too;
+    // probing those missing keys would silently lose punctuation literals.
+    let bytes = fold("abcd abc_ Ki aſb abc def ab-cd".as_bytes());
+    let mut keys = BTreeSet::new();
+    extract(&bytes, Variant::Word4, &[], |gram| { keys.insert(gram.to_vec()); });
+    assert!(keys.contains(b"abcd".as_slice()));
+    assert!(keys.contains(b"abc_".as_slice()));
+    assert!(keys.contains("Ki".as_bytes()));
+    assert!(keys.contains("aſb".as_bytes()));
+    assert!(!keys.contains(b"abc ".as_slice()));
+    assert!(!keys.contains(b"ab-c".as_slice()));
+    assert!(bytes.windows(3).all(|gram| keys.contains(gram)));
+    check(&["abc def", "ab-cd", "kilo", "aſb"], &[b"abc def", b"ab-cd", "Kilo".as_bytes(), "aſb".as_bytes()], true);
+}
