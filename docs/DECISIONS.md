@@ -83,7 +83,7 @@ Predecessors, carried forward where still open:
 | D65 | The term dictionary is 87% of the index                                | answered       | blocks + block-prefix FST for the static dictionary; H: C, measured as arms C1–C3 (run codec; + graduation; + first offsets)                                  |
 | D66 | Phrase queries read too much: positions, or not                        | answered       | D: per-document Bloom 8 over adjacent pairs, pairs only, streaming fold; agent transcripts out of the content index                                           |
 | D67 | How `ferret search` spells a content regex, and when it refuses        | answered       | (a) A2: `grep:REGEX`, case-sensitive, `(?i)` inline, line anchors; (b) i: refuse past live/4 Maybe, `--scan`                                                  |
-| D68 | Per-document filters: a screening stage, terms and trigrams separately | open           | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b)                      |
+| D68 | Per-document filters: a screening stage, terms and trigrams separately | answered       | B: neither filter built (M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower)                                                   |
 | D69 | Saturated large documents in trigram postings                          | answered       | A: index every document's trigrams (M1b: no threshold is both large and fast)                                                                                 |
 | D70 | How large the trigram follow buffer may grow                           | answered       | B: one shared 64 MiB budget (follow RSS 458→248 MiB, +1.1% steady term index); budget to become configurable                                                  |
 | D71 | Agent habits `ferret search` silently gets wrong                       | answered       | A: operators in any case; `content:` aliases `text:`; operator-in-argument error only when another prefix follows                                             |
@@ -4168,7 +4168,9 @@ hit it on broad positive queries, raise the fraction.
 
 ## D68 — Per-document filters: a screening stage, terms and trigrams separately
 
-**Status: open.** S3 M0, revision 3, 2026-10-08;
+**Status: answered, B (Dave, 2026-10-11).** Neither filter is built: no layout
+passed M1b's screen. Term filters could return only as a density opt-in, under
+a new brief. S3 M0, revision 3, 2026-10-08;
 [design](S3.md#per-document-trigram-filters).
 
 **Question:** ROADMAP says S3 builds per-document trigram filters beside trigram
