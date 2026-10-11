@@ -19,6 +19,7 @@
 //! ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>  D69: saturated large documents
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
+//! ferret-bench rank-fp <catalog-dir> <out-dir>   static df≥2 dictionary: 32-bit sparse fingerprints vs 20-bit buckets
 //! ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>  M5 candidate-byte diagnostic
 //! ferret-bench chunk-census <catalog-dir> <index-dir>   D66 heuristic chunk map census (S3 M6)
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
@@ -71,6 +72,7 @@ mod content_snapshot;
 mod corpus;
 mod fuse;
 mod index_build;
+mod rank_fp;
 mod regex_volume;
 mod saturation;
 mod screen;
@@ -183,6 +185,7 @@ fn main() -> ExitCode {
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)
             }
+            ("rank-fp", [dir, out]) => rank_fp::run(Path::new(dir), Path::new(out)),
             ("chunk-census", [dir, index]) => chunk_census::run(Path::new(dir), Path::new(index)),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
             ("log-append-once", [dir, rows]) => log_append_once(Path::new(dir), rows),
@@ -243,6 +246,7 @@ fn usage() -> ExitCode {
          ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench regex-query <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [--corpus snapshot-dir] [--covered] [class...]\n       \
+         ferret-bench rank-fp <catalog-dir> <out-dir>\n       \
          ferret-bench chunk-census <catalog-dir> <index-dir>\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \
          ferret-bench open <catalog-dir>\n       \
