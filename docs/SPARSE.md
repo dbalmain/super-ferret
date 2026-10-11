@@ -293,3 +293,8 @@ Disk resumption: Dave freed storage; the preflight now reports 69 GiB free.
 Resume only word-four and word 4+5, retaining the complete shipped baseline.
 The partial word-four attempt has no emitted timings, so it requires a full
 query replay. The existing release binary and validated source are unchanged.
+
+Resumed oracle preparation reproduced the exact population in 509.830 CPU
+seconds / 512.101 wall seconds. Word-four again encoded to 688,833,945 bytes
+with 12,225,432 keys and 616,673,535 posting bytes. Its first 100 cold/warm
+query pairs passed candidate and oracle identities. Free space is 73 GiB.
