@@ -14,7 +14,7 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[3]
-CODECS = {"control": "1", "h0": "h", "c1": "c1", "c2": "c2", "c3": "c3"}
+CODECS = {"control": "1", "h0": "h", "c1": "c1", "c2": "c2", "c3": "c3", "c4a": "c4a", "c4b": "c4b"}
 
 
 def run(command, log):
@@ -35,11 +35,13 @@ def main():
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/ferret-bench")
     parser.add_argument("--cleanup-states", action="store_true")
+    parser.add_argument("--name", help="output name for a re-run; defaults to the arm")
     args = parser.parse_args()
-    base, arm, binary = args.run_dir, args.arm, str(args.binary)
+    base, codec, binary = args.run_dir, CODECS[args.arm], str(args.binary)
+    arm = args.name or args.arm
     catalog, corpus, index = base / "catalog", base / "corpus", base / arm
     if args.phase in ("build", "all"):
-        run([binary, "index-build", str(catalog), str(index), "--codec", CODECS[arm],
+        run([binary, "index-build", str(catalog), str(index), "--codec", codec,
              "--corpus", str(corpus), "--snapshots"], base / f"{arm}-build.log")
     if args.phase in ("query", "all"):
         for state in ("first", "steady", "full"):
@@ -47,14 +49,14 @@ def main():
             command = [binary, "content-query", str(catalog), str(path),
                        "df1", "df2-100", "df1-natural", "df2-100-natural", "absent", "mid", "common", "--terms",
                        str(base / "control"), "--corpus", str(corpus)]
-            if arm != "control":
+            if args.arm != "control":
                 command += ["--compare", str(base / "control")]
             run(command, base / f"{arm}-{state}-query.log")
             if args.cleanup_states and state != "full":
                 shutil.rmtree(path)
         # The fully merged trigram bytes are independent of term codec. Share
         # only a byte-identical file after measurements, keeping valid indexes.
-        if arm != "control":
+        if args.arm != "control":
             reference = list((base / "control").glob("*.tri"))
             outputs = list(index.glob("*.tri"))
             if len(reference) == len(outputs) == 1 and filecmp.cmp(reference[0], outputs[0], shallow=False):
@@ -63,7 +65,7 @@ def main():
                 temporary.replace(outputs[0])
     if args.phase in ("churn", "all"):
         run([binary, "index-churn", str(base / f"{arm}-churn"), "100", "--codec",
-             CODECS[arm]], base / f"{arm}-churn.log")
+             codec], base / f"{arm}-churn.log")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,33 @@ pub struct Window {
 /// requested term now. Hosts may return the whole document for either request.
 pub type DocumentReader<'a> = dyn FnMut(u32, Option<u32>, &mut Vec<u8>) -> Option<Window> + 'a;
 
+/// Successful merge-time document reads and the bytes they returned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DocumentReads {
+    pub count: u64,
+    pub bytes: u64,
+}
+
+impl DocumentReads {
+    /// Wraps `read`, counting every read that returns bytes.
+    pub fn counting<'a>(
+        &'a mut self,
+        read: &'a mut DocumentReader<'_>,
+    ) -> impl FnMut(u32, Option<u32>, &mut Vec<u8>) -> Option<Window> + 'a {
+        move |doc, offset, bytes| {
+            let window = read(doc, offset, bytes)?;
+            self.count += 1;
+            self.bytes += bytes.len() as u64;
+            Some(window)
+        }
+    }
+
+    pub fn add(&mut self, other: DocumentReads) {
+        self.count += other.count;
+        self.bytes += other.bytes;
+    }
+}
+
 /// A verified occurrence and whether its shared record can be removed.
 #[derive(Clone, Copy, Debug)]
 pub struct Verified {

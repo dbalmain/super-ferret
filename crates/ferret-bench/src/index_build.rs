@@ -27,7 +27,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use ferret_catalog::{Catalog, NameId};
-use ferret_index::segment::{DICTIONARY_CODEC, FINGERPRINT_CODEC, Section};
+use ferret_index::segment::{DICTIONARY_CODEC, DocumentReads, FINGERPRINT_CODEC, Section};
 use ferret_index::{Budget, CatalogView, DocSet, Fault, IndexWriter, Stopped, View};
 
 use crate::census::hashed_documents;
@@ -105,6 +105,14 @@ fn ratio(numerator: u64, denominator: u64) -> String {
         return "-".into();
     }
     format!("{:.4}", numerator as f64 / denominator as f64)
+}
+
+/// Merge-time document reads, split into graduation and demotion (D65 C4).
+fn read_lines(out: &mut String, prefix: &str, graduation: DocumentReads, demotion: DocumentReads) {
+    for (key, reads) in [("graduation", graduation), ("demotion", demotion)] {
+        let _ = writeln!(out, "{prefix}{key}_reads: {}", reads.count);
+        let _ = writeln!(out, "{prefix}{key}_read_bytes: {}", reads.bytes);
+    }
 }
 
 fn shape_lines(out: &mut String, prefix: &str, s: &Shape, content_bytes: u64) {
@@ -273,11 +281,15 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     let start = Instant::now();
     let (mut merges, mut merge_read, mut merge_written) = (0u64, 0u64, 0u64);
     let (mut demoted, mut purged, mut graduated) = (0u64, 0u64, 0u64);
+    let (mut graduation_reads, mut demotion_reads) =
+        (DocumentReads::default(), DocumentReads::default());
     while let Some(merged) =
         writer.merge_if_needed_verified(&view, &Budget::unbounded(), &mut reader)?
     {
         crate::trigram::check_disk()?;
         merges += 1;
+        graduation_reads.add(merged.graduation_reads);
+        demotion_reads.add(merged.demotion_reads);
         demoted += merged.records_added;
         purged += merged.records_removed;
         graduated += merged.records_graduated;
@@ -333,6 +345,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
         "steady_document_read_bytes",
         document_bytes.get().to_string(),
     );
+    read_lines(&mut report, "steady_", graduation_reads, demotion_reads);
     document_reads.set(0);
     document_bytes.set(0);
     let steady = shape(&writer.view())?;
@@ -365,6 +378,12 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
             merged.records_graduated.to_string(),
         );
         line(&mut report, "full_merge_inputs", merged.inputs.to_string());
+        read_lines(
+            &mut report,
+            "full_",
+            merged.graduation_reads,
+            merged.demotion_reads,
+        );
         line(
             &mut report,
             "full_merge_read_bytes",
@@ -514,8 +533,10 @@ impl Options {
                         Some("c1") => ferret_index::segment::RUN_CODEC,
                         Some("c2") => ferret_index::segment::GRADUATION_CODEC,
                         Some("c3") => ferret_index::segment::OFFSET_CODEC,
+                        Some("c4a") => ferret_index::segment::KEPT_RECORD_CODEC,
+                        Some("c4b") => ferret_index::segment::UNREAD_CODEC,
                         Some("1") => DICTIONARY_CODEC,
-                        _ => return Err("codec must be 1, h, c1, c2 or c3".into()),
+                        _ => return Err("codec must be 1, h, c1, c2, c3, c4a or c4b".into()),
                     }
                 }
                 "--corpus" => {
@@ -748,6 +769,8 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
     let cpu_start = crate::segment_build::cpu_seconds()?;
     let (mut document_reads, mut document_bytes, mut graduated, mut merge_cpu) =
         (0u64, 0u64, 0u64, 0f64);
+    let (mut graduation_reads, mut demotion_reads) =
+        (DocumentReads::default(), DocumentReads::default());
     for round in 0..rounds {
         crate::trigram::check_disk()?;
         let (mut added, mut removed) = (0, 0);
@@ -807,6 +830,8 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
             added += merged.records_added;
             removed += merged.records_removed;
             graduated += merged.records_graduated;
+            graduation_reads.add(merged.graduation_reads);
+            demotion_reads.add(merged.demotion_reads);
             merge_written += merged.written;
             term_merge_written += merged.segment.as_ref().map_or(0, |s| s.bytes);
         }
@@ -836,6 +861,13 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
     line("merge_document_reads", document_reads.to_string());
     line("merge_document_read_bytes", document_bytes.to_string());
     line("graduated_records", graduated.to_string());
+    for (key, reads) in [
+        ("graduation", graduation_reads),
+        ("demotion", demotion_reads),
+    ] {
+        line(&format!("merge_{key}_reads"), reads.count.to_string());
+        line(&format!("merge_{key}_read_bytes"), reads.bytes.to_string());
+    }
     line("rounds", rounds.to_string());
     line("births_per_round", BIRTHS.to_string());
     line("death_chance_per_round", format!("1/{DEATH}"));
@@ -919,6 +951,13 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
         println!("churn_full_demoted_records: {}", merged.records_added);
         println!("churn_full_purged_records: {}", merged.records_removed);
         println!("churn_full_graduated_records: {}", merged.records_graduated);
+        for (key, reads) in [
+            ("graduation", merged.graduation_reads),
+            ("demotion", merged.demotion_reads),
+        ] {
+            println!("churn_full_{key}_reads: {}", reads.count);
+            println!("churn_full_{key}_read_bytes: {}", reads.bytes);
+        }
     }
     println!(
         "churn_full_index_bytes: {}",

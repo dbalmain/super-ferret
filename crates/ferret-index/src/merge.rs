@@ -113,6 +113,11 @@ pub fn stream<R: ReadAt>(
 /// A real streaming merge with an indexed-version document reader. Only
 /// confirmed records become exact dictionary occurrences. Failed reads keep
 /// their records; collisions sharing one record also keep it.
+///
+/// Codecs 4 and 5 graduate records; codecs 5 and 6 read a demoted term's
+/// document to recover its first offset. Codec 7 never calls `read`: its
+/// records stay records, and a demoted term's record has an unknown offset,
+/// which queries answer with a full check.
 pub fn stream_verified<R: ReadAt>(
     inputs: &[Segment<R>],
     live: &DocSet,
@@ -121,16 +126,23 @@ pub fn stream_verified<R: ReadAt>(
     cancelled: &dyn Fn() -> bool,
     read: &mut crate::segment::DocumentReader<'_>,
 ) -> Result<Sizes, Error> {
-    use crate::segment::{GRADUATION_CODEC, OFFSET_CODEC, verify_record};
-    let graduate = matches!(writer.codec(), GRADUATION_CODEC | OFFSET_CODEC);
-    let offsets = writer.codec() == OFFSET_CODEC;
+    use crate::segment::{
+        DocumentReads, GRADUATION_CODEC, KEPT_RECORD_CODEC, OFFSET_CODEC, verify_record,
+    };
+    let codec = writer.codec();
+    let graduate = matches!(codec, GRADUATION_CODEC | OFFSET_CODEC);
+    let recover = matches!(codec, OFFSET_CODEC | KEPT_RECORD_CODEC);
+    let (mut graduation_reads, mut demotion_reads) =
+        (DocumentReads::default(), DocumentReads::default());
     let mut batch = if graduate {
-        graduation::collect(inputs, live, offsets, read, cancelled)?
+        let mut read = graduation_reads.counting(read);
+        graduation::collect(inputs, live, codec == OFFSET_CODEC, &mut read, cancelled)?
     } else {
         Vec::new()
     }
     .into_iter()
     .peekable();
+    let mut demotion_read = demotion_reads.counting(read);
     let mut graduated = HashSet::new();
     let mut bytes = Vec::new();
     let mut cursors: Vec<Terms<'_, R>> = inputs.iter().map(Segment::terms).collect();
@@ -194,8 +206,11 @@ pub fn stream_verified<R: ReadAt>(
             if docs.len() > 1 {
                 graduated.extend(confirmed);
             }
-            let offset = if offsets && docs.len() == 1 {
-                verify_record(docs[0], &term, None, false, read, &mut bytes).map(|v| v.offset)
+            // Every input dictionary entry has df > 1, so a single document
+            // here is a demotion.
+            let offset = if recover && docs.len() == 1 {
+                verify_record(docs[0], &term, None, false, &mut demotion_read, &mut bytes)
+                    .map(|v| v.offset)
             } else {
                 None
             };
@@ -240,6 +255,9 @@ pub fn stream_verified<R: ReadAt>(
     sizes.records_added = sizes.records.saturating_sub(carried);
     sizes.records_removed = removed;
     sizes.records_graduated = graduated.len() as u64;
+    drop(demotion_read);
+    sizes.graduation_reads = graduation_reads;
+    sizes.demotion_reads = demotion_reads;
     Ok(sizes)
 }
 

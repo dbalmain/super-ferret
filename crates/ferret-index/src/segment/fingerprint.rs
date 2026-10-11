@@ -4,7 +4,7 @@
 //! which reads one block back. The run lookup and the record stream that
 //! use them are on [`super::Segment`].
 
-use super::{FINGERPRINT_CODEC, OFFSET_CODEC, put, take, u32_at};
+use super::{FINGERPRINT_CODEC, put, stores_offsets, take, u32_at};
 
 /// A fingerprint occurrence. The byte offset is a hint, never evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,7 +106,7 @@ impl Encoder {
                 if i != 0 {
                     put(u64::from(record.doc - doc), &mut self.bytes);
                 }
-                if self.codec == OFFSET_CODEC {
+                if stores_offsets(self.codec) {
                     put(
                         record.offset.map_or(0, |o| u64::from(o) + 1),
                         &mut self.bytes,
@@ -340,7 +340,7 @@ fn decode_runs(
                     return None;
                 }
             }
-            let offset = if codec == OFFSET_CODEC {
+            let offset = if stores_offsets(codec) {
                 let value = take(bytes, &mut at)?;
                 if value == 0 {
                     None

@@ -23,8 +23,8 @@ use intpack::pfor128skip;
 
 use super::fingerprint::{Encoder, Record, fingerprint};
 use super::{
-    ALL, BLOCK, CHUNK, DICTIONARY_CODEC, FIELDS, FORMAT_VERSION, MAGIC, POSTINGS_CODEC, Section,
-    WriteError, checksum, chunk_sums, head_len, put, sections,
+    ALL, BLOCK, CHUNK, DICTIONARY_CODEC, DocumentReads, FIELDS, FORMAT_VERSION, MAGIC,
+    POSTINGS_CODEC, Section, WriteError, checksum, chunk_sums, head_len, put, sections,
 };
 
 /// What a finished segment holds, in bytes and counts, for measurement.
@@ -56,6 +56,10 @@ pub struct Sizes {
     pub records_removed: u64,
     /// Records safely removed after becoming dictionary occurrences.
     pub records_graduated: u64,
+    /// Merge-time document reads made to graduate records.
+    pub graduation_reads: DocumentReads,
+    /// Merge-time document reads made to recover a demoted term's offset.
+    pub demotion_reads: DocumentReads,
 }
 
 impl Sizes {
@@ -93,6 +97,8 @@ impl Sizes {
         self.records_added += other.records_added;
         self.records_removed += other.records_removed;
         self.records_graduated += other.records_graduated;
+        self.graduation_reads.add(other.graduation_reads);
+        self.demotion_reads.add(other.demotion_reads);
     }
 }
 

@@ -188,6 +188,10 @@ pub struct Merged {
     pub records_removed: u64,
     /// Records replaced by verified dictionary occurrences.
     pub records_graduated: u64,
+    /// Document reads made to graduate records.
+    pub graduation_reads: crate::segment::DocumentReads,
+    /// Document reads made to recover demoted terms' offsets.
+    pub demotion_reads: crate::segment::DocumentReads,
     /// The merged segment; `None` when every input document was dead and
     /// the inputs were simply dropped.
     pub segment: Option<SegmentEntry>,
@@ -573,7 +577,8 @@ impl IndexWriter {
         })
     }
 
-    /// Full merge with version-checked graduation for codecs 4 and 5.
+    /// Full merge with version-checked reads for codecs 4–6
+    /// (merge::stream_verified).
     pub fn merge_all_verified(
         &mut self,
         catalog: &CatalogView,
@@ -694,7 +699,7 @@ impl IndexWriter {
                     }
                     let mut failed = None;
                     tokenize(&bytes, &mut scratch, |token| {
-                        let added = if self.codec == crate::segment::OFFSET_CODEC
+                        let added = if crate::segment::stores_offsets(self.codec)
                             && let Ok(offset) = u32::try_from(token.run.start)
                         {
                             inverter.add_at(doc, cap(token.bytes), offset)
@@ -847,6 +852,8 @@ impl IndexWriter {
                 records_added: 0,
                 records_removed: input_records,
                 records_graduated: 0,
+                graduation_reads: Default::default(),
+                demotion_reads: Default::default(),
                 segment: None,
             }));
         }
@@ -878,7 +885,7 @@ impl IndexWriter {
         let number = manifest.next_number;
         let scratch = self.dir.join(format!("tmp-{number}.postings"));
         let codec = self.codec;
-        let mut changes = (0, 0, 0);
+        let mut changes = Sizes::default();
         let result = Self::write_pair(
             &self.dir,
             &mut manifest,
@@ -914,11 +921,7 @@ impl IndexWriter {
                 let _ = fs::remove_file(&scratch);
                 let sizes = result?;
                 if !tri {
-                    changes = (
-                        sizes.records_added,
-                        sizes.records_removed,
-                        sizes.records_graduated,
-                    );
+                    changes = sizes;
                 }
                 Ok(sizes)
             },
@@ -940,9 +943,11 @@ impl IndexWriter {
             read,
             written: entry.total_bytes(),
             purged,
-            records_added: changes.0,
-            records_removed: changes.1,
-            records_graduated: changes.2,
+            records_added: changes.records_added,
+            records_removed: changes.records_removed,
+            records_graduated: changes.records_graduated,
+            graduation_reads: changes.graduation_reads,
+            demotion_reads: changes.demotion_reads,
             segment: Some(entry),
         }))
     }

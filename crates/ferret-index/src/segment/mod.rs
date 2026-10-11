@@ -109,7 +109,7 @@ pub use fingerprint::{RECORD_BLOCK, Record, fingerprint};
 pub use invert::Inverter;
 pub use read::{Hit, Info, PostingCursor, Postings, ReadAt, Segment, TermEntry, Terms};
 pub use trigram::TrigramInverter;
-pub use verify::{DocumentReader, Verified, Window, token_at, verify_record};
+pub use verify::{DocumentReader, DocumentReads, Verified, Window, token_at, verify_record};
 pub use write::{Sizes, Writer};
 
 const MAGIC: [u8; 8] = *b"ferretsg";
@@ -131,6 +131,17 @@ pub const RUN_CODEC: u32 = 3;
 pub const GRADUATION_CODEC: u32 = 4;
 /// D65 C3: run records with first token offsets and checked graduation.
 pub const OFFSET_CODEC: u32 = 5;
+/// D65 C4a: codec 5's records without graduation. A demoted term's first
+/// offset is recovered by a checked full read.
+pub const KEPT_RECORD_CODEC: u32 = 6;
+/// D65 C4b: codec 5's records without graduation or any merge-time read.
+/// A demoted term's record carries the unknown-offset hint.
+pub const UNREAD_CODEC: u32 = 7;
+
+/// Whether `codec`'s records carry a first-offset hint (codecs 5–7).
+pub const fn stores_offsets(codec: u32) -> bool {
+    matches!(codec, OFFSET_CODEC | KEPT_RECORD_CODEC | UNREAD_CODEC)
+}
 
 /// `pfor128skip` doc ids relative to the segment's first DocId, no
 /// frequencies (D61 B).
@@ -183,7 +194,8 @@ const SECTIONS_H: [Section; 6] = [
 fn sections(codec: u32) -> Option<&'static [Section]> {
     match codec {
         DICTIONARY_CODEC => Some(&SECTIONS),
-        FINGERPRINT_CODEC | RUN_CODEC | GRADUATION_CODEC | OFFSET_CODEC => Some(&SECTIONS_H),
+        FINGERPRINT_CODEC | RUN_CODEC | GRADUATION_CODEC | OFFSET_CODEC | KEPT_RECORD_CODEC
+        | UNREAD_CODEC => Some(&SECTIONS_H),
         _ => None,
     }
 }
@@ -237,8 +249,8 @@ impl fmt::Display for ReadError {
                 postings,
             } => write!(
                 f,
-                "segment codecs {dictionary}/{postings}, expected {DICTIONARY_CODEC} or \
-                 {FINGERPRINT_CODEC}, {RUN_CODEC}, {GRADUATION_CODEC} or {OFFSET_CODEC}/{POSTINGS_CODEC}"
+                "segment codecs {dictionary}/{postings}, expected {DICTIONARY_CODEC} to \
+                 {UNREAD_CODEC}/{POSTINGS_CODEC}"
             ),
             Self::Head => write!(f, "segment head corrupt"),
             Self::Layout => write!(f, "segment truncated or corrupt: bad section table"),
