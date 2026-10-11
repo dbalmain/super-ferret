@@ -9,10 +9,11 @@ pub(super) enum Variant {
     Sparse { frequency: bool, cap: usize },
     Fixed(usize),
     Word4,
+    Word45,
 }
 
 impl Variant {
-    pub(super) const ALL: [Self; 8] = [
+    pub(super) const ALL: [Self; 9] = [
         Self::Trigram,
         Self::Sparse {
             frequency: false,
@@ -33,6 +34,7 @@ impl Variant {
         Self::Fixed(4),
         Self::Fixed(8),
         Self::Word4,
+        Self::Word45,
     ];
 
     pub(super) fn label(self) -> String {
@@ -46,6 +48,7 @@ impl Variant {
             }
             Self::Fixed(length) => format!("fixed-{length}"),
             Self::Word4 => "word-fixed-4".into(),
+            Self::Word45 => "word-fixed-4+5".into(),
         }
     }
 }
@@ -94,9 +97,11 @@ pub(super) fn extract<'a>(
             bytes.windows(length).for_each(emit);
             return;
         }
-        Variant::Word4 => {
+        Variant::Word4 | Variant::Word45 => {
             bytes.windows(3).for_each(&mut emit);
-            bytes.windows(4).filter(|gram| word(gram)).for_each(emit);
+            for length in 4..=if matches!(variant, Variant::Word4) { 4 } else { 5 } {
+                bytes.windows(length).filter(|gram| word(gram)).for_each(&mut emit);
+            }
             return;
         }
         Variant::Sparse { cap, .. } => cap,
@@ -160,9 +165,11 @@ pub(super) fn extract_partition<'a>(
             }
             return;
         }
-        Variant::Word4 => {
-            for gram in bytes.windows(3).chain(bytes.windows(4).filter(|gram| word(gram)))
-                .filter(|gram| gram[0] >> 3 == partition) { emit(gram); }
+        Variant::Word4 | Variant::Word45 => {
+            for gram in bytes.windows(3).filter(|gram| gram[0] >> 3 == partition) { emit(gram); }
+            for length in 4..=if matches!(variant, Variant::Word4) { 4 } else { 5 } {
+                for gram in bytes.windows(length).filter(|gram| gram[0] >> 3 == partition && word(gram)) { emit(gram); }
+            }
             return;
         }
         Variant::Sparse { cap, .. } => cap,

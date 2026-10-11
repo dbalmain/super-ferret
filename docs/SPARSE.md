@@ -146,3 +146,16 @@ falls back to trigrams. It is therefore sound for punctuation, partial UTF-8,
 and Unicode case alternatives. It measures whether concentrating long keys
 on word literals removes much of the full raw-byte dictionary cost. The new
 control's regression and measurements are pending; checkpoint is WIP.
+
+Hash cap 32 is complete and passes all 250 oracle checks. It uses
+**268,757,928 keys**, **3,722,459,430 total bytes**, and **1,154.94 CPU s**.
+Its headline candidate medians/p90s equal cap 8 in every class; doubling the
+length cap has not bought headline selectivity. Frequency cap 8 is running.
+
+The word-only control also includes a 4+5-gram arm. Every M5 rare literal has
+at least five bytes, so this tests fixed interior coverage where sparse
+endpoint choices can leave a short literal with only three- or four-byte keys.
+Word-only 4-grams remain the smaller control and cover four-byte identifier
+ends. Both retain all raw trigrams and apply the same local predicate to query
+keys, including fallback for punctuation and partial UTF-8. No whole-word
+boundary is required: regex substrings inside an identifier remain candidates.
