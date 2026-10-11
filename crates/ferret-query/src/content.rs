@@ -160,6 +160,20 @@ impl TextAtom {
         &self.text
     }
 
+    /// A cheap verification hint for a single exact normalised token only.
+    fn offset(&self, doc: u32) -> Option<(&[u8], u32)> {
+        let term = self.text.whole()?;
+        if self.text.is_case_sensitive()
+            || !exact_under_cap(term)
+            || self.text.units().len() != 1
+            || self.text.units().next() != Some(term)
+        {
+            return None;
+        }
+        let Candidates::Postings(postings) = self.whole.as_ref()?.as_ref()?;
+        postings.offset(doc).map(|offset| (term, offset))
+    }
+
     /// The atom's cursor tree over `pinned`, uncovered documents included
     /// as Maybe. Liveness is not applied: the planner filters the whole
     /// content tree once ([`Pinned::top`]).
@@ -256,6 +270,13 @@ pub(crate) enum ReadAtom {
 }
 
 impl ReadAtom {
+    pub(crate) fn offset(&self, doc: u32) -> Option<(&[u8], u32)> {
+        match self {
+            Self::Text(atom) => atom.offset(doc),
+            Self::Grep(_) => None,
+        }
+    }
+
     pub(crate) fn cursor_until<'a>(
         &'a self,
         pinned: &'a Pinned<'_>,

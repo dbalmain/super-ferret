@@ -27,7 +27,7 @@
 //! 31 segments.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::ops::Range;
 
 use crate::live::DocSet;
@@ -101,10 +101,29 @@ pub fn choose(
 pub fn stream<R: ReadAt>(
     inputs: &[Segment<R>],
     live: &DocSet,
-    mut writer: Writer,
+    writer: Writer,
     pace: &dyn Fn(usize) -> std::io::Result<()>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Sizes, Error> {
+    stream_verified(inputs, live, writer, pace, cancelled, &mut |_, _, _| None)
+}
+
+/// A real streaming merge with an indexed-version document reader. Only
+/// confirmed records become exact dictionary occurrences. Failed reads keep
+/// their records; collisions sharing one record also keep it.
+pub fn stream_verified<R: ReadAt>(
+    inputs: &[Segment<R>],
+    live: &DocSet,
+    mut writer: Writer,
+    pace: &dyn Fn(usize) -> std::io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+    read: &mut crate::segment::DocumentReader<'_>,
+) -> Result<Sizes, Error> {
+    use crate::segment::{GRADUATION_CODEC, OFFSET_CODEC, verify_record};
+    let graduate = matches!(writer.codec(), GRADUATION_CODEC | OFFSET_CODEC);
+    let offsets = writer.codec() == OFFSET_CODEC;
+    let mut graduated = HashSet::new();
+    let mut bytes = Vec::new();
     let mut cursors: Vec<Terms<'_, R>> = inputs.iter().map(Segment::terms).collect();
     // Each input's current entry; the heap orders (term, input), so equal
     // terms pop in input order, which is range order.
@@ -146,8 +165,41 @@ pub fn stream<R: ReadAt>(
                 heap.push(Reverse((term, j)));
             }
         }
+        let mut confirmed = Vec::new();
+        if graduate {
+            for input in inputs {
+                for record in input.fingerprint_hits_until(&term, cancelled)? {
+                    if !live.contains(record.doc) {
+                        continue;
+                    }
+                    if let Some(verified) = verify_record(
+                        record.doc,
+                        &term,
+                        if offsets { record.offset } else { None },
+                        offsets && record.offset.is_some(),
+                        read,
+                        &mut bytes,
+                    ) {
+                        docs.push(record.doc);
+                        if verified.removable {
+                            confirmed.push(record.key());
+                        }
+                    }
+                }
+            }
+            docs.sort_unstable();
+            docs.dedup();
+        }
         if !docs.is_empty() {
-            writer.push(&term, &docs)?;
+            if docs.len() > 1 {
+                graduated.extend(confirmed);
+            }
+            let offset = if offsets && docs.len() == 1 {
+                verify_record(docs[0], &term, None, false, read, &mut bytes).map(|v| v.offset)
+            } else {
+                None
+            };
+            writer.push_at(&term, &docs, offset)?;
             writer.spill(pace)?;
             if !midway {
                 midway = true;
@@ -158,7 +210,7 @@ pub fn stream<R: ReadAt>(
     let mut records: Vec<_> = inputs.iter().map(Segment::records).collect();
     let mut heap = BinaryHeap::new();
     for (i, cursor) in records.iter_mut().enumerate() {
-        if let Some(record) = cursor.next_record()? {
+        if let Some(record) = cursor.next_positioned_record()? {
             heap.push(Reverse((record, i)));
         }
     }
@@ -168,22 +220,26 @@ pub fn stream<R: ReadAt>(
         if cancelled() {
             return Err(Error::Cancelled);
         }
-        if live.contains(record.1) && previous != Some(record) {
+        if live.contains(record.doc)
+            && !graduated.contains(&record.key())
+            && previous != Some(record.key())
+        {
             carried += 1;
-            writer.push_record(record.0, record.1)?;
+            writer.push_positioned_record(record)?;
             writer.spill(pace)?;
-            previous = Some(record);
+            previous = Some(record.key());
         }
-        if !live.contains(record.1) {
+        if !live.contains(record.doc) {
             removed += 1;
         }
-        if let Some(record) = records[i].next_record()? {
+        if let Some(record) = records[i].next_positioned_record()? {
             heap.push(Reverse((record, i)));
         }
     }
     let mut sizes = writer.finish_spilled(pace)?;
     sizes.records_added = sizes.records.saturating_sub(carried);
     sizes.records_removed = removed;
+    sizes.records_graduated = graduated.len() as u64;
     Ok(sizes)
 }
 

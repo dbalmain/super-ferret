@@ -49,6 +49,10 @@ const INODES_PER_DOC: (u64, u64) = (6, 5);
 pub enum ReadRequest<'a> {
     /// A cheap stat against the catalog key; never reads content bytes.
     Stat,
+    /// Confirms a token at an untrusted offset with a small version-checked
+    /// window. Return Catalogued only on a positive normalised token match;
+    /// None means the caller must perform its ordinary full-byte check.
+    TokenAt { term: &'a [u8], offset: u32 },
     /// A stable, bracketed read, replacing the output buffer.
     Bytes(&'a mut Vec<u8>),
 }
@@ -492,7 +496,19 @@ impl Query {
                 } else {
                     let verification_start = Instant::now();
                     report.verified += 1;
-                    let Some(version) = read(row.name, ReadRequest::Bytes(&mut bytes)) else {
+                    let hint = (read_atoms.len() == 1)
+                        .then(|| read_atoms[0].offset(doc))
+                        .flatten();
+                    let positive = hint.filter(|&(term, offset)| {
+                        read(row.name, ReadRequest::TokenAt { term, offset })
+                            == Some(ReadVersion::Catalogued)
+                    });
+                    let version = if positive.is_some() {
+                        Some(ReadVersion::Catalogued)
+                    } else {
+                        read(row.name, ReadRequest::Bytes(&mut bytes))
+                    };
+                    let Some(version) = version else {
                         report.verification_time += verification_start.elapsed();
                         report.changed += 1;
                         return ControlFlow::Continue(());
@@ -505,7 +521,10 @@ impl Query {
                                 return None;
                             }
                             let engine_start = Instant::now();
-                            let answer = text.find(&mut matcher, &bytes);
+                            let answer = positive.map_or_else(
+                                || text.find(&mut matcher, &bytes),
+                                |(_, offset)| Some(offset as usize),
+                            );
                             if matches!(text, crate::ContentAtom::Grep(_)) {
                                 report.regex_time += engine_start.elapsed();
                                 report.matching.regex_documents += 1;

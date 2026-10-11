@@ -15,11 +15,20 @@ const PER_TERM: usize = 64;
 /// the bound the caller set.
 #[derive(Debug)]
 pub struct Inverter {
-    terms: HashMap<Box<[u8]>, Vec<u32>>,
+    terms: HashMap<Box<[u8]>, Occurrences>,
     memory: usize,
     bound: usize,
     last: Option<u32>,
     payload_capacity: usize,
+}
+
+/// The offset matters only if this term remains a singleton. Keeping it
+/// beside the list avoids a second copy of every key for codec 5. The
+/// existing 64-byte per-term flush charge includes this header.
+#[derive(Debug, Default)]
+struct Occurrences {
+    docs: Vec<u32>,
+    first_offset: Option<u32>,
 }
 
 impl Inverter {
@@ -38,11 +47,25 @@ impl Inverter {
     /// Records that `doc` holds `term`. `doc` must not be below any document
     /// added before; repeats of a `(doc, term)` pair are free.
     pub fn add(&mut self, doc: u32, term: &[u8]) -> Result<(), WriteError> {
+        self.add_occurrence(doc, term, None)
+    }
+
+    /// Adds an occurrence and remembers the first byte offset for codec 5.
+    pub fn add_at(&mut self, doc: u32, term: &[u8], offset: u32) -> Result<(), WriteError> {
+        self.add_occurrence(doc, term, Some(offset))
+    }
+
+    fn add_occurrence(
+        &mut self,
+        doc: u32,
+        term: &[u8],
+        offset: Option<u32>,
+    ) -> Result<(), WriteError> {
         if self.last.is_some_and(|last| doc < last) {
             return Err(WriteError::DocOrder);
         }
         self.last = Some(doc);
-        let docs = match self.terms.get_mut(term) {
+        let occurrences = match self.terms.get_mut(term) {
             Some(docs) => docs,
             None => {
                 self.memory += term.len() + PER_TERM;
@@ -50,6 +73,10 @@ impl Inverter {
                 self.terms.entry(term.into()).or_default()
             }
         };
+        if occurrences.docs.is_empty() {
+            occurrences.first_offset = offset;
+        }
+        let docs = &mut occurrences.docs;
         if docs.last() != Some(&doc) {
             let capacity = docs.capacity();
             docs.push(doc);
@@ -76,12 +103,12 @@ impl Inverter {
             return 0;
         }
         let buckets = (self.terms.capacity() + 1).next_power_of_two();
-        buckets * (size_of::<(Box<[u8]>, Vec<u32>)>() + 1) + 16
+        buckets * (size_of::<(Box<[u8]>, Occurrences)>() + 1) + 16
     }
 
     /// Capacity charge including the vector of entries needed at drain.
     pub fn flush_bytes(&self) -> usize {
-        self.allocated_bytes() + self.terms.len() * size_of::<(Box<[u8]>, Vec<u32>)>()
+        self.allocated_bytes() + self.terms.len() * size_of::<(Box<[u8]>, Occurrences)>()
     }
 
     /// Whether the estimate has reached the bound.
@@ -145,13 +172,14 @@ impl Inverter {
         let payload = self.payload_capacity;
         let mut terms: Vec<_> = self.terms.drain().collect();
         let allocated =
-            payload + self.table_bytes() + terms.capacity() * size_of::<(Box<[u8]>, Vec<u32>)>();
+            payload + self.table_bytes() + terms.capacity() * size_of::<(Box<[u8]>, Occurrences)>();
         self.memory = 0;
         self.payload_capacity = 0;
         self.last = None;
         terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (term, docs) in &terms {
-            let bytes = writer.push(term, docs)?;
+        for (term, occurrences) in &terms {
+            let docs = &occurrences.docs;
+            let bytes = writer.push_at(term, docs, occurrences.first_offset)?;
             on_entry(term, docs, bytes);
             observe(allocated + writer.allocated_bytes());
         }

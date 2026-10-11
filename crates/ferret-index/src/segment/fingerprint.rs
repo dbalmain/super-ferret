@@ -4,7 +4,21 @@
 //! which reads one block back. The run lookup and the record stream that
 //! use them are on [`super::Segment`].
 
-use super::{put, take, u32_at};
+use super::{FINGERPRINT_CODEC, OFFSET_CODEC, put, take, u32_at};
+
+/// A fingerprint occurrence. The byte offset is a hint, never evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Record {
+    pub fingerprint: u32,
+    pub doc: u32,
+    pub offset: Option<u32>,
+}
+
+impl Record {
+    pub(crate) fn key(self) -> (u32, u32) {
+        (self.fingerprint, self.doc)
+    }
+}
 
 /// Records per restart block. A run of one fingerprint can start anywhere
 /// in a block and span any number of them.
@@ -48,13 +62,81 @@ pub(super) struct Encoder {
     records: u64,
     in_block: usize,
     last: Option<(u32, u32)>,
+    codec: u32,
+    block: Vec<Record>,
 }
 
 impl Encoder {
+    pub(super) fn new(codec: u32) -> Self {
+        Self {
+            codec,
+            ..Self::default()
+        }
+    }
+
+    /// Flushes the final partial restart block before writing its sections.
+    pub(super) fn finish(&mut self) {
+        self.flush_block();
+    }
+
+    fn flush_block(&mut self) {
+        if self.block.is_empty() {
+            return;
+        }
+        self.index
+            .extend_from_slice(&self.block[0].fingerprint.to_le_bytes());
+        self.index
+            .extend_from_slice(&(self.len() as u32).to_le_bytes());
+        let mut at = 0;
+        let mut previous = 0;
+        while at < self.block.len() {
+            let first = self.block[at];
+            let end = at + self.block[at..].partition_point(|r| r.fingerprint == first.fingerprint);
+            if at == 0 {
+                self.bytes
+                    .extend_from_slice(&first.fingerprint.to_le_bytes());
+                self.bytes.extend_from_slice(&first.doc.to_le_bytes());
+            } else {
+                put(u64::from(first.fingerprint - previous), &mut self.bytes);
+                put(u64::from(first.doc), &mut self.bytes);
+            }
+            put((end - at) as u64, &mut self.bytes);
+            let mut doc = first.doc;
+            for (i, record) in self.block[at..end].iter().enumerate() {
+                if i != 0 {
+                    put(u64::from(record.doc - doc), &mut self.bytes);
+                }
+                if self.codec == OFFSET_CODEC {
+                    put(
+                        record.offset.map_or(0, |o| u64::from(o) + 1),
+                        &mut self.bytes,
+                    );
+                }
+                doc = record.doc;
+            }
+            previous = first.fingerprint;
+            at = end;
+        }
+        self.block.clear();
+    }
+
     /// Appends record `(fp, offset)`, where `offset` is `doc - first`.
     /// Returns false, adding nothing, when it does not sort strictly after
     /// the previous record.
-    pub(super) fn push(&mut self, fp: u32, offset: u32) -> bool {
+    pub(super) fn push(&mut self, record: Record) -> bool {
+        let (fp, offset) = record.key();
+        if self.codec != FINGERPRINT_CODEC {
+            if self.last.is_some_and(|last| (fp, offset) <= last) {
+                return false;
+            }
+            self.block.push(record);
+            self.last = Some((fp, offset));
+            self.records += 1;
+            if self.block.len() == RECORD_BLOCK {
+                self.flush_block();
+            }
+            return true;
+        }
         if self.last.is_some_and(|last| (fp, offset) <= last) {
             return false;
         }
@@ -105,7 +187,7 @@ impl Encoder {
     }
 
     pub(super) fn allocated_bytes(&self) -> usize {
-        self.bytes.capacity() + self.index.capacity()
+        self.bytes.capacity() + self.index.capacity() + self.block.capacity() * size_of::<Record>()
     }
 }
 
@@ -178,8 +260,12 @@ pub(super) fn decode_block(
     first_fp: u32,
     count: usize,
     span: u32,
-    mut each: impl FnMut(u32, u32) -> bool,
+    codec: u32,
+    mut each: impl FnMut(Record) -> bool,
 ) -> Option<()> {
+    if codec != FINGERPRINT_CODEC {
+        return decode_runs(bytes, first_fp, count, span, codec, each);
+    }
     if bytes.len() < 8 {
         return None;
     }
@@ -198,9 +284,81 @@ pub(super) fn decode_block(
             fp = fp.checked_add(delta)?;
             offset = next;
         }
-        if !each(fp, offset) {
+        if !each(Record {
+            fingerprint: fp,
+            doc: offset,
+            offset: None,
+        }) {
             return Some(());
         }
+    }
+    (at == bytes.len()).then_some(())
+}
+
+/// Each restart block splits runs at its boundary: no decoder needs an
+/// earlier block's fingerprint or document base.
+fn decode_runs(
+    bytes: &[u8],
+    first_fp: u32,
+    count: usize,
+    span: u32,
+    codec: u32,
+    mut each: impl FnMut(Record) -> bool,
+) -> Option<()> {
+    if bytes.len() < 9 {
+        return None;
+    }
+    let (mut fp, mut doc) = (u32_at(bytes, 0), u32_at(bytes, 4));
+    if fp != first_fp || doc > span {
+        return None;
+    }
+    let (mut at, mut seen) = (8, 0);
+    while seen < count {
+        if seen > 0 {
+            let delta = u32::try_from(take(bytes, &mut at)?).ok()?;
+            if delta == 0 {
+                return None;
+            }
+            fp = fp.checked_add(delta)?;
+            doc = u32::try_from(take(bytes, &mut at)?).ok()?;
+            if doc > span {
+                return None;
+            }
+        }
+        let run = usize::try_from(take(bytes, &mut at)?).ok()?;
+        if run == 0 || run > count - seen {
+            return None;
+        }
+        for i in 0..run {
+            if i > 0 {
+                let delta = u32::try_from(take(bytes, &mut at)?).ok()?;
+                if delta == 0 {
+                    return None;
+                }
+                doc = doc.checked_add(delta)?;
+                if doc > span {
+                    return None;
+                }
+            }
+            let offset = if codec == OFFSET_CODEC {
+                let value = take(bytes, &mut at)?;
+                if value == 0 {
+                    None
+                } else {
+                    Some(u32::try_from(value - 1).ok()?)
+                }
+            } else {
+                None
+            };
+            if !each(Record {
+                fingerprint: fp,
+                doc,
+                offset,
+            }) {
+                return Some(());
+            }
+        }
+        seen += run;
     }
     (at == bytes.len()).then_some(())
 }

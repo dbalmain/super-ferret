@@ -407,6 +407,19 @@ impl<R: ReadAt> Segment<R> {
         term: &[u8],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<u32>, ReadError> {
+        Ok(self
+            .fingerprint_hits_until(term, cancelled)?
+            .into_iter()
+            .map(|r| r.doc)
+            .collect())
+    }
+
+    /// Matching records, retaining their untrusted byte-offset hints.
+    pub fn fingerprint_hits_until(
+        &self,
+        term: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<super::Record>, ReadError> {
         if cancelled() {
             return Err(ReadError::Cancelled);
         }
@@ -420,9 +433,10 @@ impl<R: ReadAt> Segment<R> {
                 return Err(ReadError::Cancelled);
             }
             let mut done = false;
-            self.record_block(b, |key, doc| {
+            self.record_block(b, |record| {
+                let key = record.fingerprint;
                 if key == fp {
-                    docs.push(doc);
+                    docs.push(record);
                 }
                 done = key > fp;
                 !done
@@ -437,7 +451,7 @@ impl<R: ReadAt> Segment<R> {
     fn record_block(
         &self,
         b: usize,
-        mut each: impl FnMut(u32, u32) -> bool,
+        mut each: impl FnMut(super::Record) -> bool,
     ) -> Result<(), ReadError> {
         let start = u64::from(self.fingerprints.starts[b]);
         let end = self
@@ -455,7 +469,11 @@ impl<R: ReadAt> Segment<R> {
             self.fingerprints.firsts[b],
             self.fingerprints.count(b),
             self.info.last - self.info.first,
-            |fp, doc| each(fp, self.info.first + doc),
+            self.codec(),
+            |mut record| {
+                record.doc += self.info.first;
+                each(record)
+            },
         )
         .ok_or(ReadError::Corrupt(Section::Fingerprints))
     }
@@ -752,19 +770,24 @@ impl<R: ReadAt> Terms<'_, R> {
 pub struct Records<'a, R> {
     segment: &'a Segment<R>,
     block: usize,
-    records: Vec<(u32, u32)>,
+    records: Vec<super::Record>,
     at: usize,
 }
 impl<R: ReadAt> Records<'_, R> {
     /// Advances the stream, checking the next block before decoding it.
     pub fn next_record(&mut self) -> Result<Option<(u32, u32)>, ReadError> {
+        Ok(self.next_positioned_record()?.map(super::Record::key))
+    }
+
+    /// Advances while retaining the offset hint used by codec 5.
+    pub fn next_positioned_record(&mut self) -> Result<Option<super::Record>, ReadError> {
         if self.at == self.records.len() {
             if self.block == self.segment.fingerprints.firsts.len() {
                 return Ok(None);
             }
             self.records.clear();
-            self.segment.record_block(self.block, |fp, doc| {
-                self.records.push((fp, doc));
+            self.segment.record_block(self.block, |record| {
+                self.records.push(record);
                 true
             })?;
             self.block += 1;

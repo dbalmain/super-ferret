@@ -20,6 +20,7 @@ pub struct Term {
     docs: u64,
     bytes: u64,
     records: u64,
+    offsets: Vec<(u32, u32)>,
 }
 
 /// The term's documents in one segment.
@@ -54,6 +55,7 @@ impl Term {
             docs: 0,
             bytes: 0,
             records: 0,
+            offsets: Vec::new(),
         };
         let mut floor = 0u64;
         for segment in segments {
@@ -70,7 +72,11 @@ impl Term {
                 return Err(ReadError::Cancelled);
             }
             let hit = entry.map(|entry| segment.read(&entry)).transpose()?;
-            let maybe = segment.fingerprint_docs_until(term, cancelled)?;
+            let records = segment.fingerprint_hits_until(term, cancelled)?;
+            found
+                .offsets
+                .extend(records.iter().filter_map(|r| r.offset.map(|o| (r.doc, o))));
+            let maybe: Vec<_> = records.into_iter().map(|r| r.doc).collect();
             found.records += maybe.len() as u64;
             found.docs += maybe.len() as u64;
             match &hit {
@@ -102,6 +108,14 @@ impl Term {
     /// Fingerprint records found, before unioning dictionary documents.
     pub fn records(&self) -> u64 {
         self.records
+    }
+
+    /// The untrusted first-offset hint for a record candidate.
+    pub fn offset(&self, doc: u32) -> Option<u32> {
+        self.offsets
+            .binary_search_by_key(&doc, |r| r.0)
+            .ok()
+            .map(|i| self.offsets[i].1)
     }
 
     /// Whether all candidates are known dictionary occurrences.

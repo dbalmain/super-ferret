@@ -308,7 +308,27 @@ impl Engine {
         let mut content = self.content.lock().map_err(|_| Error::WriterPanicked)?;
         let index = content.as_mut().ok_or(Error::NoContentIndex)?;
         let pin = self.pin();
-        let merged = index.merge_if_needed(&catalog_view(&view, pin.live()), budget);
+        let names = pin.doc_names().map_err(Error::Catalog)?;
+        let mut documents = ferret_crawl::Documents::by_name(&view).map_err(Error::Catalog)?;
+        let merged = index.merge_if_needed_verified(
+            &catalog_view(&view, pin.live()),
+            budget,
+            &mut |doc, offset, bytes| {
+                let name = *names.names(doc).first()?;
+                let start = if let Some(offset) = offset {
+                    documents
+                        .read_window_name(&view, name, offset, bytes)
+                        .ok()?
+                } else {
+                    documents.read_name(&view, name, bytes).ok()?;
+                    0
+                };
+                Some(ferret_index::segment::Window {
+                    start,
+                    complete: offset.is_none(),
+                })
+            },
+        );
         let published = index.view();
         drop(content);
         self.select_content(published);
@@ -500,6 +520,22 @@ impl QuerySession {
         let mut reader = ferret_crawl::Documents::by_name(catalog)?;
         let mut read = |name, request: ferret_query::ReadRequest<'_>| {
             let observed = match request {
+                ferret_query::ReadRequest::TokenAt { term, offset } => {
+                    let mut bytes = Vec::new();
+                    let start = reader
+                        .read_window_name(catalog, name, offset, &mut bytes)
+                        .ok()?;
+                    return ferret_index::segment::token_at(
+                        &bytes,
+                        ferret_index::segment::Window {
+                            start,
+                            complete: false,
+                        },
+                        offset,
+                        term,
+                    )
+                    .then_some(ferret_query::ReadVersion::Catalogued);
+                }
                 ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
                 ferret_query::ReadRequest::Bytes(out) => {
                     reader.read_current_name_until(catalog, name, out, &stopped)

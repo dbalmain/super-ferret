@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use ferret_catalog::{Catalog, Content, Stat, Transaction};
@@ -43,8 +44,11 @@ impl Fixture {
         let tree = self.base.join("tree");
         let mut transaction = Transaction::begin(&self.base.join("cat"), 1).unwrap();
         let mut batch = transaction.batch();
-        let root = batch.root(tree.as_os_str().as_bytes(), stat(1, 0o040_755, 0));
-        for (ino, &(name, bytes)) in (2..).zip(files) {
+        let root = batch.root(
+            tree.as_os_str().as_bytes(),
+            stat(&fs::metadata(&tree).unwrap()),
+        );
+        for &(name, bytes) in files {
             fs::write(tree.join(name), bytes).unwrap();
             let state = content
                 .iter()
@@ -53,7 +57,7 @@ impl Fixture {
                     || Content::Hashed(ferret_catalog::checkpoint_checksum(bytes)),
                     |&(_, state)| state,
                 );
-            let stat = stat(ino, 0o100_644, bytes.len() as u64);
+            let stat = stat(&fs::metadata(tree.join(name)).unwrap());
             batch.file(root, name.as_bytes(), stat, state);
         }
         transaction.add(batch);
@@ -67,13 +71,18 @@ impl Drop for Fixture {
     }
 }
 
-fn stat(ino: u64, mode: u32, size: u64) -> Stat {
+fn stat(meta: &fs::Metadata) -> Stat {
     Stat {
-        dev: 1,
-        ino,
-        size,
-        mode,
-        nlink: 1,
-        ..Stat::default()
+        dev: meta.dev(),
+        ino: meta.ino(),
+        size: meta.len(),
+        mode: meta.mode(),
+        nlink: meta.nlink(),
+        uid: meta.uid(),
+        gid: meta.gid(),
+        mtime_sec: meta.mtime(),
+        mtime_nsec: meta.mtime_nsec() as u32,
+        ctime_sec: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec() as u32,
     }
 }

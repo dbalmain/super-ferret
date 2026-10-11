@@ -4,7 +4,6 @@
 //! by DocId, and no source name or content is reported.
 
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -57,18 +56,24 @@ pub(crate) fn capture(catalog_dir: &Path, out: &Path) -> crate::Result<()> {
     fs::create_dir(out)?;
     fs::set_permissions(out, fs::Permissions::from_mode(0o700))?;
     let catalog = crate::open_catalog(catalog_dir)?;
+    catalog.load(&ferret_catalog::Section::INODE)?;
     let mut meta = catalog.generation().incarnation.to_vec();
     meta.extend_from_slice(&catalog.next_doc().0.to_le_bytes());
-    let mut path = Vec::new();
     let (mut count, mut bytes, mut missing) = (0u64, 0u64, 0u64);
     for document in hashed_documents(&catalog)? {
         if count.is_multiple_of(256) {
             crate::trigram::check_disk()?;
         }
-        path.clear();
-        catalog.path(document.name, &mut path);
-        match fs::read(Path::new(std::ffi::OsStr::from_bytes(&path))) {
-            Ok(content) if content.len() as u64 == document.size => {
+        let mut content = Vec::new();
+        match crate::document_read::read(
+            &catalog,
+            document.name,
+            document.doc.0,
+            None,
+            None,
+            &mut content,
+        ) {
+            Some(_) => {
                 fs::write(out.join(document.doc.0.to_string()), &content)?;
                 meta.extend_from_slice(&document.doc.0.to_le_bytes());
                 count += 1;

@@ -22,6 +22,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 use ferret_catalog::bulk::Limiter;
@@ -161,6 +162,43 @@ impl Documents {
         self.files_read += 1;
         self.bytes_read += out.len() as u64;
         Ok(())
+    }
+
+    /// Reads a small window around an offset, bracketed against the
+    /// catalogued version through the same no-follow walk as `read_name`.
+    /// Returns its absolute start. The hint may be wrong; hosts must verify
+    /// the token and fall back to a full read on uncertainty.
+    pub fn read_window_name(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        offset: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<u64, ContentFault> {
+        out.clear();
+        let (parent, bytes) = catalog.name_reader().edge(name);
+        let Target::Inode(inode) = catalog.name(name).target() else {
+            return Err(ContentFault::Changed);
+        };
+        let recorded = catalog.inode(inode).stat;
+        let dir = self.directory(catalog, parent)?;
+        let file = match Reader::open(dir.as_fd(), std::ffi::OsStr::from_bytes(bytes), &recorded) {
+            Opened::Ready { file, .. } => file,
+            Opened::Fault(fault) => return Err(fault),
+        };
+        let start = u64::from(offset).saturating_sub(256).min(recorded.size);
+        let len = (recorded.size - start).min(1280) as usize;
+        out.resize(len, 0);
+        if let Some(limiter) = self.limiter.as_deref() {
+            limiter.transfer(len, || file.read_exact_at(out, start))
+        } else {
+            file.read_exact_at(out, start)
+        }
+        .map_err(ContentFault::Read)?;
+        bracket(&file, &recorded, ferret_catalog::Content::Binary)?;
+        self.files_read += 1;
+        self.bytes_read += len as u64;
+        Ok(start)
     }
 
     /// Checks the file's version through its own fresh directory walk, with

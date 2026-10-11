@@ -10,12 +10,10 @@
 //! the dictionary's share, h (dictionary entries per distinct term, counted
 //! exactly by merging every segment's term stream) and the singleton share.
 //!
-//! Documents are read by path with a size check, as `segment-build` and
-//! `terms` read them, not through `ferret_crawl::Documents`' checked opens:
-//! `ferret-bench` has no `ferret-crawl` edge, and the extra syscalls
-//! (one `fstat` per document, one `openat` per directory change) are small
-//! beside the read and tokenize. A size mismatch or failed read is
-//! [`Fault::Unreadable`], as a checked open's refusal would be.
+//! Documents are read by path, bracketed against the full catalog version
+//! key before and after the read (`document_read`); the bench has no crawl
+//! edge. A changed or unreadable version is [`Fault::Unreadable`]. The real
+//! product also checks each parent directory through no-follow opens.
 //!
 //! `index-churn <out-dir> <rounds>` runs generated text only: each round
 //! adds documents, kills a share of the live ones, follows and merges. It
@@ -25,7 +23,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Write as _;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Instant;
 
@@ -176,6 +173,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
         return Err(format!("{} exists; the build wants a fresh index", out.display()).into());
     }
     let catalog = crate::open_catalog(dir)?;
+    catalog.load(&ferret_catalog::Section::INODE)?;
     let snapshot = options
         .corpus
         .as_ref()
@@ -197,31 +195,17 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     let (cpu_start, start) = (crate::segment_build::cpu_seconds()?, Instant::now());
     let io_start = io_counters()?;
     let mut writer = IndexWriter::open_with_codec(out, &view, options.codec)?;
-    let (mut path, mut content_bytes, mut docs, mut unreadable, mut passes) =
-        (Vec::new(), 0u64, 0u64, 0u64, 0u64);
+    let (mut content_bytes, mut docs, mut unreadable, mut passes) = (0u64, 0u64, 0u64, 0u64);
     let mut written = 0u64;
     loop {
         crate::trigram::check_disk()?;
         let followed = writer.follow(&view, &Budget::unbounded(), &mut |doc, bytes| {
-            let Some(&(name, size)) = named.get(&doc) else {
+            let Some(&(name, _)) = named.get(&doc) else {
                 return Err(Fault::Unreadable);
             };
-            if let Some(snapshot) = &snapshot {
-                if !snapshot.contains(doc) {
-                    return Err(Fault::Unreadable);
-                }
-                *bytes = fs::read(snapshot.path(doc)).map_err(|_| Fault::Unreadable)?;
-                return Ok(());
-            }
-            path.clear();
-            catalog.path(name, &mut path);
-            match fs::read(Path::new(std::ffi::OsStr::from_bytes(&path))) {
-                Ok(read) if read.len() as u64 == size => {
-                    *bytes = read;
-                    Ok(())
-                }
-                _ => Err(Fault::Unreadable),
-            }
+            crate::document_read::read(&catalog, name, doc, snapshot.as_ref(), None, bytes)
+                .map(|_| ())
+                .ok_or(Fault::Unreadable)
         })?;
         passes += 1;
         content_bytes += followed.bytes;
@@ -274,11 +258,22 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
         return Ok(());
     }
 
+    let (document_reads, document_bytes) = (std::cell::Cell::new(0u64), std::cell::Cell::new(0u64));
+    let mut reader = |doc: u32, offset: Option<u32>, bytes: &mut Vec<u8>| {
+        let &(name, _) = named.get(&doc)?;
+        let window =
+            crate::document_read::read(&catalog, name, doc, snapshot.as_ref(), offset, bytes)?;
+        document_reads.set(document_reads.get() + 1);
+        document_bytes.set(document_bytes.get() + bytes.len() as u64);
+        Some(window)
+    };
     // 2. Merge to steady state.
     let cpu_start = crate::segment_build::cpu_seconds()?;
     let start = Instant::now();
     let (mut merges, mut merge_read, mut merge_written) = (0u64, 0u64, 0u64);
-    while let Some(merged) = writer.merge_if_needed(&view, &Budget::unbounded())? {
+    while let Some(merged) =
+        writer.merge_if_needed_verified(&view, &Budget::unbounded(), &mut reader)?
+    {
         crate::trigram::check_disk()?;
         merges += 1;
         merge_read += merged.read;
@@ -305,6 +300,18 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
         "steady_merge_cpu_seconds",
         format!("{:.2}", crate::segment_build::cpu_seconds()? - cpu_start),
     );
+    line(
+        &mut report,
+        "steady_document_reads",
+        document_reads.get().to_string(),
+    );
+    line(
+        &mut report,
+        "steady_document_read_bytes",
+        document_bytes.get().to_string(),
+    );
+    document_reads.set(0);
+    document_bytes.set(0);
     let steady = shape(&writer.view())?;
     shape_lines(&mut report, "steady_", &steady, content_bytes);
     print!("{report}");
@@ -317,7 +324,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     // 3. One forced full merge.
     let cpu_start = crate::segment_build::cpu_seconds()?;
     let start = Instant::now();
-    if let Some(merged) = writer.merge_all(&view, &Budget::unbounded())? {
+    if let Some(merged) = writer.merge_all_verified(&view, &Budget::unbounded(), &mut reader)? {
         line(&mut report, "full_merge_inputs", merged.inputs.to_string());
         line(
             &mut report,
@@ -334,6 +341,16 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
         &mut report,
         "full_merge_cpu_seconds",
         format!("{:.2}", crate::segment_build::cpu_seconds()? - cpu_start),
+    );
+    line(
+        &mut report,
+        "full_document_reads",
+        document_reads.get().to_string(),
+    );
+    line(
+        &mut report,
+        "full_document_read_bytes",
+        document_bytes.get().to_string(),
     );
     let full = shape(&writer.view())?;
     shape_lines(&mut report, "full_", &full, content_bytes);
@@ -443,9 +460,12 @@ impl Options {
             match arg.as_str() {
                 "--codec" => {
                     result.codec = match args.next().map(String::as_str) {
-                        Some("h") => FINGERPRINT_CODEC,
+                        Some("h" | "h0") => FINGERPRINT_CODEC,
+                        Some("c1") => ferret_index::segment::RUN_CODEC,
+                        Some("c2") => ferret_index::segment::GRADUATION_CODEC,
+                        Some("c3") => ferret_index::segment::OFFSET_CODEC,
                         Some("1") => DICTIONARY_CODEC,
-                        _ => return Err("codec must be 1 or h".into()),
+                        _ => return Err("codec must be 1, h, c1, c2 or c3".into()),
                     }
                 }
                 "--corpus" => {
@@ -544,8 +564,12 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
         options.codec,
     )?;
     let (mut followed_written, mut merge_written, mut merges) = (0u64, 0u64, 0u64);
+    let (mut term_follow_written, mut term_merge_written) = (0u64, 0u64);
     let (mut content, mut max_segments) = (0u64, 0usize);
     let start = Instant::now();
+    let cpu_start = crate::segment_build::cpu_seconds()?;
+    let (mut document_reads, mut document_bytes, mut graduated, mut merge_cpu) =
+        (0u64, 0u64, 0u64, 0f64);
     for round in 0..rounds {
         crate::trigram::check_disk()?;
         let (mut added, mut removed) = (0, 0);
@@ -577,6 +601,7 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
                 Ok(())
             })?;
             followed_written += followed.written;
+            term_follow_written += followed.segment.as_ref().map_or(0, |s| s.bytes);
             content += followed.bytes;
             if followed.stopped == Stopped::Covered {
                 break;
@@ -590,12 +615,37 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
             .sum::<u64>()
             - before;
         max_segments = max_segments.max(writer.view().segments().len());
-        while let Some(merged) = writer.merge_if_needed(&view, &Budget::unbounded())? {
+        let merge_start = crate::segment_build::cpu_seconds()?;
+        let mut reader = |doc: u32, offset: Option<u32>, bytes: &mut Vec<u8>| {
+            bytes.clear();
+            generated(doc, &vocabulary, bytes);
+            let mut start = 0;
+            let mut complete = true;
+            if let Some(offset) = offset {
+                start = (offset as usize).saturating_sub(256).min(bytes.len());
+                let end = (start + 1280).min(bytes.len());
+                complete = start == 0 && end == bytes.len();
+                bytes.truncate(end);
+                bytes.drain(..start);
+            }
+            document_reads += 1;
+            document_bytes += bytes.len() as u64;
+            Some(ferret_index::segment::Window {
+                start: start as u64,
+                complete,
+            })
+        };
+        while let Some(merged) =
+            writer.merge_if_needed_verified(&view, &Budget::unbounded(), &mut reader)?
+        {
             merges += 1;
             added += merged.records_added;
             removed += merged.records_removed;
+            graduated += merged.records_graduated;
             merge_written += merged.written;
+            term_merge_written += merged.segment.as_ref().map_or(0, |s| s.bytes);
         }
+        merge_cpu += crate::segment_build::cpu_seconds()? - merge_start;
         let population: u64 = writer
             .view()
             .segments()
@@ -603,7 +653,7 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
             .map(|s| s.fingerprint_records())
             .sum();
         println!(
-            "churn_round: {} followed_records: {followed_records} demoted_records: {added} purged_records: {removed} net_records: {population}",
+            "churn_round: {} followed_records: {followed_records} demoted_records: {added} purged_records: {removed} graduated_total: {graduated} net_records: {population}",
             round + 1
         );
     }
@@ -613,6 +663,14 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
     let mut line = |key: &str, value: String| {
         let _ = writeln!(report, "{key}: {value}");
     };
+    line(
+        "cpu_seconds",
+        format!("{:.3}", crate::segment_build::cpu_seconds()? - cpu_start),
+    );
+    line("merge_cpu_seconds", format!("{merge_cpu:.3}"));
+    line("merge_document_reads", document_reads.to_string());
+    line("merge_document_read_bytes", document_bytes.to_string());
+    line("graduated_records", graduated.to_string());
     line("rounds", rounds.to_string());
     line("births_per_round", BIRTHS.to_string());
     line("death_chance_per_round", format!("1/{DEATH}"));
@@ -624,11 +682,37 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
     line("merge_written_bytes", merge_written.to_string());
     line(
         "merge_write_amplification",
+        ratio(
+            term_follow_written + term_merge_written,
+            term_follow_written,
+        ),
+    );
+    line(
+        "paired_merge_write_amplification",
         ratio(followed_written + merge_written, followed_written),
     );
+    line("term_follow_written_bytes", term_follow_written.to_string());
+    line("term_merge_written_bytes", term_merge_written.to_string());
     line("max_segments_before_merge", max_segments.to_string());
     line("final_segments", view.segments().len().to_string());
-    line("final_index_bytes", view.bytes().to_string());
+    line(
+        "final_index_bytes",
+        view.manifest()
+            .segments
+            .iter()
+            .map(|s| s.bytes)
+            .sum::<u64>()
+            .to_string(),
+    );
+    line("final_paired_bytes", view.bytes().to_string());
+    line(
+        "final_records",
+        view.segments()
+            .iter()
+            .map(|s| s.fingerprint_records())
+            .sum::<u64>()
+            .to_string(),
+    );
     line("seconds", format!("{:.2}", start.elapsed().as_secs_f64()));
     print!("{report}");
     Ok(())

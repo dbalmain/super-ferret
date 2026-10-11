@@ -21,10 +21,10 @@ use std::os::unix::fs::FileExt;
 
 use intpack::pfor128skip;
 
-use super::fingerprint::{Encoder, fingerprint};
+use super::fingerprint::{Encoder, Record, fingerprint};
 use super::{
-    ALL, BLOCK, CHUNK, DICTIONARY_CODEC, FIELDS, FINGERPRINT_CODEC, FORMAT_VERSION, MAGIC,
-    POSTINGS_CODEC, Section, WriteError, checksum, chunk_sums, head_len, put, sections,
+    ALL, BLOCK, CHUNK, DICTIONARY_CODEC, FIELDS, FORMAT_VERSION, MAGIC, POSTINGS_CODEC, Section,
+    WriteError, checksum, chunk_sums, head_len, put, sections,
 };
 
 /// What a finished segment holds, in bytes and counts, for measurement.
@@ -54,6 +54,8 @@ pub struct Sizes {
     /// Merge-only population changes after collision deduplication.
     pub records_added: u64,
     pub records_removed: u64,
+    /// Records safely removed after becoming dictionary occurrences.
+    pub records_graduated: u64,
 }
 
 impl Sizes {
@@ -90,6 +92,7 @@ impl Sizes {
         self.records += other.records;
         self.records_added += other.records_added;
         self.records_removed += other.records_removed;
+        self.records_graduated += other.records_graduated;
     }
 }
 
@@ -128,7 +131,7 @@ pub struct Writer {
 struct Singles {
     /// `(fingerprint, doc - first)` of each single-document term pushed,
     /// in term order until sealed, then sorted and deduplicated.
-    pending: Vec<(u32, u32)>,
+    pending: Vec<Record>,
     /// Whether the dictionary is closed and `pending` sorted.
     sealed: bool,
     /// The first record of `pending` not yet encoded.
@@ -145,7 +148,15 @@ impl Singles {
     fn seal(&mut self) {
         if !self.sealed {
             self.pending.sort_unstable();
-            self.pending.dedup();
+            self.pending.dedup_by(|later, earlier| {
+                if later.key() != earlier.key() {
+                    return false;
+                }
+                // One record may represent two colliding terms. Its offset
+                // cannot license removal after graduating only one of them.
+                earlier.offset = None;
+                true
+            });
             self.sealed = true;
         }
     }
@@ -153,11 +164,11 @@ impl Singles {
     /// Encodes pending records below `bound`, or all of them.
     fn flush_below(&mut self, bound: Option<(u32, u32)>) {
         while let Some(&record) = self.pending.get(self.next)
-            && bound.is_none_or(|bound| record < bound)
+            && bound.is_none_or(|bound| record.key() < bound)
         {
             // An equal record is a collision of two terms in one document:
             // one record already says the document may hold both.
-            self.encoder.push(record.0, record.1);
+            self.encoder.push(record);
             self.next += 1;
         }
         if self.next == self.pending.len() {
@@ -223,7 +234,10 @@ impl Writer {
             relative: Vec::new(),
             sizes: Sizes::default(),
             spill: None,
-            singles: (codec == FINGERPRINT_CODEC).then(Singles::default),
+            singles: (codec != DICTIONARY_CODEC).then(|| Singles {
+                encoder: Encoder::new(codec),
+                ..Singles::default()
+            }),
         })
     }
 
@@ -387,6 +401,16 @@ impl Writer {
     /// record instead, and the entry's size is 0. Terms may not follow
     /// [`Writer::push_record`].
     pub fn push(&mut self, term: &[u8], docs: &[u32]) -> Result<u64, WriteError> {
+        self.push_at(term, docs, None)
+    }
+
+    /// Writes a term with its first occurrence's offset when it is a singleton.
+    pub fn push_at(
+        &mut self,
+        term: &[u8],
+        docs: &[u32],
+        offset: Option<u32>,
+    ) -> Result<u64, WriteError> {
         if self.pushed > 0 && term <= self.last_term.as_slice() {
             return Err(WriteError::TermOrder);
         }
@@ -406,7 +430,11 @@ impl Writer {
                 return Err(WriteError::RecordOrder);
             }
             if let [doc] = docs {
-                singles.pending.push((fingerprint(term), doc - self.first));
+                singles.pending.push(Record {
+                    fingerprint: fingerprint(term),
+                    doc: doc - self.first,
+                    offset,
+                });
                 self.sizes.singletons += 1;
                 self.last_term.clear();
                 self.last_term.extend_from_slice(term);
@@ -470,6 +498,16 @@ impl Writer {
     /// after the last term: the first one closes the dictionary. A codec 1
     /// writer has no records and refuses it.
     pub fn push_record(&mut self, fp: u32, doc: u32) -> Result<(), WriteError> {
+        self.push_positioned_record(Record {
+            fingerprint: fp,
+            doc,
+            offset: None,
+        })
+    }
+
+    /// Carries an occurrence and its optional offset hint into this segment.
+    pub fn push_positioned_record(&mut self, input: Record) -> Result<(), WriteError> {
+        let (fp, doc) = input.key();
         let Some(singles) = self.singles.as_mut() else {
             return Err(WriteError::RecordOrder);
         };
@@ -482,7 +520,21 @@ impl Writer {
         }
         singles.seal();
         singles.flush_below(Some(record));
-        singles.encoder.push(record.0, record.1);
+        let offset = if singles
+            .pending
+            .get(singles.next)
+            .is_some_and(|r| r.key() == record)
+        {
+            singles.next += 1;
+            None
+        } else {
+            input.offset
+        };
+        singles.encoder.push(Record {
+            fingerprint: fp,
+            doc: doc - self.first,
+            offset,
+        });
         singles.carried = Some(record);
         Ok(())
     }
@@ -492,6 +544,7 @@ impl Writer {
         if let Some(singles) = self.singles.as_mut() {
             singles.seal();
             singles.flush_below(None);
+            singles.encoder.finish();
         }
     }
 

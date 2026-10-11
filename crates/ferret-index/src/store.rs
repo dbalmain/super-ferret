@@ -186,6 +186,8 @@ pub struct Merged {
     pub records_added: u64,
     /// Fingerprint records removed because their documents died.
     pub records_removed: u64,
+    /// Records replaced by verified dictionary occurrences.
+    pub records_graduated: u64,
     /// The merged segment; `None` when every input document was dead and
     /// the inputs were simply dropped.
     pub segment: Option<SegmentEntry>,
@@ -534,7 +536,7 @@ impl IndexWriter {
             let Some(run) = writer.current.merge_run(catalog.live) else {
                 return Ok(None);
             };
-            writer.merge_run(catalog, budget, run)
+            writer.merge_run(catalog, budget, run, &mut |_, _, _| None)
         })
     }
 
@@ -551,7 +553,40 @@ impl IndexWriter {
             if count == 0 {
                 return Ok(None);
             }
-            writer.merge_run(catalog, budget, 0..count)
+            writer.merge_run(catalog, budget, 0..count, &mut |_, _, _| None)
+        })
+    }
+
+    /// Policy-selected merge with a reader of stable indexed-version bytes.
+    pub fn merge_if_needed_verified(
+        &mut self,
+        catalog: &CatalogView,
+        budget: &Budget,
+        read: &mut crate::segment::DocumentReader<'_>,
+    ) -> Result<Option<Merged>, Error> {
+        self.guard(|writer| {
+            writer.reconcile(catalog)?;
+            let Some(run) = writer.current.merge_run(catalog.live) else {
+                return Ok(None);
+            };
+            writer.merge_run(catalog, budget, run, read)
+        })
+    }
+
+    /// Full merge with version-checked graduation for codecs 4 and 5.
+    pub fn merge_all_verified(
+        &mut self,
+        catalog: &CatalogView,
+        budget: &Budget,
+        read: &mut crate::segment::DocumentReader<'_>,
+    ) -> Result<Option<Merged>, Error> {
+        self.guard(|writer| {
+            writer.reconcile(catalog)?;
+            let count = writer.current.manifest.segments.len();
+            if count == 0 {
+                return Ok(None);
+            }
+            writer.merge_run(catalog, budget, 0..count, read)
         })
     }
 
@@ -659,7 +694,14 @@ impl IndexWriter {
                     }
                     let mut failed = None;
                     tokenize(&bytes, &mut scratch, |token| {
-                        if let Err(error) = inverter.add(doc, cap(token.bytes)) {
+                        let added = if self.codec == crate::segment::OFFSET_CODEC
+                            && let Ok(offset) = u32::try_from(token.run.start)
+                        {
+                            inverter.add_at(doc, cap(token.bytes), offset)
+                        } else {
+                            inverter.add(doc, cap(token.bytes))
+                        };
+                        if let Err(error) = added {
                             failed = Some(error);
                         }
                     });
@@ -751,6 +793,7 @@ impl IndexWriter {
         catalog: &CatalogView,
         budget: &Budget,
         run: std::ops::Range<usize>,
+        reader: &mut crate::segment::DocumentReader<'_>,
     ) -> Result<Option<Merged>, Error> {
         // Remember identities without replacing the published content view:
         // cancellation preserves its manifest, descriptors and pin identity.
@@ -803,6 +846,7 @@ impl IndexWriter {
                 purged,
                 records_added: 0,
                 records_removed: input_records,
+                records_graduated: 0,
                 segment: None,
             }));
         }
@@ -834,7 +878,7 @@ impl IndexWriter {
         let number = manifest.next_number;
         let scratch = self.dir.join(format!("tmp-{number}.postings"));
         let codec = self.codec;
-        let mut changes = (0, 0);
+        let mut changes = (0, 0, 0);
         let result = Self::write_pair(
             &self.dir,
             &mut manifest,
@@ -859,17 +903,22 @@ impl IndexWriter {
                 } else {
                     Writer::spilling_with_codec(first, last, codec, file.try_clone()?, postings)?
                 };
-                let result = merge::stream(
+                let result = merge::stream_verified(
                     if tri { &trigram_inputs } else { &inputs },
                     catalog.live,
                     writer,
                     &merge_pace,
                     budget.cancelled,
+                    reader,
                 );
                 let _ = fs::remove_file(&scratch);
                 let sizes = result?;
                 if !tri {
-                    changes = (sizes.records_added, sizes.records_removed);
+                    changes = (
+                        sizes.records_added,
+                        sizes.records_removed,
+                        sizes.records_graduated,
+                    );
                 }
                 Ok(sizes)
             },
@@ -893,6 +942,7 @@ impl IndexWriter {
             purged,
             records_added: changes.0,
             records_removed: changes.1,
+            records_graduated: changes.2,
             segment: Some(entry),
         }))
     }

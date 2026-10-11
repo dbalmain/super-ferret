@@ -73,11 +73,13 @@ impl Rng {
 struct Reservoir {
     seen: u64,
     items: Vec<Vec<u8>>,
+    limit: usize,
 }
 
 impl Reservoir {
     fn new() -> Self {
         Self {
+            limit: PER_CLASS,
             seen: 0,
             items: Vec::new(),
         }
@@ -85,11 +87,11 @@ impl Reservoir {
 
     fn offer(&mut self, rng: &mut Rng, item: &[u8]) {
         self.seen += 1;
-        if self.items.len() < PER_CLASS {
+        if self.items.len() < self.limit {
             self.items.push(item.to_vec());
         } else {
             let at = rng.below(self.seen) as usize;
-            if at < PER_CLASS {
+            if at < self.limit {
                 self.items[at] = item.to_vec();
             }
         }
@@ -111,6 +113,8 @@ struct Sample {
     /// Bytes the verification reader returned.
     read_bytes: u64,
     records: u64,
+    bucket: usize,
+    verified_bucket: usize,
 }
 
 /// `only`, when not empty, names the classes to run.
@@ -182,7 +186,12 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
         .ok_or_else(|| "no fitting comparison index".into())
     };
     let terms_view = terms_dir.map(|dir| open(Path::new(dir))).transpose()?;
-    let classes = pick_terms(terms_view.as_ref().unwrap_or(&view))?;
+    let sizes: std::collections::HashMap<u32, u64> = crate::census::hashed_documents(&catalog)?
+        .into_iter()
+        .map(|d| (d.doc.0, d.size))
+        .collect();
+    let reference = terms_view.as_ref().unwrap_or(&view);
+    let classes = pick_terms(reference, &sizes)?;
     let compare_view = compare_dir.map(|dir| open(Path::new(dir))).transpose()?;
     let compare_pinned = compare_view
         .as_ref()
@@ -247,6 +256,21 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                 args.iter().map(String::as_bytes),
                 std::time::SystemTime::now(),
             )?;
+            let diagnostic = once(&catalog, &names, &content, &query, snapshot.as_ref())?;
+            for doc in &diagnostic.verified_docs {
+                let file = if let Some(snapshot) = &snapshot {
+                    File::open(snapshot.path(*doc)).ok()
+                } else {
+                    docs.names(*doc).first().and_then(|&name| {
+                        let mut path = Vec::new();
+                        catalog.path(name, &mut path);
+                        File::open(Path::new(std::ffi::OsStr::from_bytes(&path))).ok()
+                    })
+                };
+                if let Some(file) = file {
+                    rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed)?;
+                }
+            }
             evict()?;
             let evicted = once(&catalog, &names, &content, &query, snapshot.as_ref())?.wall;
             let warm = once(&catalog, &names, &content, &query, snapshot.as_ref())?;
@@ -266,7 +290,29 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
             } else {
                 0
             };
+            let bucket = if matches!(class, "df1" | "df2-100") {
+                let term = args[0].strip_prefix("text:").ok_or("term prefix")?;
+                size_bucket(
+                    reference
+                        .lookup(term.as_bytes())?
+                        .iter()
+                        .filter_map(|d| sizes.get(d))
+                        .copied()
+                        .max(),
+                )
+            } else {
+                0
+            };
+            let verified_bucket = size_bucket(
+                warm.verified_docs
+                    .iter()
+                    .filter_map(|d| sizes.get(d))
+                    .copied()
+                    .max(),
+            );
             samples.push(Sample {
+                bucket,
+                verified_bucket,
                 evicted,
                 records,
                 warm: warm.wall,
@@ -275,6 +321,45 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                 read: warm.read,
                 read_bytes: warm.read_bytes,
             });
+        }
+        if matches!(class, "df1" | "df2-100" | "absent") {
+            for actual in [false, true] {
+                for (bucket, label) in SIZE_LABELS.iter().enumerate() {
+                    let subset: Vec<_> = samples
+                        .iter()
+                        .filter(|s| {
+                            if actual {
+                                s.verified_bucket == bucket
+                            } else {
+                                s.bucket == bucket
+                            }
+                        })
+                        .collect();
+                    if subset.is_empty() {
+                        continue;
+                    }
+                    let mut warm: Vec<_> = subset.iter().map(|s| ms(s.warm)).collect();
+                    let mut cold: Vec<_> = subset.iter().map(|s| ms(s.evicted)).collect();
+                    let mut verified: Vec<_> =
+                        subset.iter().map(|s| s.report.verified as f64).collect();
+                    let mut records: Vec<_> = subset.iter().map(|s| s.records as f64).collect();
+                    let mut reads: Vec<_> = subset.iter().map(|s| s.read_bytes as f64).collect();
+                    println!(
+                        "d65_size class={class} partition={} bucket={label} n={} warm_median_ms={:.4} warm_p90_ms={:.4} cold_median_ms={:.4} cold_p90_ms={:.4} verified_median={:.1} verified_p90={:.1} records_median={:.1} records_p90={:.1} read_bytes_median={:.0}",
+                        if actual { "verified" } else { "reference" },
+                        subset.len(),
+                        quantile(&mut warm, 0.5),
+                        quantile(&mut warm, 0.9),
+                        quantile(&mut cold, 0.5),
+                        quantile(&mut cold, 0.9),
+                        quantile(&mut verified, 0.5),
+                        quantile(&mut verified, 0.9),
+                        quantile(&mut records, 0.5),
+                        quantile(&mut records, 0.9),
+                        quantile(&mut reads, 0.5)
+                    );
+                }
+            }
         }
         let mut warm: Vec<f64> = samples.iter().map(|s| ms(s.warm)).collect();
         let mut evicted: Vec<f64> = samples.iter().map(|s| ms(s.evicted)).collect();
@@ -396,6 +481,7 @@ pub(crate) struct Once {
     pub(crate) report: ContentReport,
     pub(crate) read: Duration,
     pub(crate) read_bytes: u64,
+    pub(crate) verified_docs: std::collections::BTreeSet<u32>,
 }
 
 /// One run of `query`, rows counted.
@@ -408,8 +494,15 @@ pub(crate) fn once(
 ) -> crate::Result<Once> {
     let (mut read, mut read_bytes) = (Duration::ZERO, 0u64);
     let mut path = Vec::new();
+    let mut verified_docs = std::collections::BTreeSet::new();
     let mut reader = |name: NameId, request: ferret_query::ReadRequest<'_>| {
         let start = Instant::now();
+        if !matches!(request, ferret_query::ReadRequest::Stat)
+            && let Target::Inode(inode) = catalog.name(name).target()
+            && let Some(doc) = catalog.doc(inode)
+        {
+            verified_docs.insert(doc.0);
+        }
         if let Some(snapshot) = snapshot {
             let doc = match catalog.name(name).target() {
                 Target::Inode(inode) => catalog.doc(inode)?,
@@ -419,6 +512,21 @@ pub(crate) fn once(
             // reader. These bytes are exactly the version both arms indexed.
             let path = snapshot.path(doc.0);
             let version = match request {
+                ferret_query::ReadRequest::TokenAt { term, offset } => {
+                    let mut bytes = Vec::new();
+                    let window = crate::document_read::read(
+                        catalog,
+                        name,
+                        doc.0,
+                        Some(snapshot),
+                        Some(offset),
+                        &mut bytes,
+                    )?;
+                    read_bytes += bytes.len() as u64;
+                    read += start.elapsed();
+                    return ferret_index::segment::token_at(&bytes, window, offset, term)
+                        .then_some(ferret_query::ReadVersion::Catalogued);
+                }
                 ferret_query::ReadRequest::Stat => fs::metadata(path)
                     .ok()
                     .map(|_| ferret_query::ReadVersion::Catalogued),
@@ -432,6 +540,25 @@ pub(crate) fn once(
             return version;
         }
         let version = match request {
+            ferret_query::ReadRequest::TokenAt { term, offset } => {
+                let Target::Inode(inode) = catalog.name(name).target() else {
+                    return None;
+                };
+                let doc = catalog.doc(inode)?;
+                let mut bytes = Vec::new();
+                let window = crate::document_read::read(
+                    catalog,
+                    name,
+                    doc.0,
+                    None,
+                    Some(offset),
+                    &mut bytes,
+                )?;
+                read_bytes += bytes.len() as u64;
+                read += start.elapsed();
+                return ferret_index::segment::token_at(&bytes, window, offset, term)
+                    .then_some(ferret_query::ReadVersion::Catalogued);
+            }
             ferret_query::ReadRequest::Stat => {
                 path.clear();
                 catalog.path(name, &mut path);
@@ -471,10 +598,11 @@ pub(crate) fn once(
         report,
         read,
         read_bytes,
+        verified_docs,
     })
 }
 
-fn same_version(catalog: &Catalog, name: NameId, meta: &fs::Metadata) -> bool {
+pub(crate) fn same_version(catalog: &Catalog, name: NameId, meta: &fs::Metadata) -> bool {
     let Target::Inode(inode) = catalog.name(name).target() else {
         return false;
     };
@@ -553,7 +681,7 @@ struct Classes {
 
 /// Term-query terms by df class, from the dictionary of a single-segment
 /// index (df is per segment, so a multi-segment index would need a merge).
-fn pick_terms(view: &View) -> crate::Result<Classes> {
+fn pick_terms(view: &View, sizes: &std::collections::HashMap<u32, u64>) -> crate::Result<Classes> {
     let [segment] = view.segments() else {
         return Err("content-query wants a fully merged, single-segment index".into());
     };
@@ -561,8 +689,9 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
         return Err("term classes require a codec-1 control; use --terms".into());
     }
     let mut rng = Rng(0x5eed_0001);
-    let mut singleton = Reservoir::new();
+    let mut singletons: [Reservoir; 4] = std::array::from_fn(|_| Reservoir::new());
     let (mut rare, mut mid, mut million) = (Reservoir::new(), Reservoir::new(), Reservoir::new());
+    rare.limit = PER_CLASS * 16;
     // The largest dfs, in case no term reaches a million documents.
     let mut top: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut terms = segment.terms();
@@ -572,7 +701,13 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
         }
         let df = entry.df;
         match df {
-            1 => singleton.offer(&mut rng, term),
+            1 => {
+                let ferret_index::segment::Hit::Single(doc) = segment.read(&entry)? else {
+                    return Err("df1 list".into());
+                };
+                let bucket = size_bucket(sizes.get(&doc).copied()).saturating_sub(1);
+                singletons[bucket].offer(&mut rng, term);
+            }
             2..=100 => rare.offer(&mut rng, term),
             1_000..=100_000 => mid.offer(&mut rng, term),
             1_000_000.. => million.offer(&mut rng, term),
@@ -584,9 +719,23 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
             top.truncate(PER_CLASS);
         }
     }
+    let singleton: Vec<_> = singletons.into_iter().flat_map(|r| r.items).collect();
+    let mut rare_buckets: [Reservoir; 4] = std::array::from_fn(|_| Reservoir::new());
+    for term in &rare.items {
+        let bucket = size_bucket(
+            view.lookup(term)?
+                .iter()
+                .filter_map(|d| sizes.get(d))
+                .copied()
+                .max(),
+        )
+        .saturating_sub(1);
+        rare_buckets[bucket].offer(&mut rng, term);
+    }
+    rare.items = rare_buckets.into_iter().flat_map(|r| r.items).collect();
     let common: Vec<Vec<u8>> = top.into_iter().map(|(_, t)| t).collect();
     let mut absent = Vec::new();
-    for original in singleton.items.iter().chain(&rare.items) {
+    for original in singleton.iter().chain(&rare.items) {
         let original = std::str::from_utf8(original)?;
         let suffix = &original[original.chars().next().ok_or("empty term")?.len_utf8()..];
         for replacement in 'a'..='z' {
@@ -613,7 +762,7 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
         million.seen
     );
     Ok(Classes {
-        singleton: singleton.items,
+        singleton,
         absent,
         rare: rare.items,
         mid: mid.items,
@@ -1036,4 +1185,95 @@ pub(crate) fn regex_identifiers(
         .into_iter()
         .map(|bytes| String::from_utf8(bytes).map_err(Into::into))
         .collect()
+}
+
+const SIZE_LABELS: [&str; 5] = ["none", "lt4K", "4K-64K", "64K-1M", "ge1M"];
+fn size_bucket(size: Option<u64>) -> usize {
+    match size {
+        None => 0,
+        Some(n) if n < 4096 => 1,
+        Some(n) if n < 65536 => 2,
+        Some(n) if n < 1048576 => 3,
+        Some(_) => 4,
+    }
+}
+
+#[cfg(test)]
+mod d65_tests {
+    use super::*;
+    use crate::support::Fixture;
+
+    #[test]
+    fn wrong_offset_uses_real_query_fallback_and_finds_normalised_token_elsewhere() {
+        // Keep the real indexed bytes, but deliberately replace the record's
+        // hint through the production writer and update the manifest digest.
+        // A raw byte comparison would miss the Kelvin sign; trusting offset
+        // zero would miss the token that is later in this same document.
+        let fixture = Fixture::new("d65-offset-query");
+        let source = "wrong elsewhere Kelvin".as_bytes();
+        let catalog = fixture
+            .commit(&[("one", source)], &[])
+            .into_resident()
+            .unwrap();
+        let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|r| r.0.0));
+        let cv = CatalogView {
+            incarnation: catalog.generation().incarnation,
+            live: &live,
+        };
+        let dir = fixture.out("index");
+        let mut index = ferret_index::IndexWriter::open_with_codec(
+            &dir,
+            &cv,
+            ferret_index::segment::OFFSET_CODEC,
+        )
+        .unwrap();
+        index
+            .follow(&cv, &ferret_index::Budget::unbounded(), &mut |_, b| {
+                b.extend_from_slice(source);
+                Ok(())
+            })
+            .unwrap();
+        let mut manifest = index.view().manifest().clone();
+        drop(index);
+        let entry = &mut manifest.segments[0];
+        let doc = entry.first;
+        let mut writer = ferret_index::segment::Writer::with_codec(
+            entry.first,
+            entry.last,
+            ferret_index::segment::OFFSET_CODEC,
+        )
+        .unwrap();
+        for term in [b"elsewhere".as_slice(), b"kelvin", b"wrong"] {
+            writer.push_at(term, &[doc], Some(0)).unwrap();
+        }
+        let mut encoded = Vec::new();
+        let sizes = writer.finish(&mut encoded).unwrap();
+        let segment = ferret_index::segment::Segment::open(encoded.clone()).unwrap();
+        entry.bytes = sizes.total();
+        entry.terms = sizes.terms;
+        entry.pairs = sizes.pairs;
+        entry.digest = segment.digest();
+        fs::write(dir.join(entry.file_name()), encoded).unwrap();
+        fs::write(dir.join(ferret_index::manifest::FILE), manifest.encode()).unwrap();
+        let view = View::open(&dir, &cv).unwrap().unwrap();
+        let pinned = Pinned::new(Some(&view), &live);
+        let docs = DocNames::new(&catalog).unwrap();
+        let names = NameIndex::new(&catalog);
+        let query = Query::from_args([b"text:kelvin"], std::time::SystemTime::now()).unwrap();
+        let result = once(
+            &catalog,
+            &names,
+            &Content {
+                pinned: &pinned,
+                docs: &docs,
+                bound: None,
+            },
+            &query,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.rows, 1);
+        assert_eq!(result.report.verified, 1);
+        assert_eq!(result.read_bytes, (source.len() * 2) as u64);
+    }
 }

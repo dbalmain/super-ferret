@@ -70,6 +70,7 @@ mod chunk_census;
 mod content_query;
 mod content_snapshot;
 mod corpus;
+mod document_read;
 mod fuse;
 mod index_build;
 mod rank_fp;

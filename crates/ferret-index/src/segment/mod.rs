@@ -77,6 +77,18 @@
 //! to the dictionary: a merge carries them, purged of dead documents, and
 //! moves into them every dictionary term its purge leaves with one live
 //! document.
+//!
+//! **Codecs 3–5 (D65 C1–C3).** The same six sections and 128-record
+//! restart blocks, with runs split at block boundaries. A block begins
+//! with fixed-width fingerprint and relative DocId; each later run begins
+//! with a vbyte fingerprint delta and absolute relative DocId. Then a
+//! vbyte run length and delta DocIds within the run (no repeated fingerprint).
+//! Codec 5 interleaves a vbyte first-token offset plus one after each DocId;
+//! zero is an unknown/ambiguous offset and requires full verification.
+//! Codec 4 and 5 merges can graduate records only through a host reader that
+//! establishes the indexed document version and confirms its normalised
+//! token. A colliding record that still represents another token survives.
+//! Offsets are hints; incomplete tokenizer runs and mismatches fall back.
 
 use std::fmt;
 use std::io;
@@ -85,6 +97,7 @@ mod fingerprint;
 mod invert;
 mod read;
 mod trigram;
+mod verify;
 mod write;
 
 #[cfg(test)]
@@ -92,10 +105,11 @@ mod h_tests;
 #[cfg(test)]
 mod tests;
 
-pub use fingerprint::{RECORD_BLOCK, fingerprint};
+pub use fingerprint::{RECORD_BLOCK, Record, fingerprint};
 pub use invert::Inverter;
 pub use read::{Hit, Info, PostingCursor, Postings, ReadAt, Segment, TermEntry, Terms};
 pub use trigram::TrigramInverter;
+pub use verify::{DocumentReader, Verified, Window, token_at, verify_record};
 pub use write::{Sizes, Writer};
 
 const MAGIC: [u8; 8] = *b"ferretsg";
@@ -110,6 +124,13 @@ pub const DICTIONARY_CODEC: u32 = 1;
 /// Codec 1's dictionary without singletons, which become fingerprint
 /// records (D65 H). Opt-in until D65 is answered.
 pub const FINGERPRINT_CODEC: u32 = 2;
+
+/// D65 C1: equal-fingerprint runs and delta-coded documents.
+pub const RUN_CODEC: u32 = 3;
+/// D65 C2: run records with version-checked graduation at merge time.
+pub const GRADUATION_CODEC: u32 = 4;
+/// D65 C3: run records with first token offsets and checked graduation.
+pub const OFFSET_CODEC: u32 = 5;
 
 /// `pfor128skip` doc ids relative to the segment's first DocId, no
 /// frequencies (D61 B).
@@ -162,7 +183,7 @@ const SECTIONS_H: [Section; 6] = [
 fn sections(codec: u32) -> Option<&'static [Section]> {
     match codec {
         DICTIONARY_CODEC => Some(&SECTIONS),
-        FINGERPRINT_CODEC => Some(&SECTIONS_H),
+        FINGERPRINT_CODEC | RUN_CODEC | GRADUATION_CODEC | OFFSET_CODEC => Some(&SECTIONS_H),
         _ => None,
     }
 }
@@ -217,7 +238,7 @@ impl fmt::Display for ReadError {
             } => write!(
                 f,
                 "segment codecs {dictionary}/{postings}, expected {DICTIONARY_CODEC} or \
-                 {FINGERPRINT_CODEC}/{POSTINGS_CODEC}"
+                 {FINGERPRINT_CODEC}, {RUN_CODEC}, {GRADUATION_CODEC} or {OFFSET_CODEC}/{POSTINGS_CODEC}"
             ),
             Self::Head => write!(f, "segment head corrupt"),
             Self::Layout => write!(f, "segment truncated or corrupt: bad section table"),
