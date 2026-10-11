@@ -82,7 +82,7 @@ Predecessors, carried forward where still open:
 | D64 | Segment bytes: positional reads or `mmap`                              | answered       | A: positional reads into owned buffers; no `unsafe` or `mmap` until measurements justify it                                                                   |
 | D65 | The term dictionary is 87% of the index                                | answered       | blocks + block-prefix FST for the static dictionary; H: C, measured as arms C1–C3 (run codec; + graduation; + first offsets)                                  |
 | D66 | Phrase queries read too much: positions, or not                        | answered       | D: per-document Bloom 8 over adjacent pairs, pairs only, streaming fold; agent transcripts out of the content index                                           |
-| D67 | How `ferret search` spells a content regex, and when it refuses        | open           | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0)                               |
+| D67 | How `ferret search` spells a content regex, and when it refuses        | answered       | (a) A2: `grep:REGEX`, case-sensitive, `(?i)` inline, line anchors; (b) i: refuse past live/4 Maybe, `--scan`                                                  |
 | D68 | Per-document filters: a screening stage, terms and trigrams separately | open           | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b)                      |
 | D69 | Saturated large documents in trigram postings                          | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b)                                      |
 | D70 | How large the trigram follow buffer may grow                           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a)                                                       |
@@ -4093,7 +4093,13 @@ A, and make the verifier parallel first.
 
 ## D67 — How `ferret search` spells a content regex, and when it refuses
 
-**Status: open.** S3 M0, revision 3, 2026-10-08;
+**Status: answered, (a) A2, (b) i (Dave, 2026-10-11).** (a) `grep:REGEX`,
+**case-sensitive** by default, with `(?i)` inline for case-insensitive; `^` and
+`$` match at line boundaries. This changes S3's shipped case-insensitive
+default, so `grep:` gives the same answers as `ferret grep`. The grep-usage
+survey found `-i` on 4.1% of 21,815 agent searches, and `grep:` as the only
+content-regex prefix in real `ferret search` commands (2 uses; `re:` and `/…/`
+0). (b) i as built. Was **open**. S3 M0, revision 3, 2026-10-08;
 [design](S3.md#query-surface-d67).
 
 **Question (a):** What prefix makes an argument a regex over file content, and
