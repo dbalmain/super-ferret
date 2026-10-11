@@ -10,6 +10,7 @@ use std::io;
 use std::path::Path;
 use std::time::Instant;
 
+use ferret_catalog::Catalog;
 use ferret_index::segment::{Segment, TrigramInverter, Writer};
 use ferret_index::{CatalogView, DocSet, Pinned, View};
 use ferret_query::GrepAtom;
@@ -20,6 +21,7 @@ use crate::content_snapshot::Snapshot;
 use crate::segment_build::cpu_seconds;
 
 mod grams;
+pub(crate) mod latency;
 mod query;
 #[cfg(test)]
 mod tests;
@@ -307,105 +309,15 @@ pub(crate) fn run(
     if variants.is_empty() {
         return Err("unknown sparse variant".into());
     }
-    crate::trigram::check_disk()?;
-    let catalog = crate::open_catalog(catalog_dir)?;
-    catalog.load_all()?;
-    let catalog = catalog.into_resident()?;
-    let snapshot = Snapshot::open(snapshot_dir, &catalog)?;
-    let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
-    let view = View::open(
-        index_dir,
-        &CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        },
-    )?
-    .ok_or("no paired control index")?;
-    let [segment] = view.segments() else {
-        return Err("sparse requires full merge".into());
-    };
-    let pinned = Pinned::new(Some(&view), &live);
-    let trigrams = view
-        .manifest()
-        .segments
-        .iter()
-        .map(|entry| {
-            Segment::open(File::open(index_dir.join(entry.trigram_file_name()))?)
-                .map_err(Into::into)
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
-    let classes = crate::screen::term_classes(segment, PER_CLASS)?;
-    let mut samples = Vec::new();
-    for (class, mut greps) in crate::screen::regex_classes(&classes, &trigrams, PER_CLASS)? {
-        if class == "identifier pattern" {
-            greps = crate::content_query::regex_identifiers(&snapshot, &live)?
-                .iter()
-                .map(|pattern| GrepFlags::default().compile(pattern).map_err(Into::into))
-                .collect::<crate::Result<Vec<_>>>()?;
-        }
-        if greps.len() != PER_CLASS {
-            return Err("insufficient sparse query seeds".into());
-        }
-        for grep in greps {
-            let facts = GrepFlags::default().required_literals(grep.pattern())?;
-            let atom = GrepAtom::read_until(grep.clone(), &pinned, &|| false)?;
-            let shipped = crate::screen::drain(pinned.top(atom.cursor_until(&pinned, &|| false)?));
-            samples.push(Sample {
-                class,
-                grep,
-                facts,
-                oracle: Vec::new(),
-                shipped,
-            });
-        }
-    }
-    let mut sizes = vec![0; live.bound() as usize];
-    for document in crate::census::hashed_documents(&catalog)? {
-        sizes[document.doc.0 as usize] = document.size;
-    }
-    let mut readable = vec![false; live.bound() as usize];
+    let Corpus {
+        snapshot,
+        live,
+        samples,
+        sizes,
+        readable,
+        ..
+    } = prepare(catalog_dir, index_dir, snapshot_dir)?;
     let live_ids: Vec<_> = live.range(0, live.bound()).collect();
-    let (cpu, wall) = (cpu_seconds()?, Instant::now());
-    for (ordinal, &doc) in live_ids.iter().enumerate() {
-        if ordinal.is_multiple_of(1024) {
-            crate::trigram::check_disk()?;
-        }
-        if !snapshot.contains(doc) {
-            continue;
-        }
-        let bytes = fs::read(snapshot.path(doc))?;
-        if bytes.len() as u64 != sizes[doc as usize] {
-            return Err("frozen size differs from catalog".into());
-        }
-        readable[doc as usize] = true;
-        for sample in &mut samples {
-            if sample.grep.regex().is_match(&bytes) {
-                sample.oracle.push(doc);
-            }
-        }
-        if ordinal.is_multiple_of(16384) {
-            println!("oracle_progress documents={}", ordinal + 1);
-        }
-    }
-    println!(
-        "population live={} readable={} unreadable={} content_bytes={} queries={} oracle_cpu_s={:.3} oracle_wall_s={:.3}",
-        live.len(),
-        readable.iter().filter(|&&r| r).count(),
-        readable
-            .iter()
-            .filter(|&&r| r)
-            .count()
-            .abs_diff(live.len() as usize),
-        sizes
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| readable[*i])
-            .map(|(_, &s)| s)
-            .sum::<u64>(),
-        samples.len(),
-        cpu_seconds()? - cpu,
-        wall.elapsed().as_secs_f64()
-    );
     println!(
         "| mode | class | band | queries | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | oracle docs median/p90 | oracle B median/p90 | candidate B sum | readable B sum | oracle B sum | false readable share | "
     );
@@ -518,4 +430,127 @@ pub(crate) fn run(
         samples.len()
     );
     Ok(())
+}
+
+/// Seed generation and the frozen oracle are shared by volume and latency;
+/// neither experiment may quietly choose a different query population.
+struct Corpus {
+    catalog: Catalog,
+    view: View,
+    snapshot: Snapshot,
+    live: DocSet,
+    samples: Vec<Sample>,
+    sizes: Vec<u64>,
+    readable: Vec<bool>,
+}
+
+fn prepare(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::Result<Corpus> {
+    crate::trigram::check_disk()?;
+    let catalog = crate::open_catalog(catalog_dir)?;
+    catalog.load_all()?;
+    let catalog = catalog.into_resident()?;
+    let snapshot = Snapshot::open(snapshot_dir, &catalog)?;
+    let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|(doc, _)| doc.0));
+    let view = View::open(
+        index_dir,
+        &CatalogView {
+            incarnation: catalog.generation().incarnation,
+            live: &live,
+        },
+    )?
+    .ok_or("no paired control index")?;
+    let [segment] = view.segments() else {
+        return Err("sparse requires full merge".into());
+    };
+    let pinned = Pinned::new(Some(&view), &live);
+    let trigrams = view
+        .manifest()
+        .segments
+        .iter()
+        .map(|entry| {
+            Segment::open(File::open(index_dir.join(entry.trigram_file_name()))?)
+                .map_err(Into::into)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let classes = crate::screen::term_classes(segment, PER_CLASS)?;
+    let mut samples = Vec::new();
+    for (class, mut greps) in crate::screen::regex_classes(&classes, &trigrams, PER_CLASS)? {
+        if class == "identifier pattern" {
+            greps = crate::content_query::regex_identifiers(&snapshot, &live)?
+                .iter()
+                .map(|pattern| GrepFlags::default().compile(pattern).map_err(Into::into))
+                .collect::<crate::Result<Vec<_>>>()?;
+        }
+        if greps.len() != PER_CLASS {
+            return Err("insufficient sparse query seeds".into());
+        }
+        for grep in greps {
+            let facts = GrepFlags::default().required_literals(grep.pattern())?;
+            let atom = GrepAtom::read_until(grep.clone(), &pinned, &|| false)?;
+            let shipped = crate::screen::drain(pinned.top(atom.cursor_until(&pinned, &|| false)?));
+            samples.push(Sample {
+                class,
+                grep,
+                facts,
+                oracle: Vec::new(),
+                shipped,
+            });
+        }
+    }
+    let mut sizes = vec![0; live.bound() as usize];
+    for document in crate::census::hashed_documents(&catalog)? {
+        sizes[document.doc.0 as usize] = document.size;
+    }
+    let mut readable = vec![false; live.bound() as usize];
+    let live_ids: Vec<_> = live.range(0, live.bound()).collect();
+    let (cpu, wall) = (cpu_seconds()?, Instant::now());
+    for (ordinal, &doc) in live_ids.iter().enumerate() {
+        if ordinal.is_multiple_of(1024) {
+            crate::trigram::check_disk()?;
+        }
+        if !snapshot.contains(doc) {
+            continue;
+        }
+        let bytes = fs::read(snapshot.path(doc))?;
+        if bytes.len() as u64 != sizes[doc as usize] {
+            return Err("frozen size differs from catalog".into());
+        }
+        readable[doc as usize] = true;
+        for sample in &mut samples {
+            if sample.grep.regex().is_match(&bytes) {
+                sample.oracle.push(doc);
+            }
+        }
+        if ordinal.is_multiple_of(16384) {
+            println!("oracle_progress documents={}", ordinal + 1);
+        }
+    }
+    println!(
+        "population live={} readable={} unreadable={} content_bytes={} queries={} oracle_cpu_s={:.3} oracle_wall_s={:.3}",
+        live.len(),
+        readable.iter().filter(|&&r| r).count(),
+        readable
+            .iter()
+            .filter(|&&r| r)
+            .count()
+            .abs_diff(live.len() as usize),
+        sizes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| readable[*i])
+            .map(|(_, &s)| s)
+            .sum::<u64>(),
+        samples.len(),
+        cpu_seconds()? - cpu,
+        wall.elapsed().as_secs_f64()
+    );
+    Ok(Corpus {
+        catalog,
+        view,
+        snapshot,
+        live,
+        samples,
+        sizes,
+        readable,
+    })
 }

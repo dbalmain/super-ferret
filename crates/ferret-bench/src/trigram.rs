@@ -23,6 +23,11 @@ use crate::census::{HashedDoc, hashed_documents};
 use crate::segment_build::cpu_seconds;
 
 pub(crate) fn check_disk() -> crate::Result<()> {
+    check_disk_for_bytes(0)
+}
+
+/// Reserve the next output write as well as the benchmark stop threshold.
+pub(crate) fn check_disk_for_bytes(additional: u64) -> crate::Result<()> {
     let output = Command::new("df")
         .args(["-B1", "--output=avail", "."])
         .output()?;
@@ -32,7 +37,7 @@ pub(crate) fn check_disk() -> crate::Result<()> {
         .ok_or("missing disk availability")?
         .trim()
         .parse()?;
-    if !output.status.success() || available < 5_000_000_000 {
+    if !output.status.success() || available < 5_000_000_000u64.saturating_add(additional) {
         return Err("free disk below 5 GB; stop and report".into());
     }
     Ok(())

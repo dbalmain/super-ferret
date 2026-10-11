@@ -76,17 +76,37 @@ impl Need {
         }
     }
 
-    fn estimate(&self, lists: &Lists, live: &[u32]) -> usize {
+    fn estimate(&self, df: &impl Fn(&[u8]) -> usize, live: usize) -> usize {
         match self {
-            Self::All => live.len(),
+            Self::All => live,
             Self::None => 0,
-            Self::Key(key) => lists.get(key.as_slice()).map_or(0, Vec::len),
+            Self::Key(key) => df(key),
             Self::And(parts) => parts
                 .iter()
-                .map(|p| p.estimate(lists, live))
+                .map(|p| p.estimate(df, live))
                 .min()
-                .unwrap_or(live.len()),
-            Self::Or(parts) => parts.iter().map(|p| p.estimate(lists, live)).sum(),
+                .unwrap_or(live),
+            Self::Or(parts) => parts.iter().map(|p| p.estimate(df, live)).sum(),
+        }
+    }
+
+    /// Freeze exactly the volume planner's four-child selection before file
+    /// reads. Estimates use the unselected child tree, as in `candidates`.
+    pub(super) fn selected(&self, df: &impl Fn(&[u8]) -> usize, live: usize) -> Self {
+        match self {
+            Self::And(parts) => {
+                let mut ranked: Vec<_> = parts.iter().collect();
+                ranked.sort_by_key(|part| (part.estimate(df, live), *part));
+                Self::And(
+                    ranked
+                        .into_iter()
+                        .take(4)
+                        .map(|part| part.selected(df, live))
+                        .collect(),
+                )
+            }
+            Self::Or(parts) => Self::Or(parts.iter().map(|part| part.selected(df, live)).collect()),
+            other => other.clone(),
         }
     }
 
@@ -97,7 +117,12 @@ impl Need {
             Self::Key(key) => lists.get(key.as_slice()).cloned().unwrap_or_default(),
             Self::And(parts) => {
                 let mut ranked: Vec<_> = parts.iter().collect();
-                ranked.sort_by_key(|p| (p.estimate(lists, live), *p));
+                ranked.sort_by_key(|p| {
+                    (
+                        p.estimate(&|key| lists.get(key).map_or(0, Vec::len), live.len()),
+                        *p,
+                    )
+                });
                 let mut selected = ranked.into_iter().take(4);
                 let Some(first) = selected.next() else {
                     return live.to_vec();

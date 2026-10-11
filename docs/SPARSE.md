@@ -268,5 +268,9 @@ are not additive. Empty bands report zero verification and the shared posting
 cost. Verify candidate inclusion and exact matched DocIds against the oracle
 for both temperatures, with missing snapshot documents admitted conservatively.
 
-Results and the updated house recommendation await the full run. Initial disk
-headroom is about 14 GiB; stop below 5 GB. No Cargo changes are planned.
+The file-backed harness and four regressions are implemented. Formatting,
+workspace clippy with warnings denied, and workspace tests pass: **945 passed /
+13 ignored**, zero Rust warnings. Release rebuilding and full measurement are
+next; results and the updated house recommendation await that run. Initial
+disk headroom was about 14 GiB, about 11 GiB after rebuilding test artifacts;
+stop below 5 GB. No Cargo manifests or lockfiles changed.

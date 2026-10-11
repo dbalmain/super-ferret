@@ -20,6 +20,7 @@
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
 //! ferret-bench rank-fp <catalog-dir> <out-dir>   static df≥2 dictionary: 32-bit sparse fingerprints vs 20-bit buckets
+//! ferret-bench sparse-latency <catalog-dir> <index-dir> <snapshot-dir> <scratch-dir> [variant]  cold/warm regex screens
 //! ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>  M5 candidate-byte diagnostic
 //! ferret-bench chunk-census <catalog-dir> <index-dir>   D66 heuristic chunk map census (S3 M6)
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
@@ -177,6 +178,20 @@ fn main() -> ExitCode {
             ("index-churn", [out, rounds, options @ ..]) => {
                 index_build::churn(Path::new(out), rounds, options)
             }
+            ("sparse-latency", [dir, index, snapshot, scratch]) => sparse::latency::run(
+                Path::new(dir),
+                Path::new(index),
+                Path::new(snapshot),
+                Path::new(scratch),
+                None,
+            ),
+            ("sparse-latency", [dir, index, snapshot, scratch, only]) => sparse::latency::run(
+                Path::new(dir),
+                Path::new(index),
+                Path::new(snapshot),
+                Path::new(scratch),
+                Some(only),
+            ),
             ("sparse", [dir, index, snapshot]) => {
                 sparse::run(Path::new(dir), Path::new(index), Path::new(snapshot), None)
             }
@@ -253,6 +268,7 @@ fn usage() -> ExitCode {
          ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench index-churn <index-dir> <rounds> [--codec 1|h]\n       \
+         ferret-bench sparse-latency <catalog-dir> <index-dir> <snapshot-dir> <scratch-dir> [variant]\n       \
          ferret-bench sparse <catalog-dir> <index-dir> <snapshot-dir> [variant]\n       \
          ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench regex-query <catalog-dir> <index-dir> <snapshot-dir>\n       \
