@@ -3653,9 +3653,10 @@ removing most of it.
 
 ## D65 — The term dictionary is 87% of the index
 
-**Status: static dictionary layout answered: front-coded blocks routed by a
-resident block-prefix FST (Dave, 2026-10-11); see the last update below. H's
-codec question (C, below) is still open.** S2 M2b, 2026-10-07;
+**Status: answered.** Static dictionary layout: front-coded blocks routed by a
+resident block-prefix FST (Dave, 2026-10-11; see the last update below). H's
+codec question: **C** (Dave, 2026-10-11), measured as three arms, C1–C3,
+below. S2 M2b, 2026-10-07;
 [measurements](S2.md#m2--segment-writer-and-reader).
 
 **Question:** The first real build is 12.7% of text, not the 6.8% S2 M0
@@ -3855,6 +3856,23 @@ is the only thing against it, and a run codec is a direct answer to it. **The
 fact that would change it:** on a refreshed catalog, small-class p90 stays over
 20 ms with full coverage. Then H's verification reads are the cost, and A
 stands.
+
+**Answered: C (Dave, 2026-10-11), measured as three arms.** H's records are
+one-way: a dictionary term demoted to a record never returns, because a record
+keeps only a 32-bit fingerprint. Under churn, recurring vocabulary therefore
+piles up at about 4 B per document against about 1 B in a postings list. The
+next slice measures, against codec 1:
+
+| Arm | Fix                                                                                                                                               | Extra cost                                        |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| C1  | Run codec: equal-fingerprint runs store the fingerprint once and delta-code DocIds                                                                | none                                              |
+| C2  | C1, plus graduation: a merge that holds a term's text pulls matching records into its postings after reading each document to rule out collisions | merge-time document reads                         |
+| C3  | C1, plus each record's first byte offset, used to verify graduation and query hits cheaply                                                        | about 3 B per record (+80 MB on `$HOME`, derived) |
+
+Each is measured for bytes at first build, steady state, full merge and under
+S2's churn trace; rare-term latency cold and warm, split by the verified file's
+size; and merge CPU and I/O. The latency verdict uses a refreshed catalog, so
+the stale-catalog floor is gone.
 
 ### D65 update — the static dictionary's layout (2026-10-10 to 2026-10-11)
 
