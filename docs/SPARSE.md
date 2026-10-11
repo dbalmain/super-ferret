@@ -1,7 +1,7 @@
 # Sparse grams: regex candidate experiment
 
-Status: implementation committed and gates green; full-corpus measurement
-running. Bench-only indexes; product formats and planning remain unchanged. No network sources used.
+Status: resumed after a usage cutoff; completed sparse and fixed-4 results
+retained. Only fixed-8 and word controls remain to measure. Bench-only indexes; product formats and planning remain unchanged. No network sources used.
 
 ## Design and soundness
 
@@ -179,3 +179,21 @@ MiB total index**, **1,150.22 MiB postings**, and **1,149.07 CPU s**. Its headli
 candidate medians/p90s equal frequency cap 8 in every class. Both weight
 functions therefore pay more than twice the cap-8 storage for no headline
 gain at cap 32. Raw fixed-4 and fixed-8 controls remain in progress.
+
+## Resumption checkpoint
+
+The cutoff killed fixed-8 at range 13/32; its incomplete build is discarded.
+All fixed-4 measurements survived: **42,441,594 keys**, **1,103.88 MiB total**,
+**853.59 MiB postings**, **591.33 CPU s**. Rare candidate bytes median/p90 are
+**69.14/164.90 MiB**, improving the sparse tail despite fewer keys. It passes
+all 250 oracle checks. Completed rows are preserved in
+[`measurements/sparse.txt`](measurements/sparse.txt).
+
+The resumption starts with WIP commit `681129f`. Final implementation gates pass: pinned formatting, workspace clippy with
+warnings denied, and **941 passed / 13 ignored**, zero Rust warnings. The
+workspace retry passed after an existing batch test's transient catalog-lock
+failure; no unrelated code was changed. The remaining invocation selects only
+`fixed-8,word-fixed-4,word-fixed-4+5`, using the same frozen corpus and oracle.
+Disk has 7.7 GiB free; each corpus pass checks the 5 GB stop threshold.
+A protected process and a foreground `while kill -0` wait preserve the run
+if the interactive turn is interrupted again.

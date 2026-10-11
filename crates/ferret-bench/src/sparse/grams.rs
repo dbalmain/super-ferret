@@ -99,8 +99,15 @@ pub(super) fn extract<'a>(
         }
         Variant::Word4 | Variant::Word45 => {
             bytes.windows(3).for_each(&mut emit);
-            for length in 4..=if matches!(variant, Variant::Word4) { 4 } else { 5 } {
-                bytes.windows(length).filter(|gram| word(gram)).for_each(&mut emit);
+            for length in 4..=if matches!(variant, Variant::Word4) {
+                4
+            } else {
+                5
+            } {
+                bytes
+                    .windows(length)
+                    .filter(|gram| word(gram))
+                    .for_each(&mut emit);
             }
             return;
         }
@@ -166,9 +173,20 @@ pub(super) fn extract_partition<'a>(
             return;
         }
         Variant::Word4 | Variant::Word45 => {
-            for gram in bytes.windows(3).filter(|gram| gram[0] >> 3 == partition) { emit(gram); }
-            for length in 4..=if matches!(variant, Variant::Word4) { 4 } else { 5 } {
-                for gram in bytes.windows(length).filter(|gram| gram[0] >> 3 == partition && word(gram)) { emit(gram); }
+            for gram in bytes.windows(3).filter(|gram| gram[0] >> 3 == partition) {
+                emit(gram);
+            }
+            for length in 4..=if matches!(variant, Variant::Word4) {
+                4
+            } else {
+                5
+            } {
+                for gram in bytes
+                    .windows(length)
+                    .filter(|gram| gram[0] >> 3 == partition && word(gram))
+                {
+                    emit(gram);
+                }
             }
             return;
         }

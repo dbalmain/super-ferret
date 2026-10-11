@@ -288,7 +288,9 @@ fn word_four_keeps_case_alternatives_and_falls_back_across_punctuation() {
     // probing those missing keys would silently lose punctuation literals.
     let bytes = fold("abcd abc_ Ki aſb abc def ab-cd".as_bytes());
     let mut keys = BTreeSet::new();
-    extract(&bytes, Variant::Word4, &[], |gram| { keys.insert(gram.to_vec()); });
+    extract(&bytes, Variant::Word4, &[], |gram| {
+        keys.insert(gram.to_vec());
+    });
     assert!(keys.contains(b"abcd".as_slice()));
     assert!(keys.contains(b"abc_".as_slice()));
     assert!(keys.contains("Ki".as_bytes()));
@@ -296,7 +298,11 @@ fn word_four_keeps_case_alternatives_and_falls_back_across_punctuation() {
     assert!(!keys.contains(b"abc ".as_slice()));
     assert!(!keys.contains(b"ab-c".as_slice()));
     assert!(bytes.windows(3).all(|gram| keys.contains(gram)));
-    check(&["abc def", "ab-cd", "kilo", "aſb"], &[b"abc def", b"ab-cd", "Kilo".as_bytes(), "aſb".as_bytes()], true);
+    check(
+        &["abc def", "ab-cd", "kilo", "aſb"],
+        &[b"abc def", b"ab-cd", "Kilo".as_bytes(), "aſb".as_bytes()],
+        true,
+    );
 }
 
 #[test]
@@ -315,11 +321,20 @@ fn repeated_pair_ties_leave_false_candidates_that_fixed_five_rejects() {
         for cap in [8, 32] {
             let variant = Variant::Sparse { frequency, cap };
             let index = lists(&documents, variant, &weights);
-            assert_eq!(Need::literals(&facts, variant, &weights).candidates(&index, &[0, 1, 2]), [0, 1, 2]);
+            assert_eq!(
+                Need::literals(&facts, variant, &weights).candidates(&index, &[0, 1, 2]),
+                [0, 1, 2]
+            );
         }
     }
     let index = lists(&documents, Variant::Word4, &[]);
-    assert_eq!(Need::literals(&facts, Variant::Word4, &[]).candidates(&index, &[0, 1, 2]), [1, 2]);
+    assert_eq!(
+        Need::literals(&facts, Variant::Word4, &[]).candidates(&index, &[0, 1, 2]),
+        [1, 2]
+    );
     let index = lists(&documents, Variant::Word45, &[]);
-    assert_eq!(Need::literals(&facts, Variant::Word45, &[]).candidates(&index, &[0, 1, 2]), [2]);
+    assert_eq!(
+        Need::literals(&facts, Variant::Word45, &[]).candidates(&index, &[0, 1, 2]),
+        [2]
+    );
 }

@@ -293,7 +293,11 @@ pub(crate) fn run(
     snapshot_dir: &Path,
     only: Option<&str>,
 ) -> crate::Result<()> {
-    if only.is_some_and(|labels| labels.split(',').any(|label| !Variant::ALL.iter().any(|variant| variant.label() == label))) {
+    if only.is_some_and(|labels| {
+        labels
+            .split(',')
+            .any(|label| !Variant::ALL.iter().any(|variant| variant.label() == label))
+    }) {
         return Err("unknown sparse variant".into());
     }
     let variants: Vec<_> = Variant::ALL
@@ -459,7 +463,8 @@ pub(crate) fn run(
         let (cpu, wall) = (cpu_seconds()?, Instant::now());
         let (lists, encoded) = if !matches!(
             variant,
-            Variant::Trigram | Variant::Word4
+            Variant::Trigram
+                | Variant::Word4
                 | Variant::Sparse {
                     frequency: false,
                     cap: 8
