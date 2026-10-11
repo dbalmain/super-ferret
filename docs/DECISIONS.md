@@ -14,83 +14,83 @@ Predecessors, carried forward where still open:
 
 ## Status
 
-| Id  | Question                                                 | Status         | Answer                                                                                                         |
-| --- | -------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------- |
-| D1  | Repository shape                                         | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                           |
-| D2  | Format of the living documents                           | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`         |
-| D3  | Build order: index first, or the no-index tool first     | answered       | B: usable tool first, to start collecting data                                                                 |
-| D4  | What identifies a document                               | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                              |
-| D5  | Where the mutable state (paths, inodes) lives            | answered       | A: own catalog; memory budget configurable, set by experiment                                                  |
-| D6  | What the index holds: postings, filters, positions       | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                              |
-| D7  | Positions                                                | merged into D6 |                                                                                                                |
-| D8  | Regex at first ship                                      | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                            |
-| D9  | What a term is                                           | answered       | B: identifier splitting, filenames especially                                                                  |
-| D10 | Which roots                                              | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                              |
-| D11 | `unsafe` posture and the intpack dependency              | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                     |
-| D12 | Licence                                                  | answered       | A: `MIT OR Apache-2.0`                                                                                         |
-| D13 | Ignore rules: precedence, and whose matcher              | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore` |
-| D14 | Filename search: scan the names, or index them           | answered       | C, scan first; an optional resident daemon keeps names warm                                                    |
-| D15 | Result unit: per path or per document                    | answered       | per path; a view may group (e.g. image search, once per content)                                               |
-| D16 | Replace `ignore` with our own gitignore matcher          | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set   |
-| D17 | Whose regex engine, and when                             | reopened       | S3: trigger fired (warm rare-literal verify 97% of wall, engine 57%); rec keep A until stronger screening is measured |
-| D18 | Symlinks: catalogue as links, and what they match        | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in          |
-| D19 | Ignore matching: whole paths, or per-directory rule sets | answered       | B-flat-indexed: one shared, indexed rule list per directory; last match wins                                   |
-| D20 | Walk across mount points, or stay on the root's device   | answered       | A: cross mount points below a root, as now                                                                     |
-| D21 | Walk by path, or by directory handle                     | answered       | B: `rustix` handles for every operation below the root, now                                                    |
-| D22 | A root inside a git work tree                            | answered       | A (revised 2026-09-27): nothing above a root applies; a root inside a work tree is treated as outside one      |
-| D23 | Recording work trees, so duplicate results can be hidden | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                        |
-| D24 | How many walk workers by default                         | answered       | B: `min(16, cores)`, fastest cold (2.50 s vs 3.08 s at 8); `default_workers()`                                 |
-| D25 | A configured root that git ignores                       | answered       | B: a configured root is always walked; rules apply below it                                                    |
-| D26 | A re-run: rebuild the snapshot, or mutate through a log  | answered       | A′: rebuild each run; any walker fault blocks publication until faults are typed                               |
-| D27 | `InoId` and `NameId`: stable, or renumbered              | answered       | A: renumber each snapshot; C once indexing is incremental                                                      |
-| D28 | Name layout: raw sorted by parent, or front-coded        | answered       | A: raw NUL-terminated heap by (parent, name); suffix array a later experiment                                  |
-| D29 | How a parallel walk tells the catalog each parent        | answered       | A: the walker carries a per-directory value                                                                    |
-| D30 | What `ferret find` builds when it opens the catalog      | answered       | C: lazy, plus a persisted directory `InoId → NameId`; cold find measured                                       |
-| D31 | One inode, several names                                 | answered       | C: one row per file inode, per directory name; shared per-run hash cache                                       |
-| D32 | A reader while `ferret index` runs                       | answered       | A: generations plus a single-writer lock                                                                       |
-| D33 | What the walker must also hand the catalog               | answered       | A: walker hands over the directory handle and work-tree kind                                                   |
-| D34 | Which roots a re-run replaces                            | answered       | B: roots stored with the index; explicit removal; innermost root owns its subtree                              |
-| D35 | Work-tree context for a root inside a repository         | answered       | moot: with D22 A, no work-tree context above a root                                                            |
-| D36 | Dead documents before there is an index to merge         | answered       | B for S1: drop dead docs, keep the id counter; reactivation is S2's call                                       |
-| D37 | Remembering why a file has no document                   | answered       | B: 2-bit content state plus sniffer version                                                                    |
-| D38 | Reading the snapshot: whole file, or by section          | answered       | B: section-wise positional reads, in slice 5 (via D40)                                                         |
-| D39 | A checksum over the snapshot                             | answered       | A: none in S1; revisit with incremental indexing                                                               |
-| D40 | What entry count S1 is built for                         | answered       | B: about 10M catalogued entries, measured at about 40M                                                         |
-| D41 | The name scanner: `memchr::memmem`, or our own           | answered       | B: own case-folding filter, AVX2 + SWAR, vs memmem control                                                     |
-| D42 | A re-run's memory: the previous generation held          | replied        | A stands; reply explains carry-over and kept roots                                                             |
-| D43 | A 10M name query costs its section loads, not its scan   | answered       | B later: compaction, then a name index, then mmap                                                              |
-| D44 | Single inode reads against an evicted catalog            | answered       | superseded by D46                                                                                              |
-| D45 | Query text in the local log                              | answered       | A: keep query text; switch with the config file                                                                |
-| D46 | Is the daemon the only mode of operation?                | answered       | C, plus a batch mode for CI and tests                                                                          |
-| D47 | `ferret find` as a drop-in for find(1)                   | answered       | C: find semantics except ignore rules                                                                          |
-| D48 | The next move after S1                                   | answered       | A: compaction; name index only if 10M misses 1 GB                                                              |
-| D49 | A one-shot query with no daemon running                  | answered       | A: spawn on first use, in-process fallback                                                                     |
-| D50 | `ferret find` stretch calls F1–F13                       | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                     |
-| D51 | Compaction while the watcher is busy                     | answered       | A: idle-boundary compaction under the writer lock; pause measured and reported in M7                            |
-| D52 | D27 C: ids across compaction                             | answered       | B: epoch-scoped InoId/NameId; DocId stays stable |
-| D53 | Cold-open overlay validation                             | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                   |
-| D54 | In-memory names: interning, postings, row order          | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                 |
-| D55 | Storing mtime as an order rather than a value          | answered       | D + F: seconds-only ordered dictionaries for mtime and ctime, exact per-block max, racy rule; no ordered structure |
-| D56 | Where an indexed find with actions executes            | answered       | A: action queries run in the client through the shared engine; routing exception to D49                        |
-| D57 | Socket codec: shared JSON lines or binary framing       | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                          |
-| D58 | Batch input: serde_json or a hand-written reader         | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                 |
-| D59 | How intpack enters the workspace                         | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                     |
-| D60 | Reactivate a dead DocId when its content returns        | open           | experiment run: git index saves ~3% (follow is 85–90%); rec B now, A′ (reactivate by content hash, no git) if wanted |
-| D61 | Term frequencies in S2's postings                       | open           | rec B: doc ids only; frequencies arrive with ranking, by reindex (S2 M0)                                       |
-| D62 | `ferret search` syntax for content and booleans          | open           | rec A: `text:` atoms; find-style `OR`, `NOT`, `(` `)` as whole arguments (S2 M0)                               |
-| D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
-| D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
-| D65 | The term dictionary is 87% of the index                  | open           | S3 M2 measured H: 53% smaller at steady state; rule fails on a stale-catalog floor that also fails the control; churn +10%; rec C: run codec, then re-measure |
-| D66 | Phrase queries read too much: positions, or not         | answered       | D: per-document Bloom 8 over adjacent pairs, pairs only, streaming fold; agent transcripts out of the content index                          |
-| D67 | How `ferret search` spells a content regex, and when it refuses | open | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0) |
-| D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b) |
-| D69 | Saturated large documents in trigram postings           | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b) |
-| D70 | How large the trigram follow buffer may grow           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a) |
-| D71 | Agent habits `ferret search` silently gets wrong     | open           | rec A: `and`/`or`/`not` any case; `content:` aliases `text:`; error on an operator inside one argument (grok survey) |
-| D72 | `ferret grep`: scan broad queries automatically?          | open           | rec A: grep scans when the index can't narrow; `search` keeps S3's refusal (GREP.md, Sol) |
-| D73 | `ferret grep`: what freshness does indexed grep promise?   | open           | rec A+D: snapshot by default like find, plus opt-in `--live` that keeps ferret's ignore rules (GREP.md, Sol) |
-| D74 | `ferret grep`: may `-g`/`--hidden` recover excluded paths? | open           | rec A: intersect with D47 visibility; `--no-ignore`/`-u` use find's live walk (GREP.md, Sol) |
-| D75 | `ferret grep`: BOMs and UTF-16, or raw bytes only?        | open           | rec D: strip a leading UTF-8 BOM for every input; UTF-16 stays a known miss (else B) (GREP.md, Luna/Astra round 2) |
+| Id  | Question                                                               | Status         | Answer                                                                                                                                                        |
+| --- | ---------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | Repository shape                                                       | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                                                                          |
+| D2  | Format of the living documents                                         | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`                                                        |
+| D3  | Build order: index first, or the no-index tool first                   | answered       | B: usable tool first, to start collecting data                                                                                                                |
+| D4  | What identifies a document                                             | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                                                                             |
+| D5  | Where the mutable state (paths, inodes) lives                          | answered       | A: own catalog; memory budget configurable, set by experiment                                                                                                 |
+| D6  | What the index holds: postings, filters, positions                     | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                                                                             |
+| D7  | Positions                                                              | merged into D6 |                                                                                                                                                               |
+| D8  | Regex at first ship                                                    | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                                                                           |
+| D9  | What a term is                                                         | answered       | B: identifier splitting, filenames especially                                                                                                                 |
+| D10 | Which roots                                                            | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                                                                             |
+| D11 | `unsafe` posture and the intpack dependency                            | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                                                                    |
+| D12 | Licence                                                                | answered       | A: `MIT OR Apache-2.0`                                                                                                                                        |
+| D13 | Ignore rules: precedence, and whose matcher                            | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore`                                                |
+| D14 | Filename search: scan the names, or index them                         | answered       | C, scan first; an optional resident daemon keeps names warm                                                                                                   |
+| D15 | Result unit: per path or per document                                  | answered       | per path; a view may group (e.g. image search, once per content)                                                                                              |
+| D16 | Replace `ignore` with our own gitignore matcher                        | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set                                                  |
+| D17 | Whose regex engine, and when                                           | reopened       | S3: trigger fired (warm rare-literal verify 97% of wall, engine 57%); rec keep A until stronger screening is measured                                         |
+| D18 | Symlinks: catalogue as links, and what they match                      | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in                                                         |
+| D19 | Ignore matching: whole paths, or per-directory rule sets               | answered       | B-flat-indexed: one shared, indexed rule list per directory; last match wins                                                                                  |
+| D20 | Walk across mount points, or stay on the root's device                 | answered       | A: cross mount points below a root, as now                                                                                                                    |
+| D21 | Walk by path, or by directory handle                                   | answered       | B: `rustix` handles for every operation below the root, now                                                                                                   |
+| D22 | A root inside a git work tree                                          | answered       | A (revised 2026-09-27): nothing above a root applies; a root inside a work tree is treated as outside one                                                     |
+| D23 | Recording work trees, so duplicate results can be hidden               | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                                                                       |
+| D24 | How many walk workers by default                                       | answered       | B: `min(16, cores)`, fastest cold (2.50 s vs 3.08 s at 8); `default_workers()`                                                                                |
+| D25 | A configured root that git ignores                                     | answered       | B: a configured root is always walked; rules apply below it                                                                                                   |
+| D26 | A re-run: rebuild the snapshot, or mutate through a log                | answered       | A′: rebuild each run; any walker fault blocks publication until faults are typed                                                                              |
+| D27 | `InoId` and `NameId`: stable, or renumbered                            | answered       | A: renumber each snapshot; C once indexing is incremental                                                                                                     |
+| D28 | Name layout: raw sorted by parent, or front-coded                      | answered       | A: raw NUL-terminated heap by (parent, name); suffix array a later experiment                                                                                 |
+| D29 | How a parallel walk tells the catalog each parent                      | answered       | A: the walker carries a per-directory value                                                                                                                   |
+| D30 | What `ferret find` builds when it opens the catalog                    | answered       | C: lazy, plus a persisted directory `InoId → NameId`; cold find measured                                                                                      |
+| D31 | One inode, several names                                               | answered       | C: one row per file inode, per directory name; shared per-run hash cache                                                                                      |
+| D32 | A reader while `ferret index` runs                                     | answered       | A: generations plus a single-writer lock                                                                                                                      |
+| D33 | What the walker must also hand the catalog                             | answered       | A: walker hands over the directory handle and work-tree kind                                                                                                  |
+| D34 | Which roots a re-run replaces                                          | answered       | B: roots stored with the index; explicit removal; innermost root owns its subtree                                                                             |
+| D35 | Work-tree context for a root inside a repository                       | answered       | moot: with D22 A, no work-tree context above a root                                                                                                           |
+| D36 | Dead documents before there is an index to merge                       | answered       | B for S1: drop dead docs, keep the id counter; reactivation is S2's call                                                                                      |
+| D37 | Remembering why a file has no document                                 | answered       | B: 2-bit content state plus sniffer version                                                                                                                   |
+| D38 | Reading the snapshot: whole file, or by section                        | answered       | B: section-wise positional reads, in slice 5 (via D40)                                                                                                        |
+| D39 | A checksum over the snapshot                                           | answered       | A: none in S1; revisit with incremental indexing                                                                                                              |
+| D40 | What entry count S1 is built for                                       | answered       | B: about 10M catalogued entries, measured at about 40M                                                                                                        |
+| D41 | The name scanner: `memchr::memmem`, or our own                         | answered       | B: own case-folding filter, AVX2 + SWAR, vs memmem control                                                                                                    |
+| D42 | A re-run's memory: the previous generation held                        | replied        | A stands; reply explains carry-over and kept roots                                                                                                            |
+| D43 | A 10M name query costs its section loads, not its scan                 | answered       | B later: compaction, then a name index, then mmap                                                                                                             |
+| D44 | Single inode reads against an evicted catalog                          | answered       | superseded by D46                                                                                                                                             |
+| D45 | Query text in the local log                                            | answered       | A: keep query text; switch with the config file                                                                                                               |
+| D46 | Is the daemon the only mode of operation?                              | answered       | C, plus a batch mode for CI and tests                                                                                                                         |
+| D47 | `ferret find` as a drop-in for find(1)                                 | answered       | C: find semantics except ignore rules                                                                                                                         |
+| D48 | The next move after S1                                                 | answered       | A: compaction; name index only if 10M misses 1 GB                                                                                                             |
+| D49 | A one-shot query with no daemon running                                | answered       | A: spawn on first use, in-process fallback                                                                                                                    |
+| D50 | `ferret find` stretch calls F1–F13                                     | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                                                                    |
+| D51 | Compaction while the watcher is busy                                   | answered       | A: idle-boundary compaction under the writer lock; pause measured and reported in M7                                                                          |
+| D52 | D27 C: ids across compaction                                           | answered       | B: epoch-scoped InoId/NameId; DocId stays stable                                                                                                              |
+| D53 | Cold-open overlay validation                                           | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                                                                |
+| D54 | In-memory names: interning, postings, row order                        | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                                                               |
+| D55 | Storing mtime as an order rather than a value                          | answered       | D + F: seconds-only ordered dictionaries for mtime and ctime, exact per-block max, racy rule; no ordered structure                                            |
+| D56 | Where an indexed find with actions executes                            | answered       | A: action queries run in the client through the shared engine; routing exception to D49                                                                       |
+| D57 | Socket codec: shared JSON lines or binary framing                      | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                                                                         |
+| D58 | Batch input: serde_json or a hand-written reader                       | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                                                                |
+| D59 | How intpack enters the workspace                                       | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                                                                    |
+| D60 | Reactivate a dead DocId when its content returns                       | open           | experiment run: git index saves ~3% (follow is 85–90%); rec B now, A′ (reactivate by content hash, no git) if wanted                                          |
+| D61 | Term frequencies in S2's postings                                      | answered       | B: doc ids only for now; frequencies arrive with ranking, by reindex                                                                                          |
+| D62 | `ferret search` syntax for content and booleans                        | answered       | A: `text:` atoms; find-style `OR`, `NOT`, `(` `)`; side survey of query languages done; `ferret grep` follows ripgrep (D72–D75)                               |
+| D63 | Tokenize in a follow pass, or in the crawl's hashing read              | answered       | A: the index follows the catalog in DocId order; D60's experiment found git does not remove the re-hash in a way that matters                                 |
+| D64 | Segment bytes: positional reads or `mmap`                              | answered       | A: positional reads into owned buffers; no `unsafe` or `mmap` until measurements justify it                                                                   |
+| D65 | The term dictionary is 87% of the index                                | open           | S3 M2 measured H: 53% smaller at steady state; rule fails on a stale-catalog floor that also fails the control; churn +10%; rec C: run codec, then re-measure |
+| D66 | Phrase queries read too much: positions, or not                        | answered       | D: per-document Bloom 8 over adjacent pairs, pairs only, streaming fold; agent transcripts out of the content index                                           |
+| D67 | How `ferret search` spells a content regex, and when it refuses        | open           | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0)                               |
+| D68 | Per-document filters: a screening stage, terms and trigrams separately | open           | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b)                      |
+| D69 | Saturated large documents in trigram postings                          | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b)                                      |
+| D70 | How large the trigram follow buffer may grow                           | open           | rec B after M1a: shared budget halves follow RSS (458→248 MiB) for +1.1% steady term index (S3 M0, M1a)                                                       |
+| D71 | Agent habits `ferret search` silently gets wrong                       | open           | rec A: `and`/`or`/`not` any case; `content:` aliases `text:`; error on an operator inside one argument (grok survey)                                          |
+| D72 | `ferret grep`: scan broad queries automatically?                       | open           | rec A: grep scans when the index can't narrow; `search` keeps S3's refusal (GREP.md, Sol)                                                                     |
+| D73 | `ferret grep`: what freshness does indexed grep promise?               | open           | rec A+D: snapshot by default like find, plus opt-in `--live` that keeps ferret's ignore rules (GREP.md, Sol)                                                  |
+| D74 | `ferret grep`: may `-g`/`--hidden` recover excluded paths?             | open           | rec A: intersect with D47 visibility; `--no-ignore`/`-u` use find's live walk (GREP.md, Sol)                                                                  |
+| D75 | `ferret grep`: BOMs and UTF-16, or raw bytes only?                     | open           | rec D: strip a leading UTF-8 BOM for every input; UTF-16 stays a known miss (else B) (GREP.md, Luna/Astra round 2)                                            |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -182,11 +182,11 @@ than as a stop-gap scanner.
 **Question:** In `document → hash → inode(s) → name → dir inode → … → root`,
 what is the primary key of a document, and what follows from it?
 
-| Option                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                   | Buys                                                                                                                                                                                                                                                                                                                              |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Option                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                  | Buys                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A. Content-addressed: doc id ← (content hash, extractor version, tokenizer version). `(dev, ino) → doc`. `(parent ino, name) → child ino`. Paths resolved by walking parents. | Every indexed file is hashed in full (it is being read in full to tokenize, so the marginal cost is the hash). A result is a (doc, path) pair, not a path: a doc with three names is three results. Metadata predicates (`ext:`, `path:`, `mtime:`) live on the inode/name, not the doc, so composing them with term postings needs a doc↔inode mapping at query time. | Rename or move of a file or a whole directory is one row update; a cross-filesystem move (copy + delete) reuses the doc. Duplicate content is indexed once. A changed tokenizer is a reindex keyed by version, not a migration. Inode reuse (a new file landing on a recycled number) is detected by hash mismatch, not by trust. |
-| B. Inode-addressed: doc id ← `(dev, ino)`; hash kept only to skip re-tokenizing unchanged content                                                                             | A duplicate file is indexed twice. Cross-filesystem moves reindex. Inode reuse after delete is a correctness hazard: `(dev, ino)` alone is not an identity on Linux — it needs `ctime` or a generation number alongside.                                                                                                                                                | Simpler results: one doc, one path. Simpler query-time composition.                                                                                                                                                                                                                                                               |
-| C. Path-addressed                                                                                                                                                             | Every rename is a reindex — the thing the chain exists to avoid.                                                                                                                                                                                                                                                                                                        | Nothing.                                                                                                                                                                                                                                                                                                                          |
+| B. Inode-addressed: doc id ← `(dev, ino)`; hash kept only to skip re-tokenizing unchanged content                                                                             | A duplicate file is indexed twice. Cross-filesystem moves reindex. Inode reuse after delete is a correctness hazard: `(dev, ino)` alone is not an identity on Linux — it needs `ctime` or a generation number alongside.                                                                                                                                               | Simpler results: one doc, one path. Simpler query-time composition.                                                                                                                                                                                                                                                               |
+| C. Path-addressed                                                                                                                                                             | Every rename is a reindex — the thing the chain exists to avoid.                                                                                                                                                                                                                                                                                                       | Nothing.                                                                                                                                                                                                                                                                                                                          |
 
 **Recommendation:** A, with two things stated now because they shape the index:
 (1) the query engine's unit of result is `(doc, name)`, and metadata filters are
@@ -704,12 +704,11 @@ dominates there. The regex-volume diagnostic says why so much is verified. A
 rare literal reads about 1.38 GB per query, against 8 MB that actually matches.
 Over 99% of that is documents that hold every required trigram but not the
 literal. A faster engine would only speed up rejecting those documents; better
-screening would avoid reading them at all.
-**Recommendation:** keep `regex` (A) for now. Measure stronger in-document
-screening first, then re-time whatever verification survives, and choose A, B
-or C on that number. **Fact that would change it:** if screening cannot cut
-warm verified bytes by more than half, the engine share decides, and B or C
-comes back.
+screening would avoid reading them at all. **Recommendation:** keep `regex` (A)
+for now. Measure stronger in-document screening first, then re-time whatever
+verification survives, and choose A, B or C on that number. **Fact that would
+change it:** if screening cannot cut warm verified bytes by more than half, the
+engine share decides, and B or C comes back.
 
 ## D18 — Symlinks: catalogue as links, and what they match
 
@@ -1440,10 +1439,9 @@ incremental indexing makes it worth it.
 **Amendment (2026-10-02, find milestone 1):** the walker now tags operations.
 EACCES while opening, listing or reopening a directory is permanent user-chosen
 state: publish its directory row without traversing it, with an unknown entry
-count.
-Every other coverage fault still blocks publication, including EACCES from an
-ignore-file read. An entry's lstat NotFound remains a deletion; content faults
-remain publishable as unhashed files.
+count. Every other coverage fault still blocks publication, including EACCES
+from an ignore-file read. An entry's lstat NotFound remains a deletion; content
+faults remain publishable as unhashed files.
 
 S1+ carries this EACCES amendment unchanged under the log: a covered opaque
 directory retires its old children and subtree in the same final set, including
@@ -2372,62 +2370,62 @@ adapter translates the subset it can express), and ferret.
 
 **Amendment (2026-10-02, compatibility handoff):** find has one evaluator over
 catalog and live entry sources. Default mode respects ignore rules; `-I` /
-`--no-ignore` selects GNU-exact behaviour. Ignored means uncatalogued beneath
-an opaque marker, not nonexistent: an explicitly named ignored start walks live
+`--no-ignore` selects GNU-exact behaviour. Ignored means uncatalogued beneath an
+opaque marker, not nonexistent: an explicitly named ignored start walks live
 without nested ignore rules, and ignored reference operands resolve normally.
 Re-included descendants have ordinary catalogued directory ancestors. Special
 files get name/stat rows without content. Ignored regular files get name-only
-rows; ignored directories with nothing visible beneath get opaque markers.
-The global setting making `-I` the default is deferred to milestone 4. Docs at
-that milestone must explain that a pasted `find ... -delete` skips ignored
-files and still exits 0. Milestone 1 builds the live engine and rejects default
-mode until those catalog and policy changes land.
+rows; ignored directories with nothing visible beneath get opaque markers. The
+global setting making `-I` the default is deferred to milestone 4. Docs at that
+milestone must explain that a pasted `find ... -delete` skips ignored files and
+still exits 0. Milestone 1 builds the live engine and rejects default mode until
+those catalog and policy changes land.
 
-**4a encoding brief (2026-10-02, D40/D43).** The handoff's fixed-width
-12-byte name row predates S1a: child is now blocked frame-of-reference, 128 rows
-per block. Does its high type sentinel justify a different physical encoding?
+**4a encoding brief (2026-10-02, D40/D43).** The handoff's fixed-width 12-byte
+name row predates S1a: child is now blocked frame-of-reference, 128 rows per
+block. Does its high type sentinel justify a different physical encoding?
 
 - **A, fixed high sentinels (retained):** seven values below NONE, one reserved
   tombstone, no inode for an ignored name. Mixed blocks widen to 32 bits.
-  10.449M names: 594,837,226 B, 10.71 s build wall, 1,641 MiB peak RSS.
-  Build load 7.86/4.22/3.22. Tags stay fixed when stable inode ids are added.
+  10.449M names: 594,837,226 B, 10.71 s build wall, 1,641 MiB peak RSS. Build
+  load 7.86/4.22/3.22. Tags stay fixed when stable inode ids are added.
 - **B, tags adjacent to inode_count (measured trial):** keep real ids unchanged,
   put seven type codes immediately after them, translate in the reader. Same
-  names/inodes/docs: 593,660,890 B, 10.69 s wall, 1,639 MiB peak RSS.
-  Build load 9.98/7.00/4.56. Saves 1,176,336 B (0.20%), but tags move as the
-  inode count changes, complicating the future incremental writer.
+  names/inodes/docs: 593,660,890 B, 10.69 s wall, 1,639 MiB peak RSS. Build load
+  9.98/7.00/4.56. Saves 1,176,336 B (0.20%), but tags move as the inode count
+  changes, complicating the future incremental writer.
 
 **Recommendation: A.** The size difference is small and B has no consistent
 query win. Full listing, warm: A 1,369 ms vs B 1,354 ms; baseline 1,340 ms.
 ROADMAP § S1c summarises the section and query numbers; the full tables, with
 their loads, are in git history as `docs/FIND-M4A.md`. The fact that would
 change it: a much more ignored-heavy 10M fixture where nullable child/type or a
-separate ignored range saves materially more space or query time. Those two options were not
-implemented or measured here. There is no departure from the settled sentinel
-encoding. All seven ignored kinds have name-only rows; visible special kinds
-use a sparse 8-byte-per-row Specials section so name search loads no stat
-columns. Re-included ancestors are ordinary for find but keep the existing
-search-suppression bit to preserve search counts (D29 compatibility). Visible
-special files are available to the find source but suppressed by search, which
-keeps its existing regular-file/directory/symlink result domain.
+separate ignored range saves materially more space or query time. Those two
+options were not implemented or measured here. There is no departure from the
+settled sentinel encoding. All seven ignored kinds have name-only rows; visible
+special kinds use a sparse 8-byte-per-row Specials section so name search loads
+no stat columns. Re-included ancestors are ordinary for find but keep the
+existing search-suppression bit to preserve search counts (D29 compatibility).
+Visible special files are available to the find source but suppressed by search,
+which keeps its existing regular-file/directory/symlink result domain.
 
 **4b fallback and configuration (2026-10-03).** Default find needs an index
 covering each explicit start. Options: refuse with status 1; walk live with
 policy (a second policy crawl and changed costs); or walk as `-I` with a warning
 (scripted actions then reach ignored data). Chosen: **refuse** missing or
 incompatible catalogs and unresolved explicit starts, with re-index/`-I`
-guidance. **New names observed while listing are visible**, using live kinds
-and lstat; an uncatalogued directory walks live as visible, without nested
-ignore rules. This replaces 4b's initial refusal of new names: actions such as
+guidance. **New names observed while listing are visible**, using live kinds and
+lstat; an uncatalogued directory walks live as visible, without nested ignore
+rules. This replaces 4b's initial refusal of new names: actions such as
 `-exec touch {}/new \;` must not invalidate their own walk. Dave selected this
 behavior after the full-corpus run. The tradeoff is that a name created after
-indexing that the ignore rules would hide shows up until the next index.
-Deleted catalog names disappear from listings or are dropped when live lstat
-fails. Metadata changes are read live, not treated as index invalidation. A
-snapshot cannot detect changes inside ignored opaque subtrees, and does not
-watch for policy-file edits: re-index after changing ignore rules. A policy-aware
-live source sharing the crawler's rules could remove the new-name tradeoff
-without duplicating traversal.
+indexing that the ignore rules would hide shows up until the next index. Deleted
+catalog names disappear from listings or are dropped when live lstat fails.
+Metadata changes are read live, not treated as index invalidation. A snapshot
+cannot detect changes inside ignored opaque subtrees, and does not watch for
+policy-file edits: re-index after changing ignore rules. A policy-aware live
+source sharing the crawler's rules could remove the new-name tradeoff without
+duplicating traversal.
 
 Directories cache their live stat observation before descending, including in
 `-depth` and implicit depth from `-delete`; child actions must not change the
@@ -2438,19 +2436,19 @@ make the directory empty during the walk, while ignored children still prevent
 emptiness. Real CatalogSource regressions cover both timings and new names
 created by directory `-exec` actions.
 
-Q4's setting is **`find_no_ignore = true`**, in
-`$XDG_CONFIG_HOME/ferret/config` (default `~/.config/ferret/config`). Its boolean
-name states the behavior directly and matches `--no-ignore`. The smallest
-shape is one `key = true|false` line, optional whitespace, blank lines and `#`
-comments; missing/empty means false. Unknown keys, duplicate keys and malformed
-values fail with status 1. No dependency or general-purpose format parser.
-Config lookup resolves only its XDG base, independent of unused state/cache
-bases. Explicit `-I` bypasses both config and index; help/version bypass them too.
+Q4's setting is **`find_no_ignore = true`**, in `$XDG_CONFIG_HOME/ferret/config`
+(default `~/.config/ferret/config`). Its boolean name states the behavior
+directly and matches `--no-ignore`. The smallest shape is one `key = true|false`
+line, optional whitespace, blank lines and `#` comments; missing/empty means
+false. Unknown keys, duplicate keys and malformed values fail with status 1. No
+dependency or general-purpose format parser. Config lookup resolves only its XDG
+base, independent of unused state/cache bases. Explicit `-I` bypasses both
+config and index; help/version bypass them too.
 
-The catalog's name order cannot reproduce readdir order. 4b retains live
-name listings solely for traversal order and intersects them with catalog
-entries. This preserves `-quit` and directory-local command batches without
-using stale stat columns. ROADMAP § S1c records the cost.
+The catalog's name order cannot reproduce readdir order. 4b retains live name
+listings solely for traversal order and intersects them with catalog entries.
+This preserves `-quit` and directory-local command batches without using stale
+stat columns. ROADMAP § S1c records the cost.
 
 A pasted `find … -delete` skips ignored files and still exits 0 when the
 selected deletions succeed. Deleting a visible directory that still contains
@@ -2474,19 +2472,20 @@ traversal order during indexing and keep it current through watches, adding
 storage/crawl/daemon work but making catalog traversal possible. C: allow
 catalog order for read-only plans without quit/commands, fast for names but
 changing plain output order and the brief's exact-order contract. Existing
-catalog-only search takes 12–21 ms here, under a different output/order contract.
-**Recommendation: investigate B and measure its storage/freshness costs**, or
-explicitly choose C if that ordering relaxation is acceptable. No ordering
-relaxation is selected. The fact that changes it: Dave accepting catalog order
-for those plans, or evidence that persisted order can stay current cheaply.
-The functional implementation therefore does not complete the speed gate.
+catalog-only search takes 12–21 ms here, under a different output/order
+contract. **Recommendation: investigate B and measure its storage/freshness
+costs**, or explicitly choose C if that ordering relaxation is acceptable. No
+ordering relaxation is selected. The fact that changes it: Dave accepting
+catalog order for those plans, or evidence that persisted order can stay current
+cheaply. The functional implementation therefore does not complete the speed
+gate.
 
-**Superseded in part (2026-10-03, D50).** F7, F8, F10 and F12 replace 4b's
-live listing order, its new-name visibility, its live stat and its live
-`-empty`: default mode is now a pure index query in catalog order, with stored
-metadata, and `-empty` subtracts the walk's own `-delete` removals. The config
-key and the refusal without a covering index stand. [FIND.md](FIND.md) is the
-current contract.
+**Superseded in part (2026-10-03, D50).** F7, F8, F10 and F12 replace 4b's live
+listing order, its new-name visibility, its live stat and its live `-empty`:
+default mode is now a pure index query in catalog order, with stored metadata,
+and `-empty` subtracts the walk's own `-delete` removals. The config key and the
+refusal without a covering index stand. [FIND.md](FIND.md) is the current
+contract.
 
 ## D48 — The next move after S1
 
@@ -2549,10 +2548,10 @@ with its options, Dave's answer and the reason. The contract they produced is
 fastest answer and the simplest to maintain over time; more work now, and
 harness changes, are fine; discuss only where fastest and simplest disagree.
 
-F1, F2, F6 and F9 are changes to the private find-compat harness, not to
-ferret. They are recorded because they decide what "zero differ" means. After
-M4 the full corpus stood at `-I` 67,394 agree / 20 differ / 6 harness failures
-and default 52,909 / 28 / 3, and every one of those rows was F1, F2 or F9.
+F1, F2, F6 and F9 are changes to the private find-compat harness, not to ferret.
+They are recorded because they decide what "zero differ" means. After M4 the
+full corpus stood at `-I` 67,394 agree / 20 differ / 6 harness failures and
+default 52,909 / 28 / 3, and every one of those rows was F1, F2 or F9.
 
 ### F1 — The sandbox root's link count
 
@@ -2587,8 +2586,8 @@ make.
 ### F3 — Parallelism in the live walk
 
 **Question:** Should `ferret find -I` walk directories in parallel, given that
-its output order would then stop matching GNU's? After M3b, single-threaded
-`-I` beat GNU on every timing row and was at or below `bfs -j1` on all but
+its output order would then stop matching GNU's? After M3b, single-threaded `-I`
+beat GNU on every timing row and was at or below `bfs -j1` on all but
 `-maxdepth 2`; the gap to default bfs and to fd was threads.
 
 - A. Keep `-I` sequential; parallelise only default mode's live fallback.
@@ -2749,17 +2748,17 @@ if a user brings a case that neither solves.
 **Question:** Should the catalog add atime and allocated-block columns, so that
 `-atime`, `-amin`, `-used`, `%a`, `%b`, `%k` and `-ls` stop doing a live lstat?
 Over 300k entries the fallback cost about 350 ms against about 40 ms stored. At
-10M: atime 31.1 MB on this fixture (up to about 77 MB with fully varying
-times) and blocks 6.1 MB, against 553 MB of sections.
+10M: atime 31.1 MB on this fixture (up to about 77 MB with fully varying times)
+and blocks 6.1 MB, against 553 MB of sections.
 
 - A. Keep the lazy fallback: no format change; these primaries run at `-I`
   speed; a stored atime is usually stale, since reading a file changes it.
 - B. Add both columns: index speed; about 37 MB at 10M and a migration.
 - C. Blocks only: 6 MB for index-speed `-ls` and `%k`.
 
-**Answer: A.** Atime, allocated blocks, birth time and device numbers stay
-lazy. The fact that would change it: query logs showing `-ls` or `%k` in normal
-use (then C).
+**Answer: A.** Atime, allocated blocks, birth time and device numbers stay lazy.
+The fact that would change it: query logs showing `-ls` or `%k` in normal use
+(then C).
 
 ### README — which mode it leads with
 
@@ -2769,207 +2768,216 @@ use (then C).
 - A. Lead with `-I`, which is current without a daemon.
 - B. Keep README as it is, leading with default mode.
 
-**Answer: B.** Dave, 2026-10-03: "not advertised" means not posting about
-ferret online. The README may lead with default mode.
+**Answer: B.** Dave, 2026-10-03: "not advertised" means not posting about ferret
+online. The README may lead with default mode.
 
 ### M4b's own calls, recorded in D47
 
 The config key `find_no_ignore = true`, and refusing default mode without a
-covering index, were decided inside M4b and are recorded under D47 (4b
-fallback and configuration). The page asked Dave to say if either should
-change; no change is recorded.
+covering index, were decided inside M4b and are recorded under D47 (4b fallback
+and configuration). The page asked Dave to say if either should change; no
+change is recorded.
 
 The two follow-ups below were asked and answered during M5b and M5c, in this
 file, and refine F11.
 
 ### Find M5b — quit while an action is running (answered)
 
-**Question.** Does F11's “stops every worker promptly” require terminating
-a command or interactive prompt already started on another worker, or
-only cancelling further traversal and expression evaluation? The M5b
-implementation does the latter, flushes collected batches, and reaps children.
-Dave answered the clarification in M5c, as recorded below.
+**Question.** Does F11's “stops every worker promptly” require terminating a
+command or interactive prompt already started on another worker, or only
+cancelling further traversal and expression evaluation? The M5b implementation
+does the latter, flushes collected batches, and reaps children. Dave answered
+the clarification in M5c, as recorded below.
 
-| Option | Behavior | Tradeoff |
-| --- | --- | --- |
-| A. Finish started actions | Cancel new traversal/evaluation immediately; flush collected batches; await already-started commands/prompts | Preserves completed child output and external effects with the existing process interface; exit can wait for a slow command or unanswered prompt |
+| Option                       | Behavior                                                                                                                   | Tradeoff                                                                                                                                                       |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Finish started actions    | Cancel new traversal/evaluation immediately; flush collected batches; await already-started commands/prompts               | Preserves completed child output and external effects with the existing process interface; exit can wait for a slow command or unanswered prompt               |
 | B. Terminate started actions | Add cancellation to process-group execution, pipe collection and prompt input; terminate running commands and stop prompts | Bounds cancellation latency, but can leave partial external effects/output and changes command completion semantics; needs a cancellation-aware host interface |
 
 **Answer (2026-10-03): A.** Dave's M5c instruction settles the policy: already
-running commands finish and are awaited, with no forced termination. Quit is
-an output latch: the first entry reaching it commits under the output lock;
-entries finishing later discard their buffered output. Side effects already
-performed remain. Collected batches flush at exit. This accepts exit latency
-from a slow command or unanswered prompt and avoids cancellation machinery.
+running commands finish and are awaited, with no forced termination. Quit is an
+output latch: the first entry reaching it commits under the output lock; entries
+finishing later discard their buffered output. Side effects already performed
+remain. Collected batches flush at exit. This accepts exit latency from a slow
+command or unanswered prompt and avoids cancellation machinery.
 
 ### Find M5c — measured batching and many-start costs (answered)
 
 **Question.** The initial implementation sequences all starts and runs full
 shared batches while holding their mutex. Fifteen warm samples on the 300k tree
 showed many-starts default/live 21.565/130.593 ms versus M5b 17.261/26.694 ms;
-batch-all 189.923/243.461 ms versus 76.342/48.539 ms. The original brief attributed
-too much of this to append contention and treated read-only starts as effectful.
+batch-all 189.923/243.461 ms versus 76.342/48.539 ms. The original brief
+attributed too much of this to append contention and treated read-only starts as
+effectful.
 
-| Option | Benefit | Cost |
-| --- | --- | --- |
-| A. Shared batch, execute outside its mutex | Minimal partition; collect while full batches run | Selected entries still synchronize on append |
-| B. Bounded worker staging into that shared batch | Amortize append synchronization | Partial stages must merge at task completion and quit; shared batch remains the sole partitioner |
-| C. Special scheduling for narrow effectful roots | Reduce short-task barriers | New scheduler policy must earn its cost in measurements |
+| Option                                           | Benefit                                           | Cost                                                                                             |
+| ------------------------------------------------ | ------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| A. Shared batch, execute outside its mutex       | Minimal partition; collect while full batches run | Selected entries still synchronize on append                                                     |
+| B. Bounded worker staging into that shared batch | Amortize append synchronization                   | Partial stages must merge at task completion and quit; shared batch remains the sole partitioner |
+| C. Special scheduling for narrow effectful roots | Reduce short-task barriers                        | New scheduler policy must earn its cost in measurements                                          |
 
-**Answer (2026-10-03): A, then measured B; overlap read-only starts.** Dave requires
-full batches to detach under the lock, then spawn and wait outside it. Concurrent
-full-batch commands are allowed by F11 A. Reuse M5a's `has_actions` for scheduling,
-extending it to all file-output actions as well as exec variants and delete.
-Only effectful starts sequence. Dave accepts 0.4–2.3% default-mode timing
-regressions as noise.
+**Answer (2026-10-03): A, then measured B; overlap read-only starts.** Dave
+requires full batches to detach under the lock, then spawn and wait outside it.
+Concurrent full-batch commands are allowed by F11 A. Reuse M5a's `has_actions`
+for scheduling, extending it to all file-output actions as well as exec variants
+and delete. Only effectful starts sequence. Dave accepts 0.4–2.3% default-mode
+timing regressions as noise.
 
-After A, append contention remains on batch-all (144.411/188.290 ms versus paired
-M5b 75.811/49.490 ms), so Dave's conditional authorization for B applies. Staging
-merges at 32 paths or 4 KiB; only the shared batch fills/partitions argv. Partial
-stages merge even after quit, before shared exit flush. Staging recovers M5b
-throughput. A cheap narrow-root donation guard made effectful starts slower
-(148.730 versus 135.290 ms live), so it was removed. The pool already persists
-across starts; no new scheduler policy is kept. ROADMAP § S1c records the
-measurements; per-cell loads and the syscall profile are in find-compat's m5c
-scratch.
+After A, append contention remains on batch-all (144.411/188.290 ms versus
+paired M5b 75.811/49.490 ms), so Dave's conditional authorization for B applies.
+Staging merges at 32 paths or 4 KiB; only the shared batch fills/partitions
+argv. Partial stages merge even after quit, before shared exit flush. Staging
+recovers M5b throughput. A cheap narrow-root donation guard made effectful
+starts slower (148.730 versus 135.290 ms live), so it was removed. The pool
+already persists across starts; no new scheduler policy is kept. ROADMAP § S1c
+records the measurements; per-cell loads and the syscall profile are in
+find-compat's m5c scratch.
 
-The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap
-in overlapping read-only starts: with `-quit`, a later missing start reported
+The final full corpus (2026-10-03, 135,693 rows, zero errors) showed one gap in
+overlapping read-only starts: with `-quit`, a later missing start reported
 ENOENT and exit 1 before the first start quit, where GNU exits 0 silently.
 Starts now also sequence when the expression contains `-quit`.
 
 ## D51 — Compaction while the watcher is busy (answered 2026-10-05)
 
-**Status: answered, A (Dave, 2026-10-05).** S1+ M0, 2026-10-03; [design](S1PLUS.md).
+**Status: answered, A (Dave, 2026-10-05).** S1+ M0, 2026-10-03;
+[design](S1PLUS.md).
 
 **Question:** May an incremental checkpoint pause the writer for seconds, or
 must S1b keep applying bursts while it compacts? Queries keep their pinned
 generation in either case. This is a disagreement between fastest updates and
 the simplest implementation to maintain, not a question about query locking.
 
-The current v3 10.45M synthetic checkpoint is measured at 594.8 MB and a
-10.71 s build (ROADMAP S1c). With D52's epoch ids, document counts and coverage,
-the new 10M checkpoint is an estimated 602.0 MB, down from 761.7 MB with
-lifetime maps; estimated compaction is 9–20 s. Removing the maps saves about
-0.56 s of model read/write/checksum work, not the whole seconds-long pause.
-All new-format time/RAM figures below are estimates, to be measured in M7.
+The current v3 10.45M synthetic checkpoint is measured at 594.8 MB and a 10.71 s
+build (ROADMAP S1c). With D52's epoch ids, document counts and coverage, the new
+10M checkpoint is an estimated 602.0 MB, down from 761.7 MB with lifetime maps;
+estimated compaction is 9–20 s. Removing the maps saves about 0.56 s of model
+read/write/checksum work, not the whole seconds-long pause. All new-format
+time/RAM figures below are estimates, to be measured in M7.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Idle-boundary checkpoint under the writer lock | Incoming updates wait 9–20 s at 10M when compaction runs; sustained churn eventually requires a pause. About 0.7 GB temporary disk and 0.2–0.7 GB transient RAM including validation, plus pinned generations. | One writer, one generation publication proof, no catch-up protocol. Queries continue on the old view. |
-| B. Concurrent checkpoint with suffix replay | Build a pinned view at sequence S while the writer appends. At cutover, take the lock, rebase S's suffix into the new epoch, write/checksum the new log, sync both files and publish one new manifest. Retain about 80 MB of transient old-to-new inode/name maps plus suffix births; map every parent/child/own-name/root/aux reference and reset epoch allocation counters while keeping DocIds. Raw suffix copying is invalid. At 1,000 unique-content edits/s for 20 s, each committed separately, the suffix is 2.72 MB payload + 3.84 MB framing = about 6.6 MB total, with an estimated 30–120 ms replay budget plus about 10 ms byte/check cost before sync; rebasing overhead is unmeasured and must be included in the cutover measurement. Extra pinned source/overlay RAM may be 0.1–0.8 GB, besides those remaps; requires a bounded catch-up policy, new-epoch writer lookups prepared in the background and tests for two epoch pairs. Queued old-epoch requests retry before id dereference. | Ordinary bursts retain small-commit latency while the snapshot is built; cutover scales with the suffix rather than 10M rows. |
-| C. Defer checkpoints until the watcher is quiet | No compulsory pause during activity, but replay and overlay costs become unbounded: 5M records cost an estimated 2.5–10 s replay and roughly 200–600 MB overlay RAM, risking the 1 GB resident goal. | Smallest scheduler and no catch-up path. |
+| Option                                            | Costs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Buys                                                                                                                          |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| A. Idle-boundary checkpoint under the writer lock | Incoming updates wait 9–20 s at 10M when compaction runs; sustained churn eventually requires a pause. About 0.7 GB temporary disk and 0.2–0.7 GB transient RAM including validation, plus pinned generations.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | One writer, one generation publication proof, no catch-up protocol. Queries continue on the old view.                         |
+| B. Concurrent checkpoint with suffix replay       | Build a pinned view at sequence S while the writer appends. At cutover, take the lock, rebase S's suffix into the new epoch, write/checksum the new log, sync both files and publish one new manifest. Retain about 80 MB of transient old-to-new inode/name maps plus suffix births; map every parent/child/own-name/root/aux reference and reset epoch allocation counters while keeping DocIds. Raw suffix copying is invalid. At 1,000 unique-content edits/s for 20 s, each committed separately, the suffix is 2.72 MB payload + 3.84 MB framing = about 6.6 MB total, with an estimated 30–120 ms replay budget plus about 10 ms byte/check cost before sync; rebasing overhead is unmeasured and must be included in the cutover measurement. Extra pinned source/overlay RAM may be 0.1–0.8 GB, besides those remaps; requires a bounded catch-up policy, new-epoch writer lookups prepared in the background and tests for two epoch pairs. Queued old-epoch requests retry before id dereference. | Ordinary bursts retain small-commit latency while the snapshot is built; cutover scales with the suffix rather than 10M rows. |
+| C. Defer checkpoints until the watcher is quiet   | No compulsory pause during activity, but replay and overlay costs become unbounded: 5M records cost an estimated 2.5–10 s replay and roughly 200–600 MB overlay RAM, risking the 1 GB resident goal.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Smallest scheduler and no catch-up path.                                                                                      |
 
 **Recommendation:** A for M7, with a measured checkpoint pause and explicit
 backlog/freshness reporting before S1b ships. It is the smallest complete
 mechanism and does not change D32's reader guarantee. Do not choose C: deferred
-work still needs a bound. B is justified if sustained activity makes A's
-pause unacceptable; design its suffix handoff as a separate review slice then.
-Epoch renumbering does not remove the pause and adds a rebasing protocol to B;
-the smaller checkpoint helps both options, so the recommendation stays A.
+work still needs a bound. B is justified if sustained activity makes A's pause
+unacceptable; design its suffix handoff as a separate review slice then. Epoch
+renumbering does not remove the pause and adds a rebasing protocol to B; the
+smaller checkpoint helps both options, so the recommendation stays A.
 
-**Fact that would change it:** a required worst-case freshness lag below
-10 s during sustained churn, or M7 measuring checkpoint pauses beyond the
-accepted lag even on an idle-priority run. Either favours B. S1b's observed
-burst rate and the permitted lag, rather than snapshot size alone, decide it.
+**Fact that would change it:** a required worst-case freshness lag below 10 s
+during sustained churn, or M7 measuring checkpoint pauses beyond the accepted
+lag even on an idle-priority run. Either favours B. S1b's observed burst rate
+and the permitted lag, rather than snapshot size alone, decide it.
 
-> Dave (2026-10-05): agreed with the recommendation, A. Compaction pauses the writer at an idle boundary; M7 measures and reports the pause.
+> Dave (2026-10-05): agreed with the recommendation, A. Compaction pauses the
+> writer at an idle boundary; M7 measures and reports the pause.
 
 ## D52 — D27 C: ids across compaction
 
-**Status: answered, B (Dave, 2026-10-05).** S1+ M0 round 2,
-2026-10-03; [design and consumer check](S1PLUS.md#epoch-scoped-ids).
+**Status: answered, B (Dave, 2026-10-05).** S1+ M0 round 2, 2026-10-03;
+[design and consumer check](S1PLUS.md#epoch-scoped-ids).
 
-**Question:** Does D27 C's “stable, never reused; holes until compaction” require
-InoId/NameId to survive compaction, or only remain stable within its epoch?
-The original C buys the same external stability as B. Dave's comment requires
-metadata edits to preserve DocId; it does not specify a compaction namespace.
-This brief records the interpretation, without claiming Dave has answered it.
+**Question:** Does D27 C's “stable, never reused; holes until compaction”
+require InoId/NameId to survive compaction, or only remain stable within its
+epoch? The original C buys the same external stability as B. Dave's comment
+requires metadata edits to preserve DocId; it does not specify a compaction
+namespace. This brief records the interpretation, without claiming Dave has
+answered it.
 
 No concrete current, S1b or S2 consumer needs inode/name ids across compaction.
 DESIGN's `CandidateSource`/`DocCursor` and content structures, ROADMAP S2/S3,
 and `ferret-index`'s boundary use DocIds. Catalog inverses belong to a pinned
 view. S1b watch locations can use checked paths or rooted `(dev, ino)` identity;
-queued requests already have expected_generation and can retry/re-resolve.
-No separate external metadata index with a durable inode-id key is specified.
+queued requests already have expected_generation and can retry/re-resolve. No
+separate external metadata index with a durable inode-id key is specified.
 
 Numbers below are **estimates at exactly 10M names**, normalised from the
 **measured** 594,837,226 B / 10,448,739-name v3 artifact in
-[S1PLUS's sourced cost model](S1PLUS.md#cost-model-at-10m). They include document
-reference counts and the all-none RetainedAt column; incremental timings are
-not measured. Both options retain identical 360 B metadata / 456 B unique
-content-replacement commits and independent stable DocIds.
+[S1PLUS's sourced cost model](S1PLUS.md#cost-model-at-10m). They include
+document reference counts and the all-none RetainedAt column; incremental
+timings are not measured. Both options retain identical 360 B metadata / 456 B
+unique content-replacement commits and independent stable DocIds.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Lifetime-stable logical ids, private physical rows | About 159.7 MB of forward/paged inverse maps at dense high water: 761.7 MB checkpoint, roughly 727 MiB encoded resident buffers and a conservative 450 MB name-load set. Translation at boundaries and map/bijection validation; sparse pages needed for churn, and lifetime high-water exhaustion remains. Roughly 100M historical ids/10M scattered survivors raise map storage toward 200 MB plus page overhead. | Inode/name handles survive compaction without re-resolution, useful only if an external consumer needs them. Physical rows can still pack densely. |
-| B. Epoch-scoped ids: id equals checkpoint row | About 602.0 MB checkpoint, roughly 574 MiB resident buffers and 291 MB name-load set. Compaction renumbers and invalidates old-epoch requests/caches; about 80 MB transient reference-remap arrays at 10M, plus bounded births. Concurrent checkpointing must rebase its suffix (D51). | Removes about 159.7 MB (21% of A), all persistent id maps/validation, scan translation and inode/name history growth. Dense BFS base ids preserve D29; log births/tombstones preserve ids and holes within the epoch. Compaction resets their high water. Pinned old readers retain their old namespace under D32. |
+| Option                                                | Costs                                                                                                                                                                                                                                                                                                                                                                                                               | Buys                                                                                                                                                                                                                                                                                                               |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A. Lifetime-stable logical ids, private physical rows | About 159.7 MB of forward/paged inverse maps at dense high water: 761.7 MB checkpoint, roughly 727 MiB encoded resident buffers and a conservative 450 MB name-load set. Translation at boundaries and map/bijection validation; sparse pages needed for churn, and lifetime high-water exhaustion remains. Roughly 100M historical ids/10M scattered survivors raise map storage toward 200 MB plus page overhead. | Inode/name handles survive compaction without re-resolution, useful only if an external consumer needs them. Physical rows can still pack densely.                                                                                                                                                                 |
+| B. Epoch-scoped ids: id equals checkpoint row         | About 602.0 MB checkpoint, roughly 574 MiB resident buffers and 291 MB name-load set. Compaction renumbers and invalidates old-epoch requests/caches; about 80 MB transient reference-remap arrays at 10M, plus bounded births. Concurrent checkpointing must rebase its suffix (D51).                                                                                                                              | Removes about 159.7 MB (21% of A), all persistent id maps/validation, scan translation and inode/name history growth. Dense BFS base ids preserve D29; log births/tombstones preserve ids and holes within the epoch. Compaction resets their high water. Pinned old readers retain their old namespace under D32. |
 
 **Recommendation: B; proceeding on the recommendation; Dave may veto.** It is
 both fastest and simplest for the identified consumers, so it is not another
-fastest-versus-maintenance question. A metadata edit retains its epoch InoId
-and live DocId; an epoch change can renumber the inode without content-index
-work. Generation must include `(incarnation, checkpoint, sequence)`: compaction
-can leave the sequence unchanged, so sequence-only comparison is insufficient.
-Reject stale scopes before interpreting ids; retain a locator or old pinned
-view for re-resolution. Keep DocId and next DocId across compaction.
+fastest-versus-maintenance question. A metadata edit retains its epoch InoId and
+live DocId; an epoch change can renumber the inode without content-index work.
+Generation must include `(incarnation, checkpoint, sequence)`: compaction can
+leave the sequence unchanged, so sequence-only comparison is insufficient.
+Reject stale scopes before interpreting ids; retain a locator or old pinned view
+for re-resolution. Keep DocId and next DocId across compaction.
 
 **Fact that would change it:** a concrete external structure or measured
 workload that requires persistent InoId/NameId references and cannot reasonably
 pin, rekey by path/identity, use DocId or retry across epochs. Its measured
 re-resolution/rebuild or freshness cost must outweigh A's extra 159.7 MB,
-translation and map maintenance. No such consumer was found in current code
-or the S1b/S2 plans. D51 remains open about the permitted writer pause.
+translation and map maintenance. No such consumer was found in current code or
+the S1b/S2 plans. D51 remains open about the permitted writer pause.
 
-> Dave (2026-10-05): agreed with the recommendation, B. Epoch-scoped InoId/NameId, renumbered at compaction; DocId stays stable.
+> Dave (2026-10-05): agreed with the recommendation, B. Epoch-scoped
+> InoId/NameId, renumbered at compaction; DocId stays stable.
 
 ## D53 — Cold-open overlay validation (answered 2026-10-05)
 
-**Status: answered, A (Dave, 2026-10-05).** S1+ M5 Part A, 2026-10-04; [design](S1PLUS.md).
+**Status: answered, A (Dave, 2026-10-05).** S1+ M5 Part A, 2026-10-04;
+[design](S1PLUS.md).
 
 **Question:** Should a cold name reader replay and semantically validate the
-published overlay, trust the writer's validated transactions, or load a persisted
-materialised namespace? Fastest and simplest to maintain disagree.
+published overlay, trust the writer's validated transactions, or load a
+persisted materialised namespace? Fastest and simplest to maintain disagree.
 
 The post-merge 10M opens are about 330 ms at 0% and 558 ms at 1%. The earlier
 profile attributes 236 ms to namespace load, including 93 ms in addition checks;
 the rest includes required query construction. All 2% and alternate-reader
-numbers below are **estimates**, not new benchmark results. They assume a similar
-transaction mix and dirty-name slope. Checksums cover accidental corruption,
-not authentication or a writer checksumming its own invalid graph. The ordinary
-writer validates its successor before publication using the shared reader code.
+numbers below are **estimates**, not new benchmark results. They assume a
+similar transaction mix and dirty-name slope. Checksums cover accidental
+corruption, not authentication or a writer checksumming its own invalid graph.
+The ordinary writer validates its successor before publication using the shared
+reader code.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Keep semantic validation | About 550–560 ms at 1%, 770–790 ms at 2%. Rebuild and check dirty namespace history on each cold name load. | No new code or publication proof; independently rejects invalid, correctly checksummed history at load, except bugs shared with writer validation. Simplest maintenance. |
-| B. Trust checksummed writer transactions | Estimated 420–470 ms at 1%, 510–610 ms at 2%; child-key/tombstone/name-heap construction remains. Lose independent graph/reference/count checks on correctly checksummed writer mistakes; retain safe decode/index checks and termination protection. Requires factoring trusted query construction from publication validation and amending the reader contract/tests. | Avoid part of duplicate validation without an extra durable file, but neither the fastest nor the smallest change. |
-| C. Persist a materialised namespace | Estimated 350–400 ms at 1%, 370–470 ms at 2%. Roughly 600–1,200 production lines plus comparable tests, not a prototype count. New checked index format and generation binding, an extra durable artifact before manifest publication, retention/cleanup and crash tests. Per-burst rewrite risks O(dirty-total) write amplification; cached prefixes need suffix replay. | Expected fastest cold name opens: no replay/sort of prefix history, just checked final-state buffers and any suffix. |
+| Option                                   | Costs                                                                                                                                                                                                                                                                                                                                                                     | Buys                                                                                                                                                                     |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A. Keep semantic validation              | About 550–560 ms at 1%, 770–790 ms at 2%. Rebuild and check dirty namespace history on each cold name load.                                                                                                                                                                                                                                                               | No new code or publication proof; independently rejects invalid, correctly checksummed history at load, except bugs shared with writer validation. Simplest maintenance. |
+| B. Trust checksummed writer transactions | Estimated 420–470 ms at 1%, 510–610 ms at 2%; child-key/tombstone/name-heap construction remains. Lose independent graph/reference/count checks on correctly checksummed writer mistakes; retain safe decode/index checks and termination protection. Requires factoring trusted query construction from publication validation and amending the reader contract/tests.   | Avoid part of duplicate validation without an extra durable file, but neither the fastest nor the smallest change.                                                       |
+| C. Persist a materialised namespace      | Estimated 350–400 ms at 1%, 370–470 ms at 2%. Roughly 600–1,200 production lines plus comparable tests, not a prototype count. New checked index format and generation binding, an extra durable artifact before manifest publication, retention/cleanup and crash tests. Per-burst rewrite risks O(dirty-total) write amplification; cached prefixes need suffix replay. | Expected fastest cold name opens: no replay/sort of prefix history, just checked final-state buffers and any suffix.                                                     |
 
 **Recommendation:** A for M5/M6; evaluate C with M7's compaction/derived-state
 budgets if the cold-open requirement warrants its writer cost. Do not implement
 B or C in M5. C is expected fastest, A simplest, so this brief requires Dave's
 choice rather than silently exchanging the existing reader corruption contract.
-The current section reader owns checked buffers; adding actual mmap is a separate
-mechanism, not an existing format feature. Part A's detailed analysis is in
-`/home/dave/w/super-ferret/.ai/s1plus-m5-done.md`.
+The current section reader owns checked buffers; adding actual mmap is a
+separate mechanism, not an existing format feature. Part A's detailed analysis
+is in `/home/dave/w/super-ferret/.ai/s1plus-m5-done.md`.
 
 **Fact that would change it:** a required cold name open below roughly 0.8 s at
 2%, or a C prototype meeting that goal with acceptable publication latency,
 write amplification and code cost. Measure query-only construction for B before
 crediting it with the full 220 ms gap.
 
-> Dave (2026-10-05): agreed with the recommendation, A. Keep semantic validation on cold open; evaluate C alongside M7's budgets.
+> Dave (2026-10-05): agreed with the recommendation, A. Keep semantic validation
+> on cold open; evaluate C alongside M7's budgets.
 
 ## D54 — In-memory names: interning, postings, row order
 
 **Status: answered, B after S1+ merges, after a prototype of the scoped-query
-check (Dave, 2026-10-05). The prototype passed; see the end of this entry.** Measured 2026-10-05 in the private bench repo
-`~/w/name-index-bench` (github.com/dbalmain/name-index-bench); its README
-holds the method and full tables.
+check (Dave, 2026-10-05). The prototype passed; see the end of this entry.**
+Measured 2026-10-05 in the private bench repo `~/w/name-index-bench`
+(github.com/dbalmain/name-index-bench); its README holds the method and full
+tables.
 
 **Question:** Should the in-memory name catalog keep D28 A's raw heap in BFS
-order, intern names and add row postings and a term index, or also move rows
-to DFS preorder?
+order, intern names and add row postings and a term index, or also move rows to
+DFS preorder?
 
 The bench models each layout over two walker dumps, `$HOME` (459,713 rows,
 133,749 distinct names) and `/nix/store` (4.2M rows, 357k distinct). It runs 46
@@ -2982,11 +2990,11 @@ rows. The **term index** is a token FST with postings. The memory figures for
 interning were measured in DFS order; B's BFS figures are **estimates** (same
 ids and table, BFS first-child array in place of the DFS tree arrays).
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Keep the raw BFS heap (D28 A) | 25.4 B/row on `$HOME`, 17.1 on nix (11.7 / 72.0 MB); ~171 MB at 10M at nix density. Selective name queries 0.4–3 ms on `$HOME` and 2–22 ms on nix; no term or Levenshtein search beyond a 100–760 ms scan. | No work. Children stay one slice; nothing in S1+ changes. |
-| B. Intern names, add row postings and the term index; keep BFS order | ~16–19 B/row on `$HOME` and ~9–10 on nix, estimated (≈ 8.7 / 43 MB; ~100 MB at 10M). A distinct-table build and a postings build at compaction; name lookup by path goes through the table (binary search) rather than the heap. Scoped name queries over big subtrees stay a walk or a global hit list filtered by ancestor (unmeasured in BFS). | Selective name queries 0.1–0.8 ms on `$HOME`, 0.3–7 ms on nix (3–10× faster than A); terms 0.7–10 ms, Levenshtein 0.8–8 ms (30–150×). 25–250× faster than warm `fd -H`. Children stay a slice. |
-| C. B, and rows in DFS preorder | Measured: 18.9 B/row on `$HOME`, 10.2 on nix (8.7 / 42.8 MB). Every place that assumes `(parent, name)` order changes. Children are found by hopping subtrees, not a slice, so path lookup and re-runs cost more (unmeasured). | A scope is one contiguous row range: scoped name queries 0.2 ms against 2.8 ms (BFS walk) in a 79k-row monorepo; listings 1.3–1.8× faster; basename-driven path scans 1.7–2.5× faster than in BFS. |
+| Option                                                               | Costs                                                                                                                                                                                                                                                                                                                                             | Buys                                                                                                                                                                                               |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Keep the raw BFS heap (D28 A)                                     | 25.4 B/row on `$HOME`, 17.1 on nix (11.7 / 72.0 MB); ~171 MB at 10M at nix density. Selective name queries 0.4–3 ms on `$HOME` and 2–22 ms on nix; no term or Levenshtein search beyond a 100–760 ms scan.                                                                                                                                        | No work. Children stay one slice; nothing in S1+ changes.                                                                                                                                          |
+| B. Intern names, add row postings and the term index; keep BFS order | ~16–19 B/row on `$HOME` and ~9–10 on nix, estimated (≈ 8.7 / 43 MB; ~100 MB at 10M). A distinct-table build and a postings build at compaction; name lookup by path goes through the table (binary search) rather than the heap. Scoped name queries over big subtrees stay a walk or a global hit list filtered by ancestor (unmeasured in BFS). | Selective name queries 0.1–0.8 ms on `$HOME`, 0.3–7 ms on nix (3–10× faster than A); terms 0.7–10 ms, Levenshtein 0.8–8 ms (30–150×). 25–250× faster than warm `fd -H`. Children stay a slice.     |
+| C. B, and rows in DFS preorder                                       | Measured: 18.9 B/row on `$HOME`, 10.2 on nix (8.7 / 42.8 MB). Every place that assumes `(parent, name)` order changes. Children are found by hopping subtrees, not a slice, so path lookup and re-runs cost more (unmeasured).                                                                                                                    | A scope is one contiguous row range: scoped name queries 0.2 ms against 2.8 ms (BFS walk) in a 79k-row monorepo; listings 1.3–1.8× faster; basename-driven path scans 1.7–2.5× faster than in BFS. |
 
 Across all three, path patterns usually imply a basename
 (`*/.github/workflows/*.yml` → names ending `.yml`). Scanning for it and
@@ -2995,10 +3003,10 @@ That is a planner rule and needs no format change. Trigrams, a suffix array and
 an FST of names did not pay: none beat a scan of the distinct table by more than
 ~20%, at 1.4–20 B/row.
 
-Fuzzy full-path search is the weak spot in every option: 60–90 ms on `$HOME`
-and 200–400 ms on nix, only 4.6× faster than `fd -H | fzf`. Per-directory
-subtree byte masks (1.4–2.2 B/row) speed long queries 2–3×. That belongs to a
-fuzzy brief when fuzzy search is scheduled, not to this one.
+Fuzzy full-path search is the weak spot in every option: 60–90 ms on `$HOME` and
+200–400 ms on nix, only 4.6× faster than `fd -H | fzf`. Per-directory subtree
+byte masks (1.4–2.2 B/row) speed long queries 2–3×. That belongs to a fuzzy
+brief when fuzzy search is scheduled, not to this one.
 
 **Recommendation:** B, after S1+ merges. Fastest and simplest disagree only on
 order. B takes most of the win — 2–2.5× less memory, and the 3–150× speed-ups —
@@ -3010,7 +3018,8 @@ large subtree (the 79k-row monorepo, a nixpkgs checkout) misses ~10 ms, or the
 writer finding DFS order cheaper to maintain across compaction. Either would
 favour C.
 
-> Dave (2026-10-05): B, after S1+ merges — prototype the scoped-query check first.
+> Dave (2026-10-05): B, after S1+ merges — prototype the scoped-query check
+> first.
 
 **Prototype (2026-10-05, name-index-bench `916825a`):** interned names in BFS
 order with BFS row postings, every output checked against the flat reference.
@@ -3021,33 +3030,34 @@ order with BFS row postings, every output checked against the flat reference.
   The faster plan for a selective name in a large scope uses the global
   postings, keeping the rows under the scope by walking parent ids up
   (memoised). For example, nixpkgs `*ripgrep*` takes 0.63 ms that way against
-  7.5 ms walking. A planner chooses between them from the stored posting
-  counts. The wrong choice costs up to 10×: 69 ms for `default.nix` through
-  the postings.
+  7.5 ms walking. A planner chooses between them from the stored posting counts.
+  The wrong choice costs up to 10×: 69 ms for `default.nix` through the
+  postings.
 - **Measured memory for B** (the brief estimated it): int-bfs plus postings plus
   terms is 8.6 MB on `$HOME` (18.6 B/row) and 39.0 MB on nix (9.3 B/row), the
   smallest configuration measured. BFS's first-child and parent arrays are
   cheaper than DFS's subtree arrays (5.4 MB on nix).
-- **Correction to the brief's figures:** the bench originally found a BFS
-  parent by predecessor search over first-child, about 0.5 µs per hit, where
-  ferret keeps a `NameParent` column. With a per-row parent column, raw-bfs
-  is 2–3× faster than the brief's table (`$HOME` `-name '*.rs'` 7.3 ms, not
-  22 ms). B matches or beats DFS on whole-index name queries: nix `Cargo.toml`
-  2.4 ms against 3.3, and `libc.so.6` 0.46 ms against 2.3 today. B's speed-up
-  over today is therefore 2–5× on selective names, not the brief's 3–10×. The
+- **Correction to the brief's figures:** the bench originally found a BFS parent
+  by predecessor search over first-child, about 0.5 µs per hit, where ferret
+  keeps a `NameParent` column. With a per-row parent column, raw-bfs is 2–3×
+  faster than the brief's table (`$HOME` `-name '*.rs'` 7.3 ms, not 22 ms). B
+  matches or beats DFS on whole-index name queries: nix `Cargo.toml` 2.4 ms
+  against 3.3, and `libc.so.6` 0.46 ms against 2.3 today. B's speed-up over
+  today is therefore 2–5× on selective names, not the brief's 3–10×. The
   100–150× from the term index is unchanged.
 
 ## D55 — Storing mtime as an order rather than a value
 
 **Status: answered, D + F with an exact per-block max (Dave, 2026-10-05).**
 Raised by Dave, 2026-10-05. Measured the same day with
-`scripts/mtime_columns.py` in the private `~/w/name-index-bench` (`d543475`), over a live walk of `$HOME` (4.2M entries, unfiltered, so
-including ignored paths) and `/nix/store` (4.5M), rows in ferret's order:
-directories breadth first, then files, siblings by name. **Revised the same
-day:** the first draft sized ranks as a plain permutation, 23 b/row; Dave
-pointed out they deserve the same blocked packing as the seconds, and packed
-that way they cost 13.2 b/row on `$HOME`. Options D and E come from that, and
-F from asking why ctime kept its nanoseconds.
+`scripts/mtime_columns.py` in the private `~/w/name-index-bench` (`d543475`),
+over a live walk of `$HOME` (4.2M entries, unfiltered, so including ignored
+paths) and `/nix/store` (4.5M), rows in ferret's order: directories breadth
+first, then files, siblings by name. **Revised the same day:** the first draft
+sized ranks as a plain permutation, 23 b/row; Dave pointed out they deserve the
+same blocked packing as the seconds, and packed that way they cost 13.2 b/row on
+`$HOME`. Options D and E come from that, and F from asking why ctime kept its
+nanoseconds.
 
 **Question:** Should the catalog store each inode's mtime as its rank in mtime
 order, rather than as a value, to save space and make time queries cheap?
@@ -3056,62 +3066,61 @@ Dave's proposal: on disk, each inode holds its rank in mtime order. In memory,
 inodes are held in mtime order, in a structure that moves an inode to the top
 cheaply. An updated mtime is nearly always the newest, so only the last few
 seconds' actual values need keeping. `-newer file` finds the reference's rank
-and lists everything after it; sorting is free. An absolute time
-(`-mtime -1`, `-newermt DATE`) binary-searches the order, stating files on disk
-at each probe.
+and lists everything after it; sorting is free. An absolute time (`-mtime -1`,
+`-newermt DATE`) binary-searches the order, stating files on disk at each probe.
 
 A rank packs well when blocked, because siblings made together have nearby
-ranks: a block's width is the log of how many other times fall between its
-own. A **dense** rank, where equal times share a rank, is also an index into
-the sorted table of distinct times, so keeping that table (sorted, it packs as
+ranks: a block's width is the log of how many other times fall between its own.
+A **dense** rank, where equal times share a rank, is also an index into the
+sorted table of distinct times, so keeping that table (sorted, it packs as
 blocked deltas) makes the rank a lossless coding of the value. That is an
 ordered dictionary, blocked.
 
 What each encoding costs, in bits per row:
 
-| Encoding | `$HOME` | `/nix/store` |
-| --- | --- | --- |
-| Today: mtime seconds + nanoseconds, each blocked | 10.9 + 25.7 = **36.6** | 0.6 + 0.6 = **1.2** |
-| Rank, a plain permutation | 23 | 23 |
-| Rank, unique (ties broken by row), blocked | 14.7 | 7.6 |
-| Rank, dense over (sec, ns), blocked | 13.2 | 0.6 |
-| Dense rank over seconds, blocked, + sorted distinct seconds | 8.0 + 0.4 = **8.4** | 0.6 + 0.0 = **0.6** |
+| Encoding                                                        | `$HOME`                | `/nix/store`        |
+| --------------------------------------------------------------- | ---------------------- | ------------------- |
+| Today: mtime seconds + nanoseconds, each blocked                | 10.9 + 25.7 = **36.6** | 0.6 + 0.6 = **1.2** |
+| Rank, a plain permutation                                       | 23                     | 23                  |
+| Rank, unique (ties broken by row), blocked                      | 14.7                   | 7.6                 |
+| Rank, dense over (sec, ns), blocked                             | 13.2                   | 0.6                 |
+| Dense rank over seconds, blocked, + sorted distinct seconds     | 8.0 + 0.4 = **8.4**    | 0.6 + 0.0 = **0.6** |
 | Dense rank over (sec, ns), blocked, + sorted distinct (sec, ns) | 13.2 + 14.7 = **27.9** | 0.6 + 0.0 = **0.6** |
-| Today: ctime seconds + nanoseconds, each blocked | 8.5 + 27.1 = 35.6 | 5.0 + 27.3 = 32.3 |
-| ctime: dense rank over (sec, ns) + sorted distinct (sec, ns) | 12.1 + 13.7 = 25.8 | 8.8 + 0.6 = 9.4 |
-| ctime: dense rank over seconds + sorted distinct seconds | 6.5 + 0.3 = 6.8 | 2.9 + 0.0 = 2.9 |
+| Today: ctime seconds + nanoseconds, each blocked                | 8.5 + 27.1 = 35.6      | 5.0 + 27.3 = 32.3   |
+| ctime: dense rank over (sec, ns) + sorted distinct (sec, ns)    | 12.1 + 13.7 = 25.8     | 8.8 + 0.6 = 9.4     |
+| ctime: dense rank over seconds + sorted distinct seconds        | 6.5 + 0.3 = 6.8        | 2.9 + 0.0 = 2.9     |
 
-How find's time predicates are used, from the find-compat corpus (24,461
-`find` occurrences): `-mtime` 1,789, `-mmin` 1,234, `-newerXY` 1,207,
-`-newer file` 597, `-printf` with a time 230, `-ls` 211, ctime 170, atime 157.
-Absolute windows outnumber relative-to-a-file ones about 7 to 1.
+How find's time predicates are used, from the find-compat corpus (24,461 `find`
+occurrences): `-mtime` 1,789, `-mmin` 1,234, `-newerXY` 1,207, `-newer file`
+597, `-printf` with a time 230, `-ls` 211, ctime 170, atime 157. Absolute
+windows outnumber relative-to-a-file ones about 7 to 1.
 
-With a stored table (D, E), every time query works as today against ids
-instead of values: an absolute window or a reference file's time becomes an id
-threshold by binary search of the table, then the scan compares ids, at the
-same cost as comparing values. Sorting by time is sorting by id. A printed time
-is a table lookup. A new time the table lacks lives in the in-memory overlay
-until compaction, which rebuilds the table and the ids. New times nearly always
-sort after every stored one, as Dave says, so the rebuild seldom moves old
-ids, though correctness does not depend on that.
+With a stored table (D, E), every time query works as today against ids instead
+of values: an absolute window or a reference file's time becomes an id threshold
+by binary search of the table, then the scan compares ids, at the same cost as
+comparing values. Sorting by time is sorting by id. A printed time is a table
+lookup. A new time the table lacks lives in the in-memory overlay until
+compaction, which rebuilds the table and the ids. New times nearly always sort
+after every stored one, as Dave says, so the rebuild seldom moves old ids,
+though correctness does not depend on that.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Keep both mtime columns as they are | 36.6 b/row on `$HOME`. | No work. Every time predicate and printed time answers from the index (D47). |
-| B. Rank only (Dave's proposal), blocked | 13.2 b/row on `$HOME`, 0.6 on nix, with no values kept. Listing in mtime order needs the inverse permutation in memory, a further ~23 b/row that does not pack. New times are often not the newest (`tar x`, `cp -p`, `rsync -a`, `unzip`, `curl -R`, `touch -d`), so the in-memory order must insert anywhere. Absolute queries, the common case, cost ~23 stats each, leave the index (D47) and fail on files deleted, unreadable or on an unmounted drive; printed times cost a stat per result. | Newest-first and `-newer file` in O(results) with no scan; exact sub-second order. |
-| C. Drop the mtime nanoseconds column; key carry-over on ctime | 10.9 b/row on `$HOME`. Sub-second mtime is gone: a printed mtime has whole seconds unless the result is stated, and `-newer file` must stat files in the reference's second to break that tie (find compares full timestamps). D26's carry-over key becomes `(dev, ino, size, ctime)`. | −70% on `$HOME`, no new coding. The key loses nothing: any change to mtime, by a write or by `utimensat`, sets ctime to the current time, which userspace cannot set, so a matching ctime implies a matching mtime. |
-| D. C, with seconds coded as a blocked ordered dictionary | 8.4 b/row on `$HOME`, 0.6 on nix. C's costs, plus a new column coding (sorted delta-packed table, blocked ids) and an indirection to print a time. | −77% on `$HOME`; exact seconds; every predicate from the index. |
-| E. Blocked ordered dictionary over full (sec, ns) | 27.9 b/row on `$HOME`, 0.6 on nix. The new coding, as D. | −24% with no semantic change: exact sub-second times, carry-over untouched, `-newer` needs no stat. |
+| Option                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Buys                                                                                                                                                                                                                |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Keep both mtime columns as they are                        | 36.6 b/row on `$HOME`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | No work. Every time predicate and printed time answers from the index (D47).                                                                                                                                        |
+| B. Rank only (Dave's proposal), blocked                       | 13.2 b/row on `$HOME`, 0.6 on nix, with no values kept. Listing in mtime order needs the inverse permutation in memory, a further ~23 b/row that does not pack. New times are often not the newest (`tar x`, `cp -p`, `rsync -a`, `unzip`, `curl -R`, `touch -d`), so the in-memory order must insert anywhere. Absolute queries, the common case, cost ~23 stats each, leave the index (D47) and fail on files deleted, unreadable or on an unmounted drive; printed times cost a stat per result. | Newest-first and `-newer file` in O(results) with no scan; exact sub-second order.                                                                                                                                  |
+| C. Drop the mtime nanoseconds column; key carry-over on ctime | 10.9 b/row on `$HOME`. Sub-second mtime is gone: a printed mtime has whole seconds unless the result is stated, and `-newer file` must stat files in the reference's second to break that tie (find compares full timestamps). D26's carry-over key becomes `(dev, ino, size, ctime)`.                                                                                                                                                                                                              | −70% on `$HOME`, no new coding. The key loses nothing: any change to mtime, by a write or by `utimensat`, sets ctime to the current time, which userspace cannot set, so a matching ctime implies a matching mtime. |
+| D. C, with seconds coded as a blocked ordered dictionary      | 8.4 b/row on `$HOME`, 0.6 on nix. C's costs, plus a new column coding (sorted delta-packed table, blocked ids) and an indirection to print a time.                                                                                                                                                                                                                                                                                                                                                  | −77% on `$HOME`; exact seconds; every predicate from the index.                                                                                                                                                     |
+| E. Blocked ordered dictionary over full (sec, ns)             | 27.9 b/row on `$HOME`, 0.6 on nix. The new coding, as D.                                                                                                                                                                                                                                                                                                                                                                                                                                            | −24% with no semantic change: exact sub-second times, carry-over untouched, `-newer` needs no stat.                                                                                                                 |
 
-The same coding applies to ctime. Under C and D, ctime is carry-over's only
-test that a file changed since it was hashed, and the question is whether it
-needs its nanoseconds:
+The same coding applies to ctime. Under C and D, ctime is carry-over's only test
+that a file changed since it was hashed, and the question is whether it needs
+its nanoseconds:
 
-- **Why keep them:** a file written again in the same second it was stated
-  and hashed, at the same size, matches `(dev, ino, size, ctime)` in whole
-  seconds. Its old hash would be carried over and stay wrong until the next
-  change. This is git's racy-index problem; nanoseconds make the collision
-  practically impossible.
+- **Why keep them:** a file written again in the same second it was stated and
+  hashed, at the same size, matches `(dev, ino, size, ctime)` in whole seconds.
+  Its old hash would be carried over and stay wrong until the next change. This
+  is git's racy-index problem; nanoseconds make the collision practically
+  impossible.
 - **Git's fix needs no nanoseconds:** a file whose ctime second is not before
   the second it was observed has an untrusted hash. It is recorded stale and
   rehashed at the next crawl. That is one check at observation and no stored
@@ -3119,10 +3128,10 @@ needs its nanoseconds:
   `bracket`) is unaffected: it compares two fresh stats in memory, at full
   precision.
 
-| ctime option | ctime b/row, `$HOME` / nix | Costs | Buys |
-| --- | --- | --- | --- |
-| E. Ordered dictionary over (sec, ns) | 25.8 / 9.4 (today 35.6 / 32.3) | The new coding. | Carry-over exactly as today. |
-| F. Ordered dictionary over seconds, plus the racy rule | 6.8 / 2.9 | One check when a file is observed; files written in the second before observation are rehashed at the next crawl. A network filesystem whose clock lags ours could stamp a later write with an earlier second and slip past the rule; treating ctime within a few seconds of the observation as racy covers modest skew for a few more rehashes. | −81% on `$HOME`, −91% on nix against today. |
+| ctime option                                           | ctime b/row, `$HOME` / nix     | Costs                                                                                                                                                                                                                                                                                                                                            | Buys                                        |
+| ------------------------------------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- |
+| E. Ordered dictionary over (sec, ns)                   | 25.8 / 9.4 (today 35.6 / 32.3) | The new coding.                                                                                                                                                                                                                                                                                                                                  | Carry-over exactly as today.                |
+| F. Ordered dictionary over seconds, plus the racy rule | 6.8 / 2.9                      | One check when a file is observed; files written in the second before observation are rehashed at the next crawl. A network filesystem whose clock lags ours could stamp a later write with an earlier second and slip past the rule; treating ctime within a few seconds of the observation as racy covers modest skew for a few more rehashes. | −81% on `$HOME`, −91% on nix against today. |
 
 Per-block minimum and maximum, implied by each block's base and width, let
 newest-first and narrow windows skip blocks under any of these. That is a scan
@@ -3131,55 +3140,52 @@ optimisation for S1b, not part of this decision.
 **Recommendation:** D for mtime and F for ctime. Together the time columns go
 from 72.2 to 15.2 b/row on `$HOME` (−79%) and from 33.5 to 3.5 on nix (−90%),
 with every query still answered from the index. (D with E for ctime: 34.2 and
-10.0.) B gets most of
-D's space saving but none of its values, and its speed edge (newest-first) is
-the case block skipping covers.
+10.0.) B gets most of D's space saving but none of its values, and its speed
+edge (newest-first) is the case block skipping covers.
 
 **Fact that would change it:** if exact find parity on `-newer` without stating
 anything matters more than ~19.5 b/row on `$HOME`, take E for mtime as well.
-Agent query logs dominated by newest-N with printed times rare would favour B.
-A filesystem ferret indexes whose ctime is not reliably updated on mtime
-changes (some FUSE mounts) would make the ctime-only carry-over key unsafe
-there; those roots would need E for mtime. Indexing network mounts with
-badly skewed clocks would favour E for ctime on those roots.
+Agent query logs dominated by newest-N with printed times rare would favour B. A
+filesystem ferret indexes whose ctime is not reliably updated on mtime changes
+(some FUSE mounts) would make the ctime-only carry-over key unsafe there; those
+roots would need E for mtime. Indexing network mounts with badly skewed clocks
+would favour E for ctime on those roots.
 
 **Time bench (2026-10-05, private `~/w/time-index-bench` `804e592`,
 github.com/dbalmain/time-index-bench):** Rust, run by an Opus 5.5 subagent and
-spot-checked here. Load, per-event update, compaction and query costs for
-eight in-memory mtime structures under simulated events (single edits, a hot
-set, archive extracts with old mtimes, `npm install` ties, cargo build/clean,
-git checkout, `cp -p` restores, future mtimes, `rm -rf`, a mixed day), on
-`$HOME`, `/nix/store` and `$HOME` tiled ×22 (10.1M rows). Every answer is
-checked against a brute-force reference after every scenario, and a positive
-control proves the check catches a non-strict `-newer`, an ignored overlay and
-wrong tie order.
+spot-checked here. Load, per-event update, compaction and query costs for eight
+in-memory mtime structures under simulated events (single edits, a hot set,
+archive extracts with old mtimes, `npm install` ties, cargo build/clean, git
+checkout, `cp -p` restores, future mtimes, `rm -rf`, a mixed day), on `$HOME`,
+`/nix/store` and `$HOME` tiled ×22 (10.1M rows). Every answer is checked against
+a brute-force reference after every scenario, and a positive control proves the
+check catches a non-strict `-newer`, an ignored overlay and wrong tie order.
 
-| At 10M | b/row | `-mmin -5` | `-mtime -365` (5.6M hits) | newest 20 | update p99, single edit | compaction |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| today's columns (sec + ns) | 44.7 | 5.5 ms | 8.0 ms | | | 265–297 ms |
-| C, seconds column | 14.1 | | | | | 97–132 ms |
-| D with block skipping | 11.6 | 1.03 ms | 6.45 ms | 2.65 ms | ~0.57 µs | 148–192 ms |
-| **D with an exact max per block** | **11.8** | **0.70 ms** | **6.0 ms** | **0.42 ms** | ~0.57 µs | 148–192 ms |
-| D + sorted permutation | 35.6 | 1 µs | 6.5 ms | 1.4 µs | ~0.57 µs | 282–329 ms |
-| D + binary heap | 75.6 | | ~230 ms | | 2.8 µs | 183–230 ms |
-| B-tree | 157.0 | 1 µs | 28 ms | | 2.0 µs | 346–385 ms |
+| At 10M                            |    b/row |  `-mmin -5` | `-mtime -365` (5.6M hits) |   newest 20 | update p99, single edit | compaction |
+| --------------------------------- | -------: | ----------: | ------------------------: | ----------: | ----------------------: | ---------: |
+| today's columns (sec + ns)        |     44.7 |      5.5 ms |                    8.0 ms |             |                         | 265–297 ms |
+| C, seconds column                 |     14.1 |             |                           |             |                         |  97–132 ms |
+| D with block skipping             |     11.6 |     1.03 ms |                   6.45 ms |     2.65 ms |                ~0.57 µs | 148–192 ms |
+| **D with an exact max per block** | **11.8** | **0.70 ms** |                **6.0 ms** | **0.42 ms** |                ~0.57 µs | 148–192 ms |
+| D + sorted permutation            |     35.6 |        1 µs |                    6.5 ms |      1.4 µs |                ~0.57 µs | 282–329 ms |
+| D + binary heap                   |     75.6 |             |                   ~230 ms |             |                  2.8 µs | 183–230 ms |
+| B-tree                            |    157.0 |        1 µs |                     28 ms |             |                  2.0 µs | 346–385 ms |
 
-- No ordered structure earns its memory. The sorted permutation turns
-  selective windows and newest-k from sub-millisecond into microseconds for
-  +24 b/row (3× D's total) and 153 ms to build at load; the heap only answers
-  newest-k; the B-tree is 13× D's memory. Keeping any of them current is
-  cheap in CPU (microseconds per event); the cost is memory. Heap and B-tree
-  still pay at compaction, because renumbering InoIds relabels every id-keyed
-  order.
+- No ordered structure earns its memory. The sorted permutation turns selective
+  windows and newest-k from sub-millisecond into microseconds for +24 b/row (3×
+  D's total) and 153 ms to build at load; the heap only answers newest-k; the
+  B-tree is 13× D's memory. Keeping any of them current is cheap in CPU
+  (microseconds per event); the cost is memory. Heap and B-tree still pay at
+  compaction, because renumbering InoIds relabels every id-keyed order.
 - An exact maximum per block costs 0.25 b/row and gets the cheap part of the
   permutation's win (newest 20: 2.65 → 0.42 ms).
 - D's base is 10.6 b/row at 10M against the 8.4 estimated above: ~0.44 is
   ferret's 16 B block-table entry, the rest the tiled corpus's 27× distinct
   seconds.
 - Combining with a name side, choosing between scanning the time column and
-  probing it per name-side id matters more than the structure: a probe costs
-  ~11 ns per id with D (~5 ns with the plain seconds column), and the
-  crossover at 10M is a name side of ~50–100k ids.
+  probing it per name-side id matters more than the structure: a probe costs ~11
+  ns per id with D (~5 ns with the plain seconds column), and the crossover at
+  10M is a name side of ~50–100k ids.
 - Block skipping weakens after compaction scatters recent edits (the bench
   scatters them uniformly, which is pessimistic): `-mtime -1` 2.0 → 5.0 ms,
   newest 20 0.42 → 2.3 ms. A real edit trace would settle how much.
@@ -3188,56 +3194,57 @@ wrong tie order.
 
 **Answer (2026-10-05):** D + F, with D's blocks carrying an exact maximum.
 
-- mtime: whole seconds as a blocked ordered dictionary (sorted distinct
-  seconds as packed deltas, a dense rank per inode in 128-row blocks), each
-  block with its exact maximum for skipping. The mtime nanoseconds column is
-  dropped; a printed mtime has whole seconds, and `-newer file` stats only
-  files in the reference's second to break that tie.
+- mtime: whole seconds as a blocked ordered dictionary (sorted distinct seconds
+  as packed deltas, a dense rank per inode in 128-row blocks), each block with
+  its exact maximum for skipping. The mtime nanoseconds column is dropped; a
+  printed mtime has whole seconds, and `-newer file` stats only files in the
+  reference's second to break that tie.
 - ctime: whole seconds in the same coding. D26's carry-over key becomes
-  `(dev, ino, size, ctime)` in seconds, with git's racy rule: a file whose
-  ctime is within a few seconds of its observation is recorded stale and
-  rehashed at the next crawl.
+  `(dev, ino, size, ctime)` in seconds, with git's racy rule: a file whose ctime
+  is within a few seconds of its observation is recorded stale and rehashed at
+  the next crawl.
 - No in-memory ordered structure (sorted permutation, heap, B-tree). Time
-  queries scan with block skipping, and the planner chooses between scanning
-  and probing per name-side id from the name side's size.
+  queries scan with block skipping, and the planner chooses between scanning and
+  probing per name-side id from the name side's size.
 
 ## D56 — Where an indexed find with actions executes
 
-**Status: answered, A (Dave, 2026-10-05).** S1b M0, 2026-10-05; [design](S1B.md#cli-and-find-effects).
+**Status: answered, A (Dave, 2026-10-05).** S1b M0, 2026-10-05;
+[design](S1B.md#cli-and-find-effects).
 
 **Question:** Should an indexed `find` with commands, deletion, prompts or file
 outputs execute in the client's instance of the shared engine, or keep its
 resident traversal in the daemon and call the client for observations/actions?
 Fastest for small selective queries and simplest to maintain disagree.
 
-F8 B/F12 D still bind both options: default predicates use stored metadata;
-only this invocation's own `-delete` corrects stored child counts. Commands
-are Boolean tests, actions run concurrently (F11 A), observed parent handles
-protect delete/execdir, and prune/depth/quit/start sequencing remain visible.
-A filtered path stream plus client commands cannot implement that contract.
-The client owns cwd, environment/PATH, umask, stdin and tty. The daemon must
-never substitute its launch context for them.
+F8 B/F12 D still bind both options: default predicates use stored metadata; only
+this invocation's own `-delete` corrects stored child counts. Commands are
+Boolean tests, actions run concurrently (F11 A), observed parent handles protect
+delete/execdir, and prune/depth/quit/start sequencing remain visible. A filtered
+path stream plus client commands cannot implement that contract. The client owns
+cwd, environment/PATH, umask, stdin and tty. The daemon must never substitute
+its launch context for them.
 
 S1+ M3 measured full reader opens at **709 / 1,012 / 1,351 ms** for clean / 1% /
-2% overlays on the actual 10.45M fixture (`2e12d7b`, warm OS cache, fresh process).
-D54-integrated opens are **estimated 1–4 s**, not measured. The socket has no
-measurement yet; **0.05–0.3 ms** per small request/response is a planning range.
-At 100 dependent callbacks that adds **5–30 ms**; at one million it adds
+2% overlays on the actual 10.45M fixture (`2e12d7b`, warm OS cache, fresh
+process). D54-integrated opens are **estimated 1–4 s**, not measured. The socket
+has no measurement yet; **0.05–0.3 ms** per small request/response is a planning
+range. At 100 dependent callbacks that adds **5–30 ms**; at one million it adds
 **50–300 s** if serialised. B can overlap workers and batch independent work,
 but it cannot batch away a command's truth value before evaluating its branch.
 Those products describe serial work, not predicted whole-query elapsed time.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Execute action plans locally through the shared resident engine | A one-shot action query pays another full query-only open, currently 0.7–1.35 s before D54, plus roughly 0.6–0.8 GiB additional process RSS while the daemon remains resident. Proposed routing exception to D49; no separate cold-query implementation. Batch pays its open once. | Existing evaluator, live source, observed handles, command batching, tty/stdin/PATH and per-query deletion accounting stay in one process. No action RPC, capability transfer or replay proof. Fastest for dense cheap actions once loaded; simplest to maintain. |
-| B. Cooperative resident traversal with client-local observations/actions | New continuation protocol, descriptor/cwd capability transfer, per-worker action replies and shared batching, delete-count feedback, prompt serialization, output commit/cancellation and no-effect-replay proof. Additional safe syscall dependency/features need review. Estimated 0.05–0.3 ms per dependent callback, plus bulk output/observation bytes. Code/latency unmeasured; count them in a prototype before choosing. | Avoids full client open and duplicate reader RSS; fastest expected for selective commands with few callbacks, where 5–30 ms beats a 0.7 s load. Actions still use the client's own context. |
+| Option                                                                   | Costs                                                                                                                                                                                                                                                                                                                                                                                                                            | Buys                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Execute action plans locally through the shared resident engine       | A one-shot action query pays another full query-only open, currently 0.7–1.35 s before D54, plus roughly 0.6–0.8 GiB additional process RSS while the daemon remains resident. Proposed routing exception to D49; no separate cold-query implementation. Batch pays its open once.                                                                                                                                               | Existing evaluator, live source, observed handles, command batching, tty/stdin/PATH and per-query deletion accounting stay in one process. No action RPC, capability transfer or replay proof. Fastest for dense cheap actions once loaded; simplest to maintain. |
+| B. Cooperative resident traversal with client-local observations/actions | New continuation protocol, descriptor/cwd capability transfer, per-worker action replies and shared batching, delete-count feedback, prompt serialization, output commit/cancellation and no-effect-replay proof. Additional safe syscall dependency/features need review. Estimated 0.05–0.3 ms per dependent callback, plus bulk output/observation bytes. Code/latency unmeasured; count them in a prototype before choosing. | Avoids full client open and duplicate reader RSS; fastest expected for selective commands with few callbacks, where 5–30 ms beats a 0.7 s load. Actions still use the client's own context.                                                                       |
 
-**Recommendation: A.** The correctness surface is materially smaller, and
-batch amortises the load for agent suites. This is a recommendation awaiting
-Dave, not permission to alter D49 or the answered find semantics. Read-only
-find/search daemon queries and local batch actions can proceed independently;
-shipping action-client routing waits for this answer. `-I` remains the existing
-local live mode under either option.
+**Recommendation: A.** The correctness surface is materially smaller, and batch
+amortises the load for agent suites. This is a recommendation awaiting Dave, not
+permission to alter D49 or the answered find semantics. Read-only find/search
+daemon queries and local batch actions can proceed independently; shipping
+action-client routing waits for this answer. `-I` remains the existing local
+live mode under either option.
 
 **Fact that would change it:** production agent traces dominated by selective
 indexed action queries, with the extra 0.7–4 s open visible in their latency,
@@ -3250,71 +3257,73 @@ cost while deletion cannot.
 
 ## D57 — Share JSON lines with the socket, or add binary framing
 
-**Status: answered, A (Dave, 2026-10-05).** S1b M0, 2026-10-05; [design](S1B.md#endpoint-and-request-context).
+**Status: answered, A (Dave, 2026-10-05).** S1b M0, 2026-10-05;
+[design](S1B.md#endpoint-and-request-context).
 
-**Question:** Should the daemon use batch's tagged JSON-lines codec, or a
-second binary socket codec for query/output blocks? Binary is faster for large
-byte streams; one shared codec is simplest to maintain.
+**Question:** Should the daemon use batch's tagged JSON-lines codec, or a second
+binary socket codec for query/output blocks? Binary is faster for large byte
+streams; one shared codec is simplest to maintain.
 
 Batch requires JSON input under D46. The current `ferret` crate only writes
 JSON; it has no general parser. Both options propose the external
 **`ferret → serde_json`** edge for batch input. The engine stays in the existing
 `ferret` library, with no new engine crate or internal dependency edge. Update
-DESIGN's enforced graph with the dependency in the implementation commit;
-M0 changes no manifest. This brief records the required proposed edge rather
-than smuggling a hand-written general JSON parser into the batch host.
+DESIGN's enforced graph with the dependency in the implementation commit; M0
+changes no manifest. This brief records the required proposed edge rather than
+smuggling a hand-written general JSON parser into the batch host.
 
 Find output can contain arbitrary bytes. Base64 is exactly **4/3** of input
 length rounded to four-byte groups before JSON framing: **800 MB → 1.067 GB**.
-Binary could save at least **267 MB** on that example. At an illustrative
-**1 GB/s** wire rate that is **267 ms** of transfer, before codec CPU. This is
+Binary could save at least **267 MB** on that example. At an illustrative **1
+GB/s** wire rate that is **267 ms** of transfer, before codec CPU. This is
 arithmetic, not a benchmark. Small connected JSON request/replies have an
 **estimated 0.05–0.3 ms** total transport/framing budget; no local JSON-versus-
 binary timing exists. Search's UTF-8 rows need not pay base64 for every path.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. One tagged JSONL codec for batch and socket | Base64's 33% byte expansion on arbitrary find output, JSON field/framing and encode/decode CPU. Bulk throughput must be measured; small-message budget is estimated 0.05–0.3 ms. Requires bounded lines/parts and a real parser. | One schema, byte convention, decoder, compatibility rule and end-status/cancellation test suite. Easy agent/CI inspection. Simplest maintenance. |
-| B. JSONL batch plus length-framed binary socket | Two encoders/decoders, equivalent schemas/version negotiation, truncation/length/cancellation tests and dual harness adapters. Small-message savings unknown. | 25% fewer payload bytes than base64 on byte output, avoiding its codec work. Expected fastest for bulk find/printf streams; no need to turn arbitrary output into text. |
+| Option                                          | Costs                                                                                                                                                                                                                            | Buys                                                                                                                                                                    |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. One tagged JSONL codec for batch and socket  | Base64's 33% byte expansion on arbitrary find output, JSON field/framing and encode/decode CPU. Bulk throughput must be measured; small-message budget is estimated 0.05–0.3 ms. Requires bounded lines/parts and a real parser. | One schema, byte convention, decoder, compatibility rule and end-status/cancellation test suite. Easy agent/CI inspection. Simplest maintenance.                        |
+| B. JSONL batch plus length-framed binary socket | Two encoders/decoders, equivalent schemas/version negotiation, truncation/length/cancellation tests and dual harness adapters. Small-message savings unknown.                                                                    | 25% fewer payload bytes than base64 on byte output, avoiding its codec work. Expected fastest for bulk find/printf streams; no need to turn arbitrary output into text. |
 
 **Recommendation: A**, pending Dave. Bound frames and stream them; measure
 first/final row and wire/CPU cost before building B. There is no socket timing
-yet that justifies another codec, but B's byte advantage is real, so fastest
-and simplest do not automatically coincide. Batch and its required parser
-edge are common to both answers; the daemon codec slice waits for the answer.
+yet that justifies another codec, but B's byte advantage is real, so fastest and
+simplest do not automatically coincide. Batch and its required parser edge are
+common to both answers; the daemon codec slice waits for the answer.
 
 **Fact that would change it:** JSON encoding/transfer dominates measured query
 CPU or adds material end-to-end latency on the real agent workload, with a
-binary prototype reducing that cost enough to justify a second protocol. A
-large synthetic listing alone is useful evidence, not evidence that most agent
-queries have that shape.
+binary prototype reducing that cost enough to justify a second protocol. A large
+synthetic listing alone is useful evidence, not evidence that most agent queries
+have that shape.
 
 > Dave (2026-10-05): agreed with the recommendation, A.
 
 ## D58 — Batch input: adopt `serde_json`, or parse the request by hand
 
-**Status: answered, B (Dave, 2026-10-05).** S1b M1 review, 2026-10-05. Raised because S1b M2, the batch host,
-would add the workspace's first serde dependency. D57 records `ferret →
-serde_json` as common to both of its options. It does not offer the alternative.
+**Status: answered, B (Dave, 2026-10-05).** S1b M1 review, 2026-10-05. Raised
+because S1b M2, the batch host, would add the workspace's first serde
+dependency. D57 records `ferret → serde_json` as common to both of its options.
+It does not offer the alternative.
 
 **Question:** `ferret batch` reads JSON-lines requests (argv, cwd, mode and
 options for each query). Should the `ferret` crate depend on `serde_json` to
 parse them, or parse the request schema with a small hand-written reader?
 
 Today nothing in the workspace uses serde. Every JSON byte `ferret` writes is
-produced by its own `json.rs`. The external dependencies are `rustix`,
-`blake3`, `regex` (confined to `ferret-verify`) and intpack.
+produced by its own `json.rs`. The external dependencies are `rustix`, `blake3`,
+`regex` (confined to `ferret-verify`) and intpack.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. `serde_json` (with `serde` for derive, or `serde_json::Value` without it) | Two to five new crates in the lockfile: `serde`, `serde_json`, `itoa`, `ryu`, `memchr`, plus `serde_derive`, `proc-macro2`, `quote` and `syn` if derive is used, which adds compile time. A DESIGN graph line. | A parser that has been fuzzed for years; request types added later cost one struct each. D57's socket codec, if A there, reuses it. |
-| B. A hand-written reader for the request schema only | About 200–300 lines: strings with escapes and `\u` surrogates, arrays, objects, integers and booleans, with a depth bound. It needs its own property test (round-trip through `json.rs`'s writer, plus rejection of malformed lines) and a fuzz target. Every new request field is hand-wired. | No new dependency. It matches how output is already written. Errors can name the exact field in ferret's own terms. |
+| Option                                                                       | Costs                                                                                                                                                                                                                                                                                          | Buys                                                                                                                                |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| A. `serde_json` (with `serde` for derive, or `serde_json::Value` without it) | Two to five new crates in the lockfile: `serde`, `serde_json`, `itoa`, `ryu`, `memchr`, plus `serde_derive`, `proc-macro2`, `quote` and `syn` if derive is used, which adds compile time. A DESIGN graph line.                                                                                 | A parser that has been fuzzed for years; request types added later cost one struct each. D57's socket codec, if A there, reuses it. |
+| B. A hand-written reader for the request schema only                         | About 200–300 lines: strings with escapes and `\u` surrogates, arrays, objects, integers and booleans, with a depth bound. It needs its own property test (round-trip through `json.rs`'s writer, plus rejection of malformed lines) and a fuzz target. Every new request field is hand-wired. | No new dependency. It matches how output is already written. Errors can name the exact field in ferret's own terms.                 |
 
 **Recommendation: A, `serde_json::Value` without derive**. That is four small
 crates, no proc-macro build cost, and a parser nobody has to maintain. "Build,
-not adopt" is about the index structures, which are the part worth learning;
-a JSON reader isn't. Fastest is a wash, since parsing a request is noise next
-to the query.
+not adopt" is about the index structures, which are the part worth learning; a
+JSON reader isn't. Fastest is a wash, since parsing a request is noise next to
+the query.
 
 **Fact that would change it:** if you want the dependency list kept minimal for
 its own sake (audit surface, offline builds), B is a bounded, testable job, and
@@ -3323,10 +3332,10 @@ the batch schema is small enough that B stays small.
 S1b M2 waits for this answer. M3 (D54's names) doesn't depend on it, so it goes
 first.
 
-> Dave (2026-10-05): I feel like B might be the right answer here. It gives
-> us more scope to optimise for our usecase. The thing that would steer me
-> toward serde would be if you think it's likely other tools might want to make
-> request to the daemon.
+> Dave (2026-10-05): I feel like B might be the right answer here. It gives us
+> more scope to optimise for our usecase. The thing that would steer me toward
+> serde would be if you think it's likely other tools might want to make request
+> to the daemon.
 
 **Answer (2026-10-05): B, a hand-written reader.** Other tools sending requests
 does not steer toward serde. The wire format is JSON lines either way (D57 A),
@@ -3335,12 +3344,13 @@ of parser is invisible to it. What other clients change is robustness: the
 reader must take any input. So B ships with a fuzz target and a property test
 that round-trips through `json.rs`'s writer and rejects malformed lines, with
 bounded depth and line length. The one case that would favour serde is a Rust
-client library shared with other tools. That would be a separate crate, and
-it could choose its own parser.
+client library shared with other tools. That would be a separate crate, and it
+could choose its own parser.
 
 ## D59 — How intpack enters the workspace
 
-**Status: answered, A (Dave, 2026-10-05); intpack pushed at `6423815`.** S1b M3, 2026-10-05.
+**Status: answered, A (Dave, 2026-10-05); intpack pushed at `6423815`.** S1b M3,
+2026-10-05.
 
 **Question:** S1b M3 is the first code to use intpack, through D54's packed
 names and row postings in `ferret-catalog`. D11 said intpack "starts as a git
@@ -3349,28 +3359,27 @@ dependency and may be vendored". In what form should it enter for good?
 **Facts, checked on 2026-10-05:**
 
 - DESIGN listed `ferret-index → intpack`, but no manifest or lockfile had it.
-  The layering test only checks that external dependencies are allowed, not
-  that they are present.
+  The layering test only checks that external dependencies are allowed, not that
+  they are present.
 - `~/w/intpack` `main` is **20 commits ahead of `origin/main`**, and those
   include the pfor128 and skip-table speedups. The D54 prototype
   (`~/w/name-index-bench`) uses it as a `path = "../intpack"` dependency.
-- So a git dependency pinned to what is on GitHub today would build against
-  code older than what D54 measured.
+- So a git dependency pinned to what is on GitHub today would build against code
+  older than what D54 measured.
 
 **What M3 is doing meanwhile:**
 
-- The edge `ferret-catalog → intpack` is approved. It is within D11 and
-  DESIGN's ownership table, since catalog owns the name dictionary and row
-  postings.
+- The edge `ferret-catalog → intpack` is approved. It is within D11 and DESIGN's
+  ownership table, since catalog owns the name dictionary and row postings.
 - The dependency is `path = "../intpack"`, with a symlink at
   `~/w/super-ferret-wt/intpack` so worktrees resolve it too.
 - There is no Nix package build of ferret, so nothing else breaks.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Git dependency pinned by `rev` | You push intpack's 20 commits first. Every intpack change is a push plus a rev bump. Offline builds need the git cache. | One copy. intpack stays its own repo, with its bench and ledger. D11's stated default. |
-| B. Vendor into `crates/intpack` | Two copies that drift. intpack's own bench harness keeps pointing at the other one. Its toolchain ledger moves into this repo. | Builds anywhere with no network and no sibling checkout. Changes to the codec land in the same commit as their consumer. |
-| C. Keep the path dependency | Builds only where `~/w/intpack` sits beside the checkout. CI and other machines break. | Zero friction while both are moving fast. |
+| Option                            | Costs                                                                                                                          | Buys                                                                                                                     |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| A. Git dependency pinned by `rev` | You push intpack's 20 commits first. Every intpack change is a push plus a rev bump. Offline builds need the git cache.        | One copy. intpack stays its own repo, with its bench and ledger. D11's stated default.                                   |
+| B. Vendor into `crates/intpack`   | Two copies that drift. intpack's own bench harness keeps pointing at the other one. Its toolchain ledger moves into this repo. | Builds anywhere with no network and no sibling checkout. Changes to the codec land in the same commit as their consumer. |
+| C. Keep the path dependency       | Builds only where `~/w/intpack` sits beside the checkout. CI and other machines break.                                         | Zero friction while both are moving fast.                                                                                |
 
 **Recommendation: A**, after you push intpack, and C until then. It is D11's
 plan, and it keeps one copy of the codec.
@@ -3386,57 +3395,65 @@ removes the push-and-bump loop.
 > up to crates.io. Please do push it to GitHub though.
 
 **Answer (2026-10-05): A, a git dependency pinned by rev.** intpack's `main` was
-pushed on 2026-10-05 (`5e352f4..6423815`). General improvements go into
-intpack itself so that other indexing projects get them. Vendoring happens
-only for a change specific to Super Ferret. crates.io comes later, when the
-format settles. The `path = "../intpack"` dependency M3 started with switches
-to `git = "https://github.com/dbalmain/intpack", rev = "6423815…"`.
+pushed on 2026-10-05 (`5e352f4..6423815`). General improvements go into intpack
+itself so that other indexing projects get them. Vendoring happens only for a
+change specific to Super Ferret. crates.io comes later, when the format settles.
+The `path = "../intpack"` dependency M3 started with switches to
+`git = "https://github.com/dbalmain/intpack", rev = "6423815…"`.
 
 ## D60 — Reactivate a dead DocId when its content returns
 
-**Status: open.** S2 M0, 2026-10-06; [design](S2.md#segments-are-disjoint-docid-ranges).
-D36 B left this to S2: "Whether a revert reactivates its old `DocId` is an S2
-decision, where postings make it worth something."
+**Status: open.** S2 M0, 2026-10-06;
+[design](S2.md#segments-are-disjoint-docid-ranges). D36 B left this to S2:
+"Whether a revert reactivates its old `DocId` is an S2 decision, where postings
+make it worth something."
 
 **Question:** When content that died comes back (a revert, a branch switched
 away and back), should it get its old DocId, whose postings may still sit in an
 unmerged segment, or a new one?
 
-Today the catalog drops a dead document's row and keeps only the counter
-(D36 B), so returning content gets the next DocId. In S2 the index follows the
-catalog and tokenizes every new DocId ([S2 § Writer and daemon
-seam](S2.md#writer-and-daemon-seam)). The crawl reads and hashes the returning
-file either way, so reactivation saves only the tokenizing and the new
-postings, never the read. All figures below are **estimates**: a branch switch
-of 5,000 files at the research's 21.6 KB mean is 108 MB, which is about
-0.36 core-s at the tokenizer's 300 MB/s/core target, plus about 7.3 MB of new
-segment bytes at the docs-only 6.8% (`108 MB × 0.068`), held until a merge
-purges the dead copy.
+Today the catalog drops a dead document's row and keeps only the counter (D36
+B), so returning content gets the next DocId. In S2 the index follows the
+catalog and tokenizes every new DocId
+([S2 § Writer and daemon seam](S2.md#writer-and-daemon-seam)). The crawl reads
+and hashes the returning file either way, so reactivation saves only the
+tokenizing and the new postings, never the read. All figures below are
+**estimates**: a branch switch of 5,000 files at the research's 21.6 KB mean is
+108 MB, which is about 0.36 core-s at the tokenizer's 300 MB/s/core target, plus
+about 7.3 MB of new segment bytes at the docs-only 6.8% (`108 MB × 0.068`), held
+until a merge purges the dead copy.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Reactivate while postings exist | The catalog keeps dead rows (D36 A's 16 B hash plus id per dead document) until the index purges their postings, so the index must tell the catalog which dead DocIds a merge purged. That is a new edge from index state into catalog state, against DESIGN's ownership table, and a new record type. Merges must keep their purge list until the catalog has applied it. | A flip-flopping branch costs no tokenizing and no new postings until merge; fewer holes in the DocId space (slightly smaller gaps, so marginally denser doc-id lists). |
-| B. Never reactivate (D36 B carried into S2) | Returning content is tokenized again: about 0.36 core-s and 7.3 MB of segment bytes per 5,000-file switch (estimate), read from the page cache. Until merge, the dead copy's postings sit beside the new ones; the 25% dead-fraction merge rule bounds that. | No code. Liveness stays one-way (live → dead), so a segment never needs to know whether a dead document might return, and the catalog stays ignorant of postings. |
+| Option                                      | Costs                                                                                                                                                                                                                                                                                                                                                                      | Buys                                                                                                                                                                   |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Reactivate while postings exist          | The catalog keeps dead rows (D36 A's 16 B hash plus id per dead document) until the index purges their postings, so the index must tell the catalog which dead DocIds a merge purged. That is a new edge from index state into catalog state, against DESIGN's ownership table, and a new record type. Merges must keep their purge list until the catalog has applied it. | A flip-flopping branch costs no tokenizing and no new postings until merge; fewer holes in the DocId space (slightly smaller gaps, so marginally denser doc-id lists). |
+| B. Never reactivate (D36 B carried into S2) | Returning content is tokenized again: about 0.36 core-s and 7.3 MB of segment bytes per 5,000-file switch (estimate), read from the page cache. Until merge, the dead copy's postings sit beside the new ones; the 25% dead-fraction merge rule bounds that.                                                                                                               | No code. Liveness stays one-way (live → dead), so a segment never needs to know whether a dead document might return, and the catalog stays ignorant of postings.      |
 
 **Recommendation: B.** It is both the simplest and, within the noise, as fast:
-the read that dominates is paid either way. Fastest and simplest do not
-disagree here by more than a fraction of a core-second per switch, so this
-brief exists only because D36 deferred it by name.
+the read that dominates is paid either way. Fastest and simplest do not disagree
+here by more than a fraction of a core-second per switch, so this brief exists
+only because D36 deferred it by name.
 
 **Fact that would change it:** M5's steady-state measurement showing follow
-passes after branch switches costing seconds of CPU or noticeable postings
-churn on Dave's real repositories, for example a monorepo whose switches touch
-tens of thousands of large files.
+passes after branch switches costing seconds of CPU or noticeable postings churn
+on Dave's real repositories, for example a monorepo whose switches touch tens of
+thousands of large files.
+
+> Dave: This is definitely an experiment I'd like to run. We should make sure
+> our metrics capture the cost of branch switches. You say that read dominates -
+> I think we should explore using the git index to avoid that read. i.e. when
+> the user switches branches, we detect the branch switch and use the same
+> algorithm git uses to determine if a file has been modified from what is in
+> the index. I assume this would mean keeping a mapping of git hashes to docIds.
 
 ### Measured update: the git-index experiment (2026-10-08)
 
 **Status: open, revised 2026-10-08** after the branch-switch experiment
-(`ferret-bench git-switch`, branch `wt/d60`). The figures below are
-**measured** unless marked otherwise.
+(`ferret-bench git-switch`, branch `wt/d60`). The figures below are **measured**
+unless marked otherwise.
 
 **Question:** When content that died comes back (a revert, a branch switched
-away and back), should it get its old DocId back? And should the crawl use
-git's index to recognise that content without reading it?
+away and back), should it get its old DocId back? And should the crawl use git's
+index to recognise that content without reading it?
 
 **What the experiment found.** The original brief said "the read dominates and
 is paid either way". That was wrong, and so is the premise behind the git-index
@@ -3445,84 +3462,89 @@ cache, and the crawl's read plus BLAKE3 runs at about 1.1 GB/s. The expensive
 part of a switch is the follow pass, which tokenizes and builds a segment for
 every new DocId. On a 5,139-file, 60 MB return (synthetic, A → B → A):
 
-| Part of the returning switch               | Cost                                     |
-| ------------------------------------------ | ---------------------------------------- |
-| Crawl read + hash                          | 50 ms wall, 57 ms CPU (4% of the switch) |
-| Rest of the crawl refresh                  | about 100 ms wall                        |
-| Follow pass (tokenize 0.39 s + segment build) | 1.17 s CPU, 1.20 s wall               |
-| New segment bytes                          | 3.35 MB                                  |
-| Dead postings until merge                  | +7.1 M (7.95 M → 15.0 M)                 |
+| Part of the returning switch                  | Cost                                     |
+| --------------------------------------------- | ---------------------------------------- |
+| Crawl read + hash                             | 50 ms wall, 57 ms CPU (4% of the switch) |
+| Rest of the crawl refresh                     | about 100 ms wall                        |
+| Follow pass (tokenize 0.39 s + segment build) | 1.17 s CPU, 1.20 s wall                  |
+| New segment bytes                             | 3.35 MB                                  |
+| Dead postings until merge                     | +7.1 M (7.95 M → 15.0 M)                 |
 
-Dave's largest real repository has only 1,897 tracked files. No repository
-under `~/w` is larger, so the synthetic one stands in for a big switch. Its
-1,479-file real return costs 16 ms of read+hash against 324 ms of follow CPU
-and 2.15 MB of segment.
+Dave's largest real repository has only 1,897 tracked files. No repository under
+`~/w` is larger, so the synthetic one stands in for a big switch. Its 1,479-file
+real return costs 16 ms of read+hash against 324 ms of follow CPU and 2.15 MB of
+segment.
 
 The git index does recognise returning content correctly. Every returning
-eligible file was skippable: 1,479 of 1,479 real and 5,139 of 5,139
-synthetic. The check found **0 BLAKE3 mismatches across 6,739 skips**. One
-condition applies: that holds only under a **nanosecond** racy-clean rule. Git's
-own default compares whole seconds, and under that rule **zero** files are
-skippable immediately after a switch, because the checkout writes them in the
-same second as the index. Once a later git command such as `git status`
-rewrites the index, they all become clean.
+eligible file was skippable: 1,479 of 1,479 real and 5,139 of 5,139 synthetic.
+The check found **0 BLAKE3 mismatches across 6,739 skips**. One condition
+applies: that holds only under a **nanosecond** racy-clean rule. Git's own
+default compares whole seconds, and under that rule **zero** files are skippable
+immediately after a switch, because the checkout writes them in the same second
+as the index. Once a later git command such as `git status` rewrites the index,
+they all become clean.
 
-| Option                                                                         | Costs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Buys                                                                                                                                                                                                                                                                                   |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| B. Never reactivate (D36 B carried into S2; today)                             | Each returning file is tokenized again under a new DocId: 1.17 s CPU, 3.35 MB of segment and +7.1 M dead postings per 5,139-file return (synthetic). The large real repository's return costs 0.32 s and 2.15 MB. The 25% dead-fraction merge rule bounds the dead postings.                                                                                                                                                                                                                                                        | No code and no new state. Liveness stays one-way, and the catalog stays ignorant of postings.                                                                                                                                                                                       |
+| Option                                                                           | Costs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Buys                                                                                                                                                                                                                                                                      |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B. Never reactivate (D36 B carried into S2; today)                               | Each returning file is tokenized again under a new DocId: 1.17 s CPU, 3.35 MB of segment and +7.1 M dead postings per 5,139-file return (synthetic). The large real repository's return costs 0.32 s and 2.15 MB. The 25% dead-fraction merge rule bounds the dead postings.                                                                                                                                                                                                                                                                                                                            | No code and no new state. Liveness stays one-way, and the catalog stays ignorant of postings.                                                                                                                                                                             |
 | C. Git-assisted identity, no reactivation: skip the crawl's read, still tokenize | A `.git/index` reader in `ferret-crawl`, written from the format docs; it is std-only, so no new crate edge. It has fallbacks for filters, attributes, sparse checkout, split index, submodules and SHA-256. A persistent `blob id → DocId` catalog section at 24 B/entry (SHA-1 plus DocId; 36 B under SHA-256), about 240 MB at 10M git-tracked entries before table overhead. A nanosecond racy rule that is less conservative than git's default and depends on 1 ns filesystem timestamps. Switch detection costs one stat per repository per burst (0.6 µs), plus a parse at about 0.45 µs/entry. | Saves 57 ms of read+hash per 5,139-file return (net about 44 ms after the 2.8 ms parse and 9.7 ms decision), about **3%** of the switch. The follow pass, which is 85–90% of the cost, is untouched. D63's re-hash saving for git repositories is real but just as small. |
-| A. Git-assisted identity plus reactivation (the original D60 A, keyed by git)  | C's costs, plus the original A's: dead catalog rows retained until a merge purges their postings (16 B hash + 4 B DocId per dead document), and a purge list that the index hands back to the catalog. That is a new flow of index state into catalog state against DESIGN's ownership table, though no new `Cargo.toml` edge, since `ferret` relays it. Merges keep their purge list until the catalog applies it.                                                                                       | Skips the read **and** the follow pass for returning content while its postings exist: 1.24 s of the switch's 1.35 s, 3.35 MB of segment and 7.1 M postings per 5,139-file return. 1,405 of the large real repository's 1,479 returning files mapped to a dead DocId.                |
-| A′. Reactivation keyed by content hash, no git                                 | The original A's retention and purge-list costs, with no git reader, no blob map and no switch detection. The crawl still reads and hashes the returning files (57 ms per 5,139). The catalog build looks the hash up among retained dead rows, in the sort it already does to assign DocIds.                                                                                                                                                                          | **96%** of A's saving: the follow pass, the segment and the dead postings. It also works for every way content returns, not only git: editor undo, `stash pop`, rsync, a restored backup. It adds no git surface for correctness to depend on.                                                         |
+| A. Git-assisted identity plus reactivation (the original D60 A, keyed by git)    | C's costs, plus the original A's: dead catalog rows retained until a merge purges their postings (16 B hash + 4 B DocId per dead document), and a purge list that the index hands back to the catalog. That is a new flow of index state into catalog state against DESIGN's ownership table, though no new `Cargo.toml` edge, since `ferret` relays it. Merges keep their purge list until the catalog applies it.                                                                                                                                                                                     | Skips the read **and** the follow pass for returning content while its postings exist: 1.24 s of the switch's 1.35 s, 3.35 MB of segment and 7.1 M postings per 5,139-file return. 1,405 of the large real repository's 1,479 returning files mapped to a dead DocId.     |
+| A′. Reactivation keyed by content hash, no git                                   | The original A's retention and purge-list costs, with no git reader, no blob map and no switch detection. The crawl still reads and hashes the returning files (57 ms per 5,139). The catalog build looks the hash up among retained dead rows, in the sort it already does to assign DocIds.                                                                                                                                                                                                                                                                                                           | **96%** of A's saving: the follow pass, the segment and the dead postings. It also works for every way content returns, not only git: editor undo, `stash pop`, rsync, a restored backup. It adds no git surface for correctness to depend on.                            |
 
 **Recommendation: B now; A′, not A, when reactivation is wanted.** Drop the
 git-index idea: it is sound, but it buys about 3% of a switch for a format
 reader, a 24 B/entry map and a racy rule that is stricter in what it assumes
-than git's own default. Fastest and simplest disagree only between B and A′.
-On Dave's real repositories a returning switch costs at most about 0.33 s of
-follow CPU, which is under the original brief's "seconds of CPU" trigger. So B
-stays, with A′ as the named upgrade. D63 A also stands: git does not remove the
-re-hash in any way that matters.
+than git's own default. Fastest and simplest disagree only between B and A′. On
+Dave's real repositories a returning switch costs at most about 0.33 s of follow
+CPU, which is under the original brief's "seconds of CPU" trigger. So B stays,
+with A′ as the named upgrade. D63 A also stands: git does not remove the re-hash
+in any way that matters.
 
-**Fact that would change it:** follow passes after real switches costing
-seconds of CPU, at the measured 51–64 MB/s per core. That means switches of
-about 100 MB or 10,000+ files on a repository Dave works in; then A′. For the
-git half: a working tree where the read is genuinely expensive, such as a
-switch larger than free memory, a network filesystem, or a cold cache that
-was not measured here. Even then A′ comes first, and C goes on top only if the
-read is measured to dominate.
+**Fact that would change it:** follow passes after real switches costing seconds
+of CPU, at the measured 51–64 MB/s per core. That means switches of about 100 MB
+or 10,000+ files on a repository Dave works in; then A′. For the git half: a
+working tree where the read is genuinely expensive, such as a switch larger than
+free memory, a network filesystem, or a cold cache that was not measured here.
+Even then A′ comes first, and C goes on top only if the read is measured to
+dominate.
 
 ## D61 — Term frequencies in S2's postings
 
-**Status: open.** S2 M0, 2026-10-06; [design](S2.md#what-a-posting-holds).
+**Status: answered, B (Dave).** S2 M0, 2026-10-06;
+[design](S2.md#what-a-posting-holds).
 
 **Question:** Should S2's postings store a term frequency per (term, document),
 or doc ids only?
 
-D6 made the index a candidate filter: it decides which documents to verify,
-not how to order them. Frequencies are ranking's input (BM25 and relatives),
-and nothing in S2 ranks. Sizes are from
-[S2 § Bytes per content byte](S2.md#bytes-per-content-byte-estimate):
-doc ids **9.69 bits/posting, measured** (intpack `pfor128skip`, `words.docs`)
-and frequencies **4.33 bits/posting, measured** (intpack `pfor128`,
-`words.freqs`); the per-content-byte totals are **estimates**.
+D6 made the index a candidate filter: it decides which documents to verify, not
+how to order them. Frequencies are ranking's input (BM25 and relatives), and
+nothing in S2 ranks. Sizes are from
+[S2 § Bytes per content byte](S2.md#bytes-per-content-byte-estimate): doc ids
+**9.69 bits/posting, measured** (intpack `pfor128skip`, `words.docs`) and
+frequencies **4.33 bits/posting, measured** (intpack `pfor128`, `words.freqs`);
+the per-content-byte totals are **estimates**.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Store frequencies | A parallel unsorted stream per list: +45% on doc-id bytes, +33% on the whole index (6.8% → 9.0% of text). At 30 GB of text, about +0.68 GB. One more stream to write, merge and check. | BM25-style ranking later without reindexing. A "most occurrences first" order for agents. |
-| B. Doc ids only | Ranking later needs a format version and a full re-follow: one pass over all text, about 16 min per 30 GB under the background pacer plus about 400 core-s (estimate, [S2 § Cost model](S2.md#cost-model-at-10m)). Until then, results come in DocId order (near path order). | The densest index, matching the goals' "index size takes priority". One stream per list. A verifier can still count matches in the documents it reads, which gives exact frequencies for phrase and regex candidates at no index cost. |
+| Option               | Costs                                                                                                                                                                                                                                                                         | Buys                                                                                                                                                                                                                                   |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Store frequencies | A parallel unsorted stream per list: +45% on doc-id bytes, +33% on the whole index (6.8% → 9.0% of text). At 30 GB of text, about +0.68 GB. One more stream to write, merge and check.                                                                                        | BM25-style ranking later without reindexing. A "most occurrences first" order for agents.                                                                                                                                              |
+| B. Doc ids only      | Ranking later needs a format version and a full re-follow: one pass over all text, about 16 min per 30 GB under the background pacer plus about 400 core-s (estimate, [S2 § Cost model](S2.md#cost-model-at-10m)). Until then, results come in DocId order (near path order). | The densest index, matching the goals' "index size takes priority". One stream per list. A verifier can still count matches in the documents it reads, which gives exact frequencies for phrase and regex candidates at no index cost. |
 
-**Recommendation: B.** Fastest (fewer bytes to read) and simplest (one
-stream) agree; this is a product-scope question rather than an engineering
-one, which is why it is here. The reindex that A avoids is the same code path
-as any tokenizer change.
+**Recommendation: B.** Fastest (fewer bytes to read) and simplest (one stream)
+agree; this is a product-scope question rather than an engineering one, which is
+why it is here. The reindex that A avoids is the same code path as any tokenizer
+change.
 
 **Fact that would change it:** ranked results scheduled for S4's agent skill or
-the TUI, which would make the reindex a certainty rather than an option; then
-A now.
+the TUI, which would make the reindex a certainty rather than an option; then A
+now.
+
+> Dave: Agree. This is a good experiment for later, but my gut says doc ids only
+> for now.
 
 ## D62 — `ferret search` syntax for content atoms and booleans
 
-**Status: open.** S2 M0, 2026-10-06; [design](S2.md#syntax-open-d62).
+**Status: answered, A (Dave).** S2 M0, 2026-10-06;
+[design](S2.md#syntax-open-d62).
 
 **Question:** How does `ferret search` spell a content atom, and how does it
 spell OR, NOT and grouping?
@@ -3532,11 +3554,11 @@ Today a query is a conjunction of atoms, one per argument, and a bare word is a
 S4's skill will document it. find(1) spells booleans as whole arguments (`-o`,
 `!`, `(` `)`), which agents quote correctly.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
+| Option                                                                       | Costs                                                                                                                                                                                                  | Buys                                                                                                                                                                                                               |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | A. A `text:` prefix for content; `OR`, `NOT`, `(` and `)` as whole arguments | Two more characters per content atom. `OR`/`NOT` become reserved words: a file literally named `OR` needs `name:OR`-style quoting, which needs a spelling (proposed: any atom prefix, e.g. `path:OR`). | S1 queries keep their meaning. Mixed queries read naturally: `ferret search ext:rs text:serde NOT text:"derive serialize"`. `case:text:Foo` composes with the existing `case:` prefix. One grammar for both sides. |
-| B. Bare words search content and names together (a union) | Changes every existing S1 query's meaning and cost: `ferret search parse` becomes a content query over the whole index. Agents' and tests' expectations change. | The shortest spelling for the most common content query. |
-| C. A separate verb (`ferret grep TERMS [-- name predicates]`) | A second grammar and parser, and two answers to "how do I combine them". | grep-like familiarity. |
+| B. Bare words search content and names together (a union)                    | Changes every existing S1 query's meaning and cost: `ferret search parse` becomes a content query over the whole index. Agents' and tests' expectations change.                                        | The shortest spelling for the most common content query.                                                                                                                                                           |
+| C. A separate verb (`ferret grep TERMS [-- name predicates]`)                | A second grammar and parser, and two answers to "how do I combine them".                                                                                                                               | grep-like familiarity.                                                                                                                                                                                             |
 
 For the booleans, the alternative to whole-argument words is Google-style
 `-atom` for NOT and `|` for OR: shorter, but `-` collides with option parsing
@@ -3549,25 +3571,37 @@ interface taste and compatibility, and it is Dave's interface.
 words used mostly with content intent, which would argue for B's default with
 `name:` as the explicit form.
 
+> Dave: Agree with A, but let's run a side investigation into the different
+> query languages used elsewhere. I'd like to include elastic search, splunk,
+> jira, datadog, dynatrace, and anything else in this space you think is worth
+> while. Give grok now, which has plenty of usage this week.
+>
+> As for `ferret grep`, that is also a must. I want a drop-in replacement for
+> grep, similar to our drop-in replacement for find. Decisions about how close
+> we match should follow the same patterns. i.e. match ripgrep's syntax for
+> compatability. Please ask grok or an opencode model to get started on the
+> ~/w/grep-compat harness, looking at ~/w/find-compat for comparison.
+
 ## D63 — Tokenize in a follow pass, or in the crawl's hashing read
 
-**Status: open.** S2 M0, 2026-10-06; [design](S2.md#the-content-flow-d63).
+**Status: answered, A (Dave).** S2 M0, 2026-10-06;
+[design](S2.md#the-content-flow-d63).
 
 **Question:** Should the index tokenize new content in its own pass after the
 catalog commits (reading each new file a second time), or during the crawl's
 existing read, which already sniffs and hashes every new or changed file?
 
 The crawl worker reads a file, hashes it, and only the catalog build, later,
-decides which hashes are new and assigns their DocIds (DESIGN § The catalog,
-by sorting). Tokens therefore cannot be keyed by DocId on the worker. All
-sizes and times below are **estimates**: 30 GB of text, the S1b M6 background
-pacer of 32 MiB/s, 1 GB/s unpaced sequential reads (S1PLUS's modelling input),
-and postings per content byte from [S2](S2.md#bytes-per-content-byte-estimate).
+decides which hashes are new and assigns their DocIds (DESIGN § The catalog, by
+sorting). Tokens therefore cannot be keyed by DocId on the worker. All sizes and
+times below are **estimates**: 30 GB of text, the S1b M6 background pacer of 32
+MiB/s, 1 GB/s unpaced sequential reads (S1PLUS's modelling input), and postings
+per content byte from [S2](S2.md#bytes-per-content-byte-estimate).
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Follow pass: after each catalog publication, the index reads the live documents it has not covered, in DocId order, and tokenizes them | New content is read twice. First build: one more pass, about 16 min per 30 GB paced, or about 30 s unpaced. Steady state: the second read is of a file the crawl read moments earlier, so it should come from the page cache (M5 measures the hit rate). | No change to `ferret-crawl` and no new crawl edge. Postings are appended in DocId order: no sort, no remap, a bounded 64 MiB buffer. One code path for the first build, a tokenizer change, a deleted index and the steady state. The index commits independently, with coverage covering the gap. |
-| B. Fused: the crawl worker tokenizes from its read buffer, for hashes not already live | `ferret-crawl → ferret-text`. Either the whole file is buffered until its hash is known (8 MiB size cap × 16 workers = 128 MiB), or every read file is tokenized, including duplicates already indexed (linked work trees). Tokens are keyed by hash on the worker, then remapped to DocIds and sorted at commit: about 1.25G postings per 30 GB, an external sort of roughly 5–10 GB of pairs. A pre-commit hook in both the checkpoint build and the log-transaction paths. A first build is a different code path from steady state and from a tokenizer change, which still needs A's pass. | One read of each new byte: the first build saves one pass, about 16 min per 30 GB paced. |
+| Option                                                                                                                                    | Costs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Buys                                                                                                                                                                                                                                                                                               |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Follow pass: after each catalog publication, the index reads the live documents it has not covered, in DocId order, and tokenizes them | New content is read twice. First build: one more pass, about 16 min per 30 GB paced, or about 30 s unpaced. Steady state: the second read is of a file the crawl read moments earlier, so it should come from the page cache (M5 measures the hit rate).                                                                                                                                                                                                                                                                                                                                        | No change to `ferret-crawl` and no new crawl edge. Postings are appended in DocId order: no sort, no remap, a bounded 64 MiB buffer. One code path for the first build, a tokenizer change, a deleted index and the steady state. The index commits independently, with coverage covering the gap. |
+| B. Fused: the crawl worker tokenizes from its read buffer, for hashes not already live                                                    | `ferret-crawl → ferret-text`. Either the whole file is buffered until its hash is known (8 MiB size cap × 16 workers = 128 MiB), or every read file is tokenized, including duplicates already indexed (linked work trees). Tokens are keyed by hash on the worker, then remapped to DocIds and sorted at commit: about 1.25G postings per 30 GB, an external sort of roughly 5–10 GB of pairs. A pre-commit hook in both the checkpoint build and the log-transaction paths. A first build is a different code path from steady state and from a tokenizer change, which still needs A's pass. | One read of each new byte: the first build saves one pass, about 16 min per 30 GB paced.                                                                                                                                                                                                           |
 
 **Recommendation: A.** Simplest by a wide margin, and in steady state, which is
 where the daemon spends its life, it should cost no extra I/O. Fastest and
@@ -3576,48 +3610,56 @@ of a second, separate code path that A still needs anyway.
 
 **Fact that would change it:** M5 measuring the second read's page-cache hit
 rate in steady state below roughly 90%, or the first build's wall-clock on
-Dave's real tree, from M1's census, being long enough that he calls it a
-product problem.
+Dave's real tree, from M1's census, being long enough that he calls it a product
+problem.
+
+> Dave: agree, but D60 may change this, at least for files with in a git repo.
+> i.e. we may not need to re-hash a file during branch switching.
 
 ## D64 — How segment bytes reach a query: positional reads or `mmap`
 
-**Status: open.** S2 M0, 2026-10-06; [design](S2.md#cost-model-at-10m).
+**Status: answered, A (Dave).** S2 M0, 2026-10-06;
+[design](S2.md#cost-model-at-10m).
 
 **Question:** Should queries read postings from segment files with positional
 reads into owned buffers, or map the segments?
 
-The catalog reads checked sections into owned buffers (D38 B), and its
-resident view is about 574 MiB at 10M (S1PLUS, estimate). The content index is
+The catalog reads checked sections into owned buffers (D38 B), and its resident
+view is about 574 MiB at 10M (S1PLUS, estimate). The content index is
 **estimated** at 0.68–6.8 GB at 10M depending on text volume
 ([S2](S2.md#bytes-per-content-byte-estimate)), so it cannot be resident under
 D48's 1 GB line in either option. Syscall and copy costs below are
 **estimates**: about 1–2 µs per warm `pread`, copies at about 10 GB/s.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Positional reads: block indexes resident (~0.4 B per term per segment), each list read with `pread` into per-query scratch | One syscall per (term, segment): a rare term across ~50 segments pays about 50–100 µs. Long lists are copied: a 1 MB list costs about 0.1 ms. A one-shot client and the daemon each copy what they read (the page cache itself is shared). | No `unsafe`; the same checked-read contract as the catalog, so a corrupt or truncated segment is an error, never a signal. Resident memory is only the block indexes. |
-| B. `mmap` each segment, read lists in place | One `unsafe` item under D11, with its ledger and the measurement that justifies it. A segment truncated or a device error under the mapping is SIGBUS in the daemon, not an error; immutability of segments makes truncation unlikely, not impossible. | Zero-copy reads and no syscall per list: the fastest rare-term lookups. Simple code once the mapping exists. |
-| C. Read whole segments resident, as the catalog does | 0.68–6.8 GB resident at 10M. | The fastest queries. Ruled out by D48's line; listed for completeness. |
+| Option                                                                                                                        | Costs                                                                                                                                                                                                                                                  | Buys                                                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Positional reads: block indexes resident (~0.4 B per term per segment), each list read with `pread` into per-query scratch | One syscall per (term, segment): a rare term across ~50 segments pays about 50–100 µs. Long lists are copied: a 1 MB list costs about 0.1 ms. A one-shot client and the daemon each copy what they read (the page cache itself is shared).             | No `unsafe`; the same checked-read contract as the catalog, so a corrupt or truncated segment is an error, never a signal. Resident memory is only the block indexes. |
+| B. `mmap` each segment, read lists in place                                                                                   | One `unsafe` item under D11, with its ledger and the measurement that justifies it. A segment truncated or a device error under the mapping is SIGBUS in the daemon, not an error; immutability of segments makes truncation unlikely, not impossible. | Zero-copy reads and no syscall per list: the fastest rare-term lookups. Simple code once the mapping exists.                                                          |
+| C. Read whole segments resident, as the catalog does                                                                          | 0.68–6.8 GB resident at 10M.                                                                                                                                                                                                                           | The fastest queries. Ruled out by D48's line; listed for completeness.                                                                                                |
 
-**Recommendation: A.** Simplest and safe; B is faster per lookup, so fastest
-and simplest disagree, but the difference is tens of microseconds on a query
-whose row emission costs milliseconds. Revisit with numbers, as D11 asks.
+**Recommendation: A.** Simplest and safe; B is faster per lookup, so fastest and
+simplest disagree, but the difference is tens of microseconds on a query whose
+row emission costs milliseconds. Revisit with numbers, as D11 asks.
 
 **Fact that would change it:** M4 measuring `pread` and copying above about 20%
 of rare-term or phrase-intersection latency at 10M, with an `mmap` prototype
 removing most of it.
 
+> Dave: Agree - avoid the unsafe and extra complexity unless we can back with
+> real numbers. Revisit when we have metrics and can run experiments.
+
 ## D65 — The term dictionary is 87% of the index
 
-**Status: open.** S2 M2b, 2026-10-07; [measurements](S2.md#m2--segment-writer-and-reader).
+**Status: open.** S2 M2b, 2026-10-07;
+[measurements](S2.md#m2--segment-writer-and-reader).
 
 **Question:** The first real build is 12.7% of text, not the 6.8% S2 M0
 estimated, and the term dictionary is 86.8% of it. What should S2 do about the
 dictionary?
 
 All figures are from one build over Dave's `$HOME`: 4.00 GB of text, 59 unmerged
-segments, `ferret-bench segment-build --breakdown` on `wt/s2` at `6d514e2`.
-Rows marked **derived** are arithmetic over measured sums.
+segments, `ferret-bench segment-build --breakdown` on `wt/s2` at `6d514e2`. Rows
+marked **derived** are arithmetic over measured sums.
 
 - **Index:** 509.5 MB (measured). The dictionary is 442.3 MB, the doc-id
   postings 65.3 MB at 8.32 bits/posting, and the rest is head and sums.
@@ -3631,27 +3673,27 @@ Rows marked **derived** are arithmetic over measured sums.
 - **`jsonl` (agent transcripts):** 29% of text. Terms seen only in `jsonl`
   account for 99.6 MB of the dictionary.
 
-What each lever leaves, in absolute bytes. M2b's S2.md block divides option
-(b) by the reduced text, which makes dropping `jsonl` look worse than doing
-nothing, so these figures use absolute bytes instead:
+What each lever leaves, in absolute bytes. M2b's S2.md block divides option (b)
+by the reduced text, which makes dropping `jsonl` look worse than doing nothing,
+so these figures use absolute bytes instead:
 
-| Lever | Index | vs 509.5 MB |
-| --- | ---: | ---: |
-| Drop hash-like singletons | 443.4 MB | −13% |
-| Drop `jsonl` documents | ≤ 409.9 MB | −20% or more (shared terms' postings not counted) |
-| Drop all per-segment singletons | 149.8 MB | −71%, before the fallback structure's own bytes |
-| Full merge to one segment (rough, **derived**: each term once at 12.8 B) | ≈ 303 MB | −40% |
+| Lever                                                                    |      Index |                                       vs 509.5 MB |
+| ------------------------------------------------------------------------ | ---------: | ------------------------------------------------: |
+| Drop hash-like singletons                                                |   443.4 MB |                                              −13% |
+| Drop `jsonl` documents                                                   | ≤ 409.9 MB | −20% or more (shared terms' postings not counted) |
+| Drop all per-segment singletons                                          |   149.8 MB |   −71%, before the fallback structure's own bytes |
+| Full merge to one segment (rough, **derived**: each term once at 12.8 B) |   ≈ 303 MB |                                              −40% |
 
 The singleton entries are long and share little with their neighbours: about
 8.35 B of string per term after front coding. An FST saves least on exactly
 those terms.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Keep front-coded blocks; let M3's merge policy cut duplication; re-measure the merged index | The index stays at roughly 7–8% of text after merging (derived, rough): about 2.3 GB at 30 GB of text. | No new structure. Every term stays exact in S2: a rare-term lookup reads one block. The format already carries a dictionary codec id, so C or B stays possible later without a format break. |
-| B. An FST dictionary | A new structure to build, merge and checksum, and slower lookups than one block decode. Expected saving is small, because 81% of the bytes are the least-shared terms. | Possibly 10–25% of the dictionary (guess, unmeasured). The textbook answer. |
-| C. Keep df = 1 entries out of the dictionary: a term missing from a segment's dictionary means "maybe", answered by S3's trigram structure and then verified | Couples S2 to S3, which isn't built or measured. Its trigram bytes add back an unknown share of the 71% saved. Every rare-term query, the most selective kind and common for agents (identifiers, error strings, hashes), becomes a trigram intersection plus a verify read instead of one block read. The dictionary can no longer say "absent" for any term. | The densest index by far: about 3.7% of text before trigram bytes. The structure that answers the dropped terms is one S3 must build anyway, because regex is a hard requirement. |
-| D. Drop hash-like whole-run terms only | −13%. Hash lookups (commit ids, UUIDs) are a real agent query; they would need C's fallback anyway. The tokenizer still emits their alphanumeric parts, so part of the noise stays. | A one-line rule. |
+| Option                                                                                                                                                       | Costs                                                                                                                                                                                                                                                                                                                                                          | Buys                                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Keep front-coded blocks; let M3's merge policy cut duplication; re-measure the merged index                                                               | The index stays at roughly 7–8% of text after merging (derived, rough): about 2.3 GB at 30 GB of text.                                                                                                                                                                                                                                                         | No new structure. Every term stays exact in S2: a rare-term lookup reads one block. The format already carries a dictionary codec id, so C or B stays possible later without a format break. |
+| B. An FST dictionary                                                                                                                                         | A new structure to build, merge and checksum, and slower lookups than one block decode. Expected saving is small, because 81% of the bytes are the least-shared terms.                                                                                                                                                                                         | Possibly 10–25% of the dictionary (guess, unmeasured). The textbook answer.                                                                                                                  |
+| C. Keep df = 1 entries out of the dictionary: a term missing from a segment's dictionary means "maybe", answered by S3's trigram structure and then verified | Couples S2 to S3, which isn't built or measured. Its trigram bytes add back an unknown share of the 71% saved. Every rare-term query, the most selective kind and common for agents (identifiers, error strings, hashes), becomes a trigram intersection plus a verify read instead of one block read. The dictionary can no longer say "absent" for any term. | The densest index by far: about 3.7% of text before trigram bytes. The structure that answers the dropped terms is one S3 must build anyway, because regex is a hard requirement.            |
+| D. Drop hash-like whole-run terms only                                                                                                                       | −13%. Hash lookups (commit ids, UUIDs) are a real agent query; they would need C's fallback anyway. The tokenizer still emits their alphanumeric parts, so part of the noise stays.                                                                                                                                                                            | A one-line rule.                                                                                                                                                                             |
 
 Excluding `jsonl` transcripts is not listed as an option. It is a crawl policy
 (what to index), not a dictionary format. It is worth about 20% of the index by
@@ -3660,21 +3702,24 @@ you want it.
 
 **Recommendation: A for S2, with C re-decided in S3 using measured trigram
 bytes.**
+
 - **Simplest:** A is simplest, and B is ruled out on the numbers.
 - **Densest:** C is far denser, but its true cost depends on S3's trigram
   postings, which nobody has measured. Choosing it now would put S2 to wait on
   S3.
-- **Why A loses nothing:** the dictionary codec id makes C a codec change
-  later, not a format break.
+- **Why A loses nothing:** the dictionary codec id makes C a codec change later,
+  not a format break.
 
 **Fact that would change it:** two possibilities.
+
 - M3 measuring the merged index above about 8% of text would make the A-only
   path unattractive; then move C's experiment forward to the start of S3.
-- If index size must come down now regardless of query cost, choose C and
-  accept that S2's rare-term queries wait for S3.
+- If index size must come down now regardless of query cost, choose C and accept
+  that S2's rare-term queries wait for S3.
 
 **Update, S2 M3 (2026-10-07, `wt/s2` at `b4a04e1`): the fact that would change
-it has happened.** Measured with `ferret-bench index-build` over the same 4.0 GB:
+it has happened.** Measured with `ferret-bench index-build` over the same 4.0
+GB:
 
 - **First build:** 49 segments, 0.1254 B per content byte. 99 s wall and 94
   CPU-s unpaced, peak RSS 282 MiB.
@@ -3685,10 +3730,10 @@ it has happened.** Measured with `ferret-bench index-build` over the same 4.0 GB
 
 Both are above the ~8% line, so merging alone does not bring A down to it.
 
-The revised recommendation is still A for S2, because S2 should not wait on
-S3, but C's experiment now moves to the **first** slice of S3. That slice
-measures trigram bytes for the singleton terms and the latency of a rare-term
-query routed through them, then reopens D65 with C costed.
+The revised recommendation is still A for S2, because S2 should not wait on S3,
+but C's experiment now moves to the **first** slice of S3. That slice measures
+trigram bytes for the singleton terms and the latency of a rare-term query
+routed through them, then reopens D65 with C costed.
 
 If you want the size down before S3, say C now, and S2's rare-term queries will
 go through a verify scan until S3 lands.
@@ -3701,10 +3746,10 @@ go through a verify scan until S3 lands.
 **C as written is unsound, and so is C′.** Three problems, the first two from
 Astra and confirmed against the code:
 
-- **False negatives.** The trigram fallback checks a normalised term against
-  the document's raw bytes. A document whose `Kelvin` is written with the
-  Kelvin sign emits the term `kelvin`, but its bytes hold no `kel` trigram, so
-  C misses it.
+- **False negatives.** The trigram fallback checks a normalised term against the
+  document's raw bytes. A document whose `Kelvin` is written with the Kelvin
+  sign emits the term `kelvin`, but its bytes hold no `kel` trigram, so C misses
+  it.
 - **Merging loses documents.** Merging a dropped singleton into a segment that
   keeps the term means a dictionary hit no longer lists every document.
 - **Every lookup pays.** A dictionary miss stops meaning absent, so every term
@@ -3716,12 +3761,12 @@ the dictionary. It is sound by construction, and it needs no trigrams.
 
 Records never return to the dictionary, so the section starts with every
 **first-build** singleton: about 26.3M records on `$HOME` (derived from M3),
-about 134 MB. A record persists while its document remains live. A purge
-removes records of dead documents, and demotes into the section dictionary
-terms left with live df 1. Its saving therefore shrinks as merging removes the
-control's own singletons. The figures below are lifecycle **estimates, not
-bounds**. Removing an entry can lengthen its front-coded successor, so M2's
-real encoding at each state decides the saving.
+about 134 MB. A record persists while its document remains live. A purge removes
+records of dead documents, and demotes into the section dictionary terms left
+with live df 1. Its saving therefore shrinks as merging removes the control's
+own singletons. The figures below are lifecycle **estimates, not bounds**.
+Removing an entry can lengthen its front-coded successor, so M2's real encoding
+at each state decides the saving.
 
 | State       | Control (measured, M3) | H (estimate) | Change |
 | ----------- | ---------------------- | ------------ | ------ |
@@ -3733,14 +3778,14 @@ An idealised conversion of only the merged index's singletons would save about
 105 MB, but H does not build that.
 
 **Latency.** Every fingerprint hit is Maybe and costs one verification read. A
-term carries one record per first-build segment in which it was a singleton
-(up to 49 on `$HOME`), plus one per later purge that left it with live df 1.
-Each lookup also pays one or two extra block reads per segment.
+term carries one record per first-build segment in which it was a singleton (up
+to 49 on `$HOME`), plus one per later purge that left it with live df 1. Each
+lookup also pays one or two extra block reads per segment.
 
-**Proposed rule.** M2 builds H through its own lifecycle, encodes each state
-for real, and runs S2's churn trace to report records added by demotion,
-records removed by purge, and the net population. H replaces
-dictionary codec 1 if, **at steady state**, all of these hold:
+**Proposed rule.** M2 builds H through its own lifecycle, encodes each state for
+real, and runs S2's churn trace to report records added by demotion, records
+removed by purge, and the net population. H replaces dictionary codec 1 if, **at
+steady state**, all of these hold:
 
 - term-index bytes fall by at least 15%;
 - warm p90 for df = 1, df 2–100 and absent terms stays under 20 ms;
@@ -3749,63 +3794,62 @@ dictionary codec 1 if, **at steady state**, all of these hold:
 
 Otherwise A stands. The full-merge figure is reported beside it.
 
-**Fact that would change it:** H passing at steady state but saving under 15%
-at full merge, which is what the estimate predicts. That matters only if the
-index spends its life near full merge. If S2's merge policy keeps `$HOME` near
-13 segments, take H. If long-running daemons drift toward one segment, H's
+**Fact that would change it:** H passing at steady state but saving under 15% at
+full merge, which is what the estimate predicts. That matters only if the index
+spends its life near full merge. If S2's merge policy keeps `$HOME` near 13
+segments, take H. If long-running daemons drift toward one segment, H's
 advantage erodes, and A is the simpler choice.
 
 ### D65 update — M2 measured H (S3 M2, 2026-10-08)
 
-**Measured on a frozen snapshot**: 107,354 readable documents, 3.51 GB.
-The home tree had changed since S2. The two arms are fresh real follows
-and real merges. Every H query returned exactly the control's rows
-(750/750).
+**Measured on a frozen snapshot**: 107,354 readable documents, 3.51 GB. The home
+tree had changed since S2. The two arms are fresh real follows and real merges.
+Every H query returned exactly the control's rows (750/750).
 
-| State     | Segments | Control bytes | H bytes | Saving |
-| --------- | -------: | ------------: | ------: | -----: |
-| first     |       45 |      471.3 MB | 202.9 MB |  56.9% |
-| steady    |        9 |      409.7 MB | 192.5 MB |  53.0% |
-| full      |        1 |      368.6 MB | 193.2 MB |  47.6% |
+| State  | Segments | Control bytes |  H bytes | Saving |
+| ------ | -------: | ------------: | -------: | -----: |
+| first  |       45 |      471.3 MB | 202.9 MB |  56.9% |
+| steady |        9 |      409.7 MB | 192.5 MB |  53.0% |
+| full   |        1 |      368.6 MB | 193.2 MB |  47.6% |
 
-The saving is roughly twice the estimate. The estimate missed 2.49M terms:
-each of them occurs in more than one document overall, but only ever as a
-singleton within a segment, so H never stores their strings. Records cost
-about 4.06 B each, against an estimated 5.1 B. Build CPU is 1.03× (follow plus
-steady merges). Peak RSS is 266 MB against 290 MB.
+The saving is roughly twice the estimate. The estimate missed 2.49M terms: each
+of them occurs in more than one document overall, but only ever as a singleton
+within a segment, so H never stores their strings. Records cost about 4.06 B
+each, against an estimated 5.1 B. Build CPU is 1.03× (follow plus steady
+merges). Peak RSS is 266 MB against 290 MB.
 
 **The rule as written fails, and the control fails it too.** Steady warm p90 for
-df1, df2–100 and absent is 24.3 / 33.7 / 23.7 ms; the control's is 23.4 / 24.8 / 22.9 ms.
-Both sit on a ~23 ms floor that is not the index. The isolated catalog is stale:
-5,656 of its 113,010 live documents are unreadable, so every query tries 22,708
-fallback name aliases. With that floor removed and nothing else changed, the
-control is 0.08 ms everywhere. H is 1.44 / 10.99 / 0.18 ms p90, and mid and common medians
-are 1.30× and 0.99×, so **every gate passes**. That diagnostic still needs a
-refreshed catalog before it counts as evidence. df2–100's p95 is 46 ms: the
-p90 rule does not bound large-file tails.
+df1, df2–100 and absent is 24.3 / 33.7 / 23.7 ms; the control's is 23.4 / 24.8 /
+22.9 ms. Both sit on a ~23 ms floor that is not the index. The isolated catalog
+is stale: 5,656 of its 113,010 live documents are unreadable, so every query
+tries 22,708 fallback name aliases. With that floor removed and nothing else
+changed, the control is 0.08 ms everywhere. H is 1.44 / 10.99 / 0.18 ms p90, and
+mid and common medians are 1.30× and 0.99×, so **every gate passes**. That
+diagnostic still needs a refreshed catalog before it counts as evidence.
+df2–100's p95 is 46 ms: the p90 rule does not bound large-file tails.
 
-**A cost the estimate did not foresee.** On S2's synthetic 5% churn trace, H ends
-**10.4% larger** than the control (13.07 MB against 11.84 MB), with write
-amplification 3.47 against 3.00. Records never return to the dictionary, and
-for recurring short vocabulary a 4-byte record costs more than a compact
-posting. Sol names two fixes, neither built: delta-code the DocIds within an
-equal-fingerprint run, or compress long runs as postings. Either keeps every
-hit Maybe.
+**A cost the estimate did not foresee.** On S2's synthetic 5% churn trace, H
+ends **10.4% larger** than the control (13.07 MB against 11.84 MB), with write
+amplification 3.47 against 3.00. Records never return to the dictionary, and for
+recurring short vocabulary a 4-byte record costs more than a compact posting.
+Sol names two fixes, neither built: delta-code the DocIds within an
+equal-fingerprint run, or compress long runs as postings. Either keeps every hit
+Maybe.
 
 **Question: should H replace codec 1?**
 
-| Option | Cost | Buys |
-| --- | --- | --- |
-| A. Keep codec 1 and drop H | Nothing more to build. | The index stays roughly twice the size H measured: 410 MB against 192 MB at steady state. |
-| B. Adopt H as it stands | The 10% churn penalty on long-lived daemons. Every rare-term hit costs a verification read. | 53% off the term index on `$HOME` now. |
-| C. Adopt H after a run-codec fix, re-measured on a refreshed catalog | One more slice: the run codec, plus re-running M2's bench and churn trace. | B's saving without the churn penalty. The latency verdict is taken without the stale-catalog floor. |
+| Option                                                               | Cost                                                                                        | Buys                                                                                                |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| A. Keep codec 1 and drop H                                           | Nothing more to build.                                                                      | The index stays roughly twice the size H measured: 410 MB against 192 MB at steady state.           |
+| B. Adopt H as it stands                                              | The 10% churn penalty on long-lived daemons. Every rare-term hit costs a verification read. | 53% off the term index on `$HOME` now.                                                              |
+| C. Adopt H after a run-codec fix, re-measured on a refreshed catalog | One more slice: the run codec, plus re-running M2's bench and churn trace.                  | B's saving without the churn penalty. The latency verdict is taken without the stale-catalog floor. |
 
 **Recommendation: C.** S3 keeps building on codec 1, with codec 2 opt-in, so
-nothing blocks. H's density win is the largest S3 has measured. The
-churn result is the only thing against it, and a run codec is a direct answer
-to it. **The fact that would change it:** on a refreshed catalog, small-class
-p90 stays over 20 ms with full coverage. Then H's verification reads are the
-cost, and A stands.
+nothing blocks. H's density win is the largest S3 has measured. The churn result
+is the only thing against it, and a run codec is a direct answer to it. **The
+fact that would change it:** on a refreshed catalog, small-class p90 stays over
+20 ms with full coverage. Then H's verification reads are the cost, and A
+stands.
 
 ## D66 — Phrase queries read too much: positions, or not
 
@@ -3826,70 +3870,73 @@ covering verification time above about 100 ms. Measured with
 - **Candidates per query:** median 2,510, p90 9,059. The count half of the
   trigger **does not fire**.
 - **Latency.** M4b tokenized every candidate byte. M4c tokenizes only windows
-  around the rarest unit's matches, with a soundness proof and a
-  30,000-case property test.
+  around the rarest unit's matches, with a soundness proof and a 30,000-case
+  property test.
 
-  | Latency | M4b | M4c |
-  | --- | ---: | ---: |
-  | median | 12.1 s | **0.72 s** |
-  | p90 | 21.9 s | **1.73 s** |
-  | bytes tokenized, median | 1,254 MiB | 32 MiB |
+  | Latency                 |       M4b |        M4c |
+  | ----------------------- | --------: | ---------: |
+  | median                  |    12.1 s | **0.72 s** |
+  | p90                     |    21.9 s | **1.73 s** |
+  | bytes tokenized, median | 1,254 MiB |     32 MiB |
 
   The time half **fires**.
-- **Reading alone:** the candidate files average 1.25 GB per query, which is
-  126 ms at the median and 250 ms at p90. No matcher change can bring p90
-  under 100 ms; only reading fewer bytes can. Of the remaining ~585 ms, about
-  190 ms is tokenizing and the rest is two whole-document regex scans. One
-  combined scan would cut part of that; that is a cheap fix, not a question.
-- **Which files the bytes come from** is not measured. Large documents
-  dominate; whether those are the `jsonl` transcripts is a guess.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. No positions. Keep windowed verification; merge its two scans into one | Phrases stay around 0.3–0.7 s median and 1–2 s p90 on this tree (derived from M4c, after the merged scan). Cold cache adds whatever reading 1.25 GB costs from disk. | The index stays as it is, against D65's size problem. One code path. Every phrase answer is checked against the current bytes. |
-| B. Full positions: a delta-coded position stream per posting | 889.8M occurrences (M1c, measured) at ~1–1.5 B each comes to **0.9–1.3 GB** against a 392 MB merged index, about 3–4× the index and 33–43% of text (**estimate**). Positions must be merged, checked and kept current. | Phrase queries never read files: milliseconds. Highlighting comes from the index. |
-| C. A coarse chunk map for large documents only. For each (term, document) over a size line, say 1 MiB, a bitmap of which 64 KiB chunks contain the term. Verification reads only chunks where every unit appears, plus their neighbours | A second postings stream for large documents. Size unmeasured: bounded by (large documents × distinct terms in each × a few bytes). Reads become `pread`s of chunks rather than whole files. | Reads shrink in proportion to how concentrated a phrase is inside big files, which is where the bytes are. Small files stay as A. The same "read fewer bytes" shape as D65 C, so S3 can measure both together. |
+- **Reading alone:** the candidate files average 1.25 GB per query, which is 126
+  ms at the median and 250 ms at p90. No matcher change can bring p90 under 100
+  ms; only reading fewer bytes can. Of the remaining ~585 ms, about 190 ms is
+  tokenizing and the rest is two whole-document regex scans. One combined scan
+  would cut part of that; that is a cheap fix, not a question.
+- **Which files the bytes come from** is not measured. Large documents dominate;
+  whether those are the `jsonl` transcripts is a guess.
+
+| Option                                                                                                                                                                                                                                  | Costs                                                                                                                                                                                                                  | Buys                                                                                                                                                                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. No positions. Keep windowed verification; merge its two scans into one                                                                                                                                                               | Phrases stay around 0.3–0.7 s median and 1–2 s p90 on this tree (derived from M4c, after the merged scan). Cold cache adds whatever reading 1.25 GB costs from disk.                                                   | The index stays as it is, against D65's size problem. One code path. Every phrase answer is checked against the current bytes.                                                                                 |
+| B. Full positions: a delta-coded position stream per posting                                                                                                                                                                            | 889.8M occurrences (M1c, measured) at ~1–1.5 B each comes to **0.9–1.3 GB** against a 392 MB merged index, about 3–4× the index and 33–43% of text (**estimate**). Positions must be merged, checked and kept current. | Phrase queries never read files: milliseconds. Highlighting comes from the index.                                                                                                                              |
+| C. A coarse chunk map for large documents only. For each (term, document) over a size line, say 1 MiB, a bitmap of which 64 KiB chunks contain the term. Verification reads only chunks where every unit appears, plus their neighbours | A second postings stream for large documents. Size unmeasured: bounded by (large documents × distinct terms in each × a few bytes). Reads become `pread`s of chunks rather than whole files.                           | Reads shrink in proportion to how concentrated a phrase is inside big files, which is where the bytes are. Small files stay as A. The same "read fewer bytes" shape as D65 C, so S3 can measure both together. |
 
 **Recommendation: A for S2, with C as an S3 experiment beside D65's C.**
-- **Fastest and simplest disagree.** B is fastest, but it roughly quadruples
-  an index that D65 already finds too big, against your "density over speed".
-  A is simplest.
-- **C** targets the measured cost, large files, at a fraction of B's bytes,
-  but its size is unknown.
+
+- **Fastest and simplest disagree.** B is fastest, but it roughly quadruples an
+  index that D65 already finds too big, against your "density over speed". A is
+  simplest.
+- **C** targets the measured cost, large files, at a fraction of B's bytes, but
+  its size is unknown.
 - **The 100 ms line** was mine, not yours. If 1–2 s at p90 for a phrase is
   acceptable to you and the agents, A is simply done.
 
 **Fact that would change it:** two possibilities.
-- Agent traces showing phrase queries are frequent, and latency-sensitive in
-  a loop, would move C forward into S2.
+
+- Agent traces showing phrase queries are frequent, and latency-sensitive in a
+  loop, would move C forward into S2.
 - A measurement that most verified bytes come from `jsonl` transcripts would
   make a `jsonl` policy (D65's side question) the cheaper fix than any
   structure.
 
 ### D66 update — the chunk-map census (S3 M6, 2026-10-08)
 
-**Heuristic estimate, not a bound** (S3.md § Experiment: D66 C). M4c's 50
-phrase queries were regenerated with the same seed, against a fresh index of
-the S2 bench catalog. Map bytes assume **1 B per (term, document, chunk)**,
-S3.md's cheapest guess; its own table expects 1.5–4 B at 256 KiB.
+**Heuristic estimate, not a bound** (S3.md § Experiment: D66 C). M4c's 50 phrase
+queries were regenerated with the same seed, against a fresh index of the S2
+bench catalog. Map bytes assume **1 B per (term, document, chunk)**, S3.md's
+cheapest guess; its own table expects 1.5–4 B at 256 KiB.
 
-| Chunk | Estimated p90 read | Actual p90 read | p90 cut | Map bytes (1 B/triple) | vs index |
-| ------- | ---------: | ---------: | ----: | ------: | -----: |
-| 1 MiB   | 1.98 GB | 2.16 GB |  8% | 32.6 MB | +8.3% |
-| 256 KiB | 1.83 GB | 2.16 GB | 15% | 41.9 MB | +10.7% |
-| 64 KiB  | 1.68 GB | 2.16 GB | 22% | 58.2 MB | +14.9% |
+| Chunk   | Estimated p90 read | Actual p90 read | p90 cut | Map bytes (1 B/triple) | vs index |
+| ------- | -----------------: | --------------: | ------: | ---------------------: | -------: |
+| 1 MiB   |            1.98 GB |         2.16 GB |      8% |                32.6 MB |    +8.3% |
+| 256 KiB |            1.83 GB |         2.16 GB |     15% |                41.9 MB |   +10.7% |
+| 64 KiB  |            1.68 GB |         2.16 GB |     22% |                58.2 MB |   +14.9% |
 
 **Corrected after review** (Astra, S3 sprint review round 1). The first run's
 estimate left out reads of files under 1 MiB, which no chunk map changes. Its
 actual figure included them, so it reported cuts of 43% / 55% / 61%. The map
 also counted uncapped tokens rather than stored terms. Both are fixed
-(`wt/s3-m6` `192c4e0`). Counting large files only, the cuts are 5% / 24% /
-34%.
+(`wt/s3-m6` `192c4e0`). Counting large files only, the cuts are 5% / 24% / 34%.
 
 The rule is a p90 cut of at least 50% for at most 10% more index. **No chunk
 size comes near the cut, so D66 C is parked, not closed.** Two caveats:
-- 1,320 forced whole reads include files whose stat differs from the stale
-  bench catalog. That understates the cut, but not by the 28+ points needed.
+
+- 1,320 forced whole reads include files whose stat differs from the stale bench
+  catalog. That understates the cut, but not by the 28+ points needed.
 - The anchor term is the one the real matcher picks: the longer unit.
 
 Recommendation A stands. **Fact that would change it:** phrase reads
@@ -3983,12 +4030,12 @@ does the query refuse, at what threshold, and through which flag?
 
 **(a) Spelling.**
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. `grep:REGEX` | One more prefix to learn. | It reads as what it does, and agents know grep. `case:grep:` composes as `case:` does elsewhere. `re:` keeps its meaning. |
-| B. `text:/REGEX/` | It changes `text:` for an argument that starts and ends with `/`, which today is a term (`text:/usr/` finds `usr`). A regex containing `/` needs a rule. | No new prefix: `text:` covers all content. |
-| C. Bare `/REGEX/`, as DESIGN sketched | `/` already makes a bare word a path substring (S1), so `/usr/` would change meaning. | The shortest spelling. |
-| D. `re:` searches content as well as names | It changes every existing `re:` query's meaning and cost, which is D62's argument against its B. | One regex prefix. |
+| Option                                     | Costs                                                                                                                                                    | Buys                                                                                                                      |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| A. `grep:REGEX`                            | One more prefix to learn.                                                                                                                                | It reads as what it does, and agents know grep. `case:grep:` composes as `case:` does elsewhere. `re:` keeps its meaning. |
+| B. `text:/REGEX/`                          | It changes `text:` for an argument that starts and ends with `/`, which today is a term (`text:/usr/` finds `usr`). A regex containing `/` needs a rule. | No new prefix: `text:` covers all content.                                                                                |
+| C. Bare `/REGEX/`, as DESIGN sketched      | `/` already makes a bare word a path substring (S1), so `/usr/` would change meaning.                                                                    | The shortest spelling.                                                                                                    |
+| D. `re:` searches content as well as names | It changes every existing `re:` query's meaning and cost, which is D62's argument against its B.                                                         | One regex prefix.                                                                                                         |
 
 Semantics under any option:
 
@@ -4010,64 +4057,64 @@ from dictionaries only, and follows each atom's real certainty rules:
 records. It covers `NOT` and `OR`: `NOT grep:\d+` and `grep:\d+ OR text:rare`
 both leave every document Maybe.
 
-To stay an upper bound, `NOT e` is assumed to admit every live document
-(P = live). That has a cost. An unindexed regex narrowed **only** by a `NOT`,
-such as `NOT text:common grep:'\d+'`, is estimated at every live document and
-refused, even when few documents actually lack `common`. A query with any
-positive narrowing atom (`ext:rs`, `text:serde`) is not affected.
+To stay an upper bound, `NOT e` is assumed to admit every live document (P =
+live). That has a cost. An unindexed regex narrowed **only** by a `NOT`, such as
+`NOT text:common grep:'\d+'`, is estimated at every live document and refused,
+even when few documents actually lack `common`. A query with any positive
+narrowing atom (`ext:rs`, `text:serde`) is not affected.
 
 S2 already refuses when uncovered documents exceed 10,000, with the flag
 `--scan-uncovered`.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
+| Option                                                                                                                                                      | Costs                                                                                                                                                                                                              | Buys                                                                                                            |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
 | i. Refuse when M > live / 4 with `ScanRequired`; one flag `--scan` overrides both this and S2's uncovered refusal, with `--scan-uncovered` kept as an alias | Some broad but legitimate queries need the flag. `grep:the` likely does on `$HOME`, and so does a regex narrowed only by `NOT`. M is an upper bound, so it sometimes refuses a query that would have been cheaper. | No accidental 4 GB read, with a bound that is proved, not hoped for. One rule an agent can learn, and one flag. |
-| ii. As i, but with a tighter `NOT` that uses an exact count of e's Yes documents, which needs reading e's lists before deciding | A list read before every refusal decision on a `NOT` query, and a second estimate path to keep correct. | Fewer refusals of `NOT`-narrowed regexes. |
-| iii. Never refuse; report M in `explain()` and the JSON stats | Agents pay the full read before learning the cost. | Nothing to learn. |
+| ii. As i, but with a tighter `NOT` that uses an exact count of e's Yes documents, which needs reading e's lists before deciding                             | A list read before every refusal decision on a `NOT` query, and a second estimate path to keep correct.                                                                                                            | Fewer refusals of `NOT`-narrowed regexes.                                                                       |
+| iii. Never refuse; report M in `explain()` and the JSON stats                                                                                               | Agents pay the full read before learning the cost.                                                                                                                                                                 | Nothing to learn.                                                                                               |
 
 **Recommendation: (a) A, with multi-line on; (b) i.** On (a), fastest and
-simplest are indifferent: this is interface taste and compatibility, as D62
-was. On (b), i is the simplest sound rule, and it follows S2's precedent. The
+simplest are indifferent: this is interface taste and compatibility, as D62 was.
+On (b), i is the simplest sound rule, and it follows S2's precedent. The
 `NOT`-only over-refusal is narrow, and `--scan` answers it.
 
 **Fact that would change it:** S4's agent traces. If agents reach for `/…/` or
-for `re:` on content, make B or D the spelling, with the old one as an alias.
-If agents hit `ScanRequired` on `NOT`-narrowed queries they meant, take ii. If
-they hit it on broad positive queries, raise the fraction.
+for `re:` on content, make B or D the spelling, with the old one as an alias. If
+agents hit `ScanRequired` on `NOT`-narrowed queries they meant, take ii. If they
+hit it on broad positive queries, raise the fraction.
 
 ## D68 — Per-document filters: a screening stage, terms and trigrams separately
 
 **Status: open.** S3 M0, revision 3, 2026-10-08;
 [design](S3.md#per-document-trigram-filters).
 
-**Question:** ROADMAP says S3 builds per-document trigram filters beside
-trigram postings, and benches per-document term filters against postings (D6,
-D8). Should either filter go into the index, or is a screening measurement
-enough to decide?
+**Question:** ROADMAP says S3 builds per-document trigram filters beside trigram
+postings, and benches per-document term filters against postings (D6, D8).
+Should either filter go into the index, or is a screening measurement enough to
+decide?
 
 A binary fuse filter's size follows from its key count, and each key is one
 posting, so its bytes can be computed exactly from the documents' key sets.
 Figures are **estimates** unless marked:
 
-- **Trigrams:** about 500 MB of filters against about 351 MB of complete
-  trigram files at the central estimate. The comparison flips if postings
-  average much above 9 bits per pair. Term lists measured 8.32 (M2), and
-  trigram lists should be denser.
+- **Trigrams:** about 500 MB of filters against about 351 MB of complete trigram
+  files at the central estimate. The comparison flips if postings average much
+  above 9 bits per pair. Term lists measured 8.32 (M2), and trigram lists should
+  be denser.
 - **Terms:** 89.7M pairs (**measured**, M1c) give about 101 MB of filters,
-  against S2's 392 MB merged index (**measured**, M3). That is 3.9× smaller,
-  so term filters are a real density option.
+  against S2's 392 MB merged index (**measured**, M3). That is 3.9× smaller, so
+  term filters are a real density option.
 - **Latency:** a filter is probed once per candidate document. Unnarrowed, that
-  is every live document: 0.13–2.7 s warm at 10M, against a rare term's
-  measured 1.94 ms warm median (M4b). Narrowed by a selective name atom or a
-  rare term, the probe cost shrinks with the narrowing.
+  is every live document: 0.13–2.7 s warm at 10M, against a rare term's measured
+  1.94 ms warm median (M4b). Narrowed by a selective name atom or a rare term,
+  the probe cost shrinks with the narrowing.
 - **D8's premise** that filters cost 12% of postings is an arithmetic error in
   the research budget: 248 Mbit should have been 248 MB.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Build both filters into the index and bench them, as ROADMAP says | A filter builder in follow and merge, a probe arm, coverage and tests: about one slice of work before knowing whether either survives. | Measured end-to-end numbers, including cold page-cache behaviour of real filter files. |
-| B. Screen first: layout bytes from exact key sets in M1a; real filters on matched workloads in M1b, after M3 (unnarrowed; narrowed by 1%, 10%, 50% name atoms; narrowed by a rare term), terms and trigrams separately; integrate only a layout that survives | A layout that survives screening still needs the integration slice later. Screening does not measure follow or merge cost. | Each structure is decided on measured bytes and probe cost, before any index code. A surviving density/latency trade comes back here with its numbers. |
-| C. Build term filters only, as a density opt-in, without screening | A second term structure to keep correct; unnarrowed rare-term queries 100–1000× slower when chosen. | The smallest term index, for users who value bytes over everything. |
+| Option                                                                                                                                                                                                                                                        | Costs                                                                                                                                  | Buys                                                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A. Build both filters into the index and bench them, as ROADMAP says                                                                                                                                                                                          | A filter builder in follow and merge, a probe arm, coverage and tests: about one slice of work before knowing whether either survives. | Measured end-to-end numbers, including cold page-cache behaviour of real filter files.                                                                 |
+| B. Screen first: layout bytes from exact key sets in M1a; real filters on matched workloads in M1b, after M3 (unnarrowed; narrowed by 1%, 10%, 50% name atoms; narrowed by a rare term), terms and trigrams separately; integrate only a layout that survives | A layout that survives screening still needs the integration slice later. Screening does not measure follow or merge cost.             | Each structure is decided on measured bytes and probe cost, before any index code. A surviving density/latency trade comes back here with its numbers. |
+| C. Build term filters only, as a density opt-in, without screening                                                                                                                                                                                            | A second term structure to keep correct; unnarrowed rare-term queries 100–1000× slower when chosen.                                    | The smallest term index, for users who value bytes over everything.                                                                                    |
 
 **Recommendation: B.** Fastest and simplest agree on screening first: it costs
 bench commands, and it can only remove work. I expect trigram filters to fail
@@ -4078,27 +4125,26 @@ survive as a trade, and come back here as a question about the opt-in.
 1.2× of postings on the narrowed workloads, and smaller on bytes. Then build it
 (A), for that structure only.
 
-**Update after M1b (measured, `wt/s3-m1` `98b6fa9`).** Real binary fuse
-filters were built from exact per-document key sets over the `$HOME` catalog.
+**Update after M1b (measured, `wt/s3-m1` `98b6fa9`).** Real binary fuse filters
+were built from exact per-document key sets over the `$HOME` catalog.
 
 - **Bytes:**
-  - trigram filters are 354.3 MB, against 296.4 MB of `.tri` (**1.20×**,
-    10.4 bits per key);
-  - term filters are 122.7 MB, against S2's 391.8 MB merged index
-    (**0.31×**, 11.0 bits per key).
+  - trigram filters are 354.3 MB, against 296.4 MB of `.tri` (**1.20×**, 10.4
+    bits per key);
+  - term filters are 122.7 MB, against S2's 391.8 MB merged index (**0.31×**,
+    11.0 bits per key).
 - **Latency,** filters against postings, by median:
-  - **Unnarrowed,** trigram filters are 25–267× slower warm. Term filters
-    are 38× slower for common terms and up to 6,343× for rare terms.
-  - **Narrowed to 1% of documents,** term filters stay 5–15× slower when
-    probed from a file. They come within 1.2× only when held in memory, for
-    mid and common terms.
+  - **Unnarrowed,** trigram filters are 25–267× slower warm. Term filters are
+    38× slower for common terms and up to 6,343× for rare terms.
+  - **Narrowed to 1% of documents,** term filters stay 5–15× slower when probed
+    from a file. They come within 1.2× only when held in memory, for mid and
+    common terms.
   - **Evicted,** filters lose by 11–482× everywhere.
-  - Filters win only when a rare term with its own postings narrows the
-    query first, which is a hybrid, not a filter layout.
+  - Filters win only when a rare term with its own postings narrows the query
+    first, which is a hybrid, not a filter layout.
 
-No layout passes the screen. **Recommendation unchanged: B**, and neither
-filter is built. Term filters could return only as a density opt-in, under a
-new brief.
+No layout passes the screen. **Recommendation unchanged: B**, and neither filter
+is built. Term filters could return only as a density opt-in, under a new brief.
 
 ## D69 — Saturated large documents in trigram postings
 
@@ -4113,53 +4159,52 @@ instead, and skip trigram postings?
 Figures are **estimates** until M1a and M1b. On `$HOME`, 53% of the text is in
 files of 1 MiB or more (**measured**, S2 M1), perhaps 800 files. At the central
 estimate they contribute about 160M of 444M trigram pairs, about 120 MB. A
-selective regex likely excludes most of them, but a broad one includes them
-all. A high distinct-key count does not prove that a document holds the keys
-queries actually use, so the threshold is swept against real regex candidates,
-not guessed. M1b's sweep takes its candidate queries from M3's derivation.
+selective regex likely excludes most of them, but a broad one includes them all.
+A high distinct-key count does not prove that a document holds the keys queries
+actually use, so the threshold is swept against real regex candidates, not
+guessed. M1b's sweep takes its candidate queries from M3's derivation.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Index every document's trigrams | The full trigram files: about 351 MB central, about 36% of it from large documents. Bytes grow with text past a few GB. | Every regex narrows over every document. One rule. |
-| B. Above a threshold chosen from M1b's sweep (16k–256k distinct keys), put the document in a per-segment "saturated" bitmap, Maybe for every trigram atom | Every regex verifies every saturated document: up to about 800 files and 2.1 GB on `$HOME` at a low threshold. Warm, that is a few hundred ms of reading (M4c) on every regex; cold, much more. | Up to about a third of trigram bytes, at the threshold the sweep picks. |
-| C. A, plus a trigram chunk map | Likely larger than the trigram postings themselves (estimate). | Large documents both narrowed and partly read. Not costed further this sprint. |
+| Option                                                                                                                                                    | Costs                                                                                                                                                                                           | Buys                                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| A. Index every document's trigrams                                                                                                                        | The full trigram files: about 351 MB central, about 36% of it from large documents. Bytes grow with text past a few GB.                                                                         | Every regex narrows over every document. One rule.                             |
+| B. Above a threshold chosen from M1b's sweep (16k–256k distinct keys), put the document in a per-segment "saturated" bitmap, Maybe for every trigram atom | Every regex verifies every saturated document: up to about 800 files and 2.1 GB on `$HOME` at a low threshold. Warm, that is a few hundred ms of reading (M4c) on every regex; cold, much more. | Up to about a third of trigram bytes, at the threshold the sweep picks.        |
+| C. A, plus a trigram chunk map                                                                                                                            | Likely larger than the trigram postings themselves (estimate).                                                                                                                                  | Large documents both narrowed and partly read. Not costed further this sprint. |
 
 **Recommendation: A**, the fastest and the simplest. B is denser but makes every
-regex pay a cost that the phrase work just removed. Fast and dense disagree,
-and that is why this is a brief.
+regex pay a cost that the phrase work just removed. Fast and dense disagree, and
+that is why this is a brief.
 
 **Fact that would change it:** M1b's sweep finding a threshold where the
-saturated documents hold more than about half of all trigram pairs, *and*
-verifying them measures under 100 ms warm, with the cold figure reported, on
-the M5 regex classes. B's cost is then small enough to buy its bytes.
+saturated documents hold more than about half of all trigram pairs, _and_
+verifying them measures under 100 ms warm, with the cold figure reported, on the
+M5 regex classes. B's cost is then small enough to buy its bytes.
 
 **Update after M1b (measured, `wt/s3-m1` `98b6fa9`).** Documents above 16k
-distinct keys hold **54%** of trigram pairs (2,852 documents), but verifying
-the candidates they add costs 154–437 ms warm for three regex classes, and
-0.7–1.5 s evicted. At 64k and above, verification stays under 100 ms warm,
-but those documents hold only 13–17% of pairs. No threshold meets both
-conditions.
+distinct keys hold **54%** of trigram pairs (2,852 documents), but verifying the
+candidates they add costs 154–437 ms warm for three regex classes, and 0.7–1.5 s
+evicted. At 64k and above, verification stays under 100 ms warm, but those
+documents hold only 13–17% of pairs. No threshold meets both conditions.
 
 **Recommendation unchanged: A.** Measured in bytes rather than pairs, a 64k
-threshold would save 38% of `.tri` bytes (113 MB) for at most 84 ms warm. If
-you would rather judge D69 in bytes, that is the case for B at 64k.
+threshold would save 38% of `.tri` bytes (113 MB) for at most 84 ms warm. If you
+would rather judge D69 in bytes, that is the case for B at 64k.
 
 ## D70 — How large the trigram follow buffer may grow
 
 **Status: open.** S3 M0, revision 5, 2026-10-08;
 [design](S3.md#memory-live-structures-not-serialized-bytes).
 
-**Question:** During a follow pass, should trigram pairs count against S2's
-64 MiB flush budget, ending segments sooner? Or should they get their own
-bound, so that segment size is still set by terms alone?
+**Question:** During a follow pass, should trigram pairs count against S2's 64
+MiB flush budget, ending segments sooner? Or should they get their own bound, so
+that segment size is still set by terms alone?
 
 **Accounting.**
 
 - **Terms** use S2's `Inverter::memory()`, a capacity estimate.
 - **Trigrams** use a pair buffer allocated once at a fixed capacity: 8 B per
-  pair, plus 8 B of radix scratch per buffered pair during a flush, plus a
-  2 MiB bitmap. A document is admitted only if `len + (doc_bytes − 2)` fits,
-  so the buffer never reallocates.
+  pair, plus 8 B of radix scratch per buffered pair during a flush, plus a 2 MiB
+  bitmap. A document is admitted only if `len + (doc_bytes − 2)` fits, so the
+  buffer never reallocates.
 
 Two rules hold under every option:
 
@@ -4170,55 +4215,56 @@ Two rules hold under every option:
 
 Allocated bytes follow the capacity formula under every option:
 `term.memory()` + 8 B × trigram capacity + 8 B × len of scratch during a flush
-+ 2 MiB. The buffer is reused, so its whole capacity counts once touched.
-Neither A nor B is an RSS limit. Encode buffers and allocator overhead are not
-reserved for, and M1a measures combined peak RSS separately.
+
+- 2 MiB. The buffer is reused, so its whole capacity counts once touched.
+  Neither A nor B is an RSS limit. Encode buffers and allocator overhead are not
+  reserved for, and M1a measures combined peak RSS separately.
 
 Figures are **estimates** until M1a, unless marked measured:
 
-- **Pairs per segment.** At S2's 49 build segments (**measured**, M3), a
-  segment holds about 9.1M trigram pairs (central), with a range of 4.1–28.2M.
+- **Pairs per segment.** At S2's 49 build segments (**measured**, M3), a segment
+  holds about 9.1M trigram pairs (central), with a range of 4.1–28.2M.
 - **S2's own build peak** was **288,616 KiB** RSS (**measured**, M3).
-- **What M1a measures.** It feeds both inverters from each read under A and
-  B, and measures combined peak RSS, both structures' bytes, segment counts and
+- **What M1a measures.** It feeds both inverters from each read under A and B,
+  and measures combined peak RSS, both structures' bytes, segment counts and
   merge work.
 
-| Option | Flush condition, checked before each document | Costs | Buys |
-| --- | --- | --- | --- |
-| A. Separate bounds | `term.memory() ≥ 64 MiB`, or the document may not fit the trigram capacity, which M1a sizes so that the term rule fires first | Follow's allocated memory is about 145 MB higher (central), 66–451 MB across the envelope, plus encode buffers. It is held while follow runs, though follow is paced. | Segment count and term-dictionary duplication (h) unchanged from S2's measured figures. |
-| B. One shared 64 MiB flush charge, with a fixed trigram reservation of 48 MiB at 16 B per pair (capacity 3,145,728 pairs, a 24 MiB buffer) | Flush charge `term.memory() + 16 B × len ≥ 64 MiB`, or the document may not fit the capacity | About 3.2× as many segments at the central estimate: the charge fires at about 2.87M pairs, against 9.1M per S2-sized segment. More term-dictionary entries are duplicated across segments, so the term index grows (by an amount M1a measures), and there is more merge work to reach steady state. The charge is not the allocation: a flush allocates about 68 MiB (central), 82 MiB in Astra's example of 48 MiB terms and 1M pairs, and at most about 90 MiB plus one document, before encode buffers. | A smaller, fixed trigram buffer: at most about 50 MiB on the trigram side (24 MiB buffer, 24 MiB scratch, 2 MiB bitmap), against A's buffer sized to a whole S2 segment, about 145 MB central. |
-| C. Spill sorted trigram runs to a scratch file within a range, merged at flush | Either of the above, with spilled runs not counted | New code, and a scratch file in the index directory to clean up. | Both: S2's segment sizes and S2's memory. |
+| Option                                                                                                                                     | Flush condition, checked before each document                                                                                 | Costs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Buys                                                                                                                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Separate bounds                                                                                                                         | `term.memory() ≥ 64 MiB`, or the document may not fit the trigram capacity, which M1a sizes so that the term rule fires first | Follow's allocated memory is about 145 MB higher (central), 66–451 MB across the envelope, plus encode buffers. It is held while follow runs, though follow is paced.                                                                                                                                                                                                                                                                                                                                       | Segment count and term-dictionary duplication (h) unchanged from S2's measured figures.                                                                                                        |
+| B. One shared 64 MiB flush charge, with a fixed trigram reservation of 48 MiB at 16 B per pair (capacity 3,145,728 pairs, a 24 MiB buffer) | Flush charge `term.memory() + 16 B × len ≥ 64 MiB`, or the document may not fit the capacity                                  | About 3.2× as many segments at the central estimate: the charge fires at about 2.87M pairs, against 9.1M per S2-sized segment. More term-dictionary entries are duplicated across segments, so the term index grows (by an amount M1a measures), and there is more merge work to reach steady state. The charge is not the allocation: a flush allocates about 68 MiB (central), 82 MiB in Astra's example of 48 MiB terms and 1M pairs, and at most about 90 MiB plus one document, before encode buffers. | A smaller, fixed trigram buffer: at most about 50 MiB on the trigram side (24 MiB buffer, 24 MiB scratch, 2 MiB bitmap), against A's buffer sized to a whole S2 segment, about 145 MB central. |
+| C. Spill sorted trigram runs to a scratch file within a range, merged at flush                                                             | Either of the above, with spilled runs not counted                                                                            | New code, and a scratch file in the index directory to clean up.                                                                                                                                                                                                                                                                                                                                                                                                                                            | Both: S2's segment sizes and S2's memory.                                                                                                                                                      |
 
-B's reservation is 48 MiB so that the flush charge, not the capacity,
-decides when a segment ends. A 16 MiB reservation, about 1M pairs, would end
-segments on capacity at roughly 9× S2's count, which is a different policy.
+B's reservation is 48 MiB so that the flush charge, not the capacity, decides
+when a segment ends. A 16 MiB reservation, about 1M pairs, would end segments on
+capacity at roughly 9× S2's count, which is a different policy.
 
-**Recommendation: A**, if M1a measures follow's combined peak RSS under
-512 MiB on `$HOME`. It is the fastest and the simplest. B is the most frugal
-with memory, about 90 MiB at most against A's roughly 200 MiB central, but
-costs density, which outranks memory here. C is the most code.
+**Recommendation: A**, if M1a measures follow's combined peak RSS under 512 MiB
+on `$HOME`. It is the fastest and the simplest. B is the most frugal with
+memory, about 90 MiB at most against A's roughly 200 MiB central, but costs
+density, which outranks memory here. C is the most code.
 
-**Fact that would change it:** M1a measuring A's combined peak above 512 MiB,
-or B's term index growing by less than 3% at steady state. Then take B. If
-neither A's memory nor B's density is acceptable, take C.
+**Fact that would change it:** M1a measuring A's combined peak above 512 MiB, or
+B's term index growing by less than 3% at steady state. Then take B. If neither
+A's memory nor B's density is acceptable, take C.
 
 **Update after M1a (measured, `wt/s3-m1` `6d63c27`).**
 
 Both inverters were fed from each read over the `$HOME` catalog (112,898
-readable documents, 3.97 GB). Each policy ran as its own process. Both
-segments were bounded by allocated capacity, not by S2's legacy estimate. B
-was built as one shared 64 MiB capacity bound, which is stricter than
-revision 5's 48 MiB-reservation flush charge.
+readable documents, 3.97 GB). Each policy ran as its own process. Both segments
+were bounded by allocated capacity, not by S2's legacy estimate. B was built as
+one shared 64 MiB capacity bound, which is stricter than revision 5's 48
+MiB-reservation flush charge.
 
-| | A (term 64 MiB, trigram own bound) | B (shared 64 MiB) |
-| --- | --- | --- |
-| Follow peak RSS | 458.3 MiB | 247.5 MiB |
-| Build segments | 73 | 177 |
-| Steady segments | 10 | 15 |
-| Steady term index | 449.3 MB | 454.3 MB (+1.1%) |
-| Steady trigram index | 323.2 MB | 329.2 MB (+1.9%) |
-| Full-merge term + trigram | 688.1 MB | 688.1 MB |
-| Steady merge work | 86.9 CPU-s, 7 merges | 182.9 CPU-s, 18 merges |
+|                           | A (term 64 MiB, trigram own bound) | B (shared 64 MiB)      |
+| ------------------------- | ---------------------------------- | ---------------------- |
+| Follow peak RSS           | 458.3 MiB                          | 247.5 MiB              |
+| Build segments            | 73                                 | 177                    |
+| Steady segments           | 10                                 | 15                     |
+| Steady term index         | 449.3 MB                           | 454.3 MB (+1.1%)       |
+| Steady trigram index      | 323.2 MB                           | 329.2 MB (+1.9%)       |
+| Full-merge term + trigram | 688.1 MB                           | 688.1 MB               |
+| Steady merge work         | 86.9 CPU-s, 7 merges               | 182.9 CPU-s, 18 merges |
 
 A is under 512 MiB, and B's term index grows by less than 3%. Both of the
 recommendation's conditions hold, so the stated rule picks **B**: half the
@@ -4226,10 +4272,10 @@ memory for 1.1% term density at steady state. B also pays 96 more CPU-s of
 merging while the index settles. The trigram index is 7.9% of text at steady
 state and 7.5% fully merged, inside the 20% gate.
 
-**Revised recommendation: B**, with revision 5's 48 MiB reservation, which
-ends fewer segments than the variant measured here. **Fact that would change
-it:** treating merge CPU during settling as more costly than 210 MiB of
-follow memory. Then A.
+**Revised recommendation: B**, with revision 5's 48 MiB reservation, which ends
+fewer segments than the variant measured here. **Fact that would change it:**
+treating merge CPU during settling as more costly than 210 MiB of follow memory.
+Then A.
 
 ## D71 — Agent habits `ferret search` silently gets wrong
 
@@ -4241,46 +4287,44 @@ upholds D62 A and D67 A. It also finds three spellings agents use that
 - **Lowercase operators.** `text:foo or text:bar` is a name search for `or`,
   ANDed with both text atoms. KQL, Sourcegraph, JQL, Kusto and Zoekt use
   lowercase operators.
-- **The whole query in quotes.** `"text:foo OR text:bar"` is one `text:`
-  phrase of four tokens. Nearly every surveyed tool takes the query as one
-  string.
-- **`content:`.** GitHub, Sourcegraph and Everything call the body
-  `content:`, which `ferret search` reads as a name substring.
+- **The whole query in quotes.** `"text:foo OR text:bar"` is one `text:` phrase
+  of four tokens. Nearly every surveyed tool takes the query as one string.
+- **`content:`.** GitHub, Sourcegraph and Everything call the body `content:`,
+  which `ferret search` reads as a name substring.
 
 `-term` for negation already errors, which is the right failure.
 
 **Question: should the grammar catch these?**
 
-| Option | Cost | Buys |
-| --- | --- | --- |
+| Option                                                                                                                                          | Cost                                                                                                                                                                | Buys                                                                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | A. Accept `and`/`or`/`not` in any case as operators. Alias `content:` to `text:`. Error when one argument contains a space-separated `OR`/`NOT` | `and`, `or` and `not` stop being bare name words; `name:or` is the escape, as for `OR` today. Two names for one atom. One help line and the grammar comment change. | All three silent misses become correct answers or errors. No query that works today changes meaning. |
-| B. Only the error on an embedded operator | Smallest change. | Catches the quoted-query habit. Lowercase `or` and `content:` stay silent misses. |
-| C. No change; document it in the help | Nothing. | Agents that read the help are right. Those that guess get wrong answers with exit 0. |
+| B. Only the error on an embedded operator                                                                                                       | Smallest change.                                                                                                                                                    | Catches the quoted-query habit. Lowercase `or` and `content:` stay silent misses.                    |
+| C. No change; document it in the help                                                                                                           | Nothing.                                                                                                                                                            | Agents that read the help are right. Those that guess get wrong answers with exit 0.                 |
 
-**Recommendation: A.** It fits "optimise for agents", and every change
-either turns a silent miss into a right answer or turns it into an error.
-The survey also recommends keeping AND tighter than OR, fold-by-default
-with `case:` (no smart-case), and the GitHub-shaped glob. A says nothing
-new about any of them.
+**Recommendation: A.** It fits "optimise for agents", and every change either
+turns a silent miss into a right answer or turns it into an error. The survey
+also recommends keeping AND tighter than OR, fold-by-default with `case:` (no
+smart-case), and the GitHub-shaped glob. A says nothing new about any of them.
 
-**The fact that would change it:** the query log showing real searches for
-files named `and`, `or` or `not`. Then B.
+**The fact that would change it:** the query log showing real searches for files
+named `and`, `or` or `not`. Then B.
 
 ## D72 — Does the grep CLI automatically scan broad queries?
 
 **Question:** Should a valid `ferret grep` command ever need `--scan` merely
 because its regex cannot narrow the indexed files?
 
-| Option | Costs | Buys |
-| --- | --- | --- |
+| Option                                                                     | Costs                                                                                                                                                    | Buys                                                                                                              |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | A. Automatically scan the selected visible files; keep refusal in `search` | At 10M entries, a broad command can read the entire searchable tree. D8's historical cold full-tree scan was 234 s. `-v` is used by 433 rg repositories. | A habitual `rg -v foo`, short pattern or `\d+` gets an answer. One grep interface; no threshold-dependent errors. |
-| B. Keep S3's M > live/4 and uncovered > 10,000 refusals; require `--scan` | Legitimate rg commands fail based on index statistics. H's estimate can over-refuse small catalogs by up to 255 records per segment. | Prevents an accidental full content read. The existing planner's refusal policy can be reused unchanged. |
-| C. Automatically scan only below a byte/file budget | Another default and estimator; known size is not reliable for stdin or changed files. Above the budget, the same command still fails. | Protects whole-root queries while retaining convenient small-directory use. |
+| B. Keep S3's M > live/4 and uncovered > 10,000 refusals; require `--scan`  | Legitimate rg commands fail based on index statistics. H's estimate can over-refuse small catalogs by up to 255 records per segment.                     | Prevents an accidental full content read. The existing planner's refusal policy can be reused unchanged.          |
+| C. Automatically scan only below a byte/file budget                        | Another default and estimator; known size is not reliable for stdin or changed files. Above the budget, the same command still fails.                    | Protects whole-root queries while retaining convenient small-directory use.                                       |
 
 **Recommendation: A (provisional).** Fastest favors B; compatibility and the
-simplest enduring grep interface favor A. Automatic scan is permission to
-read, not permission to change visibility, size policy or snapshot freshness.
-Use postings only when useful; broad/inverted commands enumerate through the
+simplest enduring grep interface favor A. Automatic scan is permission to read,
+not permission to change visibility, size policy or snapshot freshness. Use
+postings only when useful; broad/inverted commands enumerate through the
 existing catalog walk. No extra index structure or stored positions.
 
 **Fact that would change it:** measured automatic scans dominating agent query
@@ -4292,30 +4336,30 @@ reliably retry with `--scan`; then B. Measure before introducing C's budget.
 **Question:** May indexed grep retain S2/S3's snapshot exclusions while reading
 current candidate bytes, or must every invocation search the current tree?
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Snapshot membership and posting absence; verify candidates now | A new file or a changed file newly containing the needle can be missed until refresh/follow. This is not exact over the current tree. | Matches find/S2's existing model, generation pins and caches. Selective queries avoid checking every file. |
-| B. Live enumerate and stat all selected files; add changed/new files to candidates | O(selected entries) metadata work on every query; at 10M entries this may dominate a rare lookup. Needs sound detection of replacements and policy changes. | Current-tree completeness for observed stable files, while postings can still skip unchanged contents. |
-| C. Refresh and follow to a query barrier first | Refresh/follow can read the entire tree and block on writer backlog; S3 measured refresh 24 ms versus S2's 7.4 ms on its small trace. A barrier still is not an atomic filesystem snapshot. | Stronger freshness with one writer model; useful once the daemon has a proved barrier. |
-| D. Opt-in current-tree search retaining ferret ignore policy | The opt-in walks selected names, loads current policy rules and reads selected bytes; latency includes that work. Host must apply policy/pruning over find's existing live source. | Separates freshness from visibility: new files/matches are found without searching ferret-excluded trees. Default selective queries keep A's low metadata cost. |
+| Option                                                                             | Costs                                                                                                                                                                                       | Buys                                                                                                                                                            |
+| ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Snapshot membership and posting absence; verify candidates now                  | A new file or a changed file newly containing the needle can be missed until refresh/follow. This is not exact over the current tree.                                                       | Matches find/S2's existing model, generation pins and caches. Selective queries avoid checking every file.                                                      |
+| B. Live enumerate and stat all selected files; add changed/new files to candidates | O(selected entries) metadata work on every query; at 10M entries this may dominate a rare lookup. Needs sound detection of replacements and policy changes.                                 | Current-tree completeness for observed stable files, while postings can still skip unchanged contents.                                                          |
+| C. Refresh and follow to a query barrier first                                     | Refresh/follow can read the entire tree and block on writer backlog; S3 measured refresh 24 ms versus S2's 7.4 ms on its small trace. A barrier still is not an atomic filesystem snapshot. | Stronger freshness with one writer model; useful once the daemon has a proved barrier.                                                                          |
+| D. Opt-in current-tree search retaining ferret ignore policy                       | The opt-in walks selected names, loads current policy rules and reads selected bytes; latency includes that work. Host must apply policy/pruning over find's existing live source.          | Separates freshness from visibility: new files/matches are found without searching ferret-excluded trees. Default selective queries keep A's low metadata cost. |
 
 **Recommendation: A+D (provisional, rechecked after round 1).** Retain A as
 indexed default, add `ferret grep --live` in M6. This is a real correctness
-tradeoff for Dave to accept, not something the fastest/simplest rule settles.
-D is the missing alternative: `--no-ignore` changes visibility and cannot
-serve as the policy-preserving freshness switch. `--live` loads covering
-catalog roots only as policy anchors, reads current rules from those roots,
-and walks current names with D13 size/binary/ignore policy plus grep filters.
-No stale name/posting exclusion; outside-root directories still need indexing
-or the separately chosen unrestricted mode. Explicit starts retain their
-existing exceptions. It is not an atomic filesystem snapshot.
+tradeoff for Dave to accept, not something the fastest/simplest rule settles. D
+is the missing alternative: `--no-ignore` changes visibility and cannot serve as
+the policy-preserving freshness switch. `--live` loads covering catalog roots
+only as policy anchors, reads current rules from those roots, and walks current
+names with D13 size/binary/ignore policy plus grep filters. No stale
+name/posting exclusion; outside-root directories still need indexing or the
+separately chosen unrestricted mode. Explicit starts retain their existing
+exceptions. It is not an atomic filesystem snapshot.
 
-A disappeared candidate is dropped; changed bytes stay path-local, never
-cached under the old DocId. Checking emitted hits cannot repair snapshot No.
+A disappeared candidate is dropped; changed bytes stay path-local, never cached
+under the old DocId. Checking emitted hits cannot repair snapshot No.
 
 **Fact that would change it:** if agent traces require current-tree completeness
-by default, promote D or measure B/C and include enumeration/barrier latency.
-If `--live` is rarely used and a proved change barrier eliminates misses at low
+by default, promote D or measure B/C and include enumeration/barrier latency. If
+`--live` is rarely used and a proved change barrier eliminates misses at low
 cost, C may replace it. Unrestricted live mode is no longer presented as the
 only way to request freshness.
 
@@ -4324,23 +4368,23 @@ only way to request freshness.
 **Question:** Should rg's positive globs and visibility switches reconstruct
 paths absent from the ferret catalog's visible universe?
 
-| Option | Costs | Buys |
-| --- | --- | --- |
+| Option                                                                                              | Costs                                                                                                                                             | Buys                                                                                                                    |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | A. Intersect indexed mode with D47 visibility; explicit starts and unrestricted live mode bypass it | `-g` cannot resurrect ignored trees. `--hidden` reveals only hidden paths ferret holds. `.ignore`/`.rgignore` are not part of the indexed policy. | One catalog universe shared with find; no query-time policy walk. `--no-ignore` reuses find's unrestricted live source. |
-| B. Apply full rg policy live, merging missing paths with indexed candidates | Extra policy inputs, walking and precedence logic on queries; a second policy universe to maintain. May search ferret's excluded build trees. | Closer answers for the 1,031 rg repositories using `-g` and 362 using `--hidden`. |
-| C. Make indexed grep refuse every widening flag | Even `--hidden` fails although ferret ordinarily catalogs hidden files. | A very small surface with explicit failures rather than partial widening. |
+| B. Apply full rg policy live, merging missing paths with indexed candidates                         | Extra policy inputs, walking and precedence logic on queries; a second policy universe to maintain. May search ferret's excluded build trees.     | Closer answers for the 1,031 rg repositories using `-g` and 362 using `--hidden`.                                       |
+| C. Make indexed grep refuse every widening flag                                                     | Even `--hidden` fails although ferret ordinarily catalogs hidden files.                                                                           | A very small surface with explicit failures rather than partial widening.                                               |
 
 **Recommendation: A (provisional).** It follows Dave's ignored-path contract;
 the user-visible meaning of rg's overrides deserves confirmation. `--no-ignore`
-(and `-u`, `-uu`) chooses the unrestricted live walk, like find's `-I`;
-`-uuu` refuses until its binary-search semantics are supported;
-`-I` in grep means no filename, never live mode. Explicit ignored directory
-starts use find's live fallback. No fallback to an external rg executable.
+(and `-u`, `-uu`) chooses the unrestricted live walk, like find's `-I`; `-uuu`
+refuses until its binary-search semantics are supported; `-I` in grep means no
+filename, never live mode. Explicit ignored directory starts use find's live
+fallback. No fallback to an external rg executable.
 
 **Fact that would change it:** visibility disagreements on ordinary agent
-commands accounting for most real misses; B would need a separate policy
-review and measurements before implementation. This slice does not authorize
-that change to D13/D47.
+commands accounting for most real misses; B would need a separate policy review
+and measurements before implementation. This slice does not authorize that
+change to D13/D47.
 
 ## D75 — Raw bytes or BOM-aware input?
 
@@ -4350,35 +4394,35 @@ including on explicit current files where freshness does not explain a miss?
 rg 15.2.0 defaults to BOM detection. Untimed synthetic probes: `^needle$`
 matches UTF-8-BOM and UTF-16 LE/BE BOM inputs with auto encoding (exit 0/count
 1), and misses all three with `--encoding=none` (exit 1). Corpus rank 42 is
-`--encoding`, used by 20 rg repositories / 34 occurrences; six rendered
-commands carry its feature label. These counts do **not** measure implicit
-BOM/UTF-16 usage. The invalid-byte fixture deliberately avoids a UTF-16 BOM;
-its binary observations cannot settle encoding compatibility.
+`--encoding`, used by 20 rg repositories / 34 occurrences; six rendered commands
+carry its feature label. These counts do **not** measure implicit BOM/UTF-16
+usage. The invalid-byte fixture deliberately avoids a UTF-16 BOM; its binary
+observations cannot settle encoding compatibility.
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Raw input everywhere, as initially proposed | Anchored matches can miss behind a UTF-8 BOM; UTF-16 matches can miss or become binary skips even on explicit files. Dave must accept that divergence. | One original-byte profile for matching, offsets and trigram soundness; no transcoding or extra enumeration. |
-| B. rg's BOM-only auto detection everywhere; arbitrary named encodings remain deferred | Strip UTF-8 BOMs; decode UTF-16 LE/BE before NUL detection. Need malformed-input rules, byte-offset mapping and bounded conversion. Indexed UTF-16 lacks ordinary text postings: include catalog-visible BOM text through enumeration/live verification, never negative raw-trigram shortcuts. Measure resulting binary-head reads; no numeric cost measured yet. | Fixes default encoding misses on both explicit and recursive input; closer drop-in behavior without a general encoding dependency. |
-| C. BOM handling only for direct files/stdin and policy-preserving live mode | Matching profiles and offsets differ by source; indexed UTF-16 still misses, and switching modes changes answers. Later B must unify those rules. | Addresses explicit-current-file failures without probing every catalogued binary file in indexed mode. |
-| D. Strip an initial UTF-8 BOM consistently for all inputs; defer UTF-16 | UTF-16 still misses. | Removing the prefix keeps the needed substring trigrams in the original bytes, so it needs no binary enumeration. It is cheap and separable from B. |
+| Option                                                                                | Costs                                                                                                                                                                                                                                                                                                                                                             | Buys                                                                                                                                                |
+| ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Raw input everywhere, as initially proposed                                        | Anchored matches can miss behind a UTF-8 BOM; UTF-16 matches can miss or become binary skips even on explicit files. Dave must accept that divergence.                                                                                                                                                                                                            | One original-byte profile for matching, offsets and trigram soundness; no transcoding or extra enumeration.                                         |
+| B. rg's BOM-only auto detection everywhere; arbitrary named encodings remain deferred | Strip UTF-8 BOMs; decode UTF-16 LE/BE before NUL detection. Need malformed-input rules, byte-offset mapping and bounded conversion. Indexed UTF-16 lacks ordinary text postings: include catalog-visible BOM text through enumeration/live verification, never negative raw-trigram shortcuts. Measure resulting binary-head reads; no numeric cost measured yet. | Fixes default encoding misses on both explicit and recursive input; closer drop-in behavior without a general encoding dependency.                  |
+| C. BOM handling only for direct files/stdin and policy-preserving live mode           | Matching profiles and offsets differ by source; indexed UTF-16 still misses, and switching modes changes answers. Later B must unify those rules.                                                                                                                                                                                                                 | Addresses explicit-current-file failures without probing every catalogued binary file in indexed mode.                                              |
+| D. Strip an initial UTF-8 BOM consistently for all inputs; defer UTF-16               | UTF-16 still misses.                                                                                                                                                                                                                                                                                                                                              | Removing the prefix keeps the needed substring trigrams in the original bytes, so it needs no binary enumeration. It is cheap and separable from B. |
 
-**Recommendation: D.** Apply UTF-8 BOM stripping consistently to all inputs
-and defer UTF-16. D fixes the cheap UTF-8 prefix miss while retaining original
-bytes and trigram soundness without binary enumeration. It keeps UTF-16 as an
-explicit known miss and remains separable from B. If that remaining miss is
-unacceptable, prefer B over C: C leaves an input-source-dependent dialect that
-builders and agents must remember. Under B, transformed matches must satisfy
-the necessary query over original indexed bytes; where unproved (notably
-UTF-16), bypass raw postings and enumerate the relevant selected names. If B is
-chosen, specify offset semantics before implementation, along with malformed
-decoding rules, bounded conversion and the selected-name universe. D/B changes
-the planned reader/profile scope and M1/M6 positive fixtures; schedule the
-chosen option before authorizing builders. No extra crate edge or index-format
-change is presumed here.
+**Recommendation: D.** Apply UTF-8 BOM stripping consistently to all inputs and
+defer UTF-16. D fixes the cheap UTF-8 prefix miss while retaining original bytes
+and trigram soundness without binary enumeration. It keeps UTF-16 as an explicit
+known miss and remains separable from B. If that remaining miss is unacceptable,
+prefer B over C: C leaves an input-source-dependent dialect that builders and
+agents must remember. Under B, transformed matches must satisfy the necessary
+query over original indexed bytes; where unproved (notably UTF-16), bypass raw
+postings and enumerate the relevant selected names. If B is chosen, specify
+offset semantics before implementation, along with malformed decoding rules,
+bounded conversion and the selected-name universe. D/B changes the planned
+reader/profile scope and M1/M6 positive fixtures; schedule the chosen option
+before authorizing builders. No extra crate edge or index-format change is
+presumed here.
 
 **Fact that would change it:** ordinary agent commands encountering UTF-16 BOM
-text, or measurements proving B's indexed UTF-16 enumeration and conversion
-cost acceptable. Then choose B and specify original-byte versus decoded offset
-semantics before building. With D, keep positive UTF-8 BOM fixtures and
-UTF-16 oracle fixtures; label the UTF-16 miss as the approved encoding
-disagreement, never freshness or binary as a substitute cause.
+text, or measurements proving B's indexed UTF-16 enumeration and conversion cost
+acceptable. Then choose B and specify original-byte versus decoded offset
+semantics before building. With D, keep positive UTF-8 BOM fixtures and UTF-16
+oracle fixtures; label the UTF-16 miss as the approved encoding disagreement,
+never freshness or binary as a substitute cause.
