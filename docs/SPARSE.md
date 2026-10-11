@@ -274,7 +274,7 @@ workspace clippy with warnings denied, and workspace tests pass: **945 passed /
 foreground run is active. Oracle preparation matched the previous population
 (112,382 live, 112,376 readable, 3,978,812,718 readable bytes, 250 queries),
 taking 506.480 CPU seconds / 514.659 wall seconds. Shipped cold/warm execution
-has passed its first 70 queries; no result is treated as complete until all
+has passed its first 200 queries; no result is treated as complete until all
 250 pass. Results and the updated recommendation await the full run. Initial
 disk headroom was about 14 GiB, about 11 GiB after rebuilding test artifacts;
 stop below 5 GB. No Cargo manifests or lockfiles changed.
