@@ -192,7 +192,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
         .map(|d| (d.doc.0, d.size))
         .collect();
     let reference = terms_view.as_ref().unwrap_or(&view);
-    let classes = pick_terms(reference, &sizes)?;
+    let classes = pick_terms(reference, &sizes, snapshot.as_ref())?;
     let compare_view = compare_dir.map(|dir| open(Path::new(dir))).transpose()?;
     let compare_pinned = compare_view
         .as_ref()
@@ -229,6 +229,8 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     for (class, terms) in [
         ("df1", &classes.singleton),
         ("df2-100", &classes.rare),
+        ("df1-natural", &classes.singleton_natural),
+        ("df2-100-natural", &classes.rare_natural),
         ("absent", &classes.absent),
         ("mid", &classes.mid),
         ("common", &classes.common),
@@ -281,7 +283,10 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                     return Err("verified rows differ from control".into());
                 }
             }
-            let records = if matches!(class, "df1" | "df2-100" | "absent" | "mid" | "common") {
+            let records = if matches!(
+                class,
+                "df1" | "df2-100" | "df1-natural" | "df2-100-natural" | "absent" | "mid" | "common"
+            ) {
                 let term = args[0].strip_prefix("text:").ok_or("missing term prefix")?;
                 ferret_index::postings::Term::read(
                     view.segments().iter().map(|s| &**s),
@@ -291,7 +296,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
             } else {
                 0
             };
-            let bucket = if matches!(class, "df1" | "df2-100") {
+            let bucket = if matches!(class, "df1" | "df2-100" | "df1-natural" | "df2-100-natural") {
                 let term = args[0].strip_prefix("text:").ok_or("term prefix")?;
                 size_bucket(
                     reference
@@ -324,7 +329,10 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                 read_bytes: warm.read_bytes,
             });
         }
-        if matches!(class, "df1" | "df2-100" | "absent") {
+        if matches!(
+            class,
+            "df1" | "df2-100" | "df1-natural" | "df2-100-natural" | "absent"
+        ) {
             for actual in [false, true] {
                 for (bucket, label) in SIZE_LABELS.iter().enumerate() {
                     let subset: Vec<_> = samples
@@ -692,13 +700,19 @@ struct Classes {
     singleton: Vec<Vec<u8>>,
     absent: Vec<Vec<u8>>,
     rare: Vec<Vec<u8>>,
+    singleton_natural: Vec<Vec<u8>>,
+    rare_natural: Vec<Vec<u8>>,
     mid: Vec<Vec<u8>>,
     common: Vec<Vec<u8>>,
 }
 
 /// Term-query terms by df class, from the dictionary of a single-segment
 /// index (df is per segment, so a multi-segment index would need a merge).
-fn pick_terms(view: &View, sizes: &std::collections::HashMap<u32, u64>) -> crate::Result<Classes> {
+fn pick_terms(
+    view: &View,
+    sizes: &std::collections::HashMap<u32, u64>,
+    snapshot: Option<&crate::content_snapshot::Snapshot>,
+) -> crate::Result<Classes> {
     let [segment] = view.segments() else {
         return Err("content-query wants a fully merged, single-segment index".into());
     };
@@ -706,6 +720,8 @@ fn pick_terms(view: &View, sizes: &std::collections::HashMap<u32, u64>) -> crate
         return Err("term classes require a codec-1 control; use --terms".into());
     }
     let mut rng = Rng(0x5eed_0001);
+    let mut natural_rng = Rng(0x5eed_0065);
+    let (mut singleton_natural, mut rare_natural) = (Reservoir::new(), Reservoir::new());
     let mut singletons: [Reservoir; 4] = std::array::from_fn(|_| Reservoir::new());
     let (mut rare, mut mid, mut million) = (Reservoir::new(), Reservoir::new(), Reservoir::new());
     rare.limit = PER_CLASS * 16;
@@ -719,13 +735,17 @@ fn pick_terms(view: &View, sizes: &std::collections::HashMap<u32, u64>) -> crate
         let df = entry.df;
         match df {
             1 => {
+                singleton_natural.offer(&mut natural_rng, term);
                 let ferret_index::segment::Hit::Single(doc) = segment.read(&entry)? else {
                     return Err("df1 list".into());
                 };
                 let bucket = size_bucket(sizes.get(&doc).copied()).saturating_sub(1);
                 singletons[bucket].offer(&mut rng, term);
             }
-            2..=100 => rare.offer(&mut rng, term),
+            2..=100 => {
+                rare.offer(&mut rng, term);
+                rare_natural.offer(&mut natural_rng, term);
+            }
             1_000..=100_000 => mid.offer(&mut rng, term),
             1_000_000.. => million.offer(&mut rng, term),
             _ => {}
@@ -748,6 +768,12 @@ fn pick_terms(view: &View, sizes: &std::collections::HashMap<u32, u64>) -> crate
         )
         .saturating_sub(1);
         rare_buckets[bucket].offer(&mut rng, term);
+    }
+    // A global term reservoir under-samples rare terms confined to tiny
+    // files. Seed that stratum from uniformly sampled small documents, then
+    // confirm the df and every matching file's size in the real control.
+    if let Some(snapshot) = snapshot {
+        seed_small_rare(view, sizes, snapshot, &mut rare_buckets[0])?;
     }
     rare.items = rare_buckets.into_iter().flat_map(|r| r.items).collect();
     let common: Vec<Vec<u8>> = top.into_iter().map(|(_, t)| t).collect();
@@ -782,6 +808,8 @@ fn pick_terms(view: &View, sizes: &std::collections::HashMap<u32, u64>) -> crate
         singleton,
         absent,
         rare: rare.items,
+        singleton_natural: singleton_natural.items,
+        rare_natural: rare_natural.items,
         mid: mid.items,
         common,
     })
@@ -1213,6 +1241,56 @@ fn size_bucket(size: Option<u64>) -> usize {
         Some(n) if n < 1048576 => 3,
         Some(_) => 4,
     }
+}
+
+fn seed_small_rare(
+    view: &View,
+    sizes: &std::collections::HashMap<u32, u64>,
+    snapshot: &crate::content_snapshot::Snapshot,
+    rare: &mut Reservoir,
+) -> crate::Result<()> {
+    if rare.items.len() == PER_CLASS {
+        return Ok(());
+    }
+    let mut docs: Vec<_> = sizes
+        .iter()
+        .filter(|&(doc, size)| *size < 4096 && snapshot.contains(*doc))
+        .map(|(&doc, _)| doc)
+        .collect();
+    docs.sort_unstable();
+    let mut rng = Rng(0xd65c_51ae);
+    for i in (1..docs.len()).rev() {
+        let j = rng.below((i + 1) as u64) as usize;
+        docs.swap(i, j);
+    }
+    let mut candidates = std::collections::BTreeSet::new();
+    for doc in docs.into_iter().take(5000) {
+        let bytes = fs::read(snapshot.path(doc))?;
+        ferret_text::tokens(&bytes, |term| {
+            if term_query(term) {
+                candidates.insert(term.to_vec());
+            }
+        });
+    }
+    let [segment] = view.segments() else {
+        return Err("small-file sampler requires full control".into());
+    };
+    for term in candidates {
+        let Some(entry) = segment.entry(&term)? else {
+            continue;
+        };
+        if !(2..=100).contains(&entry.df) || rare.items.contains(&term) {
+            continue;
+        }
+        let docs = view.lookup(&term)?;
+        if docs
+            .iter()
+            .all(|doc| sizes.get(doc).is_some_and(|&size| size < 4096))
+        {
+            rare.offer(&mut rng, &term);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

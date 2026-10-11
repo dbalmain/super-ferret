@@ -45,7 +45,7 @@ def main():
         for state in ("first", "steady", "full"):
             path = index if state == "full" else index.with_suffix(f".{state}")
             command = [binary, "content-query", str(catalog), str(path),
-                       "df1", "df2-100", "absent", "mid", "common", "--terms",
+                       "df1", "df2-100", "df1-natural", "df2-100-natural", "absent", "mid", "common", "--terms",
                        str(base / "control"), "--corpus", str(corpus)]
             if arm != "control":
                 command += ["--compare", str(base / "control")]

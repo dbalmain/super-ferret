@@ -586,6 +586,29 @@ fn generated(doc: u32, vocabulary: &[Vec<u8>], out: &mut Vec<u8>) {
     out.extend_from_slice(format!("u{doc:x}q").as_bytes());
 }
 
+fn generated_window(
+    doc: u32,
+    offset: Option<u32>,
+    vocabulary: &[Vec<u8>],
+    bytes: &mut Vec<u8>,
+) -> ferret_index::segment::Window {
+    bytes.clear();
+    generated(doc, vocabulary, bytes);
+    let mut start = 0;
+    let mut complete = true;
+    if let Some(offset) = offset {
+        start = (offset as usize).saturating_sub(256).min(bytes.len());
+        let end = (start + 1280).min(bytes.len());
+        complete = start == 0 && end == bytes.len();
+        bytes.truncate(end);
+        bytes.drain(..start);
+    }
+    ferret_index::segment::Window {
+        start: start as u64,
+        complete,
+    }
+}
+
 pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Result<()> {
     let options = Options::parse(options)?;
     if options.snapshots || options.control_bytes.is_some() || options.corpus.is_some() {
@@ -667,23 +690,10 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
         max_segments = max_segments.max(writer.view().segments().len());
         let merge_start = crate::segment_build::cpu_seconds()?;
         let mut reader = |doc: u32, offset: Option<u32>, bytes: &mut Vec<u8>| {
-            bytes.clear();
-            generated(doc, &vocabulary, bytes);
-            let mut start = 0;
-            let mut complete = true;
-            if let Some(offset) = offset {
-                start = (offset as usize).saturating_sub(256).min(bytes.len());
-                let end = (start + 1280).min(bytes.len());
-                complete = start == 0 && end == bytes.len();
-                bytes.truncate(end);
-                bytes.drain(..start);
-            }
+            let window = generated_window(doc, offset, &vocabulary, bytes);
             document_reads += 1;
             document_bytes += bytes.len() as u64;
-            Some(ferret_index::segment::Window {
-                start: start as u64,
-                complete,
-            })
+            Some(window)
         };
         while let Some(merged) =
             writer.merge_if_needed_verified(&view, &Budget::unbounded(), &mut reader)?
@@ -765,6 +775,63 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
     );
     line("seconds", format!("{:.2}", start.elapsed().as_secs_f64()));
     print!("{report}");
+    // Keep the ordinary S2 trace and its write amplification intact. Measure
+    // a final forced merge separately, including purge of the last deaths.
+    let live = DocSet::new(
+        alive.len() as u32,
+        alive
+            .iter()
+            .enumerate()
+            .filter(|&(_, &a)| a)
+            .map(|(d, _)| d as u32),
+    );
+    let catalog = CatalogView {
+        incarnation,
+        live: &live,
+    };
+    let cpu = crate::segment_build::cpu_seconds()?;
+    let io = io_counters()?;
+    let (mut reads, mut bytes_read) = (0u64, 0u64);
+    let mut reader = |doc, offset, bytes: &mut Vec<u8>| {
+        let window = generated_window(doc, offset, &vocabulary, bytes);
+        reads += 1;
+        bytes_read += bytes.len() as u64;
+        Some(window)
+    };
+    let merged = writer.merge_all_verified(&catalog, &Budget::unbounded(), &mut reader)?;
+    let after_io = io_counters()?;
+    println!(
+        "churn_full_cpu_seconds: {:.3}",
+        crate::segment_build::cpu_seconds()? - cpu
+    );
+    println!("churn_full_rchar_bytes: {}", after_io.0 - io.0);
+    println!("churn_full_device_read_bytes: {}", after_io.1 - io.1);
+    println!("churn_full_document_reads: {reads}");
+    println!("churn_full_document_read_bytes: {bytes_read}");
+    if let Some(merged) = merged {
+        println!("churn_full_demoted_records: {}", merged.records_added);
+        println!("churn_full_purged_records: {}", merged.records_removed);
+        println!("churn_full_graduated_records: {}", merged.records_graduated);
+    }
+    println!(
+        "churn_full_index_bytes: {}",
+        writer
+            .view()
+            .manifest()
+            .segments
+            .iter()
+            .map(|s| s.bytes)
+            .sum::<u64>()
+    );
+    println!(
+        "churn_full_records: {}",
+        writer
+            .view()
+            .segments()
+            .iter()
+            .map(|s| s.fingerprint_records())
+            .sum::<u64>()
+    );
     Ok(())
 }
 

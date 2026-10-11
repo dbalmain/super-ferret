@@ -862,3 +862,37 @@ fn c2_batches_large_document_checks_through_the_real_merge() {
         );
     }
 }
+
+#[test]
+fn c3_offsets_survive_restart_boundaries_and_purge() {
+    let _arm = Arm::new(OFFSET_CODEC);
+    let _forced = Forced::new(|_| 7);
+    let offsets = [0, 127, 128, 16_383, 16_384, 1 << 21, u32::MAX];
+    let expected: Vec<Record> = (0..513)
+        .map(|doc| Record {
+            fingerprint: 7,
+            doc,
+            offset: Some(offsets[doc as usize % offsets.len()]),
+        })
+        .collect();
+    let mut writer = Writer::with_codec(0, 512, OFFSET_CODEC).unwrap();
+    for &record in &expected {
+        writer.push_positioned_record(record).unwrap();
+    }
+    let mut bytes = Vec::new();
+    writer.finish(&mut bytes).unwrap();
+    let input = Segment::open(bytes).unwrap();
+    assert_eq!(
+        input.fingerprint_hits_until(b"needle", &|| false).unwrap(),
+        expected
+    );
+    let live = DocSet::new(513, (0..513).filter(|doc| doc % 3 != 0));
+    let output = merged(&[input], &live);
+    assert_eq!(
+        output.fingerprint_hits_until(b"needle", &|| false).unwrap(),
+        expected
+            .into_iter()
+            .filter(|r| live.contains(r.doc))
+            .collect::<Vec<_>>()
+    );
+}
