@@ -235,3 +235,30 @@ fn quantiles_and_size_bands_use_candidate_documents_not_gram_occurrences() {
     }
     assert_eq!(stats((1..=50).collect()), (25, 45, 1275));
 }
+
+#[test]
+fn partitioned_maps_produce_byte_identical_segments_and_query_lists() {
+    // Partitioning must not turn global front-coding or postings into an
+    // estimate, or drop query keys when the full map is released.
+    let index = lists(&[b"abcdefghijk", b"zzabcdefghijkl", b"123456789abcd"], Variant::Fixed(8), &[]);
+    let mut required = BTreeSet::new();
+    required.insert(b"abcdefgh".to_vec());
+    required.insert(b"123".to_vec());
+    let mut ordinary = Writer::keyed(0, 2, 1).unwrap();
+    let mut sorted: Vec<_> = index.iter().collect();
+    sorted.sort_unstable_by_key(|(key, _)| *key);
+    for (key, docs) in sorted { ordinary.push(key, docs).unwrap(); }
+    let mut expected = Vec::new();
+    ordinary.finish(&mut expected).unwrap();
+    let mut partitioned = Writer::keyed(0, 2, 1).unwrap();
+    let mut query_lists = Lists::new();
+    for part in 0..32 {
+        let partition = index.iter().filter(|(key, _)| key[0] >> 3 == part)
+            .map(|(key, docs)| (key.clone(), docs.clone())).collect();
+        append_partition(&mut partitioned, partition, &required, &mut query_lists).unwrap();
+    }
+    let mut actual = Vec::new();
+    partitioned.finish(&mut actual).unwrap();
+    assert_eq!(actual, expected);
+    for key in required { assert_eq!(query_lists.get(key.as_slice()), index.get(key.as_slice())); }
+}

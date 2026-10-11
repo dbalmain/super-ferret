@@ -54,6 +54,8 @@ pub(super) fn fold(bytes: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Index and query must share this frozen table. Retraining frequency ranks
+/// changes gram boundaries, so an existing index cannot use the new ranks.
 pub(super) fn weights(counts: &[u64], frequency: bool) -> Vec<(u64, u16)> {
     counts
         .iter()
@@ -163,6 +165,27 @@ mod tests {
                 }
                 assert_eq!(actual, expected);
                 assert!(bytes.windows(3).all(|gram| actual.contains(gram)));
+            }
+        }
+    }
+
+    #[test]
+    fn length_caps_keep_an_internal_32_byte_peak_pair_but_reject_33() {
+        // A cap applied to bigram distance rather than byte length admits one
+        // byte too many. A long valley also distinguishes 8 from 32.
+        for length in [32, 33] {
+            let bytes = &b"abcdefghijklmnopqrstuvwxyz0123456"[..length];
+            let mut weights = vec![(0, 0); 1 << 16];
+            for pair in [&bytes[..2], &bytes[length - 2..]] {
+                weights[usize::from(u16::from_be_bytes([pair[0], pair[1]]))] = (100, 0);
+            }
+            for cap in [8, 32] {
+                let mut found = false;
+                extract(bytes, Variant::Sparse { frequency: false, cap }, &weights, |gram| {
+                    assert!(gram.len() <= cap);
+                    found |= gram == bytes;
+                });
+                assert_eq!(found, length <= cap);
             }
         }
     }

@@ -178,7 +178,10 @@ fn main() -> ExitCode {
                 index_build::churn(Path::new(out), rounds, options)
             }
             ("sparse", [dir, index, snapshot]) => {
-                sparse::run(Path::new(dir), Path::new(index), Path::new(snapshot))
+                sparse::run(Path::new(dir), Path::new(index), Path::new(snapshot), None)
+            }
+            ("sparse", [dir, index, snapshot, only]) => {
+                sparse::run(Path::new(dir), Path::new(index), Path::new(snapshot), Some(only))
             }
             ("regex-volume", [dir, index, snapshot]) => {
                 regex_volume::run(Path::new(dir), Path::new(index), Path::new(snapshot))
@@ -247,7 +250,7 @@ fn usage() -> ExitCode {
          ferret-bench filter-screen <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>\n       \
          ferret-bench index-churn <index-dir> <rounds> [--codec 1|h]\n       \
-         ferret-bench sparse <catalog-dir> <index-dir> <snapshot-dir>\n       \
+         ferret-bench sparse <catalog-dir> <index-dir> <snapshot-dir> [variant]\n       \
          ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench regex-query <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [--corpus snapshot-dir] [--covered] [class...]\n       \

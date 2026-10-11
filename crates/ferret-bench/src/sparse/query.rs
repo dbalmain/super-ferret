@@ -66,6 +66,14 @@ impl Need {
         }
     }
 
+    pub(super) fn keys(&self, out: &mut BTreeSet<Vec<u8>>) {
+        match self {
+            Self::Key(key) => { out.insert(key.clone()); }
+            Self::And(parts) | Self::Or(parts) => parts.iter().for_each(|p| p.keys(out)),
+            Self::All | Self::None => {},
+        }
+    }
+
     fn estimate(&self, lists: &Lists, live: &[u32]) -> usize {
         match self {
             Self::All => live.len(),

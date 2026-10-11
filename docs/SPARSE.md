@@ -1,7 +1,7 @@
 # Sparse grams: regex candidate experiment
 
-Status: design committed; implementation and measurement pending. Bench-only
-indexes; product formats and planning remain unchanged. No network sources used.
+Status: implementation committed and gates green; full-corpus measurement
+running. Bench-only indexes; product formats and planning remain unchanged. No network sources used.
 
 ## Design and soundness
 
@@ -28,7 +28,11 @@ gram implies it. Include fixed-length literal grams as a cheaper control.
 
 ## Measurement plan
 
-Prefer the refreshed D65C population and its frozen bytes over S3's old corpus.
+The run uses the refreshed D65C catalog at `/tmp/d65c/catalog`, its codec-1
+fully merged control at `/tmp/d65c/control`, and frozen bytes at
+`/tmp/d65c/corpus`. `Snapshot::open` verifies incarnation and DocId bound.
+The checked-out S3 document describes an isolated `$HOME` catalog but has no
+concrete catalog/snapshot paths; the supplied fresh D65C paths supersede it.
 Reuse M5 class seeds, including its snapshot-derived identifier patterns, and
 also measure the other `screen::regex_classes` workloads. Compare actual shipped
 four-child trigram candidates against each variant. Encode whole-corpus posting
@@ -84,3 +88,29 @@ Measurement and final recommendation remain pending. The implementation
 checkpoint passes pinned formatting, workspace clippy with warnings denied,
 and **937 tests / 13 ignored**, with zero Rust warnings (baseline 928 passed;
 nine added). No Cargo manifest or lockfile changes.
+
+## Baseline measurement checkpoint
+
+D65C compatibility checks passed: **112,382 live**, **112,376 readable**,
+**6 unreadable**, **3,978,812,718 content bytes**, **250 queries** (50 per class).
+The complete oracle costs 506.34 CPU s / 513.06 wall s. Shipped candidates
+include every oracle match. Rare-literal candidate bytes median/p90 are
+**1,540,658,366 / 1,861,211,679**, against oracle **4,033,515 / 22,288,165**.
+The rare class's readable-byte false share is **99.52%** (sum-based, not the
+ratio of independent medians). Identifier candidate bytes median/p90 are
+**2,783,209,101 / 3,097,586,912**, against oracle **36,785,558 / 238,940,235**.
+
+Product trigram full-merge accounting: **10,158,272 distinct keys**,
+**259,877,638 postings**, **228,353,108 postings bytes**, **56,655,667 dictionary
+bytes**, **286,112,775 total bytes**, **22.31 CPU s / 22.60 wall s**. Frequency
+training costs **3.93 CPU s / 4.09 wall s** over **3,978,700,343 bigram
+occurrences**, **52,900 distinct bigrams**. Experimental variants remain running.
+
+Sparse-hash-8 already has 98.5M distinct keys after 49,153 documents. The
+fixed-8 control now has a bounded map path: 32 disjoint, contiguous first-byte
+ranges feed one persistent segment writer in global key order. It retains only
+query postings after each range, and still measures every corpus key. This
+produces the same dictionary and postings bytes as a single map; a fixture
+compares whole encoded segments byte for byte. Extra corpus passes are charged
+to its build CPU. The new cap and partition regressions await the final gate
+run, so this checkpoint is WIP. A variant label can resume an individual arm.

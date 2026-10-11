@@ -4,7 +4,7 @@
 //! fold; `grams` selects substring-local keys; `query` weakens conjunctions by
 //! df. All reported fields are aggregate counts, bytes and times.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::Path;
@@ -149,6 +149,7 @@ fn build(
     live: &[u32],
     variant: Variant,
     weights: &[(u64, u16)],
+    partition: Option<u8>,
 ) -> crate::Result<Lists> {
     let mut lists = Lists::new();
     for (ordinal, &doc) in live.iter().enumerate() {
@@ -162,7 +163,7 @@ fn build(
         // Borrowed slices deduplicate without allocating every occurrence.
         let mut distinct = HashSet::new();
         extract(&bytes, variant, weights, |gram| {
-            distinct.insert(gram);
+            if partition.is_none_or(|part| gram[0] >> 3 == part) { distinct.insert(gram); }
         });
         for gram in distinct {
             if let Some(docs) = lists.get_mut(gram) {
@@ -171,7 +172,7 @@ fn build(
                 lists.insert(gram.into(), vec![doc]);
             }
         }
-        if ordinal.is_multiple_of(16384) {
+        if partition.is_none() && ordinal.is_multiple_of(16384) {
             println!(
                 "progress mode={} documents={} distinct_keys={}",
                 variant.label(),
@@ -197,6 +198,43 @@ fn encode(lists: &Lists, bound: u32) -> crate::Result<ferret_index::segment::Siz
     Ok(writer.finish(&mut io::sink())?)
 }
 
+/// Ranges of the first folded byte are disjoint and contiguous in key order.
+/// Keeping one writer across ranges gives byte-identical whole-index encoding;
+/// only the in-memory map is partitioned. Query lists survive each range.
+fn bounded_fixed(
+    snapshot: &Snapshot,
+    live: &[u32],
+    bound: u32,
+    needs: &[Need],
+) -> crate::Result<(Lists, ferret_index::segment::Sizes)> {
+    let mut required = BTreeSet::new();
+    for need in needs { need.keys(&mut required); }
+    let mut query_lists = Lists::new();
+    let mut writer = Writer::keyed(0, bound.saturating_sub(1), 1)?;
+    for part in 0..32 {
+        let lists = build(snapshot, live, Variant::Fixed(8), &[], Some(part))?;
+        let count = lists.len();
+        append_partition(&mut writer, lists, &required, &mut query_lists)?;
+        println!("partition mode=fixed-8 completed={} distinct_keys={count}", part + 1);
+    }
+    Ok((query_lists, writer.finish(&mut io::sink())?))
+}
+
+fn append_partition(
+    writer: &mut Writer,
+    lists: Lists,
+    required: &BTreeSet<Vec<u8>>,
+    query_lists: &mut Lists,
+) -> crate::Result<()> {
+    let mut sorted: Vec<_> = lists.into_iter().collect();
+    sorted.sort_unstable();
+    for (key, docs) in sorted {
+        writer.push(&key, &docs)?;
+        if required.contains(key.as_ref()) { query_lists.insert(key, docs); }
+    }
+    Ok(())
+}
+
 fn product_trigram(
     snapshot: &Snapshot,
     live: &[u32],
@@ -216,7 +254,9 @@ fn product_trigram(
         .finish(&mut io::sink())?)
 }
 
-pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::Result<()> {
+pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path, only: Option<&str>) -> crate::Result<()> {
+    let variants: Vec<_> = Variant::ALL.into_iter().filter(|v| only.is_none_or(|label| v.label() == label)).collect();
+    if variants.is_empty() { return Err("unknown sparse variant".into()); }
     crate::trigram::check_disk()?;
     let catalog = crate::open_catalog(catalog_dir)?;
     catalog.load_all()?;
@@ -354,7 +394,8 @@ pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> 
         frequencies.iter().sum::<u64>(),
         frequencies.iter().filter(|&&n| n > 0).count()
     );
-    for variant in Variant::ALL {
+    for variant in &variants {
+        let variant = *variant;
         let weights = weights(
             &frequencies,
             matches!(
@@ -365,13 +406,19 @@ pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> 
                 }
             ),
         );
+        let needs: Vec<_> = samples.iter().map(|sample| Need::literals(&sample.facts, variant, &weights)).collect();
         let (cpu, wall) = (cpu_seconds()?, Instant::now());
-        let lists = build(&snapshot, &live_ids, variant, &weights)?;
-        let encoded = encode(&lists, live.bound())?;
+        let (lists, encoded) = if matches!(variant, Variant::Fixed(8)) {
+            bounded_fixed(&snapshot, &live_ids, live.bound(), &needs)?
+        } else {
+            let lists = build(&snapshot, &live_ids, variant, &weights, None)?;
+            let encoded = encode(&lists, live.bound())?;
+            (lists, encoded)
+        };
         println!(
             "index mode={} distinct_keys={} pairs={} postings_bytes={} singleton_bytes={} dictionary_bytes={} total_bytes={} build_cpu_s={:.3} build_wall_s={:.3}",
             variant.label(),
-            lists.len(),
+            encoded.terms,
             encoded.pairs,
             encoded.postings,
             encoded.singleton_bytes,
@@ -380,10 +427,7 @@ pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> 
             cpu_seconds()? - cpu,
             wall.elapsed().as_secs_f64()
         );
-        let candidates: Vec<_> = samples
-            .iter()
-            .map(|sample| {
-                let need = Need::literals(&sample.facts, variant, &weights);
+        let candidates: Vec<_> = needs.iter().map(|need| {
                 let mut docs = need.candidates(&lists, &live_ids);
                 docs.extend(live_ids.iter().filter(|&&doc| !snapshot.contains(doc)));
                 docs.sort_unstable();
@@ -399,8 +443,8 @@ pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> 
         );
     }
     println!(
-        "correctness shipped_and_variants=8 queries={} missed_matches=0",
-        samples.len()
+        "correctness shipped_and_variants={} queries={} missed_matches=0",
+        variants.len() + 1, samples.len()
     );
     Ok(())
 }
