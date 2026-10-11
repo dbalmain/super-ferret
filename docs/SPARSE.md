@@ -159,3 +159,17 @@ Word-only 4-grams remain the smaller control and cover four-byte identifier
 ends. Both retain all raw trigrams and apply the same local predicate to query
 keys, including fallback for punctuation and partial UTF-8. No whole-word
 boundary is required: regex substrings inside an identifier remain candidates.
+
+Frequency cap 8 passes all 250 oracle checks. It has **114,965,290 keys**,
+**1,527.20 MiB total index**, **794.63 MiB postings**, and **726.48 CPU s**.
+Rare candidate MiB median/p90 are **300.14 / 1,464.51** (worse than hash), while
+identifier is **2,319.50 / 2,867.31** and code class **1,723.12 / 2,739.59**.
+Rare false-readable share remains **98.24%**. Frequency weighting has traded
+some rare-literal selectivity for modest gains in the other literal classes.
+
+A further regression records a limitation of the strict tie rule: the required
+literal `aaaaa` emits only `aaa` under either sparse weight or cap, admitting
+a document containing just `aaa`. The word 4+5 control rejects that false
+candidate through the real extractor and required-literal derivation. Repeated
+pairs cannot use absolute-offset tie breaks without invalidating soundness.
+The new word/tie tests await final gates (expected 941 passed / 13 ignored).

@@ -298,3 +298,25 @@ fn word_four_keeps_case_alternatives_and_falls_back_across_punctuation() {
     assert!(bytes.windows(3).all(|gram| keys.contains(gram)));
     check(&["abc def", "ab-cd", "kilo", "aſb"], &[b"abc def", b"ab-cd", "Kilo".as_bytes(), "aſb".as_bytes()], true);
 }
+
+#[test]
+fn repeated_pair_ties_leave_false_candidates_that_fixed_five_rejects() {
+    // Substring-local ranks cannot break repeated pairs by document offset.
+    // Fixed coverage can therefore buy selectivity unavailable at any cap.
+    let documents: [&[u8]; 2] = [b"aaa", b"aaaaa"];
+    let flags = GrepFlags::default();
+    let grep = flags.compile("aaaaa").unwrap();
+    assert!(!grep.regex().is_match(documents[0]));
+    assert!(grep.regex().is_match(documents[1]));
+    let facts = flags.required_literals("aaaaa").unwrap();
+    for frequency in [false, true] {
+        let weights = weights(&vec![0; 1 << 16], frequency);
+        for cap in [8, 32] {
+            let variant = Variant::Sparse { frequency, cap };
+            let index = lists(&documents, variant, &weights);
+            assert_eq!(Need::literals(&facts, variant, &weights).candidates(&index, &[0, 1]), [0, 1]);
+        }
+    }
+    let index = lists(&documents, Variant::Word45, &[]);
+    assert_eq!(Need::literals(&facts, Variant::Word45, &[]).candidates(&index, &[0, 1]), [1]);
+}
