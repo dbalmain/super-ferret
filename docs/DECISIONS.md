@@ -75,7 +75,7 @@ Predecessors, carried forward where still open:
 | D57 | Socket codec: shared JSON lines or binary framing                      | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                                                                         |
 | D58 | Batch input: serde_json or a hand-written reader                       | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                                                                |
 | D59 | How intpack enters the workspace                                       | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                                                                    |
-| D60 | Reactivate a dead DocId when its content returns                       | open           | experiment run: git index saves ~3% (follow is 85–90%); rec B now, A′ (reactivate by content hash, no git) if wanted                                          |
+| D60 | Reactivate a dead DocId when its content returns                       | answered       | B now: never reactivate; A′ (reactivate by content hash, no git) is the named upgrade; git-index idea dropped (saves ~3%)                                     |
 | D61 | Term frequencies in S2's postings                                      | answered       | B: doc ids only for now; frequencies arrive with ranking, by reindex                                                                                          |
 | D62 | `ferret search` syntax for content and booleans                        | answered       | A: `text:` atoms; find-style `OR`, `NOT`, `(` `)`; side survey of query languages done; `ferret grep` follows ripgrep (D72–D75)                               |
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read              | answered       | A: the index follows the catalog in DocId order; D60's experiment found git does not remove the re-hash in a way that matters                                 |
@@ -3403,10 +3403,10 @@ The `path = "../intpack"` dependency M3 started with switches to
 
 ## D60 — Reactivate a dead DocId when its content returns
 
-**Status: open.** S2 M0, 2026-10-06;
-[design](S2.md#segments-are-disjoint-docid-ranges). D36 B left this to S2:
-"Whether a revert reactivates its old `DocId` is an S2 decision, where postings
-make it worth something."
+**Status: answered, B now, A′ as the upgrade (Dave, 2026-10-11).** S2 M0,
+2026-10-06; [design](S2.md#segments-are-disjoint-docid-ranges). D36 B left this
+to S2: "Whether a revert reactivates its old `DocId` is an S2 decision, where
+postings make it worth something."
 
 **Question:** When content that died comes back (a revert, a branch switched
 away and back), should it get its old DocId, whose postings may still sit in an
@@ -3507,6 +3507,9 @@ working tree where the read is genuinely expensive, such as a switch larger than
 free memory, a network filesystem, or a cold cache that was not measured here.
 Even then A′ comes first, and C goes on top only if the read is measured to
 dominate.
+
+> Dave (2026-10-11): Agree: B now, A′ when reactivation is wanted, and drop the
+> git-index idea.
 
 ## D61 — Term frequencies in S2's postings
 
