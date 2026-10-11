@@ -273,8 +273,11 @@ workspace clippy with warnings denied, and workspace tests pass: **945 passed /
 13 ignored**, zero Rust warnings. The release rebuild passed and the protected
 foreground run is active. Oracle preparation matched the previous population
 (112,382 live, 112,376 readable, 3,978,812,718 readable bytes, 250 queries),
-taking 506.480 CPU seconds / 514.659 wall seconds. Shipped cold/warm execution
-has passed its first 200 queries; no result is treated as complete until all
-250 pass. Results and the updated recommendation await the full run. Initial
+taking 506.480 CPU seconds / 514.659 wall seconds. All 250 shipped cold/warm query pairs passed candidate and oracle identity
+checks. Their 40 complete class/cache/band rows are in
+[the latency aggregates](measurements/sparse-latency.txt). Rare total median/p90
+is 2,952.403/3,664.757 ms cold and 244.707/297.236 ms warm; posting read median/p90
+is 24,576/45,056 bytes. Word-four is building next. The final recommendation
+awaits both longer-key layouts. Initial
 disk headroom was about 14 GiB, about 11 GiB after rebuilding test artifacts;
 stop below 5 GB. No Cargo manifests or lockfiles changed.
