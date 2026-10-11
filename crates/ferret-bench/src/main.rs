@@ -180,9 +180,12 @@ fn main() -> ExitCode {
             ("sparse", [dir, index, snapshot]) => {
                 sparse::run(Path::new(dir), Path::new(index), Path::new(snapshot), None)
             }
-            ("sparse", [dir, index, snapshot, only]) => {
-                sparse::run(Path::new(dir), Path::new(index), Path::new(snapshot), Some(only))
-            }
+            ("sparse", [dir, index, snapshot, only]) => sparse::run(
+                Path::new(dir),
+                Path::new(index),
+                Path::new(snapshot),
+                Some(only),
+            ),
             ("regex-volume", [dir, index, snapshot]) => {
                 regex_volume::run(Path::new(dir), Path::new(index), Path::new(snapshot))
             }

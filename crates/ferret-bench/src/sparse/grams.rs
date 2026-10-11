@@ -117,6 +117,56 @@ pub(super) fn extract<'a>(
     }
 }
 
+/// Bounded maps need only starts in one first-byte range. Scanning forward
+/// from those starts avoids building the entire stack on every partition
+/// pass. Stop at the first pair at least as heavy as the left endpoint: it
+/// blocks every later gram. Worst case visits `cap` pairs per selected start.
+pub(super) fn extract_partition<'a>(
+    bytes: &'a [u8],
+    variant: Variant,
+    weights: &[(u64, u16)],
+    partition: u8,
+    mut emit: impl FnMut(&'a [u8]),
+) {
+    let cap = match variant {
+        Variant::Trigram => {
+            for gram in bytes.windows(3).filter(|g| g[0] >> 3 == partition) {
+                emit(gram);
+            }
+            return;
+        }
+        Variant::Fixed(length) => {
+            for gram in bytes
+                .windows(3)
+                .chain(bytes.windows(length))
+                .filter(|g| g[0] >> 3 == partition)
+            {
+                emit(gram);
+            }
+            return;
+        }
+        Variant::Sparse { cap, .. } => cap,
+    };
+    let rank = |at: usize| weights[usize::from(u16::from_be_bytes([bytes[at], bytes[at + 1]]))];
+    for left in 0..bytes.len().saturating_sub(2) {
+        if bytes[left] >> 3 != partition {
+            continue;
+        }
+        let first = rank(left);
+        let mut interior = None;
+        for right in left + 1..(bytes.len() - 1).min(left + cap - 1) {
+            let last = rank(right);
+            if interior.is_none_or(|maximum| last > maximum) {
+                emit(&bytes[left..right + 2]);
+            }
+            if last >= first {
+                break;
+            }
+            interior = Some(interior.map_or(last, |maximum| maximum.max(last)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -164,6 +214,13 @@ mod tests {
                     }
                 }
                 assert_eq!(actual, expected);
+                let mut partitioned = BTreeSet::new();
+                for part in 0..32 {
+                    extract_partition(&bytes, variant, weights, part, |gram| {
+                        partitioned.insert(gram.to_vec());
+                    });
+                }
+                assert_eq!(partitioned, actual);
                 assert!(bytes.windows(3).all(|gram| actual.contains(gram)));
             }
         }
@@ -181,11 +238,34 @@ mod tests {
             }
             for cap in [8, 32] {
                 let mut found = false;
-                extract(bytes, Variant::Sparse { frequency: false, cap }, &weights, |gram| {
-                    assert!(gram.len() <= cap);
-                    found |= gram == bytes;
-                });
+                extract(
+                    bytes,
+                    Variant::Sparse {
+                        frequency: false,
+                        cap,
+                    },
+                    &weights,
+                    |gram| {
+                        assert!(gram.len() <= cap);
+                        found |= gram == bytes;
+                    },
+                );
                 assert_eq!(found, length <= cap);
+                let mut filtered = false;
+                extract_partition(
+                    bytes,
+                    Variant::Sparse {
+                        frequency: false,
+                        cap,
+                    },
+                    &weights,
+                    bytes[0] >> 3,
+                    |gram| {
+                        assert!(gram.len() <= cap);
+                        filtered |= gram == bytes;
+                    },
+                );
+                assert_eq!(filtered, found);
             }
         }
     }

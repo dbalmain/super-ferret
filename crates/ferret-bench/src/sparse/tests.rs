@@ -1,21 +1,14 @@
 //! Soundness checks drive the production Cox fold, the real gram extractor,
 //! and the benchmark's four-child candidate evaluation together.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use super::*;
 
 fn lists(documents: &[&[u8]], variant: Variant, weights: &[(u64, u16)]) -> Lists {
     let mut lists = Lists::new();
     for (doc, bytes) in documents.iter().enumerate() {
-        let bytes = fold(bytes);
-        let mut distinct = HashSet::new();
-        extract(&bytes, variant, weights, |gram| {
-            distinct.insert(gram);
-        });
-        for gram in distinct {
-            lists.entry(gram.into()).or_default().push(doc as u32);
-        }
+        add_document(&mut lists, doc as u32, bytes, variant, weights, None);
     }
     lists
 }
@@ -240,25 +233,51 @@ fn quantiles_and_size_bands_use_candidate_documents_not_gram_occurrences() {
 fn partitioned_maps_produce_byte_identical_segments_and_query_lists() {
     // Partitioning must not turn global front-coding or postings into an
     // estimate, or drop query keys when the full map is released.
-    let index = lists(&[b"abcdefghijk", b"zzabcdefghijkl", b"123456789abcd"], Variant::Fixed(8), &[]);
-    let mut required = BTreeSet::new();
-    required.insert(b"abcdefgh".to_vec());
-    required.insert(b"123".to_vec());
-    let mut ordinary = Writer::keyed(0, 2, 1).unwrap();
-    let mut sorted: Vec<_> = index.iter().collect();
-    sorted.sort_unstable_by_key(|(key, _)| *key);
-    for (key, docs) in sorted { ordinary.push(key, docs).unwrap(); }
-    let mut expected = Vec::new();
-    ordinary.finish(&mut expected).unwrap();
-    let mut partitioned = Writer::keyed(0, 2, 1).unwrap();
-    let mut query_lists = Lists::new();
-    for part in 0..32 {
-        let partition = index.iter().filter(|(key, _)| key[0] >> 3 == part)
-            .map(|(key, docs)| (key.clone(), docs.clone())).collect();
-        append_partition(&mut partitioned, partition, &required, &mut query_lists).unwrap();
+    let documents: [&[u8]; 3] = [b"abcdefghijk", b"zzabcdefghijkl", b"123456789abcd"];
+    for variant in Variant::ALL {
+        let weights = weights(
+            &vec![0; 1 << 16],
+            matches!(
+                variant,
+                Variant::Sparse {
+                    frequency: true,
+                    ..
+                }
+            ),
+        );
+        let index = lists(&documents, variant, &weights);
+        let mut required = BTreeSet::new();
+        required.insert(b"abcdefgh".to_vec());
+        required.insert(b"123".to_vec());
+        let mut ordinary = Writer::keyed(0, 2, 1).unwrap();
+        let mut sorted: Vec<_> = index.iter().collect();
+        sorted.sort_unstable_by_key(|(key, _)| *key);
+        for (key, docs) in sorted {
+            ordinary.push(key, docs).unwrap();
+        }
+        let mut expected = Vec::new();
+        ordinary.finish(&mut expected).unwrap();
+        let mut partitioned = Writer::keyed(0, 2, 1).unwrap();
+        let mut query_lists = Lists::new();
+        for part in 0..32 {
+            let mut partition = Lists::new();
+            for (doc, bytes) in documents.iter().enumerate() {
+                add_document(
+                    &mut partition,
+                    doc as u32,
+                    bytes,
+                    variant,
+                    &weights,
+                    Some(part),
+                );
+            }
+            append_partition(&mut partitioned, partition, &required, &mut query_lists).unwrap();
+        }
+        let mut actual = Vec::new();
+        partitioned.finish(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        for key in required {
+            assert_eq!(query_lists.get(key.as_slice()), index.get(key.as_slice()));
+        }
     }
-    let mut actual = Vec::new();
-    partitioned.finish(&mut actual).unwrap();
-    assert_eq!(actual, expected);
-    for key in required { assert_eq!(query_lists.get(key.as_slice()), index.get(key.as_slice())); }
 }

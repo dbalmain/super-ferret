@@ -66,7 +66,7 @@ trigrams retain every original cap (including two-byte edges); the bench API
 returns folded literal AND/OR facts, retaining 31-byte edges and exact strings
 up to 32 bytes before release. No product index or planner code changes.
 Unicode case equivalences stay HIR alternatives, rather than being normalized
-by the byte index. Nine new tests drive extraction and derivation together.
+by the byte index. Eleven new tests drive extraction, derivation and bounded encoding together.
 
 Hash weights use a fixed SplitMix64 avalanche of the folded pair number.
 Frequency weights use corpus occurrence counts, with rarer pairs ranked higher.
@@ -80,14 +80,14 @@ Indexing keeps every emitted distinct key per document. Queries flatten AND,
 rank children by posting frequency, retain four, and keep every OR branch.
 Whole-index accounting runs the real segment writer to a sink, including its
 front-coded dictionary, relative DocIds, PFor blocks, singleton inlining and
-checksums. The benchmark keeps one index in RAM at a time and writes no corpus
-index files. Generic map build CPU is a prototype cost, not a production builder
+checksums. The benchmark writes no corpus index files. Trigrams and hash cap 8 use
+a whole map; other arms use bounded first-byte ranges. Generic map build CPU is a prototype cost, not a production builder
 projection. Frequency training is a separate one-time corpus pass.
 
 Measurement and final recommendation remain pending. The implementation
 checkpoint passes pinned formatting, workspace clippy with warnings denied,
-and **937 tests / 13 ignored**, with zero Rust warnings (baseline 928 passed;
-nine added). No Cargo manifest or lockfile changes.
+and **939 tests / 13 ignored**, with zero Rust warnings (baseline 928 passed;
+eleven added). No Cargo manifest or lockfile changes.
 
 ## Baseline measurement checkpoint
 
@@ -106,11 +106,29 @@ bytes**, **286,112,775 total bytes**, **22.31 CPU s / 22.60 wall s**. Frequency
 training costs **3.93 CPU s / 4.09 wall s** over **3,978,700,343 bigram
 occurrences**, **52,900 distinct bigrams**. Experimental variants remain running.
 
-Sparse-hash-8 already has 98.5M distinct keys after 49,153 documents. The
-fixed-8 control now has a bounded map path: 32 disjoint, contiguous first-byte
-ranges feed one persistent segment writer in global key order. It retains only
-query postings after each range, and still measures every corpus key. This
-produces the same dictionary and postings bytes as a single map; a fixture
-compares whole encoded segments byte for byte. Extra corpus passes are charged
-to its build CPU. The new cap and partition regressions await the final gate
-run, so this checkpoint is WIP. A variant label can resume an individual arm.
+The unbounded hash cap-32 attempt reached 208.9M keys and caused heavy swapping
+(about 38 GB RSS, machine swap 20 GB against 8.7 GB initially). It was stopped;
+its incomplete timing is discarded. All remaining arms now use 32 disjoint,
+contiguous first-byte ranges and one persistent segment writer in global key
+order, retaining only query postings after each range. A fixture calls the real
+document inverter and compares whole encoded segments byte for byte for all
+seven variants. Exact whole-index bytes are preserved.
+
+Bounded sparse extraction scans forward only from starts in its current range,
+until an endpoint at least as heavy as the first would block further grams.
+Its worst case is `cap` pairs per selected start. It agrees exhaustively with
+the monotonic stack and with the definition, including ties and length caps.
+Extra corpus passes are included in build CPU. The 32-way builder is a memory
+tradeoff, so build times compare complete prototype layouts, rather than solely
+weight functions. A comma-separated variant label can resume individual arms.
+
+The bounded implementation passes all gates: **939 passed / 13 ignored**, zero
+Rust warnings. The remaining five variants are being restarted serially on the
+same snapshot and class seeds; their oracle is recomputed, not inferred.
+
+First sparse result (hash cap 8): **116,535,553 keys**, **799,093,308 postings**,
+**882,968,921 postings bytes**, **1,664,977,098 total bytes**, **634.51 CPU s**.
+Rare candidate bytes median/p90 fall to **28,488,102 / 1,391,555,674**;
+identifier to **2,673,273,947 / 3,056,592,693**. Every oracle match survives.
+The 54.1× rare median reduction does not remove the tail; total storage rises
+5.82× and the sum-based rare false-readable share remains 97.62%.

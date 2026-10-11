@@ -24,7 +24,7 @@ mod query;
 #[cfg(test)]
 mod tests;
 
-use grams::{Variant, extract, fold, weights};
+use grams::{Variant, extract, extract_partition, fold, weights};
 use query::{Lists, Need};
 
 const PER_CLASS: usize = 50;
@@ -159,19 +159,14 @@ fn build(
         if !snapshot.contains(doc) {
             continue;
         }
-        let bytes = fold(&fs::read(snapshot.path(doc))?);
-        // Borrowed slices deduplicate without allocating every occurrence.
-        let mut distinct = HashSet::new();
-        extract(&bytes, variant, weights, |gram| {
-            if partition.is_none_or(|part| gram[0] >> 3 == part) { distinct.insert(gram); }
-        });
-        for gram in distinct {
-            if let Some(docs) = lists.get_mut(gram) {
-                docs.push(doc);
-            } else {
-                lists.insert(gram.into(), vec![doc]);
-            }
-        }
+        add_document(
+            &mut lists,
+            doc,
+            &fs::read(snapshot.path(doc))?,
+            variant,
+            weights,
+            partition,
+        );
         if partition.is_none() && ordinal.is_multiple_of(16384) {
             println!(
                 "progress mode={} documents={} distinct_keys={}",
@@ -182,6 +177,34 @@ fn build(
         }
     }
     Ok(lists)
+}
+
+fn add_document(
+    lists: &mut Lists,
+    doc: u32,
+    bytes: &[u8],
+    variant: Variant,
+    weights: &[(u64, u16)],
+    partition: Option<u8>,
+) {
+    let bytes = fold(bytes);
+    // Borrowed slices deduplicate without allocating every occurrence.
+    let mut distinct = HashSet::new();
+    let mut emit = |gram| {
+        distinct.insert(gram);
+    };
+    if let Some(partition) = partition {
+        extract_partition(&bytes, variant, weights, partition, &mut emit);
+    } else {
+        extract(&bytes, variant, weights, &mut emit);
+    }
+    for gram in distinct {
+        if let Some(docs) = lists.get_mut(gram) {
+            docs.push(doc);
+        } else {
+            lists.insert(gram.into(), vec![doc]);
+        }
+    }
 }
 
 /// Encodes a fully merged index through the actual segment writer, including
@@ -201,21 +224,29 @@ fn encode(lists: &Lists, bound: u32) -> crate::Result<ferret_index::segment::Siz
 /// Ranges of the first folded byte are disjoint and contiguous in key order.
 /// Keeping one writer across ranges gives byte-identical whole-index encoding;
 /// only the in-memory map is partitioned. Query lists survive each range.
-fn bounded_fixed(
+fn bounded_build(
     snapshot: &Snapshot,
     live: &[u32],
     bound: u32,
     needs: &[Need],
+    variant: Variant,
+    weights: &[(u64, u16)],
 ) -> crate::Result<(Lists, ferret_index::segment::Sizes)> {
     let mut required = BTreeSet::new();
-    for need in needs { need.keys(&mut required); }
+    for need in needs {
+        need.keys(&mut required);
+    }
     let mut query_lists = Lists::new();
     let mut writer = Writer::keyed(0, bound.saturating_sub(1), 1)?;
     for part in 0..32 {
-        let lists = build(snapshot, live, Variant::Fixed(8), &[], Some(part))?;
+        let lists = build(snapshot, live, variant, weights, Some(part))?;
         let count = lists.len();
         append_partition(&mut writer, lists, &required, &mut query_lists)?;
-        println!("partition mode=fixed-8 completed={} distinct_keys={count}", part + 1);
+        println!(
+            "partition mode={} completed={} distinct_keys={count}",
+            variant.label(),
+            part + 1
+        );
     }
     Ok((query_lists, writer.finish(&mut io::sink())?))
 }
@@ -230,7 +261,9 @@ fn append_partition(
     sorted.sort_unstable();
     for (key, docs) in sorted {
         writer.push(&key, &docs)?;
-        if required.contains(key.as_ref()) { query_lists.insert(key, docs); }
+        if required.contains(key.as_ref()) {
+            query_lists.insert(key, docs);
+        }
     }
     Ok(())
 }
@@ -254,9 +287,19 @@ fn product_trigram(
         .finish(&mut io::sink())?)
 }
 
-pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path, only: Option<&str>) -> crate::Result<()> {
-    let variants: Vec<_> = Variant::ALL.into_iter().filter(|v| only.is_none_or(|label| v.label() == label)).collect();
-    if variants.is_empty() { return Err("unknown sparse variant".into()); }
+pub(crate) fn run(
+    catalog_dir: &Path,
+    index_dir: &Path,
+    snapshot_dir: &Path,
+    only: Option<&str>,
+) -> crate::Result<()> {
+    let variants: Vec<_> = Variant::ALL
+        .into_iter()
+        .filter(|v| only.is_none_or(|labels| labels.split(',').any(|label| v.label() == label)))
+        .collect();
+    if variants.is_empty() {
+        return Err("unknown sparse variant".into());
+    }
     crate::trigram::check_disk()?;
     let catalog = crate::open_catalog(catalog_dir)?;
     catalog.load_all()?;
@@ -406,10 +449,27 @@ pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path, onl
                 }
             ),
         );
-        let needs: Vec<_> = samples.iter().map(|sample| Need::literals(&sample.facts, variant, &weights)).collect();
+        let needs: Vec<_> = samples
+            .iter()
+            .map(|sample| Need::literals(&sample.facts, variant, &weights))
+            .collect();
         let (cpu, wall) = (cpu_seconds()?, Instant::now());
-        let (lists, encoded) = if matches!(variant, Variant::Fixed(8)) {
-            bounded_fixed(&snapshot, &live_ids, live.bound(), &needs)?
+        let (lists, encoded) = if !matches!(
+            variant,
+            Variant::Trigram
+                | Variant::Sparse {
+                    frequency: false,
+                    cap: 8
+                }
+        ) {
+            bounded_build(
+                &snapshot,
+                &live_ids,
+                live.bound(),
+                &needs,
+                variant,
+                &weights,
+            )?
         } else {
             let lists = build(&snapshot, &live_ids, variant, &weights, None)?;
             let encoded = encode(&lists, live.bound())?;
@@ -427,7 +487,9 @@ pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path, onl
             cpu_seconds()? - cpu,
             wall.elapsed().as_secs_f64()
         );
-        let candidates: Vec<_> = needs.iter().map(|need| {
+        let candidates: Vec<_> = needs
+            .iter()
+            .map(|need| {
                 let mut docs = need.candidates(&lists, &live_ids);
                 docs.extend(live_ids.iter().filter(|&&doc| !snapshot.contains(doc)));
                 docs.sort_unstable();
@@ -444,7 +506,8 @@ pub(crate) fn run(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path, onl
     }
     println!(
         "correctness shipped_and_variants={} queries={} missed_matches=0",
-        variants.len() + 1, samples.len()
+        variants.len() + 1,
+        samples.len()
     );
     Ok(())
 }
