@@ -115,6 +115,7 @@ struct Sample {
     records: u64,
     bucket: usize,
     verified_bucket: usize,
+    readable_verified: usize,
 }
 
 /// `only`, when not empty, names the classes to run.
@@ -257,7 +258,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                 std::time::SystemTime::now(),
             )?;
             let diagnostic = once(&catalog, &names, &content, &query, snapshot.as_ref())?;
-            for doc in &diagnostic.verified_docs {
+            for doc in &diagnostic.attempted_docs {
                 let file = if let Some(snapshot) = &snapshot {
                     File::open(snapshot.path(*doc)).ok()
                 } else {
@@ -311,6 +312,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                     .max(),
             );
             samples.push(Sample {
+                readable_verified: warm.verified_docs.len(),
                 bucket,
                 verified_bucket,
                 evicted,
@@ -342,10 +344,12 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                     let mut cold: Vec<_> = subset.iter().map(|s| ms(s.evicted)).collect();
                     let mut verified: Vec<_> =
                         subset.iter().map(|s| s.report.verified as f64).collect();
+                    let mut readable: Vec<_> =
+                        subset.iter().map(|s| s.readable_verified as f64).collect();
                     let mut records: Vec<_> = subset.iter().map(|s| s.records as f64).collect();
                     let mut reads: Vec<_> = subset.iter().map(|s| s.read_bytes as f64).collect();
                     println!(
-                        "d65_size class={class} partition={} bucket={label} n={} warm_median_ms={:.4} warm_p90_ms={:.4} cold_median_ms={:.4} cold_p90_ms={:.4} verified_median={:.1} verified_p90={:.1} records_median={:.1} records_p90={:.1} read_bytes_median={:.0}",
+                        "d65_size class={class} partition={} bucket={label} n={} warm_median_ms={:.4} warm_p90_ms={:.4} cold_median_ms={:.4} cold_p90_ms={:.4} verified_median={:.1} verified_p90={:.1} records_median={:.1} records_p90={:.1} read_bytes_median={:.0} readable_verified_median={:.1} readable_verified_p90={:.1}",
                         if actual { "verified" } else { "reference" },
                         subset.len(),
                         quantile(&mut warm, 0.5),
@@ -356,7 +360,9 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
                         quantile(&mut verified, 0.9),
                         quantile(&mut records, 0.5),
                         quantile(&mut records, 0.9),
-                        quantile(&mut reads, 0.5)
+                        quantile(&mut reads, 0.5),
+                        quantile(&mut readable, 0.5),
+                        quantile(&mut readable, 0.9)
                     );
                 }
             }
@@ -482,6 +488,7 @@ pub(crate) struct Once {
     pub(crate) read: Duration,
     pub(crate) read_bytes: u64,
     pub(crate) verified_docs: std::collections::BTreeSet<u32>,
+    pub(crate) attempted_docs: std::collections::BTreeSet<u32>,
 }
 
 /// One run of `query`, rows counted.
@@ -495,13 +502,14 @@ pub(crate) fn once(
     let (mut read, mut read_bytes) = (Duration::ZERO, 0u64);
     let mut path = Vec::new();
     let mut verified_docs = std::collections::BTreeSet::new();
+    let mut attempted_docs = std::collections::BTreeSet::new();
     let mut reader = |name: NameId, request: ferret_query::ReadRequest<'_>| {
         let start = Instant::now();
         if !matches!(request, ferret_query::ReadRequest::Stat)
             && let Target::Inode(inode) = catalog.name(name).target()
             && let Some(doc) = catalog.doc(inode)
         {
-            verified_docs.insert(doc.0);
+            attempted_docs.insert(doc.0);
         }
         if let Some(snapshot) = snapshot {
             let doc = match catalog.name(name).target() {
@@ -522,6 +530,7 @@ pub(crate) fn once(
                         Some(offset),
                         &mut bytes,
                     )?;
+                    verified_docs.insert(doc.0);
                     read_bytes += bytes.len() as u64;
                     read += start.elapsed();
                     return ferret_index::segment::token_at(&bytes, window, offset, term)
@@ -531,6 +540,7 @@ pub(crate) fn once(
                     .ok()
                     .map(|_| ferret_query::ReadVersion::Catalogued),
                 ferret_query::ReadRequest::Bytes(out) => fs::read(path).ok().map(|bytes| {
+                    verified_docs.insert(doc.0);
                     read_bytes += bytes.len() as u64;
                     *out = bytes;
                     ferret_query::ReadVersion::Catalogued
@@ -554,6 +564,7 @@ pub(crate) fn once(
                     Some(offset),
                     &mut bytes,
                 )?;
+                verified_docs.insert(doc.0);
                 read_bytes += bytes.len() as u64;
                 read += start.elapsed();
                 return ferret_index::segment::token_at(&bytes, window, offset, term)
@@ -570,6 +581,11 @@ pub(crate) fn once(
             ferret_query::ReadRequest::Bytes(out) => {
                 let version = read_current_name(catalog, name, &mut path, out);
                 if version.is_some() {
+                    if let Target::Inode(inode) = catalog.name(name).target()
+                        && let Some(doc) = catalog.doc(inode)
+                    {
+                        verified_docs.insert(doc.0);
+                    }
                     read_bytes += out.len() as u64;
                 }
                 version
@@ -599,6 +615,7 @@ pub(crate) fn once(
         read,
         read_bytes,
         verified_docs,
+        attempted_docs,
     })
 }
 

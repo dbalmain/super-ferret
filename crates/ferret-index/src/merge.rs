@@ -35,6 +35,8 @@ use crate::manifest::SegmentEntry;
 use crate::segment::{Hit, ReadAt, ReadError, Segment, Sizes, TermEntry, Terms, Writer};
 use crate::store::{Error, Point, hit};
 
+mod graduation;
+
 /// Segments merged at once, and per tier before the next tier up.
 pub const MERGE_FACTOR: usize = 10;
 
@@ -122,6 +124,13 @@ pub fn stream_verified<R: ReadAt>(
     use crate::segment::{GRADUATION_CODEC, OFFSET_CODEC, verify_record};
     let graduate = matches!(writer.codec(), GRADUATION_CODEC | OFFSET_CODEC);
     let offsets = writer.codec() == OFFSET_CODEC;
+    let mut batch = if writer.codec() == GRADUATION_CODEC {
+        graduation::collect(inputs, live, read, cancelled)?
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .peekable();
     let mut graduated = HashSet::new();
     let mut bytes = Vec::new();
     let mut cursors: Vec<Terms<'_, R>> = inputs.iter().map(Segment::terms).collect();
@@ -166,7 +175,18 @@ pub fn stream_verified<R: ReadAt>(
             }
         }
         let mut confirmed = Vec::new();
-        if graduate {
+        while batch
+            .peek()
+            .is_some_and(|occurrence| occurrence.term.as_ref() == term)
+        {
+            if let Some(occurrence) = batch.next() {
+                docs.push(occurrence.record.doc);
+                if occurrence.removable {
+                    confirmed.push(occurrence.record.key());
+                }
+            }
+        }
+        if offsets {
             for input in inputs {
                 for record in input.fingerprint_hits_until(&term, cancelled)? {
                     if !live.contains(record.doc) {
@@ -187,6 +207,8 @@ pub fn stream_verified<R: ReadAt>(
                     }
                 }
             }
+        }
+        if graduate {
             docs.sort_unstable();
             docs.dedup();
         }

@@ -268,17 +268,40 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
         Some(window)
     };
     // 2. Merge to steady state.
+    let io_start = io_counters()?;
     let cpu_start = crate::segment_build::cpu_seconds()?;
     let start = Instant::now();
     let (mut merges, mut merge_read, mut merge_written) = (0u64, 0u64, 0u64);
+    let (mut demoted, mut purged, mut graduated) = (0u64, 0u64, 0u64);
     while let Some(merged) =
         writer.merge_if_needed_verified(&view, &Budget::unbounded(), &mut reader)?
     {
         crate::trigram::check_disk()?;
         merges += 1;
+        demoted += merged.records_added;
+        purged += merged.records_removed;
+        graduated += merged.records_graduated;
         merge_read += merged.read;
         merge_written += merged.written;
     }
+    let io_end = io_counters()?;
+    line(
+        &mut report,
+        "steady_rchar_bytes",
+        (io_end.0 - io_start.0).to_string(),
+    );
+    line(
+        &mut report,
+        "steady_device_read_bytes",
+        (io_end.1 - io_start.1).to_string(),
+    );
+    line(&mut report, "steady_records_demoted", demoted.to_string());
+    line(&mut report, "steady_records_purged", purged.to_string());
+    line(
+        &mut report,
+        "steady_records_graduated",
+        graduated.to_string(),
+    );
     line(&mut report, "steady_merges", merges.to_string());
     line(
         &mut report,
@@ -322,9 +345,25 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     }
     crate::trigram::check_disk()?;
     // 3. One forced full merge.
+    let io_start = io_counters()?;
     let cpu_start = crate::segment_build::cpu_seconds()?;
     let start = Instant::now();
     if let Some(merged) = writer.merge_all_verified(&view, &Budget::unbounded(), &mut reader)? {
+        line(
+            &mut report,
+            "full_records_demoted",
+            merged.records_added.to_string(),
+        );
+        line(
+            &mut report,
+            "full_records_purged",
+            merged.records_removed.to_string(),
+        );
+        line(
+            &mut report,
+            "full_records_graduated",
+            merged.records_graduated.to_string(),
+        );
         line(&mut report, "full_merge_inputs", merged.inputs.to_string());
         line(
             &mut report,
@@ -332,6 +371,17 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
             merged.read.to_string(),
         );
     }
+    let io_end = io_counters()?;
+    line(
+        &mut report,
+        "full_rchar_bytes",
+        (io_end.0 - io_start.0).to_string(),
+    );
+    line(
+        &mut report,
+        "full_device_read_bytes",
+        (io_end.1 - io_start.1).to_string(),
+    );
     line(
         &mut report,
         "full_merge_seconds",

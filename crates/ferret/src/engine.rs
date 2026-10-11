@@ -325,7 +325,8 @@ impl Engine {
                 };
                 Some(ferret_index::segment::Window {
                     start,
-                    complete: offset.is_none(),
+                    complete: offset.is_none()
+                        || start == 0 && bytes.len() as u64 == view.size(view.name(name).child),
                 })
             },
         );
@@ -529,7 +530,8 @@ impl QuerySession {
                         &bytes,
                         ferret_index::segment::Window {
                             start,
-                            complete: false,
+                            complete: start == 0
+                                && bytes.len() as u64 == catalog.size(catalog.name(name).child),
                         },
                         offset,
                         term,

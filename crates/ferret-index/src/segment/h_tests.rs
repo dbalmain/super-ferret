@@ -827,3 +827,38 @@ fn truncated_utf8_window_cannot_invent_a_certain_token() {
         b"needle"
     ));
 }
+
+#[test]
+fn c2_batches_large_document_checks_through_the_real_merge() {
+    let _arm = Arm::new(GRADUATION_CODEC);
+    let terms = [b"alpha".as_slice(), b"beta", b"gamma"];
+    let first = build(0, 0, &terms.iter().map(|t| (t.to_vec(), vec![0])).collect());
+    let second = build(
+        1,
+        2,
+        &terms.iter().map(|t| (t.to_vec(), vec![1, 2])).collect(),
+    );
+    let mut reads = 0;
+    let mut reader = |doc: u32, offset: Option<u32>, bytes: &mut Vec<u8>| {
+        assert_eq!((doc, offset), (0, None));
+        reads += 1;
+        *bytes = b"alpha beta gamma".to_vec();
+        Some(Window {
+            start: 0,
+            complete: true,
+        })
+    };
+    let (output, sizes) = merged_verified(&[first, second], &DocSet::new(3, 0..3), &mut reader);
+    assert_eq!(reads, 1);
+    assert_eq!(sizes.records_graduated, 3);
+    for term in terms {
+        assert_eq!(
+            candidates(std::slice::from_ref(&output), term),
+            [
+                (0, Certainty::Yes),
+                (1, Certainty::Yes),
+                (2, Certainty::Yes)
+            ]
+        );
+    }
+}
