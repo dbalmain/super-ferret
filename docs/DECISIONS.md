@@ -81,7 +81,7 @@ Predecessors, carried forward where still open:
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read | open          | rec A: the index follows the catalog in DocId order; new content is read twice (S2 M0)                         |
 | D64 | Segment bytes: positional reads or `mmap`                | open           | rec A: positional reads into owned buffers; block indexes resident; no `unsafe` (S2 M0)                        |
 | D65 | The term dictionary is 87% of the index                  | open           | S3 M2 measured H: 53% smaller at steady state; rule fails on a stale-catalog floor that also fails the control; churn +10%; rec C: run codec, then re-measure |
-| D66 | Phrase queries read too much: positions, or not         | open           | rec A: no positions; ship windowed verify. S3 M6 chunk census (heuristic, corrected in review): p90 cut 8–22%, far below 50%, so C is parked |
+| D66 | Phrase queries read too much: positions, or not         | answered       | D: per-document Bloom 8 over adjacent pairs, pairs only, streaming fold; agent transcripts out of the content index                          |
 | D67 | How `ferret search` spells a content regex, and when it refuses | open | rec (a) A: `grep:REGEX`, case-insensitive, multi-line; (b) i: refuse on conservative Maybe estimate, `--scan` overrides (S3 M0) |
 | D68 | Per-document filters: a screening stage, terms and trigrams separately | open | rec B, confirmed by M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower unless held in memory (S3 M0, M1b) |
 | D69 | Saturated large documents in trigram postings           | open           | rec A, confirmed by M1b: >16k keys = 54% of pairs but 154–437 ms warm verify; ≥64k fast but 13–17% of pairs (S3 M0, M1b) |
@@ -3809,7 +3809,8 @@ cost, and A stands.
 
 ## D66 — Phrase queries read too much: positions, or not
 
-**Status: open.** S2 M4c, 2026-10-07;
+**Status: answered, D: a per-document Bloom 8 pair filter (Dave, 2026-10-11).**
+S2 M4c, 2026-10-07;
 [measurements](S2.md#m4--cursors-planner-and-ferret-search-text).
 
 **Question:** Two-word phrase queries on your `$HOME` take 0.7 s at the median
@@ -3894,6 +3895,76 @@ size comes near the cut, so D66 C is parked, not closed.** Two caveats:
 Recommendation A stands. **Fact that would change it:** phrase reads
 concentrated in a few huge files, for example after a `jsonl` policy change.
 Then the large-file cut would decide it, so re-run the census.
+
+### D66 update — per-document pair fingerprints (2026-10-09 to 2026-10-11)
+
+**Answered: D, below (Dave, 2026-10-11).** Measured in its own repo,
+`dbalmain/pair-fp-bench` (private), on msa2, geekom and p16s. The questions and
+answers were kept on an
+[options page](https://claude.ai/artifact/J8m565JvH3q7nkCrRnHRPg) and are
+summarised here.
+
+**Option D.** Each document stores a Bloom filter of its adjacent-unit pairs.
+Units are the tokenizer's identifier parts, case-folded and capped; each pair
+hashes to 64 bits. The filter has 8 bits per distinct pair and k = round(8 ln 2)
+= 6 probes. A phrase query probes each candidate's filter for the phrase's pairs
+and verifies only the documents that pass. It is sound: a document that contains
+the phrase contains all its pairs. Verification stays as in A.
+
+**Measured.** Workload C is 200 real multi-word patterns mined from agent
+transcripts, one pinned core, filters held in memory, p90 per query:
+
+| Workload C, p90                   | geekom warm | geekom evicted | msa2 warm | msa2 evicted |
+| --------------------------------- | ----------: | -------------: | --------: | -----------: |
+| Verify every candidate (A, today) |      922 ms |         3.18 s |    2.46 s |       8.13 s |
+| Bloom 8, then verify              |      121 ms |         691 ms |    293 ms |       1.20 s |
+| Transcripts out, verify every one |      748 ms |         1.97 s |    1.02 s |       3.12 s |
+| **Transcripts out, Bloom 8**      |   **19 ms** |      **69 ms** | **61 ms** |   **171 ms** |
+| Transcripts out, binary fuse 8    |      8.8 ms |          52 ms |     39 ms |       139 ms |
+
+- **Size:** Bloom 8 is 236 MB on msa2's `$HOME` (112k documents, 3.9 GB of
+  text), 60% of the 392 MB merged index. That fails D66's "at most 10% more
+  index", and the bar is relaxed for it: the p90 cut is 85–98%.
+- **Probing** costs under 0.6 ms a query. Verify costs 1.4–1.7 ms/MB warm and
+  4.4–4.5 ms/MB evicted on both machines.
+- **Build:** 41 ns/byte for pair keys plus Bloom 8 in the bench, an upper bound
+  because its fold allocates per unit (see Q6 below).
+- **Accuracy:** within 7–9% of a perfect pair filter at p90. Bloom 8's measured
+  false-positive rate is 2.2%, as the formula predicts.
+
+**Sub-decisions** (Dave, 2026-10-10 and 2026-10-11):
+
+- **Filter: Bloom 8.** Binary fuse 8 reads 2–5% less at p90 for 25–30% more
+  bytes (1.25–1.30 B/key measured, against Bloom 8's 1.00). It wins at equal
+  bytes, but Bloom 8 is chosen for size. **Fact that would change it:** index
+  size ceasing to matter; then take fuse 8.
+- **Agent transcripts are not in the content index for now** (`.codex/sessions`,
+  `.grok/sessions`, `projects` under `.claude*`). They are large append-only
+  JSONL files where nearly every pair occurs, so whole-file filters barely
+  reject them. Structured logs get their own index and query language later, in
+  the planned VictoriaLogs alternative. Chunking transcripts into 64 KiB runs of
+  lines was measured as evidence for that index. It cut transcript reads 2.4–6×
+  and lost no matches across 9,250 A and 34,489 C matches on p16s.
+- **Pairs only.** Adding triples removes long-phrase sequence false positives
+  (workload B, 3 units: p90 1.13 GB → 64 MB). But it costs 2.5× the keys, and
+  real queries gain only 4–16%.
+- **Pair keys come from a streaming fold.** Each unit is hashed as it is read,
+  and only the previous unit's hash is kept, so there is no per-unit allocation.
+
+**Measured and not pursued:**
+
+- **Filtering only large files:** files of 64 KiB and up still need 81% of the
+  keys, and C's p90 gets 10% worse. The bytes worth rejecting are in files of 64
+  KiB to 1 MiB.
+- **df pruning:** dropping pairs in 1,000+ documents saves 8.7% of keys and more
+  than doubles A's p90.
+- **A per-document bitset for the 64–4,096 most common pairs,** taken only where
+  it saves bytes: 0.14–1.97% smaller (0.41% at 256 bits). The key mass is in the
+  long tail.
+
+B (positions) stays rejected on size, and C (chunk map) stays parked. **Fact
+that would change D:** a hard index-size budget near the 392 MB index. Then take
+A, and make the verifier parallel first.
 
 ## D67 — How `ferret search` spells a content regex, and when it refuses
 
