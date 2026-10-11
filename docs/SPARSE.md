@@ -280,8 +280,10 @@ Rare total median/p90 is **2,952.403/3,664.757 ms cold and 244.707/297.236 ms wa
 for shipped trigrams, versus **113.599/299.366 ms cold and 13.465/30.035 ms warm**
 for word-four. Rare posting read median/p90 is 24,576/45,056 bytes versus
 20,480/36,864 bytes. Word-four reproduces its 688,833,945-byte encoded segment
-exactly; its owned file was removed after all measurements passed. Word 4+5 is
-now building in 32 bounded partitions. The final recommendation awaits it.
+exactly; its owned file was removed after all measurements passed. Word 4+5
+finished its 32-partition build with 68,638,052 keys, 1,221,311,876 posting bytes
+and 1,607,232,467 total bytes, exactly matching the volume experiment. Its first
+120 cold/warm query pairs passed; the final recommendation awaits the rest.
 
 The first word-four attempt stopped at the 5 GB floor after 150 query pairs.
 Its owned index was removed and its unemitted partial timings discarded. Dave
