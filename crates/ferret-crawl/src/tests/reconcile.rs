@@ -640,8 +640,7 @@ fn reopening_session_preserves_document_hash_holes_and_never_resurrects_docids()
 
 #[test]
 fn compact_equal_observation_joins_a_new_alias_before_conflict_resolution() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use ferret_catalog::ContentState;
 
@@ -649,8 +648,8 @@ fn compact_equal_observation_joins_a_new_alias_before_conflict_resolution() {
     use crate::index::Probe;
 
     let tmp = Tmp::new("recrawl-compact-alias-conflict");
-    tmp.write("a", b"content");
-    fs::create_dir(tmp.at("z")).unwrap();
+    tmp.write("d/a", b"content");
+    tmp.write("side/a", b"content");
     let roots = [tmp.tree()];
     let opts = IndexOptions {
         workers: 1,
@@ -659,29 +658,42 @@ fn compact_equal_observation_joins_a_new_alias_before_conflict_resolution() {
     index(&tmp.cat(), &roots, Refresh::All, &opts).unwrap();
     let mut session = super::log_session(&tmp.cat()).unwrap();
     let old = session.view();
-    let id = file(&old, &roots[0], b"a");
-    let changed = Arc::new(AtomicBool::new(false));
+    let carried = Arc::new(Mutex::new(None));
     let tree = tmp.tree();
     let hook = Hook::set(&tree, {
         let tree = tree.clone();
-        let changed = Arc::clone(&changed);
+        let carried = Arc::clone(&carried);
         move |probe| {
-            if let Probe::Carried(path) = probe
-                && path == Path::new("a")
-                && !changed.swap(true, Ordering::SeqCst)
-            {
-                fs::hard_link(tree.join("a"), tree.join("z/alias")).unwrap();
+            if let Probe::Carried(path) = probe {
+                let mut carried = carried.lock().unwrap();
+                if carried.is_none() {
+                    let (source, pending) = match path.to_str().unwrap() {
+                        "d/a" => ("d", "side"),
+                        "side/a" => ("side", "d"),
+                        _ => panic!("unexpected carried path: {path:?}"),
+                    };
+                    // With one worker, the other directory has not been
+                    // listed yet. Creating an alias in a fixed sibling
+                    // would miss it whenever readdir visited that one first.
+                    fs::hard_link(tree.join(path), tree.join(pending).join("alias")).unwrap();
+                    *carried = Some(source);
+                }
             }
         }
     });
     recrawl(&mut session, &roots, Refresh::All, &opts).unwrap();
     drop(hook);
-    assert!(changed.load(Ordering::SeqCst));
+    let source = carried.lock().unwrap().expect("a compact row was carried");
+    let source_file = |c: &Catalog| {
+        let parent = file(c, &roots[0], source.as_bytes());
+        c.name(c.lookup(parent, b"a").unwrap()).child
+    };
+    let id = source_file(&old);
     let current = session.view();
     // The old single-name row was fully equal and compacted. The new alias
     // observes nlink/ctime after the mutation. Omitting the compact row from
     // the residue would publish Hashed instead of the required shared Fault.
-    assert_eq!(file(&current, &roots[0], b"a"), id);
+    assert_eq!(source_file(&current), id);
     assert_eq!(current.state(id), ContentState::Fault);
     assert_eq!(current.doc(id), None);
     assert_eq!(session.name_references(id), 2);
