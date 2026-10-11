@@ -271,7 +271,7 @@ for both temperatures, with missing snapshot documents admitted conservatively.
 The file-backed harness and four regressions are implemented. Formatting,
 workspace clippy with warnings denied, and workspace tests pass: **945 passed /
 13 ignored**, zero Rust warnings. The release rebuild passed and the protected
-foreground run is active. Oracle preparation matched the previous population
+first foreground run stopped at the disk floor. Oracle preparation matched the previous population
 (112,382 live, 112,376 readable, 3,978,812,718 readable bytes, 250 queries),
 taking 506.480 CPU seconds / 514.659 wall seconds. All 250 shipped cold/warm query pairs passed candidate and oracle identity
 checks. Their 40 complete class/cache/band rows are in
@@ -288,3 +288,8 @@ files were deleted. Resumption needs room for the 1.61 GB word 4+5 segment plus
 the 5 GB floor (prefer at least 8 GB free). Initial
 disk headroom was about 14 GiB, about 11 GiB after rebuilding test artifacts;
 stop below 5 GB. No Cargo manifests or lockfiles changed.
+
+Disk resumption: Dave freed storage; the preflight now reports 69 GiB free.
+Resume only word-four and word 4+5, retaining the complete shipped baseline.
+The partial word-four attempt has no emitted timings, so it requires a full
+query replay. The existing release binary and validated source are unchanged.
