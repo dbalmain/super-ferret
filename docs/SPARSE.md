@@ -150,7 +150,7 @@ The last band is empty on this policy-filtered corpus. Band medians are not
 additive. The aggregate artifact retains both smaller bands for every class
 and layout.
 
-## Interpretation and decision brief
+## Volume interpretation and initial decision brief
 
 Question: which screen should follow D17's instruction to measure candidate
 screening before changing the regex engine?
@@ -183,7 +183,7 @@ Options, with costs and buys:
   alternation/code medians. Identifier headline volumes remain equal to
   word-four. The CPU comparison includes its bounded builder's extra passes.
 
-**Recommendation:** advance **word four plus five** to a posting-read and
+**Initial recommendation (before latency):** advance **word four plus five** to a posting-read and
 verification-latency experiment; use word-four as the smaller-storage comparison.
 Keep the product unchanged until that measurement supports an index policy.
 Do not advance full sparse augmentation, cap 32, or raw fixed-8 on this evidence.
@@ -207,7 +207,7 @@ additional 876 MiB over word-four. Candidate volumes alone do not establish
 latency, and one refreshed developer corpus does not establish a general
 production policy.
 
-## Validation and run notes
+## Volume validation and run notes
 
 Pinned formatting, full workspace clippy with warnings denied, and full
 workspace tests pass: **941 passed / 13 ignored**, **zero Rust warnings**
@@ -239,56 +239,152 @@ target/release/ferret-bench sparse /tmp/d65c/catalog /tmp/d65c/control /tmp/d65c
 An optional comma-separated label list selects only named layouts, e.g.
 `fixed-8,word-fixed-4,word-fixed-4+5`. Unknown labels fail before corpus access.
 
-## Latency (follow-up in progress)
+## Latency
 
-Question: does the candidate-volume gain survive real posting reads and regex
-verification? Measure shipped four-child trigrams, word-four and word 4+5 on
-the same D65C snapshot and 250 regexes. This remains measurement only.
+The rare-literal volume gain becomes execution-time gain. Against shipped
+trigrams, word 4+5 cuts rare **p90 total time 87.0× cold and
+99.1× warm**, versus the earlier 68.6× conservative candidate-byte
+p90 reduction. Word-four buys 12.2× / 9.9× cold/warm p90 reductions
+with the smaller index. Longer keys add whole-index storage; their selected
+posting reads do not erase the verification savings. Rare posting bytes
+actually fall from 24/44 KiB to 16/24 KiB median/p90: longer keys do not imply
+longer selected lists. Identifier p90 posting bytes rise from 84 to 112 KiB,
+but the posting phase remains small beside verification.
 
-Use complete codec-1 segments, one intermediate layout at a time, deleting
-only files this experiment creates. Reuse the real segment reader and posting
-cursors, including checksum-aligned reads and singleton inlining. Shipped
-selection comes from the public query explanation; experimental selection must
-match the existing volume experiment. Dictionary ranking and regex compilation
-are prepared outside timing; timed posting reads include selected dictionary
-lookups, checksums and cursor intersection.
+Same D65C catalog, paired control and frozen corpus as the volume experiment:
+112,382 live documents, 112,376 readable, 3,978,812,718 readable bytes, and 250
+regexes (50 per class). The completed trigram baseline was retained. Both word
+segments reproduced the volume experiment's key counts, posting bytes and total
+encoded bytes exactly. [Raw aggregates](measurements/sparse-latency.txt) contain
+**120 class/cache/band rows**, byte counts and nanosecond sums; no corpus text or
+individual document paths.
 
-Global cache dropping is unavailable for uid 1000. Cold runs therefore use
-`posix_fadvise(DONTNEED)` on the index and every surviving readable snapshot
-file, outside timing; warm runs immediately repeat the same query. Catalog,
-compiled regex and segment resident metadata stay resident. Report logical
-posting bytes actually requested, including checksum chunk amplification,
-separately from total index read bytes. Advisory eviction is not a cold boot.
+Cold uses **`posix_fadvise(DONTNEED)`**, since global cache dropping is unavailable
+for uid 1000. Before each cold query, evict the index and every surviving readable
+snapshot file, outside timing, then immediately repeat warm. This is advisory
+file-page eviction; catalog, compiled regex and segment metadata remain resident.
+There is one cold/warm pair per query. The baseline predates disk cleanup and the
+word runs follow it; these are serial measurements, not confidence intervals.
 
-Verification reads each surviving frozen document and applies the real regex.
-Record full-query posting, verification and total elapsed time. Attribute
-per-document verification work to the existing size bands; band totals include
-the shared posting phase plus that band's measured verification work, so they
-are not additive. Empty bands report zero verification and the shared posting
-cost. Verify candidate inclusion and exact matched DocIds against the oracle
-for both temperatures, with missing snapshot documents admitted conservatively.
+Each layout uses the production codec-1 segment writer, positional reader,
+checked postings and cursor intersection. Shipped selection comes from the public
+query explanation; word selection uses the volume experiment's four-child rule
+and full dictionary frequencies. Regex compilation and frequency ranking are
+prepared outside timing. Posting time includes selected dictionary lookup,
+checksum-aligned list reads and intersection. Warm rereads and decodes the same
+encoded lists rather than retaining decoded postings. Verification includes
+opening, reading, matching and freeing each surviving readable document. Total
+is the measured full execution of both phases plus their bookkeeping; it excludes
+preparation. Quantiles are computed separately, so phase quantiles need not sum
+to the total quantile.
 
-The file-backed harness and four regressions are implemented. The prior full
-formatting, clippy and test gates passed: **945 passed / 13 ignored**, zero
-Rust warnings. Source is unchanged at resumption; full gates will be refreshed
-after the timed work. No Cargo manifests or lockfiles changed.
+All entries below are **median/p90**, times in milliseconds. Posting bytes are
+whole verified chunks actually requested; index bytes also include dictionary
+reads. These are logical read bytes, including repeated chunks, not device
+sectors. Inline singletons consume dictionary bytes but zero posting bytes.
 
-Shipped trigrams and word-four each completed all 250 cold/warm query pairs,
-with zero missed matches or candidate identity differences. Their **80 complete
-class/cache/band rows** are in [the latency aggregates](measurements/sparse-latency.txt).
-Rare total median/p90 is **2,952.403/3,664.757 ms cold and 244.707/297.236 ms warm**
-for shipped trigrams, versus **113.599/299.366 ms cold and 13.465/30.035 ms warm**
-for word-four. Rare posting read median/p90 is 24,576/45,056 bytes versus
-20,480/36,864 bytes. Word-four reproduces its 688,833,945-byte encoded segment
-exactly; its owned file was removed after all measurements passed. Word 4+5
-finished its 32-partition build with 68,638,052 keys, 1,221,311,876 posting bytes
-and 1,607,232,467 total bytes, exactly matching the volume experiment. Its first
-120 cold/warm query pairs passed; the final recommendation awaits the rest.
+| Class | Screen | Cache | Posting ms | Verify ms | Total ms | Posting KiB | Index KiB |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| rare literal | trigrams | cold | 0.869/1.505 | 2951.365/3663.539 | 2952.403/3664.757 | 24/44 | 44/68 |
+| rare literal | trigrams | warm | 0.265/0.388 | 244.430/296.936 | 244.707/297.236 | 24/44 | 44/68 |
+| rare literal | word 4 | cold | 0.331/0.848 | 113.099/299.154 | 113.599/299.366 | 20/36 | 40/76 |
+| rare literal | word 4 | warm | 0.128/0.176 | 13.349/29.925 | 13.465/30.035 | 20/36 | 40/76 |
+| rare literal | word 4+5 | cold | 0.222/0.473 | 9.207/41.935 | 9.852/42.126 | 16/24 | 36/68 |
+| rare literal | word 4+5 | warm | 0.060/0.119 | 0.468/2.914 | 0.563/2.998 | 16/24 | 36/68 |
+| identifier pattern | trigrams | cold | 3.651/6.930 | 6644.977/8615.793 | 6649.651/8621.766 | 68/84 | 88/112 |
+| identifier pattern | trigrams | warm | 1.377/2.999 | 500.925/625.998 | 502.260/629.330 | 68/84 | 88/112 |
+| identifier pattern | word 4 | cold | 1.670/6.208 | 4616.435/7209.410 | 4617.481/7215.559 | 72/120 | 96/160 |
+| identifier pattern | word 4 | warm | 0.891/2.613 | 396.916/582.023 | 397.641/585.408 | 72/120 | 96/160 |
+| identifier pattern | word 4+5 | cold | 1.671/5.960 | 4542.545/7142.478 | 4544.362/7149.640 | 72/112 | 92/160 |
+| identifier pattern | word 4+5 | warm | 0.915/2.789 | 400.972/597.515 | 401.742/599.912 | 72/112 | 92/160 |
+| alternation | trigrams | cold | 10.064/15.601 | 8980.500/10639.372 | 8992.090/10650.757 | 180/252 | 232/324 |
+| alternation | trigrams | warm | 3.961/6.263 | 541.844/654.405 | 544.304/659.544 | 180/252 | 232/324 |
+| alternation | word 4 | cold | 6.092/8.146 | 5884.819/8553.479 | 5890.445/8564.776 | 136/164 | 200/240 |
+| alternation | word 4 | warm | 2.045/3.744 | 351.002/447.597 | 352.853/452.062 | 136/164 | 200/240 |
+| alternation | word 4+5 | cold | 5.298/8.393 | 5482.179/8651.491 | 5484.930/8659.648 | 112/140 | 176/208 |
+| alternation | word 4+5 | warm | 1.739/3.431 | 299.711/406.701 | 301.555/409.051 | 112/140 | 176/208 |
+| broad | trigrams | cold | 5.107/6.209 | 11210.190/11634.707 | 11212.788/11640.375 | 20/28 | 24/40 |
+| broad | trigrams | warm | 2.154/3.323 | 837.953/1061.850 | 840.381/1063.889 | 20/28 | 24/40 |
+| broad | word 4 | cold | 5.109/6.225 | 10985.289/11455.422 | 10990.092/11460.823 | 20/28 | 24/44 |
+| broad | word 4 | warm | 2.082/2.929 | 883.305/1049.081 | 886.025/1051.912 | 20/28 | 24/44 |
+| broad | word 4+5 | cold | 5.193/5.824 | 11158.808/11602.682 | 11164.002/11608.059 | 20/28 | 24/44 |
+| broad | word 4+5 | warm | 2.059/2.786 | 878.344/1026.936 | 880.458/1028.993 | 20/28 | 24/44 |
+| code class | trigrams | cold | 2.744/6.242 | 11659.059/13894.782 | 11664.175/13902.867 | 60/76 | 76/104 |
+| code class | trigrams | warm | 1.243/2.817 | 5393.505/6669.222 | 5393.946/6670.787 | 60/76 | 76/104 |
+| code class | word 4 | cold | 1.458/4.926 | 6200.807/9822.370 | 6202.369/9826.578 | 44/84 | 64/124 |
+| code class | word 4 | warm | 0.708/1.760 | 3064.723/4117.411 | 3065.319/4117.943 | 44/84 | 64/124 |
+| code class | word 4+5 | cold | 1.201/4.602 | 5637.659/8917.440 | 5638.349/8922.044 | 40/88 | 60/144 |
+| code class | word 4+5 | warm | 0.541/1.407 | 2550.537/3531.906 | 2551.578/3532.550 | 40/88 | 60/144 |
 
-The first word-four attempt stopped at the 5 GB floor after 150 query pairs.
-Its owned index was removed and its unemitted partial timings discarded. Dave
-freed storage; the restarted job reran only the missing word layouts, preserving
-the complete shipped baseline. The new oracle pass reproduced 112,382 live /
-112,376 readable documents, 3,978,812,718 readable bytes and 250 queries in
-509.830 CPU seconds / 512.101 wall seconds. Disk was 69 GiB at resumption and
-73 GiB at the word-four checkpoint; stop below 5 GB. No other files were deleted.
+The same size bands are in the raw report: below 1 MiB, 1–16 MiB and at least
+16 MiB. Verification is attributed from each full query's per-document work.
+Each band repeats the shared posting phase and adds its own verification, so
+band totals and posting bytes are not additive. No surviving readable candidates
+occur in the largest band. The six missing snapshot documents remain conservative
+candidates and contribute candidate sizes but no verified bytes or oracle matches.
+For rare literals, the 1–16 MiB band's verification median/p90 is
+1887.229/2266.023 ms cold / 165.045/197.124 ms warm with trigrams,
+111.510/275.145 / 13.022/27.659 with word-four, and
+6.179/39.858 / 0.368/2.714 with word 4+5.
+
+Question: which longer-key screen should advance after measuring actual posting
+reads and surviving verification for D17's rare-literal problem?
+
+Options, with costs and buys (whole-index and build CPU from the volume run):
+
+- **Keep shipped trigrams:** 273 MiB / 22.31 CPU seconds, no extra index cost.
+  Rare total p90 is 3664.757 ms cold / 297.236 ms warm.
+  Verification dominates; this leaves the measured false-candidate problem.
+- **Word four:** 657 MiB / 336.81 CPU seconds. Rare total p90 falls to
+  299.366 / 30.035 ms, with improvements for identifier,
+  alternation and code classes. It is the lower-storage comparison and preserves
+  all raw-trigram fallback coverage.
+- **Word four plus five:** 1,533 MiB / 884.15 CPU seconds, **876 MiB more** than
+  word-four. Rare total p90 falls again to 42.126 / 2.998 ms.
+  Its main extra buy is the rare-literal tail; the broader classes gain less.
+  Across the deliberately balanced 250-query set, mean total time is
+  8575.8/1539.2 ms cold/warm for trigrams,
+  5862.4/937.2 for word-four, and
+  5747.0/834.6 for word 4+5. These means are not workload weights.
+
+**Recommendation:** advance **word 4+5 to a controlled prototype that runs
+complete rare-literal queries**, with word-four retained as the option for
+a smaller storage budget.
+This measurement supports the rare-screening direction: the additional posting
+reads do not consume the gain. Include frequency planning, resident metadata
+and a representative query mix in that prototype before choosing a product
+index policy. Broad candidate volumes remain identical and their timing
+variation is a control for run noise; longer grams cannot improve facts that
+remain only three bytes. Keep regex-engine work behind the remaining screening
+measurements. The product is unchanged in this slice.
+
+**Fact that would change it:** a representative query log showing word-four
+already meets the latency target and few queries benefit from five-byte facts;
+then its 876 MiB saving should decide the policy. Planning costs that consume
+the extra rare-literal gain would likewise favour word-four. One developer
+corpus and prepared execution phases do not establish an unconditional default.
+
+Validation: all **250 queries × three layouts × two temperatures = 1,500**
+completed-run checks include every readable oracle match and return exactly the
+oracle's matched DocIds. File-backed candidates also equal the real volume
+planner's identities; aggregate candidate/read/oracle bytes equal the original
+volume rows. Cold/warm read counts and size-band accounting pass. Formatting,
+workspace clippy with warnings denied and full workspace tests pass:
+**945 passed / 13 ignored**, zero Rust warnings (four latency regressions added).
+
+The initial word-four run stopped at the 5 GB disk floor after 150 query pairs;
+its owned file was cleaned up and unemitted timings discarded. After Dave freed
+storage, only the two missing word layouts were rerun, preserving the completed
+baseline. Preflight checked all three benchmark process names; one benchmark
+ran at a time with hangup protection and a foreground `while kill -0` wait.
+The resumed job finished successfully; both owned intermediate segments were
+removed. Disk headroom was 69 GiB at resumption and 73 GiB at completion. No
+other files were deleted. No Cargo manifests or lockfiles changed, and no
+pushes or agent CLI launches occurred.
+
+Reproduce all layouts after the same host preflight, or pass the optional
+comma-separated labels to run only the missing layouts:
+
+```sh
+target/release/ferret-bench sparse-latency /tmp/d65c/catalog /tmp/d65c/control /tmp/d65c/corpus /tmp/sparse-latency
+```
