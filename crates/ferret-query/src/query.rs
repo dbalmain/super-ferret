@@ -113,8 +113,10 @@ pub enum ParseError {
     Nul(Vec<u8>),
     /// `text:` whose argument holds no token: nothing to search for.
     Text(String),
-    /// `OR` or `NOT` (the operator) without a query on a side it needs.
+    /// An operator without a query on a side it needs.
     Dangling(&'static str),
+    /// One argument contains an operator and a later atom prefix (D71).
+    EmbeddedOperator(String),
     /// A `(` that no `)` closes.
     Unclosed,
     /// A `)` that no `(` opened.
@@ -146,6 +148,10 @@ impl fmt::Display for ParseError {
             Self::Text(a) => write!(f, "`{a}`: text: needs a letter or digit to search for"),
             Self::Dangling("NOT") => write!(f, "`NOT` needs a query after it"),
             Self::Dangling(op) => write!(f, "`{op}` needs a query on each side"),
+            Self::EmbeddedOperator(a) => write!(
+                f,
+                "`{a}` contains an operator and another atom prefix; pass the query as separate arguments"
+            ),
             Self::Unclosed => write!(f, "a `(` is not closed by a `)`"),
             Self::Unopened => write!(f, "a `)` has no `(` before it"),
             Self::EmptyGroup => write!(f, "`( )` holds no query"),
@@ -183,9 +189,15 @@ impl Query {
             if arg.contains(&0) {
                 return Err(ParseError::Nul(arg.to_vec()));
             }
+            if embedded_operator(arg) {
+                return Err(ParseError::EmbeddedOperator(
+                    String::from_utf8_lossy(arg).into_owned(),
+                ));
+            }
             tokens.push(match arg {
-                b"OR" => Token::Or,
-                b"NOT" => Token::Not,
+                _ if arg.eq_ignore_ascii_case(b"AND") => Token::And,
+                _ if arg.eq_ignore_ascii_case(b"OR") => Token::Or,
+                _ if arg.eq_ignore_ascii_case(b"NOT") => Token::Not,
                 b"(" => Token::Open,
                 b")" => Token::Close,
                 _ => {
@@ -357,6 +369,34 @@ enum Atom {
     Content(ContentAtom),
 }
 
+/// Shell quotes are already gone. An operator word alone is valid phrase
+/// content; a later atom prefix distinguishes an embedded query (D71 A).
+fn embedded_operator(arg: &[u8]) -> bool {
+    let words = || arg.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty());
+    words().any(|w| {
+        [b"AND".as_slice(), b"OR", b"NOT"]
+            .iter()
+            .any(|op| w.eq_ignore_ascii_case(op))
+    }) && words().skip(1).any(|w| {
+        [
+            b"case:".as_slice(),
+            b"name:",
+            b"name-term:",
+            b"re:",
+            b"ext:",
+            b"path:",
+            b"size:",
+            b"mtime:",
+            b"type:",
+            b"text:",
+            b"content:",
+            GREP_PREFIX.as_bytes(),
+        ]
+        .iter()
+        .any(|prefix| w.starts_with(prefix))
+    })
+}
+
 impl Atom {
     /// The per-row test for this atom; a content atom is added to `atoms`.
     fn test(self, atoms: &mut Vec<ContentAtom>) -> Test {
@@ -430,13 +470,13 @@ fn parse_atom(atom: &[u8], fold: bool, arg: &[u8]) -> Result<Atom, ParseError> {
     if let Some(v) = value(GREP_PREFIX.as_bytes())? {
         let pattern = std::str::from_utf8(v).map_err(|_| ParseError::NotUtf8(arg.to_vec()))?;
         return GrepFlags {
-            case_insensitive: fold,
+            case_insensitive: false,
         }
         .compile(pattern)
         .map(|grep| Atom::Content(ContentAtom::Grep(grep)))
         .map_err(|e| ParseError::Grep(text(), e));
     }
-    if let Some(v) = value(b"text:")? {
+    if let Some(v) = value(b"text:")?.or(value(b"content:")?) {
         return Text::new(v, !fold)
             .map(|text| Atom::Content(ContentAtom::Text(text)))
             .ok_or_else(|| ParseError::Text(text()));

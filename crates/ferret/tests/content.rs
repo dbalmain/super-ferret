@@ -303,7 +303,7 @@ enum Q {
     Grep(String, bool),
     /// A bare word: a folded name substring.
     Word(String),
-    /// `name:OR` (folded) or `case:OR` (exact).
+    /// A reserved operator word under `name:` (folded) or `case:` (exact).
     Prefixed(String, bool),
     And(Vec<Q>),
     Or(Vec<Q>),
@@ -316,6 +316,8 @@ fn atom(rng: &mut Rng) -> Q {
         6 | 7 => Q::Grep(
             rng.pick(&[
                 "alpha",
+                "Alpha",
+                "(?i)Alpha",
                 "a.*beta",
                 "(?-u:\\xFF)",
                 "^foo",
@@ -331,7 +333,7 @@ fn atom(rng: &mut Rng) -> Q {
             rng.one_in(3),
         ),
         0 => Q::Word(rng.pick(NAMES).to_ascii_lowercase()),
-        1 => Q::Prefixed("OR".to_owned(), rng.one_in(2)),
+        1 => Q::Prefixed(rng.pick(&["OR", "and", "Not"]).to_owned(), rng.one_in(2)),
         2 => {
             let sep = rng.pick(&[" ", ".", "-", "_"]);
             Q::Text(
@@ -379,27 +381,38 @@ impl Q {
                 out.push(format!("{}grep:{arg}", if *case { "case:" } else { "" }))
             }
             Q::Text(arg, case) => {
-                out.push(format!("{}text:{arg}", if *case { "case:" } else { "" }))
+                let prefix = rng.pick(&["text:", "content:"]);
+                out.push(format!("{}{prefix}{arg}", if *case { "case:" } else { "" }))
             }
-            Q::Word(word) => out.push(word.clone()),
+            Q::Word(word) => {
+                // D71 reserves lowercase operator words too; escape name atoms.
+                if matches!(word.as_str(), "and" | "or" | "not") {
+                    out.push(format!("name:{word}"));
+                } else {
+                    out.push(word.clone());
+                }
+            }
             Q::Prefixed(word, case) => {
                 out.push(format!("{}{word}", if *case { "case:" } else { "name:" }))
             }
             Q::And(all) => {
-                for q in all {
+                for (i, q) in all.iter().enumerate() {
+                    if i > 0 && rng.one_in(2) {
+                        out.push(rng.pick(&["AND", "and", "AnD"]).to_owned());
+                    }
                     q.operand(rng, out, matches!(q, Q::Or(_)));
                 }
             }
             Q::Or(any) => {
                 for (i, q) in any.iter().enumerate() {
                     if i > 0 {
-                        out.push("OR".to_owned());
+                        out.push(rng.pick(&["OR", "or", "Or", "oR"]).to_owned());
                     }
                     q.operand(rng, out, matches!(q, Q::Or(_)));
                 }
             }
             Q::Not(inner) => {
-                out.push("NOT".to_owned());
+                out.push(rng.pick(&["NOT", "not", "Not", "nOt"]).to_owned());
                 let needs = matches!(**inner, Q::And(_) | Q::Or(_));
                 inner.operand(rng, out, needs);
             }
@@ -420,9 +433,9 @@ impl Q {
     /// its bytes, `None` for a directory.
     fn eval(&self, name: &str, doc: Option<&[u8]>) -> bool {
         match self {
-            Q::Grep(arg, case) => doc.is_some_and(|doc| {
+            Q::Grep(arg, _) => doc.is_some_and(|doc| {
                 GrepFlags {
-                    case_insensitive: !case,
+                    case_insensitive: false,
                 }
                 .compile(arg)
                 .unwrap()
@@ -1133,6 +1146,110 @@ fn grep_refusal_table_and_scan_override() {
 }
 
 #[test]
+fn grep_case_defaults_verify_folded_candidates() {
+    // D67 A2: folded trigram keys must not decide the regex's case semantics.
+    let tree = Tree::new();
+    let lower = tree.write("lower.txt", b"foo\n");
+    let upper = tree.write("upper.txt", b"Foo\n");
+    let kelvin = tree.write("kelvin.txt", "Kelvin\n".as_bytes());
+    let engine = tree.engine();
+    for covered in [false, true] {
+        if covered {
+            engine.attach_content(&tree.index()).unwrap();
+            engine.follow_content(&Budget::unbounded(), None).unwrap();
+        }
+        for (arg, expected) in [
+            ("grep:Foo", paths(&[&upper])),
+            ("grep:(?i)Foo", paths(&[&lower, &upper])),
+            ("case:grep:Foo", paths(&[&upper])),
+            ("case:grep:(?i)Foo", paths(&[&lower, &upper])),
+            ("grep:(?i)kelvin", paths(&[&kelvin])),
+            ("grep:kelvin", paths(&[])),
+            ("text:Foo", paths(&[&lower, &upper])),
+            ("case:text:Foo", paths(&[&upper])),
+        ] {
+            assert_eq!(
+                search(&engine.pin(), &query(&[arg]), None).unwrap().0,
+                expected,
+                "{covered} {arg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn operator_cases_content_alias_and_phrases_reach_real_documents() {
+    // D71: these spellings used to silently become name words or wrong phrases.
+    let tree = Tree::new();
+    let foo = tree.write("foo.txt", b"foo\n");
+    let bar = tree.write("bar.txt", b"bar\n");
+    let both = tree.write("foo-bar.txt", b"Foo bar\n");
+    let and = tree.write("and", b"this or that\n");
+    let or = tree.write("or", b"rock and roll\n");
+    let not = tree.write("not", b"do not enter\n");
+    let engine = tree.engine();
+    for covered in [false, true] {
+        if covered {
+            engine.attach_content(&tree.index()).unwrap();
+            engine.follow_content(&Budget::unbounded(), None).unwrap();
+        }
+        let pin = engine.pin();
+        for op in ["or", "Or", "oR", "OR"] {
+            assert_eq!(
+                search(&pin, &query(&["text:foo", op, "text:bar"]), None)
+                    .unwrap()
+                    .0,
+                paths(&[&foo, &bar, &both])
+            );
+        }
+        for op in ["and", "And", "aNd", "AND"] {
+            assert_eq!(
+                search(&pin, &query(&["foo", op, "bar"]), None).unwrap().0,
+                paths(&[&both])
+            );
+        }
+        for op in ["not", "Not", "nOt", "NOT"] {
+            assert_eq!(
+                search(&pin, &query(&["ext:txt", op, "text:foo"]), None)
+                    .unwrap()
+                    .0,
+                paths(&[&bar])
+            );
+        }
+        for (args, expected) in [
+            (vec!["content:foo"], paths(&[&foo, &both])),
+            (vec!["case:content:Foo"], paths(&[&both])),
+            (vec!["name:and"], paths(&[&and])),
+            (vec!["name:or"], paths(&[&or])),
+            (vec!["name:OR"], paths(&[&or])),
+            (vec!["name:not"], paths(&[&not])),
+            (vec!["text:this or that"], paths(&[&and])),
+            (vec!["text:rock and roll"], paths(&[&or])),
+            (vec!["text:do not enter"], paths(&[&not])),
+        ] {
+            assert_eq!(
+                search(&pin, &query(&args), None).unwrap().0,
+                expected,
+                "{covered} {args:?}"
+            );
+        }
+        for prefix in ["", "case:"] {
+            let text = format!("{prefix}text:Foo");
+            let content = format!("{prefix}content:Foo");
+            assert_eq!(
+                search(&pin, &query(&[&content]), None).unwrap().0,
+                search(&pin, &query(&[&text]), None).unwrap().0
+            );
+        }
+    }
+    let err = Query::from_args(["text:foo OR text:bar"], SystemTime::now()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("pass the query as separate arguments")
+    );
+}
+
+#[test]
 fn grep_unicode_raw_bytes_anchors_and_uncovered_negation() {
     let tree = Tree::new();
     let kelvin = tree.write("kelvin.txt", "before\nKelvin\nafter\n".as_bytes());
@@ -1149,8 +1266,10 @@ fn grep_unicode_raw_bytes_anchors_and_uncovered_negation() {
         for (args, expected) in [
             (vec!["grep:(?i)kelvin"], paths(&[&kelvin])),
             (vec![r"grep:(?-u:[\x80-\x81])ab"], paths(&[&raw])),
-            (vec!["grep:^kelvin$"], paths(&[&kelvin])),
-            (vec!["grep:(?-m)^kelvin$"], paths(&[])),
+            (vec!["grep:^kelvin$"], paths(&[])),
+            (vec!["grep:(?i)^kelvin$"], paths(&[&kelvin])),
+            (vec!["grep:(?i)(?-m)^kelvin$"], paths(&[])),
+            (vec!["case:grep:(?i)kelvin"], paths(&[&kelvin])),
             (vec!["case:grep:kelvin"], paths(&[])),
             (vec!["grep:HttpRequest"], paths(&[&substring])),
             (

@@ -4123,8 +4123,9 @@ does the query refuse, at what threshold, and through which flag?
 
 Semantics under any option:
 
-- **case-insensitive by default**, as `text:` and `re:` are, with `case:` for
-  exact case;
+- **case-sensitive by default** (A2, answered 2026-10-11), with `(?i)`
+  for Unicode case folding; `case:grep:` is accepted as a no-op to preserve
+  existing queries. `text:` and `re:` keep folding by default;
 - **multi-line:** `^` and `$` match at line boundaries, as grep users expect,
   and `(?-m)` restores whole-document anchors;
 - `.` does not match `\n`, the `regex` default.

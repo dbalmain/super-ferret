@@ -232,7 +232,8 @@ fn an_operator_spelled_with_a_prefix_is_a_name_atom() {
         ("name:NOT", r#"heap scan for "not" (folded)"#),
         ("name:(", r#"heap scan for "(" (folded)"#),
         ("case:)", r#"heap scan for ")""#),
-        ("or", r#"heap scan for "or" (folded)"#),
+        ("name:or", r#"heap scan for "or" (folded)"#),
+        ("name:and", r#"heap scan for "and" (folded)"#),
     ] {
         assert_eq!(plan(query).1, explain, "{query}");
     }
@@ -241,6 +242,15 @@ fn an_operator_spelled_with_a_prefix_is_a_name_atom() {
 #[test]
 fn misplaced_operators_are_errors_that_say_what_is_missing() {
     let cases = [
+        ("and", ParseError::Dangling("AND")),
+        ("AND a", ParseError::Dangling("AND")),
+        ("a AnD", ParseError::Dangling("AND")),
+        ("a AND AND b", ParseError::Dangling("AND")),
+        ("a AND OR b", ParseError::Dangling("AND")),
+        ("( a AND )", ParseError::Dangling("AND")),
+        ("NOT AND b", ParseError::Dangling("NOT")),
+        ("or", ParseError::Dangling("OR")),
+        ("nOt", ParseError::Dangling("NOT")),
         ("OR", ParseError::Dangling("OR")),
         ("OR a", ParseError::Dangling("OR")),
         ("a OR", ParseError::Dangling("OR")),
@@ -269,6 +279,64 @@ fn misplaced_operators_are_errors_that_say_what_is_missing() {
     ];
     for (query, message) in messages {
         assert_eq!(error(query).to_string(), message, "{query}");
+    }
+}
+
+/// D71 reserves every operator case while keeping prefixed words and phrases.
+#[test]
+fn operator_cases_and_content_alias_use_the_same_grammar() {
+    for op in ["and", "And", "aNd", "AND"] {
+        assert_eq!(plan(&format!("foo {op} bar")), plan("foo bar"));
+    }
+    for op in ["or", "Or", "oR", "OR"] {
+        assert_eq!(
+            plan(&format!("text:foo {op} text:bar")),
+            plan("text:foo OR text:bar")
+        );
+    }
+    for op in ["not", "Not", "nOt", "NOT"] {
+        assert_eq!(plan(&format!("{op} text:foo")), plan("NOT text:foo"));
+    }
+    for prefix in ["", "case:"] {
+        assert_eq!(
+            plan(&format!("{prefix}content:Foo")),
+            plan(&format!("{prefix}text:Foo"))
+        );
+        let arg = format!("{prefix}content:");
+        assert_eq!(error(&arg), ParseError::Empty(arg));
+    }
+}
+
+/// D71 catches a whole query in one shell argument without reserving phrase
+/// words.
+#[test]
+fn embedded_queries_error_but_operator_phrases_remain_atoms() {
+    for arg in [
+        "text:foo OR text:bar",
+        "text:foo or content:bar",
+        "case:content:foo AnD case:text:bar",
+        "foo not name:bar",
+        "text:foo\tOR\ttext:bar",
+        "text:foo OR grep:bar",
+        "text:foo AND ext:rs",
+    ] {
+        let err = Query::from_args([arg], now()).unwrap_err();
+        assert_eq!(err, ParseError::EmbeddedOperator(arg.into()));
+        assert!(
+            err.to_string()
+                .contains("pass the query as separate arguments")
+        );
+    }
+    for arg in [
+        "text:this or that",
+        "text:rock and roll",
+        "text:do not enter",
+        "content:this Or that",
+        "text:or",
+        "text:foo OR unknown:bar",
+        "text:foo text:bar",
+    ] {
+        assert!(Query::from_args([arg], now()).is_ok(), "{arg}");
     }
 }
 
