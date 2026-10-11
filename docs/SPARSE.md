@@ -1,199 +1,208 @@
 # Sparse grams: regex candidate experiment
 
-Status: resumed after a usage cutoff; completed sparse and fixed-4 results
-retained. Only fixed-8 and word controls remain to measure. Bench-only indexes; product formats and planning remain unchanged. No network sources used.
+Measurement running: sparse and fixed-4 are complete; fixed-8 and word controls remain.
+Bench-only indexes; no product index or query changes. No network sources used.
 
-## Design and soundness
+## Question and design
 
-Question: do variable-length grams reject M5's false regex candidates cheaply
-enough to justify a larger index?
+Does a larger gram index screen enough false regex candidates to justify its
+storage and build cost? Compare shipped trigrams (four rarest children per AND)
+with hash and inverse-frequency sparse grams at byte-length caps 8/32. Include
+raw fixed 4/8 and word-only fixed 4/4+5 controls, all retaining trigrams.
 
-A gram has at least three bytes. Its two endpoint bigrams must each outrank all
-interior bigrams. Every trigram qualifies vacuously. Use ASCII-folded raw bytes
-before weighting and keying, exactly as `ferret_text::trigram_key` does. Compare
-fixed bigram hash and inverse corpus occurrence frequency, caps 8 and 32. Ties
-use a local, deterministic ordering; absolute document offsets cannot enter a
-weight because they would invalidate the substring argument.
+For a substring of at least three bytes, both endpoint bigrams must strictly
+outrank every interior bigram. Endpoint ranks may equal one another. Every
+trigram qualifies: it has no interior bigram. Thus this experiment augments the
+trigram index; it does not establish that GitHub's replacement policy was this
+exact definition. The historical claim was not checked offline.
 
-A required literal is necessary for the regex, never sufficient. Reuse Cox's
-existing HIR fold, preserving its AND/OR structure, with longer exact and edge
-facts for the experiment. Extract grams only inside each literal. Every gram
-then reappears in any containing document: its predicate inspects only its own
-folded bytes. Outside endpoints cannot make a gram required. OR retains every
-branch; weakening AND by selecting rare children preserves completeness.
+Fold ASCII raw bytes **before** weighting and extraction, using
+`ferret_text::trigram_key`'s rule. Hash ranks use fixed SplitMix64 of the folded
+pair. Frequency ranks use inverse corpus **occurrence** counts. Both break ties
+by folded pair number; repeated identical pairs stay equal. Absolute offsets
+cannot break ties without breaking substring soundness. Frequency tables are
+frozen and shared by index/query; retraining requires rebuilding the index.
 
-Retain trigrams: deleting a covered trigram from the index would lose queries
-for that shorter literal. Query-side omission is safe when a retained longer
-gram implies it. Include fixed-length literal grams as a cheaper control.
+The monotonic stack emits every qualifying gram in linear time, with at most
+two emissions per bigram. Length caps filter emissions. Equal stack ranks are
+replaced after visiting their pair. A bounded builder selects 32 contiguous
+first-byte ranges, scanning forward from selected starts until the first right
+rank at least as large as the left rank blocks all subsequent intervals. Its
+worst case is `cap` comparisons per selected start. Exhaustive tests compare
+both extractors with the definition.
 
-## Measurement plan
+Fixed controls emit all trigrams plus every window of their fixed length.
+Word controls emit all trigrams plus 4-byte, or 4- and 5-byte, windows whose
+bytes form valid UTF-8 consisting of alphanumeric characters or underscore.
+This is a local selection predicate, without a whole-word boundary requirement;
+keys remain folded raw bytes. Punctuation and partial UTF-8 windows fall back to
+trigrams on both index and query sides.
 
-The run uses the refreshed D65C catalog at `/tmp/d65c/catalog`, its codec-1
-fully merged control at `/tmp/d65c/control`, and frozen bytes at
-`/tmp/d65c/corpus`. `Snapshot::open` verifies incarnation and DocId bound.
-The checked-out S3 document describes an isolated `$HOME` catalog but has no
-concrete catalog/snapshot paths; the supplied fresh D65C paths supersede it.
-Reuse M5 class seeds, including its snapshot-derived identifier patterns, and
-also measure the other `screen::regex_classes` workloads. Compare actual shipped
-four-child trigram candidates against each variant. Encode whole-corpus posting
-lists with the segment codec, reporting singleton inlining separately. Report
-distinct keys, build CPU, candidate and oracle document/byte median and p90,
-and the same file-size bands. Check every oracle match against every variant.
-Only aggregates are recorded; no corpus names or text.
+## Necessary facts and soundness
 
-Initial free disk: about 11 GB. Stop below 5 GB. Run only one foreground
-benchmark at a time after process preflight. Keep checkpoints at 20–30 minutes.
+`ferret-verify` exposes `GrepFlags::required_literals`, sharing the existing
+Cox HIR fold through a second fact consumer. Product trigram caps stay unchanged.
+The experiment retains exact strings up to 32 bytes and concatenation edges up
+to 31; existing class/set caps still weaken facts. It preserves AND/OR, Unicode
+case alternatives, raw-byte classes, optionality and repetitions. It introduces
+no second regex parser. The result is necessary, never sufficient.
 
-## Decision brief (pending results)
+1. A matching document satisfies at least one alternative of the literal-fact
+   tree. Unicode case equivalents stay separate HIR alternatives; only ASCII
+   bytes are folded by the index.
+2. Each required key is extracted wholly inside one such literal. Its predicate
+   inspects only that key's bytes and the frozen weights. Any containing document
+   therefore emits the same key, independently of text outside the literal.
+3. Indexing deduplicates keys per document. Query AND selects four rarest children
+   by actual document frequency, weakening a necessary conjunction. OR unions
+   every branch, including an unconstrained branch. No oracle match can be lost.
 
-- Shipped trigrams: no new storage; high false-candidate read volume.
-- Sparse grams: extra extraction and storage; potentially selective long keys.
-- Fixed longer grams: simpler extraction; potentially higher postings volume.
+Deleting an indexed trigram merely because a longer gram covers it is unsound:
+a query for the shorter literal must still find documents where outside bytes
+change the longer gram. Query-side omission is sound when an included longer
+key implies it. The experiment retains all trigrams rather than assuming such
+index savings.
 
-Recommendation and the fact that would change it await measurements.
+Tests drive the real document extractor, shared derivation and candidate
+planner: a selective gram crossing a literal edge, folded ASCII and Unicode
+case alternatives, disjoint alternation, unconstrained branches, classes,
+repetitions, invalid UTF-8, exhaustive/generated matches, caps 8/32/33 and
+byte-identical whole versus partitioned segment encoding. A discriminating
+synthetic case is `aaaaa`: identical pair ties permit only `aaa` for every
+sparse weight/cap, while fixed four/five keys distinguish shorter documents.
+Rare endpoints do not guarantee long or selective grams.
 
-## Implementation checkpoint
+## Corpus and method
 
-`ferret-bench sparse <catalog> <paired-index> <snapshot>` constructs all seven
-layouts serially: trigrams through longer literal facts, hash caps 8/32,
-frequency caps 8/32, and fixed 4/8 plus trigrams. The shipped planner supplies
-a separate real four-child baseline. The optimized product trigram inverter
-also supplies build CPU and full-merge bytes, separate from the generic map
-builder used for experimental layouts.
+Use D65C's refreshed `/tmp/d65c/catalog`, codec-1 fully merged paired index at
+`/tmp/d65c/control`, and frozen `/tmp/d65c/corpus`. `Snapshot::open` checks
+incarnation and DocId bound. The checked-out S3 document describes an isolated
+catalog but records no concrete catalog/snapshot paths; the supplied fresh D65C
+paths supersede it. D65C construction is recorded on `wt/d65c:docs/D65C.md`.
 
-The shared Cox fold now has two fact consumers in `ferret-verify`: existing
-trigrams retain every original cap (including two-byte edges); the bench API
-returns folded literal AND/OR facts, retaining 31-byte edges and exact strings
-up to 32 bytes before release. No product index or planner code changes.
-Unicode case equivalences stay HIR alternatives, rather than being normalized
-by the byte index. Eleven new tests drive extraction, derivation and bounded encoding together.
+Population: **112,382 live documents**, **112,376 readable**, **6 unreadable**,
+**3,978,812,718 readable bytes**. All layouts conservatively admit the six
+unreadable documents, adding **4,830,452 candidate bytes** per query. The oracle
+covers every frozen readable document with the actual `regex` verifier.
 
-Hash weights use a fixed SplitMix64 avalanche of the folded pair number.
-Frequency weights use corpus occurrence counts, with rarer pairs ranked higher.
-Both rank by `(weight, folded pair number)`; repeated identical pairs have equal
-rank. Equal endpoints are permitted, but every interior must be strictly lower.
-The stack removes equal ranks after emitting their pair, so repeated ties do
-not create arbitrary long grams. Each pair is pushed once and popped once;
-at most two grams are emitted per bigram. Caps filter emissions, not the stack.
+Use 50 queries each from the five `screen::regex_classes` classes, with the
+same deterministic snapshot-derived identifier helper as `regex-volume`.
+The existing `regex-volume` command itself measures only rare literals and
+identifiers; this experiment also measures alternation, broad and code classes.
+Shipped candidates come from the real `GrepAtom` planner. The longer-facts
+trigram control separates derivation effects from additional indexed keys.
+Experimental ANDs use four rarest children with deterministic tie ordering.
+The changed fact representation can change ties/budgets, so this control is
+not assumed identical to shipped planning.
 
-Indexing keeps every emitted distinct key per document. Queries flatten AND,
-rank children by posting frequency, retain four, and keep every OR branch.
-Whole-index accounting runs the real segment writer to a sink, including its
-front-coded dictionary, relative DocIds, PFor blocks, singleton inlining and
-checksums. The benchmark writes no corpus index files. Trigrams and hash cap 8 use
-a whole map; other arms use bounded first-byte ranges. Generic map build CPU is a prototype cost, not a production builder
-projection. Frequency training is a separate one-time corpus pass.
+Encode whole posting lists with the real segment writer: relative DocIds,
+PFor blocks, front-coded dictionary, inline singletons and checksums. One writer
+spans all partitions in global lexical order, making whole-index byte counts
+exact; only maps are partitioned. The sink avoids scratch index files.
+`postings_bytes` excludes singletons inlined in the dictionary; total includes
+them. `singleton_bytes` counts their complete dictionary entries, not just IDs.
 
-Measurement and final recommendation remain pending. The implementation
-checkpoint passes pinned formatting, workspace clippy with warnings denied,
-and **939 tests / 13 ignored**, with zero Rust warnings (baseline 928 passed;
-eleven added). No Cargo manifest or lockfile changes.
+Build CPU includes extraction, deduplication, sorting and encoding. Product
+trigrams use their optimized inverter; prototype maps are deliberately reported
+separately. Trigrams, hash-8 and word-4 use whole maps; other rows include 32
+corpus passes for bounded maps. These are complete prototype build costs, not
+isolated weight-function timings or a production builder projection. Frequency
+training adds **3.93 CPU s / 4.09 wall s**, once per frozen corpus. The first
+oracle pass costs **506.34 CPU s / 513.06 wall s**. One build per completed
+variant; the median/p90 describe 50 query populations, not repeated latencies.
 
-## Baseline measurement checkpoint
+Candidate bytes count entire candidate files. Oracle bytes count entire files
+with a match, not matched spans. Median uses M5's lower middle and p90 nearest
+rank. False share is `(sum readable candidate bytes - sum oracle bytes) /
+sum readable candidate bytes`, not a ratio of independent medians.
 
-D65C compatibility checks passed: **112,382 live**, **112,376 readable**,
-**6 unreadable**, **3,978,812,718 content bytes**, **250 queries** (50 per class).
-The complete oracle costs 506.34 CPU s / 513.06 wall s. Shipped candidates
-include every oracle match. Rare-literal candidate bytes median/p90 are
-**1,540,658,366 / 1,861,211,679**, against oracle **4,033,515 / 22,288,165**.
-The rare class's readable-byte false share is **99.52%** (sum-based, not the
-ratio of independent medians). Identifier candidate bytes median/p90 are
-**2,783,209,101 / 3,097,586,912**, against oracle **36,785,558 / 238,940,235**.
+## Results
 
-Product trigram full-merge accounting: **10,158,272 distinct keys**,
-**259,877,638 postings**, **228,353,108 postings bytes**, **56,655,667 dictionary
-bytes**, **286,112,775 total bytes**, **22.31 CPU s / 22.60 wall s**. Frequency
-training costs **3.93 CPU s / 4.09 wall s** over **3,978,700,343 bigram
-occurrences**, **52,900 distinct bigrams**. Experimental variants remain running.
+MiB = 2^20 bytes. Candidate columns are **median/p90 MiB**. Index cells are
+**whole index / postings MiB**. Full candidate-document and byte median/p90,
+oracle-document and byte median/p90, sums, wall times, singleton/dictionary
+bytes and file-size bands are in [`measurements/sparse.txt`](measurements/sparse.txt).
+Only aggregate counts, bytes and timings are tracked.
 
-The unbounded hash cap-32 attempt reached 208.9M keys and caused heavy swapping
-(about 38 GB RSS, machine swap 20 GB against 8.7 GB initially). It was stopped;
-its incomplete timing is discarded. All remaining arms now use 32 disjoint,
-contiguous first-byte ranges and one persistent segment writer in global key
-order, retaining only query postings after each range. A fixture calls the real
-document inverter and compares whole encoded segments byte for byte for all
-seven variants. Exact whole-index bytes are preserved.
+| Variant | Index / postings MiB | Distinct keys | Build CPU s | Rare literal MiB med/p90 | Identifier MiB med/p90 | Alternation MiB med/p90 | Broad MiB med/p90 | Code MiB med/p90 | Rare false share |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| shipped four | 272.86 / 217.77 | 10158272 | 22.310 | 1469.29/1774.99 | 2654.28/2954.09 | 2959.49/3193.48 | 3405.53/3558.59 | 2537.48/2945.89 | 99.52% |
+| longer-facts trigrams | 272.86 / 217.77 | 10158272 | 162.900 | 1469.29/1774.99 | 2654.28/2954.09 | 2959.49/3195.53 | 3405.53/3558.59 | 2537.48/2945.89 | 99.52% |
+| sparse-hash-8 | 1587.85 / 842.06 | 116535553 | 634.510 | 27.17/1327.09 | 2549.43/2914.99 | 2735.66/3095.89 | 3405.53/3558.59 | 1778.24/2849.80 | 97.62% |
+| sparse-hash-32 | 3550.01 / 1167.84 | 268757928 | 1154.940 | 27.17/1327.09 | 2549.43/2914.99 | 2735.66/3095.89 | 3405.53/3558.59 | 1778.24/2849.80 | 97.62% |
+| sparse-frequency-8 | 1527.20 / 794.63 | 114965290 | 726.480 | 300.14/1464.51 | 2319.50/2867.31 | 2637.91/3096.23 | 3405.53/3558.59 | 1723.12/2739.59 | 98.24% |
+| sparse-frequency-32 | 3615.68 / 1150.22 | 278334955 | 1149.070 | 300.14/1464.51 | 2319.50/2867.31 | 2637.91/3096.23 | 3405.53/3558.59 | 1723.12/2739.59 | 98.24% |
+| fixed-4 | 1103.88 / 853.59 | 42441594 | 591.330 | 69.14/164.90 | 1933.45/2607.16 | 2275.54/2830.22 | 3405.53/3558.59 | 1431.50/2242.83 | 92.67% |
 
-Bounded sparse extraction scans forward only from starts in its current range,
-until an endpoint at least as heavy as the first would block further grams.
-Its worst case is `cap` pairs per selected start. It agrees exhaustively with
-the monotonic stack and with the definition, including ties and length caps.
-Extra corpus passes are included in build CPU. The 32-way builder is a memory
-tradeoff, so build times compare complete prototype layouts, rather than solely
-weight functions. A comma-separated variant label can resume individual arms.
+Oracle document median/p90 and byte median/p90 are common to every layout:
 
-The bounded implementation passes all gates: **939 passed / 13 ignored**, zero
-Rust warnings. The remaining five variants are being restarted serially on the
-same snapshot and class seeds; their oracle is recomputed, not inferred.
+- Rare literal: **2/14 docs**, **4,033,515/22,288,165 B**.
+- Identifier: **64/376 docs**, **36,785,558/238,940,235 B**.
+- Alternation: **10,221/22,526 docs**, **2,154,123,266/2,903,629,998 B**.
+- Broad: **943/1,290 docs**, **1,087,134,189/1,240,328,547 B**.
+- Code class: **694/3,779 docs**, **474,794,928/1,524,143,713 B**.
 
-First sparse result (hash cap 8): **116,535,553 keys**, **799,093,308 postings**,
-**882,968,921 postings bytes**, **1,664,977,098 total bytes**, **634.51 CPU s**.
-Rare candidate bytes median/p90 fall to **28,488,102 / 1,391,555,674**;
-identifier to **2,673,273,947 / 3,056,592,693**. Every oracle match survives.
-The 54.1× rare median reduction does not remove the tail; total storage rises
-5.82× and the sum-based rare false-readable share remains 97.62%.
+All-query bands are recomputed separately for <1 MiB, 1–16 MiB and >=16 MiB.
+The last band is empty on this policy-filtered corpus. Band medians are not
+additive. The aggregate artifact retains both smaller bands for every class
+and layout.
 
-The resumed oracle reproduces all 20 shipped rows exactly. Its CPU/wall cost is
-518.00/672.81 s; the wall difference follows cold reads after the aborted build.
-The optimized trigram replay is byte-identical (22.72 CPU s), and frequency
-training is 3.99 CPU s. The bounded cap-32 build has completed 12/32 ranges
-without the former memory pressure.
+## Interpretation and decision brief
 
-An additional cheaper control is being added: all trigrams plus fixed 4-grams
-whose bytes form valid UTF-8 alphanumeric/underscore characters. Both index
-and query use that substring-local predicate, and every rejected long gram
-falls back to trigrams. It is therefore sound for punctuation, partial UTF-8,
-and Unicode case alternatives. It measures whether concentrating long keys
-on word literals removes much of the full raw-byte dictionary cost. The new
-control's regression and measurements are pending; checkpoint is WIP.
+Question: which screen should follow D17's instruction to measure candidate
+screening before changing the regex engine?
 
-Hash cap 32 is complete and passes all 250 oracle checks. It uses
-**268,757,928 keys**, **3,722,459,430 total bytes**, and **1,154.94 CPU s**.
-Its headline candidate medians/p90s equal cap 8 in every class; doubling the
-length cap has not bought headline selectivity. Frequency cap 8 is running.
+Options, with costs and buys:
 
-The word-only control also includes a 4+5-gram arm. Every M5 rare literal has
-at least five bytes, so this tests fixed interior coverage where sparse
-endpoint choices can leave a short literal with only three- or four-byte keys.
-Word-only 4-grams remain the smaller control and cover four-byte identifier
-ends. Both retain all raw trigrams and apply the same local predicate to query
-keys, including fallback for punctuation and partial UTF-8. No whole-word
-boundary is required: regex substrings inside an identifier remain candidates.
+- **Shipped trigrams:** 273 MiB and optimized 22.31 CPU s build; rare false
+  readable share 99.52%, median 1,469 MiB and p90 1,775 MiB.
+- **Full sparse augmentation:** hash-8 buys a 54× rare median reduction, but
+  p90 remains 1,327 MiB and total storage grows 5.82×. Frequency-8 is worse for
+  rare literals (300 MiB median), modestly better for identifier/code classes.
+  Cap 32 more than doubles either cap-8 index without improving any class's
+  headline median/p90. The four-child budget can change chosen constraints,
+  so larger caps need not monotonically reduce every individual candidate set.
+- **Fixed literal screens:** fixed-4 uses fewer keys and less storage than
+  either sparse cap-8 index, with a much better rare p90 (165 MiB). Fixed-8 and
+  word-only controls are being measured to test whether selective local key
+  coverage is cheaper still.
 
-Frequency cap 8 passes all 250 oracle checks. It has **114,965,290 keys**,
-**1,527.20 MiB total index**, **794.63 MiB postings**, and **726.48 CPU s**.
-Rare candidate MiB median/p90 are **300.14 / 1,464.51** (worse than hash), while
-identifier is **2,319.50 / 2,867.31** and code class **1,723.12 / 2,739.59**.
-Rare false-readable share remains **98.24%**. Frequency weighting has traded
-some rare-literal selectivity for modest gains in the other literal classes.
+Recommendation is pending the three remaining controls. Sparse cap 32 already
+fails its storage tradeoff on this corpus. Broad-class candidate bytes are
+identical across completed layouts: their usable literal facts are only three
+bytes, so longer-key screening cannot help those queries. Class caps and
+Unicode alternatives can also fragment literals and limit other screens.
+This experiment measures the shared necessary-fact derivation, not every
+possible extraction policy.
 
-A further regression records a limitation of the strict tie rule: the required
-literal `aaaaa` emits only `aaa` under either sparse weight or cap, admitting
-a document containing just `aaa`. The word 4+5 control rejects that false
-candidate through the real extractor and required-literal derivation. Repeated
-pairs cannot use absolute-offset tie breaks without invalidating soundness.
-The new word/tie tests await final gates (expected 941 passed / 13 ignored).
+The fact that would change the decision is a representative workload where
+sparse grams reduce candidate verification cost enough to offset their whole
+index and build cost compared with a fixed literal screen. A next screen
+experiment should time posting reads plus surviving verification; these volume
+measurements alone do not establish query latency or justify changing regex
+engines.
 
-Frequency cap 32 passes all 250 checks, with **278,334,955 keys**, **3,615.68
-MiB total index**, **1,150.22 MiB postings**, and **1,149.07 CPU s**. Its headline
-candidate medians/p90s equal frequency cap 8 in every class. Both weight
-functions therefore pay more than twice the cap-8 storage for no headline
-gain at cap 32. Raw fixed-4 and fixed-8 controls remain in progress.
+## Validation and run notes
 
-## Resumption checkpoint
+Pinned formatting, full workspace clippy with warnings denied, and full
+workspace tests pass: **941 passed / 13 ignored**, **zero Rust warnings**
+(baseline 928 passed; 13 added). An existing batch test hit a transient catalog
+lock failure on the first resumption run; the complete unchanged retry passed.
+No Cargo manifest/lockfile edits, dependencies, pushes or agent CLI launches.
 
-The cutoff killed fixed-8 at range 13/32; its incomplete build is discarded.
-All fixed-4 measurements survived: **42,441,594 keys**, **1,103.88 MiB total**,
-**853.59 MiB postings**, **591.33 CPU s**. Rare candidate bytes median/p90 are
-**69.14/164.90 MiB**, improving the sparse tail despite fewer keys. It passes
-all 250 oracle checks. Completed rows are preserved in
-[`measurements/sparse.txt`](measurements/sparse.txt).
+An unbounded hash-32 attempt was stopped at heavy swapping; its incomplete
+measurement is discarded. Bounded builds preserve exact encoded bytes. A usage
+cutoff killed fixed-8 at range 13/32; only missing layouts were restarted with
+hangup protection and a foreground `while kill -0` wait. Host preflight checks
+`ferret-bench`, `term-dict-bench` and `pair-fp-bench`; only one benchmark runs.
+Free disk was 11 GB initially, 7.7 GiB at resumption. Corpus passes check free
+disk every 1,024 documents and stop below 5 GB. All index encoding goes to a sink.
 
-The resumption starts with WIP commit `681129f`. Final implementation gates pass: pinned formatting, workspace clippy with
-warnings denied, and **941 passed / 13 ignored**, zero Rust warnings. The
-workspace retry passed after an existing batch test's transient catalog-lock
-failure; no unrelated code was changed. The remaining invocation selects only
-`fixed-8,word-fixed-4,word-fixed-4+5`, using the same frozen corpus and oracle.
-Disk has 7.7 GiB free; each corpus pass checks the 5 GB stop threshold.
-A protected process and a foreground `while kill -0` wait preserve the run
-if the interactive turn is interrupted again.
+Build `nix develop --command cargo build --release -p ferret-bench`, then run:
+
+```sh
+target/release/ferret-bench sparse /tmp/d65c/catalog /tmp/d65c/control /tmp/d65c/corpus
+```
+
+An optional comma-separated label list selects only named layouts, e.g.
+`fixed-8,word-fixed-4,word-fixed-4+5`. Unknown labels fail before corpus access.
