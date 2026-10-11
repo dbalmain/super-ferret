@@ -1,6 +1,6 @@
 # Sparse grams: regex candidate experiment
 
-Measurement running: eight experimental layouts are complete; word 4+5 remains.
+Complete: all nine experimental layouts and the shipped baseline pass the oracle.
 Bench-only indexes; no product index or query changes. No network sources used.
 
 ## Question and design
@@ -135,6 +135,7 @@ Only aggregate counts, bytes and timings are tracked.
 | fixed-4 | 1103.88 / 853.59 | 42441594 | 591.330 | 69.14/164.90 | 1933.45/2607.16 | 2275.54/2830.22 | 3405.53/3558.59 | 1431.50/2242.83 | 92.67% |
 | fixed-8 | 4939.70 / 1446.62 | 448754825 | 1400.400 | 1441.54/1568.56 | 2654.28/2954.09 | 2915.27/3175.76 | 3405.53/3558.59 | 2320.21/2910.63 | 99.30% |
 | word-fixed-4 | 656.92 / 588.11 | 12225432 | 336.810 | 69.14/164.90 | 1933.45/2607.16 | 2275.54/2830.22 | 3405.53/3558.59 | 1431.50/2242.83 | 92.67% |
+| word-fixed-4+5 | 1532.78 / 1164.73 | 68638052 | 884.150 | 8.86/25.86 | 1933.45/2607.16 | 2096.02/2815.61 | 3405.53/3558.59 | 1302.38/2242.83 | 12.90% |
 
 Oracle document median/p90 and byte median/p90 are common to every layout:
 
@@ -157,35 +158,54 @@ screening before changing the regex engine?
 Options, with costs and buys:
 
 - **Shipped trigrams:** 273 MiB and optimized 22.31 CPU s build; rare false
-  readable share 99.52%, median 1,469 MiB and p90 1,775 MiB.
-- **Full sparse augmentation:** hash-8 buys a 54× rare median reduction, but
-  p90 remains 1,327 MiB and total storage grows 5.82×. Frequency-8 is worse for
-  rare literals (300 MiB median), modestly better for identifier/code classes.
-  Cap 32 more than doubles either cap-8 index without improving any class's
-  headline median/p90. The four-child budget can change chosen constraints,
-  so larger caps need not monotonically reduce every individual candidate set.
-- **Fixed literal screens:** fixed-4 uses fewer keys and less storage than
-  either sparse cap-8 index, with a much better rare p90 (165 MiB). Fixed-8 costs 4,940 MiB yet rare median/p90 remain 1,442/1,569 MiB: it
-  needs 8-byte literal facts and supplies no 4–7-byte coverage. Word-only
-  four-grams reproduce all headline fixed-4 volumes at 657 MiB instead of
-  1,104 MiB (40.5% less storage), with 336.81 CPU s instead of 591.33. The
-  word 4+5 control is still running.
+  readable share 99.52%, median 1,469 MiB and p90 1,775 MiB. No additional
+  storage, but most verification reads remain false candidates.
+- **Full sparse augmentation:** hash-8 costs 1,588 MiB / 634.51 CPU s and buys
+  a 54× rare median reduction, but p90 remains 1,327 MiB. Frequency-8 costs
+  1,527 MiB / 726.48 CPU s; it is worse for rare literals (300 MiB median),
+  modestly better for identifier/code classes. Cap 32 more than doubles either
+  cap-8 index without improving any class's headline median/p90. The four-child
+  budget can change chosen constraints, so larger caps need not monotonically
+  reduce every individual candidate set.
+- **Raw fixed additions:** fixed-4 costs 1,104 MiB / 591.33 CPU s, with a much
+  better rare p90 (165 MiB) than sparse grams. Fixed-8 costs 4,940 MiB / 1,400.40
+  CPU s yet rare median/p90 remain 1,442/1,569 MiB. It requires 8-byte literal
+  facts and supplies no 4–7-byte coverage; rare seeds allow 5–30-byte words.
+- **Word four:** 657 MiB / 336.81 CPU s, preserving all 20 reported fixed-4
+  class/band aggregate rows exactly at 40.5% less storage. Rare median/p90 are
+  69/165 MiB. It is the smaller-storage screen; retaining every raw trigram
+  preserves queries across punctuation and partial UTF-8 boundaries.
+- **Word four plus five:** 1,533 MiB / 884.15 CPU s, with rare median/p90
+  **8.86/25.86 MiB** and rare false readable share **12.90%**. Its whole index
+  is 3.5% smaller than hash-8 and 0.4% larger than frequency-8, while screening
+  more candidate bytes in every class that benefits from longer facts. It
+  costs 876 MiB more than word-four, improves rare p90 by 6.4×, and improves
+  alternation/code medians. Identifier headline volumes remain equal to
+  word-four. The CPU comparison includes its bounded builder's extra passes.
 
-Recommendation is pending the final word 4+5 control. Word-four already
-improves fixed-four's storage tradeoff without losing headline selectivity. Sparse cap 32 already
-fails its storage tradeoff on this corpus. Broad-class candidate bytes are
-identical across completed layouts: their usable literal facts are only three
-bytes, so longer-key screening cannot help those queries. Class caps and
-Unicode alternatives can also fragment literals and limit other screens.
-This experiment measures the shared necessary-fact derivation, not every
-possible extraction policy.
+**Recommendation:** advance **word four plus five** to a posting-read and
+verification-latency experiment; use word-four as the smaller-storage comparison.
+Keep the product unchanged until that measurement supports an index policy.
+Do not advance full sparse augmentation, cap 32, or raw fixed-8 on this evidence.
+Word 4+5 cuts rare p90 candidate volume 68.6× against shipped trigrams, at
+5.62× their whole-index storage. Hash ranks do not provide reliable selective
+coverage of short literals; frequency ranks choose rare endpoints, not rare
+whole literals. The original all-trigrams guess was right, while the expectation
+that rare stretches necessarily yield useful long grams was not.
 
-The fact that would change the decision is a representative workload where
-sparse grams reduce candidate verification cost enough to offset their whole
-index and build cost compared with a fixed literal screen. A next screen
-experiment should time posting reads plus surviving verification; these volume
-measurements alone do not establish query latency or justify changing regex
-engines.
+Broad-class candidate bytes are identical across all layouts: their usable
+literal facts are only three bytes, so longer-key screening cannot help those
+queries. Class/set caps and Unicode alternatives can also fragment literals
+and limit other screens. This experiment measures the shared necessary-fact
+derivation, not every possible extraction policy. Residual identifier and broad
+volume remains large; the volumes do not justify changing regex engines.
+
+**Fact that would change it:** a representative workload where sparse grams
+beat word 4+5 after including posting reads and surviving verification, with
+acceptable whole-index/build cost; or a storage budget that cannot afford the
+additional 876 MiB over word-four. Candidate volumes alone do not establish
+latency, and one refreshed developer corpus does not establish a general
+production policy.
 
 ## Validation and run notes
 
@@ -193,15 +213,22 @@ Pinned formatting, full workspace clippy with warnings denied, and full
 workspace tests pass: **941 passed / 13 ignored**, **zero Rust warnings**
 (baseline 928 passed; 13 added). An existing batch test hit a transient catalog
 lock failure on the first resumption run; the complete unchanged retry passed.
-No Cargo manifest/lockfile edits, dependencies, pushes or agent CLI launches.
+All **250 regexes × 10 screens = 2,500 distinct query/screen checks** include
+all oracle matches; all required boundary, folding and alternation regressions
+pass. The three shipped baseline replays have byte-identical aggregate rows.
+The protected remaining job finished successfully and its foreground wait
+returned exit status 0. Complete aggregates contain 10 index rows and 200
+class/band rows. No Cargo manifest/lockfile edits, dependencies, pushes or agent
+CLI launches.
 
 An unbounded hash-32 attempt was stopped at heavy swapping; its incomplete
 measurement is discarded. Bounded builds preserve exact encoded bytes. A usage
 cutoff killed fixed-8 at range 13/32; only missing layouts were restarted with
 hangup protection and a foreground `while kill -0` wait. Host preflight checks
 `ferret-bench`, `term-dict-bench` and `pair-fp-bench`; only one benchmark runs.
-Free disk was 11 GB initially, 7.7 GiB at resumption. Corpus passes check free
-disk every 1,024 documents and stop below 5 GB. All index encoding goes to a sink.
+Free disk was 11 GB initially, 7.7 GiB at resumption, and 7.0 GiB at completion.
+Corpus passes check free disk every 1,024 documents and stop below 5 GB. All
+index encoding goes to a sink.
 
 Build `nix develop --command cargo build --release -p ferret-bench`, then run:
 
