@@ -238,3 +238,35 @@ target/release/ferret-bench sparse /tmp/d65c/catalog /tmp/d65c/control /tmp/d65c
 
 An optional comma-separated label list selects only named layouts, e.g.
 `fixed-8,word-fixed-4,word-fixed-4+5`. Unknown labels fail before corpus access.
+
+## Latency (follow-up in progress)
+
+Question: does the candidate-volume gain survive real posting reads and regex
+verification? Measure shipped four-child trigrams, word-four and word 4+5 on
+the same D65C snapshot and 250 regexes. This remains measurement only.
+
+Use complete codec-1 segments, one intermediate layout at a time, deleting
+only files this experiment creates. Reuse the real segment reader and posting
+cursors, including checksum-aligned reads and singleton inlining. Shipped
+selection comes from the public query explanation; experimental selection must
+match the existing volume experiment. Dictionary ranking and regex compilation
+are prepared outside timing; timed posting reads include selected dictionary
+lookups, checksums and cursor intersection.
+
+Global cache dropping is unavailable for uid 1000. Cold runs therefore use
+`posix_fadvise(DONTNEED)` on the index and every surviving readable snapshot
+file, outside timing; warm runs immediately repeat the same query. Catalog,
+compiled regex and segment resident metadata stay resident. Report logical
+posting bytes actually requested, including checksum chunk amplification,
+separately from total index read bytes. Advisory eviction is not a cold boot.
+
+Verification reads each surviving frozen document and applies the real regex.
+Record full-query posting, verification and total elapsed time. Attribute
+per-document verification work to the existing size bands; band totals include
+the shared posting phase plus that band's measured verification work, so they
+are not additive. Empty bands report zero verification and the shared posting
+cost. Verify candidate inclusion and exact matched DocIds against the oracle
+for both temperatures, with missing snapshot documents admitted conservatively.
+
+Results and the updated house recommendation await the full run. Initial disk
+headroom is about 14 GiB; stop below 5 GB. No Cargo changes are planned.
