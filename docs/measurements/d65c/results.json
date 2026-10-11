@@ -140,6 +140,7 @@
       "demoted_records": 0,
       "purged_records": 0
     },
+    "churn_queries": [],
     "queries": {
       "first": {
         "classes": {
@@ -1874,6 +1875,7 @@
       "demoted_records": 614935,
       "purged_records": 4248473
     },
+    "churn_queries": [],
     "queries": {
       "first": {
         "classes": {
@@ -4067,6 +4069,7 @@
       "demoted_records": 511692,
       "purged_records": 4173283
     },
+    "churn_queries": [],
     "queries": {
       "first": {
         "classes": {
@@ -6127,11 +6130,11 @@
       "build_documents": 112376,
       "build_unreadable": 6,
       "content_bytes": 3978812718,
-      "build_wall_seconds": 128.62,
-      "build_cpu_seconds": 119.61,
-      "build_peak_rss": "275684 kB",
-      "build_rchar_bytes": 4018006173,
-      "build_device_read_bytes": 0,
+      "build_wall_seconds": 124.23,
+      "build_cpu_seconds": 117.7,
+      "build_peak_rss": "274868 kB",
+      "build_rchar_bytes": 4018006172,
+      "build_device_read_bytes": 90112,
       "build_written_bytes": 691981239,
       "built_segments": 120,
       "built_total_bytes": 267937327,
@@ -6154,16 +6157,16 @@
       "built_fingerprint_bytes": 140953620,
       "built_fingerprint_index_bytes": 1894660,
       "built_checksum_bytes": 1025968,
-      "steady_rchar_bytes": 330523858514,
-      "steady_device_read_bytes": 69632,
+      "steady_rchar_bytes": 235522923732,
+      "steady_device_read_bytes": 12288,
       "steady_records_demoted": 0,
       "steady_records_purged": 0,
       "steady_records_graduated": 5784019,
       "steady_merges": 12,
       "steady_merge_read_bytes": 1606277554,
       "steady_merge_written_bytes": 1436976683,
-      "steady_merge_seconds": 758.64,
-      "steady_merge_cpu_seconds": 754.79,
+      "steady_merge_seconds": 667.37,
+      "steady_merge_cpu_seconds": 661.55,
       "steady_document_reads": 58487,
       "steady_document_read_bytes": 9566464225,
       "steady_segments": 12,
@@ -6192,10 +6195,10 @@
       "full_records_graduated": 3049086,
       "full_merge_inputs": 12,
       "full_merge_read_bytes": 522680368,
-      "full_rchar_bytes": 85676191336,
-      "full_device_read_bytes": 40960,
-      "full_merge_seconds": 254.24,
-      "full_merge_cpu_seconds": 253.16,
+      "full_rchar_bytes": 52131818322,
+      "full_device_read_bytes": 0,
+      "full_merge_seconds": 219.45,
+      "full_merge_cpu_seconds": 218.39,
       "full_document_reads": 33756,
       "full_document_read_bytes": 3361283403,
       "full_segments": 1,
@@ -6219,9 +6222,10 @@
       "full_fingerprint_bytes": 94834170,
       "full_fingerprint_index_bytes": 1341748,
       "full_checksum_bytes": 783888,
-      "final_peak_rss": "411948 kB"
+      "final_peak_rss": "834848 kB"
     },
     "churn": {},
+    "churn_queries": [],
     "queries": {
       "first": {
         "classes": {},
@@ -6232,6 +6236,7 @@
   "c3": {
     "build": {},
     "churn": {},
+    "churn_queries": [],
     "queries": {}
   }
 }
