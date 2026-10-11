@@ -436,35 +436,56 @@ experiments replace it with measurements.
 **Segments.** Immutable files per structure over a doc-id range, committed by a
 manifest rename. S2 ships front-coded dictionary blocks (codec 1).
 
-**Static term dictionary (D65, decided 2026-10-10).** The fully merged index
-keeps terms with df ≥ 2 in an **FST mapping each term to its postings offset**.
-A list's range ends at the next term's output. Rare terms (df = 1) are 32-bit
-fingerprint records, not FST keys. The FST is read whole at open and stays
-resident: about 75 MB against codec 1's 10 MB on `$HOME`, and a 60–140 ms cold
-open. In exchange, lookups are 5–14× faster, and prefix, regex and Levenshtein
-expansion over terms comes from automaton intersection. That expansion is best
-effort, because rare terms are not in the FST. Measured in
-`dbalmain/term-dict-bench` (`results/msa2-home-2026-10-10.txt`, reviewed in
-`results/review-1-astra.md`).
+**Static term dictionary (D65, decided 2026-10-11).** The fully merged index
+keeps terms with df ≥ 2 in **front-coded blocks on disk, routed by a small
+resident FST over block keys** (Lucene's layout; bench arm 4). Each block holds
+32 codec-1 entries (term suffix, df, list length) and starts with its full first
+term and postings base. The FST maps the shortest separator between adjacent
+blocks to the block's offset. Rare terms (df = 1) are 32-bit fingerprint
+records, not dictionary entries. On p16s's `$HOME` (10.3M terms) the resident
+part is 17 MB, of which the FST is 3.2 MB, and opening costs 23 ms cold.
 
-**Alternative kept open: term ordinals.** The FST could map each term to its
-position in the sorted sequence instead, with an Elias–Fano array from ordinal
-to postings offset (bench arm 2). That costs 2.9 MB more on `$HOME` (+1.3% of
-the index) and one more structure to build, checksum and merge. It buys a dense,
-exact 23-bit id per dictionary term, ordinal → term in about 2 µs, and a home
-for per-term columns indexed by ordinal. It was not chosen because no consumer
-needs it yet. Ordinals are renumbered by every merge, the rare terms have none,
-and the phrase-pair filter is keyed by fingerprints, which avoid both problems.
-**Switch to ordinals when a design needs either of these:**
+- **Exact lookup:** one FST walk, then one block read and decode: 4 µs warm,
+  150 µs cold.
+- **Prefix, regex and Levenshtein expansion:** the automaton walks the blocks
+  and skips any block whose common prefix leaves it dead. A Levenshtein query
+  takes 40 ms, against 821 ms for a scan; a two-word alternation takes 4 ms.
+  Expansion is best effort, because rare terms are not in the dictionary.
+
+A full term FST (term → postings offset, arm 3) was measured too: 134 MB
+resident, a 266 ms cold open, and Levenshtein in 7 ms. It is not stored.
+**Possible later addition:** build it in memory on demand from the blocks,
+which already hold the terms in sorted order. That costs about 7 s of
+background CPU on p16s and 134 MB while it is resident, and it needs no extra
+disk. Add it if measured query logs show term-level automaton queries are
+common enough for 40 ms → 7 ms to matter. Measured in `dbalmain/term-dict-bench`
+(slice 1 `results/*-2026-10-10.txt`, reviewed in `results/review-1-astra.md`;
+slice 2 `results/*-2026-10-11-slice2.txt`).
+
+**Alternative kept open: term ordinals.** With fixed 32-entry blocks, a term's
+position in the sorted sequence is implicit: block number × 32 + slot. Ordinal
+→ term is one block decode, and the dictionary needs no extra structure to
+expose it. Ordinals give a dense, exact 24-bit id per dictionary term and a
+home for per-term columns indexed by ordinal. Nothing uses them yet. Every
+merge renumbers them, rare terms have none, and the phrase-pair filter is keyed
+by fingerprints, which avoid both problems. **Use ordinals when a design needs
+either of these:**
 
 - a per-term value resident for query planning, such as exact df, where a list's
   byte length is not a good enough proxy;
 - a structure rebuilt with each merge anyway that benefits from small exact term
   ids, such as a per-segment filter over dictionary terms only.
 
-The switch is a dictionary codec change, not a format break. The reasoning, with
-diagrams:
+The reasoning, with diagrams:
 [Term Ordinals for D65](https://claude.ai/artifact/EeBPfDj46NVpnGNW6Ub4h9).
+
+**Measured, not pursued: permanent term ids.** Ids assigned when a term first
+reaches df 2, stable across merges, would let segments key postings by id and
+drop their own term strings. On p16s they add 39 MB (29%) to the global
+dictionary. Dropping per-segment strings covers that only at 16 unmerged
+segments: a net saving of 38 MB. At 4 segments the net is −42 MB, and at 1 it is
+−79 MB. Index-time lookups were not the obstacle: a file's distinct terms (p50
+about 75) resolve in 0.26 ms warm and 2 ms cold from disk blocks.
 
 ## Find syntax
 

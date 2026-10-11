@@ -3653,7 +3653,9 @@ removing most of it.
 
 ## D65 — The term dictionary is 87% of the index
 
-**Status: open.** S2 M2b, 2026-10-07;
+**Status: static dictionary layout answered: front-coded blocks routed by a
+resident block-prefix FST (Dave, 2026-10-11); see the last update below. H's
+codec question (C, below) is still open.** S2 M2b, 2026-10-07;
 [measurements](S2.md#m2--segment-writer-and-reader).
 
 **Question:** The first real build is 12.7% of text, not the 6.8% S2 M0
@@ -3853,6 +3855,61 @@ is the only thing against it, and a run codec is a direct answer to it. **The
 fact that would change it:** on a refreshed catalog, small-class p90 stays over
 20 ms with full coverage. Then H's verification reads are the cost, and A
 stands.
+
+### D65 update — the static dictionary's layout (2026-10-10 to 2026-10-11)
+
+**Answered: blocks on disk, routed by a resident FST over block keys (Dave,
+2026-10-11).** [DESIGN.md](DESIGN.md) § Static term dictionary holds the result.
+Measured in its own repo, `dbalmain/term-dict-bench` (private), on msa2, geekom
+and p16s; slice 1 was reviewed by Astra (`results/review-1-astra.md`). The
+questions were kept on a
+[decisions page](https://claude.ai/artifact/EeBPfDj46NVpnGNW6Ub4h9).
+
+The question was how the fully merged dictionary should hold the terms left
+after H moves rare terms (df = 1) to fingerprint records. Option B above guessed
+an FST was slower and saved little. Both guesses were made before H, when 81%
+of the bytes were singletons.
+
+| p16s `$HOME`, 10.3M terms          | Codec 1 (A) | Full FST, term → offset | Blocks + block-prefix FST |
+| ---------------------------------- | ----------: | ----------------------: | ------------------------: |
+| Dictionary on disk                 |    127.9 MB |                133.3 MB |                  133.8 MB |
+| Resident                           |     16.6 MB |                134.5 MB |                   17.4 MB |
+| Open, cold / warm                  |  30 / 10 ms |             266 / 94 ms |                 23 / 6 ms |
+| Exact lookup, warm p50             |      4.3 µs |                  1.9 µs |                    4.4 µs |
+| Levenshtein (`config`, distance 1) |      821 ms |                  6.7 ms |                     40 ms |
+| Two-word alternation (`get\|set`)  |      826 ms |                  1.7 ms |                    3.7 ms |
+| Substring (`.*timeout.*`)          |      1.09 s |                  2.01 s |                    1.09 s |
+
+The block-prefix FST is 3.2 MB of the 17.4 MB resident. All arms return
+identical ranges for every kept term and identical pattern sets. Timings are
+single runs. msa2's `$HOME` (6.0M terms) ranks the same way.
+
+**Decided along the way (Dave):**
+
+- **An FST, not plain codec 1** (2026-10-10). Term-level regex and fuzzy
+  expansion is best effort, because rare terms are not in it. Trigrams stay, as
+  an optional feature.
+- **Blocks plus a block-prefix FST, not a resident full FST** (2026-10-11). The
+  full FST's open cost grows with the corpus: 61–84 ms cold on msa2, 266 ms on
+  p16s.
+- **A full FST stays possible, in memory only.** It can be built on demand from
+  the blocks, which hold the terms sorted: about 7 s of background CPU and 134
+  MB resident on p16s, no extra disk. Add it if measurements show term-level
+  automaton queries are common enough for 40 ms → 7 ms to matter.
+- **Term ordinals kept open.** They are implicit with fixed 32-entry blocks.
+  DESIGN.md lists when to use them.
+
+**Measured and not pursued: permanent term ids.** Ids given when a term reaches
+df 2, stable across merges, would let segments drop their own term strings. On
+p16s the ids add 39 MB to the global dictionary. Dropping segment strings pays
+for that only at 16 unmerged segments (net +38 MB); at 4 segments the net is
+−42 MB, and at 1 it is −79 MB.
+
+**Corrections.** The ordinal arm's first premise, "about 18 MB of per-entry df
+and list-length bytes", was wrong: on msa2 it is 12.0 MB, 6.0 MB each. And the
+ordinal arm's apparent saving was mostly the df it left out: a fair saving is
+0.7% (Astra). Codec-1 postings lists carry no document count, so any layout that
+drops the entry's df must store it somewhere else.
 
 ## D66 — Phrase queries read too much: positions, or not
 
