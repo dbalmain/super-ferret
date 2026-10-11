@@ -4372,6 +4372,14 @@ named `and`, `or` or `not`. Then B.
 
 ## D72 — Does the grep CLI automatically scan broad queries?
 
+**Status: answered, A (Dave, 2026-10-11).** Any pattern the index cannot
+narrow, including a literal shorter than 3 bytes, scans the selected files.
+Trigram indexes are optional, and `ferret grep` works without them by scanning.
+The documentation says plainly that without trigram indexes it should not be
+expected to beat ripgrep. The grep-usage survey (`dbalmain/ferret-survey`, 21,815 agent searches)
+found 8.7% of patterns cannot be narrowed at all; under B those would have
+needed `--scan`.
+
 **Question:** Should a valid `ferret grep` command ever need `--scan` merely
 because its regex cannot narrow the indexed files?
 
@@ -4392,6 +4400,11 @@ time on broad accidental commands, together with traces showing agents can
 reliably retry with `--scan`; then B. Measure before introducing C's budget.
 
 ## D73 — What freshness does indexed grep promise?
+
+**Status: answered, A+D (Dave, 2026-10-11):** snapshot by default, plus
+`ferret grep --live`. The grep-usage survey found 35.3% of agent searches
+follow an edit within 5 calls, but only 0.25% search for bytes the edit just
+wrote.
 
 **Question:** May indexed grep retain S2/S3's snapshot exclusions while reading
 current candidate bytes, or must every invocation search the current tree?
@@ -4425,6 +4438,10 @@ only way to request freshness.
 
 ## D74 — May visibility flags recover ferret-excluded paths?
 
+**Status: answered, A (Dave, 2026-10-11).** Possible later feature, not
+scheduled: respect `.ignore` and `.rgignore` files. The grep-usage survey found
+13 uses of `--hidden` and none of `-u` or `--no-ignore`.
+
 **Question:** Should rg's positive globs and visibility switches reconstruct
 paths absent from the ferret catalog's visible universe?
 
@@ -4447,6 +4464,10 @@ and measurements before implementation. This slice does not authorize that
 change to D13/D47.
 
 ## D75 — Raw bytes or BOM-aware input?
+
+**Status: answered, D (Dave, 2026-10-11).** UTF-16 is a known difference from
+rg. The BOM census (`dbalmain/ferret-survey`) found 1,389 files with a UTF-8 BOM
+and 832 with a UTF-16LE BOM, most of the latter `.json` in one archive.
 
 **Question:** May grep keep UTF-8 BOM bytes and decline UTF-16 BOM detection,
 including on explicit current files where freshness does not explain a miss?

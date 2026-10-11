@@ -1919,7 +1919,8 @@ Follow-ups the review left open, none blocking:
 Dave's answer to D62: `ferret grep` is a must, as a drop-in replacement for
 grep, the way `ferret find` is for find(1).
 
-- It matches **ripgrep's syntax** for compatibility, and follows the same
+- It matches **ripgrep's syntax** for compatibility (reconfirmed 2026-10-11:
+  rg, not GNU grep, because agents are trained on rg), and follows the same
   rules as find on how closely to match: match where cheap, err towards
   performance, and ignored paths don't exist.
 - The private differential harness is `~/w/grep-compat` (bootstrapping,
