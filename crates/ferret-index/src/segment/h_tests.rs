@@ -896,3 +896,48 @@ fn c3_offsets_survive_restart_boundaries_and_purge() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn c3_reuses_one_checked_full_fallback_for_a_documents_records() {
+    let _arm = Arm::new(OFFSET_CODEC);
+    let terms = [b"alpha".as_slice(), b"beta", b"gamma"];
+    let mut writer = Writer::with_codec(0, 0, OFFSET_CODEC).unwrap();
+    for term in terms {
+        writer.push_at(term, &[0], Some(1000)).unwrap();
+    }
+    let mut bytes = Vec::new();
+    writer.finish(&mut bytes).unwrap();
+    let first = Segment::open(bytes).unwrap();
+    let second = build(
+        1,
+        2,
+        &terms.iter().map(|t| (t.to_vec(), vec![1, 2])).collect(),
+    );
+    let (mut windows, mut full_reads) = (0, 0);
+    let mut reader = |doc, offset: Option<u32>, bytes: &mut Vec<u8>| {
+        assert_eq!(doc, 0);
+        *bytes = b"alpha beta gamma".to_vec();
+        if offset.is_some() {
+            windows += 1;
+        } else {
+            full_reads += 1;
+        }
+        Some(Window {
+            start: 0,
+            complete: offset.is_none(),
+        })
+    };
+    let (output, sizes) = merged_verified(&[first, second], &DocSet::new(3, 0..3), &mut reader);
+    assert_eq!((windows, full_reads), (1, 1));
+    assert_eq!(sizes.records_graduated, 3);
+    for term in terms {
+        assert_eq!(
+            candidates(std::slice::from_ref(&output), term),
+            [
+                (0, Certainty::Yes),
+                (1, Certainty::Yes),
+                (2, Certainty::Yes)
+            ]
+        );
+    }
+}

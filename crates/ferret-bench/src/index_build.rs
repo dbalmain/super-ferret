@@ -609,6 +609,111 @@ fn generated_window(
     }
 }
 
+/// Churn query classes come from the generator's live-document oracle,
+/// independently of any codec's retained strings. Sampling is untimed.
+fn churn_samples(alive: &[bool], vocabulary: &[Vec<u8>]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+    let mut df: HashMap<&[u8], u32> = vocabulary.iter().map(|t| (t.as_slice(), 0)).collect();
+    let mut bytes = Vec::new();
+    let mut unique = Vec::new();
+    let mut rng = Rng(0x5eed_0065);
+    let mut seen_unique = 0;
+    for (doc, &live) in alive.iter().enumerate() {
+        if !live {
+            continue;
+        }
+        bytes.clear();
+        generated(doc as u32, vocabulary, &mut bytes);
+        let mut seen = std::collections::HashSet::new();
+        for word in bytes
+            .split(u8::is_ascii_whitespace)
+            .filter(|w| !w.is_empty())
+        {
+            if seen.insert(word)
+                && let Some(count) = df.get_mut(word)
+            {
+                *count += 1;
+            }
+        }
+        // A digit in the document's hex id distinguishes this whole token
+        // from the letters-only vocabulary. It is unique to this document.
+        let id = format!("{doc:x}");
+        if id.bytes().any(|b| b.is_ascii_digit()) {
+            seen_unique += 1;
+            let term = format!("u{id}q").into_bytes();
+            if unique.len() < 50 {
+                unique.push(term);
+            } else {
+                let slot = rng.below(seen_unique) as usize;
+                if slot < 50 {
+                    unique[slot] = term;
+                }
+            }
+        }
+    }
+    let mut eligible: Vec<_> = df
+        .into_iter()
+        .filter(|&(_, n)| (2..=100).contains(&n))
+        .collect();
+    eligible.sort_unstable_by_key(|&(term, _)| term);
+    let mut rare = Vec::new();
+    for (i, &(term, _)) in eligible.iter().enumerate() {
+        if rare.len() < 50 {
+            rare.push(term.to_vec());
+        } else {
+            let slot = rng.below(i as u64 + 1) as usize;
+            if slot < 50 {
+                rare[slot] = term.to_vec();
+            }
+        }
+    }
+    let absent = (0..50)
+        .map(|i| format!("d65absent{i:04}").into_bytes())
+        .collect();
+    vec![("df1", unique), ("df2-100", rare), ("absent", absent)]
+}
+
+fn churn_lookup_records(
+    view: &View,
+    live: &DocSet,
+    samples: &[(&str, Vec<Vec<u8>>)],
+    state: &str,
+) -> crate::Result<()> {
+    for (class, terms) in samples {
+        let (mut raw, mut alive) = (Vec::new(), Vec::new());
+        for term in terms {
+            let mut records = 0;
+            let mut live_records = 0;
+            for segment in view.segments() {
+                for record in segment.fingerprint_hits_until(term, &|| false)? {
+                    records += 1;
+                    live_records += u64::from(live.contains(record.doc));
+                }
+            }
+            raw.push(records);
+            alive.push(live_records);
+        }
+        raw.sort_unstable();
+        alive.sort_unstable();
+        let q = |counts: &[u64], fraction: f64| {
+            counts
+                .get(((counts.len().saturating_sub(1)) as f64 * fraction).round() as usize)
+                .copied()
+                .unwrap_or(0)
+        };
+        println!(
+            "churn_records state={state} class={class} n={} raw_median={} raw_p90={} raw_max={} live_median={} live_p90={} live_max={}",
+            terms.len(),
+            q(&raw, 0.5),
+            q(&raw, 0.9),
+            q(&raw, 1.0),
+            q(&alive, 0.5),
+            q(&alive, 0.9),
+            q(&alive, 1.0)
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Result<()> {
     let options = Options::parse(options)?;
     if options.snapshots || options.control_bytes.is_some() || options.corpus.is_some() {
@@ -789,6 +894,8 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
         incarnation,
         live: &live,
     };
+    let samples = churn_samples(&alive, &vocabulary);
+    churn_lookup_records(&writer.view(), &live, &samples, "ordinary")?;
     let cpu = crate::segment_build::cpu_seconds()?;
     let io = io_counters()?;
     let (mut reads, mut bytes_read) = (0u64, 0u64);
@@ -832,6 +939,7 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
             .map(|s| s.fingerprint_records())
             .sum::<u64>()
     );
+    churn_lookup_records(&writer.view(), &live, &samples, "full")?;
     Ok(())
 }
 

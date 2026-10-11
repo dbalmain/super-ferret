@@ -124,8 +124,8 @@ pub fn stream_verified<R: ReadAt>(
     use crate::segment::{GRADUATION_CODEC, OFFSET_CODEC, verify_record};
     let graduate = matches!(writer.codec(), GRADUATION_CODEC | OFFSET_CODEC);
     let offsets = writer.codec() == OFFSET_CODEC;
-    let mut batch = if writer.codec() == GRADUATION_CODEC {
-        graduation::collect(inputs, live, read, cancelled)?
+    let mut batch = if graduate {
+        graduation::collect(inputs, live, offsets, read, cancelled)?
     } else {
         Vec::new()
     }
@@ -183,28 +183,6 @@ pub fn stream_verified<R: ReadAt>(
                 docs.push(occurrence.record.doc);
                 if occurrence.removable {
                     confirmed.push(occurrence.record.key());
-                }
-            }
-        }
-        if offsets {
-            for input in inputs {
-                for record in input.fingerprint_hits_until(&term, cancelled)? {
-                    if !live.contains(record.doc) {
-                        continue;
-                    }
-                    if let Some(verified) = verify_record(
-                        record.doc,
-                        &term,
-                        if offsets { record.offset } else { None },
-                        offsets && record.offset.is_some(),
-                        read,
-                        &mut bytes,
-                    ) {
-                        docs.push(record.doc);
-                        if verified.removable {
-                            confirmed.push(record.key());
-                        }
-                    }
                 }
             }
         }

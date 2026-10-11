@@ -38,10 +38,14 @@ def fields(path):
 result = {}
 for arm in ARMS:
     data = {'build': fields(BASE / f'{arm}-build.log'),
-            'churn': fields(BASE / f'{arm}-churn.log'), 'queries': {}}
+            'churn': fields(BASE / f'{arm}-churn.log'), 'churn_queries': [], 'queries': {}}
     path = BASE / f'{arm}-churn.log'
     if path.exists():
         text = path.read_text()
+        for line in text.splitlines():
+            if line.startswith('churn_records '):
+                data['churn_queries'].append(dict((k, value(v)) for k, v in
+                                                  (part.split('=', 1) for part in line.split()[1:])))
         for key in ['followed_records', 'demoted_records', 'purged_records']:
             data['churn'][key] = sum(map(int, re.findall(rf'{key}: (\d+)', text)))
     for state in ['first', 'steady', 'full']:
@@ -94,3 +98,7 @@ write_csv('latency-sizes.csv', [dict(arm=arm, state=state, **row)
                               for arm, data in result.items()
                               for state, query in data['queries'].items()
                               for row in query['sizes']])
+
+write_csv('churn-records.csv', [dict(arm=arm, **row)
+                               for arm, data in result.items()
+                               for row in data['churn_queries']])
