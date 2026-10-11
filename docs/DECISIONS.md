@@ -4339,6 +4339,11 @@ Then A.
 
 ## D71 — Agent habits `ferret search` silently gets wrong
 
+**Status: answered, A (Dave, 2026-10-11).** Phrases containing "or", "and" or
+"not" must keep working: `text:"this or that"` is a phrase, not an error. So
+the embedded-operator error fires only when the argument also holds another
+atom prefix, as in `"text:foo OR text:bar"`.
+
 **Raised 2026-10-08** by the D62 side investigation:
 [query languages](research/grok/query-languages.html), a survey by grok. It
 upholds D62 A and D67 A. It also finds three spellings agents use that
