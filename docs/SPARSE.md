@@ -277,7 +277,14 @@ taking 506.480 CPU seconds / 514.659 wall seconds. All 250 shipped cold/warm que
 checks. Their 40 complete class/cache/band rows are in
 [the latency aggregates](measurements/sparse-latency.txt). Rare total median/p90
 is 2,952.403/3,664.757 ms cold and 244.707/297.236 ms warm; posting read median/p90
-is 24,576/45,056 bytes. Word-four is building next. The final recommendation
-awaits both longer-key layouts. Initial
+is 24,576/45,056 bytes. Word-four reproduced its 688,833,945-byte segment
+exactly and its first 150 query pairs passed, then the benchmark stopped at
+the 5 GB disk floor. Its owned intermediate segment was removed. Those partial
+word-four timings were not emitted and are discarded; both longer-key layouts
+remain to be measured. The final recommendation awaits those runs. Shipped
+trigrams are complete and must not be rerun. Free space fell from about 11 GiB
+to below 5 GB while no further experiment files were being created; no other
+files were deleted. Resumption needs room for the 1.61 GB word 4+5 segment plus
+the 5 GB floor (prefer at least 8 GB free). Initial
 disk headroom was about 14 GiB, about 11 GiB after rebuilding test artifacts;
 stop below 5 GB. No Cargo manifests or lockfiles changed.
