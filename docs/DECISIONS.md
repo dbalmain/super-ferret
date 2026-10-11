@@ -4099,7 +4099,7 @@ A, and make the verifier parallel first.
 default, so `grep:` gives the same answers as `ferret grep`. The grep-usage
 survey found `-i` on 4.1% of 21,815 agent searches, and `grep:` as the only
 content-regex prefix in real `ferret search` commands (2 uses; `re:` and `/…/`
-0). (b) i as built. Was **open**. S3 M0, revision 3, 2026-10-08;
+0). (b) i as built. S3 M0, revision 3, 2026-10-08;
 [design](S3.md#query-surface-d67).
 
 **Question (a):** What prefix makes an argument a regex over file content, and
