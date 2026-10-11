@@ -82,7 +82,7 @@ for arm, data in result.items():
 def write_csv(name, rows):
     columns = list(dict.fromkeys(key for row in rows for key in row))
     with (args.output_dir / name).open('w', newline='') as output:
-        writer = csv.DictWriter(output, fieldnames=columns)
+        writer = csv.DictWriter(output, fieldnames=columns, lineterminator='\n')
         writer.writeheader()
         writer.writerows(rows)
 
