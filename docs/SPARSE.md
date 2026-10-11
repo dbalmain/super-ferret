@@ -268,33 +268,25 @@ are not additive. Empty bands report zero verification and the shared posting
 cost. Verify candidate inclusion and exact matched DocIds against the oracle
 for both temperatures, with missing snapshot documents admitted conservatively.
 
-The file-backed harness and four regressions are implemented. Formatting,
-workspace clippy with warnings denied, and workspace tests pass: **945 passed /
-13 ignored**, zero Rust warnings. The release rebuild passed and the protected
-first foreground run stopped at the disk floor. Oracle preparation matched the previous population
-(112,382 live, 112,376 readable, 3,978,812,718 readable bytes, 250 queries),
-taking 506.480 CPU seconds / 514.659 wall seconds. All 250 shipped cold/warm query pairs passed candidate and oracle identity
-checks. Their 40 complete class/cache/band rows are in
-[the latency aggregates](measurements/sparse-latency.txt). Rare total median/p90
-is 2,952.403/3,664.757 ms cold and 244.707/297.236 ms warm; posting read median/p90
-is 24,576/45,056 bytes. Word-four reproduced its 688,833,945-byte segment
-exactly and its first 150 query pairs passed, then the benchmark stopped at
-the 5 GB disk floor. Its owned intermediate segment was removed. Those partial
-word-four timings were not emitted and are discarded; both longer-key layouts
-remain to be measured. The final recommendation awaits those runs. Shipped
-trigrams are complete and must not be rerun. Free space fell from about 11 GiB
-to below 5 GB while no further experiment files were being created; no other
-files were deleted. Resumption needs room for the 1.61 GB word 4+5 segment plus
-the 5 GB floor (prefer at least 8 GB free). Initial
-disk headroom was about 14 GiB, about 11 GiB after rebuilding test artifacts;
-stop below 5 GB. No Cargo manifests or lockfiles changed.
+The file-backed harness and four regressions are implemented. The prior full
+formatting, clippy and test gates passed: **945 passed / 13 ignored**, zero
+Rust warnings. Source is unchanged at resumption; full gates will be refreshed
+after the timed work. No Cargo manifests or lockfiles changed.
 
-Disk resumption: Dave freed storage; the preflight now reports 69 GiB free.
-Resume only word-four and word 4+5, retaining the complete shipped baseline.
-The partial word-four attempt has no emitted timings, so it requires a full
-query replay. The existing release binary and validated source are unchanged.
+Shipped trigrams and word-four each completed all 250 cold/warm query pairs,
+with zero missed matches or candidate identity differences. Their **80 complete
+class/cache/band rows** are in [the latency aggregates](measurements/sparse-latency.txt).
+Rare total median/p90 is **2,952.403/3,664.757 ms cold and 244.707/297.236 ms warm**
+for shipped trigrams, versus **113.599/299.366 ms cold and 13.465/30.035 ms warm**
+for word-four. Rare posting read median/p90 is 24,576/45,056 bytes versus
+20,480/36,864 bytes. Word-four reproduces its 688,833,945-byte encoded segment
+exactly; its owned file was removed after all measurements passed. Word 4+5 is
+now building in 32 bounded partitions. The final recommendation awaits it.
 
-Resumed oracle preparation reproduced the exact population in 509.830 CPU
-seconds / 512.101 wall seconds. Word-four again encoded to 688,833,945 bytes
-with 12,225,432 keys and 616,673,535 posting bytes. Its first 100 cold/warm
-query pairs passed candidate and oracle identities. Free space is 73 GiB.
+The first word-four attempt stopped at the 5 GB floor after 150 query pairs.
+Its owned index was removed and its unemitted partial timings discarded. Dave
+freed storage; the restarted job reran only the missing word layouts, preserving
+the complete shipped baseline. The new oracle pass reproduced 112,382 live /
+112,376 readable documents, 3,978,812,718 readable bytes and 250 queries in
+509.830 CPU seconds / 512.101 wall seconds. Disk was 69 GiB at resumption and
+73 GiB at the word-four checkpoint; stop below 5 GB. No other files were deleted.
