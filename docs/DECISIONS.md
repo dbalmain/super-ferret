@@ -3972,6 +3972,73 @@ offset-fallback and repeated-merge soundness tests pass; all eleven original
 H tests exercise every arm. Workspace gates pass **938 tests**, versus 928
 on main, with zero warnings.
 
+### D65 update — offsets without graduation
+
+2026-10-12, same refreshed catalog and frozen corpus as slice C;
+[measurements](D65C.md#offsets-without-graduation-c4). Astra's review found
+graduation cannot soundly avoid document reads and proposed C3's offsets with
+every merge-time verification turned off. Two arms test that, both C3's on-disk
+format: **C4a** (codec 6) keeps C3's full read when a dictionary term is demoted
+to a record, to recover its offset; **C4b** (codec 7) reads nothing during a
+merge and gives a demoted record the unknown-offset hint, which queries answer
+with a full check. Neither graduates, so every record stays a Maybe hit that a
+query verifies. All 1,875 C4b queries matched the codec-1 control.
+
+**The read split.** A C3 re-run reproduced slice C's bytes and read counts
+exactly, now counted by purpose. On `$HOME` **all 9.33 GB of steady reads, and
+all 2.99 GB of full-merge reads, are graduation**: a frozen corpus has no
+deaths, so nothing is purged and nothing is demoted. Demotion exists only under
+churn. On S2's trace it is 0.74 GB of C3's 2.92 GB (329k of 2.45M reads); C4a,
+which keeps more records to demote, reads 1.15 GB for it.
+
+| Steady unless noted | Codec 1 | C3 | C4a | C4b |
+| --- | --- | --- | --- | --- |
+| Term index | 450.28 MB | 287.91 MB (36.1%) | 317.95 MB (29.4%) | 317.95 MB (29.4%) |
+| Full merge | 398.12 MB | 271.75 MB (31.7%) | 305.18 MB (23.3%) | 305.18 MB (23.3%) |
+| Follow + steady CPU | 269.05 s | 998.29 s (3.71×) | 287.14 s (1.067×) | 284.17 s (1.056×) |
+| Merge document reads | 0 | 9.33 GB | 0 | 0 |
+| df1 / df2–100 / absent warm p90 | 0.12 / 0.15 / 0.12 ms | 0.09 / 0.14 / 0.05 ms | as C4b | 0.21 / 0.51 / 0.21 ms |
+| Mid / common warm median | 1.88 / 26.26 ms | 1.05× / 1.00× | as C4b | 1.51× / 1.06× |
+| S2 churn, ordinary / full | 19.77 / 11.84 MB | −4.2% / +1.3% | −5.3% / +18.2% | −5.9% / +17.3% |
+| S2 churn merge CPU | 50.11 s | 120.56 s | 79.28 s | 43.75 s |
+
+C4a and C4b write byte-identical sizes on `$HOME`, because neither demotes
+anything there; their latency is the same index, so only C4b's was timed.
+Astra's estimate of about 318 MB steady was right to the megabyte.
+
+**The mid median sits on the gate.** The paired run gives 2.84 / 1.88 ms, 1.51×.
+Two more C4b runs gave 2.81 and 2.82 ms; a rebuilt control gave 1.94 and 1.92
+ms. Pooled, that is 1.48×. Mid terms keep a median of six records each, and
+where an offset window cannot prove the token (its enclosing run leaves the
+1,280 B window) the query reads the whole file: mid p90 is 15.2 ms against 5.5
+ms, and p95 about 99 ms. At full merge mid is 1.55×. The rule tests medians.
+
+**Question: should C4b replace codec 1?**
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. Keep codec 1 | 450.28 MB steady term index. | Nothing to change; every gate passes by definition. |
+| B. C4b, codec 7 | Mid median 1.48–1.51× (at the gate), mid p90 2.8×; full-merge churn 17.3% larger than codec 1, because records are one-way again and each carries an offset. | 29.4% steady saving at 1.056× CPU with zero merge-time reads; rare/absent p90 under 0.6 ms. |
+| C. C4a, codec 6 | B's costs, plus 1.15 GB of demotion reads and 81% more merge CPU than B under churn. | Known offsets on demoted records, which only churned indexes have; unmeasured on query latency. |
+| D. C3, codec 5 | 3.7× CPU and 9.33 GB of merge reads. | 36.1% saving and the best latency. |
+
+**Recommendation: B, as the opt-in candidate, with codec 1 staying default
+until the mid median is settled.** It is the first arm to pass size, CPU and
+rare-term latency together, and it does so with no merge-time reads at all, so
+it carries no version-race or memory-growth risk at merge. C over B buys
+nothing measurable: `$HOME` never demotes, and under churn it costs reads for
+offsets the query would otherwise get by a full check. **The fact that would
+change it:** mid medians on a second machine or corpus landing clearly above
+1.5×, which would make the window-miss fallback the cost and point at a cheaper
+fix there (coalescing a document's windows, or widening a failed window before
+a full read) rather than at graduation. A long-lived daemon on a churning tree
+would also see the +17% full-merge penalty; if that matters more than the
+`$HOME` saving, A stands.
+
+Workspace gates pass **939 tests** (938 + one new: a real merge for codecs 5–7
+counting graduation and demotion reads, which asserts C4b's reader is never
+called). Every H soundness test that looped codecs 2–5 now loops 2–7.
+
 ## D66 — Phrase queries read too much: positions, or not
 
 **Status: answered, D: a per-document Bloom 8 pair filter (Dave, 2026-10-11).**
