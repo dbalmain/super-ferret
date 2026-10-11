@@ -8,6 +8,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::*;
 use crate::{Certainty, Cursor, DocSet, postings::Term};
 
+/// Every record codec: H0, C1, C2, C3, C4a and C4b.
+const H_CODECS: [u32; 6] = [
+    FINGERPRINT_CODEC,
+    RUN_CODEC,
+    GRADUATION_CODEC,
+    OFFSET_CODEC,
+    KEPT_RECORD_CODEC,
+    UNREAD_CODEC,
+];
+
+/// Codecs whose merges take a document reader.
+const VERIFIED_CODECS: [u32; 4] = [
+    GRADUATION_CODEC,
+    OFFSET_CODEC,
+    KEPT_RECORD_CODEC,
+    UNREAD_CODEC,
+];
+
 thread_local! { static ARM: std::cell::Cell<u32> = const { std::cell::Cell::new(FINGERPRINT_CODEC) }; }
 fn arm() -> u32 {
     ARM.with(std::cell::Cell::get)
@@ -103,7 +121,7 @@ fn numbered(term: &[u8]) -> u32 {
 
 #[test]
 fn h_run_starts_at_previous_blocks_last_record_and_spans_four_blocks() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         let _forced = Forced::new(numbered);
@@ -140,7 +158,7 @@ fn h_run_starts_at_previous_blocks_last_record_and_spans_four_blocks() {
 
 #[test]
 fn h_empty_section_and_lower_bound_at_end() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         let _forced = Forced::new(numbered);
@@ -157,7 +175,7 @@ fn h_empty_section_and_lower_bound_at_end() {
 
 #[test]
 fn h_dictionary_front_coding_ignores_removed_singletons() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         let terms = BTreeMap::from([
@@ -176,7 +194,7 @@ fn h_dictionary_front_coding_ignores_removed_singletons() {
 
 #[test]
 fn h_mixed_dictionary_and_fingerprint_occurrences_survive_merges_and_purge() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         let first = build(0, 0, &BTreeMap::from([(b"shared".to_vec(), vec![0])]));
@@ -207,7 +225,7 @@ fn h_mixed_dictionary_and_fingerprint_occurrences_survive_merges_and_purge() {
 
 #[test]
 fn h_forced_collisions_use_real_lookup_merge_and_verification_oracle() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         let _forced = Forced::new(|_| 7);
@@ -242,7 +260,7 @@ fn h_forced_collisions_use_real_lookup_merge_and_verification_oracle() {
 
 #[test]
 fn h_random_corpora_and_merge_sequences_match_brute_force() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         for seed in 1..=32u64 {
@@ -330,7 +348,7 @@ fn h_random_corpora_and_merge_sequences_match_brute_force() {
 
 #[test]
 fn h_purge_regroups_a_run_across_restart_boundaries() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         let _forced = Forced::new(numbered);
@@ -357,7 +375,7 @@ fn h_purge_regroups_a_run_across_restart_boundaries() {
 
 #[test]
 fn h_spilled_records_match_in_memory_bytes_and_detect_damage() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         let dir = std::env::temp_dir().join(format!("ferret-h-spill-{}", std::process::id()));
@@ -404,7 +422,7 @@ fn h_spilled_records_match_in_memory_bytes_and_detect_damage() {
 
 #[test]
 fn h_real_follow_purge_and_codec_change_rebuild_coverage() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         use crate::{Budget, CatalogView, IndexWriter, Stopped};
@@ -456,7 +474,7 @@ fn h_real_follow_purge_and_codec_change_rebuild_coverage() {
 
 #[test]
 fn h_long_candidate_run_cancels_before_reading_the_next_block() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         let _forced = Forced::new(|_| 7);
@@ -479,7 +497,7 @@ fn h_long_candidate_run_cancels_before_reading_the_next_block() {
 
 #[test]
 fn h_source_estimate_bounds_snapshot_maybe_without_fingerprint_reads() {
-    for codec in [FINGERPRINT_CODEC, RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS {
         let _arm = Arm::new(codec);
 
         use crate::{Atom, Budget, CatalogView, IndexWriter, Pinned, Source, Stopped};
@@ -532,7 +550,7 @@ fn h_source_estimate_bounds_snapshot_maybe_without_fingerprint_reads() {
 fn graduation_rejects_dictionary_record_collisions_and_keeps_both_queries() {
     // A fingerprint match may never become an unverified certain hit, and
     // one shared record may represent two different tokens in one document.
-    for codec in [GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in VERIFIED_CODECS {
         let _arm = Arm::new(codec);
         let _forced = Forced::new(|_| 7);
         let inputs = [
@@ -575,7 +593,7 @@ fn graduation_rejects_dictionary_record_collisions_and_keeps_both_queries() {
 #[test]
 fn changed_or_unreadable_disk_documents_cannot_graduate() {
     use std::os::unix::fs::MetadataExt;
-    for codec in [GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in VERIFIED_CODECS {
         let _arm = Arm::new(codec);
         let dir = std::env::temp_dir().join(format!(
             "ferret-graduation-version-{}-{codec}",
@@ -703,7 +721,7 @@ fn offset_shared_by_whole_and_part_cannot_erase_a_collision() {
 
 #[test]
 fn graduation_across_partial_merges_matches_a_token_oracle() {
-    for codec in [RUN_CODEC, GRADUATION_CODEC, OFFSET_CODEC] {
+    for codec in H_CODECS[1..].iter().copied() {
         let _arm = Arm::new(codec);
         for collisions in [false, true] {
             let _forced = collisions.then(|| Forced::new(|t| u32::from(t[0] % 3)));
@@ -938,6 +956,74 @@ fn c3_reuses_one_checked_full_fallback_for_a_documents_records() {
                 (1, Certainty::Yes),
                 (2, Certainty::Yes)
             ]
+        );
+    }
+}
+
+#[test]
+fn c4_merges_never_graduate_and_count_demotion_reads_apart() {
+    // Doc 0's alpha record matches a dictionary term in the other input,
+    // which C3 would graduate after reading doc 0. Doc 3 dies, leaving beta
+    // with live df 1 in doc 2: a demotion. Counters come from the real merge;
+    // `calls` counts every reader call independently of them.
+    let text: [&[u8]; 4] = [b"alpha", b"alpha", b"alpha beta", b"beta"];
+    let cases = [
+        // codec, graduated, graduation reads, demotion reads, beta's offset
+        (OFFSET_CODEC, 1, 1, 1, Some(6)),
+        (KEPT_RECORD_CODEC, 0, 0, 1, Some(6)),
+        (UNREAD_CODEC, 0, 0, 0, None),
+    ];
+    for (codec, graduated, graduation_reads, demotion_reads, beta_offset) in cases {
+        let _arm = Arm::new(codec);
+        let first = build(0, 0, &BTreeMap::from([(b"alpha".to_vec(), vec![0])]));
+        let second = build(
+            1,
+            3,
+            &BTreeMap::from([
+                (b"alpha".to_vec(), vec![1, 2]),
+                (b"beta".to_vec(), vec![2, 3]),
+            ]),
+        );
+        let mut calls = 0;
+        let mut reader = |doc: u32, _: Option<u32>, bytes: &mut Vec<u8>| {
+            calls += 1;
+            *bytes = text[doc as usize].to_vec();
+            Some(Window {
+                start: 0,
+                complete: true,
+            })
+        };
+        let (output, sizes) = merged_verified(&[first, second], &DocSet::new(4, 0..3), &mut reader);
+        assert_eq!(sizes.records_graduated, graduated, "codec {codec}");
+        assert_eq!(
+            sizes.graduation_reads.count, graduation_reads,
+            "codec {codec}"
+        );
+        assert_eq!(sizes.demotion_reads.count, demotion_reads, "codec {codec}");
+        assert_eq!(calls, graduation_reads + demotion_reads, "codec {codec}");
+        let alpha_first = if graduated == 1 {
+            Certainty::Yes
+        } else {
+            Certainty::Maybe
+        };
+        let output = std::slice::from_ref(&output);
+        assert_eq!(
+            candidates(output, b"alpha"),
+            [(0, alpha_first), (1, Certainty::Yes), (2, Certainty::Yes)],
+            "codec {codec}"
+        );
+        assert_eq!(
+            candidates(output, b"beta"),
+            [(2, Certainty::Maybe)],
+            "codec {codec}"
+        );
+        let beta = output[0]
+            .fingerprint_hits_until(b"beta", &|| false)
+            .unwrap();
+        assert_eq!(
+            beta.iter().map(|r| (r.doc, r.offset)).collect::<Vec<_>>(),
+            [(2, beta_offset)],
+            "codec {codec}"
         );
     }
 }

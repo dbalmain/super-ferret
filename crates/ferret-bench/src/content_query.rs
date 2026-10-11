@@ -1304,71 +1304,69 @@ mod d65_tests {
         // hint through the production writer and update the manifest digest.
         // A raw byte comparison would miss the Kelvin sign; trusting offset
         // zero would miss the token that is later in this same document.
-        let fixture = Fixture::new("d65-offset-query");
-        let source = "wrong elsewhere Kelvin".as_bytes();
-        let catalog = fixture
-            .commit(&[("one", source)], &[])
-            .into_resident()
-            .unwrap();
-        let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|r| r.0.0));
-        let cv = CatalogView {
-            incarnation: catalog.generation().incarnation,
-            live: &live,
-        };
-        let dir = fixture.out("index");
-        let mut index = ferret_index::IndexWriter::open_with_codec(
-            &dir,
-            &cv,
+        // Codecs 6 and 7 share codec 5's record hints; only merges differ.
+        for codec in [
             ferret_index::segment::OFFSET_CODEC,
-        )
-        .unwrap();
-        index
-            .follow(&cv, &ferret_index::Budget::unbounded(), &mut |_, b| {
-                b.extend_from_slice(source);
-                Ok(())
-            })
+            ferret_index::segment::KEPT_RECORD_CODEC,
+            ferret_index::segment::UNREAD_CODEC,
+        ] {
+            let fixture = Fixture::new(&format!("d65-offset-query-{codec}"));
+            let source = "wrong elsewhere Kelvin".as_bytes();
+            let catalog = fixture
+                .commit(&[("one", source)], &[])
+                .into_resident()
+                .unwrap();
+            let live = DocSet::new(catalog.next_doc().0, catalog.docs().map(|r| r.0.0));
+            let cv = CatalogView {
+                incarnation: catalog.generation().incarnation,
+                live: &live,
+            };
+            let dir = fixture.out("index");
+            let mut index = ferret_index::IndexWriter::open_with_codec(&dir, &cv, codec).unwrap();
+            index
+                .follow(&cv, &ferret_index::Budget::unbounded(), &mut |_, b| {
+                    b.extend_from_slice(source);
+                    Ok(())
+                })
+                .unwrap();
+            let mut manifest = index.view().manifest().clone();
+            drop(index);
+            let entry = &mut manifest.segments[0];
+            let doc = entry.first;
+            let mut writer =
+                ferret_index::segment::Writer::with_codec(entry.first, entry.last, codec).unwrap();
+            for term in [b"elsewhere".as_slice(), b"kelvin", b"wrong"] {
+                writer.push_at(term, &[doc], Some(0)).unwrap();
+            }
+            let mut encoded = Vec::new();
+            let sizes = writer.finish(&mut encoded).unwrap();
+            let segment = ferret_index::segment::Segment::open(encoded.clone()).unwrap();
+            entry.bytes = sizes.total();
+            entry.terms = sizes.terms;
+            entry.pairs = sizes.pairs;
+            entry.digest = segment.digest();
+            fs::write(dir.join(entry.file_name()), encoded).unwrap();
+            fs::write(dir.join(ferret_index::manifest::FILE), manifest.encode()).unwrap();
+            let view = View::open(&dir, &cv).unwrap().unwrap();
+            let pinned = Pinned::new(Some(&view), &live);
+            let docs = DocNames::new(&catalog).unwrap();
+            let names = NameIndex::new(&catalog);
+            let query = Query::from_args([b"text:kelvin"], std::time::SystemTime::now()).unwrap();
+            let result = once(
+                &catalog,
+                &names,
+                &Content {
+                    pinned: &pinned,
+                    docs: &docs,
+                    bound: None,
+                },
+                &query,
+                None,
+            )
             .unwrap();
-        let mut manifest = index.view().manifest().clone();
-        drop(index);
-        let entry = &mut manifest.segments[0];
-        let doc = entry.first;
-        let mut writer = ferret_index::segment::Writer::with_codec(
-            entry.first,
-            entry.last,
-            ferret_index::segment::OFFSET_CODEC,
-        )
-        .unwrap();
-        for term in [b"elsewhere".as_slice(), b"kelvin", b"wrong"] {
-            writer.push_at(term, &[doc], Some(0)).unwrap();
+            assert_eq!(result.rows, 1);
+            assert_eq!(result.report.verified, 1);
+            assert_eq!(result.read_bytes, (source.len() * 2) as u64);
         }
-        let mut encoded = Vec::new();
-        let sizes = writer.finish(&mut encoded).unwrap();
-        let segment = ferret_index::segment::Segment::open(encoded.clone()).unwrap();
-        entry.bytes = sizes.total();
-        entry.terms = sizes.terms;
-        entry.pairs = sizes.pairs;
-        entry.digest = segment.digest();
-        fs::write(dir.join(entry.file_name()), encoded).unwrap();
-        fs::write(dir.join(ferret_index::manifest::FILE), manifest.encode()).unwrap();
-        let view = View::open(&dir, &cv).unwrap().unwrap();
-        let pinned = Pinned::new(Some(&view), &live);
-        let docs = DocNames::new(&catalog).unwrap();
-        let names = NameIndex::new(&catalog);
-        let query = Query::from_args([b"text:kelvin"], std::time::SystemTime::now()).unwrap();
-        let result = once(
-            &catalog,
-            &names,
-            &Content {
-                pinned: &pinned,
-                docs: &docs,
-                bound: None,
-            },
-            &query,
-            None,
-        )
-        .unwrap();
-        assert_eq!(result.rows, 1);
-        assert_eq!(result.report.verified, 1);
-        assert_eq!(result.read_bytes, (source.len() * 2) as u64);
     }
 }

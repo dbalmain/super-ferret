@@ -11,10 +11,11 @@ import csv
 parser = argparse.ArgumentParser(description="Collect D65C numeric benchmark reports")
 parser.add_argument("--run-dir", type=Path, required=True)
 parser.add_argument("--output-dir", type=Path, required=True)
+parser.add_argument("--arms", nargs="+", default=['control', 'h0', 'c1', 'c2', 'c3'])
 args = parser.parse_args()
 BASE = args.run_dir
 args.output_dir.mkdir(parents=True, exist_ok=True)
-ARMS = ['control', 'h0', 'c1', 'c2', 'c3']
+ARMS = args.arms
 
 
 def value(v):
