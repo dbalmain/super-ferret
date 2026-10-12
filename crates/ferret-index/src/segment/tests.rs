@@ -82,7 +82,7 @@ fn check(bytes: &[u8], first: u32, last: u32, terms: &Terms, rng: &mut Rng) {
     assert_eq!((info.first, info.last), (first, last));
     assert_eq!(info.terms, terms.len() as u64);
     assert_eq!(info.pairs, terms.values().map(|d| d.len() as u64).sum());
-    assert_eq!(info.tokenizer_version, ferret_text::TOKENIZER_VERSION);
+    assert_eq!(info.tokenizer_version, ferret_text::TERM_VERSION);
 
     let mut iter = segment.terms();
     let mut expected = terms.iter();

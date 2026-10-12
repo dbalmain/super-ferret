@@ -199,13 +199,13 @@ mod tests {
 
     #[test]
     fn keyed_versions_survive_ordinary_and_full_spilling_merges() {
-        use ferret_text::{TOKENIZER_VERSION, TRIGRAM_VERSION};
+        use ferret_text::{TERM_VERSION, TRIGRAM_VERSION};
         use std::fs::{self, File};
 
         let dir = std::env::temp_dir().join(format!("ferret-keyed-merge-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir(&dir).unwrap();
-        for version in [TOKENIZER_VERSION, TRIGRAM_VERSION] {
+        for version in [TERM_VERSION, TRIGRAM_VERSION] {
             let mut inputs = Vec::new();
             for doc in 0..11 {
                 let path = dir.join(format!("{version}-{doc}"));

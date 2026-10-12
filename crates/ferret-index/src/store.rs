@@ -32,7 +32,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use ferret_text::{Scratch, TOKENIZER_VERSION, TRIGRAM_VERSION, cap, tokenize};
+use ferret_text::{Scratch, TERM_VERSION, TRIGRAM_VERSION, cap, tokenize_terms};
 
 use crate::live::DocSet;
 use crate::manifest::{Manifest, SegmentEntry};
@@ -658,7 +658,7 @@ impl IndexWriter {
                         }
                     }
                     let mut failed = None;
-                    tokenize(&bytes, &mut scratch, |token| {
+                    tokenize_terms(&bytes, &mut scratch, |token| {
                         if let Err(error) = inverter.add(doc, cap(token.bytes)) {
                             failed = Some(error);
                         }
@@ -929,7 +929,7 @@ impl IndexWriter {
             let version = if tri {
                 TRIGRAM_VERSION
             } else {
-                TOKENIZER_VERSION
+                TERM_VERSION
             };
             if (
                 info.first,
@@ -1024,11 +1024,11 @@ impl IndexWriter {
     }
 }
 
-/// Whether `manifest` belongs to `catalog`'s view: same incarnation and
-/// tokenizer, and no DocId the view has not published.
+/// Whether `manifest` belongs to `catalog`'s view: same incarnation, term
+/// and trigram versions, and no DocId the view has not published.
 fn fits(manifest: &Manifest, catalog: &CatalogView) -> bool {
     manifest.incarnation == catalog.incarnation
-        && manifest.tokenizer_version == TOKENIZER_VERSION
+        && manifest.tokenizer_version == TERM_VERSION
         && manifest.trigram_version == TRIGRAM_VERSION
         && manifest.high_water <= catalog.live.bound()
 }

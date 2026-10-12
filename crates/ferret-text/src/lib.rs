@@ -13,8 +13,19 @@
 use std::collections::BTreeMap;
 use std::ops::{ControlFlow, Range};
 
+mod blob;
+
+pub use blob::{BASE64_MIN, base64_runs, has_base64_run, tokenize_terms};
+
 /// Change when the token contract changes; indexes must rebuild on a change.
 pub const TOKENIZER_VERSION: u32 = 1;
+
+/// What the content term index holds: [`TOKENIZER_VERSION`]'s tokens less
+/// T1's base64-like runs ([`tokenize_terms`]). Term segments and the index
+/// manifest record it, and an index recording another value is discarded
+/// and rebuilt. Change it when either the tokenizer or the blob detector
+/// changes. Version 1 was the tokenizer alone, before T1.
+pub const TERM_VERSION: u32 = 2;
 
 /// Change when the raw-byte trigram extraction contract changes.
 pub const TRIGRAM_VERSION: u32 = 0x7472_0001;
@@ -55,6 +66,8 @@ pub struct Scratch {
     part: String,
     parts: Vec<Range<usize>>,
     casing: BTreeMap<char, Casing>,
+    /// [`tokenize_terms`]' blob spans.
+    spans: Vec<Range<usize>>,
 }
 
 impl Scratch {
@@ -65,7 +78,7 @@ impl Scratch {
     pub fn allocated_bytes(&self) -> usize {
         self.whole.capacity()
             + self.part.capacity()
-            + self.parts.capacity() * size_of::<Range<usize>>()
+            + (self.parts.capacity() + self.spans.capacity()) * size_of::<Range<usize>>()
             + self.casing.len() * (11 * size_of::<(char, Casing)>() + 12 * size_of::<usize>() + 32)
     }
 }
@@ -315,6 +328,7 @@ fn char_run<B>(
         part,
         parts,
         casing,
+        ..
     } = scratch;
     whole.clear();
     parts.clear();

@@ -17,6 +17,11 @@
 //! digest      BLAKE3-128 of every preceding byte
 //! ```
 //!
+//! The head's tokenizer version is [`ferret_text::TERM_VERSION`], what the
+//! term segments hold (the tokenizer less T1's blobs), which each term segment
+//! head records too. A manifest recording another value, such as 1 from an
+//! index built before T1, is discarded and rebuilt through coverage.
+//!
 //! **Frontier.** Every DocId below `frontier` has been dealt with by some
 //! follow pass: it was dead when the pass reached it, or the pass tokenized
 //! it into the segment whose range holds it, or it is in `unreadable` (and
@@ -151,7 +156,7 @@ impl Manifest {
     /// An index that covers nothing, for `incarnation`.
     pub fn empty(incarnation: [u8; 16]) -> Self {
         Self {
-            tokenizer_version: ferret_text::TOKENIZER_VERSION,
+            tokenizer_version: ferret_text::TERM_VERSION,
             trigram_version: ferret_text::TRIGRAM_VERSION,
             incarnation,
             high_water: 0,

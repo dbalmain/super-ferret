@@ -185,7 +185,7 @@ impl Writer {
     /// A writer for documents `first..=last`, stamped with the current
     /// tokenizer version.
     pub fn new(first: u32, last: u32) -> Result<Self, WriteError> {
-        Self::keyed(first, last, ferret_text::TOKENIZER_VERSION)
+        Self::keyed(first, last, ferret_text::TERM_VERSION)
     }
 
     /// A writer for opaque byte keys, stamped with their extractor version.
@@ -196,7 +196,7 @@ impl Writer {
     /// A writer for documents `first..=last` with dictionary codec `codec`:
     /// [`DICTIONARY_CODEC`] or [`FINGERPRINT_CODEC`].
     pub fn with_codec(first: u32, last: u32, codec: u32) -> Result<Self, WriteError> {
-        Self::build(first, last, ferret_text::TOKENIZER_VERSION, codec)
+        Self::build(first, last, ferret_text::TERM_VERSION, codec)
     }
 
     fn build(first: u32, last: u32, version: u32, codec: u32) -> Result<Self, WriteError> {
@@ -246,7 +246,7 @@ impl Writer {
     /// file `postings`. Both must be empty, writable files.
     /// [`Writer::finish_spilled`] completes `out`.
     pub fn spilling(first: u32, last: u32, out: File, postings: File) -> Result<Self, WriteError> {
-        Self::keyed_spilling(first, last, ferret_text::TOKENIZER_VERSION, out, postings)
+        Self::keyed_spilling(first, last, ferret_text::TERM_VERSION, out, postings)
     }
 
     /// [`Writer::spilling`] with an explicit key extractor version.

@@ -338,18 +338,61 @@ fn a_tokenizer_version_change_rebuilds_through_coverage() {
     drop(writer);
 
     let mut manifest = Manifest::read(&dir.0).unwrap().unwrap();
-    manifest.tokenizer_version = TOKENIZER_VERSION + 1;
+    manifest.tokenizer_version = TERM_VERSION + 1;
     manifest.publish(&dir.0).unwrap();
 
     let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
     let view = writer.view();
     assert!(view.manifest().segments.is_empty());
-    assert_eq!(view.manifest().tokenizer_version, TOKENIZER_VERSION);
+    assert_eq!(view.manifest().tokenizer_version, TERM_VERSION);
     assert_eq!(view.uncovered(&catalog.live).len(), 49);
     assert_eq!(dir.files(), named(&view), "the old segments are removed");
     let asked = follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
     assert_eq!(asked.len(), 49);
     assert_eq!(answers(&writer.view(), &catalog), catalog.truth(&corpus));
+}
+
+#[test]
+fn an_index_built_before_t1_is_rebuilt() {
+    let dir = Dir::new("pre-t1");
+    let corpus = Corpus::new(5, 20);
+    let catalog = Catalog::new(20, &[]);
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    follow_all(&mut writer, &catalog, &corpus, &budget(100)).unwrap();
+    drop(writer);
+
+    // Every index written before T1 records the bare tokenizer's version.
+    let mut manifest = Manifest::read(&dir.0).unwrap().unwrap();
+    assert_eq!(manifest.tokenizer_version, TERM_VERSION);
+    assert_ne!(TERM_VERSION, ferret_text::TOKENIZER_VERSION);
+    manifest.tokenizer_version = ferret_text::TOKENIZER_VERSION;
+    manifest.publish(&dir.0).unwrap();
+
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    assert!(writer.view().manifest().segments.is_empty());
+    assert_eq!(writer.view().uncovered(&catalog.live).len(), 20);
+    follow_all(&mut writer, &catalog, &corpus, &Budget::unbounded()).unwrap();
+    assert_eq!(writer.view().manifest().tokenizer_version, TERM_VERSION);
+    assert_eq!(answers(&writer.view(), &catalog), catalog.truth(&corpus));
+}
+
+#[test]
+fn follow_leaves_blob_tokens_out_of_the_term_index() {
+    let dir = Dir::new("t1-follow");
+    let catalog = Catalog::new(1, &[]);
+    let text = b"amber nkzzCi5csBBZh21Dh5Z7n8pP1UaPL+fox+KKcXB0xYeDUnGtBJe3j1LIyw== basalt";
+    let mut writer = IndexWriter::open(&dir.0, &catalog.view()).unwrap();
+    writer
+        .follow(&catalog.view(), &Budget::unbounded(), &mut |_, bytes| {
+            bytes.extend_from_slice(text);
+            Ok(())
+        })
+        .unwrap();
+    let view = writer.view();
+    assert_eq!(view.lookup(b"amber").unwrap(), [0]);
+    assert_eq!(view.lookup(b"basalt").unwrap(), [0]);
+    assert!(view.lookup(b"fox").unwrap().is_empty(), "inside the blob");
+    assert!(view.lookup(b"nkzzci5csbbzh21dh5z7n8pp1uapl").unwrap().is_empty());
 }
 
 /// Four segments over 0..10, 10..20, 20..30 and 30..40, one pass each.
@@ -926,7 +969,7 @@ fn every_head_fact_is_checked_for_each_file() {
                     let version = if tri {
                         TRIGRAM_VERSION
                     } else {
-                        TOKENIZER_VERSION
+                        TERM_VERSION
                     };
                     let mut out = File::create(dir.0.join(&name)).unwrap();
                     let first = entry.first + u32::from(field == 0);
