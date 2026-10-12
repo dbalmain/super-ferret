@@ -16,8 +16,8 @@ use std::ops::{ControlFlow, Range};
 mod policy;
 
 pub use policy::{
-    BASE64_MIN, EPOCH_RANGE, Form, Policy, Timestamp, base64_runs, has_timestamp_in, suppressed,
-    timestamps, tokenize_with,
+    BASE64_MIN, EPOCH_RANGE, Form, Key, Policy, Timestamp, base64_runs, epoch_key,
+    has_timestamp_in, suppressed, timestamps, tokenize_with,
 };
 
 /// Change when the token contract changes; indexes must rebuild on a change.

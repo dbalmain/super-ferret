@@ -58,6 +58,16 @@ fn identifiers_and_hashes_are_not_base64() {
         "src/components/UserProfileCard/index",
         "_ZN4core3fmt5write17h0123456789abcdefE",
         "kSecAttrAccessibleWhenUnlockedThisDeviceOnly1",
+        "oAuth2ClientCredentialsToJSON",
+        "glTexImage2DMultisampleCoverageNV",
+        "Cat_Video_1080_30s_2MB_final",
+        "0x7a3F9b2C4d6E8f0A1b3C5d7E9f1A3b5C7d9E1f3A",
+        // Bundler chunk names and CSS-module classes: a written name around
+        // a short hash.
+        "/DatePickerPanel-Xk3pQ9aZ",
+        "js/settingsView-Qw7rT2xY",
+        "ColorSwatchFns-B7kQx2Lm-Zp4TnR8w",
+        "_cardHeader_aB3dE_cardHeader",
     ] {
         assert!(runs(word).is_empty(), "{word}");
         assert_eq!(kept(word, T1), kept(word, Policy::NONE), "{word}");
@@ -127,7 +137,7 @@ fn time_of_day_and_epochs_leave_but_dates_stay() {
 
 #[test]
 fn an_in_range_identifier_stays_a_term() {
-    // Both numbers are in EPOCH_RANGE; only the key says one is an id.
+    // Every number is in EPOCH_RANGE; only the key says what it is.
     for text in [
         "\"id\": 1760238245",
         "userId=1760238245123",
@@ -141,11 +151,16 @@ fn an_in_range_identifier_stays_a_term() {
     let mut found = Vec::new();
     timestamps(b"\"time\": 1760238245", |stamp| found.push(stamp.form));
     assert_eq!(found, [Form::EpochSeconds]);
+    // Without a key, a number in range is still not an epoch: as many such
+    // 10-digit numbers fall just outside the window as in it.
+    let mut found = 0;
+    timestamps(b"order 1760238245 shipped", |_| found += 1);
+    assert_eq!(found, 0);
 }
 
 #[test]
 fn spans_merge_across_policies() {
-    let text = "1760238245123 iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+    let text = "\"ts\":1760238245123 iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
     let mut spans = Vec::new();
     suppressed(
         text.as_bytes(),
@@ -155,5 +170,5 @@ fn spans_merge_across_policies() {
         },
         &mut spans,
     );
-    assert_eq!(spans, [0..13, 14..text.len()]);
+    assert_eq!(spans, [5..18, 19..text.len()]);
 }

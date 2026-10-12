@@ -48,7 +48,7 @@ impl DateIndex {
         let mut previous = 0;
         for group in pairs.chunk_by(|a, b| a.0 == b.0) {
             let key = group[0].0;
-            if index.keys % SKIP == 0 {
+            if index.keys.is_multiple_of(SKIP) {
                 index.skips.push((key, index.bytes.len()));
                 previous = 0;
             }
@@ -133,7 +133,7 @@ impl DateIndex {
             .position(|&(_, offset)| offset == start)
             .map_or(0, |i| i * SKIP);
         while at < self.bytes.len() {
-            if ordinal % SKIP == 0 {
+            if ordinal.is_multiple_of(SKIP) {
                 key = 0;
             }
             let (Some(delta), Some(count)) =

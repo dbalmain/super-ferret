@@ -56,7 +56,7 @@ pub fn tokenize_with(
         {
             at += 1;
         }
-        if !spans.get(at).is_some_and(|span| span.start < token.run.end) {
+        if spans.get(at).is_none_or(|span| span.start >= token.run.end) {
             emit(token);
         }
     });
@@ -100,18 +100,23 @@ fn base64_byte(b: u8) -> bool {
 }
 
 /// Visits each maximal run of the base64 and base64url alphabets, with up to
-/// two `=` of padding, that looks random rather than written:
+/// two `=` of padding, that looks random rather than written.
 ///
-/// - at least [`BASE64_MIN`] characters before the padding;
-/// - at least one digit, and upper and lower case each a tenth of the run;
+/// First, written segments are trimmed off both ends of the run. Segments are
+/// split at `-`, `_` and `/`; a segment is written if it is empty, short
+/// lowercase (`sha512-…`, `forms/d/…`), or fails the randomness test below
+/// regardless of length (`LazyRender-mkD3tyWn`, `_taskRow_sU7PM_taskRow`).
+/// What remains is reported if it has at least [`BASE64_MIN`] characters
+/// before the padding, is not all hex digits, and looks random:
+///
+/// - at least one digit, and upper and lower case each a tenth of it;
 /// - case changes between at least a quarter of adjacent letter pairs (random
 ///   text: half);
 /// - lowercase letters in runs averaging at most 2.6 (random text: about 1.7;
-///   camelCase words: 4 or more).
-///
-/// A short all-lowercase-or-digit word joined to either end by `-`, `_` or
-/// `/` (`sha512-…`, `…/index`) is trimmed off the reported span, so it stays
-/// a term.
+///   camelCase words: 3 or more);
+/// - of the lowercase runs two or more long, fewer than 60% hold a vowel
+///   (random text: about 45%; `MapViewOfFile3FromApp`: 80%). Not applied to
+///   fewer than two such runs.
 pub fn base64_runs(bytes: &[u8], mut emit: impl FnMut(Range<usize>)) {
     let mut at = 0;
     while at < bytes.len() {
@@ -123,39 +128,76 @@ pub fn base64_runs(bytes: &[u8], mut emit: impl FnMut(Range<usize>)) {
         while at < bytes.len() && base64_byte(bytes[at]) {
             at += 1;
         }
-        let body = start..at;
-        let mut end = at;
-        while end < bytes.len() && end - at < 2 && bytes[end] == b'=' {
-            end += 1;
-        }
-        if random_looking(&bytes[body.clone()]) {
-            let start = trim_word(bytes, body.clone(), true);
-            let tail = trim_word(bytes, start..body.end, false);
-            let end = if tail < body.end { tail } else { end };
-            if end - start >= BASE64_MIN {
-                emit(start..end);
+        let (start, body_end) = trim_written(bytes, start..at);
+        let mut end = body_end;
+        if body_end == at {
+            while end < bytes.len() && end - at < 2 && bytes[end] == b'=' {
+                end += 1;
             }
         }
-        at = end.max(at);
+        let body = &bytes[start..body_end];
+        if body.len() >= BASE64_MIN && !hex(body) && random_looking(body) {
+            emit(start..end);
+        }
+        at = at.max(end);
     }
 }
 
-fn random_looking(run: &[u8]) -> bool {
-    if run.len() < BASE64_MIN {
-        return false;
+fn joiner(b: u8) -> bool {
+    matches!(b, b'-' | b'_' | b'/')
+}
+
+/// The run without its written edge segments.
+fn trim_written(bytes: &[u8], run: Range<usize>) -> (usize, usize) {
+    let (mut start, mut end) = (run.start, run.end);
+    while let Some(len) = bytes[start..end].iter().position(|&b| joiner(b)) {
+        if !written(&bytes[start..start + len]) {
+            break;
+        }
+        start += len + 1;
     }
+    while let Some(len) = bytes[start..end].iter().rev().position(|&b| joiner(b)) {
+        if !written(&bytes[end - len..end]) {
+            break;
+        }
+        end -= len + 1;
+    }
+    (start, end.max(start))
+}
+
+fn written(segment: &[u8]) -> bool {
+    segment.len() <= 16
+        && segment
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        || !random_looking(segment)
+}
+
+fn hex(run: &[u8]) -> bool {
+    let run = run.strip_prefix(b"0x").unwrap_or(run);
+    run.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn random_looking(run: &[u8]) -> bool {
     let (mut upper, mut lower, mut digit) = (0, 0, 0);
     let (mut pairs, mut flips) = (0, 0);
-    let mut lower_runs = 0;
+    let (mut lower_runs, mut long_runs, mut voweled) = (0, 0, 0);
+    let (mut run_len, mut run_vowel) = (0, false);
     let mut previous = 0u8;
-    for &b in run {
-        if b.is_ascii_uppercase() {
-            upper += 1;
-        } else if b.is_ascii_lowercase() {
+    for &b in run.iter().chain([&0]) {
+        if b.is_ascii_lowercase() {
             lower += 1;
-            lower_runs += usize::from(!previous.is_ascii_lowercase());
-        } else if b.is_ascii_digit() {
-            digit += 1;
+            lower_runs += usize::from(run_len == 0);
+            run_len += 1;
+            run_vowel |= matches!(b, b'a' | b'e' | b'i' | b'o' | b'u' | b'y');
+        } else {
+            if run_len >= 2 {
+                long_runs += 1;
+                voweled += usize::from(run_vowel);
+            }
+            (run_len, run_vowel) = (0, false);
+            upper += usize::from(b.is_ascii_uppercase());
+            digit += usize::from(b.is_ascii_digit());
         }
         if b.is_ascii_alphabetic() && previous.is_ascii_alphabetic() {
             pairs += 1;
@@ -169,28 +211,7 @@ fn random_looking(run: &[u8]) -> bool {
         && lower >= tenth
         && flips * 4 >= pairs
         && lower * 10 <= lower_runs * 26
-}
-
-/// Where the run starts (or, when `!leading`, ends) once a short written word
-/// at that edge is cut off: at most 16 lowercase letters or digits, joined to
-/// the rest by `-`, `_` or `/`.
-fn trim_word(bytes: &[u8], run: Range<usize>, leading: bool) -> usize {
-    let word = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-    let joiner = |b: u8| matches!(b, b'-' | b'_' | b'/');
-    let slice = &bytes[run.clone()];
-    if leading {
-        let len = slice.iter().take_while(|b| word(b)).count();
-        if (1..=16).contains(&len) && slice.get(len).is_some_and(|&b| joiner(b)) {
-            return run.start + len + 1;
-        }
-        run.start
-    } else {
-        let len = slice.iter().rev().take_while(|b| word(b)).count();
-        if (1..=16).contains(&len) && len < slice.len() && joiner(slice[slice.len() - len - 1]) {
-            return run.end - len - 1;
-        }
-        run.end
-    }
+        && (long_runs < 2 || voweled * 10 < long_runs * 6)
 }
 
 // ── T2: timestamps ──
@@ -219,15 +240,17 @@ pub enum Form {
     DateTime,
     /// `yyyy-mm-dd` or `yyyy/mm/dd` alone.
     Date,
-    /// A 10-digit number in [`EPOCH_RANGE`].
+    /// A 10-digit number in [`EPOCH_RANGE`] after a time key.
     EpochSeconds,
-    /// A 13-digit number whose seconds are in [`EPOCH_RANGE`].
+    /// A 13-digit number whose seconds are in [`EPOCH_RANGE`], after a time
+    /// key.
     EpochMillis,
 }
 
-/// Epoch seconds [`timestamps`] accepts: 2010-01-01 to 2030-01-01 UTC. An
-/// identifier of the right length that lands here is a false positive
-/// (TOKENS.md measures how many).
+/// Epoch seconds [`timestamps`] accepts: 2010-01-01 to 2030-01-01 UTC. A
+/// number is read as an epoch only after a key naming a time ([`epoch_key`]):
+/// without one, as many 10-digit numbers fall in the 20 years beside this
+/// window as in it (TOKENS.md).
 pub const EPOCH_RANGE: Range<i64> = 1_262_304_000..1_893_456_000;
 
 /// Visits each recognised timestamp in `bytes`, left to right, without
@@ -384,7 +407,7 @@ fn epoch(bytes: &[u8], start: usize) -> Option<Timestamp> {
     if continues
         || decimal(bytes.get(end), bytes.get(end + 1))
         || start >= 2 && decimal(bytes.get(start - 1), bytes.get(start - 2))
-        || names_identifier(bytes, start)
+        || epoch_key(bytes, start) != Key::Time
     {
         return None;
     }
@@ -407,10 +430,21 @@ fn epoch(bytes: &[u8], start: usize) -> Option<Timestamp> {
     })
 }
 
-/// Whether the key just before a number names an identifier: `"id": `,
-/// `userId=`, `msg_ids: `. Up to three quote, colon, equals or space bytes may
-/// separate the key from the number.
-pub(crate) fn names_identifier(bytes: &[u8], start: usize) -> bool {
+/// What the key just before a number says it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    /// `"id": `, `userId=`, `msg_ids: `.
+    Identifier,
+    /// `"ts":`, `createdAt=`, `"timestamp": `, `expires_ms `.
+    Time,
+    /// No key, or one that says neither.
+    Other,
+}
+
+/// Reads the key before the number at `start`: a run of letters, digits,
+/// `_` or `-`, separated from the number by one to three quote, colon,
+/// equals or space bytes. An identifier key wins over a time word in it.
+pub fn epoch_key(bytes: &[u8], start: usize) -> Key {
     let before = &bytes[start.saturating_sub(40)..start];
     let gap = before
         .iter()
@@ -419,7 +453,7 @@ pub(crate) fn names_identifier(bytes: &[u8], start: usize) -> bool {
         .take_while(|&&b| matches!(b, b'"' | b'\'' | b':' | b'=' | b' '))
         .count();
     if gap == 0 {
-        return false;
+        return Key::Other;
     }
     let key = &before[..before.len() - gap];
     let len = key
@@ -428,8 +462,34 @@ pub(crate) fn names_identifier(bytes: &[u8], start: usize) -> bool {
         .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
         .count();
     let key = key[key.len() - len..].to_ascii_lowercase();
-    key.ends_with(b"id") || key.ends_with(b"ids")
+    let has = |word: &[u8]| key.windows(word.len()).any(|w| w == word);
+    if key.ends_with(b"id") || key.ends_with(b"ids") {
+        Key::Identifier
+    } else if TIME_WORDS.iter().any(|w| has(w))
+        || key.ends_with(b"at")
+        || key == b"ts"
+        || key.ends_with(b"_ts")
+    {
+        Key::Time
+    } else {
+        Key::Other
+    }
 }
+
+const TIME_WORDS: [&[u8]; 12] = [
+    b"time",
+    b"date",
+    b"stamp",
+    b"epoch",
+    b"created",
+    b"updated",
+    b"modified",
+    b"expire",
+    b"when",
+    b"start",
+    b"end",
+    b"ms",
+];
 
 fn days_in_month(year: i64, month: i64) -> i64 {
     match month {

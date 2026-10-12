@@ -19,15 +19,15 @@ use std::fmt::Write as _;
 use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use ferret_catalog::{Catalog, NameId, Section, Target};
 use ferret_index::dates::{DateIndex, pair_layout_bytes};
 use ferret_text::{
-    EPOCH_RANGE, Form, Policy, Scratch, base64_runs, cap, has_timestamp_in, timestamps, tokenize,
-    tokenize_with,
+    EPOCH_RANGE, Form, Key, Policy, Scratch, base64_runs, cap, epoch_key, has_timestamp_in,
+    timestamps, tokenize, tokenize_with,
 };
 
 /// `none`, `t1`, `t2` or `t1t2`.
@@ -261,7 +261,7 @@ pub(crate) fn census(catalog_dir: &Path, corpus: &Path, options: &[String]) -> c
                             } else {
                                 Kind::Prose
                             };
-                            picked.lock().expect("no panics").push((
+                            picked.lock().unwrap_or_else(PoisonError::into_inner).push((
                                 kind,
                                 doc_ext.to_owned(),
                                 bytes[run.clone()].to_vec(),
@@ -274,13 +274,13 @@ pub(crate) fn census(catalog_dir: &Path, corpus: &Path, options: &[String]) -> c
                         doc_pairs.dedup();
                         pairs
                             .lock()
-                            .expect("no panics")
+                            .unwrap_or_else(PoisonError::into_inner)
                             .extend(doc_pairs.iter().map(|&s| (s, doc)));
                     }
                     if doc_occurrences.len() > 4096 {
                         occurrences
                             .lock()
-                            .expect("no panics")
+                            .unwrap_or_else(PoisonError::into_inner)
                             .append(&mut doc_occurrences);
                     }
 
@@ -315,7 +315,7 @@ pub(crate) fn census(catalog_dir: &Path, corpus: &Path, options: &[String]) -> c
                         if entries.is_empty() {
                             continue;
                         }
-                        let mut map = shards[shard].lock().expect("no panics");
+                        let mut map = shards[shard].lock().unwrap_or_else(PoisonError::into_inner);
                         for (term, mask) in entries.drain(..) {
                             let df = map.entry(term.into_boxed_slice()).or_default();
                             for (arm, count) in df.iter_mut().enumerate() {
@@ -326,9 +326,12 @@ pub(crate) fn census(catalog_dir: &Path, corpus: &Path, options: &[String]) -> c
                 }
                 occurrences
                     .lock()
-                    .expect("no panics")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .append(&mut doc_occurrences);
-                totals.lock().expect("no panics").add(&local);
+                totals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .add(&local);
             });
         }
     });
@@ -340,7 +343,9 @@ pub(crate) fn census(catalog_dir: &Path, corpus: &Path, options: &[String]) -> c
     report_base64(&totals);
     report_stamps(&totals);
     let mut pairs = pairs.into_inner()?;
-    let occurrences = occurrences.into_inner()?;
+    let mut occurrences = occurrences.into_inner()?;
+    // Threads append in any order; sort so the seeded picks repeat.
+    occurrences.sort_unstable();
     report_dates(corpus, &mut pairs, &occurrences)?;
     if let Some(out) = samples_out {
         write_samples(out, picked.into_inner()?)?;
@@ -443,49 +448,10 @@ fn epoch_candidates(bytes: &[u8], tally: &mut EpochTally) {
 /// 0: the key before the number names an identifier; 1: a time; 2: neither
 /// or no key.
 fn key_context(bytes: &[u8], start: usize) -> usize {
-    let before = &bytes[start.saturating_sub(40)..start];
-    let gap = before
-        .iter()
-        .rev()
-        .take(3)
-        .take_while(|&&b| matches!(b, b'"' | b'\'' | b':' | b'=' | b' '))
-        .count();
-    if gap == 0 {
-        return 2;
-    }
-    let key = &before[..before.len() - gap];
-    let len = key
-        .iter()
-        .rev()
-        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-        .count();
-    let key = key[key.len() - len..].to_ascii_lowercase();
-    let has = |needle: &[u8]| key.windows(needle.len()).any(|w| w == needle);
-    if key.ends_with(b"id") || key.ends_with(b"ids") {
-        0
-    } else if [
-        &b"time"[..],
-        b"date",
-        b"stamp",
-        b"epoch",
-        b"created",
-        b"updated",
-        b"modified",
-        b"expire",
-        b"when",
-        b"start",
-        b"end",
-        b"ms",
-    ]
-    .iter()
-    .any(|n| has(n))
-        || key.ends_with(b"at")
-        || key == b"ts"
-        || key.ends_with(b"_ts")
-    {
-        1
-    } else {
-        2
+    match epoch_key(bytes, start) {
+        Key::Identifier => 0,
+        Key::Time => 1,
+        Key::Other => 2,
     }
 }
 
@@ -497,6 +463,9 @@ fn report_terms(shards: Vec<Mutex<Shard>>) -> crate::Result<()> {
     // from terms still at df≥2 ("false suppression" candidates), and their
     // term count.
     let mut lost = [[0u64; 7]; 3];
+    // T1's drops from terms it leaves at df≥2, by term length: terms and
+    // postings.
+    let mut fragments = [[0u64; 2]; 4];
     // Hapaxes T2 removes, by shape.
     let mut shapes: HashMap<&'static str, (u64, u64)> = HashMap::new();
     for shard in shards {
@@ -535,6 +504,16 @@ fn report_terms(shards: Vec<Mutex<Shard>>) -> crate::Result<()> {
                     row[6] += 1;
                 }
             }
+            if df[1] >= 2 && df[0] > df[1] {
+                let bucket = match term.len() {
+                    0..=3 => 0,
+                    4..=7 => 1,
+                    8..=15 => 2,
+                    _ => 3,
+                };
+                fragments[bucket][0] += 1;
+                fragments[bucket][1] += u64::from(df[0] - df[1]);
+            }
             if df[0] == 1 && df[2] == 0 {
                 let entry = shapes.entry(shape(&term)).or_default();
                 entry.0 += 1;
@@ -563,8 +542,14 @@ fn report_terms(shards: Vec<Mutex<Shard>>) -> crate::Result<()> {
         }
         println!("{line}");
     }
+    println!();
+    println!("| t1 drops from terms left at df≥2, by length | terms | postings dropped |");
+    println!("| --- | --- | --- |");
+    for (label, row) in ["1–3", "4–7", "8–15", "16+"].iter().zip(fragments) {
+        println!("| {label} | {} | {} |", row[0], row[1]);
+    }
     let mut shapes: Vec<_> = shapes.into_iter().collect();
-    shapes.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    shapes.sort_by_key(|s| std::cmp::Reverse(s.1.0));
     println!();
     println!("| hapaxes t2 removes, by shape | count | bytes |");
     println!("| --- | --- | --- |");

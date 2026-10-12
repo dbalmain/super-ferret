@@ -1,0 +1,87 @@
+example "2026-10-12T03:04:05.123Z": tokens ["2026", "10", "12t03", "12", "t", "03", "04", "05", "123z", "123", "z"]; t2 keeps ["2026", "10", "12"]
+example "2026/10/12 03:04:05": tokens ["2026", "10", "12", "03", "04", "05"]; t2 keeps ["2026", "10", "12"]
+example "1760238245123": tokens ["1760238245123"]; t2 keeps ["1760238245123"]
+census_seconds: 13.0
+documents: 112376
+document_bytes: 3978812718
+
+| arm | terms | term bytes | hapaxes | hapax bytes | postings |
+| --- | --- | --- | --- | --- | --- |
+| none | 18990510 | 305000438 | 13329685 | 231950335 | 87306842 |
+| t1 | 11445463 | 142714480 | 7393844 | 97806244 | 60423857 |
+| t2 | 18209876 | 295133822 | 12556546 | 222140266 | 85603887 |
+| t1t2 | 10664815 | 132847782 | 6620696 | 87996117 | 58694575 |
+
+| arm | postings dropped | terms gone | hapaxes gone | df≥2 terms gone | terms partly dropped | postings dropped from terms left at df≥2 | such terms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| t1 | 26882985 | 7545047 | 6097173 | 1447874 | 568287 | 14126968 | 406955 |
+| t2 | 1702955 | 780634 | 778143 | 2491 | 11937 | 695609 | 6933 |
+| t1t2 | 28612267 | 8325695 | 6875316 | 1450379 | 579011 | 14847431 | 412684 |
+
+| t1 drops from terms left at df≥2, by length | terms | postings dropped |
+| --- | --- | --- |
+| 1–3 | 43720 | 10071084 |
+| 4–7 | 360439 | 4037967 |
+| 8–15 | 2499 | 16624 |
+| 16+ | 297 | 1293 |
+
+| hapaxes t2 removes, by shape | count | bytes |
+| --- | --- | --- |
+| 13 digits | 716032 | 9308416 |
+| digits and letters | 24067 | 194932 |
+| 10 digits | 20829 | 208290 |
+| 5-9 digits | 17214 | 131276 |
+| other digits | 1 | 12 |
+
+| base64 runs | code | prose | other |
+| --- | --- | --- | --- |
+| documents | 404 | 107 | 7297 |
+| runs | 4410 | 317 | 1946348 |
+| run bytes | 17482217 | 2483346 | 277929502 |
+base64_document_bytes: 2240627858 (documents a has-suppressed-runs flag would send to verification)
+
+timestamp_documents: 14288
+timestamps_date_time: 1679296
+timestamps_date: 238020
+timestamps_epoch_seconds: 119949
+timestamps_epoch_millis: 833799
+
+Epoch-length numbers, standalone (not part of a word or decimal). Bands are 20 years each: below 2010, 2010–2030 (accepted), 2030–2050.
+| digits | band | id key | time key | other |
+| --- | --- | --- | --- | --- |
+| 10 | 1990–2010 | 664 | 47 | 34444 |
+| 10 | 2010–2030 | 807 | 119656 | 103882 |
+| 10 | 2030–2050 | 3 | 21 | 33822 |
+| 13 | 1990–2010 | 13 | 2603 | 7264 |
+| 13 | 2010–2030 | 326 | 833799 | 10119 |
+| 13 | 2030–2050 | 1 | 0 | 319 |
+
+timestamp_occurrences: 2871064
+distinct_second_doc_pairs: 1255072
+
+| key | index bytes | pair-layout bytes | keys | pairs | docs/key median | docs/key p99 | docs/key max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| second | 4856298 | 3915428 | 950219 | 1255069 | 1 | 5 | 314 |
+| minute | 1619748 | 1849824 | 200785 | 690997 | 2 | 20 | 712 |
+| hour | 647239 | 829220 | 56786 | 311557 | 2 | 55 | 737 |
+| day | 305388 | 525530 | 7100 | 236712 | 14 | 205 | 829 |
+
+30 seeded queries per class, picked from timestamp occurrences. Point: the occurrence's instant to the millisecond. Day: its UTC day, and its local (UTC+11) day. Month: its UTC month. Candidates are documents the index returns; verified are those that must be read, because the query is not on key boundaries (or carries a fraction). Warm verify reads and scans each verified document once untimed, then times it.
+| key | query | candidates median | candidates p90 | verified docs median | verified docs p90 | verify MB median | verify MB p90 | lookup ms median | verify ms median | verify ms p90 | true matches median |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| second | point | 2 | 4 | 2 | 4 | 3.98 | 8.99 | 0.007 | 7.60 | 13.33 | 1 |
+| second | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.209 | 0.00 | 0.00 | 187 |
+| second | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.156 | 0.00 | 0.00 | 162 |
+| second | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 3.747 | 0.00 | 0.00 | 2196 |
+| minute | point | 7 | 12 | 7 | 12 | 15.70 | 32.33 | 0.006 | 43.82 | 81.45 | 1 |
+| minute | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.049 | 0.00 | 0.00 | 187 |
+| minute | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.047 | 0.00 | 0.00 | 162 |
+| minute | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 1.126 | 0.00 | 0.00 | 2196 |
+| hour | point | 24 | 69 | 24 | 69 | 27.90 | 57.65 | 0.008 | 55.41 | 116.00 | 1 |
+| hour | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.012 | 0.00 | 0.00 | 187 |
+| hour | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.011 | 0.00 | 0.00 | 162 |
+| hour | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 0.159 | 0.00 | 0.00 | 2196 |
+| day | point | 187 | 348 | 187 | 348 | 171.25 | 259.48 | 0.016 | 283.53 | 383.27 | 1 |
+| day | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.009 | 0.00 | 0.00 | 187 |
+| day | local-day | 283 | 395 | 283 | 395 | 241.43 | 333.43 | 0.024 | 390.90 | 475.49 | 162 |
+| day | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 0.074 | 0.00 | 0.00 | 2196 |
