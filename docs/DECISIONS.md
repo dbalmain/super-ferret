@@ -14,83 +14,83 @@ Predecessors, carried forward where still open:
 
 ## Status
 
-| Id  | Question                                                               | Status         | Answer                                                                                                                                                        |
-| --- | ---------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1  | Repository shape                                                       | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                                                                          |
-| D2  | Format of the living documents                                         | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`                                                        |
-| D3  | Build order: index first, or the no-index tool first                   | answered       | B: usable tool first, to start collecting data                                                                                                                |
-| D4  | What identifies a document                                             | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                                                                             |
-| D5  | Where the mutable state (paths, inodes) lives                          | answered       | A: own catalog; memory budget configurable, set by experiment                                                                                                 |
-| D6  | What the index holds: postings, filters, positions                     | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                                                                             |
-| D7  | Positions                                                              | merged into D6 |                                                                                                                                                               |
-| D8  | Regex at first ship                                                    | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                                                                           |
-| D9  | What a term is                                                         | answered       | B: identifier splitting, filenames especially                                                                                                                 |
-| D10 | Which roots                                                            | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                                                                             |
-| D11 | `unsafe` posture and the intpack dependency                            | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                                                                    |
-| D12 | Licence                                                                | answered       | A: `MIT OR Apache-2.0`                                                                                                                                        |
-| D13 | Ignore rules: precedence, and whose matcher                            | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore`                                                |
-| D14 | Filename search: scan the names, or index them                         | answered       | C, scan first; an optional resident daemon keeps names warm                                                                                                   |
-| D15 | Result unit: per path or per document                                  | answered       | per path; a view may group (e.g. image search, once per content)                                                                                              |
-| D16 | Replace `ignore` with our own gitignore matcher                        | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set                                                  |
-| D17 | Whose regex engine, and when                                           | reopened       | S3: trigger fired (warm rare-literal verify 97% of wall, engine 57%); rec keep A until stronger screening is measured                                         |
-| D18 | Symlinks: catalogue as links, and what they match                      | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in                                                         |
-| D19 | Ignore matching: whole paths, or per-directory rule sets               | answered       | B-flat-indexed: one shared, indexed rule list per directory; last match wins                                                                                  |
-| D20 | Walk across mount points, or stay on the root's device                 | answered       | A: cross mount points below a root, as now                                                                                                                    |
-| D21 | Walk by path, or by directory handle                                   | answered       | B: `rustix` handles for every operation below the root, now                                                                                                   |
-| D22 | A root inside a git work tree                                          | answered       | A (revised 2026-09-27): nothing above a root applies; a root inside a work tree is treated as outside one                                                     |
-| D23 | Recording work trees, so duplicate results can be hidden               | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                                                                       |
-| D24 | How many walk workers by default                                       | answered       | B: `min(16, cores)`, fastest cold (2.50 s vs 3.08 s at 8); `default_workers()`                                                                                |
-| D25 | A configured root that git ignores                                     | answered       | B: a configured root is always walked; rules apply below it                                                                                                   |
-| D26 | A re-run: rebuild the snapshot, or mutate through a log                | answered       | A′: rebuild each run; any walker fault blocks publication until faults are typed                                                                              |
-| D27 | `InoId` and `NameId`: stable, or renumbered                            | answered       | A: renumber each snapshot; C once indexing is incremental                                                                                                     |
-| D28 | Name layout: raw sorted by parent, or front-coded                      | answered       | A: raw NUL-terminated heap by (parent, name); suffix array a later experiment                                                                                 |
-| D29 | How a parallel walk tells the catalog each parent                      | answered       | A: the walker carries a per-directory value                                                                                                                   |
-| D30 | What `ferret find` builds when it opens the catalog                    | answered       | C: lazy, plus a persisted directory `InoId → NameId`; cold find measured                                                                                      |
-| D31 | One inode, several names                                               | answered       | C: one row per file inode, per directory name; shared per-run hash cache                                                                                      |
-| D32 | A reader while `ferret index` runs                                     | answered       | A: generations plus a single-writer lock                                                                                                                      |
-| D33 | What the walker must also hand the catalog                             | answered       | A: walker hands over the directory handle and work-tree kind                                                                                                  |
-| D34 | Which roots a re-run replaces                                          | answered       | B: roots stored with the index; explicit removal; innermost root owns its subtree                                                                             |
-| D35 | Work-tree context for a root inside a repository                       | answered       | moot: with D22 A, no work-tree context above a root                                                                                                           |
-| D36 | Dead documents before there is an index to merge                       | answered       | B for S1: drop dead docs, keep the id counter; reactivation is S2's call                                                                                      |
-| D37 | Remembering why a file has no document                                 | answered       | B: 2-bit content state plus sniffer version                                                                                                                   |
-| D38 | Reading the snapshot: whole file, or by section                        | answered       | B: section-wise positional reads, in slice 5 (via D40)                                                                                                        |
-| D39 | A checksum over the snapshot                                           | answered       | A: none in S1; revisit with incremental indexing                                                                                                              |
-| D40 | What entry count S1 is built for                                       | answered       | B: about 10M catalogued entries, measured at about 40M                                                                                                        |
-| D41 | The name scanner: `memchr::memmem`, or our own                         | answered       | B: own case-folding filter, AVX2 + SWAR, vs memmem control                                                                                                    |
-| D42 | A re-run's memory: the previous generation held                        | replied        | A stands; reply explains carry-over and kept roots                                                                                                            |
-| D43 | A 10M name query costs its section loads, not its scan                 | answered       | B later: compaction, then a name index, then mmap                                                                                                             |
-| D44 | Single inode reads against an evicted catalog                          | answered       | superseded by D46                                                                                                                                             |
-| D45 | Query text in the local log                                            | answered       | A: keep query text; switch with the config file                                                                                                               |
-| D46 | Is the daemon the only mode of operation?                              | answered       | C, plus a batch mode for CI and tests                                                                                                                         |
-| D47 | `ferret find` as a drop-in for find(1)                                 | answered       | C: find semantics except ignore rules                                                                                                                         |
-| D48 | The next move after S1                                                 | answered       | A: compaction; name index only if 10M misses 1 GB                                                                                                             |
-| D49 | A one-shot query with no daemon running                                | answered       | A: spawn on first use, in-process fallback                                                                                                                    |
-| D50 | `ferret find` stretch calls F1–F13                                     | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                                                                    |
-| D51 | Compaction while the watcher is busy                                   | answered       | A: idle-boundary compaction under the writer lock; pause measured and reported in M7                                                                          |
-| D52 | D27 C: ids across compaction                                           | answered       | B: epoch-scoped InoId/NameId; DocId stays stable                                                                                                              |
-| D53 | Cold-open overlay validation                                           | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                                                                |
-| D54 | In-memory names: interning, postings, row order                        | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                                                               |
-| D55 | Storing mtime as an order rather than a value                          | answered       | D + F: seconds-only ordered dictionaries for mtime and ctime, exact per-block max, racy rule; no ordered structure                                            |
-| D56 | Where an indexed find with actions executes                            | answered       | A: action queries run in the client through the shared engine; routing exception to D49                                                                       |
-| D57 | Socket codec: shared JSON lines or binary framing                      | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                                                                         |
-| D58 | Batch input: serde_json or a hand-written reader                       | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                                                                |
-| D59 | How intpack enters the workspace                                       | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                                                                    |
-| D60 | Reactivate a dead DocId when its content returns                       | answered       | B now: never reactivate; A′ (reactivate by content hash, no git) is the named upgrade; git-index idea dropped (saves ~3%)                                     |
-| D61 | Term frequencies in S2's postings                                      | answered       | B: doc ids only for now; frequencies arrive with ranking, by reindex                                                                                          |
-| D62 | `ferret search` syntax for content and booleans                        | answered       | A: `text:` atoms; find-style `OR`, `NOT`, `(` `)`; side survey of query languages done; `ferret grep` follows ripgrep (D72–D75)                               |
-| D63 | Tokenize in a follow pass, or in the crawl's hashing read              | answered       | A: the index follows the catalog in DocId order; D60's experiment found git does not remove the re-hash in a way that matters                                 |
-| D64 | Segment bytes: positional reads or `mmap`                              | answered       | A: positional reads into owned buffers; no `unsafe` or `mmap` until measurements justify it                                                                   |
-| D65 | The term dictionary is 87% of the index                                | answered       | blocks + block-prefix FST; slice C: codec 1 stays; tokens: T1, blob `text:` via trigrams, no date index                                                       |
-| D66 | Phrase queries read too much: positions, or not                        | answered       | D: per-document Bloom 8 over adjacent pairs, pairs only, streaming fold; agent transcripts out of the content index                                           |
-| D67 | How `ferret search` spells a content regex, and when it refuses        | answered       | (a) A2: `grep:REGEX`, case-sensitive, `(?i)` inline, line anchors; (b) i: refuse past live/4 Maybe, `--scan`                                                  |
-| D68 | Per-document filters: a screening stage, terms and trigrams separately | answered       | B: neither filter built (M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower)                                                   |
-| D69 | Saturated large documents in trigram postings                          | answered       | A: index every document's trigrams (M1b: no threshold is both large and fast)                                                                                 |
-| D70 | How large the trigram follow buffer may grow                           | answered       | B: one shared 64 MiB budget (follow RSS 458→248 MiB, +1.1% steady term index); budget to become configurable                                                  |
-| D71 | Agent habits `ferret search` silently gets wrong                       | answered       | A: operators in any case; `content:` aliases `text:`; operator-in-argument error only when another prefix follows                                             |
-| D72 | `ferret grep`: scan broad queries automatically?                       | answered       | A: grep scans when the index can't narrow; works without trigrams, documented as no faster than rg                                                            |
-| D73 | `ferret grep`: what freshness does indexed grep promise?               | answered       | A+D: snapshot by default, plus `--live` keeping ferret's ignore rules                                                                                         |
-| D74 | `ferret grep`: may `-g`/`--hidden` recover excluded paths?             | answered       | A: intersect with D47 visibility; `.ignore`/`.rgignore` a possible later feature                                                                              |
-| D75 | `ferret grep`: BOMs and UTF-16, or raw bytes only?                     | answered       | D: strip a leading UTF-8 BOM for every input; UTF-16 a known difference from rg                                                                               |
+| Id  | Question                                                               | Status         | Answer                                                                                                                          |
+| --- | ---------------------------------------------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | Repository shape                                                       | answered       | A: one repo, workspace under `crates/`; crate boundaries get the most design thought                                            |
+| D2  | Format of the living documents                                         | answered       | A: Markdown living docs; research HTML under `docs/research/`; intpack pages copied to `docs/intpack/`                          |
+| D3  | Build order: index first, or the no-index tool first                   | answered       | B: usable tool first, to start collecting data                                                                                  |
+| D4  | What identifies a document                                             | answered       | ordinal doc ids in add order; doc → hash → inodes → names (restatement confirmed)                                               |
+| D5  | Where the mutable state (paths, inodes) lives                          | answered       | A: own catalog; memory budget configurable, set by experiment                                                                   |
+| D6  | What the index holds: postings, filters, positions                     | answered       | every structure is a candidate filter, verified by scan; trade-offs by experiment                                               |
+| D7  | Positions                                                              | merged into D6 |                                                                                                                                 |
+| D8  | Regex at first ship                                                    | answered       | not a bare scan: trigram filters (B) or postings (C), by experiment                                                             |
+| D9  | What a term is                                                         | answered       | B: identifier splitting, filenames especially                                                                                   |
+| D10 | Which roots                                                            | answered       | A: configured roots; `.gitignore` respected, `.ferretignore` and global overrides                                               |
+| D11 | `unsafe` posture and the intpack dependency                            | answered       | flexible: no blanket `forbid`; SIMD where it pays; intpack may be vendored                                                      |
+| D12 | Licence                                                                | answered       | A: `MIT OR Apache-2.0`                                                                                                          |
+| D13 | Ignore rules: precedence, and whose matcher                            | answered       | A: `ignore` crate behind `DirRules::decide`; `!` un-ignores over an ancestor `.ferretignore` or a `.gitignore`                  |
+| D14 | Filename search: scan the names, or index them                         | answered       | C, scan first; an optional resident daemon keeps names warm                                                                     |
+| D15 | Result unit: per path or per document                                  | answered       | per path; a view may group (e.g. image search, once per content)                                                                |
+| D16 | Replace `ignore` with our own gitignore matcher                        | adopted        | A, adopted: own matcher in `ferret-policy`, no dependencies; at or below `ignore` on every measured rule set                    |
+| D17 | Whose regex engine, and when                                           | reopened       | S3: trigger fired (warm rare-literal verify 97% of wall, engine 57%); rec keep A until stronger screening is measured           |
+| D18 | Symlinks: catalogue as links, and what they match                      | deferred       | links catalogued as links now (target text stored); reverse map and content matches later; no pull-in                           |
+| D19 | Ignore matching: whole paths, or per-directory rule sets               | answered       | B-flat-indexed: one shared, indexed rule list per directory; last match wins                                                    |
+| D20 | Walk across mount points, or stay on the root's device                 | answered       | A: cross mount points below a root, as now                                                                                      |
+| D21 | Walk by path, or by directory handle                                   | answered       | B: `rustix` handles for every operation below the root, now                                                                     |
+| D22 | A root inside a git work tree                                          | answered       | A (revised 2026-09-27): nothing above a root applies; a root inside a work tree is treated as outside one                       |
+| D23 | Recording work trees, so duplicate results can be hidden               | answered       | A: a `worktrees` table; collapse identical copies by `DocId` by default                                                         |
+| D24 | How many walk workers by default                                       | answered       | B: `min(16, cores)`, fastest cold (2.50 s vs 3.08 s at 8); `default_workers()`                                                  |
+| D25 | A configured root that git ignores                                     | answered       | B: a configured root is always walked; rules apply below it                                                                     |
+| D26 | A re-run: rebuild the snapshot, or mutate through a log                | answered       | A′: rebuild each run; any walker fault blocks publication until faults are typed                                                |
+| D27 | `InoId` and `NameId`: stable, or renumbered                            | answered       | A: renumber each snapshot; C once indexing is incremental                                                                       |
+| D28 | Name layout: raw sorted by parent, or front-coded                      | answered       | A: raw NUL-terminated heap by (parent, name); suffix array a later experiment                                                   |
+| D29 | How a parallel walk tells the catalog each parent                      | answered       | A: the walker carries a per-directory value                                                                                     |
+| D30 | What `ferret find` builds when it opens the catalog                    | answered       | C: lazy, plus a persisted directory `InoId → NameId`; cold find measured                                                        |
+| D31 | One inode, several names                                               | answered       | C: one row per file inode, per directory name; shared per-run hash cache                                                        |
+| D32 | A reader while `ferret index` runs                                     | answered       | A: generations plus a single-writer lock                                                                                        |
+| D33 | What the walker must also hand the catalog                             | answered       | A: walker hands over the directory handle and work-tree kind                                                                    |
+| D34 | Which roots a re-run replaces                                          | answered       | B: roots stored with the index; explicit removal; innermost root owns its subtree                                               |
+| D35 | Work-tree context for a root inside a repository                       | answered       | moot: with D22 A, no work-tree context above a root                                                                             |
+| D36 | Dead documents before there is an index to merge                       | answered       | B for S1: drop dead docs, keep the id counter; reactivation is S2's call                                                        |
+| D37 | Remembering why a file has no document                                 | answered       | B: 2-bit content state plus sniffer version                                                                                     |
+| D38 | Reading the snapshot: whole file, or by section                        | answered       | B: section-wise positional reads, in slice 5 (via D40)                                                                          |
+| D39 | A checksum over the snapshot                                           | answered       | A: none in S1; revisit with incremental indexing                                                                                |
+| D40 | What entry count S1 is built for                                       | answered       | B: about 10M catalogued entries, measured at about 40M                                                                          |
+| D41 | The name scanner: `memchr::memmem`, or our own                         | answered       | B: own case-folding filter, AVX2 + SWAR, vs memmem control                                                                      |
+| D42 | A re-run's memory: the previous generation held                        | replied        | A stands; reply explains carry-over and kept roots                                                                              |
+| D43 | A 10M name query costs its section loads, not its scan                 | answered       | B later: compaction, then a name index, then mmap                                                                               |
+| D44 | Single inode reads against an evicted catalog                          | answered       | superseded by D46                                                                                                               |
+| D45 | Query text in the local log                                            | answered       | A: keep query text; switch with the config file                                                                                 |
+| D46 | Is the daemon the only mode of operation?                              | answered       | C, plus a batch mode for CI and tests                                                                                           |
+| D47 | `ferret find` as a drop-in for find(1)                                 | answered       | C: find semantics except ignore rules                                                                                           |
+| D48 | The next move after S1                                                 | answered       | A: compaction; name index only if 10M misses 1 GB                                                                               |
+| D49 | A one-shot query with no daemon running                                | answered       | A: spawn on first use, in-process fallback                                                                                      |
+| D50 | `ferret find` stretch calls F1–F13                                     | answered       | F10 B free order, F11 A concurrent actions, F8 B stored stat, F12 D, F13 A                                                      |
+| D51 | Compaction while the watcher is busy                                   | answered       | A: idle-boundary compaction under the writer lock; pause measured and reported in M7                                            |
+| D52 | D27 C: ids across compaction                                           | answered       | B: epoch-scoped InoId/NameId; DocId stays stable                                                                                |
+| D53 | Cold-open overlay validation                                           | answered       | A for M5/M6; evaluate C with M7 if cold-open budget warrants the durable index                                                  |
+| D54 | In-memory names: interning, postings, row order                        | answered       | B after S1+ merges; prototype passed the scoped check (worst 7.4 ms, bar 10 ms)                                                 |
+| D55 | Storing mtime as an order rather than a value                          | answered       | D + F: seconds-only ordered dictionaries for mtime and ctime, exact per-block max, racy rule; no ordered structure              |
+| D56 | Where an indexed find with actions executes                            | answered       | A: action queries run in the client through the shared engine; routing exception to D49                                         |
+| D57 | Socket codec: shared JSON lines or binary framing                      | answered       | A: one tagged JSONL codec for batch and the socket; measure before considering binary                                           |
+| D58 | Batch input: serde_json or a hand-written reader                       | answered       | B: hand-written request reader with a fuzz target and round-trip property test                                                  |
+| D59 | How intpack enters the workspace                                       | answered       | A: git dependency pinned by rev; vendor only for project-specific changes; crates.io later                                      |
+| D60 | Reactivate a dead DocId when its content returns                       | answered       | B now: never reactivate; A′ (reactivate by content hash, no git) is the named upgrade; git-index idea dropped (saves ~3%)       |
+| D61 | Term frequencies in S2's postings                                      | answered       | B: doc ids only for now; frequencies arrive with ranking, by reindex                                                            |
+| D62 | `ferret search` syntax for content and booleans                        | answered       | A: `text:` atoms; find-style `OR`, `NOT`, `(` `)`; side survey of query languages done; `ferret grep` follows ripgrep (D72–D75) |
+| D63 | Tokenize in a follow pass, or in the crawl's hashing read              | answered       | A: the index follows the catalog in DocId order; D60's experiment found git does not remove the re-hash in a way that matters   |
+| D64 | Segment bytes: positional reads or `mmap`                              | answered       | A: positional reads into owned buffers; no `unsafe` or `mmap` until measurements justify it                                     |
+| D65 | The term dictionary is 87% of the index                                | answered       | blocks + block-prefix FST; slice C: codec 1 stays; tokens: T1, blob `text:` via trigrams, no date index                         |
+| D66 | Phrase queries read too much: positions, or not                        | answered       | D: per-document Bloom 8 over adjacent pairs, pairs only, streaming fold; agent transcripts out of the content index             |
+| D67 | How `ferret search` spells a content regex, and when it refuses        | answered       | (a) A2: `grep:REGEX`, case-sensitive, `(?i)` inline, line anchors; (b) i: refuse past live/4 Maybe, `--scan`                    |
+| D68 | Per-document filters: a screening stage, terms and trigrams separately | answered       | B: neither filter built (M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower)                     |
+| D69 | Saturated large documents in trigram postings                          | answered       | A: index every document's trigrams (M1b: no threshold is both large and fast)                                                   |
+| D70 | How large the trigram follow buffer may grow                           | answered       | B: one shared 64 MiB budget (follow RSS 458→248 MiB, +1.1% steady term index); budget to become configurable                    |
+| D71 | Agent habits `ferret search` silently gets wrong                       | answered       | A: operators in any case; `content:` aliases `text:`; operator-in-argument error only when another prefix follows               |
+| D72 | `ferret grep`: scan broad queries automatically?                       | answered       | A: grep scans when the index can't narrow; works without trigrams, documented as no faster than rg                              |
+| D73 | `ferret grep`: what freshness does indexed grep promise?               | answered       | A+D: snapshot by default, plus `--live` keeping ferret's ignore rules                                                           |
+| D74 | `ferret grep`: may `-g`/`--hidden` recover excluded paths?             | answered       | A: intersect with D47 visibility; `.ignore`/`.rgignore` a possible later feature                                                |
+| D75 | `ferret grep`: BOMs and UTF-16, or raw bytes only?                     | answered       | D: strip a leading UTF-8 BOM for every input; UTF-16 a known difference from rg                                                 |
 
 What the research already measured, and this record assumes (M1, 2026-09-04, on
 `~/w`): 578,200 files / 153 GB, of which 96% of bytes are build output; after
@@ -182,11 +182,11 @@ than as a stop-gap scanner.
 **Question:** In `document → hash → inode(s) → name → dir inode → … → root`,
 what is the primary key of a document, and what follows from it?
 
-| Option                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                  | Buys                                                                                                                                                                                                                                                                                                                              |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Option                                                                                                                                                                        | Costs                                                                                                                                                                                                                                                                                                                                                                   | Buys                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A. Content-addressed: doc id ← (content hash, extractor version, tokenizer version). `(dev, ino) → doc`. `(parent ino, name) → child ino`. Paths resolved by walking parents. | Every indexed file is hashed in full (it is being read in full to tokenize, so the marginal cost is the hash). A result is a (doc, path) pair, not a path: a doc with three names is three results. Metadata predicates (`ext:`, `path:`, `mtime:`) live on the inode/name, not the doc, so composing them with term postings needs a doc↔inode mapping at query time. | Rename or move of a file or a whole directory is one row update; a cross-filesystem move (copy + delete) reuses the doc. Duplicate content is indexed once. A changed tokenizer is a reindex keyed by version, not a migration. Inode reuse (a new file landing on a recycled number) is detected by hash mismatch, not by trust. |
-| B. Inode-addressed: doc id ← `(dev, ino)`; hash kept only to skip re-tokenizing unchanged content                                                                             | A duplicate file is indexed twice. Cross-filesystem moves reindex. Inode reuse after delete is a correctness hazard: `(dev, ino)` alone is not an identity on Linux — it needs `ctime` or a generation number alongside.                                                                                                                                               | Simpler results: one doc, one path. Simpler query-time composition.                                                                                                                                                                                                                                                               |
-| C. Path-addressed                                                                                                                                                             | Every rename is a reindex — the thing the chain exists to avoid.                                                                                                                                                                                                                                                                                                       | Nothing.                                                                                                                                                                                                                                                                                                                          |
+| B. Inode-addressed: doc id ← `(dev, ino)`; hash kept only to skip re-tokenizing unchanged content                                                                             | A duplicate file is indexed twice. Cross-filesystem moves reindex. Inode reuse after delete is a correctness hazard: `(dev, ino)` alone is not an identity on Linux — it needs `ctime` or a generation number alongside.                                                                                                                                                | Simpler results: one doc, one path. Simpler query-time composition.                                                                                                                                                                                                                                                               |
+| C. Path-addressed                                                                                                                                                             | Every rename is a reindex — the thing the chain exists to avoid.                                                                                                                                                                                                                                                                                                        | Nothing.                                                                                                                                                                                                                                                                                                                          |
 
 **Recommendation:** A, with two things stated now because they shape the index:
 (1) the query engine's unit of result is `(doc, name)`, and metadata filters are
@@ -3655,10 +3655,9 @@ removing most of it.
 
 **Status: answered.** Static dictionary layout: front-coded blocks routed by a
 resident block-prefix FST (Dave, 2026-10-11; see the last update below). H's
-codec question: **C** (Dave, 2026-10-11), measured as three arms, C1–C3,
-below. Slice C: codec 1 stays the only term codec; token policy: T1, blob
-`text:` terms through trigrams, no date index (Dave, 2026-10-12). S2 M2b,
-2026-10-07;
+codec question: **C** (Dave, 2026-10-11), measured as three arms, C1–C3, below.
+Slice C: codec 1 stays the only term codec; token policy: T1, blob `text:` terms
+through trigrams, no date index (Dave, 2026-10-12). S2 M2b, 2026-10-07;
 [measurements](S2.md#m2--segment-writer-and-reader).
 
 **Question:** The first real build is 12.7% of text, not the 6.8% S2 M0
@@ -3887,8 +3886,8 @@ questions were kept on a
 
 The question was how the fully merged dictionary should hold the terms left
 after H moves rare terms (df = 1) to fingerprint records. Option B above guessed
-an FST was slower and saved little. Both guesses were made before H, when 81%
-of the bytes were singletons.
+an FST was slower and saved little. Both guesses were made before H, when 81% of
+the bytes were singletons.
 
 | p16s `$HOME`, 10.3M terms          | Codec 1 (A) | Full FST, term → offset | Blocks + block-prefix FST |
 | ---------------------------------- | ----------: | ----------------------: | ------------------------: |
@@ -3922,8 +3921,8 @@ single runs. msa2's `$HOME` (6.0M terms) ranks the same way.
 **Measured and not pursued: permanent term ids.** Ids given when a term reaches
 df 2, stable across merges, would let segments drop their own term strings. On
 p16s the ids add 39 MB to the global dictionary. Dropping segment strings pays
-for that only at 16 unmerged segments (net +38 MB); at 4 segments the net is
-−42 MB, and at 1 it is −79 MB.
+for that only at 16 unmerged segments (net +38 MB); at 4 segments the net is −42
+MB, and at 1 it is −79 MB.
 
 **Corrections.** The ordinal arm's first premise, "about 18 MB of per-entry df
 and list-length bytes", was wrong: on msa2 it is 12.0 MB, 6.0 MB each. And the
@@ -3934,49 +3933,49 @@ drops the entry's df must store it somewhere else.
 ### D65 update — slice C
 
 **Status: answered, A (Dave, 2026-10-12).** Codec 1 stays the only term codec.
-Hapaxes get no special treatment, and codecs 2–7 stay on branch `wt/d65c`;
-this record and [D65C.md](D65C.md) come to main without the code.
+Hapaxes get no special treatment, and codecs 2–7 stay on branch `wt/d65c`; this
+record and [D65C.md](D65C.md) come to main without the code.
 
-2026-10-12, refreshed catalog; [measurements and soundness](D65C.md).
-112,382 live documents, 112,376 readable frozen representatives (3.98 GB),
-six changed/unreadable representatives. The codec-1 control's steady rare-term
-warm p90 is **0.12 ms**, so the stale-catalog floor is gone. All arms are real
+2026-10-12, refreshed catalog; [measurements and soundness](D65C.md). 112,382
+live documents, 112,376 readable frozen representatives (3.98 GB), six
+changed/unreadable representatives. The codec-1 control's steady rare-term warm
+p90 is **0.12 ms**, so the stale-catalog floor is gone. All arms are real
 follows and merges. All 7,500 experimental queries agree with the control.
 
 **Question: which measured arm should replace codec 1?** The original rule
 requires ≥15% steady saving, rare/absent warm p90 <20 ms, mid/common medians
 ≤1.5× control, and follow-plus-steady CPU ≤1.2×.
 
-| Option | Cost | Buys |
-| --- | --- | --- |
-| A. Keep codec 1 | 450.28 MB steady term index. | Passes latency; no graduation reads. Existing default. |
-| B. H0, codec 2 | df2 p90 23.83 ms; mid 4.07×; full churn +10.8%; CPU 1.152×. | 52.6% steady saving. |
-| C1. Run codec, codec 3 | df2 p90 25.88 ms; mid 4.48×; full churn +0.9%; CPU 1.162×. | 50.3% steady saving; nearly removes compact churn penalty. |
-| C2. Runs + verified graduation, codec 4 | CPU 2.896×; steady merge reads 9.57 GB; peak RSS 815 MiB. | 51.7% steady saving; full churn −2.5%; df2 p90 17.15 ms and all latency gates pass. |
-| C3. Runs + first offsets + graduation, codec 5 | CPU 3.698×; steady merge reads 9.33 GB across 2.22M reads; peak RSS 743 MiB; full churn +1.3%. | 36.1% steady saving; rare warm p90 0.09 / 0.14 ms; all latency gates pass. |
+| Option                                         | Cost                                                                                           | Buys                                                                                |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| A. Keep codec 1                                | 450.28 MB steady term index.                                                                   | Passes latency; no graduation reads. Existing default.                              |
+| B. H0, codec 2                                 | df2 p90 23.83 ms; mid 4.07×; full churn +10.8%; CPU 1.152×.                                    | 52.6% steady saving.                                                                |
+| C1. Run codec, codec 3                         | df2 p90 25.88 ms; mid 4.48×; full churn +0.9%; CPU 1.162×.                                     | 50.3% steady saving; nearly removes compact churn penalty.                          |
+| C2. Runs + verified graduation, codec 4        | CPU 2.896×; steady merge reads 9.57 GB; peak RSS 815 MiB.                                      | 51.7% steady saving; full churn −2.5%; df2 p90 17.15 ms and all latency gates pass. |
+| C3. Runs + first offsets + graduation, codec 5 | CPU 3.698×; steady merge reads 9.33 GB across 2.22M reads; peak RSS 743 MiB; full churn +1.3%. | 36.1% steady saving; rare warm p90 0.09 / 0.14 ms; all latency gates pass.          |
 
-**Recommendation: A for the default; keep C1–C3 opt-in.** C1 answers most
-of the compact churn cost, but verification latency still fails the rule.
-C2 and C3 solve enough latency to pass, but graduation exceeds the CPU budget.
-Offsets make typical queries cheap; they do not make graduation cheap on this
-corpus. C3's df2 p95 is still 32.91 ms, and its steady state has three segments
-versus twelve for the other arms under today's paired merge policy.
+**Recommendation: A for the default; keep C1–C3 opt-in.** C1 answers most of the
+compact churn cost, but verification latency still fails the rule. C2 and C3
+solve enough latency to pass, but graduation exceeds the CPU budget. Offsets
+make typical queries cheap; they do not make graduation cheap on this corpus.
+C3's df2 p95 is still 32.91 ms, and its steady state has three segments versus
+twelve for the other arms under today's paired merge policy.
 
-The one-way-record diagnosis is confirmed. Today's ordinary paired churn
-state makes H0 10.3% smaller; the 10.8% penalty appears at full merge. C1's
-run headers add 30.42 MB at first build despite adding no offset payload.
-C3's first-build increment is 94.39 MB (3.12 B/record), above the derived
-80 MB because this refreshed corpus contains more records.
+The one-way-record diagnosis is confirmed. Today's ordinary paired churn state
+makes H0 10.3% smaller; the 10.8% penalty appears at full merge. C1's run
+headers add 30.42 MB at first build despite adding no offset payload. C3's
+first-build increment is 94.39 MB (3.12 B/record), above the derived 80 MB
+because this refreshed corpus contains more records.
 
 **Fact that would change it:** a measured C3 implementation with bounded
-graduation buffers and coalesced/budgeted reads that meets the original
-≤1.2× CPU rule while retaining these size, latency and soundness results; or
-Dave explicitly choosing a higher CPU budget for the measured density gain.
-Any skipped or failed verification must leave a record intact. The current
-buffers grow with the merge input. All required collision, changed-file,
-offset-fallback and repeated-merge soundness tests pass; all eleven original
-H tests exercise every arm. Workspace gates pass **938 tests**, versus 928
-on main, with zero warnings.
+graduation buffers and coalesced/budgeted reads that meets the original ≤1.2×
+CPU rule while retaining these size, latency and soundness results; or Dave
+explicitly choosing a higher CPU budget for the measured density gain. Any
+skipped or failed verification must leave a record intact. The current buffers
+grow with the merge input. All required collision, changed-file, offset-fallback
+and repeated-merge soundness tests pass; all eleven original H tests exercise
+every arm. Workspace gates pass **938 tests**, versus 928 on main, with zero
+warnings.
 
 ### D65 update — offsets without graduation
 
@@ -4000,16 +3999,16 @@ deaths, so nothing is purged and nothing is demoted. Demotion exists only under
 churn. On S2's trace it is 0.74 GB of C3's 2.92 GB (329k of 2.45M reads); C4a,
 which keeps more records to demote, reads 1.15 GB for it.
 
-| Steady unless noted | Codec 1 | C3 | C4a | C4b |
-| --- | --- | --- | --- | --- |
-| Term index | 450.28 MB | 287.91 MB (36.1%) | 317.95 MB (29.4%) | 317.95 MB (29.4%) |
-| Full merge | 398.12 MB | 271.75 MB (31.7%) | 305.18 MB (23.3%) | 305.18 MB (23.3%) |
-| Follow + steady CPU | 269.05 s | 998.29 s (3.71×) | 287.14 s (1.067×) | 284.17 s (1.056×) |
-| Merge document reads | 0 | 9.33 GB | 0 | 0 |
-| df1 / df2–100 / absent warm p90 | 0.12 / 0.15 / 0.12 ms | 0.09 / 0.14 / 0.05 ms | as C4b | 0.21 / 0.51 / 0.21 ms |
-| Mid / common warm median | 1.88 / 26.26 ms | 1.05× / 1.00× | as C4b | 1.51× / 1.06× |
-| S2 churn, ordinary / full | 19.77 / 11.84 MB | −4.2% / +1.3% | −5.3% / +18.2% | −5.9% / +17.3% |
-| S2 churn merge CPU | 50.11 s | 120.56 s | 79.28 s | 43.75 s |
+| Steady unless noted             | Codec 1               | C3                    | C4a               | C4b                   |
+| ------------------------------- | --------------------- | --------------------- | ----------------- | --------------------- |
+| Term index                      | 450.28 MB             | 287.91 MB (36.1%)     | 317.95 MB (29.4%) | 317.95 MB (29.4%)     |
+| Full merge                      | 398.12 MB             | 271.75 MB (31.7%)     | 305.18 MB (23.3%) | 305.18 MB (23.3%)     |
+| Follow + steady CPU             | 269.05 s              | 998.29 s (3.71×)      | 287.14 s (1.067×) | 284.17 s (1.056×)     |
+| Merge document reads            | 0                     | 9.33 GB               | 0                 | 0                     |
+| df1 / df2–100 / absent warm p90 | 0.12 / 0.15 / 0.12 ms | 0.09 / 0.14 / 0.05 ms | as C4b            | 0.21 / 0.51 / 0.21 ms |
+| Mid / common warm median        | 1.88 / 26.26 ms       | 1.05× / 1.00×         | as C4b            | 1.51× / 1.06×         |
+| S2 churn, ordinary / full       | 19.77 / 11.84 MB      | −4.2% / +1.3%         | −5.3% / +18.2%    | −5.9% / +17.3%        |
+| S2 churn merge CPU              | 50.11 s               | 120.56 s              | 79.28 s           | 43.75 s               |
 
 C4a and C4b write byte-identical sizes on `$HOME`, because neither demotes
 anything there; their latency is the same index, so only C4b's was timed.
@@ -4024,23 +4023,23 @@ ms, and p95 about 99 ms. At full merge mid is 1.55×. The rule tests medians.
 
 **Question: should C4b replace codec 1?**
 
-| Option | Cost | Buys |
-| --- | --- | --- |
-| A. Keep codec 1 | 450.28 MB steady term index. | Nothing to change; every gate passes by definition. |
-| B. C4b, codec 7 | Mid median 1.48–1.51× (at the gate), mid p90 2.8×; full-merge churn 17.3% larger than codec 1, because records are one-way again and each carries an offset. | 29.4% steady saving at 1.056× CPU with zero merge-time reads; rare/absent p90 under 0.6 ms. |
-| C. C4a, codec 6 | B's costs, plus 1.15 GB of demotion reads and 81% more merge CPU than B under churn. | Known offsets on demoted records, which only churned indexes have; unmeasured on query latency. |
-| D. C3, codec 5 | 3.7× CPU and 9.33 GB of merge reads. | 36.1% saving and the best latency. |
+| Option          | Cost                                                                                                                                                         | Buys                                                                                            |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| A. Keep codec 1 | 450.28 MB steady term index.                                                                                                                                 | Nothing to change; every gate passes by definition.                                             |
+| B. C4b, codec 7 | Mid median 1.48–1.51× (at the gate), mid p90 2.8×; full-merge churn 17.3% larger than codec 1, because records are one-way again and each carries an offset. | 29.4% steady saving at 1.056× CPU with zero merge-time reads; rare/absent p90 under 0.6 ms.     |
+| C. C4a, codec 6 | B's costs, plus 1.15 GB of demotion reads and 81% more merge CPU than B under churn.                                                                         | Known offsets on demoted records, which only churned indexes have; unmeasured on query latency. |
+| D. C3, codec 5  | 3.7× CPU and 9.33 GB of merge reads.                                                                                                                         | 36.1% saving and the best latency.                                                              |
 
-**Recommendation: B, as the opt-in candidate, with codec 1 staying default
-until the mid median is settled.** It is the first arm to pass size, CPU and
-rare-term latency together, and it does so with no merge-time reads at all, so
-it carries no version-race or memory-growth risk at merge. C over B buys
-nothing measurable: `$HOME` never demotes, and under churn it costs reads for
-offsets the query would otherwise get by a full check. **The fact that would
-change it:** mid medians on a second machine or corpus landing clearly above
-1.5×, which would make the window-miss fallback the cost and point at a cheaper
-fix there (coalescing a document's windows, or widening a failed window before
-a full read) rather than at graduation. A long-lived daemon on a churning tree
+**Recommendation: B, as the opt-in candidate, with codec 1 staying default until
+the mid median is settled.** It is the first arm to pass size, CPU and rare-term
+latency together, and it does so with no merge-time reads at all, so it carries
+no version-race or memory-growth risk at merge. C over B buys nothing
+measurable: `$HOME` never demotes, and under churn it costs reads for offsets
+the query would otherwise get by a full check. **The fact that would change
+it:** mid medians on a second machine or corpus landing clearly above 1.5×,
+which would make the window-miss fallback the cost and point at a cheaper fix
+there (coalescing a document's windows, or widening a failed window before a
+full read) rather than at graduation. A long-lived daemon on a churning tree
 would also see the +17% full-merge penalty; if that matters more than the
 `$HOME` saving, A stands.
 
@@ -4056,91 +4055,99 @@ verification. Question 2: **A**, no date index; T2 is held. Question 3: **A**,
 mtime and ctime stay as they are. The experiment code stays on branch
 `wt/tokens`.
 
+**Follow-up, answered A (Dave, 2026-10-12): a slow `text:<blob>` is accepted.**
+Routed through trigrams, a blob query returns the same rows as before T1. On 300
+sampled blobs it took 2.4–15.6 s median and read about 1.4 GB, against about 0.1
+ms as a dictionary lookup. Base64 trigrams are close to random, so blob-heavy
+documents hold all of them
+([TOKENS.md](TOKENS.md#screening-routed-blob-text-queries)). The rejected
+options were indexing each whole blob run as one hashed term (about 1.95M
+one-off terms back) and dropping T1. What would reopen it: query logs showing
+blob lookups are a habit.
+
 2026-10-12, same catalog and corpus as slice C;
-[method, results and semantics](TOKENS.md). Two opt-in tokenizer policies
-were tried, over codec 1 and over C4b.
+[method, results and semantics](TOKENS.md). Two opt-in tokenizer policies were
+tried, over codec 1 and over C4b.
 
 - **T1** drops base64-like runs from the term index.
 - **T2** moves timestamps to a date index, keeping their date pieces as terms
   and dropping the time of day and keyed epoch numbers.
 
-Trigrams are untouched, so `grep:` still sees every byte. Every query
-matched the codec-1 control apart from rows the policy explains: the
-document held the term only inside a suppressed span.
+Trigrams are untouched, so `grep:` still sees every byte. Every query matched
+the codec-1 control apart from rows the policy explains: the document held the
+term only inside a suppressed span.
 
-| Steady, against codec 1 | Term index | CPU | Mid median | Rows dropped (mid / common) |
-| --- | --- | --- | --- | --- |
-| codec 1, no policy | 450.28 MB | 269.05 s | 1.88 ms | — |
-| codec 1, T1 | 221.21 MB (50.9%) | 1.026× | 0.88× | 11,227 / 23,417 |
-| codec 1, T2 | 442.63 MB (1.7%) + 3.3 MB dates | 1.016× | 1.04× | 2,008 / 2,894 |
-| codec 1, T1+T2 | 215.62 MB (52.1%) + 3.3 MB dates | 1.060× | 0.88× | 13,424 / 26,393 |
-| C4b, T1+T2 | 189.94 MB (57.8%) + 3.3 MB dates | 1.134× | 1.43× (1.63× same policy) | as above |
+| Steady, against codec 1 | Term index                       | CPU      | Mid median                | Rows dropped (mid / common) |
+| ----------------------- | -------------------------------- | -------- | ------------------------- | --------------------------- |
+| codec 1, no policy      | 450.28 MB                        | 269.05 s | 1.88 ms                   | —                           |
+| codec 1, T1             | 221.21 MB (50.9%)                | 1.026×   | 0.88×                     | 11,227 / 23,417             |
+| codec 1, T2             | 442.63 MB (1.7%) + 3.3 MB dates  | 1.016×   | 1.04×                     | 2,008 / 2,894               |
+| codec 1, T1+T2          | 215.62 MB (52.1%) + 3.3 MB dates | 1.060×   | 0.88×                     | 13,424 / 26,393             |
+| C4b, T1+T2              | 189.94 MB (57.8%) + 3.3 MB dates | 1.134×   | 1.43× (1.63× same policy) | as above                    |
 
 Hapaxes fall from 13.33M to 7.39M under T1 and to 12.56M under T2. On a
 hand-checked sample, T1's false suppressions were about 6 of 150 code runs
-(identifiers built from short capitalised words and digits), plus about 13
-runs of SVG path data. Prose had none. A has-suppressed-runs flag that
-restored exact `text:` would send 2.24 GB of documents to verification.
+(identifiers built from short capitalised words and digits), plus about 13 runs
+of SVG path data. Prose had none. A has-suppressed-runs flag that restored exact
+`text:` would send 2.24 GB of documents to verification.
 
 **The brief's headline question, "does T1+T2 bring C4b inside the gates?",
 answers no.**
 
-- The mid median passes on paper, at 1.43×, only because the policies
-  removed 13,424 mid rows, about 8% at the median of 3,363 rows a query.
-  Against codec 1 under the same policy, C4b is 1.63×, and mid p90 is still
-  2.6×.
+- The mid median passes on paper, at 1.43×, only because the policies removed
+  13,424 mid rows, about 8% at the median of 3,363 rows a query. Against codec 1
+  under the same policy, C4b is 1.63×, and mid p90 is still 2.6×.
 - The churn penalty is unchanged byte for byte. The S2 trace is synthetic and
   holds no blobs or timestamps.
 
-So the policies are a separate decision from C4b. T1 alone halves codec 1's
-term index at 2.6% CPU.
+So the policies are a separate decision from C4b. T1 alone halves codec 1's term
+index at 2.6% CPU.
 
 **Question 1: should the term index adopt T1?**
 
-| Option | Cost | Buys |
-| --- | --- | --- |
-| A. No policy | 450 MB steady; 13.3M hapaxes, 44% of them blob fragments. | Exact `text:` for any token. |
-| B. T1, plus a manifest field and version check | `text:` stops matching blob pieces: 21–30% of rare control terms, and 24 of 50 mid queries lose rows (11k), all inside blobs. About 4% of reviewed code runs are real identifiers. 2.6% CPU. | 50.9% steady saving (229 MB) on codec 1, and better rare and mid latency. |
-| C. T1, routing blob-looking `text:` terms to trigrams | B's costs, minus the blob-term misses; a planner branch on the detector. | B's saving, with `text:<blob>` still answering through trigrams. Short words inside blobs stay unmatched. |
+| Option                                                | Cost                                                                                                                                                                                         | Buys                                                                                                      |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| A. No policy                                          | 450 MB steady; 13.3M hapaxes, 44% of them blob fragments.                                                                                                                                    | Exact `text:` for any token.                                                                              |
+| B. T1, plus a manifest field and version check        | `text:` stops matching blob pieces: 21–30% of rare control terms, and 24 of 50 mid queries lose rows (11k), all inside blobs. About 4% of reviewed code runs are real identifiers. 2.6% CPU. | 50.9% steady saving (229 MB) on codec 1, and better rare and mid latency.                                 |
+| C. T1, routing blob-looking `text:` terms to trigrams | B's costs, minus the blob-term misses; a planner branch on the detector.                                                                                                                     | B's saving, with `text:<blob>` still answering through trigrams. Short words inside blobs stay unmatched. |
 
-**Recommendation: C.** The saving is the largest any D65 arm has found, and
-it costs no merge-time reads. What it drops is almost all noise. Option C
-keeps the one query a user would notice, pasting a blob into `text:`.
-**The fact that would change it:** a second corpus where the code-run false
-positives clearly exceed about 5%, or where users search `text:` for short
-words inside keys.
+**Recommendation: C.** The saving is the largest any D65 arm has found, and it
+costs no merge-time reads. What it drops is almost all noise. Option C keeps the
+one query a user would notice, pasting a blob into `text:`. **The fact that
+would change it:** a second corpus where the code-run false positives clearly
+exceed about 5%, or where users search `text:` for short words inside keys.
 
 **Question 2: should timestamps go to a date index, and in which layout?**
 
-T2 is a capability, not a saving. It removes 7.6 MB of terms and adds 3.3 MB
-of dates. Following Dave's framing, dates are stored as u32 UTC seconds,
+T2 is a capability, not a saving. It removes 7.6 MB of terms and adds 3.3 MB of
+dates. Following Dave's framing, dates are stored as u32 UTC seconds,
 deduplicated per (time, doc).
 
-| Option | Cost | Buys |
-| --- | --- | --- |
-| A. No date index | Dates stay terms; no range queries. | Nothing to build. |
+| Option                          | Cost                                                  | Buys                                                                                                                    |
+| ------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| A. No date index                | Dates stay terms; no range queries.                   | Nothing to build.                                                                                                       |
 | B. Bucketed by day, 1 s offsets | 3.29 MB, 2.62 B/entry (17 offset bits, 3.4 doc bits). | Day, local-day and month exact; a point query verifies 2 docs / 4 MB / 8 ms (only for its fraction); month lookup 2 ms. |
-| C. Time-major, 1 s | 3.88 MB, 3.09 B/entry (17 of 24 bits are doc ids). | The same exactness; simpler; 0.1 ms day lookup. |
-| D. Day buckets, 1 min offsets | 1.57 MB, 2.27 B/entry. | Half the bytes; a point query reads 16 MB / 47 ms (p90 88). |
-| E. Day buckets, no offset | 0.38 MB. | Smallest; a point query reads 171 MB / 328 ms, and a local day 241 MB. |
+| C. Time-major, 1 s              | 3.88 MB, 3.09 B/entry (17 of 24 bits are doc ids).    | The same exactness; simpler; 0.1 ms day lookup.                                                                         |
+| D. Day buckets, 1 min offsets   | 1.57 MB, 2.27 B/entry.                                | Half the bytes; a point query reads 16 MB / 47 ms (p90 88).                                                             |
+| E. Day buckets, no offset       | 0.38 MB.                                              | Smallest; a point query reads 171 MB / 328 ms, and a local day 241 MB.                                                  |
 
 **Recommendation: B, if date search is wanted at all.** At second resolution
-uniqueness costs only bits. Day buckets delta-code their doc lists to 3.4
-bits, where time-major cannot compress doc ids. B is 15% smaller than C with
-the same exactness. Under T2, `text:2026` still matches, because date pieces
-stay as terms. **The fact that would change it:** point queries turning out
-rare next to day queries, which would favour D. Or a corpus whose timestamps
-spread across far more documents per day, which would erode B's doc-list
-advantage and favour C.
+uniqueness costs only bits. Day buckets delta-code their doc lists to 3.4 bits,
+where time-major cannot compress doc ids. B is 15% smaller than C with the same
+exactness. Under T2, `text:2026` still matches, because date pieces stay as
+terms. **The fact that would change it:** point queries turning out rare next to
+day queries, which would favour D. Or a corpus whose timestamps spread across
+far more documents per day, which would erode B's doc-list advantage and favour
+C.
 
-**Question 3: where do mtime and ctime belong?** They are one u32 per inode,
-and the catalog already stores both as columns.
+**Question 3: where do mtime and ctime belong?** They are one u32 per inode, and
+the catalog already stores both as columns.
 
-| Option | Cost | Buys |
-| --- | --- | --- |
+| Option                                  | Cost                                                                            | Buys                                                                             |
+| --------------------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
 | A. The existing catalog column, scanned | 4 B/inode, already paid; 0.32 ms per range at 394k inodes (about 0.8 ms at 1M). | No new structure; fastest for month and week ranges, which match 7–9% of inodes. |
-| B. A sorted index in B's layout | 4.2 B/inode more (bucketed); single-valued keys lose the doc-list compression. | 0.06 ms instead of 0.32 for a one-day range. |
-| C. Time-major sorted permutation | 2.9 B/inode more. | 0.16 ms day ranges; slower than a scan for month ranges. |
+| B. A sorted index in B's layout         | 4.2 B/inode more (bucketed); single-valued keys lose the doc-list compression.  | 0.06 ms instead of 0.32 for a one-day range.                                     |
+| C. Time-major sorted permutation        | 2.9 B/inode more.                                                               | 0.16 ms day ranges; slower than a scan for month ranges.                         |
 
 **Recommendation: A.** No measured range needs anything faster than a column
 scan. **The fact that would change it:** catalogs of about 10M inodes, where a
@@ -4386,8 +4393,8 @@ hit it on broad positive queries, raise the fraction.
 ## D68 — Per-document filters: a screening stage, terms and trigrams separately
 
 **Status: answered, B (Dave, 2026-10-11).** Neither filter is built: no layout
-passed M1b's screen. Term filters could return only as a density opt-in, under
-a new brief. S3 M0, revision 3, 2026-10-08;
+passed M1b's screen. Term filters could return only as a density opt-in, under a
+new brief. S3 M0, revision 3, 2026-10-08;
 [design](S3.md#per-document-trigram-filters).
 
 **Question:** ROADMAP says S3 builds per-document trigram filters beside trigram
@@ -4588,9 +4595,9 @@ Then A.
 ## D71 — Agent habits `ferret search` silently gets wrong
 
 **Status: answered, A (Dave, 2026-10-11).** Phrases containing "or", "and" or
-"not" must keep working: `text:"this or that"` is a phrase, not an error. So
-the embedded-operator error fires only when the argument also holds another
-atom prefix, as in `"text:foo OR text:bar"`.
+"not" must keep working: `text:"this or that"` is a phrase, not an error. So the
+embedded-operator error fires only when the argument also holds another atom
+prefix, as in `"text:foo OR text:bar"`.
 
 **Raised 2026-10-08** by the D62 side investigation:
 [query languages](research/grok/query-languages.html), a survey by grok. It
@@ -4625,13 +4632,13 @@ named `and`, `or` or `not`. Then B.
 
 ## D72 — Does the grep CLI automatically scan broad queries?
 
-**Status: answered, A (Dave, 2026-10-11).** Any pattern the index cannot
-narrow, including a literal shorter than 3 bytes, scans the selected files.
-Trigram indexes are optional, and `ferret grep` works without them by scanning.
-The documentation says plainly that without trigram indexes it should not be
-expected to beat ripgrep. The grep-usage survey (`dbalmain/ferret-survey`, 21,815 agent searches)
-found 8.7% of patterns cannot be narrowed at all; under B those would have
-needed `--scan`.
+**Status: answered, A (Dave, 2026-10-11).** Any pattern the index cannot narrow,
+including a literal shorter than 3 bytes, scans the selected files. Trigram
+indexes are optional, and `ferret grep` works without them by scanning. The
+documentation says plainly that without trigram indexes it should not be
+expected to beat ripgrep. The grep-usage survey (`dbalmain/ferret-survey`,
+21,815 agent searches) found 8.7% of patterns cannot be narrowed at all; under B
+those would have needed `--scan`.
 
 **Question:** Should a valid `ferret grep` command ever need `--scan` merely
 because its regex cannot narrow the indexed files?
@@ -4655,9 +4662,8 @@ reliably retry with `--scan`; then B. Measure before introducing C's budget.
 ## D73 — What freshness does indexed grep promise?
 
 **Status: answered, A+D (Dave, 2026-10-11):** snapshot by default, plus
-`ferret grep --live`. The grep-usage survey found 35.3% of agent searches
-follow an edit within 5 calls, but only 0.25% search for bytes the edit just
-wrote.
+`ferret grep --live`. The grep-usage survey found 35.3% of agent searches follow
+an edit within 5 calls, but only 0.25% search for bytes the edit just wrote.
 
 **Question:** May indexed grep retain S2/S3's snapshot exclusions while reading
 current candidate bytes, or must every invocation search the current tree?
