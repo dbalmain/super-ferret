@@ -203,6 +203,7 @@ pub(crate) fn run(dir: &Path, out: &Path, options: &[String]) -> crate::Result<(
     let (cpu_start, start) = (crate::segment_build::cpu_seconds()?, Instant::now());
     let io_start = io_counters()?;
     let mut writer = IndexWriter::open_with_codec(out, &view, options.codec)?;
+    writer.set_policy(options.policy);
     let (mut content_bytes, mut docs, mut unreadable, mut passes) = (0u64, 0u64, 0u64, 0u64);
     let mut written = 0u64;
     loop {
@@ -512,6 +513,8 @@ pub(crate) fn refresh_trace(out: &Path) -> crate::Result<()> {
 /// H remains opt-in; snapshots preserve the real encoded lifecycle states.
 struct Options {
     codec: u32,
+    /// The token-policy experiment (docs/TOKENS.md), `--tokens`.
+    policy: ferret_text::Policy,
     snapshots: bool,
     control_bytes: Option<u64>,
     corpus: Option<std::path::PathBuf>,
@@ -520,6 +523,7 @@ impl Options {
     fn parse(args: &[String]) -> crate::Result<Self> {
         let mut result = Self {
             codec: DICTIONARY_CODEC,
+            policy: ferret_text::Policy::NONE,
             snapshots: false,
             control_bytes: None,
             corpus: None,
@@ -542,6 +546,9 @@ impl Options {
                 "--corpus" => {
                     result.corpus = Some(args.next().ok_or("missing corpus snapshot")?.into())
                 }
+                "--tokens" => {
+                    result.policy = crate::tokens::policy(args.next().ok_or("missing --tokens")?)?
+                }
                 "--snapshots" => result.snapshots = true,
                 "--control-bytes" => {
                     result.control_bytes =
@@ -549,6 +556,17 @@ impl Options {
                 }
                 _ => return Err("unknown index-build option".into()),
             }
+        }
+        // These codecs tokenize documents at merge without the policy.
+        if !result.policy.is_none()
+            && matches!(
+                result.codec,
+                ferret_index::segment::GRADUATION_CODEC
+                    | ferret_index::segment::OFFSET_CODEC
+                    | ferret_index::segment::KEPT_RECORD_CODEC
+            )
+        {
+            return Err("--tokens needs a codec that never reads at merge".into());
         }
         Ok(result)
     }
@@ -762,6 +780,7 @@ pub(crate) fn churn(out: &Path, rounds: &str, options: &[String]) -> crate::Resu
         },
         options.codec,
     )?;
+    writer.set_policy(options.policy);
     let (mut followed_written, mut merge_written, mut merges) = (0u64, 0u64, 0u64);
     let (mut term_follow_written, mut term_merge_written) = (0u64, 0u64);
     let (mut content, mut max_segments) = (0u64, 0usize);

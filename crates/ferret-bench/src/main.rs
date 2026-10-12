@@ -19,6 +19,7 @@
 //! ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>  D69: saturated large documents
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
+//! ferret-bench token-census <catalog-dir> <corpus-dir>  token policies T1/T2: terms, hapaxes, date index (TOKENS.md)
 //! ferret-bench rank-fp <catalog-dir> <out-dir>   static df≥2 dictionary: 32-bit sparse fingerprints vs 20-bit buckets
 //! ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>  M5 candidate-byte diagnostic
 //! ferret-bench chunk-census <catalog-dir> <index-dir>   D66 heuristic chunk map census (S3 M6)
@@ -80,6 +81,7 @@ mod screen;
 mod segment_build;
 mod terms;
 mod tokenize;
+mod tokens;
 mod trigram;
 
 #[cfg(test)]
@@ -182,6 +184,9 @@ fn main() -> ExitCode {
             }
             ("regex-query", [dir, index, snapshot]) => {
                 content_query::run_regex(Path::new(dir), Path::new(index), Path::new(snapshot))
+            }
+            ("token-census", [dir, corpus, options @ ..]) => {
+                tokens::census(Path::new(dir), Path::new(corpus), options)
             }
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)

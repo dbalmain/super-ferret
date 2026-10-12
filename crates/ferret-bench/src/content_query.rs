@@ -123,10 +123,14 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
     let mut classes_only = Vec::new();
     let (mut terms_dir, mut compare_dir, mut corpus_dir) = (None, None, None);
     let mut covered = false;
+    let mut policy = ferret_text::Policy::NONE;
     let mut options = only.iter();
     while let Some(option) = options.next() {
         match option.as_str() {
             "--covered" => covered = true,
+            "--policy" => {
+                policy = crate::tokens::policy(options.next().ok_or("missing token policy")?)?
+            }
             "--corpus" => corpus_dir = Some(options.next().ok_or("missing corpus snapshot")?),
             "--terms" => terms_dir = Some(options.next().ok_or("missing terms index")?),
             "--compare" => compare_dir = Some(options.next().ok_or("missing comparison index")?),
@@ -253,6 +257,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
         if !only.is_empty() && !only.iter().any(|c| c == class) {
             continue;
         }
+        let (mut changed_queries, mut explained_rows) = (0u64, 0u64);
         let mut samples = Vec::new();
         for args in &queries {
             let query = Query::from_args(
@@ -280,7 +285,22 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
             if let Some(compare) = &compare {
                 let control = once(&catalog, &names, compare, &query, snapshot.as_ref())?;
                 if warm.identities != control.identities {
-                    return Err("verified rows differ from control".into());
+                    // A policy may drop rows whose only occurrences it
+                    // suppressed; any other difference is a bug.
+                    let term = args
+                        .last()
+                        .and_then(|a| a.strip_prefix("text:"))
+                        .filter(|_| !policy.is_none() && class != "phrase")
+                        .ok_or("verified rows differ from control")?;
+                    explained_rows += crate::tokens::explain_missing(
+                        &catalog,
+                        snapshot.as_ref(),
+                        policy,
+                        term.as_bytes(),
+                        &warm.identities,
+                        &control.identities,
+                    )?;
+                    changed_queries += 1;
                 }
             }
             let records = if matches!(
@@ -414,6 +434,11 @@ pub(crate) fn run(dir: &Path, index_dir: &Path, only: &[String]) -> crate::Resul
             quantile(&mut bytes, 0.5),
             quantile(&mut bytes, 0.9)
         );
+        if !policy.is_none() {
+            println!(
+                "{class}_policy_changes: queries {changed_queries}; rows dropped, all explained {explained_rows}"
+            );
+        }
         if class == "phrase" {
             phrase_samples = samples;
         }

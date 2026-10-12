@@ -13,6 +13,13 @@
 use std::collections::BTreeMap;
 use std::ops::{ControlFlow, Range};
 
+mod policy;
+
+pub use policy::{
+    BASE64_MIN, EPOCH_RANGE, Form, Policy, Timestamp, base64_runs, has_timestamp_in, suppressed,
+    timestamps, tokenize_with,
+};
+
 /// Change when the token contract changes; indexes must rebuild on a change.
 pub const TOKENIZER_VERSION: u32 = 1;
 
@@ -55,6 +62,8 @@ pub struct Scratch {
     part: String,
     parts: Vec<Range<usize>>,
     casing: BTreeMap<char, Casing>,
+    /// [`tokenize_with`]'s suppressed spans.
+    spans: Vec<Range<usize>>,
 }
 
 impl Scratch {
@@ -65,7 +74,7 @@ impl Scratch {
     pub fn allocated_bytes(&self) -> usize {
         self.whole.capacity()
             + self.part.capacity()
-            + self.parts.capacity() * size_of::<Range<usize>>()
+            + (self.parts.capacity() + self.spans.capacity()) * size_of::<Range<usize>>()
             + self.casing.len() * (11 * size_of::<(char, Casing)>() + 12 * size_of::<usize>() + 32)
     }
 }
@@ -315,6 +324,7 @@ fn char_run<B>(
         part,
         parts,
         casing,
+        ..
     } = scratch;
     whole.clear();
     parts.clear();

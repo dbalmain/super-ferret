@@ -32,7 +32,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use ferret_text::{Scratch, TOKENIZER_VERSION, TRIGRAM_VERSION, cap, tokenize};
+use ferret_text::{Policy, Scratch, TOKENIZER_VERSION, TRIGRAM_VERSION, cap, tokenize_with};
 
 use crate::live::DocSet;
 use crate::manifest::{Manifest, SegmentEntry};
@@ -448,6 +448,7 @@ pub struct IndexWriter {
     current: Arc<View>,
     poisoned: bool,
     codec: u32,
+    policy: Policy,
     trigrams: TrigramInverter,
     publishing: bool,
 }
@@ -496,6 +497,7 @@ impl IndexWriter {
             }),
             poisoned: false,
             codec,
+            policy: Policy::NONE,
             trigrams: TrigramInverter::with_capacity(PairBuffer::CAPACITY),
             publishing: false,
         };
@@ -505,6 +507,15 @@ impl IndexWriter {
         }
         remove_unnamed(dir, &writer.current.manifest)?;
         Ok(writer)
+    }
+
+    /// Sets the token policy experiment (docs/TOKENS.md) that later follows
+    /// index with. Nothing records it: segments still carry the default
+    /// tokenizer version, so an index must be built under one policy from
+    /// empty. Merge-time document reads (codecs 4–6) tokenize without it, so
+    /// only codecs that never read at merge give the policy's semantics.
+    pub fn set_policy(&mut self, policy: Policy) {
+        self.policy = policy;
     }
 
     /// The published state a query pins with its catalog view.
@@ -698,7 +709,7 @@ impl IndexWriter {
                         }
                     }
                     let mut failed = None;
-                    tokenize(&bytes, &mut scratch, |token| {
+                    tokenize_with(&bytes, &mut scratch, self.policy, |token| {
                         let added = if crate::segment::stores_offsets(self.codec)
                             && let Ok(offset) = u32::try_from(token.run.start)
                         {

@@ -331,7 +331,7 @@ fn chunks(len: u64) -> u64 {
 }
 
 /// Appends one LEB128 value.
-fn put(mut value: u64, out: &mut Vec<u8>) {
+pub(crate) fn put(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push(value as u8 | 0x80);
         value >>= 7;
@@ -341,7 +341,7 @@ fn put(mut value: u64, out: &mut Vec<u8>) {
 
 /// Reads one LEB128 value at `*at`, advancing it; `None` past the end or
 /// beyond 64 bits.
-fn take(bytes: &[u8], at: &mut usize) -> Option<u64> {
+pub(crate) fn take(bytes: &[u8], at: &mut usize) -> Option<u64> {
     let mut value = 0u64;
     for shift in (0..64).step_by(7) {
         let byte = *bytes.get(*at)?;
