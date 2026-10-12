@@ -477,14 +477,36 @@ fn pair(values: Vec<u64>) -> String {
     format!("{median}/{p90}")
 }
 
-/// One timed screen arm: discovery outside the timing, the positive
-/// control, eviction, then a cold and a warm run per query.
+/// What one arm run measures: which classes it times (the rest are
+/// volume only), and whether a missed oracle match is a measurement (an
+/// unsound screen's upper bound) or an error.
+struct Measure<'a> {
+    timed: &'a dyn Fn(&str) -> bool,
+    allow_miss: bool,
+}
+
+const ALL_TIMED: Measure = Measure {
+    timed: &|_| true,
+    allow_miss: false,
+};
+
+struct Row {
+    candidates: super::Counts,
+    runs: Option<(Run, Run)>,
+    missed: usize,
+    prefix_terms: u64,
+    capped: u64,
+}
+
+/// One screen arm: discovery outside the timing, the positive control,
+/// then, for timed classes, eviction and a cold and a warm run per query.
 fn time_arm(
     arm: &str,
     corpus: &Corpus,
     plans: &[Plan],
     src: &Sources,
     extra_docs: &[u32],
+    measure: &Measure,
     private: &mut String,
 ) -> crate::Result<()> {
     let mut rows = Vec::new();
@@ -492,52 +514,65 @@ fn time_arm(
         crate::trigram::check_disk()?;
         let discovery = read(src, plan, extra_docs)?;
         let oracle = readable_oracle(corpus, q);
-        if !oracle
+        let found: Vec<u32> = oracle
             .iter()
-            .all(|d| discovery.docs.binary_search(d).is_ok())
-        {
+            .copied()
+            .filter(|d| discovery.docs.binary_search(d).is_ok())
+            .collect();
+        let missed = oracle.len() - found.len();
+        if missed > 0 && !measure.allow_miss {
             return Err(format!("positive control failed: {arm} query {q}").into());
         }
-        evict_files(corpus, &discovery.docs)?;
-        for segment in src.segments() {
-            segment.source().evict()?;
-        }
-        let (cold, cold_docs, cold_matches) = trial(corpus, q, src, plan, extra_docs)?;
-        let (warm, warm_docs, warm_matches) = trial(corpus, q, src, plan, extra_docs)?;
-        if cold_docs != discovery.docs || warm_docs != discovery.docs {
-            return Err(format!("candidates moved between runs: {arm} query {q}").into());
-        }
-        if cold_matches != oracle || warm_matches != oracle {
-            return Err(format!("matches differ from the oracle: {arm} query {q}").into());
-        }
+        let class = corpus.samples[q].class;
+        let runs = if (measure.timed)(class) {
+            evict_files(corpus, &discovery.docs)?;
+            for segment in src.segments() {
+                segment.source().evict()?;
+            }
+            let (cold, cold_docs, cold_matches) = trial(corpus, q, src, plan, extra_docs)?;
+            let (warm, warm_docs, warm_matches) = trial(corpus, q, src, plan, extra_docs)?;
+            if cold_docs != discovery.docs || warm_docs != discovery.docs {
+                return Err(format!("candidates moved between runs: {arm} query {q}").into());
+            }
+            if cold_matches != found || warm_matches != found {
+                return Err(format!("matches differ from the oracle: {arm} query {q}").into());
+            }
+            Some((cold, warm))
+        } else {
+            None
+        };
         let c = counts(&discovery.docs, &corpus.sizes, &corpus.readable)[0];
+        let (cold_ns, warm_ns) = runs.map_or((0, 0), |(c, w)| (ns(c.total), ns(w.total)));
         let _ = writeln!(
             private,
-            "{arm}\t{q}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            corpus.samples[q].class,
+            "{arm}\t{q}\t{class}\t{}\t{}\t{}\t{missed}\t{cold_ns}\t{warm_ns}\t{}\t{}\t{}",
             c.docs,
             c.bytes,
             oracle.len(),
-            ns(cold.total),
-            ns(warm.total),
-            cold.postings_bytes,
-            cold.index_bytes,
+            ns(discovery.time),
             discovery.prefix_terms,
             discovery.capped_prefixes,
         );
         println!(
-            "progress arm={arm} query={} cold_ms={:.1} warm_ms={:.1}",
+            "progress arm={arm} query={} candidate_B={} cold_ms={:.1} warm_ms={:.1}",
             q + 1,
-            cold.total.as_secs_f64() * 1e3,
-            warm.total.as_secs_f64() * 1e3
+            c.bytes,
+            cold_ns as f64 / 1e6,
+            warm_ns as f64 / 1e6
         );
-        rows.push((c, cold, warm, discovery.prefix_terms, discovery.capped_prefixes));
+        rows.push(Row {
+            candidates: c,
+            runs,
+            missed,
+            prefix_terms: discovery.prefix_terms,
+            capped: discovery.capped_prefixes,
+        });
     }
     println!(
-        "| arm | class | cache | queries | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | prefix terms sum | capped prefixes |"
+        "| arm | class | cache | queries | timed | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | missed oracle docs | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | lookup terms sum | capped lookups |"
     );
     for class in CLASSES {
-        let picked: Vec<_> = corpus
+        let picked: Vec<&Row> = corpus
             .samples
             .iter()
             .zip(&rows)
@@ -545,28 +580,49 @@ fn time_arm(
             .map(|(_, r)| r)
             .collect();
         for cache in ["cold", "warm"] {
-            let run = |r: &(_, Run, Run, u64, u64)| if cache == "cold" { r.1 } else { r.2 };
+            let runs: Vec<Run> = picked
+                .iter()
+                .filter_map(|r| r.runs)
+                .map(|(c, w)| if cache == "cold" { c } else { w })
+                .collect();
+            let times = |f: &dyn Fn(&Run) -> u64| {
+                if runs.is_empty() {
+                    "-".to_string()
+                } else {
+                    ms(runs.iter().map(f).collect())
+                }
+            };
+            let bytes = |f: &dyn Fn(&Run) -> u64| {
+                if runs.is_empty() {
+                    "-".to_string()
+                } else {
+                    pair(runs.iter().map(f).collect())
+                }
+            };
             println!(
-                "| {arm} | {class} | {cache} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {arm} | {class} | {cache} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 picked.len(),
-                pair(picked.iter().map(|r| r.0.docs).collect()),
-                pair(picked.iter().map(|r| r.0.bytes).collect()),
-                pair(picked.iter().map(|r| r.0.readable).collect()),
-                ms(picked.iter().map(|r| ns(run(r).postings)).collect()),
-                ms(picked.iter().map(|r| ns(run(r).verify)).collect()),
-                ms(picked.iter().map(|r| ns(run(r).total)).collect()),
-                pair(picked.iter().map(|r| run(r).postings_bytes).collect()),
-                pair(picked.iter().map(|r| run(r).index_bytes).collect()),
-                pair(picked.iter().map(|r| run(r).verified_bytes).collect()),
-                picked.iter().map(|r| ns(run(r).total)).sum::<u64>(),
-                picked.iter().map(|r| r.3).sum::<u64>(),
-                picked.iter().map(|r| r.4).sum::<u64>(),
+                runs.len(),
+                pair(picked.iter().map(|r| r.candidates.docs).collect()),
+                pair(picked.iter().map(|r| r.candidates.bytes).collect()),
+                pair(picked.iter().map(|r| r.candidates.readable).collect()),
+                picked.iter().map(|r| r.missed).sum::<usize>(),
+                times(&|r| ns(r.postings)),
+                times(&|r| ns(r.verify)),
+                times(&|r| ns(r.total)),
+                bytes(&|r| r.postings_bytes),
+                bytes(&|r| r.index_bytes),
+                bytes(&|r| r.verified_bytes),
+                runs.iter().map(|r| ns(r.total)).sum::<u64>(),
+                picked.iter().map(|r| r.prefix_terms).sum::<u64>(),
+                picked.iter().map(|r| r.capped).sum::<u64>(),
             );
         }
     }
     println!(
-        "correctness arm={arm} queries={} positive_control=all candidates_stable=yes matches_equal_oracle=yes",
-        plans.len()
+        "correctness arm={arm} queries={} missed_oracle_docs={} candidates_stable=yes matches_equal_found=yes",
+        plans.len(),
+        rows.iter().map(|r| r.missed).sum::<usize>()
     );
     Ok(())
 }
@@ -744,9 +800,21 @@ fn shipped_plans(corpus: &Corpus, flags: GrepFlags) -> crate::Result<Vec<Plan>> 
     Ok(plans)
 }
 
-const ARMS: [&str; 7] = [
-    "rg", "rg-j1", "trigrams", "terms", "word45", "hashed", "units",
+const ARMS: [&str; 8] = [
+    "rg",
+    "rg-j1",
+    "trigrams",
+    "terms",
+    "terms-raw",
+    "word45",
+    "hashed",
+    "units",
 ];
+
+/// Hashed variants are timed where a screen can change verification;
+/// broad, alternation and code classes are volume only, to keep the six
+/// variants from crowding out arms 1-4.
+const HASHED_TIMED: [&str; 2] = ["rare literal", "identifier pattern"];
 
 pub(crate) fn run(args: &[String]) -> crate::Result<()> {
     let [catalog, index, corpus_dir, scratch, case, arms] = args else {
@@ -827,7 +895,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
         Lookups::Both
     };
 
-    if wants("units") || wants("terms") {
+    if wants("units") || wants("terms") || wants("terms-raw") {
         unit_report(&corpus, flags)?;
     }
     if wants("rg") {
@@ -844,9 +912,9 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             fallback: &empty,
             live: &corpus.live,
         };
-        time_arm("trigrams", &corpus, &shipped, &src, &extra_docs, &mut private)?;
+        time_arm("trigrams", &corpus, &shipped, &src, &extra_docs, &ALL_TIMED, &mut private)?;
     }
-    if wants("terms") {
+    if wants("terms") || wants("terms-raw") {
         let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
         let src = Sources {
             tri: &tri,
@@ -863,7 +931,25 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             .zip(&shipped)
             .map(|(s, p)| Plan::and([p.clone(), term_plan(&s.facts, lookups)]))
             .collect();
-        miss_report(&corpus, &raw, &src, &extra_docs)?;
+        if wants("terms-raw") {
+            miss_report(&corpus, &raw, &src, &extra_docs)?;
+            // The unsound screen's upper bound, timed on rare literals.
+            time_arm(
+                "terms-raw",
+                &corpus,
+                &raw,
+                &src,
+                &extra_docs,
+                &Measure {
+                    timed: &|class| class == "rare literal",
+                    allow_miss: true,
+                },
+                &mut private,
+            )?;
+        }
+        if !wants("terms") {
+            return finish(scratch, case, &arms, private);
+        }
         let plans: Vec<_> = corpus
             .samples
             .iter()
@@ -887,7 +973,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
                     .count()
             );
         }
-        time_arm("terms", &corpus, &plans, &src, &extra_docs, &mut private)?;
+        time_arm("terms", &corpus, &plans, &src, &extra_docs, &ALL_TIMED, &mut private)?;
     }
     if wants("word45") {
         crate::trigram::check_disk()?;
@@ -911,7 +997,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             fallback: &empty,
             live: &corpus.live,
         };
-        time_arm("word45", &corpus, &plans, &src, &extra_docs, &mut private)?;
+        time_arm("word45", &corpus, &plans, &src, &extra_docs, &ALL_TIMED, &mut private)?;
         drop(segment);
         owned.remove()?;
     }
@@ -940,10 +1026,26 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             fallback: &empty,
             live: &corpus.live,
         };
-        time_arm(&label, &corpus, &plans, &src, &extra_docs, &mut private)?;
+        time_arm(
+            &label,
+            &corpus,
+            &plans,
+            &src,
+            &extra_docs,
+            &Measure {
+                timed: &|class| HASHED_TIMED.contains(&class),
+                allow_miss: false,
+            },
+            &mut private,
+        )?;
         drop(segment);
         built.owned.remove()?;
     }
+    finish(scratch, case, &arms, private)
+}
+
+/// The per-query rows: classes and numbers, no pattern or path.
+fn finish(scratch: &Path, case: &str, arms: &[&str], private: String) -> crate::Result<()> {
     let path = scratch.join(format!(
         "rows-{case}-{}-{}.tsv",
         arms.join("+"),
