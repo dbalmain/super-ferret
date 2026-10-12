@@ -25,6 +25,7 @@ use super::query::Need;
 use super::{Corpus, counts, prepare_with, stats};
 
 mod hashed;
+mod residue;
 mod rg;
 mod units;
 
@@ -800,8 +801,9 @@ fn shipped_plans(corpus: &Corpus, flags: GrepFlags) -> crate::Result<Vec<Plan>> 
     Ok(plans)
 }
 
-const ARMS: [&str; 8] = [
+const ARMS: [&str; 9] = [
     "rg",
+    "residue",
     "rg-j1",
     "trigrams",
     "terms",
@@ -947,6 +949,17 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
                 &mut private,
             )?;
         }
+    }
+    if wants("residue") {
+        let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
+        let src = Sources {
+            tri: &tri,
+            term: Some(&term),
+            extra: None,
+            fallback: &fallback,
+            live: &corpus.live,
+        };
+        residue_arm(&corpus, &shipped, lookups, &src, &extra_docs)?;
     }
     if wants("terms") {
         let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
@@ -1142,6 +1155,130 @@ fn miss_report(
         println!(
             "terms_raw class={class} queries_with_miss={queries} missed_docs={missed} missed_docs_in_fallback={fallback} candidate_B_median_p90={}",
             pair(bytes)
+        );
+    }
+    Ok(())
+}
+
+/// The term screen made sound by a per-query residue fallback instead of
+/// the arm's blanket one: volumes and the positive control, plus the cost
+/// of the substring lookups against a resident dictionary.
+fn residue_arm(
+    corpus: &Corpus,
+    shipped: &[Plan],
+    lookups: Lookups,
+    src: &Sources,
+    extra_docs: &[u32],
+) -> crate::Result<()> {
+    let raw: Vec<_> = corpus
+        .samples
+        .iter()
+        .zip(shipped)
+        .map(|(s, p)| Plan::and([p.clone(), term_plan(&s.facts, lookups)]))
+        .collect();
+    let per_query: Vec<Vec<Vec<u8>>> = raw
+        .iter()
+        .map(|plan| {
+            let mut leaves = BTreeSet::new();
+            plan.leaves(&mut leaves);
+            leaves
+                .into_iter()
+                .filter_map(|leaf| match leaf {
+                    Leaf::Substring(needle) => Some(needle),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    let needles: Vec<Vec<u8>> = per_query
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let start = Instant::now();
+    let fallback: Vec<u32> = src.fallback.range(0, corpus.live.bound()).collect();
+    let admitted = residue::admit(corpus, &fallback, &needles)?;
+    println!(
+        "residue fallback_docs={} residue_docs={} residue_bytes={} residue_trigram_pairs={} needles={} wall_s={:.3}",
+        fallback.len(),
+        admitted.residue_docs,
+        admitted.residue_bytes,
+        admitted.pairs,
+        needles.len(),
+        start.elapsed().as_secs_f64()
+    );
+
+    // The resident dictionary: every term once, newline-separated, scanned
+    // with memmem per needle.
+    let mut dictionary = Vec::new();
+    let mut terms = src.term.ok_or("residue needs terms")?.terms();
+    let mut term_count = 0u64;
+    while let Some((term, _)) = terms.next_term()? {
+        dictionary.extend_from_slice(term);
+        dictionary.push(b'\n');
+        term_count += 1;
+    }
+    println!(
+        "resident_dictionary terms={term_count} bytes={}",
+        dictionary.len()
+    );
+
+    let union = |lists: &[Vec<u32>], wanted: &[Vec<u8>]| -> Vec<u32> {
+        let mut docs: Vec<u32> = wanted
+            .iter()
+            .flat_map(|n| &lists[needles.binary_search(n).expect("needle listed")])
+            .copied()
+            .collect();
+        docs.sort_unstable();
+        docs.dedup();
+        docs
+    };
+    type ClassRows = (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, usize, usize);
+    let mut by_class: BTreeMap<&str, ClassRows> = BTreeMap::new();
+    for (q, sample) in corpus.samples.iter().enumerate() {
+        let shipped_docs = read(src, &shipped[q], extra_docs)?.docs;
+        let raw_docs = read(src, &raw[q], extra_docs)?.docs;
+        let with = |admit: &[u32]| -> Vec<u32> {
+            let mut docs = raw_docs.clone();
+            docs.extend(admit.iter().filter(|d| shipped_docs.binary_search(d).is_ok()));
+            docs.sort_unstable();
+            docs.dedup();
+            docs
+        };
+        let by_trigrams = with(&union(&admitted.by_trigrams, &per_query[q]));
+        let exact = with(&union(&admitted.exact, &per_query[q]));
+        let oracle = readable_oracle(corpus, q);
+        let missing = |docs: &[u32]| oracle.iter().filter(|d| docs.binary_search(d).is_err()).count();
+        let scan = Instant::now();
+        let mut hits = 0usize;
+        for needle in &per_query[q] {
+            hits += memchr::memmem::find_iter(&dictionary, needle).count();
+        }
+        let scan_ns = scan.elapsed().as_nanos() as u64;
+        std::hint::black_box(hits);
+        let bytes = |docs: &[u32]| counts(docs, &corpus.sizes, &corpus.readable)[0].bytes;
+        let entry = by_class.entry(sample.class).or_default();
+        entry.0.push(bytes(&raw_docs));
+        entry.1.push(bytes(&by_trigrams));
+        entry.2.push(bytes(&exact));
+        entry.3.push(bytes(&shipped_docs));
+        entry.4.push(scan_ns);
+        entry.5 += missing(&by_trigrams);
+        entry.6 += missing(&exact);
+        if q % 25 == 24 {
+            eprintln!("progress arm=residue query={}", q + 1);
+        }
+    }
+    for (class, (raw, by_trigrams, exact, shipped, scan, miss_tri, miss_exact)) in by_class {
+        println!(
+            "residue class={class} shipped_B_median_p90={} raw_B_median_p90={} residue_trigram_B_median_p90={} residue_exact_B_median_p90={} missed_docs_trigram={miss_tri} missed_docs_exact={miss_exact} resident_scan_ms_median_p90={}",
+            pair(shipped),
+            pair(raw),
+            pair(by_trigrams),
+            pair(exact),
+            ms(scan)
         );
     }
     Ok(())
