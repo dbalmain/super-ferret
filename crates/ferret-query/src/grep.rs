@@ -65,18 +65,18 @@ fn select(
     })
 }
 
+/// `planning` within the key cap, ranked by dictionary frequency.
 fn ranked(
-    grep: &Grep,
+    planning: &Trigrams,
     pinned: &Pinned<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(Trigrams, BTreeMap<[u8; 3], u64>), ReadError> {
-    let frequencies = grep
-        .planning_trigrams()
+    let frequencies = planning
         .keys()
         .into_iter()
         .map(|key| Ok((key, df(key, pinned, cancelled)?)))
         .collect::<Result<BTreeMap<_, _>, ReadError>>()?;
-    Ok((grep.trigrams_by_frequency(&frequencies), frequencies))
+    Ok((planning.fit_by_frequency(&frequencies), frequencies))
 }
 
 impl GrepAtom {
@@ -86,7 +86,17 @@ impl GrepAtom {
         pinned: &Pinned<'_>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<u64, ReadError> {
-        let (tree, frequencies) = ranked(grep, pinned, cancelled)?;
+        Self::estimate_trigrams_until(grep.planning_trigrams(), pinned, cancelled)
+    }
+
+    /// [`GrepAtom::estimate_until`] for any uncapped trigram query, such as
+    /// a blob `text:` atom's ([`ferret_verify::Text::trigrams`]).
+    pub(crate) fn estimate_trigrams_until(
+        planning: &Trigrams,
+        pinned: &Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<u64, ReadError> {
+        let (tree, frequencies) = ranked(planning, pinned, cancelled)?;
         Ok(select(
             &tree,
             &frequencies,
@@ -109,6 +119,16 @@ impl GrepAtom {
             pinned,
             cancelled,
         )
+    }
+
+    /// [`GrepAtom::read_until`] for any uncapped trigram query.
+    pub(crate) fn read_trigrams_until(
+        planning: &Trigrams,
+        pinned: &Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadError> {
+        let (selected, _) = select_ranked(planning, pinned, cancelled)?;
+        Self::read_selected_until(&selected, pinned, cancelled)
     }
 
     pub(crate) fn read_selected_until(
@@ -193,14 +213,7 @@ pub(crate) fn explain(
     pinned: &Pinned<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<GrepReport, ReadError> {
-    let (tree, frequencies) = ranked(grep, pinned, cancelled)?;
-    let selected = select(
-        &tree,
-        &frequencies,
-        u64::from(pinned.live().len()),
-        cancelled,
-    )?
-    .0;
+    let (selected, frequencies) = select_ranked(grep.planning_trigrams(), pinned, cancelled)?;
     let frequencies = frequencies.into_iter().collect();
     let read_keys = selected.keys().into_iter().collect();
     Ok(GrepReport {
@@ -209,4 +222,22 @@ pub(crate) fn explain(
         frequencies,
         read_keys,
     })
+}
+
+/// The children to read for `planning`, and the frequencies that chose
+/// them.
+fn select_ranked(
+    planning: &Trigrams,
+    pinned: &Pinned<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Trigrams, BTreeMap<[u8; 3], u64>), ReadError> {
+    let (tree, frequencies) = ranked(planning, pinned, cancelled)?;
+    let selected = select(
+        &tree,
+        &frequencies,
+        u64::from(pinned.live().len()),
+        cancelled,
+    )?
+    .0;
+    Ok((selected, frequencies))
 }

@@ -193,18 +193,36 @@ impl Grep {
         &self,
         frequencies: &std::collections::BTreeMap<[u8; 3], u64>,
     ) -> Trigrams {
-        if self.planning.keys().len() <= LIMITS.keys {
-            return self.planning.clone();
-        }
-        self.planning.clone().fit_by(LIMITS.keys, &|key| {
-            frequencies.get(&key).copied().unwrap_or(u64::MAX)
-        })
+        self.planning.fit_by_frequency(frequencies)
     }
 
     /// What every match contains.
     pub fn trigrams(&self) -> &Trigrams {
         &self.trigrams
     }
+}
+
+/// What every case-insensitive occurrence of `literal` contains, uncapped:
+/// the derivation of the escaped literal under the default flags, so Unicode
+/// case folding (`k` and the Kelvin sign) is the verifier's. `All` should
+/// the derivation refuse, which only admits more documents.
+pub(crate) fn literal_trigrams(literal: &str) -> Trigrams {
+    let limits = Limits {
+        keys: usize::MAX,
+        ..LIMITS
+    };
+    GrepFlags::default()
+        .derive(
+            &regex_syntax::escape(literal),
+            &limits,
+            &mut Trims::default(),
+        )
+        .unwrap_or(Trigrams::All)
+}
+
+/// [`Trigrams::and`], for the crate's other derivations.
+pub(crate) fn all_of(parts: impl IntoIterator<Item = Trigrams>) -> Trigrams {
+    Trigrams::and(parts)
 }
 
 /// Why [`GrepFlags::compile`] failed.
@@ -290,6 +308,21 @@ impl Trigrams {
             1 => flat.pop().unwrap_or(identity),
             _ => node(flat),
         }
+    }
+
+    /// The tree within the 64-key cap, using dictionary frequencies: common
+    /// bare keys are discarded first. Alternatives are weakened, never
+    /// deleted. A tree within the cap is returned unchanged.
+    pub fn fit_by_frequency(
+        &self,
+        frequencies: &std::collections::BTreeMap<[u8; 3], u64>,
+    ) -> Trigrams {
+        if self.keys().len() <= LIMITS.keys {
+            return self.clone();
+        }
+        self.clone().fit_by(LIMITS.keys, &|key| {
+            frequencies.get(&key).copied().unwrap_or(u64::MAX)
+        })
     }
 
     /// Every distinct key in the tree.

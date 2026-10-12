@@ -104,7 +104,7 @@ mod run;
 #[cfg(test)]
 mod tests;
 
-pub use content::{ContentAtom, TextAtom};
+pub use content::{ContentAtom, TextAtom, answered_by_trigrams};
 pub use grep::{GrepAtom, GrepReport};
 pub use name_index::{NameEstimate, NameIndex, NamePlan};
 pub use plan::{

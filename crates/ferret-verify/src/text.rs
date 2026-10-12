@@ -70,6 +70,8 @@ use std::sync::{LazyLock, OnceLock};
 use ferret_text::{Kind, Scratch, Token, tokenize, tokenize_until};
 use regex::bytes::Regex;
 
+use crate::Trigrams;
+
 /// The non-ASCII characters whose lowercase, as `ferret-text` computes it,
 /// holds an ASCII byte: `İ` (to `i` and a combining dot) and the Kelvin
 /// sign (to `k`). A test derives the set by lowercasing every `char`
@@ -274,6 +276,35 @@ impl Text {
     /// Whether this is `case:text:`, which postings cannot decide.
     pub fn is_case_sensitive(&self) -> bool {
         self.case
+    }
+
+    /// The argument as given.
+    pub fn arg(&self) -> &[u8] {
+        &self.arg
+    }
+
+    /// Trigrams every document holding the atom contains: for each distinct
+    /// unit spelled in ASCII alone, those of a case-insensitive occurrence
+    /// of it. Lets a planner answer the atom from trigrams where the term
+    /// index cannot, as for a base64-like argument the term index leaves
+    /// out (DECISIONS.md D65 update — token policy).
+    ///
+    /// Necessary, never sufficient: a holding document emits a token whose
+    /// lowercase is the unit, or (one run) the whole token, of which each
+    /// ASCII unit is a slice. A token lowercasing to ASCII alone is spelled
+    /// in ASCII and the Kelvin sign (`İ` adds a combining dot), and the
+    /// derivation folds `k` to the Kelvin sign as the verifier's regex
+    /// does. Units with other characters, or shorter than three bytes,
+    /// add nothing.
+    pub fn trigrams(&self) -> Trigrams {
+        crate::trigram::all_of(
+            self.units
+                .iter()
+                .enumerate()
+                .filter(|&(i, unit)| self.ids[i] == i && unit.token.is_ascii())
+                .filter_map(|(_, unit)| std::str::from_utf8(&unit.token).ok())
+                .map(crate::trigram::literal_trigrams),
+        )
     }
 
     /// Whether `token`, from `doc`, is `unit`.

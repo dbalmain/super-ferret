@@ -9,7 +9,15 @@
 //! one token, no parts     term(whole)                                    Yes
 //! one run with parts      Or(term(whole) Yes, Maybe(And(term(part)…)))
 //! several runs            Maybe(And(term(unit)…))
+//! holds a base64-like run the trigram screen of its units                Maybe
 //! ```
+//!
+//! The last row is T1 (DECISIONS.md D65 update — token policy): the term
+//! index leaves out every token of a base64-like run, so an argument holding
+//! one ([`answered_by_trigrams`], the indexer's own detector run on the
+//! argument) is screened by trigrams instead, as a `grep:` literal is, and
+//! verified by the same [`Text`] matcher. Without a trigram source every
+//! live document is a candidate, as for `grep:`.
 //!
 //! A term is looked up capped (`ferret_text::cap`) and is Yes only when no
 //! longer token could share its cap (`ferret_text::exact_under_cap`), and
@@ -21,7 +29,7 @@
 
 use crate::GrepAtom;
 use ferret_index::{Atom, Candidates, Certainty, Cursor, Pinned, ReadError};
-use ferret_text::{cap, exact_under_cap};
+use ferret_text::{cap, exact_under_cap, has_base64_run};
 
 use ferret_verify::{Grep, Text, TextMatcher};
 
@@ -34,6 +42,16 @@ pub struct TextAtom {
     whole: Option<Option<Candidates>>,
     /// The distinct units' answers, when there are several.
     units: Vec<Option<Candidates>>,
+    /// The trigram screen, which replaces the terms when
+    /// [`answered_by_trigrams`].
+    screen: Option<GrepAtom>,
+}
+
+/// Whether the term index cannot answer `text`: its argument holds a
+/// base64-like run, whose tokens the indexer leaves out
+/// ([`ferret_text::tokenize_terms`]). The same detector decides both.
+pub fn answered_by_trigrams(text: &Text) -> bool {
+    has_base64_run(text.arg())
 }
 
 impl TextAtom {
@@ -51,6 +69,15 @@ impl TextAtom {
     ) -> Result<Self, ReadError> {
         if cancelled() {
             return Err(ReadError::Cancelled);
+        }
+        if answered_by_trigrams(&text) {
+            let screen = GrepAtom::read_trigrams_until(&text.trigrams(), pinned, cancelled)?;
+            return Ok(Self {
+                text,
+                whole: None,
+                units: Vec::new(),
+                screen: Some(screen),
+            });
         }
         let lookup = |term: &[u8]| -> Result<Option<Candidates>, ReadError> {
             for source in pinned.sources() {
@@ -71,7 +98,12 @@ impl TextAtom {
         } else {
             distinct.into_iter().map(lookup).collect::<Result<_, _>>()?
         };
-        Ok(Self { text, whole, units })
+        Ok(Self {
+            text,
+            whole,
+            units,
+            screen: None,
+        })
     }
 
     /// The documents [`TextAtom::cursor`] may yield, uncovered ones
@@ -100,6 +132,10 @@ impl TextAtom {
     ) -> Result<(u64, Certainty, u64), ReadError> {
         if cancelled() {
             return Err(ReadError::Cancelled);
+        }
+        if answered_by_trigrams(text) {
+            let possible = GrepAtom::estimate_trigrams_until(&text.trigrams(), pinned, cancelled)?;
+            return Ok((possible, Certainty::Maybe, possible));
         }
         let mut sources_exact = true;
         let mut fingerprints = 0;
@@ -176,6 +212,9 @@ impl TextAtom {
     ) -> Result<Cursor<'a>, ReadError> {
         if cancelled() {
             return Err(ReadError::Cancelled);
+        }
+        if let Some(screen) = &self.screen {
+            return screen.cursor_until(pinned, cancelled);
         }
         // A term no source answers could hold anywhere.
         let term = |found: &'a Option<Candidates>| match found {

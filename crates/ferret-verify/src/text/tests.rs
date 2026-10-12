@@ -505,3 +505,74 @@ fn windows_never_change_the_answer() {
         "{stats:?}"
     );
 }
+
+// ── Trigrams for planners ──
+
+fn doc_keys(doc: &[u8]) -> std::collections::HashSet<[u8; 3]> {
+    doc.windows(3)
+        .map(|w| ferret_text::trigram_key([w[0], w[1], w[2]]))
+        .collect()
+}
+
+fn admits(query: &Trigrams, keys: &std::collections::HashSet<[u8; 3]>) -> bool {
+    match query {
+        Trigrams::All => true,
+        Trigrams::None => false,
+        Trigrams::Key(key) => keys.contains(key),
+        Trigrams::And(parts) => parts.iter().all(|p| admits(p, keys)),
+        Trigrams::Or(parts) => parts.iter().any(|p| admits(p, keys)),
+    }
+}
+
+/// `Text::trigrams` is necessary: every document the matcher says holds
+/// the atom satisfies it, in both case modes, over the pieces that break
+/// byte searches (the Kelvin sign above all).
+#[test]
+fn every_holding_document_satisfies_the_trigrams() {
+    let mut rng = Rng(0x7e1_b10b);
+    let mut matcher = TextMatcher::new();
+    let (mut hits, mut screened) = (0, 0);
+    for _ in 0..30_000 {
+        let (arg_pieces, doc_pieces) = (1 + rng.below(3), rng.below(12));
+        let arg = rng.bytes(arg_pieces);
+        let doc = rng.bytes(doc_pieces);
+        for case in [false, true] {
+            let Some(text) = Text::new(&arg, case) else {
+                continue;
+            };
+            let trigrams = text.trigrams();
+            if matcher.is_match(&text, &doc) {
+                hits += 1;
+                screened += usize::from(trigrams != Trigrams::All);
+                assert!(
+                    admits(&trigrams, &doc_keys(&doc)),
+                    "{:?} in {:?}: {trigrams:?}",
+                    String::from_utf8_lossy(&arg),
+                    String::from_utf8_lossy(&doc)
+                );
+            }
+        }
+    }
+    assert!(hits > 1000 && screened > 100, "{hits} hits, {screened} screened");
+}
+
+#[test]
+fn trigrams_admit_respellings_and_the_kelvin_sign() {
+    // The discriminating cases: a document whose bytes differ from the
+    // argument's, yet holds it.
+    for (arg, doc) in [
+        ("kelvin", "\u{212A}ELVIN"),
+        ("Zqab9+Rtxy7/Wmcd3x", "zqab9 rtxy7 wmcd3x"),
+        ("Zqab9+Rtxy7/Wmcd3x", "ZQAB_9_RTXY_7_WMCD_3_X"),
+    ] {
+        let text = Text::new(arg.as_bytes(), false).unwrap();
+        assert!(TextMatcher::new().is_match(&text, doc.as_bytes()), "{arg} {doc}");
+        let trigrams = text.trigrams();
+        assert_ne!(trigrams, Trigrams::All, "{arg}");
+        assert!(admits(&trigrams, &doc_keys(doc.as_bytes())), "{arg} {doc}");
+        assert!(!admits(&trigrams, &doc_keys(b"unrelated text")), "{arg}");
+    }
+    // Units shorter than three bytes give no trigram: a blob spelled only in
+    // them is screened by nothing, and verification decides alone.
+    assert_eq!(Text::new(b"Zq9+Rt7/Wm3x", false).unwrap().trigrams(), Trigrams::All);
+}
