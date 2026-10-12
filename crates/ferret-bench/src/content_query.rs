@@ -621,6 +621,12 @@ fn pick_terms(view: &View) -> crate::Result<Classes> {
     })
 }
 
+/// [`PER_CLASS`] df = 1 terms of a fully merged codec-1 index, as the df1
+/// class draws them.
+pub(crate) fn pick_singletons(view: &View) -> crate::Result<Vec<Vec<u8>>> {
+    Ok(pick_terms(view)?.singleton)
+}
+
 /// Whether `term`, as `text:term`, is a single-unit term query: under the
 /// cap's ambiguity, and one run with no parts.
 fn term_query(term: &[u8]) -> bool {

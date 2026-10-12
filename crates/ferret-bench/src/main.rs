@@ -19,6 +19,7 @@
 //! ferret-bench saturation <catalog-dir> <term-segment> <tri-dir> <out-dir>  D69: saturated large documents
 //! ferret-bench index-churn <index-dir> <rounds>   synthetic churn: merge write amplification
 //! ferret-bench content-query <catalog-dir> <index-dir> [class...]  text: latency by class, phrase verification (S2 M4b)
+//! ferret-bench blob-screen sample|run <catalog-dir> <index-dir> <snapshot-dir> ...  T1: routed blob text: screens
 //! ferret-bench rank-fp <catalog-dir> <out-dir>   static df≥2 dictionary: 32-bit sparse fingerprints vs 20-bit buckets
 //! ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>  M5 candidate-byte diagnostic
 //! ferret-bench chunk-census <catalog-dir> <index-dir>   D66 heuristic chunk map census (S3 M6)
@@ -65,6 +66,7 @@ use ferret_catalog::{Catalog, Section};
 use ferret_query::Query;
 use ferret_verify::{Arm, Finder};
 
+mod blob_screen;
 mod census;
 mod chunk_census;
 mod content_query;
@@ -185,6 +187,7 @@ fn main() -> ExitCode {
             ("content-query", [dir, index, only @ ..]) => {
                 content_query::run(Path::new(dir), Path::new(index), only)
             }
+            ("blob-screen", args) => blob_screen::run(args),
             ("rank-fp", [dir, out]) => rank_fp::run(Path::new(dir), Path::new(out)),
             ("chunk-census", [dir, index]) => chunk_census::run(Path::new(dir), Path::new(index)),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
@@ -246,6 +249,8 @@ fn usage() -> ExitCode {
          ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench regex-query <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [--corpus snapshot-dir] [--covered] [class...]\n       \
+         ferret-bench blob-screen sample <catalog-dir> <index-dir> <snapshot-dir> <out-file>\n       \
+         ferret-bench blob-screen run <catalog-dir> <index-dir> <snapshot-dir> <queries-file> <out-tsv>\n       \
          ferret-bench rank-fp <catalog-dir> <out-dir>\n       \
          ferret-bench chunk-census <catalog-dir> <index-dir>\n       \
          ferret-bench recrawl-once <catalog-dir> <changed-files> <crawl-producer>\n       \

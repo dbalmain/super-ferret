@@ -327,6 +327,28 @@ a lived-in tree, because the catalog was refreshed from a frozen copy.
 catalog column, scanned. A sorted permutation becomes worth building only for
 selective ranges at about ten times this inode count.
 
+### Screening routed blob `text:` queries
+
+A `text:` argument holding a base64 blob is screened by the trigrams of its
+tokenizer units of 3 bytes or more (A, built on `wt/t1`). The alternative was
+the trigrams of its literal `[A-Za-z0-9]` runs (B). B misses documents that hold the
+blob respelled. On 300 blob arguments sampled from the corpus, banded by
+length, **A stays** ([measurements/t1-screen/](measurements/t1-screen/results.md)):
+
+- B's p90 verified bytes are 0.49–0.72 of A's per band, a factor of 1.4–2.
+- A screens with nothing for 3 queries, all 20–31 bytes long. Those 3 are the
+  only refusals in either arm.
+- Rows were identical for all 300 queries, and every query found its own
+  document.
+
+Neither screen makes these queries cheap. Base64 trigrams are close to random,
+so the large blob-heavy documents (D69's saturated documents) hold all of them.
+No query in either arm had fewer than 291 candidates, and even B verifies
+0.6–1.1 GB per query, with medians of 1.4–8.4 s warm per band. Arguments over
+256 bytes are slowest: the matcher's cost per byte grows with the argument.
+Making blob `text:` fast needs a fix for the saturated documents or the
+matcher, not B.
+
 ## Semantics
 
 - **`text:` under T1.**
