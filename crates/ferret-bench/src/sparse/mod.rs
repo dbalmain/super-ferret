@@ -23,6 +23,7 @@ use crate::segment_build::cpu_seconds;
 mod grams;
 pub(crate) mod latency;
 mod query;
+pub(crate) mod screens;
 #[cfg(test)]
 mod tests;
 
@@ -445,6 +446,25 @@ struct Corpus {
 }
 
 fn prepare(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::Result<Corpus> {
+    prepare_with(
+        catalog_dir,
+        index_dir,
+        snapshot_dir,
+        GrepFlags::default(),
+        None,
+    )
+}
+
+/// `prepare` with the seeds compiled under `flags`, and the oracle read
+/// from or saved to `oracle_cache`. The cache records each pattern beside
+/// its matches, so a different seed list or flag is refused, not reused.
+fn prepare_with(
+    catalog_dir: &Path,
+    index_dir: &Path,
+    snapshot_dir: &Path,
+    flags: GrepFlags,
+    oracle_cache: Option<&Path>,
+) -> crate::Result<Corpus> {
     crate::trigram::check_disk()?;
     let catalog = crate::open_catalog(catalog_dir)?;
     catalog.load_all()?;
@@ -485,7 +505,8 @@ fn prepare(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::
             return Err("insufficient sparse query seeds".into());
         }
         for grep in greps {
-            let facts = GrepFlags::default().required_literals(grep.pattern())?;
+            let grep = flags.compile(grep.pattern())?;
+            let facts = flags.required_literals(grep.pattern())?;
             let atom = GrepAtom::read_until(grep.clone(), &pinned, &|| false)?;
             let shipped = crate::screen::drain(pinned.top(atom.cursor_until(&pinned, &|| false)?));
             samples.push(Sample {
@@ -503,6 +524,44 @@ fn prepare(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::
     }
     let mut readable = vec![false; live.bound() as usize];
     let live_ids: Vec<_> = live.range(0, live.bound()).collect();
+    let cache_key = format!("case_insensitive={}\n", flags.case_insensitive);
+    if let Some(cached) = oracle_cache
+        .filter(|path| path.exists())
+        .map(fs::read_to_string)
+        .transpose()?
+    {
+        let mut lines = cached.lines();
+        if lines.next() != Some(cache_key.trim_end()) {
+            return Err("oracle cache flags differ".into());
+        }
+        for sample in &mut samples {
+            let (pattern, docs) = lines
+                .next()
+                .and_then(|line| line.rsplit_once('\t'))
+                .ok_or("oracle cache too short")?;
+            if pattern != sample.grep.pattern().escape_default().to_string() {
+                return Err("oracle cache patterns differ".into());
+            }
+            sample.oracle = docs
+                .split(',')
+                .filter(|d| !d.is_empty())
+                .map(str::parse)
+                .collect::<Result<_, _>>()?;
+        }
+        for &doc in &live_ids {
+            readable[doc as usize] = snapshot.contains(doc);
+        }
+        println!("oracle_cache hit queries={}", samples.len());
+        return Ok(Corpus {
+            catalog,
+            view,
+            snapshot,
+            live,
+            samples,
+            sizes,
+            readable,
+        });
+    }
     let (cpu, wall) = (cpu_seconds()?, Instant::now());
     for (ordinal, &doc) in live_ids.iter().enumerate() {
         if ordinal.is_multiple_of(1024) {
@@ -544,6 +603,18 @@ fn prepare(catalog_dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> crate::
         cpu_seconds()? - cpu,
         wall.elapsed().as_secs_f64()
     );
+    if let Some(path) = oracle_cache {
+        let mut out = cache_key;
+        for sample in &samples {
+            let docs: Vec<_> = sample.oracle.iter().map(u32::to_string).collect();
+            out += &format!(
+                "{}\t{}\n",
+                sample.grep.pattern().escape_default(),
+                docs.join(",")
+            );
+        }
+        fs::write(path, out)?;
+    }
     Ok(Corpus {
         catalog,
         view,

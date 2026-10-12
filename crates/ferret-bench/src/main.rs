@@ -22,6 +22,7 @@
 //! ferret-bench blob-screen sample|run <catalog-dir> <index-dir> <snapshot-dir> ...  T1: routed blob text: screens
 //! ferret-bench rank-fp <catalog-dir> <out-dir>   static df≥2 dictionary: 32-bit sparse fingerprints vs 20-bit buckets
 //! ferret-bench sparse-latency <catalog-dir> <index-dir> <snapshot-dir> <scratch-dir> [variant]  cold/warm regex screens
+//! ferret-bench screens <catalog-dir> <control-index> <t1-index> <snapshot-dir> <scratch-dir> <arm,...>  screens against rg (SCREENS.md)
 //! ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>  M5 candidate-byte diagnostic
 //! ferret-bench chunk-census <catalog-dir> <index-dir>   D66 heuristic chunk map census (S3 M6)
 //! ferret-bench overlay-fill <catalog-dir> <rows>   mixed name/inode overrides
@@ -213,6 +214,7 @@ fn main() -> ExitCode {
                 content_query::run(Path::new(dir), Path::new(index), only)
             }
             ("blob-screen", args) => blob_screen::run(args),
+            ("screens", args) => sparse::screens::run(args),
             ("rank-fp", [dir, out]) => rank_fp::run(Path::new(dir), Path::new(out)),
             ("chunk-census", [dir, index]) => chunk_census::run(Path::new(dir), Path::new(index)),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),
@@ -273,6 +275,7 @@ fn usage() -> ExitCode {
          ferret-bench index-churn <index-dir> <rounds> [--codec 1|h]\n       \
          ferret-bench sparse-latency <catalog-dir> <index-dir> <snapshot-dir> <scratch-dir> [variant]\n       \
          ferret-bench sparse <catalog-dir> <index-dir> <snapshot-dir> [variant]\n       \
+         ferret-bench screens <catalog-dir> <control-index> <t1-index> <snapshot-dir> <scratch-dir> <arm,...>\n       \
          ferret-bench regex-volume <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench regex-query <catalog-dir> <index-dir> <snapshot-dir>\n       \
          ferret-bench content-query <catalog-dir> <index-dir> [--terms control-full] [--compare control-state] [--corpus snapshot-dir] [--covered] [class...]\n       \

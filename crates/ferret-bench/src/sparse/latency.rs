@@ -23,9 +23,9 @@ const MODES: [&str; 3] = ["shipped-four", "word-fixed-4", "word-fixed-4+5"];
 
 /// Logical positional-read bytes, not device sectors. Duplicate checksum
 /// chunks are counted each time the reader requests them.
-struct Meter {
+pub(super) struct Meter {
     file: File,
-    bytes: Cell<u64>,
+    pub(super) bytes: Cell<u64>,
 }
 
 impl ReadAt for Meter {
@@ -41,14 +41,14 @@ impl ReadAt for Meter {
 }
 
 impl Meter {
-    fn open(path: &Path) -> crate::Result<Segment<Self>> {
+    pub(super) fn open(path: &Path) -> crate::Result<Segment<Self>> {
         Ok(Segment::open(Self {
             file: File::open(path)?,
             bytes: Cell::new(0),
         })?)
     }
 
-    fn evict(&self) -> crate::Result<()> {
+    pub(super) fn evict(&self) -> crate::Result<()> {
         rustix::fs::fadvise(&self.file, 0, None, rustix::fs::Advice::DontNeed)?;
         Ok(())
     }
@@ -56,10 +56,10 @@ impl Meter {
 
 /// Creation must succeed before this guard owns anything. An existing file
 /// can never be removed on a failed create; cleanup touches only this path.
-struct OwnedIndex(PathBuf);
+pub(super) struct OwnedIndex(pub(super) PathBuf);
 
 impl OwnedIndex {
-    fn create(dir: &Path, label: &str) -> crate::Result<(Self, File)> {
+    pub(super) fn create(dir: &Path, label: &str) -> crate::Result<(Self, File)> {
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{label}.{}.segment", std::process::id()));
         let file = OpenOptions::new()
@@ -69,7 +69,7 @@ impl OwnedIndex {
         Ok((Self(path), file))
     }
 
-    fn remove(self) -> crate::Result<()> {
+    pub(super) fn remove(self) -> crate::Result<()> {
         fs::remove_file(&self.0)?;
         Ok(())
     }
@@ -83,7 +83,7 @@ impl Drop for OwnedIndex {
 
 /// Check headroom before every bounded output write, so our own index cannot
 /// take the filesystem through the 5 GB stop threshold while being finished.
-struct Output(File);
+pub(super) struct Output(pub(super) File);
 
 impl io::Write for Output {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -98,7 +98,7 @@ impl io::Write for Output {
     }
 }
 
-fn write_index(
+pub(super) fn write_index(
     corpus: &Corpus,
     variant: Variant,
     dir: &Path,
@@ -222,13 +222,13 @@ fn read_postings(
 }
 
 #[derive(Clone, Copy, Default)]
-struct Timing {
-    postings: Duration,
-    verify: Duration,
-    total: Duration,
-    postings_bytes: u64,
-    index_bytes: u64,
-    verified_bytes: u64,
+pub(super) struct Timing {
+    pub(super) postings: Duration,
+    pub(super) verify: Duration,
+    pub(super) total: Duration,
+    pub(super) postings_bytes: u64,
+    pub(super) index_bytes: u64,
+    pub(super) verified_bytes: u64,
 }
 
 struct Trial {
@@ -247,7 +247,7 @@ fn band(size: u64) -> usize {
     }
 }
 
-fn verify(
+pub(super) fn verify(
     grep: &Grep,
     docs: &[u32],
     sizes: &[u64],
@@ -331,7 +331,7 @@ fn check_trial(trial: &Trial, expected: &[u32], oracle: &[u32]) -> crate::Result
     Ok(())
 }
 
-fn ns(d: Duration) -> u64 {
+pub(super) fn ns(d: Duration) -> u64 {
     d.as_nanos().try_into().unwrap_or(u64::MAX)
 }
 fn ms_pair(values: Vec<u64>) -> String {
