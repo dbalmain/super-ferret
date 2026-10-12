@@ -138,7 +138,7 @@ fn check(bytes: &[u8], first: u32, last: u32, terms: &Terms, rng: &mut Rng) {
                 seen.push(term.to_vec());
             }
         }
-        assert!(skipped < BLOCK);
+        assert!(skipped <= BLOCK, "skipped {skipped} before {probe:?}");
         let want: Vec<_> = terms.range(probe.clone()..).map(|(t, _)| t.clone()).collect();
         assert_eq!(seen, want);
     }

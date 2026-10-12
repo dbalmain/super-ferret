@@ -10,11 +10,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use ferret_index::segment::{Hit, Segment};
-use ferret_index::{CatalogView, Certainty, Cursor, DocSet, Pinned, View, postings};
+use ferret_index::{Certainty, Cursor, DocSet, Pinned, postings};
 use ferret_query::{NameIndex, Query};
 use ferret_verify::trigram::RequiredLiterals;
 use ferret_verify::{GrepFlags, Trigrams};
@@ -48,10 +48,13 @@ enum Leaf {
     Tri(Vec<u8>),
     Term(Vec<u8>),
     Prefix(Vec<u8>),
+    /// Every term containing these lowercase bytes: one dictionary pass.
+    Substring(Vec<u8>),
     /// A key of the arm's own segment: word 4+5 or a hashed variant.
     Extra(Vec<u8>),
-    /// Documents T1 suppressed a run in: their terms are incomplete.
-    Blob,
+    /// Documents whose terms are incomplete: T1 suppressed a run, or a
+    /// token over the 64-byte cap lost its tail.
+    Fallback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -139,20 +142,41 @@ fn from_need(need: &Need) -> Plan {
     }
 }
 
-/// The term screen of a case-sensitive regex's facts: each literal's safe
-/// units ANDed, `All` where a literal has none. OR branches stay.
-fn term_plan(facts: &RequiredLiterals) -> Plan {
+/// How the term screen reads a literal: the brief's units (exact and
+/// prefix lookups, sound only case-sensitive), substrings of whole terms
+/// (sound in either case), or both.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lookups {
+    Units,
+    Substrings,
+    Both,
+}
+
+/// The term screen of a regex's facts: each literal's lookups ANDed, `All`
+/// where a literal has none. OR branches stay.
+fn term_plan(facts: &RequiredLiterals, lookups: Lookups) -> Plan {
     match facts {
         RequiredLiterals::All => Plan::All,
         RequiredLiterals::None => Plan::None,
         RequiredLiterals::Literal(bytes) => {
-            Plan::and(units::units(bytes).into_iter().map(|unit| match unit {
-                Unit::Exact(term) => Plan::Leaf(Leaf::Term(term)),
-                Unit::Prefix(prefix) => Plan::Leaf(Leaf::Prefix(prefix)),
-            }))
+            let mut leaves = Vec::new();
+            if lookups != Lookups::Substrings {
+                leaves.extend(units::units(bytes).into_iter().map(|unit| match unit {
+                    Unit::Exact(term) => Plan::Leaf(Leaf::Term(term)),
+                    Unit::Prefix(prefix) => Plan::Leaf(Leaf::Prefix(prefix)),
+                }));
+            }
+            if lookups != Lookups::Units {
+                leaves.extend(
+                    units::substrings(bytes)
+                        .into_iter()
+                        .map(|needle| Plan::Leaf(Leaf::Substring(needle))),
+                );
+            }
+            Plan::and(leaves)
         }
-        RequiredLiterals::And(parts) => Plan::and(parts.iter().map(term_plan)),
-        RequiredLiterals::Or(parts) => Plan::or(parts.iter().map(term_plan)),
+        RequiredLiterals::And(parts) => Plan::and(parts.iter().map(|p| term_plan(p, lookups))),
+        RequiredLiterals::Or(parts) => Plan::or(parts.iter().map(|p| term_plan(p, lookups))),
     }
 }
 
@@ -198,7 +222,7 @@ struct Sources<'a> {
     tri: &'a Segment<Meter>,
     term: Option<&'a Segment<Meter>>,
     extra: Option<&'a Segment<Meter>>,
-    blob: &'a DocSet,
+    fallback: &'a DocSet,
     live: &'a DocSet,
 }
 
@@ -229,8 +253,8 @@ fn compile<'a>(
     match plan {
         Plan::All => Cursor::bits(src.live, Certainty::Maybe),
         Plan::None => Cursor::Empty,
-        Plan::Leaf(Leaf::Blob) => Cursor::bits(src.blob, Certainty::Maybe),
-        Plan::Leaf(leaf @ Leaf::Prefix(_)) => match &sets[leaf] {
+        Plan::Leaf(Leaf::Fallback) => Cursor::bits(src.fallback, Certainty::Maybe),
+        Plan::Leaf(leaf @ (Leaf::Prefix(_) | Leaf::Substring(_))) => match &sets[leaf] {
             Some(set) => Cursor::bits(set, Certainty::Maybe),
             None => Cursor::bits(src.live, Certainty::Maybe),
         },
@@ -262,12 +286,17 @@ fn read(src: &Sources, plan: &Plan, extra_docs: &[u32]) -> crate::Result<Read> {
     plan.leaves(&mut leaves);
     let (mut lists, mut sets) = (BTreeMap::new(), BTreeMap::new());
     let (mut postings_bytes, mut prefix_terms, mut capped_prefixes) = (0, 0, 0);
+    let mut needles = Vec::new();
     for leaf in leaves {
         let segment = match &leaf {
             Leaf::Tri(_) => src.tri,
             Leaf::Term(_) | Leaf::Prefix(_) => src.term.ok_or("term leaf without terms")?,
             Leaf::Extra(_) => src.extra.ok_or("extra leaf without segment")?,
-            Leaf::Blob => continue,
+            Leaf::Substring(needle) => {
+                needles.push(needle.clone());
+                continue;
+            }
+            Leaf::Fallback => continue,
         };
         match &leaf {
             Leaf::Tri(key) | Leaf::Term(key) | Leaf::Extra(key) => {
@@ -304,7 +333,16 @@ fn read(src: &Sources, plan: &Plan, extra_docs: &[u32]) -> crate::Result<Read> {
                 };
                 sets.insert(leaf, set);
             }
-            Leaf::Blob => {}
+            Leaf::Substring(_) | Leaf::Fallback => {}
+        }
+    }
+    if !needles.is_empty() {
+        let segment = src.term.ok_or("substring leaf without terms")?;
+        let found = substring_scan(segment, &needles, src.live.bound(), &mut postings_bytes)?;
+        for (needle, (named, set)) in needles.into_iter().zip(found) {
+            prefix_terms += named;
+            capped_prefixes += u64::from(set.is_none());
+            sets.insert(Leaf::Substring(needle), set);
         }
     }
     let cursor = compile(plan, &lists, &sets, src);
@@ -324,6 +362,49 @@ fn read(src: &Sources, plan: &Plan, extra_docs: &[u32]) -> crate::Result<Read> {
         prefix_terms,
         capped_prefixes,
     })
+}
+
+/// One pass over the dictionary for every needle at once: each needle's
+/// matching terms and the union of their documents, or `None` past
+/// [`PREFIX_CAP`] terms, which drops the needle from the conjunction.
+fn substring_scan(
+    segment: &Segment<Meter>,
+    needles: &[Vec<u8>],
+    bound: u32,
+    postings_bytes: &mut u64,
+) -> crate::Result<Vec<(u64, Option<DocSet>)>> {
+    let finders: Vec<_> = needles.iter().map(memchr::memmem::Finder::new).collect();
+    let mut named = vec![0u64; needles.len()];
+    let mut docs: Vec<Vec<u32>> = vec![Vec::new(); needles.len()];
+    let mut terms = segment.terms();
+    while let Some((term, entry)) = terms.next_term()? {
+        let mut hit = None;
+        for (i, finder) in finders.iter().enumerate() {
+            if term.len() >= needles[i].len() && finder.find(term).is_some() {
+                named[i] += 1;
+                if named[i] as usize <= PREFIX_CAP {
+                    hit.get_or_insert_with(Vec::new).push(i);
+                }
+            }
+        }
+        let Some(hit) = hit else { continue };
+        let mut list = Vec::new();
+        match segment.read(&entry)? {
+            Hit::Single(doc) => list.push(doc),
+            Hit::Postings(postings) => {
+                *postings_bytes += postings.bytes();
+                postings.decode(&mut list);
+            }
+        }
+        for i in hit {
+            docs[i].extend_from_slice(&list);
+        }
+    }
+    Ok(named
+        .into_iter()
+        .zip(docs)
+        .map(|(n, d)| (n, (n as usize <= PREFIX_CAP).then(|| DocSet::new(bound, d))))
+        .collect())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -585,41 +666,76 @@ fn rg_arm(
     Ok(())
 }
 
-/// Documents with a T1 run: their term lists are incomplete, so the term
-/// screen admits them and leaves them to trigrams.
-fn blob_docs(corpus: &Corpus) -> crate::Result<DocSet> {
-    let start = Instant::now();
-    let mut docs = Vec::new();
-    for doc in 0..corpus.live.bound() {
-        if corpus.readable[doc as usize]
-            && ferret_text::has_base64_run(&fs::read(corpus.snapshot.path(doc))?)
-        {
-            docs.push(doc);
+/// Documents whose term lists are incomplete, so a term screen must admit
+/// them and leave them to trigrams: T1 dropped a run's tokens (blob), or a
+/// token was longer than the 64-byte cap and lost its tail (long). Read
+/// from `cache` when present.
+fn fallback_docs(corpus: &Corpus, cache: &Path) -> crate::Result<DocSet> {
+    let docs: Vec<u32> = if cache.exists() {
+        fs::read_to_string(cache)?
+            .lines()
+            .map(str::parse)
+            .collect::<Result<_, _>>()?
+    } else {
+        let start = Instant::now();
+        let (mut docs, mut blob, mut long) = (Vec::new(), (0u64, 0u64), (0u64, 0u64));
+        let mut scratch = ferret_text::Scratch::default();
+        for doc in 0..corpus.live.bound() {
+            if !corpus.readable[doc as usize] {
+                continue;
+            }
+            let bytes = fs::read(corpus.snapshot.path(doc))?;
+            let has_blob = ferret_text::has_base64_run(&bytes);
+            let mut has_long = false;
+            ferret_text::tokenize_terms(&bytes, &mut scratch, |token| {
+                has_long |= token.bytes.len() > ferret_text::MAX_TOKEN_BYTES;
+            });
+            let size = bytes.len() as u64;
+            if has_blob {
+                blob = (blob.0 + 1, blob.1 + size);
+            }
+            if has_long {
+                long = (long.0 + 1, long.1 + size);
+            }
+            if has_blob || has_long {
+                docs.push(doc);
+            }
         }
-    }
-    let bytes: u64 = docs.iter().map(|&d| corpus.sizes[d as usize]).sum();
-    println!(
-        "blob_docs docs={} bytes={bytes} wall_s={:.3}",
-        docs.len(),
-        start.elapsed().as_secs_f64()
-    );
+        let union: u64 = docs.iter().map(|&d| corpus.sizes[d as usize]).sum();
+        println!(
+            "fallback_docs blob_docs={} blob_bytes={} long_docs={} long_bytes={} union_docs={} union_bytes={union} wall_s={:.3}",
+            blob.0,
+            blob.1,
+            long.0,
+            long.1,
+            docs.len(),
+            start.elapsed().as_secs_f64()
+        );
+        let text: Vec<_> = docs.iter().map(u32::to_string).collect();
+        fs::write(cache, text.join("\n") + "\n")?;
+        docs
+    };
     Ok(DocSet::new(corpus.live.bound(), docs))
 }
 
-fn shipped_plans(corpus: &Corpus) -> crate::Result<Vec<Plan>> {
+/// The product planner's trigram selection for each seed. The population's
+/// case rides in the pattern, since `grep:` itself is case-sensitive.
+fn shipped_plans(corpus: &Corpus, flags: GrepFlags) -> crate::Result<Vec<Plan>> {
     let pinned = Pinned::new(Some(&corpus.view), &corpus.live);
     let names = NameIndex::new(&corpus.catalog);
+    let inline = if flags.case_insensitive { "(?i)" } else { "" };
     let mut plans = Vec::new();
     for sample in &corpus.samples {
         let query = Query::from_args(
-            &[format!("grep:{}", sample.grep.pattern())],
+            &[format!("grep:{inline}{}", sample.grep.pattern())],
             SystemTime::now(),
         )?;
         let explained = query.explain_content(&corpus.catalog, &names, &pinned)?;
         let [plan] = explained.greps.as_slice() else {
             return Err("screens requires one regex plan".into());
         };
-        if plan.derived != *sample.grep.trigrams() && plan.derived != *sample.grep.planning_trigrams()
+        if plan.derived != *sample.grep.trigrams()
+            && plan.derived != *sample.grep.planning_trigrams()
         {
             return Err("product grep: derived a different tree than the seed".into());
         }
@@ -628,48 +744,36 @@ fn shipped_plans(corpus: &Corpus) -> crate::Result<Vec<Plan>> {
     Ok(plans)
 }
 
-struct Args {
-    catalog: PathBuf,
-    control: PathBuf,
-    t1: PathBuf,
-    corpus: PathBuf,
-    scratch: PathBuf,
-    arms: Vec<String>,
-}
-
-const ARMS: [&str; 7] = ["rg", "rg-j1", "trigrams", "terms", "word45", "hashed", "units"];
+const ARMS: [&str; 7] = [
+    "rg", "rg-j1", "trigrams", "terms", "word45", "hashed", "units",
+];
 
 pub(crate) fn run(args: &[String]) -> crate::Result<()> {
-    let [catalog, control, t1, corpus, scratch, arms] = args else {
-        return Err(
-            "screens <catalog> <control-index> <t1-index> <corpus> <scratch> <arm,...>".into(),
-        );
+    let [catalog, index, corpus_dir, scratch, case, arms] = args else {
+        return Err("screens <catalog> <index> <corpus> <scratch> <ci|cs> <arm,...>".into());
     };
-    let args = Args {
-        catalog: catalog.into(),
-        control: control.into(),
-        t1: t1.into(),
-        corpus: corpus.into(),
-        scratch: scratch.into(),
-        arms: arms.split(',').map(str::to_owned).collect(),
-    };
-    if let Some(bad) = args
-        .arms
+    let (index, corpus_dir, scratch) = (Path::new(index), Path::new(corpus_dir), Path::new(scratch));
+    let arms: Vec<&str> = arms.split(',').collect();
+    if let Some(bad) = arms
         .iter()
-        .find(|a| !ARMS.contains(&a.as_str()) && !a.starts_with("hash"))
+        .find(|a| !ARMS.contains(a) && !Hashed::ALL.iter().any(|h| h.label() == **a))
     {
         return Err(format!("unknown screens arm {bad}").into());
     }
-    fs::create_dir_all(&args.scratch)?;
     let flags = GrepFlags {
-        case_insensitive: false,
+        case_insensitive: match case.as_str() {
+            "ci" => true,
+            "cs" => false,
+            _ => return Err("case must be ci or cs".into()),
+        },
     };
+    fs::create_dir_all(scratch)?;
     let corpus = prepare_with(
-        &args.catalog,
-        &args.control,
-        &args.corpus,
+        Path::new(catalog),
+        index,
+        corpus_dir,
         flags,
-        Some(&args.scratch.join("oracle-case-sensitive.tsv")),
+        Some(&scratch.join(format!("oracle-{case}.tsv"))),
     )?;
     let live_ids: Vec<_> = corpus.live.range(0, corpus.live.bound()).collect();
     let pinned = Pinned::new(Some(&corpus.view), &corpus.live);
@@ -677,86 +781,87 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
     extra_docs.extend(live_ids.iter().filter(|&&d| !corpus.snapshot.contains(d)));
     extra_docs.sort_unstable();
     extra_docs.dedup();
-    let oracle_docs: Vec<_> = corpus.samples.iter().map(|s| s.oracle.len() as u64).collect();
     for class in CLASSES {
-        let picked: Vec<_> = corpus
+        let picked: Vec<u64> = corpus
             .samples
             .iter()
-            .zip(&oracle_docs)
-            .filter(|(s, _)| s.class == class)
-            .map(|(_, &n)| n)
+            .filter(|s| s.class == class)
+            .map(|s| s.oracle.len() as u64)
+            .collect();
+        let bytes: Vec<u64> = corpus
+            .samples
+            .iter()
+            .filter(|s| s.class == class)
+            .map(|s| counts(&s.oracle, &corpus.sizes, &corpus.readable)[0].bytes)
             .collect();
         println!(
-            "population class={class} queries={} oracle_docs_median_p90={} zero_match_queries={}",
+            "population case={case} class={class} queries={} oracle_docs_median_p90={} oracle_B_median_p90={} zero_match_queries={}",
             picked.len(),
             pair(picked.clone()),
+            pair(bytes),
             picked.iter().filter(|&&n| n == 0).count()
         );
     }
     println!("uncovered_or_unreadable_docs={}", extra_docs.len());
 
-    let [tri_entry] = corpus.view.manifest().segments.as_slice() else {
-        return Err("screens requires a fully merged control".into());
+    let [entry] = corpus.view.manifest().segments.as_slice() else {
+        return Err("screens requires a fully merged index".into());
     };
-    let tri = Meter::open(&args.control.join(tri_entry.trigram_file_name()))?;
-    let t1_view = View::open(
-        &args.t1,
-        &CatalogView {
-            incarnation: corpus.catalog.generation().incarnation,
-            live: &corpus.live,
-        },
-    )?
-    .ok_or("no T1 index")?;
-    let [term_entry] = t1_view.manifest().segments.as_slice() else {
-        return Err("screens requires a fully merged T1 index".into());
-    };
-    let term = Meter::open(&args.t1.join(term_entry.file_name()))?;
+    let tri = Meter::open(&index.join(entry.trigram_file_name()))?;
+    let term = Meter::open(&index.join(entry.file_name()))?;
     println!(
-        "index_bytes trigram={} t1_terms={} t1_trigram={}",
-        fs::metadata(args.control.join(tri_entry.trigram_file_name()))?.len(),
-        fs::metadata(args.t1.join(term_entry.file_name()))?.len(),
-        fs::metadata(args.t1.join(term_entry.trigram_file_name()))?.len(),
+        "index_bytes trigram={} terms={}",
+        fs::metadata(index.join(entry.trigram_file_name()))?.len(),
+        fs::metadata(index.join(entry.file_name()))?.len(),
     );
 
-    let shipped = shipped_plans(&corpus)?;
+    let shipped = shipped_plans(&corpus, flags)?;
     let mut private = String::new();
     let empty = DocSet::new(corpus.live.bound(), []);
-    let wants = |arm: &str| args.arms.iter().any(|a| a == arm);
+    let wants = |arm: &str| arms.contains(&arm);
+    // The brief's unit rules are sound only case-sensitive; substrings of
+    // whole terms are sound either way.
+    let lookups = if flags.case_insensitive {
+        Lookups::Substrings
+    } else {
+        Lookups::Both
+    };
 
     if wants("units") || wants("terms") {
-        unit_report(&corpus, &shipped)?;
+        unit_report(&corpus, flags)?;
     }
     if wants("rg") {
-        rg_arm("rg", &corpus, flags, &args.corpus, None, &mut private)?;
+        rg_arm("rg", &corpus, flags, corpus_dir, None, &mut private)?;
     }
     if wants("rg-j1") {
-        rg_arm("rg-j1", &corpus, flags, &args.corpus, Some(1), &mut private)?;
+        rg_arm("rg-j1", &corpus, flags, corpus_dir, Some(1), &mut private)?;
     }
     if wants("trigrams") {
         let src = Sources {
             tri: &tri,
             term: None,
             extra: None,
-            blob: &empty,
+            fallback: &empty,
             live: &corpus.live,
         };
         time_arm("trigrams", &corpus, &shipped, &src, &extra_docs, &mut private)?;
     }
     if wants("terms") {
-        let blob = blob_docs(&corpus)?;
+        let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
         let src = Sources {
             tri: &tri,
             term: Some(&term),
             extra: None,
-            blob: &blob,
+            fallback: &fallback,
             live: &corpus.live,
         };
-        // Without the fallback: what T1 loses, measured, never timed.
+        // Without the fallback: what T1 and the cap lose, measured, never
+        // timed.
         let raw: Vec<_> = corpus
             .samples
             .iter()
             .zip(&shipped)
-            .map(|(s, p)| Plan::and([p.clone(), term_plan(&s.facts)]))
+            .map(|(s, p)| Plan::and([p.clone(), term_plan(&s.facts, lookups)]))
             .collect();
         miss_report(&corpus, &raw, &src, &extra_docs)?;
         let plans: Vec<_> = corpus
@@ -766,16 +871,28 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             .map(|(s, p)| {
                 Plan::and([
                     p.clone(),
-                    Plan::or([term_plan(&s.facts), Plan::Leaf(Leaf::Blob)]),
+                    Plan::or([term_plan(&s.facts, lookups), Plan::Leaf(Leaf::Fallback)]),
                 ])
             })
             .collect();
+        let narrowed: Vec<_> = plans.iter().zip(&shipped).map(|(a, b)| a != b).collect();
+        for class in CLASSES {
+            println!(
+                "terms_plan class={class} narrowed_queries={}",
+                corpus
+                    .samples
+                    .iter()
+                    .zip(&narrowed)
+                    .filter(|(s, n)| s.class == class && **n)
+                    .count()
+            );
+        }
         time_arm("terms", &corpus, &plans, &src, &extra_docs, &mut private)?;
     }
     if wants("word45") {
         crate::trigram::check_disk()?;
         let (cpu, wall) = (crate::segment_build::cpu_seconds()?, Instant::now());
-        let (owned, lists) = write_index(&corpus, Variant::Word45, &args.scratch)?;
+        let (owned, lists) = write_index(&corpus, Variant::Word45, scratch)?;
         drop(lists);
         println!(
             "word45_build cpu_s={:.3} wall_s={:.3} bytes={}",
@@ -791,7 +908,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             tri: &tri,
             term: None,
             extra: Some(&segment),
-            blob: &empty,
+            fallback: &empty,
             live: &corpus.live,
         };
         time_arm("word45", &corpus, &plans, &src, &extra_docs, &mut private)?;
@@ -809,7 +926,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             &corpus.snapshot,
             &live_ids,
             corpus.live.bound(),
-            &args.scratch,
+            scratch,
         )?;
         println!("{}", built.report);
         let segment = Meter::open(&built.owned.0)?;
@@ -820,16 +937,16 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             tri: &tri,
             term: None,
             extra: Some(&segment),
-            blob: &empty,
+            fallback: &empty,
             live: &corpus.live,
         };
         time_arm(&label, &corpus, &plans, &src, &extra_docs, &mut private)?;
         drop(segment);
         built.owned.remove()?;
     }
-    let path = args.scratch.join(format!(
-        "rows-{}-{}.tsv",
-        args.arms.join("+"),
+    let path = scratch.join(format!(
+        "rows-{case}-{}-{}.tsv",
+        arms.join("+"),
         std::process::id()
     ));
     fs::write(&path, private)?;
@@ -867,28 +984,32 @@ fn extra_plans(
     Ok(plans)
 }
 
-/// Safe-unit coverage per class: how many queries the term screen can
-/// narrow at all, and how many have an exact whole-term unit.
-fn unit_report(corpus: &Corpus, shipped: &[Plan]) -> crate::Result<()> {
+/// Lookup coverage per class: how many queries each kind of term lookup
+/// can narrow at all. The unit rules are reported for a case-sensitive
+/// population only.
+fn unit_report(corpus: &Corpus, flags: GrepFlags) -> crate::Result<()> {
     for class in CLASSES {
-        let mut row = (0, 0, 0, 0, 0);
-        for (sample, _) in corpus.samples.iter().zip(shipped).filter(|(s, _)| s.class == class) {
-            let plan = term_plan(&sample.facts);
-            row.0 += 1;
-            row.1 += usize::from(plan != Plan::All);
-            row.2 += usize::from(plan.has(&|l| matches!(l, Leaf::Term(_))));
-            row.3 += usize::from(plan.has(&|l| matches!(l, Leaf::Prefix(_))));
-            row.4 += usize::from(!matches!(sample.facts, RequiredLiterals::All));
+        let mut row = [0usize; 6];
+        for sample in corpus.samples.iter().filter(|s| s.class == class) {
+            let units = term_plan(&sample.facts, Lookups::Units);
+            let substrings = term_plan(&sample.facts, Lookups::Substrings);
+            row[0] += 1;
+            row[1] += usize::from(!matches!(sample.facts, RequiredLiterals::All));
+            row[2] += usize::from(units != Plan::All);
+            row[3] += usize::from(units.has(&|l| matches!(l, Leaf::Term(_))));
+            row[4] += usize::from(units.has(&|l| matches!(l, Leaf::Prefix(_))));
+            row[5] += usize::from(substrings != Plan::All);
         }
         println!(
-            "units class={class} queries={} with_literal_facts={} narrowed={} with_exact_unit={} with_prefix_unit={}",
-            row.0, row.4, row.1, row.2, row.3
+            "lookups case_insensitive={} class={class} queries={} with_literal_facts={} unit_narrowed={} with_exact_unit={} with_prefix_unit={} substring_narrowed={}",
+            flags.case_insensitive, row[0], row[1], row[2], row[3], row[4], row[5]
         );
     }
     Ok(())
 }
 
-/// The term screen without T1's fallback: oracle matches it would lose.
+/// The term screen without the fallback: oracle matches it would lose,
+/// and how many of those are in fallback documents.
 fn miss_report(
     corpus: &Corpus,
     plans: &[Plan],
@@ -898,23 +1019,19 @@ fn miss_report(
     let mut by_class: BTreeMap<&str, (usize, usize, usize, Vec<u64>)> = BTreeMap::new();
     for (q, plan) in plans.iter().enumerate() {
         let read = read(src, plan, extra_docs)?;
-        let missed = readable_oracle(corpus, q)
-            .iter()
+        let missed: Vec<_> = readable_oracle(corpus, q)
+            .into_iter()
             .filter(|d| read.docs.binary_search(d).is_err())
-            .count();
-        let blob_missed = readable_oracle(corpus, q)
-            .iter()
-            .filter(|&&d| read.docs.binary_search(&d).is_err() && src.blob.contains(d))
-            .count();
+            .collect();
         let entry = by_class.entry(corpus.samples[q].class).or_default();
-        entry.0 += usize::from(missed > 0);
-        entry.1 += missed;
-        entry.2 += blob_missed;
+        entry.0 += usize::from(!missed.is_empty());
+        entry.1 += missed.len();
+        entry.2 += missed.iter().filter(|&&d| src.fallback.contains(d)).count();
         entry.3.push(counts(&read.docs, &corpus.sizes, &corpus.readable)[0].bytes);
     }
-    for (class, (queries, missed, blob, bytes)) in by_class {
+    for (class, (queries, missed, fallback, bytes)) in by_class {
         println!(
-            "terms_raw class={class} queries_with_miss={queries} missed_docs={missed} missed_docs_in_blob_docs={blob} candidate_B_median_p90={}",
+            "terms_raw class={class} queries_with_miss={queries} missed_docs={missed} missed_docs_in_fallback={fallback} candidate_B_median_p90={}",
             pair(bytes)
         );
     }
