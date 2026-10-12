@@ -1,0 +1,184 @@
+example "2026-10-12T03:04:05.123Z": tokens ["2026", "10", "12t03", "12", "t", "03", "04", "05", "123z", "123", "z"]; t2 keeps ["2026", "10", "12"]
+example "2026/10/12 03:04:05": tokens ["2026", "10", "12", "03", "04", "05"]; t2 keeps ["2026", "10", "12"]
+example "1760238245123": tokens ["1760238245123"]; t2 keeps ["1760238245123"]
+census_seconds: 13.6
+documents: 112376
+document_bytes: 3978812718
+
+| arm | terms | term bytes | hapaxes | hapax bytes | postings |
+| --- | --- | --- | --- | --- | --- |
+| none | 18990510 | 305000438 | 13329685 | 231950335 | 87306842 |
+| t1 | 11445463 | 142714480 | 7393844 | 97806244 | 60423857 |
+| t2 | 18209876 | 295133822 | 12556546 | 222140266 | 85603887 |
+| t1t2 | 10664815 | 132847782 | 6620696 | 87996117 | 58694575 |
+
+| arm | postings dropped | terms gone | hapaxes gone | df≥2 terms gone | terms partly dropped | postings dropped from terms left at df≥2 | such terms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| t1 | 26882985 | 7545047 | 6097173 | 1447874 | 568287 | 14126968 | 406955 |
+| t2 | 1702955 | 780634 | 778143 | 2491 | 11937 | 695609 | 6933 |
+| t1t2 | 28612267 | 8325695 | 6875316 | 1450379 | 579011 | 14847431 | 412684 |
+
+| t1 drops from terms left at df≥2, by length | terms | postings dropped |
+| --- | --- | --- |
+| 1–3 | 43720 | 10071084 |
+| 4–7 | 360439 | 4037967 |
+| 8–15 | 2499 | 16624 |
+| 16+ | 297 | 1293 |
+
+| hapaxes t2 removes, by shape | count | bytes |
+| --- | --- | --- |
+| 13 digits | 716032 | 9308416 |
+| digits and letters | 24067 | 194932 |
+| 10 digits | 20829 | 208290 |
+| 5-9 digits | 17214 | 131276 |
+| other digits | 1 | 12 |
+
+| base64 runs | code | prose | other |
+| --- | --- | --- | --- |
+| documents | 404 | 107 | 7297 |
+| runs | 4410 | 317 | 1946348 |
+| run bytes | 17482217 | 2483346 | 277929502 |
+base64_document_bytes: 2240627858 (documents a has-suppressed-runs flag would send to verification)
+
+timestamp_documents: 14288
+timestamps_date_time: 1679296
+timestamps_date: 238020
+timestamps_epoch_seconds: 119949
+timestamps_epoch_millis: 833799
+
+Epoch-length numbers, standalone (not part of a word or decimal). Bands are 20 years each: below 2010, 2010–2030 (accepted), 2030–2050.
+| digits | band | id key | time key | other |
+| --- | --- | --- | --- | --- |
+| 10 | 1990–2010 | 664 | 47 | 34444 |
+| 10 | 2010–2030 | 807 | 119656 | 103882 |
+| 10 | 2030–2050 | 3 | 21 | 33822 |
+| 13 | 1990–2010 | 13 | 2603 | 7264 |
+| 13 | 2010–2030 | 326 | 833799 | 10119 |
+| 13 | 2030–2050 | 1 | 0 | 319 |
+
+timestamp_occurrences: 2871064
+distinct_second_doc_pairs: 1255072
+
+Date layouts: (time, doc) entries as integers, deduplicated at each layout's resolution; doc ids fit 17 bits.
+| layout | entries | bytes | bytes/entry | time bits/entry | doc bits/entry | header bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| time-major, s | 1255069 | 3876658 | 3.09 | 6.9 | 17.0 | 127479 |
+| time-major, min | 690997 | 1927116 | 2.79 | 4.5 | 17.0 | 70188 |
+| bucketed by day, s offset | 1255069 | 3286095 | 2.62 | 17.0 | 3.4 | 85200 |
+| bucketed by day, min offset | 690997 | 1568649 | 2.27 | 11.0 | 6.2 | 85200 |
+| bucketed by hour, s offset | 1255069 | 3450036 | 2.75 | 12.0 | 5.6 | 681432 |
+| bucketed by hour, min offset | 690997 | 2085159 | 3.02 | 6.0 | 10.3 | 681432 |
+| bucketed by hour, no offset | 311557 | 1255354 | 4.03 | 0.0 | 14.7 | 681432 |
+| bucketed by day, no offset | 236712 | 381498 | 1.61 | 0.0 | 10.0 | 85200 |
+
+30 seeded queries per class, picked from timestamp occurrences. Point: the occurrence's instant to the millisecond (so every candidate verifies). Day: its UTC day, and its local (UTC+11) day. Month: its UTC month. Exact documents need no read; maybe documents come from cells the range clips and must be read. Warm verify reads and scans each maybe document once untimed, then times it.
+| layout | query | candidates median | candidates p90 | verified docs median | verified docs p90 | verify MB median | verify MB p90 | lookup ms median | verify ms median | verify ms p90 | true matches median |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| time-major, s | point | 2 | 4 | 2 | 4 | 3.98 | 8.99 | 0.003 | 7.94 | 16.56 | 1 |
+| time-major, s | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.115 | 0.00 | 0.00 | 187 |
+| time-major, s | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.095 | 0.00 | 0.00 | 162 |
+| time-major, s | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 2.452 | 0.00 | 0.00 | 2196 |
+| time-major, min | point | 7 | 12 | 7 | 12 | 15.70 | 32.33 | 0.003 | 46.40 | 88.01 | 1 |
+| time-major, min | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.044 | 0.00 | 0.00 | 187 |
+| time-major, min | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.040 | 0.00 | 0.00 | 162 |
+| time-major, min | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 1.022 | 0.00 | 0.00 | 2196 |
+| bucketed by day, s offset | point | 2 | 4 | 2 | 4 | 3.98 | 8.99 | 0.037 | 8.01 | 15.97 | 1 |
+| bucketed by day, s offset | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.045 | 0.00 | 0.00 | 187 |
+| bucketed by day, s offset | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.114 | 0.00 | 0.00 | 162 |
+| bucketed by day, s offset | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 1.980 | 0.00 | 0.00 | 2196 |
+| bucketed by day, min offset | point | 7 | 12 | 7 | 12 | 15.70 | 32.33 | 0.017 | 46.71 | 86.93 | 1 |
+| bucketed by day, min offset | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.019 | 0.00 | 0.00 | 187 |
+| bucketed by day, min offset | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.049 | 0.00 | 0.00 | 162 |
+| bucketed by day, min offset | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 0.847 | 0.00 | 0.00 | 2196 |
+| bucketed by hour, s offset | point | 2 | 4 | 2 | 4 | 3.98 | 8.99 | 0.005 | 7.96 | 15.46 | 1 |
+| bucketed by hour, s offset | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.099 | 0.00 | 0.00 | 187 |
+| bucketed by hour, s offset | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.075 | 0.00 | 0.00 | 162 |
+| bucketed by hour, s offset | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 2.037 | 0.00 | 0.00 | 2196 |
+| bucketed by hour, min offset | point | 7 | 12 | 7 | 12 | 15.70 | 32.33 | 0.006 | 46.95 | 84.36 | 1 |
+| bucketed by hour, min offset | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.040 | 0.00 | 0.00 | 187 |
+| bucketed by hour, min offset | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.034 | 0.00 | 0.00 | 162 |
+| bucketed by hour, min offset | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 0.910 | 0.00 | 0.00 | 2196 |
+| bucketed by hour, no offset | point | 24 | 69 | 24 | 69 | 27.90 | 57.65 | 0.005 | 59.55 | 125.53 | 1 |
+| bucketed by hour, no offset | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.009 | 0.00 | 0.00 | 187 |
+| bucketed by hour, no offset | local-day | 162 | 266 | 0 | 0 | 0.00 | 0.00 | 0.008 | 0.00 | 0.00 | 162 |
+| bucketed by hour, no offset | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 0.154 | 0.00 | 0.00 | 2196 |
+| bucketed by day, no offset | point | 187 | 348 | 187 | 348 | 171.25 | 259.48 | 0.007 | 327.90 | 461.61 | 1 |
+| bucketed by day, no offset | utc-day | 187 | 348 | 0 | 0 | 0.00 | 0.00 | 0.002 | 0.00 | 0.00 | 187 |
+| bucketed by day, no offset | local-day | 283 | 395 | 283 | 395 | 241.43 | 333.43 | 0.014 | 455.03 | 587.79 | 162 |
+| bucketed by day, no offset | month | 2196 | 2538 | 0 | 0 | 0.00 | 0.00 | 0.062 | 0.00 | 0.00 | 2196 |
+
+mtime: 394197 inodes, 27347 distinct seconds; plain column 1576788 bytes (4 per inode)
+| layout | entries | bytes | bytes/entry | time bits/entry | doc bits/entry | header bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| time-major, s | 394197 | 1140275 | 2.89 | 3.3 | 19.0 | 40041 |
+| time-major, min | 394197 | 1063214 | 2.70 | 1.8 | 19.0 | 40041 |
+| bucketed by day, s offset | 394197 | 1655746 | 4.20 | 17.0 | 16.3 | 13704 |
+| bucketed by day, min offset | 394197 | 1360098 | 3.45 | 11.0 | 16.3 | 13704 |
+| bucketed by hour, s offset | 394197 | 1454331 | 3.69 | 12.0 | 16.6 | 45384 |
+| bucketed by hour, min offset | 394197 | 1158683 | 2.94 | 6.0 | 16.6 | 45384 |
+| bucketed by hour, no offset | 394197 | 468838 | 1.19 | 0.0 | 8.6 | 45384 |
+| bucketed by day, no offset | 394197 | 423880 | 1.08 | 0.0 | 8.3 | 13704 |
+| mtime query | layout | matches median | maybe median | lookup ms median | column scan ms median |
+| --- | --- | --- | --- | --- | --- |
+| day | time-major, s | 10061 | 0 | 0.155 | 0.319 |
+| day | time-major, min | 10061 | 0 | 0.154 | 0.319 |
+| day | bucketed by day, s offset | 10061 | 0 | 0.055 | 0.319 |
+| day | bucketed by day, min offset | 10061 | 0 | 0.056 | 0.319 |
+| day | bucketed by hour, s offset | 10061 | 0 | 0.161 | 0.319 |
+| day | bucketed by hour, min offset | 10061 | 0 | 0.157 | 0.319 |
+| day | bucketed by hour, no offset | 10061 | 0 | 0.131 | 0.319 |
+| day | bucketed by day, no offset | 10061 | 0 | 0.032 | 0.319 |
+| month | time-major, s | 35968 | 0 | 0.696 | 0.319 |
+| month | time-major, min | 35968 | 0 | 0.672 | 0.319 |
+| month | bucketed by day, s offset | 35968 | 0 | 0.663 | 0.319 |
+| month | bucketed by day, min offset | 35968 | 0 | 0.670 | 0.319 |
+| month | bucketed by hour, s offset | 35968 | 0 | 0.698 | 0.319 |
+| month | bucketed by hour, min offset | 35968 | 0 | 0.691 | 0.319 |
+| month | bucketed by hour, no offset | 35968 | 0 | 0.611 | 0.319 |
+| month | bucketed by day, no offset | 35968 | 0 | 0.562 | 0.319 |
+| last 7 days | time-major, s | 28883 | 0 | 0.520 | 0.321 |
+| last 7 days | time-major, min | 28883 | 0 | 0.497 | 0.321 |
+| last 7 days | bucketed by day, s offset | 28883 | 0 | 0.525 | 0.321 |
+| last 7 days | bucketed by day, min offset | 28883 | 0 | 0.492 | 0.321 |
+| last 7 days | bucketed by hour, s offset | 28883 | 0 | 0.531 | 0.321 |
+| last 7 days | bucketed by hour, min offset | 28883 | 0 | 0.502 | 0.321 |
+| last 7 days | bucketed by hour, no offset | 28883 | 0 | 0.410 | 0.321 |
+| last 7 days | bucketed by day, no offset | 28883 | 0 | 0.430 | 0.321 |
+
+ctime: 394197 inodes, 18102 distinct seconds; plain column 1576788 bytes (4 per inode)
+| layout | entries | bytes | bytes/entry | time bits/entry | doc bits/entry | header bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| time-major, s | 394197 | 1085027 | 2.75 | 2.2 | 19.0 | 40041 |
+| time-major, min | 394197 | 1024750 | 2.60 | 1.0 | 19.0 | 40041 |
+| bucketed by day, s offset | 394197 | 1636354 | 4.15 | 17.0 | 16.2 | 1944 |
+| bucketed by day, min offset | 394197 | 1340706 | 3.40 | 11.0 | 16.2 | 1944 |
+| bucketed by hour, s offset | 394197 | 1413256 | 3.59 | 12.0 | 16.4 | 16296 |
+| bucketed by hour, min offset | 394197 | 1117608 | 2.84 | 6.0 | 16.4 | 16296 |
+| bucketed by hour, no offset | 394197 | 427763 | 1.09 | 0.0 | 8.4 | 16296 |
+| bucketed by day, no offset | 394197 | 404488 | 1.03 | 0.0 | 8.2 | 1944 |
+| ctime query | layout | matches median | maybe median | lookup ms median | column scan ms median |
+| --- | --- | --- | --- | --- | --- |
+| day | time-major, s | 11586 | 0 | 0.188 | 0.318 |
+| day | time-major, min | 11586 | 0 | 0.179 | 0.318 |
+| day | bucketed by day, s offset | 11586 | 0 | 0.061 | 0.318 |
+| day | bucketed by day, min offset | 11586 | 0 | 0.063 | 0.318 |
+| day | bucketed by hour, s offset | 11586 | 0 | 0.173 | 0.318 |
+| day | bucketed by hour, min offset | 11586 | 0 | 0.169 | 0.318 |
+| day | bucketed by hour, no offset | 11586 | 0 | 0.143 | 0.318 |
+| day | bucketed by day, no offset | 11586 | 0 | 0.031 | 0.318 |
+| month | time-major, s | 42794 | 0 | 0.850 | 0.320 |
+| month | time-major, min | 42794 | 0 | 0.791 | 0.320 |
+| month | bucketed by day, s offset | 42794 | 0 | 0.808 | 0.320 |
+| month | bucketed by day, min offset | 42794 | 0 | 0.822 | 0.320 |
+| month | bucketed by hour, s offset | 42794 | 0 | 0.820 | 0.320 |
+| month | bucketed by hour, min offset | 42794 | 0 | 0.816 | 0.320 |
+| month | bucketed by hour, no offset | 42794 | 0 | 0.714 | 0.320 |
+| month | bucketed by day, no offset | 42794 | 0 | 0.681 | 0.320 |
+| last 7 days | time-major, s | 29157 | 0 | 0.525 | 0.320 |
+| last 7 days | time-major, min | 29157 | 0 | 0.517 | 0.320 |
+| last 7 days | bucketed by day, s offset | 29157 | 0 | 0.534 | 0.320 |
+| last 7 days | bucketed by day, min offset | 29157 | 0 | 0.502 | 0.320 |
+| last 7 days | bucketed by hour, s offset | 29157 | 0 | 0.541 | 0.320 |
+| last 7 days | bucketed by hour, min offset | 29157 | 0 | 0.544 | 0.320 |
+| last 7 days | bucketed by hour, no offset | 29157 | 0 | 0.452 | 0.320 |
+| last 7 days | bucketed by day, no offset | 29157 | 0 | 0.451 | 0.320 |

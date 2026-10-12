@@ -80,7 +80,7 @@ Predecessors, carried forward where still open:
 | D62 | `ferret search` syntax for content and booleans                        | answered       | A: `text:` atoms; find-style `OR`, `NOT`, `(` `)`; side survey of query languages done; `ferret grep` follows ripgrep (D72–D75)                               |
 | D63 | Tokenize in a follow pass, or in the crawl's hashing read              | answered       | A: the index follows the catalog in DocId order; D60's experiment found git does not remove the re-hash in a way that matters                                 |
 | D64 | Segment bytes: positional reads or `mmap`                              | answered       | A: positional reads into owned buffers; no `unsafe` or `mmap` until measurements justify it                                                                   |
-| D65 | The term dictionary is 87% of the index                                | answered       | blocks + block-prefix FST for the static dictionary; H: C, measured as arms C1–C3 (run codec; + graduation; + first offsets)                                  |
+| D65 | The term dictionary is 87% of the index                                | answered       | blocks + block-prefix FST; slice C: codec 1 stays; tokens: T1, blob `text:` via trigrams, no date index                                                       |
 | D66 | Phrase queries read too much: positions, or not                        | answered       | D: per-document Bloom 8 over adjacent pairs, pairs only, streaming fold; agent transcripts out of the content index                                           |
 | D67 | How `ferret search` spells a content regex, and when it refuses        | answered       | (a) A2: `grep:REGEX`, case-sensitive, `(?i)` inline, line anchors; (b) i: refuse past live/4 Maybe, `--scan`                                                  |
 | D68 | Per-document filters: a screening stage, terms and trigrams separately | answered       | B: neither filter built (M1b: trigram filters 1.20× postings; term filters 0.31× bytes but 5–6,343× slower)                                                   |
@@ -3656,7 +3656,9 @@ removing most of it.
 **Status: answered.** Static dictionary layout: front-coded blocks routed by a
 resident block-prefix FST (Dave, 2026-10-11; see the last update below). H's
 codec question: **C** (Dave, 2026-10-11), measured as three arms, C1–C3,
-below. S2 M2b, 2026-10-07;
+below. Slice C: codec 1 stays the only term codec; token policy: T1, blob
+`text:` terms through trigrams, no date index (Dave, 2026-10-12). S2 M2b,
+2026-10-07;
 [measurements](S2.md#m2--segment-writer-and-reader).
 
 **Question:** The first real build is 12.7% of text, not the 6.8% S2 M0
@@ -3928,6 +3930,221 @@ and list-length bytes", was wrong: on msa2 it is 12.0 MB, 6.0 MB each. And the
 ordinal arm's apparent saving was mostly the df it left out: a fair saving is
 0.7% (Astra). Codec-1 postings lists carry no document count, so any layout that
 drops the entry's df must store it somewhere else.
+
+### D65 update — slice C
+
+**Status: answered, A (Dave, 2026-10-12).** Codec 1 stays the only term codec.
+Hapaxes get no special treatment, and codecs 2–7 stay on branch `wt/d65c`;
+this record and [D65C.md](D65C.md) come to main without the code.
+
+2026-10-12, refreshed catalog; [measurements and soundness](D65C.md).
+112,382 live documents, 112,376 readable frozen representatives (3.98 GB),
+six changed/unreadable representatives. The codec-1 control's steady rare-term
+warm p90 is **0.12 ms**, so the stale-catalog floor is gone. All arms are real
+follows and merges. All 7,500 experimental queries agree with the control.
+
+**Question: which measured arm should replace codec 1?** The original rule
+requires ≥15% steady saving, rare/absent warm p90 <20 ms, mid/common medians
+≤1.5× control, and follow-plus-steady CPU ≤1.2×.
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. Keep codec 1 | 450.28 MB steady term index. | Passes latency; no graduation reads. Existing default. |
+| B. H0, codec 2 | df2 p90 23.83 ms; mid 4.07×; full churn +10.8%; CPU 1.152×. | 52.6% steady saving. |
+| C1. Run codec, codec 3 | df2 p90 25.88 ms; mid 4.48×; full churn +0.9%; CPU 1.162×. | 50.3% steady saving; nearly removes compact churn penalty. |
+| C2. Runs + verified graduation, codec 4 | CPU 2.896×; steady merge reads 9.57 GB; peak RSS 815 MiB. | 51.7% steady saving; full churn −2.5%; df2 p90 17.15 ms and all latency gates pass. |
+| C3. Runs + first offsets + graduation, codec 5 | CPU 3.698×; steady merge reads 9.33 GB across 2.22M reads; peak RSS 743 MiB; full churn +1.3%. | 36.1% steady saving; rare warm p90 0.09 / 0.14 ms; all latency gates pass. |
+
+**Recommendation: A for the default; keep C1–C3 opt-in.** C1 answers most
+of the compact churn cost, but verification latency still fails the rule.
+C2 and C3 solve enough latency to pass, but graduation exceeds the CPU budget.
+Offsets make typical queries cheap; they do not make graduation cheap on this
+corpus. C3's df2 p95 is still 32.91 ms, and its steady state has three segments
+versus twelve for the other arms under today's paired merge policy.
+
+The one-way-record diagnosis is confirmed. Today's ordinary paired churn
+state makes H0 10.3% smaller; the 10.8% penalty appears at full merge. C1's
+run headers add 30.42 MB at first build despite adding no offset payload.
+C3's first-build increment is 94.39 MB (3.12 B/record), above the derived
+80 MB because this refreshed corpus contains more records.
+
+**Fact that would change it:** a measured C3 implementation with bounded
+graduation buffers and coalesced/budgeted reads that meets the original
+≤1.2× CPU rule while retaining these size, latency and soundness results; or
+Dave explicitly choosing a higher CPU budget for the measured density gain.
+Any skipped or failed verification must leave a record intact. The current
+buffers grow with the merge input. All required collision, changed-file,
+offset-fallback and repeated-merge soundness tests pass; all eleven original
+H tests exercise every arm. Workspace gates pass **938 tests**, versus 928
+on main, with zero warnings.
+
+### D65 update — offsets without graduation
+
+**Status: answered, A (Dave, 2026-10-12).** Codec 1 stays; C4b is not adopted,
+as part of the slice C answer.
+
+2026-10-12, same refreshed catalog and frozen corpus as slice C;
+[measurements](D65C.md#offsets-without-graduation-c4). Astra's review found
+graduation cannot soundly avoid document reads and proposed C3's offsets with
+every merge-time verification turned off. Two arms test that, both C3's on-disk
+format: **C4a** (codec 6) keeps C3's full read when a dictionary term is demoted
+to a record, to recover its offset; **C4b** (codec 7) reads nothing during a
+merge and gives a demoted record the unknown-offset hint, which queries answer
+with a full check. Neither graduates, so every record stays a Maybe hit that a
+query verifies. All 1,875 C4b queries matched the codec-1 control.
+
+**The read split.** A C3 re-run reproduced slice C's bytes and read counts
+exactly, now counted by purpose. On `$HOME` **all 9.33 GB of steady reads, and
+all 2.99 GB of full-merge reads, are graduation**: a frozen corpus has no
+deaths, so nothing is purged and nothing is demoted. Demotion exists only under
+churn. On S2's trace it is 0.74 GB of C3's 2.92 GB (329k of 2.45M reads); C4a,
+which keeps more records to demote, reads 1.15 GB for it.
+
+| Steady unless noted | Codec 1 | C3 | C4a | C4b |
+| --- | --- | --- | --- | --- |
+| Term index | 450.28 MB | 287.91 MB (36.1%) | 317.95 MB (29.4%) | 317.95 MB (29.4%) |
+| Full merge | 398.12 MB | 271.75 MB (31.7%) | 305.18 MB (23.3%) | 305.18 MB (23.3%) |
+| Follow + steady CPU | 269.05 s | 998.29 s (3.71×) | 287.14 s (1.067×) | 284.17 s (1.056×) |
+| Merge document reads | 0 | 9.33 GB | 0 | 0 |
+| df1 / df2–100 / absent warm p90 | 0.12 / 0.15 / 0.12 ms | 0.09 / 0.14 / 0.05 ms | as C4b | 0.21 / 0.51 / 0.21 ms |
+| Mid / common warm median | 1.88 / 26.26 ms | 1.05× / 1.00× | as C4b | 1.51× / 1.06× |
+| S2 churn, ordinary / full | 19.77 / 11.84 MB | −4.2% / +1.3% | −5.3% / +18.2% | −5.9% / +17.3% |
+| S2 churn merge CPU | 50.11 s | 120.56 s | 79.28 s | 43.75 s |
+
+C4a and C4b write byte-identical sizes on `$HOME`, because neither demotes
+anything there; their latency is the same index, so only C4b's was timed.
+Astra's estimate of about 318 MB steady was right to the megabyte.
+
+**The mid median sits on the gate.** The paired run gives 2.84 / 1.88 ms, 1.51×.
+Two more C4b runs gave 2.81 and 2.82 ms; a rebuilt control gave 1.94 and 1.92
+ms. Pooled, that is 1.48×. Mid terms keep a median of six records each, and
+where an offset window cannot prove the token (its enclosing run leaves the
+1,280 B window) the query reads the whole file: mid p90 is 15.2 ms against 5.5
+ms, and p95 about 99 ms. At full merge mid is 1.55×. The rule tests medians.
+
+**Question: should C4b replace codec 1?**
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. Keep codec 1 | 450.28 MB steady term index. | Nothing to change; every gate passes by definition. |
+| B. C4b, codec 7 | Mid median 1.48–1.51× (at the gate), mid p90 2.8×; full-merge churn 17.3% larger than codec 1, because records are one-way again and each carries an offset. | 29.4% steady saving at 1.056× CPU with zero merge-time reads; rare/absent p90 under 0.6 ms. |
+| C. C4a, codec 6 | B's costs, plus 1.15 GB of demotion reads and 81% more merge CPU than B under churn. | Known offsets on demoted records, which only churned indexes have; unmeasured on query latency. |
+| D. C3, codec 5 | 3.7× CPU and 9.33 GB of merge reads. | 36.1% saving and the best latency. |
+
+**Recommendation: B, as the opt-in candidate, with codec 1 staying default
+until the mid median is settled.** It is the first arm to pass size, CPU and
+rare-term latency together, and it does so with no merge-time reads at all, so
+it carries no version-race or memory-growth risk at merge. C over B buys
+nothing measurable: `$HOME` never demotes, and under churn it costs reads for
+offsets the query would otherwise get by a full check. **The fact that would
+change it:** mid medians on a second machine or corpus landing clearly above
+1.5×, which would make the window-miss fallback the cost and point at a cheaper
+fix there (coalescing a document's windows, or widening a failed window before
+a full read) rather than at graduation. A long-lived daemon on a churning tree
+would also see the +17% full-merge penalty; if that matters more than the
+`$HOME` saving, A stands.
+
+Workspace gates pass **939 tests** (938 + one new: a real merge for codecs 5–7
+counting graduation and demotion reads, which asserts C4b's reader is never
+called). Every H soundness test that looped codecs 2–5 now loops 2–7.
+
+### D65 update — token policy
+
+**Status: answered (Dave, 2026-10-12).** Question 1: **C**, T1 on by default,
+with `text:` terms that look like blobs answered through trigrams and
+verification. Question 2: **A**, no date index; T2 is held. Question 3: **A**,
+mtime and ctime stay as they are. The experiment code stays on branch
+`wt/tokens`.
+
+2026-10-12, same catalog and corpus as slice C;
+[method, results and semantics](TOKENS.md). Two opt-in tokenizer policies
+were tried, over codec 1 and over C4b.
+
+- **T1** drops base64-like runs from the term index.
+- **T2** moves timestamps to a date index, keeping their date pieces as terms
+  and dropping the time of day and keyed epoch numbers.
+
+Trigrams are untouched, so `grep:` still sees every byte. Every query
+matched the codec-1 control apart from rows the policy explains: the
+document held the term only inside a suppressed span.
+
+| Steady, against codec 1 | Term index | CPU | Mid median | Rows dropped (mid / common) |
+| --- | --- | --- | --- | --- |
+| codec 1, no policy | 450.28 MB | 269.05 s | 1.88 ms | — |
+| codec 1, T1 | 221.21 MB (50.9%) | 1.026× | 0.88× | 11,227 / 23,417 |
+| codec 1, T2 | 442.63 MB (1.7%) + 3.3 MB dates | 1.016× | 1.04× | 2,008 / 2,894 |
+| codec 1, T1+T2 | 215.62 MB (52.1%) + 3.3 MB dates | 1.060× | 0.88× | 13,424 / 26,393 |
+| C4b, T1+T2 | 189.94 MB (57.8%) + 3.3 MB dates | 1.134× | 1.43× (1.63× same policy) | as above |
+
+Hapaxes fall from 13.33M to 7.39M under T1 and to 12.56M under T2. On a
+hand-checked sample, T1's false suppressions were about 6 of 150 code runs
+(identifiers built from short capitalised words and digits), plus about 13
+runs of SVG path data. Prose had none. A has-suppressed-runs flag that
+restored exact `text:` would send 2.24 GB of documents to verification.
+
+**The brief's headline question, "does T1+T2 bring C4b inside the gates?",
+answers no.**
+
+- The mid median passes on paper, at 1.43×, only because the policies
+  removed 13,424 mid rows, about 8% at the median of 3,363 rows a query.
+  Against codec 1 under the same policy, C4b is 1.63×, and mid p90 is still
+  2.6×.
+- The churn penalty is unchanged byte for byte. The S2 trace is synthetic and
+  holds no blobs or timestamps.
+
+So the policies are a separate decision from C4b. T1 alone halves codec 1's
+term index at 2.6% CPU.
+
+**Question 1: should the term index adopt T1?**
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. No policy | 450 MB steady; 13.3M hapaxes, 44% of them blob fragments. | Exact `text:` for any token. |
+| B. T1, plus a manifest field and version check | `text:` stops matching blob pieces: 21–30% of rare control terms, and 24 of 50 mid queries lose rows (11k), all inside blobs. About 4% of reviewed code runs are real identifiers. 2.6% CPU. | 50.9% steady saving (229 MB) on codec 1, and better rare and mid latency. |
+| C. T1, routing blob-looking `text:` terms to trigrams | B's costs, minus the blob-term misses; a planner branch on the detector. | B's saving, with `text:<blob>` still answering through trigrams. Short words inside blobs stay unmatched. |
+
+**Recommendation: C.** The saving is the largest any D65 arm has found, and
+it costs no merge-time reads. What it drops is almost all noise. Option C
+keeps the one query a user would notice, pasting a blob into `text:`.
+**The fact that would change it:** a second corpus where the code-run false
+positives clearly exceed about 5%, or where users search `text:` for short
+words inside keys.
+
+**Question 2: should timestamps go to a date index, and in which layout?**
+
+T2 is a capability, not a saving. It removes 7.6 MB of terms and adds 3.3 MB
+of dates. Following Dave's framing, dates are stored as u32 UTC seconds,
+deduplicated per (time, doc).
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. No date index | Dates stay terms; no range queries. | Nothing to build. |
+| B. Bucketed by day, 1 s offsets | 3.29 MB, 2.62 B/entry (17 offset bits, 3.4 doc bits). | Day, local-day and month exact; a point query verifies 2 docs / 4 MB / 8 ms (only for its fraction); month lookup 2 ms. |
+| C. Time-major, 1 s | 3.88 MB, 3.09 B/entry (17 of 24 bits are doc ids). | The same exactness; simpler; 0.1 ms day lookup. |
+| D. Day buckets, 1 min offsets | 1.57 MB, 2.27 B/entry. | Half the bytes; a point query reads 16 MB / 47 ms (p90 88). |
+| E. Day buckets, no offset | 0.38 MB. | Smallest; a point query reads 171 MB / 328 ms, and a local day 241 MB. |
+
+**Recommendation: B, if date search is wanted at all.** At second resolution
+uniqueness costs only bits. Day buckets delta-code their doc lists to 3.4
+bits, where time-major cannot compress doc ids. B is 15% smaller than C with
+the same exactness. Under T2, `text:2026` still matches, because date pieces
+stay as terms. **The fact that would change it:** point queries turning out
+rare next to day queries, which would favour D. Or a corpus whose timestamps
+spread across far more documents per day, which would erode B's doc-list
+advantage and favour C.
+
+**Question 3: where do mtime and ctime belong?** They are one u32 per inode,
+and the catalog already stores both as columns.
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. The existing catalog column, scanned | 4 B/inode, already paid; 0.32 ms per range at 394k inodes (about 0.8 ms at 1M). | No new structure; fastest for month and week ranges, which match 7–9% of inodes. |
+| B. A sorted index in B's layout | 4.2 B/inode more (bucketed); single-valued keys lose the doc-list compression. | 0.06 ms instead of 0.32 for a one-day range. |
+| C. Time-major sorted permutation | 2.9 B/inode more. | 0.16 ms day ranges; slower than a scan for month ranges. |
+
+**Recommendation: A.** No measured range needs anything faster than a column
+scan. **The fact that would change it:** catalogs of about 10M inodes, where a
+scan nears 10 ms and selective "changed today" queries dominate. Then C.
 
 ## D66 — Phrase queries read too much: positions, or not
 

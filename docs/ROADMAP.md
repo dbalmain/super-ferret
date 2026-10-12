@@ -1914,6 +1914,13 @@ Follow-ups the review left open, none blocking:
   segment), which can mis-pick a driving conjunct or refuse with `--scan` on
   small catalogs. Never a missed match.
 
+**D65 slice C and token policy (2026-10-12).** Codec 1 stays the only term
+codec; the hapax codecs 2–7 stay on `wt/d65c` ([D65C.md](D65C.md)). T1 ships on
+by default: base64-like runs leave the term index (50.9% steady saving on
+codec 1 at 1.026× CPU), and `text:` terms that look like blobs are answered
+through trigrams and verification ([TOKENS.md](TOKENS.md)). The date index
+(T2) is held; its code stays on `wt/tokens`.
+
 ## `ferret grep` — a ripgrep-compatible drop-in (Dave, 2026-10-08)
 
 Dave's answer to D62: `ferret grep` is a must, as a drop-in replacement for
