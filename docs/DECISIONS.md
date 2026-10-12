@@ -4767,3 +4767,41 @@ acceptable. Then choose B and specify original-byte versus decoded offset
 semantics before building. With D, keep positive UTF-8 BOM fixtures and UTF-16
 oracle fixtures; label the UTF-16 miss as the approved encoding disagreement,
 never freshness or binary as a substitute cause.
+
+## D76 — Rare-literal regex screens: word 4+5, the term screen, or nothing
+
+**Status: open.** Measured in [SCREENS.md](SCREENS.md) on the D65C corpus
+(3.98 GB, 112,376 readable documents, 250 case-insensitive regexes). Times
+are median ms, cold / warm; `rg` is the full scan on 32 threads.
+
+**Question:** Should regex search get a second screen for rare literals
+— the 1.5 GiB word 4+5 index, or a term-index screen — or neither?
+
+| Class | rg | trigrams | word 4+5 | term screen (sound) |
+| --- | ---: | ---: | ---: | ---: |
+| rare literal | 5,182 / 168 | 2,966 / 249 | 9.9 / 0.56 | 75 / 57 |
+| identifier | 6,135 / 172 | 6,356 / 501 | 4,544 / 402 | 7,211 / 595 |
+| alternation | 5,226 / 179 | 8,272 / 542 | 5,485 / 302 | 6,347 / 428 |
+| code | 5,142 / 169 | 11,137 / 5,316 | 5,638 / 2,552 | 6,594 / 3,012 |
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Opt-in word 4+5 index | 1,533 MiB beside 286 MB of trigrams (38% of corpus bytes); 884 CPU s to build; a second extractor kept in step with follow and merge. | Rare literals 526× faster than a cold scan and 298× warm; sub-ms warm. Other classes 0.07–1.35× a scan, so no help there. |
+| B. Term screen with a flat dictionary and a residue store | About 484 MB new (154 MB flat dictionary, 330 MB of lost whole runs); every regex with a literal scans both (56 ms warm, linear in residue); new writer paths for both in follow and merge; substring lookups in the planner. | The same rare-literal volume as A (8.9 vs 9.3 MB median), sound in both cases; 69× a cold scan, 2.9× warm. Reuses the term index; a third of A's bytes. |
+| C. Neither; parallelise verification first | No new index. Rare literals stay at trigram speed (1.7× a cold scan, slower than a warm one) until verification is threaded. | Verification is single-threaded today and is most of every class's time; threading it is the lever for all five classes (estimate: near a warm scan), and it composes with A or B later. |
+
+Rejected on the numbers: the term screen as briefed (no unit is safe under
+case-insensitive search; 7/50 rare literals case-sensitive), the term screen
+with a blanket fallback (65% of corpus bytes admitted; slower than
+trigrams), and hashed 4/5-grams at 15–17 bits (180–400 MB for at most 1.5×).
+
+**Recommendation: C now, then B if rare literals still matter.** Four classes
+of five are bound by single-threaded verification of 1.4–3.6 GB, and no
+screen here moves their volume more than about 2×. For rare literals B
+reaches A's volume at a third of the bytes and is already 69× a cold scan;
+A's 56 ms warm saving buys little against a 170 ms scan.
+
+**Fact that would change it:** agent traces showing rare literals are a large
+share of grep time *and* warm latency below ~10 ms matters for them; then A,
+since only A is sub-ms warm. If the residue store would grow with blob
+content past roughly the size of A's index, also A.

@@ -1,0 +1,37 @@
+population live=112382 readable=112376 unreadable=6 content_bytes=3978812718 queries=250 oracle_cpu_s=511.710 oracle_wall_s=514.045
+population case=ci class=rare literal queries=50 oracle_docs_median_p90=2/10 oracle_B_median_p90=4064976/20422335 zero_match_queries=0
+population case=ci class=identifier pattern queries=50 oracle_docs_median_p90=64/376 oracle_B_median_p90=36785558/238940235 zero_match_queries=0
+population case=ci class=alternation queries=50 oracle_docs_median_p90=8020/24075 oracle_B_median_p90=2074321413/2713366572 zero_match_queries=0
+population case=ci class=broad queries=50 oracle_docs_median_p90=943/1290 oracle_B_median_p90=1087134189/1240328547 zero_match_queries=0
+population case=ci class=code class queries=50 oracle_docs_median_p90=451/5802 oracle_B_median_p90=377405999/1535748852 zero_match_queries=0
+uncovered_or_unreadable_docs=6
+index_bytes trigram=286112775 terms=200818708
+lookups case_insensitive=true class=rare literal queries=50 with_literal_facts=50 unit_narrowed=7 with_exact_unit=6 with_prefix_unit=2 substring_narrowed=50
+lookups case_insensitive=true class=identifier pattern queries=50 with_literal_facts=50 unit_narrowed=0 with_exact_unit=0 with_prefix_unit=0 substring_narrowed=48
+lookups case_insensitive=true class=alternation queries=50 with_literal_facts=50 unit_narrowed=0 with_exact_unit=0 with_prefix_unit=0 substring_narrowed=50
+lookups case_insensitive=true class=broad queries=50 with_literal_facts=50 unit_narrowed=0 with_exact_unit=0 with_prefix_unit=0 substring_narrowed=0
+lookups case_insensitive=true class=code class queries=50 with_literal_facts=50 unit_narrowed=0 with_exact_unit=0 with_prefix_unit=0 substring_narrowed=50
+fallback_docs blob_docs=7808 blob_bytes=2240627858 long_docs=5700 long_bytes=2422989247 union_docs=9980 union_bytes=2583771698 wall_s=71.626
+terms_raw class=alternation queries_with_miss=17 missed_docs=628 missed_docs_in_fallback=628 candidate_B_median_p90=2100652190/3291391574
+terms_raw class=broad queries_with_miss=0 missed_docs=0 missed_docs_in_fallback=0 candidate_B_median_p90=3570960779/3731451033
+terms_raw class=code class queries_with_miss=9 missed_docs=333 missed_docs_in_fallback=333 candidate_B_median_p90=1190726279/3009124215
+terms_raw class=identifier pattern queries_with_miss=1 missed_docs=2 missed_docs_in_fallback=2 candidate_B_median_p90=2779328434/3097586912
+terms_raw class=rare literal queries_with_miss=15 missed_docs=80 missed_docs_in_fallback=80 candidate_B_median_p90=6379211/16847558
+terms_plan class=rare literal narrowed_queries=50
+terms_plan class=identifier pattern narrowed_queries=48
+terms_plan class=alternation narrowed_queries=50
+terms_plan class=broad narrowed_queries=0
+terms_plan class=code class narrowed_queries=50
+| arm | class | cache | queries | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | prefix terms sum | capped prefixes |
+| terms | rare literal | cold | 50 | 1295/1867 | 1543392371/1905092698 | 1538561919/1900262246 | 1705.883/1791.152 | 3027.512/3909.587 | 4680.927/5560.367 | 32768/69632 | 1591934055/1591987303 | 1538561919/1900262246 | 242750673170 | 93 | 0 |
+| terms | rare literal | warm | 50 | 1295/1867 | 1543392371/1905092698 | 1538561919/1900262246 | 1686.434/1747.101 | 250.347/311.281 | 1938.923/2018.734 | 32768/69632 | 1591934055/1591987303 | 1538561919/1900262246 | 96849645387 | 93 | 0 |
+| terms | identifier pattern | cold | 50 | 7982/19490 | 2779328434/3097586912 | 2774497982/3092756460 | 1916.838/2047.596 | 6534.477/10571.424 | 8487.249/12300.319 | 3760128/4444160 | 1595657319/1596337255 | 2774497982/3092756460 | 473730023451 | 616244 | 76 |
+| terms | identifier pattern | warm | 50 | 7982/19490 | 2779328434/3097586912 | 2774497982/3092756460 | 1837.907/1944.857 | 500.917/639.200 | 2335.816/2564.324 | 3760128/4444160 | 1595657319/1596337255 | 2774497982/3092756460 | 114254876729 | 616244 | 76 |
+| terms | alternation | cold | 50 | 11565/32546 | 2879863088/3291391574 | 2875032636/3286561122 | 2032.307/2238.830 | 6975.937/9629.824 | 8995.872/11652.816 | 2899968/4550656 | 1594825831/1596496999 | 2875032636/3286561122 | 504382012104 | 158071 | 32 |
+| terms | alternation | warm | 50 | 11565/32546 | 2879863088/3291391574 | 2875032636/3286561122 | 1959.009/2167.978 | 483.773/661.817 | 2467.118/2652.781 | 2899968/4550656 | 1594825831/1596496999 | 2875032636/3286561122 | 124520794819 | 158071 | 32 |
+| terms | broad | cold | 50 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 5.113/6.184 | 11048.080/11562.861 | 11052.631/11568.004 | 20480/28672 | 24576/40960 | 3566130327/3726620581 | 579975374528 | 0 | 0 |
+| terms | broad | warm | 50 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 2.041/3.155 | 841.899/1062.152 | 843.779/1065.437 | 20480/28672 | 24576/40960 | 3566130327/3726620581 | 48779614540 | 0 | 0 |
+| terms | code class | cold | 50 | 3953/18760 | 2500159764/3009124215 | 2495329312/3004293763 | 2160.115/3176.967 | 11146.548/20982.770 | 13365.060/23293.468 | 2531328/4145152 | 1594424423/1596079207 | 2495329312/3004293763 | 848279632368 | 448411 | 79 |
+| terms | code class | warm | 50 | 3953/18760 | 2500159764/3009124215 | 2495329312/3004293763 | 2052.630/2699.430 | 5628.788/11024.031 | 7747.387/12951.379 | 2531328/4145152 | 1594424423/1596079207 | 2495329312/3004293763 | 463970959515 | 448411 | 79 |
+correctness arm=terms queries=250 positive_control=all candidates_stable=yes matches_equal_oracle=yes
+private_rows written

@@ -381,7 +381,11 @@ fn read(src: &Sources, plan: &Plan, extra_docs: &[u32]) -> crate::Result<Read> {
         docs,
         time,
         postings_bytes,
-        index_bytes: src.segments().iter().map(|s| s.source().bytes.get()).sum::<u64>()
+        index_bytes: src
+            .segments()
+            .iter()
+            .map(|s| s.source().bytes.get())
+            .sum::<u64>()
             + src.resident.map_or(0, |r| r.bytes.get()),
         prefix_terms,
         capped_prefixes,
@@ -849,7 +853,8 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
     let [catalog, index, corpus_dir, scratch, case, arms] = args else {
         return Err("screens <catalog> <index> <corpus> <scratch> <ci|cs> <arm,...>".into());
     };
-    let (index, corpus_dir, scratch) = (Path::new(index), Path::new(corpus_dir), Path::new(scratch));
+    let (index, corpus_dir, scratch) =
+        (Path::new(index), Path::new(corpus_dir), Path::new(scratch));
     let arms: Vec<&str> = arms.split(',').collect();
     if let Some(bad) = arms
         .iter()
@@ -942,7 +947,15 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             live: &corpus.live,
             resident: None,
         };
-        time_arm("trigrams", &corpus, &shipped, &src, &extra_docs, &ALL_TIMED, &mut private)?;
+        time_arm(
+            "trigrams",
+            &corpus,
+            &shipped,
+            &src,
+            &extra_docs,
+            &ALL_TIMED,
+            &mut private,
+        )?;
     }
     if wants("terms-raw") {
         let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
@@ -1018,7 +1031,15 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
                 ])
             })
             .collect();
-        time_arm("resident", &corpus, &plans, &src, &extra_docs, &ALL_TIMED, &mut private)?;
+        time_arm(
+            "resident",
+            &corpus,
+            &plans,
+            &src,
+            &extra_docs,
+            &ALL_TIMED,
+            &mut private,
+        )?;
     }
     if wants("terms") {
         let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
@@ -1053,7 +1074,15 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
                     .count()
             );
         }
-        time_arm("terms", &corpus, &plans, &src, &extra_docs, &ALL_TIMED, &mut private)?;
+        time_arm(
+            "terms",
+            &corpus,
+            &plans,
+            &src,
+            &extra_docs,
+            &ALL_TIMED,
+            &mut private,
+        )?;
     }
     if wants("word45") {
         crate::trigram::check_disk()?;
@@ -1078,7 +1107,15 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             live: &corpus.live,
             resident: None,
         };
-        time_arm("word45", &corpus, &plans, &src, &extra_docs, &ALL_TIMED, &mut private)?;
+        time_arm(
+            "word45",
+            &corpus,
+            &plans,
+            &src,
+            &extra_docs,
+            &ALL_TIMED,
+            &mut private,
+        )?;
         drop(segment);
         owned.remove()?;
     }
@@ -1211,7 +1248,9 @@ fn miss_report(
         entry.0 += usize::from(!missed.is_empty());
         entry.1 += missed.len();
         entry.2 += missed.iter().filter(|&&d| src.fallback.contains(d)).count();
-        entry.3.push(counts(&read.docs, &corpus.sizes, &corpus.readable)[0].bytes);
+        entry
+            .3
+            .push(counts(&read.docs, &corpus.sizes, &corpus.readable)[0].bytes);
     }
     for (class, (queries, missed, fallback, bytes)) in by_class {
         println!(
@@ -1290,21 +1329,34 @@ fn residue_arm(
     let union = |lists: &[Vec<u32>], wanted: &[Vec<u8>]| -> Vec<u32> {
         let mut docs: Vec<u32> = wanted
             .iter()
-            .flat_map(|n| &lists[needles.binary_search(n).expect("needle listed")])
-            .copied()
+            // Every query's needles are in the deduplicated list.
+            .filter_map(|n| needles.binary_search(n).ok())
+            .flat_map(|i| lists[i].iter().copied())
             .collect();
         docs.sort_unstable();
         docs.dedup();
         docs
     };
-    type ClassRows = (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, usize, usize);
+    type ClassRows = (
+        Vec<u64>,
+        Vec<u64>,
+        Vec<u64>,
+        Vec<u64>,
+        Vec<u64>,
+        usize,
+        usize,
+    );
     let mut by_class: BTreeMap<&str, ClassRows> = BTreeMap::new();
     for (q, sample) in corpus.samples.iter().enumerate() {
         let shipped_docs = read(src, &shipped[q], extra_docs)?.docs;
         let raw_docs = read(src, &raw[q], extra_docs)?.docs;
         let with = |admit: &[u32]| -> Vec<u32> {
             let mut docs = raw_docs.clone();
-            docs.extend(admit.iter().filter(|d| shipped_docs.binary_search(d).is_ok()));
+            docs.extend(
+                admit
+                    .iter()
+                    .filter(|d| shipped_docs.binary_search(d).is_ok()),
+            );
             docs.sort_unstable();
             docs.dedup();
             docs
@@ -1312,7 +1364,12 @@ fn residue_arm(
         let by_trigrams = with(&union(&admitted.by_trigrams, &per_query[q]));
         let exact = with(&union(&admitted.exact, &per_query[q]));
         let oracle = readable_oracle(corpus, q);
-        let missing = |docs: &[u32]| oracle.iter().filter(|d| docs.binary_search(d).is_err()).count();
+        let missing = |docs: &[u32]| {
+            oracle
+                .iter()
+                .filter(|d| docs.binary_search(d).is_err())
+                .count()
+        };
         let scan = Instant::now();
         let mut hits = 0usize;
         for needle in &per_query[q] {

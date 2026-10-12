@@ -1,0 +1,14 @@
+population live=112382 readable=112376 unreadable=6 content_bytes=3978812718 queries=250 oracle_cpu_s=47.330 oracle_wall_s=47.733
+population class=rare literal queries=50 oracle_docs_median_p90=0/2 zero_match_queries=31
+population class=identifier pattern queries=50 oracle_docs_median_p90=49/295 zero_match_queries=0
+population class=alternation queries=50 oracle_docs_median_p90=6721/19880 zero_match_queries=0
+population class=broad queries=50 oracle_docs_median_p90=288/725 zero_match_queries=0
+population class=code class queries=50 oracle_docs_median_p90=136/1530 zero_match_queries=1
+uncovered_or_unreadable_docs=6
+index_bytes trigram=286112775 t1_terms=200818708 t1_trigram=286112775
+units class=rare literal queries=50 with_literal_facts=50 narrowed=7 with_exact_unit=6 with_prefix_unit=2
+units class=identifier pattern queries=50 with_literal_facts=50 narrowed=0 with_exact_unit=0 with_prefix_unit=0
+units class=alternation queries=50 with_literal_facts=50 narrowed=0 with_exact_unit=0 with_prefix_unit=0
+units class=broad queries=50 with_literal_facts=50 narrowed=0 with_exact_unit=0 with_prefix_unit=0
+units class=code class queries=50 with_literal_facts=50 narrowed=0 with_exact_unit=0 with_prefix_unit=0
+private_rows written

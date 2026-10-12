@@ -6,8 +6,8 @@
 //! in every one-character context, as:
 //!
 //! - **exact**: a token whose run is exactly that span, looked up whole;
-//! - **prefix**: a token whose run starts at the span and covers it, looked
-//!   up by prefix enumeration.
+//! - **prefix**: a token whose run starts at the span and covers it, looked up
+//!   by prefix enumeration.
 //!
 //! The contexts stand for every character shape the split rule and the
 //! run rule distinguish, so checking them is checking every document.
@@ -150,10 +150,16 @@ mod tests {
     fn substrings_are_lowercased_word_runs() {
         let v = |s: &str| s.as_bytes().to_vec();
         assert_eq!(substrings(b"a.Config_Value("), vec![v("config_value")]);
-        assert_eq!(substrings(b"deserializeledger"), vec![v("deserializeledger")]);
+        assert_eq!(
+            substrings(b"deserializeledger"),
+            vec![v("deserializeledger")]
+        );
         assert_eq!(substrings(b"abc"), Vec::<Vec<u8>>::new());
         assert_eq!(substrings(b"\xffabcd"), Vec::<Vec<u8>>::new());
-        assert_eq!(substrings("Kelvin\u{212a}x".as_bytes()), vec![v("kelvinkx")]);
+        assert_eq!(
+            substrings("Kelvin\u{212a}x".as_bytes()),
+            vec![v("kelvinkx")]
+        );
     }
 
     /// A document holding the literal in any case and any context has a
@@ -164,7 +170,11 @@ mod tests {
         let literals = ["cachevalues", "a.config_value(", "x9y_z", "École_ab"];
         let neighbours = ["", " ", "q", "Q", "7", "_", "é", "."];
         for literal in literals {
-            for spelling in [literal.to_string(), literal.to_uppercase(), literal.to_lowercase()] {
+            for spelling in [
+                literal.to_string(),
+                literal.to_uppercase(),
+                literal.to_lowercase(),
+            ] {
                 for left in neighbours {
                     for right in neighbours {
                         let doc = format!("{left}{spelling}{right}");
@@ -174,7 +184,9 @@ mod tests {
                         });
                         for needle in substrings(literal.as_bytes()) {
                             assert!(
-                                terms.iter().any(|t| t.windows(needle.len()).any(|w| w == needle)),
+                                terms
+                                    .iter()
+                                    .any(|t| t.windows(needle.len()).any(|w| w == needle)),
                                 "{needle:?} not in {doc:?}"
                             );
                         }

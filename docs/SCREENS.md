@@ -19,13 +19,18 @@ of that gain at no extra bytes, and wanted hashed 4- and 5-grams at 15, 16 and
 
 - **A scan is fast.** `rg` scans the whole 3.98 GB corpus in about 170 ms warm
   and 5.2 s cold, using 32 threads. Warm, it beats shipped trigrams on every
-  class. Only word 4+5 on rare literals, and the sound term screen described
-  below, are much faster than a scan.
-- **The term screen can match word 4+5's rare-literal volume soundly**, but only
-  with two pieces the product lacks: a flat, scannable copy of the dictionary,
-  and a residue store for the whole runs the term index loses. Built as the
-  brief described it, the term screen is unsound under case-insensitive search.
-  Made sound with a blanket fallback, it is slower than trigrams.
+  class. Only rare literals get much faster than a scan: word 4+5 at 526× cold
+  and 298× warm, and the sound term screen below at 69× cold and 2.9× warm.
+  On identifier, alternation, broad and code patterns no arm beats a warm scan.
+- **The term screen can match word 4+5's rare-literal volume soundly** (8.9 MB
+  median against 9.3 MB), but only with two pieces the product lacks: a flat,
+  scannable copy of the dictionary (154 MB) and a residue store for the whole
+  runs the term index loses (330 MB). Built as the brief described it, the
+  term screen is unsound under case-insensitive search. Made sound with a
+  blanket fallback, it is slower than trigrams.
+- **Verification is single-threaded** in every indexed arm, and `rg` is not.
+  Most of the gap to a warm scan on the broad classes is that, not the
+  screen; see [Answers](#answers).
 - **Hashed 4/5-grams buy nothing** at 15–17 bits. Every key is used, and the
   median key holds thousands of documents.
 
@@ -109,17 +114,17 @@ median/p90. For `rg`, the "candidates" are the whole corpus.
 | rare literal | **rg**                              |        3,979 |   5,182/7,275 |      168/176 |
 | rare literal | trigrams                            |  1,565/2,007 |   2,966/3,904 |      249/317 |
 | rare literal | term screen, blanket fallback       |  1,543/1,905 |   4,681/5,560 |  1,939/2,019 |
-| rare literal | term screen, resident + residue     |     RES_RARE |
+| rare literal | term screen, resident + residue     | 8.9/25.3 | 75/103 † | 57/74 |
 | rare literal | word 4+5 (SPARSE)                   |     9.3/27.1 |      9.9/42.1 |     0.56/3.0 |
 | identifier   | **rg**                              |        3,979 |   6,135/6,227 |      172/182 |
 | identifier   | trigrams                            |  2,783/3,098 |   6,356/8,581 |      501/641 |
 | identifier   | term screen, blanket fallback       |  2,779/3,098 |  8,487/12,300 |  2,336/2,564 |
-| identifier   | term screen, resident + residue     |       RES_ID |
+| identifier   | term screen, resident + residue     | 2,779/3,098 | 7,211/8,861 † | 595/745 |
 | identifier   | word 4+5 (SPARSE)                   |  2,027/2,734 |   4,544/7,150 |      402/600 |
 | alternation  | **rg**                              |        3,979 |   5,226/6,192 |      179/198 |
 | alternation  | trigrams                            |  3,135/3,330 |   8,272/9,914 |      542/718 |
 | alternation  | term screen, blanket fallback       |  2,880/3,291 |  8,996/11,653 |  2,467/2,653 |
-| alternation  | term screen, resident + residue     |      RES_ALT |
+| alternation  | term screen, resident + residue     | 2,148/3,291 | 6,347/19,372 † | 428/850 |
 | alternation  | word 4+5 (SPARSE)                   |  2,198/2,952 |   5,485/8,660 |      302/409 |
 | broad        | **rg**                              |        3,979 |  5,208/11,480 |      172/185 |
 | broad        | trigrams                            |  3,571/3,731 | 10,915/11,474 |    837/1,051 |
@@ -128,10 +133,17 @@ median/p90. For `rg`, the "candidates" are the whole corpus.
 | code         | **rg**                              |        3,979 |   5,142/5,276 |      169/206 |
 | code         | trigrams                            |  2,796/3,009 | 11,137/13,297 |  5,316/6,784 |
 | code         | term screen, blanket fallback       |  2,500/3,009 | 13,365/23,293 | 7,747/12,951 |
-| code         | term screen, resident + residue     |     RES_CODE |
+| code         | term screen, resident + residue     | 1,408/3,009 | 6,594/12,759 † | 3,012/5,357 |
 | code         | word 4+5 (SPARSE)                   |  1,366/2,352 |   5,638/8,922 |  2,552/3,533 |
 
 Word 4+5's candidate MiB from SPARSE.md is converted to MB.
+
+† The resident arm's flat files sat on tmpfs (see [below](#term-index-screen)),
+so its "cold" evicts the index and documents but not those 484 MB. Reading
+them from NVMe would add roughly 0.2–0.3 s cold (sequential 484 MB; an
+estimate, not measured). That arm also ran while other sessions' builds filled
+the root filesystem; its identifier, alternation and code timings overlap that
+and may be contaminated.
 
 `rg` details:
 
@@ -145,7 +157,7 @@ Word 4+5's candidate MiB from SPARSE.md is converted to MB.
 | Arm         |                                                                Index bytes |
 | ----------- | -------------------------------------------------------------------------: |
 | trigrams    |                                                                286,112,775 |
-| term screen | 0 new (terms 200,818,708 already exist); resident form adds RESIDENT_BYTES |
+| term screen | 0 new (terms 200,818,708 already exist); resident form adds 484,319,153 (flat dictionary 154,159,943 + residue 330,159,210) |
 | word 4+5    |                                 1,532.78 MiB = 1,607,233,000 (whole index) |
 | hashed      |                                             [grid below](#hashed-45-grams) |
 
@@ -155,11 +167,11 @@ These are `rg` median ÷ arm median. Below 1 means slower than a scan.
 
 | Class        | trigrams cold / warm | term screen (resident) cold / warm | word 4+5 cold / warm |
 | ------------ | -------------------: | ---------------------------------: | -------------------: |
-| rare literal |         1.7× / 0.67× |                            RX_RARE |      **526× / 298×** |
-| identifier   |        0.97× / 0.34× |                              RX_ID |        1.35× / 0.43× |
-| alternation  |        0.63× / 0.33× |                             RX_ALT |        0.95× / 0.59× |
+| rare literal |         1.7× / 0.67× | **69× / 2.9×** † |      **526× / 298×** |
+| identifier   |        0.97× / 0.34× | 0.85× / 0.29× |        1.35× / 0.43× |
+| alternation  |        0.63× / 0.33× | 0.82× / 0.42× |        0.95× / 0.59× |
 | broad        |        0.48× / 0.21× |                                  — |        0.47× / 0.20× |
-| code         |        0.46× / 0.03× |                            RX_CODE |        0.91× / 0.07× |
+| code         |        0.46× / 0.03× | 0.78× / 0.06× |        0.91× / 0.07× |
 
 Against `rg`'s CPU rather than its wall time, warm trigrams use 6.7× less CPU on
 rare literals (249 ms against 1,670 ms) and 3.3× less on identifiers. On code
@@ -295,11 +307,64 @@ Read the residue columns this way:
 Timed end to end, with both flat files scanned inside the timing (`resident`
 arm):
 
-RESIDENT_TABLE
+Medians/p90, ms; candidate MB as above. Index bytes read per query are
+the two flat files, 484.6 MB, plus postings.
+
+| Class | Candidate MB | Lookup cold | Lookup warm | Total cold † | Total warm |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| rare literal | 8.9/25.3 | 57/82 | 56/73 | 75/103 | 57/74 |
+| identifier | 2,779/3,098 | 99/130 | 96/119 | 7,211/8,861 | 595/745 |
+| alternation | 2,148/3,291 | 171/242 | 146/190 | 6,347/19,372 | 428/850 |
+| code | 1,408/3,009 | 164/237 | 139/206 | 6,594/12,759 | 3,012/5,357 |
+
+All 250 queries passed the positive control, with candidates stable and
+matches equal to the oracle. The lookup phase is the cost now: about 56 ms
+to copy and memmem 484 MB through `pread` in 8 MB chunks. mmap would drop
+the copy; an index over the residue instead of a scan of it would drop
+two-thirds of the bytes (the flat dictionary alone scans in 6–23 ms, from
+the `residue` arm). Neither is measured.
+
+**This arm runs on tmpfs.** At the time it ran, other sessions' builds had
+taken the root filesystem from about 60 GB free at the start of this work to
+4.5 GB, and then to 0; the bench's own guard refuses below 5 GB. The arm
+writes only its two flat files and its rows, so it ran with its working
+directory and scratch on `/dev/shm`, writing nothing to `/`.
 
 ## Hashed 4/5-grams
 
-HASHED_SECTION
+Every folded 4- or 5-byte window, hashed to 15, 16 or 17 bits. Sizes are
+bytes; docs per key are over used keys; build CPU covers reading the corpus,
+inverting and writing. Rare-literal and identifier rows are timed; the
+other classes' volumes are in [`hashed.txt`](measurements/screens/hashed.txt).
+
+| Variant | Whole / postings MB | Keys used | Pairs | Docs per key median / p99 | Build CPU s | Rare MB median/p90 | Rare cold / warm ms | Identifier MB median | Identifier warm ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| trigrams (shipped) | 286.1 / — | — | — | — | — | 1,565/2,007 | 2,966 / 249 | 2,783 | 501 |
+| 4-gram, 15 bits | 180.3 / 179.4 | 32,768 of 32,768 | 253,384,855 | 6,308 / 26,824 | 22.3 | 1,530/1,823 | 3,005 / 244 | 2,631 | 479 |
+| 4-gram, 16 bits | 242.6 / 241.2 | 65,536 of 65,536 | 312,000,652 | 3,736 / 20,039 | 24.4 | 1,401/1,595 | 2,540 / 221 | 2,571 | 459 |
+| 4-gram, 17 bits | 322.0 / 319.8 | 131,072 of 131,072 | 375,321,185 | 2,164 / 14,766 | 35.1 | 1,044/1,240 | 1,882 / 169 | 2,429 | 457 |
+| 5-gram, 15 bits | 215.4 / 214.4 | 32,768 of 32,768 | 299,755,468 | 8,234 / 22,850 | 25.9 | 1,556/1,948 | 3,304 / 261 | 2,783 | 513 |
+| 5-gram, 16 bits | 295.6 / 294.0 | 65,536 of 65,536 | 374,913,689 | 4,984 / 16,836 | 28.9 | 1,475/1,677 | 2,740 / 229 | 2,783 | 506 |
+| 5-gram, 17 bits | 399.6 / 397.1 | 131,072 of 131,072 | 458,672,780 | 2,949 / 11,986 | 33.5 | 1,159/1,433 | 2,262 / 184 | 2,783 | 508 |
+
+All six pass the positive control on all 250 queries.
+
+**Size grows with width.** Every key is used at every width, so a wider
+hash does not leave keys empty; it splits them. Within a document,
+distinct grams that collide share one posting; with more bits fewer
+collide, so the per-document deduplication merges less and pairs rise:
+4-grams go 253 M → 312 M → 375 M (+23%, +20% per bit). Postings bytes
+rise faster (+34%, +33%), because the lists also get sparser and their
+deltas longer. 5-grams hold more distinct windows per document than
+4-grams, so more pairs at the same width. The limit is unhashed fixed-4
+in SPARSE.md: 42.4 M keys, 1,104 MiB.
+
+**What it buys.** The median key holds 2,164–8,234 documents of 112,382,
+so a key screens out little and a blob document holds nearly every key.
+The best variant, 4-gram at 17 bits, cuts the rare-literal median from
+1,565 to 1,044 MB (1.5×) and warm time from 249 to 169 ms, which merely
+equals a warm `rg`. Identifiers gain 1.1× at best, and 5-gram variants leave them at
+exactly the trigram volume (not investigated further).
 
 ## Answers
 
@@ -307,8 +372,16 @@ HASHED_SECTION
 [the table](#times-faster-than-a-scan). Warm, a full `rg` scan beats shipped
 trigrams on every class: it takes 170 ms on 32 threads. Only word 4+5 on rare
 literals is "much faster than scanning", at 526× cold and 298× warm.
-RESIDENT_ANSWER On every other class, no arm beats a warm scan, and on broad and
+The sound term screen (resident dictionary plus residue scan) is 69× cold and 2.9× warm on rare literals †. On every other class, no arm beats a warm scan, and on broad and
 code patterns, nothing beats a cold one.
+
+**Why does a warm scan beat the indexes?** Candidate volume is 1.4–3.6 GB
+median on every class but rare literals, so verification dominates, and the
+harness verifies on one thread. `rg` spends 1.7 s of CPU per warm query across
+32 threads. Verifying trigram candidates on as many threads would bring them
+near or under a warm scan (an estimate from the CPU figures, not measured);
+it is the cheaper lever for four classes of five, and no screen here changes
+those classes' volume by more than about 2×.
 
 **How much of word 4+5's rare-literal gain does the term screen capture?** That
 depends on the form:
@@ -318,13 +391,21 @@ depends on the form:
   trigrams warm.
 - **Raw, unsound:** an upper bound. It narrows further than word 4+5, to 6.4 MB
   against 9.3 MB, but misses 80 matches across 15 queries.
-- **With the residue scan and a flat dictionary:** RESIDENT_SHARE.
+- **With the residue scan and a flat dictionary:** **all of the volume gain** (8.9 against 9.3 MB median), and
+most of the cold time: of the 2,942 ms word 4+5 saves cold over trigrams,
+it saves 2,891 (98%); warm, 192 of 244 ms (79%). As a ratio it is far
+behind: 40× faster than trigrams cold against word 4+5's 300×, because a
+lookup scans 484 MB where word 4+5 reads 36 KB of index.
 
 **What share of rare literals has a safe whole unit?** 0 of 50 case-insensitive,
 and 7 of 50 case-sensitive. The substring lookup, which needs no unit, covers 50
 of 50.
 
-**What do hashed 4/5-grams cost and buy?** HASHED_ANSWER
+**What do hashed 4/5-grams cost and buy?** 15–17 bits cost 180–400 MB and 22–35 CPU s to
+build, and buy at most 1.5× on rare literals (4-gram, 17 bits) and 1.1× on
+identifiers. Every key is used at every width; the median key names
+thousands of documents. Size grows with width. Dave's expectation holds: they
+do not pay.
 
 ## What the brief got wrong
 

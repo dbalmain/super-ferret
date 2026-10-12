@@ -13,7 +13,7 @@ use std::time::Instant;
 use ferret_index::segment::Writer;
 
 use super::super::grams::fold;
-use super::super::latency::{OwnedIndex, Output};
+use super::super::latency::{Output, OwnedIndex};
 use crate::content_snapshot::Snapshot;
 use crate::segment_build::cpu_seconds;
 
@@ -58,10 +58,7 @@ impl Hashed {
     /// The hashed keys of a literal fact's folded windows; empty when the
     /// literal is shorter than `n`.
     pub(super) fn literal_keys(self, literal: &[u8]) -> Vec<u32> {
-        let mut keys: Vec<_> = fold(literal)
-            .windows(self.n)
-            .map(|w| self.key(w))
-            .collect();
+        let mut keys: Vec<_> = fold(literal).windows(self.n).map(|w| self.key(w)).collect();
         keys.sort_unstable();
         keys.dedup();
         keys
@@ -117,11 +114,7 @@ pub(super) fn build(
     out.flush()?;
     out.0.sync_all()?;
     let build_cpu = cpu_seconds()? - cpu;
-    let mut dfs: Vec<usize> = lists
-        .iter()
-        .map(Vec::len)
-        .filter(|&len| len > 0)
-        .collect();
+    let mut dfs: Vec<usize> = lists.iter().map(Vec::len).filter(|&len| len > 0).collect();
     dfs.sort_unstable();
     let quantile = |q: f64| dfs[((dfs.len() as f64 * q).ceil() as usize).clamp(1, dfs.len()) - 1];
     let report = format!(
@@ -166,8 +159,15 @@ mod tests {
     fn a_containing_document_holds_every_query_key() {
         let literal = b"ledger_entry";
         for variant in Hashed::ALL {
-            for doc in [&b"xxLEDGER_Entryyy"[..], b"ledger_entry", b"a ledger_entryb"] {
-                let held: Vec<_> = fold(doc).windows(variant.n).map(|w| variant.key(w)).collect();
+            for doc in [
+                &b"xxLEDGER_Entryyy"[..],
+                b"ledger_entry",
+                b"a ledger_entryb",
+            ] {
+                let held: Vec<_> = fold(doc)
+                    .windows(variant.n)
+                    .map(|w| variant.key(w))
+                    .collect();
                 for key in variant.literal_keys(literal) {
                     assert!(held.contains(&key), "{} {key}", variant.label());
                 }

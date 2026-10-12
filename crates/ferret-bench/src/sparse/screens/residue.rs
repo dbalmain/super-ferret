@@ -54,9 +54,16 @@ pub(super) struct Admitted {
     pub(super) residue_docs: u64,
 }
 
-pub(super) fn admit(corpus: &Corpus, fallback: &[u32], needles: &[Vec<u8>]) -> crate::Result<Admitted> {
+pub(super) fn admit(
+    corpus: &Corpus,
+    fallback: &[u32],
+    needles: &[Vec<u8>],
+) -> crate::Result<Admitted> {
     let finders: Vec<_> = needles.iter().map(memchr::memmem::Finder::new).collect();
-    let needle_grams: Vec<Vec<usize>> = needles.iter().map(|n| n.windows(3).map(trigram).collect()).collect();
+    let needle_grams: Vec<Vec<usize>> = needles
+        .iter()
+        .map(|n| n.windows(3).map(trigram).collect())
+        .collect();
     let mut bits = vec![0u64; 1 << 18];
     let mut touched = Vec::new();
     let mut scratch = Scratch::default();
@@ -116,7 +123,9 @@ mod tests {
         // A base64 span drops its runs from the terms; they land here.
         let blob = b"key = QmFzZTY0X2VuY29kZWRfc2VjcmV0X3ZhbHVlX2hlcmU0Mg== done";
         let mut terms = Vec::new();
-        ferret_text::tokenize_terms(blob, &mut Scratch::default(), |t| terms.push(t.bytes.to_vec()));
+        ferret_text::tokenize_terms(blob, &mut Scratch::default(), |t| {
+            terms.push(t.bytes.to_vec())
+        });
         residue(blob, &mut Scratch::default(), &mut out);
         let mut all = Vec::new();
         tokenize(blob, &mut Scratch::default(), |t| {

@@ -1,0 +1,21 @@
+oracle_cache hit queries=250
+population case=ci class=rare literal queries=50 oracle_docs_median_p90=2/10 oracle_B_median_p90=4064976/20422335 zero_match_queries=0
+population case=ci class=identifier pattern queries=50 oracle_docs_median_p90=64/376 oracle_B_median_p90=36785558/238940235 zero_match_queries=0
+population case=ci class=alternation queries=50 oracle_docs_median_p90=8020/24075 oracle_B_median_p90=2074321413/2713366572 zero_match_queries=0
+population case=ci class=broad queries=50 oracle_docs_median_p90=943/1290 oracle_B_median_p90=1087134189/1240328547 zero_match_queries=0
+population case=ci class=code class queries=50 oracle_docs_median_p90=451/5802 oracle_B_median_p90=377405999/1535748852 zero_match_queries=0
+uncovered_or_unreadable_docs=6
+index_bytes trigram=286112775 terms=200818708
+| arm | class | cache | queries | timed | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | missed oracle docs | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | lookup terms sum | capped lookups |
+| trigrams | rare literal | cold | 50 | 50 | 1301/2156 | 1565474661/2006597876 | 1560644209/2001767424 | 0 | 0.975/2.095 | 2964.875/3902.465 | 2965.580/3903.503 | 32768/65536 | 53248/110592 | 1560644209/2001767424 | 152174177563 | 0 | 0 |
+| trigrams | rare literal | warm | 50 | 50 | 1301/2156 | 1565474661/2006597876 | 1560644209/2001767424 | 0 | 0.283/0.552 | 248.611/316.714 | 249.093/317.083 | 32768/65536 | 53248/110592 | 1560644209/2001767424 | 12786116941 | 0 | 0 |
+| trigrams | identifier pattern | cold | 50 | 50 | 8282/19490 | 2783209101/3097586912 | 2778378649/3092756460 | 0 | 3.284/14.168 | 6353.797/8572.400 | 6355.965/8581.103 | 69632/86016 | 90112/114688 | 2778378649/3092756460 | 349565825564 | 0 | 0 |
+| trigrams | identifier pattern | warm | 50 | 50 | 8282/19490 | 2783209101/3097586912 | 2778378649/3092756460 | 0 | 1.340/2.943 | 500.034/640.004 | 501.355/641.490 | 69632/86016 | 90112/114688 | 2778378649/3092756460 | 24980123008 | 0 | 0 |
+| trigrams | alternation | cold | 50 | 50 | 17214/32546 | 3135031871/3329673389 | 3130201419/3324842937 | 0 | 11.446/20.392 | 8252.847/9894.074 | 8272.457/9914.476 | 200704/245760 | 266240/331776 | 3130201419/3324842937 | 448040292948 | 0 | 0 |
+| trigrams | alternation | warm | 50 | 50 | 17214/32546 | 3135031871/3329673389 | 3130201419/3324842937 | 0 | 4.370/7.490 | 536.531/713.311 | 542.194/718.216 | 200704/245760 | 266240/331776 | 3130201419/3324842937 | 28615938258 | 0 | 0 |
+| trigrams | broad | cold | 50 | 50 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | 4.986/6.424 | 10910.609/11467.054 | 10915.461/11473.862 | 20480/28672 | 24576/40960 | 3566130327/3726620581 | 589540393124 | 0 | 0 |
+| trigrams | broad | warm | 50 | 50 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | 2.109/2.950 | 833.870/1047.940 | 837.004/1050.811 | 20480/28672 | 24576/40960 | 3566130327/3726620581 | 42744707073 | 0 | 0 |
+| trigrams | code class | cold | 50 | 50 | 8104/18760 | 2795514566/3009124215 | 2790684114/3004293763 | 0 | 3.341/6.875 | 11135.358/13291.737 | 11137.012/13296.869 | 61440/81920 | 86016/122880 | 2790684114/3004293763 | 565851207277 | 0 | 0 |
+| trigrams | code class | warm | 50 | 50 | 8104/18760 | 2795514566/3009124215 | 2790684114/3004293763 | 0 | 1.158/2.146 | 5315.828/6782.707 | 5316.109/6784.340 | 61440/81920 | 86016/122880 | 2790684114/3004293763 | 272632812710 | 0 | 0 |
+correctness arm=trigrams queries=250 missed_oracle_docs=0 candidates_stable=yes matches_equal_found=yes
+private_rows written
