@@ -36,27 +36,33 @@ def main():
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/ferret-bench")
     parser.add_argument("--cleanup-states", action="store_true")
     parser.add_argument("--name", help="output name for a re-run; defaults to the arm")
+    parser.add_argument("--tokens", choices=("none", "t1", "t2", "t1t2"), default="none",
+                        help="token policy (docs/TOKENS.md); compared against the plain control")
     args = parser.parse_args()
     base, codec, binary = args.run_dir, CODECS[args.arm], str(args.binary)
-    arm = args.name or args.arm
+    arm = args.name or (args.arm if args.tokens == "none" else f"{args.arm}-{args.tokens}")
+    tokens = ["--tokens", args.tokens] if args.tokens != "none" else []
+    compare = args.arm != "control" or args.tokens != "none"
     catalog, corpus, index = base / "catalog", base / "corpus", base / arm
     if args.phase in ("build", "all"):
         run([binary, "index-build", str(catalog), str(index), "--codec", codec,
-             "--corpus", str(corpus), "--snapshots"], base / f"{arm}-build.log")
+             "--corpus", str(corpus), "--snapshots", *tokens], base / f"{arm}-build.log")
     if args.phase in ("query", "all"):
         for state in ("first", "steady", "full"):
             path = index if state == "full" else index.with_suffix(f".{state}")
             command = [binary, "content-query", str(catalog), str(path),
                        "df1", "df2-100", "df1-natural", "df2-100-natural", "absent", "mid", "common", "--terms",
                        str(base / "control"), "--corpus", str(corpus)]
-            if args.arm != "control":
+            if compare:
                 command += ["--compare", str(base / "control")]
+            if tokens:
+                command += ["--policy", args.tokens]
             run(command, base / f"{arm}-{state}-query.log")
             if args.cleanup_states and state != "full":
                 shutil.rmtree(path)
         # The fully merged trigram bytes are independent of term codec. Share
         # only a byte-identical file after measurements, keeping valid indexes.
-        if args.arm != "control":
+        if compare:
             reference = list((base / "control").glob("*.tri"))
             outputs = list(index.glob("*.tri"))
             if len(reference) == len(outputs) == 1 and filecmp.cmp(reference[0], outputs[0], shallow=False):
@@ -65,7 +71,7 @@ def main():
                 temporary.replace(outputs[0])
     if args.phase in ("churn", "all"):
         run([binary, "index-churn", str(base / f"{arm}-churn"), "100", "--codec",
-             codec], base / f"{arm}-churn.log")
+             codec, *tokens], base / f"{arm}-churn.log")
 
 
 if __name__ == "__main__":
