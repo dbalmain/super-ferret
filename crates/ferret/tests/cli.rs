@@ -2328,7 +2328,10 @@ fn grep_search_reaches_verified_rows_from_argv() {
         );
     }
     assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
-    let found = env.run(&[os("search"), os("grep:^needle[0-9]+$"), os("--json")]);
+    // D67 A2: the mixed-case hit requires the pattern's explicit (?i).
+    let sensitive = env.run(&[os("search"), os("grep:^needle[0-9]+$")]);
+    assert_eq!(code(&sensitive), 1, "{}", stderr(&sensitive));
+    let found = env.run(&[os("search"), os("grep:(?i)^needle[0-9]+$"), os("--json")]);
     assert_eq!(code(&found), 0, "{}", stderr(&found));
     let output = String::from_utf8(found.stdout).unwrap();
     assert_eq!(output.lines().count(), 1);

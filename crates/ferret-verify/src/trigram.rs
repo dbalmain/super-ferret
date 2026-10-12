@@ -32,7 +32,8 @@ mod tests;
 /// the two parses see the same HIR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrepFlags {
-    /// Default true; false under `case:`.
+    /// Builder default true; `ferret search grep:` passes false (D67 A2).
+    /// Inline pattern flags override this setting.
     pub case_insensitive: bool,
 }
 

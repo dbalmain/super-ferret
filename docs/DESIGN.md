@@ -536,9 +536,18 @@ differences from GNU — is specified in [FIND.md](FIND.md).
 
 ## Query (S1 for names and metadata, S2 onwards for content)
 
-1. **Parse** into atoms combined with AND / OR / NOT: `term`, `"phrase"`,
-   `/regex/`, `name:pattern`, and metadata predicates (`ext:`, `size:`,
-   `mtime:`, `type:`, `path:` — growing toward `find`'s full set).
+1. **Parse** one atom or operator per shell argument. Adjacent atoms imply
+   AND; `AND`, `OR` and `NOT` accept any case, with AND tighter than OR and
+   NOT tightest. Parentheses group expressions. Bare words search names;
+   `name:or` escapes an operator word. `text:WORDS` (alias `content:WORDS`)
+   searches content terms or phrases, and `grep:REGEX` searches content bytes.
+   `re:REGEX` searches names. Name and text atoms fold by default; `case:`
+   makes them exact, including `case:content:`. `grep:` is case-sensitive
+   by default, with `(?i)` for Unicode folding; `case:grep:` is a no-op.
+   Its `^`/`$` match lines; `(?-m)` restores whole-document anchors. Metadata
+   predicates include `ext:`, `size:`, `mtime:`, `type:` and `path:`. An
+   argument with an operator word and a later atom prefix is an error asking
+   for separate arguments; `text:"this or that"` remains a phrase (D71 A).
 2. **Plan.** Each content atom asks the registered sources for estimates and
    takes the cheapest; name and metadata atoms go to the catalog.
 3. **Execute** in doc space (leapfrog intersection over `Cursor`s), map live

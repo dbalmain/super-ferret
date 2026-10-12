@@ -1504,7 +1504,10 @@ fn grep_argv_through_socket_returns_verified_rows_and_offsets() {
     }
     assert!(tree.local(&["index", "src"]).status.success());
     tree.start(&[]);
-    let got = tree.run(&["search", "--json", "grep:^needle[0-9]+$"]);
+    // D67 A2 must survive argv forwarding through the daemon protocol.
+    let sensitive = tree.run(&["search", "grep:^needle[0-9]+$"]);
+    assert_eq!(sensitive.status.code(), Some(1));
+    let got = tree.run(&["search", "--json", "grep:(?i)^needle[0-9]+$"]);
     assert!(
         got.status.success(),
         "{}",

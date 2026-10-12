@@ -21,17 +21,22 @@
 //!
 //! # Grammar
 //!
-//! A query is a boolean expression over atoms. Adjacent atoms AND; `OR`,
-//! `NOT`, `(` and `)` are operators only as whole arguments, as in find(1).
+//! A query is a boolean expression over atoms. Adjacent atoms AND; `AND`,
+//! `OR` and `NOT` are operators in any ASCII case, as whole arguments, along
+//! with `(` and `)`.
 //! AND binds tighter than OR, and NOT tightest. [`Query::from_args`] takes
-//! one atom per argument, so a quoted argument with spaces is one atom.
+//! one atom per argument, so a quoted argument with spaces is one atom. An
+//! argument containing an operator word and a later atom prefix is an error:
+//! pass the query as separate arguments. Phrases like `text:"this or that"`
+//! remain atoms (D71 A).
 //!
 //! ```text
 //! query  = expr?
 //! expr   = and ("OR" and)*
-//! and    = unary+
+//! and    = unary (["AND"] unary)*
 //! unary  = "NOT" unary | "(" expr ")" | atom
-//! atom   = "case:" match | match | meta | "text:" ARG | "case:text:" ARG
+//! atom   = ["case:"] (match | meta | content)
+//! content = ("text:" | "content:") ARG | "grep:" REGEX
 //! match  = word | "name:" word | glob | "re:" REGEX | "path:" TEXT | "ext:" EXT
 //!        | "name-term:" TOKEN
 //! meta   = "size:" [<>] N [kKmMgGtT]   size in bytes, powers of 1024; no
@@ -50,11 +55,12 @@
 //!   substring of the whole path instead, as is `path:TEXT`. `name:WORD` is a
 //!   word whatever it spells, so a file named `OR` is `name:OR` (folded) or
 //!   `case:OR` (exact).
-//! - `text:ARG` matches file content (docs/S2.md § What `text:ARG` means): ARG
-//!   goes through the content tokenizer, one token is a term, several are a
-//!   phrase over their parts. `case:text:ARG` compares the original bytes. A
-//!   row with no document (a directory, an unindexed file) holds no `text:`
-//!   atom, so `NOT text:x` holds there (D4).
+//! - `text:ARG` (alias `content:ARG`, also after `case:`) matches file content
+//!   (docs/S2.md § What `text:ARG` means): ARG goes through the content
+//!   tokenizer, one token is a term, several are a phrase over their parts.
+//!   `case:text:ARG` compares the original bytes. A row with no document (a
+//!   directory, an unindexed file) holds no `text:` atom, so `NOT text:x` holds
+//!   there (D4).
 //! - A **glob** is a word containing `*`, `?` or `[`. Without a `/` it matches
 //!   the whole name (`*.rs`); with one it matches the path's trailing
 //!   components (`src/**/*.rs`), or the whole path if it starts with `/`. `*`
@@ -63,11 +69,14 @@
 //!   unanchored unless it anchors itself.
 //! - `ext:EXT` is a name ending in `.EXT` (a name that is only `.EXT` is not
 //!   one: `.rs` has no extension).
-//! - **Case:** every match atom folds ASCII case, except under `case:`, which
-//!   makes the one atom after it exact: `case:README`, `case:re:^[A-Z]`,
-//!   `case:*.C`, `case:ext:C`. There is no smart-case rule, so a query means
-//!   the same whatever letters it is typed in. Folding is ASCII-only for words,
-//!   globs and `ext:`; `re:` folds with Unicode rules.
+//! - `grep:REGEX` searches content case-sensitively by default (D67 A2). `(?i)`
+//!   folds Unicode case; `case:grep:` is a no-op, including with inline flags.
+//!   `^` and `$` match lines; `(?-m)` restores whole-document anchors.
+//! - **Case:** name and text atoms fold case, except under `case:`, which makes
+//!   the one atom after it exact: `case:README`, `case:re:^[A-Z]`, `case:*.C`,
+//!   `case:ext:C`. There is no smart-case rule, so a query means the same
+//!   whatever letters it is typed in. Folding is ASCII-only for words, globs
+//!   and `ext:`; `re:` folds with Unicode rules.
 //! - A name is bytes; a match atom given bytes that are not UTF-8 matches them
 //!   as bytes (a `re:` pattern must be UTF-8).
 //!

@@ -97,12 +97,14 @@ find expressions:
   No action adds -print to the entire expression. Stars match dots and slashes.
 
 query (one atom or operator per argument; adjacent atoms must all match):
-  A B             both A and B
+  A B / A AND B   both A and B
   A OR B          either; AND binds tighter: a b OR c is (a b) OR c
   NOT A           A does not match
   ( ... )         grouping; quote the parentheses for the shell: \\( a OR b \\)
-  OR, NOT, ( and ) are operators only as whole arguments. A file named OR
-  is name:OR (or case:OR).
+  AND, OR and NOT accept any case, as whole arguments, along with ( and ).
+  A file named or is name:or (or case:or). Pass queries as separate arguments;
+  one argument with an operator word and another atom prefix is an error.
+  Phrases such as text:\"this or that\" remain valid.
 
 query atoms:
   WORD            the name contains WORD; with a '/', the path does
@@ -117,9 +119,11 @@ query atoms:
                   words: text:BLOB still finds the blob, through trigrams,
                   but a word found only inside one does not match; use
                   {grep_prefix}WORD for that.
+  content:WORDS   alias of text:WORDS, including after case:
   GLOB            *.rs matches the name; src/**/*.rs the path's end,
                   /home/*/x the whole path
-  {grep_prefix}REGEX     a regex over content; folds Unicode case; ^/$ match lines
+  {grep_prefix}REGEX     a regex over content; case-sensitive; (?i) folds Unicode case
+                  ^/$ match lines
                   (?-m) restores whole-document anchors; dot excludes newline
   re:REGEX        a regex over the name
   path:TEXT       the path contains TEXT
@@ -128,8 +132,9 @@ query atoms:
   mtime:(<|>)N(s|m|h|d|w|y)     age: mtime:<1d changed within a day
   type:(f|d|l)                  file, directory or symlink
   case:ATOM       match ATOM case-sensitively. Otherwise words, globs and
-                  ext: fold ASCII case only, re: and {grep_prefix} fold Unicode case;
+                  ext: fold ASCII case only; re: folds Unicode case;
                   text: folds as the content index does (case:text:Foo).
+                  case:{grep_prefix} is a no-op; regex inline flags control case.
 
 search freshness:
   Content answers are as of the index's last follow; names are as of the

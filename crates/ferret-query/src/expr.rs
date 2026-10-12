@@ -1,11 +1,13 @@
-//! The boolean grammar (D62 A): `OR`, `NOT`, `(` and `)` as whole
+//! The boolean grammar (D62 A, D71 A): `AND`, `OR`, `NOT`, `(` and `)` as whole
 //! arguments over atoms, parsed into a [`Node`] tree, and the Kleene
-//! evaluation of a tree on one row.
+//! evaluation of a tree on one row. Word operators accept any ASCII case.
+//! An atom may contain operator words; an argument also holding a later atom
+//! prefix is an error, asking for separate arguments.
 //!
 //! ```text
 //! query = expr?
 //! expr  = and ("OR" and)*
-//! and   = unary+
+//! and   = unary (["AND"] unary)*
 //! unary = "NOT" unary | "(" expr ")" | atom
 //! ```
 //!
@@ -33,6 +35,7 @@ pub(crate) enum Node<L> {
 
 /// One argument, lexed: an operator or an atom.
 pub(crate) enum Token<A> {
+    And,
     Or,
     Not,
     Open,
@@ -109,6 +112,17 @@ impl<A> Parser<A> {
     fn and(&mut self, after: After, depth: usize) -> Result<Node<A>, ParseError> {
         let mut all = Vec::new();
         while !matches!(self.tokens.peek(), None | Some(Token::Or | Token::Close)) {
+            if matches!(self.tokens.peek(), Some(Token::And)) {
+                self.tokens.next();
+                if all.is_empty()
+                    || matches!(
+                        self.tokens.peek(),
+                        None | Some(Token::And | Token::Or | Token::Close)
+                    )
+                {
+                    return Err(ParseError::Dangling("AND"));
+                }
+            }
             all.push(self.unary(depth)?);
         }
         if all.is_empty() {
@@ -129,7 +143,10 @@ impl<A> Parser<A> {
                         limit: NESTING_LIMIT,
                     });
                 }
-                if matches!(self.tokens.peek(), None | Some(Token::Or | Token::Close)) {
+                if matches!(
+                    self.tokens.peek(),
+                    None | Some(Token::And | Token::Or | Token::Close)
+                ) {
                     return Err(ParseError::Dangling("NOT"));
                 }
                 Ok(Node::Not(Box::new(self.unary(depth + 1)?)))
@@ -148,6 +165,7 @@ impl<A> Parser<A> {
             }
             Some(Token::Atom(atom)) => Ok(Node::Leaf(atom)),
             // `and` peeks before calling: only these three start a unary.
+            Some(Token::And) => Err(ParseError::Dangling("AND")),
             Some(Token::Or | Token::Close) | None => Err(ParseError::Unopened),
         }
     }
