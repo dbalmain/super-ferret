@@ -12,7 +12,9 @@
 //! the keys mean exactly what the index's keys mean.
 //!
 //! Seams: `ferret-query` receives the finished [`Trigrams`] and knows nothing
-//! about regex syntax; `ferret-text` owns the key function.
+//! about regex syntax; `ferret-text` owns the key function. `ferret-bench`
+//! uses [`GrepFlags::required_literals`] to measure longer grams through
+//! the same fold, while shipped trigrams retain their original limits.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -136,6 +138,26 @@ impl GrepFlags {
             trigrams,
             planning,
         })
+    }
+
+    /// Experimental required literals, using the same Cox fold and flags as
+    /// the shipped trigram derivation. Byte strings are ASCII-folded; the
+    /// AND/OR tree is necessary, never sufficient. Longer edge facts allow
+    /// bench callers to extract grams without a second regex parser.
+    pub fn required_literals(&self, pattern: &str) -> Result<RequiredLiterals, GrepError> {
+        self.compile(pattern)?;
+        let hir = self
+            .parser()
+            .build()
+            .parse(pattern)
+            .map_err(|e| GrepError::Derivation(e.to_string()))?;
+        let limits = Limits {
+            exact_len: 32,
+            edge_len: 31,
+            ..LIMITS
+        };
+        let info: Info<RequiredLiterals> = fold_node(&hir, &limits, &mut Trims::default());
+        Ok(finish(info))
     }
 
     fn derive(
@@ -393,6 +415,90 @@ impl Trigrams {
     }
 }
 
+/// Folded byte strings that every regex match must satisfy. An alternative
+/// with no useful literal remains `All`; no branch may be dropped.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RequiredLiterals {
+    All,
+    None,
+    Literal(Vec<u8>),
+    And(Vec<RequiredLiterals>),
+    Or(Vec<RequiredLiterals>),
+}
+
+/// The fold saves strings at exactly the same points for both consumers.
+/// Trigrams retain their shipped simplification and key budget.
+trait Facts: Clone {
+    fn all() -> Self;
+    fn and(parts: impl IntoIterator<Item = Self>) -> Self;
+    fn or(parts: impl IntoIterator<Item = Self>) -> Self;
+    fn string(bytes: &[u8]) -> Self;
+}
+
+impl Facts for Trigrams {
+    fn all() -> Self {
+        Self::All
+    }
+    fn and(parts: impl IntoIterator<Item = Self>) -> Self {
+        Self::and(parts)
+    }
+    fn or(parts: impl IntoIterator<Item = Self>) -> Self {
+        Self::or(parts)
+    }
+    fn string(bytes: &[u8]) -> Self {
+        string_trigrams(bytes)
+    }
+}
+
+impl Facts for RequiredLiterals {
+    fn all() -> Self {
+        Self::All
+    }
+    fn and(parts: impl IntoIterator<Item = Self>) -> Self {
+        let mut flat = Vec::new();
+        for part in parts {
+            match part {
+                Self::All => {}
+                Self::None => return Self::None,
+                Self::And(inner) => flat.extend(inner),
+                other => flat.push(other),
+            }
+        }
+        Self::collect(flat, Self::All, Self::And)
+    }
+    fn or(parts: impl IntoIterator<Item = Self>) -> Self {
+        let mut flat = Vec::new();
+        for part in parts {
+            match part {
+                Self::None => {}
+                Self::All => return Self::All,
+                Self::Or(inner) => flat.extend(inner),
+                other => flat.push(other),
+            }
+        }
+        Self::collect(flat, Self::None, Self::Or)
+    }
+    fn string(bytes: &[u8]) -> Self {
+        if bytes.len() < 3 {
+            Self::All
+        } else {
+            Self::Literal(bytes.to_vec())
+        }
+    }
+}
+
+impl RequiredLiterals {
+    fn collect(mut flat: Vec<Self>, identity: Self, node: fn(Vec<Self>) -> Self) -> Self {
+        flat.sort();
+        flat.dedup();
+        match flat.len() {
+            0 => identity,
+            1 => flat.pop().unwrap_or(identity),
+            _ => node(flat),
+        }
+    }
+}
+
 // ── limits ──
 
 /// The simplification's caps (S3 § Simplification). `exact` and `set` are
@@ -410,6 +516,8 @@ struct Limits {
     set: usize,
     /// A finished query is weakened until it holds at most this many keys.
     keys: usize,
+    /// Bytes retained at each open concatenation edge.
+    edge_len: usize,
 }
 
 const LIMITS: Limits = Limits {
@@ -418,6 +526,7 @@ const LIMITS: Limits = Limits {
     exact_len: 4,
     set: 20,
     keys: 64,
+    edge_len: 2,
 };
 
 /// How often each cap discarded information: the measurement M3 reports.
@@ -438,14 +547,14 @@ type Strings = BTreeSet<Vec<u8>>;
 /// member of `prefix` and ends with a member of `suffix`, so either holds
 /// `""` whenever nothing better is known.
 #[derive(Clone, Debug)]
-struct Info {
+struct Info<Q = Trigrams> {
     emptyable: bool,
     /// The finite set of folded byte strings the node matches, or unknown.
-    /// While known, its trigrams are not yet in `matches`.
+    /// While known, its string facts are not yet in `matches`.
     exact: Option<Strings>,
     prefix: Strings,
     suffix: Strings,
-    matches: Trigrams,
+    matches: Q,
 }
 
 /// The one folding rule: a byte folds as it does inside a key.
@@ -464,33 +573,33 @@ fn string_trigrams(s: &[u8]) -> Trigrams {
 
 /// `OR` over the set: any short member poisons it to `All`; the empty set is
 /// `None`.
-fn set_trigrams(set: &Strings) -> Trigrams {
-    Trigrams::or(set.iter().map(|s| string_trigrams(s)))
+fn set_facts<Q: Facts>(set: &Strings) -> Q {
+    Q::or(set.iter().map(|s| Q::string(s)))
 }
 
-fn single(set: Strings) -> Info {
+fn single<Q: Facts>(set: Strings) -> Info<Q> {
     let emptyable = set.contains(&[][..]);
     Info {
         emptyable,
         exact: Some(set),
         prefix: Strings::new(),
         suffix: Strings::new(),
-        matches: Trigrams::All,
+        matches: Q::all(),
     }
 }
 
-fn empty() -> Info {
+fn empty<Q: Facts>() -> Info<Q> {
     single(Strings::from([Vec::new()]))
 }
 
 /// A node about which nothing is known but whether it can be empty.
-fn unknown(emptyable: bool) -> Info {
+fn unknown<Q: Facts>(emptyable: bool) -> Info<Q> {
     Info {
         emptyable,
         exact: None,
         prefix: Strings::from([Vec::new()]),
         suffix: Strings::from([Vec::new()]),
-        matches: Trigrams::All,
+        matches: Q::all(),
     }
 }
 
@@ -500,12 +609,12 @@ fn product(left: &Strings, right: &Strings) -> Strings {
         .collect()
 }
 
-impl Info {
-    /// Makes `exact` unknown, saving its trigrams into `matches` first, and
+impl<Q: Facts> Info<Q> {
+    /// Makes `exact` unknown, saving its string facts into `matches` first, and
     /// its strings become the prefix and suffix sets.
-    fn release(mut self) -> Info {
+    fn release(mut self) -> Info<Q> {
         if let Some(exact) = self.exact.take() {
-            self.matches = Trigrams::and([self.matches, set_trigrams(&exact)]);
+            self.matches = Q::and([self.matches, set_facts(&exact)]);
             self.prefix = exact.clone();
             self.suffix = exact;
         }
@@ -522,16 +631,18 @@ impl Info {
     }
 }
 
-fn derive(hir: &Hir, limits: &Limits, trims: &mut Trims) -> Trigrams {
-    let info = fold_node(hir, limits, trims);
-    let query = match &info.exact {
-        Some(exact) => Trigrams::and([info.matches.clone(), set_trigrams(exact)]),
+fn finish<Q: Facts>(info: Info<Q>) -> Q {
+    match &info.exact {
+        Some(exact) => Q::and([info.matches.clone(), set_facts(exact)]),
         None => info.matches,
-    };
-    cap_keys(query, limits.keys, trims)
+    }
 }
 
-fn fold_node(hir: &Hir, limits: &Limits, trims: &mut Trims) -> Info {
+fn derive(hir: &Hir, limits: &Limits, trims: &mut Trims) -> Trigrams {
+    cap_keys(finish(fold_node(hir, limits, trims)), limits.keys, trims)
+}
+
+fn fold_node<Q: Facts>(hir: &Hir, limits: &Limits, trims: &mut Trims) -> Info<Q> {
     let info = match hir.kind() {
         HirKind::Empty | HirKind::Look(_) => empty(),
         HirKind::Literal(literal) => single(Strings::from([fold(&literal.0)])),
@@ -557,12 +668,12 @@ fn fold_node(hir: &Hir, limits: &Limits, trims: &mut Trims) -> Info {
             let mut info = empty();
             let mut conjuncts = Vec::new();
             for part in parts {
-                conjuncts.push(std::mem::replace(&mut info.matches, Trigrams::All));
+                conjuncts.push(std::mem::replace(&mut info.matches, Q::all()));
                 let next = fold_node(part, limits, trims);
                 info = concat(info, next, limits, trims);
             }
             conjuncts.push(info.matches);
-            info.matches = Trigrams::and(conjuncts);
+            info.matches = Q::and(conjuncts);
             info
         }
         HirKind::Alternation(parts) => {
@@ -581,7 +692,7 @@ fn fold_node(hir: &Hir, limits: &Limits, trims: &mut Trims) -> Info {
 /// A class consumes one unit: a raw byte for `Class::Bytes`, one scalar's
 /// UTF-8 encoding for `Class::Unicode`. Folding merges at most an ASCII
 /// letter pair, so more than twice the cap of raw members cannot fit.
-fn fold_class(class: &Class, limits: &Limits, trims: &mut Trims) -> Info {
+fn fold_class<Q: Facts>(class: &Class, limits: &Limits, trims: &mut Trims) -> Info<Q> {
     let members: Option<Strings> = match class {
         Class::Bytes(set) => {
             let count: usize = set
@@ -621,7 +732,7 @@ fn fold_class(class: &Class, limits: &Limits, trims: &mut Trims) -> Info {
     }
 }
 
-fn concat(left: Info, right: Info, limits: &Limits, trims: &mut Trims) -> Info {
+fn concat<Q: Facts>(left: Info<Q>, right: Info<Q>, limits: &Limits, trims: &mut Trims) -> Info<Q> {
     let emptyable = left.emptyable && right.emptyable;
     if let (Some(l), Some(r)) = (&left.exact, &right.exact) {
         let exact = product(l, r);
@@ -631,22 +742,25 @@ fn concat(left: Info, right: Info, limits: &Limits, trims: &mut Trims) -> Info {
                 exact: Some(exact),
                 prefix: Strings::new(),
                 suffix: Strings::new(),
-                matches: Trigrams::and([left.matches, right.matches]),
+                matches: Q::and([left.matches, right.matches]),
             },
             limits,
             trims,
         );
     }
-    // Only trigrams spanning the boundary are new: two bytes from each side
-    // are enough to form them, and each side's own trigrams are already in
-    // its `matches` once released.
-    let tails: Strings = left.ends().iter().map(|s| last_two(s).to_vec()).collect();
+    // Each consumer retains enough edge bytes for its longest useful gram.
+    // These strings are actual adjacent boundaries, never nonadjacent facts.
+    let tails: Strings = left
+        .ends()
+        .iter()
+        .map(|s| last_edge(s, limits.edge_len).to_vec())
+        .collect();
     let heads: Strings = right
         .starts()
         .iter()
-        .map(|s| first_two(s).to_vec())
+        .map(|s| first_edge(s, limits.edge_len).to_vec())
         .collect();
-    let boundary = set_trigrams(&product(&tails, &heads));
+    let boundary = set_facts(&product(&tails, &heads));
     let prefix = match &left.exact {
         Some(exact) => product(exact, &right.prefix),
         None => left.prefix.clone(),
@@ -662,14 +776,19 @@ fn concat(left: Info, right: Info, limits: &Limits, trims: &mut Trims) -> Info {
             exact: None,
             prefix,
             suffix,
-            matches: Trigrams::and([left.matches, right.matches, boundary]),
+            matches: Q::and([left.matches, right.matches, boundary]),
         },
         limits,
         trims,
     )
 }
 
-fn alternate(left: Info, right: Info, limits: &Limits, trims: &mut Trims) -> Info {
+fn alternate<Q: Facts>(
+    left: Info<Q>,
+    right: Info<Q>,
+    limits: &Limits,
+    trims: &mut Trims,
+) -> Info<Q> {
     let emptyable = left.emptyable || right.emptyable;
     let info = match (left.exact, right.exact) {
         (Some(l), Some(r)) => Info {
@@ -677,7 +796,7 @@ fn alternate(left: Info, right: Info, limits: &Limits, trims: &mut Trims) -> Inf
             exact: Some(l.union(&r).cloned().collect()),
             prefix: Strings::new(),
             suffix: Strings::new(),
-            matches: Trigrams::or([left.matches, right.matches]),
+            matches: Q::or([left.matches, right.matches]),
         },
         (l, r) => {
             let left = Info { exact: l, ..left }.release();
@@ -687,7 +806,7 @@ fn alternate(left: Info, right: Info, limits: &Limits, trims: &mut Trims) -> Inf
                 exact: None,
                 prefix: left.prefix.union(&right.prefix).cloned().collect(),
                 suffix: left.suffix.union(&right.suffix).cloned().collect(),
-                matches: Trigrams::or([left.matches, right.matches]),
+                matches: Q::or([left.matches, right.matches]),
             }
         }
     };
@@ -701,7 +820,13 @@ const UNROLL: u32 = 8;
 /// `sub{min,max}` with `min ≥ 1`: every match is `min` or more copies, so it
 /// starts and ends with `sub` repeated `min` times. Unrolled as a
 /// concatenation while that is exact; otherwise released.
-fn repeat(sub: Info, min: u32, max: Option<u32>, limits: &Limits, trims: &mut Trims) -> Info {
+fn repeat<Q: Facts>(
+    sub: Info<Q>,
+    min: u32,
+    max: Option<u32>,
+    limits: &Limits,
+    trims: &mut Trims,
+) -> Info<Q> {
     let copies = min.min(UNROLL);
     let mut info = sub.clone();
     for _ in 1..copies {
@@ -714,24 +839,24 @@ fn repeat(sub: Info, min: u32, max: Option<u32>, limits: &Limits, trims: &mut Tr
     }
 }
 
-fn first_two(s: &[u8]) -> &[u8] {
-    &s[..s.len().min(2)]
+fn first_edge(s: &[u8], length: usize) -> &[u8] {
+    &s[..s.len().min(length)]
 }
 
-fn last_two(s: &[u8]) -> &[u8] {
-    &s[s.len().saturating_sub(2)..]
+fn last_edge(s: &[u8], length: usize) -> &[u8] {
+    &s[s.len().saturating_sub(length)..]
 }
 
 /// Cox's order: save before you discard. An exact set over the caps has its
 /// trigrams saved into `matches` before it is released.
 ///
-/// Once `exact` is unknown, every prefix and suffix string's own trigrams are
+/// Once `exact` is unknown, every prefix and suffix string's facts are
 /// already in `matches`: each string came from a released exact set, or from
-/// a concatenation whose boundary trigrams were saved. Only the two bytes at
-/// the open end can still form a new key, across a later boundary, so the
-/// sets keep just those. Shortening a set to the cap then discards boundary
-/// keys only, which no saving could keep.
-fn simplify(mut info: Info, limits: &Limits, trims: &mut Trims) -> Info {
+/// a concatenation whose boundary facts were saved. The shipped trigram fold
+/// retains two bytes at each open edge; longer grams retain `edge_len` bytes
+/// so later concatenations can recover their boundary facts. Shortening a set
+/// to the cap then discards boundary keys only, which no saving could keep.
+fn simplify<Q: Facts>(mut info: Info<Q>, limits: &Limits, trims: &mut Trims) -> Info<Q> {
     if let Some(exact) = &info.exact {
         let shortest = exact.iter().map(Vec::len).min().unwrap_or(0);
         if exact.len() > limits.exact || shortest > limits.exact_len {
@@ -740,8 +865,16 @@ fn simplify(mut info: Info, limits: &Limits, trims: &mut Trims) -> Info {
         }
     }
     if info.exact.is_none() {
-        info.prefix = info.prefix.iter().map(|s| first_two(s).to_vec()).collect();
-        info.suffix = info.suffix.iter().map(|s| last_two(s).to_vec()).collect();
+        info.prefix = info
+            .prefix
+            .iter()
+            .map(|s| first_edge(s, limits.edge_len).to_vec())
+            .collect();
+        info.suffix = info
+            .suffix
+            .iter()
+            .map(|s| last_edge(s, limits.edge_len).to_vec())
+            .collect();
         if info.prefix.len() > limits.set {
             trims.set += 1;
             info.prefix = shorten(
