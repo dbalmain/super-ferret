@@ -3,14 +3,14 @@
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
 use ferret_policy::{Config, Decision};
 
-use super::{Scratch, write};
-use crate::{Event, EventVisitor, Stat, WalkOptions, walk, walk_parallel};
+use super::{Scratch, SpillTree, write};
+use crate::{Event, EventVisitor, IoOp, Stat, WalkOptions, walk, walk_parallel};
 
 #[derive(Default)]
 struct Collected {
@@ -188,28 +188,23 @@ fn a_spilled_parent_does_not_follow_a_swapped_ancestor() {
     fs::create_dir(&root).unwrap();
     fs::create_dir(&outside).unwrap();
     write(&outside.join("leaked"), "outside");
-    let mut current = root.clone();
-    for _ in 0..140 {
-        let parent = current.clone();
-        current.push("d");
-        fs::create_dir(&current).unwrap();
-        write(&parent.join("side"), "inside");
-    }
-
-    let mut swapped = false;
+    let mut frontier = SpillTree::new(&root, &outside);
+    let mut reopens = 0;
     let mut events = Vec::new();
     walk(&root, None, Config::default(), |event| {
-        if let Event::Decided(decided) = &event
-            && decided.decision == Decision::Descend
-            && decided.path.components().count() == 140
+        if let Event::Decided(decided) = &event {
+            frontier.decided(decided.path, decided.decision);
+        }
+        if let Event::Io {
+            op: IoOp::Reopen, ..
+        } = &event
         {
-            fs::rename(root.join("d"), root.join("d.was")).unwrap();
-            symlink(&outside, root.join("d")).unwrap();
-            swapped = true;
+            reopens += 1;
         }
         events.extend(line(event));
     });
-    assert!(swapped);
+    assert!(frontier.swapped);
+    assert!(reopens > 0);
     assert!(events.iter().any(|event| event.contains(" io ")));
     assert!(!events.iter().any(|event| event.contains("leaked")));
 }

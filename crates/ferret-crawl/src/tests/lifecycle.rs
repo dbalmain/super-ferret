@@ -8,6 +8,7 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use ferret_policy::{Config, DEFAULT_IGNORE, Decision};
 use rustix::fs::{AtFlags, statat};
 
 use super::gitfile::{git_ok, init};
-use super::{Scratch, write};
+use super::{Scratch, SpillTree, write};
 use crate::{
     Boundary, Event, EventVisitor, FaultContext, IoOp, Stat, WalkOptions, WorkTreeKind,
     walk_parallel,
@@ -783,27 +784,17 @@ fn a_failed_reopen_is_a_fault_on_the_spilled_directory() {
     let root = tree.join("root");
     let outside = tree.join("outside");
     fs::create_dir_all(&outside).unwrap();
-    let mut current = root.clone();
-    for _ in 0..140 {
-        let parent = current.clone();
-        current.push("d");
-        fs::create_dir_all(&current).unwrap();
-        write(&parent.join("side"), "inside");
-    }
-    let swapped = AtomicBool::new(false);
+    write(&outside.join("leaked"), "outside");
+    let frontier = Mutex::new(SpillTree::new(&root, &outside));
     let swap = |path: &Path, decision: Decision| {
-        if decision == Decision::Descend && path.components().count() == 140 {
-            fs::rename(root.join("d"), root.join("d.was")).unwrap();
-            symlink(&outside, root.join("d")).unwrap();
-            swapped.store(true, Ordering::SeqCst);
-        }
+        frontier.lock().unwrap().decided(path, decision);
     };
     let hooks = Hooks {
         on_decided: Some(&swap),
         ..Hooks::default()
     };
     let merged = run(&root, Vec::new(), 1, &hooks);
-    assert!(swapped.load(Ordering::SeqCst));
+    assert!(frontier.lock().unwrap().swapped);
     let reopens: Vec<_> = merged
         .io
         .iter()
@@ -813,6 +804,12 @@ fn a_failed_reopen_is_a_fault_on_the_spilled_directory() {
     for (path, _, context, _) in reopens {
         assert_eq!(context, &Context::Dir(path.clone()));
     }
+    assert!(
+        merged
+            .decided
+            .iter()
+            .all(|(_, path, _)| !path.ends_with("leaked"))
+    );
 }
 
 // ── boundaries ──

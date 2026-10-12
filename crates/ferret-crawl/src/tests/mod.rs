@@ -17,7 +17,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -54,6 +54,51 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         restore(&self.path);
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Grow the first child visited at each level, leaving its sibling pending.
+/// A static `d/side` chain spills only when readdir puts `d` first; this
+/// fixture must exceed the descriptor budget under either listing order.
+struct SpillTree<'a> {
+    root: &'a Path,
+    outside: &'a Path,
+    frontier: PathBuf,
+    swapped: bool,
+}
+
+impl<'a> SpillTree<'a> {
+    fn new(root: &'a Path, outside: &'a Path) -> Self {
+        Self::children(root);
+        Self {
+            root,
+            outside,
+            frontier: PathBuf::new(),
+            swapped: false,
+        }
+    }
+
+    fn children(parent: &Path) {
+        for name in ["d", "side"] {
+            fs::create_dir_all(parent.join(name)).unwrap();
+        }
+    }
+
+    fn decided(&mut self, path: &Path, decision: Decision) {
+        if self.swapped || decision != Decision::Descend || path.parent() != Some(&self.frontier) {
+            return;
+        }
+        self.frontier = path.to_owned();
+        if path.components().count() < 140 {
+            // The child has not been listed yet. Whichever sibling came
+            // first becomes the chain; the other remains an unfinished job.
+            Self::children(&self.root.join(path));
+        } else {
+            let ancestor = self.root.join(path.components().next().unwrap());
+            fs::rename(&ancestor, self.root.join("was")).unwrap();
+            symlink(self.outside, ancestor).unwrap();
+            self.swapped = true;
+        }
     }
 }
 
