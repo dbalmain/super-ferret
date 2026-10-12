@@ -52,7 +52,12 @@ fn base64_blobs_are_detected_with_padding() {
 fn base64url_and_data_uris_are_detected() {
     let text = format!("token={URL}; src=\"data:image/png;base64,{PADDED}\"");
     assert_eq!(runs(&text), [URL, PADDED]);
-    assert_eq!(kept(&text), ["token", "src", "data", "image", "png", "base64", "base", "64"]);
+    assert_eq!(
+        kept(&text),
+        [
+            "token", "src", "data", "image", "png", "base64", "base", "64"
+        ]
+    );
     assert!(has_base64_run(URL.as_bytes()));
 }
 

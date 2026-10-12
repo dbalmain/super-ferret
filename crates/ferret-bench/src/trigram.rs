@@ -17,7 +17,7 @@ use std::time::Instant;
 use ferret_catalog::Catalog;
 use ferret_index::segment::{Inverter, ReadAt, Section, Segment, TrigramInverter, Writer};
 use ferret_index::{BUFFER, DocSet, SegmentEntry, merge};
-use ferret_text::{Scratch, TOKENIZER_VERSION, TRIGRAM_VERSION, cap, tokenize};
+use ferret_text::{Scratch, TERM_VERSION, TRIGRAM_VERSION, cap, tokenize};
 
 use crate::census::{HashedDoc, hashed_documents};
 use crate::segment_build::cpu_seconds;
@@ -550,7 +550,7 @@ impl Flush<'_> {
             *peak = (*peak).max(other + term.allocated_bytes() + writer.finishing_bytes());
             let path = out.join(format!("{stem}.seg"));
             writer.finish(&mut File::create(&path)?)?;
-            Some(artifact(path, number, docs, TOKENIZER_VERSION)?)
+            Some(artifact(path, number, docs, TERM_VERSION)?)
         } else {
             None
         };
@@ -675,14 +675,7 @@ fn merge_run(
     let term = if terms.is_empty() {
         None
     } else {
-        Some(merge_files(
-            out,
-            &terms,
-            live,
-            *number,
-            TOKENIZER_VERSION,
-            work,
-        )?)
+        Some(merge_files(out, &terms, live, *number, TERM_VERSION, work)?)
     };
     work.merges += 1;
     work.inputs += inputs.len() as u64;

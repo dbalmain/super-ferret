@@ -553,7 +553,10 @@ fn every_holding_document_satisfies_the_trigrams() {
             }
         }
     }
-    assert!(hits > 1000 && screened > 100, "{hits} hits, {screened} screened");
+    assert!(
+        hits > 1000 && screened > 100,
+        "{hits} hits, {screened} screened"
+    );
 }
 
 #[test]
@@ -566,7 +569,10 @@ fn trigrams_admit_respellings_and_the_kelvin_sign() {
         ("Zqab9+Rtxy7/Wmcd3x", "ZQAB_9_RTXY_7_WMCD_3_X"),
     ] {
         let text = Text::new(arg.as_bytes(), false).unwrap();
-        assert!(TextMatcher::new().is_match(&text, doc.as_bytes()), "{arg} {doc}");
+        assert!(
+            TextMatcher::new().is_match(&text, doc.as_bytes()),
+            "{arg} {doc}"
+        );
         let trigrams = text.trigrams();
         assert_ne!(trigrams, Trigrams::All, "{arg}");
         assert!(admits(&trigrams, &doc_keys(doc.as_bytes())), "{arg} {doc}");
@@ -574,5 +580,8 @@ fn trigrams_admit_respellings_and_the_kelvin_sign() {
     }
     // Units shorter than three bytes give no trigram: a blob spelled only in
     // them is screened by nothing, and verification decides alone.
-    assert_eq!(Text::new(b"Zq9+Rt7/Wm3x", false).unwrap().trigrams(), Trigrams::All);
+    assert_eq!(
+        Text::new(b"Zq9+Rt7/Wm3x", false).unwrap().trigrams(),
+        Trigrams::All
+    );
 }

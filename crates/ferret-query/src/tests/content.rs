@@ -54,7 +54,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str, followed: u32, dead: &[u32], unreadable: &[u32]) -> Self {
-        let docs = corpus();
+        Self::with_docs(name, corpus(), followed, dead, unreadable)
+    }
+
+    fn with_docs(
+        name: &str,
+        docs: Vec<String>,
+        followed: u32,
+        dead: &[u32],
+        unreadable: &[u32],
+    ) -> Self {
         let dir = Scratch::new(&format!("content-{name}"));
         let at_follow = DocSet::new(followed, (0..followed).filter(|d| !dead.contains(d)));
         let catalog = CatalogView {
@@ -248,6 +257,73 @@ fn not_of_a_term_only_an_uncovered_document_holds_is_maybe() {
             assert_eq!(got, expected, "NOT text:{arg}, document {d}");
         }
     }
+}
+
+/// Synthetic base64: seeded random bytes, encoded. `BLOB` carries `fox` as
+/// a run of its own.
+const BLOB: &str = "nkzzCi5csBBZh21Dh5Z7n8pP1UaPL+fox+KKcXB0xYeDUnGtBJe3j1LIyw==";
+const OTHER_BLOB: &str = "1JOTcOPq4q3fcyTvh2TyF4M5UUU/RrO8u3Z0y+bzGU4Kq4CjigRY3CWFBF1S3Q==";
+
+/// T1: the term index leaves out a blob's tokens, so a blob argument is
+/// screened by trigrams and verified by the same matcher, finding what the
+/// terms would have found before T1, respellings included.
+#[test]
+fn a_blob_argument_is_screened_by_trigrams_and_verified() {
+    let respelled = BLOB.replace(['+', '='], " ");
+    let docs: Vec<String> = (0..3)
+        .flat_map(|_| {
+            [
+                format!("key = {BLOB}"),
+                "a quiet harbour at dawn".to_owned(),
+                format!("key = {OTHER_BLOB}"),
+                respelled.clone(),
+                format!("x{BLOB}"),
+            ]
+        })
+        .collect();
+    let fixture = Fixture::with_docs("blob", docs, 15, &[], &[]);
+    let text = Text::new(BLOB.as_bytes(), false).unwrap();
+    assert!(crate::answered_by_trigrams(&text));
+    assert!(!crate::answered_by_trigrams(
+        &Text::new(b"harbour", false).unwrap()
+    ));
+
+    for case in [false, true] {
+        let found = fixture.check(BLOB, case);
+        assert_eq!(certainties(&found), [Certainty::Maybe].into());
+        let docs: Vec<u32> = found.iter().map(|&(d, _)| d).collect();
+        // The screen keeps every holder and the near miss, and drops the
+        // prose and the other blob.
+        assert_eq!(docs, [0, 3, 4, 5, 8, 9, 10, 13, 14], "case={case}");
+    }
+    // Respelled with spaces for `+` and `=`, it still holds, under `case:`
+    // too; `x` glued to its front makes another first token.
+    for case in [false, true] {
+        assert_eq!(fixture.truth(BLOB, case), [0, 3, 5, 8, 10, 13]);
+    }
+    // A word only inside a blob is not in the term index: the accepted
+    // loss. The respelling splits the blob, so its `fox` stands alone.
+    use Certainty::Yes;
+    assert_eq!(
+        fixture.candidates("fox", false),
+        [(3, Yes), (8, Yes), (13, Yes)]
+    );
+    assert_eq!(fixture.truth("fox", false), [0, 3, 4, 5, 8, 9, 10, 13, 14]);
+    assert_eq!(
+        certainties(&fixture.check("harbour", false)),
+        [Certainty::Yes].into()
+    );
+}
+
+/// With no source to answer trigrams, every live document is a blob
+/// argument's candidate, as for `grep:`.
+#[test]
+fn a_blob_argument_without_an_index_is_maybe_everywhere() {
+    let live = DocSet::new(2, 0..2);
+    let pinned = Pinned::new(None, &live);
+    let atom = TextAtom::read(Text::new(BLOB.as_bytes(), false).unwrap(), &pinned).unwrap();
+    let found = walk(pinned.top(atom.cursor(&pinned)));
+    assert_eq!(found, [(0, Certainty::Maybe), (1, Certainty::Maybe)]);
 }
 
 /// Frequency ordering must weaken before the bound is calculated; a bound

@@ -416,6 +416,33 @@ boundaries (`parseHTTPRequest2` → `parsehttprequest2`, `parse`, `http`,
 `request`, `2`). The tokenizer has a version; segments record the version that
 wrote them. Query terms go through the same function.
 
+**Base64-like runs leave the term index (T1, D65 token policy, 2026-10-12).**
+`ferret-text`'s `tokenize_terms` drops every token overlapping a run of the
+base64 or base64url alphabet that looks random rather than written: at least
+20 characters once written edge segments (`sha512-`, `forms/d/`) are trimmed,
+not all hex, with digits, mixed case changing often, short lowercase runs and
+few vowels. On `$HOME` that halves codec 1's steady term index (450 → 221 MB)
+for 2.6% more follow CPU ([TOKENS.md](TOKENS.md)). Trigrams still see every
+byte. What the term index holds is `TERM_VERSION` (2: the tokenizer less
+blobs), which term segments and the manifest record in place of the bare
+tokenizer version; an index recording anything else, such as 1 from before T1,
+is discarded and rebuilt through coverage.
+
+- **Blob arguments.** A `text:` argument in which the same detector finds a
+  run is screened by trigrams instead of terms (`ferret-query`'s
+  `answered_by_trigrams`): the trigrams of each distinct ASCII unit of three
+  bytes or more, ranked and capped as a `grep:` literal's are, then verified by
+  the usual `Text` matcher. The answer is the one the terms gave before T1,
+  respellings included; only the screen is weaker, since a blob's units are
+  short (one spelled only in units under three bytes is screened by nothing).
+  Without a trigram source every live document is a candidate, as for `grep:`,
+  so `ferret search` may ask for `--scan`.
+- **Accepted loss.** A word that occurs only inside a blob, such as `fox` in
+  `…UaPL+fox+KKcX…`, no longer matches `text:fox`; `grep:fox` still finds it.
+  Likewise a fragment of a blob too short to be detected on its own (under 20
+  characters) is answered from terms, which lack it. About 4% of reviewed code runs, identifiers built from short
+  capitalised words and digits, are suppressed this way, as is SVG path data.
+
 **Structures**, each a candidate `Source` over doc ids, and each a row in the
 experiments:
 

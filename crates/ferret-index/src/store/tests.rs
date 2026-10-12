@@ -392,7 +392,11 @@ fn follow_leaves_blob_tokens_out_of_the_term_index() {
     assert_eq!(view.lookup(b"amber").unwrap(), [0]);
     assert_eq!(view.lookup(b"basalt").unwrap(), [0]);
     assert!(view.lookup(b"fox").unwrap().is_empty(), "inside the blob");
-    assert!(view.lookup(b"nkzzci5csbbzh21dh5z7n8pp1uapl").unwrap().is_empty());
+    assert!(
+        view.lookup(b"nkzzci5csbbzh21dh5z7n8pp1uapl")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Four segments over 0..10, 10..20, 20..30 and 30..40, one pass each.
@@ -966,11 +970,7 @@ fn every_head_fact_is_checked_for_each_file() {
                     } else {
                         entry.file_name()
                     };
-                    let version = if tri {
-                        TRIGRAM_VERSION
-                    } else {
-                        TERM_VERSION
-                    };
+                    let version = if tri { TRIGRAM_VERSION } else { TERM_VERSION };
                     let mut out = File::create(dir.0.join(&name)).unwrap();
                     let first = entry.first + u32::from(field == 0);
                     let last = entry.last - u32::from(field == 1);

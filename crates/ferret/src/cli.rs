@@ -113,6 +113,10 @@ query atoms:
                   several (quote them: text:\"request handler\") match in
                   order, whatever separates them. A file with no indexed
                   content (directory, binary, too large) never matches.
+                  Base64-like runs (keys, data: URIs) are not indexed as
+                  words: text:BLOB still finds the blob, through trigrams,
+                  but a word found only inside one does not match; use
+                  {grep_prefix}WORD for that.
   GLOB            *.rs matches the name; src/**/*.rs the path's end,
                   /home/*/x the whole path
   {grep_prefix}REGEX     a regex over content; folds Unicode case; ^/$ match lines

@@ -926,11 +926,7 @@ impl IndexWriter {
             file.sync_all()?;
             let segment = Segment::open(file)?;
             let info = segment.info();
-            let version = if tri {
-                TRIGRAM_VERSION
-            } else {
-                TERM_VERSION
-            };
+            let version = if tri { TRIGRAM_VERSION } else { TERM_VERSION };
             if (
                 info.first,
                 info.last,

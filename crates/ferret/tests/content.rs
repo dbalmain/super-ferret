@@ -1378,3 +1378,59 @@ fn mixed_queries_and_bounds_equal_the_oracle_with_h_records() {
         check(&engine.pin(), &mut rng, 40, "H dead postings");
     }
 }
+
+/// T1 (DECISIONS.md D65 update — token policy) through the real pipeline:
+/// base64-like runs leave the term index, a blob `text:` argument is
+/// answered through trigrams and verification, and a word occurring only
+/// inside a blob is found by `grep:` but no longer by `text:`. The blobs are
+/// synthetic: seeded random bytes, base64-encoded.
+#[test]
+fn t1_blobs_route_through_trigrams_and_words_inside_them_are_lost() {
+    const BLOB: &str = "nkzzCi5csBBZh21Dh5Z7n8pP1UaPL+fox+KKcXB0xYeDUnGtBJe3j1LIyw==";
+    const OTHER: &str = "1JOTcOPq4q3fcyTvh2TyF4M5UUU/RrO8u3Z0y+bzGU4Kq4CjigRY3CWFBF1S3Q==";
+    let tree = Tree::new();
+    let blob = tree.write("a.txt", format!("token = {BLOB}\n").as_bytes());
+    let other = tree.write("b.txt", format!("token = {OTHER}\n").as_bytes());
+    let prose = tree.write("c.txt", b"a quiet harbour at dawn\n");
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let blob_arg = format!("text:{BLOB}");
+    let check = |engine: &Engine| {
+        let pin = engine.pin();
+        for (args, expected) in [
+            (vec![blob_arg.as_str()], paths(&[&blob])),
+            (vec!["text:harbour"], paths(&[&prose])),
+            (vec!["text:token"], paths(&[&blob, &other])),
+            (vec!["text:fox"], paths(&[])),
+            (vec!["grep:fox"], paths(&[&blob])),
+        ] {
+            let (got, report) = search(&pin, &query(&args), None).unwrap();
+            assert_eq!(got, expected, "{args:?}");
+            if args == [blob_arg.as_str()] {
+                // Trigrams screened out the other two; the matcher settled
+                // the one left.
+                let report = report.unwrap();
+                assert_eq!(report.documents, 1, "{report:?}");
+                assert_eq!(report.verified, 1, "{report:?}");
+            }
+        }
+    };
+    check(&engine);
+
+    // An index recording the term version every index had before T1 is
+    // discarded on open and rebuilt by the next follow, never read as if
+    // its terms left blobs out.
+    drop(engine);
+    let dir = tree.index().join(ferret::engine::CONTENT_DIR);
+    let mut manifest = ferret_index::Manifest::read(&dir).unwrap().unwrap();
+    assert!(!manifest.segments.is_empty());
+    manifest.tokenizer_version = 1;
+    fs::write(dir.join(ferret_index::manifest::FILE), manifest.encode()).unwrap();
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    let (_, report) = search(&engine.pin(), &query(&["text:harbour"]), None).unwrap();
+    assert_eq!(report.unwrap().uncovered, 3, "the old index was discarded");
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    check(&engine);
+}
