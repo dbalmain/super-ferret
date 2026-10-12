@@ -25,11 +25,13 @@ use super::query::Need;
 use super::{Corpus, counts, prepare_with, stats};
 
 mod hashed;
+mod resident;
 mod residue;
 mod rg;
 mod units;
 
 use hashed::Hashed;
+use resident::Resident;
 use units::Unit;
 
 const CLASSES: [&str; 5] = [
@@ -225,6 +227,9 @@ struct Sources<'a> {
     extra: Option<&'a Segment<Meter>>,
     fallback: &'a DocSet,
     live: &'a DocSet,
+    /// Substring lookups and the residue fallback from flat files, in
+    /// place of the dictionary pass and the blanket fallback.
+    resident: Option<&'a Resident>,
 }
 
 impl Sources<'_> {
@@ -249,12 +254,13 @@ fn compile<'a>(
     plan: &Plan,
     lists: &'a BTreeMap<Leaf, postings::Term>,
     sets: &'a BTreeMap<Leaf, Option<DocSet>>,
+    fallback: &'a DocSet,
     src: &Sources<'a>,
 ) -> Cursor<'a> {
     match plan {
         Plan::All => Cursor::bits(src.live, Certainty::Maybe),
         Plan::None => Cursor::Empty,
-        Plan::Leaf(Leaf::Fallback) => Cursor::bits(src.fallback, Certainty::Maybe),
+        Plan::Leaf(Leaf::Fallback) => Cursor::bits(fallback, Certainty::Maybe),
         Plan::Leaf(leaf @ (Leaf::Prefix(_) | Leaf::Substring(_))) => match &sets[leaf] {
             Some(set) => Cursor::bits(set, Certainty::Maybe),
             None => Cursor::bits(src.live, Certainty::Maybe),
@@ -263,13 +269,13 @@ fn compile<'a>(
         Plan::And(parts) => Cursor::and(
             parts
                 .iter()
-                .map(|p| compile(p, lists, sets, src))
+                .map(|p| compile(p, lists, sets, fallback, src))
                 .collect(),
         ),
         Plan::Or(parts) => Cursor::or(
             parts
                 .iter()
-                .map(|p| compile(p, lists, sets, src))
+                .map(|p| compile(p, lists, sets, fallback, src))
                 .collect(),
             src.live.bound(),
         ),
@@ -337,16 +343,32 @@ fn read(src: &Sources, plan: &Plan, extra_docs: &[u32]) -> crate::Result<Read> {
             Leaf::Substring(_) | Leaf::Fallback => {}
         }
     }
+    if let Some(resident) = src.resident {
+        resident.bytes.set(0);
+    }
+    let mut residue = None;
     if !needles.is_empty() {
         let segment = src.term.ok_or("substring leaf without terms")?;
-        let found = substring_scan(segment, &needles, src.live.bound(), &mut postings_bytes)?;
+        let found = match src.resident {
+            Some(resident) => {
+                residue = Some(resident.residue_docs(&needles, src.live.bound())?);
+                resident.substrings(segment, &needles, src.live.bound(), &mut postings_bytes)?
+            }
+            None => substring_scan(segment, &needles, src.live.bound(), &mut postings_bytes)?,
+        };
         for (needle, (named, set)) in needles.into_iter().zip(found) {
             prefix_terms += named;
             capped_prefixes += u64::from(set.is_none());
             sets.insert(Leaf::Substring(needle), set);
         }
     }
-    let cursor = compile(plan, &lists, &sets, src);
+    let empty = DocSet::new(src.live.bound(), []);
+    let fallback = match (src.resident, &residue) {
+        (Some(_), Some(set)) => set,
+        (Some(_), None) => &empty,
+        (None, _) => src.fallback,
+    };
+    let cursor = compile(plan, &lists, &sets, fallback, src);
     let mut docs = crate::screen::drain(Cursor::and(vec![
         cursor,
         Cursor::bits(src.live, Certainty::Maybe),
@@ -359,7 +381,8 @@ fn read(src: &Sources, plan: &Plan, extra_docs: &[u32]) -> crate::Result<Read> {
         docs,
         time,
         postings_bytes,
-        index_bytes: src.segments().iter().map(|s| s.source().bytes.get()).sum(),
+        index_bytes: src.segments().iter().map(|s| s.source().bytes.get()).sum::<u64>()
+            + src.resident.map_or(0, |r| r.bytes.get()),
         prefix_terms,
         capped_prefixes,
     })
@@ -529,6 +552,9 @@ fn time_arm(
             evict_files(corpus, &discovery.docs)?;
             for segment in src.segments() {
                 segment.source().evict()?;
+            }
+            if let Some(resident) = src.resident {
+                resident.evict()?;
             }
             let (cold, cold_docs, cold_matches) = trial(corpus, q, src, plan, extra_docs)?;
             let (warm, warm_docs, warm_matches) = trial(corpus, q, src, plan, extra_docs)?;
@@ -801,9 +827,10 @@ fn shipped_plans(corpus: &Corpus, flags: GrepFlags) -> crate::Result<Vec<Plan>> 
     Ok(plans)
 }
 
-const ARMS: [&str; 9] = [
+const ARMS: [&str; 10] = [
     "rg",
     "residue",
+    "resident",
     "rg-j1",
     "trigrams",
     "terms",
@@ -913,6 +940,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             extra: None,
             fallback: &empty,
             live: &corpus.live,
+            resident: None,
         };
         time_arm("trigrams", &corpus, &shipped, &src, &extra_docs, &ALL_TIMED, &mut private)?;
     }
@@ -924,6 +952,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             extra: None,
             fallback: &fallback,
             live: &corpus.live,
+            resident: None,
         };
         // Without the fallback: what T1 and the cap lose, measured, never
         // timed.
@@ -958,8 +987,38 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             extra: None,
             fallback: &fallback,
             live: &corpus.live,
+            resident: None,
         };
         residue_arm(&corpus, &shipped, lookups, &src, &extra_docs)?;
+    }
+    if wants("resident") {
+        let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
+        let docs: Vec<u32> = fallback.range(0, corpus.live.bound()).collect();
+        let resident = Resident::build(&term, &corpus, &docs, scratch)?;
+        let (dictionary, residue, terms, residue_docs) = resident.sizes();
+        println!(
+            "resident dictionary_bytes={dictionary} terms={terms} residue_bytes={residue} residue_docs={residue_docs}"
+        );
+        let src = Sources {
+            tri: &tri,
+            term: Some(&term),
+            extra: None,
+            fallback: &empty,
+            live: &corpus.live,
+            resident: Some(&resident),
+        };
+        let plans: Vec<_> = corpus
+            .samples
+            .iter()
+            .zip(&shipped)
+            .map(|(s, p)| {
+                Plan::and([
+                    p.clone(),
+                    Plan::or([term_plan(&s.facts, lookups), Plan::Leaf(Leaf::Fallback)]),
+                ])
+            })
+            .collect();
+        time_arm("resident", &corpus, &plans, &src, &extra_docs, &ALL_TIMED, &mut private)?;
     }
     if wants("terms") {
         let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
@@ -969,6 +1028,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             extra: None,
             fallback: &fallback,
             live: &corpus.live,
+            resident: None,
         };
         let plans: Vec<_> = corpus
             .samples
@@ -1016,6 +1076,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             extra: Some(&segment),
             fallback: &empty,
             live: &corpus.live,
+            resident: None,
         };
         time_arm("word45", &corpus, &plans, &src, &extra_docs, &ALL_TIMED, &mut private)?;
         drop(segment);
@@ -1045,6 +1106,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             extra: Some(&segment),
             fallback: &empty,
             live: &corpus.live,
+            resident: None,
         };
         time_arm(
             &label,
