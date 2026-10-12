@@ -914,7 +914,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
         };
         time_arm("trigrams", &corpus, &shipped, &src, &extra_docs, &ALL_TIMED, &mut private)?;
     }
-    if wants("terms") || wants("terms-raw") {
+    if wants("terms-raw") {
         let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
         let src = Sources {
             tri: &tri,
@@ -947,9 +947,16 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
                 &mut private,
             )?;
         }
-        if !wants("terms") {
-            return finish(scratch, case, &arms, private);
-        }
+    }
+    if wants("terms") {
+        let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
+        let src = Sources {
+            tri: &tri,
+            term: Some(&term),
+            extra: None,
+            fallback: &fallback,
+            live: &corpus.live,
+        };
         let plans: Vec<_> = corpus
             .samples
             .iter()
