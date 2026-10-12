@@ -5,7 +5,8 @@
 //! frozen corpus once and reports, for no policy, T1, T2 and T1+T2: terms,
 //! hapaxes and their bytes, postings each policy drops, false-suppression
 //! counts, epoch candidates by range band and key context, and the date
-//! index's shape and query costs at second, minute, hour and day keys.
+//! layouts' sizes and query costs (`ferret_index::dates`): for timestamps in
+//! content, and for the catalog's mtime and ctime against a plain column.
 //! `--samples` writes suppressed runs from code and prose files, and their
 //! extensions, for review by hand: that file holds content, so it belongs
 //! in a gitignored directory. Stdout carries counts only.
@@ -23,8 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
-use ferret_catalog::{Catalog, NameId, Section, Target};
-use ferret_index::dates::{DateIndex, pair_layout_bytes};
+use ferret_catalog::{Catalog, InoId, NameId, Section, Target};
+use ferret_index::dates::{Bucketed, Hits, Size, TimeMajor};
 use ferret_text::{
     EPOCH_RANGE, Form, Key, Policy, Scratch, base64_runs, cap, epoch_key, has_timestamp_in,
     timestamps, tokenize, tokenize_with,
@@ -118,12 +119,6 @@ const ARMS: [(&str, Policy); 4] = [
 ];
 
 const SHARDS: usize = 256;
-const GRANULARITIES: [(&str, i64); 4] = [
-    ("second", 1),
-    ("minute", 60),
-    ("hour", 3600),
-    ("day", 86_400),
-];
 /// Seconds east of UTC for the local-day ranges: Sydney in October.
 const LOCAL_OFFSET: i64 = 11 * 3600;
 const QUERIES: usize = 30;
@@ -347,6 +342,7 @@ pub(crate) fn census(catalog_dir: &Path, corpus: &Path, options: &[String]) -> c
     // Threads append in any order; sort so the seeded picks repeat.
     occurrences.sort_unstable();
     report_dates(corpus, &mut pairs, &occurrences)?;
+    report_file_times(catalog_dir)?;
     if let Some(out) = samples_out {
         write_samples(out, picked.into_inner()?)?;
     }
@@ -622,11 +618,90 @@ fn report_stamps(totals: &DocTotals) {
     }
 }
 
-fn quantile(sorted: &[u32], q: f64) -> u32 {
-    if sorted.is_empty() {
-        return 0;
+/// A date layout under measurement.
+enum Layout {
+    TimeMajor(TimeMajor),
+    Bucketed(Bucketed),
+}
+
+impl Layout {
+    fn label(&self) -> String {
+        let unit = |s: i64| match s {
+            1 => "s".to_owned(),
+            60 => "min".to_owned(),
+            3_600 => "hour".to_owned(),
+            86_400 => "day".to_owned(),
+            _ => format!("{s}s"),
+        };
+        match self {
+            Self::TimeMajor(i) => format!("time-major, {}", unit(i.resolution())),
+            Self::Bucketed(i) if i.bucket() == i.resolution() => {
+                format!("bucketed by {}, no offset", unit(i.bucket()))
+            }
+            Self::Bucketed(i) => {
+                format!(
+                    "bucketed by {}, {} offset",
+                    unit(i.bucket()),
+                    unit(i.resolution())
+                )
+            }
+        }
     }
-    sorted[((sorted.len() - 1) as f64 * q).round() as usize]
+
+    fn size(&self) -> Size {
+        match self {
+            Self::TimeMajor(i) => i.size(),
+            Self::Bucketed(i) => i.size(),
+        }
+    }
+
+    fn range(&self, from: i64, to: i64) -> Hits {
+        match self {
+            Self::TimeMajor(i) => i.range(from, to),
+            Self::Bucketed(i) => i.range(from, to),
+        }
+    }
+}
+
+/// The layouts measured: time-major at a second and a minute, bucketed by day
+/// and by hour at several offset resolutions, and offset-free buckets.
+fn layouts(pairs: &[(i64, u32)]) -> Vec<Layout> {
+    let mut out = Vec::new();
+    for resolution in [1, 60] {
+        out.push(Layout::TimeMajor(TimeMajor::build(resolution, pairs)));
+    }
+    for (bucket, resolution) in [
+        (86_400, 1),
+        (86_400, 60),
+        (3_600, 1),
+        (3_600, 60),
+        (3_600, 3_600),
+        (86_400, 86_400),
+    ] {
+        out.push(Layout::Bucketed(Bucketed::build(bucket, resolution, pairs)));
+    }
+    out
+}
+
+fn print_sizes(layouts: &[Layout]) {
+    println!(
+        "| layout | entries | bytes | bytes/entry | time bits/entry | doc bits/entry | header bytes |"
+    );
+    println!("| --- | --- | --- | --- | --- | --- | --- |");
+    for layout in layouts {
+        let size = layout.size();
+        let per = |bits: usize| bits as f64 / size.entries.max(1) as f64;
+        println!(
+            "| {} | {} | {} | {:.2} | {:.1} | {:.1} | {} |",
+            layout.label(),
+            size.entries,
+            size.bytes(),
+            size.bytes() as f64 / size.entries.max(1) as f64,
+            per(size.time_bits),
+            per(size.doc_bits),
+            size.header_bytes,
+        );
+    }
 }
 
 fn report_dates(
@@ -654,41 +729,25 @@ fn report_dates(
             occurrences.get(i).map(|o| (o.0, o.1))
         })
         .collect();
-    println!();
-    println!(
-        "| key | index bytes | pair-layout bytes | keys | pairs | docs/key median | docs/key p99 | docs/key max |"
-    );
-    println!("| --- | --- | --- | --- | --- | --- | --- | --- |");
-    let mut indexes = Vec::new();
-    for (label, granularity) in GRANULARITIES {
-        let mut copy = pairs.clone();
-        let index = DateIndex::build(granularity, &mut copy);
-        let pair_bytes = pair_layout_bytes(&copy);
-        let mut per_key = index.docs_per_key();
-        per_key.sort_unstable();
-        println!(
-            "| {label} | {} | {pair_bytes} | {} | {} | {} | {} | {} |",
-            index.bytes(),
-            index.keys(),
-            index.pairs(),
-            quantile(&per_key, 0.5),
-            quantile(&per_key, 0.99),
-            per_key.last().copied().unwrap_or(0),
-        );
-        indexes.push((label, index));
-    }
+    let layouts = layouts(pairs);
     pairs.clear();
     pairs.shrink_to_fit();
+    println!();
+    println!(
+        "Date layouts: (time, doc) entries as integers, deduplicated at each layout's resolution; doc ids fit {} bits.",
+        64 - u64::from(sizes.keys().max().copied().unwrap_or(0)).leading_zeros()
+    );
+    print_sizes(&layouts);
 
     println!();
     println!(
-        "{QUERIES} seeded queries per class, picked from timestamp occurrences. Point: the occurrence's instant to the millisecond. Day: its UTC day, and its local (UTC+11) day. Month: its UTC month. Candidates are documents the index returns; verified are those that must be read, because the query is not on key boundaries (or carries a fraction). Warm verify reads and scans each verified document once untimed, then times it."
+        "{QUERIES} seeded queries per class, picked from timestamp occurrences. Point: the occurrence's instant to the millisecond (so every candidate verifies). Day: its UTC day, and its local (UTC+11) day. Month: its UTC month. Exact documents need no read; maybe documents come from cells the range clips and must be read. Warm verify reads and scans each maybe document once untimed, then times it."
     );
     println!(
-        "| key | query | candidates median | candidates p90 | verified docs median | verified docs p90 | verify MB median | verify MB p90 | lookup ms median | verify ms median | verify ms p90 | true matches median |"
+        "| layout | query | candidates median | candidates p90 | verified docs median | verified docs p90 | verify MB median | verify MB p90 | lookup ms median | verify ms median | verify ms p90 | true matches median |"
     );
     println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
-    for (label, index) in &indexes {
+    for layout in &layouts {
         for query in ["point", "utc-day", "local-day", "month"] {
             let mut rows: Vec<[f64; 6]> = Vec::new();
             for &(seconds, nanos) in &picks {
@@ -714,50 +773,38 @@ fn report_dates(
                 // A range ending on a fraction still needs its last second.
                 let to_key = if to_n > 0 { to + 1 } else { to };
                 let lookup_start = Instant::now();
-                let mut docs = Vec::new();
-                index.range(from, to_key, &mut docs);
+                let mut hits = layout.range(from, to_key);
                 let lookup = lookup_start.elapsed();
-                let exact = from_n == 0 && to_n == 0 && index.exact(from, to);
-                let mut verify_docs = Vec::new();
-                if !exact {
-                    // Interior keys are exact; only documents of the edge
-                    // keys need reading.
-                    let g = index.granularity();
-                    let mut edges = Vec::new();
-                    index.range(from, from - from.rem_euclid(g) + g, &mut edges);
-                    let mut tail = Vec::new();
-                    let last_key_start = (to_key - 1) - (to_key - 1).rem_euclid(g);
-                    index.range(last_key_start, to_key, &mut tail);
-                    edges.extend(tail);
-                    edges.sort_unstable();
-                    edges.dedup();
-                    verify_docs = edges;
+                if from_n > 0 || to_n > 0 {
+                    // The layouts dropped fractions: nothing is exact.
+                    hits.maybe.append(&mut hits.exact);
+                    hits.maybe.sort_unstable();
                 }
-                let bytes: u64 = verify_docs.iter().filter_map(|d| sizes.get(d)).sum();
-                let mut matched = docs.len() - verify_docs.len();
+                let bytes: u64 = hits.maybe.iter().filter_map(|d| sizes.get(d)).sum();
+                let mut matched = hits.exact.len();
                 let mut verify_ms = 0.0;
-                if !verify_docs.is_empty() {
+                if !hits.maybe.is_empty() {
                     let mut buffer = Vec::new();
                     for pass in 0..2 {
                         let start = Instant::now();
-                        let mut hits = 0;
-                        for &doc in &verify_docs {
+                        let mut found = 0;
+                        for &doc in &hits.maybe {
                             buffer.clear();
                             if let Ok(b) = fs::read(corpus.join(doc.to_string())) {
                                 buffer = b;
                             }
-                            hits +=
+                            found +=
                                 usize::from(has_timestamp_in(&buffer, (from, from_n), (to, to_n)));
                         }
                         if pass == 1 {
                             verify_ms = start.elapsed().as_secs_f64() * 1e3;
-                            matched += hits;
+                            matched += found;
                         }
                     }
                 }
                 rows.push([
-                    docs.len() as f64,
-                    verify_docs.len() as f64,
+                    hits.len() as f64,
+                    hits.maybe.len() as f64,
                     bytes as f64 / 1e6,
                     lookup.as_secs_f64() * 1e3,
                     verify_ms,
@@ -770,7 +817,8 @@ fn report_dates(
                 values[((values.len() - 1) as f64 * q).round() as usize]
             };
             println!(
-                "| {label} | {query} | {:.0} | {:.0} | {:.0} | {:.0} | {:.2} | {:.2} | {:.3} | {:.2} | {:.2} | {:.0} |",
+                "| {} | {query} | {:.0} | {:.0} | {:.0} | {:.0} | {:.2} | {:.2} | {:.3} | {:.2} | {:.2} | {:.0} |",
+                layout.label(),
                 column(0, 0.5),
                 column(0, 0.9),
                 column(1, 0.5),
@@ -782,6 +830,93 @@ fn report_dates(
                 column(4, 0.9),
                 column(5, 0.5),
             );
+        }
+    }
+    Ok(())
+}
+
+/// mtime and ctime: one u32 per inode. The same layouts against a plain
+/// column, a u32 per inode in inode order, scanned in full for a range.
+fn report_file_times(catalog_dir: &Path) -> crate::Result<()> {
+    let catalog = crate::open_catalog(catalog_dir)?;
+    catalog.load(&[Section::Mtime, Section::Ctime])?;
+    let inodes = catalog.inode_count();
+    for (label, read) in [
+        ("mtime", Catalog::mtime as fn(&Catalog, InoId) -> i64),
+        ("ctime", Catalog::ctime),
+    ] {
+        let column: Vec<u32> = (0..inodes)
+            .map(|i| read(&catalog, InoId(i)).clamp(0, i64::from(u32::MAX)) as u32)
+            .collect();
+        let pairs: Vec<(i64, u32)> = column
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (i64::from(t), i as u32))
+            .collect();
+        let mut distinct = column.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        println!();
+        println!(
+            "{label}: {inodes} inodes, {} distinct seconds; plain column {} bytes (4 per inode)",
+            distinct.len(),
+            column.len() * 4
+        );
+        let layouts = layouts(&pairs);
+        print_sizes(&layouts);
+        // Seeded day and month ranges around real values, and the last 7 days
+        // before the newest value.
+        let mut rng = crate::content_query::Rng(0x6d74_696d);
+        let newest = i64::from(distinct.last().copied().unwrap_or(0));
+        let mut ranges = Vec::new();
+        for _ in 0..QUERIES {
+            let t = i64::from(column[rng.below(u64::from(inodes.max(1))) as usize]);
+            let day = t - t.rem_euclid(86_400);
+            ranges.push(("day", day, day + 86_400));
+            let (from, to) = month_bounds(t);
+            ranges.push(("month", from, to));
+        }
+        let week = newest - newest.rem_euclid(86_400) + 86_400;
+        ranges.push(("last 7 days", week - 7 * 86_400, week));
+        println!(
+            "| {label} query | layout | matches median | maybe median | lookup ms median | column scan ms median |"
+        );
+        println!("| --- | --- | --- | --- | --- | --- |");
+        for class in ["day", "month", "last 7 days"] {
+            let chosen: Vec<_> = ranges.iter().filter(|r| r.0 == class).collect();
+            let mut scan = Vec::new();
+            for &&(_, from, to) in &chosen {
+                let start = Instant::now();
+                let found = column
+                    .iter()
+                    .filter(|&&t| (from..to).contains(&i64::from(t)))
+                    .count();
+                std::hint::black_box(found);
+                scan.push(start.elapsed().as_secs_f64() * 1e3);
+            }
+            scan.sort_by(f64::total_cmp);
+            for layout in &layouts {
+                let mut rows: Vec<[f64; 3]> = Vec::new();
+                for &&(_, from, to) in &chosen {
+                    let start = Instant::now();
+                    let hits = layout.range(from, to);
+                    let ms = start.elapsed().as_secs_f64() * 1e3;
+                    rows.push([hits.len() as f64, hits.maybe.len() as f64, ms]);
+                }
+                let median = |i: usize| {
+                    let mut v: Vec<f64> = rows.iter().map(|r| r[i]).collect();
+                    v.sort_by(f64::total_cmp);
+                    v[v.len() / 2]
+                };
+                println!(
+                    "| {class} | {} | {:.0} | {:.0} | {:.3} | {:.3} |",
+                    layout.label(),
+                    median(0),
+                    median(1),
+                    median(2),
+                    scan[scan.len() / 2],
+                );
+            }
         }
     }
     Ok(())

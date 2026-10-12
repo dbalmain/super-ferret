@@ -4039,6 +4039,98 @@ Workspace gates pass **939 tests** (938 + one new: a real merge for codecs 5–7
 counting graduation and demotion reads, which asserts C4b's reader is never
 called). Every H soundness test that looped codecs 2–5 now loops 2–7.
 
+### D65 update — token policy
+
+2026-10-12, same catalog and corpus as slice C;
+[method, results and semantics](TOKENS.md). Two opt-in tokenizer policies
+were tried, over codec 1 and over C4b.
+
+- **T1** drops base64-like runs from the term index.
+- **T2** moves timestamps to a date index, keeping their date pieces as terms
+  and dropping the time of day and keyed epoch numbers.
+
+Trigrams are untouched, so `grep:` still sees every byte. Every query
+matched the codec-1 control apart from rows the policy explains: the
+document held the term only inside a suppressed span.
+
+| Steady, against codec 1 | Term index | CPU | Mid median | Rows dropped (mid / common) |
+| --- | --- | --- | --- | --- |
+| codec 1, no policy | 450.28 MB | 269.05 s | 1.88 ms | — |
+| codec 1, T1 | 221.21 MB (50.9%) | 1.026× | 0.88× | 11,227 / 23,417 |
+| codec 1, T2 | 442.63 MB (1.7%) + 3.3 MB dates | 1.016× | 1.04× | 2,008 / 2,894 |
+| codec 1, T1+T2 | 215.62 MB (52.1%) + 3.3 MB dates | 1.060× | 0.88× | 13,424 / 26,393 |
+| C4b, T1+T2 | 189.94 MB (57.8%) + 3.3 MB dates | 1.134× | 1.43× (1.63× same policy) | as above |
+
+Hapaxes fall from 13.33M to 7.39M under T1 and to 12.56M under T2. On a
+hand-checked sample, T1's false suppressions were about 6 of 150 code runs
+(identifiers built from short capitalised words and digits), plus about 13
+runs of SVG path data. Prose had none. A has-suppressed-runs flag that
+restored exact `text:` would send 2.24 GB of documents to verification.
+
+**The brief's headline question, "does T1+T2 bring C4b inside the gates?",
+answers no.**
+
+- The mid median passes on paper, at 1.43×, only because the policies
+  removed 13,424 mid rows, about 8% at the median of 3,363 rows a query.
+  Against codec 1 under the same policy, C4b is 1.63×, and mid p90 is still
+  2.6×.
+- The churn penalty is unchanged byte for byte. The S2 trace is synthetic and
+  holds no blobs or timestamps.
+
+So the policies are a separate decision from C4b. T1 alone halves codec 1's
+term index at 2.6% CPU.
+
+**Question 1: should the term index adopt T1?**
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. No policy | 450 MB steady; 13.3M hapaxes, 44% of them blob fragments. | Exact `text:` for any token. |
+| B. T1, plus a manifest field and version check | `text:` stops matching blob pieces: 21–30% of rare control terms, and 24 of 50 mid queries lose rows (11k), all inside blobs. About 4% of reviewed code runs are real identifiers. 2.6% CPU. | 50.9% steady saving (229 MB) on codec 1, and better rare and mid latency. |
+| C. T1, routing blob-looking `text:` terms to trigrams | B's costs, minus the blob-term misses; a planner branch on the detector. | B's saving, with `text:<blob>` still answering through trigrams. Short words inside blobs stay unmatched. |
+
+**Recommendation: C.** The saving is the largest any D65 arm has found, and
+it costs no merge-time reads. What it drops is almost all noise. Option C
+keeps the one query a user would notice, pasting a blob into `text:`.
+**The fact that would change it:** a second corpus where the code-run false
+positives clearly exceed about 5%, or where users search `text:` for short
+words inside keys.
+
+**Question 2: should timestamps go to a date index, and in which layout?**
+
+T2 is a capability, not a saving. It removes 7.6 MB of terms and adds 3.3 MB
+of dates. Following Dave's framing, dates are stored as u32 UTC seconds,
+deduplicated per (time, doc).
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. No date index | Dates stay terms; no range queries. | Nothing to build. |
+| B. Bucketed by day, 1 s offsets | 3.29 MB, 2.62 B/entry (17 offset bits, 3.4 doc bits). | Day, local-day and month exact; a point query verifies 2 docs / 4 MB / 8 ms (only for its fraction); month lookup 2 ms. |
+| C. Time-major, 1 s | 3.88 MB, 3.09 B/entry (17 of 24 bits are doc ids). | The same exactness; simpler; 0.1 ms day lookup. |
+| D. Day buckets, 1 min offsets | 1.57 MB, 2.27 B/entry. | Half the bytes; a point query reads 16 MB / 47 ms (p90 88). |
+| E. Day buckets, no offset | 0.38 MB. | Smallest; a point query reads 171 MB / 328 ms, and a local day 241 MB. |
+
+**Recommendation: B, if date search is wanted at all.** At second resolution
+uniqueness costs only bits. Day buckets delta-code their doc lists to 3.4
+bits, where time-major cannot compress doc ids. B is 15% smaller than C with
+the same exactness. Under T2, `text:2026` still matches, because date pieces
+stay as terms. **The fact that would change it:** point queries turning out
+rare next to day queries, which would favour D. Or a corpus whose timestamps
+spread across far more documents per day, which would erode B's doc-list
+advantage and favour C.
+
+**Question 3: where do mtime and ctime belong?** They are one u32 per inode,
+and the catalog already stores both as columns.
+
+| Option | Cost | Buys |
+| --- | --- | --- |
+| A. The existing catalog column, scanned | 4 B/inode, already paid; 0.32 ms per range at 394k inodes (about 0.8 ms at 1M). | No new structure; fastest for month and week ranges, which match 7–9% of inodes. |
+| B. A sorted index in B's layout | 4.2 B/inode more (bucketed); single-valued keys lose the doc-list compression. | 0.06 ms instead of 0.32 for a one-day range. |
+| C. Time-major sorted permutation | 2.9 B/inode more. | 0.16 ms day ranges; slower than a scan for month ranges. |
+
+**Recommendation: A.** No measured range needs anything faster than a column
+scan. **The fact that would change it:** catalogs of about 10M inodes, where a
+scan nears 10 ms and selective "changed today" queries dominate. Then C.
+
 ## D66 — Phrase queries read too much: positions, or not
 
 **Status: answered, D: a per-document Bloom 8 pair filter (Dave, 2026-10-11).**
