@@ -25,6 +25,7 @@ use super::query::Need;
 use super::{Corpus, counts, prepare_with, stats};
 
 mod hashed;
+mod product;
 mod resident;
 mod residue;
 mod rg;
@@ -831,8 +832,9 @@ fn shipped_plans(corpus: &Corpus, flags: GrepFlags) -> crate::Result<Vec<Plan>> 
     Ok(plans)
 }
 
-const ARMS: [&str; 10] = [
+const ARMS: [&str; 11] = [
     "rg",
+    "product",
     "residue",
     "resident",
     "rg-j1",
@@ -934,6 +936,9 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
     }
     if wants("rg") {
         rg_arm("rg", &corpus, flags, corpus_dir, None, &mut private)?;
+    }
+    if wants("product") {
+        product::arm(&corpus, flags, index, &mut private)?;
     }
     if wants("rg-j1") {
         rg_arm("rg-j1", &corpus, flags, corpus_dir, Some(1), &mut private)?;

@@ -23,9 +23,17 @@ pub(super) struct Scan {
     pub(super) device: u64,
 }
 
-/// Reaped children's I/O lands in the parent's `/proc/self/io`, and their
-/// CPU in `cutime`/`cstime`; deltas around one spawn are that child's.
-fn counters() -> crate::Result<(u64, u64, f64)> {
+/// This process's I/O and CPU, threads included. Reaped children's I/O
+/// lands in `/proc/self/io` too, and their CPU in `cutime`/`cstime`; deltas
+/// around one spawn are that child's.
+pub(super) struct Counters {
+    pub(super) rchar: u64,
+    pub(super) device: u64,
+    pub(super) children_cpu: f64,
+    pub(super) self_cpu: f64,
+}
+
+pub(super) fn counters() -> crate::Result<Counters> {
     let io = fs::read_to_string("/proc/self/io")?;
     let field = |name: &str| -> crate::Result<u64> {
         Ok(io
@@ -36,17 +44,19 @@ fn counters() -> crate::Result<(u64, u64, f64)> {
             .parse()?)
     };
     let stat = fs::read_to_string("/proc/self/stat")?;
+    // Fields after the command, from `state` (field 3) on.
     let fields: Vec<&str> = stat
         .rsplit_once(") ")
         .map_or(Vec::new(), |(_, rest)| rest.split(' ').collect());
     let tick = |i: usize| -> crate::Result<u64> {
         Ok(fields.get(i).ok_or("short /proc/self/stat")?.parse()?)
     };
-    Ok((
-        field("rchar:")?,
-        field("read_bytes:")?,
-        (tick(13)? + tick(14)?) as f64 / 100.0,
-    ))
+    Ok(Counters {
+        rchar: field("rchar:")?,
+        device: field("read_bytes:")?,
+        self_cpu: (tick(11)? + tick(12)?) as f64 / 100.0,
+        children_cpu: (tick(13)? + tick(14)?) as f64 / 100.0,
+    })
 }
 
 pub(super) fn scan(
@@ -103,8 +113,8 @@ pub(super) fn scan(
     Ok(Scan {
         docs,
         wall,
-        cpu: after.2 - before.2,
-        rchar: after.0 - before.0,
-        device: after.1 - before.1,
+        cpu: after.children_cpu - before.children_cpu,
+        rchar: after.rchar - before.rchar,
+        device: after.device - before.device,
     })
 }
