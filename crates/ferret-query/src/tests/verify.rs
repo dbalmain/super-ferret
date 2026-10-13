@@ -411,14 +411,26 @@ fn a_ready_head_leaves_while_candidates_are_rejected() {
     let files: Vec<_> = files.iter().map(|(n, s, h)| (n.as_str(), *s, *h)).collect();
     let fx = fixture("rejected", &files);
     let query = "grep:needle AND ( name:a.txt OR name:absent )";
-    let script = Script::new(files.iter().map(|&(name, ..)| (name, "needle")));
-    // The first rejection waits until `a.txt` has been answered; each counts.
+    let script = || Script::new(files.iter().map(|&(name, ..)| (name, "needle")));
+    // `a.txt`'s read is held until the first rejection, so it cannot be
+    // answered before the window first looks; that rejection then waits
+    // until it has been. Each rejection counts.
+    let rejected = Arc::new(Signal::default());
+    let gated = script().gated({
+        let rejected = Arc::clone(&rejected);
+        move |name, _| {
+            if name == "a.txt" {
+                rejected.wait("the first rejection");
+            }
+        }
+    });
     let polls = Arc::new(AtomicUsize::new(0));
     let _seams = Seams {
         on_poll: Some({
             let polls = Arc::clone(&polls);
             Arc::new(move |finished: &dyn Fn() -> u64| {
                 polls.fetch_add(1, Ordering::AcqRel);
+                rejected.set();
                 let deadline = Instant::now() + PATIENCE;
                 while finished() == 0 {
                     assert!(Instant::now() < deadline, "a.txt never finished");
@@ -430,7 +442,7 @@ fn a_ready_head_leaves_while_candidates_are_rejected() {
     }
     .set();
     let mut polls_at_emit = None;
-    let (rows, stats) = run(&fx, query, 2, &script, None, |_| {
+    let (rows, stats) = run(&fx, query, 2, &gated, None, |_| {
         polls_at_emit = Some(polls.load(Ordering::Acquire));
         ControlFlow::Break(())
     });
@@ -441,7 +453,7 @@ fn a_ready_head_leaves_while_candidates_are_rejected() {
         "the head waited for later candidates"
     );
     assert_eq!(stats.candidates, 1);
-    let one = run(&fx, query, 1, &script, None, limit(1));
+    let one = run(&fx, query, 1, &script(), None, limit(1));
     assert_eq!(comparable((rows, stats)), comparable(one));
 }
 
