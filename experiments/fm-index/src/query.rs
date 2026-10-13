@@ -165,6 +165,10 @@ fn rarest(
     }
 }
 
+/// FM_DRY=1: count and plan, but locate nothing; `located` then says how
+/// many occurrences the plan would locate. Candidates are meaningless.
+static DRY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("FM_DRY").is_ok());
+
 /// How much of the tree a lookup locates.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
@@ -231,6 +235,10 @@ pub fn run(
             continue;
         }
         cost.located += n;
+        if *DRY {
+            positions.push((lit, None));
+            continue;
+        }
         let mut out = Vec::with_capacity(n as usize);
         match &index {
             Index::Sa(sa) => sa.positions((lo as usize, hi as usize), &mut out),

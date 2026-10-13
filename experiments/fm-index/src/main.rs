@@ -126,6 +126,9 @@ fn lookup(
     if std::env::var("FM_RESIDENT").is_ok() {
         set += "-resident";
     }
+    if std::env::var("FM_DRY").is_ok() {
+        set += "-dry";
+    }
     // FM_CLASS limits a run to one class (rows for the rest are skipped).
     let only = std::env::var("FM_CLASS").ok();
     let cand_dir = dir.join("cand").join(&set);
@@ -170,7 +173,7 @@ fn lookup(
             .join("cand")
             .join(set.replacen(arm, "sa", 1).replace("-resident", ""))
             .join(format!("q{i}.k{k}"));
-        if rate.is_some() && twin.exists() {
+        if rate.is_some() && twin.exists() && std::env::var("FM_DRY").is_err() {
             // The FM-index must locate exactly what the suffix array did
             // under the same plan and cap.
             let sa = fs::read(&twin).expect("sa cands");
