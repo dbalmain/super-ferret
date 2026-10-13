@@ -87,13 +87,7 @@ fn plan(corpus: &Path, oracle: &Path, dir: &Path) {
             picked.len(),
             picked.iter().filter(|q| q.lines.is_ok()).count(),
             util::median_p90(leaf_sets.iter().map(|s| s.len() as f64).collect()),
-            util::median_p90(
-                leaf_sets
-                    .iter()
-                    .flatten()
-                    .map(|l| l.len() as f64)
-                    .collect()
-            ),
+            util::median_p90(leaf_sets.iter().flatten().map(|l| l.len() as f64).collect()),
         );
     }
     fs::create_dir_all(dir.join("rows")).expect("rows");
@@ -157,11 +151,27 @@ fn lookup(
     let run = |q: &pop::Query| match rate {
         None => {
             let sa = Sa::open(dir, k);
-            query::run(Index::Sa(&sa), &table, &sizes, &q.facts, q.lines.is_ok(), cap, plan)
+            query::run(
+                Index::Sa(&sa),
+                &table,
+                &sizes,
+                &q.facts,
+                q.lines.is_ok(),
+                cap,
+                plan,
+            )
         }
         Some(r) => {
             let fm = Fm::open(dir, k, r);
-            query::run(Index::Fm(&fm), &table, &sizes, &q.facts, q.lines.is_ok(), cap, plan)
+            query::run(
+                Index::Fm(&fm),
+                &table,
+                &sizes,
+                &q.facts,
+                q.lines.is_ok(),
+                cap,
+                plan,
+            )
         }
     };
     for (i, q) in queries.iter().enumerate() {
@@ -177,7 +187,10 @@ fn lookup(
             // The FM-index must locate exactly what the suffix array did
             // under the same plan and cap.
             let sa = fs::read(&twin).expect("sa cands");
-            assert!(query::decode(&sa) == found, "fm differs from sa: query {i} segment {k}");
+            assert!(
+                query::decode(&sa) == found,
+                "fm differs from sa: query {i} segment {k}"
+            );
         }
         fs::write(cand_dir.join(format!("q{i}.k{k}")), query::encode(&found)).expect("cands");
         if !resident {
@@ -189,7 +202,10 @@ fn lookup(
         let (cold_c, cold) = run(q);
         let device = util::device_read_bytes() - device;
         let (warm_c, warm) = run(q);
-        assert!(cold_c == found && warm_c == found, "candidates moved: query {i}");
+        assert!(
+            cold_c == found && warm_c == found,
+            "candidates moved: query {i}"
+        );
         let ns = |d: std::time::Duration| d.as_nanos();
         let _ = writeln!(
             rows,
@@ -220,7 +236,8 @@ fn lookup(
     }
     let suffix = only.map_or(String::new(), |c| format!("-{}", c.replace(' ', "_")));
     fs::write(
-        dir.join("rows").join(format!("lookup-{set}-k{k}{suffix}.tsv")),
+        dir.join("rows")
+            .join(format!("lookup-{set}-k{k}{suffix}.tsv")),
         rows,
     )
     .expect("rows");
@@ -243,7 +260,11 @@ fn verify(corpus: &Path, oracle: &Path, dir: &Path, set: &str, threads: usize, m
             cands.extend(query::decode(&bytes));
         }
         let ids: Vec<u32> = cands.iter().map(|c| c.doc).collect();
-        let missed = q.oracle.iter().filter(|d| ids.binary_search(d).is_err()).count();
+        let missed = q
+            .oracle
+            .iter()
+            .filter(|d| ids.binary_search(d).is_err())
+            .count();
         let cand_bytes: u64 = ids.iter().map(|&d| sizes[d as usize]).sum();
         for mode in modes.split(',') {
             let whole = mode == "whole";

@@ -128,10 +128,12 @@ fn verify_table(dir: &Path, file: &str) {
             if r.is_empty() {
                 continue;
             }
-            let col = |i: usize| {
-                median_p90(r.iter().map(|x| x[i].parse().expect("num")).collect())
+            let col = |i: usize| median_p90(r.iter().map(|x| x[i].parse().expect("num")).collect());
+            let sum = |i: usize| {
+                r.iter()
+                    .map(|x| x[i].parse::<f64>().expect("num"))
+                    .sum::<f64>()
             };
-            let sum = |i: usize| r.iter().map(|x| x[i].parse::<f64>().expect("num")).sum::<f64>();
             println!(
                 "| {class} | {mode} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}/{} | {}/{} |",
                 r.len(),
@@ -198,7 +200,10 @@ pub fn run(dir: &Path) {
     names.sort();
     let mut sets = BTreeSet::new();
     for n in &names {
-        if let Some(rest) = n.strip_prefix("lookup-").and_then(|r| r.strip_suffix(".tsv")) {
+        if let Some(rest) = n
+            .strip_prefix("lookup-")
+            .and_then(|r| r.strip_suffix(".tsv"))
+        {
             let (set, tail) = rest.rsplit_once("-k").expect("segment");
             let suffix = tail.trim_start_matches(|c: char| c.is_ascii_digit());
             sets.insert((set.to_string(), suffix.to_string()));
@@ -223,7 +228,11 @@ pub fn run(dir: &Path) {
         // FM runs over every segment whose candidates equal the verified
         // set's (asserted at lookup time) share its verification.
         for (s, suffix) in &sets {
-            if s.starts_with("fm") && !s.contains("cap") && !s.contains("dry") && !s.contains("resident") {
+            if s.starts_with("fm")
+                && !s.contains("cap")
+                && !s.contains("dry")
+                && !s.contains("resident")
+            {
                 totals(dir, s, suffix, n, "line");
             }
         }
@@ -255,13 +264,20 @@ fn estimate(dir: &Path, verify_file: &str) {
         if alt.is_empty() || count.is_empty() || sa.is_empty() {
             continue;
         }
-        let per: f64 = alt.values().map(|v| v.1[5]).sum::<f64>() / alt.values().map(|v| v.1[9]).sum::<f64>();
+        let per: f64 =
+            alt.values().map(|v| v.1[5]).sum::<f64>() / alt.values().map(|v| v.1[9]).sum::<f64>();
         println!(
             "\n## FM s={rate} estimate, warm ms median/p90 (locate {per:.0} ns per occurrence, measured)"
         );
-        println!("| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |");
+        println!(
+            "| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |"
+        );
         for class in CLASSES {
-            let qs: Vec<usize> = sa.keys().copied().filter(|q| CLASSES[q / 50] == class).collect();
+            let qs: Vec<usize> = sa
+                .keys()
+                .copied()
+                .filter(|q| CLASSES[q / 50] == class)
+                .collect();
             let row = |located: &dyn Fn(usize) -> f64| -> (Vec<f64>, Vec<f64>) {
                 qs.iter()
                     .map(|&q| {

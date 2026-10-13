@@ -18,7 +18,8 @@ pub fn cpu_seconds() -> f64 {
     let after = &stat[stat.rfind(')').expect("comm") + 2..];
     let fields: Vec<&str> = after.split(' ').collect();
     // utime and stime are fields 14 and 15; `after` starts at field 3.
-    let ticks: u64 = fields[11].parse::<u64>().expect("utime") + fields[12].parse::<u64>().expect("stime");
+    let ticks: u64 =
+        fields[11].parse::<u64>().expect("utime") + fields[12].parse::<u64>().expect("stime");
     ticks as f64 / 100.0
 }
 
@@ -49,7 +50,11 @@ pub fn device_read_bytes() -> u64 {
 pub fn check_disk(path: &Path) {
     let st = rustix::fs::statvfs(path).expect("statvfs");
     let free = st.f_bavail * st.f_frsize;
-    assert!(free >= 8_000_000_000, "disk floor: {free} bytes free under {}", path.display());
+    assert!(
+        free >= 8_000_000_000,
+        "disk floor: {free} bytes free under {}",
+        path.display()
+    );
 }
 
 pub fn median_p90(mut v: Vec<f64>) -> (f64, f64) {

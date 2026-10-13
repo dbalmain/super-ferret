@@ -54,11 +54,7 @@ fn unescape(s: &str) -> String {
             Some('r') => out.push('\r'),
             Some('n') => out.push('\n'),
             Some('u') => {
-                let hex: String = chars
-                    .by_ref()
-                    .skip(1)
-                    .take_while(|&c| c != '}')
-                    .collect();
+                let hex: String = chars.by_ref().skip(1).take_while(|&c| c != '}').collect();
                 let code = u32::from_str_radix(&hex, 16).expect("escape");
                 out.push(char::from_u32(code).expect("scalar"));
             }
@@ -80,7 +76,10 @@ pub fn load(corpus: &Path, oracle: &Path) -> (Vec<Query>, Docs) {
     for (q, line) in lines.enumerate() {
         let (pattern, docs) = line.rsplit_once('\t').expect("row");
         let pattern = unescape(pattern);
-        assert_eq!(pattern.escape_default().to_string(), line.rsplit_once('\t').unwrap().0);
+        assert_eq!(
+            pattern.escape_default().to_string(),
+            line.rsplit_once('\t').unwrap().0
+        );
         let grep = flags.compile(&pattern).expect("compile");
         let facts = flags.required_literals(&pattern).expect("facts");
         let oracle = docs
@@ -148,14 +147,22 @@ fn walk(hir: &Hir) -> Result<(), &'static str> {
             }
         }
         HirKind::Class(Class::Unicode(set)) => {
-            if set.ranges().iter().any(|r| r.start() <= '\n' && '\n' <= r.end()) {
+            if set
+                .ranges()
+                .iter()
+                .any(|r| r.start() <= '\n' && '\n' <= r.end())
+            {
                 Err("class matches newline")
             } else {
                 Ok(())
             }
         }
         HirKind::Class(Class::Bytes(set)) => {
-            if set.ranges().iter().any(|r| r.start() <= b'\n' && b'\n' <= r.end()) {
+            if set
+                .ranges()
+                .iter()
+                .any(|r| r.start() <= b'\n' && b'\n' <= r.end())
+            {
                 Err("class matches newline")
             } else {
                 Ok(())

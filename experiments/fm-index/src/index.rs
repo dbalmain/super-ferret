@@ -98,7 +98,11 @@ pub fn read_u32s(path: &Path) -> Vec<u32> {
             break;
         }
         assert_eq!(n % 4, 0, "short u32 read");
-        out.extend(buf[..n].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().expect("4"))));
+        out.extend(
+            buf[..n]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("4"))),
+        );
     }
     out
 }
@@ -339,7 +343,9 @@ pub fn build_fm(dir: &Path, k: usize, rates: &[u32]) -> String {
         freq[b as usize] += 1;
     }
     let (nodes, codes) = huffman(&freq);
-    let total_words = nodes.last().map_or(0, |n| n.word0 as usize + 8 * blocks_for(n.len));
+    let total_words = nodes
+        .last()
+        .map_or(0, |n| n.word0 as usize + 8 * blocks_for(n.len));
     let mut words = vec![0u64; total_words];
     let mut cursor: Vec<u64> = nodes.iter().map(|n| n.word0 * 64).collect();
     for &b in &bwt {
@@ -362,7 +368,8 @@ pub fn build_fm(dir: &Path, k: usize, rates: &[u32]) -> String {
     let dir_words = directory(&words, &starts);
     let tree_bits: u64 = nodes.iter().map(|n| n.len).sum();
     {
-        let mut w = BufWriter::with_capacity(1 << 22, File::create(file(dir, k, "wt")).expect("wt"));
+        let mut w =
+            BufWriter::with_capacity(1 << 22, File::create(file(dir, k, "wt")).expect("wt"));
         let header = [
             n as u64,
             primary as u64,
@@ -423,9 +430,16 @@ pub fn build_fm(dir: &Path, k: usize, rates: &[u32]) -> String {
             w.flush().expect("flush");
         }
         write_u32s(&file(dir, k, &format!("s{rate}")), samples.iter().copied());
-        let m = fs::metadata(file(dir, k, &format!("m{rate}"))).expect("m").len();
-        let s = fs::metadata(file(dir, k, &format!("s{rate}"))).expect("s").len();
-        out += &format!(" rate{rate}_mark_bytes={m} rate{rate}_sample_bytes={s} rate{rate}_samples={}", samples.len());
+        let m = fs::metadata(file(dir, k, &format!("m{rate}")))
+            .expect("m")
+            .len();
+        let s = fs::metadata(file(dir, k, &format!("s{rate}")))
+            .expect("s")
+            .len();
+        out += &format!(
+            " rate{rate}_mark_bytes={m} rate{rate}_sample_bytes={s} rate{rate}_samples={}",
+            samples.len()
+        );
     }
     out
 }
@@ -682,7 +696,11 @@ mod tests {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            text.push(if i % 7 == 0 { b"abcab"[(x % 5) as usize] } else { (x % 256) as u8 });
+            text.push(if i % 7 == 0 {
+                b"abcab"[(x % 5) as usize]
+            } else {
+                (x % 256) as u8
+            });
         }
         text.extend_from_slice(b"\0\0abcabcabc\0");
         let sa: Vec<i32> = libsais::SuffixArrayConstruction::for_text(&text)
@@ -697,7 +715,16 @@ mod tests {
         let sa_view = Sa::open(&dir, 0);
         for rate in [1, 4, 32] {
             let fm = Fm::open(&dir, 0, rate);
-            for pat in [&b"a"[..], b"ab", b"abc", b"\0", b"\0\0a", b"cab", b"\xff", b"zzzz"] {
+            for pat in [
+                &b"a"[..],
+                b"ab",
+                b"abc",
+                b"\0",
+                b"\0\0a",
+                b"cab",
+                b"\xff",
+                b"zzzz",
+            ] {
                 let mut naive: Vec<u32> = (0..text.len())
                     .filter(|&i| text[i..].starts_with(pat))
                     .map(|i| i as u32)

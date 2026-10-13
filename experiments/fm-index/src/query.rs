@@ -49,12 +49,18 @@ pub fn leaves(tree: &RequiredLiterals, out: &mut BTreeSet<Vec<u8>>) {
     }
 }
 
+/// Each literal's (document, offset) hits, or `None` when it was not located.
+type Hits = BTreeMap<Vec<u8>, Option<Vec<(u32, u32)>>>;
+
 enum Res {
     All,
-    Set { docs: Vec<u32>, anchors: Vec<(u32, u32)> },
+    Set {
+        docs: Vec<u32>,
+        anchors: Vec<(u32, u32)>,
+    },
 }
 
-fn eval(tree: &RequiredLiterals, hits: &BTreeMap<Vec<u8>, Option<Vec<(u32, u32)>>>) -> Res {
+fn eval(tree: &RequiredLiterals, hits: &Hits) -> Res {
     match tree {
         RequiredLiterals::All => Res::All,
         RequiredLiterals::None => Res::Set {
@@ -103,7 +109,10 @@ fn eval(tree: &RequiredLiterals, hits: &BTreeMap<Vec<u8>, Option<Vec<(u32, u32)>
             for p in parts {
                 match eval(p, hits) {
                     Res::All => return Res::All,
-                    Res::Set { docs: d, anchors: a } => {
+                    Res::Set {
+                        docs: d,
+                        anchors: a,
+                    } => {
                         docs.extend(d);
                         anchors.extend(a);
                     }
@@ -167,7 +176,8 @@ fn rarest(
 
 /// FM_DRY=1: count and plan, but locate nothing; `located` then says how
 /// many occurrences the plan would locate. Candidates are meaningless.
-static DRY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("FM_DRY").is_ok());
+static DRY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("FM_DRY").is_ok());
 
 /// How much of the tree a lookup locates.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -215,7 +225,10 @@ pub fn run(
     let wanted = match plan {
         Plan::Full => None,
         Plan::Rarest => {
-            let counts = ranges.iter().map(|(l, (lo, hi))| (l.clone(), hi - lo)).collect();
+            let counts = ranges
+                .iter()
+                .map(|(l, (lo, hi))| (l.clone(), hi - lo))
+                .collect();
             let mut s = BTreeSet::new();
             rarest(tree, &counts, cap, &mut s);
             Some(s)
