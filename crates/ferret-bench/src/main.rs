@@ -215,6 +215,7 @@ fn main() -> ExitCode {
             }
             ("blob-screen", args) => blob_screen::run(args),
             ("screens", args) => sparse::screens::run(args),
+            ("pure-scan", args) => sparse::screens::scan::run(args),
             ("rank-fp", [dir, out]) => rank_fp::run(Path::new(dir), Path::new(out)),
             ("chunk-census", [dir, index]) => chunk_census::run(Path::new(dir), Path::new(index)),
             ("log-fill", [dir, transactions, rows]) => log_fill(Path::new(dir), transactions, rows),

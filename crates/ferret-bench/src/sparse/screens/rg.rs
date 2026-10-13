@@ -4,9 +4,10 @@
 //! no ignore rules or hidden-file skipping (`--no-ignore --hidden`),
 //! treats binary files as text (`-a`), never transcodes a UTF-16 BOM
 //! (`-E none`), and lists files (`-l`), stopping at a file's first match
-//! as `is_match` does. Case follows the population's flag. No seed
-//! pattern can match a newline, so line-oriented search finds the same
-//! files as a whole-file match; the file-set check confirms it per query.
+//! as `is_match` does; [`lines`] prints
+//! every matching line instead, rg's default. Case follows the population's
+//! flag. No seed pattern can match a newline, so line-oriented search finds the
+//! same files as a whole-file match; the file-set check confirms it per query.
 
 use std::fs;
 use std::path::Path;
@@ -59,12 +60,15 @@ pub(super) fn counters() -> crate::Result<Counters> {
     })
 }
 
-pub(super) fn scan(
+/// rg flagged to the oracle's semantics, listing files with `-l` or
+/// printing every matching line.
+fn command(
     pattern: &str,
     case_insensitive: bool,
     corpus: &Path,
     threads: Option<usize>,
-) -> crate::Result<Scan> {
+    list: bool,
+) -> Command {
     let mut command = Command::new("rg");
     command.args([
         "--no-config",
@@ -73,11 +77,13 @@ pub(super) fn scan(
         "-a",
         "-E",
         "none",
-        "-l",
         "--no-messages",
         "-g",
         "!population",
     ]);
+    if list {
+        command.arg("-l");
+    }
     if case_insensitive {
         command.arg("-i");
     } else {
@@ -92,6 +98,67 @@ pub(super) fn scan(
         .arg(corpus)
         .stdin(Stdio::null())
         .stderr(Stdio::inherit());
+    command
+}
+
+/// Where `lines` sends rg's output.
+#[derive(Clone, Copy)]
+pub(super) enum Sink {
+    DevNull,
+    /// A pipe this process drains, counting the bytes.
+    Pipe,
+}
+
+/// One run of rg printing lines.
+pub(super) struct Printed {
+    pub(super) wall: Duration,
+    pub(super) cpu: f64,
+    pub(super) device: u64,
+    /// Bytes printed into a pipe; zero for /dev/null.
+    pub(super) printed: u64,
+}
+
+/// rg printing every matching line (its default output) into `sink`.
+pub(super) fn lines(
+    pattern: &str,
+    case_insensitive: bool,
+    corpus: &Path,
+    threads: Option<usize>,
+    sink: Sink,
+) -> crate::Result<Printed> {
+    let mut command = command(pattern, case_insensitive, corpus, threads, false);
+    command.stdout(match sink {
+        Sink::DevNull => Stdio::from(fs::File::create("/dev/null")?),
+        Sink::Pipe => Stdio::piped(),
+    });
+    let before = counters()?;
+    let start = Instant::now();
+    let mut child = command.spawn()?;
+    let mut printed = 0;
+    if let Some(mut out) = child.stdout.take() {
+        printed = std::io::copy(&mut out, &mut std::io::sink())?;
+    }
+    let status = child.wait()?;
+    let wall = start.elapsed();
+    let after = counters()?;
+    if !matches!(status.code(), Some(0 | 1)) {
+        return Err(format!("rg failed: {status}").into());
+    }
+    Ok(Printed {
+        wall,
+        cpu: after.children_cpu - before.children_cpu,
+        device: after.device - before.device,
+        printed,
+    })
+}
+
+pub(super) fn scan(
+    pattern: &str,
+    case_insensitive: bool,
+    corpus: &Path,
+    threads: Option<usize>,
+) -> crate::Result<Scan> {
+    let mut command = command(pattern, case_insensitive, corpus, threads, true);
     let before = counters()?;
     let start = Instant::now();
     let output = command.output()?;
