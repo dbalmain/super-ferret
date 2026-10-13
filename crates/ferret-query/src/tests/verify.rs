@@ -15,7 +15,7 @@ use ferret_catalog::{Catalog, Content, NameId, Transaction};
 use ferret_index::{DocSet, Pinned};
 
 use super::{Scratch, dir, file, lazy, now};
-use crate::verify::seam::Seams;
+use crate::verify::seam::{Poll, Seams};
 use crate::{
     Content as Plan, DocNames, NameIndex, Query, ReadRequest, ReadVersion, Reader, Row, Stats,
     Workers,
@@ -343,49 +343,79 @@ fn a_cancelling_callback_stops_buffered_rows() {
     }
 }
 
+/// The budget scene for the limit tests. `a0` (no catalogued size) heads
+/// the run; `b1` holds the whole budget; `c2` waits for bytes; `zz`, which
+/// the query rejects, comes after `c2`, so its poll says `c2` has been
+/// submitted. `a0`'s read waits for that and for `b1`'s read: otherwise
+/// `a0` can be emitted, and the run stopped, before S1 reaches `c2`.
+const BUDGET: &[(&str, u64, u8)] = &[
+    ("a0", 0, 1),
+    ("b1", crate::IN_FLIGHT_BYTES, 2),
+    ("c2", 1, 3),
+    ("zz", 1, 4),
+];
+const BUDGET_QUERY: &str = "grep:needle AND NOT name:zz";
+
+/// Sets `waiting` when a worker waits for bytes and `submitted` at the
+/// first poll.
+fn budget_seams(
+    waiting: &Arc<Signal>,
+    submitted: &Arc<Signal>,
+    teardown: Option<Arc<Poll>>,
+) -> Seams {
+    let (waiting, submitted) = (Arc::clone(waiting), Arc::clone(submitted));
+    Seams {
+        on_budget_wait: Some(Arc::new(move || waiting.set())),
+        on_poll: Some(Arc::new(move |_: &dyn Fn() -> u64| submitted.set())),
+        on_teardown: teardown,
+        ..Seams::default()
+    }
+}
+
+/// The budget scene's reader: `a0` waits for `b1`'s read and `c2`'s
+/// submission; `b1` runs `hold` once started.
+fn budget_script(
+    submitted: Arc<Signal>,
+    hold: impl Fn(&dyn Fn() -> bool) + Send + Sync + 'static,
+) -> Script {
+    let started = Signal::default();
+    Script::new(BUDGET.iter().map(|&(name, ..)| (name, "needle"))).gated(move |name, stop| {
+        match name {
+            "a0" => {
+                started.wait("b1's read");
+                submitted.wait("c2 submitted");
+            }
+            "b1" => {
+                started.set();
+                hold(stop);
+            }
+            _ => {}
+        }
+    })
+}
+
 /// Finding 3: once a limit stops the run, a read in progress is told to
 /// stop, and a worker waiting for budget bytes starts no read.
 #[test]
 fn a_limit_stops_reads_in_progress_and_starts_none() {
-    // `b1` holds the whole budget and reads until told to stop. `a0` (of no
-    // catalogued size) waits for it to start, so the worker that read `a0`
-    // next takes `c2` and waits for bytes; `a0`'s callback waits for that,
-    // then stops the run.
-    let fx = fixture(
-        "budget",
-        &[
-            ("a0", 0, 1),
-            ("b1", crate::IN_FLIGHT_BYTES, 2),
-            ("c2", 1, 3),
-        ],
-    );
-    let waiting = Arc::new(Signal::default());
-    let _seams = Seams {
-        on_budget_wait: Some({
-            let waiting = Arc::clone(&waiting);
-            Arc::new(move || waiting.set())
-        }),
-        ..Seams::default()
-    }
-    .set();
-    let started = Arc::new(Signal::default());
+    // `b1` reads until told to stop. The worker that read `a0` next takes
+    // `c2` and waits for bytes; `a0`'s callback waits for that, then stops
+    // the run.
+    let fx = fixture("budget", BUDGET);
+    let (waiting, submitted) = (Arc::new(Signal::default()), Arc::new(Signal::default()));
+    let _seams = budget_seams(&waiting, &submitted, None).set();
     let told = Arc::new(AtomicBool::new(false));
-    let script = Script::new([("a0", "needle"), ("b1", "needle"), ("c2", "needle")]).gated({
+    let script = budget_script(submitted, {
         let told = Arc::clone(&told);
-        move |name, stop| match name {
-            "a0" => started.wait("b1's read"),
-            "b1" => {
-                started.set();
-                let deadline = Instant::now() + PATIENCE;
-                while !stop() && Instant::now() < deadline {
-                    std::thread::yield_now();
-                }
-                told.store(stop(), Ordering::Release);
+        move |stop| {
+            let deadline = Instant::now() + PATIENCE;
+            while !stop() && Instant::now() < deadline {
+                std::thread::yield_now();
             }
-            _ => {}
+            told.store(stop(), Ordering::Release);
         }
     });
-    let (rows, stats) = run(&fx, "grep:needle", 2, &script, None, |_| {
+    let (rows, stats) = run(&fx, BUDGET_QUERY, 2, &script, None, |_| {
         waiting.wait("a worker waiting for bytes");
         ControlFlow::Break(())
     });
@@ -399,6 +429,44 @@ fn a_limit_stops_reads_in_progress_and_starts_none() {
         script.requests("c2"),
         Vec::<&str>::new(),
         "c2 read after the limit"
+    );
+}
+
+/// Round 2: the workers stop when the head sees the limit, not when the run
+/// has finished dropping its window and cache. `b1` holds the whole budget,
+/// and the worker that read `a0` waits for bytes to read `c2`. Once the
+/// limit is seen, the caller is held in teardown while `b1` finishes and
+/// frees its bytes. The woken worker must start no read.
+#[test]
+fn a_limit_stops_workers_before_teardown() {
+    let fx = fixture("teardown", BUDGET);
+    let (waiting, submitted) = (Arc::new(Signal::default()), Arc::new(Signal::default()));
+    let release = Arc::new(Signal::default());
+    // Teardown frees `b1`, then waits until every job has finished, read
+    // or stopped, `c2`'s included.
+    let teardown: Arc<Poll> = {
+        let release = Arc::clone(&release);
+        Arc::new(move |finished: &dyn Fn() -> u64| {
+            release.set();
+            let deadline = Instant::now() + PATIENCE;
+            while finished() < 3 {
+                assert!(Instant::now() < deadline, "jobs never finished");
+                std::thread::yield_now();
+            }
+        })
+    };
+    let _seams = budget_seams(&waiting, &submitted, Some(teardown)).set();
+    let script = budget_script(submitted, move |_| release.wait("teardown"));
+    let (rows, stats) = run(&fx, BUDGET_QUERY, 2, &script, None, |_| {
+        waiting.wait("a worker waiting for bytes");
+        ControlFlow::Break(())
+    });
+    assert_eq!(names(&rows), ["a0"]);
+    assert_eq!(report(&stats).verified, 1);
+    assert_eq!(
+        script.requests("c2"),
+        Vec::<&str>::new(),
+        "c2 read during teardown"
     );
 }
 

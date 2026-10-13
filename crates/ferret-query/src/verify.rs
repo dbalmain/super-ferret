@@ -9,8 +9,9 @@
 //!
 //! - which rows are emitted, their offsets, and their order;
 //! - a `Break` from `emit` (a limit, a closed pipe) stops at the same row.
-//!   Workers stop taking jobs, reads in progress stop at their next chunk, and
-//!   documents read past that row are not counted anywhere;
+//!   Workers stop taking jobs as soon as the head sees it, reads in progress
+//!   stop at their next chunk, and documents read past that row are not counted
+//!   anywhere;
 //! - the report's counts (`verified`, `changed`, the matching statistics) are
 //!   summed at the head, so they count exactly the rows the sequential order
 //!   consumed;
@@ -256,6 +257,10 @@ impl Query {
             }
             None => {}
         }
+        #[cfg(test)]
+        if let Some(pool) = window.pool {
+            pool.seams.tearing_down(&|| pool.finished());
+        }
         stats.rows = window.rows;
         let mut tally = window.verifier.tally;
         tally.maybe_docs = window.maybe_docs.len() as u64;
@@ -317,8 +322,7 @@ impl<E: FnMut(&Row<'_>) -> ControlFlow<()>> Window<'_, '_, '_, '_, E> {
             // The accounting boundary (module doc): a cancelled run
             // consumes no further row.
             if (self.stopped)() {
-                self.halted_at = Some(head.candidates);
-                return ControlFlow::Break(());
+                return self.halt(head.candidates);
             }
             let ready = match head.slot {
                 Slot::Holds | Slot::Here(_) => true,
@@ -335,11 +339,22 @@ impl<E: FnMut(&Row<'_>) -> ControlFlow<()>> Window<'_, '_, '_, '_, E> {
             };
             let candidates = head.candidates;
             if self.finish(head).is_break() {
-                self.halted_at = Some(candidates);
-                return ControlFlow::Break(());
+                return self.halt(candidates);
             }
         }
         ControlFlow::Continue(())
+    }
+
+    /// Ends the run at the row with this candidate count. The workers stop
+    /// now, not when the scope ends: dropping the window and its cache of
+    /// answers comes first and scales with the documents verified, and a
+    /// worker that took freed bytes meanwhile would start another read.
+    fn halt(&mut self, candidates: u64) -> ControlFlow<()> {
+        self.halted_at = Some(candidates);
+        if let Some(pool) = self.pool {
+            pool.halt();
+        }
+        ControlFlow::Break(())
     }
 
     /// [`Window::drain`] without waiting, between rows: a head job can
@@ -910,6 +925,9 @@ pub(crate) mod seam {
         /// Called on the calling thread at each candidate that joins no
         /// window, with the pool's finished-job count.
         pub on_poll: Option<Arc<Poll>>,
+        /// Called on the calling thread when the run is over and the window
+        /// is about to be dropped, with the pool's finished-job count.
+        pub on_teardown: Option<Arc<Poll>>,
     }
 
     thread_local! {
@@ -942,6 +960,12 @@ pub(crate) mod seam {
 
         pub(super) fn polling(&self, finished: &dyn Fn() -> u64) {
             if let Some(hook) = &self.on_poll {
+                hook(finished);
+            }
+        }
+
+        pub(super) fn tearing_down(&self, finished: &dyn Fn() -> u64) {
+            if let Some(hook) = &self.on_teardown {
                 hook(finished);
             }
         }
