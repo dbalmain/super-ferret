@@ -377,18 +377,30 @@ Measured 2026-10-13 on branch `wt/par-verify` (D76 C). Aggregates are in
 pool of threads (`ferret-query/src/verify.rs`). The calling thread still
 produces candidate rows in name order. It hands each new document to a
 worker, and it emits rows from the head of a window in the same order as
-before. Output is byte-identical at any thread count: rows, `--limit`,
-refusals, exit status, stderr, stdout and the query log's counts. Two tests
-compare 1 thread against several, including vanished, changed, unreadable
-and oversized files.
+before. For files that do not change during the query, and without
+cancellation, output is byte-identical at any thread count: rows,
+`--limit`, refusals, exit status, stderr, stdout and the query log's
+counts. Only the times and the thread count itself differ. Two tests
+compare 1 thread against several, including files that vanished, changed,
+became unreadable or grew too large after indexing. Tests with a scripted
+reader in `ferret-query` force the completion orders that matter rather
+than waiting for the scheduler to produce them.
 
-One order does change. A worker can read a document before the caller has
-emitted the rows ahead of it, up to 64 rows per thread ahead. A result
-callback can therefore no longer change what a later read sees.
+Verification observes a file's bytes when it reads them. A worker can read
+a document up to 64 rows per thread ahead of the caller, so the read may
+come before the result callbacks for earlier rows run. A callback that
+deletes or rewrites a later file may therefore leave that file's row as it
+was read, where one thread would see the change. No production caller's
+callback changes files; a caller that must see its own effects uses one
+thread. Where a cancellation lands is a matter of timing, so a cancelled
+query's counts vary with the thread count.
 
 The thread count is `FERRET_SEARCH_THREADS`, defaulting to every available
-core (32 here). Document bytes in flight are capped at 64 MiB by catalogued
-size, plus 1 MiB of kept buffer per worker.
+core (32 here). The workers' buffers hold at most 64 MiB of documents by
+catalogued size, plus 1 MiB of kept buffer per worker, plus whatever the
+files being read grew since they were indexed. The calling thread's buffer
+is separate: it reads one document at a time and keeps the capacity of the
+largest.
 
 **The bench now calls the product.** The arms above verify through the
 harness's own loop. The new `product` arm runs every seed as `grep:` through

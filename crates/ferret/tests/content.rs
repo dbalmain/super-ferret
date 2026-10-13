@@ -1595,30 +1595,51 @@ fn output(
 /// document has several names; and, after indexing, changed, vanished and
 /// oversized files, so that reads fail or see a current version.
 fn mixed_tree(tree: &Tree) -> Engine {
+    let path = |i: usize| format!("d{}/f{i:03}.txt", i % 7);
+    // Every eleventh file shares its bytes with the file before.
+    let copied = |i: usize| i % 11 == 10;
     for i in 0..240 {
-        let pad = if i % 37 == 0 { 400_000 } else { i * 13 % 900 };
-        let marker = match i % 5 {
+        let n = if copied(i) { i - 1 } else { i };
+        let pad = if n % 37 == 0 { 400_000 } else { n * 13 % 900 };
+        let marker = match n % 5 {
             0 => "needle7 here",
             1 => "Needle42 there",
             2 => "need le",
             _ => "nothing",
         };
-        // Every eleventh file shares its bytes with the file before.
-        let n = if i % 11 == 10 { i - 1 } else { i };
         tree.write(
-            &format!("d{}/f{i:03}.txt", i % 7),
+            &path(i),
             format!("{} {marker} {n}\n", "x".repeat(pad)).as_bytes(),
         );
     }
     let engine = tree.engine();
     engine.attach_content(&tree.index()).unwrap();
     engine.follow_content(&Budget::unbounded(), None).unwrap();
+    let pin = engine.pin();
+    let catalog = pin.catalog();
+    let doc = |i: usize| {
+        let name = format!("f{i:03}.txt");
+        catalog
+            .names()
+            .find_map(|(id, bytes)| match catalog.name(id).target() {
+                ferret_catalog::Target::Inode(inode) if bytes == name.as_bytes() => {
+                    catalog.doc(inode)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} has no document"))
+    };
+    for i in (0..240).filter(|&i| copied(i)) {
+        assert_eq!(doc(i), doc(i - 1), "f{i:03} is a copy of the file before");
+        assert_ne!(doc(i), doc(i + 1), "f{:03} is not a copy", i + 1);
+    }
+    drop(pin);
     for i in [3, 50, 51, 120] {
-        fs::remove_file(tree.root().join(format!("d{}/f{i:03}.txt", i % 7))).unwrap();
+        fs::remove_file(tree.root().join(path(i))).unwrap();
     }
     for i in [5, 10, 21, 64] {
         tree.write(
-            &format!("d{}/f{i:03}.txt", i % 7),
+            &path(i),
             format!("changed needle99 {i} and longer\n").as_bytes(),
         );
     }
@@ -1627,8 +1648,10 @@ fn mixed_tree(tree: &Tree) -> Engine {
     engine
 }
 
-/// D76 C: output is byte-identical at any verification thread count,
-/// including where a limit stops it, and where reads fail.
+/// D76 C: over files that do not change during the query, output is
+/// byte-identical at any verification thread count, including where a limit
+/// stops it, and where reads fail. The scheduler picks the completion order
+/// here; `ferret-query`'s `tests/verify.rs` forces the orders that matter.
 #[test]
 fn verification_output_is_the_same_at_every_thread_count() {
     let tree = Tree::new();

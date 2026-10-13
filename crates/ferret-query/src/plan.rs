@@ -262,10 +262,13 @@ impl Query {
     }
 
     /// [`Query::run_content`], reading and matching Maybe documents on
-    /// `workers`. Rows, their order,
-    /// where a `Break` stops, and every count in the report are as
-    /// [`Query::run_content`] gives them; only the report's times differ
-    /// (see `verify.rs`). One thread verifies on the calling thread.
+    /// `workers`. For files that do not change during the run, and without
+    /// cancellation, rows, their order, where a `Break` stops, and every
+    /// count in the report are as [`Query::run_content`] gives them; only
+    /// the report's times and thread count differ. A document may be read
+    /// before the callbacks for earlier rows run, so a callback whose
+    /// effects later reads must see needs one thread (see `verify.rs`).
+    /// One thread verifies on the calling thread.
     pub fn run_content_parallel(
         &self,
         catalog: &Catalog,

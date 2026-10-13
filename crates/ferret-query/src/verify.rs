@@ -9,8 +9,8 @@
 //!
 //! - which rows are emitted, their offsets, and their order;
 //! - a `Break` from `emit` (a limit, a closed pipe) stops at the same row.
-//!   Workers stop taking jobs, reads in progress stop at their next chunk,
-//!   and documents read past that row are not counted anywhere;
+//!   Workers stop taking jobs, reads in progress stop at their next chunk, and
+//!   documents read past that row are not counted anywhere;
 //! - the report's counts (`verified`, `changed`, the matching statistics) are
 //!   summed at the head, so they count exactly the rows the sequential order
 //!   consumed;
@@ -349,6 +349,8 @@ impl<E: FnMut(&Row<'_>) -> ControlFlow<()>> Window<'_, '_, '_, '_, E> {
         let Some(pool) = self.pool else {
             return ControlFlow::Continue(());
         };
+        #[cfg(test)]
+        pool.seams.polling(&|| pool.finished());
         let finished = pool.finished();
         if self.waiting.is_empty() || finished == self.polled {
             return ControlFlow::Continue(());
@@ -751,7 +753,14 @@ impl Pool {
                         size,
                         bytes: &mut bytes,
                     };
-                    verify(atoms, &mut *read, &mut matcher, &mut *held.bytes, name, &halt)
+                    verify(
+                        atoms,
+                        &mut *read,
+                        &mut matcher,
+                        &mut *held.bytes,
+                        name,
+                        &halt,
+                    )
                 }
                 None => Outcome::Stopped(Matched::default()),
             };
@@ -889,12 +898,18 @@ pub(crate) mod seam {
     use std::cell::RefCell;
     use std::sync::Arc;
 
+    /// Given the pool's finished-job count.
+    pub(crate) type Poll = dyn Fn(&dyn Fn() -> u64) + Send + Sync;
+
     #[derive(Clone, Default)]
     pub(crate) struct Seams {
         /// The worker whose spawn fails.
         pub fail_spawn_at: Option<usize>,
         /// Called, under the budget lock, when a worker waits for bytes.
         pub on_budget_wait: Option<Arc<dyn Fn() + Send + Sync>>,
+        /// Called on the calling thread at each candidate that joins no
+        /// window, with the pool's finished-job count.
+        pub on_poll: Option<Arc<Poll>>,
     }
 
     thread_local! {
@@ -924,5 +939,56 @@ pub(crate) mod seam {
                 hook();
             }
         }
+
+        pub(super) fn polling(&self, finished: &dyn Fn() -> u64) {
+            if let Some(hook) = &self.on_poll {
+                hook(finished);
+            }
+        }
+    }
+}
+
+/// Finding 4 of the round-1 review: a document cancelled between atoms on
+/// the calling thread counts the atoms that finished, as the sequential
+/// order did. Cancellation is a flag, so it cannot be timed to land between
+/// two atoms through the query; this drives [`Verifier::here`], the calling
+/// thread's path, with a predicate that says stop after the first atom.
+#[cfg(test)]
+mod partial {
+    use std::cell::Cell;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{Settled, Verifier};
+    use crate::{Query, ReadRequest, ReadVersion};
+
+    #[test]
+    fn a_document_cancelled_between_atoms_counts_the_finished_atom() {
+        let query = Query::parse(
+            "grep:needle grep:other",
+            UNIX_EPOCH + Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut read = |_, request: ReadRequest<'_>| {
+            if let ReadRequest::Bytes(out, _) = request {
+                out.clear();
+                out.extend_from_slice(b"a needle here");
+            }
+            Some(ReadVersion::Catalogued)
+        };
+        let mut verifier = Verifier::new(&query, &mut read, 1);
+        // Checked before the read, before the first atom, then after it.
+        let checks = Cell::new(0);
+        let stopped = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 2
+        };
+        let settled = verifier.here(0, ferret_catalog::NameId(0), &stopped);
+        assert!(matches!(settled, Settled::Stopped));
+        let tally = &verifier.tally;
+        assert_eq!(tally.verified, 1);
+        assert_eq!(tally.matching.regex_documents, 1);
+        assert_eq!(tally.matching.regex_bytes, 13);
+        assert_eq!(tally.matching.regex_rejected, 0);
+        assert!(verifier.exact.is_empty());
     }
 }

@@ -6,6 +6,7 @@ mod grammar;
 mod overlay;
 mod pattern;
 mod run;
+mod verify;
 
 use std::fs;
 use std::ops::ControlFlow;

@@ -4810,11 +4810,14 @@ content past roughly the size of A's index, also A.
 ### Update 2026-10-13: C built and measured
 
 Content verification now runs on a pool of threads. `FERRET_SEARCH_THREADS`
-sets the count, which defaults to every core. Output is byte-identical at
-any thread count, and two tests compare 1 thread against N. Document bytes
-in flight are capped at 64 MiB, plus 1 MiB per worker. The one order that
-changes is that a document can be read up to 64 rows per thread before its
-predecessors are emitted.
+sets the count, which defaults to every core. For files that do not change
+during the query, and without cancellation, output is byte-identical at any
+thread count, and tests compare 1 thread against N. Document bytes in flight
+are capped at 64 MiB, plus 1 MiB per worker. The one order that changes is
+that a document can be read up to 64 rows per thread before its
+predecessors are emitted, so a result callback that changes a later file
+may not change that file's row
+([SCREENS.md § Parallel verification](SCREENS.md#parallel-verification)).
 
 Measured through the product path in
 [SCREENS.md § Parallel verification](SCREENS.md#parallel-verification):

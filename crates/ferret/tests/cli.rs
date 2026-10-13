@@ -2346,10 +2346,11 @@ fn grep_search_reaches_verified_rows_from_argv() {
     );
 }
 
-/// D76 C: `ferret search` prints the same stdout and stderr, exits the same,
-/// and logs the same counts whatever `FERRET_SEARCH_THREADS` says, including
-/// with a limit, a refusal, and files that vanished, changed or became
-/// unreadable after indexing.
+/// D76 C: over files that do not change during the query, `ferret search`
+/// prints the same stdout and stderr, exits the same, and logs the same
+/// counts whatever `FERRET_SEARCH_THREADS` says, including with a limit, a
+/// refusal, and files that vanished, changed or became unreadable after
+/// indexing.
 #[test]
 fn search_output_is_the_same_at_any_verify_thread_count() {
     let env = Env::new("verify-threads");

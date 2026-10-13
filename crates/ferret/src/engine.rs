@@ -482,8 +482,11 @@ impl QuerySession {
     }
 
     /// [`QuerySession::search_content`] verifying Maybe documents on
-    /// `threads` workers; one verifies on the calling thread. Output is the
-    /// same for any count (`ferret_query::Query::run_content_parallel`).
+    /// `threads` workers; one verifies on the calling thread. For files
+    /// that do not change during the query, and without cancellation,
+    /// output is the same for any count; a document may be read before
+    /// earlier rows' callbacks run
+    /// (`ferret_query::Query::run_content_parallel`).
     pub fn search_content_threads(
         &self,
         query: &Query,
