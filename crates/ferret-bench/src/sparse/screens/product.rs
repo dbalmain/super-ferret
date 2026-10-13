@@ -36,6 +36,36 @@ use super::{CLASSES, evict_files, readable_oracle};
 const THREADS: [usize; 5] = [1, 4, 8, 16, 32];
 const COLD: [usize; 3] = [1, 8, 32];
 
+/// The warm and cold thread counts, from the environment or the defaults.
+fn thread_lists() -> crate::Result<(Vec<usize>, Vec<usize>)> {
+    let warm = counts("PRODUCT_THREADS", &THREADS)?;
+    let cold = counts("PRODUCT_COLD", &COLD)?;
+    check_lists(&warm, &cold)?;
+    Ok((warm, cold))
+}
+
+/// Refuses lists the report cannot label: no warm count, a count of zero, a
+/// count given twice, or a cold count with no warm run to go with it.
+fn check_lists(warm: &[usize], cold: &[usize]) -> crate::Result<()> {
+    if warm.is_empty() {
+        return Err("PRODUCT_THREADS: no thread counts".into());
+    }
+    for (name, list) in [("PRODUCT_THREADS", warm), ("PRODUCT_COLD", cold)] {
+        for (i, &threads) in list.iter().enumerate() {
+            if threads == 0 {
+                return Err(format!("{name}: thread counts must be positive").into());
+            }
+            if list[..i].contains(&threads) {
+                return Err(format!("{name}: {threads} given twice").into());
+            }
+        }
+    }
+    if let Some(threads) = cold.iter().find(|t| !warm.contains(t)) {
+        return Err(format!("PRODUCT_COLD: {threads} is not in PRODUCT_THREADS").into());
+    }
+    Ok(())
+}
+
 fn counts(name: &str, default: &[usize]) -> crate::Result<Vec<usize>> {
     match std::env::var(name) {
         Err(_) => Ok(default.to_vec()),
@@ -187,8 +217,9 @@ fn evict_index(index: &Path) -> crate::Result<()> {
 struct Row {
     class: &'static str,
     candidates: u64,
-    cold: Vec<Run>,
-    warm: Vec<Run>,
+    /// Each run with the thread count it ran at.
+    cold: Vec<(usize, Run)>,
+    warm: Vec<(usize, Run)>,
 }
 
 pub(super) fn arm(
@@ -200,8 +231,7 @@ pub(super) fn arm(
     let names = NameIndex::new(&corpus.catalog);
     let docs = DocNames::new(&corpus.catalog)?;
     let inline = if flags.case_insensitive { "(?i)" } else { "" };
-    let threads_list = counts("PRODUCT_THREADS", &THREADS)?;
-    let cold_list = counts("PRODUCT_COLD", &COLD)?;
+    let (threads_list, cold_list) = thread_lists()?;
     let most = *threads_list.iter().max().ok_or("no thread counts")?;
     let mut rows = Vec::new();
     for (q, sample) in corpus.samples.iter().enumerate() {
@@ -232,11 +262,11 @@ pub(super) fn arm(
                 evict_files(corpus, &discovery.read_docs)?;
                 let run = once(corpus, &names, &docs, &query, threads)?;
                 check(&run, &format!("cold at {threads}"))?;
-                cold.push(run.run);
+                cold.push((threads, run.run));
             }
             let run = once(corpus, &names, &docs, &query, threads)?;
             check(&run, &format!("warm at {threads}"))?;
-            warm.push(run.run);
+            warm.push((threads, run.run));
         }
         let candidates = corpus_bytes(corpus, &discovery.read_docs);
         let _ = writeln!(
@@ -245,11 +275,11 @@ pub(super) fn arm(
             sample.class,
             discovery.read_docs.len(),
             cold.iter()
-                .map(|r| ns(r.wall).to_string())
+                .map(|(_, r)| ns(r.wall).to_string())
                 .collect::<Vec<_>>()
                 .join(","),
             warm.iter()
-                .map(|r| ns(r.wall).to_string())
+                .map(|(_, r)| ns(r.wall).to_string())
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -258,11 +288,11 @@ pub(super) fn arm(
             q + 1,
             sample.class,
             cold.iter()
-                .map(|r| format!("{:.1}", r.wall.as_secs_f64() * 1e3))
+                .map(|(_, r)| format!("{:.1}", r.wall.as_secs_f64() * 1e3))
                 .collect::<Vec<_>>()
                 .join("/"),
             warm.iter()
-                .map(|r| format!("{:.1}", r.wall.as_secs_f64() * 1e3))
+                .map(|(_, r)| format!("{:.1}", r.wall.as_secs_f64() * 1e3))
                 .collect::<Vec<_>>()
                 .join("/"),
         );
@@ -301,12 +331,16 @@ fn report(rows: &[Row], threads_list: &[usize], cold_list: &[usize]) {
             (
                 "cold",
                 cold_list,
-                (|r: &Row| &r.cold) as fn(&Row) -> &Vec<Run>,
+                (|r: &Row| &r.cold) as fn(&Row) -> &Vec<(usize, Run)>,
             ),
             ("warm", threads_list, |r: &Row| &r.warm),
         ] {
-            for (i, &threads) in counts.iter().enumerate() {
-                let runs: Vec<Run> = picked.iter().map(|r| pick(r)[i]).collect();
+            for &threads in counts {
+                let runs: Vec<Run> = picked
+                    .iter()
+                    .flat_map(|r| pick(r).iter().filter(|&&(t, _)| t == threads))
+                    .map(|&(_, run)| run)
+                    .collect();
                 let rate: Vec<u64> = runs
                     .iter()
                     .map(|r| (r.device as f64 / r.wall.as_secs_f64().max(1e-9) / 1e6) as u64)
@@ -326,6 +360,28 @@ fn report(rows: &[Row], threads_list: &[usize], cold_list: &[usize]) {
                     stats(rate).0,
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_lists;
+
+    #[test]
+    fn thread_lists_that_would_mislabel_runs_are_refused() {
+        assert!(check_lists(&[1, 4, 8], &[1, 8]).is_ok());
+        assert!(check_lists(&[1, 8], &[8, 1]).is_ok());
+        assert!(check_lists(&[8], &[]).is_ok());
+        for (warm, cold) in [
+            (&[][..], &[][..]),
+            (&[0, 4], &[]),
+            (&[1, 4], &[0]),
+            (&[1, 4, 1], &[]),
+            (&[1, 4], &[4, 4]),
+            (&[1, 4], &[8]),
+        ] {
+            assert!(check_lists(warm, cold).is_err(), "{warm:?} {cold:?}");
         }
     }
 }
