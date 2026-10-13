@@ -97,7 +97,7 @@ fn once(
                 // The snapshot is frozen: still a filesystem operation, as
                 // in the product reader, always the catalogued version.
                 ReadRequest::Stat => fs::metadata(path).ok().map(|_| ReadVersion::Catalogued),
-                ReadRequest::Bytes(out) => {
+                ReadRequest::Bytes(out, _) => {
                     first
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)

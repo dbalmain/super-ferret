@@ -520,8 +520,10 @@ impl QuerySession {
             Box::new(move |name, request: ferret_query::ReadRequest<'_>| {
                 let observed = match request {
                     ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
-                    ferret_query::ReadRequest::Bytes(out) => {
-                        reader.read_current_name_until(catalog, name, out, &stopped)
+                    // `stop` is the query's cancellation, and on a
+                    // worker also the pool's stop at a limit.
+                    ferret_query::ReadRequest::Bytes(out, stop) => {
+                        reader.read_current_name_until(catalog, name, out, stop)
                     }
                 }
                 .ok()?;

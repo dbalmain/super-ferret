@@ -422,7 +422,7 @@ pub(crate) fn once(
                 ferret_query::ReadRequest::Stat => fs::metadata(path)
                     .ok()
                     .map(|_| ferret_query::ReadVersion::Catalogued),
-                ferret_query::ReadRequest::Bytes(out) => fs::read(path).ok().map(|bytes| {
+                ferret_query::ReadRequest::Bytes(out, _) => fs::read(path).ok().map(|bytes| {
                     read_bytes += bytes.len() as u64;
                     *out = bytes;
                     ferret_query::ReadVersion::Catalogued
@@ -440,7 +440,7 @@ pub(crate) fn once(
                     .filter(fs::Metadata::is_file)
                     .map(|meta| version(catalog, name, &meta))
             }
-            ferret_query::ReadRequest::Bytes(out) => {
+            ferret_query::ReadRequest::Bytes(out, _) => {
                 let version = read_current_name(catalog, name, &mut path, out);
                 if version.is_some() {
                     read_bytes += out.len() as u64;
@@ -872,7 +872,7 @@ pub(crate) fn run_regex(dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> cr
                 &names,
                 &content,
                 &mut |name, request| {
-                    if matches!(request, ferret_query::ReadRequest::Bytes(_))
+                    if matches!(request, ferret_query::ReadRequest::Bytes(..))
                         && let Target::Inode(inode) = catalog.name(name).target()
                         && let Some(doc) = catalog.doc(inode)
                     {

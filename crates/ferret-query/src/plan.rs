@@ -49,8 +49,10 @@ const INODES_PER_DOC: (u64, u64) = (6, 5);
 pub enum ReadRequest<'a> {
     /// A cheap stat against the catalog key; never reads content bytes.
     Stat,
-    /// A stable, bracketed read, replacing the output buffer.
-    Bytes(&'a mut Vec<u8>),
+    /// A stable, bracketed read, replacing the output buffer. The read
+    /// should stop between chunks, failing, once the predicate returns
+    /// true: the query was cancelled, or verification no longer needs it.
+    Bytes(&'a mut Vec<u8>, &'a dyn Fn() -> bool),
 }
 
 /// The version established by a successful stat or bracketed read.
