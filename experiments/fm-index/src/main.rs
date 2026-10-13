@@ -6,7 +6,7 @@
 //! fm-screen plan     <corpus> <oracle> <dir>
 //! fm-screen build-sa <corpus> <oracle> <dir> <k> <threads>
 //! fm-screen build-fm <dir> <k> <rate,...>
-//! fm-screen lookup   <corpus> <oracle> <dir> <sa|fm32|fm64|...> <k> [cap]
+//! fm-screen lookup   <corpus> <oracle> <dir> <sa|fm32|fm64|...> <k> <full|rarest> [cap]
 //! fm-screen verify   <corpus> <oracle> <dir> <candset> <threads> <line,whole>
 //! fm-screen report   <dir>
 //! ```
@@ -99,7 +99,15 @@ fn plan(corpus: &Path, oracle: &Path, dir: &Path) {
     fs::create_dir_all(dir.join("rows")).expect("rows");
 }
 
-fn lookup(corpus: &Path, oracle: &Path, dir: &Path, arm: &str, k: usize, cap: Option<u64>) {
+fn lookup(
+    corpus: &Path,
+    oracle: &Path,
+    dir: &Path,
+    arm: &str,
+    k: usize,
+    plan: query::Plan,
+    cap: Option<u64>,
+) {
     let (queries, docs) = pop::load(corpus, oracle);
     let sizes = sizes_by_doc(&docs);
     let table = Table::read(dir, k);
@@ -108,34 +116,71 @@ fn lookup(corpus: &Path, oracle: &Path, dir: &Path, arm: &str, k: usize, cap: Op
         None => Sa::files(dir, k).to_vec(),
         Some(r) => Fm::files(dir, k, r).to_vec(),
     };
-    let set = match cap {
-        Some(c) => format!("{arm}-cap{c}"),
-        None => arm.to_string(),
-    };
+    let mut set = arm.to_string();
+    if plan == query::Plan::Rarest {
+        set += "-rarest";
+    }
+    if let Some(c) = cap {
+        set += &format!("-cap{c}");
+    }
+    if std::env::var("FM_RESIDENT").is_ok() {
+        set += "-resident";
+    }
+    // FM_CLASS limits a run to one class (rows for the rest are skipped).
+    let only = std::env::var("FM_CLASS").ok();
     let cand_dir = dir.join("cand").join(&set);
     fs::create_dir_all(&cand_dir).expect("cand dir");
     fs::create_dir_all(dir.join("rows")).expect("rows");
+    // FM_RESIDENT=1: the index is loaded whole before the queries (timed,
+    // from cold, as a sequential read) and never evicted, so "cold" rows are
+    // only the documents' cold; demand-paged random faults are not measured.
+    let resident = std::env::var("FM_RESIDENT").is_ok();
+    if resident {
+        for f in &files {
+            index::evict(f);
+        }
+        let t = std::time::Instant::now();
+        let mut bytes = 0u64;
+        for f in &files {
+            bytes += fs::read(f).expect("index file").len() as u64;
+        }
+        println!(
+            "resident_load arm={arm} segment={k} bytes={bytes} cold_sequential_ms={:.1}",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        // fs::read leaves the pages cached; mapped queries now find them.
+    }
     let mut rows = String::new();
     let run = |q: &pop::Query| match rate {
         None => {
             let sa = Sa::open(dir, k);
-            query::run(Index::Sa(&sa), &table, &sizes, &q.facts, q.lines.is_ok(), cap)
+            query::run(Index::Sa(&sa), &table, &sizes, &q.facts, q.lines.is_ok(), cap, plan)
         }
         Some(r) => {
             let fm = Fm::open(dir, k, r);
-            query::run(Index::Fm(&fm), &table, &sizes, &q.facts, q.lines.is_ok(), cap)
+            query::run(Index::Fm(&fm), &table, &sizes, &q.facts, q.lines.is_ok(), cap, plan)
         }
     };
     for (i, q) in queries.iter().enumerate() {
+        if only.as_deref().is_some_and(|c| c != q.class) {
+            continue;
+        }
         let (found, _) = run(q);
-        if rate.is_some() && cap.is_none() {
-            // The FM-index must locate exactly what the suffix array did.
-            let sa = fs::read(dir.join("cand/sa").join(format!("q{i}.k{k}"))).expect("sa cands");
+        let twin = dir
+            .join("cand")
+            .join(set.replacen(arm, "sa", 1).replace("-resident", ""))
+            .join(format!("q{i}.k{k}"));
+        if rate.is_some() && twin.exists() {
+            // The FM-index must locate exactly what the suffix array did
+            // under the same plan and cap.
+            let sa = fs::read(&twin).expect("sa cands");
             assert!(query::decode(&sa) == found, "fm differs from sa: query {i} segment {k}");
         }
         fs::write(cand_dir.join(format!("q{i}.k{k}")), query::encode(&found)).expect("cands");
-        for f in &files {
-            index::evict(f);
+        if !resident {
+            for f in &files {
+                index::evict(f);
+            }
         }
         let device = util::device_read_bytes();
         let (cold_c, cold) = run(q);
@@ -170,7 +215,12 @@ fn lookup(corpus: &Path, oracle: &Path, dir: &Path, arm: &str, k: usize, cap: Op
             warm.locate.as_secs_f64() * 1e3
         );
     }
-    fs::write(dir.join("rows").join(format!("lookup-{set}-k{k}.tsv")), rows).expect("rows");
+    let suffix = only.map_or(String::new(), |c| format!("-{}", c.replace(' ', "_")));
+    fs::write(
+        dir.join("rows").join(format!("lookup-{set}-k{k}{suffix}.tsv")),
+        rows,
+    )
+    .expect("rows");
 }
 
 fn verify(corpus: &Path, oracle: &Path, dir: &Path, set: &str, threads: usize, modes: &str) {
@@ -264,7 +314,12 @@ fn main() {
             &p(3),
             &args[4],
             args[5].parse().expect("k"),
-            args.get(6).map(|c| c.parse().expect("cap")),
+            match args[6].as_str() {
+                "full" => query::Plan::Full,
+                "rarest" => query::Plan::Rarest,
+                other => panic!("unknown plan {other}"),
+            },
+            args.get(7).map(|c| c.parse().expect("cap")),
         ),
         "verify" => verify(
             &p(1),

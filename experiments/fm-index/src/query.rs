@@ -118,6 +118,62 @@ fn eval(tree: &RequiredLiterals, hits: &BTreeMap<Vec<u8>, Option<Vec<(u32, u32)>
     }
 }
 
+/// The leaves worth locating when only each AND's rarest part is located:
+/// counts are cheap, and the rarest part's lines already hold every match
+/// line. Returns the estimated occurrences (`None` for unbounded, i.e. `All`).
+fn rarest(
+    tree: &RequiredLiterals,
+    counts: &BTreeMap<Vec<u8>, u64>,
+    cap: Option<u64>,
+    out: &mut BTreeSet<Vec<u8>>,
+) -> Option<u64> {
+    match tree {
+        RequiredLiterals::All => None,
+        RequiredLiterals::None => Some(0),
+        RequiredLiterals::Literal(b) => {
+            let n = counts[b];
+            if cap.is_some_and(|c| n > c) {
+                None
+            } else {
+                out.insert(b.clone());
+                Some(n)
+            }
+        }
+        RequiredLiterals::And(parts) => {
+            let mut best: Option<(u64, BTreeSet<Vec<u8>>)> = None;
+            for p in parts {
+                let mut s = BTreeSet::new();
+                if let Some(n) = rarest(p, counts, cap, &mut s)
+                    && best.as_ref().is_none_or(|b| n < b.0)
+                {
+                    best = Some((n, s));
+                }
+            }
+            let (n, s) = best?;
+            out.extend(s);
+            Some(n)
+        }
+        RequiredLiterals::Or(parts) => {
+            let mut total = 0u64;
+            let mut s = BTreeSet::new();
+            for p in parts {
+                total += rarest(p, counts, cap, &mut s)?;
+            }
+            out.extend(s);
+            Some(total)
+        }
+    }
+}
+
+/// How much of the tree a lookup locates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// Every literal: an AND intersects documents.
+    Full,
+    /// Each AND's rarest part only, by count; the other parts are `All`.
+    Rarest,
+}
+
 /// Runs one query on one segment. `cap`: a literal with more occurrences
 /// than this is not located and counts as `All`, which only weakens the
 /// screen. `lines`: whether line verification is sound for the query.
@@ -128,6 +184,7 @@ pub fn run(
     tree: &RequiredLiterals,
     lines: bool,
     cap: Option<u64>,
+    plan: Plan,
 ) -> (Vec<Cand>, Cost) {
     let start = Instant::now();
     let mut cost = Cost::default();
@@ -151,10 +208,23 @@ pub fn run(
     cost.count = t.elapsed();
     // Locate.
     let t = Instant::now();
+    let wanted = match plan {
+        Plan::Full => None,
+        Plan::Rarest => {
+            let counts = ranges.iter().map(|(l, (lo, hi))| (l.clone(), hi - lo)).collect();
+            let mut s = BTreeSet::new();
+            rarest(tree, &counts, cap, &mut s);
+            Some(s)
+        }
+    };
     let mut positions: Vec<(Vec<u8>, Option<Vec<u32>>)> = Vec::with_capacity(ranges.len());
     for (lit, (lo, hi)) in ranges {
         let n = hi - lo;
         cost.occurrences += n;
+        if wanted.as_ref().is_some_and(|w| !w.contains(&lit)) {
+            positions.push((lit, None));
+            continue;
+        }
         if cap.is_some_and(|c| n > c) {
             cost.capped_leaves += 1;
             positions.push((lit, None));
