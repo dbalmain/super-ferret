@@ -17,7 +17,9 @@
 //!   [`Row`]s.
 //! - `expr`: the boolean tree (D62 A) and its three-valued evaluation.
 //! - `plan`: [`Query::run_content`], the content planner: driver choice,
-//!   `DocId` → rows ([`DocNames`]), verification of Maybe documents.
+//!   `DocId` → rows ([`DocNames`]).
+//! - `verify`: settling Maybe rows by reading their documents, on the calling
+//!   thread or a bounded pool, in name order ([`Query::run_content_parallel`]).
 //!
 //! # Grammar
 //!
@@ -109,6 +111,7 @@ mod pattern;
 mod plan;
 mod query;
 mod run;
+mod verify;
 
 #[cfg(test)]
 mod tests;
@@ -122,3 +125,4 @@ pub use plan::{
 };
 pub use query::{GREP_PREFIX, ParseError, Query, Strategy};
 pub use run::{Row, RunError, Stats};
+pub use verify::{Fork, IN_FLIGHT_BYTES, KEPT_BUFFER, Workers};

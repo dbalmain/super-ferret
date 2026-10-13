@@ -23,18 +23,18 @@
 //! inverse ([`DocNames`], built once per catalog generation) and the
 //! checked reader; this crate opens no file.
 
-use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ferret_catalog::{Catalog, NameId, OpenError, Section, Target};
 use ferret_index::{Advance, Certainty, Cursor, DocSet, Pinned};
-use ferret_verify::{MatchStats, TextMatcher};
+use ferret_verify::MatchStats;
 
 use crate::content::ReadAtom;
 use crate::expr::{Node, Test, Truth};
 use crate::query::{Cmp, MetaTest, Query};
+use crate::verify::{Probed, Readers, Workers};
 use crate::{NameIndex, Row, RunError, Stats};
 
 /// The default bound on uncovered documents a query verifies rather than
@@ -121,6 +121,8 @@ pub struct ContentReport {
     /// The matcher's work over the documents read: atoms checked, rejected
     /// by byte search alone, tokenized whole, bytes tokenized.
     pub matching: MatchStats,
+    /// Threads that read and matched Maybe documents.
+    pub threads: usize,
 }
 
 impl ContentReport {
@@ -243,7 +245,8 @@ impl DocNames {
 impl Query {
     /// Runs a query with content atoms; see the module doc. Rows come in
     /// name order. A query without content atoms runs as
-    /// [`Query::run_indexed_until`] does.
+    /// [`Query::run_indexed_until`] does. Maybe documents are read on the
+    /// calling thread, through `read`.
     pub fn run_content(
         &self,
         catalog: &Catalog,
@@ -253,7 +256,43 @@ impl Query {
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
-        match self.content_until(catalog, index, content, read, cancelled, emit) {
+        self.content_or_cancelled(catalog, index, content, Readers::One(read), cancelled, emit)
+    }
+
+    /// [`Query::run_content`], reading and matching Maybe documents on
+    /// `workers`. Rows, their order,
+    /// where a `Break` stops, and every count in the report are as
+    /// [`Query::run_content`] gives them; only the report's times differ
+    /// (see `verify.rs`). One thread verifies on the calling thread.
+    pub fn run_content_parallel(
+        &self,
+        catalog: &Catalog,
+        index: &NameIndex,
+        content: &Content<'_>,
+        workers: Workers<'_, '_>,
+        cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        self.content_or_cancelled(
+            catalog,
+            index,
+            content,
+            Readers::Pool(workers),
+            cancelled,
+            emit,
+        )
+    }
+
+    fn content_or_cancelled(
+        &self,
+        catalog: &Catalog,
+        index: &NameIndex,
+        content: &Content<'_>,
+        readers: Readers<'_, '_>,
+        cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
+        match self.content_until(catalog, index, content, readers, cancelled, emit) {
             Err(RunError::Index(ferret_index::ReadError::Cancelled)) => Ok(Stats::default()),
             result => result,
         }
@@ -264,9 +303,9 @@ impl Query {
         catalog: &Catalog,
         index: &NameIndex,
         content: &Content<'_>,
-        read: &mut Reader<'_>,
+        readers: Readers<'_, '_>,
         cancelled: Option<&AtomicBool>,
-        mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
         let stopped = || cancelled.is_some_and(|flag| flag.load(Ordering::Acquire));
         let mut advance = Advance::new(&stopped);
@@ -440,126 +479,24 @@ impl Query {
             verified: 0,
             changed: 0,
             matching: MatchStats::default(),
+            threads: 1,
         };
         catalog.load(&self.residual_sections())?;
-        let mut matcher = TextMatcher::new();
-        let mut bytes = Vec::new();
-        // Only content facts established by a bracketed catalog-version read.
-        // Path failures never enter this map; every path has its own stat.
-        let mut exact: HashMap<u32, Vec<Option<usize>>> = HashMap::new();
-        let mut maybe_docs = HashSet::new();
-        let mut possible_docs = HashSet::new();
-        let mut rows = 0;
-        let mut stats = self.s1_ids(catalog, &ids, cancelled, |row| {
-            let doc = catalog.doc(row.inode).map(|d| d.0);
-            let at = doc.and_then(|d| docs.binary_search(&d).ok());
-            let indexed = |i: usize| match at.and_then(|j| table[j * width + i]) {
-                None => Truth::No,
-                Some(Certainty::Maybe) => Truth::Maybe,
-                Some(Certainty::Yes) => Truth::Yes,
-            };
-            let mut truth = self.eval_residual(&mut |test| match test {
-                Test::Content(i) => indexed(*i),
-                other => self.test_row(catalog, row, other),
-            });
-            if let Some(doc) = doc {
-                if truth != Truth::No {
-                    possible_docs.insert(doc);
-                }
-                if truth == Truth::Maybe {
-                    maybe_docs.insert(doc);
-                }
-            }
-            let mut offset = None;
-            if truth == Truth::Maybe
-                && let Some(doc) = doc
-            {
-                let reusable = if exact.contains_key(&doc) {
-                    match read(row.name, ReadRequest::Stat) {
-                        Some(ReadVersion::Catalogued) => true,
-                        Some(ReadVersion::Current) => false,
-                        None => {
-                            report.changed += 1;
-                            return ControlFlow::Continue(());
-                        }
-                    }
-                } else {
-                    false
-                };
-                let current;
-                let answers = if reusable {
-                    &exact[&doc]
-                } else {
-                    let verification_start = Instant::now();
-                    report.verified += 1;
-                    let Some(version) = read(row.name, ReadRequest::Bytes(&mut bytes)) else {
-                        report.verification_time += verification_start.elapsed();
-                        report.changed += 1;
-                        return ControlFlow::Continue(());
-                    };
-                    let answers: Option<Vec<Option<usize>>> = self
-                        .atoms
-                        .iter()
-                        .map(|text| {
-                            if stopped() {
-                                return None;
-                            }
-                            let engine_start = Instant::now();
-                            let answer = text.find(&mut matcher, &bytes);
-                            if matches!(text, crate::ContentAtom::Grep(_)) {
-                                report.regex_time += engine_start.elapsed();
-                                report.matching.regex_documents += 1;
-                                report.matching.regex_bytes += bytes.len() as u64;
-                                report.matching.regex_rejected += u64::from(answer.is_none());
-                            }
-                            (!stopped()).then_some(answer)
-                        })
-                        .collect();
-                    let Some(answers) = answers else {
-                        report.verification_time += verification_start.elapsed();
-                        return ControlFlow::Break(());
-                    };
-                    report.verification_time += verification_start.elapsed();
-                    match version {
-                        ReadVersion::Catalogued => exact.entry(doc).or_insert(answers),
-                        ReadVersion::Current => {
-                            report.changed += 1;
-                            current = answers;
-                            &current
-                        }
-                    }
-                };
-                offset = answers
-                    .iter()
-                    .zip(&self.atoms)
-                    .filter_map(|(answer, atom)| {
-                        if matches!(atom, crate::ContentAtom::Grep(_)) {
-                            *answer
-                        } else {
-                            None
-                        }
-                    })
-                    .min();
-                truth = self.eval_residual(&mut |test| match test {
-                    Test::Content(i) => answers[*i].is_some().into(),
-                    other => self.test_row(catalog, row, other),
-                });
-            }
-            if truth != Truth::Yes {
-                return ControlFlow::Continue(());
-            }
-            rows += 1;
-            let row = Row { offset, ..*row };
-            emit(&row)
-        })?;
-        stats.rows = rows;
-        report.snapshot_maybe = maybe_docs.len() as u64;
-        report.snapshot_possible = possible_docs.len() as u64;
-        let text_stats = matcher.stats();
-        report.matching.documents = text_stats.documents;
-        report.matching.rejected = text_stats.rejected;
-        report.matching.whole = text_stats.whole;
-        report.matching.tokenized = text_stats.tokenized;
+        let probed = Probed {
+            ids: &ids,
+            docs: &docs,
+            table: &table,
+            width,
+        };
+        let (mut stats, tally) = self.verify_rows(catalog, &probed, readers, cancelled, emit)?;
+        report.verified = tally.verified;
+        report.changed = tally.changed;
+        report.verification_time = tally.time;
+        report.regex_time = tally.regex;
+        report.matching = tally.matching;
+        report.snapshot_maybe = tally.maybe_docs;
+        report.snapshot_possible = tally.possible_docs;
+        report.threads = tally.threads;
         stats.content = Some(report);
         Ok(stats)
     }

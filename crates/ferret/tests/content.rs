@@ -811,6 +811,8 @@ fn an_already_cancelled_content_query_reads_no_postings() {
 }
 
 /// The first result callback can change the directory before the next read.
+/// On one verification thread the next read follows the callback; with
+/// more, it may already have been read ahead (D76 C), so this pins one.
 #[test]
 fn a_result_callback_cannot_redirect_later_directory_reads() {
     let tree = Tree::new();
@@ -822,7 +824,7 @@ fn a_result_callback_cannot_redirect_later_directory_reads() {
     let mut rows = Vec::new();
     engine
         .pin()
-        .search_content(&query(&["text:alpha beta"]), None, None, |row| {
+        .search_content_threads(&query(&["text:alpha beta"]), None, 1, None, |row| {
             rows.push(row.path.to_vec());
             if rows.len() == 1 {
                 fs::rename(tree.root().join("d"), tree.0.join("moved")).unwrap();
@@ -1552,4 +1554,127 @@ fn t1_blobs_route_through_trigrams_and_words_inside_them_are_lost() {
     assert_eq!(report.unwrap().uncovered, 3, "the old index was discarded");
     engine.follow_content(&Budget::unbounded(), None).unwrap();
     check(&engine);
+}
+
+// ------------------------------------------------- parallel verification
+
+/// One run's full output: each row's path, offset and kind in order, the
+/// stats, and the content report with its times cleared (the one thing the
+/// thread count may change; `verify.rs`).
+type Output = (Vec<(Vec<u8>, Option<usize>, String)>, String);
+
+fn output(
+    pin: &QuerySession,
+    query: &Query,
+    bound: Option<u32>,
+    threads: usize,
+    limit: Option<usize>,
+) -> Result<Output, String> {
+    let mut rows = Vec::new();
+    let stats = pin
+        .search_content_threads(query, bound, threads, None, |row| {
+            rows.push((row.path.to_vec(), row.offset, format!("{:?}", row.kind)));
+            match limit {
+                Some(limit) if rows.len() >= limit => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let mut stats = stats;
+    if let Some(report) = &mut stats.content {
+        assert_eq!(report.threads, threads);
+        report.verification_time = Default::default();
+        report.regex_time = Default::default();
+        report.threads = 0;
+    }
+    Ok((rows, format!("{stats:?}")))
+}
+
+/// The tree for the thread-count tests: documents of mixed sizes, so that
+/// workers finish out of order; copies with equal bytes, so that one
+/// document has several names; and, after indexing, changed, vanished and
+/// oversized files, so that reads fail or see a current version.
+fn mixed_tree(tree: &Tree) -> Engine {
+    for i in 0..240 {
+        let pad = if i % 37 == 0 { 400_000 } else { i * 13 % 900 };
+        let marker = match i % 5 {
+            0 => "needle7 here",
+            1 => "Needle42 there",
+            2 => "need le",
+            _ => "nothing",
+        };
+        // Every eleventh file shares its bytes with the file before.
+        let n = if i % 11 == 10 { i - 1 } else { i };
+        tree.write(
+            &format!("d{}/f{i:03}.txt", i % 7),
+            format!("{} {marker} {n}\n", "x".repeat(pad)).as_bytes(),
+        );
+    }
+    let engine = tree.engine();
+    engine.attach_content(&tree.index()).unwrap();
+    engine.follow_content(&Budget::unbounded(), None).unwrap();
+    for i in [3, 50, 51, 120] {
+        fs::remove_file(tree.root().join(format!("d{}/f{i:03}.txt", i % 7))).unwrap();
+    }
+    for i in [5, 10, 21, 64] {
+        tree.write(
+            &format!("d{}/f{i:03}.txt", i % 7),
+            format!("changed needle99 {i} and longer\n").as_bytes(),
+        );
+    }
+    // Over the reader's size cap: unverifiable, so dropped.
+    tree.write("d0/f070.txt", &vec![b'n'; 9 << 20]);
+    engine
+}
+
+/// D76 C: output is byte-identical at any verification thread count,
+/// including where a limit stops it, and where reads fail.
+#[test]
+fn verification_output_is_the_same_at_every_thread_count() {
+    let tree = Tree::new();
+    let engine = mixed_tree(&tree);
+    let pin = engine.pin();
+    let queries: &[&[&str]] = &[
+        &[r"grep:needle\d+"],
+        &[r"grep:(?i)needle\d+"],
+        &[r"grep:(?i)needle\d+", "OR", "text:nothing"],
+        &["NOT", r"grep:needle\d+", "ext:txt"],
+        &["text:needle7"],
+        &["text:need", "name:f0"],
+        &[r"grep:\d+"],
+    ];
+    for args in queries {
+        let q = query(args);
+        for bound in [None, Some(10_000)] {
+            let one = output(&pin, &q, bound, 1, None);
+            if let Ok((rows, _)) = &one {
+                assert!(!rows.is_empty() || args[0] == "NOT", "{args:?}");
+            }
+            for threads in [2, 3, 8] {
+                assert_eq!(
+                    output(&pin, &q, bound, threads, None),
+                    one,
+                    "{args:?} {bound:?} at {threads} threads"
+                );
+            }
+            let Ok((rows, _)) = one else {
+                // The refusal: the same error at every count.
+                continue;
+            };
+            for limit in 1..=rows.len().min(40) {
+                let one = output(&pin, &q, bound, 1, Some(limit));
+                for threads in [2, 8] {
+                    assert_eq!(
+                        output(&pin, &q, bound, threads, Some(limit)),
+                        one,
+                        "{args:?} {bound:?} limit {limit} at {threads} threads"
+                    );
+                }
+            }
+        }
+    }
+    // The error case is exercised: a refusal, and failed reads.
+    assert!(output(&pin, &query(&[r"grep:\d+"]), Some(10_000), 4, None).is_err());
+    let (_, stats) = output(&pin, &query(&[r"grep:(?i)needle\d+"]), None, 4, None).unwrap();
+    assert!(!stats.contains("changed: 0"), "{stats}");
 }

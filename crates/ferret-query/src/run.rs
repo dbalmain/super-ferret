@@ -324,13 +324,14 @@ impl Query {
 
 impl Query {
     /// Tests the names `ids`, in the order given, against S1's tests, and
-    /// emits each that passes: a content-driven plan's rows.
+    /// emits each that passes: a content-driven plan's rows. `emit` is also
+    /// given the candidates counted so far, this row's included.
     pub(crate) fn s1_ids(
         &self,
         catalog: &Catalog,
         ids: &[NameId],
         cancelled: Option<&AtomicBool>,
-        mut emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+        mut emit: impl FnMut(&Row<'_>, u64) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
         catalog.load(&ROW_SECTIONS)?;
         let mut run = Run {
@@ -346,8 +347,11 @@ impl Query {
         let mut kinds = catalog.kinds();
         for &id in ids {
             run.stats.candidates += 1;
+            let seen = run.stats.candidates;
             if run
-                .consider(&mut kinds, id, catalog.name(id), None, false, &mut emit)?
+                .consider(&mut kinds, id, catalog.name(id), None, false, &mut |row| {
+                    emit(row, seen)
+                })?
                 .is_break()
             {
                 break;

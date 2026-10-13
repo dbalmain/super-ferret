@@ -99,6 +99,20 @@ impl Documents {
         })
     }
 
+    /// Another reader by name with this one's policy and limiter, for a
+    /// second thread: [`Documents::by_name`] without loading again. Counts
+    /// start at zero.
+    pub fn fork(&self) -> Self {
+        Self {
+            names: Vec::new(),
+            dir: None,
+            limiter: self.limiter.clone(),
+            config: self.config,
+            files_read: 0,
+            bytes_read: 0,
+        }
+    }
+
     /// Uses the same size cap as a crawl configured with this policy. Product
     /// indexing and querying both use the default policy (8 MiB).
     pub fn with_config(mut self, config: ferret_policy::Config) -> Self {
