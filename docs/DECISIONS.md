@@ -4812,8 +4812,10 @@ content past roughly the size of A's index, also A.
 Content verification now runs on a pool of threads. `FERRET_SEARCH_THREADS`
 sets the count, which defaults to every core. For files that do not change
 during the query, and without cancellation, output is byte-identical at any
-thread count, and tests compare 1 thread against N. Document bytes in flight
-are capped at 64 MiB, plus 1 MiB per worker. The one order that changes is
+thread count, and tests compare 1 thread against N. Workers reserve at most
+64 MiB of documents at once, by catalogued size, plus 1 MiB of kept buffer
+each; files that grew since indexing hold more than they reserved, and the
+calling thread's buffer sits outside the budget. The one order that changes is
 that a document can be read up to 64 rows per thread before its
 predecessors are emitted, so a result callback that changes a later file
 may not change that file's row
