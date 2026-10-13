@@ -31,7 +31,7 @@ const SMALL: u64 = 64 << 10;
 /// The line around `at`, read by growing windows. Returns the line and the
 /// bytes read.
 fn line_at(file: &File, size: u64, at: u64) -> (u64, Vec<u8>, u64) {
-    let mut w = 1024u64;
+    let mut w = 256u64;
     let mut read = 0;
     loop {
         let s = at.saturating_sub(w);
@@ -71,7 +71,9 @@ fn one(grep: &Grep, path: &Path, size: u64, anchors: Option<&[u32]>) -> (bool, u
             assert_eq!(bytes.len() as u64, size, "frozen size moved");
             (grep.is_match(&bytes), size, size)
         }
-        Some(anchors) if size <= SMALL => {
+        // Small, or hits dense enough that the windows would cover most of
+        // it: one read, then only the hit lines through the regex.
+        Some(anchors) if size <= SMALL || anchors.len() as u64 * 2048 >= size => {
             let bytes = fs::read(path).expect("doc");
             assert_eq!(bytes.len() as u64, size, "frozen size moved");
             let (mut done, mut regex) = (0usize, 0u64);

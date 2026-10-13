@@ -278,7 +278,10 @@ fn verify(corpus: &Path, oracle: &Path, dir: &Path, set: &str, threads: usize, m
         }
     }
     fs::write(
-        dir.join("rows").join(format!("verify-{set}-t{threads}.tsv")),
+        dir.join("rows").join(format!(
+            "verify-{set}-t{threads}{}.tsv",
+            std::env::var("FM_VERIFY_TAG").unwrap_or_default()
+        )),
         rows,
     )
     .expect("rows");

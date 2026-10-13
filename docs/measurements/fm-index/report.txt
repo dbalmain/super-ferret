@@ -1,0 +1,202 @@
+# fm-screen report, D65C corpus (3,978,812,718 bytes, 112,376 readable docs), 250 ci regexes
+# branch wt/fm-index, experiments/fm-index; 2026-10-13; Ryzen 9 9955HX 16c/32t, 60 GB
+# lookup rows summed over 4 segments per query; verify-sa-t16 = 16 rayon threads; -v2 = line mode retuned (256 B first window, whole read when hits*2048 >= size)
+# 'cold' lookups: index files evicted (fadvise DONTNEED), mmap MADV_RANDOM (text, FM files) / normal (SA); 'cold' verify: candidate docs evicted
+# resident-alternation rows: segment 0 only, index pre-read (FM_RESIDENT); cap0 rows: count only; dry rows: rarest-plan occurrence counts, no locate
+
+## lookup fm128-rare_literal (ms median/p90 summed over segments; segments per query: {4})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| rare literal | 50 | 3.00/13.0 | 3.00/13.0 | 190/1028 | 31.9/62.3 | 92.8/539 | 143/577 | 0.423/0.701 | 0.997/4.95 | 0.010/0.031 | 1.52/5.33 | 2.00/10.0 |
+|  ↳ rare literal | sums: located 347, warm locate 259058.4 ns per occurrence, 62.5 LF steps per occurrence; locate is 78% of warm lookup |
+
+## lookup fm128-cap0 (ms median/p90 summed over segments; segments per query: {4})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| rare literal | 50 | 3.00/13.0 | 0.000/0.000 | 0.000/0.000 | 32.3/63.6 | 0.001/0.002 | 32.3/63.7 | 0.387/0.671 | 0.000/0.001 | 0.039/0.085 | 0.429/0.739 | 55226/94010 |
+| identifier pattern | 50 | 2051286/4665355 | 0.000/0.000 | 0.000/0.000 | 54.7/81.4 | 0.001/0.002 | 54.8/81.6 | 0.566/0.768 | 0.001/0.001 | 0.082/0.106 | 0.653/0.857 | 112376/112376 |
+| alternation | 50 | 112259/589987 | 0.000/0.000 | 0.000/0.000 | 113/141 | 0.002/0.003 | 113/141 | 1.04/1.35 | 0.001/0.002 | 0.088/0.123 | 1.14/1.52 | 112376/112376 |
+| broad | 50 | 3608541/6449993 | 0.000/0.000 | 0.000/0.000 | 16.7/36.9 | 0.001/0.002 | 16.8/37.0 | 0.200/0.362 | 0.000/0.001 | 0.068/0.081 | 0.272/0.446 | 112376/112376 |
+| code class | 50 | 1438488/5111528 | 0.000/0.000 | 0.000/0.000 | 94.5/177 | 0.002/0.003 | 94.6/177 | 0.771/1.28 | 0.001/0.002 | 0.096/0.119 | 0.873/1.42 | 112376/112376 |
+
+## lookup fm128-resident-alternation (ms median/p90 summed over segments; segments per query: {1})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| alternation | 50 | 27752/187604 | 27752/187604 | 1762264/11917952 | 0.544/0.643 | 567/3320 | 569/3330 | 0.557/0.634 | 567/3308 | 1.49/8.61 | 569/3317 | 1951/4091 |
+|  ↳ alternation | sums: located 3868311, warm locate 17881.4 ns per occurrence, 63.5 LF steps per occurrence; locate is 100% of warm lookup |
+
+## lookup fm32-rare_literal (ms median/p90 summed over segments; segments per query: {4})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| rare literal | 50 | 3.00/13.0 | 3.00/13.0 | 37.0/226 | 31.2/61.5 | 26.5/183 | 65.5/206 | 0.380/0.689 | 0.295/1.20 | 0.009/0.026 | 0.705/1.92 | 2.00/10.0 |
+|  ↳ rare literal | sums: located 347, warm locate 78579.7 ns per occurrence, 15.6 LF steps per occurrence; locate is 54% of warm lookup |
+
+## lookup fm32-cap0 (ms median/p90 summed over segments; segments per query: {4})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| rare literal | 50 | 3.00/13.0 | 0.000/0.000 | 0.000/0.000 | 32.4/61.3 | 0.001/0.001 | 32.4/61.3 | 0.359/0.628 | 0.000/0.001 | 0.037/0.092 | 0.400/0.726 | 55226/94010 |
+| identifier pattern | 50 | 2051286/4665355 | 0.000/0.000 | 0.000/0.000 | 54.7/80.0 | 0.001/0.002 | 54.8/80.1 | 0.528/0.709 | 0.001/0.001 | 0.083/0.098 | 0.620/0.825 | 112376/112376 |
+| alternation | 50 | 112259/589987 | 0.000/0.000 | 0.000/0.000 | 110/137 | 0.002/0.003 | 110/137 | 1.06/1.35 | 0.001/0.001 | 0.100/0.116 | 1.17/1.47 | 112376/112376 |
+| broad | 50 | 3608541/6449993 | 0.000/0.000 | 0.000/0.000 | 16.8/37.0 | 0.001/0.001 | 16.9/37.0 | 0.190/0.336 | 0.000/0.001 | 0.068/0.078 | 0.260/0.414 | 112376/112376 |
+| code class | 50 | 1438488/5111528 | 0.000/0.000 | 0.000/0.000 | 86.7/178 | 0.002/0.004 | 86.8/178 | 0.741/1.37 | 0.001/0.002 | 0.093/0.115 | 0.831/1.50 | 112376/112376 |
+
+## lookup fm32-rarest-resident-dry (ms median/p90 summed over segments; segments per query: {4})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| rare literal | 50 | 3.00/13.0 | 3.00/13.0 | 0.000/0.000 | 0.541/0.933 | 0.002/0.005 | 0.618/1.02 | 0.567/0.918 | 0.002/0.004 | 0.066/0.072 | 0.637/1.03 | 112376/112376 |
+|  ↳ rare literal | sums: located 347, warm locate 289.3 ns per occurrence, 0.0 LF steps per occurrence; locate is 0% of warm lookup |
+| identifier pattern | 50 | 2051286/4665355 | 141016/706979 | 0.000/0.000 | 0.766/1.11 | 0.004/0.007 | 0.847/1.19 | 0.709/0.926 | 0.003/0.007 | 0.067/0.072 | 0.781/1.01 | 112376/112376 |
+|  ↳ identifier pattern | sums: located 14002422, warm locate 0.0 ns per occurrence, 0.0 LF steps per occurrence; locate is 1% of warm lookup |
+| alternation | 50 | 112259/589987 | 112259/589987 | 0.000/0.000 | 1.37/1.70 | 0.006/0.010 | 1.44/1.77 | 1.35/1.69 | 0.005/0.009 | 0.069/0.078 | 1.43/1.77 | 112376/112376 |
+|  ↳ alternation | sums: located 16465382, warm locate 0.0 ns per occurrence, 0.0 LF steps per occurrence; locate is 0% of warm lookup |
+| broad | 50 | 3608541/6449993 | 3608541/6449993 | 0.000/0.000 | 0.264/0.453 | 0.001/0.002 | 0.332/0.523 | 0.255/0.445 | 0.001/0.002 | 0.066/0.071 | 0.324/0.519 | 112376/112376 |
+|  ↳ broad | sums: located 199623282, warm locate 0.0 ns per occurrence, 0.0 LF steps per occurrence; locate is 0% of warm lookup |
+| code class | 50 | 1438488/5111528 | 30396/184252 | 0.000/0.000 | 0.988/1.55 | 0.007/0.018 | 1.06/1.67 | 0.918/1.63 | 0.006/0.015 | 0.069/0.075 | 0.992/1.74 | 112376/112376 |
+|  ↳ code class | sums: located 4583415, warm locate 0.1 ns per occurrence, 0.0 LF steps per occurrence; locate is 1% of warm lookup |
+
+## lookup fm32-resident-alternation (ms median/p90 summed over segments; segments per query: {1})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| alternation | 50 | 27752/187604 | 27752/187604 | 430552/2907616 | 0.540/0.628 | 123/661 | 125/671 | 0.536/0.637 | 122/657 | 1.49/8.76 | 124/666 | 1951/4091 |
+|  ↳ alternation | sums: located 3868311, warm locate 3617.2 ns per occurrence, 15.5 LF steps per occurrence; locate is 98% of warm lookup |
+
+## lookup fm64-rare_literal (ms median/p90 summed over segments; segments per query: {4})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| rare literal | 50 | 3.00/13.0 | 3.00/13.0 | 78.0/452 | 31.4/61.5 | 42.2/326 | 89.8/378 | 0.373/0.667 | 0.530/2.22 | 0.010/0.027 | 0.952/2.53 | 2.00/10.0 |
+|  ↳ rare literal | sums: located 347, warm locate 137665.0 ns per occurrence, 30.0 LF steps per occurrence; locate is 68% of warm lookup |
+
+## lookup fm64-cap0 (ms median/p90 summed over segments; segments per query: {4})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| rare literal | 50 | 3.00/13.0 | 0.000/0.000 | 0.000/0.000 | 31.1/64.3 | 0.001/0.002 | 31.2/64.4 | 0.339/0.607 | 0.000/0.001 | 0.037/0.083 | 0.382/0.665 | 55226/94010 |
+| identifier pattern | 50 | 2051286/4665355 | 0.000/0.000 | 0.000/0.000 | 54.8/81.8 | 0.001/0.002 | 54.9/81.9 | 0.545/0.736 | 0.001/0.001 | 0.080/0.097 | 0.635/0.823 | 112376/112376 |
+| alternation | 50 | 112259/589987 | 0.000/0.000 | 0.000/0.000 | 111/136 | 0.002/0.003 | 111/136 | 1.07/1.35 | 0.001/0.002 | 0.100/0.119 | 1.18/1.47 | 112376/112376 |
+| broad | 50 | 3608541/6449993 | 0.000/0.000 | 0.000/0.000 | 16.6/36.8 | 0.001/0.001 | 16.7/36.9 | 0.205/0.362 | 0.000/0.001 | 0.069/0.083 | 0.283/0.428 | 112376/112376 |
+| code class | 50 | 1438488/5111528 | 0.000/0.000 | 0.000/0.000 | 86.9/177 | 0.002/0.003 | 87.1/177 | 0.820/1.32 | 0.001/0.002 | 0.092/0.113 | 0.917/1.44 | 112376/112376 |
+
+## lookup fm64-resident-alternation (ms median/p90 summed over segments; segments per query: {1})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| alternation | 50 | 27752/187604 | 27752/187604 | 876248/5904896 | 0.532/0.631 | 266/1516 | 268/1526 | 0.543/0.645 | 264/1517 | 1.50/8.73 | 266/1527 | 1951/4091 |
+|  ↳ alternation | sums: located 3868311, warm locate 8430.1 ns per occurrence, 31.5 LF steps per occurrence; locate is 99% of warm lookup |
+
+## lookup sa (ms median/p90 summed over segments; segments per query: {4})
+| class | queries | occurrences | located | LF steps | count cold | locate cold | total cold | count warm | locate warm | combine warm | total warm | candidate docs |
+| rare literal | 50 | 3.00/13.0 | 3.00/13.0 | 0.000/0.000 | 46.1/208 | 0.002/0.003 | 46.1/208 | 0.494/0.834 | 0.001/0.001 | 0.009/0.026 | 0.506/0.842 | 2.00/10.0 |
+|  ↳ rare literal | sums: located 347, warm locate 94.9 ns per occurrence, 0.0 LF steps per occurrence; locate is 0% of warm lookup |
+| identifier pattern | 50 | 2051286/4665355 | 2051286/4665355 | 0.000/0.000 | 152/684 | 4.64/15.0 | 234/759 | 1.64/2.24 | 0.470/1.33 | 51.0/140 | 53.4/144 | 4613/13579 |
+|  ↳ identifier pattern | sums: located 121433528, warm locate 0.4 ns per occurrence, 0.0 LF steps per occurrence; locate is 1% of warm lookup |
+| alternation | 50 | 112259/589987 | 112259/589987 | 0.000/0.000 | 188/265 | 0.049/1.07 | 202/283 | 1.92/2.68 | 0.025/0.139 | 6.34/30.3 | 8.36/33.1 | 8020/24075 |
+|  ↳ alternation | sums: located 16465382, warm locate 0.3 ns per occurrence, 0.0 LF steps per occurrence; locate is 1% of warm lookup |
+| broad | 50 | 3608541/6449993 | 3608541/6449993 | 0.000/0.000 | 57.6/260 | 11.3/56.7 | 204/485 | 0.732/1.14 | 0.981/2.06 | 85.7/152 | 87.9/154 | 57627/71597 |
+|  ↳ broad | sums: located 199623282, warm locate 0.3 ns per occurrence, 0.0 LF steps per occurrence; locate is 1% of warm lookup |
+| code class | 50 | 1438488/5111528 | 1438488/5111528 | 0.000/0.000 | 151/227 | 1.48/6.03 | 189/351 | 1.55/2.38 | 0.253/1.07 | 31.6/117 | 33.1/120 | 2008/13482 |
+|  ↳ code class | sums: located 107661735, warm locate 0.3 ns per occurrence, 0.0 LF steps per occurrence; locate is 1% of warm lookup |
+
+## verify-sa-t16-v2.tsv (MB = 10^6 bytes; ms median/p90)
+| class | mode | queries | candidate docs | candidate MB | read MB | regex MB | device MB cold | cold ms | warm ms | missed oracle docs | matches == oracle | whole-doc / line verifications |
+| rare literal | line | 50 | 2.00/10.0 | 4.06/20.4 | 2.71/27.3 | 1.29/14.8 | 1.33/15.3 | 27.2/99.1 | 0.429/3.21 | 0 | 50/50 | 0/187 |
+| identifier pattern | line | 50 | 4613/13579 | 2023/2729 | 2286/4162 | 825/1501 | 1365/2317 | 1066/2256 | 64.5/107 | 0 | 50/50 | 11908/317905 |
+| alternation | line | 50 | 8020/24075 | 2074/2713 | 1007/1837 | 468/804 | 720/1350 | 629/2012 | 38.1/58.0 | 0 | 50/50 | 44012/545065 |
+| broad | line | 50 | 57627/71597 | 3566/3727 | 4015/5144 | 2233/2478 | 3437/3709 | 2684/4822 | 122/140 | 0 | 50/50 | 576839/2424432 |
+| code class | line | 50 | 2008/13482 | 1186/2247 | 611/1710 | 272/706 | 453/1254 | 459/1168 | 43.2/94.3 | 0 | 50/50 | 10342/229723 |
+
+## verify-sa-t16.tsv (MB = 10^6 bytes; ms median/p90)
+| class | mode | queries | candidate docs | candidate MB | read MB | regex MB | device MB cold | cold ms | warm ms | missed oracle docs | matches == oracle | whole-doc / line verifications |
+| rare literal | line | 50 | 2.00/10.0 | 4.06/20.4 | 2.71/27.3 | 1.29/14.8 | 1.33/15.3 | 4.12/17.7 | 0.236/3.08 | 0 | 50/50 | 0/187 |
+| rare literal | whole | 50 | 2.00/10.0 | 4.06/20.4 | 4.06/20.4 | 4.06/20.4 | 4.07/20.5 | 4.82/15.2 | 0.254/1.16 | 0 | 50/50 | 187/0 |
+| identifier pattern | line | 50 | 4613/13579 | 2023/2729 | 2299/4408 | 825/1501 | 1363/2268 | 1018/1694 | 64.8/112 | 0 | 50/50 | 11908/317905 |
+| identifier pattern | whole | 50 | 4613/13579 | 2023/2729 | 2023/2729 | 2023/2729 | 2034/2758 | 1288/1747 | 60.6/88.6 | 0 | 50/50 | 329813/0 |
+| alternation | line | 50 | 8020/24075 | 2074/2713 | 1000/1727 | 468/804 | 708/1280 | 657/1123 | 41.6/69.4 | 0 | 50/50 | 44012/545065 |
+| alternation | whole | 50 | 8020/24075 | 2074/2713 | 2074/2713 | 2074/2713 | 2093/2743 | 1457/2041 | 57.6/76.0 | 0 | 50/50 | 589077/0 |
+| broad | line | 50 | 57627/71597 | 3566/3727 | 7149/8215 | 2233/2478 | 3270/3488 | 2729/10598 | 134/155 | 0 | 50/50 | 576839/2424432 |
+| broad | whole | 50 | 57627/71597 | 3566/3727 | 3566/3727 | 3566/3727 | 3690/3885 | 2740/11699 | 105/118 | 0 | 50/50 | 3001271/0 |
+| code class | line | 50 | 2008/13482 | 1186/2247 | 613/1557 | 272/706 | 453/1125 | 369/994 | 43.2/88.1 | 0 | 50/50 | 10342/229723 |
+| code class | whole | 50 | 2008/13482 | 1186/2247 | 1186/2247 | 1186/2247 | 1190/2270 | 710/1533 | 131/205 | 0 | 50/50 | 240065/0 |
+
+## total: lookup sa + verify-sa-t16-v2.tsv line (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 93.2/211 | 0.983/3.63 |
+| identifier pattern | 50 | 1488/2870 | 114/232 |
+| alternation | 50 | 855/2259 | 49.2/101 |
+| broad | 50 | 2927/5024 | 206/281 |
+| code class | 50 | 730/1368 | 92.1/187 |
+
+## total: lookup fm128-rare_literal + verify-sa-t16-v2.tsv line (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 172/636 | 2.40/8.82 |
+
+## total: lookup fm32-rare_literal + verify-sa-t16-v2.tsv line (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 94.8/242 | 1.34/5.13 |
+
+## total: lookup fm64-rare_literal + verify-sa-t16-v2.tsv line (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 124/393 | 1.63/6.32 |
+
+## FM s=32 estimate, warm ms median/p90 (locate 3617 ns per occurrence, measured)
+| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |
+| rare literal | 0.383/0.680 | 0.776/3.52 | 0.383/0.680 | 0.776/3.52 |
+| identifier pattern | 7478/17020 | 7564/17127 | 564/2676 | 613/2786 |
+| alternation | 413/2165 | 437/2216 | 413/2165 | 437/2216 |
+| broad | 13137/23483 | 13241/23597 | 13137/23483 | 13241/23597 |
+| code class | 5243/18605 | 5322/18684 | 137/785 | 188/864 |
+
+## FM s=64 estimate, warm ms median/p90 (locate 8430 ns per occurrence, measured)
+| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |
+| rare literal | 0.400/0.682 | 0.822/3.56 | 0.400/0.682 | 0.822/3.56 |
+| identifier pattern | 17350/39474 | 17461/39580 | 1243/6078 | 1291/6189 |
+| alternation | 953/5005 | 977/5055 | 953/5005 | 977/5055 |
+| broad | 30505/54526 | 30608/54640 | 30505/54526 | 30608/54640 |
+| code class | 12166/43206 | 12245/43286 | 280/1672 | 332/1751 |
+
+## FM s=128 estimate, warm ms median/p90 (locate 17881 ns per occurrence, measured)
+| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |
+| rare literal | 0.474/0.834 | 0.917/3.71 | 0.474/0.834 | 0.917/3.71 |
+| identifier pattern | 36738/83567 | 36848/83674 | 2575/12760 | 2624/12871 |
+| alternation | 2014/10581 | 2038/10632 | 2014/10581 | 2038/10632 |
+| broad | 64610/115486 | 64713/115601 | 64610/115486 | 64713/115601 |
+| code class | 25761/91517 | 25841/91596 | 563/3413 | 613/3492 |
+
+## total: lookup sa + verify-sa-t16.tsv line (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 57.9/208 | 0.824/3.53 |
+| identifier pattern | 50 | 1447/2110 | 114/236 |
+| alternation | 50 | 878/1575 | 53.3/99.8 |
+| broad | 50 | 2949/10952 | 225/297 |
+| code class | 50 | 568/1254 | 92.4/184 |
+
+## total: lookup sa + verify-sa-t16.tsv whole (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 58.1/208 | 0.854/1.74 |
+| identifier pattern | 50 | 1610/2214 | 112/221 |
+| alternation | 50 | 1639/2493 | 70.7/106 |
+| broad | 50 | 2907/12025 | 191/262 |
+| code class | 50 | 879/1750 | 190/263 |
+
+## total: lookup fm128-rare_literal + verify-sa-t16.tsv line (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 148/586 | 2.21/7.36 |
+
+## total: lookup fm32-rare_literal + verify-sa-t16.tsv line (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 70.5/211 | 1.16/4.20 |
+
+## total: lookup fm64-rare_literal + verify-sa-t16.tsv line (ms median/p90)
+| class | queries | total cold | total warm |
+| rare literal | 50 | 96.8/383 | 1.36/5.66 |
+
+## FM s=32 estimate, warm ms median/p90 (locate 3617 ns per occurrence, measured)
+| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |
+| rare literal | 0.383/0.680 | 0.677/3.43 | 0.383/0.680 | 0.677/3.43 |
+| identifier pattern | 7478/17020 | 7578/17141 | 564/2676 | 620/2774 |
+| alternation | 413/2165 | 438/2213 | 413/2165 | 438/2213 |
+| broad | 13137/23483 | 13276/23607 | 13137/23483 | 13276/23607 |
+| code class | 5243/18605 | 5322/18688 | 137/785 | 185/865 |
+
+## FM s=64 estimate, warm ms median/p90 (locate 8430 ns per occurrence, measured)
+| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |
+| rare literal | 0.400/0.682 | 0.698/3.60 | 0.400/0.682 | 0.698/3.60 |
+| identifier pattern | 17350/39474 | 17465/39595 | 1243/6078 | 1291/6177 |
+| alternation | 953/5005 | 978/5053 | 953/5005 | 978/5053 |
+| broad | 30505/54526 | 30644/54650 | 30505/54526 | 30644/54650 |
+| code class | 12166/43206 | 12249/43289 | 280/1672 | 332/1752 |
+
+## FM s=128 estimate, warm ms median/p90 (locate 17881 ns per occurrence, measured)
+| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |
+| rare literal | 0.474/0.834 | 0.790/3.70 | 0.474/0.834 | 0.790/3.70 |
+| identifier pattern | 36738/83567 | 36852/83688 | 2575/12760 | 2624/12859 |
+| alternation | 2014/10581 | 2039/10629 | 2014/10581 | 2039/10629 |
+| broad | 64610/115486 | 64749/115611 | 64610/115486 | 64749/115611 |
+| code class | 25761/91517 | 25845/91600 | 563/3413 | 613/3494 |

@@ -137,16 +137,16 @@ fn verify_table(dir: &Path, file: &str) {
                 r.len(),
                 fmt(col(3), 1.0),
                 fmt(col(4), 1e6),
+                fmt(col(9), 1e6),
                 fmt(col(10), 1e6),
                 fmt(col(11), 1e6),
-                fmt(col(12), 1e6),
                 fmt(col(7), 1e6),
                 fmt(col(8), 1e6),
                 sum(5),
                 r.iter().filter(|x| x[6] == "true").count(),
                 r.len(),
+                sum(12),
                 sum(13),
-                sum(14),
             );
         }
     }
@@ -173,9 +173,10 @@ fn totals(dir: &Path, set: &str, class_suffix: &str, file: &str, mode: &str) {
         e.0.push(l.1[3] + f[7].parse::<f64>().expect("cold"));
         e.1.push(l.1[7] + f[8].parse::<f64>().expect("warm"));
     }
-    println!(
-        "\n## total: lookup {set}{class_suffix} + {file} {mode} (ms median/p90)"
-    );
+    if by_class.is_empty() {
+        return;
+    }
+    println!("\n## total: lookup {set}{class_suffix} + {file} {mode} (ms median/p90)");
     println!("| class | queries | total cold | total warm |");
     for class in CLASSES {
         if let Some((c, w)) = by_class.get(class) {
@@ -219,12 +220,65 @@ pub fn run(dir: &Path) {
         for mode in ["line", "whole"] {
             totals(dir, vset, "", n, mode);
         }
-        // FM runs whose candidates equal the verified set's (asserted at
-        // lookup time) share its verification.
+        // FM runs over every segment whose candidates equal the verified
+        // set's (asserted at lookup time) share its verification.
         for (s, suffix) in &sets {
-            if s.starts_with("fm") && !s.contains("cap") {
+            if s.starts_with("fm") && !s.contains("cap") && !s.contains("dry") && !s.contains("resident") {
                 totals(dir, s, suffix, n, "line");
             }
+        }
+        estimate(dir, n);
+    }
+}
+
+/// FM-index warm totals where locating every occurrence was too slow to
+/// run: count (measured, `cap0` rows) + occurrences x warm per-occurrence
+/// locate cost (measured on segment 0's alternation class, resident) + the
+/// suffix array's combine + line verification of the same candidates.
+/// The rarest-part plan's occurrences come from the dry run; its candidates
+/// are a superset, so verifying the full plan's makes it a lower bound.
+fn estimate(dir: &Path, verify_file: &str) {
+    let Ok(text) = fs::read_to_string(dir.join("rows").join(verify_file)) else {
+        return;
+    };
+    let verify: BTreeMap<usize, f64> = text
+        .lines()
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .filter(|f| f[2] == "line")
+        .map(|f| (f[0].parse().expect("q"), f[8].parse().expect("warm")))
+        .collect();
+    let sa = lookups(dir, "sa", "");
+    let dry = lookups(dir, "fm32-rarest-resident-dry", "");
+    for rate in [32, 64, 128] {
+        let alt = lookups(dir, &format!("fm{rate}-resident"), "-alternation");
+        let count = lookups(dir, &format!("fm{rate}-cap0"), "");
+        if alt.is_empty() || count.is_empty() || sa.is_empty() {
+            continue;
+        }
+        let per: f64 = alt.values().map(|v| v.1[5]).sum::<f64>() / alt.values().map(|v| v.1[9]).sum::<f64>();
+        println!(
+            "\n## FM s={rate} estimate, warm ms median/p90 (locate {per:.0} ns per occurrence, measured)"
+        );
+        println!("| class | lookup, every literal | total, every literal | lookup, rarest AND part | total lower bound, rarest |");
+        for class in CLASSES {
+            let qs: Vec<usize> = sa.keys().copied().filter(|q| CLASSES[q / 50] == class).collect();
+            let row = |located: &dyn Fn(usize) -> f64| -> (Vec<f64>, Vec<f64>) {
+                qs.iter()
+                    .map(|&q| {
+                        let l = count[&q].1[4] + located(q) * per + sa[&q].1[6];
+                        (l, l + verify.get(&q).copied().unwrap_or(f64::NAN))
+                    })
+                    .unzip()
+            };
+            let (full_l, full_t) = row(&|q| sa[&q].1[9]);
+            let (r_l, r_t) = row(&|q| dry.get(&q).map_or(f64::NAN, |d| d.1[9]));
+            println!(
+                "| {class} | {} | {} | {} | {} |",
+                fmt(median_p90(full_l), 1e6),
+                fmt(median_p90(full_t), 1e6),
+                fmt(median_p90(r_l), 1e6),
+                fmt(median_p90(r_t), 1e6)
+            );
         }
     }
 }
