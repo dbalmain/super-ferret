@@ -537,7 +537,7 @@ struct Pool {
     /// A job finished, or a worker was lost.
     done: Condvar,
     /// Bytes reserved by workers reading now.
-    budget: Mutex<u64>,
+    budget: Mutex<Budget>,
     freed: Condvar,
     stop: AtomicBool,
 }
@@ -550,6 +550,18 @@ struct PoolState {
     next: u64,
     /// A worker panicked; its job will never finish.
     lost: bool,
+    /// Workers waiting for a job. Wakes are syscalls, so a submit or a
+    /// finish signals only a thread that is waiting for it.
+    idle: usize,
+    /// The job the calling thread is waiting for, if it is.
+    awaited: Option<u64>,
+}
+
+#[derive(Default)]
+struct Budget {
+    used: u64,
+    /// Workers waiting for bytes to be freed.
+    waiting: usize,
 }
 
 impl Pool {
@@ -559,7 +571,7 @@ impl Pool {
             state: Mutex::default(),
             work: Condvar::new(),
             done: Condvar::new(),
-            budget: Mutex::new(0),
+            budget: Mutex::default(),
             freed: Condvar::new(),
             stop: AtomicBool::new(false),
         }
@@ -576,7 +588,11 @@ impl Pool {
         let seq = state.next;
         state.next += 1;
         state.jobs.push_back((seq, name, size));
-        self.work.notify_one();
+        let wake = state.idle > 0;
+        drop(state);
+        if wake {
+            self.work.notify_one();
+        }
         seq
     }
 
@@ -594,10 +610,12 @@ impl Pool {
             if state.lost {
                 return None;
             }
+            state.awaited = Some(seq);
             state = self
                 .done
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            state.awaited = None;
         }
     }
 
@@ -628,8 +646,13 @@ impl Pool {
             if bytes.capacity() > KEPT_BUFFER {
                 bytes = Vec::new();
             }
-            self.state().finished.insert(seq, outcome);
-            self.done.notify_all();
+            let mut state = self.state();
+            state.finished.insert(seq, outcome);
+            let wake = state.awaited == Some(seq);
+            drop(state);
+            if wake {
+                self.done.notify_all();
+            }
         }
     }
 
@@ -642,10 +665,12 @@ impl Pool {
             if let Some(job) = state.jobs.pop_front() {
                 return Some(job);
             }
+            state.idle += 1;
             state = self
                 .work
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            state.idle -= 1;
         }
     }
 
@@ -653,21 +678,27 @@ impl Pool {
     /// stops; one reader always proceeds alone.
     fn reserve(&self, size: u64) -> u64 {
         let size = size.min(IN_FLIGHT_BYTES);
-        let mut used = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
-        while *used > 0 && *used + size > IN_FLIGHT_BYTES && !self.halted() {
-            used = self
+        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+        while budget.used > 0 && budget.used + size > IN_FLIGHT_BYTES && !self.halted() {
+            budget.waiting += 1;
+            budget = self
                 .freed
-                .wait(used)
+                .wait(budget)
                 .unwrap_or_else(PoisonError::into_inner);
+            budget.waiting -= 1;
         }
-        *used += size;
+        budget.used += size;
         size
     }
 
     fn release(&self, size: u64) {
-        let mut used = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
-        *used -= size;
-        self.freed.notify_all();
+        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+        budget.used -= size;
+        let wake = budget.waiting > 0;
+        drop(budget);
+        if wake {
+            self.freed.notify_all();
+        }
     }
 }
 

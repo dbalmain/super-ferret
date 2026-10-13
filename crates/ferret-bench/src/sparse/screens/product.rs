@@ -30,9 +30,22 @@ use super::super::{Corpus, stats};
 use super::rg::counters;
 use super::{CLASSES, evict_files, readable_oracle};
 
-/// Warm runs at each count; cold at the ends and the middle.
+/// Warm runs at each count; cold at the ends and the middle. Either list
+/// can be replaced, comma-separated, by `PRODUCT_THREADS` / `PRODUCT_COLD`
+/// (the cold counts must be among the warm ones; empty for none).
 const THREADS: [usize; 5] = [1, 4, 8, 16, 32];
 const COLD: [usize; 3] = [1, 8, 32];
+
+fn counts(name: &str, default: &[usize]) -> crate::Result<Vec<usize>> {
+    match std::env::var(name) {
+        Err(_) => Ok(default.to_vec()),
+        Ok(list) => list
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| Ok(s.parse()?))
+            .collect(),
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct Run {
@@ -43,6 +56,9 @@ struct Run {
     /// Summed busy time of every verifying thread.
     busy: Duration,
     cpu: f64,
+    /// On-CPU time of the calling thread, which runs the candidate rows and
+    /// emits in order: the pipeline's serial part.
+    caller: Duration,
     /// Bytes the kernel fetched from the device.
     device: u64,
 }
@@ -99,6 +115,7 @@ fn once(
     };
     let mut matched = Vec::new();
     let before = counters()?;
+    let caller_before = caller_cpu()?;
     let start = Instant::now();
     let stats = query.run_content_parallel(
         catalog,
@@ -117,6 +134,7 @@ fn once(
         },
     )?;
     let wall = start.elapsed();
+    let caller = caller_cpu()? - caller_before;
     let after = counters()?;
     let report = stats
         .content
@@ -136,11 +154,23 @@ fn once(
             before_reads: first.map_or(wall, |at| at - start),
             busy: report.verification_time,
             cpu: after.self_cpu - before.self_cpu,
+            caller,
             device: after.device - before.device,
         },
         matched,
         read_docs,
     })
+}
+
+/// This thread's on-CPU time, in nanoseconds since it started.
+fn caller_cpu() -> crate::Result<Duration> {
+    let stat = fs::read_to_string("/proc/thread-self/schedstat")?;
+    let ns = stat
+        .split_whitespace()
+        .next()
+        .ok_or("empty schedstat")?
+        .parse()?;
+    Ok(Duration::from_nanos(ns))
 }
 
 fn evict_index(index: &Path) -> crate::Result<()> {
@@ -170,7 +200,9 @@ pub(super) fn arm(
     let names = NameIndex::new(&corpus.catalog);
     let docs = DocNames::new(&corpus.catalog)?;
     let inline = if flags.case_insensitive { "(?i)" } else { "" };
-    let most = THREADS[THREADS.len() - 1];
+    let threads_list = counts("PRODUCT_THREADS", &THREADS)?;
+    let cold_list = counts("PRODUCT_COLD", &COLD)?;
+    let most = *threads_list.iter().max().ok_or("no thread counts")?;
     let mut rows = Vec::new();
     for (q, sample) in corpus.samples.iter().enumerate() {
         crate::trigram::check_disk()?;
@@ -194,8 +226,8 @@ pub(super) fn arm(
         check(&discovery, "discovery")?;
         let mut cold = Vec::new();
         let mut warm = Vec::new();
-        for &threads in &THREADS {
-            if COLD.contains(&threads) {
+        for &threads in &threads_list {
+            if cold_list.contains(&threads) {
                 evict_index(index)?;
                 evict_files(corpus, &discovery.read_docs)?;
                 let run = once(corpus, &names, &docs, &query, threads)?;
@@ -241,7 +273,7 @@ pub(super) fn arm(
             warm,
         });
     }
-    report(&rows);
+    report(&rows, &threads_list, &cold_list);
     println!(
         "correctness arm=product queries={} matches_equal_oracle=all reads_stable=all",
         corpus.samples.len()
@@ -258,9 +290,9 @@ fn ms(values: Vec<u64>) -> String {
     format!("{:.1}/{:.1}", median as f64 / 1e6, p90 as f64 / 1e6)
 }
 
-fn report(rows: &[Row]) {
+fn report(rows: &[Row], threads_list: &[usize], cold_list: &[usize]) {
     println!(
-        "| class | cache | threads | queries | read MB median | wall ms median/p90 | before reads ms median/p90 | busy ms median/p90 | cpu ms median/p90 | device MB median/p90 | device MB/s median |"
+        "| class | cache | threads | queries | read MB median | wall ms median/p90 | before reads ms median/p90 | busy ms median/p90 | cpu ms median/p90 | caller cpu ms median/p90 | device MB median/p90 | device MB/s median |"
     );
     for class in CLASSES {
         let picked: Vec<&Row> = rows.iter().filter(|r| r.class == class).collect();
@@ -268,10 +300,10 @@ fn report(rows: &[Row]) {
         for (cache, counts, pick) in [
             (
                 "cold",
-                &COLD[..],
+                cold_list,
                 (|r: &Row| &r.cold) as fn(&Row) -> &Vec<Run>,
             ),
-            ("warm", &THREADS[..], |r: &Row| &r.warm),
+            ("warm", threads_list, |r: &Row| &r.warm),
         ] {
             for (i, &threads) in counts.iter().enumerate() {
                 let runs: Vec<Run> = picked.iter().map(|r| pick(r)[i]).collect();
@@ -280,12 +312,13 @@ fn report(rows: &[Row]) {
                     .map(|r| (r.device as f64 / r.wall.as_secs_f64().max(1e-9) / 1e6) as u64)
                     .collect();
                 println!(
-                    "| {class} | {cache} | {threads} | {} | {read:.0} | {} | {} | {} | {} | {} | {} |",
+                    "| {class} | {cache} | {threads} | {} | {read:.0} | {} | {} | {} | {} | {} | {} | {} |",
                     runs.len(),
                     ms(runs.iter().map(|r| ns(r.wall)).collect()),
                     ms(runs.iter().map(|r| ns(r.before_reads)).collect()),
                     ms(runs.iter().map(|r| ns(r.busy)).collect()),
                     ms(runs.iter().map(|r| (r.cpu * 1e9) as u64).collect()),
+                    ms(runs.iter().map(|r| ns(r.caller)).collect()),
                     {
                         let (m, p, _) = stats(runs.iter().map(|r| r.device).collect());
                         format!("{:.0}/{:.0}", m as f64 / 1e6, p as f64 / 1e6)
