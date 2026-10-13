@@ -395,7 +395,7 @@ fn boolean_nesting_is_bounded_on_a_two_mib_stack() {
                             bound: None,
                         },
                         &mut |_, request| {
-                            if let crate::ReadRequest::Bytes(bytes) = request {
+                            if let crate::ReadRequest::Bytes(bytes, _) = request {
                                 bytes.extend_from_slice(b"x y z");
                             }
                             Some(crate::ReadVersion::Catalogued)

@@ -1,0 +1,87 @@
+oracle_cache hit queries=250
+population case=ci class=rare literal queries=50 oracle_docs_median_p90=2/10 oracle_B_median_p90=4064976/20422335 zero_match_queries=0
+population case=ci class=identifier pattern queries=50 oracle_docs_median_p90=64/376 oracle_B_median_p90=36785558/238940235 zero_match_queries=0
+population case=ci class=alternation queries=50 oracle_docs_median_p90=8020/24075 oracle_B_median_p90=2074321413/2713366572 zero_match_queries=0
+population case=ci class=broad queries=50 oracle_docs_median_p90=943/1290 oracle_B_median_p90=1087134189/1240328547 zero_match_queries=0
+population case=ci class=code class queries=50 oracle_docs_median_p90=451/5802 oracle_B_median_p90=377405999/1535748852 zero_match_queries=0
+uncovered_or_unreadable_docs=6
+index_bytes trigram=286112775 terms=200818708
+hashed mode=hash4-15 n=4 bits=15 key_space=32768 keys_used=32768 pairs=253384855 docs_per_key_median=6308 docs_per_key_p90=12566 docs_per_key_p99=26824 docs_per_key_max=82180 postings_bytes=179403363 singleton_bytes=0 dictionary_bytes=237208 total_bytes=180342475 invert_cpu_s=20.490 build_cpu_s=22.340 build_wall_s=30.561
+| arm | class | cache | queries | timed | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | missed oracle docs | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | lookup terms sum | capped lookups |
+| hash4-15 | rare literal | cold | 50 | 50 | 1206/1474 | 1529871507/1822518498 | 1525041055/1817688046 | 0 | 2.093/6.368 | 3002.475/3695.887 | 3005.106/3698.088 | 73728/147456 | 106496/221184 | 1525041055/1817688046 | 155482883187 | 0 | 0 |
+| hash4-15 | rare literal | warm | 50 | 50 | 1206/1474 | 1529871507/1822518498 | 1525041055/1817688046 | 0 | 0.537/1.837 | 242.021/299.931 | 244.112/300.803 | 73728/147456 | 106496/221184 | 1525041055/1817688046 | 12347527883 | 0 | 0 |
+| hash4-15 | identifier pattern | cold | 50 | 50 | 5487/14801 | 2631128378/2980337638 | 2626297926/2975507186 | 0 | 3.644/9.278 | 6146.868/8571.342 | 6149.208/8578.638 | 102400/155648 | 131072/212992 | 2626297926/2975507186 | 331856921775 | 0 | 0 |
+| hash4-15 | identifier pattern | warm | 50 | 50 | 5487/14801 | 2631128378/2980337638 | 2626297926/2975507186 | 0 | 1.779/4.227 | 477.186/593.802 | 478.742/599.169 | 102400/155648 | 131072/212992 | 2626297926/2975507186 | 23775680320 | 0 | 0 |
+| hash4-15 | alternation | cold | 50 | 0 | 12567/25466 | 2993780680/3199347474 | 2988950228/3194517022 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-15 | alternation | warm | 50 | 0 | 12567/25466 | 2993780680/3199347474 | 2988950228/3194517022 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-15 | broad | cold | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-15 | broad | warm | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-15 | code class | cold | 50 | 0 | 4110/14466 | 2511973441/2847149780 | 2507142989/2842319328 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-15 | code class | warm | 50 | 0 | 4110/14466 | 2511973441/2847149780 | 2507142989/2842319328 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+correctness arm=hash4-15 queries=250 missed_oracle_docs=0 candidates_stable=yes matches_equal_found=yes
+hashed mode=hash4-16 n=4 bits=16 key_space=65536 keys_used=65536 pairs=312000652 docs_per_key_median=3736 docs_per_key_p90=7736 docs_per_key_p99=20039 docs_per_key_max=82117 postings_bytes=241219018 singleton_bytes=0 dictionary_bytes=472289 total_bytes=242635563 invert_cpu_s=22.210 build_cpu_s=24.380 build_wall_s=28.935
+| arm | class | cache | queries | timed | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | missed oracle docs | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | lookup terms sum | capped lookups |
+| hash4-16 | rare literal | cold | 50 | 50 | 931/1154 | 1400834935/1594947781 | 1396004483/1590117329 | 0 | 1.767/6.056 | 2534.042/3024.913 | 2539.817/3031.655 | 65536/139264 | 102400/208896 | 1396004483/1590117329 | 126136857547 | 0 | 0 |
+| hash4-16 | rare literal | warm | 50 | 50 | 931/1154 | 1400834935/1594947781 | 1396004483/1590117329 | 0 | 0.484/1.429 | 219.702/254.084 | 220.574/255.103 | 65536/139264 | 102400/208896 | 1396004483/1590117329 | 10967283156 | 0 | 0 |
+| hash4-16 | identifier pattern | cold | 50 | 50 | 5223/14456 | 2570810151/2918536358 | 2565979699/2913705906 | 0 | 4.093/8.964 | 6070.205/8164.030 | 6074.350/8172.299 | 98304/143360 | 126976/200704 | 2565979699/2913705906 | 317560354411 | 0 | 0 |
+| hash4-16 | identifier pattern | warm | 50 | 50 | 5223/14456 | 2570810151/2918536358 | 2565979699/2913705906 | 0 | 1.550/4.096 | 457.703/611.519 | 459.192/615.404 | 98304/143360 | 126976/200704 | 2565979699/2913705906 | 23380301877 | 0 | 0 |
+| hash4-16 | alternation | cold | 50 | 0 | 11370/25218 | 2908764424/3134821835 | 2903933972/3129991383 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-16 | alternation | warm | 50 | 0 | 11370/25218 | 2908764424/3134821835 | 2903933972/3129991383 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-16 | broad | cold | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-16 | broad | warm | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-16 | code class | cold | 50 | 0 | 3735/13898 | 2366833213/2735796308 | 2362002761/2730965856 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-16 | code class | warm | 50 | 0 | 3735/13898 | 2366833213/2735796308 | 2362002761/2730965856 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+correctness arm=hash4-16 queries=250 missed_oracle_docs=0 candidates_stable=yes matches_equal_found=yes
+hashed mode=hash4-17 n=4 bits=17 key_space=131072 keys_used=131072 pairs=375321185 docs_per_key_median=2164 docs_per_key_p90=4555 docs_per_key_p99=14766 docs_per_key_max=81803 postings_bytes=319776247 singleton_bytes=0 dictionary_bytes=943115 total_bytes=321972258 invert_cpu_s=32.320 build_cpu_s=35.060 build_wall_s=42.563
+| arm | class | cache | queries | timed | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | missed oracle docs | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | lookup terms sum | capped lookups |
+| hash4-17 | rare literal | cold | 50 | 50 | 598/786 | 1044258085/1240432197 | 1039427633/1235601745 | 0 | 1.988/5.700 | 1877.931/2353.901 | 1881.734/2361.818 | 61440/131072 | 102400/204800 | 1039427633/1235601745 | 95847909559 | 0 | 0 |
+| hash4-17 | rare literal | warm | 50 | 50 | 598/786 | 1044258085/1240432197 | 1039427633/1235601745 | 0 | 0.430/1.066 | 168.323/213.466 | 169.366/214.120 | 61440/131072 | 102400/204800 | 1039427633/1235601745 | 8529169400 | 0 | 0 |
+| hash4-17 | identifier pattern | cold | 50 | 50 | 5079/14308 | 2429467861/2855830610 | 2424637409/2851000158 | 0 | 3.057/8.733 | 5461.859/8536.101 | 5464.604/8538.512 | 98304/135168 | 126976/184320 | 2424637409/2851000158 | 303447037613 | 0 | 0 |
+| hash4-17 | identifier pattern | warm | 50 | 50 | 5079/14308 | 2429467861/2855830610 | 2424637409/2851000158 | 0 | 1.516/3.643 | 455.455/597.623 | 456.977/600.513 | 98304/135168 | 126976/184320 | 2424637409/2851000158 | 23171700188 | 0 | 0 |
+| hash4-17 | alternation | cold | 50 | 0 | 10962/24959 | 2806511548/3086129873 | 2801681096/3081299421 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-17 | alternation | warm | 50 | 0 | 10962/24959 | 2806511548/3086129873 | 2801681096/3081299421 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-17 | broad | cold | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-17 | broad | warm | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-17 | code class | cold | 50 | 0 | 3394/13842 | 2163810044/2670960795 | 2158979592/2666130343 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash4-17 | code class | warm | 50 | 0 | 3394/13842 | 2163810044/2670960795 | 2158979592/2666130343 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+correctness arm=hash4-17 queries=250 missed_oracle_docs=0 candidates_stable=yes matches_equal_found=yes
+hashed mode=hash5-15 n=5 bits=15 key_space=32768 keys_used=32768 pairs=299755468 docs_per_key_median=8234 docs_per_key_p90=12758 docs_per_key_p99=22850 docs_per_key_max=66431 postings_bytes=214355113 singleton_bytes=0 dictionary_bytes=236793 total_bytes=215430338 invert_cpu_s=23.830 build_cpu_s=25.880 build_wall_s=31.304
+| arm | class | cache | queries | timed | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | missed oracle docs | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | lookup terms sum | capped lookups |
+| hash5-15 | rare literal | cold | 50 | 50 | 1255/1655 | 1556259437/1947994107 | 1551428985/1943163655 | 0 | 2.929/13.261 | 3300.011/7038.684 | 3304.289/7076.774 | 69632/143360 | 106496/208896 | 1551428985/1943163655 | 206465216001 | 0 | 0 |
+| hash5-15 | rare literal | warm | 50 | 50 | 1255/1655 | 1556259437/1947994107 | 1551428985/1943163655 | 0 | 0.824/2.226 | 258.868/567.068 | 260.550/567.719 | 69632/143360 | 106496/208896 | 1551428985/1943163655 | 16851403034 | 0 | 0 |
+| hash5-15 | identifier pattern | cold | 50 | 50 | 8282/19490 | 2783209101/3097586912 | 2778378649/3092756460 | 0 | 5.221/7.144 | 6692.719/11304.594 | 6698.500/11312.117 | 69632/86016 | 90112/114688 | 2778378649/3092756460 | 394210516972 | 0 | 0 |
+| hash5-15 | identifier pattern | warm | 50 | 50 | 8282/19490 | 2783209101/3097586912 | 2778378649/3092756460 | 0 | 1.478/3.039 | 510.610/657.186 | 512.669/659.832 | 69632/86016 | 90112/114688 | 2778378649/3092756460 | 26311508510 | 0 | 0 |
+| hash5-15 | alternation | cold | 50 | 0 | 13503/32546 | 3018644822/3288459885 | 3013814370/3283629433 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-15 | alternation | warm | 50 | 0 | 13503/32546 | 3018644822/3288459885 | 3013814370/3283629433 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-15 | broad | cold | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-15 | broad | warm | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-15 | code class | cold | 50 | 0 | 4542/15040 | 2608906691/2906683313 | 2604076239/2901852861 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-15 | code class | warm | 50 | 0 | 4542/15040 | 2608906691/2906683313 | 2604076239/2901852861 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+correctness arm=hash5-15 queries=250 missed_oracle_docs=0 candidates_stable=yes matches_equal_found=yes
+hashed mode=hash5-16 n=5 bits=16 key_space=65536 keys_used=65536 pairs=374913689 docs_per_key_median=4984 docs_per_key_p90=8191 docs_per_key_p99=16836 docs_per_key_max=65159 postings_bytes=294021459 singleton_bytes=0 dictionary_bytes=471769 total_bytes=295643740 invert_cpu_s=26.300 build_cpu_s=28.890 build_wall_s=38.266
+| arm | class | cache | queries | timed | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | missed oracle docs | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | lookup terms sum | capped lookups |
+| hash5-16 | rare literal | cold | 50 | 50 | 1020/1268 | 1474723563/1676563360 | 1469893111/1671732908 | 0 | 2.024/6.186 | 2737.301/3287.481 | 2740.381/3289.918 | 65536/135168 | 102400/217088 | 1469893111/1671732908 | 146785753290 | 0 | 0 |
+| hash5-16 | rare literal | warm | 50 | 50 | 1020/1268 | 1474723563/1676563360 | 1469893111/1671732908 | 0 | 0.537/1.524 | 227.564/261.326 | 228.853/262.307 | 65536/135168 | 102400/217088 | 1469893111/1671732908 | 11233755722 | 0 | 0 |
+| hash5-16 | identifier pattern | cold | 50 | 50 | 8282/19490 | 2783209101/3097586912 | 2778378649/3092756460 | 0 | 5.066/7.161 | 6526.393/9482.430 | 6533.340/9487.827 | 69632/86016 | 90112/114688 | 2778378649/3092756460 | 375286478651 | 0 | 0 |
+| hash5-16 | identifier pattern | warm | 50 | 50 | 8282/19490 | 2783209101/3097586912 | 2778378649/3092756460 | 0 | 1.471/2.918 | 504.766/652.924 | 506.122/655.584 | 69632/86016 | 90112/114688 | 2778378649/3092756460 | 25382961693 | 0 | 0 |
+| hash5-16 | alternation | cold | 50 | 0 | 12402/32546 | 2968288274/3288459885 | 2963457822/3283629433 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-16 | alternation | warm | 50 | 0 | 12402/32546 | 2968288274/3288459885 | 2963457822/3283629433 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-16 | broad | cold | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-16 | broad | warm | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-16 | code class | cold | 50 | 0 | 4033/14427 | 2437461056/2824748486 | 2432630604/2819918034 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-16 | code class | warm | 50 | 0 | 4033/14427 | 2437461056/2824748486 | 2432630604/2819918034 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+correctness arm=hash5-16 queries=250 missed_oracle_docs=0 candidates_stable=yes matches_equal_found=yes
+hashed mode=hash5-17 n=5 bits=17 key_space=131072 keys_used=131072 pairs=458672780 docs_per_key_median=2949 docs_per_key_p90=5099 docs_per_key_p99=11986 docs_per_key_max=64000 postings_bytes=397057238 singleton_bytes=0 dictionary_bytes=942608 total_bytes=399554614 invert_cpu_s=30.200 build_cpu_s=33.500 build_wall_s=42.691
+| arm | class | cache | queries | timed | candidate docs median/p90 | candidate B median/p90 | readable B median/p90 | missed oracle docs | posting ms median/p90 | verify ms median/p90 | total ms median/p90 | posting B median/p90 | index B median/p90 | verified B median/p90 | total ns sum | lookup terms sum | capped lookups |
+| hash5-17 | rare literal | cold | 50 | 50 | 670/976 | 1159003527/1432969665 | 1154173075/1428139213 | 0 | 1.572/5.624 | 2256.816/2731.946 | 2262.302/2733.675 | 57344/122880 | 90112/208896 | 1154173075/1428139213 | 112282502475 | 0 | 0 |
+| hash5-17 | rare literal | warm | 50 | 50 | 670/976 | 1159003527/1432969665 | 1154173075/1428139213 | 0 | 0.469/1.202 | 183.132/226.141 | 183.575/227.424 | 57344/122880 | 90112/208896 | 1154173075/1428139213 | 9191114236 | 0 | 0 |
+| hash5-17 | identifier pattern | cold | 50 | 50 | 8282/19490 | 2783209101/3097586912 | 2778378649/3092756460 | 0 | 3.277/6.909 | 6778.016/9405.844 | 6784.072/9413.928 | 69632/86016 | 90112/114688 | 2778378649/3092756460 | 366289946036 | 0 | 0 |
+| hash5-17 | identifier pattern | warm | 50 | 50 | 8282/19490 | 2783209101/3097586912 | 2778378649/3092756460 | 0 | 1.524/2.973 | 506.090/642.881 | 507.829/644.408 | 69632/86016 | 90112/114688 | 2778378649/3092756460 | 25330825082 | 0 | 0 |
+| hash5-17 | alternation | cold | 50 | 0 | 12021/32546 | 2928983859/3288459885 | 2924153407/3283629433 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-17 | alternation | warm | 50 | 0 | 12021/32546 | 2928983859/3288459885 | 2924153407/3283629433 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-17 | broad | cold | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-17 | broad | warm | 50 | 0 | 57633/71603 | 3570960779/3731451033 | 3566130327/3726620581 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-17 | code class | cold | 50 | 0 | 3323/14075 | 2222313407/2821987870 | 2217482955/2817157418 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+| hash5-17 | code class | warm | 50 | 0 | 3323/14075 | 2222313407/2821987870 | 2217482955/2817157418 | 0 | - | - | - | - | - | - | 0 | 0 | 0 |
+correctness arm=hash5-17 queries=250 missed_oracle_docs=0 candidates_stable=yes matches_equal_found=yes
+private_rows written

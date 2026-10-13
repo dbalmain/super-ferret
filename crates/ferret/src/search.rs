@@ -158,7 +158,8 @@ pub(crate) fn log_content(object: &mut Object<'_>, content: &ContentReport) {
             "verification_us",
             content.verification_time.as_micros() as i128,
         )
-        .int("regex_us", content.regex_time.as_micros() as i128);
+        .int("regex_us", content.regex_time.as_micros() as i128)
+        .int("verify_threads", content.threads as u64);
     });
 }
 

@@ -2345,3 +2345,62 @@ fn grep_search_reaches_verified_rows_from_argv() {
         0
     );
 }
+
+/// D76 C: over files that do not change during the query, `ferret search`
+/// prints the same stdout and stderr, exits the same, and logs the same
+/// counts whatever `FERRET_SEARCH_THREADS` says, including with a limit, a
+/// refusal, and files that vanished, changed or became unreadable after
+/// indexing.
+#[test]
+fn search_output_is_the_same_at_any_verify_thread_count() {
+    let env = Env::new("verify-threads");
+    for i in 0..120 {
+        let pad = if i % 29 == 0 { 300_000 } else { i * 7 % 500 };
+        let marker = ["needle7", "Needle42", "need le"][i % 3];
+        env.write(
+            &format!("d{}/f{i:03}.txt", i % 5),
+            format!("{} {marker} {i}\n", "x".repeat(pad)).as_bytes(),
+        );
+    }
+    assert_eq!(code(&env.run(&[os("index"), env.tree().as_os_str()])), 0);
+    fs::remove_file(env.at("d1/f001.txt")).unwrap();
+    env.write("d3/f003.txt", b"changed needle99 and longer\n");
+    let private = env.at("d2/f012.txt");
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+    let queries: &[&[&str]] = &[
+        &["search", "--scan", r"grep:needle\d+"],
+        &["search", "--scan", "--json", r"grep:(?i)needle\d+"],
+        &["search", "--scan", "--limit=3", r"grep:(?i)needle\d+"],
+        &["search", "--scan", "NOT", r"grep:needle\d+", "ext:txt"],
+        &["search", r"grep:\d+"],
+        &["search", "--scan", "grep:nomatch"],
+    ];
+    // Log fields that are times or the thread count itself.
+    let scrub = |line: &str| -> String {
+        line.split(',')
+            .filter(|field| {
+                !["_us\":", "\"at_ms\":", "\"verify_threads\":"]
+                    .iter()
+                    .any(|key| field.contains(key))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    for args in queries {
+        let args: Vec<&OsStr> = args.iter().map(os).collect();
+        let run = |threads: &str| {
+            let output = env
+                .command(&args)
+                .env("FERRET_SEARCH_THREADS", threads)
+                .output()
+                .unwrap();
+            let line = env.log_lines().pop().unwrap();
+            (code(&output), stderr(&output), scrub(&line), output.stdout)
+        };
+        let one = run("1");
+        for threads in ["4", "16"] {
+            assert_eq!(run(threads), one, "{args:?} at {threads} threads");
+        }
+    }
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+}

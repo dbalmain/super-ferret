@@ -124,6 +124,27 @@ fn check(bytes: &[u8], first: u32, last: u32, terms: &Terms, rng: &mut Rng) {
             assert!(segment.lookup(&probe).unwrap().is_none());
         }
     }
+    // A seek, at absent probes and at present terms, yields every later
+    // term after at most one block of earlier ones.
+    let present = terms.keys().step_by(terms.len() / 20 + 1).cloned();
+    for probe in (0..20).map(|_| rng.bytes(0, 12)).chain(present) {
+        let mut iter = segment.terms_from(&probe);
+        let (mut skipped, mut seen) = (0, Vec::new());
+        while let Some((term, _)) = iter.next_term().unwrap() {
+            if term < probe.as_slice() {
+                assert!(seen.is_empty());
+                skipped += 1;
+            } else {
+                seen.push(term.to_vec());
+            }
+        }
+        assert!(skipped <= BLOCK, "skipped {skipped} before {probe:?}");
+        let want: Vec<_> = terms
+            .range(probe.clone()..)
+            .map(|(t, _)| t.clone())
+            .collect();
+        assert_eq!(seen, want);
+    }
 }
 
 /// Random terms in two families, long shared prefixes and none, with

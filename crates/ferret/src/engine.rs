@@ -475,6 +475,26 @@ impl QuerySession {
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<Stats, RunError> {
+        if is_cancelled(cancelled) {
+            return Ok(Stats::default());
+        }
+        self.search_content_threads(query, bound, search_threads(), cancelled, emit)
+    }
+
+    /// [`QuerySession::search_content`] verifying Maybe documents on
+    /// `threads` workers; one verifies on the calling thread. For files
+    /// that do not change during the query, and without cancellation,
+    /// output is the same for any count; a document may be read before
+    /// earlier rows' callbacks run
+    /// (`ferret_query::Query::run_content_parallel`).
+    pub fn search_content_threads(
+        &self,
+        query: &Query,
+        bound: Option<u32>,
+        threads: usize,
+        cancelled: Option<&AtomicBool>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<Stats, RunError> {
         let stopped = || is_cancelled(cancelled);
         if stopped() {
             return Ok(Stats::default());
@@ -497,23 +517,38 @@ impl QuerySession {
             docs,
             bound,
         };
-        let mut reader = ferret_crawl::Documents::by_name(catalog)?;
-        let mut read = |name, request: ferret_query::ReadRequest<'_>| {
-            let observed = match request {
-                ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
-                ferret_query::ReadRequest::Bytes(out) => {
-                    reader.read_current_name_until(catalog, name, out, &stopped)
+        let documents = ferret_crawl::Documents::by_name(catalog)?;
+        let fork = || -> Box<ferret_query::Reader<'_>> {
+            let mut reader = documents.fork();
+            Box::new(move |name, request: ferret_query::ReadRequest<'_>| {
+                let observed = match request {
+                    ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
+                    // `stop` is the query's cancellation, and on a
+                    // worker also the pool's stop at a limit.
+                    ferret_query::ReadRequest::Bytes(out, stop) => {
+                        reader.read_current_name_until(catalog, name, out, stop)
+                    }
                 }
-            }
-            .ok()?;
-            let recorded = catalog.inode(catalog.name(name).child).stat;
-            Some(if recorded.same_version(&observed) {
-                ferret_query::ReadVersion::Catalogued
-            } else {
-                ferret_query::ReadVersion::Current
+                .ok()?;
+                let recorded = catalog.inode(catalog.name(name).child).stat;
+                Some(if recorded.same_version(&observed) {
+                    ferret_query::ReadVersion::Catalogued
+                } else {
+                    ferret_query::ReadVersion::Current
+                })
             })
         };
-        query.run_content(catalog, &self.names, &content, &mut read, cancelled, emit)
+        query.run_content_parallel(
+            catalog,
+            &self.names,
+            &content,
+            ferret_query::Workers {
+                fork: &fork,
+                threads,
+            },
+            cancelled,
+            emit,
+        )
     }
 
     /// The catalog view's live documents, built once per view.
@@ -615,6 +650,24 @@ impl QuerySession {
         };
         Ok(Some(self.derived.docs.get_or_init(|| built)))
     }
+}
+
+/// Threads that verify a content query's Maybe documents:
+/// `FERRET_SEARCH_THREADS` if set to a positive number, else every available
+/// core, read once per process (finding the cores reads cgroup files).
+/// Measured, warm verification levels off at 8–16 threads on cheap patterns
+/// (memory bandwidth, or the ordered caller) and keeps scaling to 32 on
+/// regex-heavy ones; every core is the better default overall
+/// (docs/SCREENS.md § Parallel verification).
+pub fn search_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("FERRET_SEARCH_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&threads| threads > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+    })
 }
 
 fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {

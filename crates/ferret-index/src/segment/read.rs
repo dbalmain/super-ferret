@@ -508,6 +508,21 @@ impl<R: ReadAt> Segment<R> {
         }
     }
 
+    /// The terms in order from the block that could hold `start`: every
+    /// term at or after `start`, preceded by at most one block's smaller
+    /// terms, which the caller skips. A prefix scan's seek: it reads no
+    /// block before that one.
+    pub fn terms_from(&self, start: &[u8]) -> Terms<'_, R> {
+        let found = self
+            .index
+            .partition_point(|b| &self.firsts[b.term_start..b.term_end] <= start);
+        Terms {
+            segment: self,
+            next_block: found.saturating_sub(1),
+            entries: None,
+        }
+    }
+
     /// The documents an entry from [`Segment::terms`] points at.
     pub fn read(&self, entry: &TermEntry) -> Result<Hit, ReadError> {
         match entry.location {

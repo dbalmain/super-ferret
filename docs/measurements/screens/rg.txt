@@ -1,0 +1,21 @@
+oracle_cache hit queries=250
+population case=ci class=rare literal queries=50 oracle_docs_median_p90=2/10 oracle_B_median_p90=4064976/20422335 zero_match_queries=0
+population case=ci class=identifier pattern queries=50 oracle_docs_median_p90=64/376 oracle_B_median_p90=36785558/238940235 zero_match_queries=0
+population case=ci class=alternation queries=50 oracle_docs_median_p90=8020/24075 oracle_B_median_p90=2074321413/2713366572 zero_match_queries=0
+population case=ci class=broad queries=50 oracle_docs_median_p90=943/1290 oracle_B_median_p90=1087134189/1240328547 zero_match_queries=0
+population case=ci class=code class queries=50 oracle_docs_median_p90=451/5802 oracle_B_median_p90=377405999/1535748852 zero_match_queries=0
+uncovered_or_unreadable_docs=6
+index_bytes trigram=286112775 terms=200818708
+| arm | class | cache | queries | wall ms median/p90 | cpu s median/p90 (x1000) | rchar B median/p90 | device read B median/p90 | wall ns sum |
+| rg | rare literal | cold | 50 | 5181.851/7274.731 | 2460/2590 | 3978825327/3978825467 | 4284538880/4284538880 | 304920691834 |
+| rg | rare literal | warm | 50 | 167.936/175.864 | 1670/1750 | 3978825327/3978825468 | 0/0 | 8424360670 |
+| rg | identifier pattern | cold | 50 | 6134.543/6226.614 | 2509/2659 | 3978825404/3978827635 | 4284538880/4284538880 | 310767101107 |
+| rg | identifier pattern | warm | 50 | 172.279/182.211 | 1689/1799 | 3978825612/3978827634 | 0/1798144 | 8641492990 |
+| rg | alternation | cold | 50 | 5225.986/6192.280 | 2600/2870 | 3917527098/3928721316 | 4230430720/4241276928 | 320428051385 |
+| rg | alternation | warm | 50 | 178.579/197.890 | 1759/1970 | 3916727294/3927555755 | 20160512/26484736 | 9080706530 |
+| rg | broad | cold | 50 | 5207.717/11479.597 | 2549/2799 | 3962309976/3967506432 | 4270952448/4275494912 | 329408471267 |
+| rg | broad | warm | 50 | 171.939/185.379 | 1709/1870 | 3961992611/3967291508 | 6811648/11997184 | 8653380083 |
+| rg | code class | cold | 50 | 5141.604/5276.189 | 2469/3059 | 3969227109/3977562400 | 4275998720/4283813888 | 269322742961 |
+| rg | code class | warm | 50 | 168.806/206.189 | 1659/2089 | 3970275058/3978407951 | 2818048/21835776 | 9248340007 |
+correctness arm=rg queries=250 file_set_equals_oracle=all
+private_rows written

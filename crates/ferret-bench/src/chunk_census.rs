@@ -123,7 +123,7 @@ pub(crate) fn run(dir: &Path, index_dir: &Path) -> crate::Result<()> {
             &names,
             &content,
             &mut |name, request| {
-                if matches!(request, ferret_query::ReadRequest::Bytes(_))
+                if matches!(request, ferret_query::ReadRequest::Bytes(..))
                     && let Target::Inode(inode) = catalog.name(name).target()
                     && let Some(doc) = catalog.doc(inode)
                     && seen.insert(doc.0)

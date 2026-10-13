@@ -4767,3 +4767,102 @@ acceptable. Then choose B and specify original-byte versus decoded offset
 semantics before building. With D, keep positive UTF-8 BOM fixtures and UTF-16
 oracle fixtures; label the UTF-16 miss as the approved encoding disagreement,
 never freshness or binary as a substitute cause.
+
+## D76 — Rare-literal regex screens: word 4+5, the term screen, or nothing
+
+**Status: C chosen and built (2026-10-13, branch `wt/par-verify`); a
+follow-up question is open below.** Measured in [SCREENS.md](SCREENS.md) on the D65C corpus
+(3.98 GB, 112,376 readable documents, 250 case-insensitive regexes). Times
+are median ms, cold / warm; `rg` is the full scan on 32 threads.
+
+**Question:** Should regex search get a second screen for rare literals
+— the 1.5 GiB word 4+5 index, or a term-index screen — or neither?
+
+| Class | rg | trigrams | word 4+5 | term screen (sound) |
+| --- | ---: | ---: | ---: | ---: |
+| rare literal | 5,182 / 168 | 2,966 / 249 | 9.9 / 0.56 | 75 / 57 |
+| identifier | 6,135 / 172 | 6,356 / 501 | 4,544 / 402 | 7,211 / 595 |
+| alternation | 5,226 / 179 | 8,272 / 542 | 5,485 / 302 | 6,347 / 428 |
+| code | 5,142 / 169 | 11,137 / 5,316 | 5,638 / 2,552 | 6,594 / 3,012 |
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Opt-in word 4+5 index | 1,533 MiB beside 286 MB of trigrams (38% of corpus bytes); 884 CPU s to build; a second extractor kept in step with follow and merge. | Rare literals 526× faster than a cold scan and 298× warm; sub-ms warm. Other classes 0.07–1.35× a scan, so no help there. |
+| B. Term screen with a flat dictionary and a residue store | About 484 MB new (154 MB flat dictionary, 330 MB of lost whole runs); every regex with a literal scans both (56 ms warm, linear in residue); new writer paths for both in follow and merge; substring lookups in the planner. | The same rare-literal volume as A (8.9 vs 9.3 MB median), sound in both cases; 69× a cold scan, 2.9× warm. Reuses the term index; a third of A's bytes. |
+| C. Neither; parallelise verification first | No new index. Rare literals stay at trigram speed (1.7× a cold scan, slower than a warm one) until verification is threaded. | Verification is single-threaded today and is most of every class's time; threading it is the lever for all five classes (estimate: near a warm scan), and it composes with A or B later. |
+
+Rejected on the numbers: the term screen as briefed (no unit is safe under
+case-insensitive search; 7/50 rare literals case-sensitive), the term screen
+with a blanket fallback (65% of corpus bytes admitted; slower than
+trigrams), and hashed 4/5-grams at 15–17 bits (180–400 MB for at most 1.5×).
+
+**Recommendation: C now, then B if rare literals still matter.** Four classes
+of five are bound by single-threaded verification of 1.4–3.6 GB, and no
+screen here moves their volume more than about 2×. For rare literals B
+reaches A's volume at a third of the bytes and is already 69× a cold scan;
+A's 56 ms warm saving buys little against a 170 ms scan.
+
+**Fact that would change it:** agent traces showing rare literals are a large
+share of grep time *and* warm latency below ~10 ms matters for them; then A,
+since only A is sub-ms warm. If the residue store would grow with blob
+content past roughly the size of A's index, also A.
+
+### Update 2026-10-13: C built and measured
+
+Content verification now runs on a pool of threads. `FERRET_SEARCH_THREADS`
+sets the count, which defaults to every core. For files that do not change
+during the query, and without cancellation, output is byte-identical at any
+thread count, and tests compare 1 thread against N. Workers reserve at most
+64 MiB of documents at once, by catalogued size, plus 1 MiB of kept buffer
+each; files that grew since indexing hold more than they reserved, and the
+calling thread's buffer sits outside the budget. The one order that changes is
+that a document can be read up to 64 rows per thread before its
+predecessors are emitted, so a result callback that changes a later file
+may not change that file's row
+([SCREENS.md § Parallel verification](SCREENS.md#parallel-verification)).
+
+Measured through the product path in
+[SCREENS.md § Parallel verification](SCREENS.md#parallel-verification):
+
+| Class | rg cold / warm | trigrams, 1 thread | trigrams, 32 threads | best warm (threads) |
+| --- | ---: | ---: | ---: | ---: |
+| rare literal | 5,182 / 168 | 3,119 / 250 | 900 / 72 | 47 (8) |
+| identifier | 6,135 / 172 | 6,848 / 514 | 1,738 / 128 | 93 (16) |
+| alternation | 5,226 / 179 | 8,617 / 606 | 2,061 / 165 | 143 (16) |
+| broad | 5,208 / 172 | 11,160 / 965 | 2,778 / 349 | 275 (8) |
+| code | 5,142 / 169 | 11,395 / 5,340 | 1,690 / 240 | 240 (32) |
+
+Cold, every class now beats a scan by 1.9–5.8×, because the reads are
+bound by the device at about 1.7 GB/s, twice `rg`'s rate. Warm, rare
+literals, identifiers and alternations beat it by 1.25–3.6×. Broad and code
+do not.
+
+Warm stops scaling at 8–16 threads, for a different reason on each class:
+
+- Memory-bound classes are limited by copying out of the page cache.
+- Broad is limited by the calling thread's per-row work: 181 of 258 ms at
+  8 threads.
+- Code is limited by the regex itself.
+
+Threading also changes option B's case. B's term screen measured 57 ms warm
+on rare literals, and threaded trigrams now take 47–72 ms. B still wins
+cold, 75 ms against 900.
+
+**Question:** What should come next for regex latency: A, B, or more
+product work on the verifier?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Opt-in word 4+5 index | As above: 1,533 MiB and a second extractor. | Rare literals 9.9 / 0.56 ms: 91× threaded trigrams cold, 84× warm. Nothing on other classes. |
+| B. Term screen and residue store | As above: about 484 MB and two new writer paths. | Rare literals 12× faster cold (75 against 900 ms). Warm is now no better than threaded trigrams. |
+| D. Take per-row work off the calling thread, and read without the copy | No index bytes. Moving residual evaluation and path building to workers touches the ordered window just built; `mmap` brings unsafe or a crate, and fault handling for a file truncated during a read. | Broad's serial ~180 ms, and the memory-bound classes' copy. These are estimates: broad could move toward 100–150 ms warm, and the light classes might gain 20–40%. Nothing here is measured. |
+
+**Recommendation: D, then decide A or B on cold traces.** Every class pays
+the caller and the copy, while A and B help only rare literals, which are
+already 3.6× faster than a warm scan. D is the lever that could take broad
+past a scan.
+
+**Fact that would change it:** if agents' rare-literal searches commonly
+run cold, for example as the first search after a boot or after memory
+pressure, then B, or A at its size, buys 12–90× cold that no amount of
+threading reaches.
