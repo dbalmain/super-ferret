@@ -650,8 +650,10 @@ impl QuerySession {
 /// Threads that verify a content query's Maybe documents:
 /// `FERRET_SEARCH_THREADS` if set to a positive number, else every available
 /// core, read once per process (finding the cores reads cgroup files).
-/// Verification is reading and matching whole documents, which scales with
-/// cores the way a full scan does (docs/SCREENS.md § Parallel verification).
+/// Measured, warm verification levels off at 8–16 threads on cheap patterns
+/// (memory bandwidth, or the ordered caller) and keeps scaling to 32 on
+/// regex-heavy ones; every core is the better default overall
+/// (docs/SCREENS.md § Parallel verification).
 pub fn search_threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {

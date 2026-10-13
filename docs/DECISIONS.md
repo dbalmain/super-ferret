@@ -4770,7 +4770,8 @@ never freshness or binary as a substitute cause.
 
 ## D76 — Rare-literal regex screens: word 4+5, the term screen, or nothing
 
-**Status: open.** Measured in [SCREENS.md](SCREENS.md) on the D65C corpus
+**Status: C chosen and built (2026-10-13, branch `wt/par-verify`); a
+follow-up question is open below.** Measured in [SCREENS.md](SCREENS.md) on the D65C corpus
 (3.98 GB, 112,376 readable documents, 250 case-insensitive regexes). Times
 are median ms, cold / warm; `rg` is the full scan on 32 threads.
 
@@ -4805,3 +4806,58 @@ A's 56 ms warm saving buys little against a 170 ms scan.
 share of grep time *and* warm latency below ~10 ms matters for them; then A,
 since only A is sub-ms warm. If the residue store would grow with blob
 content past roughly the size of A's index, also A.
+
+### Update 2026-10-13: C built and measured
+
+Content verification now runs on a pool of threads. `FERRET_SEARCH_THREADS`
+sets the count, which defaults to every core. Output is byte-identical at
+any thread count, and two tests compare 1 thread against N. Document bytes
+in flight are capped at 64 MiB, plus 1 MiB per worker. The one order that
+changes is that a document can be read up to 64 rows per thread before its
+predecessors are emitted.
+
+Measured through the product path in
+[SCREENS.md § Parallel verification](SCREENS.md#parallel-verification):
+
+| Class | rg cold / warm | trigrams, 1 thread | trigrams, 32 threads | best warm (threads) |
+| --- | ---: | ---: | ---: | ---: |
+| rare literal | 5,182 / 168 | 3,119 / 250 | 900 / 72 | 47 (8) |
+| identifier | 6,135 / 172 | 6,848 / 514 | 1,738 / 128 | 93 (16) |
+| alternation | 5,226 / 179 | 8,617 / 606 | 2,061 / 165 | 143 (16) |
+| broad | 5,208 / 172 | 11,160 / 965 | 2,778 / 349 | 275 (8) |
+| code | 5,142 / 169 | 11,395 / 5,340 | 1,690 / 240 | 240 (32) |
+
+Cold, every class now beats a scan by 1.9–5.8×, because the reads are
+bound by the device at about 1.7 GB/s, twice `rg`'s rate. Warm, rare
+literals, identifiers and alternations beat it by 1.25–3.6×. Broad and code
+do not.
+
+Warm stops scaling at 8–16 threads, for a different reason on each class:
+
+- Memory-bound classes are limited by copying out of the page cache.
+- Broad is limited by the calling thread's per-row work: 181 of 258 ms at
+  8 threads.
+- Code is limited by the regex itself.
+
+Threading also changes option B's case. B's term screen measured 57 ms warm
+on rare literals, and threaded trigrams now take 47–72 ms. B still wins
+cold, 75 ms against 900.
+
+**Question:** What should come next for regex latency: A, B, or more
+product work on the verifier?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Opt-in word 4+5 index | As above: 1,533 MiB and a second extractor. | Rare literals 9.9 / 0.56 ms: 91× threaded trigrams cold, 84× warm. Nothing on other classes. |
+| B. Term screen and residue store | As above: about 484 MB and two new writer paths. | Rare literals 12× faster cold (75 against 900 ms). Warm is now no better than threaded trigrams. |
+| D. Take per-row work off the calling thread, and read without the copy | No index bytes. Moving residual evaluation and path building to workers touches the ordered window just built; `mmap` brings unsafe or a crate, and fault handling for a file truncated during a read. | Broad's serial ~180 ms, and the memory-bound classes' copy. These are estimates: broad could move toward 100–150 ms warm, and the light classes might gain 20–40%. Nothing here is measured. |
+
+**Recommendation: D, then decide A or B on cold traces.** Every class pays
+the caller and the copy, while A and B help only rare literals, which are
+already 3.6× faster than a warm scan. D is the lever that could take broad
+past a scan.
+
+**Fact that would change it:** if agents' rare-literal searches commonly
+run cold, for example as the first search after a boot or after memory
+pressure, then B, or A at its size, buys 12–90× cold that no amount of
+threading reaches.

@@ -30,7 +30,9 @@ of that gain at no extra bytes, and wanted hashed 4- and 5-grams at 15, 16 and
   blanket fallback, it is slower than trigrams.
 - **Verification is single-threaded** in every indexed arm, and `rg` is not.
   Most of the gap to a warm scan on the broad classes is that, not the
-  screen; see [Answers](#answers).
+  screen; see [Answers](#answers). Since threaded (D76 C), three classes beat
+  a warm scan by 1.25–3.6× and every class beats a cold one; see
+  [Parallel verification](#parallel-verification).
 - **Hashed 4/5-grams buy nothing** at 15–17 bits. Every key is used, and the
   median key holds thousands of documents.
 
@@ -366,6 +368,116 @@ The best variant, 4-gram at 17 bits, cuts the rare-literal median from
 equals a warm `rg`. Identifiers gain 1.1× at best, and 5-gram variants leave them at
 exactly the trigram volume (not investigated further).
 
+## Parallel verification
+
+Measured 2026-10-13 on branch `wt/par-verify` (D76 C). Aggregates are in
+[`measurements/par-verify/`](measurements/par-verify/).
+
+**What changed.** A content query's Maybe documents are now verified on a
+pool of threads (`ferret-query/src/verify.rs`). The calling thread still
+produces candidate rows in name order. It hands each new document to a
+worker, and it emits rows from the head of a window in the same order as
+before. Output is byte-identical at any thread count: rows, `--limit`,
+refusals, exit status, stderr, stdout and the query log's counts. Two tests
+compare 1 thread against several, including vanished, changed, unreadable
+and oversized files.
+
+One order does change. A worker can read a document before the caller has
+emitted the rows ahead of it, up to 64 rows per thread ahead. A result
+callback can therefore no longer change what a later read sees.
+
+The thread count is `FERRET_SEARCH_THREADS`, defaulting to every available
+core (32 here). Document bytes in flight are capped at 64 MiB by catalogued
+size, plus 1 MiB of kept buffer per worker.
+
+**The bench now calls the product.** The arms above verify through the
+harness's own loop. The new `product` arm runs every seed as `grep:` through
+`Query::run_content_parallel`: the planner, postings, candidate rows and the
+pooled verifier. Only the reader is the bench's: a snapshot `open` and read,
+not the crawl's checked re-walk. At 1 thread the product path costs 0–15%
+more than the harness loop (broad: 965 against 837 ms warm). That extra is
+the caller's per-row work.
+
+Every run's matches equal the oracle's at every thread count. Every run
+reads the same documents.
+
+**Warm, by threads.** Median ms over 50 queries. `rg` is cited from
+[the results above](#results), because the harness is unchanged.
+
+| Class        |    1 |    4 |      8 |     16 |     32 |  rg | best ÷ rg |
+| ------------ | ---: | ---: | -----: | -----: | -----: | --: | --------: |
+| rare literal |  250 |   69 | **47** |     50 |     72 | 168 |  3.6× faster |
+| identifier   |  514 |  148 |     99 | **93** |    128 | 172 |  1.9× faster |
+| alternation  |  606 |  194 |    146 | **143** |   165 | 179 |  1.25× faster |
+| broad        |  965 |  315 | **275** |    302 |    349 | 172 |  0.63× (slower) |
+| code         | 5,340 | 1,367 |   714 |    359 | **240** | 169 |  0.70× (slower) |
+
+**Cold, by threads.** The index and every candidate document are evicted
+before each run. Median wall ms, with device read throughput in GB/s.
+
+| Class        |      1 |     8 |    32 |    rg | 32 ÷ rg |
+| ------------ | -----: | ----: | ----: | ----: | ------: |
+| rare literal |  3,119 (0.52) |   930 (1.73) |   900 (1.73) | 5,182 (0.82) | 5.8× faster |
+| identifier   |  6,848 (0.42) | 1,845 (1.52) | 1,738 (1.65) | 6,135 | 3.5× faster |
+| alternation  |  8,617 (0.37) | 2,356 (1.32) | 2,061 (1.53) | 5,226 | 2.5× faster |
+| broad        | 11,160 (0.33) | 3,532 (1.05) | 2,778 (1.33) | 5,208 | 1.9× faster |
+| code         | 11,395 (0.24) | 2,195 (1.30) | 1,690 (1.66) | 5,142 | 3.0× faster |
+
+`rg`'s cold rate is 4.28 GB from the device in about 5.2 s.
+
+**Cold is bound by the device, near 1.7 GB/s.** From 8 to 32 threads, rare
+literals and identifiers gain under 7%, and every class levels off at
+1.3–1.7 GB/s. Process CPU stays at 0.5–6 s while the workers' summed busy
+time reaches 24–85 s, so the threads are waiting for reads. This is about
+twice `rg`'s cold rate. I did not measure the NVMe's raw ceiling. A
+deeper queue (readahead hints, or more reads in flight per thread) might go
+further, but that is a guess.
+
+**Warm stops scaling at 8–16 threads, for two reasons:**
+
+- **Memory-bound classes** (rare literal, identifier, alternation). The
+  caller is idle: 5–65 ms of its CPU per query at 8 threads. The workers are
+  busy over 90% of the time, but the CPU spent on the same bytes grows with
+  thread count: rare literals use 0.33 s at 8 threads and 1.37 s at 32.
+  Rare literals plateau at about 35 GB/s of document bytes through `read`
+  into a buffer, which is a copy out of the page cache. Two process-wide
+  measurements point at copying and memory bandwidth rather than locks:
+  - sys time is a third of all CPU time;
+  - keeping every buffer, instead of dropping those over 1 MiB, changed
+    nothing (`experiments.txt`).
+  Waking only a waiting thread, rather than signalling on every submit and
+  finish, gained 0–8%. That change is kept.
+- **Broad is bound by the caller.** The calling thread spends 181 ms on the
+  CPU in a 258 ms query at 8 threads, and 262 of 324 ms at 32. Workers are
+  busy 55% of the time at 8 threads and 28% at 32. The serial part is the
+  caller's per-row work for 57,000 candidates: S1's rows, residual
+  evaluation, a stat for each repeated document, and emitting. At 1 thread
+  that is about 120 ms. Contention inflates it further as threads are added.
+- **Code** is bound by the regex, so it scales to 32 threads (22× at 32).
+
+32 threads is slower than 16 on four classes, by 15–46%: 22–47 ms against
+`rg`'s 170. On code it is faster by 119 ms. The default stays at every core.
+The absolute loss on the light classes is smaller than code's gain, and a
+query cannot know its class before it runs.
+
+**So: verification is no longer the bottleneck on any class but code.** Warm,
+three classes beat a scan, but only by 1.25–3.6×. That is "faster than
+scanning", not "much faster". Broad loses to a scan because the caller is
+serial. Code loses because of regex cost per byte: `rg` beats it on the
+regex itself, not on volume. Cold, every class beats `rg` by 1.9–5.8×,
+because it reads 39–90% of the bytes at twice the rate.
+
+Next levers, from these numbers:
+
+1. **Move per-row work off the caller.** This is for broad. Workers could
+   evaluate the residual and paths could be built lazily, or S1 could be
+   split across threads in name-ordered chunks.
+2. **Read without the copy.** This is for the memory-bound classes. `mmap`,
+   or matching while reading in blocks, would remove one pass over memory.
+3. **Fewer candidate bytes.** Screens (D76 A/B) remain the only lever that
+   makes rare literals *much* faster than a scan. Threading alone gets them
+   to 3.6× warm and 5.8× cold.
+
 ## Answers
 
 **How many times faster than a scan is each arm?** See
@@ -381,7 +493,10 @@ harness verifies on one thread. `rg` spends 1.7 s of CPU per warm query across
 32 threads. Verifying trigram candidates on as many threads would bring them
 near or under a warm scan (an estimate from the CPU figures, not measured);
 it is the cheaper lever for four classes of five, and no screen here changes
-those classes' volume by more than about 2×.
+those classes' volume by more than about 2×. *Since measured:* threaded, rare
+literals, identifiers and alternations beat a warm scan by 1.25–3.6×; broad
+and code patterns still do not. See
+[Parallel verification](#parallel-verification).
 
 **How much of word 4+5's rare-literal gain does the term screen capture?** That
 depends on the form:
@@ -435,8 +550,12 @@ do not pay.
 nix develop --command cargo build --release -p ferret-bench
 B=target/release/ferret-bench
 $B screens /tmp/d65c/catalog /tmp/d65c/screens/t1 /tmp/d65c/corpus /tmp/d65c/screens ci rg
-# then, one at a time: trigrams, terms, terms-raw, residue, resident, hashed
+# then, one at a time: trigrams, terms, terms-raw, residue, resident, hashed, product
 ```
+
+`product` defaults to warm at 1/4/8/16/32 threads and cold at 1/8/32.
+`PRODUCT_THREADS` and `PRODUCT_COLD` replace those lists (comma-separated; the
+cold counts must be among the warm ones; empty means none).
 
 Arms run in the order given and print aggregate tables. Per-query rows, which
 carry no pattern or path, go to the scratch directory. `hashed` builds, times
