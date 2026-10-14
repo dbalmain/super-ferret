@@ -122,24 +122,51 @@ fn prefix(name: &[u8]) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-struct Legacy {
-    heap: Vec<u8>,
-    offsets: Vec<usize>,
+/// Below this many rows [`ResidentNames::build`] stays on the calling
+/// thread: starting threads would cost more than the work.
+const PARALLEL_ROWS: u32 = 16_384;
+/// The most threads a build uses.
+const BUILD_THREADS: usize = 8;
+
+fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
-impl ResidentNames {
-    pub(crate) fn build(names: NameReader<'_>, rows: u32) -> Self {
-        let started = std::time::Instant::now();
-        // Intern while streaming rows. Sort only distinct names, never one
-        // borrowed slice per row; repeated names must not multiply build
-        // scratch.
-        let mut lookup = HashMap::with_capacity(rows as usize / 2);
-        let mut ids = Vec::with_capacity(rows as usize);
-        for (_, name) in names.runs_from(NameId(0)) {
+/// `parts - 1` ascending [`prefix`] values cutting a sample of the names
+/// into `parts` ranges of about equal size. Equal prefixes always fall in
+/// one part, so every name of a part sorts before every name of the next.
+fn splitters(names: NameReader<'_>, rows: u32, parts: usize) -> Vec<u64> {
+    if parts == 1 || rows == 0 {
+        return Vec::new();
+    }
+    let samples = (rows as usize).min(256 * parts);
+    let mut sample: Vec<u64> = (0..samples)
+        .map(|i| prefix(names.heap_bytes(NameId((i * rows as usize / samples) as u32))))
+        .collect();
+    sample.sort_unstable();
+    (1..parts).map(|p| sample[p * samples / parts]).collect()
+}
+
+/// One name range's share of a build: its distinct names in order and its
+/// postings, encoded.
+struct Part<'c> {
+    names: Vec<&'c [u8]>,
+    lists: ListsBuilder,
+}
+
+impl<'c> Part<'c> {
+    /// Interns the names of `rows` (ascending), fills `posts` with the same
+    /// rows grouped by name in name order, and leaves each row's local key
+    /// in its place in `rows`.
+    fn build(names: NameReader<'c>, rows: &mut [u32], posts: &mut [u32]) -> Self {
+        let mut lookup = HashMap::with_capacity(rows.len() / 2);
+        let mut keys = Vec::with_capacity(rows.len());
+        for &row in rows.iter() {
             let next = lookup.len() as u32;
-            ids.push(*lookup.entry(name.bytes).or_insert(next));
+            keys.push(*lookup.entry(names.heap_bytes(NameId(row))).or_insert(next));
         }
-        debug_assert_eq!(ids.len(), rows as usize);
         // A name's first eight bytes, big-endian and zero-padded, order as
         // the name does wherever they differ; comparing them first keeps
         // most comparisons out of `memcmp` and off the name heap.
@@ -148,42 +175,206 @@ impl ResidentNames {
             .map(|(name, old)| (prefix(name), name, old))
             .collect();
         distinct.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-        let distinct: Vec<_> = distinct
-            .into_iter()
-            .map(|(_, name, old)| (name, old))
-            .collect();
         let mut remap = vec![0u32; distinct.len()];
-        for (key, &(_, old)) in distinct.iter().enumerate() {
+        for (key, &(_, _, old)) in distinct.iter().enumerate() {
             remap[old as usize] = key as u32;
         }
-        for key in &mut ids {
+        for key in &mut keys {
             *key = remap[*key as usize];
         }
-        let distinct_names = PackedStrings::new(distinct.iter().map(|&(name, _)| name));
         // One row array and a prefix sum, rather than one allocation per name.
-        let mut counts = vec![0u32; distinct.len()];
-        for &key in &ids {
+        let mut counts = vec![0usize; distinct.len()];
+        for &key in &keys {
             counts[key as usize] += 1;
         }
-        let mut starts = vec![0usize; counts.len() + 1];
-        for (i, &count) in counts.iter().enumerate() {
-            starts[i + 1] = starts[i] + count as usize;
+        let mut next = Vec::with_capacity(counts.len());
+        let mut at = 0;
+        for &count in &counts {
+            next.push(at);
+            at += count;
         }
-        let mut next = starts.clone();
-        let mut postings_rows = vec![0u32; rows as usize];
-        for (row, &key) in ids.iter().enumerate() {
-            postings_rows[next[key as usize]] = row as u32;
+        for (&row, &key) in rows.iter().zip(&keys) {
+            posts[next[key as usize]] = row;
             next[key as usize] += 1;
         }
-        let postings = PackedNameLists::new(
-            (0..counts.len()).map(|i| &postings_rows[starts[i]..starts[i + 1]]),
-        );
-        let keys = Keys::new(&ids);
+        let mut lists = ListsBuilder::default();
+        let mut at = 0;
+        for &count in &counts {
+            lists.push(&posts[at..at + count]);
+            at += count;
+        }
+        rows.copy_from_slice(&keys);
+        Self {
+            names: distinct.into_iter().map(|(_, name, _)| name).collect(),
+            lists,
+        }
+    }
+}
+
+struct Legacy {
+    heap: Vec<u8>,
+    offsets: Vec<usize>,
+}
+
+impl ResidentNames {
+    pub(crate) fn build(names: NameReader<'_>, rows: u32) -> Self {
+        let threads = match rows < PARALLEL_ROWS {
+            true => 1,
+            false => std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .min(BUILD_THREADS),
+        };
+        Self::build_with(names, rows, threads)
+    }
+
+    /// Builds on `threads` threads; the result is the same at every count.
+    ///
+    /// Rows are split by name range, not by row: names are cut at sampled
+    /// [`prefix`] splitters, so every part's distinct names sort after the
+    /// previous part's and the parts' sorted tables concatenate into the
+    /// whole one. Each part interns, sorts and posts its own names; no merge
+    /// is needed. Interning still streams rows and sorts only distinct
+    /// names, never one borrowed slice per row (D40's scratch); the split
+    /// adds a byte and a row number per row.
+    pub(crate) fn build_with(names: NameReader<'_>, rows: u32, threads: usize) -> Self {
+        let started = std::time::Instant::now();
+        let parts = threads.clamp(1, u8::MAX as usize);
+        let total = rows as usize;
+        let splitters = splitters(names, rows, parts);
+        let splitters = &splitters[..];
+        let chunk = total.div_ceil(parts).max(1);
+
+        // Pass 1, by row chunk: each row's part, and each chunk's count per
+        // part.
+        let mut part = vec![0u8; total];
+        let counts: Vec<Vec<usize>> = std::thread::scope(|scope| {
+            let spawned: Vec<_> = part
+                .chunks_mut(chunk)
+                .enumerate()
+                .map(|(c, out)| {
+                    scope.spawn(move || {
+                        let mut counts = vec![0; parts];
+                        let from = NameId((c * chunk) as u32);
+                        for ((_, name), slot) in names.runs_from(from).zip(out.iter_mut()) {
+                            let p = splitters.partition_point(|&s| s <= prefix(name.bytes));
+                            *slot = p as u8;
+                            counts[p] += 1;
+                        }
+                        counts
+                    })
+                })
+                .collect();
+            spawned.into_iter().map(join).collect()
+        });
+        let chunks = counts.len();
+        let sizes: Vec<usize> = (0..parts)
+            .map(|p| counts.iter().map(|c| c[p]).sum())
+            .collect();
+
+        // Pass 2, by row chunk: rows grouped by part, ascending within each.
+        // Chunk c's rows of part p go after earlier chunks' rows of part p.
+        let mut by_part = vec![0u32; total];
+        {
+            let mut slots: Vec<Vec<&mut [u32]>> = (0..chunks).map(|_| Vec::new()).collect();
+            let mut rest = &mut by_part[..];
+            for p in 0..parts {
+                for (c, counts) in counts.iter().enumerate() {
+                    let (here, tail) = rest.split_at_mut(counts[p]);
+                    slots[c].push(here);
+                    rest = tail;
+                }
+            }
+            std::thread::scope(|scope| {
+                for ((c, mut slots), part) in slots.into_iter().enumerate().zip(part.chunks(chunk))
+                {
+                    scope.spawn(move || {
+                        let mut next = vec![0; parts];
+                        for (i, &p) in part.iter().enumerate() {
+                            let p = p as usize;
+                            slots[p][next[p]] = (c * chunk + i) as u32;
+                            next[p] += 1;
+                        }
+                    });
+                }
+            });
+        }
+
+        // Pass 3, by part: intern, sort and post. A part's postings take the
+        // same span of the row array as its rows, since its keys are
+        // contiguous; its local keys then overwrite its rows.
+        let mut postings_rows = vec![0u32; total];
+        let built: Vec<Part<'_>> = std::thread::scope(|scope| {
+            let mut rows_rest = &mut by_part[..];
+            let mut posts_rest = &mut postings_rows[..];
+            let spawned: Vec<_> = sizes
+                .iter()
+                .map(|&size| {
+                    let (rows, tail) = std::mem::take(&mut rows_rest).split_at_mut(size);
+                    rows_rest = tail;
+                    let (posts, tail) = std::mem::take(&mut posts_rest).split_at_mut(size);
+                    posts_rest = tail;
+                    scope.spawn(move || Part::build(names, rows, posts))
+                })
+                .collect();
+            spawned.into_iter().map(join).collect()
+        });
+        drop(postings_rows);
+        let firsts: Vec<u32> = built
+            .iter()
+            .scan(0u32, |next, part| {
+                let first = *next;
+                *next += part.names.len() as u32;
+                Some(first)
+            })
+            .collect();
+
+        // Pass 4, by row chunk: each row's global key, read back in row order
+        // from its part's local keys (now in `by_part`).
+        let mut ids = vec![0u32; total];
+        {
+            let mut starts = vec![0usize; parts];
+            for p in 1..parts {
+                starts[p] = starts[p - 1] + sizes[p - 1];
+            }
+            let (by_part, firsts) = (&by_part[..], &firsts[..]);
+            std::thread::scope(|scope| {
+                for ((ids, part), counts) in
+                    ids.chunks_mut(chunk).zip(part.chunks(chunk)).zip(&counts)
+                {
+                    let next = starts.clone();
+                    for p in 0..parts {
+                        starts[p] += counts[p];
+                    }
+                    scope.spawn(move || {
+                        let mut next = next;
+                        for (id, &p) in ids.iter_mut().zip(part) {
+                            let p = p as usize;
+                            *id = firsts[p] + by_part[next[p]];
+                            next[p] += 1;
+                        }
+                    });
+                }
+            });
+        }
+        drop((part, by_part));
+
+        // The three packings are independent; run them side by side.
+        let distinct = built.iter().map(|part| part.names.len()).sum::<usize>();
+        let (names, lists): (Vec<_>, Vec<_>) = built
+            .into_iter()
+            .map(|part| (part.names, part.lists))
+            .unzip();
+        let (distinct_names, postings, keys) = std::thread::scope(|scope| {
+            let strings = scope.spawn(|| PackedStrings::new(names.iter().flatten()));
+            let postings = scope.spawn(|| PackedNameLists::concat(lists));
+            let keys = Keys::new(&ids);
+            (join(strings), join(postings), keys)
+        });
         Self {
             distinct_names,
             keys,
             postings,
-            distinct: distinct.len() as u32,
+            distinct: distinct as u32,
             rows,
             legacy: OnceLock::new(),
             build_time: started.elapsed(),
@@ -267,17 +458,20 @@ pub struct PackedNameLists {
 }
 impl PackedNameLists {
     pub fn new<'a>(lists: impl Iterator<Item = &'a [u32]>) -> Self {
-        let (mut counts, mut offsets, mut bytes) = (Vec::new(), Vec::new(), Vec::new());
+        let mut builder = ListsBuilder::default();
         for list in lists {
-            assert!(
-                list.windows(2).all(|pair| pair[0] < pair[1]),
-                "name postings must ascend"
-            );
-            counts.push(
-                u32::try_from(list.len()).unwrap_or_else(|_| panic!("name postings exceed u32")),
-            );
-            offsets.push(bytes.len() as u64);
-            pfor128::encode_sorted(list, &mut bytes);
+            builder.push(list);
+        }
+        Self::concat([builder])
+    }
+    /// The lists of each builder in turn, as one.
+    fn concat(builders: impl IntoIterator<Item = ListsBuilder>) -> Self {
+        let (mut counts, mut offsets, mut bytes) = (Vec::new(), Vec::new(), Vec::new());
+        for builder in builders {
+            let base = bytes.len() as u64;
+            counts.extend_from_slice(&builder.counts);
+            offsets.extend(builder.offsets.iter().map(|&offset| base + offset));
+            bytes.extend_from_slice(&builder.bytes);
         }
         offsets.push(bytes.len() as u64);
         Self {
@@ -296,6 +490,27 @@ impl PackedNameLists {
     }
     pub fn bytes(&self) -> usize {
         self.counts.bytes() + self.offsets.bytes() + self.bytes.capacity()
+    }
+}
+
+/// [`PackedNameLists`] being encoded: counts, start offsets and bytes.
+#[derive(Default)]
+struct ListsBuilder {
+    counts: Vec<u32>,
+    offsets: Vec<u64>,
+    bytes: Vec<u8>,
+}
+
+impl ListsBuilder {
+    fn push(&mut self, list: &[u32]) {
+        assert!(
+            list.windows(2).all(|pair| pair[0] < pair[1]),
+            "name postings must ascend"
+        );
+        self.counts
+            .push(u32::try_from(list.len()).unwrap_or_else(|_| panic!("name postings exceed u32")));
+        self.offsets.push(self.bytes.len() as u64);
+        pfor128::encode_sorted(list, &mut self.bytes);
     }
 }
 
@@ -332,5 +547,117 @@ mod packed_strings_tests {
         }
         assert_eq!(packed.get(0), b"");
         assert!(strings.iter().any(|string| !string.is_ascii()));
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::{Keys, PackedNameLists, PackedStrings, ResidentNames};
+    use crate::{Catalog, Content, NameId, Stat, Transaction};
+
+    fn stat(ino: u64, mode: u32) -> Stat {
+        Stat {
+            dev: 7,
+            ino,
+            size: 1,
+            mtime_sec: 1_700_000_000,
+            mtime_nsec: 0,
+            ctime_sec: 1_700_000_000,
+            ctime_nsec: 0,
+            mode,
+            uid: 1000,
+            gid: 100,
+            nlink: 1,
+        }
+    }
+
+    /// Names that stress a range split: one name repeated in every
+    /// directory, many sharing their first eight bytes (so one part holds
+    /// them all), one-byte names, names that are prefixes of others, bytes
+    /// above 0x7f, and a run of distinct numbers like the scan corpus.
+    fn names(d: u64) -> Vec<Vec<u8>> {
+        let mut names = vec![b"index.js".to_vec(), b"a".to_vec(), vec![0xff, b'z']];
+        for i in 0..150u64 {
+            names.push(format!("node_modules_{:03}", (i * 7 + d) % 150).into_bytes());
+            names.push(format!("{}", d * 1000 + i).into_bytes());
+            names.push(format!("n{i}").into_bytes());
+        }
+        names.push(b"node_modul".to_vec());
+        names.push(vec![b'\xe2', b'\x84', b'\xaa', d as u8 + b'a']);
+        names
+    }
+
+    fn catalog(dir: &std::path::Path) -> Catalog {
+        let mut txn = Transaction::begin(dir, 1).unwrap();
+        let mut b = txn.batch();
+        let root = b.root(b"/w", stat(1, 0o040_755));
+        let mut ino = 10;
+        for d in 0..12u64 {
+            let sub = b.dir(root, format!("d{d}").as_bytes(), stat(2 + d, 0o040_755));
+            for name in names(d) {
+                ino += 1;
+                b.file(sub, &name, stat(ino, 0o100_644), Content::Unindexed);
+            }
+        }
+        txn.add(b);
+        txn.commit().unwrap();
+        let catalog = Catalog::open(dir).unwrap().unwrap();
+        catalog.load_all().unwrap();
+        catalog
+    }
+
+    fn keys(keys: &Keys) -> (u32, usize, &[u8]) {
+        (keys.width, keys.len, &keys.bytes)
+    }
+    fn strings(strings: &PackedStrings) -> (&[u8], (u32, usize, &[u8])) {
+        (&strings.table, keys(&strings.offsets))
+    }
+    type Lists<'a> = ((u32, usize, &'a [u8]), (u32, usize, &'a [u8]), &'a [u8]);
+    fn lists(lists: &PackedNameLists) -> Lists<'_> {
+        (keys(&lists.counts), keys(&lists.offsets), &lists.bytes)
+    }
+
+    #[test]
+    fn a_build_is_the_same_bytes_on_any_number_of_threads() {
+        let dir = std::env::temp_dir().join(format!("ferret-resident-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalog = catalog(&dir);
+        let (reader, rows) = (catalog.name_reader(), catalog.base_name_count());
+        assert!(rows > 5000, "{rows} rows");
+        let one = ResidentNames::build_with(reader, rows, 1);
+        // The serial build against a plain sort: names ascend, every row's
+        // key names its own bytes, and postings list exactly those rows.
+        let mut expected: Vec<_> = (0..rows)
+            .map(|row| reader.heap_bytes(NameId(row)))
+            .collect();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(one.distinct_count() as usize, expected.len());
+        for (key, name) in expected.iter().enumerate() {
+            assert_eq!(one.distinct_name(key as u32), *name);
+            let mut postings = Vec::new();
+            one.postings(key as u32, &mut postings);
+            let rows: Vec<u32> = (0..rows)
+                .filter(|&row| reader.heap_bytes(NameId(row)) == *name)
+                .collect();
+            assert_eq!(postings, rows, "{name:?}");
+        }
+        for threads in [2, 3, 5, 8, 16, 64, 255] {
+            let many = ResidentNames::build_with(reader, rows, threads);
+            assert_eq!(many.distinct, one.distinct, "{threads} threads");
+            assert_eq!(many.rows, one.rows);
+            assert_eq!(strings(&many.distinct_names), strings(&one.distinct_names));
+            assert_eq!(keys(&many.keys), keys(&one.keys), "{threads} threads");
+            assert_eq!(lists(&many.postings), lists(&one.postings));
+        }
+        // More threads than rows leaves parts and chunks empty.
+        let few = ResidentNames::build_with(reader, 3, 16);
+        let serial = ResidentNames::build_with(reader, 3, 1);
+        assert_eq!(keys(&few.keys), keys(&serial.keys));
+        assert_eq!(
+            strings(&few.distinct_names),
+            strings(&serial.distinct_names)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -339,13 +339,22 @@ impl Catalog {
     /// Existing pins retain their own representation; no borrowed section
     /// is invalidated.
     pub fn into_resident(mut self) -> Result<Self, OpenError> {
-        self.load_all()?;
         if self.resident_names().is_some() {
+            self.load_all()?;
             return Ok(self);
         }
         let mut base = self.clone();
         base.overlay = None;
-        let names = crate::ResidentNames::build(base.name_reader(), self.base_name_count());
+        let build = || crate::ResidentNames::build(base.name_reader(), self.base_name_count());
+        // The build reads only the names; the other sections load alongside
+        // it. `load_all` then checks everything in order, as before, and
+        // reports the first failure a serial load would.
+        let names = std::thread::scope(|scope| {
+            scope.spawn(|| self.prefetch(&[Section::NameHeap, Section::Names]));
+            self.load_one(Section::Names).ok().map(|()| build())
+        });
+        self.load_all()?;
+        let names = names.unwrap_or_else(build);
         let sections = Box::new(std::array::from_fn(|i| {
             let section = SECTIONS[i];
             if section == Section::NameHeap {
@@ -733,6 +742,41 @@ impl Catalog {
             o.validate_all(self)?;
         }
         Ok(())
+    }
+
+    /// Reads and checks the base sections but `skip` on a few threads,
+    /// ignoring failures: [`Catalog::load_all`] then finds them loaded, and
+    /// loads any that failed again in order, so it reports what a serial
+    /// load would. Sections with nothing to wait for go first, then those
+    /// needing only them; the rest are a few bytes and load serially.
+    fn prefetch(&self, skip: &[Section]) {
+        const WORKERS: usize = 4;
+        if !matches!(self.source.as_ref(), Source::File { .. }) {
+            return;
+        }
+        let size = |section: Section| {
+            let (start, end) = self.layout.range(section);
+            std::cmp::Reverse(end - start)
+        };
+        let sections = SECTIONS.into_iter().filter(|s| !skip.contains(s));
+        let mut first: Vec<_> = sections.clone().filter(|s| s.needs().is_empty()).collect();
+        let mut second: Vec<_> = sections
+            .filter(|s| !s.needs().is_empty() && s.needs().iter().all(|n| n.needs().is_empty()))
+            .collect();
+        first.sort_by_key(|&s| size(s));
+        second.sort_by_key(|&s| size(s));
+        for wave in [first, second] {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..WORKERS.min(wave.len()) {
+                    scope.spawn(|| {
+                        while let Some(&section) = wave.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let _ = self.load_one(section);
+                        }
+                    });
+                }
+            });
+        }
     }
 
     fn load_one(&self, section: Section) -> Result<(), OpenError> {
@@ -1706,6 +1750,13 @@ impl<'c> NameReader<'c> {
         if let Some(names) = self.resident {
             return (InoId(self.parents.get(i) as u32), names.name(id));
         }
+        (InoId(self.parents.get(i) as u32), self.heap_bytes(id))
+    }
+
+    /// A name's bytes from the raw heap, without its parent: what the
+    /// resident build reads. Not for an overlay or a resident reader.
+    pub(crate) fn heap_bytes(&self, id: NameId) -> &'c [u8] {
+        let i = id.0 as usize;
         let offsets = self.offsets.unwrap_or_else(|| unreachable!("raw offsets"));
         // A name runs to the next one's start, less its NUL: decoding checked
         // that the spans tile the heap. One decode is cheaper than a search.
@@ -1713,10 +1764,7 @@ impl<'c> NameReader<'c> {
             true => offsets.get(i + 1) as usize,
             false => self.heap.len(),
         };
-        (
-            InoId(self.parents.get(i) as u32),
-            &self.heap[offsets.get(i) as usize..end - 1],
-        )
+        &self.heap[offsets.get(i) as usize..end - 1]
     }
 
     /// The names from `from` on, in order, decoded a run at a time.
