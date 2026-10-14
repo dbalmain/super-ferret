@@ -151,12 +151,19 @@ struct Part<'c> {
     lists: ListsBuilder,
 }
 
+/// The most a part's intern table reserves before it sees its names.
+const RESERVE: usize = 1 << 16;
+
 impl<'c> Part<'c> {
     /// Interns the names of `rows` (ascending), fills `posts` with the same
     /// rows grouped by name in name order, and leaves each row's local key
     /// in its place in `rows`.
     fn build(names: NameReader<'c>, rows: &mut [u32], posts: &mut [u32]) -> Self {
-        let mut lookup = HashMap::with_capacity(rows.len() / 2);
+        // Half the rows, as a first guess at the distinct names, up to
+        // RESERVE: names repeat. On a 10M-row catalog with 133k distinct
+        // names, reserving half of every part's rows cost 55 MB of peak RSS
+        // and 25 ms of build.
+        let mut lookup = HashMap::with_capacity((rows.len() / 2).min(RESERVE));
         let mut keys = Vec::with_capacity(rows.len());
         for &row in rows.iter() {
             let next = lookup.len() as u32;
