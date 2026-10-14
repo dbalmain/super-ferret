@@ -7,9 +7,14 @@ has threaded verification, D76 C). The aggregates are in
 The goal is for Super Ferret to **match or beat `rg` on a pure scan**: every
 live document verified against a regex, with no index screen helping. This page
 is the baseline that later slices are judged by. It optimises nothing.
+[After the scan work](#after-the-scan-work) records what the slices did.
 
 ## Summary
 
+- **After the scan work (wt/scan, c6335b4):** end to end at the default of 16
+  threads we take 163–175 ms warm in ci against `rg`'s 164–174, and 158–171 in
+  cs against its 146–159. Cold we still win, 3.4–4.3 s against 5.1–6.2. The rest
+  of this summary is the baseline.
 - **Cold, we already beat `rg`, by 1.3–1.6×.** Both read the same 4.29 GB from
   the device. We take 3.8–4.1 s and `rg` takes 5.2–6.1 s.
 - **Warm, we lose on every class, by 3.2–6×.** `rg` takes 149–171 ms. Our best
@@ -250,6 +255,132 @@ From our own code (`ferret-verify/src/trigram.rs`, `GrepFlags::regex`, and
     timings and the profile, not from the regex crate's internals.
   - Testing it would mean timing the ci code patterns with `(?i-u)` or with an
     ASCII-only class. That has not been done here.
+  - It has since been tested, and the inference was wrong; see
+    [the correction](#correction-folding-does-not-remove-the-literal-fast-path).
+
+## After the scan work
+
+Measured 2026-10-14 on `wt/scan`. Four steps, each aimed at one of the costs
+above, then two cuts to the serial setup of a one-shot search. Per-step figures
+are a quick subset, the first 5 queries of each class, in
+[`measurements/scan/steps.txt`](measurements/scan/steps.txt). The full 250-query
+runs after step 4 are in
+[`measurements/scan/after.txt`](measurements/scan/after.txt). Every arm stayed
+correct on every query.
+
+### Per step
+
+Warm medians in ms, ranges over the five classes, with the ci code class
+separately where it differs. Cold medians are in seconds. `rg` is 149–183 ms
+warm and 5.1–5.3 s cold throughout.
+
+| step                   | commit  | ci warm, ours               | cs warm, ours      | ci e2e warm       | cs e2e warm | cold, ours    |
+| ---------------------- | ------- | --------------------------- | ------------------ | ----------------- | ----------- | ------------- |
+| baseline               | 8112777 | 531–624 (8 thr); code 1686  | 515–533 (8 thr)    | 476–528; code 774 | 482–497     | 3.9–4.0 s     |
+| 1. workers do the rows | c2733e7 | 206–254 (32 thr); code 1220 | 182–196 (32 thr)   | 252–276; code 834 | 234–250     | unchanged     |
+| 2. streamed reads      | b74ef20 | 175–266 (16 thr); code 1056 | 153–161 (16 thr)   | 192–211; code 650 | 185–193     | 3.1–3.7 s     |
+| 3. required run first  | 3fa8597 | 162–216 (16 thr), code 162  | 155–173 (16 thr)   | 187–214           | 182–191     | unchanged     |
+| 4. default 16 threads  | 75db759 | 162–189 (full run)          | 154–165 (full run) | 174–204           | 171–176     | 3.5–3.9 s     |
+| setup cuts             | c6335b4 | —                           | —                  | 163–175           | 158–171     | e2e 3.4–4.3 s |
+
+1. **The calling thread only emits.** Workers claim batches from an atomic
+   counter and do each position's tests, read, residual and path; the caller
+   takes finished batches in order and calls emit. The caller's CPU fell from
+   425–615 ms to 54–106, and futex calls per query from 994,206 to 766.
+2. **The reader streams.** A grep that cannot see a newline or a text end reads
+   each document through one reused 64 KiB buffer per worker, searches up to the
+   last newline read, and stops once every atom has matched. There is no
+   zero-fill. Directories on the path stay open per worker and are re-checked
+   for every path. File syscalls per document fell from 8.1 to 5: open, read,
+   fstat, close, and the held root's stat. Regexes are cloned per worker, and
+   the result ring holds 16 batches per thread.
+3. **A required run first, for ci code patterns.** See the correction below. For
+   a line-local pattern with no finite literal prefix, `Search` (ferret-verify)
+   finds the pattern's longest required run, searches for that, and runs the
+   full pattern only over the window around each hit: the stretch of bytes a
+   match can be made of, or the line when the pattern has assertions. The match
+   and its offset are unchanged. The ci code class went from 1056 to 162 ms warm
+   at 16 threads.
+4. **The default is every core up to 16** (D77). See below.
+
+The setup cuts are in [Remaining gap](#remaining-gap).
+
+### Correction: folding does not remove the literal fast path
+
+The baseline inferred that case folding takes away the seed word's literal
+search. Timing refutes it. End to end at 32 threads, `(?i-u)[A-Z_]+worse` costs
+the same as `(?i)[A-Z_]+worse`: 0.75 s wall, 9.9 s CPU. So does
+`(?i:[A-Z_])+worse`, with only the class folded. `[A-Z_]+worse` costs 0.19 s,
+and `(?i)worse` alone 0.19 s. The cost comes from the class matching any letter
+in either case: the pattern has no literal prefix, so the engine runs its lazy
+DFA over every byte, at about 0.4 GB/s per thread. Unicode and case variants are
+not involved. Step 3 is the fix for this: `(?i)[A-Z_]+worse` now costs 0.20 s
+and 1.2 s CPU.
+
+### Threads
+
+Full runs, warm medians in ms over the five classes, and process CPU:
+
+| threads          | ci      | cs      | CPU, s  |
+| ---------------- | ------- | ------- | ------- |
+| 8                | 234–417 | 193–323 | 1.4–1.7 |
+| 12               | 177–226 | 163–204 | 1.8–1.9 |
+| 16               | 162–189 | 154–165 | 2.1–2.3 |
+| 24               | 163–184 | 161–164 | 3.0–3.2 |
+| 32               | 181–193 | 172–176 | 3.5–3.9 |
+| `rg`, default 12 | 161–174 | 147–156 | 1.4–1.7 |
+
+Cold, at 16 threads ours is 3.48–3.91 s in ci and 3.47–3.81 s in cs. At 32 it is
+3.14–3.80 s and 3.16–3.67 s, which is 2–12% faster. `rg` takes 5.12–5.22 s.
+
+Warm is fastest at 16 on every class in both cases. Past 16, each thread adds
+CPU and no speed. The product's default is now `min(16, cores)`
+(`SEARCH_THREADS` in `crates/ferret/src/engine.rs`); D77 asks whether that is
+the right rule.
+
+### End to end
+
+`ferret search --scan` as a process at the default 16 threads, against `rg` on
+the same files; 5 queries per class at 75db759 (after.txt), 10 per class at
+c6335b4.
+
+|                   | ci warm | cs warm | ci cold     | cs cold     |
+| ----------------- | ------- | ------- | ----------- | ----------- |
+| `ferret`, 75db759 | 174–204 | 171–176 | 3.49–3.84 s | 3.48–3.91 s |
+| `ferret`, c6335b4 | 163–175 | 158–171 | 3.43–4.28 s | 3.45–3.88 s |
+| `rg`, same run    | 164–174 | 146–159 | 5.16–6.21 s | 5.11–5.17 s |
+
+Cold, we beat `rg` by 1.2–1.5×. Warm, we tie it in ci: 1–6 ms behind on four
+classes and 11 ms ahead on alternations (163 against 174). In cs we trail by
+0–20 ms: equal on alternations, 12–20 ms behind on the other four classes. The
+c6335b4 rows are in
+[`measurements/scan/setup.txt`](measurements/scan/setup.txt).
+
+### Remaining gap
+
+The named cause is serial work before the first read. A no-daemon process
+reaches its first document read about 50 ms after exec, instrumented at 16
+threads, and `rg` needs no such stage:
+
+- **Catalog residency: 33 ms.** `Engine::open` builds the resident names
+  (`Catalog::into_resident`): loading 6.5 ms, interning 2.06M names 9–11 ms,
+  sorting the distinct names 11 ms, packing 2 ms, postings 3.3 ms.
+- **The content setup: about 7 ms** (doc names, live set, pin), then S1's id
+  pass at 4.3 ms.
+- **The certainty table: 3–20 ms.** With no content index every trigram key
+  covers every live document, yet each key built a bitmap cursor over all of
+  them. 20 ms was a ci alternation.
+
+Cut so far (03717d6, c6335b4): the intern map is presized and distinct names
+sort on an 8-byte prefix first, so residency is 26 ms. A tree whose keys have no
+postings is now the live bitmap itself, so the certainty table costs nothing
+here.
+
+What remains is about 37 ms of serial work (26 + 7 + 4), more than the cs gap:
+the scan itself now takes less wall than `rg`'s whole run. What is left is
+mostly residency, which a daemon would pay once and a one-shot process pays
+every time. `search` does not start a daemon. Whether a one-shot search should
+build it at all is D78.
 
 ## Reproduce
 

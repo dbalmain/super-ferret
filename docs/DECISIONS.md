@@ -4902,3 +4902,31 @@ cold, by at most 0.38 s of a 3.5 s scan that already beats `rg` by 1.4 s.
 since its cold gain (70–380 ms) exceeds B's warm gain (10–20 ms) in
 absolute terms. If a machine with more than 16 physical cores is a target,
 C.
+
+## D78 — Should a one-shot `ferret search` build resident names?
+
+**Status: open for Dave (2026-10-14, branch `wt/scan`).** Measured in
+[SCAN.md § Remaining gap](SCAN.md#remaining-gap): a no-daemon `ferret search
+--scan` over the D65C catalog (2.06M name rows) spends 26 ms in
+`Engine::open` building the resident names (D54 B's interned table and
+postings) before it reads a document. After the scan work the whole query
+takes 158–175 ms warm, against `rg`'s 146–174, so this is the largest single
+piece of the remaining warm gap. A daemon pays it once; `search` does not
+start one.
+
+**Question:** Should a one-shot search keep building the resident names on
+open, build them only when a query needs them, or load them prebuilt?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Build on every open (today) | 26 ms per one-shot query here, about 125 ms at 10M rows (D40) if it scales with rows. | Nothing new to build or test; one catalog state per engine. |
+| B. Build lazily, on the first query that needs name search | An engine holding the catalog in two states, and a test that every name path forces the build. Saves nothing for queries that need names. | Up to 26 ms off every one-shot content query that needs no name search, if such queries exist (unverified: S1 may need the names for every query). |
+| C. Write the interned table in the checkpoint and load it | A storage format change, more checkpoint writing and index bytes; loading still costs a read and validation. | Most of the 26 ms off every one-shot query, names or not. |
+
+**Recommendation: A for now**, and measure B's premise first: whether a
+content-only query reaches any name search at all. If it does not, B, since
+it is local to the engine.
+
+**Fact that would change it:** if agents mostly run one-shot `search`
+without a daemon (D71-style habits), the 26 ms recurs on every call and C
+becomes worth its format change. If a daemon is started for them, A.
