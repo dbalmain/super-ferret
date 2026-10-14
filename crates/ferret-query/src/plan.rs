@@ -239,6 +239,13 @@ impl DocNames {
             names[fill[doc as usize] as usize] = id;
             fill[doc as usize] += 1;
         }
+        // The checkpoint's names come in id order, then the overlay's, which
+        // may reuse a lower id: then a document's names are sorted here.
+        if !found.is_sorted_by_key(|&(_, id)| id) {
+            for doc in starts.windows(2) {
+                names[doc[0] as usize..doc[1] as usize].sort_unstable();
+            }
+        }
         Ok(Some(Self { starts, names }))
     }
 

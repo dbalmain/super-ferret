@@ -14,24 +14,24 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Node {
+pub(super) struct Node {
     stat: Stat,
-    kind: Kind,
+    pub(super) kind: Kind,
     hash: Option<Hash>,
     link: Vec<u8>,
     root: Option<Vec<u8>>,
     traversed: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Edge {
+pub(super) struct Edge {
     parent: u32,
-    child: u32,
-    name: Vec<u8>,
+    pub(super) child: u32,
+    pub(super) name: Vec<u8>,
 }
 #[derive(Clone, Debug)]
-struct State {
-    nodes: BTreeMap<u32, Node>,
-    edges: BTreeMap<u32, Edge>,
+pub(super) struct State {
+    pub(super) nodes: BTreeMap<u32, Node>,
+    pub(super) edges: BTreeMap<u32, Edge>,
     next_ino: u32,
     next_name: u32,
     next_doc: u32,
@@ -463,7 +463,7 @@ fn oracle(state: &State, effective: &Catalog, scratch: &Scratch, label: &str) {
         );
     }
 }
-fn setup(label: &str) -> (Scratch, State, Writer) {
+pub(super) fn setup(label: &str) -> (Scratch, State, Writer) {
     let scratch = Scratch::new(label);
     let mut state = State::initial();
     let base = state.materialise(&scratch.0);
@@ -471,7 +471,7 @@ fn setup(label: &str) -> (Scratch, State, Writer) {
     let writer = Writer::open(&scratch.0).unwrap();
     (scratch, state, writer)
 }
-fn publish(state: &mut State, old: &State, w: &mut Writer) -> Catalog {
+pub(super) fn publish(state: &mut State, old: &State, w: &mut Writer) -> Catalog {
     let delta = state.delta(old);
     w.commit(w.generation(), &delta).unwrap();
     w.view()

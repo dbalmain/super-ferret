@@ -57,6 +57,21 @@ struct Fixture {
     live: DocSet,
 }
 
+impl Fixture {
+    fn of(scratch: Scratch, catalog: Catalog) -> Self {
+        let names = NameIndex::new(&catalog);
+        let docs = DocNames::new(&catalog).unwrap();
+        let live = DocSet::new(catalog.next_doc().0, 0..catalog.next_doc().0);
+        Fixture {
+            _scratch: scratch,
+            catalog,
+            names,
+            docs,
+            live,
+        }
+    }
+}
+
 fn fixture(name: &str, files: &[(&str, u64, u8)]) -> Fixture {
     let scratch = Scratch::new(&format!("verify-{name}"));
     let mut txn = Transaction::begin(&scratch.0, 1).unwrap();
@@ -73,16 +88,7 @@ fn fixture(name: &str, files: &[(&str, u64, u8)]) -> Fixture {
     txn.add(w);
     txn.commit().unwrap();
     let catalog = lazy(&scratch).into_resident().unwrap();
-    let names = NameIndex::new(&catalog);
-    let docs = DocNames::new(&catalog).unwrap();
-    let live = DocSet::new(catalog.next_doc().0, 0..catalog.next_doc().0);
-    Fixture {
-        _scratch: scratch,
-        catalog,
-        names,
-        docs,
-        live,
-    }
+    Fixture::of(scratch, catalog)
 }
 
 /// A gate: runs on the reading thread once a read has taken its bytes,
@@ -701,4 +707,62 @@ fn a_duplicate_after_its_document_settles_on_a_worker() {
         assert_eq!(pool.requests("c3"), requests, "{case}");
         assert_eq!(pool.requests("a1"), ["read"], "{case}");
     }
+}
+
+/// Sol round 1, P2: an overlay can give a document a name whose id is below
+/// its checkpoint name's, so its names are not stored in id order. The
+/// lower id still reads the document, once: `included.rs`'s checkpoint
+/// name sorts after the overlay's `old.rs`, which now names its file too.
+/// `old.rs`'s read is held until every other position is finished, so a
+/// worker that took `included.rs` for a first name would have read it.
+#[test]
+fn an_overlay_name_below_its_documents_checkpoint_name_reads_it_once() {
+    let (scratch, mut state, mut writer) = super::overlay::setup("verify-overlay");
+    let old = state.clone();
+    let id = |name: &[u8]| *state.edges.iter().find(|(_, e)| e.name == name).unwrap().0;
+    let (moved, kept) = (id(b"old.rs"), id(b"included.rs"));
+    assert!(
+        moved < kept,
+        "the fixture needs old.rs's id below included.rs's"
+    );
+    let gone = state.edges[&moved].child;
+    let target = state.edges[&kept].child;
+    state.edges.get_mut(&moved).unwrap().child = target;
+    state.nodes.remove(&gone);
+    let view = super::overlay::publish(&mut state, &old, &mut writer);
+    let fx = Fixture::of(scratch, view);
+    let doc = fx.catalog.doc(ferret_catalog::InoId(target)).unwrap();
+    assert_eq!(
+        fx.docs.names(doc.0).len(),
+        2,
+        "old.rs and included.rs name one document"
+    );
+    let files = ["old.rs", "included.rs", "kept.rs"].map(|name| (name, "a needle"));
+    let one = Script::new(files);
+    let alone = run(&fx, "grep:needle", 1, &one, None, all);
+    let positions = alone.1.candidates;
+    let expected = comparable(alone);
+    assert_eq!(one.requests("included.rs"), ["stat"]);
+    let others = Arc::new(Signal::default());
+    let _seams = Seams {
+        on_publish: Some({
+            let others = Arc::clone(&others);
+            Arc::new(move |finished: &dyn Fn() -> u64| {
+                if finished() + 1 >= positions {
+                    others.set();
+                }
+            })
+        }),
+        ..Seams::default()
+    }
+    .set();
+    let pool = Script::new(files).gated(move |name, _| {
+        if name == "old.rs" {
+            others.wait("every other position finished");
+        }
+    });
+    let output = comparable(run(&fx, "grep:needle", 2, &pool, None, all));
+    assert_eq!(output, expected);
+    assert_eq!(pool.requests("included.rs"), ["stat"]);
+    assert_eq!(pool.requests("old.rs"), ["read"]);
 }
