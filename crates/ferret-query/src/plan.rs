@@ -56,9 +56,7 @@ pub enum ReadRequest<'a> {
     /// The same read, handing the bytes to the consumer as a reader with the
     /// document's size, instead of collecting them: the consumer reads what
     /// it needs, and stops between reads, failing, once the predicate
-    /// returns true. The host may call it again for the same request, from
-    /// the first byte, when the bytes it was given prove not to be one
-    /// version; only the last call saw the version returned.
+    /// returns true.
     Stream(Consumer<'a>, &'a dyn Fn() -> bool),
 }
 

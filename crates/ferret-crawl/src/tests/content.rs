@@ -148,13 +148,10 @@ fn current_reads_check_cancellation_between_chunks() {
         .unwrap()
         .name
         .unwrap();
-    // Four checks pass reading the five catalogued bytes, which the stat
-    // after shows are not the current version; the re-read of 8 MiB is
-    // cancelled at its third check, after two 256 KiB chunks.
     let calls = Cell::new(0);
     let cancelled = || {
         calls.set(calls.get() + 1);
-        calls.get() >= 8
+        calls.get() >= 4
     };
     let mut reader = Documents::by_name(&catalog).unwrap();
     let mut bytes = Vec::new();
@@ -215,11 +212,48 @@ fn a_held_directory_is_checked_again_for_each_path() {
     }
 }
 
-/// A streamed read of the catalogued version hands the bytes over once,
-/// and a consumer may stop early. A file rewritten since is read again from
-/// its start, and the stat returned is its current one.
+/// What a stream returned, and each consumer call's bytes and size.
+type Streamed = (
+    Result<ferret_catalog::Stat, ContentFault>,
+    Vec<(Vec<u8>, u64)>,
+);
+
+/// Streams `rel` through `documents`, with `during` run once inside the
+/// consumer after its first read: what the stream returned, and each
+/// consumer call's bytes and size.
+fn stream_with(
+    tmp: &Tmp,
+    catalog: &Catalog,
+    documents: &mut Documents,
+    rel: &str,
+    during: &dyn Fn(),
+) -> Streamed {
+    let mut calls = Vec::new();
+    let name = name_of(tmp, catalog, rel);
+    let stat = documents.stream_current_name_until(
+        catalog,
+        name,
+        &mut |source, size| {
+            let mut seen = Vec::new();
+            let mut chunk = [0; 4];
+            let n = source.read(&mut chunk)?;
+            seen.extend_from_slice(&chunk[..n]);
+            if calls.is_empty() {
+                during();
+            }
+            source.read_to_end(&mut seen)?;
+            calls.push((seen, size));
+            Ok(())
+        },
+        &|| false,
+    );
+    (stat, calls)
+}
+
+/// A stream hands the consumer the current version, once, with the stat
+/// it was read at: the catalogued file, then the same file rewritten.
 #[test]
-fn a_stream_is_read_again_when_the_file_changed() {
+fn a_stream_reads_the_current_version_once() {
     let tmp = Tmp::new("content-stream");
     let (catalog, _) = indexed(&tmp, &FILES);
     let recorded = |rel| {
@@ -227,37 +261,61 @@ fn a_stream_is_read_again_when_the_file_changed() {
         catalog.inode(catalog.name(name).child).stat
     };
     let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
-    let stream = |documents: &mut Documents, rel, take: usize| {
-        let mut calls = Vec::new();
-        let name = name_of(&tmp, &catalog, rel);
-        let stat = documents.stream_current_name_until(
-            &catalog,
-            name,
-            &mut |source, size| {
-                let mut seen = vec![0; take];
-                let n = source.read(&mut seen)?;
-                seen.truncate(n);
-                calls.push((seen, size));
-                Ok(())
-            },
-            &|| false,
-        );
-        (stat, calls)
-    };
-    let (stat, calls) = stream(&mut documents, "a/b/one.txt", 5);
+    let (stat, calls) = stream_with(&tmp, &catalog, &mut documents, "a/b/one.txt", &|| {});
     assert!(stat.unwrap().same_version(&recorded("a/b/one.txt")));
-    assert_eq!(calls, [(b"first".to_vec(), 11)]);
+    assert_eq!(calls, [(b"first file\n".to_vec(), 11)]);
 
     let before = recorded("a/b/two.txt");
     fs::write(tmp.at("a/b/two.txt"), b"changed, and longer\n").unwrap();
-    let (stat, calls) = stream(&mut documents, "a/b/two.txt", 64);
+    let (stat, calls) = stream_with(&tmp, &catalog, &mut documents, "a/b/two.txt", &|| {});
     let stat = stat.unwrap();
     assert!(!stat.same_version(&before));
     assert_eq!(stat.size, 20);
-    assert_eq!(calls[1..], [(b"changed, and longer\n".to_vec(), 20)]);
-    assert_eq!(
-        calls.len(),
-        2,
-        "the catalogued size first, then the current"
-    );
+    assert_eq!(calls, [(b"changed, and longer\n".to_vec(), 20)]);
+}
+
+/// Sol round 1, P4: a file unlinked, or replaced by a rename, while the
+/// consumer reads it is not accepted: neither the detached bytes nor the
+/// old inode's under the new file's path.
+#[test]
+fn a_stream_rejects_a_file_unlinked_or_replaced_during_its_read() {
+    for replace in [false, true] {
+        let tmp = Tmp::new(if replace {
+            "stream-replaced"
+        } else {
+            "stream-unlinked"
+        });
+        let (catalog, _) = indexed(&tmp, &FILES);
+        let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
+        let path = tmp.at("a/b/one.txt");
+        let during = || match replace {
+            false => fs::remove_file(&path).unwrap(),
+            true => {
+                let fresh = tmp.at("a/b/fresh");
+                fs::write(&fresh, b"replacement\n").unwrap();
+                fs::rename(&fresh, &path).unwrap();
+            }
+        };
+        let (stat, calls) = stream_with(&tmp, &catalog, &mut documents, "a/b/one.txt", &during);
+        assert!(
+            matches!(stat, Err(ContentFault::Changed)),
+            "replace={replace}: {stat:?}"
+        );
+        assert_eq!(calls.len(), 1, "replace={replace}");
+    }
+}
+
+/// Sol round 1, P5: a catalogued file replaced by a FIFO is refused before
+/// the consumer sees it, so no writer's bytes are drained.
+#[test]
+fn a_stream_refuses_a_fifo_before_reading() {
+    let tmp = Tmp::new("stream-fifo");
+    let (catalog, _) = indexed(&tmp, &FILES);
+    let path = tmp.at("a/b/one.txt");
+    fs::remove_file(&path).unwrap();
+    super::mkfifo(&path);
+    let mut documents = Documents::by_name(&catalog).unwrap();
+    let (stat, calls) = stream_with(&tmp, &catalog, &mut documents, "a/b/one.txt", &|| {});
+    assert!(matches!(stat, Err(ContentFault::Changed)), "{stat:?}");
+    assert!(calls.is_empty(), "the consumer was given a FIFO");
 }

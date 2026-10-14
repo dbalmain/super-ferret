@@ -19,7 +19,7 @@
 //! scan is what M3's measurement and tests need.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
@@ -262,12 +262,8 @@ impl Documents {
     /// [`Documents::read_current_name_until`], handing the bytes to `each`
     /// as a reader instead of collecting them: `each` reads as much as it
     /// needs, with the document's size, and should stop between reads once
-    /// `cancelled` says so, failing.
-    ///
-    /// `each` may be called twice for one document, the second time from
-    /// its first byte: when the file proves not to be the catalogued
-    /// version, it is read again bracketed by its current stat. Only what
-    /// the last call saw describes the returned version.
+    /// `cancelled` says so, failing. `each` is called once, and only for a
+    /// regular file.
     pub fn stream_current_name_until(
         &mut self,
         catalog: &Catalog,
@@ -302,17 +298,11 @@ impl Documents {
     }
 
     /// The current version of the file `name` names, read by `pass` (given
-    /// the file at its start and the size to read), with the version
-    /// established by a stat.
+    /// the file at its start and the size to read), bracketed by two stats
+    /// of the open file: the first must show a regular file before `pass`
+    /// sees a byte, and the second the same version as the first.
     ///
-    /// When the catalog recorded the file at most the size cap, `pass` first
-    /// reads that size and one `fstat` follows. If it is the catalogued
-    /// version, nothing has changed the file since its recorded ctime, so
-    /// what `pass` read was that version: no stat is needed before it. Else
-    /// `pass` runs again from the start, bracketed by that stat and one
-    /// more, as a read of a changed file always was.
-    ///
-    /// The calls, for a catalogued file in a held directory: `openat`, the
+    /// The calls, for a file in a held directory: `openat`, `fstat`, the
     /// reads, `fstat`, `close`.
     fn current_until(
         &mut self,
@@ -325,7 +315,6 @@ impl Documents {
             return Err(ContentFault::Cancelled);
         }
         let (parent, bytes) = catalog.name_reader().edge(name);
-        let recorded = catalog.inode(catalog.name(name).child).stat;
         let dir = self.directory(catalog, parent)?;
         let fd = openat(
             dir,
@@ -334,31 +323,12 @@ impl Documents {
             Mode::empty(),
         )
         .map_err(|e| ContentFault::Open(e.into()))?;
-        let mut file = File::from(fd);
-        let stat = |file: &File| fstat(file).map_err(|e| ContentFault::Stat(e.into()));
-        let regular = |stat: &rustix::fs::Stat| {
-            FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
-        };
-        let seen = if recorded.size <= self.config.size_cap {
-            let read = pass(&mut file, recorded.size);
-            let after = stat(&file)?;
-            if regular(&after) && catalog_stat(&after).same_version(&recorded) {
-                read?;
-                self.files_read += 1;
-                return Ok(catalog_stat(&after));
-            }
-            if let Err(ContentFault::Cancelled) = read {
-                return Err(ContentFault::Cancelled);
-            }
-            file.seek(SeekFrom::Start(0)).map_err(ContentFault::Read)?;
-            after
-        } else {
-            stat(&file)?
-        };
-        if !regular(&seen) {
+        let stat = fstat(&fd).map_err(|e| ContentFault::Stat(e.into()))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
             return Err(ContentFault::Changed);
         }
-        let current = catalog_stat(&seen);
+        let current = catalog_stat(&stat);
+        let mut file = File::from(fd);
         pass(&mut file, current.size)?;
         bracket(&file, &current, ferret_catalog::Content::Binary)?;
         self.files_read += 1;
