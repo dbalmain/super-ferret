@@ -440,6 +440,7 @@ impl Held {
         }
     }
 
+    /// Closes all but the first `len` descriptors, then credits them back.
     fn truncate(&mut self, len: usize) {
         let closed = self.fds.len().saturating_sub(len);
         self.fds.truncate(len);
@@ -449,7 +450,9 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.budget.give(self.fds.len());
+        // Closed before credited, so the budget never counts more than are
+        // open.
+        self.truncate(0);
     }
 }
 
