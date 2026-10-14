@@ -408,3 +408,46 @@ fn grep_key_cap_retains_a_rare_key_the_default_order_discards() {
     assert_eq!(candidates, vec![(0, Certainty::Maybe)]);
     assert!(grep.find(literal.as_bytes()).is_some());
 }
+
+#[test]
+fn a_grep_cursor_without_postings_is_the_one_its_keys_build() {
+    // The shortcut to one bitmap must yield what the key-by-key tree and
+    // the uncovered documents yield, with no index and with one that holds
+    // some of the keys.
+    let dir = Scratch::new("grep-whole");
+    let live = DocSet::new(20, (0..20).filter(|d| d % 3 != 1));
+    let catalog = CatalogView {
+        incarnation: [7; 16],
+        live: &live,
+    };
+    let mut writer = IndexWriter::open(&dir.0, &catalog).unwrap();
+    writer
+        .follow(&catalog, &Budget::unbounded(), &mut |doc, out| {
+            if doc % 2 == 0 {
+                out.extend_from_slice(b"says runtime join");
+            }
+            Ok(())
+        })
+        .unwrap();
+    let view = writer.view();
+    for pinned in [Pinned::new(None, &live), Pinned::new(Some(&view), &live)] {
+        for pattern in [
+            "says",
+            "(says|runtime|modern)",
+            "(?i)[A-Z_]+join",
+            "a.*",
+            "x[^\\s\\S]y",
+            "(abc|zzq)",
+        ] {
+            let grep = ferret_verify::GrepFlags::default()
+                .compile(pattern)
+                .unwrap();
+            let atom = crate::GrepAtom::read_until(grep, &pinned, &|| false).unwrap();
+            assert_eq!(
+                walk(atom.cursor_until(&pinned, &|| false).unwrap()),
+                walk(atom.tree_cursor_until(&pinned, &|| false).unwrap()),
+                "{pattern}"
+            );
+        }
+    }
+}
