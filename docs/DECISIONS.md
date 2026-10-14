@@ -4912,21 +4912,37 @@ Measured in [SCAN.md § Remaining gap](SCAN.md#remaining-gap): a no-daemon
 before it read a document. The build now runs on up to 8 threads, with the other
 sections loading alongside, and costs about 9 ms. The whole query now takes
 136–155 ms warm against `rg`'s 147–180, so this no longer decides the comparison
-with `rg`. A daemon pays it once; `search` does not start one.
+with `rg`. These are the benchmark's `FERRET_NO_DAEMON=1` runs. By default a
+`search` that finds no daemon starts one and answers that query in-process
+(`daemon/client.rs`); the daemon then pays the build once, so a one-shot query
+pays it only before the daemon is ready, or where daemons are disabled.
+
+**Measured at 10M rows (2026-10-15):** building the resident names for the
+synthetic 10M catalog (D40; 10,448,739 name rows) took 300 ms on up to 8
+threads, with a process peak of 841 MB, after the intern table's initial
+reservation was capped at 64K entries (it had reserved half the rows: 325 ms,
+896 MB). One warm run of an uncommitted probe, not the bench CLI. The fixture's
+limit: it replicates one real tree's dump, so it has only 133,385 distinct
+names. A real 10M tree has more, and its table hashes and stores more, so 300 ms
+is nearer a lower bound than a typical cost.
 
 **Question:** Should a one-shot search keep building the resident names on open,
 build them only when a query needs them, or load them prebuilt?
 
-| Option                                                     | Costs                                                                                                                                                                               | Buys                                                                                                                                            |
-| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| A. Build on every open (today)                             | 9 ms per one-shot query here. At 10M rows (D40), about 0.8 s if it scales with rows, which is extrapolated, not measured; the serial build it replaced would have been about 2.3 s. | Nothing new to build or test; one catalog state per engine.                                                                                     |
-| B. Build lazily, on the first query that needs name search | An engine holding the catalog in two states, and a test that every name path forces the build. Saves nothing for queries that need names.                                           | Up to 7 ms here off every one-shot content query that needs no name search, if such queries exist (unverified: S1 reads names for every query). |
-| C. Write the interned table in the checkpoint and load it  | A storage format change, more checkpoint writing and index bytes; loading still costs a read and validation, about 2 ms for the name sections here.                                 | Most of the build off every one-shot query, names or not: about 7 ms here, and most of the extrapolated 0.8 s at 10M rows.                      |
+| Option                                                     | Costs                                                                                                                                               | Buys                                                                                                                                            |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Build on every open (today)                             | 9 ms per one-shot query here; 300 ms measured at 10M rows, on a fixture with few distinct names.                                                    | Nothing new to build or test; one catalog state per engine.                                                                                     |
+| B. Build lazily, on the first query that needs name search | An engine holding the catalog in two states, and a test that every name path forces the build. Saves nothing for queries that need names.           | Up to 7 ms here off every one-shot content query that needs no name search, if such queries exist (unverified: S1 reads names for every query). |
+| C. Write the interned table in the checkpoint and load it  | A storage format change, more checkpoint writing and index bytes; loading still costs a read and validation, about 2 ms for the name sections here. | Most of the build off every one-shot query, names or not: about 7 ms here, and most of the 300 ms measured at 10M rows.                         |
 
-**Recommendation: A for now.** At this catalog's size the build is 9 ms of a
-query that already beats `rg`. Measure the build on a 10M-row catalog before
-choosing B or C.
+**Recommendation: A.** The 10M build, 300 ms, crosses the threshold this brief
+first set ("hundreds of milliseconds"), but that threshold assumed every
+one-shot `search` builds. By default only the queries before a daemon is ready
+do, and the daemon builds once per catalog generation. At this catalog's size
+the build is 9 ms of a query that already beats `rg`.
 
-**Fact that would change it:** a measured build of hundreds of milliseconds on a
-10M-row catalog, with agents running one-shot `search` without a daemon, makes C
-worth its format change. If a daemon is started for them, A.
+**Fact that would change it:** agents running `search` where no daemon can run
+(`FERRET_NO_DAEMON=1`, or a sandbox where the client cannot start one) on
+catalogs near 10M rows make C worth its format change, since each query would
+pay 300 ms or more. So would a real 10M tree whose build exceeds about 1 s, with
+daemons or not, since the first query after each start pays it.

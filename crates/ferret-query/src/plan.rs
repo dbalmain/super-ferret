@@ -110,9 +110,11 @@ pub struct ContentReport {
     /// Documents left Maybe by the snapshot before verification.
     pub snapshot_maybe: u64,
     pub snapshot_possible: u64,
-    /// Reader plus engine time for bracketed Maybe verification.
+    /// Reader plus engine time for bracketed Maybe verification, summed
+    /// over the reads on every thread: work done, not wall time.
     pub verification_time: Duration,
-    /// Time in regex engines, excluding reading and text matching.
+    /// Time in regex engines, excluding reading and text matching, summed
+    /// the same way.
     pub regex_time: Duration,
     /// In the order the atoms appear in the query.
     pub atoms: Vec<AtomReport>,
@@ -126,9 +128,11 @@ pub struct ContentReport {
     /// Paths whose current version differs from the catalog, or whose
     /// read/stat failed (including size/allocation refusal). Stable changed
     /// bytes are evaluated for this path alone; vanished or unreadable
-    /// paths are dropped. A read that failed or was abandoned because the
-    /// run was cancelled is not counted: it shows the cancellation, not a
-    /// change. An I/O failure that races cancellation is not counted either.
+    /// paths are dropped. A content read that failed or was abandoned once
+    /// the run was stopped is not counted: it shows the stop, not a change.
+    /// The stat that checks a second name of an already-read document
+    /// against its cached answers is counted whenever it fails, stop or
+    /// not.
     pub changed: u64,
     /// The matcher's work over the documents read: atoms checked, rejected
     /// by byte search alone, tokenized whole, bytes tokenized.
