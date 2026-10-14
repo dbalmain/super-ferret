@@ -22,7 +22,8 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use ferret_catalog::bulk::Limiter;
 use ferret_catalog::{Catalog, DocId, InoId, NameId, OpenError, Section, Target};
@@ -39,7 +40,7 @@ pub struct Documents {
     dir: Option<(InoId, OwnedFd)>,
     /// With [`Documents::holding_directories`]: the last checked walk, root
     /// first, each directory with its descriptor, kept for the next path.
-    held: Option<Vec<(InoId, OwnedFd)>>,
+    held: Option<Held>,
     limiter: Option<Arc<Limiter>>,
     config: ferret_policy::Config,
     /// Documents read whole and checked.
@@ -106,12 +107,13 @@ impl Documents {
 
     /// Another reader by name with this one's policy and limiter, for a
     /// second thread: [`Documents::by_name`] without loading again. Counts
-    /// start at zero.
+    /// start at zero, and it holds directories if this one does, from the
+    /// same budget, holding none yet.
     pub fn fork(&self) -> Self {
         Self {
             names: Vec::new(),
             dir: None,
-            held: None,
+            held: self.held.as_ref().map(|held| Held::new(held.budget)),
             limiter: self.limiter.clone(),
             config: self.config,
             files_read: 0,
@@ -130,10 +132,32 @@ impl Documents {
     /// through the same directories: each path still checks every directory
     /// on it, by a stat of its path, instead of opening it again
     /// ([`hold_directory`]). For a reader that lives for one query: it holds
-    /// a descriptor per level of the last path.
-    pub fn holding_directories(mut self) -> Self {
-        self.held = Some(Vec::new());
+    /// a descriptor per level of the last path, as far as the process's
+    /// budget for held descriptors allows ([`Budget`]), and opens the rest
+    /// of a path without holding them.
+    pub fn holding_directories(self) -> Self {
+        self.holding_within(Budget::process())
+    }
+
+    /// [`Documents::holding_directories`] within `budget`.
+    fn holding_within(mut self, budget: &'static Budget) -> Self {
+        self.held = Some(Held::new(budget));
         self
+    }
+
+    /// [`Documents::holding_directories`] within a budget of its own, shared
+    /// with its forks, of `fds` descriptors.
+    #[cfg(test)]
+    pub(crate) fn holding_at_most(self, fds: usize) -> Self {
+        self.holding_within(Box::leak(Box::new(Budget(AtomicUsize::new(fds)))))
+    }
+
+    /// Descriptors this reader holds, and those its budget has left.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> (usize, usize) {
+        self.held.as_ref().map_or((0, 0), |held| {
+            (held.fds.len(), held.budget.0.load(Ordering::Relaxed))
+        })
     }
 
     /// Paces every read through the shared byte limiter: background work.
@@ -340,11 +364,21 @@ impl Documents {
     /// reader [holding directories](Documents::holding_directories) checks
     /// each path again before reusing one.
     fn directory(&mut self, catalog: &Catalog, dir: InoId) -> Result<&OwnedFd, ContentFault> {
-        if let Some(held) = &mut self.held {
-            return hold_directory(held, catalog, dir);
-        }
+        // The last path's unheld descriptor is closed before any opening.
         self.dir = None;
-        let fd = open_directory(catalog, dir)?;
+        let fd = match &mut self.held {
+            Some(held) => match hold_directory(held, catalog, dir)? {
+                None => {
+                    return held
+                        .fds
+                        .last()
+                        .map(|(_, fd)| fd)
+                        .ok_or(ContentFault::Changed);
+                }
+                Some(fd) => fd,
+            },
+            None => open_directory(catalog, dir)?,
+        };
         self.dir = Some((dir, fd));
         match &self.dir {
             Some((_, fd)) => Ok(fd),
@@ -353,16 +387,83 @@ impl Documents {
     }
 }
 
+/// Directory descriptors the process's readers may hold between paths: a
+/// quarter of its open-file limit, at most [`Budget::MOST`]. Without one,
+/// every reader of a pool holds its whole last path, and a deep tree on
+/// many threads runs out of descriptors where one thread does not, which
+/// would make the rows depend on the thread count. A reader past the budget
+/// opens the rest of a path as an unheld walk does, two at a time.
+#[derive(Debug)]
+pub(crate) struct Budget(AtomicUsize);
+
+impl Budget {
+    const MOST: usize = 1024;
+
+    fn process() -> &'static Budget {
+        static PROCESS: OnceLock<Budget> = OnceLock::new();
+        PROCESS.get_or_init(|| {
+            let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+            let quarter = limit.map_or(Self::MOST as u64, |limit| limit / 4);
+            Budget(AtomicUsize::new(quarter.min(Self::MOST as u64) as usize))
+        })
+    }
+
+    fn take(&self) -> bool {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    fn give(&self, fds: usize) {
+        self.0.fetch_add(fds, Ordering::AcqRel);
+    }
+}
+
+/// None to hold: an unheld walk.
+static NO_BUDGET: Budget = Budget(AtomicUsize::new(0));
+
+/// A reader's held walk, root first, each descriptor charged to `budget`
+/// until it is closed.
+#[derive(Debug)]
+struct Held {
+    fds: Vec<(InoId, OwnedFd)>,
+    budget: &'static Budget,
+}
+
+impl Held {
+    fn new(budget: &'static Budget) -> Self {
+        Self {
+            fds: Vec::new(),
+            budget,
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        let closed = self.fds.len().saturating_sub(len);
+        self.fds.truncate(len);
+        self.budget.give(closed);
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.budget.give(self.fds.len());
+    }
+}
+
 /// Opens `dir` from its root, one `O_NOFOLLOW` component at a time, each
-/// checked against the catalog's `(dev, ino)`.
+/// checked against the catalog's `(dev, ino)`, with at most two open.
 fn open_directory(catalog: &Catalog, dir: InoId) -> Result<OwnedFd, ContentFault> {
-    let mut held = Vec::new();
-    hold_directory(&mut held, catalog, dir)?;
-    held.pop().map(|(_, fd)| fd).ok_or(ContentFault::Changed)
+    hold_directory(&mut Held::new(&NO_BUDGET), catalog, dir)?.ok_or(ContentFault::Changed)
 }
 
 /// [`open_directory`], reusing the descriptors `held` has for the start of
-/// `dir`'s chain and leaving the whole chain in it, root first.
+/// `dir`'s chain and leaving as much of the chain in it, root first, as its
+/// budget allows. `None` when the whole chain is held, its last descriptor
+/// being `dir`'s; else `dir`'s descriptor, opened from the last held one
+/// (or the root) without holding those between.
 ///
 /// A held descriptor is reused only once its path is checked again: the
 /// root's path by a `stat`, each directory below by a no-follow `fstatat`
@@ -372,11 +473,11 @@ fn open_directory(catalog: &Catalog, dir: InoId) -> Result<OwnedFd, ContentFault
 /// the walk's start and the file's open; a renamed or replaced directory
 /// fails the same way. One call per level instead of three (open, fstat,
 /// close).
-fn hold_directory<'h>(
-    held: &'h mut Vec<(InoId, OwnedFd)>,
+fn hold_directory(
+    held: &mut Held,
     catalog: &Catalog,
     dir: InoId,
-) -> Result<&'h OwnedFd, ContentFault> {
+) -> Result<Option<OwnedFd>, ContentFault> {
     let names = catalog.name_reader();
     // `dir` and its ancestors below the root, nearest first.
     let mut chain = Vec::new();
@@ -399,13 +500,13 @@ fn hold_directory<'h>(
     };
     // How much of the held chain is `dir`'s and still at its path.
     let mut kept = 0;
-    if held.first().is_some_and(|&(id, _)| id == root) {
+    if held.fds.first().is_some_and(|&(id, _)| id == root) {
         // The root's own path may pass through symlinks: the user's.
         let stat = rustix::fs::stat(path).map_err(|e| ContentFault::Stat(e.into()))?;
         if same(&stat, root) {
             kept = 1;
             for (&(id, bytes), (parent, (held_id, _))) in
-                chain.iter().rev().zip(held.iter().zip(&held[1..]))
+                chain.iter().rev().zip(held.fds.iter().zip(&held.fds[1..]))
             {
                 if id != *held_id {
                     break;
@@ -425,31 +526,38 @@ fn hold_directory<'h>(
     }
     held.truncate(kept);
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    if held.is_empty() {
+    // Past the budget, the walk goes on through this one descriptor.
+    let mut unheld = None;
+    if held.fds.is_empty() {
         // The root's own path is the user's; symlinks above it are theirs
         // to keep. Everything below it must not follow one.
         let fd = open(path, flags, Mode::empty()).map_err(|e| ContentFault::Open(e.into()))?;
         check_directory(&fd, catalog, root)?;
-        held.push((root, fd));
+        match held.budget.take() {
+            true => held.fds.push((root, fd)),
+            false => unheld = Some(fd),
+        }
     }
-    for &(id, bytes) in chain.iter().rev().skip(held.len() - 1) {
-        let fd = match held.last() {
-            Some((_, parent)) => openat(
-                parent,
-                std::ffi::OsStr::from_bytes(bytes),
-                flags | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(|e| ContentFault::Open(e.into()))?,
-            None => return Err(ContentFault::Changed),
+    let done = held.fds.len().saturating_sub(1);
+    for &(id, bytes) in chain.iter().rev().skip(done) {
+        let parent = match (&unheld, held.fds.last()) {
+            (Some(fd), _) | (None, Some((_, fd))) => fd,
+            (None, None) => return Err(ContentFault::Changed),
         };
+        let fd = openat(
+            parent,
+            std::ffi::OsStr::from_bytes(bytes),
+            flags | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|e| ContentFault::Open(e.into()))?;
         check_directory(&fd, catalog, id)?;
-        held.push((id, fd));
+        match unheld.is_none() && held.budget.take() {
+            true => held.fds.push((id, fd)),
+            false => unheld = Some(fd),
+        }
     }
-    match held.last() {
-        Some((_, fd)) => Ok(fd),
-        None => Err(ContentFault::Changed),
-    }
+    Ok(unheld)
 }
 
 fn check_directory(fd: &OwnedFd, catalog: &Catalog, id: InoId) -> Result<(), ContentFault> {

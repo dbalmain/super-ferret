@@ -319,3 +319,52 @@ fn a_stream_refuses_a_fifo_before_reading() {
     assert!(matches!(stat, Err(ContentFault::Changed)), "{stat:?}");
     assert!(calls.is_empty(), "the consumer was given a FIFO");
 }
+
+/// Astra: held descriptors come from a budget shared by a reader's forks,
+/// so a pool on a deep tree holds no more than one thread would be allowed
+/// to; past it, a path's lower directories are opened as an unheld walk
+/// opens them, and every read still checks and returns the same bytes.
+#[test]
+fn held_directories_stay_within_their_budget() {
+    let deep: Vec<(String, Vec<u8>)> = ["x", "y"]
+        .iter()
+        .flat_map(|branch| {
+            (1..=2).map(move |i| {
+                let rel = format!("{branch}/1/2/3/4/5/f{i}.txt");
+                let bytes = format!("{rel} body\n").into_bytes();
+                (rel, bytes)
+            })
+        })
+        .collect();
+    let files: Vec<(&str, &[u8])> = deep.iter().map(|(r, b)| (r.as_str(), &b[..])).collect();
+    let tmp = Tmp::new("held-budget");
+    let (catalog, _) = indexed(&tmp, &files);
+    let read = |documents: &mut Documents, rel: &str| {
+        let mut out = Vec::new();
+        let name = name_of(&tmp, &catalog, rel);
+        documents
+            .read_current_name_until(&catalog, name, &mut out, &|| false)
+            .map(|_| out)
+    };
+    for budget in [0, 1, 3, 7, 20] {
+        let first = Documents::by_name(&catalog)
+            .unwrap()
+            .holding_at_most(budget);
+        let mut readers = [first.fork(), first];
+        // Two readers on different branches, a path each in turn: each
+        // holds what the budget lets it and gives it back on a new branch.
+        for round in 0..2 {
+            for (i, (rel, bytes)) in files.iter().enumerate() {
+                let reader = &mut readers[(i + round) % 2];
+                assert_eq!(read(reader, rel).unwrap(), *bytes, "{rel}, budget {budget}");
+                let ((one, left), (two, _)) = (readers[0].held(), readers[1].held());
+                assert_eq!(one + two + left, budget, "budget {budget}");
+                // Each holds at most its path: the tree and six below it.
+                assert!(one + two <= budget.min(14), "budget {budget}");
+            }
+        }
+        let fork = readers[0].fork();
+        drop(readers);
+        assert_eq!(fork.held(), (0, budget), "returned, budget {budget}");
+    }
+}
