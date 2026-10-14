@@ -21,6 +21,7 @@ mod budget;
 mod build;
 pub mod bulk;
 mod compact;
+mod fan_out;
 mod format;
 mod generation;
 mod input;

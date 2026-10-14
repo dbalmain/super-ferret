@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::batch::{Stat, WorkTreeKind};
+use crate::fan_out::fan_out;
 use crate::format::{
     self, COLUMNS, Column, Facts, HASH_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
     WORK_TREE_ROW, u32_at, u64_at,
@@ -346,14 +347,26 @@ impl Catalog {
         }
         let mut base = self.clone();
         base.overlay = None;
-        let build = || crate::ResidentNames::build(base.name_reader(), self.base_name_count());
-        // The build reads only the names; the other sections load alongside
-        // it. `load_all` then checks everything in order, as before, and
-        // reports the first failure a serial load would.
-        let names = std::thread::scope(|scope| {
-            scope.spawn(|| self.prefetch(&[Section::NameHeap, Section::Names]));
-            self.load_one(Section::Names).ok().map(|()| build())
-        });
+        let rows = self.base_name_count();
+        let build = || crate::ResidentNames::build(base.name_reader(), rows);
+        // The build reads only the names; when it runs on several threads,
+        // the other sections load alongside it. `load_all` then checks
+        // everything in order, as before, and reports the first failure a
+        // serial load would.
+        let names = match crate::ResidentNames::threads(rows) {
+            1 => None,
+            _ => {
+                let tasks = vec![true, false];
+                let mut built = fan_out(tasks, 2, |names| match names {
+                    true => self.load_one(Section::Names).ok().map(|()| build()),
+                    false => {
+                        self.prefetch(&[Section::NameHeap, Section::Names]);
+                        None
+                    }
+                });
+                built.swap_remove(0)
+            }
+        };
         self.load_all()?;
         let names = names.unwrap_or_else(build);
         let sections = Box::new(std::array::from_fn(|i| {
@@ -767,15 +780,8 @@ impl Catalog {
         first.sort_by_key(|&s| size(s));
         second.sort_by_key(|&s| size(s));
         for wave in [first, second] {
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            std::thread::scope(|scope| {
-                for _ in 0..WORKERS.min(wave.len()) {
-                    scope.spawn(|| {
-                        while let Some(&section) = wave.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let _ = self.load_one(section);
-                        }
-                    });
-                }
+            fan_out(wave, WORKERS, |section| {
+                let _ = self.load_one(section);
             });
         }
     }

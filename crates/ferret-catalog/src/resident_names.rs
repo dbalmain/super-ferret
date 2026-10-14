@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 use intpack::{bits, pfor128};
 
+use crate::fan_out::fan_out;
 use crate::{NameId, NameReader};
 
 /// An owned fixed-width array; its codec is intpack, not a second decoder.
@@ -128,12 +129,6 @@ const PARALLEL_ROWS: u32 = 16_384;
 /// The most threads a build uses.
 const BUILD_THREADS: usize = 8;
 
-fn join<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
-    handle
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-}
-
 /// `parts - 1` ascending [`prefix`] values cutting a sample of the names
 /// into `parts` ranges of about equal size. Equal prefixes always fall in
 /// one part, so every name of a part sorts before every name of the next.
@@ -211,6 +206,19 @@ impl<'c> Part<'c> {
     }
 }
 
+/// The three packings at the end of a build, and what each makes.
+enum Packing {
+    Strings,
+    Lists(Vec<ListsBuilder>),
+    Keys,
+}
+
+enum Packed {
+    Strings(PackedStrings),
+    Lists(PackedNameLists),
+    Keys(Keys),
+}
+
 struct Legacy {
     heap: Vec<u8>,
     offsets: Vec<usize>,
@@ -218,16 +226,23 @@ struct Legacy {
 
 impl ResidentNames {
     pub(crate) fn build(names: NameReader<'_>, rows: u32) -> Self {
-        let threads = match rows < PARALLEL_ROWS {
+        Self::build_with(names, rows, Self::threads(rows))
+    }
+
+    /// The threads a build of `rows` uses: one, the calling thread, below
+    /// [`PARALLEL_ROWS`].
+    pub(crate) fn threads(rows: u32) -> usize {
+        match rows < PARALLEL_ROWS {
             true => 1,
             false => std::thread::available_parallelism()
                 .map_or(1, |n| n.get())
                 .min(BUILD_THREADS),
-        };
-        Self::build_with(names, rows, threads)
+        }
     }
 
-    /// Builds on `threads` threads; the result is the same at every count.
+    /// Builds on `threads` threads, the calling thread among them
+    /// ([`fan_out`]); the result is the same at every count, and with one
+    /// nothing is spawned.
     ///
     /// Rows are split by name range, not by row: names are cut at sampled
     /// [`prefix`] splitters, so every part's distinct names sort after the
@@ -247,25 +262,20 @@ impl ResidentNames {
         // Pass 1, by row chunk: each row's part, and each chunk's count per
         // part.
         let mut part = vec![0u8; total];
-        let counts: Vec<Vec<usize>> = std::thread::scope(|scope| {
-            let spawned: Vec<_> = part
-                .chunks_mut(chunk)
-                .enumerate()
-                .map(|(c, out)| {
-                    scope.spawn(move || {
-                        let mut counts = vec![0; parts];
-                        let from = NameId((c * chunk) as u32);
-                        for ((_, name), slot) in names.runs_from(from).zip(out.iter_mut()) {
-                            let p = splitters.partition_point(|&s| s <= prefix(name.bytes));
-                            *slot = p as u8;
-                            counts[p] += 1;
-                        }
-                        counts
-                    })
-                })
-                .collect();
-            spawned.into_iter().map(join).collect()
-        });
+        let counts: Vec<Vec<usize>> = fan_out(
+            part.chunks_mut(chunk).enumerate().collect(),
+            threads,
+            |(c, out)| {
+                let mut counts = vec![0; parts];
+                let from = NameId((c * chunk) as u32);
+                for ((_, name), slot) in names.runs_from(from).zip(out.iter_mut()) {
+                    let p = splitters.partition_point(|&s| s <= prefix(name.bytes));
+                    *slot = p as u8;
+                    counts[p] += 1;
+                }
+                counts
+            },
+        );
         let chunks = counts.len();
         let sizes: Vec<usize> = (0..parts)
             .map(|p| counts.iter().map(|c| c[p]).sum())
@@ -284,17 +294,13 @@ impl ResidentNames {
                     rest = tail;
                 }
             }
-            std::thread::scope(|scope| {
-                for ((c, mut slots), part) in slots.into_iter().enumerate().zip(part.chunks(chunk))
-                {
-                    scope.spawn(move || {
-                        let mut next = vec![0; parts];
-                        for (i, &p) in part.iter().enumerate() {
-                            let p = p as usize;
-                            slots[p][next[p]] = (c * chunk + i) as u32;
-                            next[p] += 1;
-                        }
-                    });
+            let work = slots.into_iter().enumerate().zip(part.chunks(chunk));
+            fan_out(work.collect(), threads, |((c, mut slots), part)| {
+                let mut next = vec![0; parts];
+                for (i, &p) in part.iter().enumerate() {
+                    let p = p as usize;
+                    slots[p][next[p]] = (c * chunk + i) as u32;
+                    next[p] += 1;
                 }
             });
         }
@@ -303,21 +309,23 @@ impl ResidentNames {
         // same span of the row array as its rows, since its keys are
         // contiguous; its local keys then overwrite its rows.
         let mut postings_rows = vec![0u32; total];
-        let built: Vec<Part<'_>> = std::thread::scope(|scope| {
+        let built: Vec<Part<'_>> = {
             let mut rows_rest = &mut by_part[..];
             let mut posts_rest = &mut postings_rows[..];
-            let spawned: Vec<_> = sizes
+            let spans = sizes
                 .iter()
                 .map(|&size| {
                     let (rows, tail) = std::mem::take(&mut rows_rest).split_at_mut(size);
                     rows_rest = tail;
                     let (posts, tail) = std::mem::take(&mut posts_rest).split_at_mut(size);
                     posts_rest = tail;
-                    scope.spawn(move || Part::build(names, rows, posts))
+                    (rows, posts)
                 })
                 .collect();
-            spawned.into_iter().map(join).collect()
-        });
+            fan_out(spans, threads, |(rows, posts)| {
+                Part::build(names, rows, posts)
+            })
+        };
         drop(postings_rows);
         let firsts: Vec<u32> = built
             .iter()
@@ -337,22 +345,19 @@ impl ResidentNames {
                 starts[p] = starts[p - 1] + sizes[p - 1];
             }
             let (by_part, firsts) = (&by_part[..], &firsts[..]);
-            std::thread::scope(|scope| {
-                for ((ids, part), counts) in
-                    ids.chunks_mut(chunk).zip(part.chunks(chunk)).zip(&counts)
-                {
-                    let next = starts.clone();
-                    for p in 0..parts {
-                        starts[p] += counts[p];
-                    }
-                    scope.spawn(move || {
-                        let mut next = next;
-                        for (id, &p) in ids.iter_mut().zip(part) {
-                            let p = p as usize;
-                            *id = firsts[p] + by_part[next[p]];
-                            next[p] += 1;
-                        }
-                    });
+            let mut work = Vec::new();
+            for ((ids, part), counts) in ids.chunks_mut(chunk).zip(part.chunks(chunk)).zip(&counts)
+            {
+                work.push((ids, part, starts.clone()));
+                for p in 0..parts {
+                    starts[p] += counts[p];
+                }
+            }
+            fan_out(work, threads, |(ids, part, mut next)| {
+                for (id, &p) in ids.iter_mut().zip(part) {
+                    let p = p as usize;
+                    *id = firsts[p] + by_part[next[p]];
+                    next[p] += 1;
                 }
             });
         }
@@ -364,12 +369,21 @@ impl ResidentNames {
             .into_iter()
             .map(|part| (part.names, part.lists))
             .unzip();
-        let (distinct_names, postings, keys) = std::thread::scope(|scope| {
-            let strings = scope.spawn(|| PackedStrings::new(names.iter().flatten()));
-            let postings = scope.spawn(|| PackedNameLists::concat(lists));
-            let keys = Keys::new(&ids);
-            (join(strings), join(postings), keys)
-        });
+        let packings = vec![Packing::Strings, Packing::Lists(lists), Packing::Keys];
+        let mut packed = fan_out(packings, threads, |packing| match packing {
+            Packing::Strings => Packed::Strings(PackedStrings::new(names.iter().flatten())),
+            Packing::Lists(lists) => Packed::Lists(PackedNameLists::concat(lists)),
+            Packing::Keys => Packed::Keys(Keys::new(&ids)),
+        })
+        .into_iter();
+        let (
+            Some(Packed::Strings(distinct_names)),
+            Some(Packed::Lists(postings)),
+            Some(Packed::Keys(keys)),
+        ) = (packed.next(), packed.next(), packed.next())
+        else {
+            unreachable!("fan_out keeps the order")
+        };
         Self {
             distinct_names,
             keys,
@@ -650,6 +664,27 @@ mod build_tests {
             assert_eq!(keys(&many.keys), keys(&one.keys), "{threads} threads");
             assert_eq!(lists(&many.postings), lists(&one.postings));
         }
+        // Helpers that cannot start leave their work to the threads that
+        // did: the same bytes, whichever is refused.
+        for fail_from in [0, 1, 3] {
+            let seams = crate::fan_out::seam::Seams {
+                fail_from: Some(fail_from),
+                ..Default::default()
+            };
+            let asked = std::sync::Arc::clone(&seams.asked);
+            let _seams = seams.set();
+            let many = ResidentNames::build_with(reader, rows, 8);
+            assert!(asked.load(std::sync::atomic::Ordering::Relaxed) > 0);
+            assert_eq!(keys(&many.keys), keys(&one.keys), "from {fail_from}");
+            assert_eq!(strings(&many.distinct_names), strings(&one.distinct_names));
+            assert_eq!(lists(&many.postings), lists(&one.postings));
+        }
+        // One thread is the calling thread alone.
+        let seams = crate::fan_out::seam::Seams::default();
+        let asked = std::sync::Arc::clone(&seams.asked);
+        let _seams = seams.set();
+        ResidentNames::build_with(reader, rows, 1);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 0);
         // More threads than rows leaves parts and chunks empty.
         let few = ResidentNames::build_with(reader, 3, 16);
         let serial = ResidentNames::build_with(reader, 3, 1);

@@ -1161,3 +1161,102 @@ fn ignored_tags_and_special_rows_validate_before_access() {
         );
     }
 }
+
+/// Sol round 1, P7: converting a catalog large enough to build its
+/// resident names on several threads gives the same names, and for a
+/// corrupt section the same first error as a serial load, whether its
+/// helper threads start or not.
+#[test]
+fn a_resident_conversion_is_the_same_whatever_threads_start() {
+    use crate::fan_out::seam::Seams;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    let scratch = Scratch::new("decode-resident-threads");
+    commit(&scratch.path, |txn| {
+        let mut w = txn.batch();
+        let root = w.root(b"/r", dir_stat(1));
+        for i in 0..20_000u64 {
+            let name = format!("f{:05}.{}", i * 7919 % 20_000, i % 7);
+            let content = Content::Hashed(hash((i % 200) as u8));
+            w.file(root, name.as_bytes(), file_stat(10 + i), content);
+        }
+        txn.add(w);
+    });
+    let bytes = std::fs::read(super::snapshot(&scratch.path)).unwrap();
+    let corrupt = Scratch::new("decode-resident-threads-corrupt");
+    // What converting `dir` gives with helpers from `fail_from` refused:
+    // the resident names, or the error; and how many spawns were asked.
+    let convert = |dir: &Path, fail_from: Option<usize>| {
+        let seams = Seams {
+            fail_from,
+            ..Seams::default()
+        };
+        let asked = Arc::clone(&seams.asked);
+        let _seams = seams.set();
+        let converted = match Catalog::open(dir) {
+            Ok(Some(catalog)) => catalog.into_resident(),
+            Ok(None) => panic!("no catalog"),
+            Err(e) => Err(e),
+        };
+        let names = converted
+            .map(|catalog| {
+                let names = catalog.resident_names().unwrap();
+                (0..names.distinct_count())
+                    .map(|key| names.distinct_name(key).to_vec())
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| format!("{e:?}"));
+        (names, asked.load(Ordering::Relaxed))
+    };
+    let (clean, asked) = convert(&scratch.path, None);
+    assert!(clean.as_ref().unwrap().len() >= 20_000);
+    assert!(asked > 0, "a large catalog builds on several threads");
+    for fail_from in [0, 1] {
+        assert_eq!(convert(&scratch.path, Some(fail_from)).0, clean);
+    }
+    let layout = format::decode_table(&bytes, bytes.len() as u64).unwrap();
+    let mut refused = 0;
+    for section in SECTIONS {
+        let (start, end) = layout.range(section);
+        if start == end {
+            continue;
+        }
+        let mut flipped = bytes.clone();
+        flipped[(start + end) / 2] ^= 0x10;
+        write_catalog(&corrupt.path, &flipped);
+        let serial = Catalog::open(&corrupt.path)
+            .map(|catalog| catalog.unwrap())
+            .and_then(|catalog| catalog.load_all().map(|()| catalog))
+            .map(drop)
+            .map_err(|e| format!("{e:?}"));
+        refused += usize::from(serial.is_err());
+        for fail_from in [None, Some(0), Some(1)] {
+            let (converted, _) = convert(&corrupt.path, fail_from);
+            assert_eq!(
+                converted.map(drop),
+                serial,
+                "{section:?}, helpers from {fail_from:?} refused"
+            );
+        }
+    }
+    assert!(refused > SECTIONS.len() / 2, "{refused} sections refused");
+}
+
+/// A catalog too small to build on several threads converts on the calling
+/// thread alone.
+#[test]
+fn a_small_resident_conversion_starts_no_thread() {
+    use crate::fan_out::seam::Seams;
+    use std::sync::atomic::Ordering;
+
+    let bytes = sample("decode-resident-small");
+    let scratch = Scratch::new("decode-resident-small-lazy");
+    write_catalog(&scratch.path, &bytes);
+    let seams = Seams::default();
+    let asked = std::sync::Arc::clone(&seams.asked);
+    let _seams = seams.set();
+    let catalog = Catalog::open(&scratch.path).unwrap().unwrap();
+    catalog.into_resident().unwrap();
+    assert_eq!(asked.load(Ordering::Relaxed), 0);
+}
