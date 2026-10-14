@@ -802,7 +802,9 @@ fn check_search(grep: &super::Grep, search: &super::Search, text: &[u8], tally: 
 
 /// Floors that keep the property from passing vacuously: most generated
 /// patterns compile, most samples match, and every feature the generator is
-/// meant to cover shows up among the matches.
+/// meant to cover shows up among the matches. Each floor is a share of the
+/// base patterns generated, `n`, whatever it counts: compiled variants
+/// (`filtered` counts led patterns too) or searched texts.
 fn assert_covers(tally: &Tally) {
     let n = tally.patterns;
     assert!(tally.refused < n / 10, "{tally:?}");
