@@ -23,8 +23,8 @@ use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
+use std::time::Duration;
 
 use ferret_catalog::bulk::Limiter;
 use ferret_catalog::{Catalog, DocId, InoId, NameId, OpenError, Section, Target};
@@ -42,6 +42,9 @@ pub struct Documents {
     /// Locked while this reader opens through it, and otherwise free for a
     /// reader out of descriptors to empty ([`Budget::relieve`]).
     held: Option<Arc<Mutex<Held>>>,
+    /// Called once this reader has locked its held walk to open through it.
+    #[cfg(test)]
+    pause: Option<Arc<dyn Fn() + Send + Sync>>,
     limiter: Option<Arc<Limiter>>,
     config: ferret_policy::Config,
     /// Documents read whole and checked.
@@ -81,6 +84,8 @@ impl Documents {
         Ok(Self {
             names,
             held: None,
+            #[cfg(test)]
+            pause: None,
             limiter: None,
             config: ferret_policy::Config::default(),
             files_read: 0,
@@ -97,6 +102,8 @@ impl Documents {
         Ok(Self {
             names: Vec::new(),
             held: None,
+            #[cfg(test)]
+            pause: None,
             limiter: None,
             config: ferret_policy::Config::default(),
             files_read: 0,
@@ -112,6 +119,8 @@ impl Documents {
         Self {
             names: Vec::new(),
             held: self.held.as_ref().map(|held| Held::new(lock(held).budget)),
+            #[cfg(test)]
+            pause: None,
             limiter: self.limiter.clone(),
             config: self.config,
             files_read: 0,
@@ -159,6 +168,14 @@ impl Documents {
         })
     }
 
+    /// Calls `pause` each time this reader has locked its held walk to open
+    /// through it, before anything else.
+    #[cfg(test)]
+    pub(crate) fn pausing(mut self, pause: impl Fn() + Send + Sync + 'static) -> Self {
+        self.pause = Some(Arc::new(pause));
+        self
+    }
+
     /// Whether the process's readers have run out of descriptors.
     #[cfg(test)]
     pub(crate) fn pressured() -> bool {
@@ -203,7 +220,7 @@ impl Documents {
         };
         let recorded = catalog.inode(inode).stat;
         let name = std::ffi::OsStr::from_bytes(bytes);
-        let mut file = self.in_directory(catalog, parent, |dir| {
+        let mut file = self.in_directory(catalog, parent, &|| false, |dir| {
             match Reader::open(dir, name, &recorded) {
                 Opened::Ready { file, .. } => Ok(file),
                 Opened::Fault(fault) => Err(fault),
@@ -242,7 +259,7 @@ impl Documents {
         name: NameId,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
         let (parent, bytes) = catalog.name_reader().edge(name);
-        let stat = self.in_directory(catalog, parent, |dir| {
+        let stat = self.in_directory(catalog, parent, &|| false, |dir| {
             statat(
                 dir,
                 std::ffi::OsStr::from_bytes(bytes),
@@ -346,7 +363,7 @@ impl Documents {
             return Err(ContentFault::Cancelled);
         }
         let (parent, bytes) = catalog.name_reader().edge(name);
-        let fd = self.in_directory(catalog, parent, |dir| {
+        let fd = self.in_directory(catalog, parent, cancelled, |dir| {
             openat(
                 dir,
                 std::ffi::OsStr::from_bytes(bytes),
@@ -375,16 +392,18 @@ impl Documents {
     ///
     /// An open that finds the process out of descriptors (`EMFILE`,
     /// `ENFILE`) is tried again once every held descriptor in the process
-    /// is closed ([`Budget::relieve`]), so a reader fails for want of
+    /// is closed ([`Budget::relieve`]), waiting as long as a reader busy
+    /// opening takes to close its own, unless `cancelled` says to stop
+    /// first. So a reader fails for want of
     /// descriptors only where an unheld walk on every thread would: whether
     /// a path reads does not depend on how many readers hold directories.
     fn in_directory<T>(
         &mut self,
         catalog: &Catalog,
         dir: InoId,
+        cancelled: &dyn Fn() -> bool,
         mut open: impl FnMut(BorrowedFd<'_>) -> Result<T, ContentFault>,
     ) -> Result<T, ContentFault> {
-        let mut deadline = None;
         let mut last = false;
         loop {
             let opened = self.once_in_directory(catalog, dir, &mut open);
@@ -393,20 +412,19 @@ impl Documents {
             let Some(budget) = budget.filter(|_| out_of_descriptors(&opened)) else {
                 return opened;
             };
-            // Readers busy opening close theirs as they finish; an unheld
-            // walk holds no descriptor past its open.
-            if budget.relieve() == 0 {
-                if last {
-                    return opened;
-                }
-                last = true;
-                continue;
-            }
-            let deadline = *deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
-            if Instant::now() >= deadline {
+            // With nothing held anywhere, this is as far as an unheld walk
+            // on every thread gets.
+            if last {
                 return opened;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            // Readers busy opening close theirs as they finish, however
+            // long that takes: a slow open elsewhere must not make this
+            // file unreadable.
+            budget.relieve();
+            if !budget.wait_unheld(cancelled) {
+                return Err(ContentFault::Cancelled);
+            }
+            last = true;
         }
     }
 
@@ -420,6 +438,10 @@ impl Documents {
             return open(open_directory(catalog, dir)?.as_fd());
         };
         let mut held = lock(held);
+        #[cfg(test)]
+        if let Some(pause) = &self.pause {
+            pause();
+        }
         if held.budget.pressured.load(Ordering::Acquire) {
             held.truncate(0);
         }
@@ -478,6 +500,9 @@ pub(crate) struct Budget {
     pressured: AtomicBool,
     /// Every reader holding from this budget, to empty under pressure.
     readers: Mutex<Vec<Weak<Mutex<Held>>>>,
+    /// Signalled under pressure as held descriptors close.
+    quiet: Mutex<()>,
+    freed: Condvar,
 }
 
 impl Budget {
@@ -489,6 +514,8 @@ impl Budget {
             capacity,
             pressured: AtomicBool::new(false),
             readers: Mutex::new(Vec::new()),
+            quiet: Mutex::new(()),
+            freed: Condvar::new(),
         }
     }
 
@@ -512,12 +539,37 @@ impl Budget {
 
     fn give(&self, fds: usize) {
         self.left.fetch_add(fds, Ordering::AcqRel);
+        if fds > 0 && self.pressured.load(Ordering::Acquire) {
+            // Taken so a waiter between its check and its wait still hears.
+            let _quiet = lock(&self.quiet);
+            self.freed.notify_all();
+        }
+    }
+
+    fn holding(&self) -> usize {
+        self.capacity - self.left.load(Ordering::Acquire)
+    }
+
+    /// Sleeps until no reader holds a descriptor from this budget: false if
+    /// `cancelled` first, which is asked every 50 ms.
+    fn wait_unheld(&self, cancelled: &dyn Fn() -> bool) -> bool {
+        let mut quiet = lock(&self.quiet);
+        while self.holding() > 0 {
+            if cancelled() {
+                return false;
+            }
+            quiet = self
+                .freed
+                .wait_timeout(quiet, Duration::from_millis(50))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
     }
 
     /// Stops all holding and closes what every idle reader holds; a reader
-    /// busy opening closes its own when it finishes. The descriptors still
-    /// held.
-    fn relieve(&self) -> usize {
+    /// busy opening closes its own when it finishes.
+    fn relieve(&self) {
         self.pressured.store(true, Ordering::Release);
         lock(&self.readers).retain(|reader| {
             let Some(reader) = reader.upgrade() else {
@@ -530,7 +582,6 @@ impl Budget {
             }
             true
         });
-        self.capacity - self.left.load(Ordering::Acquire)
     }
 }
 

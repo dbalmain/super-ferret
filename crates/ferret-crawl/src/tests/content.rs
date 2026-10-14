@@ -407,7 +407,7 @@ fn readers_out_of_descriptors_close_held_ones_and_retry() {
     let files: Vec<(&str, &[u8])> = files.iter().map(|(r, b)| (r.as_str(), &b[..])).collect();
     let tmp = Tmp::new("fd-pressure");
     indexed(&tmp, &files);
-    for mode in ["idle", "concurrent"] {
+    for mode in ["idle", "concurrent", "stalled"] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -486,6 +486,71 @@ fn pressure_child(mode: &str, base: &std::path::Path) {
             });
             // Else the race tested nothing.
             assert!(Documents::pressured());
+        }
+        "stalled" => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Barrier};
+            // Astra round 3: a reader stalled mid-open, its chain locked,
+            // for longer than any deadline. The other waits it out.
+            let (armed, paused, release) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Barrier::new(2)),
+                Arc::new(Barrier::new(2)),
+            );
+            let mut stalled = reader.fork().pausing({
+                let (armed, paused, release) = (armed.clone(), paused.clone(), release.clone());
+                move || {
+                    if armed.swap(false, Ordering::AcqRel) {
+                        paused.wait();
+                        release.wait();
+                    }
+                }
+            });
+            let mut other = reader.fork();
+            read(&mut stalled, &files[0]);
+            assert_eq!(stalled.held().0, FREE - 1);
+            armed.store(true, Ordering::Release);
+            let (done, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+            std::thread::scope(|scope| {
+                scope.spawn(|| read(&mut stalled, &files[1]));
+                paused.wait();
+                scope.spawn(|| {
+                    read(&mut other, &files[3]);
+                    done.store(true, Ordering::Release);
+                });
+                // Past the deadline the retry once had.
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                assert!(
+                    !done.load(Ordering::Acquire),
+                    "read while the chain was held"
+                );
+                assert!(Documents::pressured());
+                // A third reader, cancelled while it waits, stops waiting.
+                let cancelled = scope.spawn(|| {
+                    let (_, name, _) = &files[6];
+                    let mut out = Vec::new();
+                    let stopped = || stop.load(Ordering::Acquire);
+                    let mut third = reader.fork();
+                    third.read_current_name_until(&catalog, *name, &mut out, &stopped)
+                });
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                stop.store(true, Ordering::Release);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !cancelled.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                // Known before the stalled reader goes on, so a failure
+                // here cannot hang the test.
+                let stopped_waiting = cancelled.is_finished();
+                release.wait();
+                assert!(stopped_waiting, "a cancelled reader kept waiting");
+                let cancelled = cancelled.join().unwrap();
+                assert!(
+                    matches!(cancelled, Err(ContentFault::Cancelled)),
+                    "{cancelled:?}"
+                );
+            });
+            assert!(done.load(Ordering::Acquire));
         }
         _ => unreachable!("{mode}"),
     }
