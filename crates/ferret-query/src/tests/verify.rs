@@ -658,6 +658,37 @@ fn the_name_ordering_pass_asks_to_stop() {
     assert!(!names[1..].is_sorted());
 }
 
+/// Astra: with a name filter, a document's later names in the run must not
+/// each check every earlier name the filter left out. One document has 1000
+/// names the query leaves out, then 1000 it keeps: checking the 1000 again
+/// for each kept name is a million membership checks; the owner is found
+/// once.
+#[test]
+fn owner_selection_is_linear_in_a_documents_names() {
+    let mut files: Vec<String> = (0..1000).map(|i| format!("a{i:04}")).collect();
+    files.extend((0..1000).map(|i| format!("keep{i:04}")));
+    let borrowed: Vec<_> = files.iter().map(|n| (n.as_str(), 10, 1)).collect();
+    let fx = fixture("owners", &borrowed);
+    let script = || Script::new(files.iter().map(|name| (name.as_str(), "text")));
+    let query = "name:keep NOT grep:zzz";
+    let one = comparable(run(&fx, query, 1, &script(), None, all));
+    assert_eq!(one.0.len(), 1000);
+    for threads in [1, 2] {
+        let checks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let _seams = Seams {
+            owner_checks: Some(Arc::clone(&checks)),
+            ..Seams::default()
+        }
+        .set();
+        let script = script();
+        let output = comparable(run(&fx, query, threads, &script, None, all));
+        assert_eq!(output, one, "{threads} threads");
+        let checks = checks.load(Ordering::Relaxed);
+        assert!(checks <= 4 * 2000, "{checks} checks on {threads} threads");
+        assert_eq!(script.requests("keep0000"), ["read"]);
+    }
+}
+
 /// Prompt head emission: `a0`'s row is emitted while `a1`, after it in its
 /// batch, is still being read; `a1`'s read waits for that emission.
 #[test]

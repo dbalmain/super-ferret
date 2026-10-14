@@ -215,7 +215,18 @@ struct Scan<'q, 'c, 'p> {
     /// the answers if the read was of the catalogued version, else `None`.
     /// Sharded by document, so threads rarely meet on a lock.
     found: Vec<Mutex<Found>>,
+    /// Ascending, for a document with many names before a position's: its
+    /// first name in the run, found once ([`Scan::owns`]). Sharded as
+    /// `found` is.
+    owners: Vec<Mutex<HashMap<u32, NameId>>>,
+    /// Membership checks [`Scan::owns`] made, for a test.
+    #[cfg(test)]
+    owner_checks: Option<std::sync::Arc<AtomicU64>>,
 }
+
+/// Names before a position's that [`Scan::owns`] checks one by one; past
+/// this, it finds the document's first name in the run once and keeps it.
+const OWNER_SCAN: usize = 16;
 
 /// One shard of [`Scan::found`]: a document's answers if its read found
 /// the catalogued version, else `None`.
@@ -258,6 +269,9 @@ impl<'q, 'c, 'p> Scan<'q, 'c, 'p> {
             cancelled,
             first,
             found: (0..FOUND_SHARDS).map(|_| Mutex::default()).collect(),
+            owners: (0..FOUND_SHARDS).map(|_| Mutex::default()).collect(),
+            #[cfg(test)]
+            owner_checks: seam::Seams::current().owner_checks,
         }
     }
 
@@ -267,13 +281,31 @@ impl<'q, 'c, 'p> Scan<'q, 'c, 'p> {
         if let Some((first, _)) = &self.first {
             return first.get(doc as usize) == Some(&(at as u32));
         }
-        // Ascending: an earlier position holds a smaller name.
+        // Ascending: an earlier position holds a smaller name. Usually the
+        // name just before is in the run, or there are few; a name filter
+        // can leave many out, and checking them again for each later name
+        // would be quadratic in the document's names.
         let id = self.ids[at];
-        self.names
-            .names(doc)
-            .iter()
-            .take_while(|&&name| name < id)
-            .all(|name| self.ids.binary_search(name).is_err())
+        let names = self.names.names(doc);
+        let before = names.partition_point(|&name| name < id);
+        let in_run = |name: &NameId| {
+            #[cfg(test)]
+            if let Some(checks) = &self.owner_checks {
+                checks.fetch_add(1, Ordering::Relaxed);
+            }
+            self.ids.binary_search(name).is_ok()
+        };
+        if before <= OWNER_SCAN {
+            return !names[..before].iter().any(in_run);
+        }
+        let shard = &self.owners[doc as usize % FOUND_SHARDS];
+        if let Some(&first) = lock(shard).get(&doc) {
+            return first == id;
+        }
+        // `id` itself is in the run, so the search ends by it.
+        let first = names[..=before].iter().copied().find(in_run).unwrap_or(id);
+        lock(shard).insert(doc, first);
+        first == id
     }
 
     /// Whether `doc` may be asked for again in this run: only then are its
@@ -1603,6 +1635,8 @@ pub(crate) mod seam {
         /// Called on a worker after it posts a position, with the pool's
         /// finished-position count.
         pub on_publish: Option<Arc<Poll>>,
+        /// Counts the run-membership checks of owner selection.
+        pub owner_checks: Option<Arc<std::sync::atomic::AtomicU64>>,
     }
 
     thread_local! {
