@@ -580,20 +580,42 @@ fn a_ready_head_is_taken_before_the_rest_of_its_batch() {
 /// Sol round 2: a stop that comes while a row is settled ends the run
 /// before the row is emitted. `a2` is `a1`'s document, answered from the
 /// cache once a stat says it is the catalogued version; the stop comes in
-/// that stat.
+/// that stat, on the calling thread, after `a1` is emitted. On a pool,
+/// `a1`'s read is held until `a2`'s worker has posted it, unread, for the
+/// calling thread: otherwise the worker may stat `a2` itself, and the stop
+/// then rightly comes before `a1` is emitted (Sol round 3).
 #[test]
 fn a_stop_during_a_cached_names_stat_emits_nothing_more() {
     let fx = fixture("emit-guard", &[("a1", 10, 1), ("a2", 10, 1)]);
     for threads in [1, 2] {
+        let posted = Arc::new(Signal::default());
+        let _seams = Seams {
+            on_publish: Some({
+                let posted = Arc::clone(&posted);
+                Arc::new(move |finished: &dyn Fn() -> u64| {
+                    if finished() >= 1 {
+                        posted.set();
+                    }
+                })
+            }),
+            ..Seams::default()
+        }
+        .set();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let script = Script::new([("a1", "needle"), ("a2", "needle")]).on_stat({
-            let cancelled = Arc::clone(&cancelled);
-            move |name| {
-                if name == "a2" {
-                    cancelled.store(true, Ordering::Release);
+        let script = Script::new([("a1", "needle"), ("a2", "needle")])
+            .on_stat({
+                let cancelled = Arc::clone(&cancelled);
+                move |name| {
+                    if name == "a2" {
+                        cancelled.store(true, Ordering::Release);
+                    }
                 }
-            }
-        });
+            })
+            .gated(move |name, _| {
+                if name == "a1" && threads > 1 {
+                    posted.wait("a2 posted for the calling thread");
+                }
+            });
         let (rows, _) = run(&fx, "grep:needle", threads, &script, Some(&cancelled), all);
         assert_eq!(names(&rows), ["a1"], "{threads} threads");
         assert_eq!(script.requests("a2"), ["stat"], "{threads} threads");
