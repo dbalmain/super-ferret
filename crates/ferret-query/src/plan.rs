@@ -489,6 +489,7 @@ impl Query {
         catalog.load(&self.residual_sections())?;
         let probed = Probed {
             ids: &ids,
+            names: content.docs,
             docs: &docs,
             table: &table,
             width,

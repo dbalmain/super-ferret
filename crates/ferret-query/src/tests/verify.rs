@@ -99,6 +99,8 @@ struct Script {
     /// Every request in the order made: the name, and `stat` or `read`.
     log: Mutex<Vec<(String, &'static str)>>,
     gate: Gate,
+    /// Runs on the stating thread after a stat is logged.
+    on_stat: Box<dyn Fn(&str) + Send + Sync>,
 }
 
 impl Script {
@@ -115,11 +117,17 @@ impl Script {
             files: Mutex::new(files),
             log: Mutex::default(),
             gate: Box::new(|_, _| {}),
+            on_stat: Box::new(|_| {}),
         }
     }
 
     fn gated(mut self, gate: impl Fn(&str, &dyn Fn() -> bool) + Send + Sync + 'static) -> Self {
         self.gate = Box::new(gate);
+        self
+    }
+
+    fn on_stat(mut self, hook: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.on_stat = Box::new(hook);
         self
     }
 
@@ -139,6 +147,7 @@ impl Script {
         match request {
             ReadRequest::Stat => {
                 self.log.lock().unwrap().push((name.clone(), "stat"));
+                (self.on_stat)(&name);
                 file(&name)?.1
             }
             ReadRequest::Bytes(out, stop) => {
@@ -345,9 +354,10 @@ fn a_cancelling_callback_stops_buffered_rows() {
 
 /// The budget scene for the limit tests. `a0` (no catalogued size) heads
 /// the run; `b1` holds the whole budget; `c2` waits for bytes; `zz`, which
-/// the query rejects, comes after `c2`, so its poll says `c2` has been
-/// submitted. `a0`'s read waits for that and for `b1`'s read: otherwise
-/// `a0` can be emitted, and the run stopped, before S1 reaches `c2`.
+/// the query rejects, comes last. Two workers and four positions make
+/// batches of one: one worker takes `a0` and then `c2`, the other `b1`.
+/// `a0`'s read waits for `b1`'s, so `b1` holds the budget before `c2` is
+/// claimed.
 const BUDGET: &[(&str, u64, u8)] = &[
     ("a0", 0, 1),
     ("b1", crate::IN_FLIGHT_BYTES, 2),
@@ -356,35 +366,23 @@ const BUDGET: &[(&str, u64, u8)] = &[
 ];
 const BUDGET_QUERY: &str = "grep:needle AND NOT name:zz";
 
-/// Sets `waiting` when a worker waits for bytes and `submitted` at the
-/// first poll.
-fn budget_seams(
-    waiting: &Arc<Signal>,
-    submitted: &Arc<Signal>,
-    teardown: Option<Arc<Poll>>,
-) -> Seams {
-    let (waiting, submitted) = (Arc::clone(waiting), Arc::clone(submitted));
+/// Sets `waiting` when a worker waits for bytes.
+fn budget_seams(waiting: &Arc<Signal>, teardown: Option<Arc<Poll>>) -> Seams {
+    let waiting = Arc::clone(waiting);
     Seams {
         on_budget_wait: Some(Arc::new(move || waiting.set())),
-        on_poll: Some(Arc::new(move |_: &dyn Fn() -> u64| submitted.set())),
         on_teardown: teardown,
         ..Seams::default()
     }
 }
 
-/// The budget scene's reader: `a0` waits for `b1`'s read and `c2`'s
-/// submission; `b1` runs `hold` once started.
-fn budget_script(
-    submitted: Arc<Signal>,
-    hold: impl Fn(&dyn Fn() -> bool) + Send + Sync + 'static,
-) -> Script {
+/// The budget scene's reader: `a0` waits for `b1`'s read; `b1` runs `hold`
+/// once started.
+fn budget_script(hold: impl Fn(&dyn Fn() -> bool) + Send + Sync + 'static) -> Script {
     let started = Signal::default();
     Script::new(BUDGET.iter().map(|&(name, ..)| (name, "needle"))).gated(move |name, stop| {
         match name {
-            "a0" => {
-                started.wait("b1's read");
-                submitted.wait("c2 submitted");
-            }
+            "a0" => started.wait("b1's read"),
             "b1" => {
                 started.set();
                 hold(stop);
@@ -402,10 +400,10 @@ fn a_limit_stops_reads_in_progress_and_starts_none() {
     // `c2` and waits for bytes; `a0`'s callback waits for that, then stops
     // the run.
     let fx = fixture("budget", BUDGET);
-    let (waiting, submitted) = (Arc::new(Signal::default()), Arc::new(Signal::default()));
-    let _seams = budget_seams(&waiting, &submitted, None).set();
+    let waiting = Arc::new(Signal::default());
+    let _seams = budget_seams(&waiting, None).set();
     let told = Arc::new(AtomicBool::new(false));
-    let script = budget_script(submitted, {
+    let script = budget_script({
         let told = Arc::clone(&told);
         move |stop| {
             let deadline = Instant::now() + PATIENCE;
@@ -433,14 +431,14 @@ fn a_limit_stops_reads_in_progress_and_starts_none() {
 }
 
 /// Round 2: the workers stop when the head sees the limit, not when the run
-/// has finished dropping its window and cache. `b1` holds the whole budget,
+/// has finished dropping its state and cache. `b1` holds the whole budget,
 /// and the worker that read `a0` waits for bytes to read `c2`. Once the
 /// limit is seen, the caller is held in teardown while `b1` finishes and
 /// frees its bytes. The woken worker must start no read.
 #[test]
 fn a_limit_stops_workers_before_teardown() {
     let fx = fixture("teardown", BUDGET);
-    let (waiting, submitted) = (Arc::new(Signal::default()), Arc::new(Signal::default()));
+    let waiting = Arc::new(Signal::default());
     let release = Arc::new(Signal::default());
     // Teardown frees `b1`, then waits until every job has finished, read
     // or stopped, `c2`'s included.
@@ -455,8 +453,8 @@ fn a_limit_stops_workers_before_teardown() {
             }
         })
     };
-    let _seams = budget_seams(&waiting, &submitted, Some(teardown)).set();
-    let script = budget_script(submitted, move |_| release.wait("teardown"));
+    let _seams = budget_seams(&waiting, Some(teardown)).set();
+    let script = budget_script(move |_| release.wait("teardown"));
     let (rows, stats) = run(&fx, BUDGET_QUERY, 2, &script, None, |_| {
         waiting.wait("a worker waiting for bytes");
         ControlFlow::Break(())
@@ -470,56 +468,43 @@ fn a_limit_stops_workers_before_teardown() {
     );
 }
 
-/// Finding 6: a ready head is emitted while S1 rejects candidates, not when
-/// the next row passes, so `--limit=1` stops the scan there.
+/// Finding 6: a limit at the head counts the candidates up to the head,
+/// however far the workers have got. `a.txt`'s read is held until workers
+/// have finished 30 later positions, all rejected by name; `--limit=1`
+/// then stops the run at `a.txt`, with one candidate counted, as on one
+/// thread.
 #[test]
-fn a_ready_head_leaves_while_candidates_are_rejected() {
+fn a_limit_at_the_head_ignores_positions_finished_beyond_it() {
     let mut files = vec![("a.txt".to_string(), 10, 1)];
     files.extend((0..200).map(|i| (format!("b{i:03}"), 10, 2 + (i % 200) as u8)));
     let files: Vec<_> = files.iter().map(|(n, s, h)| (n.as_str(), *s, *h)).collect();
     let fx = fixture("rejected", &files);
     let query = "grep:needle AND ( name:a.txt OR name:absent )";
     let script = || Script::new(files.iter().map(|&(name, ..)| (name, "needle")));
-    // `a.txt`'s read is held until the first rejection, so it cannot be
-    // answered before the window first looks; that rejection then waits
-    // until it has been. Each rejection counts.
-    let rejected = Arc::new(Signal::default());
-    let gated = script().gated({
-        let rejected = Arc::clone(&rejected);
-        move |name, _| {
-            if name == "a.txt" {
-                rejected.wait("the first rejection");
-            }
-        }
-    });
-    let polls = Arc::new(AtomicUsize::new(0));
+    let ahead = Arc::new(Signal::default());
+    let finished = Arc::new(AtomicUsize::new(0));
     let _seams = Seams {
-        on_poll: Some({
-            let polls = Arc::clone(&polls);
-            Arc::new(move |finished: &dyn Fn() -> u64| {
-                polls.fetch_add(1, Ordering::AcqRel);
-                rejected.set();
-                let deadline = Instant::now() + PATIENCE;
-                while finished() == 0 {
-                    assert!(Instant::now() < deadline, "a.txt never finished");
-                    std::thread::yield_now();
+        on_publish: Some({
+            let (ahead, finished) = (Arc::clone(&ahead), Arc::clone(&finished));
+            Arc::new(move |count: &dyn Fn() -> u64| {
+                let count = count() as usize;
+                finished.fetch_max(count, Ordering::AcqRel);
+                if count >= 30 {
+                    ahead.set();
                 }
             })
         }),
         ..Seams::default()
     }
     .set();
-    let mut polls_at_emit = None;
-    let (rows, stats) = run(&fx, query, 2, &gated, None, |_| {
-        polls_at_emit = Some(polls.load(Ordering::Acquire));
-        ControlFlow::Break(())
+    let gated = script().gated(move |name, _| {
+        if name == "a.txt" {
+            ahead.wait("30 later positions finished");
+        }
     });
+    let (rows, stats) = run(&fx, query, 2, &gated, None, limit(1));
     assert_eq!(names(&rows), ["a.txt"]);
-    assert_eq!(
-        polls_at_emit,
-        Some(1),
-        "the head waited for later candidates"
-    );
+    assert!(finished.load(Ordering::Acquire) >= 30);
     assert_eq!(stats.candidates, 1);
     let one = run(&fx, query, 1, &script(), None, limit(1));
     assert_eq!(comparable((rows, stats)), comparable(one));
@@ -593,5 +578,49 @@ fn a_duplicate_behind_its_document_in_flight_settles_sequentially() {
         assert_eq!(output, expected, "{case}");
         assert_eq!(pool.requests("a2"), duplicate, "{case}");
         assert_eq!(pool.requests("b3"), ["read"], "{case}");
+    }
+}
+
+/// A later name of a document whose read has finished is settled on a
+/// worker, as the sequential order settles it at the head: `c3` is stated
+/// (and read again if its stat finds another version) while `b2`, ahead of
+/// it, is still being read, so the calling thread cannot have done it.
+#[test]
+fn a_duplicate_after_its_document_settles_on_a_worker() {
+    let fx = fixture("settled", &[("a1", 10, 1), ("b2", 10, 2), ("c3", 10, 1)]);
+    let cases = [
+        // Still the catalogued version: the cached answers hold.
+        ("catalogued", Some(ReadVersion::Catalogued), vec!["stat"]),
+        // Another version: the duplicate reads for itself.
+        ("current", Some(ReadVersion::Current), vec!["stat", "read"]),
+        // Gone: changed, with no row.
+        ("gone", None, vec!["stat"]),
+    ];
+    for (case, duplicate, requests) in cases {
+        let script = |threads: usize| {
+            let stated = Arc::new(Signal::default());
+            let waited = stated.clone();
+            let script = Script::new([("a1", "x needle"), ("b2", "needle"), ("c3", "x needle")])
+                .gated(move |name, _| {
+                    if name == "b2" && threads > 1 {
+                        waited.wait("c3's stat");
+                    }
+                })
+                .on_stat(move |name| {
+                    if name == "c3" {
+                        stated.set();
+                    }
+                });
+            script.set("c3", "x needle", duplicate);
+            script
+        };
+        let one = script(1);
+        let expected = comparable(run(&fx, "grep:needle", 1, &one, None, all));
+        assert_eq!(one.requests("c3"), requests, "{case}");
+        let pool = script(2);
+        let output = comparable(run(&fx, "grep:needle", 2, &pool, None, all));
+        assert_eq!(output, expected, "{case}");
+        assert_eq!(pool.requests("c3"), requests, "{case}");
+        assert_eq!(pool.requests("a1"), ["read"], "{case}");
     }
 }
