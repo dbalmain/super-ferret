@@ -5,11 +5,13 @@
 //! handled whole by one thread: S1's tests, the index truth, reading and
 //! matching the document, and the residual, which leaves a finished row or
 //! nothing. Workers claim positions in batches, in order, from an atomic
-//! counter, and publish each finished batch into a slot of a bounded ring.
-//! The calling thread takes the slots in order and emits their rows, so it
-//! does a few additions and the callback per row, and sleeps only when the
-//! next batch is not finished. A worker more than the ring's length ahead
-//! of the calling thread waits for it.
+//! counter, and post each finished position into its batch's slot of a
+//! bounded ring before starting the next, so a finished position never
+//! waits for a slower one after it in its batch. The calling thread takes
+//! the slots in order and emits their rows, so it does a few additions and
+//! the callback per row, and sleeps only when the next position is not
+//! finished. A worker more than the ring's length of batches ahead of the
+//! calling thread waits for it.
 //!
 //! For inputs that do not change during the run, and without cancellation,
 //! the output is the sequential order's at any thread count:
@@ -349,18 +351,28 @@ impl<'q, 'c, 'p> Scan<'q, 'c, 'p> {
         pool: &Pool,
         ledger: &mut Ledger<'_, 'q, 'c, 'p, '_, '_, E>,
     ) -> Result<(), RunError> {
+        let mut part = Batch::default();
+        let mut items = Vec::new();
         for index in 0..pool.batches {
-            let Some(batch) = pool.take(index) else {
-                // A worker panicked; the scope re-raises it.
-                return Ok(());
-            };
-            for (offset, item) in batch.items.into_iter().enumerate() {
-                let at = batch.start + offset;
-                // The accounting boundary (module doc): a cancelled run
-                // consumes no further position.
-                if self.stopped() || ledger.consume(item, &batch.paths)?.is_break() {
-                    ledger.halt(pool, at);
+            loop {
+                part.clear();
+                let Some(complete) = pool.take(index, &mut part) else {
+                    // A worker panicked; the scope re-raises it.
                     return Ok(());
+                };
+                std::mem::swap(&mut items, &mut part.items);
+                for (offset, item) in items.drain(..).enumerate() {
+                    let at = part.start + offset;
+                    // The accounting boundary (module doc): a cancelled run
+                    // consumes no further position.
+                    if self.stopped() || ledger.consume(item, &part.paths)?.is_break() {
+                        ledger.halt(pool, at);
+                        return Ok(());
+                    }
+                }
+                std::mem::swap(&mut items, &mut part.items);
+                if complete {
+                    break;
                 }
             }
         }
@@ -598,7 +610,7 @@ enum How {
     Here(u32),
 }
 
-/// A batch of consecutive positions, finished.
+/// Consecutive positions, finished.
 #[derive(Default)]
 struct Batch {
     /// The first position.
@@ -613,6 +625,26 @@ impl Batch {
         self.items.clear();
         self.paths.clear();
     }
+
+    /// Appends `item`, whose path is all of `paths`.
+    fn push(&mut self, mut item: Item, paths: &[u8]) {
+        if let Item::Row(pending) = &mut item {
+            let start = self.paths.len();
+            pending.path = start..start + paths.len();
+        }
+        self.paths.extend_from_slice(paths);
+        self.items.push(item);
+    }
+}
+
+/// A slot of the ring: one batch's finished positions not yet taken.
+#[derive(Default)]
+struct Slot {
+    /// The batch, plus one (0: none).
+    index: usize,
+    part: Batch,
+    /// Every position of the batch has been posted.
+    complete: bool,
 }
 
 // ── the calling thread's side ──
@@ -1156,10 +1188,12 @@ struct Pool {
     next: AtomicUsize,
     /// Batches the calling thread has taken.
     head: AtomicUsize,
-    /// Finished batches not yet taken, at `index % ring.len()`, with the
-    /// index of the batch each slot holds plus one (0: empty).
-    ring: Vec<Mutex<Option<Batch>>>,
-    filled: Vec<AtomicUsize>,
+    /// Each batch's finished positions not yet taken, at
+    /// `index % ring.len()`.
+    ring: Vec<Mutex<Slot>>,
+    /// Positions posted to each slot, ever: the calling thread sleeps until
+    /// its slot's count moves.
+    posted: Vec<AtomicUsize>,
     /// The batch the calling thread sleeps for, plus one (0: none).
     awaited: AtomicUsize,
     ready: Mutex<()>,
@@ -1199,8 +1233,8 @@ impl Pool {
             batches: positions.div_ceil(batch),
             next: AtomicUsize::new(0),
             head: AtomicUsize::new(0),
-            ring: (0..slots).map(|_| Mutex::new(None)).collect(),
-            filled: (0..slots).map(|_| AtomicUsize::new(0)).collect(),
+            ring: (0..slots).map(|_| Mutex::default()).collect(),
+            posted: (0..slots).map(|_| AtomicUsize::new(0)).collect(),
             awaited: AtomicUsize::new(0),
             ready: Mutex::new(()),
             ready_signal: Condvar::new(),
@@ -1235,14 +1269,15 @@ impl Pool {
         self.stop.load(Ordering::SeqCst)
     }
 
-    /// One worker: claim batches in order, finish and publish each, until
-    /// none is left or the pool stops.
+    /// One worker: claim batches in order and post each position as it
+    /// finishes, until none is left or the pool stops.
     fn work(&self, scan: &Scan<'_, '_, '_>, fork: &Fork<'_>, stopped: &(dyn Fn() -> bool + Sync)) {
         let _lost = LostOnPanic(self);
         let mut read = fork();
         let mut hand = Hand::new(&mut *read, &scan.query.atoms);
         let mut names = NameTester::new(scan.query, scan.catalog, scan.cancelled);
         let halt = || self.halted() || stopped();
+        let mut paths = Vec::new();
         loop {
             if self.halted() {
                 return;
@@ -1253,23 +1288,11 @@ impl Pool {
             }
             let start = index * self.batch;
             let end = (start + self.batch).min(self.positions);
-            let mut batch = Batch {
-                start,
-                items: Vec::with_capacity(end - start),
-                paths: Vec::new(),
-            };
             for at in start..end {
-                let item = scan.item(
-                    at,
-                    &mut names,
-                    &mut hand,
-                    Some(self),
-                    &halt,
-                    &mut batch.paths,
-                );
-                batch.items.push(item);
+                paths.clear();
+                let item = scan.item(at, &mut names, &mut hand, Some(self), &halt, &mut paths);
+                self.post(index, at, item, &paths, at + 1 == end);
             }
-            self.publish(index, batch);
         }
     }
 
@@ -1293,13 +1316,25 @@ impl Pool {
         !self.halted()
     }
 
-    fn publish(&self, index: usize, batch: Batch) {
+    /// Posts position `at` of batch `index`, whose row's path is `paths`;
+    /// `last` if it is the batch's last.
+    fn post(&self, index: usize, at: usize, item: Item, paths: &[u8], last: bool) {
         let slot = index % self.ring.len();
+        {
+            let mut held = lock(&self.ring[slot]);
+            if held.index != index + 1 {
+                held.index = index + 1;
+                held.part.clear();
+            }
+            if held.part.items.is_empty() {
+                held.part.start = at;
+            }
+            held.part.push(item, paths);
+            held.complete = last;
+        }
         #[cfg(test)]
-        self.finished
-            .fetch_add(batch.items.len() as u64, Ordering::AcqRel);
-        *lock(&self.ring[slot]) = Some(batch);
-        self.filled[slot].store(index + 1, Ordering::SeqCst);
+        self.finished.fetch_add(1, Ordering::AcqRel);
+        self.posted[slot].fetch_add(1, Ordering::SeqCst);
         if self.awaited.load(Ordering::SeqCst) == index + 1 {
             drop(lock(&self.ready));
             self.ready_signal.notify_one();
@@ -1308,15 +1343,38 @@ impl Pool {
         self.seams.published(&|| self.finished());
     }
 
-    /// Batch `index` once finished, freeing its slot; `None` if a worker
-    /// was lost.
-    fn take(&self, index: usize) -> Option<Batch> {
+    /// Batch `index`'s next finished positions, into `out` (empty): waits
+    /// until there is at least one, or the batch is complete. True once the
+    /// batch is complete, which frees its slot; `None` if a worker was lost.
+    fn take(&self, index: usize, out: &mut Batch) -> Option<bool> {
         let slot = index % self.ring.len();
-        let filled = || self.filled[slot].load(Ordering::SeqCst) == index + 1;
-        if !filled() {
+        let posted = &self.posted[slot];
+        loop {
+            let seen = posted.load(Ordering::SeqCst);
+            {
+                let mut held = lock(&self.ring[slot]);
+                if held.index == index + 1 && (!held.part.items.is_empty() || held.complete) {
+                    std::mem::swap(&mut held.part, out);
+                    let complete = held.complete;
+                    if complete {
+                        held.index = 0;
+                        held.complete = false;
+                    }
+                    drop(held);
+                    if complete {
+                        self.head.store(index + 1, Ordering::SeqCst);
+                        if self.roomless.load(Ordering::SeqCst) > 0 {
+                            drop(lock(&self.room));
+                            self.room_signal.notify_all();
+                        }
+                    }
+                    return Some(complete);
+                }
+            }
             let mut guard = lock(&self.ready);
             self.awaited.store(index + 1, Ordering::SeqCst);
-            while !filled() && !self.lost.load(Ordering::SeqCst) {
+            let moved = || posted.load(Ordering::SeqCst) != seen;
+            while !moved() && !self.lost.load(Ordering::SeqCst) {
                 guard = self
                     .ready_signal
                     .wait(guard)
@@ -1324,18 +1382,10 @@ impl Pool {
             }
             self.awaited.store(0, Ordering::SeqCst);
             drop(guard);
-            if !filled() {
+            if !moved() {
                 return None;
             }
         }
-        let batch = lock(&self.ring[slot]).take();
-        self.filled[slot].store(0, Ordering::SeqCst);
-        self.head.store(index + 1, Ordering::SeqCst);
-        if self.roomless.load(Ordering::SeqCst) > 0 {
-            drop(lock(&self.room));
-            self.room_signal.notify_all();
-        }
-        batch
     }
 
     /// Reads and matches one document on a worker, within the byte budget.
@@ -1481,7 +1531,7 @@ pub(crate) mod seam {
         /// Called on the calling thread when the run is over and its state
         /// is about to be dropped, with the pool's finished-position count.
         pub on_teardown: Option<Arc<Poll>>,
-        /// Called on a worker after it publishes a batch, with the pool's
+        /// Called on a worker after it posts a position, with the pool's
         /// finished-position count.
         pub on_publish: Option<Arc<Poll>>,
     }

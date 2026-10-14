@@ -518,6 +518,76 @@ fn a_limit_at_the_head_ignores_positions_finished_beyond_it() {
     assert_eq!(comparable((rows, stats)), comparable(one));
 }
 
+/// 64 positions on two workers make batches of two: `a0` and `a1` are
+/// the first batch, read by one worker in turn. The rest are fillers.
+fn pairs() -> Vec<(String, u64, u8)> {
+    let mut files = vec![("a0".to_string(), 10, 1), ("a1".to_string(), 10, 2)];
+    files.extend((0..62).map(|i| (format!("b{i:02}"), 10, 3 + i as u8)));
+    files
+}
+
+fn pairs_fixture(name: &str) -> (Fixture, Vec<String>) {
+    let files = pairs();
+    let borrowed: Vec<_> = files.iter().map(|(n, s, h)| (n.as_str(), *s, *h)).collect();
+    let fx = fixture(name, &borrowed);
+    (fx, files.iter().map(|(n, ..)| n.clone()).collect())
+}
+
+fn pairs_script(names: &[String]) -> Script {
+    Script::new(names.iter().map(|name| (name.as_str(), "needle")))
+}
+
+/// Sol round 1, P1: a finished position is taken before the rest of its
+/// batch. `a1`, after `a0` in its batch, reads until told to stop, which
+/// only `a0`'s row reaching `--limit=1` can do.
+#[test]
+fn a_ready_head_is_taken_before_the_rest_of_its_batch() {
+    let (fx, files) = pairs_fixture("batch-limit");
+    let told = Arc::new(AtomicBool::new(false));
+    let script = pairs_script(&files).gated({
+        let told = Arc::clone(&told);
+        move |name, stop| {
+            if name == "a1" {
+                let deadline = Instant::now() + PATIENCE;
+                while !stop() && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                told.store(stop(), Ordering::Release);
+            }
+        }
+    });
+    let (rows, stats) = run(&fx, "grep:needle", 2, &script, None, limit(1));
+    assert!(told.load(Ordering::Acquire), "a0 waited for a1's read");
+    assert_eq!(names(&rows), ["a0"]);
+    let one = run(&fx, "grep:needle", 1, &pairs_script(&files), None, limit(1));
+    assert_eq!(comparable((rows, stats)), comparable(one));
+}
+
+/// Prompt head emission: `a0`'s row is emitted while `a1`, after it in its
+/// batch, is still being read; `a1`'s read waits for that emission.
+#[test]
+fn a_ready_head_is_emitted_while_its_batch_is_read() {
+    let (fx, files) = pairs_fixture("batch-prompt");
+    let emitted = Arc::new(Signal::default());
+    let script = pairs_script(&files).gated({
+        let emitted = Arc::clone(&emitted);
+        move |name, _| {
+            if name == "a1" {
+                emitted.wait("a0's row emitted");
+            }
+        }
+    });
+    let output = run(&fx, "grep:needle", 2, &script, None, |rows| {
+        if rows.len() == 1 {
+            emitted.set();
+        }
+        ControlFlow::Continue(())
+    });
+    assert_eq!(output.0.len(), files.len());
+    let one = run(&fx, "grep:needle", 1, &pairs_script(&files), None, all);
+    assert_eq!(comparable(output), comparable(one));
+}
+
 /// Finding 7: on a pool, a document is read when a worker gets to it,
 /// which can be before an earlier row's callback runs. Here `b1` has been
 /// read before `a0`'s callback deletes it: one thread drops `b1` as
