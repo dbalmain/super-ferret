@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 
 use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
 use ferret_index::Certainty;
-use ferret_verify::{MatchStats, Regex, TextMatcher};
+use ferret_verify::{MatchStats, Search, TextMatcher};
 
 use crate::expr::{Test, Truth};
 use crate::plan::{ReadRequest, ReadVersion, Reader};
@@ -814,10 +814,10 @@ struct Hand<'r, 'a> {
     bytes: Vec<u8>,
     /// A run of lines at a time, for line-local patterns ([`stream`]).
     lines: Vec<u8>,
-    /// This thread's own copy of each grep atom's regex, by atom: a regex
+    /// This thread's own copy of each grep atom's search, by atom: a regex
     /// shared between threads hands each a match cache from a pool, which
     /// many threads at once contend on.
-    regexes: Vec<Option<Regex>>,
+    regexes: Vec<Option<Search>>,
 }
 
 impl<'r, 'a> Hand<'r, 'a> {
@@ -825,7 +825,7 @@ impl<'r, 'a> Hand<'r, 'a> {
         let regexes = atoms
             .iter()
             .map(|atom| match atom {
-                ContentAtom::Grep(grep) => Some(grep.regex().clone()),
+                ContentAtom::Grep(grep) => Some(grep.search()),
                 ContentAtom::Text(_) => None,
             })
             .collect();
@@ -956,7 +956,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
 /// unless `stopped` says to stop first; the reader is given `stopped` too.
 fn verify(
     atoms: &[ContentAtom],
-    regexes: &[Option<Regex>],
+    regexes: &[Option<Search>],
     read: &mut Reader<'_>,
     matcher: &mut TextMatcher,
     bytes: &mut Vec<u8>,
@@ -981,7 +981,7 @@ fn verify(
         }
         let engine_start = Instant::now();
         let answer = match regex {
-            Some(regex) => regex.find(bytes).map(|span| span.start),
+            Some(search) => search.find(bytes),
             None => atom.find(matcher, bytes),
         };
         if matches!(atom, ContentAtom::Grep(_)) {
@@ -1037,7 +1037,7 @@ fn streams(atoms: &[ContentAtom]) -> bool {
 /// run's offset plus the match's. The counts are too: each atom counts the
 /// document's whole size, matched or not.
 fn stream(
-    regexes: &[Option<Regex>],
+    regexes: &[Option<Search>],
     read: &mut Reader<'_>,
     buffer: &mut Vec<u8>,
     name: NameId,
@@ -1092,7 +1092,7 @@ fn stream(
                     continue;
                 };
                 if let Some(found) = regex.find(run) {
-                    *answer = Some(base + found.start);
+                    *answer = Some(base + found);
                     open -= 1;
                 }
             }

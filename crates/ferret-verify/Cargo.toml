@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 ferret-text.workspace = true
+memchr = "2" # line ends around a required run's hits (Search); MIT OR Unlicense
 regex = "1" # name regexes (D17); MIT OR Apache-2.0
 regex-syntax = "0.8.11" # the HIR the trigram derivation folds (S3); MIT OR Apache-2.0
 

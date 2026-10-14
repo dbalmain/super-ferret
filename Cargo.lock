@@ -155,6 +155,7 @@ name = "ferret-verify"
 version = "0.0.0"
 dependencies = [
  "ferret-text",
+ "memchr",
  "regex",
  "regex-syntax",
 ]

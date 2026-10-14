@@ -893,3 +893,146 @@ fn derivation_coverage_over_the_regex_classes() {
         }
     }
 }
+
+// ── the search: required run, then windows ──
+
+/// [`super::Search::find`] against the pattern over the whole text.
+fn same_first_match(pattern: &str, case_insensitive: bool, text: &[u8]) {
+    let grep = GrepFlags { case_insensitive }.compile(pattern).unwrap();
+    same_first(&grep, text);
+}
+
+fn same_first(grep: &super::Grep, text: &[u8]) {
+    let pattern = grep.pattern();
+    assert_eq!(
+        grep.search().find(text),
+        grep.regex().find(text).map(|span| span.start),
+        "{pattern} in {:?}",
+        String::from_utf8_lossy(text)
+    );
+}
+
+#[test]
+fn only_patterns_without_a_literal_prefix_filter() {
+    for (pattern, filters) in [
+        (r"(?i)[A-Z_]+worse", true),
+        (r"[A-Z_]+worse", true),
+        (r"(?i)\b[A-Z_]+join\b", true),
+        (r"(?i)defi\w+acro", false),
+        (r"(?i)ion\d+", false),
+        (r"(?i)(says|runtime|modern)", false),
+        (r"(?i)[A-Z_]+ab", false),
+        // Not line-local: `\s` matches a newline.
+        (r"(?i)[A-Z_]+\s+worse", false),
+    ] {
+        let grep = GrepFlags::default().compile(pattern).unwrap();
+        assert_eq!(grep.search().filters(), filters, "{pattern}");
+    }
+}
+
+#[test]
+fn the_run_keeps_every_case_variant_the_pattern_has() {
+    // KELVIN SIGN folds with `k`, LATIN SMALL LETTER LONG S with `s`: a run
+    // folded byte by byte in ASCII would miss both.
+    for text in ["x x\u{212A}elvin\n", "a\nzz\u{212A}ELVIN"] {
+        same_first_match(r"(?i)[a-z_]+kelvin", false, text.as_bytes());
+        same_first_match(r"[a-z_]+kelvin", true, text.as_bytes());
+        assert!(
+            GrepFlags::default()
+                .compile(r"(?i)[a-z_]+kelvin")
+                .unwrap()
+                .search()
+                .find(text.as_bytes())
+                .is_some()
+        );
+    }
+    same_first_match(r"(?i)[a-z]+worse", false, "x xwor\u{17F}e".as_bytes());
+    same_first_match(r"(?i)[a-zé]+join", false, "--éJOIN".as_bytes());
+}
+
+#[test]
+fn a_window_without_a_match_moves_on_to_the_next() {
+    for text in [
+        "join foo xjoin",
+        "join\njoin\n_join",
+        "xjoinjoin",
+        "jo in joi n_JOIN ajoin",
+        "",
+        "join",
+    ] {
+        same_first_match(r"(?i)[A-Z_]+join", false, text.as_bytes());
+    }
+}
+
+#[test]
+fn an_assertion_sees_the_whole_line_not_a_window() {
+    // In "1xjoin" the `x` follows a word byte, so `\b` does not hold before
+    // it. A window of the pattern's own bytes would start at `x` and see a
+    // boundary there; the line does not.
+    for text in ["1xjoin", "1xjoin xjoin", "a-xjoin", "xjoin1"] {
+        same_first_match(r"(?i)\b[a-z]+join", false, text.as_bytes());
+        same_first_match(r"(?i)[a-z]+join\b", false, text.as_bytes());
+        same_first_match(r"(?im)^[a-z]+join$", false, text.as_bytes());
+    }
+    assert_eq!(
+        GrepFlags::default()
+            .compile(r"(?i)\b[a-z]+join")
+            .unwrap()
+            .search()
+            .find(b"1xjoin"),
+        None
+    );
+}
+
+#[test]
+fn the_search_finds_the_patterns_first_match_in_random_text() {
+    let pieces: [&[u8]; 14] = [
+        b"join",
+        b"JOIN",
+        b"jo",
+        b"in",
+        b"x",
+        b"_",
+        b" ",
+        b"\n",
+        b"1",
+        b"-",
+        "\u{212A}".as_bytes(),
+        b"k",
+        "é".as_bytes(),
+        b"\xff",
+    ];
+    let patterns = [
+        r"(?i)[A-Z_]+join",
+        r"[a-z_]+join",
+        r"(?i)\b[A-Z_]+join\b",
+        r"(?i)[A-Z_]+jo[^\n]in",
+        r"(?i)(?:[a-z]|é)+kjoin",
+        r"(?i)[0-9]*[a-z]+(join|xjoin)_",
+        r"(?i-u)[a-z_]+join",
+        r"(?-u)[\x80-\xff]+join",
+    ];
+    let greps: Vec<_> = patterns
+        .iter()
+        .flat_map(|pattern| {
+            [false, true]
+                .map(|case_insensitive| GrepFlags { case_insensitive }.compile(pattern).unwrap())
+        })
+        .collect();
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = |below: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % below as u64) as usize
+    };
+    for _ in 0..4000 {
+        let mut text = Vec::new();
+        for _ in 0..next(24) {
+            text.extend_from_slice(pieces[next(pieces.len())]);
+        }
+        for grep in &greps {
+            same_first(grep, &text);
+        }
+    }
+}

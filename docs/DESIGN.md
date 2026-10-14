@@ -35,7 +35,7 @@ ferret-query   → ferret-index (the candidate seam only), ferret-catalog, ferre
 ferret-crawl   → ferret-policy, ferret-catalog, rustix, blake3
 ferret-index   → ferret-text, intpack (git dependency pinned by rev — D59), blake3 (segment checksums)
 ferret-catalog → blake3 (checkpoint integrity), intpack (git dependency pinned by rev — D59)
-ferret-verify  → ferret-text (the phrase matcher tokenizes documents — S2), regex, regex-syntax (the regex-to-trigram derivation — S3)
+ferret-verify  → ferret-text (the phrase matcher tokenizes documents — S2), regex, regex-syntax (the regex-to-trigram derivation — S3), memchr (line ends around a required run's hits)
 ferret-policy  → (std only)
 ferret-text    → (std only)
 ferret-bench   → anything; nothing depends on it

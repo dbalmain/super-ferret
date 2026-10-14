@@ -138,11 +138,14 @@ impl GrepFlags {
             .build()
             .parse(pattern)
             .map_err(|e| GrepError::Derivation(e.to_string()))?;
+        let line_local = line_local(&hir);
+        let filter = if line_local { filter(&hir) } else { None };
         Ok(Grep {
             regex,
             trigrams,
             planning,
-            line_local: line_local(&hir),
+            line_local,
+            filter,
         })
     }
 
@@ -190,6 +193,10 @@ pub struct Grep {
     /// Every match lies within one line, and finding it needs nothing
     /// beyond that line ([`Grep::is_line_local`]).
     line_local: bool,
+    /// A required run of the pattern, searched first to find where a match
+    /// can be ([`Search`]); only for line-local patterns whose matches the
+    /// engine cannot find by a literal prefix.
+    filter: Option<Filter>,
 }
 
 impl crate::Matcher for Grep {
@@ -220,6 +227,15 @@ impl Grep {
         self.line_local
     }
 
+    /// A copy of what finds the first match, for one thread's own use
+    /// (its engine caches are then its own).
+    pub fn search(&self) -> Search {
+        Search {
+            regex: self.regex.clone(),
+            filter: self.filter.clone(),
+        }
+    }
+
     /// The verifier: the only judge of a match.
     pub fn regex(&self) -> &Regex {
         &self.regex
@@ -247,6 +263,215 @@ impl Grep {
     /// What every match contains.
     pub fn trigrams(&self) -> &Trigrams {
         &self.trigrams
+    }
+}
+
+/// A [`Grep`]'s search for its first match.
+///
+/// Patterns that start with a large class, such as `(?i)[A-Z_]+worse`, give
+/// the engine no literal prefix to look for, and it runs its automaton over
+/// every byte: about 10 s of CPU on the bench corpus where `(?i)worse`
+/// alone costs 1 s. When the pattern is line-local and has a required run
+/// of literals or small classes, the search looks for that run first, and
+/// runs the pattern only over the window around each occurrence, in order.
+///
+/// A window is the longest stretch around the occurrence of bytes a match
+/// can be made of. For a pattern without assertions that is the bytes its
+/// literals and classes can match (any byte above ASCII when a class has a
+/// character there), so `(?i)[A-Z_]+worse` searches the word holding each
+/// `worse`, not its line. With an assertion (`^`, `$`, `\b`), whose answer
+/// depends on the bytes beside a match, the window is the line.
+///
+/// This finds the same first match as the pattern over the whole text.
+/// Every match contains an occurrence of the run and lies within one
+/// window, so a window without one has no match, and windows are searched
+/// in order. Within a window the pattern finds what it finds in the text:
+/// with no assertions a match depends only on its own bytes, all of them
+/// in the window; with assertions the window is a line, and a line-local
+/// pattern matches within a line as it does within the text around it
+/// ([`Grep::is_line_local`]). The run is cut from the parsed pattern itself,
+/// after case folding, so it accepts every case variant the pattern does
+/// (`k` and the Kelvin sign, `s` and the long s).
+#[derive(Clone, Debug)]
+pub struct Search {
+    regex: Regex,
+    filter: Option<Filter>,
+}
+
+/// [`Search`]'s required run and window.
+#[derive(Clone, Debug)]
+struct Filter {
+    run: Regex,
+    /// The bytes a match can be made of, by byte value; `None` for a
+    /// pattern with assertions, whose window is the line.
+    within: Option<Box<[bool; 256]>>,
+}
+
+impl Search {
+    /// Offset of the first match's start in `text`.
+    pub fn find(&self, text: &[u8]) -> Option<usize> {
+        let Some(filter) = &self.filter else {
+            return self.regex.find(text).map(|span| span.start);
+        };
+        let mut at = 0;
+        while at <= text.len() {
+            let hit = filter.run.find(&text[at..])?;
+            let (hit, hit_end) = (at + hit.start, at + hit.end);
+            let (start, end) = match &filter.within {
+                None => (
+                    memchr::memrchr(b'\n', &text[at..hit]).map_or(at, |i| at + i + 1),
+                    memchr::memchr(b'\n', &text[hit_end..]).map_or(text.len(), |i| hit_end + i),
+                ),
+                Some(within) => (
+                    text[at..hit]
+                        .iter()
+                        .rposition(|&b| !within[usize::from(b)])
+                        .map_or(at, |i| at + i + 1),
+                    text[hit_end..]
+                        .iter()
+                        .position(|&b| !within[usize::from(b)])
+                        .map_or(text.len(), |i| hit_end + i),
+                ),
+            };
+            if let Some(span) = self.regex.find(&text[start..end]) {
+                return Some(start + span.start);
+            }
+            // `text[end]` is outside every window.
+            at = end + 1;
+        }
+        None
+    }
+
+    /// Whether the search looks for a required run before the pattern.
+    pub fn filters(&self) -> bool {
+        self.filter.is_some()
+    }
+}
+
+/// [`Search`]'s filter for a line-local pattern; `None` when the engine
+/// finds the pattern's matches by a literal prefix of its own (a finite
+/// prefix set), or when there is no run of three or more.
+fn filter(hir: &Hir) -> Option<Filter> {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+    if Extractor::new()
+        .kind(ExtractKind::Prefix)
+        .extract(hir)
+        .is_finite()
+    {
+        return None;
+    }
+    let run = required_run(hir)?;
+    // Printing a HIR gives a pattern that parses back to it; it is already
+    // case folded, so it compiles with the builder's defaults.
+    let run = Regex::build(&regex::bytes::RegexBuilder::new(&run.to_string())).ok()?;
+    let mut within = Box::new([false; 256]);
+    let within = match_bytes(hir, &mut within).then(|| {
+        within[usize::from(b'\n')] = false;
+        within
+    });
+    Some(Filter { run, within })
+}
+
+/// Marks in `within` every byte a match of `hir` can contain; false when
+/// `hir` has an assertion, whose answer depends on bytes beside the match.
+fn match_bytes(hir: &Hir, within: &mut [bool; 256]) -> bool {
+    let mut mark = |from: u32, to: u32| {
+        for b in from..=to.min(0xFF) {
+            within[b as usize] = true;
+        }
+    };
+    match hir.kind() {
+        HirKind::Empty => true,
+        HirKind::Literal(literal) => {
+            for &b in literal.0.iter() {
+                within[usize::from(b)] = true;
+            }
+            true
+        }
+        // A character above ASCII is two or more bytes, each above it.
+        HirKind::Class(Class::Unicode(class)) => {
+            for range in class.ranges() {
+                let (from, to) = (u32::from(range.start()), u32::from(range.end()));
+                if from < 0x80 {
+                    mark(from, to.min(0x7F));
+                }
+                if to >= 0x80 {
+                    mark(0x80, 0xFF);
+                }
+            }
+            true
+        }
+        HirKind::Class(Class::Bytes(class)) => {
+            for range in class.ranges() {
+                mark(u32::from(range.start()), u32::from(range.end()));
+            }
+            true
+        }
+        HirKind::Look(_) => false,
+        HirKind::Repetition(repetition) => match_bytes(&repetition.sub, within),
+        HirKind::Capture(capture) => match_bytes(&capture.sub, within),
+        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => {
+            hirs.iter().all(|hir| match_bytes(hir, within))
+        }
+    }
+}
+
+/// The longest run of consecutive literals and small classes that every
+/// match of `hir` contains: at least three long (bytes of a literal, one per
+/// class), and short of the whole pattern.
+fn required_run(hir: &Hir) -> Option<Hir> {
+    Some(run_in(hir)?.1)
+}
+
+/// [`required_run`], with its length.
+fn run_in(hir: &Hir) -> Option<(usize, Hir)> {
+    match hir.kind() {
+        HirKind::Capture(capture) => run_in(&capture.sub),
+        HirKind::Repetition(repetition) if repetition.min > 0 => run_in(&repetition.sub),
+        HirKind::Concat(hirs) => {
+            let (mut best, mut length, mut start, mut sum) = (0..0, 0, 0, 0);
+            for (i, child) in hirs.iter().enumerate() {
+                match literal_length(child) {
+                    None => (start, sum) = (i + 1, 0),
+                    Some(n) => {
+                        sum += n;
+                        if sum > length {
+                            (best, length) = (start..i + 1, sum);
+                        }
+                    }
+                }
+            }
+            let own = (length >= 3 && best.len() < hirs.len())
+                .then(|| (length, Hir::concat(hirs[best].to_vec())));
+            // A run inside a child is required too.
+            own.into_iter()
+                .chain(hirs.iter().filter_map(run_in))
+                .max_by_key(|(length, _)| *length)
+        }
+        _ => None,
+    }
+}
+
+/// How many bytes a literal matches, or 1 for a class of
+/// at most four characters (the case variants of one); `None` otherwise.
+fn literal_length(hir: &Hir) -> Option<usize> {
+    let small = |sizes: &mut dyn Iterator<Item = u32>| (sizes.sum::<u32>() <= 4).then_some(1);
+    match hir.kind() {
+        HirKind::Literal(literal) => Some(literal.0.len()),
+        HirKind::Class(Class::Unicode(class)) => small(
+            &mut class
+                .ranges()
+                .iter()
+                .map(|r| u32::from(r.end()) - u32::from(r.start()) + 1),
+        ),
+        HirKind::Class(Class::Bytes(class)) => small(
+            &mut class
+                .ranges()
+                .iter()
+                .map(|r| u32::from(r.end()) - u32::from(r.start()) + 1),
+        ),
+        HirKind::Capture(capture) => literal_length(&capture.sub),
+        _ => None,
     }
 }
 
