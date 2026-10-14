@@ -368,3 +368,125 @@ fn held_directories_stay_within_their_budget() {
         assert_eq!(fork.held(), (0, budget), "returned, budget {budget}");
     }
 }
+
+/// The pressure tests' tree: eight branches, each a chain of fifteen
+/// directories from the tree's root to three files.
+fn pressure_files() -> Vec<(String, Vec<u8>)> {
+    let chain = (1..=13).map(|level| level.to_string()).collect::<Vec<_>>();
+    (0..8)
+        .flat_map(|branch| {
+            let dir = format!("b{branch}/{}", chain.join("/"));
+            (0..3).map(move |file| {
+                let rel = format!("{dir}/f{file}.txt");
+                let bytes = format!("{rel} body\n").into_bytes();
+                (rel, bytes)
+            })
+        })
+        .collect()
+}
+
+/// Descriptors left free to the readers in a pressure test: enough for four
+/// unheld walks (two directories and a file each), and fewer than the
+/// process's budget lets them hold (a quarter of 256).
+const FREE: usize = 16;
+
+/// Astra: the budget alone reserves nothing for descriptors the rest of the
+/// process holds, so readers could run out where unheld walks would not. A
+/// reader out of descriptors closes every reader's held ones, idle readers'
+/// too, and tries again. In a child process with all but [`FREE`]
+/// descriptors in use: `idle`, one reader holds a chain that leaves too few
+/// for another's walk; `concurrent`, four readers race on the tree.
+#[test]
+fn readers_out_of_descriptors_close_held_ones_and_retry() {
+    const MODE: &str = "FERRET_FD_PRESSURE";
+    const BASE: &str = "FERRET_FD_PRESSURE_BASE";
+    if let (Some(mode), Some(base)) = (std::env::var_os(MODE), std::env::var_os(BASE)) {
+        return pressure_child(mode.to_str().unwrap(), std::path::Path::new(&base));
+    }
+    let files = pressure_files();
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(r, b)| (r.as_str(), &b[..])).collect();
+    let tmp = Tmp::new("fd-pressure");
+    indexed(&tmp, &files);
+    for mode in ["idle", "concurrent"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::content::readers_out_of_descriptors_close_held_ones_and_retry",
+                "--nocapture",
+            ])
+            .env(MODE, mode)
+            .env(BASE, tmp.cat().parent().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn pressure_child(mode: &str, base: &std::path::Path) {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let catalog = Catalog::open(&base.join("cat")).unwrap().unwrap();
+    catalog.load_all().unwrap();
+    let files: Vec<_> = pressure_files()
+        .into_iter()
+        .map(|(rel, bytes)| {
+            let path = base.join("tree").join(&rel);
+            let name = catalog.resolve(path.as_os_str().as_encoded_bytes());
+            (rel, name.unwrap().name.unwrap(), bytes)
+        })
+        .collect();
+    // The limit is set before the first holding reader sizes the budget.
+    let mut limit = getrlimit(Resource::Nofile);
+    limit.current = Some(256);
+    setrlimit(Resource::Nofile, limit).unwrap();
+    let mut reader = Documents::by_name(&catalog).unwrap().holding_directories();
+    let open = fs::read_dir("/proc/self/fd").unwrap().count() - 1;
+    let _filler: Vec<_> = (open..256 - FREE)
+        .map(|_| fs::File::open("/dev/null").unwrap())
+        .collect();
+    let read = |reader: &mut Documents, (rel, name, bytes): &(String, _, Vec<u8>)| {
+        let mut out = Vec::new();
+        let read = reader.read_current_name_until(&catalog, *name, &mut out, &|| false);
+        assert!(read.is_ok(), "{rel}: {read:?}");
+        assert_eq!(out, *bytes, "{rel}");
+    };
+    match mode {
+        "idle" => {
+            let mut other = reader.fork();
+            read(&mut reader, &files[0]);
+            // The chain and the file took every free descriptor; the chain
+            // leaves one, too few for any walk.
+            assert_eq!(reader.held().0, FREE - 1);
+            assert!(!Documents::pressured());
+            read(&mut other, &files[3]);
+            assert!(Documents::pressured());
+            assert_eq!((reader.held().0, other.held().0), (0, 0));
+            for file in &files {
+                read(&mut reader, file);
+                read(&mut other, file);
+            }
+        }
+        "concurrent" => {
+            let readers: Vec<_> = (0..4).map(|_| reader.fork()).collect();
+            std::thread::scope(|scope| {
+                for (i, mut reader) in readers.into_iter().enumerate() {
+                    let (files, read) = (&files, &read);
+                    scope.spawn(move || {
+                        for round in 0..3 {
+                            for k in 0..files.len() {
+                                read(&mut reader, &files[(k + i * 6 + round) % files.len()]);
+                            }
+                        }
+                    });
+                }
+            });
+            // Else the race tested nothing.
+            assert!(Documents::pressured());
+        }
+        _ => unreachable!("{mode}"),
+    }
+}
