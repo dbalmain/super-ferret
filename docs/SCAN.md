@@ -1,0 +1,272 @@
+# A pure scan against `rg`
+
+Measured 2026-10-14 on branch `wt/scan` (d7160c9, from main at dc2530e, which
+has threaded verification, D76 C). The aggregates are in
+[`measurements/scan/baseline.txt`](measurements/scan/baseline.txt).
+
+The goal is for Super Ferret to **match or beat `rg` on a pure scan**: every
+live document verified against a regex, with no index screen helping. This page
+is the baseline that later slices are judged by. It optimises nothing.
+
+## Summary
+
+- **Cold, we already beat `rg`, by 1.3–1.6×.** Both read the same 4.29 GB from
+  the device. We take 3.8–4.1 s and `rg` takes 5.2–6.1 s.
+- **Warm, we lose on every class, by 3.2–6×.** `rg` takes 149–171 ms. Our best
+  is 511–585 ms, at 8 threads. At the default of 32 threads we take 656–688 ms,
+  and 983 ms on case-insensitive code patterns.
+- **The floor is the calling thread.** It spends 425–615 ms of CPU per query,
+  serially, whatever the thread count. Until that moves, no thread count gets a
+  warm scan under about 450 ms.
+
+## Method
+
+`ferret-bench pure-scan` (`crates/ferret-bench/src/sparse/screens/scan.rs`).
+
+- **Population.** It is the screens population: the D65C catalog and its frozen
+  corpus.
+  - 112,382 live documents, of which 112,376 are readable, holding 3,978,812,718
+    bytes.
+  - 250 regexes, 50 in each of five classes: rare literal, identifier pattern,
+    alternation, broad and code class.
+  - The seeds and their oracle come from the screens oracle caches
+    (`oracle-ci.tsv`, `oracle-case-sensitive.tsv`), so no index is needed.
+  - Each pattern is checked to round-trip through the cache's escaping.
+- **Case.** The population runs both ways. `grep:` is case-sensitive by default
+  (D67 A2). Case-insensitive prefixes `(?i)`, as `rg -i` folds.
+- **Our scan.** It runs `Query::run_content_parallel` with
+  `Pinned::new(None, live)`, so there is no content index and every live
+  document is an uncovered Maybe. The bound is `None`, as `--scan` sets it.
+  - The reader is the bench's: one `open` of the snapshot file and a
+    `read_to_end`.
+  - Every run must match the oracle's documents exactly, and must read every
+    readable document and every byte.
+  - The bench records, per run:
+    - wall time and process CPU;
+    - the calling thread's CPU (`/proc/thread-self/schedstat`);
+    - the workers' summed busy time;
+    - the time summed inside the reader (`read ms`);
+    - the regex engine's time (`regex ms`).
+- **`rg -l`.** It runs at its default thread count, which is 12: logical CPUs
+  capped at 12. It is also timed warm at `-j32`. Its file set must equal the
+  oracle's on every query and at every setting.
+- **`rg`'s default output.** It prints every matching line into /dev/null, cold
+  and warm, and again warm into a pipe the bench drains (ci only).
+- **End to end.** This runs `ferret search --scan` as a process, on the first 5
+  queries of each class, with `rg -l` beside it. Both must list exactly the
+  oracle's files.
+  - The catalog is `ferret index /tmp/d65c/corpus` (28 s, 112,376 documents),
+    with its content index directory then removed, so the search is a pure scan.
+  - `FERRET_NO_DAEMON=1` is set. Without it, `search` starts `ferretd`. The
+    daemon follows the catalog and rebuilt 273 MB of content index within
+    seconds, which would turn the scan into an indexed search.
+- **Protocol.** It is the screens one: one cold/warm pair per query.
+  - Cold evicts every readable corpus file with `posix_fadvise(DONTNEED)`. For
+    the end-to-end runs it also evicts the catalog.
+  - Warm is an immediate repeat.
+  - Figures are medians/p90 over the 50 queries of a class, in ms.
+- **Output order.** Ours keeps name order. `rg`'s is unordered, and any `--sort`
+  forces it onto one thread, so it is not used.
+
+### The fair `rg` flags
+
+```text
+rg --no-config --no-ignore --hidden -a -E none --no-messages \
+   -g '!population' -l (-i | -s) -e <pattern> /tmp/d65c/corpus
+```
+
+- **The file set is already ours.** The corpus holds only catalogued documents,
+  named by DocId. Ferret's ignore rules, size cap and binary check were applied
+  when it was catalogued, so there is nothing more to exclude on `rg`'s side.
+  `-g '!population'` drops the snapshot's own metadata file.
+- **`-a` is required.** With `-uu` alone, `rg` stops reading a file at its first
+  NUL. It then searched 3,930,833,755 bytes rather than 3,978,812,718, and
+  missed a matching file on the broad query checked. With `-a`, `rg --stats`
+  reports exactly the corpus: 112,376 files and 3,978,812,718 bytes, the same
+  bytes we verify.
+- **`-l` is the fair mode.** Our product emits one row per matching file and
+  stops matching a file at its first match, which is what `-l` does.
+  - Printing every line into /dev/null costs `rg` 0–21% warm (162–208 ms against
+    161–171).
+  - Into a drained pipe it costs up to 2.1× on dense classes: 358 ms for
+    alternation, which printed a median of 811 MB.
+
+## Baseline
+
+Ours runs at its default of 32 threads; `rg` runs at its default of 12. Medians
+in ms, with "×" as `rg` ÷ ours, so above 1 means we are faster.
+
+| Case | Class        | Cold ours | Cold rg |    × | Warm ours | Warm rg |    × | Best warm ours |
+| ---- | ------------ | --------: | ------: | ---: | --------: | ------: | ---: | -------------: |
+| ci   | rare literal |     3,912 |   5,196 | 1.33 |       675 |     161 | 0.24 |        540 (8) |
+| ci   | identifier   |     3,935 |   5,207 | 1.32 |       672 |     169 | 0.25 |        543 (8) |
+| ci   | alternation  |     3,943 |   5,186 | 1.32 |       688 |     171 | 0.25 |        585 (8) |
+| ci   | broad        |     3,902 |   5,201 | 1.33 |       666 |     165 | 0.25 |        545 (8) |
+| ci   | code class   |     4,056 |   6,115 | 1.51 |       983 |     164 | 0.17 |       983 (32) |
+| cs   | rare literal |     3,871 |   5,210 | 1.35 |       658 |     149 | 0.23 |        511 (8) |
+| cs   | identifier   |     3,852 |   5,183 | 1.35 |       657 |     156 | 0.24 |        516 (8) |
+| cs   | alternation  |     3,859 |   5,158 | 1.34 |       670 |     156 | 0.23 |        527 (8) |
+| cs   | broad        |     3,841 |   5,215 | 1.36 |       656 |     155 | 0.24 |        511 (8) |
+| cs   | code class   |     3,824 |   6,074 | 1.59 |       659 |     149 | 0.23 |        512 (8) |
+
+- **p90.** Cold p90s are 4.0–4.4 s for us and 5.3–6.2 s for `rg`, with outliers
+  of 8–17 s on both sides. The outliers coincide with device stalls seen during
+  the ci run; one NVMe sensor read 79 °C. Warm p90s are within 10% of the
+  medians. All the p90s are in `baseline.txt`.
+- **Cold at 12 threads,** `rg`'s count, we take 4,053–4,276 ms (ci): 3–5% slower
+  than at 32, and still 1.27–1.43× faster than `rg`.
+- **Cold code class.** `rg`'s cold code class (6.1 s) is about 0.9 s slower than
+  its other classes in both cases. Code ran last in each arm, so this may be
+  thermal; it has not been explained.
+- **Cold rate.** Cold, we read at about 1.1 GB/s against `rg`'s 0.82. That is
+  below the 1.3–1.7 GB/s the screened product reached, because here every
+  document is read.
+- **`rg -j32`** is no faster warm (161–168 ms) and uses 2.3× the CPU (3.5–3.8 s
+  against 1.45–1.7 s). `rg` is not thread-bound at 12.
+
+### Thread curve, warm
+
+Median ms.
+
+| Case | Class        |     1 |     8 |    12 |    16 |  32 |  rg |
+| ---- | ------------ | ----: | ----: | ----: | ----: | --: | --: |
+| ci   | rare literal | 1,356 |   540 |   570 |   622 | 675 | 161 |
+| ci   | identifier   | 1,386 |   543 |   572 |   611 | 672 | 169 |
+| ci   | alternation  | 1,481 |   585 |   611 |   648 | 688 | 171 |
+| ci   | broad        | 1,398 |   545 |   561 |   618 | 666 | 165 |
+| ci   | code class   | 9,955 | 1,649 | 1,305 | 1,150 | 983 | 164 |
+| cs   | rare literal | 1,072 |   511 |   537 |   565 | 658 | 149 |
+| cs   | identifier   | 1,108 |   516 |   543 |   571 | 657 | 156 |
+| cs   | alternation  | 1,212 |   527 |   552 |   570 | 670 | 156 |
+| cs   | broad        | 1,195 |   511 |   536 |   560 | 656 | 155 |
+| cs   | code class   | 1,090 |   512 |   543 |   582 | 659 | 149 |
+
+8 threads is the best on every cell but ci code. From 8 to 32 threads, wall
+grows by 18–29% and process CPU roughly doubles: 2.0–2.4 s at 8, 4.3–4.6 s
+at 32.
+
+### End to end, as processes
+
+`ferret search --scan` against `rg -l`, 5 queries per class. Median ms.
+
+| Case | Class        | Cold ferret | Cold rg | Warm ferret | Warm rg |
+| ---- | ------------ | ----------: | ------: | ----------: | ------: |
+| ci   | rare literal |       4,108 |   5,183 |         493 |     165 |
+| ci   | identifier   |       4,064 |   5,116 |         498 |     164 |
+| ci   | alternation  |       4,085 |   5,107 |         515 |     166 |
+| ci   | broad        |       4,120 |   5,113 |         477 |     185 |
+| ci   | code class   |       4,172 |   5,087 |         780 |     160 |
+| cs   | rare literal |       3,982 |   5,126 |         478 |     148 |
+| cs   | identifier   |       3,965 |   5,123 |         493 |     154 |
+| cs   | alternation  |       4,021 |   5,093 |         491 |     154 |
+| cs   | broad        |       4,002 |   5,166 |         493 |     158 |
+| cs   | code class   |       4,051 |  12,586 |         495 |     148 |
+
+- **Startup, catalog open and output cost little.** Cold, the process costs
+  110–200 ms more than the bench arm.
+- **Warm, the product beats the bench arm.** It takes 477–515 ms against the
+  arm's 656–688 at the same 32 threads (780 against 983 on ci code).
+  - The difference is the reader: the bench's `read_to_end` against the crawl
+    reader's sized read.
+  - The arm therefore overstates warm cost by about 170 ms. The end-to-end
+    figures are the product's.
+  - Even so, the product is 3.0–3.3× slower than `rg` warm, and 4.9× on ci code.
+- **The cs code `rg` cold median (12.6 s)** is three of five runs hitting the
+  stall noted above.
+
+## Where the time goes
+
+The figures come from the bench's breakdown columns: warm, ci broad unless
+stated, summed over threads where marked. One `perf stat`, `perf record` and
+`strace -c -f` run of `ferret search --scan` per class backs them. With
+`perf_event_paranoid` at 2, perf sees user space only, so memory bandwidth could
+not be counted.
+
+### The top five costs
+
+1. **The serial calling thread: 425–615 ms of CPU per query.**
+   - It costs 425–460 ms cold, 445–490 at 8 threads and 585–615 at 32, in both
+     cases and on every class.
+   - At 32 threads that is 591 of 666 ms of wall: 89%. At 8 it is 457 of 545.
+   - Wall tracks it, so it is the floor. It works out to about 4–5 µs for each
+     of 112,376 documents: candidate rows, the ordered window and the handoff to
+     workers.
+   - The handoff dominates. `strace` counts 994,206 futex calls per query, 8.8
+     per document, of which 770,209 returned EAGAIN. `rg` makes 113.
+   - Mutex contention is 8% of user samples: 5.9% on the workers and 2.2% on the
+     caller.
+   - **This is the cost `rg` does not have at all.** It has no serial stage.
+2. **Reading, which scales badly: summed read time grows from 574 ms at 1 thread
+   to 900 at 8, 1,150 at 12, 1,430 at 16 and 2,400 at 32.**
+   - That is for the same 3.98 GB, and it is the same in cs.
+   - Per-thread throughput falls from 6.9 GB/s to 1.7: a 4.2× per-byte cost at
+     32 threads. It points at memory bandwidth and page-cache contention.
+   - The product reader adds to it:
+     - It zero-fills its buffer before each read (`resize(…, 0)` in
+       `ferret-crawl`'s `read_all`), which is 13–17% of user samples.
+     - It makes 8.1 file syscalls per document: it reopens the root directory
+       for every document, and makes three `fstat`s, two `open`s and two
+       `close`s. `rg` makes 5.2.
+   - Kernel time is 3.1 s against `rg`'s 0.9 s. User time is 2.2 s against its
+     1.1 s.
+3. **Case-insensitive code patterns in the regex engine: about 9 s of CPU.**
+   - It is 8.9 s at 1 thread, 9.1 s summed at 8 and 9.6 s at 32: about 0.45 GB/s
+     per thread. `perf` puts 89% of user samples in
+     `regex_automata::hybrid::search::find_fwd`.
+   - **The same patterns case-sensitive cost 166–300 ms** (cs, 8 threads).
+     `rg`'s whole query costs 1.4–1.6 s of CPU either way.
+   - This is the one class that 32 threads helps (983 ms). It still loses 6×.
+4. **Threads past 8 cost more than they give.**
+   - From 8 to 32 threads, wall rises 18–29% on every cell but ci code. Process
+     CPU goes from 2.0–2.4 s to 4.3–4.6 s. The caller's CPU rises by about 130
+     ms (cost 1).
+   - The default of every core is the worst warm setting for a scan of non-code
+     patterns. `rg` caps at 12 and does not slow down at 32.
+5. **Regex on the other classes: 400–500 ms of CPU at 1 thread (ci).**
+   - That is 8–10 GB/s, and 166–300 ms summed at 8 threads in cs.
+   - It grows to 800 ms summed at 32 threads, which is contention again.
+   - It is the smallest of the five, and is spread across the workers.
+
+### Is the code-class regex compiled expensively?
+
+From our own code (`ferret-verify/src/trigram.rs`, `GrepFlags::regex`, and
+`ferret-query/src/content.rs`):
+
+- **Bytes or `&str`: bytes.** It is `regex::bytes::RegexBuilder`, so there is no
+  UTF-8 validation of documents.
+- **Captures: none.** The verifier calls `grep.find(bytes)` and keeps only
+  `span.start`.
+- **Start of match: yes.** `find` reports the start, where `is_match` would not.
+  Getting the start costs a reverse pass, but only on a document that matches.
+  The profile's time is in the forward search (`find_fwd`), so this is not the
+  cost on a scan where most documents do not match.
+- **Unicode: on** (`unicode: true`), with `(?i)` from the inline flag. Under
+  Unicode case folding, `[A-Z_]` also admits multi-byte characters: U+212A
+  KELVIN SIGN folds to k, and U+017F LONG S folds to s. Each lowercase seed word
+  also gains its case variants.
+  - The cs/ci split (166–300 ms against 9.1 s for identical patterns) implies
+    that folding takes away the fast path: the literal search for the seed word.
+  - Without it, the lazy DFA walks every byte. This is an inference from the
+    timings and the profile, not from the regex crate's internals.
+  - Testing it would mean timing the ci code patterns with `(?i-u)` or with an
+    ASCII-only class. That has not been done here.
+
+## Reproduce
+
+```sh
+nix develop --command cargo build --release -p ferret-bench -p ferret
+B=target/release/ferret-bench
+# end-to-end catalog: index the corpus, then drop its content index
+ferret --index /tmp/d65c/scan/e2e index /tmp/d65c/corpus
+rm -r /tmp/d65c/scan/e2e/index
+SCAN_FERRET=target/release/ferret SCAN_FERRET_INDEX=/tmp/d65c/scan/e2e \
+SCAN_XDG=/tmp/d65c/scan/xdg \
+  $B pure-scan /tmp/d65c/catalog /tmp/d65c/corpus \
+     /tmp/d65c/screens/oracle-ci.tsv ci /tmp/d65c/scan/runs rg,rg-lines,ours,e2e
+```
+
+- `SCAN_THREADS` and `SCAN_COLD` replace the thread lists. They default to
+  1,8,12,16,32 and 0,12 respectively, where 0 means every core.
+- `SCAN_PER_CLASS` keeps the first n queries of each class.
+- `SCAN_E2E_PER_CLASS` sets the end-to-end count, which defaults to 5.
+- Per-query rows, which carry no pattern or path, go to the scratch directory.

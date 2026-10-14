@@ -1,0 +1,189 @@
+# pure-scan: the product's scan of every live readable document against rg
+# commit d7160c9 (wt/scan, from main dc2530e), 2026-10-14; ripgrep 15.1.0
+# machine: Ryzen 9 9955HX, 16 cores / 32 threads, 60 GB, NVMe; desktop otherwise idle
+# command: ferret-bench pure-scan /tmp/d65c/catalog /tmp/d65c/corpus <oracle cache> <ci|cs> <scratch> <arms>
+#   ci: oracle-ci.tsv, arms rg,rg-lines,ours,e2e, cold at 32 and 12 threads
+#   cs: oracle-case-sensitive.tsv, arms rg,ours,e2e, SCAN_COLD=0 (cold at 32 only)
+#   e2e: SCAN_FERRET=<release ferret> SCAN_FERRET_INDEX=/tmp/d65c/scan/e2e (catalog of the corpus, content index removed), FERRET_NO_DAEMON=1
+# rg 'default' threads = 12 (logical CPUs capped at 12). 'ours' default = 32.
+# p90 outliers of 9-17 s on cold runs (both tools) coincide with device stalls seen during the ci run; medians are unaffected.
+
+## case-insensitive (ci)
+population case_insensitive=true live=112382 readable=112376 bytes=3978812718 queries=250
+correctness arm=rg queries=250 file_set_equals_oracle=all
+correctness arm=ours queries=250 matches_equal_oracle=all read_every_document=all
+correctness arm=e2e file_sets_equal_oracle=all
+| arm | cache | threads | class | queries | wall ms median/p90 | cpu ms median/p90 | device MB median | extras median/p90 |
+| rg -l | cold | default | rare literal | 50 | 5196.4/5305.2 | 2400.0/2470.0 | 4285 |  |
+| rg -l | cold | default | identifier pattern | 50 | 5206.7/9206.1 | 2470.0/2610.0 | 4285 |  |
+| rg -l | cold | default | alternation | 50 | 5185.8/5318.6 | 2570.0/2800.0 | 4234 |  |
+| rg -l | cold | default | broad | 50 | 5201.1/5343.8 | 2500.0/2690.0 | 4269 |  |
+| rg -l | cold | default | code class | 50 | 6115.3/9213.1 | 2450.0/3020.0 | 4278 |  |
+| rg -l | warm | default | rare literal | 50 | 161.4/173.2 | 1610.0/1740.0 | 0 |  |
+| rg -l | warm | default | identifier pattern | 50 | 169.1/177.6 | 1650.0/1770.0 | 0 |  |
+| rg -l | warm | default | alternation | 50 | 171.0/190.7 | 1700.0/1930.0 | 19 |  |
+| rg -l | warm | default | broad | 50 | 164.7/181.2 | 1650.0/1890.0 | 7 |  |
+| rg -l | warm | default | code class | 50 | 164.3/206.5 | 1610.0/2070.0 | 3 |  |
+| rg -l | warm | 32 | rare literal | 50 | 163.2/166.6 | 3730.0/3960.0 | 0 |  |
+| rg -l | warm | 32 | identifier pattern | 50 | 167.2/173.3 | 3830.0/3970.0 | 0 |  |
+| rg -l | warm | 32 | alternation | 50 | 168.3/175.9 | 3690.0/3890.0 | 2 |  |
+| rg -l | warm | 32 | broad | 50 | 163.5/168.4 | 3710.0/3940.0 | 1 |  |
+| rg -l | warm | 32 | code class | 50 | 164.9/171.7 | 3770.0/4010.0 | 0 |  |
+| rg lines >/dev/null | cold | default | rare literal | 50 | 5253.0/6226.5 | 2450.0/2560.0 | 4285 | printed B 0/0 |
+| rg lines >/dev/null | cold | default | identifier pattern | 50 | 5196.6/9249.3 | 2490.0/2700.0 | 4285 | printed B 0/0 |
+| rg lines >/dev/null | cold | default | alternation | 50 | 5198.3/5278.6 | 2890.0/3250.0 | 4285 | printed B 0/0 |
+| rg lines >/dev/null | cold | default | broad | 50 | 5164.8/5346.2 | 2590.0/2850.0 | 4285 | printed B 0/0 |
+| rg lines >/dev/null | cold | default | code class | 50 | 5149.5/5411.2 | 2490.0/3060.0 | 4285 | printed B 0/0 |
+| rg lines >/dev/null | warm | default | rare literal | 50 | 162.2/173.1 | 1620.0/1730.0 | 0 | printed B 0/0 |
+| rg lines >/dev/null | warm | default | identifier pattern | 50 | 169.9/180.2 | 1660.0/1830.0 | 0 | printed B 0/0 |
+| rg lines >/dev/null | warm | default | alternation | 50 | 207.1/233.8 | 2170.0/2490.0 | 0 | printed B 0/0 |
+| rg lines >/dev/null | warm | default | broad | 50 | 187.5/201.6 | 1870.0/2030.0 | 0 | printed B 0/0 |
+| rg lines >/dev/null | warm | default | code class | 50 | 177.9/211.2 | 1770.0/2170.0 | 0 | printed B 0/0 |
+| rg lines | pipe | warm | default | rare literal | 50 | 160.5/167.5 | 1610.0/1710.0 | 0 | printed B 1291530/14786274 |
+| rg lines | pipe | warm | default | identifier pattern | 50 | 171.1/185.6 | 1690.0/1790.0 | 0 | printed B 10870867/85816117 |
+| rg lines | pipe | warm | default | alternation | 50 | 358.1/539.1 | 2460.0/2790.0 | 0 | printed B 810585198/1338045139 |
+| rg lines | pipe | warm | default | broad | 50 | 248.6/274.8 | 1950.0/2140.0 | 0 | printed B 489770554/565571010 |
+| rg lines | pipe | warm | default | code class | 50 | 194.8/270.7 | 1840.0/2140.0 | 0 | printed B 121175781/507125109 |
+| ours | cold | 32 | rare literal | 50 | 3912.1/5429.8 | 3300.0/3510.0 | 4285 | before reads ms 13.8/25.6; busy ms 116647.1/165146.2; read ms 116008.7/164507.8; regex ms 485.4/529.2; caller cpu ms 434.6/454.4 |
+| ours | cold | 32 | identifier pattern | 50 | 3935.1/4031.8 | 3440.0/3600.0 | 4285 | before reads ms 14.7/32.3; busy ms 117017.8/120495.3; read ms 116350.4/119864.9; regex ms 535.8/654.7; caller cpu ms 442.6/456.7 |
+| ours | cold | 32 | alternation | 50 | 3942.8/4075.9 | 3460.0/3770.0 | 4285 | before reads ms 38.1/72.0; busy ms 117062.9/119890.6; read ms 116105.8/119115.6; regex ms 622.1/893.3; caller cpu ms 460.0/493.8 |
+| ours | cold | 32 | broad | 50 | 3902.3/4036.7 | 3310.0/3590.0 | 4285 | before reads ms 10.6/18.4; busy ms 116572.0/120535.3; read ms 115937.8/119914.4; regex ms 556.4/743.0; caller cpu ms 426.1/440.9 |
+| ours | cold | 32 | code class | 50 | 4056.0/4156.0 | 11970.0/12400.0 | 4285 | before reads ms 13.9/34.3; busy ms 118544.6/121889.1; read ms 110068.7/112704.3; regex ms 9210.1/9632.2; caller cpu ms 428.5/444.7 |
+| ours | cold | 12 | rare literal | 50 | 4070.6/6207.3 | 2780.0/2940.0 | 4285 | before reads ms 12.9/25.4; busy ms 46491.1/72192.4; read ms 45930.7/71599.7; regex ms 453.4/498.3; caller cpu ms 420.7/452.6 |
+| ours | cold | 12 | identifier pattern | 50 | 4052.9/4163.0 | 2830.0/3010.0 | 4285 | before reads ms 13.2/31.2; busy ms 46387.4/47659.1; read ms 45812.5/47073.3; regex ms 487.5/614.4; caller cpu ms 422.0/444.1 |
+| ours | cold | 12 | alternation | 50 | 4084.5/11915.8 | 2970.0/3580.0 | 4285 | before reads ms 37.0/71.6; busy ms 46444.0/139586.6; read ms 45815.9/138774.4; regex ms 586.7/866.3; caller cpu ms 449.5/516.0 |
+| ours | cold | 12 | broad | 50 | 4074.9/5879.9 | 2900.0/3240.0 | 4285 | before reads ms 9.5/17.7; busy ms 46659.7/68097.5; read ms 45904.3/67400.2; regex ms 517.6/721.9; caller cpu ms 424.6/449.2 |
+| ours | cold | 12 | code class | 50 | 4276.0/4422.8 | 11410.0/11980.0 | 4285 | before reads ms 13.0/33.2; busy ms 47769.3/49385.5; read ms 38940.8/42665.7; regex ms 9096.7/9607.3; caller cpu ms 424.9/454.5 |
+| ours | warm | 1 | rare literal | 50 | 1356.1/1369.4 | 1350.0/1370.0 | 0 | before reads ms 12.3/24.2; busy ms 1023.1/1036.6; read ms 574.4/584.1; regex ms 395.1/402.2; caller cpu ms 1349.8/1363.0 |
+| ours | warm | 1 | identifier pattern | 50 | 1386.0/1504.4 | 1390.0/1500.0 | 0 | before reads ms 13.5/31.0; busy ms 1054.4/1151.6; read ms 580.3/585.8; regex ms 416.4/519.5; caller cpu ms 1379.7/1497.6 |
+| ours | warm | 1 | alternation | 50 | 1480.6/1713.7 | 1480.0/1710.0 | 0 | before reads ms 37.4/70.8; busy ms 1132.2/1360.7; read ms 590.2/595.3; regex ms 496.5/715.5; caller cpu ms 1473.2/1706.1 |
+| ours | warm | 1 | broad | 50 | 1398.2/1567.3 | 1400.0/1560.0 | 0 | before reads ms 9.1/17.2; busy ms 1074.2/1238.9; read ms 583.8/590.8; regex ms 440.4/612.9; caller cpu ms 1390.8/1560.2 |
+| ours | warm | 1 | code class | 50 | 9955.1/10328.4 | 9920.0/10290.0 | 0 | before reads ms 12.4/33.3; busy ms 9608.6/9981.9; read ms 617.3/624.7; regex ms 8930.6/9315.7; caller cpu ms 9916.1/10290.9 |
+| ours | warm | 8 | rare literal | 50 | 539.7/585.5 | 2200.0/2340.0 | 0 | before reads ms 12.4/24.1; busy ms 1435.3/1502.5; read ms 901.3/951.7; regex ms 445.0/467.0; caller cpu ms 455.8/497.4 |
+| ours | warm | 8 | identifier pattern | 50 | 542.6/588.4 | 2230.0/2350.0 | 0 | before reads ms 13.1/30.7; busy ms 1498.6/1594.9; read ms 911.7/949.9; regex ms 477.4/581.7; caller cpu ms 452.5/491.5 |
+| ours | warm | 8 | alternation | 50 | 585.2/641.7 | 2400.0/2610.0 | 0 | before reads ms 36.4/71.5; busy ms 1585.8/1840.8; read ms 943.6/1002.6; regex ms 556.2/806.3; caller cpu ms 486.4/543.0 |
+| ours | warm | 8 | broad | 50 | 544.7/596.5 | 2270.0/2450.0 | 0 | before reads ms 9.2/17.1; busy ms 1495.5/1665.5; read ms 898.5/957.0; regex ms 498.1/698.2; caller cpu ms 456.7/499.6 |
+| ours | warm | 8 | code class | 50 | 1649.4/1726.3 | 10400.0/10810.0 | 0 | before reads ms 12.5/32.9; busy ms 9913.6/10311.9; read ms 772.3/813.1; regex ms 9055.1/9451.3; caller cpu ms 428.0/449.0 |
+| ours | warm | 12 | rare literal | 50 | 569.8/618.5 | 2720.0/2820.0 | 0 | before reads ms 12.5/23.9; busy ms 1717.3/1910.6; read ms 1143.6/1253.9; regex ms 501.3/552.3; caller cpu ms 497.1/542.2 |
+| ours | warm | 12 | identifier pattern | 50 | 572.2/633.5 | 2770.0/2870.0 | 0 | before reads ms 13.6/30.8; busy ms 1810.6/2031.2; read ms 1152.8/1275.3; regex ms 536.0/654.4; caller cpu ms 496.1/554.4 |
+| ours | warm | 12 | alternation | 50 | 610.7/666.9 | 2930.0/3120.0 | 0 | before reads ms 37.6/70.9; busy ms 1903.5/2173.1; read ms 1199.8/1322.8; regex ms 596.1/863.1; caller cpu ms 532.9/583.3 |
+| ours | warm | 12 | broad | 50 | 560.5/621.1 | 2780.0/2910.0 | 0 | before reads ms 9.3/17.1; busy ms 1825.1/2039.0; read ms 1151.8/1295.0; regex ms 557.2/715.9; caller cpu ms 482.5/539.5 |
+| ours | warm | 12 | code class | 50 | 1304.6/1367.6 | 10700.0/11100.0 | 0 | before reads ms 12.4/32.9; busy ms 10018.3/10421.3; read ms 860.7/956.2; regex ms 9066.2/9470.6; caller cpu ms 458.7/483.1 |
+| ours | warm | 16 | rare literal | 50 | 622.2/646.6 | 3140.0/3220.0 | 0 | before reads ms 12.5/23.9; busy ms 2022.2/2193.0; read ms 1384.3/1465.1; regex ms 526.2/630.1; caller cpu ms 546.0/570.5 |
+| ours | warm | 16 | identifier pattern | 50 | 610.6/656.7 | 3200.0/3300.0 | 0 | before reads ms 13.6/31.0; busy ms 2094.8/2378.0; read ms 1398.3/1554.6; regex ms 582.5/728.6; caller cpu ms 538.2/577.4 |
+| ours | warm | 16 | alternation | 50 | 647.6/679.3 | 3340.0/3530.0 | 0 | before reads ms 36.7/71.5; busy ms 2219.7/2533.5; read ms 1481.1/1616.3; regex ms 619.9/909.8; caller cpu ms 563.1/603.5 |
+| ours | warm | 16 | broad | 50 | 618.2/642.8 | 3240.0/3330.0 | 0 | before reads ms 9.3/17.1; busy ms 2098.8/2363.1; read ms 1426.8/1527.0; regex ms 592.3/768.9; caller cpu ms 538.2/566.6 |
+| ours | warm | 16 | code class | 50 | 1150.4/1209.6 | 10940.0/11410.0 | 0 | before reads ms 12.6/33.4; busy ms 10105.7/10589.3; read ms 946.5/1095.8; regex ms 9082.5/9553.9; caller cpu ms 496.4/523.0 |
+| ours | warm | 32 | rare literal | 50 | 674.9/687.5 | 4490.0/4570.0 | 0 | before reads ms 13.1/25.5; busy ms 3320.9/3388.4; read ms 2367.5/2431.8; regex ms 813.5/848.0; caller cpu ms 594.9/608.9 |
+| ours | warm | 32 | identifier pattern | 50 | 671.5/684.2 | 4500.0/4610.0 | 0 | before reads ms 14.3/31.4; busy ms 3362.1/3470.4; read ms 2379.0/2426.3; regex ms 848.5/972.8; caller cpu ms 593.2/606.9 |
+| ours | warm | 32 | alternation | 50 | 688.2/725.1 | 4580.0/4800.0 | 0 | before reads ms 37.7/71.9; busy ms 3397.6/3613.7; read ms 2470.2/2589.6; regex ms 792.3/1147.1; caller cpu ms 614.9/647.7 |
+| ours | warm | 32 | broad | 50 | 666.0/678.8 | 4450.0/4650.0 | 0 | before reads ms 9.8/17.9; busy ms 3338.5/3481.8; read ms 2396.5/2480.9; regex ms 801.6/996.2; caller cpu ms 591.1/604.6 |
+| ours | warm | 32 | code class | 50 | 983.2/1014.7 | 11540.0/11970.0 | 0 | before reads ms 13.2/35.5; busy ms 10980.8/11701.2; read ms 1348.4/1545.6; regex ms 9575.7/10108.1; caller cpu ms 571.5/584.4 |
+| e2e ferret | cold | default | rare literal | 5 | 4107.7/4154.2 | 3120.0/3220.0 | 4289 | stdout B 23/138 |
+| e2e ferret | cold | default | identifier pattern | 5 | 4063.6/11024.1 | 3040.0/3440.0 | 4289 | stdout B 4025/32777 |
+| e2e ferret | cold | default | alternation | 5 | 4084.6/4174.3 | 3050.0/4240.0 | 4289 | stdout B 166544/279957 |
+| e2e ferret | cold | default | broad | 5 | 4119.8/4570.5 | 3420.0/3620.0 | 4289 | stdout B 29482/53400 |
+| e2e ferret | cold | default | code class | 5 | 4171.5/4268.0 | 11750.0/12090.0 | 4289 | stdout B 6017/62280 |
+| e2e rg -l | cold | default | rare literal | 5 | 5183.3/5269.1 | 2360.0/2440.0 | 4285 |  |
+| e2e rg -l | cold | default | identifier pattern | 5 | 5115.9/16855.3 | 2520.0/2970.0 | 4285 |  |
+| e2e rg -l | cold | default | alternation | 5 | 5107.2/5226.6 | 2540.0/3470.0 | 4234 |  |
+| e2e rg -l | cold | default | broad | 5 | 5112.9/16040.7 | 2790.0/3170.0 | 4267 |  |
+| e2e rg -l | cold | default | code class | 5 | 5086.6/16805.0 | 2430.0/3400.0 | 4276 |  |
+| e2e ferret | warm | default | rare literal | 5 | 492.8/519.9 | 4520.0/4550.0 | 0 | stdout B 23/138 |
+| e2e ferret | warm | default | identifier pattern | 5 | 498.3/509.6 | 4570.0/4590.0 | 0 | stdout B 4025/32777 |
+| e2e ferret | warm | default | alternation | 5 | 515.3/534.2 | 4480.0/5390.0 | 51 | stdout B 166544/279957 |
+| e2e ferret | warm | default | broad | 5 | 477.0/503.1 | 4630.0/4650.0 | 17 | stdout B 29482/53400 |
+| e2e ferret | warm | default | code class | 5 | 779.5/817.0 | 11780.0/12320.0 | 9 | stdout B 6017/62280 |
+| e2e rg -l | warm | default | rare literal | 5 | 165.2/174.3 | 1640.0/1730.0 | 0 |  |
+| e2e rg -l | warm | default | identifier pattern | 5 | 163.9/168.6 | 1620.0/1680.0 | 0 |  |
+| e2e rg -l | warm | default | alternation | 5 | 165.7/234.7 | 1700.0/2510.0 | 0 |  |
+| e2e rg -l | warm | default | broad | 5 | 184.6/195.3 | 1930.0/2020.0 | 0 |  |
+| e2e rg -l | warm | default | code class | 5 | 159.8/200.2 | 1620.0/2030.0 | 0 |  |
+private_rows written
+
+## case-sensitive (cs)
+population case_insensitive=false live=112382 readable=112376 bytes=3978812718 queries=250
+correctness arm=rg queries=250 file_set_equals_oracle=all
+correctness arm=ours queries=250 matches_equal_oracle=all read_every_document=all
+correctness arm=e2e file_sets_equal_oracle=all
+| arm | cache | threads | class | queries | wall ms median/p90 | cpu ms median/p90 | device MB median | extras median/p90 |
+| rg -l | cold | default | rare literal | 50 | 5209.5/5609.3 | 2170.0/2260.0 | 4285 |  |
+| rg -l | cold | default | identifier pattern | 50 | 5183.1/5312.1 | 2210.0/2360.0 | 4285 |  |
+| rg -l | cold | default | alternation | 50 | 5158.1/5258.3 | 2300.0/2360.0 | 4232 |  |
+| rg -l | cold | default | broad | 50 | 5214.5/6215.2 | 2300.0/2470.0 | 4280 |  |
+| rg -l | cold | default | code class | 50 | 6074.4/6177.0 | 2210.0/2270.0 | 4282 |  |
+| rg -l | warm | default | rare literal | 50 | 148.7/156.0 | 1450.0/1540.0 | 0 |  |
+| rg -l | warm | default | identifier pattern | 50 | 155.9/166.8 | 1470.0/1610.0 | 0 |  |
+| rg -l | warm | default | alternation | 50 | 155.8/164.5 | 1510.0/1580.0 | 19 |  |
+| rg -l | warm | default | broad | 50 | 154.8/162.1 | 1510.0/1620.0 | 2 |  |
+| rg -l | warm | default | code class | 50 | 148.9/160.0 | 1440.0/1560.0 | 0 |  |
+| rg -l | warm | 32 | rare literal | 50 | 161.5/166.5 | 3520.0/3700.0 | 0 |  |
+| rg -l | warm | 32 | identifier pattern | 50 | 168.4/172.7 | 3630.0/3870.0 | 0 |  |
+| rg -l | warm | 32 | alternation | 50 | 163.7/171.4 | 3550.0/3720.0 | 2 |  |
+| rg -l | warm | 32 | broad | 50 | 163.0/166.6 | 3620.0/3880.0 | 0 |  |
+| rg -l | warm | 32 | code class | 50 | 162.0/164.8 | 3540.0/3800.0 | 0 |  |
+| ours | cold | 32 | rare literal | 50 | 3871.2/8179.5 | 3100.0/3210.0 | 4285 | before reads ms 13.7/14.1; busy ms 115641.8/251395.2; read ms 115324.5/251061.3; regex ms 189.4/214.8; caller cpu ms 432.5/442.5 |
+| ours | cold | 32 | identifier pattern | 50 | 3852.4/4005.3 | 3160.0/3320.0 | 4285 | before reads ms 13.6/14.0; busy ms 114853.1/119867.9; read ms 114523.3/119340.2; regex ms 247.3/322.8; caller cpu ms 432.8/443.6 |
+| ours | cold | 32 | alternation | 50 | 3859.4/3969.5 | 3270.0/3410.0 | 4285 | before reads ms 30.1/31.5; busy ms 114780.0/118407.8; read ms 114330.5/117978.5; regex ms 327.5/367.3; caller cpu ms 453.1/460.8 |
+| ours | cold | 32 | broad | 50 | 3840.8/3979.1 | 3180.0/3420.0 | 4285 | before reads ms 10.4/10.6; busy ms 114865.0/118390.6; read ms 114400.2/117882.4; regex ms 353.3/471.1; caller cpu ms 424.8/439.1 |
+| ours | cold | 32 | code class | 50 | 3823.6/5567.2 | 3130.0/3260.0 | 4285 | before reads ms 13.6/13.9; busy ms 113907.5/170141.1; read ms 113570.0/169797.5; regex ms 218.9/251.6; caller cpu ms 436.8/447.1 |
+| ours | warm | 1 | rare literal | 50 | 1071.8/1090.2 | 1070.0/1090.0 | 0 | before reads ms 12.3/12.6; busy ms 748.9/766.1; read ms 570.0/575.4; regex ms 122.3/142.7; caller cpu ms 1066.9/1085.4 |
+| ours | warm | 1 | identifier pattern | 50 | 1107.5/1166.1 | 1110.0/1160.0 | 0 | before reads ms 12.4/12.7; busy ms 784.9/840.9; read ms 573.0/579.6; regex ms 158.4/215.9; caller cpu ms 1101.8/1161.1 |
+| ours | warm | 1 | alternation | 50 | 1211.8/1253.0 | 1200.0/1250.0 | 0 | before reads ms 29.0/30.4; busy ms 871.3/914.0; read ms 577.8/584.2; regex ms 242.1/287.3; caller cpu ms 1205.5/1246.7 |
+| ours | warm | 1 | broad | 50 | 1194.9/1301.0 | 1190.0/1300.0 | 0 | before reads ms 9.1/9.4; busy ms 876.6/979.3; read ms 575.1/581.8; regex ms 249.4/354.7; caller cpu ms 1189.3/1294.3 |
+| ours | warm | 1 | code class | 50 | 1090.3/1121.7 | 1090.0/1120.0 | 0 | before reads ms 12.4/12.8; busy ms 766.8/797.1; read ms 577.3/581.9; regex ms 139.8/168.4; caller cpu ms 1084.7/1115.7 |
+| ours | warm | 8 | rare literal | 50 | 511.0/547.5 | 2000.0/2110.0 | 0 | before reads ms 12.4/12.6; busy ms 1268.3/1316.8; read ms 1009.3/1043.7; regex ms 166.0/191.1; caller cpu ms 449.4/488.1 |
+| ours | warm | 8 | identifier pattern | 50 | 516.4/562.2 | 2050.0/2220.0 | 0 | before reads ms 12.3/12.5; busy ms 1297.3/1353.0; read ms 979.9/1027.9; regex ms 197.4/267.8; caller cpu ms 453.8/495.6 |
+| ours | warm | 8 | alternation | 50 | 527.3/559.4 | 2100.0/2190.0 | 0 | before reads ms 28.6/29.8; busy ms 1367.7/1412.4; read ms 996.2/1041.0; regex ms 274.5/324.7; caller cpu ms 458.1/488.7 |
+| ours | warm | 8 | broad | 50 | 510.8/530.9 | 2080.0/2200.0 | 0 | before reads ms 9.2/9.3; busy ms 1361.8/1448.5; read ms 961.1/1023.2; regex ms 299.4/411.6; caller cpu ms 442.7/459.3 |
+| ours | warm | 8 | code class | 50 | 511.5/543.3 | 2030.0/2110.0 | 0 | before reads ms 12.3/12.6; busy ms 1283.2/1328.7; read ms 1011.5/1033.5; regex ms 182.0/225.0; caller cpu ms 450.1/482.6 |
+| ours | warm | 12 | rare literal | 50 | 537.1/571.7 | 2520.0/2620.0 | 0 | before reads ms 12.4/12.7; busy ms 1651.4/1785.2; read ms 1300.1/1402.8; regex ms 237.1/281.0; caller cpu ms 473.8/508.7 |
+| ours | warm | 12 | identifier pattern | 50 | 542.9/606.6 | 2570.0/2670.0 | 0 | before reads ms 12.4/12.7; busy ms 1662.4/1786.2; read ms 1288.2/1381.5; regex ms 262.5/349.9; caller cpu ms 477.8/538.2 |
+| ours | warm | 12 | alternation | 50 | 552.1/615.5 | 2590.0/2730.0 | 0 | before reads ms 28.6/29.9; busy ms 1707.7/1833.6; read ms 1297.1/1412.7; regex ms 314.9/351.7; caller cpu ms 490.2/544.7 |
+| ours | warm | 12 | broad | 50 | 536.2/588.3 | 2610.0/2720.0 | 0 | before reads ms 9.2/9.3; busy ms 1742.5/1848.9; read ms 1245.0/1343.4; regex ms 357.0/481.5; caller cpu ms 473.0/520.2 |
+| ours | warm | 12 | code class | 50 | 543.4/589.9 | 2530.0/2620.0 | 0 | before reads ms 12.4/12.6; busy ms 1630.4/1742.3; read ms 1289.5/1378.4; regex ms 237.2/290.5; caller cpu ms 480.9/523.2 |
+| ours | warm | 16 | rare literal | 50 | 564.9/625.4 | 2900.0/3030.0 | 0 | before reads ms 12.4/12.6; busy ms 1871.2/2126.4; read ms 1506.8/1654.0; regex ms 253.9/365.1; caller cpu ms 505.2/556.5 |
+| ours | warm | 16 | identifier pattern | 50 | 571.4/622.0 | 2970.0/3100.0 | 0 | before reads ms 12.4/12.8; busy ms 1972.7/2129.5; read ms 1542.8/1622.8; regex ms 321.8/409.8; caller cpu ms 511.1/554.7 |
+| ours | warm | 16 | alternation | 50 | 570.0/625.0 | 3010.0/3120.0 | 0 | before reads ms 28.5/29.9; busy ms 2040.5/2184.9; read ms 1581.9/1715.2; regex ms 351.6/409.7; caller cpu ms 515.0/559.6 |
+| ours | warm | 16 | broad | 50 | 560.3/610.9 | 3000.0/3140.0 | 0 | before reads ms 9.3/9.5; busy ms 2025.4/2312.1; read ms 1502.6/1621.8; regex ms 409.5/547.1; caller cpu ms 502.7/541.6 |
+| ours | warm | 16 | code class | 50 | 582.2/624.7 | 2970.0/3030.0 | 0 | before reads ms 12.5/12.7; busy ms 1895.5/2183.2; read ms 1519.3/1691.6; regex ms 266.2/370.7; caller cpu ms 517.4/557.6 |
+| ours | warm | 32 | rare literal | 50 | 658.0/670.9 | 4270.0/4390.0 | 0 | before reads ms 13.0/13.4; busy ms 3110.8/3178.6; read ms 2466.2/2535.5; regex ms 506.5/524.7; caller cpu ms 585.6/596.9 |
+| ours | warm | 32 | identifier pattern | 50 | 656.6/669.6 | 4280.0/4420.0 | 0 | before reads ms 13.0/13.3; busy ms 3124.8/3233.5; read ms 2446.5/2502.1; regex ms 537.5/621.7; caller cpu ms 584.9/597.8 |
+| ours | warm | 32 | alternation | 50 | 670.3/684.9 | 4300.0/4410.0 | 0 | before reads ms 29.2/30.7; busy ms 3120.6/3197.1; read ms 2506.3/2574.6; regex ms 475.9/555.1; caller cpu ms 603.8/617.7 |
+| ours | warm | 32 | broad | 50 | 655.9/665.1 | 4340.0/4480.0 | 0 | before reads ms 9.9/10.1; busy ms 3203.2/3320.7; read ms 2423.5/2495.8; regex ms 631.5/737.8; caller cpu ms 585.8/594.9 |
+| ours | warm | 32 | code class | 50 | 658.5/669.7 | 4300.0/4380.0 | 0 | before reads ms 13.0/13.2; busy ms 3118.5/3198.2; read ms 2481.6/2564.4; regex ms 517.5/554.1; caller cpu ms 588.6/601.5 |
+| e2e ferret | cold | default | rare literal | 5 | 3981.9/4013.7 | 2660.0/2870.0 | 4289 | stdout B 0/0 |
+| e2e ferret | cold | default | identifier pattern | 5 | 3965.2/4038.4 | 2790.0/2900.0 | 4289 | stdout B 3703/28575 |
+| e2e ferret | cold | default | alternation | 5 | 4020.8/4067.3 | 2810.0/3010.0 | 4289 | stdout B 140319/233978 |
+| e2e ferret | cold | default | broad | 5 | 4002.2/4117.7 | 3040.0/3220.0 | 4289 | stdout B 16647/38714 |
+| e2e ferret | cold | default | code class | 5 | 4050.8/9656.2 | 2690.0/2960.0 | 4289 | stdout B 302/15757 |
+| e2e rg -l | cold | default | rare literal | 5 | 5125.7/5172.1 | 2090.0/2140.0 | 4285 |  |
+| e2e rg -l | cold | default | identifier pattern | 5 | 5123.1/16143.0 | 2200.0/2580.0 | 4285 |  |
+| e2e rg -l | cold | default | alternation | 5 | 5093.1/5147.6 | 2280.0/2370.0 | 4225 |  |
+| e2e rg -l | cold | default | broad | 5 | 5165.6/5186.0 | 2420.0/2590.0 | 4280 |  |
+| e2e rg -l | cold | default | code class | 5 | 12586.1/16974.4 | 2450.0/2650.0 | 4285 |  |
+| e2e ferret | warm | default | rare literal | 5 | 478.4/494.5 | 4240.0/4410.0 | 0 | stdout B 0/0 |
+| e2e ferret | warm | default | identifier pattern | 5 | 493.2/512.0 | 4270.0/4320.0 | 0 | stdout B 3703/28575 |
+| e2e ferret | warm | default | alternation | 5 | 491.0/509.9 | 4230.0/4360.0 | 59 | stdout B 140319/233978 |
+| e2e ferret | warm | default | broad | 5 | 493.1/494.9 | 4500.0/4590.0 | 5 | stdout B 16647/38714 |
+| e2e ferret | warm | default | code class | 5 | 495.3/503.0 | 4260.0/4320.0 | 0 | stdout B 302/15757 |
+| e2e rg -l | warm | default | rare literal | 5 | 148.1/158.1 | 1450.0/1530.0 | 0 |  |
+| e2e rg -l | warm | default | identifier pattern | 5 | 153.5/160.6 | 1440.0/1500.0 | 0 |  |
+| e2e rg -l | warm | default | alternation | 5 | 154.3/163.0 | 1520.0/1610.0 | 0 |  |
+| e2e rg -l | warm | default | broad | 5 | 157.6/162.4 | 1560.0/1660.0 | 0 |  |
+| e2e rg -l | warm | default | code class | 5 | 147.9/157.0 | 1440.0/1500.0 | 0 |  |
+private_rows written
+
+## single-query observations, warm, one broad ci query unless noted (not repeated; indicative)
+# rg --stats with the fair flags (-a): 112376 files searched, 3978812718 bytes searched (= the corpus, = our verified bytes)
+# rg --stats with -uu (no -a, stops at first NUL): 112376 files, 3930833755 bytes, and one matching file fewer than the oracle
+# perf stat (user-only counters, perf_event_paranoid=2), ferret search --scan:
+#   broad:        wall 0.75 s, user 2.21 s, sys 3.15 s, page faults 69971
+#   code class:   wall 0.71 s, user 8.10 s, sys 2.02 s
+#   rare literal: wall 0.52 s, user 1.88 s, sys 2.76 s
+# perf stat, rg -l same broad query: wall 0.20 s, user 1.12 s, sys 0.92 s, page faults 48403
+# strace -c -f, ferret search --scan (broad), calls per query: futex 994206 (770209 EAGAIN), fstat 337214, close 224832,
+#   read 122731, openat 112530, open 112377  => 8.1 file syscalls + 8.8 futex per document
+# strace -c -f, rg -l (broad): read 361619, openat 112402, close 112388, futex 113 => 5.2 syscalls per file
+# perf record (user samples), ferret search --scan broad: teddy/regex 49%, memset 13.4%, mutex lock_contended 8.1%
+#   (workers 5.9 + caller 2.2), Pool::work 6.4%; code class: regex_automata hybrid find_fwd 89%; rare literal: memset 16.6%
