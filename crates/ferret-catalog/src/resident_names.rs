@@ -113,6 +113,15 @@ pub struct ResidentNames {
     build_time: std::time::Duration,
 }
 
+/// [`ResidentNames::build`]'s sort key: `name`'s first eight bytes as a
+/// big-endian number, zero-padded.
+fn prefix(name: &[u8]) -> u64 {
+    let mut bytes = [0; 8];
+    let n = name.len().min(8);
+    bytes[..n].copy_from_slice(&name[..n]);
+    u64::from_be_bytes(bytes)
+}
+
 struct Legacy {
     heap: Vec<u8>,
     offsets: Vec<usize>,
@@ -124,15 +133,25 @@ impl ResidentNames {
         // Intern while streaming rows. Sort only distinct names, never one
         // borrowed slice per row; repeated names must not multiply build
         // scratch.
-        let mut lookup = HashMap::new();
+        let mut lookup = HashMap::with_capacity(rows as usize / 2);
         let mut ids = Vec::with_capacity(rows as usize);
         for (_, name) in names.runs_from(NameId(0)) {
             let next = lookup.len() as u32;
             ids.push(*lookup.entry(name.bytes).or_insert(next));
         }
         debug_assert_eq!(ids.len(), rows as usize);
-        let mut distinct: Vec<_> = lookup.into_iter().collect();
-        distinct.sort_unstable_by_key(|&(name, _)| name);
+        // A name's first eight bytes, big-endian and zero-padded, order as
+        // the name does wherever they differ; comparing them first keeps
+        // most comparisons out of `memcmp` and off the name heap.
+        let mut distinct: Vec<_> = lookup
+            .into_iter()
+            .map(|(name, old)| (prefix(name), name, old))
+            .collect();
+        distinct.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let distinct: Vec<_> = distinct
+            .into_iter()
+            .map(|(_, name, old)| (name, old))
+            .collect();
         let mut remap = vec![0u32; distinct.len()];
         for (key, &(_, old)) in distinct.iter().enumerate() {
             remap[old as usize] = key as u32;
