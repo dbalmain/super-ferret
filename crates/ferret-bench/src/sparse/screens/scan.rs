@@ -47,10 +47,9 @@ use crate::content_snapshot::Snapshot;
 
 const PER_CLASS: usize = 50;
 
-/// Warm runs at each count, cold at the default and at rg's default of 12;
-/// replaced, comma-separated, by `SCAN_THREADS` / `SCAN_COLD`. 0 means the
-/// default count, every core, as the product's `FERRET_SEARCH_THREADS`
-/// default.
+/// Warm runs at each count, cold at every core and at rg's default of 12;
+/// replaced, comma-separated, by `SCAN_THREADS` / `SCAN_COLD`. 0 means every
+/// core (the product's default is every core up to 16, D77).
 const THREADS: [usize; 5] = [1, 8, 12, 16, 32];
 const COLD: [usize; 2] = [0, 12];
 

@@ -397,7 +397,8 @@ thread. Where a cancellation lands is a matter of timing, so a cancelled
 query's counts vary with the thread count.
 
 The thread count is `FERRET_SEARCH_THREADS`, defaulting to every available
-core (32 here). The workers' buffers hold at most 64 MiB of documents by
+core up to 16 (D77; it was every core, 32 here, when this section was
+measured). The workers' buffers hold at most 64 MiB of documents by
 catalogued size, plus 1 MiB of kept buffer per worker, plus whatever the
 files being read grew since they were indexed. The calling thread's buffer
 is separate: it reads one document at a time and keeps the capacity of the
@@ -470,6 +471,8 @@ further, but that is a guess.
 
 32 threads is slower than 16 on four classes, by 15–46%: 22–47 ms against
 `rg`'s 170. On code it is faster by 119 ms. The default stays at every core.
+(Superseded by D77: after the scan work, 16 threads is the fastest warm
+setting on every class, code included; see SCAN.md § Threads.)
 The absolute loss on the light classes is smaller than code's gain, and a
 query cannot know its class before it runs.
 

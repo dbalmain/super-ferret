@@ -657,13 +657,16 @@ impl QuerySession {
     }
 }
 
+/// The most threads [`search_threads`] defaults to. Measured on 16 cores
+/// with 32 threads, a warm scan is fastest at 16 threads on every class, and
+/// 32 uses 60% more CPU for 10–20 ms more wall; a cold scan is 2–12% faster
+/// at 32 (docs/SCAN.md § Threads, D77).
+const SEARCH_THREADS: usize = 16;
+
 /// Threads that verify a content query's Maybe documents:
 /// `FERRET_SEARCH_THREADS` if set to a positive number, else every available
-/// core, read once per process (finding the cores reads cgroup files).
-/// Measured, warm verification levels off at 8–16 threads on cheap patterns
-/// (memory bandwidth, or the ordered caller) and keeps scaling to 32 on
-/// regex-heavy ones; every core is the better default overall
-/// (docs/SCREENS.md § Parallel verification).
+/// core up to [`SEARCH_THREADS`], read once per process (finding the cores
+/// reads cgroup files).
 pub fn search_threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
@@ -671,7 +674,11 @@ pub fn search_threads() -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&threads| threads > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+                    .min(SEARCH_THREADS)
+            })
     })
 }
 

@@ -4810,13 +4810,15 @@ content past roughly the size of A's index, also A.
 ### Update 2026-10-13: C built and measured
 
 Content verification now runs on a pool of threads. `FERRET_SEARCH_THREADS`
-sets the count, which defaults to every core. For files that do not change
+sets the count, which defaults to every core (every core up to 16 since
+D77). For files that do not change
 during the query, and without cancellation, output is byte-identical at any
 thread count, and tests compare 1 thread against N. Workers reserve at most
 64 MiB of documents at once, by catalogued size, plus 1 MiB of kept buffer
 each; files that grew since indexing hold more than they reserved, and the
 calling thread's buffer sits outside the budget. The one order that changes is
-that a document can be read up to 64 rows per thread before its
+that a document can be read up to 64 rows per thread (since the scan
+work, up to 16 batches of up to 256 positions per thread) before its
 predecessors are emitted, so a result callback that changes a later file
 may not change that file's row
 ([SCREENS.md § Parallel verification](SCREENS.md#parallel-verification)).
@@ -4866,3 +4868,37 @@ past a scan.
 run cold, for example as the first search after a boot or after memory
 pressure, then B, or A at its size, buys 12–90× cold that no amount of
 threading reaches.
+
+## D77 — Default verification threads: every core, or at most 16
+
+**Status: B built (2026-10-14, branch `wt/scan`); open for Dave.**
+Measured in [SCAN.md § Threads](SCAN.md#threads) on the D65C corpus (3.98 GB,
+112,376 readable documents), a pure scan through the product path, 5 queries
+per class and case, after the scan work (steps 1–3). Median ms over the five
+classes, as the range of class medians; 16 cores, 32 threads.
+
+| Threads | Warm ci | Warm cs | Warm CPU s | Cold ci | Cold cs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 12 | 178–265 | 162–219 | 1.8–2.1 | 3,825–4,136 | 3,813–4,174 |
+| 16 | 162–216 | 155–173 | 2.1–2.4 | 3,544–3,822 | 3,507–3,871 |
+| 24 | 164–222 | 167–179 | 2.9–3.3 | | |
+| 32 | 179–217 | 174–187 | 3.5–4.0 | 3,194–3,654 | 3,135–3,749 |
+| `rg` (12) | 158–175 | 144–156 | 1.4–1.8 | 5,137–5,332 | 5,174–5,247 |
+
+**Question:** Should `ferret search` verify content on every available core,
+or on at most 16?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Every core (32 here), the default before | 1.3–1.6 s more CPU per warm scan than B (about 60%), for 10–20 ms more wall on most classes. | The fastest cold scan: 2–12% faster than B (70–380 ms), most on alternations. |
+| B. `min(16, available_parallelism)` (built) | Cold 2–12% slower than A; still 1.35–1.5× faster than `rg`. On a machine with more than 16 physical cores, leaves cores idle. | The fastest warm scan on every class and case, at 60% of A's CPU, which matters on a laptop running other work. |
+| C. Physical cores, read from `/sys/devices/system/cpu` topology | A sysfs read and its fallback on every `search` process; more code to test. | B's result here, and the right count on machines whose physical core count is not 16. |
+
+**Recommendation: B.** The warm scan is the repeated case for an agent
+working in one tree, and B is fastest there at the least CPU. A wins only
+cold, by at most 0.38 s of a 3.5 s scan that already beats `rg` by 1.4 s.
+
+**Fact that would change it:** if agents' full scans mostly run cold, A,
+since its cold gain (70–380 ms) exceeds B's warm gain (10–20 ms) in
+absolute terms. If a machine with more than 16 physical cores is a target,
+C.
