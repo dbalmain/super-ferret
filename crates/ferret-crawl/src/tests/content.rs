@@ -148,10 +148,13 @@ fn current_reads_check_cancellation_between_chunks() {
         .unwrap()
         .name
         .unwrap();
+    // Four checks pass reading the five catalogued bytes, which the stat
+    // after shows are not the current version; the re-read of 8 MiB is
+    // cancelled at its third check, after two 256 KiB chunks.
     let calls = Cell::new(0);
     let cancelled = || {
         calls.set(calls.get() + 1);
-        calls.get() >= 4
+        calls.get() >= 8
     };
     let mut reader = Documents::by_name(&catalog).unwrap();
     let mut bytes = Vec::new();
@@ -167,4 +170,94 @@ fn current_reads_check_cancellation_between_chunks() {
     );
     assert!(bytes.len() < 8 << 20);
     assert_eq!(reader.files_read, 0);
+}
+
+/// A file's name in `catalog`, by its path under the tree.
+fn name_of(tmp: &Tmp, catalog: &Catalog, rel: &str) -> ferret_catalog::NameId {
+    catalog
+        .resolve(tmp.at(rel).as_os_str().as_encoded_bytes())
+        .unwrap()
+        .name
+        .unwrap()
+}
+
+/// A query's reader holds the directories it walked, and must check each
+/// again before reading through it: a moved ancestor, replaced by a link to
+/// it or by a fresh directory, fails the next path through it.
+#[test]
+fn a_held_directory_is_checked_again_for_each_path() {
+    for ancestor in ["a/b", "a"] {
+        for link in [false, true] {
+            let tmp = Tmp::new(if link { "held-link" } else { "held-copy" });
+            let (catalog, _) = indexed(&tmp, &FILES);
+            let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
+            let read = |documents: &mut Documents, rel| {
+                let mut out = Vec::new();
+                let name = name_of(&tmp, &catalog, rel);
+                documents
+                    .read_current_name_until(&catalog, name, &mut out, &|| false)
+                    .map(|_| out)
+            };
+            assert_eq!(read(&mut documents, "a/b/one.txt").unwrap(), FILES[0].1);
+            assert_eq!(read(&mut documents, "a/b/two.txt").unwrap(), FILES[1].1);
+            fs::rename(tmp.at(ancestor), tmp.base.join("moved")).unwrap();
+            if link {
+                symlink(tmp.base.join("moved"), tmp.at(ancestor)).unwrap();
+            } else {
+                fs::create_dir(tmp.at(ancestor)).unwrap();
+            }
+            assert!(
+                read(&mut documents, "a/b/two.txt").is_err(),
+                "{ancestor}, link={link}"
+            );
+            assert_eq!(read(&mut documents, "top.txt").unwrap(), FILES[2].1);
+        }
+    }
+}
+
+/// A streamed read of the catalogued version hands the bytes over once,
+/// and a consumer may stop early. A file rewritten since is read again from
+/// its start, and the stat returned is its current one.
+#[test]
+fn a_stream_is_read_again_when_the_file_changed() {
+    let tmp = Tmp::new("content-stream");
+    let (catalog, _) = indexed(&tmp, &FILES);
+    let recorded = |rel| {
+        let name = name_of(&tmp, &catalog, rel);
+        catalog.inode(catalog.name(name).child).stat
+    };
+    let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
+    let stream = |documents: &mut Documents, rel, take: usize| {
+        let mut calls = Vec::new();
+        let name = name_of(&tmp, &catalog, rel);
+        let stat = documents.stream_current_name_until(
+            &catalog,
+            name,
+            &mut |source, size| {
+                let mut seen = vec![0; take];
+                let n = source.read(&mut seen)?;
+                seen.truncate(n);
+                calls.push((seen, size));
+                Ok(())
+            },
+            &|| false,
+        );
+        (stat, calls)
+    };
+    let (stat, calls) = stream(&mut documents, "a/b/one.txt", 5);
+    assert!(stat.unwrap().same_version(&recorded("a/b/one.txt")));
+    assert_eq!(calls, [(b"first".to_vec(), 11)]);
+
+    let before = recorded("a/b/two.txt");
+    fs::write(tmp.at("a/b/two.txt"), b"changed, and longer\n").unwrap();
+    let (stat, calls) = stream(&mut documents, "a/b/two.txt", 64);
+    let stat = stat.unwrap();
+    assert!(!stat.same_version(&before));
+    assert_eq!(stat.size, 20);
+    assert_eq!(calls[1..], [(b"changed, and longer\n".to_vec(), 20)]);
+    assert_eq!(
+        calls.len(),
+        2,
+        "the catalogued size first, then the current"
+    );
 }

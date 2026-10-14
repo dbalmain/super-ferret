@@ -133,10 +133,16 @@ impl GrepFlags {
         };
         let planning = self.derive(pattern, &limits, &mut Trims::default())?;
         let trigrams = cap_keys(planning.clone(), LIMITS.keys, &mut Trims::default());
+        let hir = self
+            .parser()
+            .build()
+            .parse(pattern)
+            .map_err(|e| GrepError::Derivation(e.to_string()))?;
         Ok(Grep {
             regex,
             trigrams,
             planning,
+            line_local: line_local(&hir),
         })
     }
 
@@ -181,6 +187,9 @@ pub struct Grep {
     regex: Regex,
     trigrams: Trigrams,
     planning: Trigrams,
+    /// Every match lies within one line, and finding it needs nothing
+    /// beyond that line ([`Grep::is_line_local`]).
+    line_local: bool,
 }
 
 impl crate::Matcher for Grep {
@@ -193,6 +202,22 @@ impl Grep {
     /// First match's byte span in the whole document.
     pub fn find(&self, bytes: &[u8]) -> Option<std::ops::Range<usize>> {
         self.regex.find(bytes)
+    }
+
+    /// Whether the pattern can be searched a run of whole lines at a time.
+    ///
+    /// True when no match can contain a `\n` byte and the only assertions
+    /// are `^`, `$` (multi-line, so at a `\n`) and word boundaries. Then a
+    /// position matches in a document exactly when it matches in any run of
+    /// whole lines around it that stops short of the next `\n`: every
+    /// assertion sees a `\n` or an end of text on each side, and both read
+    /// the same to it. So the first match of the document is the first
+    /// match of the first such run that has one, searched in order. `\A`,
+    /// `\z` and the CRLF forms of `^` and `$` (inline `R`) see a run's ends
+    /// differently, and rule it out, as do classes such as `\s` and `[^x]`,
+    /// which match `\n`.
+    pub fn is_line_local(&self) -> bool {
+        self.line_local
     }
 
     /// The verifier: the only judge of a match.
@@ -222,6 +247,30 @@ impl Grep {
     /// What every match contains.
     pub fn trigrams(&self) -> &Trigrams {
         &self.trigrams
+    }
+}
+
+/// [`Grep::is_line_local`] of a parsed pattern.
+fn line_local(hir: &Hir) -> bool {
+    use regex_syntax::hir::Look;
+    match hir.kind() {
+        HirKind::Empty => true,
+        HirKind::Literal(literal) => !literal.0.contains(&b'\n'),
+        HirKind::Class(Class::Unicode(class)) => !class
+            .ranges()
+            .iter()
+            .any(|range| range.start() <= '\n' && '\n' <= range.end()),
+        HirKind::Class(Class::Bytes(class)) => !class
+            .ranges()
+            .iter()
+            .any(|range| range.start() <= b'\n' && b'\n' <= range.end()),
+        HirKind::Look(look) => !matches!(
+            look,
+            Look::Start | Look::End | Look::StartCRLF | Look::EndCRLF
+        ),
+        HirKind::Repetition(repetition) => line_local(&repetition.sub),
+        HirKind::Capture(capture) => line_local(&capture.sub),
+        HirKind::Concat(hirs) | HirKind::Alternation(hirs) => hirs.iter().all(line_local),
     }
 }
 

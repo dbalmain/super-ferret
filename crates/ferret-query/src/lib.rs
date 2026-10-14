@@ -120,8 +120,8 @@ pub use content::{ContentAtom, TextAtom, answered_by_trigrams};
 pub use grep::{GrepAtom, GrepReport};
 pub use name_index::{NameEstimate, NameIndex, NamePlan};
 pub use plan::{
-    AtomReport, Bounds, Content, ContentPlan, ContentReport, DocNames, NodeReport, ReadRequest,
-    ReadVersion, Reader, Side, UNCOVERED_BOUND,
+    AtomReport, Bounds, Consumer, Content, ContentPlan, ContentReport, DocNames, NodeReport,
+    ReadRequest, ReadVersion, Reader, Side, UNCOVERED_BOUND,
 };
 pub use query::{GREP_PREFIX, ParseError, Query, Strategy};
 pub use run::{Row, RunError, Stats};

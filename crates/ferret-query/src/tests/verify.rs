@@ -161,6 +161,14 @@ impl Script {
                 out.extend_from_slice(&bytes);
                 version
             }
+            ReadRequest::Stream(each, stop) => {
+                self.log.lock().unwrap().push((name.clone(), "read"));
+                let file = file(&name);
+                (self.gate)(&name, stop);
+                let (bytes, version) = file?;
+                each(&mut bytes.as_slice(), bytes.len() as u64).ok()?;
+                version
+            }
         }
     }
 

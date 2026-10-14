@@ -387,7 +387,8 @@ reader in `ferret-query` force the completion orders that matter rather
 than waiting for the scheduler to produce them.
 
 Verification observes a file's bytes when it reads them. A worker can read
-a document up to 64 rows per thread ahead of the caller, so the read may
+a document up to 16 batches of up to 256 positions per thread ahead of the
+caller (docs/SCAN.md), so the read may
 come before the result callbacks for earlier rows run. A callback that
 deletes or rewrites a later file may therefore leave that file's row as it
 was read, where one thread would see the change. No production caller's

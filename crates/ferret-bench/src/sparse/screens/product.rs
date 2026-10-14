@@ -140,6 +140,21 @@ fn once(
                         .push(doc);
                     Some(ReadVersion::Catalogued)
                 }
+                // Read whole, as this screen always has, then handed over.
+                ReadRequest::Stream(each, _) => {
+                    first
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert_with(Instant::now);
+                    let mut bytes = Vec::new();
+                    File::open(path).ok()?.read_to_end(&mut bytes).ok()?;
+                    each(&mut bytes.as_slice(), bytes.len() as u64).ok()?;
+                    read_docs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(doc);
+                    Some(ReadVersion::Catalogued)
+                }
             }
         })
     };

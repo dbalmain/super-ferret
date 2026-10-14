@@ -519,7 +519,9 @@ impl QuerySession {
         };
         let documents = ferret_crawl::Documents::by_name(catalog)?;
         let fork = || -> Box<ferret_query::Reader<'_>> {
-            let mut reader = documents.fork();
+            // One reader per thread for this query: the directories it
+            // walks are held for the query's later paths.
+            let mut reader = documents.fork().holding_directories();
             Box::new(move |name, request: ferret_query::ReadRequest<'_>| {
                 let observed = match request {
                     ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
@@ -527,6 +529,9 @@ impl QuerySession {
                     // worker also the pool's stop at a limit.
                     ferret_query::ReadRequest::Bytes(out, stop) => {
                         reader.read_current_name_until(catalog, name, out, stop)
+                    }
+                    ferret_query::ReadRequest::Stream(each, stop) => {
+                        reader.stream_current_name_until(catalog, name, each, stop)
                     }
                 }
                 .ok()?;

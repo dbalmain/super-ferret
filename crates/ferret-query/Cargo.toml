@@ -13,6 +13,7 @@ ferret-index.workspace = true
 ferret-text.workspace = true
 ferret-verify.workspace = true
 rustix.workspace = true
+memchr = "2"
 
 [lints]
 workspace = true

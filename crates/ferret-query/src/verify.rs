@@ -62,6 +62,7 @@
 //! words per position.
 
 use std::collections::HashMap;
+use std::io::{self, Read};
 use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -70,7 +71,7 @@ use std::time::{Duration, Instant};
 
 use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
 use ferret_index::Certainty;
-use ferret_verify::{MatchStats, TextMatcher};
+use ferret_verify::{MatchStats, Regex, TextMatcher};
 
 use crate::expr::{Test, Truth};
 use crate::plan::{ReadRequest, ReadVersion, Reader};
@@ -96,8 +97,10 @@ const BATCHES_PER_THREAD: usize = 16;
 const MAX_BATCH: usize = 256;
 
 /// Finished batches per worker that the ring holds ahead of the calling
-/// thread.
-const RING_PER_THREAD: usize = 4;
+/// thread. Enough that workers rarely wait on a slow batch at the head:
+/// at 4, workers at 16 threads spent about 30 ms each waiting for room in a
+/// 160 ms scan; at 16, almost none (docs/SCAN.md, step 2).
+const RING_PER_THREAD: usize = 16;
 
 /// Verifying on `threads` workers, each with a reader from `fork`.
 #[derive(Clone, Copy)]
@@ -807,15 +810,31 @@ enum Settled {
 struct Hand<'r, 'a> {
     read: &'r mut Reader<'a>,
     matcher: TextMatcher,
+    /// A whole document, for atoms that need one.
     bytes: Vec<u8>,
+    /// A run of lines at a time, for line-local patterns ([`stream`]).
+    lines: Vec<u8>,
+    /// This thread's own copy of each grep atom's regex, by atom: a regex
+    /// shared between threads hands each a match cache from a pool, which
+    /// many threads at once contend on.
+    regexes: Vec<Option<Regex>>,
 }
 
 impl<'r, 'a> Hand<'r, 'a> {
-    fn new(read: &'r mut Reader<'a>) -> Self {
+    fn new(read: &'r mut Reader<'a>, atoms: &[ContentAtom]) -> Self {
+        let regexes = atoms
+            .iter()
+            .map(|atom| match atom {
+                ContentAtom::Grep(grep) => Some(grep.regex().clone()),
+                ContentAtom::Text(_) => None,
+            })
+            .collect();
         Self {
             read,
             matcher: TextMatcher::new(),
             bytes: Vec::new(),
+            lines: Vec::new(),
+            regexes,
         }
     }
 
@@ -827,8 +846,18 @@ impl<'r, 'a> Hand<'r, 'a> {
         name: NameId,
         stopped: &dyn Fn() -> bool,
     ) -> Outcome {
+        if streams(atoms) {
+            return stream(
+                &self.regexes,
+                &mut *self.read,
+                &mut self.lines,
+                name,
+                stopped,
+            );
+        }
         verify(
             atoms,
+            &self.regexes,
             &mut *self.read,
             &mut self.matcher,
             &mut self.bytes,
@@ -853,7 +882,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
     fn new(query: &'q Query, read: &'r mut Reader<'a>, threads: usize) -> Self {
         Self {
             atoms: &query.atoms,
-            hand: Hand::new(read),
+            hand: Hand::new(read, &query.atoms),
             exact: HashMap::new(),
             tally: Tally {
                 threads,
@@ -927,6 +956,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
 /// unless `stopped` says to stop first; the reader is given `stopped` too.
 fn verify(
     atoms: &[ContentAtom],
+    regexes: &[Option<Regex>],
     read: &mut Reader<'_>,
     matcher: &mut TextMatcher,
     bytes: &mut Vec<u8>,
@@ -944,13 +974,16 @@ fn verify(
     let mut work = Matched::default();
     let mut answers = Vec::with_capacity(atoms.len());
     let mut halted = false;
-    for atom in atoms {
+    for (atom, regex) in atoms.iter().zip(regexes) {
         if stopped() {
             halted = true;
             break;
         }
         let engine_start = Instant::now();
-        let answer = atom.find(matcher, bytes);
+        let answer = match regex {
+            Some(regex) => regex.find(bytes).map(|span| span.start),
+            None => atom.find(matcher, bytes),
+        };
         if matches!(atom, ContentAtom::Grep(_)) {
             work.regex += engine_start.elapsed();
             work.matching.regex_documents += 1;
@@ -972,6 +1005,119 @@ fn verify(
     if halted {
         return Outcome::Stopped(work);
     }
+    Outcome::Read {
+        version,
+        answers,
+        work,
+    }
+}
+
+/// The read buffer for streamed documents: one per thread, reused, small
+/// enough to stay in cache while the regex runs over what was just read.
+const LINES: usize = 64 << 10;
+
+/// Whether every atom is a pattern [`stream`] can search a run of lines at
+/// a time: then documents are streamed, not read whole.
+fn streams(atoms: &[ContentAtom]) -> bool {
+    !atoms.is_empty()
+        && atoms
+            .iter()
+            .all(|atom| matches!(atom, ContentAtom::Grep(grep) if grep.is_line_local()))
+}
+
+/// [`verify`] for line-local patterns ([`ferret_verify::Grep::is_line_local`]):
+/// the document streams through `buffer`, and each read is searched up to
+/// its last `\n`, not including it, with the partial line after it carried
+/// to the next. A line longer than the buffer grows it. The run stops early
+/// once every atom has matched.
+///
+/// The answers are the whole-document search's. The first match of a
+/// line-local pattern in a document is the first match in the first run of
+/// whole lines, cut short of a `\n`, that has one, and its offset is the
+/// run's offset plus the match's. The counts are too: each atom counts the
+/// document's whole size, matched or not.
+fn stream(
+    regexes: &[Option<Regex>],
+    read: &mut Reader<'_>,
+    buffer: &mut Vec<u8>,
+    name: NameId,
+    stopped: &dyn Fn() -> bool,
+) -> Outcome {
+    let start = Instant::now();
+    if stopped() {
+        return Outcome::Stopped(Matched::default());
+    }
+    if buffer.len() < LINES {
+        buffer.resize(LINES, 0);
+    }
+    // Sized before the read, in case the host never calls `each`.
+    let mut answers = vec![None; regexes.len()];
+    let mut regex = Duration::ZERO;
+    let mut size = 0;
+    let mut each = |source: &mut dyn Read, len: u64| {
+        size = len;
+        regex = Duration::ZERO;
+        answers.clear();
+        answers.resize(regexes.len(), None);
+        let mut open = regexes.len();
+        // `buffer[..filled]` is the document from offset `base`, starting
+        // at a line.
+        let (mut filled, mut base) = (0, 0);
+        loop {
+            if stopped() {
+                return Err(io::Error::other("stopped"));
+            }
+            if filled == buffer.len() {
+                buffer.resize(buffer.len() * 2, 0);
+            }
+            let n = match source.read(&mut buffer[filled..]) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            // `buffer[..filled]` held no `\n` before this read.
+            let fresh = filled;
+            filled += n;
+            let end = match n {
+                0 => filled,
+                _ => match memchr::memrchr(b'\n', &buffer[fresh..filled]) {
+                    Some(end) => fresh + end,
+                    None => continue,
+                },
+            };
+            let run = &buffer[..end];
+            let engine = Instant::now();
+            for (regex, answer) in regexes.iter().zip(&mut answers) {
+                let (None, Some(regex)) = (&answer, regex) else {
+                    continue;
+                };
+                if let Some(found) = regex.find(run) {
+                    *answer = Some(base + found.start);
+                    open -= 1;
+                }
+            }
+            regex += engine.elapsed();
+            if open == 0 || n == 0 {
+                return Ok(());
+            }
+            buffer.copy_within(end + 1..filled, 0);
+            filled -= end + 1;
+            base += end + 1;
+        }
+    };
+    let version = read(name, ReadRequest::Stream(&mut each, stopped));
+    let Some(version) = version else {
+        return Outcome::Unread(start.elapsed());
+    };
+    let mut work = Matched {
+        regex,
+        ..Matched::default()
+    };
+    let documents = regexes.len() as u64;
+    work.matching.regex_documents = documents;
+    work.matching.regex_bytes = documents * size;
+    work.matching.regex_rejected = answers.iter().filter(|a| a.is_none()).count() as u64;
+    work.time = start.elapsed();
     Outcome::Read {
         version,
         answers,
@@ -1094,7 +1240,7 @@ impl Pool {
     fn work(&self, scan: &Scan<'_, '_, '_>, fork: &Fork<'_>, stopped: &(dyn Fn() -> bool + Sync)) {
         let _lost = LostOnPanic(self);
         let mut read = fork();
-        let mut hand = Hand::new(&mut *read);
+        let mut hand = Hand::new(&mut *read, &scan.query.atoms);
         let mut names = NameTester::new(scan.query, scan.catalog, scan.cancelled);
         let halt = || self.halted() || stopped();
         loop {
@@ -1206,6 +1352,9 @@ impl Pool {
                 let outcome = hand.verify(&query.atoms, name, halt);
                 if hand.bytes.capacity() > KEPT_BUFFER {
                     hand.bytes = Vec::new();
+                }
+                if hand.lines.capacity() > KEPT_BUFFER {
+                    hand.lines = Vec::new();
                 }
                 // Freed only after an oversized buffer is: a reader that the
                 // release wakes cannot allocate against bytes still held.
@@ -1395,7 +1544,9 @@ mod partial {
     #[test]
     fn a_document_cancelled_between_atoms_counts_the_finished_atom() {
         let query = Query::parse(
-            "grep:needle grep:other",
+            // `(?s)` lets `.` match a newline, so the document is read
+            // whole: the path that checks between atoms.
+            "grep:needle grep:(?s)oth.r",
             UNIX_EPOCH + Duration::from_secs(1),
         )
         .unwrap();
@@ -1421,5 +1572,147 @@ mod partial {
         assert_eq!(tally.matching.regex_bytes, 13);
         assert_eq!(tally.matching.regex_rejected, 0);
         assert!(verifier.exact.is_empty());
+    }
+}
+
+/// [`stream`] against [`verify`], the whole-document search, on the same
+/// bytes: every answer and count agree for line-local patterns, with the
+/// bytes arriving a few at a time, so runs end at every kind of place, and
+/// with a line longer than the buffer.
+#[cfg(test)]
+mod streamed {
+    use std::io::Read;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ferret_catalog::NameId;
+    use ferret_verify::TextMatcher;
+
+    use super::{Hand, Outcome, stream, streams, verify};
+    use crate::{Query, ReadRequest, ReadVersion};
+
+    /// Hands out `bytes` 1 to `most` at a time.
+    struct Dribble<'a> {
+        bytes: &'a [u8],
+        most: usize,
+        reads: usize,
+    }
+
+    impl Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            let n = buf
+                .len()
+                .min(1 + self.reads % self.most)
+                .min(self.bytes.len());
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            Ok(n)
+        }
+    }
+
+    fn documents() -> Vec<Vec<u8>> {
+        let alphabet = b"ao f\nk1_\n";
+        let mut seed = 0x2545_f491_u64;
+        let mut docs: Vec<Vec<u8>> = (0..300)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let len = (seed >> 33) as usize % 300;
+                (0..len)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        alphabet[(seed >> 33) as usize % alphabet.len()]
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut long = vec![b'a'; 70_000];
+        long.extend_from_slice(b"o foo_\n\nk1 a");
+        docs.push(long);
+        docs.extend([
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"foo".to_vec(),
+            b"a\n\n".to_vec(),
+        ]);
+        docs
+    }
+
+    fn answers(outcome: Outcome) -> (Vec<Option<usize>>, ferret_verify::MatchStats) {
+        match outcome {
+            Outcome::Read { answers, work, .. } => (answers, work.matching),
+            _ => panic!("not read"),
+        }
+    }
+
+    #[test]
+    fn streamed_answers_are_the_whole_documents() {
+        let patterns = [
+            "foo", "^foo", "foo$", "^$", r"\bfo", r"o\b", r"\Bo", "^a*$", "k1", "(?i)K", "[a-z]+1",
+            "f.o", "^", "$", "a{3}", "_$", r"^\b", r"\b$", "(?-u)o_",
+        ];
+        let docs = documents();
+        let never = || false;
+        for pattern in patterns {
+            let text = format!("grep:{pattern} grep:a");
+            let query = Query::parse(&text, UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+            assert!(streams(&query.atoms), "{pattern} is line-local");
+            for doc in &docs {
+                let mut whole = |_, request: ReadRequest<'_>| {
+                    let ReadRequest::Bytes(out, _) = request else {
+                        panic!("whole reads are bytes");
+                    };
+                    out.clear();
+                    out.extend_from_slice(doc);
+                    Some(ReadVersion::Catalogued)
+                };
+                let mut bytes = Vec::new();
+                let mut matcher = TextMatcher::new();
+                let regexes = Hand::new(&mut whole, &query.atoms).regexes;
+                let expected = answers(verify(
+                    &query.atoms,
+                    &regexes,
+                    &mut whole,
+                    &mut matcher,
+                    &mut bytes,
+                    NameId(0),
+                    &never,
+                ));
+                let mut dribbled = |_, request: ReadRequest<'_>| {
+                    let ReadRequest::Stream(each, _) = request else {
+                        panic!("line-local reads stream");
+                    };
+                    // A few bytes at a time; the long line in larger
+                    // pieces, which still end mid-line.
+                    let mut source = Dribble {
+                        bytes: doc,
+                        most: if doc.len() > 1000 { 4093 } else { 7 },
+                        reads: 0,
+                    };
+                    each(&mut source, doc.len() as u64).ok()?;
+                    Some(ReadVersion::Catalogued)
+                };
+                let mut buffer = Vec::new();
+                let got = answers(stream(
+                    &regexes,
+                    &mut dribbled,
+                    &mut buffer,
+                    NameId(0),
+                    &never,
+                ));
+                let shown = String::from_utf8_lossy(&doc[..doc.len().min(80)]);
+                assert_eq!(got, expected, "{pattern} over {shown:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn patterns_that_see_a_newline_or_a_text_end_are_read_whole() {
+        for pattern in [
+            r"a\nb", r"\s", "[^a]", "(?s).", r"\Aa", r"a\z", "(?R)^a", "(?R)a$",
+        ] {
+            let text = format!("grep:{pattern}");
+            let query = Query::parse(&text, UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+            assert!(!streams(&query.atoms), "{pattern} is not line-local");
+        }
     }
 }

@@ -70,6 +70,8 @@ struct Population {
     live: DocSet,
     readable: Vec<u32>,
     bytes: u64,
+    /// Each readable document's size, by DocId, for a streamed read.
+    sizes: Vec<u64>,
     seeds: Vec<Seed>,
     case_insensitive: bool,
 }
@@ -117,8 +119,11 @@ fn load(
         .filter(|&d| snapshot.contains(d))
         .collect();
     let mut bytes = 0;
+    let mut sizes = vec![0; catalog.next_doc().0 as usize];
     for &doc in &readable {
-        bytes += fs::metadata(snapshot.path(doc))?.len();
+        let size = fs::metadata(snapshot.path(doc))?.len();
+        sizes[doc as usize] = size;
+        bytes += size;
     }
     let text = fs::read_to_string(cache)?;
     let mut lines = text.lines();
@@ -166,6 +171,7 @@ fn load(
         live,
         readable,
         bytes,
+        sizes,
         seeds,
         case_insensitive,
     })
@@ -236,10 +242,25 @@ struct Tally<'a> {
 impl Tally<'_> {
     /// A method, so the reader's closure captures the whole tally (and its
     /// `Drop`) rather than copies of its fields.
-    fn add(&mut self, bytes: usize, time: Duration) {
+    fn add(&mut self, bytes: u64, time: Duration) {
         self.reads.docs += 1;
-        self.reads.bytes += bytes as u64;
+        self.reads.bytes += bytes;
         self.reads.time += time;
+    }
+}
+
+/// A streamed document, timing its reads.
+struct Timed {
+    file: std::io::Take<File>,
+    time: Duration,
+}
+
+impl std::io::Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let start = Instant::now();
+        let read = self.file.read(buf);
+        self.time += start.elapsed();
+        read
     }
 }
 
@@ -301,7 +322,25 @@ impl Session<'_> {
                         first.get_or_init(|| start);
                         out.clear();
                         File::open(path).ok()?.read_to_end(out).ok()?;
-                        tally.add(out.len(), start.elapsed());
+                        tally.add(out.len() as u64, start.elapsed());
+                        Some(ReadVersion::Catalogued)
+                    }
+                    // Streamed as the product streams: the consumer reads
+                    // what it needs into its own buffer. "read ms" is the
+                    // open and the reads, not the matching between them;
+                    // the bytes counted are the size offered, since the
+                    // consumer stops once every atom has matched.
+                    ReadRequest::Stream(each, _) => {
+                        let start = Instant::now();
+                        first.get_or_init(|| start);
+                        let size = pop.sizes[doc as usize];
+                        let file = File::open(path).ok()?;
+                        let mut timed = Timed {
+                            file: file.take(size),
+                            time: start.elapsed(),
+                        };
+                        each(&mut timed, size).ok()?;
+                        tally.add(size, timed.time);
                         Some(ReadVersion::Catalogued)
                     }
                 }

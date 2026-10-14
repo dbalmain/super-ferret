@@ -53,7 +53,17 @@ pub enum ReadRequest<'a> {
     /// should stop between chunks, failing, once the predicate returns
     /// true: the query was cancelled, or verification no longer needs it.
     Bytes(&'a mut Vec<u8>, &'a dyn Fn() -> bool),
+    /// The same read, handing the bytes to the consumer as a reader with the
+    /// document's size, instead of collecting them: the consumer reads what
+    /// it needs, and stops between reads, failing, once the predicate
+    /// returns true. The host may call it again for the same request, from
+    /// the first byte, when the bytes it was given prove not to be one
+    /// version; only the last call saw the version returned.
+    Stream(Consumer<'a>, &'a dyn Fn() -> bool),
 }
+
+/// The consumer of a [`ReadRequest::Stream`].
+pub type Consumer<'a> = &'a mut dyn FnMut(&mut dyn std::io::Read, u64) -> std::io::Result<()>;
 
 /// The version established by a successful stat or bracketed read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

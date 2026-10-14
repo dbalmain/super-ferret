@@ -19,7 +19,7 @@
 //! scan is what M3's measurement and tests need.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
@@ -37,6 +37,9 @@ pub struct Documents {
     names: Vec<u32>,
     /// The parent directory held for the current checked walk.
     dir: Option<(InoId, OwnedFd)>,
+    /// With [`Documents::holding_directories`]: the last checked walk, root
+    /// first, each directory with its descriptor, kept for the next path.
+    held: Option<Vec<(InoId, OwnedFd)>>,
     limiter: Option<Arc<Limiter>>,
     config: ferret_policy::Config,
     /// Documents read whole and checked.
@@ -76,6 +79,7 @@ impl Documents {
         Ok(Self {
             names,
             dir: None,
+            held: None,
             limiter: None,
             config: ferret_policy::Config::default(),
             files_read: 0,
@@ -92,6 +96,7 @@ impl Documents {
         Ok(Self {
             names: Vec::new(),
             dir: None,
+            held: None,
             limiter: None,
             config: ferret_policy::Config::default(),
             files_read: 0,
@@ -106,6 +111,7 @@ impl Documents {
         Self {
             names: Vec::new(),
             dir: None,
+            held: None,
             limiter: self.limiter.clone(),
             config: self.config,
             files_read: 0,
@@ -117,6 +123,16 @@ impl Documents {
     /// indexing and querying both use the default policy (8 MiB).
     pub fn with_config(mut self, config: ferret_policy::Config) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Keeps each checked directory walk's descriptors for later paths
+    /// through the same directories: each path still checks every directory
+    /// on it, by a stat of its path, instead of opening it again
+    /// ([`hold_directory`]). For a reader that lives for one query: it holds
+    /// a descriptor per level of the last path.
+    pub fn holding_directories(mut self) -> Self {
+        self.held = Some(Vec::new());
         self
     }
 
@@ -232,10 +248,84 @@ impl Documents {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ferret_catalog::Stat, ContentFault> {
         out.clear();
+        let (cap, limiter) = (self.config.size_cap, self.limiter.clone());
+        let current = self.current_until(catalog, name, cancelled, &mut |file, size| {
+            out.clear();
+            read_all(file, size, cap, limiter.as_deref(), out, cancelled)
+        });
+        if current.is_ok() {
+            self.bytes_read += out.len() as u64;
+        }
+        current
+    }
+
+    /// [`Documents::read_current_name_until`], handing the bytes to `each`
+    /// as a reader instead of collecting them: `each` reads as much as it
+    /// needs, with the document's size, and should stop between reads once
+    /// `cancelled` says so, failing.
+    ///
+    /// `each` may be called twice for one document, the second time from
+    /// its first byte: when the file proves not to be the catalogued
+    /// version, it is read again bracketed by its current stat. Only what
+    /// the last call saw describes the returned version.
+    pub fn stream_current_name_until(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
+        let (cap, limiter) = (self.config.size_cap, self.limiter.clone());
+        self.current_until(catalog, name, cancelled, &mut |file, size| {
+            if cancelled() {
+                return Err(ContentFault::Cancelled);
+            }
+            if size > cap {
+                return Err(ContentFault::TooLarge { size, cap });
+            }
+            let done = match limiter.as_deref() {
+                Some(limiter) => each(
+                    &mut BulkRead {
+                        file,
+                        limiter: Some(limiter),
+                        remaining: size,
+                    },
+                    size,
+                ),
+                None => each(&mut Read::take(file, size), size),
+            };
+            done.map_err(|e| match cancelled() {
+                true => ContentFault::Cancelled,
+                false => ContentFault::Read(e),
+            })
+        })
+    }
+
+    /// The current version of the file `name` names, read by `pass` (given
+    /// the file at its start and the size to read), with the version
+    /// established by a stat.
+    ///
+    /// When the catalog recorded the file at most the size cap, `pass` first
+    /// reads that size and one `fstat` follows. If it is the catalogued
+    /// version, nothing has changed the file since its recorded ctime, so
+    /// what `pass` read was that version: no stat is needed before it. Else
+    /// `pass` runs again from the start, bracketed by that stat and one
+    /// more, as a read of a changed file always was.
+    ///
+    /// The calls, for a catalogued file in a held directory: `openat`, the
+    /// reads, `fstat`, `close`.
+    fn current_until(
+        &mut self,
+        catalog: &Catalog,
+        name: NameId,
+        cancelled: &dyn Fn() -> bool,
+        pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
+    ) -> Result<ferret_catalog::Stat, ContentFault> {
         if cancelled() {
             return Err(ContentFault::Cancelled);
         }
         let (parent, bytes) = catalog.name_reader().edge(name);
+        let recorded = catalog.inode(catalog.name(name).child).stat;
         let dir = self.directory(catalog, parent)?;
         let fd = openat(
             dir,
@@ -244,29 +334,45 @@ impl Documents {
             Mode::empty(),
         )
         .map_err(|e| ContentFault::Open(e.into()))?;
-        let stat = fstat(&fd).map_err(|e| ContentFault::Stat(e.into()))?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        let mut file = File::from(fd);
+        let stat = |file: &File| fstat(file).map_err(|e| ContentFault::Stat(e.into()));
+        let regular = |stat: &rustix::fs::Stat| {
+            FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+        };
+        let seen = if recorded.size <= self.config.size_cap {
+            let read = pass(&mut file, recorded.size);
+            let after = stat(&file)?;
+            if regular(&after) && catalog_stat(&after).same_version(&recorded) {
+                read?;
+                self.files_read += 1;
+                return Ok(catalog_stat(&after));
+            }
+            if let Err(ContentFault::Cancelled) = read {
+                return Err(ContentFault::Cancelled);
+            }
+            file.seek(SeekFrom::Start(0)).map_err(ContentFault::Read)?;
+            after
+        } else {
+            stat(&file)?
+        };
+        if !regular(&seen) {
             return Err(ContentFault::Changed);
         }
-        let current = catalog_stat(&stat);
-        let mut file = File::from(fd);
-        read_all(
-            &mut file,
-            current.size,
-            self.config.size_cap,
-            self.limiter.as_deref(),
-            out,
-            cancelled,
-        )?;
+        let current = catalog_stat(&seen);
+        pass(&mut file, current.size)?;
         bracket(&file, &current, ferret_catalog::Content::Binary)?;
         self.files_read += 1;
-        self.bytes_read += out.len() as u64;
         Ok(current)
     }
 
     /// Re-walk from the root for each path. A retained descriptor alone cannot
-    /// establish that its original path still names it after a rename.
+    /// establish that its original path still names it after a rename: a
+    /// reader [holding directories](Documents::holding_directories) checks
+    /// each path again before reusing one.
     fn directory(&mut self, catalog: &Catalog, dir: InoId) -> Result<&OwnedFd, ContentFault> {
+        if let Some(held) = &mut self.held {
+            return hold_directory(held, catalog, dir);
+        }
         self.dir = None;
         let fd = open_directory(catalog, dir)?;
         self.dir = Some((dir, fd));
@@ -280,7 +386,29 @@ impl Documents {
 /// Opens `dir` from its root, one `O_NOFOLLOW` component at a time, each
 /// checked against the catalog's `(dev, ino)`.
 fn open_directory(catalog: &Catalog, dir: InoId) -> Result<OwnedFd, ContentFault> {
+    let mut held = Vec::new();
+    hold_directory(&mut held, catalog, dir)?;
+    held.pop().map(|(_, fd)| fd).ok_or(ContentFault::Changed)
+}
+
+/// [`open_directory`], reusing the descriptors `held` has for the start of
+/// `dir`'s chain and leaving the whole chain in it, root first.
+///
+/// A held descriptor is reused only once its path is checked again: the
+/// root's path by a `stat`, each directory below by a no-follow `fstatat`
+/// in its held parent, each against the catalog's `(dev, ino)` that the
+/// descriptor was checked against when opened. So, as on a fresh walk, the
+/// directory read through is the one its path named, at a moment between
+/// the walk's start and the file's open; a renamed or replaced directory
+/// fails the same way. One call per level instead of three (open, fstat,
+/// close).
+fn hold_directory<'h>(
+    held: &'h mut Vec<(InoId, OwnedFd)>,
+    catalog: &Catalog,
+    dir: InoId,
+) -> Result<&'h OwnedFd, ContentFault> {
     let names = catalog.name_reader();
+    // `dir` and its ancestors below the root, nearest first.
     let mut chain = Vec::new();
     let mut at = dir;
     while let Some(name) = catalog.dir_name(at) {
@@ -288,28 +416,70 @@ fn open_directory(catalog: &Catalog, dir: InoId) -> Result<OwnedFd, ContentFault
         chain.push((at, bytes));
         at = parent;
     }
-    let root = catalog
+    let root = at;
+    let path = catalog
         .roots()
-        .find(|&(id, _)| id == at)
+        .find(|&(id, _)| id == root)
         .map(|(_, path)| path)
         .ok_or(ContentFault::Changed)?;
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    // The root's own path is the user's; symlinks above it are theirs to
-    // keep. Everything below it must not follow one.
-    let mut fd = open(std::ffi::OsStr::from_bytes(root), flags, Mode::empty())
-        .map_err(|e| ContentFault::Open(e.into()))?;
-    check_directory(&fd, catalog, at)?;
-    for (id, bytes) in chain.into_iter().rev() {
-        fd = openat(
-            &fd,
-            std::ffi::OsStr::from_bytes(bytes),
-            flags | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(|e| ContentFault::Open(e.into()))?;
-        check_directory(&fd, catalog, id)?;
+    let path = std::ffi::OsStr::from_bytes(path);
+    let same = |stat: &rustix::fs::Stat, id: InoId| {
+        FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+            && (stat.st_dev, stat.st_ino) == catalog.identity(id)
+    };
+    // How much of the held chain is `dir`'s and still at its path.
+    let mut kept = 0;
+    if held.first().is_some_and(|&(id, _)| id == root) {
+        // The root's own path may pass through symlinks: the user's.
+        let stat = rustix::fs::stat(path).map_err(|e| ContentFault::Stat(e.into()))?;
+        if same(&stat, root) {
+            kept = 1;
+            for (&(id, bytes), (parent, (held_id, _))) in
+                chain.iter().rev().zip(held.iter().zip(&held[1..]))
+            {
+                if id != *held_id {
+                    break;
+                }
+                let stat = statat(
+                    &parent.1,
+                    std::ffi::OsStr::from_bytes(bytes),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .map_err(|e| ContentFault::Stat(e.into()))?;
+                if !same(&stat, id) {
+                    return Err(ContentFault::Changed);
+                }
+                kept += 1;
+            }
+        }
     }
-    Ok(fd)
+    held.truncate(kept);
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    if held.is_empty() {
+        // The root's own path is the user's; symlinks above it are theirs
+        // to keep. Everything below it must not follow one.
+        let fd = open(path, flags, Mode::empty()).map_err(|e| ContentFault::Open(e.into()))?;
+        check_directory(&fd, catalog, root)?;
+        held.push((root, fd));
+    }
+    for &(id, bytes) in chain.iter().rev().skip(held.len() - 1) {
+        let fd = match held.last() {
+            Some((_, parent)) => openat(
+                parent,
+                std::ffi::OsStr::from_bytes(bytes),
+                flags | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|e| ContentFault::Open(e.into()))?,
+            None => return Err(ContentFault::Changed),
+        };
+        check_directory(&fd, catalog, id)?;
+        held.push((id, fd));
+    }
+    match held.last() {
+        Some((_, fd)) => Ok(fd),
+        None => Err(ContentFault::Changed),
+    }
 }
 
 fn check_directory(fd: &OwnedFd, catalog: &Catalog, id: InoId) -> Result<(), ContentFault> {
@@ -338,34 +508,26 @@ fn read_all(
     let size_usize = usize::try_from(size).map_err(|_| ContentFault::TooLarge { size, cap })?;
     out.try_reserve_exact(size_usize)
         .map_err(ContentFault::Allocation)?;
-    let mut source = BulkRead {
-        file,
-        limiter,
-        remaining: size,
-    };
+    let mut remaining = size;
     loop {
         if cancelled() {
             return Err(ContentFault::Cancelled);
         }
-        if source.remaining == 0 {
+        if remaining == 0 {
             return Ok(());
         }
-        let start = out.len();
-        // Zero only what the read can fill: a small file's verification
-        // read once cleared 512 KiB, which dominated it.
-        let want = source.remaining.min(256 << 10) as usize;
-        out.resize(start + want, 0);
-        match source.read(&mut out[start..]) {
-            Ok(0) => {
-                out.truncate(start);
-                return Ok(());
-            }
-            Ok(n) => out.truncate(start + n),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => out.truncate(start),
-            Err(e) => {
-                out.truncate(start);
-                return Err(ContentFault::Read(e));
-            }
+        // A chunk at a time, for cancellation, and appended without zeroing
+        // first: `File` reads into the spare capacity as it is.
+        let want = remaining.min(256 << 10);
+        let mut chunk = Read::take(&mut *file, want);
+        let read = match limiter {
+            Some(limiter) => limiter.transfer(want as usize, || chunk.read_to_end(out)),
+            None => chunk.read_to_end(out),
+        };
+        match read {
+            Ok(0) => return Ok(()),
+            Ok(n) => remaining -= n as u64,
+            Err(e) => return Err(ContentFault::Read(e)),
         }
     }
 }

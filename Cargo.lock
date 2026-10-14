@@ -142,6 +142,7 @@ dependencies = [
  "ferret-index",
  "ferret-text",
  "ferret-verify",
+ "memchr",
  "rustix",
 ]
 
