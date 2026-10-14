@@ -346,6 +346,14 @@ impl Search {
     pub fn filters(&self) -> bool {
         self.filter.is_some()
     }
+
+    /// Whether the required run occurs in `text`: a window is searched.
+    #[cfg(test)]
+    fn run_occurs(&self, text: &[u8]) -> bool {
+        self.filter
+            .as_ref()
+            .is_some_and(|filter| filter.run.find(text).is_some())
+    }
 }
 
 /// [`Search`]'s filter for a line-local pattern; `None` when the engine

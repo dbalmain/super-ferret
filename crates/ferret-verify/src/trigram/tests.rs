@@ -680,6 +680,12 @@ struct Tally {
     matched_narrowed: u32,
     /// Documents the query excluded and the regex rejected: the query prunes.
     excluded: u32,
+    /// Patterns whose [`super::Search`] looks for a required run first.
+    filtered: u32,
+    /// Texts such a search matched, and texts it rejected although the
+    /// required run occurs (so a window was searched).
+    filtered_matched: u32,
+    filtered_windowed: u32,
 }
 
 /// Documents per pattern: two thirds hold a sample, the rest are noise.
@@ -708,6 +714,9 @@ fn run_property(patterns: u32, seed: u64) -> Tally {
             }
             Err(e @ GrepError::Derivation(_)) => panic!("{pattern:?}: {e}"),
         };
+        let search = grep.search();
+        tally.filtered += u32::from(search.filters());
+        let mut docs = Vec::new();
         for doc_kind in 0..DOCS {
             let mut doc = Vec::new();
             noise(&mut rng, &mut doc);
@@ -715,6 +724,8 @@ fn run_property(patterns: u32, seed: u64) -> Tally {
                 sample(&node, &mut rng, ctx, &mut doc);
             }
             noise(&mut rng, &mut doc);
+            check_search(&grep, &search, &doc, &mut tally);
+            docs.push(doc.clone());
             tally.checked += 1;
             let admitted = admits(grep.trigrams(), &doc_keys(&doc));
             if !grep.regex().is_match(&doc) {
@@ -736,8 +747,57 @@ fn run_property(patterns: u32, seed: u64) -> Tally {
             );
             tally.matched_narrowed += u32::from(*grep.trigrams() != Trigrams::All);
         }
+        let joined = join(&mut rng, &docs);
+        check_search(&grep, &search, &joined, &mut tally);
+        // Few generated patterns lack a literal prefix, which is when a
+        // search filters; led by a large class, as in `(?i)[A-Z_]+worse`,
+        // most do.
+        let lead = LEADS[rng.below(LEADS.len())];
+        if let Ok(led) = flags(case_insensitive).compile(&format!("{lead}(?:{pattern})")) {
+            let search = led.search();
+            tally.filtered += u32::from(search.filters());
+            for doc in docs.iter().chain([&joined]) {
+                check_search(&led, &search, doc, &mut tally);
+            }
+        }
     }
     tally
+}
+
+/// Large classes to lead a pattern with, without and with an assertion
+/// (whose window is the line, not the word).
+const LEADS: [&str; 4] = [
+    r"[A-Za-z_]+",
+    r"\b[a-z]+",
+    r"[0-9a-z]*",
+    r"(?:[[:alnum:]_]|-)+\B",
+];
+
+/// Every document in one text, so a search meets several windows and must
+/// pick the first match among them; some on one line.
+fn join(rng: &mut Rng, docs: &[Vec<u8>]) -> Vec<u8> {
+    let mut joined = Vec::new();
+    for doc in docs {
+        joined.extend_from_slice(doc);
+        joined.push(if rng.below(2) == 0 { b'\n' } else { b' ' });
+    }
+    joined
+}
+
+/// [`super::Search::find`] against the pattern over the whole text: the
+/// same first match.
+fn check_search(grep: &super::Grep, search: &super::Search, text: &[u8], tally: &mut Tally) {
+    let expected = grep.regex().find(text).map(|m| m.start);
+    assert_eq!(
+        search.find(text),
+        expected,
+        "{:?} over {text:?}",
+        grep.pattern()
+    );
+    if search.filters() {
+        tally.filtered_matched += u32::from(expected.is_some());
+        tally.filtered_windowed += u32::from(expected.is_none() && search.run_occurs(text));
+    }
 }
 
 /// Floors that keep the property from passing vacuously: most generated
@@ -751,10 +811,13 @@ fn assert_covers(tally: &Tally) {
     assert!(tally.matched_non_ascii_fold > n / 100, "{tally:?}");
     assert!(tally.matched_narrowed > n / 5, "{tally:?}");
     assert!(tally.excluded > n / 20, "{tally:?}");
+    assert!(tally.filtered > n / 10, "{tally:?}");
+    assert!(tally.filtered_matched > n / 5, "{tally:?}");
+    assert!(tally.filtered_windowed > n / 5, "{tally:?}");
 }
 
 /// 3,400 patterns × 9 documents: 30,600 cases, inside the default suite's
-/// budget in debug.
+/// budget in debug (about 16 s, most of it compiling the led patterns).
 #[test]
 fn every_match_satisfies_the_derived_query() {
     let tally = run_property(3_400, 0x9e37_79b9_7f4a_7c15);
