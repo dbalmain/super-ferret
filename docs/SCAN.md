@@ -284,6 +284,7 @@ warm and 5.1–5.3 s cold throughout.
 | 4. default 16 threads  | 75db759 | 162–189 (full run)          | 154–165 (full run) | 174–204           | 171–176     | 3.5–3.9 s     |
 | setup cuts             | c6335b4 | —                           | —                  | 163–175           | 158–171     | e2e 3.4–4.3 s |
 | parallel setup         | 0d51f02 | —                           | —                  | 146–155           | 136–151     | e2e 3.5–3.9 s |
+| review fixes           | 111d2bc | —                           | —                  | 139–151           | 141–154     | e2e 3.4–4.2 s |
 
 1. **The calling thread only emits.** Workers claim batches from an atomic
    counter and do each position's tests, read, residual and path; the caller
@@ -352,6 +353,8 @@ the same files; 5 queries per class at 75db759 (after.txt), 10 per class later.
 | `rg`, same run    | 164–174 | 146–159 | 5.16–6.21 s | 5.11–5.17 s |
 | `ferret`, 0d51f02 | 146–155 | 136–151 | 3.49–3.88 s | 3.49–3.84 s |
 | `rg`, same runs   | 162–180 | 147–163 | 5.13–5.22 s | 5.17–5.37 s |
+| `ferret`, 111d2bc | 139–151 | 141–154 | 3.42–4.24 s | 3.39–3.84 s |
+| `rg`, same run    | 157–178 | 154–164 | 5.15–6.14 s | 5.12–5.22 s |
 
 At c6335b4 we tied `rg` warm in ci and trailed it by 0–20 ms in cs. The named
 cause was serial setup, below. With the setup on several threads (0d51f02), we
@@ -362,6 +365,17 @@ repeated because two of its cold medians, and `rg`'s on the same classes, came
 out 0.3–1 s high; the repeat is the cs cold row. The rows are in
 [`measurements/scan/setup.txt`](measurements/scan/setup.txt) and
 [`measurements/scan/parallel-setup.txt`](measurements/scan/parallel-setup.txt).
+
+After Sol's round-1 review (111d2bc) we still beat `rg` on every class, warm and
+cold, in both cases: by 9–39 ms warm in ci and 6–23 ms in cs. Those fixes post
+each finished position rather than each batch, check for a stop around each
+search in a stream, bound a long line's buffer by the document's length, and
+start setup helpers that may fail. The reader is back to open, `fstat` and type
+check, read, and `fstat` to bracket, so a document costs six file syscalls, not
+step 2's five; the extra `fstat` measured about 1–2 ms warm. The ci cold rare
+literal median (4.24 s) is high, as is `rg`'s on the same class (6.14 s). The
+rows are in
+[`measurements/scan/review-fixes.txt`](measurements/scan/review-fixes.txt).
 
 ### Remaining gap
 
