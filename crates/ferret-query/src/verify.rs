@@ -124,6 +124,8 @@ pub(crate) enum Readers<'r, 'a> {
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
     pub verified: u64,
+    /// Reads that failed or found a new version; not a read a stop ended
+    /// ([`unread`]).
     pub changed: u64,
     pub time: Duration,
     pub regex: Duration,
@@ -800,6 +802,12 @@ impl<'s, 'q, 'c, 'p, 'r, 'a, E: FnMut(&Row<'_>) -> ControlFlow<()>>
         let Some(offset) = offset else {
             return Ok(ControlFlow::Continue(()));
         };
+        // The emission guard: a stop that came while this position was
+        // settled (a host's checks after a successful read, a cached
+        // answer's stat) ends the run here, as one before it would have.
+        if scan.stopped() {
+            return Ok(ControlFlow::Break(()));
+        }
         row.offset = offset;
         self.rows += 1;
         Ok((self.emit)(&row))
@@ -1083,10 +1091,11 @@ fn streams(atoms: &[ContentAtom]) -> bool {
 /// run's offset plus the match's. The counts are too: each atom counts the
 /// document's whole size, matched or not.
 ///
-/// `stopped` is asked before each read and each atom's search, and before
-/// the answers are accepted, as [`verify`] asks it between atoms. A stopped
-/// document counts the atoms that had finished: those that matched, and
-/// every atom once the last run was searched.
+/// `stopped` is asked before each read and each atom's search, before the
+/// answers are accepted, and again once the host's read returns, as
+/// [`verify`] asks it between atoms. A stopped document, whatever the host
+/// returned, counts the atoms that had finished: those that matched, and
+/// those the last run was searched for without a match.
 fn stream(
     regexes: &[Option<Search>],
     read: &mut Reader<'_>,
@@ -1103,18 +1112,22 @@ fn stream(
     }
     // Sized before the read, in case the host never calls `each`.
     let mut answers = vec![None; regexes.len()];
+    // Which atoms' answers are final: matched, or searched to the end.
+    let mut done = vec![false; regexes.len()];
     let mut regex = Duration::ZERO;
     let mut size = 0;
-    // Set when `stopped` ends the read: whether every atom had finished.
-    let mut halted = None;
+    // Set when `stopped` ends the read.
+    let mut halted = false;
     let mut each = |source: &mut dyn Read, len: u64| {
         size = len;
         regex = Duration::ZERO;
         answers.clear();
         answers.resize(regexes.len(), None);
+        done.clear();
+        done.resize(regexes.len(), false);
         let mut open = regexes.len();
-        let mut halt = |all: bool| {
-            halted = Some(all);
+        let mut halt = || {
+            halted = true;
             Err(io::Error::other("stopped"))
         };
         // `buffer[..filled]` is the document from offset `base`, starting
@@ -1122,7 +1135,7 @@ fn stream(
         let (mut filled, mut base) = (0, 0);
         loop {
             if stopped() {
-                return halt(false);
+                return halt();
             }
             // The source holds at most `len` bytes: once they are all in,
             // that is the end, and the buffer never grows past them.
@@ -1156,23 +1169,25 @@ fn stream(
             };
             let run = &buffer[..end];
             let engine = Instant::now();
-            for (search, answer) in regexes.iter().zip(&mut answers) {
-                let (None, Some(search)) = (&answer, search) else {
+            for ((search, answer), done) in regexes.iter().zip(&mut answers).zip(&mut done) {
+                let (false, Some(search)) = (*done, search) else {
                     continue;
                 };
                 if stopped() {
                     regex += engine.elapsed();
-                    return halt(false);
+                    return halt();
                 }
                 if let Some(found) = search.find(run) {
                     *answer = Some(base + found);
                     open -= 1;
                 }
+                // The last run settles a miss too.
+                *done = answer.is_some() || n == 0;
             }
             regex += engine.elapsed();
             if open == 0 || n == 0 {
                 if stopped() {
-                    return halt(true);
+                    return halt();
                 }
                 return Ok(());
             }
@@ -1182,25 +1197,30 @@ fn stream(
         }
     };
     let version = read(name, ReadRequest::Stream(&mut each, stopped));
-    // The atoms that finished: every one, or those that matched.
-    let finished = |all: bool| {
-        let counted = answers.iter().filter(|a| all || a.is_some()).count() as u64;
+    // The atoms that finished, matched or not: every one after a full read.
+    let finished = || {
+        let settled = || answers.iter().zip(&done).filter(|(_, done)| **done);
+        let counted = settled().count() as u64;
         let mut work = Matched {
             regex,
             ..Matched::default()
         };
         work.matching.regex_documents = counted;
         work.matching.regex_bytes = counted * size;
-        work.matching.regex_rejected = answers.iter().filter(|a| all && a.is_none()).count() as u64;
+        work.matching.regex_rejected = settled().filter(|(a, _)| a.is_none()).count() as u64;
         work.time = start.elapsed();
         work
     };
-    match (version, halted) {
-        (_, Some(all)) => Outcome::Stopped(finished(all)),
-        (None, None) => unread(start, stopped),
-        (Some(version), None) => Outcome::Read {
+    // A stop after `each` returned, in the host's own checks, is a stop
+    // too: the host may have succeeded or given up because of it.
+    if halted || stopped() {
+        return Outcome::Stopped(finished());
+    }
+    match version {
+        None => Outcome::Unread(start.elapsed()),
+        Some(version) => Outcome::Read {
             version,
-            work: finished(true),
+            work: finished(),
             answers,
         },
     }
@@ -1782,6 +1802,93 @@ mod partial {
         assert_eq!(tally.changed, 0);
         assert_eq!(tally.matching.regex_documents, 1);
         assert_eq!(tally.matching.regex_bytes, 19);
+    }
+
+    /// Sol round 2: an atom that finished without a match counts when a
+    /// stop ends the next. The document is empty, so its end is the first
+    /// run: `needle` is searched and rejected, then the stop comes before
+    /// `other`, at the fourth check (before the read, before the first
+    /// read of the source, before each atom). The whole-document path
+    /// counts the same rejection.
+    #[test]
+    fn a_stream_stopped_after_a_rejection_at_its_end_counts_it() {
+        let query = Query::parse(
+            "grep:needle grep:other",
+            UNIX_EPOCH + Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut read = |_, request: ReadRequest<'_>| {
+            let ReadRequest::Stream(each, _) = request else {
+                panic!("line-local reads stream");
+            };
+            each(&mut &b""[..], 0).ok()?;
+            Some(ReadVersion::Catalogued)
+        };
+        let mut verifier = Verifier::new(&query, &mut read, 1);
+        let checks = Cell::new(0);
+        let stopped = || {
+            checks.set(checks.get() + 1);
+            checks.get() >= 4
+        };
+        let settled = verifier.here(0, ferret_catalog::NameId(0), &stopped);
+        assert!(matches!(settled, Settled::Stopped));
+        let tally = &verifier.tally;
+        assert_eq!(tally.changed, 0);
+        assert_eq!(tally.matching.regex_documents, 1);
+        assert_eq!(tally.matching.regex_rejected, 1);
+    }
+
+    /// Sol round 2: the stream finishes, then the stop comes in the host's
+    /// own checks after it (its bracketing `fstat`, say). Whether the host
+    /// still returns a version or gives up, the document is stopped, not
+    /// accepted and not a change, and both finished atoms count.
+    #[test]
+    fn a_stream_stopped_after_it_finished_counts_its_work() {
+        for host_returns in [Some(ReadVersion::Catalogued), None] {
+            let query = Query::parse(
+                "grep:needle grep:other",
+                UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap();
+            let stop = Cell::new(false);
+            let mut read = |_, request: ReadRequest<'_>| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("line-local reads stream");
+                };
+                each(&mut &b"a needle\nother\n"[..], 15).ok()?;
+                stop.set(true);
+                host_returns
+            };
+            let mut verifier = Verifier::new(&query, &mut read, 1);
+            let settled = verifier.here(0, ferret_catalog::NameId(0), &|| stop.get());
+            assert!(matches!(settled, Settled::Stopped), "{host_returns:?}");
+            let tally = &verifier.tally;
+            assert_eq!(tally.changed, 0, "{host_returns:?}");
+            assert_eq!(tally.matching.regex_documents, 2, "{host_returns:?}");
+            assert_eq!(tally.matching.regex_bytes, 30, "{host_returns:?}");
+            assert!(verifier.exact.is_empty());
+        }
+    }
+
+    /// Sol round 2: a whole-document read that fails as the run is
+    /// cancelled is stopped, not a change.
+    #[test]
+    fn a_whole_read_failing_as_the_run_stops_is_not_a_change() {
+        let query = Query::parse("grep:(?s)need.e", UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+        assert!(!super::streams(&query.atoms));
+        let stop = Cell::new(false);
+        let mut read = |_, request: ReadRequest<'_>| {
+            let ReadRequest::Bytes(..) = request else {
+                panic!("a `(?s)` pattern reads whole");
+            };
+            stop.set(true);
+            None
+        };
+        let mut verifier = Verifier::new(&query, &mut read, 1);
+        let settled = verifier.here(0, ferret_catalog::NameId(0), &|| stop.get());
+        assert!(matches!(settled, Settled::Stopped));
+        assert_eq!(verifier.tally.verified, 1);
+        assert_eq!(verifier.tally.changed, 0);
     }
 }
 

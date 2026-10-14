@@ -126,7 +126,9 @@ pub struct ContentReport {
     /// Paths whose current version differs from the catalog, or whose
     /// read/stat failed (including size/allocation refusal). Stable changed
     /// bytes are evaluated for this path alone; vanished or unreadable
-    /// paths are dropped.
+    /// paths are dropped. A read that failed or was abandoned because the
+    /// run was cancelled is not counted: it shows the cancellation, not a
+    /// change. An I/O failure that races cancellation is not counted either.
     pub changed: u64,
     /// The matcher's work over the documents read: atoms checked, rejected
     /// by byte search alone, tokenized whole, bytes tokenized.

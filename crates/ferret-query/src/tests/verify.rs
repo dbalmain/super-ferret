@@ -577,6 +577,29 @@ fn a_ready_head_is_taken_before_the_rest_of_its_batch() {
     assert_eq!(comparable((rows, stats)), comparable(one));
 }
 
+/// Sol round 2: a stop that comes while a row is settled ends the run
+/// before the row is emitted. `a2` is `a1`'s document, answered from the
+/// cache once a stat says it is the catalogued version; the stop comes in
+/// that stat.
+#[test]
+fn a_stop_during_a_cached_names_stat_emits_nothing_more() {
+    let fx = fixture("emit-guard", &[("a1", 10, 1), ("a2", 10, 1)]);
+    for threads in [1, 2] {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let script = Script::new([("a1", "needle"), ("a2", "needle")]).on_stat({
+            let cancelled = Arc::clone(&cancelled);
+            move |name| {
+                if name == "a2" {
+                    cancelled.store(true, Ordering::Release);
+                }
+            }
+        });
+        let (rows, _) = run(&fx, "grep:needle", threads, &script, Some(&cancelled), all);
+        assert_eq!(names(&rows), ["a1"], "{threads} threads");
+        assert_eq!(script.requests("a2"), ["stat"], "{threads} threads");
+    }
+}
+
 /// Sol round 2: the ordering pass for overlay catalogs runs over every
 /// document id, holes included, and asks to stop as it goes: every
 /// [`ferret_index::DocSet::CHECK_EVERY`] ids, and before a long slice.
