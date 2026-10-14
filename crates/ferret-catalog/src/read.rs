@@ -145,7 +145,8 @@ pub enum Target {
 }
 
 impl Target {
-    pub(crate) fn from_child(child: InoId) -> Self {
+    /// What a name's child column value names.
+    pub fn from_child(child: InoId) -> Self {
         Kind::from_ignored_child(child.0).map_or(Self::Inode(child), Self::Ignored)
     }
 }

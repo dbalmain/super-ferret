@@ -180,8 +180,9 @@ impl DocNames {
 
     /// As [`DocNames::new`], `Ok(None)` once `cancelled` answers true. It is
     /// asked at entry, after loading, after every [`DocSet::CHECK_EVERY`]
-    /// names each name pass reads, every [`DocSet::CHECK_EVERY`] ids of the
-    /// prefix pass, and on each side of copying the offsets. A host that
+    /// names the name pass reads, every [`DocSet::CHECK_EVERY`] ids of the
+    /// prefix pass, on each side of copying the offsets, and every
+    /// [`DocSet::CHECK_EVERY`] names the fill places. A host that
     /// caches the result publishes it only when this returns one.
     pub fn new_until(
         catalog: &Catalog,
@@ -197,26 +198,25 @@ impl DocNames {
         }
         let bound = catalog.next_doc().0 as usize;
         let mut starts = vec![0u32; bound + 1];
-        // False when cancelled before every name was seen.
-        let each = |f: &mut dyn FnMut(usize, NameId)| {
-            let names = catalog.name_reader().runs_from(NameId(0));
-            for (seen, (id, name)) in names.enumerate() {
-                if (seen + 1).is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
-                    return false;
-                }
-                if let Target::Inode(inode) = name.target()
-                    && catalog.is_live_name(id)
-                    && catalog.is_live_inode(inode)
-                    && let Some(doc) = catalog.doc(inode)
-                    && (doc.0 as usize) < bound
-                {
-                    f(doc.0 as usize, id);
-                }
+        // One pass over the child column (a name's bytes are not needed),
+        // keeping each document-bearing name with its document; the fill
+        // reads these rather than walking the names again. A second walk
+        // cost as much as the first, 2 ms at 112k names; these cost 8 bytes
+        // a document's name until the build returns.
+        let mut found = Vec::new();
+        for (seen, (id, child)) in catalog.name_reader().child_ids().enumerate() {
+            if (seen + 1).is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
+                return Ok(None);
             }
-            true
-        };
-        if !each(&mut |doc, _| starts[doc + 1] += 1) {
-            return Ok(None);
+            if let Target::Inode(inode) = Target::from_child(child)
+                && catalog.is_live_name(id)
+                && catalog.is_live_inode(inode)
+                && let Some(doc) = catalog.doc(inode)
+                && (doc.0 as usize) < bound
+            {
+                starts[doc.0 as usize + 1] += 1;
+                found.push((doc.0, id));
+            }
         }
         for d in 0..bound {
             if d.is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
@@ -232,11 +232,14 @@ impl DocNames {
             return Ok(None);
         }
         let mut names = vec![NameId(0); starts[bound] as usize];
-        let filled = each(&mut |doc, id| {
-            names[fill[doc] as usize] = id;
-            fill[doc] += 1;
-        });
-        Ok(filled.then_some(Self { starts, names }))
+        for (seen, &(doc, id)) in found.iter().enumerate() {
+            if (seen + 1).is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
+                return Ok(None);
+            }
+            names[fill[doc as usize] as usize] = id;
+            fill[doc as usize] += 1;
+        }
+        Ok(Some(Self { starts, names }))
     }
 
     /// The document's live names, ascending; empty for an id it never saw.
