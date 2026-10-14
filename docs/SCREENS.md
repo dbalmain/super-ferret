@@ -374,17 +374,22 @@ Measured 2026-10-13 on branch `wt/par-verify` (D76 C). Aggregates are in
 [`measurements/par-verify/`](measurements/par-verify/).
 
 **What changed.** A content query's Maybe documents are now verified on a
-pool of threads (`ferret-query/src/verify.rs`). The calling thread still
-produces candidate rows in name order. It hands each new document to a
-worker, and it emits rows from the head of a window in the same order as
-before. For files that do not change during the query, and without
-cancellation, output is byte-identical at any thread count: rows,
-`--limit`, refusals, exit status, stderr, stdout and the query log's
-counts. Only the times and the thread count itself differ. Two tests
-compare 1 thread against several, including files that vanished, changed,
-became unreadable or grew too large after indexing. Tests with a scripted
-reader in `ferret-query` force the completion orders that matter rather
-than waiting for the scheduler to produce them.
+pool of threads (`ferret-query/src/verify.rs`). On `wt/scan` the workers do
+the candidate work as well: they claim batches of positions in name order
+from an atomic counter and, for each position, run the name tests, read the
+document if the position is its first name in the run, evaluate the residual
+and build the path. Each finished position is posted to its batch's slot in
+a ring. The calling thread takes positions from the head of the ring in name
+order, settles a later name of a document from the document's cached answers
+(with a stat, or a read of its own if the file changed), and emits the rows
+in the same order as before. For files that do not change during the query,
+and without cancellation, output is byte-identical at any thread count:
+rows, `--limit`, refusals, exit status, stderr, stdout and the query log's
+counts. Only the times and the thread count itself differ. Two tests compare
+1 thread against several, including files that vanished, changed, became
+unreadable or grew too large after indexing. Tests with a scripted reader in
+`ferret-query` force the completion orders that matter rather than waiting
+for the scheduler to produce them.
 
 Verification observes a file's bytes when it reads them. A worker can read
 a document up to 16 batches of up to 256 positions per thread ahead of the
