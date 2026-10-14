@@ -61,6 +61,16 @@ pub(crate) fn fan_out<I: Send, T: Send>(
         .collect()
 }
 
+/// The cores this process may run on; a test may say otherwise, so that
+/// a parallel path runs on a machine with one.
+pub(crate) fn cores() -> usize {
+    #[cfg(test)]
+    if let Some(cores) = seam::current().cores {
+        return cores;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -84,7 +94,7 @@ fn spawn<'scope>(
 
 /// Test-only control of [`fan_out`]'s helpers, set per thread and carried
 /// into the helpers it starts: a helper index from which spawning fails,
-/// and a count of the spawns asked for.
+/// a count of the spawns asked for, and the cores to report.
 #[cfg(test)]
 pub(crate) mod seam {
     use std::cell::RefCell;
@@ -97,6 +107,8 @@ pub(crate) mod seam {
         pub fail_from: Option<usize>,
         /// Spawns asked for, failed or not.
         pub asked: Arc<AtomicUsize>,
+        /// The cores [`super::cores`] reports, when set.
+        pub cores: Option<usize>,
     }
 
     thread_local! {

@@ -1188,8 +1188,11 @@ fn a_resident_conversion_is_the_same_whatever_threads_start() {
     // What converting `dir` gives with helpers from `fail_from` refused:
     // the resident names, or the error; and how many spawns were asked.
     let convert = |dir: &Path, fail_from: Option<usize>| {
+        // Four cores whatever the machine has, so the build is parallel
+        // with one available CPU too.
         let seams = Seams {
             fail_from,
+            cores: Some(4),
             ..Seams::default()
         };
         let asked = Arc::clone(&seams.asked);

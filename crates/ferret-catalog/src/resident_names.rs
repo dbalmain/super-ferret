@@ -234,9 +234,7 @@ impl ResidentNames {
     pub(crate) fn threads(rows: u32) -> usize {
         match rows < PARALLEL_ROWS {
             true => 1,
-            false => std::thread::available_parallelism()
-                .map_or(1, |n| n.get())
-                .min(BUILD_THREADS),
+            false => crate::fan_out::cores().min(BUILD_THREADS),
         }
     }
 
