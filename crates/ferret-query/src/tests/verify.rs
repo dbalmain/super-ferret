@@ -550,10 +550,12 @@ fn pairs_script(names: &[String]) -> Script {
 fn a_ready_head_is_taken_before_the_rest_of_its_batch() {
     let (fx, files) = pairs_fixture("batch-limit");
     let told = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(Signal::default());
     let script = pairs_script(&files).gated({
-        let told = Arc::clone(&told);
+        let (told, entered) = (Arc::clone(&told), Arc::clone(&entered));
         move |name, stop| {
             if name == "a1" {
+                entered.set();
                 let deadline = Instant::now() + PATIENCE;
                 while !stop() && Instant::now() < deadline {
                     std::thread::yield_now();
@@ -562,7 +564,13 @@ fn a_ready_head_is_taken_before_the_rest_of_its_batch() {
             }
         }
     });
-    let (rows, stats) = run(&fx, "grep:needle", 2, &script, None, limit(1));
+    // `a0`'s callback waits until `a1`'s read has begun: a correct pool
+    // may otherwise emit `a0` and stop before `a1` is ever read.
+    let entered = Arc::clone(&entered);
+    let (rows, stats) = run(&fx, "grep:needle", 2, &script, None, |rows| {
+        entered.wait("a1's read");
+        limit(1)(rows)
+    });
     assert!(told.load(Ordering::Acquire), "a0 waited for a1's read");
     assert_eq!(names(&rows), ["a0"]);
     let one = run(&fx, "grep:needle", 1, &pairs_script(&files), None, limit(1));
