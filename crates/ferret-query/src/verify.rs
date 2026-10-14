@@ -1072,8 +1072,10 @@ fn streams(atoms: &[ContentAtom]) -> bool {
 /// [`verify`] for line-local patterns ([`ferret_verify::Grep::is_line_local`]):
 /// the document streams through `buffer`, and each read is searched up to
 /// its last `\n`, not including it, with the partial line after it carried
-/// to the next. A line longer than the buffer grows it. The run stops early
-/// once every atom has matched.
+/// to the next. A line longer than the buffer grows it, by doubling, up to
+/// the rest of the document's declared length: a document's buffer is never
+/// larger than [`LINES`] or its length. The run stops early once every atom
+/// has matched.
 ///
 /// The answers are the whole-document search's. The first match of a
 /// line-local pattern in a document is the first match in the first run of
@@ -1122,13 +1124,25 @@ fn stream(
             if stopped() {
                 return halt(false);
             }
-            if filled == buffer.len() {
-                buffer.resize(buffer.len() * 2, 0);
-            }
-            let n = match source.read(&mut buffer[filled..]) {
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+            // The source holds at most `len` bytes: once they are all in,
+            // that is the end, and the buffer never grows past them.
+            let left = len.saturating_sub(base as u64 + filled as u64);
+            let n = match left {
+                0 => 0,
+                _ => {
+                    if filled == buffer.len() {
+                        let grown = (buffer.len() * 2).min(filled + left as usize);
+                        buffer
+                            .try_reserve_exact(grown - buffer.len())
+                            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                        buffer.resize(grown, 0);
+                    }
+                    match source.read(&mut buffer[filled..]) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
             };
             // `buffer[..filled]` held no `\n` before this read.
             let fresh = filled;
@@ -1897,6 +1911,47 @@ mod streamed {
                 ));
                 let shown = String::from_utf8_lossy(&doc[..doc.len().min(80)]);
                 assert_eq!(got, expected, "{pattern} over {shown:?}");
+            }
+        }
+    }
+
+    /// Sol round 1, P6: a line as long as the document grows the buffer to
+    /// the document's length and no further, at the doubling boundaries
+    /// and at 8 MiB, the size cap, and the answers stay the whole search's.
+    #[test]
+    fn a_long_line_grows_the_buffer_to_the_documents_length_at_most() {
+        use super::LINES;
+        let query = Query::parse("grep:a$ grep:ab", UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+        let never = || false;
+        let regexes = Hand::new(&mut |_, _| None, &query.atoms).regexes;
+        for size in [
+            LINES - 1,
+            LINES,
+            LINES + 1,
+            2 * LINES - 1,
+            2 * LINES,
+            3 * LINES,
+            8 << 20,
+        ] {
+            for end in [b'a', b'\n'] {
+                let mut doc = vec![b'a'; size];
+                doc[size - 1] = end;
+                let mut read = |_, request: ReadRequest<'_>| {
+                    let ReadRequest::Stream(each, _) = request else {
+                        panic!("line-local reads stream");
+                    };
+                    each(&mut doc.as_slice(), doc.len() as u64).ok()?;
+                    Some(ReadVersion::Catalogued)
+                };
+                let mut buffer = Vec::new();
+                let got = answers(stream(&regexes, &mut read, &mut buffer, NameId(0), &never));
+                let at = size - 1 - usize::from(end == b'\n');
+                assert_eq!(got.0, [Some(at), None], "{size} ending {end}");
+                assert!(
+                    buffer.capacity() <= size.max(LINES),
+                    "{size} ending {end}: a {} byte buffer",
+                    buffer.capacity()
+                );
             }
         }
     }
