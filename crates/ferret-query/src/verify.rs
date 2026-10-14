@@ -1961,18 +1961,40 @@ mod streamed {
         }
     }
 
+    /// Random documents from pieces that include CRLF, NUL, two- and
+    /// three-byte characters (which the dribbled reads split), and
+    /// malformed UTF-8: a lone continuation byte, a truncated lead, and
+    /// 0xff.
     fn documents() -> Vec<Vec<u8>> {
-        let alphabet = b"ao f\nk1_\n";
+        let alphabet: [&[u8]; 16] = [
+            b"a",
+            b"o",
+            b" ",
+            b"f",
+            b"\n",
+            b"k",
+            b"1",
+            b"_",
+            b"\n",
+            b"\r\n",
+            b"\0",
+            "\u{e9}".as_bytes(),
+            "\u{65e5}".as_bytes(),
+            b"\xa9",
+            b"\xe6\x97",
+            b"\xff",
+        ];
         let mut seed = 0x2545_f491_u64;
         let mut docs: Vec<Vec<u8>> = (0..300)
             .map(|_| {
                 seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 let len = (seed >> 33) as usize % 300;
                 (0..len)
-                    .map(|_| {
+                    .flat_map(|_| {
                         seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                         alphabet[(seed >> 33) as usize % alphabet.len()]
                     })
+                    .copied()
                     .collect()
             })
             .collect();
@@ -1998,13 +2020,46 @@ mod streamed {
     #[test]
     fn streamed_answers_are_the_whole_documents() {
         let patterns = [
-            "foo", "^foo", "foo$", "^$", r"\bfo", r"o\b", r"\Bo", "^a*$", "k1", "(?i)K", "[a-z]+1",
-            "f.o", "^", "$", "a{3}", "_$", r"^\b", r"\b$", "(?-u)o_",
+            "foo",
+            "^foo",
+            "foo$",
+            "^$",
+            r"\bfo",
+            r"o\b",
+            r"\Bo",
+            "^a*$",
+            "k1",
+            "(?i)K",
+            "[a-z]+1",
+            "f.o",
+            "^",
+            "$",
+            "a{3}",
+            "_$",
+            r"^\b",
+            r"\b$",
+            "(?-u)o_",
+            r"\r$",
+            r"\x00",
+            r"a\x00",
+            "\u{e9}",
+            "(?i)\u{c9}",
+            "\u{65e5}",
+            r"\w+$",
+            "^.$",
+            "f.$",
+            r"[^a\r\n]+$",
+            r"(?-u)\xff",
+            r"(?-u)[\x80-\xff]{2}",
+            r"(?-u)^[^\x00\n]*$",
         ];
         let docs = documents();
         let never = || false;
-        for pattern in patterns {
-            let text = format!("grep:{pattern} grep:a");
+        for (i, pattern) in patterns.into_iter().enumerate() {
+            // Every other query negates its second atom: the answers are
+            // the atoms', whatever the expression does with them.
+            let not = if i % 2 == 0 { "" } else { "NOT " };
+            let text = format!("grep:{pattern} {not}grep:a");
             let query = Query::parse(&text, UNIX_EPOCH + Duration::from_secs(1)).unwrap();
             assert!(streams(&query.atoms), "{pattern} is line-local");
             for doc in &docs {
