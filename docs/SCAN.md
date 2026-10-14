@@ -11,10 +11,11 @@ is the baseline that later slices are judged by. It optimises nothing.
 
 ## Summary
 
-- **After the scan work (wt/scan, c6335b4):** end to end at the default of 16
-  threads we take 163–175 ms warm in ci against `rg`'s 164–174, and 158–171 in
-  cs against its 146–159. Cold we still win, 3.4–4.3 s against 5.1–6.2. The rest
-  of this summary is the baseline.
+- **After the scan work (wt/scan, 0d51f02):** end to end at the default of 16
+  threads we take 146–155 ms warm in ci against `rg`'s 162–180, and 136–151 in
+  cs against its 147–163: level on cs rare literals, ahead everywhere else. Cold
+  we still win, 3.5–3.9 s against 5.1–5.4. The rest of this summary is the
+  baseline.
 - **Cold, we already beat `rg`, by 1.3–1.6×.** Both read the same 4.29 GB from
   the device. We take 3.8–4.1 s and `rg` takes 5.2–6.1 s.
 - **Warm, we lose on every class, by 3.2–6×.** `rg` takes 149–171 ms. Our best
@@ -260,9 +261,9 @@ From our own code (`ferret-verify/src/trigram.rs`, `GrepFlags::regex`, and
 
 ## After the scan work
 
-Measured 2026-10-14 on `wt/scan`. Four steps, each aimed at one of the costs
-above, then two cuts to the serial setup of a one-shot search. Per-step figures
-are a quick subset, the first 5 queries of each class, in
+Measured 2026-10-14 and 15 on `wt/scan`. Four steps, each aimed at one of the
+costs above, then cuts to the serial setup of a one-shot search. Per-step
+figures are a quick subset, the first 5 queries of each class, in
 [`measurements/scan/steps.txt`](measurements/scan/steps.txt). The full 250-query
 runs after step 4 are in
 [`measurements/scan/after.txt`](measurements/scan/after.txt). Every arm stayed
@@ -282,6 +283,7 @@ warm and 5.1–5.3 s cold throughout.
 | 3. required run first  | 3fa8597 | 162–216 (16 thr), code 162  | 155–173 (16 thr)   | 187–214           | 182–191     | unchanged     |
 | 4. default 16 threads  | 75db759 | 162–189 (full run)          | 154–165 (full run) | 174–204           | 171–176     | 3.5–3.9 s     |
 | setup cuts             | c6335b4 | —                           | —                  | 163–175           | 158–171     | e2e 3.4–4.3 s |
+| parallel setup         | 0d51f02 | —                           | —                  | 146–155           | 136–151     | e2e 3.5–3.9 s |
 
 1. **The calling thread only emits.** Workers claim batches from an atomic
    counter and do each position's tests, read, residual and path; the caller
@@ -341,46 +343,74 @@ the right rule.
 ### End to end
 
 `ferret search --scan` as a process at the default 16 threads, against `rg` on
-the same files; 5 queries per class at 75db759 (after.txt), 10 per class at
-c6335b4.
+the same files; 5 queries per class at 75db759 (after.txt), 10 per class later.
 
 |                   | ci warm | cs warm | ci cold     | cs cold     |
 | ----------------- | ------- | ------- | ----------- | ----------- |
 | `ferret`, 75db759 | 174–204 | 171–176 | 3.49–3.84 s | 3.48–3.91 s |
 | `ferret`, c6335b4 | 163–175 | 158–171 | 3.43–4.28 s | 3.45–3.88 s |
 | `rg`, same run    | 164–174 | 146–159 | 5.16–6.21 s | 5.11–5.17 s |
+| `ferret`, 0d51f02 | 146–155 | 136–151 | 3.49–3.88 s | 3.49–3.84 s |
+| `rg`, same runs   | 162–180 | 147–163 | 5.13–5.22 s | 5.17–5.37 s |
 
-Cold, we beat `rg` by 1.2–1.5×. Warm, we tie it in ci: 1–6 ms behind on four
-classes and 11 ms ahead on alternations (163 against 174). In cs we trail by
-0–20 ms: equal on alternations, 12–20 ms behind on the other four classes. The
-c6335b4 rows are in
-[`measurements/scan/setup.txt`](measurements/scan/setup.txt).
+At c6335b4 we tied `rg` warm in ci and trailed it by 0–20 ms in cs. The named
+cause was serial setup, below. With the setup on several threads (0d51f02), we
+beat `rg` warm on every class in ci, by 10–26 ms. In cs we are level on rare
+literals (146.3 against 146.7 ms, and 146.8 against 149.1 in a repeat) and ahead
+by 2–22 ms on the other four. Cold we beat it by 1.3–1.5×. The cs run was
+repeated because two of its cold medians, and `rg`'s on the same classes, came
+out 0.3–1 s high; the repeat is the cs cold row. The rows are in
+[`measurements/scan/setup.txt`](measurements/scan/setup.txt) and
+[`measurements/scan/parallel-setup.txt`](measurements/scan/parallel-setup.txt).
 
 ### Remaining gap
 
-The named cause is serial work before the first read. A no-daemon process
-reaches its first document read about 50 ms after exec, instrumented at 16
-threads, and `rg` needs no such stage:
+The named cause of the warm gap was serial work before the first read. A
+no-daemon process reached its first document read about 50 ms after exec,
+instrumented at 16 threads, and `rg` has no such stage. Medians of a few
+instrumented runs on the scan catalog (112,377 names), in ms:
 
-- **Catalog residency: 33 ms.** `Engine::open` builds the resident names
-  (`Catalog::into_resident`): loading 6.5 ms, interning 2.06M names 9–11 ms,
-  sorting the distinct names 11 ms, packing 2 ms, postings 3.3 ms.
-- **The content setup: about 7 ms** (doc names, live set, pin), then S1's id
-  pass at 4.3 ms.
-- **The certainty table: 3–20 ms.** With no content index every trigram key
-  covers every live document, yet each key built a bitmap cursor over all of
-  them. 20 ms was a ci alternation.
+| Stage                                | 75db759 | c6335b4 | 0d51f02 |
+| ------------------------------------ | ------: | ------: | ------: |
+| Catalog residency, in `Engine::open` |      33 |      26 |       9 |
+| Document names, live set and pin     |     6–7 |     6–7 |       4 |
+| S1's id pass                         |       4 |       4 |       4 |
+| Certainty table                      |    3–20 | about 1 | about 1 |
 
-Cut so far (03717d6, c6335b4): the intern map is presized and distinct names
-sort on an 8-byte prefix first, so residency is 26 ms. A tree whose keys have no
-postings is now the live bitmap itself, so the certainty table costs nothing
-here.
+- **03717d6** presizes the intern map and sorts distinct names on an 8-byte
+  prefix first.
+- **c6335b4**: with no content index every trigram key covers every live
+  document, yet each key built a bitmap cursor over all of them. A tree whose
+  keys have no postings is now the live bitmap itself.
+- **e6b3134** builds the resident names on up to 8 threads. Names are split at
+  sampled 8-byte-prefix ranges, so each part interns, sorts and posts its own
+  names, and the parts' tables concatenate into the whole one: no merge, and the
+  same bytes at any thread count, which a test checks at 1 to 255. The other
+  catalog sections load on four threads during the build. `load_all` then checks
+  every section in order, so a failure is reported as before.
+- **0d51f02** builds the document names in one pass over the child column, not
+  two over the names: 5.9 ms to 3.8.
 
-What remains is about 37 ms of serial work (26 + 7 + 4), more than the cs gap:
-the scan itself now takes less wall than `rg`'s whole run. What is left is
-mostly residency, which a daemon would pay once and a one-shot process pays
-every time. `search` does not start a daemon. Whether a one-shot search should
-build it at all is D78.
+What is left is about 18 ms, and the scan itself now takes less wall than `rg`'s
+whole run. Taking each piece in turn:
+
+- **Residency, 9 ms.** The names must load and be checked before the build
+  starts (1.8 ms). The build's passes take about 3.5 ms on 8 threads, and its
+  packing 2 ms on three, mostly bit-packing at about 8 ns a value. A daemon pays
+  this once. Whether a one-shot search should build it at all is D78.
+- **Document names, 4 ms.** Every content query needs them. They could be built
+  alongside S1's pass, since neither reads the other, but `Content` takes them
+  built, and making that lazy changes an interface every host and test uses. Not
+  done.
+- **S1's id pass, 4 ms.** It cannot be skipped: it is where liveness, the
+  structural suppression and the result-kind domain apply to each name. Its path
+  building is wasted on a content query, since the workers build the paths
+  again, but skipping it saves only 0.6 ms (measured). Running it by name range
+  on several threads would keep its order, since chunks concatenate; it is the
+  next candidate if the gap reopens.
+- **Overlapping setup with the reads** was not tried. The setup cuts closed the
+  gap first. The reads need S1's ids, so starting them early means streaming S1
+  into the pool, which touches the limit and count invariants.
 
 ## Reproduce
 

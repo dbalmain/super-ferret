@@ -4905,28 +4905,28 @@ C.
 
 ## D78 — Should a one-shot `ferret search` build resident names?
 
-**Status: open for Dave (2026-10-14, branch `wt/scan`).** Measured in
-[SCAN.md § Remaining gap](SCAN.md#remaining-gap): a no-daemon `ferret search
---scan` over the D65C catalog (2.06M name rows) spends 26 ms in
-`Engine::open` building the resident names (D54 B's interned table and
-postings) before it reads a document. After the scan work the whole query
-takes 158–175 ms warm, against `rg`'s 146–174, so this is the largest single
-piece of the remaining warm gap. A daemon pays it once; `search` does not
-start one.
+**Status: open for Dave (2026-10-14, updated 2026-10-15; branch `wt/scan`).**
+Measured in [SCAN.md § Remaining gap](SCAN.md#remaining-gap): a no-daemon
+`ferret search --scan` over the D65C catalog (112,377 name rows) spent 26 ms in
+`Engine::open` building the resident names (D54 B's interned table and postings)
+before it read a document. The build now runs on up to 8 threads, with the other
+sections loading alongside, and costs about 9 ms. The whole query now takes
+136–155 ms warm against `rg`'s 147–180, so this no longer decides the comparison
+with `rg`. A daemon pays it once; `search` does not start one.
 
-**Question:** Should a one-shot search keep building the resident names on
-open, build them only when a query needs them, or load them prebuilt?
+**Question:** Should a one-shot search keep building the resident names on open,
+build them only when a query needs them, or load them prebuilt?
 
-| Option | Costs | Buys |
-| --- | --- | --- |
-| A. Build on every open (today) | 26 ms per one-shot query here, about 125 ms at 10M rows (D40) if it scales with rows. | Nothing new to build or test; one catalog state per engine. |
-| B. Build lazily, on the first query that needs name search | An engine holding the catalog in two states, and a test that every name path forces the build. Saves nothing for queries that need names. | Up to 26 ms off every one-shot content query that needs no name search, if such queries exist (unverified: S1 may need the names for every query). |
-| C. Write the interned table in the checkpoint and load it | A storage format change, more checkpoint writing and index bytes; loading still costs a read and validation. | Most of the 26 ms off every one-shot query, names or not. |
+| Option                                                     | Costs                                                                                                                                                                               | Buys                                                                                                                                            |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Build on every open (today)                             | 9 ms per one-shot query here. At 10M rows (D40), about 0.8 s if it scales with rows, which is extrapolated, not measured; the serial build it replaced would have been about 2.3 s. | Nothing new to build or test; one catalog state per engine.                                                                                     |
+| B. Build lazily, on the first query that needs name search | An engine holding the catalog in two states, and a test that every name path forces the build. Saves nothing for queries that need names.                                           | Up to 7 ms here off every one-shot content query that needs no name search, if such queries exist (unverified: S1 reads names for every query). |
+| C. Write the interned table in the checkpoint and load it  | A storage format change, more checkpoint writing and index bytes; loading still costs a read and validation, about 2 ms for the name sections here.                                 | Most of the build off every one-shot query, names or not: about 7 ms here, and most of the extrapolated 0.8 s at 10M rows.                      |
 
-**Recommendation: A for now**, and measure B's premise first: whether a
-content-only query reaches any name search at all. If it does not, B, since
-it is local to the engine.
+**Recommendation: A for now.** At this catalog's size the build is 9 ms of a
+query that already beats `rg`. Measure the build on a 10M-row catalog before
+choosing B or C.
 
-**Fact that would change it:** if agents mostly run one-shot `search`
-without a daemon (D71-style habits), the 26 ms recurs on every call and C
-becomes worth its format change. If a daemon is started for them, A.
+**Fact that would change it:** a measured build of hundreds of milliseconds on a
+10M-row catalog, with agents running one-shot `search` without a daemon, makes C
+worth its format change. If a daemon is started for them, A.
