@@ -577,6 +577,42 @@ fn a_ready_head_is_taken_before_the_rest_of_its_batch() {
     assert_eq!(comparable((rows, stats)), comparable(one));
 }
 
+/// Sol round 2: the ordering pass for overlay catalogs runs over every
+/// document id, holes included, and asks to stop as it goes: every
+/// [`ferret_index::DocSet::CHECK_EVERY`] ids, and before a long slice.
+#[test]
+fn the_name_ordering_pass_asks_to_stop() {
+    use ferret_catalog::NameId;
+    use ferret_index::DocSet;
+
+    let every = DocSet::CHECK_EVERY;
+    // Empty documents up to the last, which has two names out of order.
+    let mut starts = vec![0u32; 3 * every + 1];
+    starts.push(2);
+    let asked = AtomicUsize::new(0);
+    let count = || {
+        asked.fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    let mut names = [NameId(5), NameId(1)];
+    assert_eq!(crate::plan::order(&starts, &mut names, &count), Some(()));
+    assert_eq!(names, [NameId(1), NameId(5)]);
+    assert_eq!(asked.load(Ordering::Relaxed), 4);
+    // A stop at the second check leaves the last document as it was.
+    let mut names = [NameId(5), NameId(1)];
+    let calls = AtomicUsize::new(0);
+    let stop_second = || calls.fetch_add(1, Ordering::Relaxed) >= 1;
+    assert_eq!(crate::plan::order(&starts, &mut names, &stop_second), None);
+    assert_eq!(names, [NameId(5), NameId(1)]);
+    // One long document, second: asked before its sort.
+    let starts = [0, 1, 1 + every as u32];
+    let mut names: Vec<_> = (0..=every as u32).rev().map(NameId).collect();
+    let calls = AtomicUsize::new(0);
+    let stop_second = || calls.fetch_add(1, Ordering::Relaxed) >= 1;
+    assert_eq!(crate::plan::order(&starts, &mut names, &stop_second), None);
+    assert!(!names[1..].is_sorted());
+}
+
 /// Prompt head emission: `a0`'s row is emitted while `a1`, after it in its
 /// batch, is still being read; `a1`'s read waits for that emission.
 #[test]

@@ -239,10 +239,16 @@ impl DocNames {
         }
         // The checkpoint's names come in id order, then the overlay's, which
         // may reuse a lower id: then a document's names are sorted here.
-        if !found.is_sorted_by_key(|&(_, id)| id) {
-            for doc in starts.windows(2) {
-                names[doc[0] as usize..doc[1] as usize].sort_unstable();
-            }
+        if cancelled() {
+            return Ok(None);
+        }
+        if !found.is_sorted_by_key(|&(_, id)| id)
+            && order(&starts, &mut names, &cancelled).is_none()
+        {
+            return Ok(None);
+        }
+        if cancelled() {
+            return Ok(None);
         }
         Ok(Some(Self { starts, names }))
     }
@@ -260,6 +266,27 @@ impl DocNames {
     pub fn bytes(&self) -> usize {
         (self.starts.len() + self.names.len()) * 4
     }
+}
+
+/// Sorts each document's slice of `names`, the documents delimited by
+/// `starts`; `None` once `cancelled` says so. The pass runs over every
+/// document id, holes included, so `cancelled` is asked every
+/// [`DocSet::CHECK_EVERY`] ids and before any slice that long.
+pub(crate) fn order(
+    starts: &[u32],
+    names: &mut [NameId],
+    cancelled: &impl Fn() -> bool,
+) -> Option<()> {
+    for (d, doc) in starts.windows(2).enumerate() {
+        let names = &mut names[doc[0] as usize..doc[1] as usize];
+        if (d.is_multiple_of(DocSet::CHECK_EVERY) || names.len() >= DocSet::CHECK_EVERY)
+            && cancelled()
+        {
+            return None;
+        }
+        names.sort_unstable();
+    }
+    Some(())
 }
 
 impl Query {
