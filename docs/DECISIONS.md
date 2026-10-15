@@ -4912,7 +4912,8 @@ C.
 
 ## D78 — Should a one-shot `ferret search` build resident names?
 
-**Status: open for Dave (2026-10-14, updated 2026-10-15; branch `wt/scan`).**
+**Status: answered 2026-10-15, A. Dave took the recommendation; nothing to
+build.**
 Measured in [SCAN.md § Remaining gap](SCAN.md#remaining-gap): a no-daemon
 `ferret search --scan` over the D65C catalog (112,377 name rows) spent 26 ms in
 `Engine::open` building the resident names (D54 B's interned table and postings)
