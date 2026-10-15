@@ -16,6 +16,8 @@
 //!   path or an id, but query text is logged as typed and may contain a path.
 //! - [`xdg`] resolves directories from the environment and touches no files;
 //!   [`setup`] writes the files a new install starts with.
+//! - [`settings`]: the index's settings file, written when the index is created
+//!   (D77).
 //! - [`protocol`]: the shared bounded reader for batch requests, socket
 //!   envelopes and events.
 //!
@@ -47,6 +49,7 @@ mod politeness;
 pub(crate) mod protocol;
 mod scheduler;
 pub mod search;
+pub mod settings;
 pub mod setup;
 pub mod stats;
 mod status;

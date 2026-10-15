@@ -7,7 +7,7 @@
 //! with its catalog view. A query-only engine does not open it in S2 M3.
 
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
@@ -45,6 +45,15 @@ pub struct QuerySession {
     /// What content queries derive from this catalog view, built by the
     /// first that needs it and shared by every pin of the view.
     derived: Arc<Derived>,
+    /// Shared by every pin of the engine.
+    threads: Arc<Threads>,
+}
+
+/// How many threads verify content, resolved by the first content query
+/// that needs it: one settings read per engine, no sysfs (D77).
+struct Threads {
+    index: PathBuf,
+    count: OnceLock<usize>,
 }
 
 /// Structures derived from one catalog view for content queries (docs/S2.md
@@ -70,6 +79,7 @@ impl Engine {
                 catalog,
                 content: None,
                 derived: Arc::default(),
+                threads: Threads::new(index),
             }),
             writer: Mutex::new(None),
             content: Mutex::new(None),
@@ -86,12 +96,14 @@ impl Engine {
     pub fn from_writer(writer: WriterSession) -> Self {
         OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
         let catalog = writer.view();
+        let threads = Threads::new(writer.dir());
         Self {
             current: RwLock::new(QuerySession {
                 names: Arc::new(NameIndex::new(&catalog)),
                 catalog,
                 content: None,
                 derived: Arc::default(),
+                threads,
             }),
             writer: Mutex::new(Some(writer)),
             content: Mutex::new(None),
@@ -354,6 +366,7 @@ impl Engine {
                 .content
                 .filter(|content| content.manifest().incarnation == incarnation),
             derived: Arc::default(),
+            threads: previous.threads,
         };
     }
 }
@@ -478,7 +491,15 @@ impl QuerySession {
         if is_cancelled(cancelled) {
             return Ok(Stats::default());
         }
-        self.search_content_threads(query, bound, search_threads(), cancelled, emit)
+        self.search_content_threads(query, bound, self.search_threads(), cancelled, emit)
+    }
+
+    /// Threads [`QuerySession::search_content`] verifies on, from
+    /// `FERRET_SEARCH_THREADS`, the index's settings file and
+    /// `available_parallelism` ([`search_threads`]). Resolved once per
+    /// engine, by the first call.
+    pub fn search_threads(&self) -> usize {
+        self.threads.get()
     }
 
     /// [`QuerySession::search_content`] verifying Maybe documents on
@@ -657,29 +678,65 @@ impl QuerySession {
     }
 }
 
-/// The most threads [`search_threads`] defaults to. Measured on 16 cores
-/// with 32 threads, a warm scan is fastest at 16 threads on every class, and
-/// 32 uses 60% more CPU for 10–20 ms more wall; a cold scan is 2–12% faster
-/// at 32 (docs/SCAN.md § Threads, D77).
+/// The most threads [`search_threads`] uses when the index stores no count
+/// (made before D77 C, or its cores could not be counted). Measured on 16
+/// cores with 32 threads, a warm scan is fastest at 16 threads on every
+/// class, and 32 uses 60% more CPU for 10–20 ms more wall; a cold scan is
+/// 2–12% faster at 32 (docs/SCAN.md § Threads, D77).
 const SEARCH_THREADS: usize = 16;
 
-/// Threads that verify a content query's Maybe documents:
-/// `FERRET_SEARCH_THREADS` if set to a positive number, else every available
-/// core up to [`SEARCH_THREADS`], read once per process (finding the cores
-/// reads cgroup files).
-pub fn search_threads() -> usize {
-    static THREADS: OnceLock<usize> = OnceLock::new();
-    *THREADS.get_or_init(|| {
-        std::env::var("FERRET_SEARCH_THREADS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&threads| threads > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(1, |n| n.get())
-                    .min(SEARCH_THREADS)
-            })
-    })
+/// Threads that verify a content query's Maybe documents. `env` is
+/// `FERRET_SEARCH_THREADS` parsed by [`env_threads`] and wins outright.
+/// Otherwise `stored`, the index's `search_threads` setting (the physical
+/// cores counted when it was created), capped by `available` so CPU
+/// affinity, cgroup quotas and a smaller machine still apply. Without a
+/// stored count, `available` up to [`SEARCH_THREADS`].
+pub fn search_threads(env: Option<usize>, stored: Option<usize>, available: usize) -> usize {
+    env.unwrap_or_else(|| available.min(stored.unwrap_or(SEARCH_THREADS)))
+}
+
+/// `FERRET_SEARCH_THREADS`'s value as a thread count: a positive number, or
+/// nothing.
+pub fn env_threads(value: Option<&str>) -> Option<usize> {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&threads| threads > 0)
+}
+
+impl Threads {
+    fn new(index: &Path) -> Arc<Self> {
+        Arc::new(Self {
+            index: index.to_path_buf(),
+            count: OnceLock::new(),
+        })
+    }
+
+    /// The count, reading the settings file only when the environment does
+    /// not decide it. An unusable file is warned about once per process and
+    /// treated as absent; it never fails the search.
+    fn get(&self) -> usize {
+        *self.count.get_or_init(|| {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            let env = env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref());
+            let stored = match env {
+                Some(_) => None,
+                None => match crate::settings::Settings::read(&self.index) {
+                    Ok(settings) => settings.and_then(|settings| settings.search_threads),
+                    Err(e) => {
+                        if !WARNED.swap(true, Ordering::Relaxed) {
+                            crate::cli::warn(&format!(
+                                "{}: {e}; searching on at most {SEARCH_THREADS} threads",
+                                self.index.join(crate::settings::FILE).display()
+                            ));
+                        }
+                        None
+                    }
+                },
+            };
+            let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+            search_threads(env, stored, available)
+        })
+    }
 }
 
 fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {

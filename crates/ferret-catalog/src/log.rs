@@ -637,6 +637,10 @@ impl Writer {
     pub fn view(&self) -> Catalog {
         self.current.clone()
     }
+    /// The catalog directory this writer holds the lock in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
     pub fn commit(
         &mut self,
         expected: Generation,

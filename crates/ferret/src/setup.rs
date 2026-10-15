@@ -77,7 +77,7 @@ fn parent_dir(path: &Path) -> &Path {
     }
 }
 
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
@@ -113,7 +113,11 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 /// Creates an owned temporary file, retrying names occupied by another setup
 /// invocation. `sequence` is injectable so collision handling can be tested
 /// without depending on process-global call order.
-fn create_temp(dir: &Path, name: &str, sequence: &AtomicU64) -> io::Result<(PathBuf, fs::File)> {
+pub(crate) fn create_temp(
+    dir: &Path,
+    name: &str,
+    sequence: &AtomicU64,
+) -> io::Result<(PathBuf, fs::File)> {
     const MAX_ATTEMPTS: usize = 128;
 
     for _ in 0..MAX_ATTEMPTS {
