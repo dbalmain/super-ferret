@@ -1,0 +1,89 @@
+# pure-scan end to end after the setup cuts: ferret search --scan as a process against rg
+# commit c6335b4 (wt/scan), 2026-10-14; ripgrep 15.1.0; same machine, corpus and flags as after.txt
+# command: SCAN_PER_CLASS=10 SCAN_E2E_PER_CLASS=10 ferret-bench pure-scan /tmp/d65c/catalog /tmp/d65c/corpus <oracle cache> <ci|cs> <scratch> rg,e2e
+#   e2e: FERRET_NO_DAEMON=1, ferret's default threads (16, D77)
+# Cold p90 outliers of 6-38 s on both tools are device stalls, as in baseline.txt; medians are unaffected.
+
+## case-insensitive (ci)
+population case_insensitive=true live=112382 readable=112376 bytes=3978812718 queries=50
+correctness arm=rg queries=50 file_set_equals_oracle=all
+correctness arm=e2e file_sets_equal_oracle=all
+| arm | cache | threads | class | queries | wall ms median/p90 | cpu ms median/p90 | device MB median | extras median/p90 |
+| rg -l | cold | default | rare literal | 10 | 5185.6/15634.2 | 2460.0/2750.0 | 4285 |  |
+| rg -l | cold | default | identifier pattern | 10 | 5121.0/5227.6 | 2500.0/2520.0 | 4285 |  |
+| rg -l | cold | default | alternation | 10 | 5128.3/5265.8 | 2530.0/2790.0 | 4222 |  |
+| rg -l | cold | default | broad | 10 | 5897.5/6187.9 | 2630.0/2790.0 | 4270 |  |
+| rg -l | cold | default | code class | 10 | 6114.1/6242.2 | 2440.0/3030.0 | 4278 |  |
+| rg -l | warm | default | rare literal | 10 | 166.5/170.6 | 1660.0/1730.0 | 0 |  |
+| rg -l | warm | default | identifier pattern | 10 | 167.2/174.3 | 1660.0/1730.0 | 0 |  |
+| rg -l | warm | default | alternation | 10 | 175.8/188.7 | 1750.0/1890.0 | 23 |  |
+| rg -l | warm | default | broad | 10 | 172.9/183.1 | 1770.0/1920.0 | 6 |  |
+| rg -l | warm | default | code class | 10 | 161.4/202.1 | 1610.0/2050.0 | 4 |  |
+| rg -l | warm | 32 | rare literal | 10 | 163.6/169.6 | 3770.0/4000.0 | 0 |  |
+| rg -l | warm | 32 | identifier pattern | 10 | 168.7/174.2 | 3810.0/3980.0 | 0 |  |
+| rg -l | warm | 32 | alternation | 10 | 164.7/176.8 | 3750.0/3940.0 | 2 |  |
+| rg -l | warm | 32 | broad | 10 | 165.8/169.1 | 3930.0/4020.0 | 0 |  |
+| rg -l | warm | 32 | code class | 10 | 167.4/172.8 | 3810.0/4210.0 | 0 |  |
+| e2e ferret | cold | default | rare literal | 10 | 4280.0/4334.6 | 2430.0/2460.0 | 4289 | stdout B 23/72 |
+| e2e ferret | cold | default | identifier pattern | 10 | 4242.5/4361.1 | 2480.0/2590.0 | 4280 | stdout B 1705/7216 |
+| e2e ferret | cold | default | alternation | 10 | 3432.5/3514.2 | 2360.0/2530.0 | 3510 | stdout B 183790/279957 |
+| e2e ferret | cold | default | broad | 10 | 3732.3/5897.5 | 2580.0/2760.0 | 4097 | stdout B 25752/47759 |
+| e2e ferret | cold | default | code class | 10 | 3793.6/3900.8 | 2400.0/2460.0 | 4176 | stdout B 8595/62280 |
+| e2e rg -l | cold | default | rare literal | 10 | 6214.8/6323.9 | 2460.0/2490.0 | 4285 |  |
+| e2e rg -l | cold | default | identifier pattern | 10 | 6175.0/38238.6 | 2510.0/3500.0 | 4285 |  |
+| e2e rg -l | cold | default | alternation | 10 | 5163.4/16979.9 | 2520.0/3170.0 | 4226 |  |
+| e2e rg -l | cold | default | broad | 10 | 5169.8/13629.6 | 2700.0/3090.0 | 4267 |  |
+| e2e rg -l | cold | default | code class | 10 | 5160.5/5252.1 | 2420.0/3000.0 | 4279 |  |
+| e2e ferret | warm | default | rare literal | 10 | 172.0/174.8 | 2020.0/2060.0 | 0 | stdout B 23/72 |
+| e2e ferret | warm | default | identifier pattern | 10 | 173.3/178.2 | 2030.0/2090.0 | 0 | stdout B 1705/7216 |
+| e2e ferret | warm | default | alternation | 10 | 162.9/175.9 | 1840.0/2020.0 | 6 | stdout B 183790/279957 |
+| e2e ferret | warm | default | broad | 10 | 175.4/178.4 | 2050.0/2120.0 | 1 | stdout B 25752/47759 |
+| e2e ferret | warm | default | code class | 10 | 168.7/171.5 | 1960.0/2010.0 | 0 | stdout B 8595/62280 |
+| e2e rg -l | warm | default | rare literal | 10 | 166.3/175.3 | 1680.0/1760.0 | 0 |  |
+| e2e rg -l | warm | default | identifier pattern | 10 | 169.8/179.9 | 1640.0/1790.0 | 0 |  |
+| e2e rg -l | warm | default | alternation | 10 | 174.2/184.6 | 1770.0/1890.0 | 18 |  |
+| e2e rg -l | warm | default | broad | 10 | 174.0/184.7 | 1750.0/1910.0 | 6 |  |
+| e2e rg -l | warm | default | code class | 10 | 164.3/197.7 | 1620.0/2040.0 | 1 |  |
+private_rows written
+
+## case-sensitive (cs)
+population case_insensitive=false live=112382 readable=112376 bytes=3978812718 queries=50
+correctness arm=rg queries=50 file_set_equals_oracle=all
+correctness arm=e2e file_sets_equal_oracle=all
+| arm | cache | threads | class | queries | wall ms median/p90 | cpu ms median/p90 | device MB median | extras median/p90 |
+| rg -l | cold | default | rare literal | 10 | 5171.9/5231.8 | 2180.0/2190.0 | 4285 |  |
+| rg -l | cold | default | identifier pattern | 10 | 5160.5/5268.0 | 2210.0/2250.0 | 4285 |  |
+| rg -l | cold | default | alternation | 10 | 5200.9/14276.0 | 2310.0/2570.0 | 4232 |  |
+| rg -l | cold | default | broad | 10 | 5160.0/5310.0 | 2400.0/2560.0 | 4280 |  |
+| rg -l | cold | default | code class | 10 | 5159.1/5430.6 | 2210.0/2250.0 | 4283 |  |
+| rg -l | warm | default | rare literal | 10 | 149.4/153.6 | 1450.0/1490.0 | 0 |  |
+| rg -l | warm | default | identifier pattern | 10 | 159.7/169.2 | 1530.0/1630.0 | 0 |  |
+| rg -l | warm | default | alternation | 10 | 157.9/171.6 | 1530.0/1660.0 | 17 |  |
+| rg -l | warm | default | broad | 10 | 162.7/168.6 | 1640.0/1700.0 | 1 |  |
+| rg -l | warm | default | code class | 10 | 149.9/166.4 | 1450.0/1640.0 | 0 |  |
+| rg -l | warm | 32 | rare literal | 10 | 162.9/165.0 | 3740.0/3940.0 | 0 |  |
+| rg -l | warm | 32 | identifier pattern | 10 | 171.2/172.2 | 3610.0/3900.0 | 0 |  |
+| rg -l | warm | 32 | alternation | 10 | 161.8/165.9 | 3630.0/3720.0 | 3 |  |
+| rg -l | warm | 32 | broad | 10 | 166.3/171.1 | 3850.0/4090.0 | 0 |  |
+| rg -l | warm | 32 | code class | 10 | 168.3/169.5 | 3590.0/3800.0 | 0 |  |
+| e2e ferret | cold | default | rare literal | 10 | 3853.4/3907.0 | 2110.0/2160.0 | 4289 | stdout B 0/23 |
+| e2e ferret | cold | default | identifier pattern | 10 | 3872.3/4116.7 | 2140.0/2170.0 | 4287 | stdout B 1196/5405 |
+| e2e ferret | cold | default | alternation | 10 | 3453.1/3581.3 | 2100.0/2160.0 | 3538 | stdout B 149634/233978 |
+| e2e ferret | cold | default | broad | 10 | 3880.4/12380.6 | 2350.0/2890.0 | 4214 | stdout B 13140/34957 |
+| e2e ferret | cold | default | code class | 10 | 3840.6/3941.8 | 2150.0/2190.0 | 4281 | stdout B 872/5889 |
+| e2e rg -l | cold | default | rare literal | 10 | 5147.5/5259.5 | 2190.0/2190.0 | 4285 |  |
+| e2e rg -l | cold | default | identifier pattern | 10 | 5109.3/5194.3 | 2210.0/2260.0 | 4285 |  |
+| e2e rg -l | cold | default | alternation | 10 | 5153.8/12981.1 | 2310.0/2620.0 | 4233 |  |
+| e2e rg -l | cold | default | broad | 10 | 5134.0/5234.1 | 2420.0/2570.0 | 4279 |  |
+| e2e rg -l | cold | default | code class | 10 | 5171.9/17041.1 | 2240.0/2570.0 | 4284 |  |
+| e2e ferret | warm | default | rare literal | 10 | 166.0/167.1 | 1940.0/1950.0 | 0 | stdout B 0/23 |
+| e2e ferret | warm | default | identifier pattern | 10 | 167.3/171.2 | 1930.0/2010.0 | 0 | stdout B 1196/5405 |
+| e2e ferret | warm | default | alternation | 10 | 157.7/160.6 | 1750.0/1820.0 | 5 | stdout B 149634/233978 |
+| e2e ferret | warm | default | broad | 10 | 170.5/174.0 | 1990.0/2040.0 | 1 | stdout B 13140/34957 |
+| e2e ferret | warm | default | code class | 10 | 167.3/173.6 | 1920.0/1990.0 | 0 | stdout B 872/5889 |
+| e2e rg -l | warm | default | rare literal | 10 | 145.6/150.1 | 1420.0/1450.0 | 0 |  |
+| e2e rg -l | warm | default | identifier pattern | 10 | 152.2/165.5 | 1440.0/1580.0 | 0 |  |
+| e2e rg -l | warm | default | alternation | 10 | 158.1/167.2 | 1540.0/1610.0 | 15 |  |
+| e2e rg -l | warm | default | broad | 10 | 158.6/171.3 | 1580.0/1700.0 | 1 |  |
+| e2e rg -l | warm | default | code class | 10 | 151.4/161.7 | 1490.0/1580.0 | 0 |  |
+private_rows written

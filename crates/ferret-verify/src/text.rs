@@ -337,12 +337,18 @@ pub struct TextMatcher {
     stats: MatchStats,
 }
 
-/// What a [`TextMatcher`] has done, summed over its calls.
+/// What a [`TextMatcher`] has done, summed over its calls, plus the content
+/// regexes' work that its host adds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MatchStats {
-    /// Whole documents checked by content regexes.
+    /// Document evaluations by content regexes: one per atom settled on a
+    /// document, so a document checked by two regex atoms counts twice.
     pub regex_documents: u64,
+    /// The logical bytes of those documents, each document's whole size
+    /// per settled atom. A streamed read may settle every atom and stop
+    /// before the end, so this is not bytes scanned.
     pub regex_bytes: u64,
+    /// Of `regex_documents`, those the regex did not match.
     pub regex_rejected: u64,
     /// Documents matched against.
     pub documents: u64,

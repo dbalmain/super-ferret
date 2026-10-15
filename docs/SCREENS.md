@@ -374,20 +374,26 @@ Measured 2026-10-13 on branch `wt/par-verify` (D76 C). Aggregates are in
 [`measurements/par-verify/`](measurements/par-verify/).
 
 **What changed.** A content query's Maybe documents are now verified on a
-pool of threads (`ferret-query/src/verify.rs`). The calling thread still
-produces candidate rows in name order. It hands each new document to a
-worker, and it emits rows from the head of a window in the same order as
-before. For files that do not change during the query, and without
-cancellation, output is byte-identical at any thread count: rows,
-`--limit`, refusals, exit status, stderr, stdout and the query log's
-counts. Only the times and the thread count itself differ. Two tests
-compare 1 thread against several, including files that vanished, changed,
-became unreadable or grew too large after indexing. Tests with a scripted
-reader in `ferret-query` force the completion orders that matter rather
-than waiting for the scheduler to produce them.
+pool of threads (`ferret-query/src/verify.rs`). On `wt/scan` the workers do
+the candidate work as well: they claim batches of positions in name order
+from an atomic counter and, for each position, run the name tests, read the
+document if the position is its first name in the run, evaluate the residual
+and build the path. Each finished position is posted to its batch's slot in
+a ring. The calling thread takes positions from the head of the ring in name
+order, settles a later name of a document from the document's cached answers
+(with a stat, or a read of its own if the file changed), and emits the rows
+in the same order as before. For files that do not change during the query,
+and without cancellation, output is byte-identical at any thread count:
+rows, `--limit`, refusals, exit status, stderr, stdout and the query log's
+counts. Only the times and the thread count itself differ. Two tests compare
+1 thread against several, including files that vanished, changed, became
+unreadable or grew too large after indexing. Tests with a scripted reader in
+`ferret-query` force the completion orders that matter rather than waiting
+for the scheduler to produce them.
 
 Verification observes a file's bytes when it reads them. A worker can read
-a document up to 64 rows per thread ahead of the caller, so the read may
+a document up to 16 batches of up to 256 positions per thread ahead of the
+caller (docs/SCAN.md), so the read may
 come before the result callbacks for earlier rows run. A callback that
 deletes or rewrites a later file may therefore leave that file's row as it
 was read, where one thread would see the change. No production caller's
@@ -396,7 +402,8 @@ thread. Where a cancellation lands is a matter of timing, so a cancelled
 query's counts vary with the thread count.
 
 The thread count is `FERRET_SEARCH_THREADS`, defaulting to every available
-core (32 here). The workers' buffers hold at most 64 MiB of documents by
+core up to 16 (D77; it was every core, 32 here, when this section was
+measured). The workers' buffers hold at most 64 MiB of documents by
 catalogued size, plus 1 MiB of kept buffer per worker, plus whatever the
 files being read grew since they were indexed. The calling thread's buffer
 is separate: it reads one document at a time and keeps the capacity of the
@@ -469,6 +476,8 @@ further, but that is a guess.
 
 32 threads is slower than 16 on four classes, by 15–46%: 22–47 ms against
 `rg`'s 170. On code it is faster by 119 ms. The default stays at every core.
+(Superseded by D77: after the scan work, 16 threads is the fastest warm
+setting on every class, code included; see SCAN.md § Threads.)
 The absolute loss on the light classes is smaller than code's gain, and a
 query cannot know its class before it runs.
 

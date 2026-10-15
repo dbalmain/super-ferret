@@ -159,43 +159,98 @@ impl GrepAtom {
         pinned: &'a Pinned<'_>,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Cursor<'a>, ReadError> {
-        fn compile<'a>(
-            tree: &Trigrams,
-            lists: &'a [([u8; 3], Option<Candidates>)],
-            pinned: &'a Pinned<'_>,
-            cancelled: &dyn Fn() -> bool,
-        ) -> Result<Cursor<'a>, ReadError> {
-            if cancelled() {
-                return Err(ReadError::Cancelled);
-            }
-            Ok(match tree {
-                Trigrams::All => Cursor::bits(pinned.live(), Certainty::Maybe),
-                Trigrams::None => Cursor::Empty,
-                Trigrams::Key(key) => match lists
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .and_then(|(_, c)| c.as_ref())
-                {
-                    Some(c) => Cursor::maybe(c.cursor()),
-                    None => Cursor::bits(pinned.live(), Certainty::Maybe),
-                },
-                Trigrams::And(parts) => Cursor::and(
-                    parts
-                        .iter()
-                        .map(|p| compile(p, lists, pinned, cancelled))
-                        .collect::<Result<_, _>>()?,
-                ),
-                Trigrams::Or(parts) => Cursor::or_until(
-                    parts
-                        .iter()
-                        .map(|p| compile(p, lists, pinned, cancelled))
-                        .collect::<Result<_, _>>()?,
-                    pinned.live().bound(),
-                    cancelled,
-                )?,
-            })
+        // With no postings under it, the tree is every live document or
+        // none, and every live document is all that adding the uncovered
+        // ones (a subset) gives: one bitmap, not a cursor per key. A scan
+        // with no content index probes every document through this.
+        if cancelled() {
+            return Err(ReadError::Cancelled);
         }
+        if whole(&self.tree, &self.lists) == Some(true) {
+            return Ok(Cursor::bits(pinned.live(), Certainty::Maybe));
+        }
+        self.tree_cursor_until(pinned, cancelled)
+    }
+
+    /// [`GrepAtom::cursor_until`] built key by key, whatever the tree.
+    pub(crate) fn tree_cursor_until<'a>(
+        &'a self,
+        pinned: &'a Pinned<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Cursor<'a>, ReadError> {
         Ok(pinned.atom(compile(&self.tree, &self.lists, pinned, cancelled)?))
+    }
+}
+
+/// One node of [`GrepAtom::tree_cursor_until`]'s tree.
+fn compile<'a>(
+    tree: &Trigrams,
+    lists: &'a [([u8; 3], Option<Candidates>)],
+    pinned: &'a Pinned<'_>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Cursor<'a>, ReadError> {
+    if cancelled() {
+        return Err(ReadError::Cancelled);
+    }
+    Ok(match tree {
+        Trigrams::All => Cursor::bits(pinned.live(), Certainty::Maybe),
+        Trigrams::None => Cursor::Empty,
+        Trigrams::Key(key) => match lists
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, c)| c.as_ref())
+        {
+            Some(c) => Cursor::maybe(c.cursor()),
+            None => Cursor::bits(pinned.live(), Certainty::Maybe),
+        },
+        Trigrams::And(parts) => Cursor::and(
+            parts
+                .iter()
+                .map(|p| compile(p, lists, pinned, cancelled))
+                .collect::<Result<_, _>>()?,
+        ),
+        Trigrams::Or(parts) => Cursor::or_until(
+            parts
+                .iter()
+                .map(|p| compile(p, lists, pinned, cancelled))
+                .collect::<Result<_, _>>()?,
+            pinned.live().bound(),
+            cancelled,
+        )?,
+    })
+}
+
+/// Whether `tree` is every live document (`true`) or none (`false`)
+/// whatever the index holds, its keys without postings standing for every
+/// live document; `None` when it depends on postings.
+fn whole(tree: &Trigrams, lists: &[([u8; 3], Option<Candidates>)]) -> Option<bool> {
+    match tree {
+        Trigrams::All => Some(true),
+        Trigrams::None => Some(false),
+        Trigrams::Key(key) => lists
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, c)| c.as_ref())
+            .is_none()
+            .then_some(true),
+        Trigrams::And(parts) => {
+            let parts: Vec<_> = parts.iter().map(|p| whole(p, lists)).collect();
+            if parts.contains(&Some(false)) {
+                Some(false)
+            } else if parts.iter().all(|p| *p == Some(true)) {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        Trigrams::Or(parts) => {
+            let parts: Vec<_> = parts.iter().map(|p| whole(p, lists)).collect();
+            if parts.contains(&None) {
+                None
+            } else {
+                Some(parts.contains(&Some(true)))
+            }
+        }
     }
 }
 

@@ -1,42 +1,57 @@
 //! Verifying a content query's Maybe rows: on the calling thread, or on a
 //! bounded pool of workers (D76 C).
 //!
-//! Rows arrive from S1 in name order and leave in name order. The calling
-//! thread keeps them in a window, hands each Maybe row whose document is new
-//! to the run to a worker, and emits from the window's head as answers come
-//! back. For inputs that do not change during the run, and without
-//! cancellation, the output is the sequential order's at any thread count:
+//! The candidate names arrive as one array in name order. Each position is
+//! handled whole by one thread: S1's tests, the index truth, reading and
+//! matching the document, and the residual, which leaves a finished row or
+//! nothing. Workers claim positions in batches, in order, from an atomic
+//! counter, and post each finished position into its batch's slot of a
+//! bounded ring before starting the next, so a finished position never
+//! waits for a slower one after it in its batch. The calling thread takes
+//! the slots in order and emits their rows, so it does a few additions and
+//! the callback per row, and sleeps only when the next position is not
+//! finished. A worker more than the ring's length of batches ahead of the
+//! calling thread waits for it.
+//!
+//! For inputs that do not change during the run, and without cancellation,
+//! the output is the sequential order's at any thread count:
 //!
 //! - which rows are emitted, their offsets, and their order;
 //! - a `Break` from `emit` (a limit, a closed pipe) stops at the same row.
-//!   Workers stop taking jobs as soon as the head sees it, reads in progress
-//!   stop at their next chunk, and documents read past that row are not counted
-//!   anywhere;
+//!   Workers claim no batch and start no read once the calling thread sees it,
+//!   reads in progress stop at their next chunk, and positions finished past
+//!   that row are not counted anywhere;
 //! - the report's counts (`verified`, `changed`, the matching statistics) are
-//!   summed at the head, so they count exactly the rows the sequential order
-//!   consumed;
-//! - a second name of a document already seen in the run is settled on the
-//!   calling thread when it reaches the head, by the sequential logic, so the
-//!   cache of catalogued answers is in the same state when it is asked.
+//!   summed by the calling thread, so they count exactly the positions the
+//!   sequential order consumed;
+//! - a document is read through the first of its names in the array. A later
+//!   name of it is settled as the sequential logic settles it: on a worker if
+//!   that read has finished and found the catalogued version (a stat, and a
+//!   read only if the stat finds another version), else on the calling thread
+//!   when it is consumed. The calling thread checks each worker's assumption
+//!   about the cache of catalogued answers when it consumes the row, and
+//!   settles the row itself when the assumption is wrong, so the cache is in
+//!   the same state when it is asked as in the sequential order.
 //!
 //! The times differ: `verification_time` and `regex_time` sum the workers'
 //! busy time, not wall time.
 //!
 //! Verification sees a document's bytes when it reads them, and a worker
-//! reads up to [`WINDOW_PER_THREAD`] rows per thread ahead of the head. A
+//! reads up to the ring's length of batches ahead of the calling thread. A
 //! read may therefore happen before the callbacks for earlier rows run, so
 //! a callback that changes a later document (deletes it, rewrites it) may or
 //! may not change that document's row, where the sequential order always
 //! would. No production caller's callback changes files; one that must see
 //! its own effects uses one thread, which keeps the sequential order.
 //!
-//! Cancellation is checked before a row leaves the window and again after
-//! waiting for its worker. A row that has not passed both checks is neither
-//! counted nor emitted, and the candidate count rewinds to it; rows that
-//! left before are counted in full. On the calling thread a document
-//! cancelled between atoms counts the atoms that finished, as the
-//! sequential order did. Where cancellation lands is a matter of timing,
-//! so the counts of a cancelled run vary with the thread count.
+//! Cancellation is checked before each position is consumed. A position
+//! that has not passed the check is neither counted nor emitted, and the
+//! candidate count rewinds to it; positions consumed before are counted in
+//! full. On the calling thread a document cancelled between atoms counts
+//! the atoms that finished, as the sequential order did, streamed or read
+//! whole, and a read cut short by cancellation is not a change. Where
+//! cancellation lands is a matter of timing, so the counts of a cancelled
+//! run vary with the thread count.
 //!
 //! Memory: a worker reserves a document's catalogued size (at most
 //! [`IN_FLIGHT_BYTES`]) from a shared budget of [`IN_FLIGHT_BYTES`] before
@@ -46,22 +61,25 @@
 //! read grew beyond their catalogued size (each still under the reader's
 //! size cap). The calling thread's buffer is separate: it reads one
 //! document at a time, as before, and keeps the capacity of the largest it
-//! read.
+//! read. The ring holds finished rows, not documents: a path and a few
+//! words per position.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::io::{self, Read};
+use std::ops::{ControlFlow, Range};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::Scope;
 use std::time::{Duration, Instant};
 
-use ferret_catalog::{Catalog, InoId, Kind, NameId};
+use ferret_catalog::{Catalog, InoId, Kind, NameId, Target};
 use ferret_index::Certainty;
-use ferret_verify::{MatchStats, TextMatcher};
+use ferret_verify::{MatchStats, Search, TextMatcher};
 
 use crate::expr::{Test, Truth};
 use crate::plan::{ReadRequest, ReadVersion, Reader};
-use crate::{ContentAtom, Query, Row, RunError, Stats};
+use crate::run::NameTester;
+use crate::{ContentAtom, DocNames, Query, Row, RunError, Stats};
 
 /// Makes one [`Reader`] per verifying thread. Each reader is used by one
 /// thread only; the factory itself is shared.
@@ -73,9 +91,19 @@ pub const IN_FLIGHT_BYTES: u64 = 64 << 20;
 /// A worker keeps a read buffer up to this capacity between documents.
 pub const KEPT_BUFFER: usize = 1 << 20;
 
-/// Rows the window holds per worker before the calling thread waits for
-/// its head.
-const WINDOW_PER_THREAD: usize = 64;
+/// Batches each worker gets on average: enough that one slow batch (a large
+/// document) leaves the others work to balance with, few enough that the
+/// calling thread wakes a few hundred times per run, not per document.
+const BATCHES_PER_THREAD: usize = 16;
+
+/// The most positions in a batch.
+const MAX_BATCH: usize = 256;
+
+/// Finished batches per worker that the ring holds ahead of the calling
+/// thread. Enough that workers rarely wait on a slow batch at the head:
+/// at 4, workers at 16 threads spent about 30 ms each waiting for room in a
+/// 160 ms scan; at 16, almost none (docs/SCAN.md, step 2).
+const RING_PER_THREAD: usize = 16;
 
 /// Verifying on `threads` workers, each with a reader from `fork`.
 #[derive(Clone, Copy)]
@@ -96,6 +124,8 @@ pub(crate) enum Readers<'r, 'a> {
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
     pub verified: u64,
+    /// Reads that failed or found a new version; not a read a stop ended
+    /// ([`unread`]).
     pub changed: u64,
     pub time: Duration,
     pub regex: Duration,
@@ -109,6 +139,8 @@ pub(crate) struct Tally {
 pub(crate) struct Probed<'t> {
     /// The names to test, in emission order.
     pub ids: &'t [NameId],
+    /// Each document's live names.
+    pub names: &'t DocNames,
     /// The probed documents, ascending.
     pub docs: &'t [u32],
     /// `table[j * width + i]` is atom `i` on `docs[j]`.
@@ -117,9 +149,8 @@ pub(crate) struct Probed<'t> {
 }
 
 impl Query {
-    /// Tests the names `ids` as [`Query::s1_ids`] does, settles each Maybe
-    /// row by reading its document, and emits the rows that hold, in the
-    /// order of `ids`.
+    /// Tests the names `ids` against S1, settles each Maybe row by reading
+    /// its document, and emits the rows that hold, in the order of `ids`.
     pub(crate) fn verify_rows(
         &self,
         catalog: &Catalog,
@@ -128,318 +159,690 @@ impl Query {
         cancelled: Option<&AtomicBool>,
         emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
     ) -> Result<(Stats, Tally), RunError> {
-        let stopped = || cancelled.is_some_and(|flag| flag.load(Ordering::Acquire));
+        NameTester::load(catalog)?;
+        let scan = Scan::new(self, catalog, probed, cancelled);
         match readers {
-            Readers::One(read) => {
-                let verifier = Verifier::new(self, read, 1);
-                self.ordered(catalog, probed, verifier, None, cancelled, emit)
-            }
+            Readers::One(read) => scan.alone(read, emit),
             Readers::Pool(Workers { fork, threads }) if threads <= 1 => {
-                let mut read = fork();
-                let verifier = Verifier::new(self, &mut *read, 1);
-                self.ordered(catalog, probed, verifier, None, cancelled, emit)
+                scan.alone(&mut *fork(), emit)
             }
             Readers::Pool(Workers { fork, threads }) => {
-                let pool = Pool::new();
+                let stopped = || scan.stopped();
+                let pool = Pool::new(scan.ids.len(), threads);
                 std::thread::scope(|scope| {
                     // Stops the workers however this returns, a failed
                     // spawn or a panic included, so the scope can join
                     // them. Installed before the first spawn: a worker
-                    // already started waits for jobs until it is stopped.
+                    // already started waits for room until it is stopped.
                     let _stop = StopOnDrop(&pool);
                     // A thread that cannot be created leaves the run with
                     // the workers that were; the output does not depend on
                     // how many there are.
                     let started = (0..threads)
                         .take_while(|&i| {
-                            spawn(scope, i, || pool.work(&self.atoms, fork, &stopped)).is_ok()
+                            spawn(scope, i, || pool.work(&scan, fork, &stopped)).is_ok()
                         })
                         .count();
                     let mut read = fork();
-                    let verifier = Verifier::new(self, &mut *read, started.max(1));
-                    let pool = (started > 0).then_some(&pool);
-                    self.ordered(catalog, probed, verifier, pool, cancelled, emit)
+                    if started == 0 {
+                        return scan.alone(&mut *read, emit);
+                    }
+                    scan.pooled(&pool, started, &mut *read, emit)
                 })
             }
         }
     }
+}
 
-    fn ordered(
-        &self,
-        catalog: &Catalog,
-        probed: &Probed<'_>,
-        verifier: Verifier<'_, '_, '_>,
-        pool: Option<&Pool>,
-        cancelled: Option<&AtomicBool>,
-        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
-    ) -> Result<(Stats, Tally), RunError> {
-        let stopped = || cancelled.is_some_and(|flag| flag.load(Ordering::Acquire));
-        let mut window = Window {
-            query: self,
-            catalog,
-            waiting: VecDeque::new(),
-            limit: pool.map_or(0, |_| verifier.tally.threads * WINDOW_PER_THREAD),
-            pool,
-            polled: 0,
-            verifier,
-            rows: 0,
-            emit,
-            stopped: &stopped,
-            halted_at: None,
-            maybe_docs: HashSet::new(),
-            possible_docs: HashSet::new(),
-        };
-        let mut seen = HashSet::new();
-        let mut halted = false;
-        let Probed {
-            ids,
-            docs,
-            table,
-            width,
-        } = *probed;
-        // A row S1 passed, if its index truth leaves it in the window.
-        let mut admit = |row: &Row<'_>, candidates| {
-            let doc = catalog.doc(row.inode).map(|d| d.0);
-            let at = doc.and_then(|d| docs.binary_search(&d).ok());
-            let indexed = |i: usize| match at.and_then(|j| table[j * width + i]) {
-                None => Truth::No,
-                Some(Certainty::Maybe) => Truth::Maybe,
-                Some(Certainty::Yes) => Truth::Yes,
-            };
-            let truth = self.eval_residual(&mut |test| match test {
-                Test::Content(i) => indexed(*i),
-                other => self.test_row(catalog, row, other),
-            });
-            let slot = match (truth, doc) {
-                (Truth::No, _) | (Truth::Maybe, None) => return None,
-                (Truth::Yes, _) => Slot::Holds,
-                (Truth::Maybe, Some(doc)) => match pool {
-                    Some(pool) if seen.insert(doc) => {
-                        Slot::Job(doc, pool.submit(row.name, catalog.size(row.inode)))
-                    }
-                    _ => {
-                        seen.insert(doc);
-                        Slot::Here(doc)
-                    }
-                },
-            };
-            Some(Waiting {
-                path: row.path.to_vec(),
-                name: row.name,
-                inode: row.inode,
-                kind: row.kind,
-                doc,
-                candidates,
-                slot,
-            })
-        };
-        let mut stats = self.s1_ids(catalog, ids, cancelled, |row, candidates| {
-            // A candidate that does not join the window still lets the head
-            // advance: otherwise a ready head waits for the next row S1
-            // passes, which may be the end of the scan.
-            let flow = match row.and_then(|row| admit(row, candidates)) {
-                Some(waiting) => {
-                    window.waiting.push_back(waiting);
-                    window.drain(false)
-                }
-                None => window.poll(),
-            };
-            halted = flow.is_break();
-            flow
-        })?;
-        match window.halted_at {
-            // S1 ran ahead of the row that stopped the run.
-            Some(candidates) => stats.candidates = candidates,
-            None if !halted => {
-                if let ControlFlow::Break(()) = window.drain(true) {
-                    stats.candidates = window.halted_at.unwrap_or(stats.candidates);
+// ── the scan: what every thread shares ──
+
+/// The run's names and what each position needs, shared by every thread.
+struct Scan<'q, 'c, 'p> {
+    query: &'q Query,
+    catalog: &'c Catalog,
+    ids: &'p [NameId],
+    names: &'p DocNames,
+    docs: &'p [u32],
+    table: &'p [Option<Certainty>],
+    width: usize,
+    cancelled: Option<&'q AtomicBool>,
+    /// Who reads each document, when `ids` is not ascending: `first[doc]`
+    /// is the first position of a name of `doc`, and `repeated` has a bit
+    /// for each document with more. Ascending, a thread asks
+    /// [`Scan::names`] instead, which costs the calling thread nothing.
+    first: Option<(Vec<u32>, Vec<u64>)>,
+    /// What each repeated document's reader found, for its later names:
+    /// the answers if the read was of the catalogued version, else `None`.
+    /// Sharded by document, so threads rarely meet on a lock.
+    found: Vec<Mutex<Found>>,
+    /// Ascending, for a document with many names before a position's: its
+    /// first name in the run, found once ([`Scan::owns`]). Sharded as
+    /// `found` is.
+    owners: Vec<Mutex<HashMap<u32, NameId>>>,
+    /// Membership checks [`Scan::owns`] made, for a test.
+    #[cfg(test)]
+    owner_checks: Option<std::sync::Arc<AtomicU64>>,
+}
+
+/// Names before a position's that [`Scan::owns`] checks one by one; past
+/// this, it finds the document's first name in the run once and keeps it.
+const OWNER_SCAN: usize = 16;
+
+/// One shard of [`Scan::found`]: a document's answers if its read found
+/// the catalogued version, else `None`.
+type Found = HashMap<u32, Option<Vec<Option<usize>>>>;
+
+/// Shards of [`Scan::found`].
+const FOUND_SHARDS: usize = 64;
+
+impl<'q, 'c, 'p> Scan<'q, 'c, 'p> {
+    fn new(
+        query: &'q Query,
+        catalog: &'c Catalog,
+        probed: &Probed<'p>,
+        cancelled: Option<&'q AtomicBool>,
+    ) -> Self {
+        let first = (!probed.ids.is_sorted()).then(|| {
+            let docs = catalog.next_doc().0 as usize;
+            let mut first = vec![u32::MAX; docs];
+            let mut repeated = vec![0; docs.div_ceil(64)];
+            for (at, &id) in probed.ids.iter().enumerate() {
+                let Some(doc) = doc_of(catalog, id) else {
+                    continue;
+                };
+                match first.get_mut(doc as usize) {
+                    Some(slot) if *slot == u32::MAX => *slot = at as u32,
+                    Some(_) => set(&mut repeated, doc),
+                    None => {}
                 }
             }
-            None => {}
+            (first, repeated)
+        });
+        Self {
+            query,
+            catalog,
+            ids: probed.ids,
+            names: probed.names,
+            docs: probed.docs,
+            table: probed.table,
+            width: probed.width,
+            cancelled,
+            first,
+            found: (0..FOUND_SHARDS).map(|_| Mutex::default()).collect(),
+            owners: (0..FOUND_SHARDS).map(|_| Mutex::default()).collect(),
+            #[cfg(test)]
+            owner_checks: seam::Seams::current().owner_checks,
         }
+    }
+
+    /// Whether position `at` holds the first name of `doc` in the run: the
+    /// one that reads it.
+    fn owns(&self, at: usize, doc: u32) -> bool {
+        if let Some((first, _)) = &self.first {
+            return first.get(doc as usize) == Some(&(at as u32));
+        }
+        // Ascending: an earlier position holds a smaller name. Usually the
+        // name just before is in the run, or there are few; a name filter
+        // can leave many out, and checking them again for each later name
+        // would be quadratic in the document's names.
+        let id = self.ids[at];
+        let names = self.names.names(doc);
+        let before = names.partition_point(|&name| name < id);
+        let in_run = |name: &NameId| {
+            #[cfg(test)]
+            if let Some(checks) = &self.owner_checks {
+                checks.fetch_add(1, Ordering::Relaxed);
+            }
+            self.ids.binary_search(name).is_ok()
+        };
+        if before <= OWNER_SCAN {
+            return !names[..before].iter().any(in_run);
+        }
+        let shard = &self.owners[doc as usize % FOUND_SHARDS];
+        if let Some(&first) = lock(shard).get(&doc) {
+            return first == id;
+        }
+        // `id` itself is in the run, so the search ends by it.
+        let first = names[..=before].iter().copied().find(in_run).unwrap_or(id);
+        lock(shard).insert(doc, first);
+        first == id
+    }
+
+    /// Whether `doc` may be asked for again in this run: only then are its
+    /// answers worth keeping.
+    fn is_repeated(&self, doc: u32) -> bool {
+        match &self.first {
+            Some((_, repeated)) => repeated
+                .get(doc as usize / 64)
+                .is_some_and(|word| word & (1 << (doc % 64)) != 0),
+            None => self.names.names(doc).len() > 1,
+        }
+    }
+
+    fn shard(&self, doc: u32) -> &Mutex<Found> {
+        &self.found[doc as usize % FOUND_SHARDS]
+    }
+
+    fn stopped(&self) -> bool {
+        self.cancelled
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    /// Every position on the calling thread, each consumed as soon as it is
+    /// handled: the sequential order.
+    fn alone(
+        &self,
+        read: &mut Reader<'_>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<(Stats, Tally), RunError> {
+        let mut ledger = Ledger::new(self, read, 1, emit);
+        let mut names = NameTester::new(self.query, self.catalog, self.cancelled);
+        let stopped = || self.stopped();
+        let mut batch = Batch::default();
+        for at in 0..self.ids.len() {
+            if stopped() {
+                return Ok(ledger.halted(at));
+            }
+            batch.clear();
+            let item = self.item(
+                at,
+                &mut names,
+                &mut ledger.verifier.hand,
+                None,
+                &stopped,
+                &mut batch.paths,
+            );
+            if ledger.consume(item, &batch.paths)?.is_break() {
+                return Ok(ledger.halted(at));
+            }
+        }
+        Ok(ledger.finished())
+    }
+
+    /// The calling thread's side of a pool: takes the batches in order and
+    /// consumes their positions.
+    fn pooled(
+        &self,
+        pool: &Pool,
+        threads: usize,
+        read: &mut Reader<'_>,
+        emit: impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> Result<(Stats, Tally), RunError> {
+        let mut ledger = Ledger::new(self, read, threads, emit);
+        let result = self.drain(pool, &mut ledger);
+        // Stop the workers before the run's state is dropped, which scales
+        // with the documents verified: a worker that found room meanwhile
+        // would start another read.
+        pool.halt();
         #[cfg(test)]
-        if let Some(pool) = window.pool {
-            pool.seams.tearing_down(&|| pool.finished());
+        pool.seams.tearing_down(&|| pool.finished());
+        result?;
+        Ok(ledger.finished())
+    }
+
+    /// Consumes every position in order, until one stops the run.
+    fn drain<E: FnMut(&Row<'_>) -> ControlFlow<()>>(
+        &self,
+        pool: &Pool,
+        ledger: &mut Ledger<'_, 'q, 'c, 'p, '_, '_, E>,
+    ) -> Result<(), RunError> {
+        let mut part = Batch::default();
+        let mut items = Vec::new();
+        for index in 0..pool.batches {
+            loop {
+                part.clear();
+                let Some(complete) = pool.take(index, &mut part) else {
+                    // A worker panicked; the scope re-raises it.
+                    return Ok(());
+                };
+                std::mem::swap(&mut items, &mut part.items);
+                for (offset, item) in items.drain(..).enumerate() {
+                    let at = part.start + offset;
+                    // The accounting boundary (module doc): a cancelled run
+                    // consumes no further position.
+                    if self.stopped() || ledger.consume(item, &part.paths)?.is_break() {
+                        ledger.halt(pool, at);
+                        return Ok(());
+                    }
+                }
+                std::mem::swap(&mut items, &mut part.items);
+                if complete {
+                    break;
+                }
+            }
         }
-        stats.rows = window.rows;
-        let mut tally = window.verifier.tally;
-        tally.maybe_docs = window.maybe_docs.len() as u64;
-        tally.possible_docs = window.possible_docs.len() as u64;
-        Ok((stats, tally))
+        Ok(())
+    }
+
+    /// Handles position `at` whole: S1's tests, the index truth, the read
+    /// if this thread owns it, and the residual. A row's path goes into
+    /// `paths`.
+    fn item(
+        &self,
+        at: usize,
+        names: &mut NameTester<'q, 'c>,
+        hand: &mut Hand<'_, '_>,
+        pool: Option<&Pool>,
+        stop: &dyn Fn() -> bool,
+        paths: &mut Vec<u8>,
+    ) -> Item {
+        let mut item = Item::Skip;
+        let flow = names.test(self.ids[at], &mut |row| {
+            item = self.admit(at, row, hand, pool, stop, paths);
+            ControlFlow::Continue(())
+        });
+        match flow {
+            Err(error) => Item::Failed(error),
+            Ok(ControlFlow::Break(())) => Item::Cancelled,
+            Ok(ControlFlow::Continue(())) => item,
+        }
+    }
+
+    /// A row S1 passed: whether its index truth keeps it, and if its
+    /// document is this position's to read, the read and the residual.
+    fn admit(
+        &self,
+        at: usize,
+        row: &Row<'_>,
+        hand: &mut Hand<'_, '_>,
+        pool: Option<&Pool>,
+        stop: &dyn Fn() -> bool,
+        paths: &mut Vec<u8>,
+    ) -> Item {
+        let (query, catalog) = (self.query, self.catalog);
+        let doc = catalog.doc(row.inode).map(|d| d.0);
+        let probed = doc.and_then(|d| self.docs.binary_search(&d).ok());
+        let indexed = |i: usize| match probed.and_then(|j| self.table[j * self.width + i]) {
+            None => Truth::No,
+            Some(Certainty::Maybe) => Truth::Maybe,
+            Some(Certainty::Yes) => Truth::Yes,
+        };
+        let truth = query.eval_residual(&mut |test| match test {
+            Test::Content(i) => indexed(*i),
+            other => query.test_row(catalog, row, other),
+        });
+        let how = match (truth, doc) {
+            (Truth::No, _) | (Truth::Maybe, None) => return Item::Skip,
+            (Truth::Yes, _) => How::Holds,
+            (Truth::Maybe, Some(doc)) if self.owns(at, doc) => {
+                let outcome = self.read(row, hand, pool, stop);
+                if pool.is_some() && self.is_repeated(doc) {
+                    let found = match &outcome {
+                        Outcome::Read {
+                            version: ReadVersion::Catalogued,
+                            answers,
+                            ..
+                        } => Some(answers.clone()),
+                        _ => None,
+                    };
+                    lock(self.shard(doc)).insert(doc, found);
+                }
+                let holds = match &outcome {
+                    Outcome::Read { answers, .. } => holds(query, catalog, row, answers),
+                    _ => None,
+                };
+                How::Read {
+                    doc,
+                    outcome,
+                    holds,
+                }
+            }
+            // A later name on a worker, whose reader found the catalogued
+            // version: what the calling thread would do on reaching it,
+            // done here. A stat; a read only if the path changed.
+            (Truth::Maybe, Some(doc)) if pool.is_some() => {
+                let found = lock(self.shard(doc)).get(&doc).cloned();
+                match found {
+                    Some(Some(answers)) => match (hand.read)(row.name, ReadRequest::Stat) {
+                        Some(ReadVersion::Catalogued) => How::Cached {
+                            doc,
+                            holds: holds(query, catalog, row, &answers),
+                        },
+                        Some(ReadVersion::Current) => {
+                            let outcome = self.read(row, hand, pool, stop);
+                            let holds = match &outcome {
+                                Outcome::Read { answers, .. } => {
+                                    holds(query, catalog, row, answers)
+                                }
+                                _ => None,
+                            };
+                            How::Again {
+                                doc,
+                                outcome,
+                                holds,
+                            }
+                        }
+                        None => How::Gone(doc),
+                    },
+                    // Not read yet, or not cacheable: left to the calling
+                    // thread.
+                    _ => How::Here(doc),
+                }
+            }
+            (Truth::Maybe, Some(doc)) => How::Here(doc),
+        };
+        let start = paths.len();
+        paths.extend_from_slice(row.path);
+        Item::Row(Pending {
+            path: start..paths.len(),
+            name: row.name,
+            inode: row.inode,
+            kind: row.kind,
+            doc,
+            how,
+        })
+    }
+
+    /// Reads and matches `row`'s document on this thread.
+    fn read(
+        &self,
+        row: &Row<'_>,
+        hand: &mut Hand<'_, '_>,
+        pool: Option<&Pool>,
+        stop: &dyn Fn() -> bool,
+    ) -> Outcome {
+        match pool {
+            Some(pool) => pool.read(
+                self.query,
+                hand,
+                row.name,
+                self.catalog.size(row.inode),
+                stop,
+            ),
+            None => hand.verify(&self.query.atoms, row.name, stop),
+        }
     }
 }
 
-// ── the window: rows in name order, waiting for their answers ──
+/// The live document `id` names, if any.
+fn doc_of(catalog: &Catalog, id: NameId) -> Option<u32> {
+    match catalog.name(id).target() {
+        Target::Inode(inode) if catalog.is_live_inode(inode) => catalog.doc(inode).map(|d| d.0),
+        _ => None,
+    }
+}
 
-/// A row S1 passed whose content truth is Yes or Maybe, copied out of the
-/// run's path buffer.
-struct Waiting {
-    path: Vec<u8>,
+fn set(bits: &mut [u64], at: u32) {
+    if let Some(word) = bits.get_mut(at as usize / 64) {
+        *word |= 1 << (at % 64);
+    }
+}
+
+/// Whether a row holds given its document's answers, and if so its offset:
+/// the first match of a `grep:` atom.
+fn holds(
+    query: &Query,
+    catalog: &Catalog,
+    row: &Row<'_>,
+    answers: &[Option<usize>],
+) -> Option<Option<usize>> {
+    let offset = answers
+        .iter()
+        .zip(&query.atoms)
+        .filter_map(|(answer, atom)| match atom {
+            ContentAtom::Grep(_) => *answer,
+            ContentAtom::Text(_) => None,
+        })
+        .min();
+    let truth = query.eval_residual(&mut |test| match test {
+        Test::Content(i) => answers[*i].is_some().into(),
+        other => query.test_row(catalog, row, other),
+    });
+    (truth == Truth::Yes).then_some(offset)
+}
+
+// ── a position's result ──
+
+/// What one position left for the calling thread.
+enum Item {
+    /// No row: S1 or the index truth rejected the name.
+    Skip,
+    /// S1 saw the query cancelled.
+    Cancelled,
+    Failed(RunError),
+    Row(Pending),
+}
+
+/// A row S1 passed whose index truth is Yes or Maybe.
+struct Pending {
+    /// Its path, in its batch's `paths`.
+    path: Range<usize>,
     name: NameId,
     inode: InoId,
     kind: Kind,
     /// Its document, if it has one.
     doc: Option<u32>,
-    /// S1's candidate count when it passed.
-    candidates: u64,
-    slot: Slot,
+    how: How,
 }
 
-enum Slot {
+enum How {
     /// The index says it holds; no read.
     Holds,
-    /// Its document, read by the worker job with this sequence number.
-    Job(u32, u64),
-    /// Its document, settled on the calling thread at the head.
+    /// Read by the first of its document's names: the outcome, and the
+    /// row's offset if it holds.
+    Read {
+        doc: u32,
+        outcome: Outcome,
+        holds: Option<Option<usize>>,
+    },
+    /// A later name of a document whose reader found the catalogued
+    /// version, and whose own stat says it is still that version: the
+    /// cached answers hold, or not.
+    Cached {
+        doc: u32,
+        holds: Option<Option<usize>>,
+    },
+    /// A later name whose stat failed.
+    Gone(u32),
+    /// A later name whose stat found another version, read for itself.
+    Again {
+        doc: u32,
+        outcome: Outcome,
+        holds: Option<Option<usize>>,
+    },
+    /// A later name of a document: settled by the calling thread when
+    /// consumed.
     Here(u32),
 }
 
-struct Window<'w, 'q, 'r, 'a, E> {
-    query: &'q Query,
-    catalog: &'w Catalog,
-    waiting: VecDeque<Waiting>,
-    /// Rows held before waiting for the head.
-    limit: usize,
-    pool: Option<&'w Pool>,
-    /// The pool's finished-job count when the window last looked.
-    polled: u64,
+/// Consecutive positions, finished.
+#[derive(Default)]
+struct Batch {
+    /// The first position.
+    start: usize,
+    items: Vec<Item>,
+    /// The rows' paths.
+    paths: Vec<u8>,
+}
+
+impl Batch {
+    fn clear(&mut self) {
+        self.items.clear();
+        self.paths.clear();
+    }
+
+    /// Appends `item`, whose path is all of `paths`.
+    fn push(&mut self, mut item: Item, paths: &[u8]) {
+        if let Item::Row(pending) = &mut item {
+            let start = self.paths.len();
+            pending.path = start..start + paths.len();
+        }
+        self.paths.extend_from_slice(paths);
+        self.items.push(item);
+    }
+}
+
+/// A slot of the ring: one batch's finished positions not yet taken.
+#[derive(Default)]
+struct Slot {
+    /// The batch, plus one (0: none).
+    index: usize,
+    part: Batch,
+    /// Every position of the batch has been posted.
+    complete: bool,
+}
+
+// ── the calling thread's side ──
+
+/// Consumes positions in order: counts them, settles later names of a
+/// document, and emits.
+struct Ledger<'s, 'q, 'c, 'p, 'r, 'a, E> {
+    scan: &'s Scan<'q, 'c, 'p>,
     verifier: Verifier<'q, 'r, 'a>,
     rows: u64,
     emit: E,
-    stopped: &'w dyn Fn() -> bool,
-    /// The candidate count at the row that stopped the run, if one did.
-    halted_at: Option<u64>,
     /// Documents of rows consumed, by their index truth: Maybe, and not No.
-    maybe_docs: HashSet<u32>,
-    possible_docs: HashSet<u32>,
+    maybe_docs: Vec<u64>,
+    possible_docs: Vec<u64>,
+    /// The candidate count at the position that stopped the run, if one did.
+    halted_at: Option<u64>,
 }
 
-impl<E: FnMut(&Row<'_>) -> ControlFlow<()>> Window<'_, '_, '_, '_, E> {
-    /// Emits from the head while it is settled, or every row when `all`.
-    /// A worker's row is waited for only when `all` or the window is full.
-    fn drain(&mut self, all: bool) -> ControlFlow<()> {
-        while let Some(head) = self.waiting.front() {
-            // The accounting boundary (module doc): a cancelled run
-            // consumes no further row.
-            if (self.stopped)() {
-                return self.halt(head.candidates);
-            }
-            let ready = match head.slot {
-                Slot::Holds | Slot::Here(_) => true,
-                Slot::Job(_, seq) => {
-                    all || self.waiting.len() > self.limit
-                        || self.pool.is_some_and(|pool| pool.is_done(seq))
-                }
-            };
-            if !ready {
-                break;
-            }
-            let Some(head) = self.waiting.pop_front() else {
-                break;
-            };
-            let candidates = head.candidates;
-            if self.finish(head).is_break() {
-                return self.halt(candidates);
-            }
+impl<'s, 'q, 'c, 'p, 'r, 'a, E: FnMut(&Row<'_>) -> ControlFlow<()>>
+    Ledger<'s, 'q, 'c, 'p, 'r, 'a, E>
+{
+    fn new(scan: &'s Scan<'q, 'c, 'p>, read: &'r mut Reader<'a>, threads: usize, emit: E) -> Self {
+        let words = (scan.catalog.next_doc().0 as usize).div_ceil(64);
+        Self {
+            scan,
+            verifier: Verifier::new(scan.query, read, threads),
+            rows: 0,
+            emit,
+            maybe_docs: vec![0; words],
+            possible_docs: vec![0; words],
+            halted_at: None,
         }
-        ControlFlow::Continue(())
     }
 
-    /// Ends the run at the row with this candidate count. The workers stop
-    /// now, not when the scope ends: dropping the window and its cache of
-    /// answers comes first and scales with the documents verified, and a
-    /// worker that took freed bytes meanwhile would start another read.
-    fn halt(&mut self, candidates: u64) -> ControlFlow<()> {
-        self.halted_at = Some(candidates);
-        if let Some(pool) = self.pool {
-            pool.halt();
-        }
-        ControlFlow::Break(())
+    /// Stops the run at position `at`, which is not consumed.
+    fn halted(mut self, at: usize) -> (Stats, Tally) {
+        self.halted_at = Some(at as u64 + 1);
+        self.finished()
     }
 
-    /// [`Window::drain`] without waiting, between rows: a head job can
-    /// only have become ready if a job finished since the last look, which
-    /// costs one atomic load per candidate to tell.
-    fn poll(&mut self) -> ControlFlow<()> {
-        let Some(pool) = self.pool else {
-            return ControlFlow::Continue(());
+    /// [`Ledger::halted`] on a pool, stopping its workers now.
+    fn halt(&mut self, pool: &Pool, at: usize) {
+        self.halted_at = Some(at as u64 + 1);
+        pool.halt();
+    }
+
+    fn finished(self) -> (Stats, Tally) {
+        let stats = Stats {
+            candidates: self.halted_at.unwrap_or(self.scan.ids.len() as u64),
+            rows: self.rows,
+            ..Stats::default()
         };
-        #[cfg(test)]
-        pool.seams.polling(&|| pool.finished());
-        let finished = pool.finished();
-        if self.waiting.is_empty() || finished == self.polled {
-            return ControlFlow::Continue(());
-        }
-        self.polled = finished;
-        self.drain(false)
+        let count = |bits: &[u64]| bits.iter().map(|w| u64::from(w.count_ones())).sum();
+        let mut tally = self.verifier.tally;
+        tally.maybe_docs = count(&self.maybe_docs);
+        tally.possible_docs = count(&self.possible_docs);
+        (stats, tally)
     }
 
     /// Counts a consumed row's document, by its index truth.
     fn consumed(&mut self, doc: Option<u32>, maybe: bool) {
         if let Some(doc) = doc {
-            self.possible_docs.insert(doc);
+            set(&mut self.possible_docs, doc);
             if maybe {
-                self.maybe_docs.insert(doc);
+                set(&mut self.maybe_docs, doc);
             }
         }
     }
 
-    /// Settles one row and emits it if it holds.
-    fn finish(&mut self, waiting: Waiting) -> ControlFlow<()> {
+    /// Consumes one position; `Break` stops the run there.
+    fn consume(&mut self, item: Item, paths: &[u8]) -> Result<ControlFlow<()>, RunError> {
+        let pending = match item {
+            Item::Skip => return Ok(ControlFlow::Continue(())),
+            Item::Cancelled => return Ok(ControlFlow::Break(())),
+            Item::Failed(error) => return Err(error),
+            Item::Row(pending) => pending,
+        };
         let mut row = Row {
-            path: &waiting.path,
-            name: waiting.name,
-            inode: waiting.inode,
-            kind: waiting.kind,
+            path: &paths[pending.path],
+            name: pending.name,
+            inode: pending.inode,
+            kind: pending.kind,
             offset: None,
         };
-        let (doc, settled) = match waiting.slot {
-            Slot::Holds => {
-                self.consumed(waiting.doc, false);
-                self.rows += 1;
-                return (self.emit)(&row);
+        let scan = self.scan;
+        let doc = pending.doc;
+        let known = |verifier: &Verifier<'_, '_, '_>, doc: u32| verifier.exact.contains_key(&doc);
+        let settled = match pending.how {
+            How::Holds => {
+                self.consumed(doc, false);
+                Ok(Some(None))
             }
-            Slot::Here(doc) => {
-                self.consumed(waiting.doc, true);
-                (doc, self.verifier.here(doc, waiting.name, self.stopped))
-            }
-            Slot::Job(doc, seq) => {
-                let Some(outcome) = self.pool.and_then(|pool| pool.wait(seq)) else {
-                    // A worker panicked; the scope re-raises it.
-                    return ControlFlow::Break(());
-                };
-                // Cancelled while waiting: the row is not consumed.
-                if (self.stopped)() {
-                    return ControlFlow::Break(());
+            // A worker took the cache's state for granted: a first read
+            // found no answers cached, a later name found them. Both hold
+            // whenever the run is as the sequential order saw it; when not,
+            // this thread settles the row as that order would.
+            How::Read {
+                doc: read,
+                outcome,
+                holds,
+            } if !known(&self.verifier, read) => {
+                self.consumed(doc, true);
+                let keep = scan.is_repeated(read);
+                match self.verifier.settle(read, outcome, keep) {
+                    Settled::Unread => return Ok(ControlFlow::Continue(())),
+                    Settled::Stopped => return Ok(ControlFlow::Break(())),
+                    Settled::Cached | Settled::Fresh(_) => Ok(holds),
                 }
-                self.consumed(waiting.doc, true);
-                (doc, self.verifier.settle(doc, outcome))
+            }
+            How::Cached { doc: read, holds } if known(&self.verifier, read) => {
+                self.consumed(doc, true);
+                Ok(holds)
+            }
+            How::Gone(read) if known(&self.verifier, read) => {
+                self.consumed(doc, true);
+                self.verifier.tally.changed += 1;
+                return Ok(ControlFlow::Continue(()));
+            }
+            How::Again {
+                doc: read,
+                outcome,
+                holds,
+            } if known(&self.verifier, read) => {
+                self.consumed(doc, true);
+                match self.verifier.settle(read, outcome, true) {
+                    Settled::Unread => return Ok(ControlFlow::Continue(())),
+                    Settled::Stopped => return Ok(ControlFlow::Break(())),
+                    Settled::Cached => Err(read),
+                    Settled::Fresh(_) => Ok(holds),
+                }
+            }
+            How::Read { doc: read, .. }
+            | How::Cached { doc: read, .. }
+            | How::Gone(read)
+            | How::Again { doc: read, .. }
+            | How::Here(read) => {
+                self.consumed(doc, true);
+                let stopped = || scan.stopped();
+                match self.verifier.here(read, pending.name, &stopped) {
+                    Settled::Unread => return Ok(ControlFlow::Continue(())),
+                    Settled::Stopped => return Ok(ControlFlow::Break(())),
+                    Settled::Cached => Err(read),
+                    Settled::Fresh(answers) => Ok(holds(scan.query, scan.catalog, &row, &answers)),
+                }
             }
         };
-        let answers = match &settled {
-            Settled::Unread => return ControlFlow::Continue(()),
-            Settled::Stopped => return ControlFlow::Break(()),
-            Settled::Cached => &self.verifier.exact[&doc],
-            Settled::Fresh(answers) => answers,
+        // `Err`: the row holds by the run's cached answers for the document.
+        let offset = match settled {
+            Ok(holds) => holds,
+            Err(read) => holds(scan.query, scan.catalog, &row, &self.verifier.exact[&read]),
         };
-        let (query, catalog) = (self.query, self.catalog);
-        row.offset = answers
-            .iter()
-            .zip(&query.atoms)
-            .filter_map(|(answer, atom)| match atom {
-                ContentAtom::Grep(_) => *answer,
-                ContentAtom::Text(_) => None,
-            })
-            .min();
-        let truth = query.eval_residual(&mut |test| match test {
-            Test::Content(i) => answers[*i].is_some().into(),
-            other => query.test_row(catalog, &row, other),
-        });
-        if truth != Truth::Yes {
-            return ControlFlow::Continue(());
+        let Some(offset) = offset else {
+            return Ok(ControlFlow::Continue(()));
+        };
+        // The emission guard: a stop that came while this position was
+        // settled (a host's checks after a successful read, a cached
+        // answer's stat) ends the run here, as one before it would have.
+        if scan.stopped() {
+            return Ok(ControlFlow::Break(()));
         }
+        row.offset = offset;
         self.rows += 1;
-        (self.emit)(&row)
+        Ok((self.emit)(&row))
     }
 }
 
@@ -476,13 +879,72 @@ enum Settled {
     Fresh(Vec<Option<usize>>),
 }
 
-/// The calling thread's side: the cache of catalogued answers, the counts,
-/// and a reader for rows settled here.
-struct Verifier<'q, 'r, 'a> {
-    atoms: &'q [ContentAtom],
+/// A thread's reading tools: its reader, matcher and buffer.
+struct Hand<'r, 'a> {
     read: &'r mut Reader<'a>,
     matcher: TextMatcher,
+    /// A whole document, for atoms that need one.
     bytes: Vec<u8>,
+    /// A run of lines at a time, for line-local patterns ([`stream`]).
+    lines: Vec<u8>,
+    /// This thread's own copy of each grep atom's search, by atom: a regex
+    /// shared between threads hands each a match cache from a pool, which
+    /// many threads at once contend on.
+    regexes: Vec<Option<Search>>,
+}
+
+impl<'r, 'a> Hand<'r, 'a> {
+    fn new(read: &'r mut Reader<'a>, atoms: &[ContentAtom]) -> Self {
+        let regexes = atoms
+            .iter()
+            .map(|atom| match atom {
+                ContentAtom::Grep(grep) => Some(grep.search()),
+                ContentAtom::Text(_) => None,
+            })
+            .collect();
+        Self {
+            read,
+            matcher: TextMatcher::new(),
+            bytes: Vec::new(),
+            lines: Vec::new(),
+            regexes,
+        }
+    }
+
+    /// Reads `name`'s document and runs every atom over it, unless `stopped`
+    /// says to stop first; the reader is given `stopped` too.
+    fn verify(
+        &mut self,
+        atoms: &[ContentAtom],
+        name: NameId,
+        stopped: &dyn Fn() -> bool,
+    ) -> Outcome {
+        if streams(atoms) {
+            return stream(
+                &self.regexes,
+                &mut *self.read,
+                &mut self.lines,
+                name,
+                stopped,
+            );
+        }
+        verify(
+            atoms,
+            &self.regexes,
+            &mut *self.read,
+            &mut self.matcher,
+            &mut self.bytes,
+            name,
+            stopped,
+        )
+    }
+}
+
+/// The calling thread's side: the cache of catalogued answers, the counts,
+/// and its reading tools, for later names of a document.
+struct Verifier<'q, 'r, 'a> {
+    atoms: &'q [ContentAtom],
+    hand: Hand<'r, 'a>,
     /// Only content facts established by a bracketed catalog-version read.
     /// Path failures never enter this map; every path has its own stat.
     exact: HashMap<u32, Vec<Option<usize>>>,
@@ -493,9 +955,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
     fn new(query: &'q Query, read: &'r mut Reader<'a>, threads: usize) -> Self {
         Self {
             atoms: &query.atoms,
-            read,
-            matcher: TextMatcher::new(),
-            bytes: Vec::new(),
+            hand: Hand::new(read, &query.atoms),
             exact: HashMap::new(),
             tally: Tally {
                 threads,
@@ -509,7 +969,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
     /// version, else read it.
     fn here(&mut self, doc: u32, name: NameId, stopped: &dyn Fn() -> bool) -> Settled {
         if self.exact.contains_key(&doc) {
-            match (self.read)(name, ReadRequest::Stat) {
+            match (self.hand.read)(name, ReadRequest::Stat) {
                 Some(ReadVersion::Catalogued) => return Settled::Cached,
                 Some(ReadVersion::Current) => {}
                 None => {
@@ -518,19 +978,13 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
                 }
             }
         }
-        let outcome = verify(
-            self.atoms,
-            &mut *self.read,
-            &mut self.matcher,
-            &mut self.bytes,
-            name,
-            stopped,
-        );
-        self.settle(doc, outcome)
+        let outcome = self.hand.verify(self.atoms, name, stopped);
+        self.settle(doc, outcome, true)
     }
 
-    /// Counts a read, wherever it ran, and caches catalogued answers.
-    fn settle(&mut self, doc: u32, outcome: Outcome) -> Settled {
+    /// Counts a read, wherever it ran, and caches catalogued answers if
+    /// `keep`: only a document with another name in the run is asked again.
+    fn settle(&mut self, doc: u32, outcome: Outcome, keep: bool) -> Settled {
         let tally = &mut self.tally;
         tally.verified += 1;
         let count = |tally: &mut Tally, work: Matched| {
@@ -556,7 +1010,9 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
                 count(tally, work);
                 match version {
                     ReadVersion::Catalogued => {
-                        self.exact.entry(doc).or_insert(answers);
+                        if keep {
+                            self.exact.entry(doc).or_insert(answers);
+                        }
                         Settled::Cached
                     }
                     ReadVersion::Current => {
@@ -573,6 +1029,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
 /// unless `stopped` says to stop first; the reader is given `stopped` too.
 fn verify(
     atoms: &[ContentAtom],
+    regexes: &[Option<Search>],
     read: &mut Reader<'_>,
     matcher: &mut TextMatcher,
     bytes: &mut Vec<u8>,
@@ -584,19 +1041,22 @@ fn verify(
         return Outcome::Stopped(Matched::default());
     }
     let Some(version) = read(name, ReadRequest::Bytes(bytes, stopped)) else {
-        return Outcome::Unread(start.elapsed());
+        return unread(start, stopped);
     };
     let before = matcher.stats();
     let mut work = Matched::default();
     let mut answers = Vec::with_capacity(atoms.len());
     let mut halted = false;
-    for atom in atoms {
+    for (atom, regex) in atoms.iter().zip(regexes) {
         if stopped() {
             halted = true;
             break;
         }
         let engine_start = Instant::now();
-        let answer = atom.find(matcher, bytes);
+        let answer = match regex {
+            Some(search) => search.find(bytes),
+            None => atom.find(matcher, bytes),
+        };
         if matches!(atom, ContentAtom::Grep(_)) {
             work.regex += engine_start.elapsed();
             work.matching.regex_documents += 1;
@@ -625,6 +1085,179 @@ fn verify(
     }
 }
 
+/// A read that failed: stopped, if the run was, which is not a change.
+fn unread(start: Instant, stopped: &dyn Fn() -> bool) -> Outcome {
+    match stopped() {
+        true => Outcome::Stopped(Matched {
+            time: start.elapsed(),
+            ..Matched::default()
+        }),
+        false => Outcome::Unread(start.elapsed()),
+    }
+}
+
+/// The read buffer for streamed documents: one per thread, reused, small
+/// enough to stay in cache while the regex runs over what was just read.
+const LINES: usize = 64 << 10;
+
+/// Whether every atom is a pattern [`stream`] can search a run of lines at
+/// a time: then documents are streamed, not read whole.
+fn streams(atoms: &[ContentAtom]) -> bool {
+    !atoms.is_empty()
+        && atoms
+            .iter()
+            .all(|atom| matches!(atom, ContentAtom::Grep(grep) if grep.is_line_local()))
+}
+
+/// [`verify`] for line-local patterns ([`ferret_verify::Grep::is_line_local`]):
+/// the document streams through `buffer`, and each read is searched up to
+/// its last `\n`, not including it, with the partial line after it carried
+/// to the next. A line longer than the buffer grows it, by doubling, up to
+/// the rest of the document's declared length: a document's buffer is never
+/// larger than [`LINES`] or its length. The run stops early once every atom
+/// has matched.
+///
+/// The answers are the whole-document search's. The first match of a
+/// line-local pattern in a document is the first match in the first run of
+/// whole lines, cut short of a `\n`, that has one, and its offset is the
+/// run's offset plus the match's. The counts are too: each atom counts the
+/// document's whole size, matched or not.
+///
+/// `stopped` is asked before each read and each atom's search, before the
+/// answers are accepted, and again once the host's read returns, as
+/// [`verify`] asks it between atoms. A stopped document, whatever the host
+/// returned, counts the atoms that had finished: those that matched, and
+/// those the last run was searched for without a match.
+fn stream(
+    regexes: &[Option<Search>],
+    read: &mut Reader<'_>,
+    buffer: &mut Vec<u8>,
+    name: NameId,
+    stopped: &dyn Fn() -> bool,
+) -> Outcome {
+    let start = Instant::now();
+    if stopped() {
+        return Outcome::Stopped(Matched::default());
+    }
+    if buffer.len() < LINES {
+        buffer.resize(LINES, 0);
+    }
+    // Sized before the read, in case the host never calls `each`.
+    let mut answers = vec![None; regexes.len()];
+    // Which atoms' answers are final: matched, or searched to the end.
+    let mut done = vec![false; regexes.len()];
+    let mut regex = Duration::ZERO;
+    let mut size = 0;
+    // Set when `stopped` ends the read.
+    let mut halted = false;
+    let mut each = |source: &mut dyn Read, len: u64| {
+        size = len;
+        regex = Duration::ZERO;
+        answers.clear();
+        answers.resize(regexes.len(), None);
+        done.clear();
+        done.resize(regexes.len(), false);
+        let mut open = regexes.len();
+        let mut halt = || {
+            halted = true;
+            Err(io::Error::other("stopped"))
+        };
+        // `buffer[..filled]` is the document from offset `base`, starting
+        // at a line.
+        let (mut filled, mut base) = (0, 0);
+        loop {
+            if stopped() {
+                return halt();
+            }
+            // The source holds at most `len` bytes: once they are all in,
+            // that is the end, and the buffer never grows past them.
+            let left = len.saturating_sub(base as u64 + filled as u64);
+            let n = match left {
+                0 => 0,
+                _ => {
+                    if filled == buffer.len() {
+                        let grown = (buffer.len() * 2).min(filled + left as usize);
+                        buffer
+                            .try_reserve_exact(grown - buffer.len())
+                            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                        buffer.resize(grown, 0);
+                    }
+                    match source.read(&mut buffer[filled..]) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+            // `buffer[..filled]` held no `\n` before this read.
+            let fresh = filled;
+            filled += n;
+            let end = match n {
+                0 => filled,
+                _ => match memchr::memrchr(b'\n', &buffer[fresh..filled]) {
+                    Some(end) => fresh + end,
+                    None => continue,
+                },
+            };
+            let run = &buffer[..end];
+            let engine = Instant::now();
+            for ((search, answer), done) in regexes.iter().zip(&mut answers).zip(&mut done) {
+                let (false, Some(search)) = (*done, search) else {
+                    continue;
+                };
+                if stopped() {
+                    regex += engine.elapsed();
+                    return halt();
+                }
+                if let Some(found) = search.find(run) {
+                    *answer = Some(base + found);
+                    open -= 1;
+                }
+                // The last run settles a miss too.
+                *done = answer.is_some() || n == 0;
+            }
+            regex += engine.elapsed();
+            if open == 0 || n == 0 {
+                if stopped() {
+                    return halt();
+                }
+                return Ok(());
+            }
+            buffer.copy_within(end + 1..filled, 0);
+            filled -= end + 1;
+            base += end + 1;
+        }
+    };
+    let version = read(name, ReadRequest::Stream(&mut each, stopped));
+    // The atoms that finished, matched or not: every one after a full read.
+    let finished = || {
+        let settled = || answers.iter().zip(&done).filter(|(_, done)| **done);
+        let counted = settled().count() as u64;
+        let mut work = Matched {
+            regex,
+            ..Matched::default()
+        };
+        work.matching.regex_documents = counted;
+        work.matching.regex_bytes = counted * size;
+        work.matching.regex_rejected = settled().filter(|(a, _)| a.is_none()).count() as u64;
+        work.time = start.elapsed();
+        work
+    };
+    // A stop after `each` returned, in the host's own checks, is a stop
+    // too: the host may have succeeded or given up because of it.
+    if halted || stopped() {
+        return Outcome::Stopped(finished());
+    }
+    match version {
+        None => Outcome::Unread(start.elapsed()),
+        Some(version) => Outcome::Read {
+            version,
+            work: finished(),
+            answers,
+        },
+    }
+}
+
 fn add(sum: &mut MatchStats, more: &MatchStats) {
     sum.regex_documents += more.regex_documents;
     sum.regex_bytes += more.regex_bytes;
@@ -637,174 +1270,249 @@ fn add(sum: &mut MatchStats, more: &MatchStats) {
 
 // ── the pool ──
 
-/// Jobs in submission order, answers by sequence number, and the byte
-/// budget the workers share.
+/// The batch counter, the ring of finished batches, and the byte budget
+/// the workers share.
+///
+/// Every wait here pairs a sequentially consistent store of the condition
+/// with a sequentially consistent load of a "someone is waiting" word on
+/// the other side, and the notifier takes the waiter's lock before it
+/// signals: so either the waiter sees the condition before it sleeps, or
+/// the notifier sees the waiter and wakes it. Nobody signals a thread that
+/// is not waiting, which keeps wakes, and their syscalls, per batch.
 struct Pool {
-    state: Mutex<PoolState>,
-    /// A job was submitted, or the pool stopped.
-    work: Condvar,
-    /// A job finished, or a worker was lost.
-    done: Condvar,
-    /// Bytes reserved by workers reading now.
-    budget: Mutex<Budget>,
-    freed: Condvar,
+    /// Positions in the run.
+    positions: usize,
+    /// Positions per batch, and the batch count.
+    batch: usize,
+    batches: usize,
+    /// The next batch to claim.
+    next: AtomicUsize,
+    /// Batches the calling thread has taken.
+    head: AtomicUsize,
+    /// Each batch's finished positions not yet taken, at
+    /// `index % ring.len()`.
+    ring: Vec<Mutex<Slot>>,
+    /// Positions posted to each slot, ever: the calling thread sleeps until
+    /// its slot's count moves.
+    posted: Vec<AtomicUsize>,
+    /// The batch the calling thread sleeps for, plus one (0: none).
+    awaited: AtomicUsize,
+    ready: Mutex<()>,
+    ready_signal: Condvar,
+    /// Workers sleeping for room in the ring.
+    roomless: AtomicUsize,
+    room: Mutex<()>,
+    room_signal: Condvar,
+    budget: Budget,
     stop: AtomicBool,
-    /// Jobs finished so far, for [`Window::poll`].
+    /// A worker panicked; its batch will never finish.
+    lost: AtomicBool,
+    /// Positions finished so far, for the test seams.
+    #[cfg(test)]
     finished: AtomicU64,
     #[cfg(test)]
     seams: seam::Seams,
 }
 
-#[derive(Default)]
-struct PoolState {
-    /// Sequence number, name, catalogued size.
-    jobs: VecDeque<(u64, NameId, u64)>,
-    finished: HashMap<u64, Outcome>,
-    next: u64,
-    /// A worker panicked; its job will never finish.
-    lost: bool,
-    /// Workers waiting for a job. Wakes are syscalls, so a submit or a
-    /// finish signals only a thread that is waiting for it.
-    idle: usize,
-    /// The job the calling thread is waiting for, if it is.
-    awaited: Option<u64>,
-}
-
+/// Bytes reserved by workers reading now.
 #[derive(Default)]
 struct Budget {
-    used: u64,
-    /// Workers waiting for bytes to be freed.
-    waiting: usize,
+    used: AtomicU64,
+    /// Workers sleeping for bytes to be freed.
+    waiting: AtomicUsize,
+    lock: Mutex<()>,
+    freed: Condvar,
 }
 
 impl Pool {
-    fn new() -> Self {
+    fn new(positions: usize, threads: usize) -> Self {
+        let batch = (positions / (threads * BATCHES_PER_THREAD)).clamp(1, MAX_BATCH);
+        let slots = threads * RING_PER_THREAD;
         Self {
-            state: Mutex::default(),
-            work: Condvar::new(),
-            done: Condvar::new(),
-            budget: Mutex::default(),
-            freed: Condvar::new(),
+            positions,
+            batch,
+            batches: positions.div_ceil(batch),
+            next: AtomicUsize::new(0),
+            head: AtomicUsize::new(0),
+            ring: (0..slots).map(|_| Mutex::default()).collect(),
+            posted: (0..slots).map(|_| AtomicUsize::new(0)).collect(),
+            awaited: AtomicUsize::new(0),
+            ready: Mutex::new(()),
+            ready_signal: Condvar::new(),
+            roomless: AtomicUsize::new(0),
+            room: Mutex::new(()),
+            room_signal: Condvar::new(),
+            budget: Budget::default(),
             stop: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
+            #[cfg(test)]
             finished: AtomicU64::new(0),
             #[cfg(test)]
             seams: seam::Seams::current(),
         }
     }
 
-    fn state(&self) -> MutexGuard<'_, PoolState> {
-        // A panicking worker holds no lock across user code, so the state
-        // is consistent; `lost` reports the panic.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn submit(&self, name: NameId, size: u64) -> u64 {
-        let mut state = self.state();
-        let seq = state.next;
-        state.next += 1;
-        state.jobs.push_back((seq, name, size));
-        let wake = state.idle > 0;
-        drop(state);
-        if wake {
-            self.work.notify_one();
-        }
-        seq
-    }
-
+    #[cfg(test)]
     fn finished(&self) -> u64 {
         self.finished.load(Ordering::Acquire)
     }
 
-    fn is_done(&self, seq: u64) -> bool {
-        self.state().finished.contains_key(&seq)
-    }
-
-    /// The job's outcome, once finished; `None` if a worker was lost.
-    fn wait(&self, seq: u64) -> Option<Outcome> {
-        let mut state = self.state();
-        loop {
-            if let Some(outcome) = state.finished.remove(&seq) {
-                return Some(outcome);
-            }
-            if state.lost {
-                return None;
-            }
-            state.awaited = Some(seq);
-            state = self
-                .done
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-            state.awaited = None;
-        }
-    }
-
     fn halt(&self) {
-        self.stop.store(true, Ordering::Release);
-        // Taking each lock orders the store before any waiter's next check.
-        drop(self.state());
-        self.work.notify_all();
-        drop(self.budget.lock().unwrap_or_else(PoisonError::into_inner));
-        self.freed.notify_all();
+        self.stop.store(true, Ordering::SeqCst);
+        // Taking each lock orders the store before any sleeper's next check.
+        drop(lock(&self.room));
+        self.room_signal.notify_all();
+        drop(lock(&self.budget.lock));
+        self.budget.freed.notify_all();
     }
 
     fn halted(&self) -> bool {
-        self.stop.load(Ordering::Acquire)
+        self.stop.load(Ordering::SeqCst)
     }
 
-    /// One worker: take jobs in order until the pool stops. Every job taken
-    /// finishes, if only as stopped, so the calling thread never waits for
-    /// one that will not.
-    fn work(&self, atoms: &[ContentAtom], fork: &Fork<'_>, stopped: &(dyn Fn() -> bool + Sync)) {
+    /// One worker: claim batches in order and post each position as it
+    /// finishes, until none is left or the pool stops.
+    fn work(&self, scan: &Scan<'_, '_, '_>, fork: &Fork<'_>, stopped: &(dyn Fn() -> bool + Sync)) {
         let _lost = LostOnPanic(self);
         let mut read = fork();
-        let mut matcher = TextMatcher::new();
-        let mut bytes = Vec::new();
+        let mut hand = Hand::new(&mut *read, &scan.query.atoms);
+        let mut names = NameTester::new(scan.query, scan.catalog, scan.cancelled);
         let halt = || self.halted() || stopped();
-        while let Some((seq, name, size)) = self.next_job() {
-            let outcome = match self.reserve(size, &halt) {
-                Some(size) => {
-                    let held = Held {
-                        pool: self,
-                        size,
-                        bytes: &mut bytes,
-                    };
-                    verify(
-                        atoms,
-                        &mut *read,
-                        &mut matcher,
-                        &mut *held.bytes,
-                        name,
-                        &halt,
-                    )
-                }
-                None => Outcome::Stopped(Matched::default()),
-            };
-            let mut state = self.state();
-            state.finished.insert(seq, outcome);
-            self.finished.fetch_add(1, Ordering::Release);
-            let wake = state.awaited == Some(seq);
-            drop(state);
-            if wake {
-                self.done.notify_all();
+        let mut paths = Vec::new();
+        loop {
+            if self.halted() {
+                return;
+            }
+            let index = self.next.fetch_add(1, Ordering::Relaxed);
+            if index >= self.batches || !self.room_for(index) {
+                return;
+            }
+            let start = index * self.batch;
+            let end = (start + self.batch).min(self.positions);
+            for at in start..end {
+                paths.clear();
+                let item = scan.item(at, &mut names, &mut hand, Some(self), &halt, &mut paths);
+                self.post(index, at, item, &paths, at + 1 == end);
             }
         }
     }
 
-    fn next_job(&self) -> Option<(u64, NameId, u64)> {
-        let mut state = self.state();
+    /// Waits until batch `index` has a slot in the ring: the calling thread
+    /// has taken the batch that held it. False once the pool stops.
+    fn room_for(&self, index: usize) -> bool {
+        let fits = || index < self.head.load(Ordering::SeqCst) + self.ring.len();
+        if fits() {
+            return !self.halted();
+        }
+        self.roomless.fetch_add(1, Ordering::SeqCst);
+        let mut guard = lock(&self.room);
+        while !fits() && !self.halted() {
+            guard = self
+                .room_signal
+                .wait(guard)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(guard);
+        self.roomless.fetch_sub(1, Ordering::SeqCst);
+        !self.halted()
+    }
+
+    /// Posts position `at` of batch `index`, whose row's path is `paths`;
+    /// `last` if it is the batch's last.
+    fn post(&self, index: usize, at: usize, item: Item, paths: &[u8], last: bool) {
+        let slot = index % self.ring.len();
+        {
+            let mut held = lock(&self.ring[slot]);
+            if held.index != index + 1 {
+                held.index = index + 1;
+                held.part.clear();
+            }
+            if held.part.items.is_empty() {
+                held.part.start = at;
+            }
+            held.part.push(item, paths);
+            held.complete = last;
+        }
+        #[cfg(test)]
+        self.finished.fetch_add(1, Ordering::AcqRel);
+        self.posted[slot].fetch_add(1, Ordering::SeqCst);
+        if self.awaited.load(Ordering::SeqCst) == index + 1 {
+            drop(lock(&self.ready));
+            self.ready_signal.notify_one();
+        }
+        #[cfg(test)]
+        self.seams.published(&|| self.finished());
+    }
+
+    /// Batch `index`'s next finished positions, into `out` (empty): waits
+    /// until there is at least one, or the batch is complete. True once the
+    /// batch is complete, which frees its slot; `None` if a worker was lost.
+    fn take(&self, index: usize, out: &mut Batch) -> Option<bool> {
+        let slot = index % self.ring.len();
+        let posted = &self.posted[slot];
         loop {
-            if self.halted() {
+            let seen = posted.load(Ordering::SeqCst);
+            {
+                let mut held = lock(&self.ring[slot]);
+                if held.index == index + 1 && (!held.part.items.is_empty() || held.complete) {
+                    std::mem::swap(&mut held.part, out);
+                    let complete = held.complete;
+                    if complete {
+                        held.index = 0;
+                        held.complete = false;
+                    }
+                    drop(held);
+                    if complete {
+                        self.head.store(index + 1, Ordering::SeqCst);
+                        if self.roomless.load(Ordering::SeqCst) > 0 {
+                            drop(lock(&self.room));
+                            self.room_signal.notify_all();
+                        }
+                    }
+                    return Some(complete);
+                }
+            }
+            let mut guard = lock(&self.ready);
+            self.awaited.store(index + 1, Ordering::SeqCst);
+            let moved = || posted.load(Ordering::SeqCst) != seen;
+            while !moved() && !self.lost.load(Ordering::SeqCst) {
+                guard = self
+                    .ready_signal
+                    .wait(guard)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            self.awaited.store(0, Ordering::SeqCst);
+            drop(guard);
+            if !moved() {
                 return None;
             }
-            if let Some(job) = state.jobs.pop_front() {
-                return Some(job);
+        }
+    }
+
+    /// Reads and matches one document on a worker, within the byte budget.
+    fn read(
+        &self,
+        query: &Query,
+        hand: &mut Hand<'_, '_>,
+        name: NameId,
+        size: u64,
+        halt: &dyn Fn() -> bool,
+    ) -> Outcome {
+        match self.reserve(size, halt) {
+            Some(size) => {
+                let outcome = hand.verify(&query.atoms, name, halt);
+                if hand.bytes.capacity() > KEPT_BUFFER {
+                    hand.bytes = Vec::new();
+                }
+                if hand.lines.capacity() > KEPT_BUFFER {
+                    hand.lines = Vec::new();
+                }
+                // Freed only after an oversized buffer is: a reader that the
+                // release wakes cannot allocate against bytes still held.
+                self.release(size);
+                outcome
             }
-            state.idle += 1;
-            state = self
-                .work
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-            state.idle -= 1;
+            None => Outcome::Stopped(Matched::default()),
         }
     }
 
@@ -813,7 +1521,8 @@ impl Pool {
     /// pool or the query stopped, waiting or not, so no read starts after.
     fn reserve(&self, size: u64, halt: &dyn Fn() -> bool) -> Option<u64> {
         let size = size.min(IN_FLIGHT_BYTES);
-        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
+        let budget = &self.budget;
+        let fits = |used: u64| used == 0 || used + size <= IN_FLIGHT_BYTES;
         loop {
             // A pool stop wakes this wait. A cancelled query does not, but
             // a reader holding bytes stops at its next chunk and frees
@@ -821,50 +1530,47 @@ impl Pool {
             if halt() {
                 return None;
             }
-            if budget.used == 0 || budget.used + size <= IN_FLIGHT_BYTES {
-                break;
+            let used = budget.used.load(Ordering::SeqCst);
+            if fits(used) {
+                if budget
+                    .used
+                    .compare_exchange(used, used + size, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Some(size);
+                }
+                continue;
             }
-            budget.waiting += 1;
-            #[cfg(test)]
-            self.seams.waiting_for_bytes();
-            budget = self
-                .freed
-                .wait(budget)
-                .unwrap_or_else(PoisonError::into_inner);
-            budget.waiting -= 1;
+            let guard = lock(&budget.lock);
+            budget.waiting.fetch_add(1, Ordering::SeqCst);
+            if !halt() && !fits(budget.used.load(Ordering::SeqCst)) {
+                #[cfg(test)]
+                self.seams.waiting_for_bytes();
+                drop(
+                    budget
+                        .freed
+                        .wait(guard)
+                        .unwrap_or_else(PoisonError::into_inner),
+                );
+            }
+            budget.waiting.fetch_sub(1, Ordering::SeqCst);
         }
-        budget.used += size;
-        Some(size)
     }
 
     fn release(&self, size: u64) {
-        let mut budget = self.budget.lock().unwrap_or_else(PoisonError::into_inner);
-        budget.used -= size;
-        let wake = budget.waiting > 0;
-        drop(budget);
-        if wake {
-            self.freed.notify_all();
+        let budget = &self.budget;
+        budget.used.fetch_sub(size, Ordering::SeqCst);
+        if budget.waiting.load(Ordering::SeqCst) > 0 {
+            drop(lock(&budget.lock));
+            budget.freed.notify_all();
         }
     }
 }
 
-/// Bytes reserved for one read, and the worker's buffer they were charged
-/// for. Dropping it frees an oversized buffer first and only then returns
-/// the bytes, so a reader that the release wakes cannot allocate against
-/// them while the buffer still holds them.
-struct Held<'p, 'b> {
-    pool: &'p Pool,
-    size: u64,
-    bytes: &'b mut Vec<u8>,
-}
-
-impl Drop for Held<'_, '_> {
-    fn drop(&mut self) {
-        if self.bytes.capacity() > KEPT_BUFFER {
-            *self.bytes = Vec::new();
-        }
-        self.pool.release(self.size);
-    }
+/// A pool lock; a panicking worker holds none across user code, so what it
+/// guards is consistent.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Starts worker `i` on the scope.
@@ -900,8 +1606,9 @@ struct LostOnPanic<'p>(&'p Pool);
 impl Drop for LostOnPanic<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.0.state().lost = true;
-            self.0.done.notify_all();
+            self.0.lost.store(true, Ordering::SeqCst);
+            drop(lock(&self.0.ready));
+            self.0.ready_signal.notify_all();
         }
     }
 }
@@ -913,21 +1620,23 @@ pub(crate) mod seam {
     use std::cell::RefCell;
     use std::sync::Arc;
 
-    /// Given the pool's finished-job count.
+    /// Given the pool's finished-position count.
     pub(crate) type Poll = dyn Fn(&dyn Fn() -> u64) + Send + Sync;
 
     #[derive(Clone, Default)]
     pub(crate) struct Seams {
         /// The worker whose spawn fails.
         pub fail_spawn_at: Option<usize>,
-        /// Called, under the budget lock, when a worker waits for bytes.
+        /// Called, under the budget lock, when a worker sleeps for bytes.
         pub on_budget_wait: Option<Arc<dyn Fn() + Send + Sync>>,
-        /// Called on the calling thread at each candidate that joins no
-        /// window, with the pool's finished-job count.
-        pub on_poll: Option<Arc<Poll>>,
-        /// Called on the calling thread when the run is over and the window
-        /// is about to be dropped, with the pool's finished-job count.
+        /// Called on the calling thread when the run is over and its state
+        /// is about to be dropped, with the pool's finished-position count.
         pub on_teardown: Option<Arc<Poll>>,
+        /// Called on a worker after it posts a position, with the pool's
+        /// finished-position count.
+        pub on_publish: Option<Arc<Poll>>,
+        /// Counts the run-membership checks of owner selection.
+        pub owner_checks: Option<Arc<std::sync::atomic::AtomicU64>>,
     }
 
     thread_local! {
@@ -958,8 +1667,8 @@ pub(crate) mod seam {
             }
         }
 
-        pub(super) fn polling(&self, finished: &dyn Fn() -> u64) {
-            if let Some(hook) = &self.on_poll {
+        pub(super) fn published(&self, finished: &dyn Fn() -> u64) {
+            if let Some(hook) = &self.on_publish {
                 hook(finished);
             }
         }
@@ -988,7 +1697,9 @@ mod partial {
     #[test]
     fn a_document_cancelled_between_atoms_counts_the_finished_atom() {
         let query = Query::parse(
-            "grep:needle grep:other",
+            // `(?s)` lets `.` match a newline, so the document is read
+            // whole: the path that checks between atoms.
+            "grep:needle grep:(?s)oth.r",
             UNIX_EPOCH + Duration::from_secs(1),
         )
         .unwrap();
@@ -1014,5 +1725,441 @@ mod partial {
         assert_eq!(tally.matching.regex_bytes, 13);
         assert_eq!(tally.matching.regex_rejected, 0);
         assert!(verifier.exact.is_empty());
+    }
+
+    /// Hands out `chunks` one per read; `stop` is set as the read after
+    /// the last of `before` chunks is made.
+    struct Chunks<'a> {
+        chunks: &'a [&'a [u8]],
+        before: usize,
+        stop: &'a Cell<bool>,
+    }
+
+    impl std::io::Read for Chunks<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.before == 0 {
+                self.stop.set(true);
+            }
+            self.before = self.before.saturating_sub(1);
+            let Some((first, rest)) = self.chunks.split_first() else {
+                return Ok(0);
+            };
+            buf[..first.len()].copy_from_slice(first);
+            self.chunks = rest;
+            Ok(first.len())
+        }
+    }
+
+    /// A streamed document whose run is stopped once `before` reads have
+    /// been made, through the calling thread's [`Verifier::here`].
+    fn stream_stopped(chunks: &[&[u8]], before: usize) -> (Settled, super::Tally) {
+        let query = Query::parse(
+            "grep:needle grep:other",
+            UNIX_EPOCH + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(super::streams(&query.atoms));
+        let stop = Cell::new(false);
+        let size = chunks.iter().map(|c| c.len() as u64).sum();
+        let mut read = |_, request: ReadRequest<'_>| {
+            let ReadRequest::Stream(each, _) = request else {
+                panic!("line-local reads stream");
+            };
+            let mut source = Chunks {
+                chunks,
+                before,
+                stop: &stop,
+            };
+            each(&mut source, size).ok()?;
+            Some(ReadVersion::Catalogued)
+        };
+        let mut verifier = Verifier::new(&query, &mut read, 1);
+        let settled = verifier.here(0, ferret_catalog::NameId(0), &|| stop.get());
+        (settled, std::mem::take(&mut verifier.tally))
+    }
+
+    /// Stopped as the last chunk is read: the document is not accepted, and
+    /// `needle`, which matched in the first, counts; `other` had not
+    /// finished. Not a change.
+    #[test]
+    fn a_stream_stopped_on_its_final_chunk_is_not_accepted() {
+        let (settled, tally) = stream_stopped(&[b"a needle\n", b"tail\n"], 1);
+        assert!(matches!(settled, Settled::Stopped));
+        assert_eq!(tally.verified, 1);
+        assert_eq!(tally.changed, 0);
+        assert_eq!(tally.matching.regex_documents, 1);
+        assert_eq!(tally.matching.regex_bytes, 14);
+        assert_eq!(tally.matching.regex_rejected, 0);
+    }
+
+    /// Stopped after the end of the document was read and searched: both
+    /// atoms finished, so both count, and the document is not accepted.
+    /// The stop is the seventh check: one before the read, one per read
+    /// (two: the text, then its end), one per unanswered atom's search
+    /// (three), then the one before the answers are accepted.
+    #[test]
+    fn a_stream_stopped_after_its_end_counts_every_atom() {
+        let query = Query::parse(
+            "grep:needle grep:other",
+            UNIX_EPOCH + Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut read = |_, request: ReadRequest<'_>| {
+            let ReadRequest::Stream(each, _) = request else {
+                panic!("line-local reads stream");
+            };
+            each(&mut &b"a needle\ntail\n"[..], 14).ok()?;
+            Some(ReadVersion::Catalogued)
+        };
+        let mut verifier = Verifier::new(&query, &mut read, 1);
+        let checks = Cell::new(0);
+        let stopped = || {
+            checks.set(checks.get() + 1);
+            checks.get() >= 7
+        };
+        let settled = verifier.here(0, ferret_catalog::NameId(0), &stopped);
+        assert!(matches!(settled, Settled::Stopped));
+        let tally = &verifier.tally;
+        assert_eq!(tally.changed, 0);
+        assert_eq!(tally.matching.regex_documents, 2);
+        assert_eq!(tally.matching.regex_bytes, 28);
+        assert_eq!(tally.matching.regex_rejected, 1);
+    }
+
+    /// Stopped while the second chunk is wanted, after `needle` finished in
+    /// the first: the finished atom counts, and cancellation is no change.
+    #[test]
+    fn a_stream_stopped_after_one_atom_counts_it() {
+        let (settled, tally) = stream_stopped(&[b"a needle\n", b"more\n", b"tail\n"], 1);
+        assert!(matches!(settled, Settled::Stopped));
+        assert_eq!(tally.verified, 1);
+        assert_eq!(tally.changed, 0);
+        assert_eq!(tally.matching.regex_documents, 1);
+        assert_eq!(tally.matching.regex_bytes, 19);
+    }
+
+    /// Sol round 2: an atom that finished without a match counts when a
+    /// stop ends the next. The document is empty, so its end is the first
+    /// run: `needle` is searched and rejected, then the stop comes before
+    /// `other`, at the fourth check (before the read, before the first
+    /// read of the source, before each atom). The whole-document path
+    /// counts the same rejection.
+    #[test]
+    fn a_stream_stopped_after_a_rejection_at_its_end_counts_it() {
+        let query = Query::parse(
+            "grep:needle grep:other",
+            UNIX_EPOCH + Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut read = |_, request: ReadRequest<'_>| {
+            let ReadRequest::Stream(each, _) = request else {
+                panic!("line-local reads stream");
+            };
+            each(&mut &b""[..], 0).ok()?;
+            Some(ReadVersion::Catalogued)
+        };
+        let mut verifier = Verifier::new(&query, &mut read, 1);
+        let checks = Cell::new(0);
+        let stopped = || {
+            checks.set(checks.get() + 1);
+            checks.get() >= 4
+        };
+        let settled = verifier.here(0, ferret_catalog::NameId(0), &stopped);
+        assert!(matches!(settled, Settled::Stopped));
+        let tally = &verifier.tally;
+        assert_eq!(tally.changed, 0);
+        assert_eq!(tally.matching.regex_documents, 1);
+        assert_eq!(tally.matching.regex_rejected, 1);
+    }
+
+    /// Sol round 2: the stream finishes, then the stop comes in the host's
+    /// own checks after it (its bracketing `fstat`, say). Whether the host
+    /// still returns a version or gives up, the document is stopped, not
+    /// accepted and not a change, and both finished atoms count.
+    #[test]
+    fn a_stream_stopped_after_it_finished_counts_its_work() {
+        for host_returns in [Some(ReadVersion::Catalogued), None] {
+            let query = Query::parse(
+                "grep:needle grep:other",
+                UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap();
+            let stop = Cell::new(false);
+            let mut read = |_, request: ReadRequest<'_>| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("line-local reads stream");
+                };
+                each(&mut &b"a needle\nother\n"[..], 15).ok()?;
+                stop.set(true);
+                host_returns
+            };
+            let mut verifier = Verifier::new(&query, &mut read, 1);
+            let settled = verifier.here(0, ferret_catalog::NameId(0), &|| stop.get());
+            assert!(matches!(settled, Settled::Stopped), "{host_returns:?}");
+            let tally = &verifier.tally;
+            assert_eq!(tally.changed, 0, "{host_returns:?}");
+            assert_eq!(tally.matching.regex_documents, 2, "{host_returns:?}");
+            assert_eq!(tally.matching.regex_bytes, 30, "{host_returns:?}");
+            assert!(verifier.exact.is_empty());
+        }
+    }
+
+    /// Sol round 2: a whole-document read that fails as the run is
+    /// cancelled is stopped, not a change.
+    #[test]
+    fn a_whole_read_failing_as_the_run_stops_is_not_a_change() {
+        let query = Query::parse("grep:(?s)need.e", UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+        assert!(!super::streams(&query.atoms));
+        let stop = Cell::new(false);
+        let mut read = |_, request: ReadRequest<'_>| {
+            let ReadRequest::Bytes(..) = request else {
+                panic!("a `(?s)` pattern reads whole");
+            };
+            stop.set(true);
+            None
+        };
+        let mut verifier = Verifier::new(&query, &mut read, 1);
+        let settled = verifier.here(0, ferret_catalog::NameId(0), &|| stop.get());
+        assert!(matches!(settled, Settled::Stopped));
+        assert_eq!(verifier.tally.verified, 1);
+        assert_eq!(verifier.tally.changed, 0);
+    }
+}
+
+/// [`stream`] against [`verify`], the whole-document search, on the same
+/// bytes: every answer and count agree for line-local patterns, with the
+/// bytes arriving a few at a time, so runs end at every kind of place, and
+/// with a line longer than the buffer.
+#[cfg(test)]
+mod streamed {
+    use std::io::Read;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ferret_catalog::NameId;
+    use ferret_verify::TextMatcher;
+
+    use super::{Hand, Outcome, stream, streams, verify};
+    use crate::{Query, ReadRequest, ReadVersion};
+
+    /// Hands out `bytes` 1 to `most` at a time.
+    struct Dribble<'a> {
+        bytes: &'a [u8],
+        most: usize,
+        reads: usize,
+    }
+
+    impl Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            let n = buf
+                .len()
+                .min(1 + self.reads % self.most)
+                .min(self.bytes.len());
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            self.bytes = &self.bytes[n..];
+            Ok(n)
+        }
+    }
+
+    /// Random documents from pieces that include CRLF, NUL, two- and
+    /// three-byte characters (which the dribbled reads split), and
+    /// malformed UTF-8: a lone continuation byte, a truncated lead, and
+    /// 0xff.
+    fn documents() -> Vec<Vec<u8>> {
+        let alphabet: [&[u8]; 16] = [
+            b"a",
+            b"o",
+            b" ",
+            b"f",
+            b"\n",
+            b"k",
+            b"1",
+            b"_",
+            b"\n",
+            b"\r\n",
+            b"\0",
+            "\u{e9}".as_bytes(),
+            "\u{65e5}".as_bytes(),
+            b"\xa9",
+            b"\xe6\x97",
+            b"\xff",
+        ];
+        let mut seed = 0x2545_f491_u64;
+        let mut docs: Vec<Vec<u8>> = (0..300)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let len = (seed >> 33) as usize % 300;
+                (0..len)
+                    .flat_map(|_| {
+                        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        alphabet[(seed >> 33) as usize % alphabet.len()]
+                    })
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        let mut long = vec![b'a'; 70_000];
+        long.extend_from_slice(b"o foo_\n\nk1 a");
+        docs.push(long);
+        docs.extend([
+            b"".to_vec(),
+            b"\n".to_vec(),
+            b"foo".to_vec(),
+            b"a\n\n".to_vec(),
+        ]);
+        docs
+    }
+
+    fn answers(outcome: Outcome) -> (Vec<Option<usize>>, ferret_verify::MatchStats) {
+        match outcome {
+            Outcome::Read { answers, work, .. } => (answers, work.matching),
+            _ => panic!("not read"),
+        }
+    }
+
+    #[test]
+    fn streamed_answers_are_the_whole_documents() {
+        let patterns = [
+            "foo",
+            "^foo",
+            "foo$",
+            "^$",
+            r"\bfo",
+            r"o\b",
+            r"\Bo",
+            "^a*$",
+            "k1",
+            "(?i)K",
+            "[a-z]+1",
+            "f.o",
+            "^",
+            "$",
+            "a{3}",
+            "_$",
+            r"^\b",
+            r"\b$",
+            "(?-u)o_",
+            r"\r$",
+            r"\x00",
+            r"a\x00",
+            "\u{e9}",
+            "(?i)\u{c9}",
+            "\u{65e5}",
+            r"\w+$",
+            "^.$",
+            "f.$",
+            r"[^a\r\n]+$",
+            r"(?-u)\xff",
+            r"(?-u)[\x80-\xff]{2}",
+            r"(?-u)^[^\x00\n]*$",
+        ];
+        let docs = documents();
+        let never = || false;
+        for (i, pattern) in patterns.into_iter().enumerate() {
+            // Every other query negates its second atom: the answers are
+            // the atoms', whatever the expression does with them.
+            let not = if i % 2 == 0 { "" } else { "NOT " };
+            let text = format!("grep:{pattern} {not}grep:a");
+            let query = Query::parse(&text, UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+            assert!(streams(&query.atoms), "{pattern} is line-local");
+            for doc in &docs {
+                let mut whole = |_, request: ReadRequest<'_>| {
+                    let ReadRequest::Bytes(out, _) = request else {
+                        panic!("whole reads are bytes");
+                    };
+                    out.clear();
+                    out.extend_from_slice(doc);
+                    Some(ReadVersion::Catalogued)
+                };
+                let mut bytes = Vec::new();
+                let mut matcher = TextMatcher::new();
+                let regexes = Hand::new(&mut whole, &query.atoms).regexes;
+                let expected = answers(verify(
+                    &query.atoms,
+                    &regexes,
+                    &mut whole,
+                    &mut matcher,
+                    &mut bytes,
+                    NameId(0),
+                    &never,
+                ));
+                let mut dribbled = |_, request: ReadRequest<'_>| {
+                    let ReadRequest::Stream(each, _) = request else {
+                        panic!("line-local reads stream");
+                    };
+                    // A few bytes at a time; the long line in larger
+                    // pieces, which still end mid-line.
+                    let mut source = Dribble {
+                        bytes: doc,
+                        most: if doc.len() > 1000 { 4093 } else { 7 },
+                        reads: 0,
+                    };
+                    each(&mut source, doc.len() as u64).ok()?;
+                    Some(ReadVersion::Catalogued)
+                };
+                let mut buffer = Vec::new();
+                let got = answers(stream(
+                    &regexes,
+                    &mut dribbled,
+                    &mut buffer,
+                    NameId(0),
+                    &never,
+                ));
+                let shown = String::from_utf8_lossy(&doc[..doc.len().min(80)]);
+                assert_eq!(got, expected, "{pattern} over {shown:?}");
+            }
+        }
+    }
+
+    /// Sol round 1, P6: a line as long as the document grows the buffer to
+    /// the document's length and no further, at the doubling boundaries
+    /// and at 8 MiB, the size cap, and the answers stay the whole search's.
+    #[test]
+    fn a_long_line_grows_the_buffer_to_the_documents_length_at_most() {
+        use super::LINES;
+        let query = Query::parse("grep:a$ grep:ab", UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+        let never = || false;
+        let regexes = Hand::new(&mut |_, _| None, &query.atoms).regexes;
+        for size in [
+            LINES - 1,
+            LINES,
+            LINES + 1,
+            2 * LINES - 1,
+            2 * LINES,
+            3 * LINES,
+            8 << 20,
+        ] {
+            for end in [b'a', b'\n'] {
+                let mut doc = vec![b'a'; size];
+                doc[size - 1] = end;
+                let mut read = |_, request: ReadRequest<'_>| {
+                    let ReadRequest::Stream(each, _) = request else {
+                        panic!("line-local reads stream");
+                    };
+                    each(&mut doc.as_slice(), doc.len() as u64).ok()?;
+                    Some(ReadVersion::Catalogued)
+                };
+                let mut buffer = Vec::new();
+                let got = answers(stream(&regexes, &mut read, &mut buffer, NameId(0), &never));
+                let at = size - 1 - usize::from(end == b'\n');
+                assert_eq!(got.0, [Some(at), None], "{size} ending {end}");
+                assert!(
+                    buffer.capacity() <= size.max(LINES),
+                    "{size} ending {end}: a {} byte buffer",
+                    buffer.capacity()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn patterns_that_see_a_newline_or_a_text_end_are_read_whole() {
+        for pattern in [
+            r"a\nb", r"\s", "[^a]", "(?s).", r"\Aa", r"a\z", "(?R)^a", "(?R)a$",
+        ] {
+            let text = format!("grep:{pattern}");
+            let query = Query::parse(&text, UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+            assert!(!streams(&query.atoms), "{pattern} is not line-local");
+        }
     }
 }

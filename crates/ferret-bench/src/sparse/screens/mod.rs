@@ -29,6 +29,7 @@ mod product;
 mod resident;
 mod residue;
 mod rg;
+pub(crate) mod scan;
 mod units;
 
 use hashed::Hashed;

@@ -427,6 +427,13 @@ pub(crate) fn once(
                     *out = bytes;
                     ferret_query::ReadVersion::Catalogued
                 }),
+                // Read whole, as this screen always has, then handed over.
+                ferret_query::ReadRequest::Stream(each, _) => {
+                    let bytes = fs::read(path).ok()?;
+                    read_bytes += bytes.len() as u64;
+                    each(&mut bytes.as_slice(), bytes.len() as u64).ok()?;
+                    Some(ferret_query::ReadVersion::Catalogued)
+                }
             };
             read += start.elapsed();
             return version;
@@ -446,6 +453,14 @@ pub(crate) fn once(
                     read_bytes += out.len() as u64;
                 }
                 version
+            }
+            // Read whole, as this screen always has, then handed over.
+            ferret_query::ReadRequest::Stream(each, _) => {
+                let mut bytes = Vec::new();
+                let version = read_current_name(catalog, name, &mut path, &mut bytes)?;
+                read_bytes += bytes.len() as u64;
+                each(&mut bytes.as_slice(), bytes.len() as u64).ok()?;
+                Some(version)
             }
         };
         read += start.elapsed();
@@ -872,8 +887,11 @@ pub(crate) fn run_regex(dir: &Path, index_dir: &Path, snapshot_dir: &Path) -> cr
                 &names,
                 &content,
                 &mut |name, request| {
-                    if matches!(request, ferret_query::ReadRequest::Bytes(..))
-                        && let Target::Inode(inode) = catalog.name(name).target()
+                    if matches!(
+                        request,
+                        ferret_query::ReadRequest::Bytes(..)
+                            | ferret_query::ReadRequest::Stream(..)
+                    ) && let Target::Inode(inode) = catalog.name(name).target()
                         && let Some(doc) = catalog.doc(inode)
                     {
                         evict_docs.insert(doc.0);

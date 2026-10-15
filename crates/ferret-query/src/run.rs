@@ -322,48 +322,51 @@ impl Query {
     }
 }
 
-impl Query {
-    /// Tests the names `ids`, in the order given, against S1's tests, and
-    /// emits each that passes: a content-driven plan's rows. `emit` is
-    /// called once per candidate, with `None` for one that does not pass,
-    /// so a caller can make progress between rows; it is also given the
-    /// candidates counted so far, this one included.
-    pub(crate) fn s1_ids(
-        &self,
-        catalog: &Catalog,
-        ids: &[NameId],
-        cancelled: Option<&AtomicBool>,
-        mut emit: impl FnMut(Option<&Row<'_>>, u64) -> ControlFlow<()>,
-    ) -> Result<Stats, RunError> {
-        catalog.load(&ROW_SECTIONS)?;
-        let mut run = Run {
-            query: self,
-            cancelled,
-            catalog,
-            meta_loaded: false,
-            stats: Stats::default(),
-            dir: None,
-            up: None,
-            path: Vec::new(),
-        };
-        let mut kinds = catalog.kinds();
-        for &id in ids {
-            run.stats.candidates += 1;
-            let seen = run.stats.candidates;
-            let mut passed = false;
-            let mut flow =
-                run.consider(&mut kinds, id, catalog.name(id), None, false, &mut |row| {
-                    passed = true;
-                    emit(Some(row), seen)
-                })?;
-            if !passed && flow.is_continue() {
-                flow = emit(None, seen);
-            }
-            if flow.is_break() {
-                break;
-            }
+/// S1's tests on one name at a time, in any order the caller gives: a
+/// content-driven plan's rows, tested by each verifying thread for its own
+/// names. Each tester keeps its own path cache, so threads share nothing.
+pub(crate) struct NameTester<'q, 'c> {
+    run: Run<'q, 'c>,
+    kinds: Kinds<'c>,
+}
+
+impl<'q, 'c> NameTester<'q, 'c> {
+    /// The sections every tester reads; loaded once, before any thread
+    /// tests a name.
+    pub(crate) fn load(catalog: &Catalog) -> Result<(), OpenError> {
+        catalog.load(&ROW_SECTIONS)
+    }
+
+    pub(crate) fn new(
+        query: &'q Query,
+        catalog: &'c Catalog,
+        cancelled: Option<&'q AtomicBool>,
+    ) -> Self {
+        Self {
+            run: Run {
+                query,
+                cancelled,
+                catalog,
+                meta_loaded: false,
+                stats: Stats::default(),
+                dir: None,
+                up: None,
+                path: Vec::new(),
+            },
+            kinds: catalog.kinds(),
         }
-        Ok(run.stats)
+    }
+
+    /// Tests `id`, calling `pass` with its row if it passes. `Break` if
+    /// the query was cancelled first.
+    pub(crate) fn test(
+        &mut self,
+        id: NameId,
+        pass: &mut impl FnMut(&Row<'_>) -> ControlFlow<()>,
+    ) -> RunResult {
+        let name = self.run.catalog.name(id);
+        self.run
+            .consider(&mut self.kinds, id, name, None, false, pass)
     }
 }
 

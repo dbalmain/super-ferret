@@ -4810,13 +4810,15 @@ content past roughly the size of A's index, also A.
 ### Update 2026-10-13: C built and measured
 
 Content verification now runs on a pool of threads. `FERRET_SEARCH_THREADS`
-sets the count, which defaults to every core. For files that do not change
+sets the count, which defaults to every core (every core up to 16 since
+D77). For files that do not change
 during the query, and without cancellation, output is byte-identical at any
 thread count, and tests compare 1 thread against N. Workers reserve at most
 64 MiB of documents at once, by catalogued size, plus 1 MiB of kept buffer
 each; files that grew since indexing hold more than they reserved, and the
 calling thread's buffer sits outside the budget. The one order that changes is
-that a document can be read up to 64 rows per thread before its
+that a document can be read up to 64 rows per thread (since the scan
+work, up to 16 batches of up to 256 positions per thread) before its
 predecessors are emitted, so a result callback that changes a later file
 may not change that file's row
 ([SCREENS.md § Parallel verification](SCREENS.md#parallel-verification)).
@@ -4866,3 +4868,81 @@ past a scan.
 run cold, for example as the first search after a boot or after memory
 pressure, then B, or A at its size, buys 12–90× cold that no amount of
 threading reaches.
+
+## D77 — Default verification threads: every core, or at most 16
+
+**Status: B built (2026-10-14, branch `wt/scan`); open for Dave.**
+Measured in [SCAN.md § Threads](SCAN.md#threads) on the D65C corpus (3.98 GB,
+112,376 readable documents), a pure scan through the product path, 5 queries
+per class and case, after the scan work (steps 1–3). Median ms over the five
+classes, as the range of class medians; 16 cores, 32 threads.
+
+| Threads | Warm ci | Warm cs | Warm CPU s | Cold ci | Cold cs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 12 | 178–265 | 162–219 | 1.8–2.1 | 3,825–4,136 | 3,813–4,174 |
+| 16 | 162–216 | 155–173 | 2.1–2.4 | 3,544–3,822 | 3,507–3,871 |
+| 24 | 164–222 | 167–179 | 2.9–3.3 | | |
+| 32 | 179–217 | 174–187 | 3.5–4.0 | 3,194–3,654 | 3,135–3,749 |
+| `rg` (12) | 158–175 | 144–156 | 1.4–1.8 | 5,137–5,332 | 5,174–5,247 |
+
+**Question:** Should `ferret search` verify content on every available core,
+or on at most 16?
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Every core (32 here), the default before | 1.3–1.6 s more CPU per warm scan than B (about 60%), for 10–20 ms more wall on most classes. | The fastest cold scan: 2–12% faster than B (70–380 ms), most on alternations. |
+| B. `min(16, available_parallelism)` (built) | Cold 2–12% slower than A; still 1.35–1.5× faster than `rg`. On a machine with more than 16 physical cores, leaves cores idle. | The fastest warm scan on every class and case, at 60% of A's CPU, which matters on a laptop running other work. |
+| C. Physical cores, read from `/sys/devices/system/cpu` topology | A sysfs read and its fallback on every `search` process; more code to test. | B's result here, and the right count on machines whose physical core count is not 16. |
+
+**Recommendation: B.** The warm scan is the repeated case for an agent
+working in one tree, and B is fastest there at the least CPU. A wins only
+cold, by at most 0.38 s of a 3.5 s scan that already beats `rg` by 1.4 s.
+
+**Fact that would change it:** if agents' full scans mostly run cold, A,
+since its cold gain (70–380 ms) exceeds B's warm gain (10–20 ms) in
+absolute terms. If a machine with more than 16 physical cores is a target,
+C.
+
+## D78 — Should a one-shot `ferret search` build resident names?
+
+**Status: open for Dave (2026-10-14, updated 2026-10-15; branch `wt/scan`).**
+Measured in [SCAN.md § Remaining gap](SCAN.md#remaining-gap): a no-daemon
+`ferret search --scan` over the D65C catalog (112,377 name rows) spent 26 ms in
+`Engine::open` building the resident names (D54 B's interned table and postings)
+before it read a document. The build now runs on up to 8 threads, with the other
+sections loading alongside, and costs about 9 ms. The whole query now takes
+136–155 ms warm against `rg`'s 147–180, so this no longer decides the comparison
+with `rg`. These are the benchmark's `FERRET_NO_DAEMON=1` runs. By default a
+`search` that finds no daemon starts one and answers that query in-process
+(`daemon/client.rs`); the daemon then pays the build once, so a one-shot query
+pays it only before the daemon is ready, or where daemons are disabled.
+
+**Measured at 10M rows (2026-10-15):** building the resident names for the
+synthetic 10M catalog (D40; 10,448,739 name rows) took 300 ms on up to 8
+threads, with a process peak of 841 MB, after the intern table's initial
+reservation was capped at 64K entries (it had reserved half the rows: 325 ms,
+896 MB). One warm run of an uncommitted probe, not the bench CLI. The fixture's
+limit: it replicates one real tree's dump, so it has only 133,385 distinct
+names. A real 10M tree has more, and its table hashes and stores more, so 300 ms
+is nearer a lower bound than a typical cost.
+
+**Question:** Should a one-shot search keep building the resident names on open,
+build them only when a query needs them, or load them prebuilt?
+
+| Option                                                     | Costs                                                                                                                                               | Buys                                                                                                                                            |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| A. Build on every open (today)                             | 9 ms per one-shot query here; 300 ms measured at 10M rows, on a fixture with few distinct names.                                                    | Nothing new to build or test; one catalog state per engine.                                                                                     |
+| B. Build lazily, on the first query that needs name search | An engine holding the catalog in two states, and a test that every name path forces the build. Saves nothing for queries that need names.           | Up to 7 ms here off every one-shot content query that needs no name search, if such queries exist (unverified: S1 reads names for every query). |
+| C. Write the interned table in the checkpoint and load it  | A storage format change, more checkpoint writing and index bytes; loading still costs a read and validation, about 2 ms for the name sections here. | Most of the build off every one-shot query, names or not: about 7 ms here, and most of the 300 ms measured at 10M rows.                         |
+
+**Recommendation: A.** The 10M build, 300 ms, crosses the threshold this brief
+first set ("hundreds of milliseconds"), but that threshold assumed every
+one-shot `search` builds. By default only the queries before a daemon is ready
+do, and the daemon builds once per catalog generation. At this catalog's size
+the build is 9 ms of a query that already beats `rg`.
+
+**Fact that would change it:** agents running `search` where no daemon can run
+(`FERRET_NO_DAEMON=1`, or a sandbox where the client cannot start one) on
+catalogs near 10M rows make C worth its format change, since each query would
+pay 300 ms or more. So would a real 10M tree whose build exceeds about 1 s, with
+daemons or not, since the first query after each start pays it.

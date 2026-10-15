@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::batch::{Stat, WorkTreeKind};
+use crate::fan_out::fan_out;
 use crate::format::{
     self, COLUMNS, Column, Facts, HASH_ROW, Layout, PAIR_ROW, SECTIONS, Section, TABLE_END, View,
     WORK_TREE_ROW, u32_at, u64_at,
@@ -145,7 +146,8 @@ pub enum Target {
 }
 
 impl Target {
-    pub(crate) fn from_child(child: InoId) -> Self {
+    /// What a name's child column value names.
+    pub fn from_child(child: InoId) -> Self {
         Kind::from_ignored_child(child.0).map_or(Self::Inode(child), Self::Ignored)
     }
 }
@@ -339,13 +341,34 @@ impl Catalog {
     /// Existing pins retain their own representation; no borrowed section
     /// is invalidated.
     pub fn into_resident(mut self) -> Result<Self, OpenError> {
-        self.load_all()?;
         if self.resident_names().is_some() {
+            self.load_all()?;
             return Ok(self);
         }
         let mut base = self.clone();
         base.overlay = None;
-        let names = crate::ResidentNames::build(base.name_reader(), self.base_name_count());
+        let rows = self.base_name_count();
+        let build = || crate::ResidentNames::build(base.name_reader(), rows);
+        // The build reads only the names; when it runs on several threads,
+        // the other sections load alongside it. `load_all` then checks
+        // everything in order, as before, and reports the first failure a
+        // serial load would.
+        let names = match crate::ResidentNames::threads(rows) {
+            1 => None,
+            _ => {
+                let tasks = vec![true, false];
+                let mut built = fan_out(tasks, 2, |names| match names {
+                    true => self.load_one(Section::Names).ok().map(|()| build()),
+                    false => {
+                        self.prefetch(&[Section::NameHeap, Section::Names]);
+                        None
+                    }
+                });
+                built.swap_remove(0)
+            }
+        };
+        self.load_all()?;
+        let names = names.unwrap_or_else(build);
         let sections = Box::new(std::array::from_fn(|i| {
             let section = SECTIONS[i];
             if section == Section::NameHeap {
@@ -733,6 +756,34 @@ impl Catalog {
             o.validate_all(self)?;
         }
         Ok(())
+    }
+
+    /// Reads and checks the base sections but `skip` on a few threads,
+    /// ignoring failures: [`Catalog::load_all`] then finds them loaded, and
+    /// loads any that failed again in order, so it reports what a serial
+    /// load would. Sections with nothing to wait for go first, then those
+    /// needing only them; the rest are a few bytes and load serially.
+    fn prefetch(&self, skip: &[Section]) {
+        const WORKERS: usize = 4;
+        if !matches!(self.source.as_ref(), Source::File { .. }) {
+            return;
+        }
+        let size = |section: Section| {
+            let (start, end) = self.layout.range(section);
+            std::cmp::Reverse(end - start)
+        };
+        let sections = SECTIONS.into_iter().filter(|s| !skip.contains(s));
+        let mut first: Vec<_> = sections.clone().filter(|s| s.needs().is_empty()).collect();
+        let mut second: Vec<_> = sections
+            .filter(|s| !s.needs().is_empty() && s.needs().iter().all(|n| n.needs().is_empty()))
+            .collect();
+        first.sort_by_key(|&s| size(s));
+        second.sort_by_key(|&s| size(s));
+        for wave in [first, second] {
+            fan_out(wave, WORKERS, |section| {
+                let _ = self.load_one(section);
+            });
+        }
     }
 
     fn load_one(&self, section: Section) -> Result<(), OpenError> {
@@ -1706,6 +1757,13 @@ impl<'c> NameReader<'c> {
         if let Some(names) = self.resident {
             return (InoId(self.parents.get(i) as u32), names.name(id));
         }
+        (InoId(self.parents.get(i) as u32), self.heap_bytes(id))
+    }
+
+    /// A name's bytes from the raw heap, without its parent: what the
+    /// resident build reads. Not for an overlay or a resident reader.
+    pub(crate) fn heap_bytes(&self, id: NameId) -> &'c [u8] {
+        let i = id.0 as usize;
         let offsets = self.offsets.unwrap_or_else(|| unreachable!("raw offsets"));
         // A name runs to the next one's start, less its NUL: decoding checked
         // that the spans tile the heap. One decode is cheaper than a search.
@@ -1713,10 +1771,7 @@ impl<'c> NameReader<'c> {
             true => offsets.get(i + 1) as usize,
             false => self.heap.len(),
         };
-        (
-            InoId(self.parents.get(i) as u32),
-            &self.heap[offsets.get(i) as usize..end - 1],
-        )
+        &self.heap[offsets.get(i) as usize..end - 1]
     }
 
     /// The names from `from` on, in order, decoded a run at a time.

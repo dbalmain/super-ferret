@@ -168,3 +168,390 @@ fn current_reads_check_cancellation_between_chunks() {
     assert!(bytes.len() < 8 << 20);
     assert_eq!(reader.files_read, 0);
 }
+
+/// A file's name in `catalog`, by its path under the tree.
+fn name_of(tmp: &Tmp, catalog: &Catalog, rel: &str) -> ferret_catalog::NameId {
+    catalog
+        .resolve(tmp.at(rel).as_os_str().as_encoded_bytes())
+        .unwrap()
+        .name
+        .unwrap()
+}
+
+/// A query's reader holds the directories it walked, and must check each
+/// again before reading through it: a moved ancestor, replaced by a link to
+/// it or by a fresh directory, fails the next path through it.
+#[test]
+fn a_held_directory_is_checked_again_for_each_path() {
+    for ancestor in ["a/b", "a"] {
+        for link in [false, true] {
+            let tmp = Tmp::new(if link { "held-link" } else { "held-copy" });
+            let (catalog, _) = indexed(&tmp, &FILES);
+            let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
+            let read = |documents: &mut Documents, rel| {
+                let mut out = Vec::new();
+                let name = name_of(&tmp, &catalog, rel);
+                documents
+                    .read_current_name_until(&catalog, name, &mut out, &|| false)
+                    .map(|_| out)
+            };
+            assert_eq!(read(&mut documents, "a/b/one.txt").unwrap(), FILES[0].1);
+            assert_eq!(read(&mut documents, "a/b/two.txt").unwrap(), FILES[1].1);
+            fs::rename(tmp.at(ancestor), tmp.base.join("moved")).unwrap();
+            if link {
+                symlink(tmp.base.join("moved"), tmp.at(ancestor)).unwrap();
+            } else {
+                fs::create_dir(tmp.at(ancestor)).unwrap();
+            }
+            assert!(
+                read(&mut documents, "a/b/two.txt").is_err(),
+                "{ancestor}, link={link}"
+            );
+            assert_eq!(read(&mut documents, "top.txt").unwrap(), FILES[2].1);
+        }
+    }
+}
+
+/// What a stream returned, and each consumer call's bytes and size.
+type Streamed = (
+    Result<ferret_catalog::Stat, ContentFault>,
+    Vec<(Vec<u8>, u64)>,
+);
+
+/// Streams `rel` through `documents`, with `during` run once inside the
+/// consumer after its first read: what the stream returned, and each
+/// consumer call's bytes and size.
+fn stream_with(
+    tmp: &Tmp,
+    catalog: &Catalog,
+    documents: &mut Documents,
+    rel: &str,
+    during: &dyn Fn(),
+) -> Streamed {
+    let mut calls = Vec::new();
+    let name = name_of(tmp, catalog, rel);
+    let stat = documents.stream_current_name_until(
+        catalog,
+        name,
+        &mut |source, size| {
+            let mut seen = Vec::new();
+            let mut chunk = [0; 4];
+            let n = source.read(&mut chunk)?;
+            seen.extend_from_slice(&chunk[..n]);
+            if calls.is_empty() {
+                during();
+            }
+            source.read_to_end(&mut seen)?;
+            calls.push((seen, size));
+            Ok(())
+        },
+        &|| false,
+    );
+    (stat, calls)
+}
+
+/// A stream hands the consumer the current version, once, with the stat
+/// it was read at: the catalogued file, then the same file rewritten.
+#[test]
+fn a_stream_reads_the_current_version_once() {
+    let tmp = Tmp::new("content-stream");
+    let (catalog, _) = indexed(&tmp, &FILES);
+    let recorded = |rel| {
+        let name = name_of(&tmp, &catalog, rel);
+        catalog.inode(catalog.name(name).child).stat
+    };
+    let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
+    let (stat, calls) = stream_with(&tmp, &catalog, &mut documents, "a/b/one.txt", &|| {});
+    assert!(stat.unwrap().same_version(&recorded("a/b/one.txt")));
+    assert_eq!(calls, [(b"first file\n".to_vec(), 11)]);
+
+    let before = recorded("a/b/two.txt");
+    fs::write(tmp.at("a/b/two.txt"), b"changed, and longer\n").unwrap();
+    let (stat, calls) = stream_with(&tmp, &catalog, &mut documents, "a/b/two.txt", &|| {});
+    let stat = stat.unwrap();
+    assert!(!stat.same_version(&before));
+    assert_eq!(stat.size, 20);
+    assert_eq!(calls, [(b"changed, and longer\n".to_vec(), 20)]);
+}
+
+/// Sol round 1, P4: a file unlinked, or replaced by a rename, while the
+/// consumer reads it is not accepted: neither the detached bytes nor the
+/// old inode's under the new file's path.
+#[test]
+fn a_stream_rejects_a_file_unlinked_or_replaced_during_its_read() {
+    for replace in [false, true] {
+        let tmp = Tmp::new(if replace {
+            "stream-replaced"
+        } else {
+            "stream-unlinked"
+        });
+        let (catalog, _) = indexed(&tmp, &FILES);
+        let mut documents = Documents::by_name(&catalog).unwrap().holding_directories();
+        let path = tmp.at("a/b/one.txt");
+        let during = || match replace {
+            false => fs::remove_file(&path).unwrap(),
+            true => {
+                let fresh = tmp.at("a/b/fresh");
+                fs::write(&fresh, b"replacement\n").unwrap();
+                fs::rename(&fresh, &path).unwrap();
+            }
+        };
+        let (stat, calls) = stream_with(&tmp, &catalog, &mut documents, "a/b/one.txt", &during);
+        assert!(
+            matches!(stat, Err(ContentFault::Changed)),
+            "replace={replace}: {stat:?}"
+        );
+        assert_eq!(calls.len(), 1, "replace={replace}");
+    }
+}
+
+/// Sol round 1, P5: a catalogued file replaced by a FIFO is refused before
+/// the consumer sees it, so no writer's bytes are drained.
+#[test]
+fn a_stream_refuses_a_fifo_before_reading() {
+    let tmp = Tmp::new("stream-fifo");
+    let (catalog, _) = indexed(&tmp, &FILES);
+    let path = tmp.at("a/b/one.txt");
+    fs::remove_file(&path).unwrap();
+    super::mkfifo(&path);
+    let mut documents = Documents::by_name(&catalog).unwrap();
+    let (stat, calls) = stream_with(&tmp, &catalog, &mut documents, "a/b/one.txt", &|| {});
+    assert!(matches!(stat, Err(ContentFault::Changed)), "{stat:?}");
+    assert!(calls.is_empty(), "the consumer was given a FIFO");
+}
+
+/// Astra: held descriptors come from a budget shared by a reader's forks,
+/// so a pool on a deep tree holds no more than one thread would be allowed
+/// to; past it, a path's lower directories are opened as an unheld walk
+/// opens them, and every read still checks and returns the same bytes.
+#[test]
+fn held_directories_stay_within_their_budget() {
+    let deep: Vec<(String, Vec<u8>)> = ["x", "y"]
+        .iter()
+        .flat_map(|branch| {
+            (1..=2).map(move |i| {
+                let rel = format!("{branch}/1/2/3/4/5/f{i}.txt");
+                let bytes = format!("{rel} body\n").into_bytes();
+                (rel, bytes)
+            })
+        })
+        .collect();
+    let files: Vec<(&str, &[u8])> = deep.iter().map(|(r, b)| (r.as_str(), &b[..])).collect();
+    let tmp = Tmp::new("held-budget");
+    let (catalog, _) = indexed(&tmp, &files);
+    let read = |documents: &mut Documents, rel: &str| {
+        let mut out = Vec::new();
+        let name = name_of(&tmp, &catalog, rel);
+        documents
+            .read_current_name_until(&catalog, name, &mut out, &|| false)
+            .map(|_| out)
+    };
+    for budget in [0, 1, 3, 7, 20] {
+        let first = Documents::by_name(&catalog)
+            .unwrap()
+            .holding_at_most(budget);
+        let mut readers = [first.fork(), first];
+        // Two readers on different branches, a path each in turn: each
+        // holds what the budget lets it and gives it back on a new branch.
+        for round in 0..2 {
+            for (i, (rel, bytes)) in files.iter().enumerate() {
+                let reader = &mut readers[(i + round) % 2];
+                assert_eq!(read(reader, rel).unwrap(), *bytes, "{rel}, budget {budget}");
+                let ((one, left), (two, _)) = (readers[0].held(), readers[1].held());
+                assert_eq!(one + two + left, budget, "budget {budget}");
+                // Each holds at most its path: the tree and six below it.
+                assert!(one + two <= budget.min(14), "budget {budget}");
+            }
+        }
+        let fork = readers[0].fork();
+        drop(readers);
+        assert_eq!(fork.held(), (0, budget), "returned, budget {budget}");
+    }
+}
+
+/// The pressure tests' tree: eight branches, each a chain of fifteen
+/// directories from the tree's root to three files.
+fn pressure_files() -> Vec<(String, Vec<u8>)> {
+    let chain = (1..=13).map(|level| level.to_string()).collect::<Vec<_>>();
+    (0..8)
+        .flat_map(|branch| {
+            let dir = format!("b{branch}/{}", chain.join("/"));
+            (0..3).map(move |file| {
+                let rel = format!("{dir}/f{file}.txt");
+                let bytes = format!("{rel} body\n").into_bytes();
+                (rel, bytes)
+            })
+        })
+        .collect()
+}
+
+/// Descriptors left free to the readers in a pressure test: enough for four
+/// unheld walks (two directories and a file each), and fewer than the
+/// process's budget lets them hold (a quarter of 256).
+const FREE: usize = 16;
+
+/// Astra: the budget alone reserves nothing for descriptors the rest of the
+/// process holds, so readers could run out where unheld walks would not. A
+/// reader out of descriptors closes every reader's held ones, idle readers'
+/// too, and tries again. In a child process with all but [`FREE`]
+/// descriptors in use: `idle`, one reader holds a chain that leaves too few
+/// for another's walk; `concurrent`, four readers race on the tree.
+#[test]
+fn readers_out_of_descriptors_close_held_ones_and_retry() {
+    const MODE: &str = "FERRET_FD_PRESSURE";
+    const BASE: &str = "FERRET_FD_PRESSURE_BASE";
+    if let (Some(mode), Some(base)) = (std::env::var_os(MODE), std::env::var_os(BASE)) {
+        return pressure_child(mode.to_str().unwrap(), std::path::Path::new(&base));
+    }
+    let files = pressure_files();
+    let files: Vec<(&str, &[u8])> = files.iter().map(|(r, b)| (r.as_str(), &b[..])).collect();
+    let tmp = Tmp::new("fd-pressure");
+    indexed(&tmp, &files);
+    for mode in ["idle", "concurrent", "stalled"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::content::readers_out_of_descriptors_close_held_ones_and_retry",
+                "--nocapture",
+            ])
+            .env(MODE, mode)
+            .env(BASE, tmp.cat().parent().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn pressure_child(mode: &str, base: &std::path::Path) {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let catalog = Catalog::open(&base.join("cat")).unwrap().unwrap();
+    catalog.load_all().unwrap();
+    let files: Vec<_> = pressure_files()
+        .into_iter()
+        .map(|(rel, bytes)| {
+            let path = base.join("tree").join(&rel);
+            let name = catalog.resolve(path.as_os_str().as_encoded_bytes());
+            (rel, name.unwrap().name.unwrap(), bytes)
+        })
+        .collect();
+    // The limit is set before the first holding reader sizes the budget.
+    let mut limit = getrlimit(Resource::Nofile);
+    limit.current = Some(256);
+    setrlimit(Resource::Nofile, limit).unwrap();
+    let mut reader = Documents::by_name(&catalog).unwrap().holding_directories();
+    let open = fs::read_dir("/proc/self/fd").unwrap().count() - 1;
+    let _filler: Vec<_> = (open..256 - FREE)
+        .map(|_| fs::File::open("/dev/null").unwrap())
+        .collect();
+    let read = |reader: &mut Documents, (rel, name, bytes): &(String, _, Vec<u8>)| {
+        let mut out = Vec::new();
+        let read = reader.read_current_name_until(&catalog, *name, &mut out, &|| false);
+        assert!(read.is_ok(), "{rel}: {read:?}");
+        assert_eq!(out, *bytes, "{rel}");
+    };
+    match mode {
+        "idle" => {
+            let mut other = reader.fork();
+            read(&mut reader, &files[0]);
+            // The chain and the file took every free descriptor; the chain
+            // leaves one, too few for any walk.
+            assert_eq!(reader.held().0, FREE - 1);
+            assert!(!Documents::pressured());
+            read(&mut other, &files[3]);
+            assert!(Documents::pressured());
+            assert_eq!((reader.held().0, other.held().0), (0, 0));
+            for file in &files {
+                read(&mut reader, file);
+                read(&mut other, file);
+            }
+        }
+        "concurrent" => {
+            let readers: Vec<_> = (0..4).map(|_| reader.fork()).collect();
+            std::thread::scope(|scope| {
+                for (i, mut reader) in readers.into_iter().enumerate() {
+                    let (files, read) = (&files, &read);
+                    scope.spawn(move || {
+                        for round in 0..3 {
+                            for k in 0..files.len() {
+                                read(&mut reader, &files[(k + i * 6 + round) % files.len()]);
+                            }
+                        }
+                    });
+                }
+            });
+            // Else the race tested nothing.
+            assert!(Documents::pressured());
+        }
+        "stalled" => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Barrier};
+            // Astra round 3: a reader stalled mid-open, its chain locked,
+            // for longer than any deadline. The other waits it out.
+            let (armed, paused, release) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Barrier::new(2)),
+                Arc::new(Barrier::new(2)),
+            );
+            let mut stalled = reader.fork().pausing({
+                let (armed, paused, release) = (armed.clone(), paused.clone(), release.clone());
+                move || {
+                    if armed.swap(false, Ordering::AcqRel) {
+                        paused.wait();
+                        release.wait();
+                    }
+                }
+            });
+            let mut other = reader.fork();
+            read(&mut stalled, &files[0]);
+            assert_eq!(stalled.held().0, FREE - 1);
+            armed.store(true, Ordering::Release);
+            let (done, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+            std::thread::scope(|scope| {
+                scope.spawn(|| read(&mut stalled, &files[1]));
+                paused.wait();
+                scope.spawn(|| {
+                    read(&mut other, &files[3]);
+                    done.store(true, Ordering::Release);
+                });
+                // Past the deadline the retry once had.
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                assert!(
+                    !done.load(Ordering::Acquire),
+                    "read while the chain was held"
+                );
+                assert!(Documents::pressured());
+                // A third reader, cancelled while it waits, stops waiting.
+                let cancelled = scope.spawn(|| {
+                    let (_, name, _) = &files[6];
+                    let mut out = Vec::new();
+                    let stopped = || stop.load(Ordering::Acquire);
+                    let mut third = reader.fork();
+                    third.read_current_name_until(&catalog, *name, &mut out, &stopped)
+                });
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                stop.store(true, Ordering::Release);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !cancelled.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                // Known before the stalled reader goes on, so a failure
+                // here cannot hang the test.
+                let stopped_waiting = cancelled.is_finished();
+                release.wait();
+                assert!(stopped_waiting, "a cancelled reader kept waiting");
+                let cancelled = cancelled.join().unwrap();
+                assert!(
+                    matches!(cancelled, Err(ContentFault::Cancelled)),
+                    "{cancelled:?}"
+                );
+            });
+            assert!(done.load(Ordering::Acquire));
+        }
+        _ => unreachable!("{mode}"),
+    }
+}

@@ -53,7 +53,15 @@ pub enum ReadRequest<'a> {
     /// should stop between chunks, failing, once the predicate returns
     /// true: the query was cancelled, or verification no longer needs it.
     Bytes(&'a mut Vec<u8>, &'a dyn Fn() -> bool),
+    /// The same read, handing the bytes to the consumer as a reader with the
+    /// document's size, instead of collecting them: the consumer reads what
+    /// it needs, and stops between reads, failing, once the predicate
+    /// returns true.
+    Stream(Consumer<'a>, &'a dyn Fn() -> bool),
 }
+
+/// The consumer of a [`ReadRequest::Stream`].
+pub type Consumer<'a> = &'a mut dyn FnMut(&mut dyn std::io::Read, u64) -> std::io::Result<()>;
 
 /// The version established by a successful stat or bracketed read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,9 +110,11 @@ pub struct ContentReport {
     /// Documents left Maybe by the snapshot before verification.
     pub snapshot_maybe: u64,
     pub snapshot_possible: u64,
-    /// Reader plus engine time for bracketed Maybe verification.
+    /// Reader plus engine time for bracketed Maybe verification, summed
+    /// over the reads on every thread: work done, not wall time.
     pub verification_time: Duration,
-    /// Time in regex engines, excluding reading and text matching.
+    /// Time in regex engines, excluding reading and text matching, summed
+    /// the same way.
     pub regex_time: Duration,
     /// In the order the atoms appear in the query.
     pub atoms: Vec<AtomReport>,
@@ -118,7 +128,11 @@ pub struct ContentReport {
     /// Paths whose current version differs from the catalog, or whose
     /// read/stat failed (including size/allocation refusal). Stable changed
     /// bytes are evaluated for this path alone; vanished or unreadable
-    /// paths are dropped.
+    /// paths are dropped. A content read that failed or was abandoned once
+    /// the run was stopped is not counted: it shows the stop, not a change.
+    /// The stat that checks a second name of an already-read document
+    /// against its cached answers is counted whenever it fails, stop or
+    /// not.
     pub changed: u64,
     /// The matcher's work over the documents read: atoms checked, rejected
     /// by byte search alone, tokenized whole, bytes tokenized.
@@ -170,8 +184,9 @@ impl DocNames {
 
     /// As [`DocNames::new`], `Ok(None)` once `cancelled` answers true. It is
     /// asked at entry, after loading, after every [`DocSet::CHECK_EVERY`]
-    /// names each name pass reads, every [`DocSet::CHECK_EVERY`] ids of the
-    /// prefix pass, and on each side of copying the offsets. A host that
+    /// names the name pass reads, every [`DocSet::CHECK_EVERY`] ids of the
+    /// prefix pass, on each side of copying the offsets, and every
+    /// [`DocSet::CHECK_EVERY`] names the fill places. A host that
     /// caches the result publishes it only when this returns one.
     pub fn new_until(
         catalog: &Catalog,
@@ -187,26 +202,25 @@ impl DocNames {
         }
         let bound = catalog.next_doc().0 as usize;
         let mut starts = vec![0u32; bound + 1];
-        // False when cancelled before every name was seen.
-        let each = |f: &mut dyn FnMut(usize, NameId)| {
-            let names = catalog.name_reader().runs_from(NameId(0));
-            for (seen, (id, name)) in names.enumerate() {
-                if (seen + 1).is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
-                    return false;
-                }
-                if let Target::Inode(inode) = name.target()
-                    && catalog.is_live_name(id)
-                    && catalog.is_live_inode(inode)
-                    && let Some(doc) = catalog.doc(inode)
-                    && (doc.0 as usize) < bound
-                {
-                    f(doc.0 as usize, id);
-                }
+        // One pass over the child column (a name's bytes are not needed),
+        // keeping each document-bearing name with its document; the fill
+        // reads these rather than walking the names again. A second walk
+        // cost as much as the first, 2 ms at 112k names; these cost 8 bytes
+        // a document's name until the build returns.
+        let mut found = Vec::new();
+        for (seen, (id, child)) in catalog.name_reader().child_ids().enumerate() {
+            if (seen + 1).is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
+                return Ok(None);
             }
-            true
-        };
-        if !each(&mut |doc, _| starts[doc + 1] += 1) {
-            return Ok(None);
+            if let Target::Inode(inode) = Target::from_child(child)
+                && catalog.is_live_name(id)
+                && catalog.is_live_inode(inode)
+                && let Some(doc) = catalog.doc(inode)
+                && (doc.0 as usize) < bound
+            {
+                starts[doc.0 as usize + 1] += 1;
+                found.push((doc.0, id));
+            }
         }
         for d in 0..bound {
             if d.is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
@@ -222,11 +236,27 @@ impl DocNames {
             return Ok(None);
         }
         let mut names = vec![NameId(0); starts[bound] as usize];
-        let filled = each(&mut |doc, id| {
-            names[fill[doc] as usize] = id;
-            fill[doc] += 1;
-        });
-        Ok(filled.then_some(Self { starts, names }))
+        for (seen, &(doc, id)) in found.iter().enumerate() {
+            if (seen + 1).is_multiple_of(DocSet::CHECK_EVERY) && cancelled() {
+                return Ok(None);
+            }
+            names[fill[doc as usize] as usize] = id;
+            fill[doc as usize] += 1;
+        }
+        // The checkpoint's names come in id order, then the overlay's, which
+        // may reuse a lower id: then a document's names are sorted here.
+        if cancelled() {
+            return Ok(None);
+        }
+        if !found.is_sorted_by_key(|&(_, id)| id)
+            && order(&starts, &mut names, &cancelled).is_none()
+        {
+            return Ok(None);
+        }
+        if cancelled() {
+            return Ok(None);
+        }
+        Ok(Some(Self { starts, names }))
     }
 
     /// The document's live names, ascending; empty for an id it never saw.
@@ -242,6 +272,27 @@ impl DocNames {
     pub fn bytes(&self) -> usize {
         (self.starts.len() + self.names.len()) * 4
     }
+}
+
+/// Sorts each document's slice of `names`, the documents delimited by
+/// `starts`; `None` once `cancelled` says so. The pass runs over every
+/// document id, holes included, so `cancelled` is asked every
+/// [`DocSet::CHECK_EVERY`] ids and before any slice that long.
+pub(crate) fn order(
+    starts: &[u32],
+    names: &mut [NameId],
+    cancelled: &impl Fn() -> bool,
+) -> Option<()> {
+    for (d, doc) in starts.windows(2).enumerate() {
+        let names = &mut names[doc[0] as usize..doc[1] as usize];
+        if (d.is_multiple_of(DocSet::CHECK_EVERY) || names.len() >= DocSet::CHECK_EVERY)
+            && cancelled()
+        {
+            return None;
+        }
+        names.sort_unstable();
+    }
+    Some(())
 }
 
 impl Query {
@@ -489,6 +540,7 @@ impl Query {
         catalog.load(&self.residual_sections())?;
         let probed = Probed {
             ids: &ids,
+            names: content.docs,
             docs: &docs,
             table: &table,
             width,
