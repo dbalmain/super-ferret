@@ -4871,7 +4871,14 @@ threading reaches.
 
 ## D77 — Default verification threads: every core, or at most 16
 
-**Status: B built (2026-10-14, branch `wt/scan`); open for Dave.**
+**Status: answered 2026-10-15, C, stored. Dave took the recommendation after
+asking that the count be kept in the index's configuration, so it is detected
+once and can be adjusted over time. B is built and merged (0849ec4); C is to
+build.** Physical cores are counted from `/sys/devices/system/cpu/*/topology`
+when the index is created and stored with it. Each search takes the smaller of
+that count and `available_parallelism`, so affinity and cgroup limits still
+apply, and `FERRET_SEARCH_THREADS` still overrides it. If the count can't be
+read, the default is `min(16, available_parallelism)`.
 Measured in [SCAN.md § Threads](SCAN.md#threads) on the D65C corpus (3.98 GB,
 112,376 readable documents), a pure scan through the product path, 5 queries
 per class and case, after the scan work (steps 1–3). Median ms over the five
