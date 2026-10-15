@@ -4873,8 +4873,13 @@ threading reaches.
 
 **Status: answered 2026-10-15, C, stored. Dave took the recommendation after
 asking that the count be kept in the index's configuration, so it is detected
-once and can be adjusted over time. B is built and merged (0849ec4); C is to
-build.** Physical cores are counted from `/sys/devices/system/cpu/*/topology`
+once and can be adjusted over time. B is built and merged (0849ec4); C is
+built (0c23072).** The count lives in `settings` in the index directory, a
+versioned `key = value` text file (`version = 1`, `search_threads = N`) that
+`ferret index` writes when it creates the catalog and never overwrites, so it
+can be edited by hand; `crates/ferret/src/settings.rs` documents it. An
+index made before C has no file and keeps B's rule until one is added; the
+daemon cannot create an index, so it writes none. Physical cores are counted from `/sys/devices/system/cpu/*/topology`
 when the index is created and stored with it. Each search takes the smaller of
 that count and `available_parallelism`, so affinity and cgroup limits still
 apply, and `FERRET_SEARCH_THREADS` still overrides it. If the count can't be

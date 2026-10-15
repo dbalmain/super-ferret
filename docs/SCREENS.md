@@ -401,9 +401,10 @@ callback changes files; a caller that must see its own effects uses one
 thread. Where a cancellation lands is a matter of timing, so a cancelled
 query's counts vary with the thread count.
 
-The thread count is `FERRET_SEARCH_THREADS`, defaulting to every available
-core up to 16 (D77; it was every core, 32 here, when this section was
-measured). The workers' buffers hold at most 64 MiB of documents by
+The thread count is `FERRET_SEARCH_THREADS`, defaulting to the physical cores
+stored with the index, capped by the available cores, or every available core
+up to 16 without a stored count (D77; it was every core, 32 here, when this
+section was measured). The workers' buffers hold at most 64 MiB of documents by
 catalogued size, plus 1 MiB of kept buffer per worker, plus whatever the
 files being read grew since they were indexed. The calling thread's buffer
 is separate: it reads one document at a time and keeps the capacity of the

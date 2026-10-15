@@ -337,9 +337,9 @@ Cold, at 16 threads ours is 3.48–3.91 s in ci and 3.47–3.81 s in cs. At 32 i
 3.14–3.80 s and 3.16–3.67 s, which is 2–12% faster. `rg` takes 5.12–5.22 s.
 
 Warm is fastest at 16 on every class in both cases. Past 16, each thread adds
-CPU and no speed. The product's default is now `min(16, cores)`
-(`SEARCH_THREADS` in `crates/ferret/src/engine.rs`); D77 asks whether that is
-the right rule.
+CPU and no speed. The product's default is now the physical cores counted when
+the index was created, capped by `available_parallelism`, falling back to
+`min(16, cores)` (`search_threads` in `crates/ferret/src/engine.rs`; D77 C).
 
 ### End to end
 
