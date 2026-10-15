@@ -274,3 +274,81 @@ fn the_uncovered_build_stops_in_an_empty_bitmap() {
         "the uncovered build did not stop at the flag"
     );
 }
+
+/// The cases that separate D77 C from its neighbours: a stored count caps
+/// at the CPUs available, is not itself capped at 16, and gives way to the
+/// environment; without one, the old `min(16, available)`.
+#[test]
+fn search_threads_takes_the_stored_count_within_the_cpus_available() {
+    for (env, stored, available, threads) in [
+        (None, Some(16), 32, 16),
+        (None, Some(16), 4, 4),
+        (None, Some(24), 32, 24),
+        (None, None, 32, 16),
+        (None, None, 8, 8),
+        (Some(3), Some(16), 32, 3),
+        (Some(48), Some(16), 32, 48),
+    ] {
+        assert_eq!(
+            search_threads(env, stored, available),
+            threads,
+            "env {env:?}, stored {stored:?}, available {available}"
+        );
+    }
+}
+
+#[test]
+fn only_a_positive_number_in_the_environment_overrides() {
+    assert_eq!(env_threads(Some("6")), Some(6));
+    for value in [None, Some(""), Some("0"), Some("-2"), Some("lots")] {
+        assert_eq!(env_threads(value), None, "{value:?}");
+    }
+}
+
+/// What a search in this process resolves `stored` to, the environment and
+/// CPUs being whatever they are here.
+fn expected_threads(stored: Option<usize>) -> usize {
+    let env = env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref());
+    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+    search_threads(env, stored, available)
+}
+
+/// An engine reads its index's settings for the thread count, whether it
+/// was opened for queries or from a writer.
+#[test]
+fn an_engine_searches_on_the_stored_thread_count() {
+    let tree = Tree::with_files(4);
+    let index = tree.0.join("index");
+    fs::write(
+        index.join(crate::settings::FILE),
+        "version = 1\nsearch_threads = 1\n",
+    )
+    .unwrap();
+    assert_eq!(
+        tree.engine().pin().search_threads(),
+        expected_threads(Some(1))
+    );
+    let reader = Engine::open(&index).unwrap().unwrap();
+    assert_eq!(reader.pin().search_threads(), expected_threads(Some(1)));
+}
+
+/// A settings file that does not parse is treated as absent: the search
+/// runs, on the default count.
+#[test]
+fn a_corrupt_settings_file_falls_back_without_failing_the_search() {
+    let tree = Tree::with_files(4);
+    let index = tree.0.join("index");
+    fs::write(index.join(crate::settings::FILE), "search_threads = lots\n").unwrap();
+    let engine = Engine::open(&index).unwrap().unwrap();
+    engine.open_content(&index).unwrap();
+    let pin = engine.pin();
+    let query = Query::from_args([b"text:alpha".as_slice()], SystemTime::now()).unwrap();
+    let mut rows = 0;
+    pin.search_content(&query, None, None, |_| {
+        rows += 1;
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert_eq!(rows, 4);
+    assert_eq!(pin.search_threads(), expected_threads(None));
+}

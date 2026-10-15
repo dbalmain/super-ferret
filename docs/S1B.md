@@ -837,7 +837,8 @@ M6 configuration uses environment keys: `FERRET_INDEX_WORKERS`,
 `FERRET_BULK_BYTES_PER_SECOND` (0 disables pacing). `FERRET_SEARCH_THREADS`,
 read once by each process that verifies content (`ferret search`, or the
 daemon serving a batch), sets the threads that verify content candidates; it
-defaults to every available core up to 16 (D77; SCREENS.md § Parallel verification). Signal mounts can be supplied
+defaults to the index's stored physical-core count capped by the available
+cores, else every available core up to 16 (D77; SCREENS.md § Parallel verification). Signal mounts can be supplied
 through `FERRET_SIGNAL_PROC` and `FERRET_SIGNAL_POWER`; defaults are `/proc` and
 `/sys/class/power_supply`. Binary fixtures use private calm mounts through the
 same production reader, avoiding dependence on ambient host pressure. Trait

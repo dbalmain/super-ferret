@@ -201,6 +201,37 @@ fn bare_index_refreshes_every_root_and_a_relative_root_is_made_absolute() {
     assert_eq!(paths(&env.run(&[os("search"), os("two")])), [two]);
 }
 
+/// D77 C: the run that creates an index stores the physical cores in its
+/// settings file. Later runs leave the file alone, a hand edit included,
+/// and do not write one into an index that lacks it.
+#[test]
+fn creating_an_index_writes_its_settings_once() {
+    use ferret::settings::{FILE, SYSFS_CPU, Settings, physical_cores};
+    let env = Env::new("settings");
+    env.write("one.txt", b"1\n");
+    let indexed = env.run(&[os("index"), env.tree().as_os_str()]);
+    assert_eq!(code(&indexed), 0, "{}", stderr(&indexed));
+    let stored = Settings::read(&env.index()).unwrap().unwrap();
+    assert_eq!(stored.search_threads, physical_cores(Path::new(SYSFS_CPU)));
+
+    let file = env.index().join(FILE);
+    fs::write(&file, "version = 1\nsearch_threads = 5\n").unwrap();
+    let refreshed = env.run(&[os("index")]);
+    assert_eq!(code(&refreshed), 0, "{}", stderr(&refreshed));
+    assert_eq!(
+        Settings::read(&env.index())
+            .unwrap()
+            .unwrap()
+            .search_threads,
+        Some(5)
+    );
+
+    fs::remove_file(&file).unwrap();
+    let refreshed = env.run(&[os("index")]);
+    assert_eq!(code(&refreshed), 0, "{}", stderr(&refreshed));
+    assert!(!file.exists(), "an existing index is not backfilled");
+}
+
 #[test]
 // `index ../x` stored the canonical path while `roots remove ../x` kept the
 // `..` and was refused. Both now spell a root the same way, and a root whose

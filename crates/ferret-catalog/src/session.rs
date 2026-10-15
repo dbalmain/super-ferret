@@ -216,6 +216,11 @@ impl WriterSession {
         self.writer.view()
     }
 
+    /// The catalog directory this session writes.
+    pub fn dir(&self) -> &std::path::Path {
+        self.writer.dir()
+    }
+
     /// Mints an observation batch; workers can call this concurrently.
     pub fn batch(&self) -> Batch {
         Batch::new(self.next_batch.fetch_add(1, Ordering::Relaxed), false)

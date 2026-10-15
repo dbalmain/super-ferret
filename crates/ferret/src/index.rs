@@ -278,7 +278,11 @@ fn run(context: &Context, command: &str, change: RootChange<'_>, refresh: Refres
         global: Some(global),
         ..IndexOptions::default()
     };
+    let creating = creates_catalog(&context.index);
     let completed = index_change_then(&context.index, change, refresh, &options, |catalog| {
+        if creating {
+            write_settings(&context.index);
+        }
         follow_committed(catalog, &context.index)
     });
     let (result, content) = match completed {
@@ -578,6 +582,30 @@ fn peak_rss_kb() -> Option<u64> {
 
 /// Completes content while crawl retains the publication's writer lock.
 /// Explicit commands use the real checked reader and no byte pacing.
+/// Whether this run creates the catalog: there is none yet, or one in
+/// another format that the run rebuilds from scratch. Only a run that
+/// creates the index writes its settings (D77), so an older index keeps
+/// today's default until someone adds the file.
+fn creates_catalog(index: &Path) -> bool {
+    matches!(
+        Catalog::open(index),
+        Ok(None) | Err(OpenError::Decode(DecodeError::Version(_)))
+    )
+}
+
+/// Seeds a new index's settings file with the physical cores counted now,
+/// the one sysfs walk the thread default costs. A file already there is
+/// kept. Failing to write it only warns: searches then use the default.
+fn write_settings(index: &Path) {
+    let settings = crate::settings::Settings::detect(Path::new(crate::settings::SYSFS_CPU));
+    if let Err(e) = settings.write_new(index) {
+        warn(&format!(
+            "{}: not written: {e}; searches use the default thread count",
+            index.join(crate::settings::FILE).display()
+        ));
+    }
+}
+
 fn follow_committed(catalog: &Catalog, path: &Path) -> Result<(), String> {
     use ferret_index::{Budget, CatalogView, Fault, IndexWriter};
     catalog.load_all().map_err(|e| e.to_string())?;
