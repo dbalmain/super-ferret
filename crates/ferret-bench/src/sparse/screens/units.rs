@@ -11,8 +11,9 @@
 //!
 //! The contexts stand for every character shape the split rule and the
 //! run rule distinguish, so checking them is checking every document.
-//! Case-insensitive matching has no safe unit: the document's case decides
-//! the camelCase splits, and lowercasing the literal loses them.
+//! This derivation needs the literal's original case. Case-insensitive
+//! matching has no safe unit, and `RequiredLiterals` folds ASCII case, so
+//! its bytes must not be passed here as though their spelling were preserved.
 
 use ferret_text::{MAX_TOKEN_BYTES, tokenize};
 

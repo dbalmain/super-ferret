@@ -147,41 +147,36 @@ fn from_need(need: &Need) -> Plan {
     }
 }
 
-/// How the term screen reads a literal: the brief's units (exact and
-/// prefix lookups, sound only case-sensitive), substrings of whole terms
-/// (sound in either case), or both.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lookups {
-    Units,
-    Substrings,
-    Both,
+/// Sound term screen for folded regex facts: each literal's substrings ANDed,
+/// `All` where a literal has none. OR branches stay.
+fn term_plan(facts: &RequiredLiterals) -> Plan {
+    match facts {
+        RequiredLiterals::All => Plan::All,
+        RequiredLiterals::None => Plan::None,
+        RequiredLiterals::Literal(bytes) => Plan::and(
+            units::substrings(bytes)
+                .into_iter()
+                .map(|needle| Plan::Leaf(Leaf::Substring(needle))),
+        ),
+        RequiredLiterals::And(parts) => Plan::and(parts.iter().map(term_plan)),
+        RequiredLiterals::Or(parts) => Plan::or(parts.iter().map(term_plan)),
+    }
 }
 
-/// The term screen of a regex's facts: each literal's lookups ANDed, `All`
-/// where a literal has none. OR branches stay.
-fn term_plan(facts: &RequiredLiterals, lookups: Lookups) -> Plan {
+/// Unit lookups derived from folded facts, for candidate counts only; this
+/// plan must not be used to screen documents.
+fn unit_candidates(facts: &RequiredLiterals) -> Plan {
     match facts {
         RequiredLiterals::All => Plan::All,
         RequiredLiterals::None => Plan::None,
         RequiredLiterals::Literal(bytes) => {
-            let mut leaves = Vec::new();
-            if lookups != Lookups::Substrings {
-                leaves.extend(units::units(bytes).into_iter().map(|unit| match unit {
-                    Unit::Exact(term) => Plan::Leaf(Leaf::Term(term)),
-                    Unit::Prefix(prefix) => Plan::Leaf(Leaf::Prefix(prefix)),
-                }));
-            }
-            if lookups != Lookups::Units {
-                leaves.extend(
-                    units::substrings(bytes)
-                        .into_iter()
-                        .map(|needle| Plan::Leaf(Leaf::Substring(needle))),
-                );
-            }
-            Plan::and(leaves)
+            Plan::and(units::units(bytes).into_iter().map(|unit| match unit {
+                Unit::Exact(term) => Plan::Leaf(Leaf::Term(term)),
+                Unit::Prefix(prefix) => Plan::Leaf(Leaf::Prefix(prefix)),
+            }))
         }
-        RequiredLiterals::And(parts) => Plan::and(parts.iter().map(|p| term_plan(p, lookups))),
-        RequiredLiterals::Or(parts) => Plan::or(parts.iter().map(|p| term_plan(p, lookups))),
+        RequiredLiterals::And(parts) => Plan::and(parts.iter().map(unit_candidates)),
+        RequiredLiterals::Or(parts) => Plan::or(parts.iter().map(unit_candidates)),
     }
 }
 
@@ -924,14 +919,6 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
     let mut private = String::new();
     let empty = DocSet::new(corpus.live.bound(), []);
     let wants = |arm: &str| arms.contains(&arm);
-    // The brief's unit rules are sound only case-sensitive; substrings of
-    // whole terms are sound either way.
-    let lookups = if flags.case_insensitive {
-        Lookups::Substrings
-    } else {
-        Lookups::Both
-    };
-
     if wants("units") || wants("terms") || wants("terms-raw") {
         unit_report(&corpus, flags)?;
     }
@@ -979,7 +966,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             .samples
             .iter()
             .zip(&shipped)
-            .map(|(s, p)| Plan::and([p.clone(), term_plan(&s.facts, lookups)]))
+            .map(|(s, p)| Plan::and([p.clone(), term_plan(&s.facts)]))
             .collect();
         if wants("terms-raw") {
             miss_report(&corpus, &raw, &src, &extra_docs)?;
@@ -1008,7 +995,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             live: &corpus.live,
             resident: None,
         };
-        residue_arm(&corpus, &shipped, lookups, &src, &extra_docs)?;
+        residue_arm(&corpus, &shipped, &src, &extra_docs)?;
     }
     if wants("resident") {
         let fallback = fallback_docs(&corpus, &scratch.join("fallback-docs.txt"))?;
@@ -1033,7 +1020,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             .map(|(s, p)| {
                 Plan::and([
                     p.clone(),
-                    Plan::or([term_plan(&s.facts, lookups), Plan::Leaf(Leaf::Fallback)]),
+                    Plan::or([term_plan(&s.facts), Plan::Leaf(Leaf::Fallback)]),
                 ])
             })
             .collect();
@@ -1064,7 +1051,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
             .map(|(s, p)| {
                 Plan::and([
                     p.clone(),
-                    Plan::or([term_plan(&s.facts, lookups), Plan::Leaf(Leaf::Fallback)]),
+                    Plan::or([term_plan(&s.facts), Plan::Leaf(Leaf::Fallback)]),
                 ])
             })
             .collect();
@@ -1211,25 +1198,26 @@ fn extra_plans(
     Ok(plans)
 }
 
-/// Lookup coverage per class: how many queries each kind of term lookup
-/// can narrow at all. The unit rules are reported for a case-sensitive
-/// population only.
+/// Lookup coverage per class. Unit candidates from folded facts are
+/// diagnostic only; the screen uses sound substring constraints instead.
 fn unit_report(corpus: &Corpus, flags: GrepFlags) -> crate::Result<()> {
     for class in CLASSES {
-        let mut row = [0usize; 6];
+        let mut row = [0usize; 8];
         for sample in corpus.samples.iter().filter(|s| s.class == class) {
-            let units = term_plan(&sample.facts, Lookups::Units);
-            let substrings = term_plan(&sample.facts, Lookups::Substrings);
+            let units = unit_candidates(&sample.facts);
+            let active = term_plan(&sample.facts);
             row[0] += 1;
             row[1] += usize::from(!matches!(sample.facts, RequiredLiterals::All));
             row[2] += usize::from(units != Plan::All);
             row[3] += usize::from(units.has(&|l| matches!(l, Leaf::Term(_))));
             row[4] += usize::from(units.has(&|l| matches!(l, Leaf::Prefix(_))));
-            row[5] += usize::from(substrings != Plan::All);
+            row[5] += usize::from(active.has(&|l| matches!(l, Leaf::Term(_))));
+            row[6] += usize::from(active.has(&|l| matches!(l, Leaf::Prefix(_))));
+            row[7] += usize::from(active != Plan::All);
         }
         println!(
-            "lookups case_insensitive={} class={class} queries={} with_literal_facts={} unit_narrowed={} with_exact_unit={} with_prefix_unit={} substring_narrowed={}",
-            flags.case_insensitive, row[0], row[1], row[2], row[3], row[4], row[5]
+            "lookups case_insensitive={} class={class} queries={} with_literal_facts={} folded_unit_candidates={} folded_exact_unit_candidates={} folded_prefix_unit_candidates={} safe_exact_units_used={} safe_prefix_units_used={} substring_narrowed={}",
+            flags.case_insensitive, row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7],
         );
     }
     Ok(())
@@ -1273,7 +1261,6 @@ fn miss_report(
 fn residue_arm(
     corpus: &Corpus,
     shipped: &[Plan],
-    lookups: Lookups,
     src: &Sources,
     extra_docs: &[u32],
 ) -> crate::Result<()> {
@@ -1281,7 +1268,7 @@ fn residue_arm(
         .samples
         .iter()
         .zip(shipped)
-        .map(|(s, p)| Plan::and([p.clone(), term_plan(&s.facts, lookups)]))
+        .map(|(s, p)| Plan::and([p.clone(), term_plan(&s.facts)]))
         .collect();
     let per_query: Vec<Vec<Vec<u8>>> = raw
         .iter()
@@ -1407,4 +1394,65 @@ fn residue_arm(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn case_sensitive_folded_facts_use_sound_substrings() {
+        let flags = GrepFlags {
+            case_insensitive: false,
+        };
+        let pattern = "foo123BAR";
+        let document = b"foo123BARq";
+        assert!(ferret_verify::Matcher::is_match(
+            &flags.compile(pattern).unwrap(),
+            document
+        ));
+
+        let facts = flags.required_literals(pattern).unwrap();
+        let plan = term_plan(&facts);
+        let mut terms = BTreeSet::new();
+        ferret_text::tokenize_terms(document, &mut ferret_text::Scratch::default(), |token| {
+            terms.insert(ferret_text::cap(token.bytes).to_vec());
+        });
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "ferret-screen-case-sensitive-{}-{nonce}",
+            std::process::id(),
+        ));
+        fs::create_dir(&directory).unwrap();
+        let segment_path = directory.join("terms.segment");
+        let mut file = File::create(&segment_path).unwrap();
+        let mut writer = ferret_index::segment::Writer::new(0, 0).unwrap();
+        for term in terms {
+            writer.push(&term, &[0]).unwrap();
+        }
+        writer.finish(&mut file).unwrap();
+        drop(file);
+        let segment = Meter::open(&segment_path).unwrap();
+        let live = DocSet::new(1, [0]);
+        let fallback = DocSet::new(1, []);
+        let src = Sources {
+            tri: &segment,
+            term: Some(&segment),
+            extra: None,
+            fallback: &fallback,
+            live: &live,
+            resident: None,
+        };
+        let result = read(&src, &plan, &[]).unwrap();
+        let admitted = result.docs.contains(&0);
+        drop(segment);
+        fs::remove_dir_all(directory).unwrap();
+        assert!(
+            admitted,
+            "case-sensitive match screened out: facts={facts:?}, plan={plan:?}"
+        );
+    }
 }

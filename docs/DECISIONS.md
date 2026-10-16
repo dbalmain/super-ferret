@@ -4792,8 +4792,8 @@ are median ms, cold / warm; `rg` is the full scan on 32 threads.
 | C. Neither; parallelise verification first | No new index. Rare literals stay at trigram speed (1.7× a cold scan, slower than a warm one) until verification is threaded. | Verification is single-threaded today and is most of every class's time; threading it is the lever for all five classes (estimate: near a warm scan), and it composes with A or B later. |
 
 Rejected on the numbers: the term screen as briefed (no unit is safe under
-case-insensitive search; 7/50 rare literals case-sensitive), the term screen
-with a blanket fallback (65% of corpus bytes admitted; slower than
+case-insensitive search; its 7/50 case-sensitive unit count was unsound), the
+term screen with a blanket fallback (65% of corpus bytes admitted; slower than
 trigrams), and hashed 4/5-grams at 15–17 bits (180–400 MB for at most 1.5×).
 
 **Recommendation: C now, then B if rare literals still matter.** Four classes
