@@ -53,6 +53,11 @@ pub enum Command {
         args: Vec<OsString>,
         json: bool,
     },
+    /// Ripgrep argv, owned by grep’s parser.
+    Grep {
+        args: Vec<OsString>,
+        json: bool,
+    },
     /// `stats`.
     Stats,
     StatsJson,
@@ -124,6 +129,21 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Args, UsageErr
     let mut flags_done = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        if operands.is_empty() && arg == "grep" {
+            if limit.is_some() {
+                return Err(UsageError::NotFor("--limit", "grep"));
+            }
+            if scan_uncovered {
+                return Err(UsageError::NotFor("--scan", "grep"));
+            }
+            return Ok(Args {
+                index,
+                command: Command::Grep {
+                    args: args.collect(),
+                    json,
+                },
+            });
+        }
         if operands.is_empty() && arg == "find" {
             if limit.is_some() {
                 return Err(UsageError::NotFor("--limit", "find"));

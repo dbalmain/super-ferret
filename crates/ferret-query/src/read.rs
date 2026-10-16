@@ -35,6 +35,8 @@ impl std::fmt::Display for ReadFault {
     }
 }
 
+impl std::error::Error for ReadFault {}
+
 /// The result of one stat or bracketed read attempt.
 #[derive(Debug)]
 pub enum ReadOutcome {
@@ -57,27 +59,35 @@ pub fn read_bytes(
     bytes: &mut Vec<u8>,
     stopped: &dyn Fn() -> bool,
 ) -> ReadOutcome {
-    for attempt in 0..2 {
+    let outcome = retry_read(
+        || {
+            bytes.clear();
+            reader(name, ReadRequest::Bytes(bytes, stopped))
+        },
+        stopped,
+    );
+    if !matches!(outcome, ReadOutcome::Stable(_)) {
         bytes.clear();
+    }
+    outcome
+}
+
+/// Retry one changed observation, checking cancellation before every attempt
+/// and before accepting a stable result. The consumer resets its output for
+/// each attempt; a failed attempt must never publish partial results.
+pub fn retry_read(
+    mut attempt: impl FnMut() -> ReadOutcome,
+    stopped: &dyn Fn() -> bool,
+) -> ReadOutcome {
+    for at in 0..2 {
         if stopped() {
             return ReadOutcome::Cancelled;
         }
-        let outcome = reader(name, ReadRequest::Bytes(bytes, stopped));
-        match outcome {
-            ReadOutcome::RetryChanged if attempt == 0 => continue,
-            ReadOutcome::RetryChanged => {
-                bytes.clear();
-                return ReadOutcome::Failed(ReadFault::Unstable);
-            }
-            ReadOutcome::Stable(_) if !stopped() => return outcome,
-            ReadOutcome::Stable(_) => {
-                bytes.clear();
-                return ReadOutcome::Cancelled;
-            }
-            _ => {
-                bytes.clear();
-                return outcome;
-            }
+        match attempt() {
+            ReadOutcome::RetryChanged if at == 0 => continue,
+            ReadOutcome::RetryChanged => return ReadOutcome::Failed(ReadFault::Unstable),
+            ReadOutcome::Stable(_) if stopped() => return ReadOutcome::Cancelled,
+            outcome => return outcome,
         }
     }
     unreachable!("the second attempt always returns")

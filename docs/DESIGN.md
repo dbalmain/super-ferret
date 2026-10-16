@@ -52,6 +52,13 @@ ferret-bench   → anything; nothing depends on it
 | `ferret-query`   | query syntax, planning, execution, result rows                                                                                 | any structure's on-disk format |
 | `ferret`         | CLI, config, XDG, JSON output, query log; shared engine coordination and batch/daemon hosts (S1b)                              | —                              |
 
+Grep M1 (2026-10-16) adds no dependency edge: query’s `line_grep` owns
+rg argv parsing, candidate selection and line records; verify owns its resolved
+line profile and matcher; policy owns override globs/hidden selection; the
+`ferret::grep` host owns operand resolution and grouped plain output. Search and
+grep share the candidate seam, crawl reader adaptation and query’s streaming
+core. Find exposes source constructors without requiring a parsed expression.
+
 Two boundaries carry the design, and both are where D1 said the thought goes:
 
 - **`ferret-index` knows doc ids and byte strings, not files.** It is the part

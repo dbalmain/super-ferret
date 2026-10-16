@@ -17,7 +17,7 @@ use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Me
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
 use ferret_query::{Content, DocNames, NameIndex, Query, Row, RunError, Stats, UNCOVERED_BOUND};
 
-mod reader;
+pub(crate) mod reader;
 
 static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -559,6 +559,16 @@ impl QuerySession {
             cancelled,
             emit,
         )
+    }
+
+    /// Grep's necessary candidates, including uncovered documents. Missing
+    /// trigram sources automatically enumerate; there is no scan refusal.
+    pub(crate) fn grep_candidates(
+        &self,
+        grep: &ferret_verify::Grep,
+    ) -> Result<DocSet, ferret_index::ReadError> {
+        let pinned = Pinned::new(self.content.as_deref(), self.live());
+        ferret_query::line_grep::candidates(grep, &pinned, &|| false)
     }
 
     /// The catalog view's live documents, built once per view.

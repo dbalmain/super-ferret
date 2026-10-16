@@ -114,7 +114,7 @@ its corpus after review fixes. These are search/name-output measurements, not
 a grep line-output benchmark or a general guarantee. The earlier warning that
 no-trigram grep should not be expected to beat rg is superseded by those
 measurements. Broad scans are a viable plan, not inherently a fallback failure.
-Reuse the D77 C index setting `search_threads`, capped by available parallelism,
+For parallel verification, reuse the D77 C index setting `search_threads`, capped by available parallelism,
 with `FERRET_SEARCH_THREADS` override and `min(16, available_parallelism)`
 fallback. D78 A keeps resident names built on open; do not add lazy residency
 as a grep prerequisite. Measure grep’s output and first-result costs separately.
@@ -197,8 +197,11 @@ negation precedence); new names; and content omitted by the size/binary
 policy. Explicit starts/live mode are the exceptions above. `--hidden` alone
 does not undo ferret ignore rules. `-g` last-match wins, supports slash, `**`,
 classes and brace alternatives; positive globs can expose held hidden names,
-but cannot resurrect excluded names. Ancestors of re-included files remain
-traversable. Apply rg glob semantics, not find's `-path` glob dialect.
+but cannot resurrect excluded names. D13 reinclusion can retain ancestor directories. The rg glob layer still
+prunes rejected ancestors: a file-only positive cannot revive a pruned or
+held-hidden parent. Globs are relative to the query cwd; explicit directory
+starts bypass their own filters (clarified by M1 probes, 2026-10-16). Apply rg
+glob semantics, not find's `-path` glob dialect.
 
 Conversely ferret can search what default rg excludes: `.ignore`/`.rgignore`
 are not ferret inputs; Git's user-global ignores differ from ferret's global
@@ -331,8 +334,8 @@ Error wording differs from rg; diagnostic presence and exit status are tested.
 capture spans; extend `GrepFlags`, do not add a CLI-only regex executor.
 `ferret-query` owns `grep` parsing, selection/planning and result records; reuse
 `GrepAtom`, P/M estimates, candidate cursors and S2 coverage/read/cache rules.
-`search grep:` keeps document truth, case-sensitive defaults and D67 refusal. It shares
-the matcher/derivation/reader, not grep's line-output grammar or `-v` semantics.
+`search grep:` keeps document truth, case-sensitive defaults and D67 refusal.
+It shares the matcher/derivation/reader, not grep's line-output grammar or `-v` semantics.
 D71 remains separate; grep arguments are patterns.
 
 `ferret` owns CLI/output/XDG and policy adapters. Reuse `Engine::pin`/
@@ -354,6 +357,23 @@ retries once, then reports instability; other faults report errors. Preserve
 cancellation and retry outcomes; failed bytes never enter caches. Constructor/
 reader adaptation must pass fault/retry regressions before M1 CLI wiring;
 direct streams use an input adapter with the same matcher and typed I/O errors.
+
+### M1 seam as built (2026-10-16)
+
+The document verifier’s worker ring carries document truth and one first-match
+offset, rather than line groups. Feeding grep through its row callback would
+require a second file read and would mishandle line anchors. M1 instead shares
+`GrepFlags::compile_lines`, `Search`, `GrepAtom`, crawl’s bracketed reader and
+the extracted streaming core (`ferret-query/src/scan.rs`). Query owns grep’s
+parser, candidate selection and line records; the local host resolves operands,
+adapts policy/read faults, and renders bounded per-file output using find’s
+spill buffer. The same typed host adapter supplies search’s legacy optional
+read result. There is no query-to-crawl/policy edge or new executor.
+
+M1 emits file groups sequentially. M2’s shared iteration and scan-planning work
+must extend the existing bounded worker scheduling to line groups, using D77’s
+thread setting; do not create a second pool. SCAN.md’s parallel search numbers
+are consequently not M1 grep timings. Resident names still build on open (D78 A).
 
 ## Differential acceptance
 

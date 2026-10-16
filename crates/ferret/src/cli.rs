@@ -78,6 +78,8 @@ usage:
                                 (begin/stdout/stderr/diagnostic/end, id \"find\");
                                 --json here is a host flag before `find` and
                                 never reaches find's own argument parser
+  ferret grep [-nq] [-g GLOB] PATTERN [PATH...]
+                                rg syntax; directories use indexed visibility
   ferret search [--json] [--limit N] [--scan] [--] ATOM...
                                 print each path that matches the query
   ferret batch [--input FILE]   process sequential JSON-lines requests
@@ -192,6 +194,10 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
         }
     };
     match args.command {
+        Command::Grep {
+            args: ref grep_args,
+            json,
+        } => return crate::grep::run(grep_args, args.index.as_deref(), json),
         Command::Find {
             args: ref find_args,
             json,
@@ -259,7 +265,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Exit {
                 }
             }
         }
-        Command::Help | Command::Version | Command::Find { .. } => Exit::Ok,
+        Command::Help | Command::Version | Command::Find { .. } | Command::Grep { .. } => Exit::Ok,
     }
 }
 

@@ -149,6 +149,34 @@ impl GrepFlags {
         })
     }
 
+    /// Compiles grep's line profile. Literal LF nodes are errors (classes
+    /// containing LF are harmless because execution excludes terminators).
+    /// The necessary query still describes the original indexed bytes when
+    /// the executor strips an initial UTF-8 BOM.
+    pub fn compile_lines(&self, pattern: &str) -> Result<Grep, GrepError> {
+        let grep = self.compile(pattern)?;
+        let hir = self
+            .parser()
+            .build()
+            .parse(pattern)
+            .map_err(|e| GrepError::Derivation(e.to_string()))?;
+        fn literal_lf(hir: &Hir) -> bool {
+            match hir.kind() {
+                HirKind::Literal(literal) => literal.0.contains(&b'\n'),
+                HirKind::Capture(capture) => literal_lf(&capture.sub),
+                HirKind::Repetition(repetition) => literal_lf(&repetition.sub),
+                HirKind::Concat(parts) | HirKind::Alternation(parts) => {
+                    parts.iter().any(literal_lf)
+                }
+                _ => false,
+            }
+        }
+        if pattern.contains('\n') || literal_lf(&hir) {
+            return Err(GrepError::LineFeed);
+        }
+        Ok(grep)
+    }
+
     /// Experimental required literals, using the same Cox fold and flags as
     /// the shipped trigram derivation. Byte strings are ASCII-folded; the
     /// AND/OR tree is necessary, never sufficient. Longer edge facts allow
@@ -533,6 +561,8 @@ pub(crate) fn all_of(parts: impl IntoIterator<Item = Trigrams>) -> Trigrams {
 /// Why [`GrepFlags::compile`] failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GrepError {
+    /// Line mode cannot execute a literal LF.
+    LineFeed,
     /// The verifier refused the pattern: the user's answer.
     Pattern(RegexError),
     /// The verifier compiled the pattern and the derivation's parse refused
@@ -543,6 +573,7 @@ pub enum GrepError {
 impl fmt::Display for GrepError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            GrepError::LineFeed => f.write_str("literal newline requires multiline mode (M7)"),
             GrepError::Pattern(e) => e.fmt(f),
             GrepError::Derivation(e) => write!(
                 f,

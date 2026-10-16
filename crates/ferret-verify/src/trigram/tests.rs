@@ -712,7 +712,7 @@ fn run_property(patterns: u32, seed: u64) -> Tally {
                 tally.refused += 1;
                 continue;
             }
-            Err(e @ GrepError::Derivation(_)) => panic!("{pattern:?}: {e}"),
+            Err(e) => panic!("{pattern:?}: {e}"),
         };
         let search = grep.search();
         tally.filtered += u32::from(search.filters());

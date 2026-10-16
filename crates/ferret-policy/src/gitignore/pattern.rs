@@ -81,8 +81,49 @@ enum PosixClass {
     Xdigit,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Syntax {
+    Ignore,
+    Override,
+}
+
 impl Pattern {
+    /// Command-line overrides match one path endpoint. Directory descent is
+    /// decided by the caller so a later file glob cannot revive a pruned dir.
+    pub(crate) fn matches_override(&self, components: &[&[u8]], directory: bool) -> bool {
+        let Some((last, parents)) = components.split_last() else {
+            return false;
+        };
+        if self.basename_only {
+            return self.matches_name(last, directory);
+        }
+        let mut cursors = vec![(0, false)];
+        for parent in parents {
+            let mut next = Vec::new();
+            self.step(cursors, parent, &mut next);
+            cursors = next;
+        }
+        let projections = self.projections();
+        cursors.into_iter().any(|(pos, fed)| {
+            projections[pos * 2 + usize::from(fed)]
+                .as_ref()
+                .is_some_and(|p| p.matches_name(last, directory))
+        })
+    }
+
     pub(crate) fn compile(index: usize, original: &str) -> Result<Option<Self>, String> {
+        Self::compile_syntax(index, original, Syntax::Ignore)
+    }
+
+    pub(crate) fn compile_override(original: &str) -> Result<Option<Self>, String> {
+        Self::compile_syntax(0, original, Syntax::Override)
+    }
+
+    fn compile_syntax(
+        index: usize,
+        original: &str,
+        syntax: Syntax,
+    ) -> Result<Option<Self>, String> {
         let line = trim_trailing_spaces(original);
         if line.is_empty() || line.starts_with('#') {
             return Ok(None);
@@ -103,8 +144,11 @@ impl Pattern {
         let mut components: Vec<Component> = parsed
             .parts
             .into_iter()
-            .map(|part| compile_component(&part, anchored))
+            .map(|part| compile_component(&part, anchored, syntax))
             .collect();
+        if syntax == Syntax::Override && components.iter().any(|p| matches!(p, Component::Never)) {
+            return Err("invalid glob character class or range".into());
+        }
         if parsed.escaped_edge
             && let Some(first) = components.first_mut()
         {
@@ -726,7 +770,7 @@ fn split_components(pattern: &[u8]) -> Result<SplitPattern, String> {
     })
 }
 
-fn compile_component(part: &[PatternByte], anchored: bool) -> Component {
+fn compile_component(part: &[PatternByte], anchored: bool, syntax: Syntax) -> Component {
     if anchored && part.len() >= 2 && part.iter().all(|byte| !byte.escaped && byte.value == b'*') {
         return Component::Globstar { allow_zero: true };
     }
@@ -759,7 +803,7 @@ fn compile_component(part: &[PatternByte], anchored: bool) -> Component {
             }
             b'[' => {
                 flush_literal(&mut atoms, &mut literal);
-                let Some((class, next)) = compile_class(part, at) else {
+                let Some((class, next)) = compile_class(part, at, syntax) else {
                     // Git silently makes malformed/unknown classes unable to
                     // match; it does not diagnose them as bad ignore lines.
                     return Component::Never;
@@ -785,7 +829,11 @@ fn flush_literal(atoms: &mut Vec<Atom>, literal: &mut Vec<u8>) {
     }
 }
 
-fn compile_class(part: &[PatternByte], start: usize) -> Option<(CharacterClass, usize)> {
+fn compile_class(
+    part: &[PatternByte],
+    start: usize,
+    syntax: Syntax,
+) -> Option<(CharacterClass, usize)> {
     let mut at = start + 1;
     let negated = part
         .get(at)
@@ -807,7 +855,8 @@ fn compile_class(part: &[PatternByte], start: usize) -> Option<(CharacterClass, 
         if !byte.escaped && byte.value == b']' {
             break at + 1;
         }
-        if !byte.escaped
+        if syntax == Syntax::Ignore
+            && !byte.escaped
             && byte.value == b'['
             && part
                 .get(at + 1)
@@ -890,6 +939,9 @@ fn compile_class(part: &[PatternByte], start: usize) -> Option<(CharacterClass, 
             if first.value <= last.value {
                 terms.push(ClassTerm::Range(first.value, last.value));
             } else {
+                if syntax == Syntax::Override {
+                    return None;
+                }
                 // Git keeps only the first endpoint of a reversed range.
                 terms.push(ClassTerm::Byte(first.value));
             }

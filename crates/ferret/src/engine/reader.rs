@@ -7,7 +7,7 @@ use ferret_query::{
     CheckedReader, ReadFault, ReadOperation, ReadOutcome, ReadRequest, ReadVersion,
 };
 
-pub(super) fn checked<'a>(
+pub(crate) fn checked<'a>(
     catalog: &'a Catalog,
     documents: &'a Documents,
 ) -> Box<CheckedReader<'a>> {

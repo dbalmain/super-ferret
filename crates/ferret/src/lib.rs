@@ -42,6 +42,7 @@ pub mod daemon;
 pub mod engine;
 pub mod find;
 mod find_json;
+pub mod grep;
 pub mod index;
 pub mod json;
 pub mod log;
