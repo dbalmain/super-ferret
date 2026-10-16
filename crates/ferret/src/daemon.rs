@@ -96,6 +96,16 @@ fn duration(name: &str, default: u64) -> Duration {
             .unwrap_or(default),
     )
 }
+fn should_exit(
+    draining: bool,
+    clients: usize,
+    busy: bool,
+    idle: Duration,
+    elapsed: Duration,
+) -> bool {
+    (draining && clients == 0 && !busy)
+        || (!idle.is_zero() && clients == 0 && !busy && elapsed >= idle)
+}
 fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let mut index = std::env::var_os("FERRET_INDEX")
         .filter(|value| !value.is_empty())
@@ -211,9 +221,7 @@ fn run(args: impl Iterator<Item = OsString>) -> io::Result<()> {
         if clients != 0 {
             idle_since = Instant::now();
         }
-        if (draining && clients == 0 && !busy)
-            || (!idle.is_zero() && clients == 0 && !busy && idle_since.elapsed() >= idle)
-        {
+        if should_exit(draining, clients, busy, idle, idle_since.elapsed()) {
             break;
         }
         // Once work blocks an expired deadline, its completion notification
@@ -653,6 +661,7 @@ fn connection(stream: UnixStream, host: &Arc<Host>) -> io::Result<()> {
     let _ = reader.join();
     result
 }
+
 fn runtime_status(request: &Request) -> u8 {
     if request.op == Op::Find { 1 } else { 3 }
 }
@@ -753,5 +762,22 @@ fn execute(host: &Host, request: &Request, destination: &Destination) -> io::Res
                 }
             },
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_exit;
+    use std::time::Duration;
+
+    #[test]
+    fn idle_exit_waits_for_publication_after_its_deadline() {
+        let idle = Duration::from_millis(80);
+        let elapsed = Duration::from_secs(1);
+
+        assert!(!should_exit(false, 0, true, idle, elapsed));
+        assert!(should_exit(false, 0, false, idle, elapsed));
+        assert!(!should_exit(true, 0, true, idle, elapsed));
+        assert!(should_exit(true, 0, false, idle, Duration::ZERO));
     }
 }

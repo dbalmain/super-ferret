@@ -748,8 +748,8 @@ fn idle_exit_waits_for_publication_and_restart_backstops_debounced_hints() {
         ("FERRET_DAEMON_IDLE_MS", "80"),
         ("FERRET_WATCH_TEST_REFRESH_DELAY_MS", "300"),
     ]);
+    // A missed idle deadline must not take down an in-flight publication.
     assert!(tree.status().contains("\"writer_busy\":true"));
-    std::thread::sleep(Duration::from_millis(150));
     assert!(
         tree.daemon
             .as_mut()
@@ -760,15 +760,14 @@ fn idle_exit_waits_for_publication_and_restart_backstops_debounced_hints() {
     );
     tree.quiet();
     write(tree.path("src/left/deep/pending.txt"), "pending");
-    std::thread::sleep(Duration::from_millis(150));
-    assert!(
+    wait(|| {
         tree.daemon
             .as_mut()
             .unwrap_or_else(|| panic!("daemon"))
             .try_wait()
             .unwrap_or_else(|error| panic!("try wait: {error:?}"))
             .is_some()
-    );
+    });
     tree.stop();
     tree.start(&[]);
     tree.converges();
