@@ -7,7 +7,7 @@
 mod fixture;
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
 
@@ -148,9 +148,15 @@ fn an_exec_childs_stderr_reaches_a_stderr_event() {
 fn a_failed_json_begin_stops_before_find_actions() {
     let tree = Tree::new("begin-broken-pipe");
     let marker = tree.0.join("marker");
-    let mut command = fixture::command(FERRET, &tree.0);
+    // Hold `ferret` behind a stdin handshake so the read end is closed before
+    // it can write the begin event.
+    let mut command = fixture::command("sh", &tree.0);
     command
         .args([
+            "-c",
+            "IFS= read -r _; exec \"$@\"",
+            "sh",
+            FERRET,
             "--json",
             "find",
             "-I",
@@ -162,10 +168,12 @@ fn a_failed_json_begin_stops_before_find_actions() {
         ])
         .arg(&marker)
         .arg(";")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
     drop(child.stdout.take());
+    child.stdin.take().unwrap().write_all(b"go\n").unwrap();
     let output = child.wait_with_output().unwrap();
     assert_ne!(output.status.code(), Some(0));
     assert!(!marker.exists(), "action ran after begin failed");
