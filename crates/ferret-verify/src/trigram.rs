@@ -370,6 +370,12 @@ impl Search {
         None
     }
 
+    /// Every match's byte span, for line rendering and match counts. The
+    /// first-match screen does not narrow the haystack or assertion context.
+    pub fn spans<'r, 't>(&'r self, text: &'t [u8]) -> crate::matcher::Spans<'r, 't> {
+        self.regex.spans(text)
+    }
+
     /// Whether the search looks for a required run before the pattern.
     pub fn filters(&self) -> bool {
         self.filter.is_some()
