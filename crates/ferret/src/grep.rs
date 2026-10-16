@@ -463,6 +463,12 @@ fn scan(
     output: &mut OutputBuffer,
 ) -> Result<InputResult, ScanError> {
     #[cfg(test)]
+    seam::BEFORE_SCAN.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
+    #[cfg(test)]
     let mut observed = seam::Observed(input);
     #[cfg(test)]
     let input: &mut dyn Read = &mut observed;
@@ -530,6 +536,94 @@ mod tests {
         assert_eq!(
             outcomes,
             [(false, true, false, false), (true, true, false, false)]
+        );
+    }
+
+    // R3: size zero changes the readable extent, never the version check.
+    // Fill after the opening stat, then splice a nonmatching line mid-read.
+    #[test]
+    fn initially_empty_files_discard_torn_matches_and_bound_retries() {
+        use std::cell::Cell;
+        use std::os::unix::fs::FileExt;
+        use std::rc::Rc;
+
+        let mut outcomes = Vec::new();
+        for recursive in [false, true] {
+            for unstable in [false, true] {
+                let path = std::env::temp_dir().join(format!(
+                    "ferret-empty-torn-{}-{recursive}-{unstable}",
+                    std::process::id()
+                ));
+                fs::write(&path, b"").unwrap();
+                let writer = OpenOptions::new().write(true).open(&path).unwrap();
+                let attempts = Rc::new(Cell::new(0));
+                let observed = attempts.clone();
+                seam::BEFORE_SCAN.with_borrow_mut(|hook| {
+                    *hook = Some(Box::new(move || {
+                        let attempt = observed.get() + 1;
+                        observed.set(attempt);
+                        if attempt == 1 {
+                            let mut bytes = vec![b'x'; 100_000];
+                            bytes[..3].copy_from_slice(b"red");
+                            bytes[99_997..].copy_from_slice(b"OLD");
+                            writer.write_all_at(&bytes, 0).unwrap();
+                        }
+                        let writer = writer.try_clone().unwrap();
+                        let mut changed = false;
+                        seam::AFTER_READ.with_borrow_mut(|hook| {
+                            *hook = Some(Box::new(move || {
+                                if changed {
+                                    return;
+                                }
+                                changed = true;
+                                if attempt == 1 {
+                                    writer.write_all_at(b"blu", 0).unwrap();
+                                    writer.write_all_at(b"NEW", 99_997).unwrap();
+                                } else if unstable {
+                                    // A size change makes retry failure
+                                    // independent
+                                    // of timestamp resolution or clock timing.
+                                    writer.write_all_at(b"x", 100_000).unwrap();
+                                }
+                            }));
+                        });
+                    }));
+                });
+                let line_grep::Command::Search(plan) =
+                    line_grep::parse(&["^red.*NEW$".into()]).unwrap()
+                else {
+                    panic!("search")
+                };
+                let mut host = Host {
+                    plan: &plan,
+                    filename: false,
+                    writer: Vec::new(),
+                    buffer: Vec::new(),
+                    matched: false,
+                    errors: false,
+                };
+                host.file(&path, recursive).unwrap();
+                seam::BEFORE_SCAN.with_borrow_mut(|hook| *hook = None);
+                seam::AFTER_READ.with_borrow_mut(|hook| *hook = None);
+                fs::remove_file(path).unwrap();
+                outcomes.push((
+                    recursive,
+                    unstable,
+                    attempts.get(),
+                    host.writer.is_empty(),
+                    host.matched,
+                    host.errors,
+                ));
+            }
+        }
+        assert_eq!(
+            outcomes,
+            [
+                (false, false, 2, true, false, false),
+                (false, true, 2, true, false, true),
+                (true, false, 2, true, false, false),
+                (true, true, 2, true, false, true),
+            ]
         );
     }
 
@@ -647,6 +741,7 @@ mod seam {
     use std::io::{self, Read};
 
     thread_local! {
+        pub(super) static BEFORE_SCAN: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
         pub(super) static AFTER_READ: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
     }
 

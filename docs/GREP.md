@@ -176,13 +176,15 @@ tree snapshot. Stdin and other non-regular streams cannot be version-checked:
 their output describes the bytes received. Explicit special-file operands still
 refuse under the operand rule below.
 
-**Size-unreliable stream exception (2026-10-16, review R2):** a regular file
-reporting size zero may still yield content (for example `/proc/version`).
-Explicit operands and opaque/ignored-directory fallback read such files to
-actual EOF as unchecked streams, without a closing version check or changed-read
-retry. Their metadata cannot validate the bytes; the same stream semantics apply
-to genuinely empty files. Other regular files retain the initial-size bound,
-closing bracket and bounded retry, so appends cannot extend an attempt forever.
+**Read-extent clarification (2026-10-17, review R3; corrects review R2):** a
+regular file reporting size zero may still yield content (for example
+`/proc/version`). Explicit operands and opaque/ignored-directory fallback read
+such files to actual EOF, retaining the closing version bracket and one
+changed-read retry. Read extent and validation are independent: zero size does
+not disable change detection. Stable procfs metadata passes the bracket; an
+ordinary file filled or mutated during the read is retried, with continued
+instability reported as an error. Nonzero sizes retain the initial-size bound,
+so appends cannot extend an attempt forever.
 An overstated nonzero size (for example a sysfs attribute reporting 4096 bytes)
 needs no separate path: EOF before that bound already ends the read. A short
 read alone does not disable the bracket, since an ordinary file may have shrunk.

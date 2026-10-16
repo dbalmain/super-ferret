@@ -35,10 +35,10 @@ use crate::observe::{BulkRead, Opened, Reader, bracket, catalog_stat};
 
 /// Streams an explicit regular file or live-fallback file, using the same
 /// current-version bracket as catalogued candidates. `None` imposes no policy
-/// size cap. A zero reported size may conceal virtual-file content: stream it
-/// to EOF without a closing bracket, as metadata cannot validate those bytes.
-/// Nonzero sizes bound reads; a closing fstat validates even an early stop.
-/// The caller owns retry and publication of buffered output.
+/// size cap. Zero reported size selects an EOF read so virtual-file content
+/// is visible; nonzero sizes bound reads. Both retain the closing fstat against
+/// the opening version, even after an early stop. The caller owns retry and
+/// publication of buffered output.
 pub fn stream_file_until(
     path: &std::path::Path,
     cap: Option<u64>,
@@ -54,7 +54,7 @@ pub fn stream_file_until(
         Mode::empty(),
     )
     .map_err(|error| ContentFault::Open(error.into()))?;
-    let (mut file, current) = regular_file(fd)?;
+    let (file, current) = regular_file(fd)?;
     if let Some(cap) = cap
         && current.size > cap
     {
@@ -63,21 +63,16 @@ pub fn stream_file_until(
             cap,
         });
     }
-    let mut pass = |file: &mut File, size| {
-        each(&mut Read::take(file, size), size).map_err(|error| {
+    checked_file(file, current, &mut |file, size| {
+        let extent = if size == 0 { u64::MAX } else { size };
+        each(&mut Read::take(file, extent), extent).map_err(|error| {
             if cancelled() {
                 ContentFault::Cancelled
             } else {
                 ContentFault::Read(error)
             }
         })
-    };
-    if current.size == 0 {
-        pass(&mut file, u64::MAX)?;
-        Ok(current)
-    } else {
-        checked_file(file, current, &mut pass)
-    }
+    })
 }
 
 /// Validate the open descriptor, rather than path metadata that may already

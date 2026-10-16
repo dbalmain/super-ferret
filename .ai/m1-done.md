@@ -338,7 +338,8 @@ My P1 change in `35bf01d` wrongly applied the indexed reader’s size-as-extent
 assumption to direct operands. The ordinary-file transaction was appropriate;
 the unconditional size bound was not.
 
-Zero reported size now selects an unchecked EOF stream, for explicit operands
+The unchecked-zero-size choice in this round is superseded by review round 3.
+Zero reported size selected an unchecked EOF stream, for explicit operands
 and opaque/ignored-directory fallback alike. Genuine empty files necessarily
 share this exception. Nonzero sizes keep the initial-size bound, shared closing
 bracket and one changed-read retry; no extra stat or ordinary-file reread is
@@ -394,3 +395,44 @@ functions, up from 1129). Neither virtual-file test skipped here; no additional
 sandbox or TCP skips. Full successful log: `/tmp/grep-review-r2-gates.log`;
 isolated JSON log: `/tmp/grep-review-r2-json-retry.log`. One R2 fix commit;
 M2 scope is unchanged.
+
+## Review round 3
+
+2026-10-17: read Astra’s full round-3 note. R2’s unchecked-zero-size exception
+was wrong: extent and validation must remain independent. Adding a deterministic
+initially-empty ordinary-file regression, then restoring the closing bracket
+and bounded retry while retaining EOF reads for zero reported size.
+Reproduced through real Host::file with the P1 hook style: create an empty
+file, fill it with a 100,000-byte `red…OLD` line after the opening stat, then
+change prefix to `blu` and suffix to `NEW` after the first actual read. Neither
+version matches `^red.*NEW$`; R2 published the torn match after one attempt.
+The regression covers explicit and recursive-fallback modes, each with a
+stable retry and with another mutation on retry. Hooks are thread-local and
+synchronous; no sleeps. The retry mutation appends a byte, making change
+detection independent of timestamp resolution. It asserts exactly two attempts,
+no published output or match, and an error only for repeated instability.
+
+The production change moves only extent selection inside the existing
+checked_file transaction. A zero opening size supplies u64::MAX to the consumer;
+the opening stat remains unchanged for the shared closing bracket. Every
+regular-file attempt is validated, and retry_read still permits one retry.
+Nonzero extents and all existing metadata costs remain unchanged. No duplicate
+bracket, retry policy or reader was added. Both virtual-file tests passed,
+including explicit /proc/version, actual ignored-directory fallback and the
+overreported sysfs-size control. GREP.md and reader documentation now distinguish
+EOF extent from version validation; the R2 unchecked wording is superseded.
+
+Revert check restored only content.rs to 0c0bd6f, retaining the regression and
+hooks. All four cases failed again: one attempt, output published, matched=true,
+errors=false. Restored the fix for gates. Logs: `/tmp/grep-review-r3-repro.log`,
+`/tmp/grep-review-r3-fixed.log`, `/tmp/grep-review-r3-revert.log`.
+
+R3 gates passed on the first full run: `nix run .#fmt`, all-target clippy
+with zero compiler warnings, and workspace tests **1132 passed / 13 ignored**
+(up one regression test from R2). The new test has four mutation/retry cases.
+Both virtual-file tests ran without skipping; no additional sandbox/TCP skips.
+The known watch idle-exit and find_json pipe tests passed, so no rerun was
+needed. Full log: `/tmp/grep-review-r3-gates.log`.
+
+One R3 fix commit. No manifest/dependency changes, pushes, other agent CLI
+launches or benchmark runs. M2 scope is unchanged.

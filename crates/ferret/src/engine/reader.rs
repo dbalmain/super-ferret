@@ -42,8 +42,8 @@ pub(crate) fn checked<'a>(
 }
 
 /// Direct paths have no catalog membership: a missing explicit operand is a
-/// read error, unlike a vanished snapshot candidate. Nonzero sizes use the
-/// crawl bracket; zero-size regular files stream unchecked to actual EOF.
+/// read error, unlike a vanished snapshot candidate. All use the crawl
+/// bracket; zero-size regular files read to actual EOF within that check.
 pub(crate) fn direct(
     path: &std::path::Path,
     cap: Option<u64>,
