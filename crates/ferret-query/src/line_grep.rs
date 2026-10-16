@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use ferret_verify::{Grep, GrepFlags, LineFlags};
 
+mod context;
+
 /// Information requests skip environment, index and input resolution.
 #[derive(Debug)]
 pub enum Command {
@@ -54,6 +56,8 @@ pub struct Plan {
     pub stdin_patterns: bool,
     pub include_zero: bool,
     pub max_count: Option<u64>,
+    pub before: u64,
+    pub after: u64,
     pub presentation: Presentation,
 }
 
@@ -99,6 +103,7 @@ pub enum ParseError {
     MissingPattern,
     Value(String),
     Number(String),
+    Context(String),
     Utf8(&'static str),
     Unsupported(String),
     Pattern(ferret_verify::GrepError),
@@ -114,6 +119,10 @@ impl std::fmt::Display for ParseError {
             Self::Number(value) => write!(
                 f,
                 "invalid --max-count: {value:?}; expected a nonnegative integer"
+            ),
+            Self::Context(value) => write!(
+                f,
+                "invalid context size {value:?}; expected a nonnegative integer"
             ),
             Self::Utf8(argument) => write!(f, "{argument} must be UTF-8"),
             Self::Unsupported(flag) => {
@@ -162,6 +171,7 @@ pub fn parse_with(
     let mut files = false;
     let mut include_zero = false;
     let mut max_count = None;
+    let (mut before, mut after, mut around) = (None, None, 0);
     let mut presentation = Presentation::default();
     let mut output = Output::Lines;
     let (mut help, mut version) = (false, false);
@@ -251,12 +261,21 @@ pub fn parse_with(
                     files = false;
                 }
                 "--scan" | "--scan-uncovered" if value.is_none() => {}
-                "--glob" | "--color" | "--regexp" | "--max-count" => {
+                "--glob" | "--color" | "--regexp" | "--max-count" | "--before-context"
+                | "--after-context" | "--context" => {
                     let value = value
                         .map(str::to_owned)
                         .or_else(|| args.next().and_then(|s| s.to_str()).map(str::to_owned))
                         .ok_or_else(|| ParseError::Value(flag.to_owned()))?;
                     match flag {
+                        "--before-context" | "--after-context" | "--context" => {
+                            let number = value.parse().map_err(|_| ParseError::Context(value))?;
+                            match flag {
+                                "--before-context" => before = Some(number),
+                                "--after-context" => after = Some(number),
+                                _ => around = number,
+                            }
+                        }
                         "--max-count" => {
                             max_count = Some(value.parse().map_err(|_| ParseError::Number(value))?)
                         }
@@ -327,14 +346,23 @@ pub fn parse_with(
                         sources.push(PatternSource::File(path));
                         break;
                     }
-                    b'g' | b'e' | b'm' => {
+                    b'g' | b'e' | b'm' | b'A' | b'B' | b'C' => {
                         let value = if at + 1 < bytes.len() {
                             std::str::from_utf8(&bytes[at + 1..]).ok()
                         } else {
                             args.next().and_then(|s| s.to_str())
                         }
                         .ok_or_else(|| ParseError::Value(format!("-{}", char::from(flag))))?;
-                        if flag == b'm' {
+                        if matches!(flag, b'A' | b'B' | b'C') {
+                            let number = value
+                                .parse()
+                                .map_err(|_| ParseError::Context(value.to_owned()))?;
+                            match flag {
+                                b'A' => after = Some(number),
+                                b'B' => before = Some(number),
+                                _ => around = number,
+                            }
+                        } else if flag == b'm' {
                             max_count = Some(
                                 value
                                     .parse()
@@ -435,6 +463,8 @@ pub fn parse_with(
         stdin_patterns,
         include_zero,
         max_count,
+        before: before.unwrap_or(around),
+        after: after.unwrap_or(around),
         presentation,
     }))
 }
@@ -536,6 +566,37 @@ pub fn scan(
     stopped: &dyn Fn() -> bool,
     mut emit: impl FnMut(u64, &[u8]) -> io::Result<()>,
 ) -> Result<InputResult, ScanError> {
+    scan_lines(plan, input, size, buffer, stopped, |line| {
+        emit(line.number, line.bytes)
+    })
+}
+
+/// A rendered line is either selected data (possibly one -o fragment) or
+/// context from the same checked input attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineKind {
+    Match,
+    Context,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Line<'a> {
+    pub number: u64,
+    pub bytes: &'a [u8],
+    pub kind: LineKind,
+    pub fragment: bool,
+}
+
+/// Stream selected records and bounded before/after context without a second
+/// input read. All context-spool failures retain output-fault classification.
+pub fn scan_lines(
+    plan: &Plan,
+    input: &mut dyn Read,
+    size: u64,
+    buffer: &mut Vec<u8>,
+    stopped: &dyn Fn() -> bool,
+    mut emit: impl FnMut(Line<'_>) -> io::Result<()>,
+) -> Result<InputResult, ScanError> {
     let search = plan.grep.search();
     let mut result = InputResult::empty(plan);
     if !result.searched {
@@ -543,6 +604,28 @@ pub fn scan(
     }
     let mut selected_lines = 0;
     let mut number = 0;
+    let rendering = plan.output == Output::Lines && !plan.quiet;
+    let after = if rendering { plan.after } else { 0 };
+    let mut before = context::Before::new(if rendering { plan.before } else { 0 }, stopped);
+    let mut trailing = 0;
+    let mut limited = false;
+    let mut emit = |line: Line<'_>| {
+        if line.kind == LineKind::Context && plan.only_matching && plan.invert {
+            for span in search.spans(line.bytes) {
+                if stopped() {
+                    return Err(io::ErrorKind::ConnectionAborted.into());
+                }
+                emit(Line {
+                    bytes: &line.bytes[span],
+                    fragment: true,
+                    ..line
+                })?;
+            }
+            Ok(())
+        } else {
+            emit(line)
+        }
+    };
     crate::scan::runs(
         input,
         size,
@@ -571,7 +654,39 @@ pub fn scan(
                 if stopped() {
                     return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                 }
-                if search.find(line).is_some() != plan.invert {
+                let selected = search.find(line).is_some() != plan.invert;
+                if limited {
+                    if rendering {
+                        if selected && plan.only_matching && !plan.invert {
+                            for span in search.spans(line) {
+                                emit(Line {
+                                    number,
+                                    bytes: &line[span],
+                                    kind: LineKind::Match,
+                                    fragment: true,
+                                })
+                                .map_err(ScanError::Output)?;
+                            }
+                        } else {
+                            emit(Line {
+                                number,
+                                bytes: line,
+                                kind: if selected {
+                                    LineKind::Match
+                                } else {
+                                    LineKind::Context
+                                },
+                                fragment: false,
+                            })
+                            .map_err(ScanError::Output)?;
+                        }
+                    }
+                    if number >= trailing {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    continue;
+                }
+                if selected {
                     if plan.output == Output::WithoutMatch {
                         result.matched = false;
                         return Ok(ControlFlow::Break(()));
@@ -581,6 +696,10 @@ pub fn scan(
                     if plan.quiet || plan.output == Output::Names {
                         return Ok(ControlFlow::Break(()));
                     }
+                    if rendering {
+                        before.emit(&mut emit).map_err(ScanError::Output)?;
+                    }
+                    trailing = number.saturating_add(after);
                     if (plan.only_matching || plan.output == Output::CountMatches) && !plan.invert {
                         for span in search.spans(line) {
                             if stopped() {
@@ -588,18 +707,43 @@ pub fn scan(
                             }
                             result.count += 1;
                             if plan.output == Output::Lines {
-                                emit(number, &line[span]).map_err(ScanError::Output)?;
+                                emit(Line {
+                                    number,
+                                    bytes: &line[span],
+                                    kind: LineKind::Match,
+                                    fragment: true,
+                                })
+                                .map_err(ScanError::Output)?;
                             }
                         }
                     } else {
                         result.count += 1;
                         if plan.output == Output::Lines {
-                            emit(number, line).map_err(ScanError::Output)?;
+                            emit(Line {
+                                number,
+                                bytes: line,
+                                kind: LineKind::Match,
+                                fragment: false,
+                            })
+                            .map_err(ScanError::Output)?;
                         }
                     }
                     if plan.max_count.is_some_and(|limit| selected_lines >= limit) {
-                        return Ok(ControlFlow::Break(()));
+                        limited = true;
+                        if after == 0 {
+                            return Ok(ControlFlow::Break(()));
+                        }
                     }
+                } else if rendering && number <= trailing {
+                    emit(Line {
+                        number,
+                        bytes: line,
+                        kind: LineKind::Context,
+                        fragment: false,
+                    })
+                    .map_err(ScanError::Output)?;
+                } else if rendering {
+                    before.push(number, line).map_err(ScanError::Output)?;
                 }
             }
             if binary.is_some() {

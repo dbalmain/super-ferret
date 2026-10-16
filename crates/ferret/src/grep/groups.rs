@@ -24,6 +24,8 @@ pub(super) struct Render<'a> {
 struct Record {
     number: u64,
     bytes: Vec<u8>,
+    kind: line_grep::LineKind,
+    fragment: bool,
 }
 
 struct Capture {
@@ -37,19 +39,21 @@ impl Capture {
             bytes: 0,
         }
     }
-    fn push(&mut self, number: u64, line: &[u8]) {
+    fn push(&mut self, line: line_grep::Line<'_>) {
         if self.records.is_none() {
             return;
         }
         self.bytes = self
             .bytes
-            .saturating_add(line.len() + std::mem::size_of::<Record>());
+            .saturating_add(line.bytes.len() + std::mem::size_of::<Record>());
         if self.bytes > ENTRY_BYTES {
             self.records = None;
         } else if let Some(records) = &mut self.records {
             records.push(Record {
-                number,
-                bytes: line.to_vec(),
+                number: line.number,
+                bytes: line.bytes.to_vec(),
+                kind: line.kind,
+                fragment: line.fragment,
             });
         }
     }
@@ -72,15 +76,14 @@ impl Render<'_> {
     fn line(
         &self,
         output: &mut OutputBuffer,
-        number: u64,
-        line: &[u8],
-        first: &mut bool,
+        line: line_grep::Line<'_>,
+        previous: &mut Option<u64>,
     ) -> io::Result<()> {
         let mut output = Cancellable {
             inner: output,
             stopped: self.stopped,
         };
-        if *first
+        if previous.is_none()
             && self.plan.presentation.heading == Some(true)
             && let Some(prefix) = self.prefix
         {
@@ -91,7 +94,17 @@ impl Render<'_> {
                 b"\n"
             })?;
         }
-        *first = false;
+        if (self.plan.before > 0 || self.plan.after > 0)
+            && previous.is_some_and(|number| line.number > number.saturating_add(1))
+        {
+            output.write_all(b"--\n")?;
+        }
+        *previous = Some(line.number);
+        let delimiter: &[u8] = if line.kind == line_grep::LineKind::Context {
+            b"-"
+        } else {
+            b":"
+        };
         if self.plan.presentation.heading != Some(true)
             && let Some(prefix) = self.prefix
         {
@@ -99,13 +112,14 @@ impl Render<'_> {
             output.write_all(if self.plan.presentation.null {
                 b"\0"
             } else {
-                b":"
+                delimiter
             })?;
         }
         if self.plan.line_number {
-            write!(output, "{number}:")?;
+            write!(output, "{}", line.number)?;
+            output.write_all(delimiter)?;
         }
-        output.write_all(line)?;
+        output.write_all(line.bytes)?;
         output.write_all(b"\n")
     }
 
@@ -127,18 +141,11 @@ impl Render<'_> {
         let mut observed = super::seam::Observed(input);
         #[cfg(test)]
         let input: &mut dyn Read = &mut observed;
-        let mut first = true;
-        line_grep::scan(
-            self.plan,
-            input,
-            size,
-            buffer,
-            self.stopped,
-            |number, line| {
-                capture.push(number, line);
-                self.line(output, number, line, &mut first)
-            },
-        )
+        let mut previous = None;
+        line_grep::scan_lines(self.plan, input, size, buffer, self.stopped, |line| {
+            capture.push(line);
+            self.line(output, line, &mut previous)
+        })
     }
 }
 
@@ -355,13 +362,17 @@ impl Worker<'_> {
                     match read(*name, ReadRequest::Stat) {
                         ReadOutcome::Stable(ReadVersion::Catalogued) => {
                             let mut output = OutputBuffer::default();
-                            let mut first = true;
+                            let mut previous = None;
                             for record in &cached.records {
                                 render.line(
                                     &mut output,
-                                    record.number,
-                                    &record.bytes,
-                                    &mut first,
+                                    line_grep::Line {
+                                        number: record.number,
+                                        bytes: &record.bytes,
+                                        kind: record.kind,
+                                        fragment: record.fragment,
+                                    },
+                                    &mut previous,
                                 )?;
                             }
                             return Ok(Observed::Ready(Group {
@@ -743,6 +754,52 @@ mod tests {
         assert_eq!(streams.get(), 3);
         assert_eq!(stats.get(), 2);
         assert_eq!(lock(&cache).entries.len(), 1);
+    }
+
+    #[test]
+    fn cached_context_replays_kinds_gaps_and_each_paths_heading() {
+        let streams = Cell::new(0);
+        let stats = Cell::new(0);
+        let read = |_: NameId, request: ReadRequest<'_>| {
+            match request {
+                ReadRequest::Stat => stats.set(stats.get() + 1),
+                ReadRequest::Stream(each, _) => {
+                    streams.set(streams.get() + 1);
+                    let bytes = b"red\na\nb\nc\nd\ne\nred\n";
+                    each(&mut &bytes[..], bytes.len() as u64).unwrap();
+                }
+                ReadRequest::Bytes(_, _) => panic!("stream expected"),
+            }
+            ReadOutcome::Stable(ReadVersion::Catalogued)
+        };
+        let mut worker = Worker {
+            plan: plan(&["--heading", "-nC1", "red"]),
+            buffer: Vec::new(),
+            read: Some(Box::new(read)),
+        };
+        let cache = Mutex::new(Cache::default());
+        for (name, path) in [(0, "copy-a"), (1, "copy-b")] {
+            let Observed::Ready(mut group) = worker
+                .prepare(
+                    &Job::Checked(path.into(), NameId(name), 0),
+                    true,
+                    &cache,
+                    true,
+                    &|| false,
+                )
+                .unwrap()
+            else {
+                panic!("ready")
+            };
+            let mut actual = Vec::new();
+            group.output.write_to(&mut actual).unwrap();
+            assert_eq!(
+                actual,
+                format!("{path}\n1:red\n2-a\n--\n6-e\n7:red\n").as_bytes()
+            );
+        }
+        assert_eq!(streams.get(), 1);
+        assert_eq!(stats.get(), 1);
     }
 
     // M2: a later quiet hit must stop a read already in progress, before the

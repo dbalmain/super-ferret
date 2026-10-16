@@ -4,7 +4,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,6 +77,58 @@ impl Write for OutputBuffer {
 }
 
 impl OutputBuffer {
+    /// Captured byte length, including spilled bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether no bytes have been captured.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    /// Replay a bounded range without changing the append cursor. Context
+    /// windows use this for rolling retention and replay; cancellation is
+    /// polled between at most 64 KiB chunks. Faults remain output faults.
+    pub fn read_range(
+        &self,
+        start: u64,
+        len: u64,
+        writer: &mut dyn Write,
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        let end = start
+            .checked_add(len)
+            .filter(|end| *end <= self.len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "output range outside capture")
+            })?;
+        let mut at = start;
+        let mut buffer = [0; MEMORY_LIMIT];
+        while at < end {
+            if stopped() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            let count = (end - at).min(MEMORY_LIMIT as u64) as usize;
+            if let Some(spill) = &self.file {
+                spill
+                    .file
+                    .read_exact_at(&mut buffer[..count], at)
+                    .map_err(|error| spill_error("read", &spill.path, error))?;
+                writer.write_all(&buffer[..count])?;
+            } else {
+                writer.write_all(&self.bytes[at as usize..at as usize + count])?;
+            }
+            at += count as u64;
+        }
+        Ok(())
+    }
+
     fn record(&mut self, bytes: &[u8], terminator: &[u8]) -> io::Result<()> {
         let len = bytes.len() + terminator.len();
         if self.file.is_none() && self.bytes.len() + len <= MEMORY_LIMIT {

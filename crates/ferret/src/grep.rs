@@ -478,8 +478,12 @@ impl<W: Write> Host<'_, W> {
             })?;
             self.writer.write_all(b": binary file matches\n")?;
         } else {
-            if previous && result.matched && self.plan.presentation.heading == Some(true) {
-                self.writer.write_all(b"\n")?;
+            if previous && result.matched && !output.is_empty() {
+                if self.plan.presentation.heading == Some(true) {
+                    self.writer.write_all(b"\n")?;
+                } else if self.plan.before > 0 || self.plan.after > 0 {
+                    self.writer.write_all(b"--\n")?;
+                }
             }
             let flag = self.cancelled;
             groups::emit(&mut output, &mut self.writer, &|| {
@@ -556,6 +560,58 @@ mod tests {
             outcomes,
             [(false, true, false, false), (true, true, false, false)]
         );
+    }
+
+    // Context and the selected line belong to one checked read. Force a
+    // first-attempt spill, then change its prefix after the first real read.
+    #[test]
+    fn retried_context_discards_the_whole_spilled_group() {
+        use std::os::unix::fs::FileExt;
+        for recursive in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "ferret-context-retry-{}-{recursive}",
+                std::process::id()
+            ));
+            let mut original = b"old context\n".repeat(20_000);
+            original.extend_from_slice(b"red\n");
+            fs::write(&path, &original).unwrap();
+            let writer = OpenOptions::new().write(true).open(&path).unwrap();
+            let mut changed = false;
+            seam::AFTER_READ.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    if !changed {
+                        writer.write_all_at(b"NEW", 0).unwrap();
+                        // A changed extent makes the retry independent of
+                        // timestamp resolution.
+                        writer
+                            .write_all_at(b"tail\n", original.len() as u64)
+                            .unwrap();
+                        changed = true;
+                    }
+                }));
+            });
+            let line_grep::Command::Search(plan) =
+                line_grep::parse(&["-B25000".into(), "red".into()]).unwrap()
+            else {
+                panic!("search")
+            };
+            let mut host = Host {
+                plan: &plan,
+                filename: false,
+                writer: Vec::new(),
+                buffer: Vec::new(),
+                matched: false,
+                errors: false,
+                cancelled: None,
+            };
+            host.file(&path, recursive).unwrap();
+            seam::AFTER_READ.with_borrow_mut(|hook| *hook = None);
+            let mut expected = fs::read(&path).unwrap();
+            expected.truncate(expected.len() - b"tail\n".len());
+            fs::remove_file(path).unwrap();
+            assert_eq!(host.writer, expected);
+            assert!(host.matched && !host.errors);
+        }
     }
 
     // R3: size zero changes the readable extent, never the version check.

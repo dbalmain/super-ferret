@@ -1627,3 +1627,73 @@ profile_cases! {
     m5_heading_disabled: 0 => @raw ["--heading", "--no-heading", "-Hn", "red", "one.rs"];
     m5_heading_reenabled: 0 => @raw ["--no-heading", "--heading", "-Hn", "red", "one.rs"];
 }
+
+// M5 context groups are compared byte for byte, without line sorting.
+profile_cases! {
+    m5_after: 0 => @raw ["-nA1", "red", "one.rs"];
+    m5_before: 0 => @raw ["-nB1", "red", "one.rs"];
+    m5_around: 0 => @raw ["-nC1", "red", "one.rs"];
+    m5_zero_context: 0 => @raw ["-nC0", "red", "one.rs"];
+    m5_before_explicit_wins: 0 => @raw ["-B0", "-C2", "red", "one.rs"];
+    m5_after_explicit_wins: 0 => @raw ["-C2", "-A0", "red", "one.rs"];
+    m5_repeated_context: 0 => @raw ["-C2", "-C0", "red", "one.rs"];
+    m5_context_filename: 0 => @raw ["-HnC1", "red", "one.rs"];
+    m5_context_null_filename: 0 => @raw ["-H0nC1", "red", "one.rs"];
+    m5_context_heading: 0 => @raw ["--heading", "-HnC1", "red", "one.rs"];
+    m5_context_inverted: 0 => @raw ["-vnC1", "red", "one.rs"];
+    m5_context_inverted_only: 0 => @raw ["-vonC1", "red", "one.rs"];
+    m5_context_only: 0 => @raw ["-onC1", "red", "one.rs"];
+    m5_context_limit: 0 => @raw ["-m1", "-nA1", "red", "one.rs"];
+    m5_context_limit_selected_tail: 0 => @raw ["-m1", "-nA2", "red", "one.rs"];
+    m5_context_limit_only: 0 => @raw ["-m1", "-onA2", "red", "one.rs"];
+    m5_context_count_ignored: 0 => @raw ["-cC4", "red", "one.rs"];
+    m5_context_matches_ignored: 0 => @raw ["--count-matches", "-C4", "red", "one.rs"];
+    m5_context_names_ignored: 0 => @raw ["-lC4", "red", "one.rs"];
+    m5_context_quiet_ignored: 0 => @raw ["-qC4", "red", "one.rs"];
+    m5_context_absent: 1 => @raw ["-C2", "violet", "one.rs"];
+    m5_context_empty: 1 => @raw ["-C2", "red", "empty"];
+    m5_context_crlf: 0 => @raw ["-nC2", "red", "crlf"];
+    m5_context_unterminated: 0 => @raw ["-nC2", "red", "last"];
+    m5_context_multi: 0 => @raw ["-nC1", "red", "one.rs", "one.rs"];
+    m5_context_multi_heading: 0 => @raw ["--heading", "-nC1", "red", "one.rs", "one.rs"];
+    m5_context_multi_hidden_names: 0 => @raw ["--heading", "-InC1", "red", "one.rs", "one.rs"];
+    m5_context_bad_count: 2 => @raw ["-Awrong", "red", "one.rs"];
+}
+
+#[test]
+fn m5_context_gaps_overlap_adjacency_and_long_spills() {
+    let fixture = Fixture::new("context-geometry");
+    for (name, bytes) in [
+        ("groups", b"red\na\nb\nc\nd\ne\nf\nred\ntail\n".as_slice()),
+        ("adjacent", b"red\na\nb\nred\nc\nd\nred\n".as_slice()),
+    ] {
+        fixture.write(name, bytes);
+        for context in ["-C1", "-C2", "-A1", "-B1", "-C0"] {
+            fixture.compare_raw(&["-Hn", context, "red", name], None);
+        }
+    }
+    let mut bytes = b"before\n".repeat(20_000);
+    bytes.extend_from_slice(b"red\n");
+    bytes.extend_from_slice(&b"after\n".repeat(20_000));
+    fixture.write("spilled", &bytes);
+    fixture.compare_raw(&["-nC25000", "red", "spilled"], None);
+}
+
+#[test]
+fn m5_before_context_spill_failure_stops_the_command() {
+    let fixture = Fixture::new("before-context-fault");
+    let mut bytes = b"blue\n".repeat(20_000);
+    bytes.extend_from_slice(b"red\n");
+    fixture.write("big.txt", &bytes);
+    fixture.write("small.txt", b"red small\n");
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "-B25000", "red", "big.txt", "small.txt"])
+        .env("TMPDIR", fixture.base.join("missing-spill-dir"));
+    let output = run(command, None);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "a later group was published");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("output spill"));
+}

@@ -335,6 +335,23 @@ headings alone do not force filenames on a single explicit file. Heading
 file groups are separated by a blank line, including when `-I` suppresses
 their path headings; count/name modes ignore headings.
 
+**M5 context (2026-10-17):** `-A`/`-B` explicitly override the corresponding
+half of `-C`, in either argv order. Within each option the last value wins.
+Adjacent and overlapping windows merge; disjoint windows and non-heading
+file groups use `--` followed by LF. After `-m`, finish only the requested
+trailing window: matching lines there keep match formatting but neither
+increase the count nor extend the window. With `-v -o`, selected lines remain
+whole; regex-matching context lines emit their individual spans with context
+separators. Counts and name/quiet modes ignore context.
+
+Context is captured inside the same checked read as the matches. A retry
+throws away both. Before-context uses a rolling, header-bearing spill spool,
+with at most 64 KiB of captured bytes in memory; compaction bounds retained
+spool bytes to twice the live window plus 64 KiB. Rendered groups retain the
+existing 64 KiB spill threshold. Replaying a context line needs one line-sized
+buffer, under the same unbounded-long-line exception as scanning; neither
+context line count nor rendered output accumulates an unbounded memory list.
+
 In line-oriented execution, empty `-o` spans emit their prefix and LF, not
 nothing. Resume after a consuming match at its end; suppress an empty match
 immediately at that previous match's end. After an empty match (emitted or
