@@ -73,6 +73,13 @@ correction, 2026-10-17); it lives neither in policy nor in the query walker.
 Unrestricted live search needs no catalog. All content reads still use the
 same bracket/retry and bounded worker/group engine.
 
+Grep M7 (2026-10-17) keeps the graph. Verify resolves multiline/dotall and
+conservative LF exclusion alongside the shared HIR/necessary query. Query's
+multiline scanner buffers one checked attempt with fallible allocation, then
+separates search-region limits, line clipping, counts and output spans. Host
+records retain cross-line highlight spans through bounded duplicate caching;
+rendering does not re-run a cross-line pattern on detached line contents.
+
 Two boundaries carry the design, and both are where D1 said the thought goes:
 
 - **`ferret-index` knows doc ids and byte strings, not files.** It is the part

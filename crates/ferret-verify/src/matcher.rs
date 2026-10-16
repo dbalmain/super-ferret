@@ -59,6 +59,17 @@ impl Regex {
             bytes,
             next: Some(at),
             previous_end: None,
+            rebased: false,
+        }
+    }
+
+    /// Multiline search-region iteration. Each resumed search sees the
+    /// remaining suffix as its haystack, as rg's multiline search does.
+    /// Counting and rendering must re-match with `spans` and their own bounds.
+    pub fn rebased_spans<'r, 't>(&'r self, bytes: &'t [u8]) -> Spans<'r, 't> {
+        Spans {
+            rebased: true,
+            ..self.spans(bytes)
         }
     }
 
@@ -84,6 +95,7 @@ pub struct Spans<'r, 't> {
     bytes: &'t [u8],
     next: Option<usize>,
     previous_end: Option<usize>,
+    rebased: bool,
 }
 
 impl Iterator for Spans<'_, '_> {
@@ -92,15 +104,22 @@ impl Iterator for Spans<'_, '_> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let from = self.next?;
-            if from > self.bytes.len() {
+            if from > self.bytes.len() || (self.rebased && from == self.bytes.len()) {
                 self.next = None;
                 return None;
             }
-            let Some(found) = self.regex.0.find_at(self.bytes, from) else {
+            let found = if self.rebased {
+                self.regex
+                    .0
+                    .find(&self.bytes[from..])
+                    .map(|m| m.start() + from..m.end() + from)
+            } else {
+                self.regex.0.find_at(self.bytes, from).map(|m| m.range())
+            };
+            let Some(span) = found else {
                 self.next = None;
                 return None;
             };
-            let span = found.range();
             self.next = if span.is_empty() {
                 span.end.checked_add(1)
             } else {
@@ -140,6 +159,25 @@ mod tests {
             regex.spans("é界x".as_bytes()).collect::<Vec<_>>(),
             [0..2, 2..5, 5..6]
         );
+    }
+
+    #[test]
+    fn multiline_search_rebases_assertions_but_count_iteration_keeps_context() {
+        let regex = Regex::new(r"\A", false).unwrap();
+        assert_eq!(
+            regex.rebased_spans(b"ab\n").collect::<Vec<_>>(),
+            [0..0, 1..1, 2..2]
+        );
+        assert_eq!(
+            regex.spans(b"ab\n").collect::<Vec<_>>(),
+            std::iter::once(0..0).collect::<Vec<_>>()
+        );
+        let regex = Regex::new("a*", false).unwrap();
+        assert_eq!(
+            regex.rebased_spans(b"abc\n").collect::<Vec<_>>(),
+            [0..1, 2..2, 3..3]
+        );
+        assert!(regex.rebased_spans(b"").next().is_none());
     }
 
     #[test]

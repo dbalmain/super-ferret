@@ -477,6 +477,46 @@ these interactions, including LF classification for impossible alternatives,
 classes, scoped dotall, fixed strings and repeated patterns; empty-span
 rendering; and limit, clipping, counting and output behavior.
 
+**M7 probes (2026-10-17):** `--multiline`/`-U` and `--no-multiline`
+resolve in argv order; `--multiline-dotall`/`--no-multiline-dotall` resolve
+independently and affect dot only when multiline is enabled. Inline/scoped
+flags still override the default. Conservative LF exclusion visits the resolved
+HIR, including classes and impossible branches; line/absolute assertions give
+no LF-exclusion proof, while word assertions do. Thus `foo|^a$` also counts
+matches rather than lines. Zero repetitions already removed by HIR lowering
+have no LF effect. Fixed strings and repeated patterns use that same profile.
+
+Multiline search, counting and presentation have distinct assertion bounds.
+The **provisional M7 implementation follows pinned rg's suffix-based search**:
+on `abc\nabc\n`, `-U -n '\A'` prints both lines, `-U -c '\A'` prints 1,
+and `-U -o '\A'` prints nothing. Empty iteration omits a terminal empty
+reached by advancing to EOF. A first terminal assertion on an unterminated
+line can select/render that line, even with `-o`; after a final LF it supplies
+no selected line, but requested before-context can still print with exit 1.
+Adjacent highlighted spans merge within each multiline output line. Multiline
+inverted output and its context remain whole lines under `-o`; context
+highlighting searches each complete context line, including its LF.
+
+**M7 inversion/limit clarification (provisional):** LF-including inversion
+follows rg's positive-search limit: one positive search per matched line group,
+then the remaining suffix is selected as a gap if the limit is exhausted.
+This can print matching lines: on `foo foo\nbar\nfoo\n`, `-U -v -m1
+'foo(?:\nbar)?'` prints `bar` and the final `foo`; unlimited prints only
+`bar`. This qualifies the earlier blanket nonmatching-line wording.
+**The counting contract deliberately remains selected-line counts under `-v`.**
+Pinned rg can instead count regex matches in the remaining gap: on
+`x\na\ny\na\nz\n`, `-U -vc -m1 'a|\n'` prints 6 for four output lines.
+Ferret prints 4 as specified here. The M7 decision briefs record both choices
+and their provisional status; this is a known spec/oracle conflict, not an
+unexplained matcher difference.
+
+`-U` buffers the complete checked input attempt (or the first-NUL prefix)
+before matching, including for quiet/name output. Reads and metadata/span
+iteration poll cancellation. Input growth and variable-size line/span metadata
+use fallible allocation; an unrepresentable extent or allocation failure is an
+input error. All bytes and rendered groups remain inside the existing
+bracket/retry transaction; a failed attempt publishes no prefix or zero record.
+
 Pipe defaults: no colour, no heading, no line numbers, filename prefixes for
 recursive/multiple operands; one explicit file/stdin omits its filename. Tty
 defaults: colour, headings and line numbers. Overrides follow rg, including

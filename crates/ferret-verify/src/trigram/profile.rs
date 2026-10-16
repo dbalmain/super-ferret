@@ -80,13 +80,16 @@ impl GrepFlags {
             .collect();
         // Resolve dotall before each argument's inline flags. Lowering the
         // resulting HIR keeps matching and derivation on identical settings.
-        let patterns: Vec<_> = patterns.into_iter().map(|pattern| {
-            if flags.multiline && flags.dotall {
-                format!("(?s){pattern}")
-            } else {
-                pattern
-            }
-        }).collect();
+        let patterns: Vec<_> = patterns
+            .into_iter()
+            .map(|pattern| {
+                if flags.multiline && flags.dotall {
+                    format!("(?s){pattern}")
+                } else {
+                    pattern
+                }
+            })
+            .collect();
         let mut resolved = *self;
         if flags.smart_case {
             let mut any = false;
@@ -136,6 +139,52 @@ impl GrepFlags {
             body
         };
         // Each HIR has resolved its own inline folding, including (?-i).
-        compile(&GrepFlags { case_insensitive: false }, &body)
+        compile(
+            &GrepFlags {
+                case_insensitive: false,
+            },
+            &body,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conservative_lf_classification_uses_resolved_hir_not_reachability() {
+        let flags = GrepFlags {
+            case_insensitive: false,
+        };
+        for (pattern, excludes) in [
+            ("foo", true),
+            (r"foo|\A\z\n", false),
+            (r"foo|\A\z", false),
+            (r"foo|[a&&b]\n", false),
+            (r"foo|[^\s\S]", true),
+            (r"foo|\s", false),
+            (r"foo|(?s:.)", false),
+            (r"foo|(?-s:.)", true),
+            (r"foo|\n{0}", true),
+            (r"foo\b", true),
+            (r"\Afoo", false),
+            (r"\A", false),
+            ("^", false),
+            (r"\b", true),
+            ("", true),
+            (r"foo|^a$", false),
+        ] {
+            let grep = flags
+                .compile_line_profile(
+                    &[pattern.to_owned()],
+                    LineFlags {
+                        multiline: true,
+                        ..LineFlags::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(grep.excludes_lf(), excludes, "{pattern}");
+        }
     }
 }

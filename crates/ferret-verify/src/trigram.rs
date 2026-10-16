@@ -148,7 +148,7 @@ impl GrepFlags {
             trigrams,
             planning,
             line_local,
-            lf_excluded: lf_excluded(&hir).unwrap_or(false),
+            lf_excluded: lf_excluded(&hir),
             filter,
         })
     }
@@ -547,24 +547,19 @@ fn literal_length(hir: &Hir) -> Option<usize> {
     }
 }
 
-// None means assertions supplied no consuming-byte evidence. In a
-// concatenation other nodes still supply it; an alternative must supply its
-// own evidence. Keep this separate from assertion-context locality.
-fn lf_excluded(hir: &Hir) -> Option<bool> {
+// Line/absolute anchors supply no proof excluding LF. Word assertions do;
+// every consuming node and every alternative must conservatively exclude LF.
+fn lf_excluded(hir: &Hir) -> bool {
+    use regex_syntax::hir::Look;
     match hir.kind() {
-        HirKind::Look(look) => {
-            use regex_syntax::hir::Look;
-            match look {
-                Look::Start | Look::End | Look::StartLF | Look::EndLF
-                | Look::StartCRLF | Look::EndCRLF => None,
-                _ => Some(true),
-            }
-        },
+        HirKind::Look(look) => !matches!(
+            look,
+            Look::Start | Look::End | Look::StartLF | Look::EndLF | Look::StartCRLF | Look::EndCRLF
+        ),
         HirKind::Capture(capture) => lf_excluded(&capture.sub),
         HirKind::Repetition(repetition) => lf_excluded(&repetition.sub),
-        HirKind::Concat(parts) => parts.iter().filter_map(lf_excluded).reduce(|a, b| a && b),
-        HirKind::Alternation(parts) => Some(parts.iter().all(|p| lf_excluded(p) == Some(true))),
-        _ => Some(line_local(hir)),
+        HirKind::Concat(parts) | HirKind::Alternation(parts) => parts.iter().all(lf_excluded),
+        _ => line_local(hir),
     }
 }
 

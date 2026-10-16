@@ -99,6 +99,7 @@ impl<'a> Before<'a> {
                 bytes: &bytes,
                 kind: LineKind::Context,
                 fragment: false,
+                highlights: None,
             })?;
             offset += 16 + len as u64;
         }

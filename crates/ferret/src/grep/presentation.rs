@@ -68,14 +68,26 @@ pub(super) fn text(plan: &Plan, writer: &mut impl Write, line: Line<'_>) -> io::
     if line.fragment {
         return paint(writer, line.bytes, MATCH, true);
     }
+    if let Some(spans) = line.highlights {
+        highlighted(writer, line.bytes, spans.iter().cloned())
+    } else {
+        highlighted(writer, line.bytes, plan.grep.search().spans(line.bytes))
+    }
+}
+
+fn highlighted(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    spans: impl Iterator<Item = std::ops::Range<usize>>,
+) -> io::Result<()> {
     let mut at = 0;
-    for span in plan.grep.search().spans(line.bytes) {
+    for span in spans {
         if span.is_empty() {
             continue;
         }
-        writer.write_all(&line.bytes[at..span.start])?;
-        paint(writer, &line.bytes[span.clone()], MATCH, true)?;
+        writer.write_all(&bytes[at..span.start])?;
+        paint(writer, &bytes[span.clone()], MATCH, true)?;
         at = span.end;
     }
-    writer.write_all(&line.bytes[at..])
+    writer.write_all(&bytes[at..])
 }

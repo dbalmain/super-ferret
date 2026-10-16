@@ -26,6 +26,7 @@ struct Record {
     bytes: Vec<u8>,
     kind: line_grep::LineKind,
     fragment: bool,
+    highlights: Option<Vec<std::ops::Range<usize>>>,
 }
 
 struct Capture {
@@ -43,9 +44,11 @@ impl Capture {
         if self.records.is_none() {
             return;
         }
-        self.bytes = self
-            .bytes
-            .saturating_add(line.bytes.len() + std::mem::size_of::<Record>());
+        self.bytes = self.bytes.saturating_add(
+            line.bytes.len()
+                + std::mem::size_of::<Record>()
+                + line.highlights.map_or(0, std::mem::size_of_val),
+        );
         if self.bytes > ENTRY_BYTES {
             self.records = None;
         } else if let Some(records) = &mut self.records {
@@ -54,6 +57,7 @@ impl Capture {
                 bytes: line.bytes.to_vec(),
                 kind: line.kind,
                 fragment: line.fragment,
+                highlights: line.highlights.map(<[_]>::to_vec),
             });
         }
     }
@@ -387,6 +391,7 @@ impl Worker<'_> {
                                         bytes: &record.bytes,
                                         kind: record.kind,
                                         fragment: record.fragment,
+                                        highlights: record.highlights.as_deref(),
                                     },
                                     &mut previous,
                                 )?;
@@ -884,6 +889,49 @@ mod tests {
                 actual,
                 format!("{path}\n1:red\n2-a\n--\n6-e\n7:red\n").as_bytes()
             );
+        }
+        assert_eq!(streams.get(), 1);
+        assert_eq!(stats.get(), 1);
+    }
+
+    #[test]
+    fn multiline_cache_replays_original_cross_line_highlights() {
+        let streams = Cell::new(0);
+        let stats = Cell::new(0);
+        let read = |_: NameId, request: ReadRequest<'_>| {
+            match request {
+                ReadRequest::Stat => stats.set(stats.get() + 1),
+                ReadRequest::Stream(each, _) => {
+                    streams.set(streams.get() + 1);
+                    let bytes = b"red\nblue\n";
+                    each(&mut &bytes[..], bytes.len() as u64).unwrap();
+                }
+                ReadRequest::Bytes(_, _) => panic!("stream expected"),
+            }
+            ReadOutcome::Stable(ReadVersion::Catalogued)
+        };
+        let mut worker = Worker {
+            plan: plan(&["-Un", "--color=always", "red\\nblue"]),
+            buffer: Vec::new(),
+            read: Some(Box::new(read)),
+        };
+        let cache = Mutex::new(Cache::default());
+        for (name, path) in [(0, "copy-a"), (1, "copy-b")] {
+            let Observed::Ready(mut group) = worker
+                .prepare(
+                    &Job::Checked(path.into(), NameId(name), 0),
+                    false,
+                    &cache,
+                    true,
+                    &|| false,
+                )
+                .unwrap()
+            else {
+                panic!("ready")
+            };
+            let mut actual = Vec::new();
+            group.output.write_to(&mut actual).unwrap();
+            assert_eq!(actual, b"\x1b[0m\x1b[32m1\x1b[0m:\x1b[0m\x1b[1m\x1b[31mred\x1b[0m\n\x1b[0m\x1b[32m2\x1b[0m:\x1b[0m\x1b[1m\x1b[31mblue\x1b[0m\n");
         }
         assert_eq!(streams.get(), 1);
         assert_eq!(stats.get(), 1);

@@ -900,6 +900,15 @@ mod tests {
     #[test]
     fn fixed_folded_and_repeated_profiles_are_sound_over_original_bytes() {
         let profiles: &[&[&str]] = &[
+            &["-U", "red\\nviolet"],
+            &["-U", "(?s:red.*violet)"],
+            &["-UF", "red\nviolet"],
+            &["-U", "red|\\A\\z\\n"],
+            &["-U", "-e", "red", "-e", "violet\\nblue"],
+            &["-Uiw", "KILO"],
+            &["-Ux", "red\\nviolet"],
+            &["-U", "--multiline-dotall", "red.*violet"],
+            &["-U", "(?-u:\\xFF)red\\nviolet"],
             &["-i", "KILO"],
             &["-Fi", "SEA"],
             &["-F", "red.*"],
@@ -915,6 +924,10 @@ mod tests {
         ];
         let documents: &[&[u8]] = &[
             b"red.*\n",
+            b"red\nviolet\n",
+            b"\xef\xbb\xbfred\nviolet\n",
+            b"\xffred\nviolet\n",
+            b"red\r\nviolet\r\n",
             b"\xef\xbb\xbfred\n",
             b"VIOLET\n",
             b"@red@\n",

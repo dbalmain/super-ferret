@@ -1,0 +1,568 @@
+//! Whole-input grep execution. The matcher owns LF classification and byte
+//! iteration; this module separates search limits, line clipping, re-matching
+//! and rendering. All input and variable-size metadata allocations are
+//! fallible.
+
+use std::ops::Range;
+
+use super::*;
+
+fn push<T>(items: &mut Vec<T>, item: T) -> io::Result<()> {
+    items.try_reserve(1).map_err(io::Error::other)?;
+    items.push(item);
+    Ok(())
+}
+
+fn cancelled(stopped: &dyn Fn() -> bool) -> io::Result<()> {
+    if stopped() {
+        Err(io::ErrorKind::Interrupted.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn read_all(
+    source: &mut dyn Read,
+    size: u64,
+    buffer: &mut Vec<u8>,
+    text: bool,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<bool> {
+    read_all_with(
+        source,
+        size,
+        buffer,
+        text,
+        stopped,
+        &mut |buffer, additional| buffer.try_reserve(additional).map_err(io::Error::other),
+    )
+}
+
+fn read_all_with(
+    source: &mut dyn Read,
+    size: u64,
+    buffer: &mut Vec<u8>,
+    text: bool,
+    stopped: &dyn Fn() -> bool,
+    reserve: &mut dyn FnMut(&mut Vec<u8>, usize) -> io::Result<()>,
+) -> io::Result<bool> {
+    buffer.clear();
+    if size != u64::MAX && size > isize::MAX as u64 {
+        return Err(io::ErrorKind::FileTooLarge.into());
+    }
+    loop {
+        cancelled(stopped)?;
+        let start = buffer.len();
+        let left = size.saturating_sub(start as u64);
+        if left == 0 {
+            return Ok(false);
+        }
+        let additional = left.min(crate::scan::BUFFER as u64) as usize;
+        let end = start
+            .checked_add(additional)
+            .filter(|&end| end <= isize::MAX as usize)
+            .ok_or(io::ErrorKind::FileTooLarge)?;
+        reserve(buffer, additional)?;
+        buffer.resize(end, 0);
+        let n = match source.read(&mut buffer[start..]) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                buffer.truncate(start);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        buffer.truncate(start + n);
+        if !text && let Some(at) = memchr::memchr(0, &buffer[start..]) {
+            buffer.truncate(start + at);
+            return Ok(true);
+        }
+        if n == 0 {
+            return Ok(false);
+        }
+    }
+}
+
+fn add_group(groups: &mut Vec<Range<usize>>, range: Range<usize>) -> io::Result<()> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    if let Some(last) = groups.last_mut()
+        && range.start <= last.end
+    {
+        last.end = last.end.max(range.end);
+        return Ok(());
+    }
+    push(groups, range)
+}
+
+fn line_at(lines: &[Range<usize>], at: usize) -> usize {
+    lines
+        .partition_point(|line| line.end <= at)
+        .min(lines.len() - 1)
+}
+
+pub(super) fn scan(
+    plan: &Plan,
+    source: &mut dyn Read,
+    size: u64,
+    buffer: &mut Vec<u8>,
+    stopped: &dyn Fn() -> bool,
+    mut emit: impl FnMut(Line<'_>) -> io::Result<()>,
+) -> Result<InputResult, ScanError> {
+    let mut result = InputResult::empty(plan);
+    if !result.searched {
+        return Ok(result);
+    }
+    result.binary = read_all(source, size, buffer, plan.text, stopped)?;
+    let bytes = buffer.strip_prefix(b"\xef\xbb\xbf").unwrap_or(buffer);
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for end in memchr::memchr_iter(b'\n', bytes) {
+        if lines.len() % 4096 == 0 {
+            cancelled(stopped)?;
+        }
+        push(&mut lines, start..end + 1)?;
+        start = end + 1;
+    }
+    if start < bytes.len() {
+        push(&mut lines, start..bytes.len())?;
+    }
+    if lines.is_empty() {
+        return Ok(result);
+    }
+
+    let whole = !plan.grep.excludes_lf();
+    let regex = plan.grep.regex();
+    let mut groups: Vec<Range<usize>> = Vec::new();
+    let mut searched = 0u64;
+    let mut clip = bytes.len();
+    let mut terminal_context = false;
+    if plan.invert {
+        // rg's multiline inversion searches one positive hit per line group.
+        // Its positive-search limit leaves the rest as a gap (M7-A).
+        let (mut at, mut next_line) = (0, 0);
+        while let Some(span) = regex.spans(&bytes[at..]).next() {
+            let span = span.start + at..span.end + at;
+            cancelled(stopped)?;
+            if span.start >= bytes.len() && bytes.ends_with(b"\n") {
+                break;
+            }
+            let first = line_at(&lines, span.start);
+            let last = line_at(&lines, span.end.saturating_sub(1).max(span.start));
+            add_group(&mut groups, next_line..first)?;
+            next_line = last + 1;
+            at = lines[last].end;
+            searched += 1;
+            if at == bytes.len() || (whole && plan.max_count.is_some_and(|limit| searched >= limit))
+            {
+                break;
+            }
+        }
+        add_group(&mut groups, next_line..lines.len())?;
+    } else {
+        let mut previous_line = None;
+        let search_spans = if whole {
+            regex.rebased_spans(bytes)
+        } else {
+            regex.spans(bytes)
+        };
+        for span in search_spans {
+            cancelled(stopped)?;
+            if span.start == bytes.len() {
+                if bytes.ends_with(b"\n") {
+                    terminal_context = true;
+                    break;
+                }
+                if !whole {
+                    break;
+                }
+            }
+            let first = line_at(&lines, span.start);
+            let last = line_at(&lines, span.end.saturating_sub(1).max(span.start));
+            add_group(&mut groups, first..last + 1)?;
+            if whole || previous_line != Some(first) {
+                searched += 1;
+            }
+            previous_line = Some(last);
+            if !plan.invert && plan.max_count.is_some_and(|limit| searched >= limit) {
+                clip = lines[last].end;
+                break;
+            }
+        }
+    }
+    if plan.invert
+        && !whole
+        && let Some(mut left) = plan.max_count
+    {
+        for group in &mut groups {
+            let keep = left.min((group.end - group.start) as u64) as usize;
+            group.end = group.start + keep;
+            left -= keep as u64;
+        }
+        groups.retain(|group| !group.is_empty());
+    }
+    let selected = !groups.is_empty();
+    if plan.output == Output::WithoutMatch {
+        result.matched = !selected;
+        return Ok(result);
+    }
+    result.matched = selected;
+    if plan.quiet || plan.output == Output::Names {
+        return Ok(result);
+    }
+    if !(selected || terminal_context && plan.before > 0 && plan.output == Output::Lines) {
+        return Ok(result);
+    }
+
+    let match_count =
+        !plan.invert && (whole || plan.only_matching || plan.output == Output::CountMatches);
+    if match_count {
+        for span in regex.spans(&bytes[..clip]) {
+            cancelled(stopped)?;
+            if span.start >= clip
+                && !(whole && result.count == 0 && !bytes[..clip].ends_with(b"\n"))
+            {
+                break;
+            }
+            result.count += 1;
+        }
+    } else {
+        result.count = groups
+            .iter()
+            .map(|group| (group.end - group.start) as u64)
+            .sum();
+    }
+    if plan.output != Output::Lines {
+        return Ok(result);
+    }
+
+    let mut windows = Vec::new();
+    for group in &groups {
+        let before = usize::try_from(plan.before).unwrap_or(usize::MAX);
+        let after = usize::try_from(plan.after).unwrap_or(usize::MAX);
+        add_group(
+            &mut windows,
+            group.start.saturating_sub(before)..group.end.saturating_add(after).min(lines.len()),
+        )?;
+    }
+    if terminal_context && plan.before > 0 {
+        let before = usize::try_from(plan.before).unwrap_or(usize::MAX);
+        add_group(
+            &mut windows,
+            lines.len().saturating_sub(before)..lines.len(),
+        )?;
+    }
+    let mut spans = Vec::new();
+    // Re-match the clipped prefix, then search the tail independently. A
+    // cross-line match clipped by -m cannot colour or select its later suffix.
+    for span in regex.spans(&bytes[..clip]) {
+        cancelled(stopped)?;
+        if span.start >= clip && !(whole && spans.is_empty() && !bytes[..clip].ends_with(b"\n")) {
+            break;
+        }
+        push(&mut spans, span)?;
+    }
+    if clip < bytes.len() {
+        for span in regex.spans_at(bytes, clip) {
+            cancelled(stopped)?;
+            if span.start >= bytes.len() {
+                break;
+            }
+            push(&mut spans, span)?;
+        }
+    }
+    let mut tail_selection = Vec::new();
+    if !plan.invert && clip < bytes.len() && plan.after > 0 {
+        for span in regex.rebased_spans(&bytes[clip..]) {
+            cancelled(stopped)?;
+            push(&mut tail_selection, span.start + clip..span.end + clip)?;
+        }
+    }
+    let (mut group_at, mut span_at, mut tail_at) = (0, 0, 0);
+    let mut highlights: Vec<Range<usize>> = Vec::new();
+    for window in windows {
+        for index in window {
+            cancelled(stopped)?;
+            while group_at < groups.len() && groups[group_at].end <= index {
+                group_at += 1;
+            }
+            let selected = groups
+                .get(group_at)
+                .is_some_and(|group| group.contains(&index));
+            let range = &lines[index];
+            let content_end = if bytes[range.end - 1] == b'\n' {
+                range.end - 1
+            } else {
+                range.end
+            };
+            while span_at < spans.len()
+                && (spans[span_at].end < range.start
+                    || (!spans[span_at].is_empty() && spans[span_at].end == range.start))
+            {
+                span_at += 1;
+            }
+            let mut end = span_at;
+            while end < spans.len()
+                && (spans[end].start < range.end
+                    || (range.end == bytes.len()
+                        && !bytes.ends_with(b"\n")
+                        && spans[end].start == range.end))
+            {
+                end += 1;
+            }
+            let relevant = &spans[span_at..end];
+            while tail_at < tail_selection.len() && tail_selection[tail_at].end < range.start {
+                tail_at += 1;
+            }
+            let tail_match = tail_selection[tail_at..]
+                .iter()
+                .take_while(|span| span.start < range.end)
+                .any(|span| {
+                    span.is_empty() || (span.start < content_end && span.end > range.start)
+                });
+            let kind = if selected || (!plan.invert && tail_match) {
+                LineKind::Match
+            } else {
+                LineKind::Context
+            };
+            if plan.only_matching && !plan.invert && kind == LineKind::Match {
+                if !selected && relevant.is_empty() {
+                    emit(Line {
+                        number: index as u64 + 1,
+                        bytes: &bytes[range.start..content_end],
+                        kind,
+                        fragment: false,
+                        highlights: Some(&[]),
+                    })
+                    .map_err(ScanError::Output)?;
+                }
+                for span in relevant {
+                    if whole && span.is_empty() {
+                        if span.start == bytes.len() && !bytes.ends_with(b"\n") {
+                            emit(Line {
+                                number: index as u64 + 1,
+                                bytes: &bytes[range.start..content_end],
+                                kind,
+                                fragment: false,
+                                highlights: Some(&[]),
+                            })
+                            .map_err(ScanError::Output)?;
+                        }
+                        continue;
+                    }
+                    let from = span.start.max(range.start).min(content_end);
+                    let to = span.end.min(content_end);
+                    // A consuming LF alone has no printable fragment.
+                    if from > to || (from == to && !span.is_empty()) {
+                        continue;
+                    }
+                    emit(Line {
+                        number: index as u64 + 1,
+                        bytes: &bytes[from..to],
+                        kind,
+                        fragment: true,
+                        highlights: None,
+                    })
+                    .map_err(ScanError::Output)?;
+                }
+            } else {
+                highlights.clear();
+                let mut local = Vec::new();
+                let relevant = if plan.invert {
+                    for span in regex.spans(&bytes[range.clone()]) {
+                        cancelled(stopped)?;
+                        push(&mut local, span.start + range.start..span.end + range.start)?;
+                    }
+                    local.as_slice()
+                } else {
+                    relevant
+                };
+                for span in relevant {
+                    let from = span.start.max(range.start);
+                    let to = span.end.min(content_end);
+                    if from < to {
+                        let highlight = from - range.start..to - range.start;
+                        if let Some(last) = highlights.last_mut()
+                            && last.end == highlight.start
+                        {
+                            last.end = highlight.end;
+                        } else {
+                            push(&mut highlights, highlight)?;
+                        }
+                    }
+                }
+                emit(Line {
+                    number: index as u64 + 1,
+                    bytes: &bytes[range.start..content_end],
+                    kind,
+                    fragment: false,
+                    highlights: Some(&highlights),
+                })
+                .map_err(ScanError::Output)?;
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn plan(args: &[&str]) -> Plan {
+        let Command::Search(plan) =
+            parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap()
+        else {
+            panic!("search")
+        };
+        plan
+    }
+
+    #[test]
+    fn oversize_and_allocation_failure_are_input_errors_before_matching() {
+        struct NoRead;
+        impl Read for NoRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("must not read")
+            }
+        }
+        let plan = plan(&["-U", "red\\nblue"]);
+        let result = scan(
+            &plan,
+            &mut NoRead,
+            isize::MAX as u64 + 1,
+            &mut Vec::new(),
+            &|| false,
+            |_| panic!("must not emit"),
+        );
+        assert!(
+            matches!(result, Err(ScanError::Input(error)) if error.kind() == io::ErrorKind::FileTooLarge)
+        );
+        let mut buffer = Vec::new();
+        let result = read_all_with(
+            &mut NoRead,
+            10,
+            &mut buffer,
+            true,
+            &|| false,
+            &mut |_, _| Err(io::ErrorKind::OutOfMemory.into()),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn cancelled_buffering_stops_before_the_next_read() {
+        let stop = Cell::new(false);
+        let reads = Cell::new(0);
+        struct Source<'a> {
+            stop: &'a Cell<bool>,
+            reads: &'a Cell<usize>,
+        }
+        impl Read for Source<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads.set(self.reads.get() + 1);
+                buffer[..4].copy_from_slice(b"red\n");
+                self.stop.set(true);
+                Ok(4)
+            }
+        }
+        let result = scan(
+            &plan(&["-U", "red"]),
+            &mut Source {
+                stop: &stop,
+                reads: &reads,
+            },
+            u64::MAX,
+            &mut Vec::new(),
+            &|| stop.get(),
+            |_| panic!("must buffer first"),
+        );
+        assert!(
+            matches!(result, Err(ScanError::Input(error)) if error.kind() == io::ErrorKind::Interrupted)
+        );
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn cancelled_rendering_stops_with_the_original_output_fault() {
+        let stop = Cell::new(false);
+        let mut emitted = 0;
+        let error = scan(
+            &plan(&["-Uo", "(?s:.)"]),
+            &mut &b"red\nblue\n"[..],
+            9,
+            &mut Vec::new(),
+            &|| stop.get(),
+            |_| {
+                emitted += 1;
+                stop.set(true);
+                Err(io::Error::other("owned output fault"))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ScanError::Output(error) if error.to_string() == "owned output fault")
+        );
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn tiny_reads_bom_binary_and_bounded_extent_share_whole_input_buffering() {
+        struct Tiny<'a>(&'a [u8]);
+        impl Read for Tiny<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.0.read(&mut bytes[..1])
+            }
+        }
+        for size in [14, u64::MAX] {
+            let mut output = Vec::new();
+            let result = scan(
+                &plan(&["-Uo", "red\\nblue"]),
+                &mut Tiny(b"\xef\xbb\xbfred\nblue\0tail"),
+                size,
+                &mut Vec::new(),
+                &|| false,
+                |line| {
+                    output.push(line.bytes.to_vec());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(result.matched && result.binary);
+            assert_eq!(output, [b"red".to_vec(), b"blue".to_vec()]);
+        }
+        let mut buffer = Vec::new();
+        assert!(
+            !read_all(&mut &b"red\nblue\nextra"[..], 9, &mut buffer, true, &|| {
+                false
+            })
+            .unwrap()
+        );
+        assert_eq!(buffer, b"red\nblue\n");
+    }
+
+    #[test]
+    fn inversion_counts_selected_lines_even_when_rg_counts_positive_tail_matches() {
+        // M7-A: rg reports 6 for this four-line gap. GREP.md explicitly
+        // requires selected nonmatching lines, including --count-matches.
+        for args in [
+            vec!["-Uvcm1", "a|\\n"],
+            vec!["-Uvm1", "--count-matches", "a|\\n"],
+        ] {
+            let result = scan(
+                &plan(&args),
+                &mut &b"x\na\ny\na\nz\n"[..],
+                10,
+                &mut Vec::new(),
+                &|| false,
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert!(result.matched);
+            assert_eq!(result.count, 4);
+        }
+    }
+}

@@ -309,7 +309,6 @@ fn unsupported_tiers_refuse_before_output() {
         "--no-files",
         "-P",
         "--heading-off",
-        "-U",
         "-r",
         "--json",
         "-j2",
@@ -2741,5 +2740,183 @@ fn m6_live_symlink_loop_on_anchor_path_fails_closed() {
                 "{output:?}"
             );
         }
+    }
+}
+
+// M7: these are owned observations, including every multiline example in
+// GREP.md. Raw assertions below also pin the examples independently of rg.
+differential! {
+    m7_cross_line_positive: ["-Un", "red lantern\\nBLUE", "one.rs"];
+    m7_cross_line_negative: ["-Un", "red lantern\\ngreen", "one.rs"];
+    m7_fixed_lf: ["-UFon", "red lantern\nBLUE", "one.rs"];
+    m7_literal_lf: ["-Un", "red lantern\nBLUE", "one.rs"];
+    m7_no_multiline_rejects_lf: ["-U", "--no-multiline", "red\nBLUE", "one.rs"];
+    m7_multiline_last_wins: ["--no-multiline", "--multiline", "red lantern\nBLUE", "one.rs"];
+    m7_dotall: ["-U", "--multiline-dotall", "lantern.*BLUE", "one.rs"];
+    m7_dotall_negative: ["-U", "lantern.*BLUE", "one.rs"];
+    m7_dotall_ignored_without_u: ["--multiline-dotall", "lantern.*BLUE", "one.rs"];
+    m7_no_dotall: ["-U", "--multiline-dotall", "--no-multiline-dotall", "lantern.*BLUE", "one.rs"];
+    m7_scoped_dotall: ["-Uon", "lantern(?s:.)BLUE", "one.rs"];
+    m7_scoped_no_dotall: ["-U", "--multiline-dotall", "lantern(?-s:.)BLUE", "one.rs"];
+    m7_dotall_repeated_local: ["-U", "--multiline-dotall", "-e", "(?-s:lantern.*BLUE)", "-e", "violet", "one.rs"];
+    m7_fixed_dotall_literal: ["-UF", "--multiline-dotall", "red.*BLUE", "one.rs"];
+    m7_plain_line_count: ["-Uc", "foo", "-"], stdin = b"foo foo\nfoo\n";
+    m7_impossible_lf_count: ["-Uc", "foo|\\A\\z\\n", "-"], stdin = b"foo foo\nfoo\n";
+    m7_impossible_anchor_count: ["-Uc", "foo|\\A\\z", "-"], stdin = b"foo foo\nfoo\n";
+    m7_empty_class_lf_count: ["-Uc", "foo|[a&&b]\\n", "-"], stdin = b"foo foo\nfoo\n";
+    m7_class_excludes_lf: ["-Uc", "foo|[^\\s\\S]", "-"], stdin = b"foo foo\nfoo\n";
+    m7_class_includes_lf: ["-Uc", "foo|[\\s]", "-"], stdin = b"foo foo\nfoo\n";
+    m7_scoped_dotall_count: ["-Uc", "foo|(?s:.)", "-"], stdin = b"foo foo\nfoo\n";
+    m7_scoped_plain_count: ["-Uc", "foo|(?-s:.)", "-"], stdin = b"foo foo\nfoo\n";
+    m7_repeated_count: ["-Uc", "-e", "foo", "-e", "\\nbar", "-"], stdin = b"foo foo\nfoo\n";
+    m7_repeated_fixed_count: ["-UFc", "-e", "foo", "-e", "\nbar", "-"], stdin = b"foo foo\nfoo\n";
+    m7_cross_count: ["-Uc", "foo\\nbar", "-"], stdin = b"foo\nbar\n";
+    m7_limit_one: ["-Ucm1", "foo(?:\\nbar)?", "-"], stdin = b"foo foo\nfoo\n";
+    m7_limit_two: ["-Ucm2", "foo(?:\\nbar)?", "-"], stdin = b"foo foo\nfoo\n";
+    m7_limit_three: ["-Ucm3", "foo(?:\\nbar)?", "-"], stdin = b"foo foo\nfoo\n";
+    m7_clip_spans: ["-Uom1", "foo(?:\\nbar)?", "-"], stdin = b"foo foo\nbar\nfoo\n";
+    m7_clip_count: ["-Ucm1", "foo(?:\\nbar)?", "-"], stdin = b"foo foo\nbar\nfoo\n";
+    m7_clip_tail: ["-Unm1", "-A2", "foo(?:\\nbar)?", "-"], stdin = b"foo foo\nbar\nfoo\n";
+    m7_clip_span_tail: ["-Uonm1", "-A2", "foo(?:\\nbar)?", "-"], stdin = b"foo foo\nbar\nfoo\n";
+    m7_empty_lazy_spans: ["-Uo", "(?s:.*?)", "-"], stdin = b"abc\n";
+    m7_empty_lazy_count: ["-Uc", "(?s:.*?)", "-"], stdin = b"abc\n";
+    m7_empty_literal_spans: ["-Uon", "", "-"], stdin = b"abc\n";
+    m7_empty_unterminated: ["-Uo", "", "-"], stdin = b"abc";
+    m7_empty_input: ["-Uo", "(?s:.*?)", "empty"];
+    m7_empty_blank: ["-Uco", "(?s:.*?)", "blank"];
+    m7_consuming_adjacent_empty: ["-Uco", "(?s:a*)", "-"], stdin = b"abc\n";
+    m7_empty_unicode_bytes: ["-Uco", "(?s:.*?)", "-"], stdin = "é界x\n".as_bytes();
+    m7_lf_only_spans: ["-Uon", "\\n", "-"], stdin = b"a\nb\n";
+    m7_span_terminal_lf: ["-Uon", "a\\n", "-"], stdin = b"a\nb\n";
+    m7_invert_cross: ["-Uvn", "a\\nb", "-"], stdin = b"a\nb\nc\n";
+    m7_invert_span_cross: ["-Uvon", "a\\nb", "-"], stdin = b"a\nb\nc\n";
+    m7_invert_count_cross: ["-Uvc", "a\\nb", "-"], stdin = b"a\nb\nc\n";
+    m7_invert_match_count: ["-Uv", "--count-matches", "a\\nb", "-"], stdin = b"a\nb\nc\n";
+    m7_invert_context: ["-UvnC1", "a\\nb", "-"], stdin = b"a\nb\nc\n";
+    m7_invert_limit: ["-Uvnm1", "foo(?:\\nbar)?", "-"], stdin = b"foo foo\nbar\nfoo\n";
+    m7_invert_excluded_limit: ["-Uvnm1", "foo", "-"], stdin = b"x\nfoo\ny\nfoo\nz\n";
+    m7_document_start: ["-Ucn", "\\Ared", "one.rs"];
+    m7_document_end: ["-Ucn", "red\\z", "one.rs"];
+    m7_word_qualifier: ["-Uwoc", "red", "one.rs"];
+    m7_line_qualifier: ["-Ux", "red lantern\\nBLUE", "one.rs"];
+    m7_bom: ["-U", "\\Ared\\n", "bom"];
+    m7_invalid_byte_span: ["-Uon", "(?-u:\\xFF) red\\n", "invalid"];
+    m7_crlf: ["-Uon", "red\\r\\nblue", "crlf"];
+    m7_names: ["-Ul", "lantern\\nBLUE", "one.rs"];
+    m7_without_match: ["-U", "--files-without-match", "violet\\nBLUE", "one.rs"];
+    m7_include_zero: ["-Uc", "--include-zero", "violet\\nBLUE", "one.rs"];
+    m7_quiet: ["-Uq", "lantern\\nBLUE", "one.rs"];
+}
+
+#[test]
+fn m7_spec_examples_have_explicit_bytes_and_counts() {
+    let fixture = Fixture::new("m7-spec-examples");
+    for (args, input, expected) in [
+        (
+            vec!["-Uo", "(?s:.*?)", "-"],
+            b"abc\n".as_slice(),
+            b"".as_slice(),
+        ),
+        (vec!["-Uc", "(?s:.*?)", "-"], b"abc\n", b"4\n"),
+        (
+            vec!["-Ucm1", "foo(?:\\nbar)?", "-"],
+            b"foo foo\nfoo\n",
+            b"2\n",
+        ),
+        (
+            vec!["-Ucm2", "foo(?:\\nbar)?", "-"],
+            b"foo foo\nfoo\n",
+            b"2\n",
+        ),
+        (
+            vec!["-Ucm3", "foo(?:\\nbar)?", "-"],
+            b"foo foo\nfoo\n",
+            b"3\n",
+        ),
+        (
+            vec!["-Uom1", "foo(?:\\nbar)?", "-"],
+            b"foo foo\nbar\nfoo\n",
+            b"foo\nfoo\n",
+        ),
+    ] {
+        let output = fixture.compare_raw(&args, Some(input));
+        assert_eq!(output.stdout, expected, "{args:?}");
+        assert_eq!(output.status.code(), Some(0));
+    }
+}
+
+#[test]
+fn m7_raw_rendering_prefix_context_colour_and_nul_matrix() {
+    let fixture = Fixture::new("m7-raw-rendering");
+    for flags in [
+        vec!["-Un"],
+        vec!["-Uon"],
+        vec!["-UnC1"],
+        vec!["-UonC1"],
+        vec!["-UHn", "--heading"],
+        vec!["-UH0n"],
+        vec!["-UH0n", "--heading"],
+        vec!["-Uon", "--color=always"],
+        vec!["-UnC1", "--color=always"],
+        vec!["-UonC1", "--color=always"],
+        vec!["-Unm1", "-A2", "--color=always"],
+        vec!["-Uonm1", "-A2", "--color=always"],
+        vec!["-UvnC1", "--color=always"],
+        vec!["-UvonC1", "--color=always"],
+    ] {
+        let mut args = flags;
+        args.extend(["red lantern\\nBLUE", "one.rs", "one.rs"]);
+        fixture.compare_raw(&args, None);
+    }
+}
+
+#[test]
+fn m7_indexed_live_unrestricted_and_direct_share_resolved_profiles() {
+    let fixture = Fixture::new("m7-sources");
+    for mode in ["-Un", "-Uon", "-Uc", "-Uco", "-Uvn"] {
+        fixture.compare(&[mode, "lantern\\nBLUE", "."], None);
+        fixture.compare(&[mode, "-u", "lantern\\nBLUE", "."], None);
+        let live = fixture.ferret(&["grep", "--live", mode, "lantern\\nBLUE", "."], None);
+        let indexed = fixture.ferret(&["grep", mode, "lantern\\nBLUE", "."], None);
+        assert_eq!(live.status.code(), indexed.status.code());
+        assert_eq!(
+            groups(&live.stdout, &fixture.tree()),
+            groups(&indexed.stdout, &fixture.tree())
+        );
+    }
+}
+
+differential! {
+    m7_anchor_alternative_classification: ["-Uc", "foo|^a$", "-"], stdin = b"foo foo\nfoo\n";
+    m7_absolute_start_rendering: ["-Un", "\\A", "-"], stdin = b"abc\nabc\n";
+    m7_absolute_start_rendering_count: ["-Uc", "\\A", "-"], stdin = b"abc\nabc\n";
+    m7_absolute_start_context: ["-Unm1", "-A2", "\\A", "-"], stdin = b"abc\nabc\nabc\n";
+    m7_absolute_start_span_context: ["-Uonm1", "-A2", "\\A", "-"], stdin = b"abc\nabc\nabc\n";
+    m7_terminal_context_without_selection: ["-UnB1", "\\z", "-"], stdin = b"abc\nabc\n";
+    m7_terminal_empty_fallback: ["-Uon", "\\z", "-"], stdin = b"abc";
+    m7_terminal_empty_count: ["-Uc", "\\z", "-"], stdin = b"abc";
+    m7_terminal_empty_inversion: ["-Uvn", "\\z", "-"], stdin = b"abc";
+    m7_lf_only_trailing_context: ["-Unm1", "-A1", "\\n", "-"], stdin = b"abc\nabc\n";
+    m7_empty_trailing_context: ["-Unm1", "-A1", "(?s:.*?)", "-"], stdin = b"abc\nabc\n";
+    m7_adjacent_colour_spans: ["-Un", "--color=always", "(?s:.)", "-"], stdin = b"abc\nabc\n";
+}
+
+#[test]
+fn m7_inverted_gap_counts_keep_the_written_line_contract() {
+    // M7-A: rg re-counts positive regex spans in this gap (6). The spec
+    // explicitly requires selected lines under inversion (4).
+    let fixture = Fixture::new("m7-inverted-gap-counts");
+    for flags in [vec!["-Uvcm1"], vec!["-Uvm1", "--count-matches"]] {
+        let mut args = flags;
+        args.extend(["a|\\n", "-"]);
+        let oracle = fixture.oracle(&args, Some(b"x\na\ny\na\nz\n"));
+        let mut ferret_args = vec!["grep"];
+        ferret_args.extend(&args);
+        let actual = fixture.ferret(&ferret_args, Some(b"x\na\ny\na\nz\n"));
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(oracle.status.code(), Some(0));
+        assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+        assert_eq!(actual.stdout, b"4\n");
+        assert_eq!(oracle.stdout, b"6\n");
     }
 }
