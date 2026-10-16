@@ -380,7 +380,7 @@ type Fork<'a> = dyn Fn() -> Option<Box<CheckedReader<'a>>> + Sync + 'a;
 
 pub(super) fn run<'a, W: Write>(
     host: &mut Host<'_, W>,
-    next: impl FnMut() -> Option<(u64, Job)> + Send,
+    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Job)> + Send,
     fork: &Fork<'a>,
     names: Option<&ferret_query::DocNames>,
     threads: usize,
@@ -461,6 +461,9 @@ pub(super) fn run<'a, W: Write>(
     }
 }
 
+#[cfg(test)]
+type OnEntry = dyn FnMut(&Path) + Send;
+
 /// The source is called by a worker while claiming its next ring position.
 /// It retains find's prune feedback and live fallback, without a path backlog.
 pub(super) struct Source<'a> {
@@ -471,6 +474,8 @@ pub(super) struct Source<'a> {
     candidates: Option<&'a ferret_index::DocSet>,
     selection: &'a GrepSelection,
     cwd: PathBuf,
+    #[cfg(test)]
+    on_entry: Option<Box<OnEntry>>,
 }
 impl<'a> Source<'a> {
     pub fn new(
@@ -488,13 +493,35 @@ impl<'a> Source<'a> {
             candidates,
             selection,
             cwd,
+            #[cfg(test)]
+            on_entry: None,
         }
     }
 
-    pub fn next(&mut self) -> Option<(u64, Job)> {
+    pub fn next(&mut self, stopped: &dyn Fn() -> bool) -> Option<(u64, Job)> {
         loop {
+            if stopped() {
+                return None;
+            }
             if let Some(source) = &mut self.source {
-                while let Some(entry) = source.next(self.descend) {
+                let mut before_directory = || {
+                    if stopped() {
+                        Err(io::Error::new(io::ErrorKind::Interrupted, "grep cancelled"))
+                    } else {
+                        Ok(())
+                    }
+                };
+                loop {
+                    if stopped() {
+                        return None;
+                    }
+                    let entry = source.next_with(self.descend, &mut before_directory);
+                    if stopped() {
+                        return None;
+                    }
+                    let Some(entry) = entry else {
+                        break;
+                    };
                     self.descend = true;
                     let entry = match entry {
                         Ok(entry) => entry,
@@ -502,6 +529,10 @@ impl<'a> Source<'a> {
                             return Some((0, Job::Failed(error.path, error.error.to_string())));
                         }
                     };
+                    #[cfg(test)]
+                    if let Some(hook) = &mut self.on_entry {
+                        hook(entry.path());
+                    }
                     let kind = match entry.kind() {
                         Ok(kind) => kind,
                         Err(error) => {
@@ -705,7 +736,7 @@ mod tests {
             .into_iter();
             run(
                 &mut host,
-                move || jobs.next().map(|job| (4, job)),
+                move |_| jobs.next().map(|job| (4, job)),
                 &fork,
                 None,
                 2,
@@ -786,5 +817,110 @@ mod tests {
         let error = emit(&mut output, &mut sink, &|| flag.load(Ordering::Acquire)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
         assert_eq!(sink.bytes, CHUNK);
+    }
+    // Review R1: a producer filtering posting-negative entries must observe a
+    // quiet hit in another worker. Count visits, rather than racing a timer.
+    #[test]
+    fn quiet_hit_stops_a_producer_filtering_catalog_entries() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+        let base =
+            std::env::temp_dir().join(format!("ferret-grep-filter-cancel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let hits = base.join("hits");
+        let negatives = base.join("negatives");
+        fs::create_dir_all(&hits).unwrap();
+        fs::create_dir_all(&negatives).unwrap();
+        fs::write(hits.join("hit"), b"red\n").unwrap();
+        for i in 0..1000 {
+            let dir = negatives.join(format!("d{}", i / 20));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("negative-{i}")), b"blue\n").unwrap();
+        }
+        let index = base.join("index");
+        ferret_crawl::index(
+            &index,
+            &[hits.clone(), negatives.clone()],
+            ferret_crawl::Refresh::All,
+            &ferret_crawl::IndexOptions::default(),
+        )
+        .unwrap();
+        let catalog = ferret_catalog::Catalog::open(&index)
+            .unwrap()
+            .unwrap()
+            .into_resident()
+            .unwrap();
+        let (name, _) = catalog.names().find(|(_, name)| *name == b"hit").unwrap();
+        let doc = catalog.doc(catalog.name(name).child).unwrap();
+        // Supply the scheduler's posting result: the hit is its sole candidate.
+        // Source still performs the real traversal and membership filtering.
+        let candidates = ferret_index::DocSet::new(catalog.doc_count(), [doc.0]);
+        let selection = GrepSelection::default();
+        let mut source = Source::new(
+            vec![Input::Directory(hits), Input::Directory(negatives.clone())],
+            Some(&catalog),
+            Some(&candidates),
+            &selection,
+            base.clone(),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let visits = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Barrier::new(2));
+        let count = visits.clone();
+        let cancelled = flag.clone();
+        let producer_gate = gate.clone();
+        source.on_entry = Some(Box::new(move |path| {
+            if path.starts_with(&negatives)
+                && path
+                    .file_name()
+                    .unwrap()
+                    .as_bytes()
+                    .starts_with(b"negative-")
+                && count.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                producer_gate.wait();
+                while !cancelled.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+        }));
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                gate.wait();
+                each(&mut &b"red\n"[..], 4).unwrap();
+                ReadOutcome::Stable(ReadVersion::Catalogued)
+            }))
+        };
+        let plan = plan(&["-q", "red"]);
+        let mut host = Host {
+            plan: &plan,
+            filename: true,
+            writer: Vec::new(),
+            buffer: Vec::new(),
+            matched: false,
+            errors: false,
+            cancelled: Some(&flag),
+        };
+        run(
+            &mut host,
+            move |stopped| source.next(stopped),
+            &fork,
+            None,
+            2,
+            &flag,
+        )
+        .unwrap();
+        assert!(host.matched);
+        assert!(!host.errors);
+        assert!(host.writer.is_empty());
+        assert_eq!(
+            visits.load(Ordering::Relaxed),
+            1,
+            "continued filtering after cancellation"
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 }

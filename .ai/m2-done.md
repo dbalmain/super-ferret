@@ -267,7 +267,7 @@ Started 2026-10-17. Read Astra’s complete note. Baseline: 1196 passed /
 fixing them; the third commit will replace sidecar-based audit acceptance with
 classification from each row’s own difference records and repeat all 3332 rows.
 
-### Fix 1 — preserve pattern argument syntax
+### Fix 1 — preserve pattern argument syntax (065cee3)
 
 Reproduced through the real CLI: `(?x)red # comment` exited 2 with an
 unclosed-group error, for a single pattern and repeated -e. The pinned
@@ -292,3 +292,30 @@ Fmt, all-target clippy and workspace tests green, zero compiler warnings:
 Final gate logs: `/tmp/grep-m2-r1-pattern-final-{fmt,clippy,gates}.log`.
 The first fix was amended before replaying fix 2, preserving one commit per
 review finding; this count is from the first fix alone.
+
+### Fix 2 — cancel the streaming producer
+
+The real Source/CatalogSource filter reproduced the gap: an early quiet hit
+still visited all 1000 posting-negative files across 50 directories. A barrier
+holds the hit reader until the producer enters its first negative file; that
+visit then waits for actual host quiet cancellation. There are no sleeps or
+wall-clock assertions. The scheduler receives a sole-candidate bitmap, and
+the real producer does membership checks/traversal; the checked hit reader is
+a controlled stable stream driving the real matcher and quiet host.
+
+The existing scheduler now gives the producer the same pool/external predicate
+as reads. The host polls between entries/operands and through next_with before
+directory descent, including live fallback. Cancellation suppresses an
+interrupted traversal error. The test now visits exactly one negative file
+(the synchronized visit already in progress), with no further visits after it.
+Revert-checked BOTH the Source polling and scheduler predicate propagation:
+either reversion restores 1000 visits and fails the assertion. Logs:
+`/tmp/grep-m2-r1-producer-{before,fixed,source-reverted,scheduler-reverted}.log`.
+Existing real CLI quiet/closed-stdout tests also remain green.
+
+Fmt and all-target clippy green, zero compiler warnings; full workspace rerun:
+**1203 passed / 13 ignored**, up one. Initial clippy caught a nested test if,
+which was collapsed. The known watch idle-exit test flaked once, passed alone,
+then passed in the full rerun. No extra skips. Final workspace log:
+`/tmp/grep-m2-r1-producer-final-gates.log`; isolated flake log:
+`/tmp/grep-m2-r1-producer-watch-rerun.log`. No new pool or dependency edge.

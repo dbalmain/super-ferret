@@ -1613,11 +1613,13 @@ impl<T: Placed> Drop for LostOnPanic<'_, T> {
 /// not accumulate a path queue. Only the calling thread emits finished groups.
 /// Each task carries the same input-byte reservation as document verification;
 /// callers discard oversized input buffers before returning bounded/spilled
-/// groups. A stop wakes the ring and budget and reaches active reads.
+/// groups. A stop wakes the ring and budget and reaches active reads. The
+/// producer receives the same stop predicate and must poll it during filtering
+/// or traversal before returning its next task.
 pub fn file_groups<Task, State, Group: Send>(
     threads: usize,
     cancelled: &AtomicBool,
-    next: impl FnMut() -> Option<(u64, Task)> + Send,
+    next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
     make: impl Fn() -> State + Sync,
     work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
     mut emit: impl FnMut(Group) -> ControlFlow<()>,
@@ -1652,7 +1654,7 @@ pub fn file_groups<Task, State, Group: Send>(
                         if !pool.room_for(at) {
                             return;
                         }
-                        let task = if external() { None } else { source.0() };
+                        let task = if external() { None } else { source.0(&stopped) };
                         let Some((size, task)) = task else {
                             source.1 = true;
                             drop(source);
@@ -1711,7 +1713,7 @@ pub fn file_groups<Task, State, Group: Send>(
 }
 
 fn groups_alone<Task, State, Group>(
-    mut next: impl FnMut() -> Option<(u64, Task)>,
+    mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)>,
     cancelled: &AtomicBool,
     make: &impl Fn() -> State,
     work: &impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group,
@@ -1720,7 +1722,7 @@ fn groups_alone<Task, State, Group>(
     let stopped = || cancelled.load(Ordering::Acquire);
     let mut state = make();
     while !stopped() {
-        let Some((_, task)) = next() else {
+        let Some((_, task)) = next(&stopped) else {
             break;
         };
         let item = work(&mut state, task, &stopped);
@@ -2302,7 +2304,7 @@ mod group_tests {
         file_groups(
             4,
             &AtomicBool::new(false),
-            move || tasks.next(),
+            move |_| tasks.next(),
             || false,
             |started, at, _| {
                 if !*started {
@@ -2332,7 +2334,7 @@ mod group_tests {
         file_groups(
             4,
             &AtomicBool::new(false),
-            move || tasks.next(),
+            move |_| tasks.next(),
             || (),
             |_, at, stopped| {
                 if at != 0 {
@@ -2367,7 +2369,7 @@ mod group_tests {
         file_groups(
             2,
             &AtomicBool::new(false),
-            move || tasks.next(),
+            move |_| tasks.next(),
             || (),
             |_, at, _| at,
             |_| {
@@ -2394,7 +2396,7 @@ mod group_tests {
         file_groups(
             4,
             &AtomicBool::new(false),
-            move || tasks.next(),
+            move |_| tasks.next(),
             || (),
             |_, at, _| at,
             |at| {

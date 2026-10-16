@@ -206,7 +206,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             );
             if let Err(error) = groups::run(
                 &mut host,
-                move || source.next(),
+                move |stopped| source.next(stopped),
                 &fork,
                 names,
                 threads,

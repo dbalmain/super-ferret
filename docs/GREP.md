@@ -452,7 +452,11 @@ A shared cancellation flag reaches planning, typed reads, retry acceptance,
 line/span iteration and chunked spill rendering/replay. A worker's stable quiet
 hit stops work immediately, even while an earlier position is still reading;
 fatal output/spill faults also stop workers. Interrupted writes are not used as
-a cancellation signal because write_all retries them. Queued groups and spill
+a cancellation signal because write_all retries them. **2026-10-17 review
+correction:** the scheduler passes its combined pool/external stop predicate
+into the streaming producer, which polls while filtering entries, switching
+operands and before directory descent (including live fallback). A quiet hit or
+closed stdout therefore also stops posting-negative traversal. Queued groups and spill
 handles are bounded by the ring/workers; spill bytes follow the required output,
 without silent truncation or an invented cap. The existing long-line input
 buffer exception still applies. No dependency or index-format change.
