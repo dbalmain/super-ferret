@@ -488,6 +488,17 @@ pub trait EntrySource {
     ) -> Option<Result<&Entry, WalkError>> {
         self.next(descend)
     }
+    /// Fetches the next entry while allowing long source operations to poll
+    /// for cancellation. Sources that cannot poll internally retain their
+    /// existing fetch behavior.
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        _cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        self.next_with(descend, before_directory)
+    }
 }
 
 impl<S: EntrySource + ?Sized> EntrySource for &mut S {
@@ -504,11 +515,21 @@ impl<S: EntrySource + ?Sized> EntrySource for &mut S {
     ) -> Option<Result<&Entry, WalkError>> {
         (**self).next_with(descend, before_directory)
     }
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        (**self).next_with_cancel(descend, before_directory, cancelled)
+    }
 }
 
 /// getdents64 buffer. One call reads a typical directory whole; 8 KiB took
 /// three calls per directory on the timing tree.
 const LISTING_BUFFER: usize = 64 * 1024;
+/// Bounds cancellation work without polling the host once per name.
+pub(super) const CANCELLATION_INTERVAL: usize = 256;
 
 /// A directory entry's own fields while its children use the lent entry.
 #[derive(Clone, Default)]
@@ -602,6 +623,7 @@ pub struct LiveWalk {
     children: Vec<Child>,
     names: Vec<u8>,
     buffer: Vec<MaybeUninit<u8>>,
+    cancelled: bool,
     #[cfg(test)]
     pub(super) force_unknown: bool,
 }
@@ -628,6 +650,7 @@ impl LiveWalk {
             children: Vec::new(),
             names: Vec::new(),
             buffer: Vec::new(),
+            cancelled: false,
             #[cfg(test)]
             force_unknown: false,
         }
@@ -715,6 +738,7 @@ impl LiveWalk {
         walk.boundary = index + 1;
         walk.children = self.children[..level.end].to_vec();
         walk.names = self.names.clone();
+        walk.cancelled = self.cancelled;
         #[cfg(test)]
         {
             walk.force_unknown = self.force_unknown;
@@ -728,6 +752,7 @@ impl LiveWalk {
     fn descend(
         &mut self,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<(), WalkError> {
         let entry = &mut self.entry;
         if self
@@ -764,7 +789,15 @@ impl LiveWalk {
             };
             let start = self.children.len();
             let names_start = self.names.len();
+            let mut seen = 0usize;
             for child in catalog.entries(dir) {
+                seen += 1;
+                if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
+                    self.children.truncate(start);
+                    self.names.truncate(names_start);
+                    self.cancelled = true;
+                    return Ok(());
+                }
                 if matches!(child.target, Target::Ignored(_)) {
                     continue;
                 }
@@ -823,6 +856,13 @@ impl LiveWalk {
                 .take_while(|(parent, _, _)| *parent == dir);
             let mut added = false;
             for (_, id, name) in roots {
+                seen += 1;
+                if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
+                    self.children.truncate(start);
+                    self.names.truncate(names_start);
+                    self.cancelled = true;
+                    return Ok(());
+                }
                 added = true;
                 let name_start = self.names.len();
                 self.names.extend_from_slice(name);
@@ -832,6 +872,12 @@ impl LiveWalk {
                     target: Some(Target::Inode(*id)),
                     parent: Some(dir),
                 });
+            }
+            if cancelled() {
+                self.children.truncate(start);
+                self.names.truncate(names_start);
+                self.cancelled = true;
+                return Ok(());
             }
             if added {
                 self.children[start..].sort_unstable_by(|a, b| {
@@ -882,6 +928,7 @@ impl LiveWalk {
             self.buffer.resize(LISTING_BUFFER, MaybeUninit::uninit());
         }
         let mut reader = RawDir::new(&*handle, &mut self.buffer);
+        let mut seen = 0usize;
         while let Some(item) = reader.next() {
             let item = match item {
                 Ok(item) => item,
@@ -894,6 +941,13 @@ impl LiveWalk {
                     });
                 }
             };
+            seen += 1;
+            if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
+                self.children.truncate(start);
+                self.names.truncate(names_start);
+                self.cancelled = true;
+                return Ok(());
+            }
             let name = item.file_name().to_bytes();
             if name == b"." || name == b".." {
                 continue;
@@ -924,6 +978,12 @@ impl LiveWalk {
                 target,
                 parent: None,
             });
+        }
+        if cancelled() {
+            self.children.truncate(start);
+            self.names.truncate(names_start);
+            self.cancelled = true;
+            return Ok(());
         }
         if self.children.len() > start
             && let Err(error) = before_directory()
@@ -1121,6 +1181,7 @@ impl LiveWalk {
     fn visit(
         &mut self,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<bool, WalkError> {
         let entry = &mut self.entry;
         if entry.check_directory {
@@ -1212,7 +1273,7 @@ impl LiveWalk {
         if self.options.xdev && entry.stat().is_ok_and(|stat| stat.dev() != self.root_dev) {
             return Ok(true);
         }
-        self.descend(before_directory)?;
+        self.descend(before_directory, cancelled)?;
         Ok(false)
     }
 
@@ -1220,12 +1281,19 @@ impl LiveWalk {
         &mut self,
         descend: bool,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
     ) -> Option<Result<&Entry, WalkError>> {
+        if self.cancelled {
+            return None;
+        }
         self.suspended = false;
         let mut loaded = match std::mem::replace(&mut self.slot, Slot::Empty) {
             Slot::Pending if descend => {
-                if let Err(error) = self.descend(before_directory) {
+                if let Err(error) = self.descend(before_directory, cancelled) {
                     return Some(Err(error));
+                }
+                if self.cancelled {
+                    return None;
                 }
                 None
             }
@@ -1234,6 +1302,9 @@ impl LiveWalk {
             Slot::Empty | Slot::Pending => None,
         };
         loop {
+            if self.cancelled {
+                return None;
+            }
             let current = match loaded.take() {
                 Some(current) => current,
                 None => match self.advance()? {
@@ -1243,7 +1314,7 @@ impl LiveWalk {
             };
             match current {
                 Loaded::Directory => return Some(Ok(&self.entry)),
-                Loaded::Entry => match self.visit(before_directory) {
+                Loaded::Entry => match self.visit(before_directory, cancelled) {
                     Ok(true) => return Some(Ok(&self.entry)),
                     Ok(false) => {}
                     Err(error) => return Some(Err(error)),
@@ -1258,14 +1329,22 @@ impl EntrySource for LiveWalk {
         self.catalog.as_deref()
     }
     fn next(&mut self, descend: bool) -> Option<Result<&Entry, WalkError>> {
-        self.next_entry(descend, &mut || Ok(()))
+        self.next_entry(descend, &mut || Ok(()), &mut || false)
     }
     fn next_with(
         &mut self,
         descend: bool,
         before_directory: &mut dyn FnMut() -> io::Result<()>,
     ) -> Option<Result<&Entry, WalkError>> {
-        self.next_entry(descend, before_directory)
+        self.next_entry(descend, before_directory, &mut || false)
+    }
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        self.next_entry(descend, before_directory, cancelled)
     }
 }
 
@@ -1338,6 +1417,15 @@ impl EntrySource for CatalogSource {
         before_directory: &mut dyn FnMut() -> io::Result<()>,
     ) -> Option<Result<&Entry, WalkError>> {
         self.walk.next_with(descend, before_directory)
+    }
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        self.walk
+            .next_with_cancel(descend, before_directory, cancelled)
     }
 }
 

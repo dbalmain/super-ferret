@@ -55,11 +55,28 @@ impl<W: EntrySource> Task<W> {
             self.quit.store(true, Ordering::Release);
             return false;
         }
-        let Some(item) = self.walk.next_with(self.descend, &mut || {
-            self.control.actions.flush(effects, true).inspect_err(|_| {
-                self.control.quit = true;
-            })
-        }) else {
+        let effects = std::cell::RefCell::new(effects);
+        let quit = self.quit.clone();
+        let item = {
+            let mut before_directory = || {
+                self.control
+                    .actions
+                    .flush(&mut **effects.borrow_mut(), true)
+                    .inspect_err(|_| {
+                        self.control.quit = true;
+                    })
+            };
+            let mut cancelled = || {
+                if effects.borrow().cancelled() {
+                    quit.store(true, Ordering::Release);
+                }
+                quit.load(Ordering::Acquire)
+            };
+            self.walk
+                .next_with_cancel(self.descend, &mut before_directory, &mut cancelled)
+        };
+        let effects = effects.into_inner();
+        let Some(item) = item else {
             return false;
         };
         self.descend = true;
