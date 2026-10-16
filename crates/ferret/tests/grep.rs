@@ -310,8 +310,6 @@ fn unsupported_tiers_refuse_before_output() {
         "-P",
         "--heading-off",
         "--live",
-        "-u",
-        "-a",
         "-U",
         "-r",
         "--json",
@@ -1901,4 +1899,128 @@ fn m5_discarded_history_does_not_force_a_small_context_window_to_spill() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(output.stdout, b"blue\nred\n");
     assert!(output.stderr.is_empty());
+}
+
+// M6: unrestricted freshness is independent of hidden filtering and depth.
+profile_cases! {
+    m6_u: 0 => ["-u", "red", "."];
+    m6_uu: 0 => ["-uu", "red", "."];
+    m6_repeated_u: 0 => ["-u", "-u", "red", "."];
+    m6_unrestricted_long: 0 => ["--unrestricted", "red", "."];
+    m6_no_ignore: 0 => ["--no-ignore", "red", "."];
+    m6_no_ignore_hidden: 0 => ["--no-ignore", "--hidden", "red", "."];
+    m6_uu_hide: 0 => ["-uu", "--no-hidden", "red", "."];
+    m6_u_glob: 0 => ["-u", "-g", "*.rs", "red", "."];
+    m6_u_negative_glob: 0 => ["-u", "-g", "!*.rs", "green", "."];
+    m6_u_explicit_bypasses_glob: 0 => @raw ["-u", "-g", "!*.rs", "red", "one.rs"];
+    m6_u_names: 0 => ["--files", "-u", "."];
+    m6_uu_names: 0 => ["--files", "-uu", "."];
+    m6_u_stdin: 0 => @raw ["-u", "red", "-"], stdin = b"red\n";
+    m6_u_absent: 1 => ["-u", "violet", "."];
+    m6_depth_zero: 1 => ["--max-depth=0", "red", "."];
+    m6_depth_one: 0 => ["--max-depth=1", "red", "."];
+    m6_depth_two: 0 => ["--max-depth=2", "red", "."];
+    m6_depth_last: 1 => ["--max-depth=3", "--max-depth", "0", "red", "."];
+    m6_depth_unrestricted: 0 => ["-uu", "--max-depth", "1", "red", "."];
+    m6_depth_names: 0 => ["--files", "--max-depth", "1", "."];
+    m6_depth_live_names: 0 => ["--files", "-uu", "--max-depth", "1", "."];
+    m6_depth_explicit_file: 0 => @raw ["--max-depth", "0", "red", "one.rs"];
+    m6_depth_explicit_symlink: 0 => @raw ["--max-depth", "0", "red", "link"];
+    m6_depth_explicit_directory: 0 => ["--max-depth", "1", "red", "sub"];
+    m6_explicit_directory_symlink: 0 => ["red", "dirlink"];
+    m6_u_directory_symlink: 0 => ["-u", "red", "dirlink"];
+    m6_depth_bad: 2 => ["--max-depth", "wrong", "red", "."];
+    m6_depth_negative: 2 => ["--max-depth=-1", "red", "."];
+    m6_text: 0 => @raw ["-a", "red", "one.rs"];
+    m6_text_long: 0 => @raw ["--text", "red", "one.rs"];
+    m6_text_reversed: 0 => @raw ["-a", "--no-text", "red", "one.rs"];
+}
+
+#[test]
+fn m6_unrestricted_needs_no_index_and_preserves_override_order() {
+    let fixture = Fixture::new("unrestricted-no-index");
+    fs::create_dir(fixture.tree().join(".git")).unwrap();
+    fixture.write(".gitignore", b"blocked\n");
+    fixture.write("blocked", b"red ignored\n");
+    fixture.write(".held", b"red hidden\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for args in [
+        vec!["-u", "--ignore", "-u", "red", "."],
+        vec!["-uu", "--ignore", "red", "."],
+        vec!["--no-ignore", "--ignore", "red", "."],
+        vec!["--ignore", "-u", "red", "."],
+    ] {
+        fixture.compare(&args, None);
+    }
+    fs::remove_dir_all(fixture.base.join("index")).unwrap();
+    for args in [
+        vec!["-u", "red", "."],
+        vec!["-uu", "red", "."],
+        vec!["--no-ignore", "--hidden", "red", "."],
+        vec!["-u", "--ignore", "-u", "red", "blocked"],
+        vec!["--files", "-uu", "."],
+        vec!["-q", "-u", "red", "."],
+    ] {
+        fixture.compare(&args, None);
+    }
+    assert!(
+        fixture
+            .ferret(&["grep", "red", "."], None)
+            .stdout
+            .is_empty()
+    );
+}
+
+#[test]
+fn m6_text_reads_snapshot_binary_names_and_all_nul_bytes() {
+    let fixture = Fixture::new("text-binary");
+    fs::create_dir(fixture.tree().join("nul")).unwrap();
+    fixture.write("nul/before", b"red\0x\nblue\n");
+    fixture.write("nul/after", b"blue\0red\n");
+    fixture.write("nul/later", b"blue\nred\0end\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for source in ["nul", "nul/before", "-"] {
+        for flags in [
+            vec!["-a"],
+            vec!["-an"],
+            vec!["-av"],
+            vec!["-ao"],
+            vec!["-ac"],
+            vec!["-a", "--count-matches"],
+            vec!["-aq"],
+            vec!["-al"],
+            vec!["-au"],
+            vec!["-auu"],
+        ] {
+            let mut args = flags;
+            args.extend(["red", source]);
+            fixture.compare(&args, Some(b"red\0x\nblue\n"));
+        }
+    }
+    for args in [
+        vec!["-ac", "--include-zero", "violet", "nul"],
+        vec!["-a", "--files-without-match", "violet", "nul"],
+        vec!["-a", "--files-without-match", "red", "nul"],
+        vec!["-au", "--no-text", "red", "nul"],
+        vec!["-u", "red", "nul"],
+        vec!["red", "nul"],
+    ] {
+        fixture.compare(&args, None);
+    }
+}
+
+#[test]
+fn m6_third_unrestricted_step_refuses_until_binary_mode_exists() {
+    let fixture = Fixture::new("uuu-refusal");
+    for flags in [vec!["-uuu"], vec!["-uu", "-u"], vec!["-uuu", "-a"]] {
+        let mut oracle = flags.clone();
+        oracle.extend(["red", "."]);
+        assert!(fixture.oracle(&oracle, None).status.success());
+        let mut args = vec!["grep"];
+        args.extend(flags);
+        args.extend(["red", "."]);
+        let output = fixture.ferret(&args, None);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+    }
 }

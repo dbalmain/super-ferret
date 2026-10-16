@@ -260,7 +260,16 @@ content aliases would otherwise return them.
 
 `--no-ignore`/`-u` uses find's unrestricted live walk, retaining the hidden
 filter; `-uu` reveals hidden entries. `-uuu` refuses until `--binary` exists.
-This bypasses ferret policy, not a fresh index query. `--files` reuses find's
+This bypasses ferret policy, not a fresh index query. **M6 probes
+(2026-10-17):** each `-u` (or `--unrestricted`) applies its next step at that
+argv position: first disable ignores, second reveal hidden paths, third refuse.
+`--ignore` reverses the ignore bypass without resetting the `-u` count or the
+hidden switch. `--no-text` reverses `-a` / `--text`. Unrestricted content
+retains recursive binary sniffing unless text mode is requested, but has no
+indexing size cap and needs no index. `--max-depth` is relative to each explicit
+start (depth zero); depth zero prunes directory contents but still searches
+explicit file operands. Names-only applies depth and visibility without content
+reads. Explicit directory symlinks follow the start only in every mode. `--files` reuses find's
 catalog/live source and name output with grep filters; no content reads or
 term/trigram sections. **M3 implementation (2026-10-17):** names-only opens a
 lazy Catalog, loads find's shared minimal namespace section set, and keeps that

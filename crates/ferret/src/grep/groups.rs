@@ -211,15 +211,17 @@ pub(super) fn observe(
 pub(super) fn read_file(
     path: &Path,
     recursive: bool,
+    plan: &Plan,
     each: ferret_query::Consumer<'_>,
     stopped: &dyn Fn() -> bool,
 ) -> ReadOutcome {
-    let cap = recursive.then(|| ferret_policy::Config::default().size_cap);
+    let cap = (recursive && !plan.traversal.unrestricted)
+        .then(|| ferret_policy::Config::default().size_cap);
     engine::reader::direct(
         path,
         cap,
         &mut |input, size| {
-            if recursive {
+            if recursive && !plan.text {
                 let mut buffered = io::BufReader::with_capacity(ferret_policy::SNIFF_LEN, input);
                 if ferret_policy::sniff(buffered.fill_buf()?) == ferret_policy::Content::Binary {
                     return Ok(());
@@ -407,7 +409,7 @@ impl Worker<'_> {
             Job::Direct(path, recursive) => observe(
                 &render,
                 &mut self.buffer,
-                &mut |each| read_file(path, *recursive, each, stopped),
+                &mut |each| read_file(path, *recursive, &self.plan, each, stopped),
                 false,
             )?,
             Job::Absent(_) => Observed::Ready(Group {
@@ -518,11 +520,13 @@ type OnEntry = dyn FnMut(&Path) + Send;
 /// It retains find's prune feedback and live fallback, without a path backlog.
 pub(super) struct Source<'a> {
     inputs: std::vec::IntoIter<Input>,
-    source: Option<CatalogSource>,
+    source: Option<sources::Directory>,
     descend: bool,
     catalog: Option<&'a ferret_catalog::Catalog>,
     candidates: Option<&'a ferret_index::DocSet>,
     emit_absent: bool,
+    traversal: line_grep::Traversal,
+    text: bool,
     selection: &'a GrepSelection,
     cwd: PathBuf,
     #[cfg(test)]
@@ -545,6 +549,8 @@ impl<'a> Source<'a> {
             catalog,
             candidates,
             emit_absent: false,
+            traversal: Default::default(),
+            text: false,
             selection,
             cwd,
             #[cfg(test)]
@@ -552,6 +558,12 @@ impl<'a> Source<'a> {
             #[cfg(test)]
             on_listing_poll: None,
         }
+    }
+
+    pub(super) fn with_traversal(mut self, traversal: line_grep::Traversal, text: bool) -> Self {
+        self.traversal = traversal;
+        self.text = text;
+        self
     }
 
     pub(super) fn with_absence(mut self, emit: bool) -> Self {
@@ -605,10 +617,22 @@ impl<'a> Source<'a> {
                         }
                     };
                     let relative = entry.path().strip_prefix(&self.cwd).unwrap_or(entry.path());
+                    if self
+                        .traversal
+                        .max_depth
+                        .is_some_and(|limit| entry.depth() > limit)
+                    {
+                        self.descend = false;
+                        continue;
+                    }
                     if kind == FileKind::Directory {
                         self.descend = self
-                            .selection
-                            .descend(relative.as_os_str().as_bytes(), entry.depth());
+                            .traversal
+                            .max_depth
+                            .is_none_or(|limit| entry.depth() < limit)
+                            && self
+                                .selection
+                                .descend(relative.as_os_str().as_bytes(), entry.depth());
                         continue;
                     }
                     if kind != FileKind::File
@@ -621,6 +645,14 @@ impl<'a> Source<'a> {
                     if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
                         let inode = catalog.name(name).child;
                         let Some(doc) = catalog.doc(inode) else {
+                            if self.text
+                                && catalog.state(inode) == ferret_catalog::ContentState::Binary
+                            {
+                                return Some((
+                                    catalog.inode(inode).stat.size,
+                                    Job::Direct(entry.path().to_owned(), true),
+                                ));
+                            }
                             continue;
                         };
                         if self
@@ -647,17 +679,15 @@ impl<'a> Source<'a> {
                     return Some((0, Job::Failed(path, error.to_string())));
                 }
                 Input::Directory(path) => {
-                    let Some(catalog) = self.catalog else {
-                        return Some((
-                            0,
-                            Job::Failed(path, "directory input has no pinned catalog".into()),
-                        ));
-                    };
-                    self.source = Some(CatalogSource::paths(
-                        catalog.clone(),
-                        vec![path],
-                        self.cwd.clone(),
-                    ));
+                    match sources::Directory::new(
+                        &path,
+                        self.catalog,
+                        &self.cwd,
+                        self.traversal.unrestricted,
+                    ) {
+                        Ok(source) => self.source = Some(source),
+                        Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
+                    }
                     self.descend = true;
                 }
                 // The parent splits operands at stdin barriers before scheduling.

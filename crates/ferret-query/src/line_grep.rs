@@ -29,6 +29,14 @@ pub struct Names {
     pub quiet: bool,
     pub hidden: bool,
     pub presentation: Presentation,
+    pub traversal: Traversal,
+}
+
+/// Namespace freshness and depth, shared by content and names-only modes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Traversal {
+    pub unrestricted: bool,
+    pub max_depth: Option<usize>,
 }
 
 /// Output choices whose defaults the host resolves from its actual stdout.
@@ -84,6 +92,8 @@ pub struct Plan {
     pub before: u64,
     pub after: u64,
     pub presentation: Presentation,
+    pub traversal: Traversal,
+    pub text: bool,
 }
 
 /// Name and count switches override one another in argv order; quiet is
@@ -129,6 +139,7 @@ pub enum ParseError {
     Value(String),
     Number(String),
     Context(String),
+    Depth(String),
     Utf8(&'static str),
     Unsupported(String),
     Pattern(ferret_verify::GrepError),
@@ -144,6 +155,10 @@ impl std::fmt::Display for ParseError {
             Self::Number(value) => write!(
                 f,
                 "invalid --max-count: {value:?}; expected a nonnegative integer"
+            ),
+            Self::Depth(value) => write!(
+                f,
+                "invalid --max-depth {value:?}; expected a nonnegative integer"
             ),
             Self::Context(value) => write!(
                 f,
@@ -193,6 +208,9 @@ pub fn parse_with(
     let mut smart_case = false;
     let (mut word, mut line) = (false, false);
     let mut hidden = false;
+    let mut text_mode = false;
+    let mut unrestricted_count = 0;
+    let mut traversal = Traversal::default();
     let mut files = false;
     let mut include_zero = false;
     let mut max_count = None;
@@ -243,6 +261,13 @@ pub fn parse_with(
                     line_number = true;
                 }
                 "--quiet" if value.is_none() => quiet = true,
+                "--no-ignore" if value.is_none() => traversal.unrestricted = true,
+                "--ignore" if value.is_none() => traversal.unrestricted = false,
+                "--unrestricted" if value.is_none() => {
+                    unrestricted(&mut unrestricted_count, &mut traversal, &mut hidden)?
+                }
+                "--text" if value.is_none() => text_mode = true,
+                "--no-text" if value.is_none() => text_mode = false,
                 "--hidden" if value.is_none() => hidden = true,
                 "--no-hidden" if value.is_none() => hidden = false,
                 "--ignore-case" if value.is_none() => {
@@ -291,7 +316,7 @@ pub fn parse_with(
                 }
                 "--scan" | "--scan-uncovered" if value.is_none() => {}
                 "--glob" | "--color" | "--regexp" | "--max-count" | "--before-context"
-                | "--after-context" | "--context" => {
+                | "--after-context" | "--context" | "--max-depth" => {
                     let value = value
                         .map(str::to_owned)
                         .or_else(|| args.next().and_then(|s| s.to_str()).map(str::to_owned))
@@ -304,6 +329,10 @@ pub fn parse_with(
                                 "--after-context" => after = Some(number),
                                 _ => around = number,
                             }
+                        }
+                        "--max-depth" => {
+                            traversal.max_depth =
+                                Some(value.parse().map_err(|_| ParseError::Depth(value))?)
                         }
                         "--max-count" => {
                             max_count = Some(value.parse().map_err(|_| ParseError::Number(value))?)
@@ -342,6 +371,8 @@ pub fn parse_with(
                         line_number = true;
                     }
                     b'q' => quiet = true,
+                    b'u' => unrestricted(&mut unrestricted_count, &mut traversal, &mut hidden)?,
+                    b'a' => text_mode = true,
                     b'.' => hidden = true,
                     b'i' => {
                         fold = true;
@@ -435,6 +466,7 @@ pub fn parse_with(
             quiet,
             hidden,
             presentation,
+            traversal,
         }));
     }
     if sources.is_empty() {
@@ -506,7 +538,25 @@ pub fn parse_with(
         before: before.unwrap_or(around),
         after: after.unwrap_or(around),
         presentation,
+        traversal,
+        text: text_mode,
     }))
+}
+
+// Each -u occurrence applies its next widening step at that argv position.
+// --ignore can reverse the first without resetting the occurrence count.
+fn unrestricted(
+    count: &mut u8,
+    traversal: &mut Traversal,
+    hidden: &mut bool,
+) -> Result<(), ParseError> {
+    *count += 1;
+    match *count {
+        1 => traversal.unrestricted = true,
+        2 => *hidden = true,
+        _ => return Err(unsupported("-uuu")),
+    }
+    Ok(())
 }
 
 enum PatternSource {
@@ -671,14 +721,14 @@ pub fn scan_lines(
         size,
         buffer,
         stopped,
-        Some(0),
+        (!plan.text).then_some(0),
         |run, base, terminated| {
             let run = if base == 0 {
                 run.strip_prefix(b"\xef\xbb\xbf").unwrap_or(run)
             } else {
                 run
             };
-            let binary = memchr::memchr(0, run);
+            let binary = (!plan.text).then(|| memchr::memchr(0, run)).flatten();
             // M4 R1: a selected-line limit cannot hide a sentinel already
             // received, even when it follows a complete selected line.
             result.binary = binary.is_some();

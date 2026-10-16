@@ -27,17 +27,6 @@ fn open_catalog(index: Option<&Path>) -> Result<Catalog, String> {
     Ok(catalog)
 }
 
-// An explicit directory symlink is followed at its start only, like rg.
-// Find's trailing-slash resolution provides this while keeping descendants
-// physical: recursive symlinks are still skipped.
-fn source(catalog: &Catalog, path: &Path, cwd: &Path) -> CatalogSource {
-    let mut path = path.as_os_str().to_owned();
-    if !path.as_bytes().ends_with(b"/") {
-        path.push("/");
-    }
-    CatalogSource::paths(catalog.clone(), vec![path.into()], cwd.to_owned())
-}
-
 fn execute(
     plan: &Names,
     index: Option<&Path>,
@@ -53,14 +42,16 @@ fn execute(
     let inputs = resolve_inputs(&plan.paths, true);
     let catalog = inputs
         .iter()
-        .any(|input| matches!(input, Input::Directory(_)))
+        .any(|input| matches!(input, Input::Directory(_)) && !plan.traversal.unrestricted)
         .then(|| open_catalog(index))
         .transpose()?;
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     if let Some(catalog) = &catalog {
         for input in &inputs {
             if let Input::Directory(path) = input
-                && let Some(Err(error)) = source(catalog, path, &cwd).next(true)
+                && let Some(Err(error)) = sources::Directory::new(path, Some(catalog), &cwd, false)
+                    .map_err(|e| e.to_string())?
+                    .next(true)
             {
                 return Err(format!(
                     "{}: {}; index this directory; live modes arrive in M6",
@@ -113,10 +104,13 @@ fn execute(
             }
             Input::Failed(_, _) => {}
             Input::Directory(path) => {
-                let Some(catalog) = &catalog else {
-                    unreachable!("directory catalog")
-                };
-                let mut source = source(catalog, &path, &cwd);
+                let mut source = sources::Directory::new(
+                    &path,
+                    catalog.as_ref(),
+                    &cwd,
+                    plan.traversal.unrestricted,
+                )
+                .map_err(|e| e.to_string())?;
                 let mut descend = true;
                 while let Some(entry) =
                     source.next_with_cancel(descend, &mut || Ok(()), &mut || {
@@ -132,6 +126,13 @@ fn execute(
                             continue;
                         }
                     };
+                    if plan
+                        .traversal
+                        .max_depth
+                        .is_some_and(|limit| entry.depth() > limit)
+                    {
+                        continue;
+                    }
                     let relative = entry
                         .path()
                         .strip_prefix(&cwd)
@@ -140,7 +141,11 @@ fn execute(
                         .as_bytes();
                     match entry.kind() {
                         Ok(FileKind::Directory) => {
-                            descend = selection.descend(relative, entry.depth())
+                            descend = plan
+                                .traversal
+                                .max_depth
+                                .is_none_or(|limit| entry.depth() < limit)
+                                && selection.descend(relative, entry.depth())
                         }
                         Ok(FileKind::File) if selection.allows(relative, entry.depth()) => {
                             if emit(entry.path())? {
@@ -223,6 +228,7 @@ mod tests {
                     globs: Vec::new(),
                     quiet: false,
                     hidden: false,
+                    traversal: Default::default(),
                     presentation: line_grep::Presentation {
                         color,
                         null: color.enabled(),

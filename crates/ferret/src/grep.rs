@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod groups;
 mod names;
 mod presentation;
+mod sources;
 
 use ferret_catalog::NameId;
 use ferret_policy::GrepSelection;
@@ -52,6 +53,10 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -0, --null         NUL-terminate filenames\n\
   -p, --pretty       colour, headings and line numbers\n\
   --color MODE       auto/always/ansi/never\n\
+  -u/--no-ignore     unrestricted current-tree walk\n\
+  -uu                unrestricted including hidden paths\n\
+  -a, --text         search binary bytes as text\n\
+  --max-depth N      limit directory traversal depth\n\
   --scan             accepted; broad patterns always scan\n\n\
 Directories use snapshot names/postings and current candidate bytes.\n\
 An index covering each directory is required; trigrams are optional.\n\
@@ -112,7 +117,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let recursive = inputs
         .iter()
         .any(|input| matches!(input, Input::Directory(_)));
-    let engine = if recursive {
+    let engine = if recursive && !plan.traversal.unrestricted {
         match open_index(index) {
             Ok(engine) => Some(engine),
             Err(error) => return failure(&error),
@@ -237,6 +242,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 &selection,
                 cwd.clone(),
             )
+            .with_traversal(plan.traversal, plan.text)
             .with_absence(plan.universe() == line_grep::Universe::Searchable);
             if let Err(error) = groups::run(
                 &mut host,
@@ -392,8 +398,9 @@ impl<W: Write> Host<'_, W> {
     fn file(&mut self, path: &Path, recursive: bool) -> io::Result<()> {
         let flag = self.cancelled;
         let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
+        let plan = self.plan;
         self.transaction(path, &mut |each| {
-            groups::read_file(path, recursive, each, &stopped)
+            groups::read_file(path, recursive, plan, each, &stopped)
         })
     }
 
