@@ -519,3 +519,60 @@ fn non_utf8_filename_bytes_are_preserved() {
     );
     assert!(actual.stdout.windows(7).any(|w| w == b"name-\xff:"));
 }
+
+// R1/P2: the writer must remain open until grep exits. A newline or EOF
+// must not be needed to notice a NUL already received by the real CLI.
+#[test]
+fn nul_stops_stdin_while_its_producer_holds_the_stream_open() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let fixture = Fixture::new("nul-open-producer");
+    for (bytes, status, expected) in [
+        (&b"\0"[..], 1, &b""[..]),
+        (
+            &b"red\n\0"[..],
+            0,
+            &b"(standard input): binary file matches\n"[..],
+        ),
+        (
+            &b"red\0"[..],
+            0,
+            &b"(standard input): binary file matches\n"[..],
+        ),
+    ] {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let (release, held) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            writer.write_all(bytes).unwrap();
+            held.recv().unwrap();
+        });
+        let fd: OwnedFd = reader.into();
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        let child = command
+            .args(["grep", "red", "-"])
+            .stdin(Stdio::from(fd))
+            .spawn()
+            .unwrap();
+        let (finished, completion) = mpsc::channel();
+        let waiter =
+            thread::spawn(move || finished.send(child.wait_with_output().unwrap()).unwrap());
+        let observed = completion.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        producer.join().unwrap();
+        let output = match observed {
+            Ok(output) => output,
+            Err(error) => {
+                waiter.join().unwrap();
+                panic!("grep needed producer EOF after NUL: {error}");
+            }
+        };
+        waiter.join().unwrap();
+        assert_eq!(output.status.code(), Some(status), "{output:?}");
+        assert_eq!(output.stdout, expected);
+        assert!(output.stderr.is_empty());
+    }
+}

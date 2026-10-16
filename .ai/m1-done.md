@@ -217,9 +217,9 @@ and actual content/output work. Report paths/patterns/content only privately.
 
 ## Review round 1
 
-2026-10-16: read Astra’s full note. Reproducing the three findings, checking
-D73’s file transaction contract, and measuring the exact parent/87feec7 search
-path on a synthetic tree. Fixes, revert checks and gate counts pending.
+2026-10-16: read Astra’s full note and reproduced all three findings. D73
+and GREP.md require checked reads for regular-file candidates. P1 is committed
+as `35bf01d`; P2 and P3 are in progress.
 
 ### P1 — regular-file transactions
 
@@ -244,3 +244,52 @@ fixed behavior is `(true, false, false)`. Logs: `/tmp/grep-review-p1-repro.log`,
 `/tmp/grep-review-p1-revert.log`, `/tmp/grep-review-p1-fixed.log`.
 P1 gates: fmt and all-target clippy passed with zero compiler warnings;
 workspace tests **1126 passed / 13 ignored**, no additional skips.
+
+### P2 — immediate NUL handling
+
+The original CLI stayed blocked after stdin received NUL until its producer
+closed the stream. A real child test now uses a socket writer that sends NUL
+and waits for a channel release, which the parent sends only after grep exits.
+No sleeps; a timeout guards deadlock and releases the producer for cleanup.
+Covers NUL alone (exit 1), a prior matching line and a matching partial line
+(exit 0, binary message). A scanner regression supplies one chunk containing
+NUL and errors on another read: grep must stop without growing its buffer.
+
+The shared stream reader now accepts an optional terminal byte. Line grep
+requests NUL and receives the buffered prefix immediately after the read that
+contains it; document search retains its existing chunk boundaries. The
+existing binary match/output rule applies. GREP.md now documents that ordinary
+non-binary lines without LF can grow the input buffer without a fixed bound;
+output spilling does not bound input buffering.
+
+Both revert checks failed as required: CLI waited for producer EOF; the real
+scanner requested another read after NUL. Logs:
+`/tmp/grep-review-p2-revert-cli.log` and
+`/tmp/grep-review-p2-revert-scan.log`. P2 gates: fmt and all-target clippy
+passed with zero compiler warnings; workspace tests **1128 passed / 13
+ignored**, no additional skips. Full log: `/tmp/grep-review-p2-gates.log`.
+
+### Shared search extraction timing (Astra’s least-verified point)
+
+Built release binaries from `87feec7^` (`b0e04f5`) and exact `87feec7` in a
+detached scratch worktree under `/tmp/grep-m1-review-search`, then removed that
+worktree. Same toolchain/profile, isolated index and environment, four search
+threads, standalone execution. Owned synthetic tree: 512 distinct text files,
+34,578,944 bytes. A catalog-only index forces streamed verification rather than
+content postings. Ran `ferret --index INDEX search --scan grep:PATTERN`, three
+warmups per binary, then 30 alternating pairs per pattern. Compared every
+run’s stdout, stderr and status: identical (zero rows for absent, 512 for hits).
+
+| Pattern | Before median (p10–p90), ms | After median (p10–p90), ms |
+| --- | --- | --- |
+| absent_marker | 4.236 (4.031–4.972) | 4.329 (4.058–5.287) |
+| ordinary | 3.828 (3.709–4.557) | 3.826 (3.726–4.296) |
+| synthetic.*words | 4.153 (4.037–4.491) | 4.211 (4.091–4.584) |
+
+Median differences are 0–2.2%, smaller than run spread: no timing change
+resolved beyond noise in this rough warm comparison. This does not establish
+performance neutrality at corpus scale or under cold I/O. No concurrent build
+or gates ran during the recorded samples. Script:
+`/tmp/grep-review-search-compare.py`; raw samples:
+`/tmp/grep-review-search-data/timings.json`. Original benchmark commands above
+remain for the benchmark machine; this limited comparison was requested in R1.

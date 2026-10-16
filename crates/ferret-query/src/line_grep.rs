@@ -192,39 +192,46 @@ pub fn scan(
     let search = plan.grep.search();
     let mut result = InputResult::default();
     let mut number = 0;
-    crate::scan::runs(input, size, buffer, stopped, |run, base, terminated| {
-        let run = if base == 0 {
-            run.strip_prefix(b"\xef\xbb\xbf").unwrap_or(run)
-        } else {
-            run
-        };
-        let binary = memchr::memchr(0, run);
-        let text = &run[..binary.unwrap_or(run.len())];
-        let mut lines = text.split(|&b| b == b'\n').peekable();
-        while let Some(line) = lines.next() {
-            // No extra line after a terminal LF or at empty EOF. A partial
-            // line before NUL is searched: NUL is a binary sentinel.
-            if line.is_empty() && lines.peek().is_none() && !terminated && binary.is_none() {
-                break;
-            }
-            number += 1;
-            if stopped() {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            if search.find(line).is_some() {
-                result.matched = true;
-                if plan.quiet {
-                    return Ok(ControlFlow::Break(()));
+    crate::scan::runs(
+        input,
+        size,
+        buffer,
+        stopped,
+        Some(0),
+        |run, base, terminated| {
+            let run = if base == 0 {
+                run.strip_prefix(b"\xef\xbb\xbf").unwrap_or(run)
+            } else {
+                run
+            };
+            let binary = memchr::memchr(0, run);
+            let text = &run[..binary.unwrap_or(run.len())];
+            let mut lines = text.split(|&b| b == b'\n').peekable();
+            while let Some(line) = lines.next() {
+                // No extra line after a terminal LF or at empty EOF. A partial
+                // line before NUL is searched: NUL is a binary sentinel.
+                if line.is_empty() && lines.peek().is_none() && !terminated && binary.is_none() {
+                    break;
                 }
-                emit(number, line)?;
+                number += 1;
+                if stopped() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                if search.find(line).is_some() {
+                    result.matched = true;
+                    if plan.quiet {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    emit(number, line)?;
+                }
             }
-        }
-        if binary.is_some() {
-            result.binary = true;
-            return Ok(ControlFlow::Break(()));
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
+            if binary.is_some() {
+                result.binary = true;
+                return Ok(ControlFlow::Break(()));
+            }
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
     Ok(result)
 }
 
@@ -345,5 +352,40 @@ mod tests {
             |_, _| panic!("cancelled"),
         );
         assert!(result.is_err());
+    }
+    // R1/P2: the scanner must stop within the chunk containing NUL, even
+    // when the source has no LF or EOF and refuses a second read.
+    #[test]
+    fn binary_sentinel_stops_before_another_read_or_buffer_growth() {
+        struct Source {
+            reads: usize,
+        }
+        impl Read for Source {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads != 1 {
+                    return Err(io::Error::other("read past NUL"));
+                }
+                bytes[..5].copy_from_slice(b"red\0x");
+                Ok(5)
+            }
+        }
+        let Command::Search(plan) = parse(&["red".into()]).unwrap() else {
+            panic!("search")
+        };
+        let mut source = Source { reads: 0 };
+        let mut buffer = Vec::new();
+        let result = scan(
+            &plan,
+            &mut source,
+            u64::MAX,
+            &mut buffer,
+            &|| false,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert!(result.matched && result.binary);
+        assert_eq!(source.reads, 1);
+        assert_eq!(buffer.len(), crate::scan::BUFFER);
     }
 }

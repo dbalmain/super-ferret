@@ -8,13 +8,17 @@ pub(crate) const BUFFER: usize = 64 << 10;
 
 /// Visits complete runs without LF at the end. `terminated` distinguishes an
 /// empty line from empty input. `len` is the bracketed size, or `u64::MAX` for
-/// an unbounded direct stream. Allocation is fallible, cancellation is checked
+/// an unbounded direct stream. A sentinel ends the scan in its first read,
+/// delivering the buffered prefix through that byte even without LF or EOF.
+/// With no sentinel the document-search chunk boundaries stay unchanged.
+/// Allocation is fallible, cancellation is checked
 /// between reads, and a consumer can stop without reading the rest of a file.
 pub(crate) fn runs(
     source: &mut dyn Read,
     len: u64,
     buffer: &mut Vec<u8>,
     stopped: &dyn Fn() -> bool,
+    sentinel: Option<u8>,
     mut each: impl FnMut(&[u8], usize, bool) -> io::Result<ControlFlow<()>>,
 ) -> io::Result<()> {
     if buffer.len() < BUFFER {
@@ -50,14 +54,17 @@ pub(crate) fn runs(
             }
         };
         filled += n;
-        let end = if n == 0 {
-            filled
+        let terminal = sentinel.and_then(|byte| memchr::memchr(byte, &buffer[fresh..filled]));
+        let (end, terminated) = if let Some(at) = terminal {
+            (fresh + at + 1, false)
+        } else if n == 0 {
+            (filled, false)
         } else if let Some(end) = memchr::memrchr(b'\n', &buffer[fresh..filled]) {
-            fresh + end
+            (fresh + end, true)
         } else {
             continue;
         };
-        if each(&buffer[..end], base, n != 0)?.is_break() || n == 0 {
+        if each(&buffer[..end], base, terminated)?.is_break() || n == 0 || terminal.is_some() {
             return Ok(());
         }
         buffer.copy_within(end + 1..filled, 0);

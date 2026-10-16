@@ -1155,32 +1155,39 @@ fn stream(
             halted = true;
             Err(io::Error::other("stopped"))
         };
-        crate::scan::runs(source, len, buffer, stopped, |run, base, terminated| {
-            let engine = Instant::now();
-            for ((search, answer), done) in regexes.iter().zip(&mut answers).zip(&mut done) {
-                let (false, Some(search)) = (*done, search) else {
-                    continue;
-                };
-                if stopped() {
-                    regex += engine.elapsed();
+        crate::scan::runs(
+            source,
+            len,
+            buffer,
+            stopped,
+            None,
+            |run, base, terminated| {
+                let engine = Instant::now();
+                for ((search, answer), done) in regexes.iter().zip(&mut answers).zip(&mut done) {
+                    let (false, Some(search)) = (*done, search) else {
+                        continue;
+                    };
+                    if stopped() {
+                        regex += engine.elapsed();
+                        return halt();
+                    }
+                    if let Some(found) = search.find(run) {
+                        *answer = Some(base + found);
+                        open -= 1;
+                    }
+                    *done = answer.is_some() || !terminated;
+                }
+                regex += engine.elapsed();
+                if (open == 0 || !terminated) && stopped() {
                     return halt();
                 }
-                if let Some(found) = search.find(run) {
-                    *answer = Some(base + found);
-                    open -= 1;
-                }
-                *done = answer.is_some() || !terminated;
-            }
-            regex += engine.elapsed();
-            if (open == 0 || !terminated) && stopped() {
-                return halt();
-            }
-            Ok(if open == 0 {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            })
-        })
+                Ok(if open == 0 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
+            },
+        )
     };
     let version = read(name, ReadRequest::Stream(&mut each, stopped));
     // The atoms that finished, matched or not: every one after a full read.

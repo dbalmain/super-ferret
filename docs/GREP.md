@@ -323,6 +323,12 @@ refuse it with names/count modes. Ferret envelopes are not rg JSON.
 
 Binary policy differs: recursive binary-sniffed files are absent. On searched
 input, first NUL stops searching and discards buffered plain file output.
+Detect NUL in each read chunk, without waiting for LF or EOF (review R1,
+2026-10-16). A producer that holds its stream open after NUL does not hold the
+query open. For non-binary input with no LF, line buffering grows with the line:
+explicit files and stdin have no invented cap and use fallible allocation;
+recursive input retains its existing file size cap. Output spill bounds output
+memory, not this input-line buffer.
 If a selected line preceded it, print `PATH: binary file matches` on stdout
 instead (stdin label: `(standard input)`); count modes also use that message,
 `-l` prints the path, `-q` prints nothing. This counts as success. Otherwise
