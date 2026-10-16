@@ -148,6 +148,7 @@ impl GrepFlags {
             trigrams,
             planning,
             line_local,
+            lf_excluded: lf_excluded(&hir).unwrap_or(false),
             filter,
         })
     }
@@ -242,6 +243,7 @@ pub struct Grep {
     /// Every match lies within one line, and finding it needs nothing
     /// beyond that line ([`Grep::is_line_local`]).
     line_local: bool,
+    lf_excluded: bool,
     /// A required run of the pattern, searched first to find where a match
     /// can be ([`Search`]); only for line-local patterns whose matches the
     /// engine cannot find by a literal prefix.
@@ -274,6 +276,13 @@ impl Grep {
     /// which match `\n`.
     pub fn is_line_local(&self) -> bool {
         self.line_local
+    }
+
+    /// Conservative LF exclusion from the resolved HIR. Assertions alone
+    /// provide no byte evidence; impossible alternatives are not discarded.
+    /// This is a counting/execution profile, not language reachability.
+    pub fn excludes_lf(&self) -> bool {
+        self.lf_excluded
     }
 
     /// A copy of what finds the first match, for one thread's own use
@@ -535,6 +544,27 @@ fn literal_length(hir: &Hir) -> Option<usize> {
         ),
         HirKind::Capture(capture) => literal_length(&capture.sub),
         _ => None,
+    }
+}
+
+// None means assertions supplied no consuming-byte evidence. In a
+// concatenation other nodes still supply it; an alternative must supply its
+// own evidence. Keep this separate from assertion-context locality.
+fn lf_excluded(hir: &Hir) -> Option<bool> {
+    match hir.kind() {
+        HirKind::Look(look) => {
+            use regex_syntax::hir::Look;
+            match look {
+                Look::Start | Look::End | Look::StartLF | Look::EndLF
+                | Look::StartCRLF | Look::EndCRLF => None,
+                _ => Some(true),
+            }
+        },
+        HirKind::Capture(capture) => lf_excluded(&capture.sub),
+        HirKind::Repetition(repetition) => lf_excluded(&repetition.sub),
+        HirKind::Concat(parts) => parts.iter().filter_map(lf_excluded).reduce(|a, b| a && b),
+        HirKind::Alternation(parts) => Some(parts.iter().all(|p| lf_excluded(p) == Some(true))),
+        _ => Some(line_local(hir)),
     }
 }
 

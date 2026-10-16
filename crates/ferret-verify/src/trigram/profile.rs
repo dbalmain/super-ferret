@@ -13,6 +13,8 @@ pub struct LineFlags {
     pub smart_case: bool,
     pub word: bool,
     pub line: bool,
+    pub multiline: bool,
+    pub dotall: bool,
 }
 
 #[derive(Default)]
@@ -59,6 +61,13 @@ impl GrepFlags {
         patterns: &[String],
         flags: LineFlags,
     ) -> Result<Grep, GrepError> {
+        let compile = |settings: &GrepFlags, pattern: &str| {
+            if flags.multiline {
+                settings.compile(pattern)
+            } else {
+                settings.compile_lines(pattern)
+            }
+        };
         let patterns: Vec<_> = patterns
             .iter()
             .map(|pattern| {
@@ -69,6 +78,15 @@ impl GrepFlags {
                 }
             })
             .collect();
+        // Resolve dotall before each argument's inline flags. Lowering the
+        // resulting HIR keeps matching and derivation on identical settings.
+        let patterns: Vec<_> = patterns.into_iter().map(|pattern| {
+            if flags.multiline && flags.dotall {
+                format!("(?s){pattern}")
+            } else {
+                pattern
+            }
+        }).collect();
         let mut resolved = *self;
         if flags.smart_case {
             let mut any = false;
@@ -90,13 +108,13 @@ impl GrepFlags {
             && !flags.line
             && let [pattern] = patterns.as_slice()
         {
-            return resolved.compile_lines(pattern);
+            return compile(&resolved, pattern);
         }
         let mut alternatives = Vec::with_capacity(patterns.len());
         for pattern in &patterns {
             // Resolving first prevents extended-mode comments swallowing a
             // wrapper, and prevents one argument's inline flags leaking.
-            resolved.compile_lines(pattern)?;
+            compile(&resolved, pattern)?;
             let hir = resolved
                 .parser()
                 .build()
@@ -118,9 +136,6 @@ impl GrepFlags {
             body
         };
         // Each HIR has resolved its own inline folding, including (?-i).
-        GrepFlags {
-            case_insensitive: false,
-        }
-        .compile_lines(&body)
+        compile(&GrepFlags { case_insensitive: false }, &body)
     }
 }

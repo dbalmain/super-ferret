@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use ferret_verify::{Grep, GrepFlags, LineFlags};
 
 mod context;
+mod multiline;
 
 /// Information requests skip environment, index and input resolution.
 #[derive(Debug)]
@@ -95,6 +96,7 @@ pub struct Plan {
     pub presentation: Presentation,
     pub traversal: Traversal,
     pub text: bool,
+    pub multiline: bool,
 }
 
 /// Name and count switches override one another in argv order; quiet is
@@ -210,6 +212,7 @@ pub fn parse_with(
     let (mut word, mut line) = (false, false);
     let mut hidden = false;
     let mut text_mode = false;
+    let (mut multiline, mut dotall) = (false, false);
     let mut unrestricted_count = 0;
     let mut traversal = Traversal::default();
     let mut files = false;
@@ -268,6 +271,10 @@ pub fn parse_with(
                 "--unrestricted" if value.is_none() => {
                     unrestricted(&mut unrestricted_count, &mut traversal, &mut hidden)?
                 }
+                "--multiline" if value.is_none() => multiline = true,
+                "--no-multiline" if value.is_none() => multiline = false,
+                "--multiline-dotall" if value.is_none() => dotall = true,
+                "--no-multiline-dotall" if value.is_none() => dotall = false,
                 "--text" if value.is_none() => text_mode = true,
                 "--no-text" if value.is_none() => text_mode = false,
                 "--hidden" if value.is_none() => hidden = true,
@@ -375,6 +382,7 @@ pub fn parse_with(
                     b'q' => quiet = true,
                     b'u' => unrestricted(&mut unrestricted_count, &mut traversal, &mut hidden)?,
                     b'a' => text_mode = true,
+                    b'U' => multiline = true,
                     b'.' => hidden = true,
                     b'i' => {
                         fold = true;
@@ -521,6 +529,8 @@ pub fn parse_with(
             smart_case,
             word,
             line,
+            multiline,
+            dotall,
         },
     )
     .map_err(ParseError::Pattern)?;
@@ -542,6 +552,7 @@ pub fn parse_with(
         presentation,
         traversal,
         text: text_mode,
+        multiline,
     }))
 }
 
@@ -677,6 +688,7 @@ pub struct Line<'a> {
     pub bytes: &'a [u8],
     pub kind: LineKind,
     pub fragment: bool,
+    pub highlights: Option<&'a [std::ops::Range<usize>]>,
 }
 
 /// Stream selected records and bounded before/after context without a second
@@ -689,6 +701,9 @@ pub fn scan_lines(
     stopped: &dyn Fn() -> bool,
     mut emit: impl FnMut(Line<'_>) -> io::Result<()>,
 ) -> Result<InputResult, ScanError> {
+    if plan.multiline {
+        return multiline::scan(plan, input, size, buffer, stopped, emit);
+    }
     let search = plan.grep.search();
     let mut result = InputResult::empty(plan);
     if !result.searched {
@@ -756,6 +771,7 @@ pub fn scan_lines(
                                     bytes: &line[span],
                                     kind: LineKind::Match,
                                     fragment: true,
+                                    highlights: None,
                                 })
                                 .map_err(ScanError::Output)?;
                             }
@@ -769,6 +785,7 @@ pub fn scan_lines(
                                     LineKind::Context
                                 },
                                 fragment: false,
+                                highlights: None,
                             })
                             .map_err(ScanError::Output)?;
                         }
@@ -804,6 +821,7 @@ pub fn scan_lines(
                                     bytes: &line[span],
                                     kind: LineKind::Match,
                                     fragment: true,
+                                    highlights: None,
                                 })
                                 .map_err(ScanError::Output)?;
                             }
@@ -816,6 +834,7 @@ pub fn scan_lines(
                                 bytes: line,
                                 kind: LineKind::Match,
                                 fragment: false,
+                                highlights: None,
                             })
                             .map_err(ScanError::Output)?;
                         }
@@ -832,6 +851,7 @@ pub fn scan_lines(
                         bytes: line,
                         kind: LineKind::Context,
                         fragment: false,
+                        highlights: None,
                     })
                     .map_err(ScanError::Output)?;
                 } else if rendering {

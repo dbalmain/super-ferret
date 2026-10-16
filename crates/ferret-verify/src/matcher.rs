@@ -49,10 +49,15 @@ impl Regex {
     /// assertions. Empty spans advance one byte, including inside UTF-8; an
     /// empty span at the previous consuming match's end is suppressed.
     pub fn spans<'r, 't>(&'r self, bytes: &'t [u8]) -> Spans<'r, 't> {
+        self.spans_at(bytes, 0)
+    }
+
+    /// Iterate with assertion context intact, starting at a byte offset.
+    pub fn spans_at<'r, 't>(&'r self, bytes: &'t [u8], at: usize) -> Spans<'r, 't> {
         Spans {
             regex: self,
             bytes,
-            next: Some(0),
+            next: Some(at),
             previous_end: None,
         }
     }
