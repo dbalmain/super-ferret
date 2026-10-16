@@ -5044,3 +5044,48 @@ not an approved blanket compatibility waiver.
 **Fact that would change it:** a documented, stable rg rule that cheaply
 explains these outputs, or significant affected commands in the 3,332 audit.
 Then B, with owned positive/negative cases for that rule.
+
+## D80 — Multiline inversion with a limit
+
+**Status: open, 2026-10-17; M7 (`wt/grep-m7`) uses B provisionally.**
+
+**Question:** should `-U -v -m` reproduce rg 15.2.0's positive-search limit and
+its gaps, or keep GREP.md's nonmatching-line selection rule? Owned probes (no
+oracle source): on `foo foo\nbar\nfoo\n`, `rg -U -vn -m1 'foo(?:\nbar)?'`
+prints `2:bar` and `3:foo`; unlimited prints only `2:bar`. On
+`x\na\ny\na\nz\n`, `-U -vnc -m1 'a|\n'` prints 6 although its plain output
+has four lines.
+
+| Option | Tradeoff |
+| --- | --- |
+| A. Selected nonmatching lines | Exclude every line a multiline match intersects, then limit selected lines. Keeps the written inversion and count contract; differs from rg's multiline path on overlapping line groups and limits. |
+| B. Reproduce rg's search path, keep selected-line counts | Limit positive searches, skip each matched line group and emit the remainder as a gap when the limit is exhausted. Agrees with the oracle's output, but can print lines that match the pattern. `-c` still counts selected lines (4 on the probe, where rg prints 6), so one owned count exception remains. |
+
+**Recommendation: B** for the LF-including multiline profile; LF-excluding
+execution keeps ordinary selected-line limits. The profile already separates
+search, clipping and re-matching, so gap selection adds little machinery.
+
+**Fact that would change it:** preferring predictable inversion over the rg
+artefact. Then A.
+
+## D81 — Multiline search assertions versus rendering assertions
+
+**Status: open, 2026-10-17; M7 (`wt/grep-m7`) uses B provisionally.**
+
+**Question:** should multiline search keep the original haystack at every
+resume, or follow rg's suffix-based search while counting and rendering against
+the clipped region? Owned probes: on `abc\nabc\n`, `rg -U -n '\A'` prints both
+lines while `-U -c '\A'` prints 1 and `-U -o '\A'` prints nothing. A terminal
+`\z` on unterminated `abc` can render the whole line even under `-o`; a
+terminal match after LF can print before-context while exiting 1.
+
+| Option | Tradeoff |
+| --- | --- |
+| A. One original haystack | Smaller API and intuitive absolute assertions (`\A` selects only the first line). Differs from rg's plain multiline rendering and trailing context. |
+| B. Suffix search, bounded re-match | An explicit search-region iterator mode in the shared verifier; counts and spans keep their own bounds and assertion context. Slightly more machinery; matches rg without a CLI regex executor or pattern-text special cases. |
+
+**Recommendation: B.** D79 (line-mode empty absolute anchors) stays separate.
+
+**Fact that would change it:** a requirement for uniform whole-document
+assertion truth across search and presentation, or a new pinned rg that removes
+the artefact. Then A.
