@@ -901,28 +901,34 @@ mod tests {
     // M2: compile, matching and necessary keys see the same resolved profile.
     #[test]
     fn fixed_folded_and_repeated_profiles_are_sound_over_original_bytes() {
-        let profiles: &[&[&str]] = &[
-            &["-U", "red\\nviolet"],
-            &["-U", "(?s:red.*violet)"],
-            &["-UF", "red\nviolet"],
-            &["-U", "red|\\A\\z\\n"],
-            &["-U", "-e", "red", "-e", "violet\\nblue"],
-            &["-Uiw", "KILO"],
-            &["-Ux", "red\\nviolet"],
-            &["-U", "--multiline-dotall", "red.*violet"],
-            &["-U", "(?-u:\\xFF)red\\nviolet"],
-            &["-i", "KILO"],
-            &["-Fi", "SEA"],
-            &["-F", "red.*"],
-            &["-w", "red"],
-            &["-x", "red"],
-            &["-Sw", "red"],
-            &["-SFx", "red.*"],
-            &["-S", "-e", "red", "-e", "VIOLET"],
-            &["-wo", "@red@"],
-            &["-wo", ""],
-            &["-e", "red", "-e", "(?i:violet)"],
-            &["-o", "-e", "", "-e", "red"],
+        let profiles: &[(&[&str], &[u8])] = &[
+            (&["-U", "red\\nviolet"], b"red\nviolet\n"),
+            (&["-U", "(?s:red.*violet)"], b"red\nviolet\n"),
+            (&["-UF", "red\nviolet"], b"red\nviolet\n"),
+            (&["-U", "red|\\A\\z\\n"], b"red.*\n"),
+            (
+                &["-U", "-e", "red", "-e", "violet\\nblue"],
+                b"red\nviolet\n",
+            ),
+            (&["-Uiw", "KILO"], "Kilo\n".as_bytes()),
+            (&["-Ux", "red\\nviolet"], b"red\nviolet\n"),
+            (
+                &["-U", "--multiline-dotall", "red.*violet"],
+                b"red\nviolet\n",
+            ),
+            (&["-U", "(?-u:\\xFF)red\\nviolet"], b"\xffred\nviolet\n"),
+            (&["-i", "KILO"], "Kilo\n".as_bytes()),
+            (&["-Fi", "SEA"], "ſea\n".as_bytes()),
+            (&["-F", "red.*"], b"red.*\n"),
+            (&["-w", "red"], b"red\nviolet\n"),
+            (&["-x", "red"], b"\xef\xbb\xbfred\n"),
+            (&["-Sw", "red"], b"red\nviolet\n"),
+            (&["-SFx", "red.*"], b"red.*\n"),
+            (&["-S", "-e", "red", "-e", "VIOLET"], b"VIOLET\n"),
+            (&["-wo", "@red@"], b"@red@\n"),
+            (&["-wo", ""], b"\n"),
+            (&["-e", "red", "-e", "(?i:violet)"], b"VIOLET\n"),
+            (&["-o", "-e", "", "-e", "red"], b"\n"),
         ];
         let documents: &[&[u8]] = &[
             b"red.*\n",
@@ -943,7 +949,8 @@ mod tests {
             b"",
         ];
         let mut positives = 0;
-        for args in profiles {
+        for &(args, expected_positive) in profiles {
+            let mut checked_positive = false;
             let Command::Search(plan) =
                 parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap()
             else {
@@ -959,11 +966,19 @@ mod tests {
                     |_, _| Ok(()),
                 )
                 .unwrap();
+                if bytes == expected_positive {
+                    checked_positive = true;
+                    assert!(
+                        result.matched,
+                        "missing required positive for {args:?}: {bytes:?}"
+                    );
+                }
                 if result.matched {
                     positives += 1;
                     assert!(admits(plan.grep.trigrams(), bytes));
                 }
             }
+            assert!(checked_positive, "missing positive fixture for {args:?}");
         }
         assert!(positives >= 12);
     }

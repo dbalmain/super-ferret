@@ -2920,3 +2920,152 @@ fn m7_inverted_gap_counts_keep_the_written_line_contract() {
         assert_eq!(oracle.stdout, b"6\n");
     }
 }
+
+#[test]
+fn m7_r1_first_terminal_word_assertion_is_discovered_counted_and_rendered() {
+    // A first hit found at EOF differs from advancing an empty iterator to EOF.
+    let fixture = Fixture::new("m7-r1-terminal-word");
+    for (flags, expected) in [
+        (vec!["-Un"], b"1:abc\n".as_slice()),
+        (vec!["-Uon"], b"1:abc\n"),
+        (vec!["-Uc"], b"1\n"),
+        (vec!["-Uco"], b"1\n"),
+        (vec!["-U", "--count-matches"], b"1\n"),
+    ] {
+        let mut args = flags;
+        args.extend([r"\b{end}", "-"]);
+        let oracle = fixture.oracle(&args, Some(b"abc"));
+        assert_eq!(oracle.status.code(), Some(0));
+        assert_eq!(oracle.stdout, expected, "{args:?}");
+        let mut actual_args = vec!["grep"];
+        actual_args.extend(&args);
+        let actual = fixture.ferret(&actual_args, Some(b"abc"));
+        assert_eq!(actual.status.code(), Some(0), "{args:?}: {actual:?}");
+        assert_eq!(actual.stdout, expected, "{args:?}");
+        assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+    }
+    for (bytes, expected) in [
+        (b"a\nbc".as_slice(), b"1:\n2:bc\n".as_slice()),
+        (b"abc def", b"1:\n"),
+        ("é".as_bytes(), "1:é\n".as_bytes()),
+    ] {
+        let output = fixture.compare_raw(&["-Uon", r"\b{end}", "-"], Some(bytes));
+        assert_eq!(output.stdout, expected);
+        fixture.compare_raw(&["-Uco", r"\b{end}", "-"], Some(bytes));
+    }
+    // These terminal positions are reached by advancement, not a first hit.
+    for pattern in ["", r"\b", "a*"] {
+        fixture.compare_raw(&["-Uco", pattern, "-"], Some(b"abc"));
+    }
+    fixture.compare_raw(&["-Uvn", r"\b{end}", "-"], Some(b"abc"));
+}
+
+#[test]
+fn m7_r1_context_only_files_emit_complete_separated_groups() {
+    let fixture = Fixture::new("m7-r1-context-groups");
+    fixture.write("m7-a", b"one\n");
+    fixture.write("m7-b", b"two\n");
+    for (extra, expected) in [
+        (
+            vec![],
+            [
+                b"m7-a-1-one\n--\nm7-b-1-two\n".as_slice(),
+                b"m7-b-1-two\n--\nm7-a-1-one\n",
+            ],
+        ),
+        (
+            vec!["--heading"],
+            [
+                b"m7-a\n1-one\n\nm7-b\n1-two\n",
+                b"m7-b\n1-two\n\nm7-a\n1-one\n",
+            ],
+        ),
+    ] {
+        let mut args = vec!["-UHnB1"];
+        args.extend(extra);
+        args.extend([r"\z", "m7-a", "m7-b"]);
+        let oracle = fixture.oracle(&args, None);
+        assert_eq!(oracle.status.code(), Some(1));
+        assert!(expected.contains(&oracle.stdout.as_slice()), "{oracle:?}");
+        let mut actual_args = vec!["grep"];
+        actual_args.extend(&args);
+        let actual = fixture.ferret(&actual_args, None);
+        assert_eq!(actual.status.code(), Some(1));
+        assert!(expected.contains(&actual.stdout.as_slice()), "{actual:?}");
+        assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+    }
+}
+
+#[test]
+fn m7_r1_empty_span_output_does_not_create_file_separators() {
+    let fixture = Fixture::new("m7-r1-empty-group");
+    fixture.write("m7-a", b"one\n");
+    fixture.write("m7-b", b"abc\n");
+    for (extra, expected) in [
+        (vec![], b"m7-b:1:abc\n".as_slice()),
+        // Suppress paths to avoid rg's unrelated empty path-heading artifact.
+        (vec!["--heading", "-I"], b"1:abc\n"),
+    ] {
+        let mut args = vec!["-UoHnB1"];
+        args.extend(extra);
+        args.extend(["abc|(?s:.*?)", "m7-a", "m7-b"]);
+        let oracle = fixture.oracle(&args, None);
+        assert_eq!(oracle.stdout, expected, "{args:?}: {oracle:?}");
+        let mut actual_args = vec!["grep"];
+        actual_args.extend(&args);
+        let actual = fixture.ferret(&actual_args, None);
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(oracle.status.code(), Some(0));
+        assert_eq!(actual.stdout, expected, "{args:?}");
+        assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+    }
+}
+
+#[test]
+fn m7_r1_clipped_zero_counts_need_include_zero_but_keep_search_success() {
+    let fixture = Fixture::new("m7-r1-clipped-zero");
+    for flags in [
+        vec!["-Ucm1"],
+        vec!["-Ucom1"],
+        vec!["-U", "--count-matches", "-m1"],
+    ] {
+        for include in [false, true] {
+            let mut args = flags.clone();
+            if include {
+                args.push("--include-zero");
+            }
+            args.extend([r"a\n\b", "-"]);
+            let oracle = fixture.oracle(&args, Some(b"a\nb\n"));
+            assert_eq!(oracle.status.code(), Some(0));
+            assert_eq!(oracle.stdout, b"1\n");
+            let mut actual_args = vec!["grep"];
+            actual_args.extend(&args);
+            let actual = fixture.ferret(&actual_args, Some(b"a\nb\n"));
+            assert_eq!(actual.status.code(), Some(0));
+            assert_eq!(
+                actual.stdout,
+                if include { b"0\n".as_slice() } else { b"" },
+                "{args:?}"
+            );
+            assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+        }
+    }
+}
+
+#[test]
+fn m7_r1_text_mode_requires_a_match_after_nul_through_the_multiline_reader() {
+    let fixture = Fixture::new("m7-r1-text-after-nul");
+    let bytes = b"before\0stop\nred\nblue\n";
+    let output = fixture.compare_raw(&["-Uaon", r"red\nblue", "-"], Some(bytes));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"2:red\n3:blue\n");
+    fixture.write("m7-post-nul", bytes);
+    fixture.compare_raw(&["-Uaon", r"red\nblue", "m7-post-nul"], None);
+    fixture.compare_raw(
+        &["-Uaon", "-u", "-g", "m7-post-nul", r"red\nblue", "."],
+        None,
+    );
+    let stopped_at_nul = fixture.ferret(&["grep", "-Uon", r"red\nblue", "-"], Some(bytes));
+    assert_eq!(stopped_at_nul.status.code(), Some(1));
+    assert!(stopped_at_nul.stdout.is_empty());
+}
