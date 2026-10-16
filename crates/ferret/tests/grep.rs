@@ -2462,3 +2462,44 @@ fn m6_live_policy_faults_never_establish_zero_or_no_match() {
     }
     fixture.live_oracle(&["--live", "-u", "red", "."], None);
 }
+
+// M6 audit: a NUL beyond the 8 KiB indexing probe is still inside rg's first
+// recursive read. Early -l/-q must not publish a match before detecting it.
+#[test]
+fn m6_unrestricted_binary_probe_covers_the_initial_scan_window() {
+    let fixture = Fixture::new("unrestricted-late-nul");
+    fs::create_dir(fixture.tree().join("late-nul")).unwrap();
+    let mut bytes = b"red\n".to_vec();
+    bytes.extend_from_slice(&b"blue\n".repeat(6400));
+    bytes.extend_from_slice(b"\0red\n");
+    fixture.write("late-nul/sample", &bytes);
+    for flags in [
+        vec![],
+        vec!["-l"],
+        vec!["-q"],
+        vec!["-c"],
+        vec!["--count-matches"],
+        vec!["-o"],
+        vec!["-c", "--include-zero"],
+    ] {
+        let mut args = vec!["-u"];
+        args.extend(flags);
+        args.extend(["red", "late-nul"]);
+        assert_eq!(fixture.compare(&args, None).status.code(), Some(1));
+        args.insert(0, "-a");
+        assert_eq!(fixture.compare(&args, None).status.code(), Some(0));
+    }
+    fixture.compare(&["-ul", "red", "late-nul/sample"], None);
+    // Recursive binary absence is the written policy, including exit status.
+    // rg's --files-without-match returns 0 with no record here; ferret's
+    // absent input produces no record and no selected name, hence exit 1.
+    let rg = fixture.oracle(&["-u", "--files-without-match", "red", "late-nul"], None);
+    let own = fixture.ferret(
+        &["grep", "-u", "--files-without-match", "red", "late-nul"],
+        None,
+    );
+    assert_eq!(rg.status.code(), Some(0));
+    assert!(rg.stdout.is_empty());
+    assert_eq!(own.status.code(), Some(1));
+    assert!(own.stdout.is_empty() && own.stderr.is_empty());
+}

@@ -286,7 +286,16 @@ argv position: first disable ignores, second reveal hidden paths, third refuse.
 `--ignore` reverses the ignore bypass without resetting the `-u` count or the
 hidden switch. `--no-text` reverses `-a` / `--text`. Unrestricted content
 retains recursive binary sniffing unless text mode is requested, but has no
-indexing size cap and needs no index. `--max-depth` is relative to each explicit
+indexing size cap and needs no index. **M6 audit correction (2026-10-17):**
+unrestricted recursion probes the initial 64 KiB scan window for NUL before
+allowing early name/quiet matches, matching rg on a NUL beyond D13's 8 KiB
+indexing probe. This is one buffered read, reused for scanning; explicit inputs
+retain their existing streaming rule, and policy-controlled walks retain D13's
+sniffer. Later unread bytes need not be checked after an early result.
+`--files-without-match` over only a skipped recursive binary remains an
+intentional binary-policy difference: ferret's absent input yields exit 1 and
+no name; rg can yield exit 0 without a name. No selected name is invented.
+`--max-depth` is relative to each explicit
 start (depth zero); depth zero prunes directory contents but still searches
 explicit file operands. Names-only applies depth and visibility without content
 reads. Explicit directory symlinks follow the start only in every mode. `--files` reuses find's

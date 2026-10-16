@@ -222,8 +222,22 @@ pub(super) fn read_file(
         cap,
         &mut |input, size| {
             if recursive && !plan.text {
-                let mut buffered = io::BufReader::with_capacity(ferret_policy::SNIFF_LEN, input);
-                if ferret_policy::sniff(buffered.fill_buf()?) == ferret_policy::Content::Binary {
+                // Unrestricted recursion follows rg's initial scan-window
+                // binary gate, including early quiet/name modes. Policy walks
+                // retain D13's indexing sniffer; explicit files bypass both.
+                let probe = if plan.traversal.unrestricted {
+                    CHUNK
+                } else {
+                    ferret_policy::SNIFF_LEN
+                };
+                let mut buffered = io::BufReader::with_capacity(probe, input);
+                let head = buffered.fill_buf()?;
+                let binary = if plan.traversal.unrestricted {
+                    head.contains(&0)
+                } else {
+                    ferret_policy::sniff(head) == ferret_policy::Content::Binary
+                };
+                if binary {
                     return Ok(());
                 }
                 each(&mut buffered, size)
