@@ -8,6 +8,7 @@ use ferret_policy::{Config, Decision, DirRules, Entry as PolicyEntry};
 use ferret_query::find::Entry;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Component;
 use std::sync::Arc;
 
 // Linux open flags, as in the other std-only CLI filesystem hosts. Opening
@@ -46,7 +47,12 @@ impl Anchors {
                 Ok(root) => roots.push(root),
                 // Stored roots retain symlink spellings. Even failed anchors
                 // need the same namespace as canonicalized operands.
-                Err(error) => faults.push((failed_scope(path).map_err(|e| e.to_string())?, error)),
+                Err(error) => faults.push((
+                    failed_scope(path).map_err(|e| {
+                        format!("cannot resolve policy root {}: {e}", path.display())
+                    })?,
+                    error,
+                )),
             }
         }
         roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
@@ -135,18 +141,60 @@ impl Anchors {
     }
 }
 
-// Resolve aliases above an unavailable anchor without requiring its tail to
-// exist or be accessible. Catalog root paths are absolute and contain no `..`.
+// read_link expands aliases even when their targets have disappeared.
+// Missing components have no aliases to resolve; an unreadable component or
+// a link loop leaves the destination unknown and must fail closed.
 fn failed_scope(path: &Path) -> io::Result<PathBuf> {
-    for ancestor in path.ancestors().skip(1) {
-        if let Ok(real) = fs::canonicalize(ancestor) {
-            return Ok(real.join(path.strip_prefix(ancestor).map_err(io::Error::other)?));
+    let mut resolved = PathBuf::new();
+    let mut pending = vec![path.to_owned()];
+    let mut links = 0;
+    while let Some(part) = pending.pop() {
+        let mut components = part.components();
+        while let Some(component) = components.next() {
+            match component {
+                Component::RootDir => resolved.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    resolved.pop();
+                }
+                Component::Normal(name) => {
+                    let candidate = resolved.join(name);
+                    match fs::read_link(&candidate) {
+                        Ok(target) => {
+                            links += 1;
+                            if links > 40 {
+                                return Err(io::Error::other(
+                                    "policy root exceeds 40 symlink expansions",
+                                ));
+                            }
+                            pending.push(components.as_path().to_owned());
+                            pending.push(target);
+                            break;
+                        }
+                        // readlink's EINVAL means this component is not a link.
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::InvalidInput
+                                    | io::ErrorKind::NotFound
+                                    | io::ErrorKind::NotADirectory
+                            ) =>
+                        {
+                            resolved.push(name)
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "policy root has a non-Unix prefix",
+                    ));
+                }
+            }
         }
     }
-    Err(io::Error::other(format!(
-        "policy root {} has no resolvable ancestor",
-        path.display()
-    )))
+    Ok(resolved)
 }
 
 fn global() -> Result<Arc<str>, String> {
@@ -348,6 +396,36 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise the production resolver at both sides of its expansion bound,
+    // including absolute targets, relative targets and parent components.
+    #[test]
+    fn failed_scope_expands_forty_links_but_rejects_forty_one() {
+        let base =
+            std::env::temp_dir().join(format!("ferret-live-link-limit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("sub")).unwrap();
+        for index in 0..40 {
+            let target = match index {
+                0 => base.join("link-1"),
+                39 => PathBuf::from("sub/../missing"),
+                _ => PathBuf::from(format!("link-{}", index + 1)),
+            };
+            std::os::unix::fs::symlink(target, base.join(format!("link-{index}"))).unwrap();
+        }
+        assert_eq!(
+            failed_scope(&base.join("link-0/child")).unwrap(),
+            base.join("missing/child")
+        );
+        std::os::unix::fs::symlink("link-0", base.join("extra")).unwrap();
+        assert!(
+            failed_scope(&base.join("extra/child"))
+                .unwrap_err()
+                .to_string()
+                .contains("40 symlink expansions")
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn live_roots_and_policy_walk_leave_traversal_and_content_sections_unloaded() {

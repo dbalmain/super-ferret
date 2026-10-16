@@ -215,15 +215,20 @@ content sections unloaded, proved through the production lazy section cells.
 It resolves the existing thread setting without opening Engine.
 
 **Review correction (2026-10-17):** a failed configured-root resolution is
-reported only for a requested scope containing that root or contained by it.
-An inaccessible unrelated root does not abort a healthy-root query. Relevant
-anchor failures still prevent both line and names output for that scope.
+reported for a requested scope containing that root or contained by it. A
+provably unrelated failed root does not abort a healthy-root query. Relevant
+anchor failures prevent both line and names output for that scope.
 
-**Review round 2 correction (2026-10-17):** stored root paths can retain symlink
-spellings. Relevance uses the canonical namespace for operands and anchors;
-when an anchor cannot be fully resolved, canonicalize its longest resolvable
-ancestor and append the remaining components. A missing nested root reached
-through a symlink therefore remains relevant through either operand spelling.
+**Review round 3 correction (2026-10-17):** stored root paths can retain symlink
+spellings. Relevance uses expanded paths for operands and anchors. Walking
+spelled ancestors (round 2's approach) misses dangling symlink targets: failed
+anchors instead expand links component by component with `read_link`, including
+relative/absolute targets and parent components, with at most 40 expansions.
+Missing components retain their destination spelling. If a component cannot be
+inspected, or expansion exceeds the bound, the destination is unknown: treat
+the failure as relevant, with empty stdout and exit 2. This deliberately fails
+closed even for an otherwise healthy operand whose independence cannot be
+established; it supersedes round 1's inaccessible-unrelated-root exception.
 
 Nested configured roots reset policy when reached or explicitly selected;
 they do not revive an ancestor already pruned by policy or grep filters. This

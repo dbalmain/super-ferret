@@ -2561,45 +2561,56 @@ fn m6_live_oversized_policy_is_a_fault() {
     }
 }
 
-// Resolving an inaccessible root used to abort queries outside its scope.
-// An ancestor query includes that failed anchor and must still fail.
+// Known unrelated root failures stay isolated. An unreadable component can
+// hide a symlink to any scope, so its unknown destination must fail closed.
 #[test]
 fn m6_live_anchor_faults_are_scoped_to_requested_roots() {
-    let fixture = Fixture::new("live-root-faults");
-    fs::create_dir(fixture.tree().join("healthy")).unwrap();
-    fs::create_dir_all(fixture.tree().join("private/other")).unwrap();
-    fixture.write("healthy/hit", b"red\n");
-    fixture.write("private/other/hit", b"red\n");
-    let indexed = fixture.ferret(&["index", "healthy", "private/other"], None);
-    assert!(indexed.status.success(), "{indexed:?}");
-    let private = fixture.tree().join("private");
-    fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
-    // Restore permissions before assertions, including when a CLI regresses.
-    let results = [
-        vec!["grep", "--live", "red", "healthy"],
-        vec!["grep", "--live", "--files", "healthy"],
-        vec!["grep", "--live", "red", "private/other"],
-        vec!["grep", "--live", "--files", "private/other"],
-        vec!["grep", "--live", "red", "."],
-        vec!["grep", "--live", "--files", "."],
-    ]
-    .map(|args| fixture.ferret(&args, None));
-    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
-    for (result, expected) in results[..2]
-        .iter()
-        .zip([&b"healthy/hit:red\n"[..], &b"healthy/hit\n"[..]])
-    {
-        assert_eq!(result.status.code(), Some(0), "{result:?}");
-        assert_eq!(result.stdout, expected, "{result:?}");
-        assert!(result.stderr.is_empty(), "{result:?}");
-    }
-    for result in &results[2..] {
-        assert_eq!(result.status.code(), Some(2), "{result:?}");
-        assert!(result.stdout.is_empty(), "{result:?}");
-        assert!(
-            String::from_utf8_lossy(&result.stderr).contains("Permission denied"),
-            "{result:?}"
-        );
+    for denied in [false, true] {
+        let fixture = Fixture::new(&format!("live-root-faults-{denied}"));
+        fs::create_dir(fixture.tree().join("healthy")).unwrap();
+        fs::create_dir_all(fixture.tree().join("private/other")).unwrap();
+        fixture.write("healthy/hit", b"red\n");
+        fixture.write("private/other/hit", b"red\n");
+        let indexed = fixture.ferret(&["index", "healthy", "private/other"], None);
+        assert!(indexed.status.success(), "{indexed:?}");
+        let private = fixture.tree().join("private");
+        if denied {
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+        } else {
+            fs::remove_dir_all(&private).unwrap();
+        }
+        // Restore permissions before assertions, including when a CLI
+        // regresses.
+        let results = [
+            vec!["grep", "--live", "red", "healthy"],
+            vec!["grep", "--live", "--files", "healthy"],
+            vec!["grep", "--live", "red", "private/other"],
+            vec!["grep", "--live", "--files", "private/other"],
+            vec!["grep", "--live", "red", "."],
+            vec!["grep", "--live", "--files", "."],
+        ]
+        .map(|args| fixture.ferret(&args, None));
+        if denied {
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if !denied {
+            for (result, expected) in results[..2]
+                .iter()
+                .zip([&b"healthy/hit:red\n"[..], &b"healthy/hit\n"[..]])
+            {
+                assert_eq!(result.status.code(), Some(0), "{result:?}");
+                assert_eq!(result.stdout, expected, "{result:?}");
+                assert!(result.stderr.is_empty(), "{result:?}");
+            }
+        }
+        let failures = if denied { &results[..] } else { &results[2..] };
+        for result in failures {
+            assert_eq!(result.status.code(), Some(2), "{result:?}");
+            assert!(
+                result.stdout.is_empty() && !result.stderr.is_empty(),
+                "{result:?}"
+            );
+        }
     }
 }
 
@@ -2641,6 +2652,92 @@ fn m6_live_failed_roots_resolve_symlink_ancestors() {
             assert_eq!(output.status.code(), Some(0), "{output:?}");
             assert!(
                 !output.stdout.is_empty() && output.stderr.is_empty(),
+                "{output:?}"
+            );
+        }
+    }
+}
+
+// Round 3: remove the symlink's target itself, not just a child below it.
+// The failed anchor must still overlap the surviving physical ancestor.
+#[test]
+fn m6_live_dangling_target_keeps_failed_root_relevant() {
+    let fixture = Fixture::new("live-dangling-root-target");
+    fs::create_dir_all(fixture.tree().join("policy-real/gone/child")).unwrap();
+    fixture.write("policy-real/hit", b"red\n");
+    symlink("policy-real/gone", fixture.tree().join("policy-link")).unwrap();
+    let indexed = fixture.ferret(&["index", "policy-real", "policy-link/child"], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    fs::remove_dir_all(fixture.tree().join("policy-real/gone")).unwrap();
+    let outputs = [
+        fixture.ferret(&["grep", "--live", "red", "policy-real"], None),
+        fixture.ferret(&["grep", "--live", "--files", "policy-real"], None),
+    ];
+    for output in outputs {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            output.stdout.is_empty() && !output.stderr.is_empty(),
+            "{output:?}"
+        );
+    }
+}
+
+// An alias can enter a private directory before its destination is known.
+// Even an apparently unrelated operand cannot rule that destination out.
+#[test]
+fn m6_live_symlink_target_inside_unreadable_ancestor_fails_closed() {
+    let fixture = Fixture::new("live-symlink-private-target");
+    fs::create_dir_all(fixture.tree().join("policy-real/private/gone/child")).unwrap();
+    fixture.write("policy-real/hit", b"red\n");
+    symlink(
+        "policy-real/private/gone",
+        fixture.tree().join("policy-link"),
+    )
+    .unwrap();
+    let indexed = fixture.ferret(&["index", "policy-real", "policy-link/child"], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    let private = fixture.tree().join("policy-real/private");
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+    let outputs = [
+        fixture.ferret(&["grep", "--live", "red", "policy-real"], None),
+        fixture.ferret(&["grep", "--live", "--files", "policy-real"], None),
+        fixture.ferret(&["grep", "--live", "red", "sub"], None),
+        fixture.ferret(&["grep", "--live", "--files", "sub"], None),
+    ];
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    for output in outputs {
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot resolve policy root"),
+            "{output:?}"
+        );
+    }
+}
+
+// A loop on an anchor's path must terminate and preserve the failure instead
+// of falling back past the alias and declaring it unrelated.
+#[test]
+fn m6_live_symlink_loop_on_anchor_path_fails_closed() {
+    let fixture = Fixture::new("live-symlink-loop-anchor");
+    fs::create_dir_all(fixture.tree().join("policy-real/gone/child")).unwrap();
+    fixture.write("policy-real/hit", b"red\n");
+    symlink("policy-real/gone", fixture.tree().join("policy-link")).unwrap();
+    let indexed = fixture.ferret(&["index", "policy-real", "policy-link/child"], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    fs::remove_file(fixture.tree().join("policy-link")).unwrap();
+    symlink("policy-loop", fixture.tree().join("policy-link")).unwrap();
+    symlink("policy-link", fixture.tree().join("policy-loop")).unwrap();
+    for operand in ["policy-real", "sub"] {
+        for flags in [vec!["red"], vec!["--files"]] {
+            let mut args = vec!["grep", "--live"];
+            args.extend(flags);
+            args.push(operand);
+            let output = fixture.ferret(&args, None);
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("40 symlink expansions"),
                 "{output:?}"
             );
         }
