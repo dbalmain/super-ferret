@@ -204,6 +204,15 @@ So under `(?i)`, no unit is ever safe. Case-sensitively, 7 of 50 rare literals
 get a safe unit (6 exact, 2 prefix, mostly digit-split units). The identifier,
 alternation, broad and code classes get none.
 
+Case-sensitively, they are sound only for **lowercase** literals. The first
+reason above applies in both modes: `required_literals` folds even a
+case-sensitive pattern's facts, so `foo123BAR` yields the fact `foo123bar` and
+a prefix lookup on `bar`, while a document holding `foo123BARq` tokenizes to
+`foo`, `123`, `ba`, `rq` and is missed. No measured row is affected: none of the
+50 rare literals contains an uppercase letter, and the other classes get no
+units. A bench reusing the unit rules on mixed-case literals would need the
+facts' original case first.
+
 The cause is the seeds themselves:
 
 - They are plain terms, `[a-z][a-z0-9]*`.

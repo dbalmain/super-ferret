@@ -148,7 +148,8 @@ fn from_need(need: &Need) -> Plan {
 }
 
 /// How the term screen reads a literal: the brief's units (exact and
-/// prefix lookups, sound only case-sensitive), substrings of whole terms
+/// prefix lookups, sound only case-sensitive and only for lowercase
+/// literals, since the facts arrive folded), substrings of whole terms
 /// (sound in either case), or both.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lookups {
@@ -924,8 +925,9 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
     let mut private = String::new();
     let empty = DocSet::new(corpus.live.bound(), []);
     let wants = |arm: &str| arms.contains(&arm);
-    // The brief's unit rules are sound only case-sensitive; substrings of
-    // whole terms are sound either way.
+    // The brief's unit rules are sound only case-sensitive, and only for
+    // lowercase literals since the facts arrive folded (every rare seed is);
+    // substrings of whole terms are sound either way.
     let lookups = if flags.case_insensitive {
         Lookups::Substrings
     } else {
