@@ -87,7 +87,7 @@ impl Render<'_> {
             && self.plan.presentation.heading == Some(true)
             && let Some(prefix) = self.prefix
         {
-            output.write_all(prefix)?;
+            presentation::path(&self.plan.presentation, &mut output, prefix)?;
             output.write_all(if self.plan.presentation.null {
                 b"\0"
             } else {
@@ -108,7 +108,7 @@ impl Render<'_> {
         if self.plan.presentation.heading != Some(true)
             && let Some(prefix) = self.prefix
         {
-            output.write_all(prefix)?;
+            presentation::path(&self.plan.presentation, &mut output, prefix)?;
             output.write_all(if self.plan.presentation.null {
                 b"\0"
             } else {
@@ -116,10 +116,10 @@ impl Render<'_> {
             })?;
         }
         if self.plan.line_number {
-            write!(output, "{}", line.number)?;
+            presentation::number(&self.plan.presentation, &mut output, line.number)?;
             output.write_all(delimiter)?;
         }
-        output.write_all(line.bytes)?;
+        presentation::text(self.plan, &mut output, line)?;
         output.write_all(b"\n")
     }
 

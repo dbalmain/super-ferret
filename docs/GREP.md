@@ -407,10 +407,24 @@ rendering; and limit, clipping, counting and output behavior.
 Pipe defaults: no colour, no heading, no line numbers, filename prefixes for
 recursive/multiple operands; one explicit file/stdin omits its filename. Tty
 defaults: colour, headings and line numbers. Overrides follow rg, including
-single-file heading suppression unless filenames are forced. M1 supplies plain
-output and refuses colour requests other than never; tty fidelity finishes M5.
-Colour mode/environment selection is matched; exact ANSI reset placement and
-hyperlinks are not promised. Files finish in any order; their groups do not
+single-file heading suppression unless filenames are forced. **M5 completion
+(2026-10-17):** stdout's actual terminal state selects those defaults. `-p` /
+`--pretty` sets heading, line numbers and always-colour in argv order; later
+switches can override each. `--color=auto` emits colour only to a tty, unless
+`NO_COLOR` is present (including empty) or `TERM=dumb`; `always` and `ansi`
+override those environment settings. Pipe auto-colour remains off.
+
+M5 matches rg's default ANSI palette and resets: paths use
+`ESC[0m ESC[35m`, numbers `ESC[0m ESC[32m`, and each nonempty match
+`ESC[0m ESC[1m ESC[31m`, each closed by `ESC[0m` (spaces here separate
+escapes, not output bytes). Separators and ordinary/context text stay plain;
+regex matches within context are highlighted. Empty spans have no escapes.
+Count numbers stay plain; count/name/files paths use the path palette.
+Owned tests compare these bytes exactly through pipes and real ptys, including
+NUL prefixes and heading/context groups. Other terminal capabilities, custom
+palettes and hyperlinks are outside this tier; exact escape placement remains
+an accepted-difference class, with no such difference found in M5's covered
+profiles. Files finish in any order; their groups do not
 interleave. Reuse find's bounded output/spill machinery where grouping needs it.
 
 **M2 output overrides (confirmed 2026-10-17):** the last `-l`/`-c` selects
@@ -419,7 +433,7 @@ name or count output; `-q` independently overrides both, in either argv order.
 nonmatching lines. `--no-fixed-strings` and `--no-invert-match` undo those
 switches. Do not invent negations rg does not accept (`--no-quiet`,
 `--no-only-matching`, `--no-count`, `--no-ignore-case`). Case-sensitive `-s` / `--case-sensitive` belongs to M4; line-number negation
-remains M5. **M4 probe (2026-10-17):** rg has no `--no-word-regexp` or
+was completed in M5. **M4 probe (2026-10-17):** rg has no `--no-word-regexp` or
 `--no-line-regexp`; those spellings refuse. Whole-word and whole-line switches
 override one another in argv order.
 

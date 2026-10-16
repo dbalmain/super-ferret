@@ -38,6 +38,31 @@ pub struct Presentation {
     pub heading: Option<bool>,
     pub numbers: Option<bool>,
     pub null: bool,
+    pub color: Color,
+}
+
+/// The host resolves Auto from its real terminal and environment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Color {
+    #[default]
+    Auto,
+    Never,
+    Always,
+    Ansi,
+}
+
+impl Color {
+    pub fn enabled(self) -> bool {
+        matches!(self, Self::Always | Self::Ansi)
+    }
+}
+
+impl Presentation {
+    fn pretty(&mut self) {
+        self.heading = Some(true);
+        self.numbers = Some(true);
+        self.color = Color::Always;
+    }
 }
 
 /// The resolved line-output profile. Unsupported flags are rejected while
@@ -213,6 +238,10 @@ pub fn parse_with(
                 "--heading" if value.is_none() => presentation.heading = Some(true),
                 "--no-heading" if value.is_none() => presentation.heading = Some(false),
                 "--null" if value.is_none() => presentation.null = true,
+                "--pretty" if value.is_none() => {
+                    presentation.pretty();
+                    line_number = true;
+                }
                 "--quiet" if value.is_none() => quiet = true,
                 "--hidden" if value.is_none() => hidden = true,
                 "--no-hidden" if value.is_none() => hidden = false,
@@ -281,8 +310,15 @@ pub fn parse_with(
                         }
                         "--glob" => globs.push(value),
                         "--regexp" => sources.push(PatternSource::Argument(value)),
-                        _ if value != "never" => return Err(unsupported(text)),
-                        _ => {}
+                        _ => {
+                            presentation.color = match value.as_str() {
+                                "auto" => Color::Auto,
+                                "never" => Color::Never,
+                                "always" => Color::Always,
+                                "ansi" => Color::Ansi,
+                                _ => return Err(unsupported(text)),
+                            }
+                        }
                     }
                 }
                 _ => return Err(unsupported(text)),
@@ -301,6 +337,10 @@ pub fn parse_with(
                     b'H' => presentation.filename = Some(true),
                     b'I' => presentation.filename = Some(false),
                     b'0' => presentation.null = true,
+                    b'p' => {
+                        presentation.pretty();
+                        line_number = true;
+                    }
                     b'q' => quiet = true,
                     b'.' => hidden = true,
                     b'i' => {

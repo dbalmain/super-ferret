@@ -316,7 +316,6 @@ fn unsupported_tiers_refuse_before_output() {
         "-r",
         "--json",
         "-j2",
-        "--color=always",
         "--no-quiet",
     ] {
         let output = fixture.ferret(&["grep", flag, "red", "."], None);
@@ -1677,6 +1676,8 @@ fn m5_context_gaps_overlap_adjacency_and_long_spills() {
     bytes.extend_from_slice(&b"after\n".repeat(20_000));
     fixture.write("spilled", &bytes);
     fixture.compare_raw(&["-nC25000", "red", "spilled"], None);
+    fixture.compare_raw(&["--color=always", "-HnC1", "red", "groups"], None);
+    fixture.compare_raw(&["--color=always", "-nC25000", "red", "spilled"], None);
 }
 
 #[test]
@@ -1696,4 +1697,208 @@ fn m5_before_context_spill_failure_stops_the_command() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(output.stdout.is_empty(), "a later group was published");
     assert!(String::from_utf8_lossy(&output.stderr).contains("output spill"));
+}
+
+// M5: these comparisons attach each child to a real pty. The helper captures
+// its terminal bytes (including the tty's LF-to-CRLF processing) unchanged.
+#[derive(Debug)]
+struct TerminalOutput {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl Fixture {
+    fn terminal(
+        &self,
+        args: &[&str],
+        environment: &[(&str, &str)],
+        candidate: bool,
+    ) -> TerminalOutput {
+        let python = std::env::var_os("FERRET_PYTHON")
+            .unwrap_or_else(|| panic!("nix develop supplies Python for real-pty comparisons"));
+        let mut command = self.command(&python);
+        command
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/grep_pty.py"
+            ))
+            .env("TERM", "xterm-256color");
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        if candidate {
+            command
+                .arg(env!("CARGO_BIN_EXE_ferret"))
+                .arg("--index")
+                .arg(self.base.join("index"))
+                .arg("grep");
+        } else {
+            command.arg(std::env::var_os("FERRET_RG").unwrap_or_else(|| panic!("pinned oracle")));
+        }
+        command.args(args);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "pty driver failed: {output:?}");
+        let bytes = &output.stdout;
+        let code = i32::from_be_bytes(bytes[..4].try_into().unwrap());
+        let size = u64::from_be_bytes(bytes[4..12].try_into().unwrap()) as usize;
+        TerminalOutput {
+            code,
+            stdout: bytes[12..12 + size].to_vec(),
+            stderr: bytes[12 + size..].to_vec(),
+        }
+    }
+    fn compare_terminal(&self, args: &[&str], environment: &[(&str, &str)]) -> TerminalOutput {
+        let expected = self.terminal(args, environment, false);
+        let actual = self.terminal(args, environment, true);
+        assert_eq!(
+            actual.code, expected.code,
+            "{args:?} {environment:?}: {actual:?} vs {expected:?}"
+        );
+        assert_eq!(actual.stdout, expected.stdout, "{args:?} {environment:?}");
+        assert_eq!(
+            actual.stderr.is_empty(),
+            expected.stderr.is_empty(),
+            "{args:?} {environment:?}"
+        );
+        actual
+    }
+}
+
+#[test]
+fn m5_real_terminal_matrix() {
+    let fixture = Fixture::new("tty-matrix");
+    let profiles: &[&[&str]] = &[
+        &[],
+        &["-N"],
+        &["-n"],
+        &["--no-heading"],
+        &["--heading"],
+        &["-I"],
+        &["-H"],
+        &["--color=never"],
+        &["--color=auto"],
+        &["--color=always"],
+        &["--color=ansi"],
+        &["-p"],
+        &["--pretty"],
+        &["-p", "-N", "--no-heading", "--color=never"],
+        &["--color=never", "-p"],
+        &["-nN"],
+        &["-Nn"],
+        &["-H0"],
+        &["-l"],
+        &["-c"],
+        &["--count-matches"],
+        &["--files"],
+        &["-HnC1"],
+        &["-vonC1"],
+        &["-m1", "-A2"],
+        &["-q"],
+    ];
+    for &profile in profiles {
+        for multiple in [false, true] {
+            let mut args = profile.to_vec();
+            if !args.contains(&"--files") {
+                args.push("red");
+            }
+            args.push("one.rs");
+            if multiple {
+                args.push("one.rs");
+            }
+            assert_eq!(fixture.compare_terminal(&args, &[]).code, 0);
+        }
+    }
+    for environment in [
+        vec![("TERM", "dumb")],
+        vec![("TERM", "")],
+        vec![("NO_COLOR", "1")],
+        vec![("NO_COLOR", "")],
+        vec![("TERM", "dumb"), ("NO_COLOR", "1")],
+    ] {
+        for color in [
+            "--color=auto",
+            "--color=always",
+            "--color=ansi",
+            "--color=never",
+        ] {
+            fixture.compare_terminal(&[color, "-H", "red", "one.rs"], &environment);
+        }
+    }
+    // Recursive defaults, including the filename heading, use the real catalog.
+    fixture.compare_terminal(&["red", "sub"], &[]);
+    fixture.compare_terminal(&["violet", "one.rs"], &[]);
+}
+
+profile_cases! {
+    m5_color_match: 0 => @raw ["--color=always", "-Hn", "red", "one.rs"];
+    m5_color_ansi: 0 => @raw ["--color=ansi", "-Hn", "red", "one.rs"];
+    m5_color_auto_pipe: 0 => @raw ["--color=auto", "-Hn", "red", "one.rs"];
+    m5_color_never: 0 => @raw ["--color=never", "-Hn", "red", "one.rs"];
+    m5_color_empty: 0 => @raw ["--color=always", "-no", "", "one.rs"];
+    m5_color_word_fragment: 0 => @raw ["--color=always", "-won", "red", "one.rs"];
+    m5_color_line_fragment: 0 => @raw ["--color=always", "-xon", "red red", "one.rs"];
+    m5_color_context: 0 => @raw ["--color=always", "-HnC1", "red", "one.rs"];
+    m5_color_inverted_context: 0 => @raw ["--color=always", "-vonC1", "red", "one.rs"];
+    m5_color_count: 0 => @raw ["--color=always", "-Hc", "red", "one.rs"];
+    m5_color_names: 0 => @raw ["--color=always", "-l0", "red", "one.rs"];
+    m5_color_files: 0 => @raw ["--color=always", "--files", "-0", "one.rs"];
+    m5_color_null_heading: 0 => @raw ["--color=always", "--heading", "-H0", "red", "one.rs"];
+    m5_pretty_pipe: 0 => @raw ["-p", "red", "one.rs"];
+    m5_pretty_long_pipe: 0 => @raw ["--pretty", "red", "one.rs"];
+    m5_pretty_color_override: 0 => @raw ["-p", "--color=never", "red", "one.rs"];
+    m5_pretty_overrides_color: 0 => @raw ["--color=never", "-p", "red", "one.rs"];
+    m5_pretty_absent: 1 => @raw ["-p", "violet", "one.rs"];
+    m5_color_absent: 1 => @raw ["--color=always", "violet", "one.rs"];
+    m5_color_bad: 2 => @raw ["--color=rainbow", "red", "one.rs"];
+}
+
+#[test]
+fn m5_null_name_records_preserve_newlines_and_distinct_paths() {
+    let fixture = Fixture::new("nul-records");
+    fixture.write("with\nnewline", b"red\n");
+    for args in [
+        vec!["--files", "-0", "one.rs", "with\nnewline", "two.txt"],
+        vec!["-l0", "red", "one.rs", "with\nnewline", "two.txt"],
+        vec![
+            "--files-without-match",
+            "-0",
+            "red",
+            "one.rs",
+            "with\nnewline",
+            "two.txt",
+        ],
+    ] {
+        let expected = fixture.oracle(&args, None);
+        let mut candidate = vec!["grep"];
+        candidate.extend_from_slice(&args);
+        let actual = fixture.ferret(&candidate, None);
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stderr.is_empty(), expected.stderr.is_empty());
+        let split = |bytes: &[u8]| {
+            let mut records: Vec<_> = bytes.split(|&byte| byte == 0).map(<[u8]>::to_vec).collect();
+            records.sort();
+            records
+        };
+        assert_eq!(split(&actual.stdout), split(&expected.stdout));
+        assert_eq!(actual.stdout.last(), Some(&0));
+    }
+}
+
+#[test]
+fn m5_discarded_history_does_not_force_a_small_context_window_to_spill() {
+    let fixture = Fixture::new("small-context-window");
+    let mut bytes = b"blue\n".repeat(20_000);
+    bytes.extend_from_slice(b"red\n");
+    fixture.write("long-history", &bytes);
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .arg("--index")
+        .arg(fixture.base.join("index"))
+        .args(["grep", "-B1", "red", "long-history"])
+        .env("TMPDIR", fixture.base.join("unavailable-spill-dir"));
+    let output = run(command, None);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"blue\nred\n");
+    assert!(output.stderr.is_empty());
 }

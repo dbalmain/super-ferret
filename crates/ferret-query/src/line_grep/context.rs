@@ -47,6 +47,16 @@ impl<'a> Before<'a> {
         if self.limit == 0 {
             return Ok(());
         }
+        // Reclaim discarded in-memory records before they can force a spill.
+        // Small -B windows must not create one temporary file per 64 KiB of
+        // history that no longer belongs to the window.
+        let incoming = 16_u64.saturating_add(bytes.len() as u64);
+        if self.head > 0
+            && self.store.len().saturating_add(incoming) > 64 << 10
+            && (self.store.len() - self.head).saturating_add(incoming) <= 64 << 10
+        {
+            self.compact()?;
+        }
         self.append(&number.to_le_bytes())?;
         self.append(&(bytes.len() as u64).to_le_bytes())?;
         self.append(bytes)?;
@@ -57,16 +67,20 @@ impl<'a> Before<'a> {
             self.count -= 1;
         }
         if self.head > 64 << 10 && self.head > self.store.len() / 2 {
-            let mut compact = OutputBuffer::default();
-            self.store.read_range(
-                self.head,
-                self.store.len() - self.head,
-                &mut compact,
-                self.stopped,
-            )?;
-            self.store = compact;
-            self.head = 0;
+            self.compact()?;
         }
+        Ok(())
+    }
+    fn compact(&mut self) -> io::Result<()> {
+        let mut compact = OutputBuffer::default();
+        self.store.read_range(
+            self.head,
+            self.store.len() - self.head,
+            &mut compact,
+            self.stopped,
+        )?;
+        self.store = compact;
+        self.head = 0;
         Ok(())
     }
     pub fn emit(&mut self, emit: &mut impl FnMut(Line<'_>) -> io::Result<()>) -> io::Result<()> {

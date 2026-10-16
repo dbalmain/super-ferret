@@ -30,7 +30,8 @@
     in {
       packages.${system} = { inherit rustfmt fmt findutils; };
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ findutils ];
+        packages = [ findutils pkgs.python3 ];
+        FERRET_PYTHON = "${pkgs.python3}/bin/python3";
         FERRET_RG = "${ripgrep}/bin/rg";
         FERRET_GNU_FIND = "${findutils}/bin/find";
       };

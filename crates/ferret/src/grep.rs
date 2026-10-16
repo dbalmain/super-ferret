@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod groups;
 mod names;
+mod presentation;
 
 use ferret_catalog::NameId;
 use ferret_policy::GrepSelection;
@@ -44,7 +45,13 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -m, --max-count N   stop after N selected lines per file\n\
   --files            list selected file names without reading contents\n\
   --hidden, -.       include held hidden files and directories\n\
-  --color=never      plain output\n\
+  -A/-B/-C N         after/before/around context\n\
+  -H/-I              force/suppress filenames\n\
+  --heading/--no-heading group matches by file\n\
+  -N, --no-line-number suppress line numbers\n\
+  -0, --null         NUL-terminate filenames\n\
+  -p, --pretty       colour, headings and line numbers\n\
+  --color MODE       auto/always/ansi/never\n\
   --scan             accepted; broad patterns always scan\n\n\
 Directories use snapshot names/postings and current candidate bytes.\n\
 An index covering each directory is required; trigrams are optional.\n\
@@ -67,15 +74,16 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         Ok(command) => command,
         Err(error) => return failure(&error.to_string()),
     };
-    let plan = match command {
+    let mut plan = match command {
         line_grep::Command::Help => return print(HELP.as_bytes()),
         line_grep::Command::Version => {
             return print(format!("ferret grep {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
         }
-        line_grep::Command::Files(plan) => {
+        line_grep::Command::Files(mut plan) => {
             if let Some(exit) = context_error(global_json) {
                 return exit;
             }
+            presentation::resolve(&mut plan.presentation);
             return names::run(&plan, index);
         }
         line_grep::Command::Search(plan) => plan,
@@ -83,6 +91,8 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     if let Some(exit) = context_error(global_json) {
         return exit;
     }
+    let tty = presentation::resolve(&mut plan.presentation);
+    plan.line_number = plan.presentation.numbers.unwrap_or(tty);
     let mut selection = GrepSelection::default().with_hidden(plan.hidden);
     for glob in &plan.globs {
         if let Err(error) = selection.push(glob) {
@@ -446,8 +456,11 @@ impl<W: Write> Host<'_, W> {
         }
         if matches!(self.plan.output, Output::Names | Output::WithoutMatch) {
             if result.matched {
-                self.writer
-                    .write_all(label(path, self.plan.paths.is_empty()))?;
+                presentation::path(
+                    &self.plan.presentation,
+                    &mut self.writer,
+                    label(path, self.plan.paths.is_empty()),
+                )?;
                 self.writer.write_all(if self.plan.presentation.null {
                     b"\0"
                 } else {
@@ -460,8 +473,11 @@ impl<W: Write> Host<'_, W> {
         if matches!(self.plan.output, Output::Count | Output::CountMatches) {
             if result.matched || (self.plan.include_zero && result.searched) {
                 if self.filename {
-                    self.writer
-                        .write_all(label(path, self.plan.paths.is_empty()))?;
+                    presentation::path(
+                        &self.plan.presentation,
+                        &mut self.writer,
+                        label(path, self.plan.paths.is_empty()),
+                    )?;
                     self.writer.write_all(if self.plan.presentation.null {
                         b"\0"
                     } else {
