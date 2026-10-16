@@ -34,7 +34,6 @@ mod units;
 
 use hashed::Hashed;
 use resident::Resident;
-use units::Unit;
 
 const CLASSES: [&str; 5] = [
     "rare literal",
@@ -51,8 +50,6 @@ const PREFIX_CAP: usize = 1024;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Leaf {
     Tri(Vec<u8>),
-    Term(Vec<u8>),
-    Prefix(Vec<u8>),
     /// Every term containing these lowercase bytes: one dictionary pass.
     Substring(Vec<u8>),
     /// A key of the arm's own segment: word 4+5 or a hashed variant.
@@ -120,6 +117,7 @@ impl Plan {
         }
     }
 
+    #[cfg(test)]
     fn has(&self, want: &impl Fn(&Leaf) -> bool) -> bool {
         let mut leaves = BTreeSet::new();
         self.leaves(&mut leaves);
@@ -147,9 +145,8 @@ fn from_need(need: &Need) -> Plan {
     }
 }
 
-/// How the term screen reads a literal: the brief's units (exact and
-/// prefix lookups, sound only case-sensitive), substrings of whole terms
-/// (sound in either case), or both.
+/// Which term constraints the plan considers. Folded literal facts cannot
+/// safely license the original-case unit lookups.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lookups {
     Units,
@@ -165,12 +162,9 @@ fn term_plan(facts: &RequiredLiterals, lookups: Lookups) -> Plan {
         RequiredLiterals::None => Plan::None,
         RequiredLiterals::Literal(bytes) => {
             let mut leaves = Vec::new();
-            if lookups != Lookups::Substrings {
-                leaves.extend(units::units(bytes).into_iter().map(|unit| match unit {
-                    Unit::Exact(term) => Plan::Leaf(Leaf::Term(term)),
-                    Unit::Prefix(prefix) => Plan::Leaf(Leaf::Prefix(prefix)),
-                }));
-            }
+            // RequiredLiterals is ASCII-folded even for case-sensitive
+            // patterns. Unit boundaries depend on the original case, so
+            // only whole-run substring constraints are sound here.
             if lookups != Lookups::Units {
                 leaves.extend(
                     units::substrings(bytes)
@@ -263,7 +257,7 @@ fn compile<'a>(
         Plan::All => Cursor::bits(src.live, Certainty::Maybe),
         Plan::None => Cursor::Empty,
         Plan::Leaf(Leaf::Fallback) => Cursor::bits(fallback, Certainty::Maybe),
-        Plan::Leaf(leaf @ (Leaf::Prefix(_) | Leaf::Substring(_))) => match &sets[leaf] {
+        Plan::Leaf(leaf @ Leaf::Substring(_)) => match &sets[leaf] {
             Some(set) => Cursor::bits(set, Certainty::Maybe),
             None => Cursor::bits(src.live, Certainty::Maybe),
         },
@@ -299,7 +293,6 @@ fn read(src: &Sources, plan: &Plan, extra_docs: &[u32]) -> crate::Result<Read> {
     for leaf in leaves {
         let segment = match &leaf {
             Leaf::Tri(_) => src.tri,
-            Leaf::Term(_) | Leaf::Prefix(_) => src.term.ok_or("term leaf without terms")?,
             Leaf::Extra(_) => src.extra.ok_or("extra leaf without segment")?,
             Leaf::Substring(needle) => {
                 needles.push(needle.clone());
@@ -308,39 +301,10 @@ fn read(src: &Sources, plan: &Plan, extra_docs: &[u32]) -> crate::Result<Read> {
             Leaf::Fallback => continue,
         };
         match &leaf {
-            Leaf::Tri(key) | Leaf::Term(key) | Leaf::Extra(key) => {
+            Leaf::Tri(key) | Leaf::Extra(key) => {
                 let term = postings::Term::read([segment], key)?;
                 postings_bytes += term.bytes();
                 lists.insert(leaf, term);
-            }
-            Leaf::Prefix(prefix) => {
-                let mut terms = segment.terms_from(prefix);
-                let mut docs = Vec::new();
-                let mut named = 0;
-                while let Some((term, entry)) = terms.next_term()? {
-                    if term < prefix.as_slice() {
-                        continue;
-                    }
-                    if !term.starts_with(prefix) || named > PREFIX_CAP {
-                        break;
-                    }
-                    named += 1;
-                    match segment.read(&entry)? {
-                        Hit::Single(doc) => docs.push(doc),
-                        Hit::Postings(list) => {
-                            postings_bytes += list.bytes();
-                            list.decode(&mut docs);
-                        }
-                    }
-                }
-                prefix_terms += named as u64;
-                let set = if named > PREFIX_CAP {
-                    capped_prefixes += 1;
-                    None
-                } else {
-                    Some(DocSet::new(src.live.bound(), docs))
-                };
-                sets.insert(leaf, set);
             }
             Leaf::Substring(_) | Leaf::Fallback => {}
         }
@@ -924,8 +888,7 @@ pub(crate) fn run(args: &[String]) -> crate::Result<()> {
     let mut private = String::new();
     let empty = DocSet::new(corpus.live.bound(), []);
     let wants = |arm: &str| arms.contains(&arm);
-    // The brief's unit rules are sound only case-sensitive; substrings of
-    // whole terms are sound either way.
+    // Required-literal facts are folded, so only substring lookups are sound.
     let lookups = if flags.case_insensitive {
         Lookups::Substrings
     } else {
@@ -1223,13 +1186,11 @@ fn unit_report(corpus: &Corpus, flags: GrepFlags) -> crate::Result<()> {
             row[0] += 1;
             row[1] += usize::from(!matches!(sample.facts, RequiredLiterals::All));
             row[2] += usize::from(units != Plan::All);
-            row[3] += usize::from(units.has(&|l| matches!(l, Leaf::Term(_))));
-            row[4] += usize::from(units.has(&|l| matches!(l, Leaf::Prefix(_))));
             row[5] += usize::from(substrings != Plan::All);
         }
         println!(
-            "lookups case_insensitive={} class={class} queries={} with_literal_facts={} unit_narrowed={} with_exact_unit={} with_prefix_unit={} substring_narrowed={}",
-            flags.case_insensitive, row[0], row[1], row[2], row[3], row[4], row[5]
+            "lookups case_insensitive={} class={class} queries={} with_literal_facts={} unit_narrowed={} with_exact_unit=0 with_prefix_unit=0 substring_narrowed={}",
+            flags.case_insensitive, row[0], row[1], row[2], row[5]
         );
     }
     Ok(())
@@ -1407,4 +1368,46 @@ fn residue_arm(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod term_plan_tests {
+    use super::*;
+    use ferret_verify::Matcher;
+
+    fn matches_terms(plan: &Plan, terms: &[Vec<u8>]) -> bool {
+        match plan {
+            Plan::All => true,
+            Plan::None => false,
+            Plan::Leaf(Leaf::Substring(needle)) => terms
+                .iter()
+                .any(|candidate| candidate.windows(needle.len()).any(|w| w == needle)),
+            Plan::And(parts) => parts.iter().all(|part| matches_terms(part, terms)),
+            Plan::Or(parts) => parts.iter().any(|part| matches_terms(part, terms)),
+            Plan::Leaf(_) => panic!("test expects only term lookups"),
+        }
+    }
+
+    #[test]
+    fn folded_facts_do_not_screen_out_case_sensitive_match() {
+        let pattern = "foo123BAR";
+        let document = b"foo123BARq";
+        let flags = GrepFlags {
+            case_insensitive: false,
+        };
+        let grep = flags.compile(pattern).unwrap();
+        assert!(grep.regex().is_match(document));
+
+        let facts = flags.required_literals(pattern).unwrap();
+        assert_eq!(facts, RequiredLiterals::Literal(b"foo123bar".to_vec()));
+        assert_eq!(term_plan(&facts, Lookups::Units), Plan::All);
+        let plan = term_plan(&facts, Lookups::Both);
+        assert!(plan.has(&|leaf| matches!(leaf, Leaf::Substring(_))));
+        let mut terms = Vec::new();
+        ferret_text::tokenize(document, &mut Default::default(), |token| {
+            terms.push(ferret_text::cap(token.bytes).to_vec());
+        });
+
+        assert!(matches_terms(&plan, &terms), "{plan:?} rejected {terms:?}");
+    }
 }

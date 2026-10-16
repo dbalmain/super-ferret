@@ -190,19 +190,17 @@ The brief proposed four rules:
 3. Look up the last unit by prefix.
 4. Drop the first.
 
-These rules are implemented in the bench (`screens/units.rs`). A unit counts as
-safe only if the real tokenizer produces it in all 144 combinations of
-one-character contexts on either side. A test pins soundness against arbitrary
-neighbours.
+The bench explored these rules in `screens/units.rs`. A unit counted as
+safe only if the real tokenizer produced it in all 144 combinations of
+one-character contexts on either side. A test pinned soundness against arbitrary
+neighbours; the check did not account for case lost by literal folding.
 
-They are **sound only for case-sensitive search**, for two reasons:
-
-- `required_literals` folds facts to ASCII lowercase.
-- The document's case decides where camelCase splits fall.
-
-So under `(?i)`, no unit is ever safe. Case-sensitively, 7 of 50 rare literals
-get a safe unit (6 exact, 2 prefix, mostly digit-split units). The identifier,
-alternation, broad and code classes get none.
+They cannot be used with these facts: `required_literals` ASCII-folds every
+fact, including case-sensitive patterns, while the document's case decides
+where camelCase splits fall. The folded bytes therefore cannot safely license
+an exact or prefix unit lookup. The fixed plan uses whole-run substring
+constraints instead; the fixed plan makes no unit lookups in any class or
+case.
 
 The cause is the seeds themselves:
 
@@ -214,10 +212,10 @@ The cause is the seeds themselves:
 
 The brief's `deserialize_ledger` shape does not occur in the query sets.
 
-**Share of rare literals with at least one safe whole unit:**
-
-- 0 of 50 case-insensitive;
-- 7 of 50 case-sensitive.
+**Share of rare literals whose folded facts license a unit lookup:** 0 of 50
+in either case. The original-case count (7 of 50: 6 exact and 2 prefix
+lookups) was unsound and has been removed. The substring lookup, which needs
+no unit, covers 50 of 50.
 
 ### The better shape: substrings of whole-run terms
 
@@ -535,8 +533,8 @@ behind: 40× faster than trigrams cold against word 4+5's 300×, because a
 lookup scans 484 MB where word 4+5 reads 36 KB of index.
 
 **What share of rare literals has a safe whole unit?** 0 of 50 case-insensitive,
-and 7 of 50 case-sensitive. The substring lookup, which needs no unit, covers 50
-of 50.
+and 0 of 50 case-sensitive after the fix. The substring lookup, which needs
+no unit, covers 50 of 50.
 
 **What do hashed 4/5-grams cost and buy?** 15–17 bits cost 180–400 MB and 22–35 CPU s to
 build, and buy at most 1.5× on rare literals (4-gram, 17 bits) and 1.1× on
@@ -555,8 +553,8 @@ do not pay.
 - **There is no FST.** The term dictionary is codec-1 front-coded blocks of 32
   terms with a resident first-term index, and it had no prefix API. The bench
   adds `Segment::terms_from`, an additive reader seek.
-- **The unit rules are unsound case-insensitive**, and facts are ASCII-folded;
-  see above. Even case-sensitive, they cannot apply to these seeds: the seeds
+- **The unit rules are unsound on folded facts**, including in case-sensitive
+  mode; see above. The seed shapes also offer no useful safe whole unit: they
   never contain an underscore.
 - **Rare literals are not "already in the term index as units"** in the way the
   brief assumed. A seed is a single run, which a document can hold inside a
