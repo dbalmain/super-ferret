@@ -16,6 +16,16 @@ pub enum Command {
     Help,
     Version,
     Search(Plan),
+    Files(Names),
+}
+
+/// Selected names only: no regex or document candidate plan is constructed.
+#[derive(Clone, Debug)]
+pub struct Names {
+    pub paths: Vec<PathBuf>,
+    pub globs: Vec<String>,
+    pub quiet: bool,
+    pub hidden: bool,
 }
 
 /// The resolved line-output profile. Unsupported flags are rejected while
@@ -96,6 +106,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
     let (mut line_number, mut quiet, mut done) = (false, false, false);
     let (mut fold, mut fixed, mut invert, mut only_matching) = (false, false, false, false);
     let mut hidden = false;
+    let mut files = false;
     let mut output = Output::Lines;
     let (mut help, mut version) = (false, false);
     let mut args = args.iter();
@@ -123,8 +134,15 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                 "--invert-match" if value.is_none() => invert = true,
                 "--no-invert-match" if value.is_none() => invert = false,
                 "--only-matching" if value.is_none() => only_matching = true,
-                "--files-with-matches" if value.is_none() => output = Output::Names,
-                "--count" if value.is_none() => output = Output::Count,
+                "--files" if value.is_none() => files = true,
+                "--files-with-matches" if value.is_none() => {
+                    output = Output::Names;
+                    files = false;
+                }
+                "--count" if value.is_none() => {
+                    output = Output::Count;
+                    files = false;
+                }
                 "--scan" | "--scan-uncovered" if value.is_none() => {}
                 "--glob" | "--color" | "--regexp" => {
                     let value = value
@@ -150,8 +168,14 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                     b'F' => fixed = true,
                     b'v' => invert = true,
                     b'o' => only_matching = true,
-                    b'l' => output = Output::Names,
-                    b'c' => output = Output::Count,
+                    b'l' => {
+                        output = Output::Names;
+                        files = false;
+                    }
+                    b'c' => {
+                        output = Output::Count;
+                        files = false;
+                    }
                     b'h' => help = true,
                     b'V' => version = true,
                     b'g' | b'e' => {
@@ -180,6 +204,14 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
     }
     if version {
         return Ok(Command::Version);
+    }
+    if files {
+        return Ok(Command::Files(Names {
+            paths: positionals.into_iter().map(PathBuf::from).collect(),
+            globs,
+            quiet,
+            hidden,
+        }));
     }
     if patterns.is_empty() {
         if positionals.is_empty() {

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod groups;
+mod names;
 
 use ferret_catalog::NameId;
 use ferret_policy::GrepSelection;
@@ -32,6 +33,7 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -F, --fixed-strings treat patterns literally\n\
   -e, --regexp PATTERN add an alternative pattern\n\
   -c, --count         count selected lines (-co counts spans)\n\
+  --files            list selected file names without reading contents\n\
   --hidden, -.       include held hidden files and directories\n\
   --color=never      plain output\n\
   --scan             accepted; broad patterns always scan\n\n\
@@ -61,15 +63,16 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         line_grep::Command::Version => {
             return print(format!("ferret grep {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
         }
+        line_grep::Command::Files(plan) => {
+            if let Some(exit) = context_error(global_json) {
+                return exit;
+            }
+            return names::run(&plan, index);
+        }
         line_grep::Command::Search(plan) => plan,
     };
-    if global_json {
-        return failure(
-            "global --json framing is not supported for grep; grep --json is deferred to M9",
-        );
-    }
-    if std::env::var_os("RIPGREP_CONFIG_PATH").is_some_and(|s| !s.is_empty()) {
-        return failure("RIPGREP_CONFIG_PATH is set; pass flags explicitly");
+    if let Some(exit) = context_error(global_json) {
+        return exit;
     }
     let mut selection = GrepSelection::default().with_hidden(plan.hidden);
     for glob in &plan.globs {
@@ -79,7 +82,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     }
     let cancelled = AtomicBool::new(false);
     let stopped = || cancelled.load(Ordering::Acquire);
-    let inputs = resolve_inputs(&plan.paths);
+    let inputs = resolve_inputs(&plan.paths, false);
     let recursive = inputs
         .iter()
         .any(|input| matches!(input, Input::Directory(_)));
@@ -241,6 +244,18 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     }
 }
 
+fn context_error(global_json: bool) -> Option<Exit> {
+    if global_json {
+        return Some(failure(
+            "global --json framing is not supported for grep; grep --json is deferred to M9",
+        ));
+    }
+    if std::env::var_os("RIPGREP_CONFIG_PATH").is_some_and(|s| !s.is_empty()) {
+        return Some(failure("RIPGREP_CONFIG_PATH is set; pass flags explicitly"));
+    }
+    None
+}
+
 fn print(bytes: &[u8]) -> Exit {
     match io::stdout().lock().write_all(bytes) {
         Ok(()) => Exit::Ok,
@@ -254,15 +269,7 @@ fn failure(message: &str) -> Exit {
 }
 
 fn open_index(index: Option<&Path>) -> Result<Engine, String> {
-    let index = index
-        .map(Path::to_owned)
-        .or_else(|| {
-            std::env::var_os("FERRET_INDEX")
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| Dirs::from_env().ok().map(|dirs| dirs.data))
-        .ok_or("cannot locate index; set --index or FERRET_INDEX")?;
+    let index = index_path(index)?;
     let engine = Engine::open(&index)
         .map_err(|error| {
             format!(
@@ -282,10 +289,23 @@ fn open_index(index: Option<&Path>) -> Result<Engine, String> {
     Ok(engine)
 }
 
-fn resolve_inputs(paths: &[PathBuf]) -> Vec<Input> {
+fn index_path(index: Option<&Path>) -> Result<PathBuf, String> {
+    index
+        .map(Path::to_owned)
+        .or_else(|| {
+            std::env::var_os("FERRET_INDEX")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| Dirs::from_env().ok().map(|dirs| dirs.data))
+        .ok_or("cannot locate index; set --index or FERRET_INDEX")
+        .map_err(str::to_owned)
+}
+
+fn resolve_inputs(paths: &[PathBuf], names_only: bool) -> Vec<Input> {
     let defaults;
     let paths = if paths.is_empty() {
-        defaults = vec![if readable_stdin() {
+        defaults = vec![if !names_only && readable_stdin() {
             PathBuf::from("-")
         } else {
             PathBuf::from(".")
@@ -301,8 +321,10 @@ fn resolve_inputs(paths: &[PathBuf]) -> Vec<Input> {
                 return Input::Stdin;
             }
             match fs::metadata(path) {
-                Ok(metadata) if metadata.is_file() => Input::File(path.clone(), metadata.len()),
                 Ok(metadata) if metadata.is_dir() => Input::Directory(path.clone()),
+                Ok(metadata) if metadata.is_file() || names_only => {
+                    Input::File(path.clone(), metadata.len())
+                }
                 Ok(_) => Input::Failed(
                     path.clone(),
                     io::Error::other("special-file operands are not supported"),

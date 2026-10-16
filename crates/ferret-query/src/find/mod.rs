@@ -435,12 +435,7 @@ impl Plan {
     /// Sections needed for traversal and the stored fields this plan reads.
     pub fn catalog_sections(&self) -> Vec<ferret_catalog::Section> {
         use ferret_catalog::Section;
-        let mut sections = vec![
-            Section::Names,
-            Section::Links,
-            Section::Roots,
-            Section::Entries,
-        ];
+        let mut sections = CatalogSource::sections().to_vec();
         if self.options.xdev || self.options.follow != Follow::Physical {
             sections.extend([Section::Dev, Section::Ino]);
         }

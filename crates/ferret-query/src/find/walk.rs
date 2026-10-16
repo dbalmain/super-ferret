@@ -1385,6 +1385,18 @@ pub struct CatalogSource {
 }
 
 impl CatalogSource {
+    /// Namespace sections needed by physical traversal, including their
+    /// validated dependencies. No document/content sections are required.
+    pub fn sections() -> &'static [ferret_catalog::Section] {
+        use ferret_catalog::Section;
+        &[
+            Section::Names,
+            Section::Links,
+            Section::Roots,
+            Section::Entries,
+        ]
+    }
+
     /// Catalog visibility with find's ordinary physical traversal and live
     /// fallback for explicit ignored/opaque starts. No expression is parsed.
     pub fn paths(catalog: Catalog, paths: Vec<PathBuf>, cwd: PathBuf) -> Self {

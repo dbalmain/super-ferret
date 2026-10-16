@@ -293,7 +293,7 @@ fn utf16_is_the_approved_encoding_difference() {
 fn unsupported_tiers_refuse_before_output() {
     let fixture = Fixture::new("refusals");
     for flag in [
-        "--files",
+        "--no-files",
         "-P",
         "-m1",
         "-x",
@@ -965,4 +965,73 @@ profile_cases! {
     hidden_glob_excluded: 1 => ["--hidden", "-g", "!.hidden/**", "red", ".hidden"];
     hidden_repeated_enable: 0 => ["--hidden", "--no-hidden", "--hidden", "red", "."];
     hidden_value_refused: 2 => ["--hidden=yes", "red", "."];
+}
+
+// M3 names-only argv is its own profile; every positional is a path.
+profile_cases! {
+    files_default: 0 => ["--files"];
+    files_explicit_root: 0 => ["--files", "."];
+    files_hidden: 0 => ["--files", "--hidden", "."];
+    files_hidden_alias: 0 => ["--files", "-.", "."];
+    files_hidden_off: 0 => ["--files", "--hidden", "--no-hidden", "."];
+    files_positive_glob: 0 => ["--files", "-g", "*.rs", "."];
+    files_negative_glob: 0 => ["--files", "-g", "!*.rs", "."];
+    files_hidden_glob: 0 => ["--files", "--hidden", "-g", "*.rs", "."];
+    files_glob_reinclude: 0 => ["--files", "-g", "*.rs", "-g", "!one.rs", "-g", "one.rs", "."];
+    files_glob_no_names: 1 => ["--files", "-g", "*.absent", "."];
+    files_hidden_excluded: 1 => ["--files", "--hidden", "-g", "!.hidden/**", ".hidden"];
+    files_explicit_hidden: 0 => ["--files", ".dot.rs"];
+    files_explicit_glob_bypass: 0 => ["--files", "-g", "!*.rs", "one.rs"];
+    files_explicit_hidden_directory: 0 => ["--files", ".hidden"];
+    files_explicit_symlink: 0 => ["--files", "link"];
+    files_explicit_directory_symlink: 0 => ["--files", "dirlink"];
+    files_explicit_directory_slash: 0 => ["--files", "dirlink/"];
+    files_empty_file: 0 => ["--files", "empty"];
+    files_duplicate_operands: 0 => ["--files", "one.rs", "one.rs"];
+    files_dash_operand: 0 => ["--files", "--", "-dash"];
+    files_stdin_label: 0 => ["--files", "-"];
+    files_stdin_and_file: 0 => ["--files", "-", "one.rs"];
+    files_ignores_piped_stdin: 0 => ["--files"], stdin = b"no path here\n";
+    files_quiet: 0 => ["--files", "-q", "."];
+    files_quiet_no_names: 1 => ["--files", "-q", "-g", "*.absent", "."];
+    files_quiet_missing: 2 => ["--files", "-q", "missing"];
+    files_quiet_hit_with_error: 0 => ["--files", "-q", "one.rs", "missing"];
+    files_missing_after_name: 2 => ["--files", "one.rs", "missing"];
+    files_dangling_symlink: 2 => ["--files", "dangling"];
+    files_bad_glob: 2 => ["--files", "-g", "[", "."];
+    files_bad_regex_ignored: 0 => ["--files", "-e", "[", "."];
+    files_other_match_flags: 0 => ["--files", "-ivFon", "."];
+    files_overrides_matching_names: 0 => ["-l", "--files", "."];
+    files_overrides_count: 0 => ["-c", "--files", "."];
+    files_count_override: 0 => ["--files", "-c", "-e", "red", "."];
+    files_matching_names_override: 0 => ["--files", "-l", "-e", "red", "."];
+    files_pattern_required_after_override: 2 => ["--files", "-l"];
+    files_switch_value_refused: 2 => ["--files=yes"];
+}
+
+#[test]
+fn files_includes_binary_and_oversized_names() {
+    let fixture = Fixture::new("files-no-content");
+    // Name visibility is independent of the recursive content policy.
+    fixture.write("binary", b"red\0tail");
+    fs::File::create(fixture.tree().join("oversized"))
+        .unwrap()
+        .set_len(9 * 1024 * 1024)
+        .unwrap();
+    let indexed = fixture.ferret(&["index", "."], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    let output = fixture.compare(&["--files", "--hidden", "."], None);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        output
+            .stdout
+            .windows(b"binary\n".len())
+            .any(|s| s == b"binary\n")
+    );
+    assert!(
+        output
+            .stdout
+            .windows(b"oversized\n".len())
+            .any(|s| s == b"oversized\n")
+    );
 }

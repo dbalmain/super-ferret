@@ -24,8 +24,10 @@ skip index/config; no query log or find config. Diagnose nonempty
 `RIPGREP_CONFIG_PATH`: pass flags explicitly. Refuse global `ferret --json`
 framing; `ferret grep --json` means rg output.
 
-Implicit stdin is selected only with **no path operands** and readable piped
-stdin; otherwise no operands means `.`. Every explicit directory/file is searched
+For content search, implicit stdin is selected only with **no path operands**
+and readable piped stdin; otherwise no operands means `.`. **M3 clarification
+(2026-10-17):** `--files` defaults to `.` even with piped stdin. Its positionals
+are all paths, and explicit `-` lists `<stdin>` without reading it. Every explicit directory/file is searched
 regardless of the pipe. Explicit `-` adds stdin alongside other operands; it
 does not replace them. Resolve inputs before index opening. Streams/explicit
 files scan directly; postings add cost and miss unindexed input. Never delegate
@@ -193,7 +195,11 @@ Explicit files bypass posting absence and ignore/glob filters, including new,
 ignored and outside-root files. Follow file symlinks; dangling links error.
 Ignored directory starts and indexed opaque directories reuse find's live
 fallback without nested ignores. Other outside-root/new directory starts fail
-with index/live advice. Special-file operands exit 2. Skip recursive symlinks;
+with index/live advice. Content searches of special-file operands exit 2.
+**M3 clarification (2026-10-17):** `--files` lists an explicit special-file
+operand without opening it; walked specials and symlinks are skipped. Explicit
+directory symlinks follow their start only, using find's trailing-slash source
+resolution. Skip recursive symlinks;
 `-L` is deferred.
 
 Indexed recursive content excludes policy's non-content files (binary-sniffed
@@ -242,7 +248,18 @@ content aliases would otherwise return them.
 filter; `-uu` reveals hidden entries. `-uuu` refuses until `--binary` exists.
 This bypasses ferret policy, not a fresh index query. `--files` reuses find's
 catalog/live source and name output with grep filters; no content reads or
-term/trigram sections.
+term/trigram sections. **M3 implementation (2026-10-17):** names-only opens a
+lazy Catalog, loads find's shared minimal namespace section set, and keeps that
+catalog alive through output. It does not open Engine (which loads resident
+sections), a content store, document identities or candidate cursors. Base and
+overlay section-state regressions check the actual lazy load cells after the
+complete host operation. Binary, oversized and empty regular files are names.
+
+`--files`, `-l` and `-c` resolve their output mode in argv order; `-q` remains
+independent. Matching flags and supplied `-e` patterns are ignored by the resolved
+names-only mode, including invalid regex syntax. Unsupported flags still refuse
+before output. Names stream directly through find's bounded, cancellable sources;
+there is no worker pool or content spill for this mode.
 
 ## Regex dialect
 
@@ -423,8 +440,9 @@ read result. There is no query-to-crawl/policy edge or new executor.
 
 M1 emitted file groups sequentially. M2 extends the same verification scheduler
 to line groups, using D77's thread setting as described below. SCAN.md's parallel
-search numbers are consequently not M1 grep timings. Resident names still build
-on open (D78 A).
+search numbers are consequently not M1 grep timings. Resident content-search
+names still build on Engine open (D78 A); M3 names-only uses the lazy Catalog
+route described above.
 
 ### M2 seam as built (2026-10-17)
 
