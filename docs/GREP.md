@@ -219,6 +219,12 @@ reported only for a requested scope containing that root or contained by it.
 An inaccessible unrelated root does not abort a healthy-root query. Relevant
 anchor failures still prevent both line and names output for that scope.
 
+**Review round 2 correction (2026-10-17):** stored root paths can retain symlink
+spellings. Relevance uses the canonical namespace for operands and anchors;
+when an anchor cannot be fully resolved, canonicalize its longest resolvable
+ancestor and append the remaining components. A missing nested root reached
+through a symlink therefore remains relevant through either operand spelling.
+
 Nested configured roots reset policy when reached or explicitly selected;
 they do not revive an ancestor already pruned by policy or grep filters. This
 matches the indexed source on an unchanged tree. Explicit ignored starts retain

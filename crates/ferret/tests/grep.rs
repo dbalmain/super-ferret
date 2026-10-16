@@ -2602,3 +2602,47 @@ fn m6_live_anchor_faults_are_scoped_to_requested_roots() {
         );
     }
 }
+
+// Failed roots must share the operand's canonical namespace even when the
+// catalog retains a symlink spelling. The operand is both a root and the
+// ancestor of a now-missing root; aliases and multiple missing components
+// must not hide that failure from either search or names-only mode.
+#[test]
+fn m6_live_failed_roots_resolve_symlink_ancestors() {
+    for (name, nested) in [("direct", "gone"), ("deep", "gone/child")] {
+        let fixture = Fixture::new(&format!("live-symlink-root-{name}"));
+        fs::create_dir_all(fixture.tree().join("policy-real").join(nested)).unwrap();
+        fixture.write("policy-real/hit", b"red\n");
+        symlink("policy-real", fixture.tree().join("policy-link")).unwrap();
+        let nested_root = format!("policy-link/{nested}");
+        let indexed = fixture.ferret(&["index", "policy-link", &nested_root], None);
+        assert!(indexed.status.success(), "{indexed:?}");
+        fs::remove_dir_all(fixture.tree().join("policy-real/gone")).unwrap();
+        for operand in ["policy-link", "policy-real"] {
+            for flags in [vec!["red"], vec!["--files"]] {
+                let mut args = vec!["grep", "--live"];
+                args.extend(flags);
+                args.push(operand);
+                let output = fixture.ferret(&args, None);
+                assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+                assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+                let diagnostic = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    diagnostic.contains("policy root") && diagnostic.contains("gone"),
+                    "{output:?}"
+                );
+            }
+        }
+        for flags in [vec!["red"], vec!["--files"]] {
+            let mut args = vec!["grep", "--live"];
+            args.extend(flags);
+            args.push("sub");
+            let output = fixture.ferret(&args, None);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert!(
+                !output.stdout.is_empty() && output.stderr.is_empty(),
+                "{output:?}"
+            );
+        }
+    }
+}

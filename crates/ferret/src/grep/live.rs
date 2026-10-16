@@ -44,9 +44,9 @@ impl Anchors {
             let path = Path::new(std::ffi::OsStr::from_bytes(root));
             match fs::canonicalize(path) {
                 Ok(root) => roots.push(root),
-                // Defer anchor faults until the requested scope is known.
-                // Catalog roots are absolute canonical paths from indexing.
-                Err(error) => faults.push((path.to_owned(), error)),
+                // Stored roots retain symlink spellings. Even failed anchors
+                // need the same namespace as canonicalized operands.
+                Err(error) => faults.push((failed_scope(path).map_err(|e| e.to_string())?, error)),
             }
         }
         roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
@@ -133,6 +133,20 @@ impl Anchors {
             rules,
         })
     }
+}
+
+// Resolve aliases above an unavailable anchor without requiring its tail to
+// exist or be accessible. Catalog root paths are absolute and contain no `..`.
+fn failed_scope(path: &Path) -> io::Result<PathBuf> {
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(real) = fs::canonicalize(ancestor) {
+            return Ok(real.join(path.strip_prefix(ancestor).map_err(io::Error::other)?));
+        }
+    }
+    Err(io::Error::other(format!(
+        "policy root {} has no resolvable ancestor",
+        path.display()
+    )))
 }
 
 fn global() -> Result<Arc<str>, String> {
