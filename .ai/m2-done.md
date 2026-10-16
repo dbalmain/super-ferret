@@ -293,7 +293,7 @@ Final gate logs: `/tmp/grep-m2-r1-pattern-final-{fmt,clippy,gates}.log`.
 The first fix was amended before replaying fix 2, preserving one commit per
 review finding; this count is from the first fix alone.
 
-### Fix 2 — cancel the streaming producer
+### Fix 2 — cancel the streaming producer (7295dde)
 
 The real Source/CatalogSource filter reproduced the gap: an early quiet hit
 still visited all 1000 posting-negative files across 50 directories. A barrier
@@ -319,3 +319,68 @@ which was collapsed. The known watch idle-exit test flaked once, passed alone,
 then passed in the full rerun. No extra skips. Final workspace log:
 `/tmp/grep-m2-r1-producer-final-gates.log`; isolated flake log:
 `/tmp/grep-m2-r1-producer-watch-rerun.log`. No new pool or dependency edge.
+
+
+### Fix 3 — classify audit rows from their own records
+
+Reproduced the old script's flaw using a scratch copy of the saved full summary:
+adding an owned oracle-only missing record to one existing difference still
+produced accepted_difference because the unrelated sidecar passed. The fixed
+`/tmp/grep-m2-compat/account.py` reads no sidecar. It imports the committed
+[m2_audit.py](m2_audit.py) predicates and checks every row's normalized records,
+channels, exits and stderr. D74 requires no oracle-only records and nonempty
+extras solely for explicitly approved policy-excluded paths. Missing evidence,
+unapproved extras, errors and unexplained differences reject the audit before
+writing its table. Counts, row IDs and E accounting are also reconciled.
+The policy fixture and all mined arguments/content remain outside this repo.
+
+The same corrupted full summary now raises an unexplained-difference error and
+writes no output. Six committed owned synthetic regression tests exercise the
+actual production predicates, including missing evidence and missing oracle
+matches. Run `python3 -B .ai/test_m2_audit.py`. Semantically reverting the
+row-evidence guard to the old exit-only acceptance produces 14 failing
+assertions; restoring it passes all six tests. Evidence logs under
+`/tmp/grep-m2-compat`: `classification-reproduction.log`,
+`classification-fixed-reproduction.log`, `classification-reverted.log`,
+`classification-tests.log`. The original scratch script is preserved as
+`account-before-r1.py` for comparison.
+
+Re-ran ALL 3332 harness commands against the fixed M2 binary, including actual
+refusals. Fresh accounting:
+
+| Outcome | Rows |
+| --- | ---: |
+| Exact agreements | 1624 |
+| D74 visibility differences | 512 |
+| Documented trailing-comment syntax differences | 2 |
+| Named deferred/refused commands | 1194 |
+| Total | 3332 |
+
+The new syntax differences are the intended fix-1 consequence: rg rejects its
+wrapper while ferret accepts valid extended-mode patterns. One is a hit, one a
+no-hit. They were exact error agreements before fix 1; they are now separately
+classified by each row's argument, wrapper diagnostic, exits, channels and
+record deltas. They are NOT charged to D74. There are still exactly 512 D74
+rows, 489 with inversion; no missing oracle records in that bucket. There are
+no execution/refusal failures or unexplained supported differences.
+
+E = 2138 - 0 within-E deferrals + 0 outside-E support = S = 2138.
+S = 1624 + 512 + 2. The committed [3332-row table](m2-accounting.tsv) has been
+regenerated; only those two rows changed. Raw fresh audit log:
+`/tmp/grep-m2-compat/review-round-1-run.log`; classification totals/refusal
+partition: `review-round-1-account.log`; per-row evidence: `summary.json`.
+The harness repo remains clean and was used read-only. No corpus commands,
+patterns or content were copied into super-ferret.
+
+Final fix-3 gates: fmt and all-target clippy green with zero compiler warnings;
+workspace **1203 passed / 13 ignored**, plus **6 passed** Python audit tests.
+No new skips or flake reruns on this final pass. Gate logs:
+`/tmp/grep-m2-r1-audit-final-{fmt,clippy,gates}.log`.
+
+Review round 1 is complete in three commits. Final owned profile cases:
+123 differential cases (87 hit, 26 no-hit, 10 error) plus two positive syntax
+exception cases = 125. All three findings were reproduced and revert-checked.
+The audit was repeated after the additional global-i scope correction, with
+unchanged final totals. D79 remains open/provisional as before this review.
+No manifests, dependency edges, benchmark runs, pushes or other agent CLIs;
+no work in grep-m1. The only harness adapter changes are in external scratch.

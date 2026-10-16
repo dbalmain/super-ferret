@@ -2290,7 +2290,7 @@ adfd8986a1b7	1	1	accepted_difference	D74 visibility: .ignore is not a ferret inp
 adfe8c65f339	1	1	agree		
 ae21a1784000	1	1	accepted_difference	D74 visibility: .ignore is not a ferret input	stdout
 ae5511ecff0f	1	1	agree		
-ae6fb7217487	1	1	agree		
+ae6fb7217487	1	1	accepted_difference	pattern syntax: preserve trailing extended-mode comments (rg wrapper error)	exit,stderr,stdout
 ae845006be3d	1	1	agree		
 ae8a256e84bb	1	1	agree		
 aee042d0aa5b	0	0	deferred	no-heading:M5,type-add:permanent refusal,type:permanent refusal,type:permanent refusal,type:permanent refusal,type-add:permanent refusal,type:permanent refusal	
@@ -2595,7 +2595,7 @@ c6fe8face996	0	0	deferred	replace:M8
 c70df98570e9	1	1	agree		
 c711dea1aab2	1	1	agree		
 c714d33770d5	1	1	agree		
-c7167dee2b4b	1	1	agree		
+c7167dee2b4b	1	1	accepted_difference	pattern syntax: preserve trailing extended-mode comments (rg wrapper error)	exit,stderr
 c7429539d30d	0	0	deferred	type:permanent refusal,json:M9	
 c754c588db75	1	1	accepted_difference	D74 visibility: .ignore is not a ferret input	stdout
 c77c977fbe98	1	1	agree		
