@@ -276,7 +276,12 @@ process fallback. Reconsider after screening/engine-share measurements.
 Grep's default is **case-sensitive**, as is `search grep:` (D67 A2;
 corrected 2026-10-16). `-i` uses Unicode
 simple folding; `-S` folds only when there is a literal and no uppercase literal
-across patterns, not uppercase letters in escapes/property names. Last case
+across patterns, not uppercase letters in escape spellings/property names.
+**M4 probe (2026-10-17):** `-S -e red -e BLUE` matches only `red` and
+`BLUE`, in either argument order: the case decision spans all arguments,
+contrary to the M4 brief's per-pattern wording. Escaped literal values count
+(`\x41` is uppercase); property and capture names and extended-mode comments
+do not. Last case
 switch wins; inline flags still scope normally. `-F` escapes literal patterns
 before shared compilation/derivation, retaining Unicode `-i`. **2026-10-17 correction:**
 compile a single argument unchanged; resolve each repeated `-e` argument's
@@ -367,8 +372,10 @@ name or count output; `-q` independently overrides both, in either argv order.
 `-o` remains a count modifier under `-c`; under `-v` it emits whole selected
 nonmatching lines. `--no-fixed-strings` and `--no-invert-match` undo those
 switches. Do not invent negations rg does not accept (`--no-quiet`,
-`--no-only-matching`, `--no-count`, `--no-ignore-case`). Case-sensitive `-s`
-and line-number negation remain in their scheduled later slices.
+`--no-only-matching`, `--no-count`, `--no-ignore-case`). Case-sensitive `-s` / `--case-sensitive` belongs to M4; line-number negation
+remains M5. **M4 probe (2026-10-17):** rg has no `--no-word-regexp` or
+`--no-line-regexp`; those spellings refuse. Whole-word and whole-line switches
+override one another in argv order.
 
 `--json` emits rg begin/match/context/end/summary JSON Lines: byte spans,
 absolute offsets, line numbers, text-or-base64 fields and semantic counts.

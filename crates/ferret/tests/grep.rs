@@ -296,11 +296,7 @@ fn unsupported_tiers_refuse_before_output() {
         "--no-files",
         "-P",
         "-m1",
-        "-x",
-        "-w",
-        "-S",
         "-f",
-        "-s",
         "-H",
         "-N",
         "--no-line-number",
@@ -1246,4 +1242,42 @@ fn files_never_waits_for_stdin_eof_even_when_implicitly_piped() {
         );
         assert!(output.stderr.is_empty() && oracle.stderr.is_empty());
     }
+}
+
+// M4: qualifiers are part of the executed matcher and necessary query.
+profile_cases! {
+    m4_word_half_punctuation: 0 => ["-wo", "@red@", "-"], stdin = b"x@red@x\n@red@\n!@red@!\n";
+    m4_word_half_rejects_word_neighbors: 1 => ["-w", "@red@", "-"], stdin = b"x@red@x\n";
+    m4_word_unicode_neighbors: 0 => ["-wo", "red", "-"], stdin = "éredé\n!red!\n".as_bytes();
+    m4_word_unicode_rejected: 1 => ["-w", "red", "-"], stdin = "éredé\n".as_bytes();
+    m4_word_empty_half_spans: 0 => ["-wo", "", "-"], stdin = b"a ! b\n";
+    m4_word_fixed: 0 => ["-wFo", "red.*", "-"], stdin = b" red.* \nxred.*y\n";
+    m4_word_indexed: 0 => ["-w", "red", "."];
+    m4_word_inverted: 0 => ["-wv", "red", "one.rs"];
+    m4_word_count: 0 => ["-wco", "red", "one.rs"];
+    m4_line_exact: 0 => ["-x", "red", "-"], stdin = b"red red\nred\n";
+    m4_line_absent: 1 => ["-x", "red", "one.rs"];
+    m4_line_empty: 0 => ["-xo", "", "-"], stdin = b"\nred\n";
+    m4_line_cr_retained: 1 => ["-x", "red", "crlf"];
+    m4_line_overrides_word: 0 => ["-wx", "red", "-"], stdin = b"red red\nred\n";
+    m4_word_overrides_line: 0 => ["-xw", "red", "-"], stdin = b"red red\nred\n";
+    m4_line_negation: 2 => ["-x", "--no-line-regexp", "red", "one.rs"];
+    m4_word_negation: 2 => ["-w", "--no-word-regexp", "red", "-"], stdin = b"bred\n";
+    m4_smart_lower: 0 => ["-S", "blue", "one.rs"];
+    m4_smart_upper: 1 => ["-S", "Blue", "one.rs"];
+    m4_smart_mixed_arguments: 0 => ["-S", "-e", "red", "-e", "BLUE", "-"], stdin = b"RED\nred\nBLUE\nblue\n";
+    m4_smart_mixed_reverse: 0 => ["-S", "-e", "BLUE", "-e", "red", "-"], stdin = b"RED\nred\nBLUE\nblue\n";
+    m4_smart_mixed_no_fold: 1 => ["-S", "-e", "red", "-e", "BLUE", "-"], stdin = b"RED\nblue\n";
+    m4_smart_decoded_lower: 0 => ["-S", r"\x61", "-"], stdin = b"A\na\n";
+    m4_smart_decoded_upper: 1 => ["-S", r"\x41", "-"], stdin = b"a\n";
+    m4_smart_property_name: 1 => ["-S", r"\p{Lu}+", "-"], stdin = b"red\n";
+    m4_smart_class_range: 0 => ["-So", "[a-z]+", "-"], stdin = b"RED\n";
+    m4_smart_upper_class: 1 => ["-S", "[A-Z]+", "-"], stdin = b"red\n";
+    m4_smart_capture_name: 0 => ["-S", "(?P<COLOR>red)", "-"], stdin = b"RED\n";
+    m4_smart_fixed: 0 => ["-SF", "red.*", "-"], stdin = b"RED.*\n";
+    m4_sensitive_overrides_fold: 1 => ["-is", "blue", "one.rs"];
+    m4_smart_overrides_sensitive: 0 => ["-sS", "blue", "one.rs"];
+    m4_fold_overrides_smart: 0 => ["-Si", "Blue", "one.rs"];
+    m4_sensitive_long: 1 => ["-i", "--case-sensitive", "blue", "one.rs"];
+    m4_profile_names_only_ignored: 0 => ["--files", "-Swx", "-e", "[", "."];
 }

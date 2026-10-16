@@ -8,7 +8,7 @@ use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use ferret_verify::{Grep, GrepFlags};
+use ferret_verify::{Grep, GrepFlags, LineFlags};
 
 /// Information requests skip environment, index and input resolution.
 #[derive(Debug)]
@@ -105,6 +105,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
     let mut globs = Vec::new();
     let (mut line_number, mut quiet, mut done) = (false, false, false);
     let (mut fold, mut fixed, mut invert, mut only_matching) = (false, false, false, false);
+    let mut smart_case = false;
+    let (mut word, mut line) = (false, false);
     let mut hidden = false;
     let mut files = false;
     let mut output = Output::Lines;
@@ -128,7 +130,26 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                 "--quiet" if value.is_none() => quiet = true,
                 "--hidden" if value.is_none() => hidden = true,
                 "--no-hidden" if value.is_none() => hidden = false,
-                "--ignore-case" if value.is_none() => fold = true,
+                "--ignore-case" if value.is_none() => {
+                    fold = true;
+                    smart_case = false;
+                }
+                "--case-sensitive" if value.is_none() => {
+                    fold = false;
+                    smart_case = false;
+                }
+                "--smart-case" if value.is_none() => {
+                    fold = false;
+                    smart_case = true;
+                }
+                "--word-regexp" if value.is_none() => {
+                    word = true;
+                    line = false;
+                }
+                "--line-regexp" if value.is_none() => {
+                    line = true;
+                    word = false;
+                }
                 "--fixed-strings" if value.is_none() => fixed = true,
                 "--no-fixed-strings" if value.is_none() => fixed = false,
                 "--invert-match" if value.is_none() => invert = true,
@@ -164,7 +185,26 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                     b'n' => line_number = true,
                     b'q' => quiet = true,
                     b'.' => hidden = true,
-                    b'i' => fold = true,
+                    b'i' => {
+                        fold = true;
+                        smart_case = false;
+                    }
+                    b's' => {
+                        fold = false;
+                        smart_case = false;
+                    }
+                    b'S' => {
+                        fold = false;
+                        smart_case = true;
+                    }
+                    b'w' => {
+                        word = true;
+                        line = false;
+                    }
+                    b'x' => {
+                        line = true;
+                        word = false;
+                    }
                     b'F' => fixed = true,
                     b'v' => invert = true,
                     b'o' => only_matching = true,
@@ -228,7 +268,15 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
     let grep = GrepFlags {
         case_insensitive: fold,
     }
-    .compile_line_patterns(&patterns, fixed)
+    .compile_line_profile(
+        &patterns,
+        LineFlags {
+            fixed,
+            smart_case,
+            word,
+            line,
+        },
+    )
     .map_err(ParseError::Pattern)?;
     Ok(Command::Search(Plan {
         grep,
@@ -407,6 +455,13 @@ mod tests {
             &["-i", "KILO"],
             &["-Fi", "SEA"],
             &["-F", "red.*"],
+            &["-w", "red"],
+            &["-x", "red"],
+            &["-Sw", "red"],
+            &["-SFx", "red.*"],
+            &["-S", "-e", "red", "-e", "VIOLET"],
+            &["-wo", "@red@"],
+            &["-wo", ""],
             &["-e", "red", "-e", "(?i:violet)"],
             &["-o", "-e", "", "-e", "red"],
         ];
@@ -414,6 +469,10 @@ mod tests {
             b"red.*\n",
             b"\xef\xbb\xbfred\n",
             b"VIOLET\n",
+            b"@red@\n",
+            b"x@red@x\n",
+            b"RED\n",
+            b"bred\n",
             "Kilo\n".as_bytes(),
             "ſea\n".as_bytes(),
             b"\xffred\n",

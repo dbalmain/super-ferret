@@ -27,6 +27,10 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -g, --glob GLOB     select paths; repeat for ordered overrides\n\
   -q, --quiet         stop after a match\n\
   -i, --ignore-case   Unicode case-insensitive matching\n\
+  -S, --smart-case    fold unless a literal is uppercase\n\
+  -s, --case-sensitive force case-sensitive matching\n\
+  -w, --word-regexp   match between half word boundaries\n\
+  -x, --line-regexp   match whole lines\n\
   -o, --only-matching print nonoverlapping match spans\n\
   -l, --files-with-matches print each matching path once\n\
   -v, --invert-match  select nonmatching lines\n\

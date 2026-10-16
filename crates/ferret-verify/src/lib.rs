@@ -33,4 +33,4 @@ pub use dialect::{Dialect, FindRegex, MatchLimit};
 pub use matcher::{Matcher, Regex, RegexError};
 pub use scan::{Arm, Finder};
 pub use text::{MatchStats, Text, TextMatcher, forces_whole};
-pub use trigram::{Grep, GrepError, GrepFlags, Search, Trigrams};
+pub use trigram::{Grep, GrepError, GrepFlags, LineFlags, Search, Trigrams};
