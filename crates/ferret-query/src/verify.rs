@@ -338,7 +338,7 @@ impl<'q, 'c, 'p> Scan<'q, 'c, 'p> {
         let mut ledger = Ledger::new(self, read, 1, emit);
         let mut names = NameTester::new(self.query, self.catalog, self.cancelled);
         let stopped = || self.stopped();
-        let mut batch = Batch::default();
+        let mut batch = Batch::<Item>::default();
         for at in 0..self.ids.len() {
             if stopped() {
                 return Ok(ledger.halted(at));
@@ -603,6 +603,18 @@ enum Item {
     Row(Pending),
 }
 
+trait Placed {
+    fn place(&mut self, path: Range<usize>);
+}
+
+impl Placed for Item {
+    fn place(&mut self, path: Range<usize>) {
+        if let Self::Row(pending) = self {
+            pending.path = path;
+        }
+    }
+}
+
 /// A row S1 passed whose index truth is Yes or Maybe.
 struct Pending {
     /// Its path, in its batch's `paths`.
@@ -646,40 +658,56 @@ enum How {
 }
 
 /// Consecutive positions, finished.
-#[derive(Default)]
-struct Batch {
+struct Batch<T = Item> {
     /// The first position.
     start: usize,
-    items: Vec<Item>,
+    items: Vec<T>,
     /// The rows' paths.
     paths: Vec<u8>,
 }
 
-impl Batch {
+impl<T> Default for Batch<T> {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            items: Vec::new(),
+            paths: Vec::new(),
+        }
+    }
+}
+
+impl<T: Placed> Batch<T> {
     fn clear(&mut self) {
         self.items.clear();
         self.paths.clear();
     }
 
     /// Appends `item`, whose path is all of `paths`.
-    fn push(&mut self, mut item: Item, paths: &[u8]) {
-        if let Item::Row(pending) = &mut item {
-            let start = self.paths.len();
-            pending.path = start..start + paths.len();
-        }
+    fn push(&mut self, mut item: T, paths: &[u8]) {
+        let start = self.paths.len();
+        item.place(start..start + paths.len());
         self.paths.extend_from_slice(paths);
         self.items.push(item);
     }
 }
 
 /// A slot of the ring: one batch's finished positions not yet taken.
-#[derive(Default)]
-struct Slot {
+struct Slot<T = Item> {
     /// The batch, plus one (0: none).
     index: usize,
-    part: Batch,
+    part: Batch<T>,
     /// Every position of the batch has been posted.
     complete: bool,
+}
+
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            part: Batch::default(),
+            complete: false,
+        }
+    }
 }
 
 // ── the calling thread's side ──
@@ -1240,7 +1268,7 @@ fn add(sum: &mut MatchStats, more: &MatchStats) {
 /// signals: so either the waiter sees the condition before it sleeps, or
 /// the notifier sees the waiter and wakes it. Nobody signals a thread that
 /// is not waiting, which keeps wakes, and their syscalls, per batch.
-struct Pool {
+struct Pool<T: Placed = Item> {
     /// Positions in the run.
     positions: usize,
     /// Positions per batch, and the batch count.
@@ -1252,7 +1280,7 @@ struct Pool {
     head: AtomicUsize,
     /// Each batch's finished positions not yet taken, at
     /// `index % ring.len()`.
-    ring: Vec<Mutex<Slot>>,
+    ring: Vec<Mutex<Slot<T>>>,
     /// Positions posted to each slot, ever: the calling thread sleeps until
     /// its slot's count moves.
     posted: Vec<AtomicUsize>,
@@ -1285,8 +1313,8 @@ struct Budget {
     freed: Condvar,
 }
 
-impl Pool {
-    fn new(positions: usize, threads: usize) -> Self {
+impl<T: Placed> Pool<T> {
+    fn schedule(positions: usize, threads: usize) -> Self {
         let batch = (positions / (threads * BATCHES_PER_THREAD)).clamp(1, MAX_BATCH);
         let slots = threads * RING_PER_THREAD;
         Self {
@@ -1331,33 +1359,6 @@ impl Pool {
         self.stop.load(Ordering::SeqCst)
     }
 
-    /// One worker: claim batches in order and post each position as it
-    /// finishes, until none is left or the pool stops.
-    fn work(&self, scan: &Scan<'_, '_, '_>, fork: &Fork<'_>, stopped: &(dyn Fn() -> bool + Sync)) {
-        let _lost = LostOnPanic(self);
-        let mut read = fork();
-        let mut hand = Hand::new(&mut *read, &scan.query.atoms);
-        let mut names = NameTester::new(scan.query, scan.catalog, scan.cancelled);
-        let halt = || self.halted() || stopped();
-        let mut paths = Vec::new();
-        loop {
-            if self.halted() {
-                return;
-            }
-            let index = self.next.fetch_add(1, Ordering::Relaxed);
-            if index >= self.batches || !self.room_for(index) {
-                return;
-            }
-            let start = index * self.batch;
-            let end = (start + self.batch).min(self.positions);
-            for at in start..end {
-                paths.clear();
-                let item = scan.item(at, &mut names, &mut hand, Some(self), &halt, &mut paths);
-                self.post(index, at, item, &paths, at + 1 == end);
-            }
-        }
-    }
-
     /// Waits until batch `index` has a slot in the ring: the calling thread
     /// has taken the batch that held it. False once the pool stops.
     fn room_for(&self, index: usize) -> bool {
@@ -1380,7 +1381,7 @@ impl Pool {
 
     /// Posts position `at` of batch `index`, whose row's path is `paths`;
     /// `last` if it is the batch's last.
-    fn post(&self, index: usize, at: usize, item: Item, paths: &[u8], last: bool) {
+    fn post(&self, index: usize, at: usize, item: T, paths: &[u8], last: bool) {
         let slot = index % self.ring.len();
         {
             let mut held = lock(&self.ring[slot]);
@@ -1408,7 +1409,7 @@ impl Pool {
     /// Batch `index`'s next finished positions, into `out` (empty): waits
     /// until there is at least one, or the batch is complete. True once the
     /// batch is complete, which frees its slot; `None` if a worker was lost.
-    fn take(&self, index: usize, out: &mut Batch) -> Option<bool> {
+    fn take(&self, index: usize, out: &mut Batch<T>) -> Option<bool> {
         let slot = index % self.ring.len();
         let posted = &self.posted[slot];
         loop {
@@ -1447,33 +1448,6 @@ impl Pool {
             if !moved() {
                 return None;
             }
-        }
-    }
-
-    /// Reads and matches one document on a worker, within the byte budget.
-    fn read(
-        &self,
-        query: &Query,
-        hand: &mut Hand<'_, '_>,
-        name: NameId,
-        size: u64,
-        halt: &dyn Fn() -> bool,
-    ) -> Outcome {
-        match self.reserve(size, halt) {
-            Some(size) => {
-                let outcome = hand.verify(&query.atoms, name, halt);
-                if hand.bytes.capacity() > KEPT_BUFFER {
-                    hand.bytes = Vec::new();
-                }
-                if hand.lines.capacity() > KEPT_BUFFER {
-                    hand.lines = Vec::new();
-                }
-                // Freed only after an oversized buffer is: a reader that the
-                // release wakes cannot allocate against bytes still held.
-                self.release(size);
-                outcome
-            }
-            None => Outcome::Stopped(Matched::default()),
         }
     }
 
@@ -1528,6 +1502,66 @@ impl Pool {
     }
 }
 
+impl Pool {
+    fn new(positions: usize, threads: usize) -> Self {
+        Self::schedule(positions, threads)
+    }
+
+    /// One worker: claim batches in order and post each position as it
+    /// finishes, until none is left or the pool stops.
+    fn work(&self, scan: &Scan<'_, '_, '_>, fork: &Fork<'_>, stopped: &(dyn Fn() -> bool + Sync)) {
+        let _lost = LostOnPanic(self);
+        let mut read = fork();
+        let mut hand = Hand::new(&mut *read, &scan.query.atoms);
+        let mut names = NameTester::new(scan.query, scan.catalog, scan.cancelled);
+        let halt = || self.halted() || stopped();
+        let mut paths = Vec::new();
+        loop {
+            if self.halted() {
+                return;
+            }
+            let index = self.next.fetch_add(1, Ordering::Relaxed);
+            if index >= self.batches || !self.room_for(index) {
+                return;
+            }
+            let start = index * self.batch;
+            let end = (start + self.batch).min(self.positions);
+            for at in start..end {
+                paths.clear();
+                let item = scan.item(at, &mut names, &mut hand, Some(self), &halt, &mut paths);
+                self.post(index, at, item, &paths, at + 1 == end);
+            }
+        }
+    }
+
+    /// Reads and matches one document on a worker, within the byte budget.
+    fn read(
+        &self,
+        query: &Query,
+        hand: &mut Hand<'_, '_>,
+        name: NameId,
+        size: u64,
+        halt: &dyn Fn() -> bool,
+    ) -> Outcome {
+        match self.reserve(size, halt) {
+            Some(size) => {
+                let outcome = hand.verify(&query.atoms, name, halt);
+                if hand.bytes.capacity() > KEPT_BUFFER {
+                    hand.bytes = Vec::new();
+                }
+                if hand.lines.capacity() > KEPT_BUFFER {
+                    hand.lines = Vec::new();
+                }
+                // Freed only after an oversized buffer is: a reader that the
+                // release wakes cannot allocate against bytes still held.
+                self.release(size);
+                outcome
+            }
+            None => Outcome::Stopped(Matched::default()),
+        }
+    }
+}
+
 /// A pool lock; a panicking worker holds none across user code, so what it
 /// guards is consistent.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1553,18 +1587,18 @@ fn spawn<'scope>(
 }
 
 /// Stops the pool when the calling thread leaves the scope, by any path.
-struct StopOnDrop<'p>(&'p Pool);
+struct StopOnDrop<'p, T: Placed = Item>(&'p Pool<T>);
 
-impl Drop for StopOnDrop<'_> {
+impl<T: Placed> Drop for StopOnDrop<'_, T> {
     fn drop(&mut self) {
         self.0.halt();
     }
 }
 
 /// Tells the calling thread a worker panicked, so it stops waiting.
-struct LostOnPanic<'p>(&'p Pool);
+struct LostOnPanic<'p, T: Placed = Item>(&'p Pool<T>);
 
-impl Drop for LostOnPanic<'_> {
+impl<T: Placed> Drop for LostOnPanic<'_, T> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.0.lost.store(true, Ordering::SeqCst);
@@ -1572,6 +1606,136 @@ impl Drop for LostOnPanic<'_> {
             self.0.ready_signal.notify_all();
         }
     }
+}
+
+/// Runs file work on the existing bounded verification scheduler, with one
+/// file per batch. Workers claim from a streaming producer so the host need
+/// not accumulate a path queue. Only the calling thread emits finished groups.
+/// Each task carries the same input-byte reservation as document verification;
+/// callers discard oversized input buffers before returning bounded/spilled
+/// groups. A stop wakes the ring and budget and reaches active reads.
+pub fn file_groups<Task, State, Group: Send>(
+    threads: usize,
+    cancelled: &AtomicBool,
+    next: impl FnMut() -> Option<(u64, Task)> + Send,
+    make: impl Fn() -> State + Sync,
+    work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
+    mut emit: impl FnMut(Group) -> ControlFlow<()>,
+) -> io::Result<()> {
+    if threads <= 1 {
+        groups_alone(next, cancelled, &make, &work, &mut emit);
+        return Ok(());
+    }
+    let external = || cancelled.load(Ordering::Acquire);
+    let pool = Pool::<GroupItem<Group>>::schedule(0, threads);
+    let source = Mutex::new((next, false));
+    std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&pool);
+        let started = (0..threads)
+            .take_while(|&i| {
+                spawn(scope, i, || {
+                    let _lost = LostOnPanic(&pool);
+                    let mut state = make();
+                    let stopped = || pool.halted() || external();
+                    loop {
+                        if pool.halted() {
+                            return;
+                        }
+                        // Assign the position with the task, so EOF cannot
+                        // precede a task already
+                        // claimed by a descheduled worker.
+                        let mut source = lock(&source);
+                        if source.1 {
+                            return;
+                        }
+                        let at = pool.next.fetch_add(1, Ordering::Relaxed);
+                        if !pool.room_for(at) {
+                            return;
+                        }
+                        let task = if external() { None } else { source.0() };
+                        let Some((size, task)) = task else {
+                            source.1 = true;
+                            drop(source);
+                            pool.post(at, at, GroupItem::End, &[], true);
+                            return;
+                        };
+                        drop(source);
+                        // Cancellation has a slot too, waking a caller already
+                        // asleep here when another worker finds a quiet match.
+                        let item =
+                            match pool.reserve(size.max(crate::scan::BUFFER as u64), &stopped) {
+                                Some(size) => {
+                                    let item = work(&mut state, task, &stopped);
+                                    pool.release(size);
+                                    Some(item)
+                                }
+                                None => None,
+                            };
+                        pool.post(at, at, GroupItem::Ready(item), &[], true);
+                    }
+                })
+                .is_ok()
+            })
+            .count();
+        if started == 0 {
+            groups_alone(&mut lock(&source).0, cancelled, &make, &work, &mut emit);
+            return Ok(());
+        }
+        let mut batch = Batch::default();
+        let mut at = 0;
+        loop {
+            if external() {
+                return Ok(());
+            }
+            if pool.take(at, &mut batch).is_none() {
+                return Err(io::Error::other("a file-group worker was lost"));
+            }
+            for item in batch.items.drain(..) {
+                if external() {
+                    return Ok(());
+                }
+                match item {
+                    GroupItem::End => return Ok(()),
+                    GroupItem::Ready(Some(item)) => {
+                        if emit(item).is_break() {
+                            return Ok(());
+                        }
+                    }
+                    GroupItem::Ready(None) => {}
+                }
+            }
+            batch.clear();
+            at += 1;
+        }
+    })
+}
+
+fn groups_alone<Task, State, Group>(
+    mut next: impl FnMut() -> Option<(u64, Task)>,
+    cancelled: &AtomicBool,
+    make: &impl Fn() -> State,
+    work: &impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group,
+    emit: &mut impl FnMut(Group) -> ControlFlow<()>,
+) {
+    let stopped = || cancelled.load(Ordering::Acquire);
+    let mut state = make();
+    while !stopped() {
+        let Some((_, task)) = next() else {
+            break;
+        };
+        let item = work(&mut state, task, &stopped);
+        if stopped() || emit(item).is_break() {
+            break;
+        }
+    }
+}
+
+enum GroupItem<T> {
+    Ready(Option<T>),
+    End,
+}
+impl<T> Placed for GroupItem<T> {
+    fn place(&mut self, _: Range<usize>) {}
 }
 
 /// Test-only hooks into the pool, set per test thread: a spawn that fails,
@@ -2122,5 +2286,123 @@ mod streamed {
             let query = Query::parse(&text, UNIX_EPOCH + Duration::from_secs(1)).unwrap();
             assert!(!streams(&query.atoms), "{pattern} is not line-local");
         }
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, mpsc};
+
+    #[test]
+    fn groups_use_parallel_workers_and_preserve_each_payload() {
+        let barrier = Barrier::new(4);
+        let mut emitted = Vec::new();
+        let mut tasks = (0..80).map(|at| (1, at));
+        file_groups(
+            4,
+            &AtomicBool::new(false),
+            move || tasks.next(),
+            || false,
+            |started, at, _| {
+                if !*started {
+                    *started = true;
+                    barrier.wait();
+                }
+                (at, vec![at as u8; 1000])
+            },
+            |item| {
+                emitted.push(item);
+                ControlFlow::Continue(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            emitted,
+            (0..80)
+                .map(|at| (at, vec![at as u8; 1000]))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_group_emission_break_cancels_in_progress_work() {
+        let mut emitted = Vec::new();
+        let mut tasks = (0..80).map(|at| (1, at));
+        file_groups(
+            4,
+            &AtomicBool::new(false),
+            move || tasks.next(),
+            || (),
+            |_, at, stopped| {
+                if at != 0 {
+                    while !stopped() {
+                        std::thread::yield_now();
+                    }
+                }
+                at
+            },
+            |at| {
+                emitted.push(at);
+                ControlFlow::Break(())
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted, [0]);
+    }
+
+    #[test]
+    fn group_queue_is_bounded_and_spawn_failure_uses_the_caller() {
+        let (published, progress) = mpsc::channel();
+        let published = Mutex::new(published);
+        let _seams = seam::Seams {
+            on_publish: Some(Arc::new(move |finished| {
+                lock(&published).send(finished()).unwrap();
+            })),
+            ..Default::default()
+        }
+        .set();
+        let mut seen = 0;
+        let mut tasks = (0..200).map(|at| (1, at));
+        file_groups(
+            2,
+            &AtomicBool::new(false),
+            move || tasks.next(),
+            || (),
+            |_, at, _| at,
+            |_| {
+                loop {
+                    let count = progress.recv_timeout(Duration::from_secs(5)).unwrap();
+                    if count >= (2 * RING_PER_THREAD + 1) as u64 {
+                        seen = count;
+                        break;
+                    }
+                }
+                ControlFlow::Break(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, (2 * RING_PER_THREAD + 1) as u64);
+        drop(_seams);
+        let _seams = seam::Seams {
+            fail_spawn_at: Some(0),
+            ..Default::default()
+        }
+        .set();
+        let mut emitted = Vec::new();
+        let mut tasks = (0..4).map(|at| (1, at));
+        file_groups(
+            4,
+            &AtomicBool::new(false),
+            move || tasks.next(),
+            || (),
+            |_, at, _| at,
+            |at| {
+                emitted.push(at);
+                ControlFlow::Continue(())
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted, [0, 1, 2, 3]);
     }
 }

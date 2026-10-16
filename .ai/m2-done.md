@@ -93,3 +93,25 @@ an approved difference there. All other probed M2 output interactions matched.
 
 Parallel host scheduling, cancellation, cache regressions and measurement
 commands remain for subsequent commits.
+
+## Commit 3 — shared bounded scheduling for file groups
+
+The existing verification Pool, Batch and Slot now carry either document rows
+or completed file groups. Search keeps its original batch sizing, ordered
+ledger/cache behavior, ring, byte budget, spawn path and stop guards. Groups
+use that same ring and budget with one-file batches. Workers claim from a
+streaming producer under a short producer lock, avoiding an unbounded path
+queue; EOF and cancellation occupy positions so a waiting emitter always wakes.
+Only the calling thread publishes a group. This extends the existing pool; it
+does not start a second pool alongside it.
+
+Three owned scheduler tests force simultaneous workers with a barrier, verify
+whole payloads/order, cancel work in progress on emission Break, force the
+finished ring to its exact bound without sleeps, and exercise spawn-failure
+sequential fallback. All use the actual scheduler. Existing search verifier
+and cache/cancellation tests remain unchanged and pass.
+
+Gates: fmt/all-target clippy green, zero compiler warnings; workspace
+**1188 passed / 13 ignored**, no extra skips.
+Log: `/tmp/grep-m2-pool-gates.log`. Host wiring/cache/CLI cancellation tests
+remain, as does the final full compatibility audit.
