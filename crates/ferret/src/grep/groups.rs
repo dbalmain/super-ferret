@@ -29,6 +29,10 @@ struct Record {
     highlights: Option<Vec<std::ops::Range<usize>>>,
 }
 
+fn record_size(bytes: &[u8], highlights: Option<&[std::ops::Range<usize>]>) -> usize {
+    bytes.len() + std::mem::size_of::<Record>() + highlights.map_or(0, std::mem::size_of_val)
+}
+
 struct Capture {
     records: Option<Vec<Record>>,
     bytes: usize,
@@ -44,11 +48,9 @@ impl Capture {
         if self.records.is_none() {
             return;
         }
-        self.bytes = self.bytes.saturating_add(
-            line.bytes.len()
-                + std::mem::size_of::<Record>()
-                + line.highlights.map_or(0, std::mem::size_of_val),
-        );
+        self.bytes = self
+            .bytes
+            .saturating_add(record_size(line.bytes, line.highlights));
         if self.bytes > ENTRY_BYTES {
             self.records = None;
         } else if let Some(records) = &mut self.records {
@@ -335,7 +337,7 @@ impl Cache {
         };
         let bytes = records
             .iter()
-            .map(|r| r.bytes.len() + std::mem::size_of::<Record>())
+            .map(|r| record_size(&r.bytes, r.highlights.as_deref()))
             .sum::<usize>()
             + std::mem::size_of::<Cached>();
         if self.bytes + bytes > CACHE_BYTES {
@@ -935,6 +937,15 @@ mod tests {
         }
         assert_eq!(streams.get(), 1);
         assert_eq!(stats.get(), 1);
+        // Two owned lines carry one cross-line highlight each. The shared
+        // cache ledger must account for both allocated Range payloads.
+        assert_eq!(
+            lock(&cache).bytes,
+            std::mem::size_of::<Cached>()
+                + 2 * std::mem::size_of::<Record>()
+                + 7
+                + 2 * std::mem::size_of::<std::ops::Range<usize>>()
+        );
     }
 
     // M2: a later quiet hit must stop a read already in progress, before the

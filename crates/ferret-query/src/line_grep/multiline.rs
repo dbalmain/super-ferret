@@ -118,12 +118,14 @@ pub(super) fn scan(
     let bytes = buffer.strip_prefix(b"\xef\xbb\xbf").unwrap_or(buffer);
     let mut lines = Vec::new();
     let mut start = 0;
-    for end in memchr::memchr_iter(b'\n', bytes) {
-        if lines.len() % 4096 == 0 {
-            cancelled(stopped)?;
+    for (chunk_number, chunk) in bytes.chunks(crate::scan::BUFFER).enumerate() {
+        cancelled(stopped)?;
+        let base = chunk_number * crate::scan::BUFFER;
+        for offset in memchr::memchr_iter(b'\n', chunk) {
+            let end = base + offset + 1;
+            push(&mut lines, start..end)?;
+            start = end;
         }
-        push(&mut lines, start..end + 1)?;
-        start = end + 1;
     }
     if start < bytes.len() {
         push(&mut lines, start..bytes.len())?;
@@ -195,12 +197,18 @@ pub(super) fn scan(
         && !whole
         && let Some(mut left) = plan.max_count
     {
+        let mut retained = 0;
         for group in &mut groups {
+            cancelled(stopped)?;
+            if left == 0 {
+                break;
+            }
             let keep = left.min((group.end - group.start) as u64) as usize;
             group.end = group.start + keep;
             left -= keep as u64;
+            retained += 1;
         }
-        groups.retain(|group| !group.is_empty());
+        groups.truncate(retained);
     }
     let selected = !groups.is_empty();
     if plan.output == Output::WithoutMatch {
@@ -228,10 +236,10 @@ pub(super) fn scan(
             result.count += 1;
         }
     } else {
-        result.count = groups
-            .iter()
-            .map(|group| (group.end - group.start) as u64)
-            .sum();
+        for group in &groups {
+            cancelled(stopped)?;
+            result.count += (group.end - group.start) as u64;
+        }
     }
     if plan.output != Output::Lines {
         return Ok(result);
@@ -239,6 +247,7 @@ pub(super) fn scan(
 
     let mut windows = Vec::new();
     for group in &groups {
+        cancelled(stopped)?;
         let before = usize::try_from(plan.before).unwrap_or(usize::MAX);
         let after = usize::try_from(plan.after).unwrap_or(usize::MAX);
         add_group(
@@ -300,6 +309,7 @@ pub(super) fn scan(
                 && (spans[span_at].end < range.start
                     || (!spans[span_at].is_empty() && spans[span_at].end == range.start))
             {
+                cancelled(stopped)?;
                 span_at += 1;
             }
             let mut end = span_at;
@@ -309,10 +319,12 @@ pub(super) fn scan(
                         && !bytes.ends_with(b"\n")
                         && spans[end].start == range.end))
             {
+                cancelled(stopped)?;
                 end += 1;
             }
             let relevant = &spans[span_at..end];
             while tail_at < tail_selection.len() && tail_selection[tail_at].end < range.start {
+                cancelled(stopped)?;
                 tail_at += 1;
             }
             let tail_match = tail_selection[tail_at..]
@@ -338,6 +350,7 @@ pub(super) fn scan(
                     .map_err(ScanError::Output)?;
                 }
                 for span in relevant {
+                    cancelled(stopped)?;
                     if whole && span.is_empty() {
                         if span.start == bytes.len() && !bytes.ends_with(b"\n") {
                             emit(Line {
@@ -379,6 +392,7 @@ pub(super) fn scan(
                     relevant
                 };
                 for span in relevant {
+                    cancelled(stopped)?;
                     let from = span.start.max(range.start);
                     let to = span.end.min(content_end);
                     if from < to {
@@ -484,6 +498,83 @@ mod tests {
             matches!(result, Err(ScanError::Input(error)) if error.kind() == io::ErrorKind::Interrupted)
         );
         assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn long_line_metadata_polls_between_input_sized_chunks() {
+        // Input reads use polls 1 and 2; the extent check uses poll 3.
+        // Cancel at the second metadata chunk, before the absent regex runs.
+        let bytes = vec![b'x'; crate::scan::BUFFER * 2];
+        let polls = Cell::new(0);
+        let result = scan(
+            &plan(&["-U", "absent\\n"]),
+            &mut &bytes[..],
+            bytes.len() as u64,
+            &mut Vec::new(),
+            &|| {
+                polls.set(polls.get() + 1);
+                polls.get() >= 5
+            },
+            |_| panic!("cancelled metadata must not emit"),
+        );
+        assert!(
+            matches!(result, Err(ScanError::Input(error)) if error.kind() == io::ErrorKind::Interrupted)
+        );
+        assert_eq!(polls.get(), 5);
+    }
+
+    #[test]
+    fn rendering_cancellation_after_a_successful_emit_stops_before_the_next_record() {
+        let stop = Cell::new(false);
+        let mut emitted = 0;
+        let result = scan(
+            &plan(&["-Uo", "(?s:.)"]),
+            &mut &b"red\nblue\n"[..],
+            9,
+            &mut Vec::new(),
+            &|| stop.get(),
+            |_| {
+                emitted += 1;
+                stop.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(result, Err(ScanError::Input(error)) if error.kind() == io::ErrorKind::Interrupted)
+        );
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn a_late_input_fault_never_publishes_a_buffered_match_or_zero() {
+        struct Source(bool);
+        impl Read for Source {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.0 {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                self.0 = true;
+                buffer[..9].copy_from_slice(b"red\nblue\n");
+                Ok(9)
+            }
+        }
+        for args in [
+            vec!["-U", "red\\nblue"],
+            vec!["-Uc", "--include-zero", "absent"],
+            vec!["-U", "--files-without-match", "absent"],
+        ] {
+            let result = scan(
+                &plan(&args),
+                &mut Source(false),
+                u64::MAX,
+                &mut Vec::new(),
+                &|| false,
+                |_| panic!("failed input must not emit"),
+            );
+            assert!(
+                matches!(result, Err(ScanError::Input(error)) if error.kind() == io::ErrorKind::PermissionDenied)
+            );
+        }
     }
 
     #[test]

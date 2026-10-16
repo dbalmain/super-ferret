@@ -1,4 +1,4 @@
-//! Resolve grep line qualifiers and smart case before compiling and deriving.
+//! Resolve grep execution flags before shared compilation and derivation.
 //! Syntax-aware case analysis uses public regex-syntax AST traversal; the
 //! executable profile and its necessary query are compiled from the same HIR.
 
@@ -6,7 +6,7 @@ use regex_syntax::ast::{self, Ast, ClassSetItem};
 
 use super::{Grep, GrepError, GrepFlags};
 
-/// Line-profile settings, resolved in argv order by the query parser.
+/// Grep execution settings, resolved in argv order by the query parser.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LineFlags {
     pub fixed: bool,

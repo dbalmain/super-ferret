@@ -278,8 +278,9 @@ impl Grep {
         self.line_local
     }
 
-    /// Conservative LF exclusion from the resolved HIR. Assertions alone
-    /// provide no byte evidence; impossible alternatives are not discarded.
+    /// Conservative LF exclusion from the resolved HIR. Line/absolute
+    /// assertions give no exclusion proof; word assertions do. Impossible
+    /// alternatives are not discarded.
     /// This is a counting/execution profile, not language reachability.
     pub fn excludes_lf(&self) -> bool {
         self.lf_excluded

@@ -88,8 +88,8 @@ impl Matcher for Regex {
     }
 }
 
-/// Shared byte-span iteration for grep output and counting. No haystack slicing
-/// changes anchor or word-boundary context when advancing the search position.
+/// Shared byte-span iteration. Ordinary output/count spans retain assertion
+/// context; multiline search explicitly opts into rebasing resumed searches.
 pub struct Spans<'r, 't> {
     regex: &'r Regex,
     bytes: &'t [u8],

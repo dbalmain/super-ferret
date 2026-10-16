@@ -1,4 +1,4 @@
-//! Grep's line-oriented profile and argument grammar. The host supplies input
+//! Grep's execution profiles and argument grammar. The host supplies input
 //! resolution, policy selection and output; matching and streaming are shared
 //! with content search through ferret-verify and `scan`.
 
@@ -658,9 +658,9 @@ impl std::error::Error for ScanError {
     }
 }
 
-/// Searches LF-delimited lines without their terminators; one initial UTF-8
-/// BOM is stripped. Every selected line is passed once to `emit` with its
-/// 1-based number. The host buffers output until a checked read succeeds.
+/// Emit selected records with 1-based line numbers after stripping one
+/// initial UTF-8 BOM. Line mode searches without LF terminators; multiline
+/// mode buffers the checked input. The host publishes only a successful read.
 pub fn scan(
     plan: &Plan,
     input: &mut dyn Read,
@@ -688,11 +688,13 @@ pub struct Line<'a> {
     pub bytes: &'a [u8],
     pub kind: LineKind,
     pub fragment: bool,
+    /// Resolved ranges relative to `bytes`; None permits line-local matching.
     pub highlights: Option<&'a [std::ops::Range<usize>]>,
 }
 
 /// Stream selected records and bounded before/after context without a second
-/// input read. All context-spool failures retain output-fault classification.
+/// input read. Multiline buffers the checked input before producing records.
+/// All context-spool failures retain output-fault classification.
 pub fn scan_lines(
     plan: &Plan,
     input: &mut dyn Read,
