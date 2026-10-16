@@ -5089,3 +5089,23 @@ terminal match after LF can print before-context while exiting 1.
 **Fact that would change it:** a requirement for uniform whole-document
 assertion truth across search and presentation, or a new pinned rg that removes
 the artefact. Then A.
+
+## D82 — Clipped multiline zero counts
+
+**Status: open, 2026-10-17; M7 (`wt/grep-m7`) uses A provisionally.**
+
+**Question:** when `-m` clips a multiline match so that bounded re-matching
+finds nothing, should the count re-match within its bound or count the
+discovered match? Owned probe: on `a\nb\n`, `rg -Ucm1 'a\n\b'` prints 1; the
+boundary after `a\n` needs the `b`, which lies beyond the clipped prefix, so
+M7's bounded re-match finds 0.
+
+| Option | Tradeoff |
+| --- | --- |
+| A. Keep bounded re-matching | Prints nothing without `--include-zero` and 0 with it, exit 0. Keeps D81 B's separation of search and count bounds; differs from rg on this boundary case. |
+| B. Count the discovered match | Reproduces rg's 1, but changes the count bounds and can disconnect counts from the separately bounded printable spans. |
+
+**Recommendation: A.** Follows from D81; if D81 goes to A, revisit this.
+
+**Fact that would change it:** a requirement to reproduce rg's count here.
+Then B.
