@@ -35,13 +35,27 @@ pub(crate) fn checked<'a>(
                 if matches!(error, ContentFault::Changed) {
                     reader = documents.fork().holding_directories();
                 }
-                fault(error)
+                fault(error, true)
             }
         }
     })
 }
 
-fn fault(error: ContentFault) -> ReadOutcome {
+/// Direct paths have no catalog membership: a missing explicit operand is a
+/// read error, unlike a vanished snapshot candidate. Both use the crawl
+/// bracket.
+pub(crate) fn direct(
+    path: &std::path::Path,
+    cap: Option<u64>,
+    each: ferret_query::Consumer<'_>,
+) -> ReadOutcome {
+    match ferret_crawl::content::stream_file_until(path, cap, each, &|| false) {
+        Ok(_) => ReadOutcome::Stable(ReadVersion::Current),
+        Err(error) => fault(error, false),
+    }
+}
+
+fn fault(error: ContentFault, vanished: bool) -> ReadOutcome {
     let (operation, error) = match error {
         ContentFault::Changed | ContentFault::Alias => return ReadOutcome::RetryChanged,
         ContentFault::Cancelled => return ReadOutcome::Cancelled,
@@ -55,7 +69,7 @@ fn fault(error: ContentFault) -> ReadOutcome {
         ContentFault::Stat(error) => (ReadOperation::Stat, error),
         ContentFault::Read(error) => (ReadOperation::Read, error),
     };
-    if error.kind() == std::io::ErrorKind::NotFound {
+    if vanished && error.kind() == std::io::ErrorKind::NotFound {
         ReadOutcome::Vanished
     } else {
         ReadOutcome::Failed(ReadFault::Io(operation, error))
@@ -84,23 +98,23 @@ mod tests {
             ),
         ] {
             assert!(
-                matches!(fault(faulted), ReadOutcome::Failed(ReadFault::Io(operation, _)) if operation == expected)
+                matches!(fault(faulted, true), ReadOutcome::Failed(ReadFault::Io(operation, _)) if operation == expected)
             );
         }
         assert!(matches!(
-            fault(ContentFault::Changed),
+            fault(ContentFault::Changed, true),
             ReadOutcome::RetryChanged
         ));
         assert!(matches!(
-            fault(ContentFault::Cancelled),
+            fault(ContentFault::Cancelled, true),
             ReadOutcome::Cancelled
         ));
         assert!(matches!(
-            fault(ContentFault::Open(io::ErrorKind::NotFound.into())),
+            fault(ContentFault::Open(io::ErrorKind::NotFound.into()), true),
             ReadOutcome::Vanished
         ));
         assert!(matches!(
-            fault(ContentFault::TooLarge { size: 9, cap: 8 }),
+            fault(ContentFault::TooLarge { size: 9, cap: 8 }, true),
             ReadOutcome::Failed(ReadFault::TooLarge { size: 9, cap: 8 })
         ));
     }

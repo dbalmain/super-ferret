@@ -33,6 +33,58 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, open, openat, statat};
 use crate::ContentFault;
 use crate::observe::{BulkRead, Opened, Reader, bracket, catalog_stat};
 
+/// Streams an explicit regular file or live-fallback file, using the same
+/// current-version bracket as catalogued candidates. `None` imposes no policy
+/// size cap. The consumer may stop early; a closing fstat still validates the
+/// bytes it observed. The caller owns retry and publication of buffered output.
+pub fn stream_file_until(
+    path: &std::path::Path,
+    cap: Option<u64>,
+    each: &mut dyn FnMut(&mut dyn Read, u64) -> io::Result<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    if cancelled() {
+        return Err(ContentFault::Cancelled);
+    }
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| ContentFault::Open(error.into()))?;
+    checked_file(fd, &mut |file, size| {
+        if let Some(cap) = cap
+            && size > cap
+        {
+            return Err(ContentFault::TooLarge { size, cap });
+        }
+        each(&mut Read::take(file, size), size).map_err(|error| {
+            if cancelled() {
+                ContentFault::Cancelled
+            } else {
+                ContentFault::Read(error)
+            }
+        })
+    })
+}
+
+/// Both named and catalogued reads validate the open descriptor, rather than
+/// path metadata that may name another inode by the time the read finishes.
+fn checked_file(
+    fd: OwnedFd,
+    pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
+) -> Result<ferret_catalog::Stat, ContentFault> {
+    let stat = fstat(&fd).map_err(|error| ContentFault::Stat(error.into()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(ContentFault::Changed);
+    }
+    let current = catalog_stat(&stat);
+    let mut file = File::from(fd);
+    pass(&mut file, current.size)?;
+    bracket(&file, &current, ferret_catalog::Content::Binary)?;
+    Ok(current)
+}
+
 /// One catalog view's documents, each with one of its names.
 pub struct Documents {
     /// `name[doc]` is the name to read `doc` through, plus one; 0 for none.
@@ -372,14 +424,7 @@ impl Documents {
             )
             .map_err(|e| ContentFault::Open(e.into()))
         })?;
-        let stat = fstat(&fd).map_err(|e| ContentFault::Stat(e.into()))?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            return Err(ContentFault::Changed);
-        }
-        let current = catalog_stat(&stat);
-        let mut file = File::from(fd);
-        pass(&mut file, current.size)?;
-        bracket(&file, &current, ferret_catalog::Content::Binary)?;
+        let current = checked_file(fd, pass)?;
         self.files_read += 1;
         Ok(current)
     }

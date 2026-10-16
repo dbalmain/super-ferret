@@ -2,10 +2,10 @@
 //! and checked reads, and commit each file's bounded plain output as a group.
 
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 use ferret_catalog::NameId;
@@ -307,48 +307,22 @@ impl<W: Write> Host<'_, W> {
     }
 
     fn file(&mut self, path: &Path, recursive: bool) -> io::Result<()> {
-        // Linux O_NONBLOCK avoids hanging if a regular file becomes a FIFO
-        // between operand resolution and open. Check the opened type again.
-        let file = OpenOptions::new().read(true).custom_flags(0x800).open(path);
-        let mut file = match file {
-            Ok(file) => file,
-            Err(error) => {
-                self.error(path, &error);
-                return Ok(());
-            }
-        };
-        let metadata = match file.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                self.error(path, &error);
-                return Ok(());
-            }
-        };
-        if !metadata.is_file() {
-            self.error(path, &"not a regular file");
-            return Ok(());
-        }
-        if recursive {
-            let cap = ferret_policy::Config::default().size_cap;
-            if metadata.len() > cap {
-                self.error(path, &format!("size {} exceeds cap {cap}", metadata.len()));
-                return Ok(());
-            }
-            let mut buffered = io::BufReader::with_capacity(ferret_policy::SNIFF_LEN, file);
-            match buffered.fill_buf() {
-                Ok(head) if ferret_policy::sniff(head) == ferret_policy::Content::Binary => {
-                    return Ok(());
+        let cap = recursive.then(|| ferret_policy::Config::default().size_cap);
+        self.transaction(path, &mut |each| {
+            engine::reader::direct(path, cap, &mut |input, size| {
+                if recursive {
+                    let mut buffered =
+                        io::BufReader::with_capacity(ferret_policy::SNIFF_LEN, input);
+                    if ferret_policy::sniff(buffered.fill_buf()?) == ferret_policy::Content::Binary
+                    {
+                        return Ok(());
+                    }
+                    each(&mut buffered, size)
+                } else {
+                    each(input, size)
                 }
-                Err(error) => {
-                    self.error(path, &error);
-                    return Ok(());
-                }
-                _ => {}
-            }
-            self.direct(path, &mut buffered, metadata.len())
-        } else {
-            self.direct(path, &mut file, u64::MAX)
-        }
+            })
+        })
     }
 
     fn direct(&mut self, path: &Path, input: &mut dyn Read, size: u64) -> io::Result<()> {
@@ -377,11 +351,22 @@ impl<W: Write> Host<'_, W> {
         name: NameId,
         reader: &mut CheckedReader<'_>,
     ) -> io::Result<()> {
+        self.transaction(path, &mut |each| {
+            reader(name, ReadRequest::Stream(each, &|| false))
+        })
+    }
+
+    fn transaction(
+        &mut self,
+        path: &Path,
+        read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
+    ) -> io::Result<()> {
         let mut output = OutputBuffer::default();
         let mut result = InputResult::default();
         let outcome = ferret_query::retry_read(
             || {
                 output = OutputBuffer::default();
+                result = InputResult::default();
                 let mut each = |input: &mut dyn Read, size| {
                     result = scan(
                         self.plan,
@@ -394,7 +379,7 @@ impl<W: Write> Host<'_, W> {
                     )?;
                     Ok(())
                 };
-                reader(name, ReadRequest::Stream(&mut each, &|| false))
+                read(&mut each)
             },
             &|| false,
         );
@@ -454,6 +439,10 @@ fn scan(
     buffer: &mut Vec<u8>,
     output: &mut OutputBuffer,
 ) -> io::Result<InputResult> {
+    #[cfg(test)]
+    let mut observed = seam::Observed(input);
+    #[cfg(test)]
+    let input: &mut dyn Read = &mut observed;
     line_grep::scan(plan, input, size, buffer, &|| false, |number, line| {
         if let Some(prefix) = prefix {
             output.write_all(prefix)?;
@@ -471,6 +460,55 @@ fn scan(
 mod tests {
     use super::*;
     use ferret_query::{ReadOperation, ReadVersion};
+    use std::fs::OpenOptions;
+
+    // R1/P1: splice two nonmatching versions after the first real read.
+    // Neither explicit input nor the opaque fallback may publish the splice.
+    #[test]
+    fn regular_files_discard_torn_matches_and_retry_current_bytes() {
+        use std::os::unix::fs::FileExt;
+        let mut outcomes = Vec::new();
+        for recursive in [false, true] {
+            let path = std::env::temp_dir()
+                .join(format!("ferret-torn-{}-{recursive}", std::process::id()));
+            let mut bytes = vec![b'x'; 100_000];
+            bytes[..3].copy_from_slice(b"red");
+            bytes[99_997..].copy_from_slice(b"OLD");
+            fs::write(&path, bytes).unwrap();
+            let writer = OpenOptions::new().write(true).open(&path).unwrap();
+            let mut changed = false;
+            seam::AFTER_READ.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move || {
+                    if !changed {
+                        writer.write_all_at(b"blu", 0).unwrap();
+                        writer.write_all_at(b"NEW", 99_997).unwrap();
+                        changed = true;
+                    }
+                }))
+            });
+            let line_grep::Command::Search(plan) =
+                line_grep::parse(&["^red.*NEW$".into()]).unwrap()
+            else {
+                panic!("search")
+            };
+            let mut host = Host {
+                plan: &plan,
+                filename: false,
+                writer: Vec::new(),
+                buffer: Vec::new(),
+                matched: false,
+                errors: false,
+            };
+            host.file(&path, recursive).unwrap();
+            seam::AFTER_READ.with_borrow_mut(|hook| *hook = None);
+            fs::remove_file(path).unwrap();
+            outcomes.push((recursive, host.writer.is_empty(), host.matched, host.errors));
+        }
+        assert_eq!(
+            outcomes,
+            [(false, true, false, false), (true, true, false, false)]
+        );
+    }
 
     #[test]
     fn checked_streams_retry_once_and_commit_only_stable_output() {
@@ -577,5 +615,31 @@ mod tests {
                 .kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+}
+
+#[cfg(test)]
+mod seam {
+    use std::cell::RefCell;
+    use std::io::{self, Read};
+
+    thread_local! {
+        pub(super) static AFTER_READ: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    pub(super) struct Observed<'a>(pub(super) &'a mut dyn Read);
+
+    impl Read for Observed<'_> {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let count = self.0.read(bytes)?;
+            if count != 0 {
+                AFTER_READ.with_borrow_mut(|hook| {
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                });
+            }
+            Ok(count)
+        }
     }
 }

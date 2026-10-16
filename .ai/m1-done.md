@@ -214,3 +214,33 @@ when a grep resident host exists; M1 is local. Keep cold-cache control on that
 machine’s existing benchmark protocol; do not claim warm hits as cold runs.
 At synthetic 10M names, separate residency (D78), candidate/name enumeration
 and actual content/output work. Report paths/patterns/content only privately.
+
+## Review round 1
+
+2026-10-16: read Astra’s full note. Reproducing the three findings, checking
+D73’s file transaction contract, and measuring the exact parent/87feec7 search
+path on a synthetic tree. Fixes, revert checks and gate counts pending.
+
+### P1 — regular-file transactions
+
+Reproduced with a deterministic hook immediately after real file reads:
+rewrite `red…OLD` to `blu…NEW` between chunks of a 100,000-byte line. Neither
+version matches `^red.*NEW$`, but the old Host::file published the mixed line
+for both explicit and recursive-fallback calls. The regression tests the actual
+Host::file path, not a reader model.
+
+GREP.md's bracket/retry promise applies to these regular-file inputs; D73's
+snapshot exclusions do not authorize torn candidate bytes. Added a path reader
+using crawl's existing closing bracket and factored the descriptor transaction
+so catalogued and direct readers share it. Host::file now uses the same host
+transaction/retry_read as CheckedReader. Success costs open + initial fstat +
+reads + closing fstat: one additional fstat, no second successful-file read.
+Fallback sniff/cap policy stays inside the checked transaction. Stdin remains
+an unchecked stream, now explicit in GREP.md.
+
+Revert check: restored only the old Host::file body, retaining the test. It
+failed for both modes: `(output empty=false, matched=true, errors=false)`;
+fixed behavior is `(true, false, false)`. Logs: `/tmp/grep-review-p1-repro.log`,
+`/tmp/grep-review-p1-revert.log`, `/tmp/grep-review-p1-fixed.log`.
+P1 gates: fmt and all-target clippy passed with zero compiler warnings;
+workspace tests **1126 passed / 13 ignored**, no additional skips.
