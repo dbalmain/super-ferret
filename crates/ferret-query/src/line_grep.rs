@@ -26,6 +26,16 @@ pub struct Names {
     pub globs: Vec<String>,
     pub quiet: bool,
     pub hidden: bool,
+    pub presentation: Presentation,
+}
+
+/// Output choices whose defaults the host resolves from its actual stdout.
+#[derive(Clone, Debug, Default)]
+pub struct Presentation {
+    pub filename: Option<bool>,
+    pub heading: Option<bool>,
+    pub numbers: Option<bool>,
+    pub null: bool,
 }
 
 /// The resolved line-output profile. Unsupported flags are rejected while
@@ -44,6 +54,7 @@ pub struct Plan {
     pub stdin_patterns: bool,
     pub include_zero: bool,
     pub max_count: Option<u64>,
+    pub presentation: Presentation,
 }
 
 /// Name and count switches override one another in argv order; quiet is
@@ -151,6 +162,7 @@ pub fn parse_with(
     let mut files = false;
     let mut include_zero = false;
     let mut max_count = None;
+    let mut presentation = Presentation::default();
     let mut output = Output::Lines;
     let (mut help, mut version) = (false, false);
     let mut args = args.iter();
@@ -178,7 +190,19 @@ pub fn parse_with(
             match flag {
                 "--help" if value.is_none() => help = true,
                 "--version" if value.is_none() => version = true,
-                "--line-number" if value.is_none() => line_number = true,
+                "--line-number" if value.is_none() => {
+                    line_number = true;
+                    presentation.numbers = Some(true);
+                }
+                "--no-line-number" if value.is_none() => {
+                    line_number = false;
+                    presentation.numbers = Some(false);
+                }
+                "--with-filename" if value.is_none() => presentation.filename = Some(true),
+                "--no-filename" if value.is_none() => presentation.filename = Some(false),
+                "--heading" if value.is_none() => presentation.heading = Some(true),
+                "--no-heading" if value.is_none() => presentation.heading = Some(false),
+                "--null" if value.is_none() => presentation.null = true,
                 "--quiet" if value.is_none() => quiet = true,
                 "--hidden" if value.is_none() => hidden = true,
                 "--no-hidden" if value.is_none() => hidden = false,
@@ -247,7 +271,17 @@ pub fn parse_with(
         } else if !done && bytes.starts_with(b"-") && bytes.len() > 1 {
             for (at, &flag) in bytes.iter().enumerate().skip(1) {
                 match flag {
-                    b'n' => line_number = true,
+                    b'n' => {
+                        line_number = true;
+                        presentation.numbers = Some(true);
+                    }
+                    b'N' => {
+                        line_number = false;
+                        presentation.numbers = Some(false);
+                    }
+                    b'H' => presentation.filename = Some(true),
+                    b'I' => presentation.filename = Some(false),
+                    b'0' => presentation.null = true,
                     b'q' => quiet = true,
                     b'.' => hidden = true,
                     b'i' => {
@@ -332,6 +366,7 @@ pub fn parse_with(
             globs,
             quiet,
             hidden,
+            presentation,
         }));
     }
     if sources.is_empty() {
@@ -400,6 +435,7 @@ pub fn parse_with(
         stdin_patterns,
         include_zero,
         max_count,
+        presentation,
     }))
 }
 

@@ -327,7 +327,13 @@ supported flags: path spelling relative to operands, filename prefixes, 1-based
 line numbers, LF termination (also for an unterminated last line), CR retained,
 `-o` nonoverlapping spans **including empty spans**, and `-l` once per matching
 path. Overlapping contexts merge; each line prints once; matches use `:`, context
-uses `-`, groups use `--`. `-0` NUL-terminates names/prefixes, not contents.
+uses `-`, groups use `--`. `-0` NUL-terminates names/prefixes, not contents. **M5 probes (2026-10-17):**
+with heading output, NUL replaces the heading's LF; otherwise it replaces the
+filename/content separator. Line numbers and count/content records still end
+in LF. Filename, heading and line-number switches resolve in argv order;
+headings alone do not force filenames on a single explicit file. Heading
+file groups are separated by a blank line, including when `-I` suppresses
+their path headings; count/name modes ignore headings.
 
 In line-oriented execution, empty `-o` spans emit their prefix and LF, not
 nothing. Resume after a consuming match at its end; suppress an empty match

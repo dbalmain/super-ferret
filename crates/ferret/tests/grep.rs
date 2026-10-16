@@ -97,6 +97,12 @@ impl Fixture {
         run(command, input)
     }
     fn compare(&self, args: &[&str], input: Option<&[u8]>) -> Output {
+        self.check(args, input, false)
+    }
+    fn compare_raw(&self, args: &[&str], input: Option<&[u8]>) -> Output {
+        self.check(args, input, true)
+    }
+    fn check(&self, args: &[&str], input: Option<&[u8]>, raw: bool) -> Output {
         let oracle = self.oracle(args, input);
         let mut ferret_args = vec!["grep"];
         ferret_args.extend_from_slice(args);
@@ -111,11 +117,18 @@ impl Fixture {
             oracle.stderr.is_empty(),
             "{args:?}: {actual:?} vs {oracle:?}"
         );
-        assert_eq!(
-            groups(&actual.stdout, &self.tree()),
-            groups(&oracle.stdout, &self.tree()),
-            "{args:?}: {actual:?} vs {oracle:?}"
-        );
+        if raw {
+            assert_eq!(
+                actual.stdout, oracle.stdout,
+                "{args:?}: {actual:?} vs {oracle:?}"
+            );
+        } else {
+            assert_eq!(
+                groups(&actual.stdout, &self.tree()),
+                groups(&oracle.stdout, &self.tree()),
+                "{args:?}: {actual:?} vs {oracle:?}"
+            );
+        }
         actual
     }
 }
@@ -295,9 +308,6 @@ fn unsupported_tiers_refuse_before_output() {
     for flag in [
         "--no-files",
         "-P",
-        "-H",
-        "-N",
-        "--no-line-number",
         "--heading-off",
         "--live",
         "-u",
@@ -714,15 +724,17 @@ fn overreported_virtual_file_sizes_end_at_real_eof() {
 // M2's owned cases assert actual hit/no-hit/error status as well as agreement,
 // so negative self-agreements cannot stand in for positive compatibility.
 macro_rules! profile_cases {
-    ($($name:ident: $status:expr => [$($arg:expr),*] $(, stdin = $input:expr)?;)+) => { $(
+    ($($name:ident: $status:expr => $(@ $mode:ident)? [$($arg:expr),*] $(, stdin = $input:expr)?;)+) => { $(
         #[test]
         fn $name() {
             let fixture = Fixture::new(stringify!($name));
             let input: Option<&[u8]> = differential!(@input $($input)?);
-            let output = fixture.compare(&[$($arg),*], input);
+            let output = profile_cases!(@run fixture, &[$($arg),*], input $(, $mode)?);
             assert_eq!(output.status.code(), Some($status));
         }
     )+ };
+    (@run $fixture:expr, $args:expr, $input:expr) => { $fixture.compare($args, $input) };
+    (@run $fixture:expr, $args:expr, $input:expr, raw) => { $fixture.compare_raw($args, $input) };
 }
 
 profile_cases! {
@@ -1590,4 +1602,28 @@ profile_cases! {
     m4_binary_count_only_matching_spans: 0 => ["-co", "red", "-"], stdin = b"red red\0x";
     m4_binary_count_only_matching_limited_spans: 0 => ["-m1", "-co", "red", "-"], stdin = b"red red\0x";
     m4_binary_match_count_limited_spans: 0 => ["-m1", "--count-matches", "red", "-"], stdin = b"red red\0x";
+}
+
+// M5: filenames, headings and NUL terminators compose with every output mode.
+profile_cases! {
+    m5_filename_force: 0 => @raw ["-H", "red", "one.rs"];
+    m5_filename_suppress: 0 => @raw ["-I", "red", "one.rs", "one.rs"];
+    m5_filename_last_force: 0 => @raw ["-IHn", "red", "one.rs"];
+    m5_filename_last_suppress: 0 => @raw ["-HIn", "red", "one.rs"];
+    m5_line_number_disable: 0 => @raw ["-nN", "red", "one.rs"];
+    m5_line_number_reenable: 0 => @raw ["-Nn", "red", "one.rs"];
+    m5_line_number_long: 0 => @raw ["-n", "--no-line-number", "red", "one.rs"];
+    m5_null_prefix: 0 => @raw ["-H0n", "red", "one.rs"];
+    m5_null_count: 0 => @raw ["-H0c", "red", "one.rs"];
+    m5_null_matching_name: 0 => @raw ["-0l", "red", "one.rs"];
+    m5_null_without_name: 0 => @raw ["-0", "--files-without-match", "violet", "one.rs"];
+    m5_null_files: 0 => @raw ["--files", "-0", "one.rs"];
+    m5_null_files_multiple: 0 => @raw ["--files", "-0", "one.rs", "one.rs"];
+    m5_heading_single_suppressed: 0 => @raw ["--heading", "red", "one.rs"];
+    m5_heading_forced: 0 => @raw ["--heading", "-Hn", "red", "one.rs"];
+    m5_heading_null: 0 => @raw ["--heading", "-H0n", "red", "one.rs"];
+    m5_heading_count: 0 => @raw ["--heading", "-Hc", "red", "one.rs"];
+    m5_heading_absent: 1 => @raw ["--heading", "-H", "violet", "one.rs"];
+    m5_heading_disabled: 0 => @raw ["--heading", "--no-heading", "-Hn", "red", "one.rs"];
+    m5_heading_reenabled: 0 => @raw ["--no-heading", "--heading", "-Hn", "red", "one.rs"];
 }

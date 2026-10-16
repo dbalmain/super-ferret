@@ -86,7 +86,7 @@ fn execute(
         }
         writer
             .write_all(label(path, plan.paths.is_empty()))
-            .and_then(|()| writer.write_all(b"\n"))
+            .and_then(|()| writer.write_all(if plan.presentation.null { b"\0" } else { b"\n" }))
             .map_err(|error| {
                 cancelled.store(true, Ordering::Release);
                 format!("writing stdout: {error}")
@@ -219,6 +219,7 @@ mod tests {
                 globs: Vec::new(),
                 quiet: false,
                 hidden: false,
+                presentation: Default::default(),
             };
             let mut output = Vec::new();
             let exit = execute(&plan, Some(&index), &mut output, &AtomicBool::new(false)).unwrap();

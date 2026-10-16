@@ -161,7 +161,10 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let stdout = io::stdout();
     let mut host = Host {
         plan: &plan,
-        filename: recursive || inputs.len() > 1,
+        filename: plan
+            .presentation
+            .filename
+            .unwrap_or(recursive || inputs.len() > 1),
         writer: stdout.lock(),
         buffer: Vec::new(),
         matched: false,
@@ -436,6 +439,7 @@ impl<W: Write> Host<'_, W> {
         result: InputResult,
         mut output: OutputBuffer,
     ) -> io::Result<()> {
+        let previous = self.matched;
         self.matched |= result.matched;
         if self.plan.quiet {
             return Ok(());
@@ -444,7 +448,11 @@ impl<W: Write> Host<'_, W> {
             if result.matched {
                 self.writer
                     .write_all(label(path, self.plan.paths.is_empty()))?;
-                self.writer.write_all(b"\n")?;
+                self.writer.write_all(if self.plan.presentation.null {
+                    b"\0"
+                } else {
+                    b"\n"
+                })?;
             }
             return Ok(());
         }
@@ -454,7 +462,11 @@ impl<W: Write> Host<'_, W> {
                 if self.filename {
                     self.writer
                         .write_all(label(path, self.plan.paths.is_empty()))?;
-                    self.writer.write_all(b":")?;
+                    self.writer.write_all(if self.plan.presentation.null {
+                        b"\0"
+                    } else {
+                        b":"
+                    })?;
                 }
                 writeln!(self.writer, "{}", result.count)?;
             }
@@ -466,6 +478,9 @@ impl<W: Write> Host<'_, W> {
             })?;
             self.writer.write_all(b": binary file matches\n")?;
         } else {
+            if previous && result.matched && self.plan.presentation.heading == Some(true) {
+                self.writer.write_all(b"\n")?;
+            }
             let flag = self.cancelled;
             groups::emit(&mut output, &mut self.writer, &|| {
                 flag.is_some_and(|flag| flag.load(Ordering::Acquire))

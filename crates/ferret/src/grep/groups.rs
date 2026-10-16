@@ -69,14 +69,38 @@ pub(super) enum Observed {
 }
 
 impl Render<'_> {
-    fn line(&self, output: &mut OutputBuffer, number: u64, line: &[u8]) -> io::Result<()> {
+    fn line(
+        &self,
+        output: &mut OutputBuffer,
+        number: u64,
+        line: &[u8],
+        first: &mut bool,
+    ) -> io::Result<()> {
         let mut output = Cancellable {
             inner: output,
             stopped: self.stopped,
         };
-        if let Some(prefix) = self.prefix {
+        if *first
+            && self.plan.presentation.heading == Some(true)
+            && let Some(prefix) = self.prefix
+        {
             output.write_all(prefix)?;
-            output.write_all(b":")?;
+            output.write_all(if self.plan.presentation.null {
+                b"\0"
+            } else {
+                b"\n"
+            })?;
+        }
+        *first = false;
+        if self.plan.presentation.heading != Some(true)
+            && let Some(prefix) = self.prefix
+        {
+            output.write_all(prefix)?;
+            output.write_all(if self.plan.presentation.null {
+                b"\0"
+            } else {
+                b":"
+            })?;
         }
         if self.plan.line_number {
             write!(output, "{number}:")?;
@@ -103,6 +127,7 @@ impl Render<'_> {
         let mut observed = super::seam::Observed(input);
         #[cfg(test)]
         let input: &mut dyn Read = &mut observed;
+        let mut first = true;
         line_grep::scan(
             self.plan,
             input,
@@ -111,7 +136,7 @@ impl Render<'_> {
             self.stopped,
             |number, line| {
                 capture.push(number, line);
-                self.line(output, number, line)
+                self.line(output, number, line, &mut first)
             },
         )
     }
@@ -330,8 +355,14 @@ impl Worker<'_> {
                     match read(*name, ReadRequest::Stat) {
                         ReadOutcome::Stable(ReadVersion::Catalogued) => {
                             let mut output = OutputBuffer::default();
+                            let mut first = true;
                             for record in &cached.records {
-                                render.line(&mut output, record.number, &record.bytes)?;
+                                render.line(
+                                    &mut output,
+                                    record.number,
+                                    &record.bytes,
+                                    &mut first,
+                                )?;
                             }
                             return Ok(Observed::Ready(Group {
                                 result: cached.result,
