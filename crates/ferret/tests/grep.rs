@@ -2444,7 +2444,10 @@ fn m6_recursive_cap_is_independent_of_text_and_freshness() {
 #[test]
 fn m6_live_policy_faults_never_establish_zero_or_no_match() {
     let fixture = Fixture::new("live-policy-faults");
-    symlink("absent-rules", fixture.tree().join(".ferretignore")).unwrap();
+    // A socket cannot be opened as a policy file. A dangling scoped ignore
+    // symlink is absent under crawl's rules, rather than an input fault.
+    let _socket =
+        std::os::unix::net::UnixListener::bind(fixture.tree().join(".ferretignore")).unwrap();
     for flags in [
         vec!["-c", "--include-zero"],
         vec!["--files-without-match"],
@@ -2502,4 +2505,58 @@ fn m6_unrestricted_binary_probe_covers_the_initial_scan_window() {
     assert!(rg.stdout.is_empty());
     assert_eq!(own.status.code(), Some(1));
     assert!(own.stdout.is_empty() && own.stderr.is_empty());
+}
+
+// Live policy used to abort on the bad line instead of retaining usable rules.
+#[test]
+fn m6_live_bad_patterns_warn_and_preserve_valid_rules() {
+    let fixture = Fixture::new("live-bad-patterns");
+    fs::create_dir(fixture.tree().join("rules")).unwrap();
+    fixture.write("rules/.ferretignore", b"*.log\nbad\\\n");
+    fixture.write("rules/keep.txt", b"red\n");
+    fixture.write("rules/drop.log", b"red\n");
+    for (flags, expected) in [
+        (vec!["red"], &b"rules/keep.txt:red\n"[..]),
+        (vec!["--files"], &b"rules/keep.txt\n"[..]),
+    ] {
+        let mut args = vec!["grep", "--live"];
+        args.extend(flags);
+        args.push("rules");
+        let result = fixture.ferret(&args, None);
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        assert_eq!(result.stdout, expected, "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("warning: ignore pattern skipped:"),
+            "{result:?}"
+        );
+    }
+}
+
+// Scoped policy must use crawl's bounded loader, including names-only and
+// negative-output modes: rejected policy cannot establish absence.
+#[test]
+fn m6_live_oversized_policy_is_a_fault() {
+    let fixture = Fixture::new("live-oversized-policy");
+    fs::write(fixture.base.join("home/config/ferret/ignore"), b"blocked\n").unwrap();
+    fixture.write("blocked", b"red\n");
+    let mut rules = b"!blocked\n#".to_vec();
+    rules.resize((1 << 20) + 1, b'x');
+    fixture.write(".ferretignore", &rules);
+    for flags in [
+        vec!["red"],
+        vec!["--files"],
+        vec!["-c", "--include-zero", "violet"],
+        vec!["--files-without-match", "violet"],
+    ] {
+        let mut args = vec!["grep", "--live"];
+        args.extend(flags);
+        args.push(".");
+        let result = fixture.ferret(&args, None);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        assert!(result.stdout.is_empty(), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("ignore file is larger than 1 MiB"),
+            "{result:?}"
+        );
+    }
 }

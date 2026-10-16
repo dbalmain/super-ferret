@@ -1,21 +1,18 @@
 //! Current-tree D13 policy over find's live source. Catalog roots anchor the
 //! policy; names and postings never exclude live input. Pure rule decisions
-//! remain in ferret-policy; this host owns reading policy inputs.
+//! remain in ferret-policy; ferret-crawl owns scoped policy loading.
 
 use super::*;
 use ferret_catalog::{Catalog, Section};
-use ferret_policy::{Config, Decision, DirRules, Entry as PolicyEntry, IgnoreFiles};
+use ferret_policy::{Config, Decision, DirRules, Entry as PolicyEntry};
 use ferret_query::find::Entry;
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
 // Linux open flags, as in the other std-only CLI filesystem hosts. Opening
-// non-regular ignore entries must not block on a FIFO, or follow .gitignore.
+// non-regular global ignore entries must not block on a FIFO.
 const NONBLOCK: i32 = 0x800;
-const DIRECTORY: i32 = 0x10000;
-const NOFOLLOW: i32 = 0x20000;
 
 #[derive(Clone)]
 pub(super) struct Anchors {
@@ -117,10 +114,7 @@ impl Anchors {
         })
     }
     fn root(&self, path: &Path, stopped: &dyn Fn() -> bool) -> io::Result<State> {
-        let loaded = Loaded::read(path, false, stopped)?;
-        let (rules, errors) =
-            DirRules::root(path, Some(&self.global), loaded.files(), Config::default());
-        patterns(errors)?;
+        let rules = load(path, None, Some(&self.global), stopped)?;
         Ok(State::Rules {
             root: path.to_owned(),
             rules,
@@ -131,9 +125,7 @@ impl Anchors {
 fn global() -> Result<Arc<str>, String> {
     let text = if let Ok(dirs) = Dirs::from_env() {
         let path = dirs.ignore_file();
-        match read_file(&path, false, false, &|| false)
-            .map_err(|e| format!("{}: {e}", path.display()))?
-        {
+        match read_global(&path).map_err(|e| format!("{}: {e}", path.display()))? {
             Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             None if fs::symlink_metadata(&path).is_ok() => {
                 return Err(format!(
@@ -241,148 +233,58 @@ impl Policy {
     }
 }
 
-fn patterns(errors: Vec<ferret_policy::PatternError>) -> io::Result<()> {
-    if let Some(error) = errors.first() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            error.to_string(),
-        ));
-    }
-    Ok(())
-}
 fn enter(parent: &DirRules, path: &Path, stopped: &dyn Fn() -> bool) -> io::Result<DirRules> {
-    let loaded = Loaded::read(path, parent.in_work_tree(), stopped)?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::other("policy directory has no name"))?;
-    let (rules, errors) = parent.enter(name, loaded.files());
-    patterns(errors)?;
+    load(path, Some(parent), None, stopped)
+}
+
+fn load(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<DirRules> {
+    if stopped() {
+        return Err(io::ErrorKind::ConnectionAborted.into());
+    }
+    let mut fault = None;
+    let rules =
+        ferret_crawl::load_policy(
+            path,
+            parent,
+            global,
+            Config::default(),
+            |event| match event {
+                ferret_crawl::Event::Pattern(error) => {
+                    eprintln!("ferret: warning: ignore pattern skipped: {error}");
+                }
+                ferret_crawl::Event::Io {
+                    path: relative,
+                    error,
+                    ..
+                } if fault.is_none() => {
+                    fault = Some(io::Error::new(
+                        error.kind(),
+                        format!("{}: {error}", path.join(relative).display()),
+                    ));
+                }
+                _ => {}
+            },
+        )?;
+    if stopped() {
+        return Err(io::ErrorKind::ConnectionAborted.into());
+    }
+    if let Some(error) = fault {
+        return Err(error);
+    }
     Ok(rules)
 }
 
-struct Loaded {
-    ferret: Option<String>,
-    git: Option<String>,
-    exclude: Option<String>,
-    work_tree: bool,
-}
-impl Loaded {
-    fn files(&self) -> IgnoreFiles<'_> {
-        IgnoreFiles {
-            ferretignore: self.ferret.as_deref(),
-            gitignore: self.git.as_deref(),
-            git_exclude: self.exclude.as_deref(),
-            git_root: self.work_tree,
-        }
-    }
-    fn read(path: &Path, in_work_tree: bool, stopped: &dyn Fn() -> bool) -> io::Result<Self> {
-        let held = directory(path, false)?;
-        let here = held_path(&held);
-        let ferret = read_text(&here.join(".ferretignore"), false, false, stopped)?;
-        let dotgit = here.join(".git");
-        let gitstat = match fs::symlink_metadata(&dotgit) {
-            Ok(stat) => Some(stat),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
-        let work_tree = gitstat.is_some();
-        let git = if in_work_tree || work_tree {
-            read_text(&here.join(".gitignore"), true, true, stopped)?
-        } else {
-            None
-        };
-        let common = if let Some(stat) = gitstat {
-            if stat.is_dir() {
-                Some(directory(&dotgit, false)?)
-            } else if stat.is_file() {
-                let bytes = read_file(&dotgit, true, false, stopped)?
-                    .ok_or_else(|| io::Error::other("gitdir file disappeared"))?;
-                let line = first_line(&bytes);
-                let raw = line
-                    .strip_prefix(b"gitdir: ")
-                    .filter(|raw| !raw.is_empty())
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "not a gitdir file")
-                    })?;
-                let gitdir = directory(&here.join(std::ffi::OsStr::from_bytes(raw)), true)?;
-                let common_path = held_path(&gitdir).join("commondir");
-                let common = read_file(&common_path, true, false, stopped)?;
-                if common.is_none() && fs::symlink_metadata(&common_path).is_ok() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "commondir is not a regular file",
-                    ));
-                }
-                Some(if let Some(bytes) = common {
-                    let raw = first_line(&bytes);
-                    if raw.is_empty() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "empty commondir",
-                        ));
-                    }
-                    directory(
-                        &held_path(&gitdir).join(std::ffi::OsStr::from_bytes(raw)),
-                        true,
-                    )?
-                } else {
-                    gitdir
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let exclude = if let Some(common) = common {
-            let info_path = held_path(&common).join("info");
-            match directory(&info_path, false) {
-                Ok(info) => read_text(&held_path(&info).join("exclude"), false, false, stopped)?,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-                Err(e) => return Err(e),
-            }
-        } else {
-            None
-        };
-        Ok(Self {
-            ferret,
-            git,
-            exclude,
-            work_tree,
-        })
-    }
-}
-fn first_line(bytes: &[u8]) -> &[u8] {
-    let line = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
-    line.strip_suffix(b"\r").unwrap_or(line)
-}
-fn directory(path: &Path, follow: bool) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(DIRECTORY | if follow { 0 } else { NOFOLLOW })
-        .open(path)
-}
-fn held_path(file: &File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
-}
-fn read_text(
-    path: &Path,
-    nofollow: bool,
-    skip_link: bool,
-    stopped: &dyn Fn() -> bool,
-) -> io::Result<Option<String>> {
-    Ok(read_file(path, nofollow, skip_link, stopped)?
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
-}
-fn read_file(
-    path: &Path,
-    nofollow: bool,
-    skip_link: bool,
-    stopped: &dyn Fn() -> bool,
-) -> io::Result<Option<Vec<u8>>> {
+// Global configuration is not a scoped crawl input: it has no 1 MiB limit
+// and a dangling link is an error. Queries must not create configuration.
+fn read_global(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let mut file = match OpenOptions::new()
         .read(true)
-        .custom_flags(NONBLOCK | if nofollow { NOFOLLOW } else { 0 })
+        .custom_flags(NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -393,7 +295,6 @@ fn read_file(
         {
             return Ok(None);
         }
-        Err(e) if skip_link && e.raw_os_error() == Some(40) => return Ok(None),
         Err(e) => return Err(e),
     };
     if !file.metadata()?.is_file() {
@@ -402,9 +303,6 @@ fn read_file(
     let mut bytes = Vec::new();
     let mut chunk = [0; 8192];
     loop {
-        if stopped() {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
         let n = file.read(&mut chunk)?;
         if n == 0 {
             break;

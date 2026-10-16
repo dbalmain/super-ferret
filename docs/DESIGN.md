@@ -68,7 +68,8 @@ are reused only after each alias's own stat; current-byte answers stay local.
 Grep M6 (2026-10-17) keeps the graph. Host namespace adapters choose find's
 catalog or physical live constructors; policy-preserving live search loads
 validated root anchors and reconstructs D13 with the existing pure DirRules.
-Ignore-file I/O lives in the CLI host, not in policy or the query walker.
+Scoped ignore-file I/O uses crawl’s shared single-directory loader (review
+correction, 2026-10-17); it lives neither in policy nor in the query walker.
 Unrestricted live search needs no catalog. All content reads still use the
 same bracket/retry and bounded worker/group engine.
 

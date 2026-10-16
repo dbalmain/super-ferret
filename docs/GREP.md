@@ -188,6 +188,21 @@ commondir, info/exclude, symlinked ignore inputs and lossy rule text follow the
 crawl policy. Policy-input faults report an error; they do not establish zero
 or no match. No names or posting absence are consulted for live exclusion.
 
+**Review correction (2026-10-17):** live scoped loading calls crawl's loader,
+including its 1 MiB stat check and bounded read (also for Git pointer files),
+non-regular and missing-input rules, symlink handling and diagnostic events.
+Malformed patterns warn and are skipped; valid rules in the same file remain.
+The remaining host differences are deliberate: live probes the three policy
+names directly rather than selecting them from crawl's prior directory listing
+(so a newly created policy name can be seen); live rejects a scope on a policy
+I/O fault rather than continuing with that input absent and recording coverage;
+and live checks cancellation around each bounded load. It does not record
+crawl's watch dependencies or worktree identities. Global configuration remains
+a separate host input: no scoped size limit; missing configuration quietly uses
+defaults without index's setup warnings or file creation; dangling links and
+unreadable or non-regular files are errors. Its nonblocking open also rejects
+FIFOs rather than blocking on them. All rule text uses crawl's lossy decoding.
+
 The validated `Catalog::Roots` API also loads its format dependencies
 `DirNames`, `Names`, `NameHeap` and `Strings`; "root anchors only" does not
 mean those dependency bytes can be avoided with the current format. It does

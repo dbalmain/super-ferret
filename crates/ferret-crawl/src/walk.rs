@@ -363,6 +363,50 @@ pub fn walk(root: &Path, global: Option<&str>, config: Config, visit: impl FnMut
     run_worker(walker, &Shared::new(root_job));
 }
 
+/// Loads one directory's policy with the same ignore reads, Git probes and
+/// diagnostics as the crawler, without enumerating or reading its contents.
+/// `parent` supplies inherited rules; `None` starts a configured root with
+/// `global` and `config`. The directory itself is opened without following a
+/// symlink. Policy names are probed directly, rather than selected from a
+/// prior directory listing; a missing name is absent.
+///
+/// I/O faults within policy inputs are reported as [`Event::Io`], and bad
+/// patterns as [`Event::Pattern`]. Valid patterns still apply. The caller
+/// decides whether input faults prevent using the returned rules. Failure to
+/// open the directory itself is returned directly.
+pub fn load_policy(
+    path: &Path,
+    parent: Option<&DirRules>,
+    global: Option<&str>,
+    config: Config,
+    visit: impl FnMut(Event<'_, ()>),
+) -> io::Result<DirRules> {
+    let fd = open_path(path, child_dir_flags(), Mode::empty())?;
+    let boundaries = BoundaryIndex::default();
+    let mut walker = Walker::new(path, &boundaries, visit);
+    let loaded = walker.load_ignores(
+        fd.as_fd(),
+        |name| {
+            !matches!(
+                statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW),
+                Err(Errno::NOENT)
+            )
+        },
+        parent.is_some_and(DirRules::in_work_tree),
+        (),
+    );
+    let (rules, errors) = if let Some(parent) = parent {
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "policy directory has no name")
+        })?;
+        parent.enter(name, loaded.files())
+    } else {
+        DirRules::root(path, global, loaded.files(), config)
+    };
+    walker.patterns(errors);
+    Ok(rules)
+}
+
 /// A worker-local visitor. The returned visitors retain their accumulated
 /// state, so callers can merge it after the walk without locking per entry.
 ///
@@ -712,7 +756,7 @@ impl<V: EventVisitor> Walker<'_, V> {
         self.root_id = Some((root_stat.st_dev, root_stat.st_ino));
         let token = self.visit.root(public_stat(&root_stat, None));
         let children = self.list(fd.as_fd(), FaultContext::Root)?;
-        let loaded = self.load_ignores(fd.as_fd(), &children, false, token);
+        let loaded = self.load_ignores(fd.as_fd(), |name| children.contains(name), false, token);
         let (rules, errors) = DirRules::root(root, global, loaded.files(), config);
         self.patterns(errors);
         self.entered(token, loaded.work_tree.as_ref(), children.count());
@@ -905,6 +949,9 @@ pub(crate) type AfterOpen = Box<dyn FnMut(&Path)>;
 
 #[cfg(test)]
 thread_local! {
+    /// Runs after the opened policy file's stat and before its bounded read.
+    pub(crate) static AFTER_IGNORE_STAT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     /// Test seam: runs with a child directory's root-relative path after it is
     /// opened and before it is listed, on the worker that opened it. No
     /// visitor callback falls in that window, and it is the one a listing
@@ -1481,7 +1528,12 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         #[cfg(test)]
         after_open(&self.rel);
         let children = self.list(child.as_fd(), FaultContext::Dir(token))?;
-        let loaded = self.load_ignores(child.as_fd(), &children, here.rules.in_work_tree(), token);
+        let loaded = self.load_ignores(
+            child.as_fd(),
+            |name| children.contains(name),
+            here.rules.in_work_tree(),
+            token,
+        );
         let (rules, errors) = here.rules.enter(name, loaded.files());
         self.patterns(errors);
         self.entered(token, loaded.work_tree.as_ref(), children.count());
@@ -1574,7 +1626,7 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
     fn load_ignores(
         &mut self,
         dir: BorrowedFd<'_>,
-        children: &Children,
+        listed: impl Fn(&str) -> bool,
         in_work_tree: bool,
         token: V::Dir,
     ) -> Ignores {
@@ -1583,7 +1635,6 @@ impl<'b, V: EventVisitor> Walker<'b, V> {
         if in_work_tree {
             self.visit.policy_input(dir, OsStr::new(".gitignore"));
         }
-        let listed = |name: &str| children.contains(name);
         let ferretignore = listed(".ferretignore")
             .then(|| self.read_named(dir, ".ferretignore", token))
             .flatten();
@@ -1999,6 +2050,10 @@ fn read_regular(fd: OwnedFd) -> io::Result<Option<Vec<u8>>> {
     }
     if meta.len() > MAX_IGNORE_BYTES {
         return Err(ignore_too_large());
+    }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_IGNORE_STAT.with_borrow_mut(Option::take) {
+        hook();
     }
     // Size the buffer from the stat. An empty `Vec` makes `read_to_end` grow
     // by small steps, one `read` each, on every ignore file.
