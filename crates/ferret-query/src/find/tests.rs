@@ -926,3 +926,125 @@ fn d_spells_depth_and_a_path_ending_in_slash_warns() {
     let plan = Plan::parse(&["-I", ".", "-name", "a/"].map(OsString::from)).unwrap();
     assert!(plan.warnings.is_empty());
 }
+
+// Review M2 R2: observe actual listing iterations, including work after the
+// cancellation flag is set, independently of polling or yielded entries.
+fn check_listing_cancellation(opaque: bool) {
+    use ferret_catalog::{Content, Kind, Stat, Transaction};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let tree = Tree::new(if opaque {
+        "cancel-opaque-listing"
+    } else {
+        "cancel-catalog-listing"
+    });
+    let directory = tree.0.join("listed");
+    fs::create_dir(&directory).unwrap();
+    let mut transaction = Transaction::begin(&tree.0.join("index"), 1).unwrap();
+    let mut batch = transaction.batch();
+    let stat = |ino, mode| Stat {
+        dev: 1,
+        ino,
+        mode,
+        nlink: 1,
+        ..Stat::default()
+    };
+    let root = batch.root(tree.0.as_os_str().as_bytes(), stat(1, 0o040_755));
+    let listed = if opaque {
+        batch.ignored(root, b"listed", Kind::Dir);
+        None
+    } else {
+        Some(batch.dir(root, b"listed", stat(2, 0o040_755)))
+    };
+    const FILES: usize = 2048;
+    for i in 0..FILES {
+        let name = format!("child-{i:04}");
+        fs::write(directory.join(&name), []).unwrap();
+        if let Some(parent) = listed {
+            batch.file(
+                parent,
+                name.as_bytes(),
+                stat(i as u64 + 3, 0o100_644),
+                Content::Unindexed,
+            );
+        }
+    }
+    batch.entry_count(root, 1);
+    if let Some(listed) = listed {
+        batch.entry_count(listed, FILES as u32);
+    }
+    transaction.add(batch);
+    let catalog = transaction.commit().unwrap().into_resident().unwrap();
+    let resolved = catalog.resolve(directory.as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        catalog.contents(resolved.target),
+        Some(if opaque {
+            ferret_catalog::Contents::Ignored
+        } else {
+            ferret_catalog::Contents::Catalogued
+        })
+    );
+    for cancel in [true, false] {
+        let flag = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let mut source =
+            CatalogSource::paths(catalog.clone(), vec![directory.clone()], tree.0.clone());
+        assert_eq!(source.next(true).unwrap().unwrap().path(), directory);
+        let (count, cancelled, extra) = (seen.clone(), flag.clone(), after.clone());
+        source.walk.on_listed = Some(Arc::new(move || {
+            let at = count.fetch_add(1, Ordering::Relaxed) + 1;
+            if cancelled.load(Ordering::Relaxed) {
+                extra.fetch_add(1, Ordering::Relaxed);
+            }
+            if cancel && at == 1000 {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        }));
+        let mut batch_at = None;
+        let entry = source.next_with_cancel(
+            true,
+            &mut || {
+                batch_at = Some(seen.load(Ordering::Relaxed));
+                Ok(())
+            },
+            &mut || flag.load(Ordering::Relaxed),
+        );
+        let total = seen.load(Ordering::Relaxed);
+        let extra = after.load(Ordering::Relaxed);
+        if cancel {
+            assert!(entry.is_none(), "yielded a partially listed child");
+            assert!(flag.load(Ordering::Relaxed));
+            assert!(
+                extra < 256,
+                "opaque={opaque}: {extra} entries listed after cancellation ({total} total)"
+            );
+            assert!((1000..1256).contains(&total));
+            assert!(batch_at.is_none(), "flushed a partial directory batch");
+            assert!(source.next(true).is_none());
+        } else {
+            assert!(entry.unwrap().is_ok());
+            assert_eq!(
+                batch_at,
+                Some(total),
+                "batch callback ran before collection finished"
+            );
+            assert!((FILES..=FILES + 2).contains(&total));
+            assert_eq!(extra, 0);
+        }
+        eprintln!(
+            "opaque={opaque} cancel={cancel}: listed={total}, after_cancel={extra}, batch_at={batch_at:?}"
+        );
+    }
+}
+
+#[test]
+fn catalog_listing_cancellation_counts_actual_entries() {
+    check_listing_cancellation(false);
+}
+
+#[test]
+fn opaque_listing_cancellation_counts_actual_entries() {
+    check_listing_cancellation(true);
+}

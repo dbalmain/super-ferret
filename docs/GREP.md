@@ -456,7 +456,15 @@ a cancellation signal because write_all retries them. **2026-10-17 review
 correction:** the scheduler passes its combined pool/external stop predicate
 into the streaming producer, which polls while filtering entries, switching
 operands and before directory descent (including live fallback). A quiet hit or
-closed stdout therefore also stops posting-negative traversal. Queued groups and spill
+closed stdout therefore also stops posting-negative traversal. **2026-10-17
+round-2 correction:** listing cancellation uses find's shared next_with_cancel
+mechanism. Catalog children (including ignored entries and nested roots) and
+live fallback names poll every 256 listing iterations and at listing completion.
+Partial listings are discarded on cancellation. The directory-batch callback
+retains its position after names are collected; grep supplies a no-op there
+because it has no directory-batch actions. Cancellation uses the separate
+shared predicate, including in-progress listings.
+Queued groups and spill
 handles are bounded by the ring/workers; spill bytes follow the required output,
 without silent truncation or an invented cap. The existing long-line input
 buffer exception still applies. No dependency or index-format change.

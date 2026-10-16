@@ -626,6 +626,8 @@ pub struct LiveWalk {
     cancelled: bool,
     #[cfg(test)]
     pub(super) force_unknown: bool,
+    #[cfg(test)]
+    pub(super) on_listed: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl LiveWalk {
@@ -653,6 +655,8 @@ impl LiveWalk {
             cancelled: false,
             #[cfg(test)]
             force_unknown: false,
+            #[cfg(test)]
+            on_listed: None,
         }
     }
 
@@ -742,6 +746,7 @@ impl LiveWalk {
         #[cfg(test)]
         {
             walk.force_unknown = self.force_unknown;
+            walk.on_listed = self.on_listed.clone();
         }
         self.levels[index].end = middle;
         pending.fetch_add(1, Ordering::Relaxed);
@@ -792,6 +797,10 @@ impl LiveWalk {
             let mut seen = 0usize;
             for child in catalog.entries(dir) {
                 seen += 1;
+                #[cfg(test)]
+                if let Some(listed) = &self.on_listed {
+                    listed();
+                }
                 if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
                     self.children.truncate(start);
                     self.names.truncate(names_start);
@@ -857,6 +866,10 @@ impl LiveWalk {
             let mut added = false;
             for (_, id, name) in roots {
                 seen += 1;
+                #[cfg(test)]
+                if let Some(listed) = &self.on_listed {
+                    listed();
+                }
                 if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
                     self.children.truncate(start);
                     self.names.truncate(names_start);
@@ -942,6 +955,10 @@ impl LiveWalk {
                 }
             };
             seen += 1;
+            #[cfg(test)]
+            if let Some(listed) = &self.on_listed {
+                listed();
+            }
             if seen.is_multiple_of(CANCELLATION_INTERVAL) && cancelled() {
                 self.children.truncate(start);
                 self.names.truncate(names_start);

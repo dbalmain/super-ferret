@@ -476,6 +476,8 @@ pub(super) struct Source<'a> {
     cwd: PathBuf,
     #[cfg(test)]
     on_entry: Option<Box<OnEntry>>,
+    #[cfg(test)]
+    on_listing_poll: Option<Box<dyn FnMut() + Send>>,
 }
 impl<'a> Source<'a> {
     pub fn new(
@@ -495,6 +497,8 @@ impl<'a> Source<'a> {
             cwd,
             #[cfg(test)]
             on_entry: None,
+            #[cfg(test)]
+            on_listing_poll: None,
         }
     }
 
@@ -504,18 +508,19 @@ impl<'a> Source<'a> {
                 return None;
             }
             if let Some(source) = &mut self.source {
-                let mut before_directory = || {
-                    if stopped() {
-                        Err(io::Error::new(io::ErrorKind::Interrupted, "grep cancelled"))
-                    } else {
-                        Ok(())
-                    }
-                };
                 loop {
                     if stopped() {
                         return None;
                     }
-                    let entry = source.next_with(self.descend, &mut before_directory);
+                    let mut cancelled = || {
+                        #[cfg(test)]
+                        if let Some(hook) = &mut self.on_listing_poll {
+                            hook();
+                        }
+                        stopped()
+                    };
+                    let entry =
+                        source.next_with_cancel(self.descend, &mut || Ok(()), &mut cancelled);
                     if stopped() {
                         return None;
                     }
@@ -922,5 +927,134 @@ mod tests {
             "continued filtering after cancellation"
         );
         fs::remove_dir_all(base).unwrap();
+    }
+    // Review R2: a real quiet hit must reach the shared listing predicate.
+    // If the host still calls next_with, release the hit at the first child
+    // instead, so the regression fails an assertion instead of hanging.
+    fn check_quiet_listing(opaque: bool) {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+        let base = std::env::temp_dir().join(format!(
+            "ferret-grep-listing-{}-{opaque}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("tree");
+        let hits = root.join("hits");
+        let directory = root.join("listed");
+        fs::create_dir_all(&hits).unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(hits.join("hit"), b"red\n").unwrap();
+        for i in 0..2048 {
+            fs::write(directory.join(format!("child-{i:04}")), b"blue\n").unwrap();
+        }
+        let index = base.join("index");
+        let options = ferret_crawl::IndexOptions {
+            global: opaque.then(|| "listed/\n".into()),
+            ..ferret_crawl::IndexOptions::default()
+        };
+        ferret_crawl::index(&index, &[root], ferret_crawl::Refresh::All, &options).unwrap();
+        let catalog = ferret_catalog::Catalog::open(&index)
+            .unwrap()
+            .unwrap()
+            .into_resident()
+            .unwrap();
+        let resolved = catalog.resolve(directory.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            catalog.contents(resolved.target),
+            Some(if opaque {
+                ferret_catalog::Contents::Ignored
+            } else {
+                ferret_catalog::Contents::Catalogued
+            })
+        );
+        let selection = GrepSelection::default();
+        let mut source = Source::new(
+            vec![Input::Directory(hits), Input::Directory(directory.clone())],
+            Some(&catalog),
+            None,
+            &selection,
+            base.clone(),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Barrier::new(2));
+        let polls = Arc::new(AtomicUsize::new(0));
+        // Source's hooks must own their captures; both routes release once.
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new({
+            let (started, gate, flag) = (started.clone(), gate.clone(), flag.clone());
+            move || {
+                if !started.swap(true, Ordering::AcqRel) {
+                    gate.wait();
+                    while !flag.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        });
+        let armed = Arc::new(AtomicBool::new(false));
+        let (count, unblock, listing) = (polls.clone(), release.clone(), armed.clone());
+        source.on_listing_poll = Some(Box::new(move || {
+            if listing.load(Ordering::Acquire) {
+                count.fetch_add(1, Ordering::Relaxed);
+                unblock();
+            }
+        }));
+        source.on_entry = Some(Box::new(move |path| {
+            if path == directory {
+                armed.store(true, Ordering::Release);
+            }
+            if path.file_name().unwrap().as_bytes().starts_with(b"child-") {
+                release();
+            }
+        }));
+        let fork = || -> Option<Box<CheckedReader<'_>>> {
+            Some(Box::new(|_, request| {
+                let ReadRequest::Stream(each, _) = request else {
+                    panic!("stream")
+                };
+                gate.wait();
+                each(&mut &b"red\n"[..], 4).unwrap();
+                ReadOutcome::Stable(ReadVersion::Catalogued)
+            }))
+        };
+        let plan = plan(&["-q", "red"]);
+        let mut host = Host {
+            plan: &plan,
+            filename: true,
+            writer: Vec::new(),
+            buffer: Vec::new(),
+            matched: false,
+            errors: false,
+            cancelled: Some(&flag),
+        };
+        run(
+            &mut host,
+            move |stopped| source.next(stopped),
+            &fork,
+            None,
+            2,
+            &flag,
+        )
+        .unwrap();
+        assert!(host.matched);
+        assert!(!host.errors);
+        assert!(host.writer.is_empty());
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            1,
+            "quiet cancellation never reached listing"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn quiet_hit_cancels_catalog_listing() {
+        check_quiet_listing(false);
+    }
+
+    #[test]
+    fn quiet_hit_cancels_opaque_listing() {
+        check_quiet_listing(true);
     }
 }
