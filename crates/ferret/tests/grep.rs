@@ -1035,3 +1035,215 @@ fn files_includes_binary_and_oversized_names() {
             .any(|s| s == b"oversized\n")
     );
 }
+
+// The table gives expected walked outcomes for each hidden/ignored pair:
+// catalog visibility, then opaque fallback visibility, each without/with
+// --hidden. Explicit files are always selected, even by negative globs.
+const VISIBILITY: [(&str, [i32; 2], [i32; 2]); 4] = [
+    ("plain.case", [0, 0], [0, 0]),
+    (".hidden.case", [1, 0], [1, 0]),
+    ("ignored.case", [1, 1], [0, 0]),
+    (".ignored.case", [1, 1], [1, 0]),
+];
+
+fn visibility_matrix(files: bool) {
+    let fixture = Fixture::new(if files {
+        "matrix-files"
+    } else {
+        "matrix-lines"
+    });
+    for directory in ["catalog", "opaque"] {
+        fs::create_dir_all(fixture.tree().join(directory)).unwrap();
+        for (name, _, _) in VISIBILITY {
+            fixture.write(&format!("{directory}/{name}"), b"red\n");
+        }
+    }
+    fixture.write(".ferretignore", b"/opaque/\n/catalog/ignored.case\n/catalog/.ignored.case\n/opaque/ignored.case\n/opaque/.ignored.case\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let mut hits = 0;
+    let mut absent = 0;
+    for (directory, fallback) in [("catalog", false), ("opaque", true)] {
+        for (name, catalogued, live) in VISIBILITY {
+            for explicit in [false, true] {
+                for hidden in [false, true] {
+                    let path = format!("{directory}/{name}");
+                    let mut args = vec!["grep", if files { "--files" } else { "-l" }];
+                    if hidden {
+                        args.push("--hidden");
+                    }
+                    // Negative-only globs do not expose a hidden name. They
+                    // isolate the target cell, without a synthetic find plan.
+                    let excluded: Vec<_> = VISIBILITY
+                        .iter()
+                        .filter(|(other, _, _)| *other != name)
+                        .map(|(other, _, _)| format!("!{other}"))
+                        .collect();
+                    for glob in &excluded {
+                        args.extend(["-g", glob]);
+                    }
+                    if !files {
+                        args.push("red");
+                    }
+                    args.push(if explicit { &path } else { directory });
+                    let expected = if explicit {
+                        0
+                    } else if fallback {
+                        live[usize::from(hidden)]
+                    } else {
+                        catalogued[usize::from(hidden)]
+                    };
+                    let actual = fixture.ferret(&args, None);
+                    assert_eq!(actual.status.code(), Some(expected), "{args:?}: {actual:?}");
+                    assert!(actual.stderr.is_empty(), "{args:?}: {actual:?}");
+                    assert_eq!(
+                        actual.stdout,
+                        if expected == 0 {
+                            format!("{path}\n").into_bytes()
+                        } else {
+                            Vec::new()
+                        },
+                        "{args:?}"
+                    );
+                    if expected == 0 {
+                        hits += 1;
+                    } else {
+                        absent += 1;
+                    }
+                    // Ferret-only exclusions intentionally differ from rg
+                    // only for walked ignored catalog rows. The other cells
+                    // are also independent binary differential checks.
+                    if explicit || fallback || !name.contains("ignored") {
+                        let rg = fixture.oracle(&args[1..], None);
+                        assert_eq!(rg.status.code(), actual.status.code(), "{args:?}: {rg:?}");
+                        assert_eq!(rg.stdout, actual.stdout, "{args:?}: {rg:?}");
+                        assert!(rg.stderr.is_empty());
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!((hits, absent), (25, 7));
+}
+
+#[test]
+fn files_visibility_matrix_covers_hidden_ignored_explicit_and_fallback() {
+    visibility_matrix(true);
+}
+
+#[test]
+fn content_visibility_matrix_covers_hidden_ignored_explicit_and_fallback() {
+    visibility_matrix(false);
+}
+
+#[test]
+fn files_hidden_ancestors_globs_and_opaque_starts_compose() {
+    let fixture = Fixture::new("files-hidden-ancestor");
+    fs::create_dir_all(fixture.tree().join(".opaque/.nested")).unwrap();
+    fixture.write(".opaque/.nested/leaf", b"red\n");
+    fixture.write(".ferretignore", b"/.opaque/\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for (args, status) in [
+        (vec!["--files", ".opaque"], 1),
+        (vec!["--files", "--hidden", ".opaque"], 0),
+        (vec!["--files", "--hidden", "-g", "!.nested", ".opaque"], 1),
+        (vec!["--files", "-g", "**", ".opaque"], 0),
+        (vec!["--files", "--hidden", "-g", "!**/leaf", ".opaque"], 1),
+        (vec!["--files", ".opaque/.nested"], 0),
+        (vec!["--files", ".opaque/.nested/leaf"], 0),
+    ] {
+        let output = fixture.compare(&args, None);
+        assert_eq!(output.status.code(), Some(status), "{args:?}: {output:?}");
+    }
+    // The opaque start is an explicit exception. Walking from its parent
+    // cannot reveal it, even with --hidden and a positive glob.
+    let output = fixture.ferret(&["grep", "--files", "--hidden", "-g", "**/leaf", "."], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+
+#[test]
+fn files_explicit_operands_need_no_index_and_never_open_streams() {
+    use std::os::unix::net::UnixListener;
+    let fixture = Fixture::new("files-direct");
+    let _listener = UnixListener::bind(fixture.tree().join("socket")).unwrap();
+    fs::remove_dir_all(fixture.base.join("index")).unwrap();
+    for args in [
+        vec!["--files", "one.rs"],
+        vec!["--files", ".dot.rs"],
+        vec!["--files", "link"],
+        vec!["--files", "empty"],
+        vec!["--files", "socket"],
+        vec!["--files", "-"],
+        vec!["--files", "one.rs", "-", "empty"],
+    ] {
+        let output = fixture.compare(&args, None);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+    }
+}
+
+#[test]
+fn files_requires_directory_coverage_before_any_output_including_quiet() {
+    let fixture = Fixture::new("files-coverage");
+    let outside = fixture.base.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    for quiet in [false, true] {
+        let mut args = vec!["grep", "--files"];
+        if quiet {
+            args.push("-q");
+        }
+        args.extend(["one.rs", outside.to_str().unwrap()]);
+        let output = fixture.ferret(&args, None);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn files_never_waits_for_stdin_eof_even_when_implicitly_piped() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let fixture = Fixture::new("files-open-stdin");
+    for args in [
+        vec!["--files", "-"],
+        vec!["--files", "-q", "-"],
+        vec!["--files"],
+    ] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let fd: OwnedFd = reader.into();
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        let child = command
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .arg("grep")
+            .args(&args)
+            .stdin(Stdio::from(fd))
+            .spawn()
+            .unwrap();
+        let (finished, completion) = mpsc::channel();
+        let waiter =
+            thread::spawn(move || finished.send(child.wait_with_output().unwrap()).unwrap());
+        // The producer stays open until grep exits; the timeout only releases
+        // a broken implementation so this regression cannot hang the suite.
+        let observed = completion.recv_timeout(Duration::from_secs(5));
+        drop(writer);
+        let output = match observed {
+            Ok(output) => output,
+            Err(error) => {
+                waiter.join().unwrap();
+                panic!("{args:?} waited for EOF: {error}");
+            }
+        };
+        waiter.join().unwrap();
+        let oracle = fixture.oracle(&args, None);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        assert_eq!(
+            groups(&output.stdout, &fixture.tree()),
+            groups(&oracle.stdout, &fixture.tree())
+        );
+        assert!(output.stderr.is_empty() && oracle.stderr.is_empty());
+    }
+}

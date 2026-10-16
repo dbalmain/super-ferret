@@ -118,8 +118,10 @@ no-trigram grep should not be expected to beat rg is superseded by those
 measurements. Broad scans are a viable plan, not inherently a fallback failure.
 For parallel verification, reuse the D77 C index setting `search_threads`, capped by available parallelism,
 with `FERRET_SEARCH_THREADS` override and `min(16, available_parallelism)`
-fallback. D78 A keeps resident names built on open; do not add lazy residency
-as a grep prerequisite. Measure grep’s output and first-result costs separately.
+fallback. D78 A keeps resident names built on Engine open for content search;
+do not add lazy Engine residency as a grep prerequisite. **M3 clarification
+(2026-10-17):** names-only uses the existing lazy Catalog namespace route
+instead. Measure grep’s output and first-result costs separately.
 
 After output-mode overrides, the plan explicitly declares its **required
 output universe**, independently of candidate matches:
