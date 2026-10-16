@@ -34,7 +34,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use ferret_policy::{Config, Decision, DirRules, Entry, IgnoreFiles, PatternError};
@@ -418,8 +418,9 @@ pub trait EventVisitor {
     /// A path-valued policy dependency outside the observed directory handle.
     fn policy_path(&mut self, _path: &Path) {}
 
-    /// Requires a separate thread even for one worker, so lowering an index
-    /// worker's priority cannot affect the caller's query or intake work.
+    /// Requests a separate thread even for one worker, so lowering an index
+    /// worker's priority cannot affect the caller's query or intake work. If
+    /// thread creation fails, the walk falls back to the calling thread.
     fn dedicated_worker(&self) -> bool {
         false
     }
@@ -467,8 +468,9 @@ pub fn default_workers() -> usize {
 /// merging. Event order is unspecified across workers. When the root fails
 /// before threads start, only its fault visitor is returned. Directories in
 /// `options.boundaries` are reported as [`Event::Boundary`] and not entered.
-/// See [`walk`] for what is read and when, and [`EventVisitor`] for the
-/// directory lifecycle.
+/// A refused worker spawn falls back to the calling thread, so the walk still
+/// completes with the same events. See [`walk`] for what is read and when, and
+/// [`EventVisitor`] for the directory lifecycle.
 pub fn walk_parallel<V: EventVisitor + Send>(
     root: &Path,
     global: Option<&str>,
@@ -490,21 +492,120 @@ pub fn walk_parallel<V: EventVisitor + Send>(
     }
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
-        handles.push(scope.spawn(|| run_guarded(first, &shared)));
-        for _ in 1..count {
-            let visitor = make_visitor();
-            let mut walker = Walker::new(root, boundaries, visitor);
-            walker.root_id = root_id;
-            handles.push(scope.spawn(|| run_guarded(walker, &shared)));
+        let mut first = Some(first);
+        for worker in 0..count {
+            let walker = if worker == 0 {
+                first
+                    .take()
+                    .unwrap_or_else(|| unreachable!("the first worker is built once"))
+            } else {
+                let visitor = make_visitor();
+                let mut walker = Walker::new(root, boundaries, visitor);
+                walker.root_id = root_id;
+                walker
+            };
+            match spawn_worker(scope, worker, walker, &shared) {
+                Ok(handle) => handles.push(Ok(handle)),
+                Err(walker) => {
+                    handles.push(Err(run_guarded(walker, &shared)));
+                    break;
+                }
+            }
         }
         handles
             .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(visitor) => visitor,
-                Err(panic) => std::panic::resume_unwind(panic),
+            .map(|handle| match handle {
+                Ok(handle) => match handle.join() {
+                    Ok(visitor) => visitor,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                },
+                Err(visitor) => visitor,
             })
             .collect()
     })
+}
+
+fn spawn_worker<'scope, 'env, V: EventVisitor + Send + 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    worker: usize,
+    walker: Walker<'env, V>,
+    shared: &'scope Shared<V::Dir>,
+) -> Result<thread::ScopedJoinHandle<'scope, V>, Walker<'env, V>>
+where
+    'env: 'scope,
+{
+    let retained = Arc::new(Mutex::new(Some(walker)));
+    let spawned = Arc::clone(&retained);
+    match spawn(scope, worker, move || {
+        let walker = spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| unreachable!("a spawned worker takes its walker once"));
+        run_guarded(walker, shared)
+    }) {
+        Ok(handle) => Ok(handle),
+        Err(_) => Err(retained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| unreachable!("a refused spawn leaves its walker with the caller"))),
+    }
+}
+
+fn spawn<'scope, T: Send + 'scope>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    worker: usize,
+    work: impl FnOnce() -> T + Send + 'scope,
+) -> io::Result<thread::ScopedJoinHandle<'scope, T>> {
+    #[cfg(test)]
+    if !spawn_seam::may_spawn(worker) {
+        return Err(io::Error::other("injected spawn failure"));
+    }
+    thread::Builder::new()
+        .name(format!("ferret-crawl-{worker}"))
+        .spawn_scoped(scope, work)
+}
+
+#[cfg(test)]
+pub(crate) mod spawn_seam {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    pub(crate) struct Seams {
+        /// Helpers from this index on fail to start.
+        pub(crate) fail_from: Option<usize>,
+        /// Spawn requests, failed or not.
+        pub(crate) asked: Arc<AtomicUsize>,
+    }
+
+    thread_local! {
+        static SEAMS: RefCell<Seams> = RefCell::default();
+    }
+
+    pub(super) fn may_spawn(index: usize) -> bool {
+        SEAMS.with(|seams| {
+            let seams = seams.borrow();
+            seams.asked.fetch_add(1, Ordering::Relaxed);
+            seams.fail_from.is_none_or(|from| index < from)
+        })
+    }
+
+    impl Seams {
+        /// Sets this thread's seams until the guard drops.
+        pub(crate) fn set(self) -> impl Drop {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    SEAMS.with(|seams| *seams.borrow_mut() = Seams::default());
+                }
+            }
+            SEAMS.with(|seams| *seams.borrow_mut() = self);
+            Reset
+        }
+    }
 }
 
 const MAX_OPEN_JOBS: usize = 128;

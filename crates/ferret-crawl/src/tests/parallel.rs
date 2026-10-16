@@ -10,6 +10,7 @@ use std::process::Command;
 use ferret_policy::{Config, Decision};
 
 use super::{Scratch, SpillTree, write};
+use crate::walk::spawn_seam::Seams;
 use crate::{Event, EventVisitor, IoOp, Stat, WalkOptions, walk, walk_parallel};
 
 #[derive(Default)]
@@ -90,6 +91,56 @@ fn many_siblings_match_sequential() {
     }
     let (events, _) = compare(&tree.path, 8);
     assert_eq!(events.len(), 384);
+}
+
+/// A refused thread creation must not panic or lose any of the walk's events.
+#[test]
+fn a_refused_worker_spawn_runs_the_real_walk_on_the_caller() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    let tree = Scratch::new("parallel-spawn-refused");
+    for index in 0..64 {
+        let dir = tree.path.join(format!("dir-{index:03}"));
+        fs::create_dir(&dir).unwrap();
+        write(&dir.join("file.txt"), "text");
+    }
+
+    let _fds = super::FDS
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut expected = Vec::new();
+    walk(&tree.path, None, Config::default(), |event| {
+        expected.extend(line(event));
+    });
+    expected.sort_unstable();
+
+    for fail_from in [0, 1, 3] {
+        let seams = Seams {
+            fail_from: Some(fail_from),
+            ..Seams::default()
+        };
+        let asked = Arc::clone(&seams.asked);
+        let _seams = seams.set();
+        let visitors = walk_parallel(
+            &tree.path,
+            None,
+            Config::default(),
+            &WalkOptions {
+                workers: 8,
+                boundaries: Vec::new(),
+            },
+            Collected::default,
+        );
+        let mut actual: Vec<_> = visitors
+            .into_iter()
+            .flat_map(|visitor| visitor.events)
+            .collect();
+        actual.sort_unstable();
+
+        assert_eq!(asked.load(Ordering::Relaxed), fail_from + 1);
+        assert_eq!(actual, expected, "helpers from {fail_from} refused");
+    }
 }
 
 /// A parent, child, git directory and exclude file must fit in four worker
