@@ -177,6 +177,29 @@ impl GrepFlags {
         Ok(grep)
     }
 
+    /// Compile a line profile's OR patterns after resolving fixed-string mode.
+    /// Pattern arguments remain intact; only the eventual pattern-file caller
+    /// splits its input into lines. Scoped alternatives keep inline flags
+    /// local.
+    pub fn compile_line_patterns(
+        &self,
+        patterns: &[String],
+        fixed: bool,
+    ) -> Result<Grep, GrepError> {
+        let patterns: Vec<String> = patterns
+            .iter()
+            .map(|pattern| {
+                let pattern = if fixed {
+                    regex::escape(pattern)
+                } else {
+                    pattern.clone()
+                };
+                format!("(?:{pattern})")
+            })
+            .collect();
+        self.compile_lines(&patterns.join("|"))
+    }
+
     /// Experimental required literals, using the same Cox fold and flags as
     /// the shipped trigram derivation. Byte strings are ASCII-folded; the
     /// AND/OR tree is necessary, never sufficient. Longer edge facts allow

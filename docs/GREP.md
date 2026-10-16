@@ -299,6 +299,12 @@ counting and rendering are separate: on `abc\n`, `-U -o '(?s:.*?)'` prints
 nothing and exits 0, while `-U -c '(?s:.*?)'` prints 4. Gate multiline rendering
 separately in M7.
 
+**M2 observation (2026-10-17, D79 open):** rg 15.2.0’s empty absolute-anchor
+`-o`/`-co` output can carry state across lines: `-o '\A'` over three `red`
+lines emits one empty record and two full lines. M2 provisionally retains the
+per-line spans specified here; D79 asks whether to reproduce that artefact.
+This is not yet an approved compatibility exception.
+
 In line mode `-c` counts selected lines; `--count-matches` and `-c -o` count
 iterator matches, including empties. With `-U`, shared compilation exposes a
 resolved classification based on conservative LF exclusion, derived from the

@@ -143,7 +143,12 @@ fn run(mut command: Command, input: Option<&[u8]>) -> Output {
 fn groups(bytes: &[u8], root: &Path) -> Vec<Vec<u8>> {
     let mut groups: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for line in bytes.split_inclusive(|&b| b == b'\n') {
-        let prefix = line.split(|&b| b == b':').next().unwrap_or_default();
+        let prefix = line
+            .strip_suffix(b"\n")
+            .unwrap_or(line)
+            .split(|&b| b == b':')
+            .next()
+            .unwrap_or_default();
         let key = if prefix == b"<stdin>" || root.join(OsStr::from_bytes(prefix)).is_file() {
             prefix.to_vec()
         } else {
@@ -288,13 +293,6 @@ fn utf16_is_the_approved_encoding_difference() {
 fn unsupported_tiers_refuse_before_output() {
     let fixture = Fixture::new("refusals");
     for flag in [
-        "-i",
-        "-o",
-        "-l",
-        "-v",
-        "-F",
-        "-e",
-        "-c",
         "--files",
         "--hidden",
         "-P",
@@ -689,4 +687,69 @@ fn overreported_virtual_file_sizes_end_at_real_eof() {
             .is_ok()
     );
     assert!(output.stderr.is_empty());
+}
+
+// M2's owned cases assert actual hit/no-hit/error status as well as agreement,
+// so negative self-agreements cannot stand in for positive compatibility.
+macro_rules! profile_cases {
+    ($($name:ident: $status:expr => [$($arg:expr),*] $(, stdin = $input:expr)?;)+) => { $(
+        #[test]
+        fn $name() {
+            let fixture = Fixture::new(stringify!($name));
+            let input: Option<&[u8]> = differential!(@input $($input)?);
+            let output = fixture.compare(&[$($arg),*], input);
+            assert_eq!(output.status.code(), Some($status));
+        }
+    )+ };
+}
+
+profile_cases! {
+    folded_lines: 0 => ["-i", "blue", "one.rs"];
+    folded_absent: 1 => ["--ignore-case", "aubergine", "."];
+    folded_kelvin: 0 => ["-i", "KILO", "unicode"];
+    folded_fixed_long_s: 0 => ["-iF", "SEA", "unicode"];
+    fixed_words: 0 => ["-F", "red red", "one.rs"];
+    fixed_metachar_absent: 1 => ["--fixed-strings", "red.*", "one.rs"];
+    fixed_off: 0 => ["-F", "--no-fixed-strings", "red.*", "one.rs"];
+    repeated_patterns: 0 => ["-e", "red", "-e", "42", "."];
+    repeated_absent: 1 => ["-e", "aubergine", "-e", "cerulean", "."];
+    attached_pattern: 0 => ["-inered", "one.rs"];
+    long_pattern_equals: 0 => ["--regexp=42", "two.txt"];
+    positional_before_pattern: 0 => ["one.rs", "-ered"];
+    repeated_empty: 0 => ["-o", "-e", "", "-e", "red", "one.rs"];
+    repeated_priority: 0 => ["-o", "-e", "re", "-e", "red", "one.rs"];
+    duplicate_pattern_count: 0 => ["-co", "-e", "red", "-e", "red", "one.rs"];
+    only_spans: 0 => ["-o", "r.d", "one.rs"];
+    only_numbered: 0 => ["-no", "red", "one.rs"];
+    only_absent: 1 => ["--only-matching", "aubergine", "one.rs"];
+    only_empty_ascii: 0 => ["-o", "", "-"], stdin = b"abc\n";
+    only_empty_unicode: 0 => ["-o", "", "-"], stdin = "é界x\n".as_bytes();
+    only_scoped_unicode_empty: 0 => ["-o", "(?u:)", "-"], stdin = "é界x\n".as_bytes();
+    only_byte_empty: 0 => ["-o", "(?-u:)", "-"], stdin = b"\xffx\n";
+    only_after_consuming: 0 => ["-o", "a*", "-"], stdin = b"abc\n";
+    only_word_boundaries: 0 => ["-o", r"\b", "-"], stdin = b"cedar stone\n";
+    only_line_anchors: 0 => ["-o", "^|$", "one.rs"];
+    only_empty_file: 1 => ["-o", "", "empty"];
+    inverted_lines: 0 => ["-v", "red", "one.rs"];
+    inverted_universe: 0 => ["--invert-match", "red", "."];
+    inverted_absent_lines: 1 => ["-v", ".*", "."];
+    inverted_only: 0 => ["-ov", "red", "one.rs"];
+    inverted_count: 0 => ["-cv", "red", "one.rs"];
+    inverted_count_only: 0 => ["-cvo", "red", "one.rs"];
+    invert_off: 0 => ["-v", "--no-invert-match", "red", "one.rs"];
+    names_match: 0 => ["-l", "red", "."];
+    names_absent: 1 => ["--files-with-matches", "aubergine", "."];
+    names_stdin: 0 => ["-l", "red", "-"], stdin = b"red\n";
+    names_inverted: 0 => ["-lv", "red", "."];
+    count_lines: 0 => ["-c", "red", "one.rs"];
+    count_absent: 1 => ["--count", "red", "two.txt"];
+    count_matches: 0 => ["-co", "red", "one.rs"];
+    count_empty_matches: 0 => ["-co", "", "-"], stdin = "é界x\n".as_bytes();
+    count_then_names: 0 => ["-cl", "red", "one.rs"];
+    names_then_count: 0 => ["-lc", "red", "one.rs"];
+    quiet_count_names: 0 => ["-qcl", "red", "one.rs"];
+    quiet_names_count: 0 => ["-lcq", "red", "one.rs"];
+    missing_pattern_value: 2 => ["-e"];
+    repeated_invalid_pattern: 2 => ["-e", "red", "-e", "[", "one.rs"];
+    fixed_linefeed_error: 2 => ["-F", "red\nBLUE", "one.rs"];
 }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use ferret_catalog::NameId;
 use ferret_policy::GrepSelection;
 use ferret_query::find::{CatalogSource, EntrySource, FileKind, OutputBuffer};
-use ferret_query::line_grep::{self, InputResult, Plan, ScanError};
+use ferret_query::line_grep::{self, InputResult, Output, Plan, ScanError};
 use ferret_query::{CheckedReader, ReadFault, ReadOutcome, ReadRequest};
 
 use crate::cli::{self, Exit};
@@ -173,10 +173,10 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                     }
                     let result = if let Some(name) = entry.catalog_name() {
                         let inode = catalog.name(name).child;
-                        if catalog
-                            .doc(inode)
-                            .is_none_or(|doc| !candidates.contains(doc.0))
-                        {
+                        if catalog.doc(inode).is_none_or(|doc| {
+                            plan.universe() == line_grep::Universe::Candidates
+                                && !candidates.contains(doc.0)
+                        }) {
                             continue;
                         }
                         host.checked(entry.path(), name, &mut **reader)
@@ -425,6 +425,14 @@ impl<W: Write> Host<'_, W> {
         if self.plan.quiet {
             return Ok(());
         }
+        if self.plan.output == Output::Names {
+            if result.matched {
+                self.writer
+                    .write_all(label(path, self.plan.paths.is_empty()))?;
+                self.writer.write_all(b"\n")?;
+            }
+            return Ok(());
+        }
         if result.binary {
             if result.matched {
                 self.writer.write_all(if path == Path::new("-") {
@@ -433,6 +441,15 @@ impl<W: Write> Host<'_, W> {
                     label(path, self.plan.paths.is_empty())
                 })?;
                 self.writer.write_all(b": binary file matches\n")?;
+            }
+        } else if self.plan.output == Output::Count {
+            if result.matched {
+                if self.filename {
+                    self.writer
+                        .write_all(label(path, self.plan.paths.is_empty()))?;
+                    self.writer.write_all(b":")?;
+                }
+                writeln!(self.writer, "{}", result.count)?;
             }
         } else {
             output.write_to(&mut self.writer)?;
