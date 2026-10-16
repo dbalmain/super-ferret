@@ -616,3 +616,77 @@ fn spill_failure_stops_before_the_next_matching_file() {
         "a later file printed after output failed"
     );
 }
+
+// R2: regular virtual files can report size zero while yielding content.
+// Exercise the real CLI for both an explicit operand and an ignored start's
+// live fallback; no symlink fixture can stand in for that recursive route.
+#[test]
+fn zero_size_virtual_files_stream_explicitly_and_in_opaque_fallback() {
+    let version = Path::new("/proc/version");
+    let ostype = Path::new("/proc/sys/kernel/ostype");
+    for path in [version, ostype] {
+        let Ok(metadata) = fs::metadata(path) else {
+            eprintln!(
+                "skipping virtual-file regression: {} is absent",
+                path.display()
+            );
+            return;
+        };
+        if !metadata.is_file() || metadata.len() != 0 {
+            eprintln!(
+                "skipping virtual-file regression: {} is not a zero-size regular file",
+                path.display()
+            );
+            return;
+        }
+    }
+    let fixture = Fixture::new("virtual-file");
+    let explicit = fixture.ferret(&["grep", "^Linux", "/proc/version"], None);
+
+    // Index only opaque child directories: avoid crawling unrelated procfs
+    // contents and ensure kernel's files are supplied by the live fallback.
+    fs::write(fixture.base.join("home/config/ferret/ignore"), b"*\n").unwrap();
+    let indexed = fixture.ferret(&["index", "/proc/sys"], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    let fallback = fixture.ferret(&["grep", "-gostype", "^Linux", "/proc/sys/kernel"], None);
+    assert_eq!(
+        [explicit.status.code(), fallback.status.code()],
+        [Some(0), Some(0)],
+        "explicit={explicit:?}, fallback={fallback:?}"
+    );
+    assert_eq!(explicit.stdout, fs::read(version).unwrap());
+    assert!(explicit.stderr.is_empty());
+    let oracle = fixture.oracle(&["^Linux", "/proc/version"], None);
+    assert_eq!(explicit.stdout, oracle.stdout);
+    assert_eq!(explicit.status.code(), oracle.status.code());
+    let mut expected = b"/proc/sys/kernel/ostype:".to_vec();
+    expected.extend(fs::read(ostype).unwrap());
+    assert_eq!(fallback.stdout, expected);
+    assert!(fallback.stderr.is_empty(), "{fallback:?}");
+}
+
+// R2 control: sysfs may overstate its extent; actual EOF must end the scan.
+#[test]
+fn overreported_virtual_file_sizes_end_at_real_eof() {
+    let path = Path::new("/sys/kernel/uevent_seqnum");
+    let Ok(metadata) = fs::metadata(path) else {
+        eprintln!(
+            "skipping virtual-file EOF control: {} is absent",
+            path.display()
+        );
+        return;
+    };
+    let bytes = fs::read(path).unwrap();
+    assert!(metadata.len() > bytes.len() as u64);
+    let fixture = Fixture::new("virtual-eof");
+    let output = fixture.ferret(&["grep", "^[0-9]+$", "/sys/kernel/uevent_seqnum"], None);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .is_ok()
+    );
+    assert!(output.stderr.is_empty());
+}

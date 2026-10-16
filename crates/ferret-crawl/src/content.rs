@@ -35,8 +35,10 @@ use crate::observe::{BulkRead, Opened, Reader, bracket, catalog_stat};
 
 /// Streams an explicit regular file or live-fallback file, using the same
 /// current-version bracket as catalogued candidates. `None` imposes no policy
-/// size cap. The consumer may stop early; a closing fstat still validates the
-/// bytes it observed. The caller owns retry and publication of buffered output.
+/// size cap. A zero reported size may conceal virtual-file content: stream it
+/// to EOF without a closing bracket, as metadata cannot validate those bytes.
+/// Nonzero sizes bound reads; a closing fstat validates even an early stop.
+/// The caller owns retry and publication of buffered output.
 pub fn stream_file_until(
     path: &std::path::Path,
     cap: Option<u64>,
@@ -52,12 +54,16 @@ pub fn stream_file_until(
         Mode::empty(),
     )
     .map_err(|error| ContentFault::Open(error.into()))?;
-    checked_file(fd, &mut |file, size| {
-        if let Some(cap) = cap
-            && size > cap
-        {
-            return Err(ContentFault::TooLarge { size, cap });
-        }
+    let (mut file, current) = regular_file(fd)?;
+    if let Some(cap) = cap
+        && current.size > cap
+    {
+        return Err(ContentFault::TooLarge {
+            size: current.size,
+            cap,
+        });
+    }
+    let mut pass = |file: &mut File, size| {
         each(&mut Read::take(file, size), size).map_err(|error| {
             if cancelled() {
                 ContentFault::Cancelled
@@ -65,21 +71,30 @@ pub fn stream_file_until(
                 ContentFault::Read(error)
             }
         })
-    })
+    };
+    if current.size == 0 {
+        pass(&mut file, u64::MAX)?;
+        Ok(current)
+    } else {
+        checked_file(file, current, &mut pass)
+    }
 }
 
-/// Both named and catalogued reads validate the open descriptor, rather than
-/// path metadata that may name another inode by the time the read finishes.
-fn checked_file(
-    fd: OwnedFd,
-    pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
-) -> Result<ferret_catalog::Stat, ContentFault> {
+/// Validate the open descriptor, rather than path metadata that may already
+/// name another inode. Shared by sized transactions and direct virtual streams.
+fn regular_file(fd: OwnedFd) -> Result<(File, ferret_catalog::Stat), ContentFault> {
     let stat = fstat(&fd).map_err(|error| ContentFault::Stat(error.into()))?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Err(ContentFault::Changed);
     }
-    let current = catalog_stat(&stat);
-    let mut file = File::from(fd);
+    Ok((File::from(fd), catalog_stat(&stat)))
+}
+
+fn checked_file(
+    mut file: File,
+    current: ferret_catalog::Stat,
+    pass: &mut dyn FnMut(&mut File, u64) -> Result<(), ContentFault>,
+) -> Result<ferret_catalog::Stat, ContentFault> {
     pass(&mut file, current.size)?;
     bracket(&file, &current, ferret_catalog::Content::Binary)?;
     Ok(current)
@@ -424,7 +439,8 @@ impl Documents {
             )
             .map_err(|e| ContentFault::Open(e.into()))
         })?;
-        let current = checked_file(fd, pass)?;
+        let (file, current) = regular_file(fd)?;
+        let current = checked_file(file, current, pass)?;
         self.files_read += 1;
         Ok(current)
     }

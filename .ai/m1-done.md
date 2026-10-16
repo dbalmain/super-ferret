@@ -328,3 +328,69 @@ review findings reproduced. The only additional finding is the indexed spill
 ENOENT/vanished mapping noted above; fixed by retaining the output fault at its
 source. M2 scope above is unchanged. The worktree used for timing was deleted;
 no pushes and no other agent CLI launches.
+
+## Review round 2
+
+2026-10-16: read Astra’s full round-2 note. Reproduced the regression through
+the real CLI: `/proc/version` is regular, reports size 0 and has readable
+content; `ferret grep '^Linux' /proc/version` exited 1 without output.
+My P1 change in `35bf01d` wrongly applied the indexed reader’s size-as-extent
+assumption to direct operands. The ordinary-file transaction was appropriate;
+the unconditional size bound was not.
+
+Zero reported size now selects an unchecked EOF stream, for explicit operands
+and opaque/ignored-directory fallback alike. Genuine empty files necessarily
+share this exception. Nonzero sizes keep the initial-size bound, shared closing
+bracket and one changed-read retry; no extra stat or ordinary-file reread is
+introduced. Extracted the initial descriptor/type observation from the existing
+transaction, so the stream exception and checked route share that observation
+without duplicating the closing bracket. Catalogued readers keep their previous
+behavior, including their zero-size checks.
+
+A nonzero overestimate needs no special EOF handling. The existing scanner
+stops at real EOF before the reported extent. A short read alone cannot justify
+relaxing the version check because an ordinary file can shrink or return short
+reads. A separate real-CLI control with `/sys/kernel/uevent_seqnum` (reports
+4096 bytes) passed even before the correction. It asserts a matching complete
+numeric line, rather than comparing a counter value that can change between
+reads. GREP.md documents the zero-size exception next to stdin and explains the
+nonzero case.
+
+The regression executes the real CLI against `/proc/version`, then indexes
+`/proc/sys` with all child entries ignored and searches the explicit ignored
+start `/proc/sys/kernel` with an `ostype` glob. This forces actual live fallback
+without crawling unrelated procfs content. Both routes failed before the fix
+with exit 1 and no output; both now return the complete matching line and exit
+0. Explicit output also agrees with pinned rg. Virtual-file tests explicitly
+skip with a diagnostic if the relevant procfs/sysfs fixtures are absent.
+
+Revert check restored only `ferret-crawl/src/content.rs` to R1, retaining the
+new tests: explicit and fallback both failed again with `[exit 1, exit 1]` and
+empty output; the overreported-size control still passed. Restored the fix for
+final gates. Logs: `/tmp/grep-review-r2-repro.log`,
+`/tmp/grep-review-r2-test-repro.log`, `/tmp/grep-review-r2-eof-control.log`,
+`/tmp/grep-review-r2-fixed.log`, `/tmp/grep-review-r2-revert.log`.
+
+First gate attempt: fmt/clippy and the new tests passed, but the existing
+watch integration test
+`idle_exit_waits_for_publication_and_restart_backstops_debounced_hints` failed
+its 150-ms idle-exit assertion at watch.rs:764 (daemon had not exited yet).
+No test or timeout was changed. Its isolated retry passed. The next full run
+failed the existing JSON pipe test `a_failed_json_begin_stops_before_find_actions`
+(find_json_cli.rs:171): its action marker existed. This is consistent with
+the child getting ahead of the parent: the test closes the pipe reader only
+after spawning the child, so the child can write begin successfully first. This path does not call the
+changed reader. No unrelated test or implementation was edited or skipped.
+The isolated JSON retry also passed. The complete final gate run passed both
+previously failing tests along with the rest of the workspace. Logs:
+`/tmp/grep-review-r2-gates-first.log`,
+`/tmp/grep-review-r2-watch-retry.log`, `/tmp/grep-review-r2-gates-second.log`.
+
+No manifests/dependencies changed; no pushes or other agent CLI launches.
+
+R2 final gates: `nix run .#fmt` and all-target clippy passed with zero compiler
+warnings; `cargo test --workspace` **1131 passed / 13 ignored** (two new test
+functions, up from 1129). Neither virtual-file test skipped here; no additional
+sandbox or TCP skips. Full successful log: `/tmp/grep-review-r2-gates.log`;
+isolated JSON log: `/tmp/grep-review-r2-json-retry.log`. One R2 fix commit;
+M2 scope is unchanged.
