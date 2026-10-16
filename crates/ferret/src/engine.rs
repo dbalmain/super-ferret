@@ -566,9 +566,14 @@ impl QuerySession {
     pub(crate) fn grep_candidates(
         &self,
         grep: &ferret_verify::Grep,
+        stopped: &dyn Fn() -> bool,
     ) -> Result<DocSet, ferret_index::ReadError> {
-        let pinned = Pinned::new(self.content.as_deref(), self.live());
-        ferret_query::line_grep::candidates(grep, &pinned, &|| false)
+        let live = self
+            .live_until(stopped)
+            .ok_or(ferret_index::ReadError::Cancelled)?;
+        let pinned = Pinned::new_until(self.content.as_deref(), live, stopped)
+            .ok_or(ferret_index::ReadError::Cancelled)?;
+        ferret_query::line_grep::candidates(grep, &pinned, stopped)
     }
 
     /// The catalog view's live documents, built once per view.
@@ -658,7 +663,7 @@ impl QuerySession {
     /// As `doc_names`, publishing only a completed build: `Ok(None)` once
     /// `cancelled` answers true, leaving the next caller to build it. Two
     /// concurrent builders may both build; the first to finish wins.
-    fn doc_names_until(
+    pub(crate) fn doc_names_until(
         &self,
         cancelled: impl Fn() -> bool,
     ) -> Result<Option<&DocNames>, OpenError> {

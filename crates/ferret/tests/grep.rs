@@ -753,3 +753,161 @@ profile_cases! {
     repeated_invalid_pattern: 2 => ["-e", "red", "-e", "[", "one.rs"];
     fixed_linefeed_error: 2 => ["-F", "red\nBLUE", "one.rs"];
 }
+
+// M2: compare whole file groups at different D77 settings, with enough output
+// to force spill. Sorting individual lines would conceal interleaving.
+#[test]
+fn parallel_groups_preserve_whole_spilled_files_at_one_and_four_threads() {
+    let fixture = Fixture::new("parallel-groups");
+    fs::create_dir_all(fixture.tree().join("groups")).unwrap();
+    for file in 0..12 {
+        let mut bytes = Vec::new();
+        for line in 0..4000 {
+            writeln!(bytes, "red file-{file:02} line-{line:04} payload").unwrap();
+        }
+        fixture.write(&format!("groups/part-{file:02}"), &bytes);
+    }
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let oracle = fixture.oracle(&["-n", "red", "groups"], None);
+    assert_eq!(oracle.status.code(), Some(0));
+    fs::write(
+        fixture.base.join("index/settings"),
+        b"version = 1\nsearch_threads = 4\n",
+    )
+    .unwrap();
+    for threads in ["1", "4"] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command
+            .args(["--index"])
+            .arg(fixture.base.join("index"))
+            .args(["grep", "-n", "red", "groups"])
+            .env("FERRET_SEARCH_THREADS", threads);
+        let output = run(command, None);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let actual = groups(&output.stdout, &fixture.tree());
+        assert_eq!(actual.len(), 12);
+        assert_eq!(actual, groups(&oracle.stdout, &fixture.tree()));
+    }
+}
+
+#[test]
+fn duplicate_aliases_and_current_bytes_agree_at_each_thread_count() {
+    let fixture = Fixture::new("duplicate-current");
+    fs::create_dir_all(fixture.tree().join("copies")).unwrap();
+    fixture.write("copies/a", b"red same\n");
+    fixture.write("copies/b", b"red same\n");
+    fs::hard_link(
+        fixture.tree().join("copies/a"),
+        fixture.tree().join("copies/link"),
+    )
+    .unwrap();
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for stage in 0..3 {
+        if stage == 1 {
+            fixture.write("copies/b", b"blue now\n");
+        }
+        if stage == 2 {
+            fixture.write("copies/a", b"blue now\n");
+            fixture.write("copies/b", b"red anew\n");
+        }
+        for args in [
+            vec!["red", "copies"],
+            vec!["-cv", "red", "copies"],
+            vec!["-l", "red", "copies"],
+        ] {
+            let oracle = fixture.oracle(&args, None);
+            for threads in ["1", "4"] {
+                let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+                command
+                    .arg("--index")
+                    .arg(fixture.base.join("index"))
+                    .arg("grep")
+                    .args(&args)
+                    .env("FERRET_SEARCH_THREADS", threads);
+                let output = run(command, None);
+                assert_eq!(output.status.code(), oracle.status.code());
+                assert_eq!(output.stderr.is_empty(), oracle.stderr.is_empty());
+                assert_eq!(
+                    groups(&output.stdout, &fixture.tree()),
+                    groups(&oracle.stdout, &fixture.tree())
+                );
+            }
+        }
+    }
+}
+
+// Keep stdin open until the test observes process exit. There are no sleeps:
+// the closed-output case first observes a real output byte, then closes stdout.
+#[test]
+fn quiet_and_closed_stdout_stop_parallel_work_before_open_stdin() {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+    let fixture = Fixture::new("parallel-cancel");
+    for file in 0..8 {
+        fixture.write(&format!("bulk-{file}"), &b"red payload\n".repeat(20_000));
+    }
+    for quiet in [true, false] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let (release, held) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            held.recv().unwrap();
+            drop(writer);
+        });
+        let fd: OwnedFd = reader.into();
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command.arg("grep");
+        if quiet {
+            command.arg("-q");
+        }
+        command
+            .arg("red")
+            .args((0..8).map(|file| format!("bulk-{file}")))
+            .arg("-")
+            .env("FERRET_SEARCH_THREADS", "4")
+            .stdin(Stdio::from(fd));
+        let mut child = command.spawn().unwrap();
+        let reader = if quiet {
+            None
+        } else {
+            let mut stdout = child.stdout.take().unwrap();
+            Some(thread::spawn(move || {
+                let mut byte = [0];
+                stdout.read_exact(&mut byte).unwrap();
+                drop(stdout);
+            }))
+        };
+        let (finished, completion) = mpsc::channel();
+        let waiter =
+            thread::spawn(move || finished.send(child.wait_with_output().unwrap()).unwrap());
+        let observed = completion.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        producer.join().unwrap();
+        let output = match observed {
+            Ok(output) => output,
+            Err(error) => {
+                waiter.join().unwrap();
+                panic!("grep waited for stdin after cancellation: {error}");
+            }
+        };
+        waiter.join().unwrap();
+        if let Some(reader) = reader {
+            reader.join().unwrap();
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(if quiet { 0 } else { 2 }),
+            "{output:?}"
+        );
+        assert_eq!(output.stderr.is_empty(), quiet);
+        assert!(output.stdout.is_empty());
+    }
+}
+
+profile_cases! {
+    quiet_before_error: 0 => ["-q", "red", "one.rs", "absent"];
+}

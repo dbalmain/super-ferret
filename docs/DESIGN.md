@@ -59,6 +59,12 @@ line profile and matcher; policy owns override globs/hidden selection; the
 grep share the candidate seam, crawl reader adaptation and query’s streaming
 core. Find exposes source constructors without requiring a parsed expression.
 
+Grep M2 (2026-10-17) keeps that graph: the existing query verification scheduler
+also carries bounded line-group payloads. Its streaming producer avoids a path
+backlog; workers own checked reads and line rendering, while the host publishes
+whole groups and propagates cancellation. Bounded catalog-version line records
+are reused only after each alias's own stat; current-byte answers stay local.
+
 Two boundaries carry the design, and both are where D1 said the thought goes:
 
 - **`ferret-index` knows doc ids and byte strings, not files.** It is the part

@@ -3,10 +3,13 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+mod groups;
 
 use ferret_catalog::NameId;
 use ferret_policy::GrepSelection;
@@ -22,7 +25,14 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -n, --line-number   print 1-based line numbers\n\
   -g, --glob GLOB     select paths; repeat for ordered overrides\n\
   -q, --quiet         stop after a match\n\
-  --color=never      plain output (M1)\n\
+  -i, --ignore-case   Unicode case-insensitive matching\n\
+  -o, --only-matching print nonoverlapping match spans\n\
+  -l, --files-with-matches print each matching path once\n\
+  -v, --invert-match  select nonmatching lines\n\
+  -F, --fixed-strings treat patterns literally\n\
+  -e, --regexp PATTERN add an alternative pattern\n\
+  -c, --count         count selected lines (-co counts spans)\n\
+  --color=never      plain output\n\
   --scan             accepted; broad patterns always scan\n\n\
 Directories use snapshot names/postings and current candidate bytes.\n\
 An index covering each directory is required; trigrams are optional.\n\
@@ -31,14 +41,15 @@ decoding is deferred. Excluded paths are absent. Exit: 0 match, 1 none, 2 error.
 
 #[derive(Debug)]
 enum Input {
-    File(PathBuf),
+    File(PathBuf, u64),
     Directory(PathBuf),
     Stdin,
     Failed(PathBuf, io::Error),
 }
 
-/// Runs M1 locally. Help/version bypass configuration and index resolution;
-/// all search errors use grep's status 2, including output failures.
+/// Runs the resolved grep profile locally. Help/version bypass configuration
+/// and index resolution; all search errors use grep's status 2, including
+/// output failures.
 pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let command = match line_grep::parse(args) {
         Ok(command) => command,
@@ -65,6 +76,8 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             return failure(&format!("glob {glob:?}: {error}"));
         }
     }
+    let cancelled = AtomicBool::new(false);
+    let stopped = || cancelled.load(Ordering::Acquire);
     let inputs = resolve_inputs(&plan.paths);
     let recursive = inputs
         .iter()
@@ -78,12 +91,24 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         None
     };
     let pin = engine.as_ref().map(Engine::pin);
-    let candidates = match pin
+    let candidates = if plan.universe() == line_grep::Universe::Candidates {
+        match pin
+            .as_ref()
+            .map(|pin| pin.grep_candidates(&plan.grep, &stopped))
+            .transpose()
+        {
+            Ok(candidates) => candidates,
+            Err(error) => return failure(&error.to_string()),
+        }
+    } else {
+        None
+    };
+    let names = match pin
         .as_ref()
-        .map(|pin| pin.grep_candidates(&plan.grep))
+        .map(|pin| pin.doc_names_until(stopped))
         .transpose()
     {
-        Ok(candidates) => candidates,
+        Ok(names) => names.flatten(),
         Err(error) => return failure(&error.to_string()),
     };
     let documents = match pin
@@ -94,10 +119,6 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         Ok(documents) => documents,
         Err(error) => return failure(&error.to_string()),
     };
-    let mut checked = pin
-        .as_ref()
-        .zip(documents.as_ref())
-        .map(|(pin, documents)| engine::reader::checked(pin.catalog(), documents));
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(error) => return failure(&error.to_string()),
@@ -125,79 +146,86 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         buffer: Vec::new(),
         matched: false,
         errors: false,
+        cancelled: Some(&cancelled),
     };
-    for input in inputs {
-        let result = match input {
-            Input::Failed(path, error) => {
+    // rg diagnoses failed explicit operands before searching, even when an
+    // earlier operand supplies a quiet match.
+    let inputs: Vec<_> = inputs
+        .into_iter()
+        .filter_map(|input| {
+            if let Input::Failed(path, error) = input {
                 host.error(&path, &error);
-                Ok(())
+                None
+            } else {
+                Some(input)
             }
-            Input::Stdin => host.direct(Path::new("-"), &mut io::stdin().lock(), u64::MAX),
-            Input::File(path) => host.file(&path, false),
-            Input::Directory(path) => {
-                let (Some(pin), Some(candidates), Some(reader)) =
-                    (pin.as_ref(), candidates.as_ref(), checked.as_mut())
-                else {
-                    return failure("directory input has no pinned reader");
-                };
-                let catalog = pin.catalog();
-                let mut source =
-                    CatalogSource::paths(catalog.clone(), vec![path.clone()], cwd.clone());
-                let mut descend = true;
-                while let Some(entry) = source.next(descend) {
-                    descend = true;
-                    let entry = match entry {
-                        Ok(entry) => entry,
-                        Err(error) => {
-                            host.error(&error.path, &error.error);
-                            continue;
-                        }
-                    };
-                    let kind = match entry.kind() {
-                        Ok(kind) => kind,
-                        Err(error) => {
-                            host.error(entry.path(), &error);
-                            continue;
-                        }
-                    };
-                    let relative = entry.path().strip_prefix(&cwd).unwrap_or(entry.path());
-                    if kind == FileKind::Directory {
-                        descend = selection.descend(relative.as_os_str().as_bytes(), entry.depth());
-                        continue;
-                    }
-                    if kind != FileKind::File {
-                        continue;
-                    }
-                    if !selection.allows(relative.as_os_str().as_bytes(), entry.depth()) {
-                        continue;
-                    }
-                    let result = if let Some(name) = entry.catalog_name() {
-                        let inode = catalog.name(name).child;
-                        if catalog.doc(inode).is_none_or(|doc| {
-                            plan.universe() == line_grep::Universe::Candidates
-                                && !candidates.contains(doc.0)
-                        }) {
-                            continue;
-                        }
-                        host.checked(entry.path(), name, &mut **reader)
-                    } else {
-                        host.file(entry.path(), true)
-                    };
-                    if let Err(error) = result {
-                        return failure(&format!("writing stdout: {error}"));
-                    }
-                    if host.plan.quiet && host.matched {
-                        break;
-                    }
-                }
-                Ok(())
+        })
+        .collect();
+    let threads = pin.as_ref().map_or_else(
+        || {
+            let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+            engine::search_threads(
+                engine::env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref()),
+                None,
+                available,
+            )
+        },
+        |pin| pin.search_threads(),
+    );
+    let fork = || {
+        pin.as_ref()
+            .zip(documents.as_ref())
+            .map(|(pin, documents)| engine::reader::checked(pin.catalog(), documents))
+    };
+    let mut inputs = inputs.into_iter().peekable();
+    while inputs.peek().is_some() {
+        let mut segment = Vec::new();
+        while inputs
+            .peek()
+            .is_some_and(|input| !matches!(input, Input::Stdin))
+        {
+            if let Some(input) = inputs.next() {
+                segment.push(input);
             }
-        };
-        if let Err(error) = result {
-            return failure(&format!("writing stdout: {error}"));
         }
-        if plan.quiet && host.matched {
-            return Exit::Ok;
+        if !segment.is_empty() {
+            let threads = if segment
+                .iter()
+                .any(|input| matches!(input, Input::Directory(_)))
+            {
+                threads
+            } else {
+                threads.min(segment.len())
+            };
+            let mut source = groups::Source::new(
+                segment,
+                pin.as_ref().map(|p| p.catalog()),
+                candidates.as_ref(),
+                &selection,
+                cwd.clone(),
+            );
+            if let Err(error) = groups::run(
+                &mut host,
+                move || source.next(),
+                &fork,
+                names,
+                threads,
+                &cancelled,
+            ) {
+                return failure(&format!("writing stdout: {error}"));
+            }
+            if plan.quiet && host.matched {
+                return Exit::Ok;
+            }
+        }
+        if matches!(inputs.peek(), Some(Input::Stdin)) {
+            inputs.next();
+            if let Err(error) = host.direct(Path::new("-"), &mut io::stdin().lock(), u64::MAX) {
+                return failure(&format!("writing stdout: {error}"));
+            }
+            if plan.quiet && host.matched {
+                return Exit::Ok;
+            }
         }
     }
     if let Err(error) = host.writer.flush() {
@@ -272,7 +300,7 @@ fn resolve_inputs(paths: &[PathBuf]) -> Vec<Input> {
                 return Input::Stdin;
             }
             match fs::metadata(path) {
-                Ok(metadata) if metadata.is_file() => Input::File(path.clone()),
+                Ok(metadata) if metadata.is_file() => Input::File(path.clone(), metadata.len()),
                 Ok(metadata) if metadata.is_dir() => Input::Directory(path.clone()),
                 Ok(_) => Input::Failed(
                     path.clone(),
@@ -298,6 +326,7 @@ struct Host<'a, W> {
     buffer: Vec<u8>,
     matched: bool,
     errors: bool,
+    cancelled: Option<&'a AtomicBool>,
 }
 
 impl<W: Write> Host<'_, W> {
@@ -306,54 +335,34 @@ impl<W: Write> Host<'_, W> {
         self.errors = true;
     }
 
+    #[cfg(test)]
     fn file(&mut self, path: &Path, recursive: bool) -> io::Result<()> {
-        let cap = recursive.then(|| ferret_policy::Config::default().size_cap);
+        let flag = self.cancelled;
+        let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
         self.transaction(path, &mut |each| {
-            engine::reader::direct(path, cap, &mut |input, size| {
-                if recursive {
-                    let mut buffered =
-                        io::BufReader::with_capacity(ferret_policy::SNIFF_LEN, input);
-                    if ferret_policy::sniff(buffered.fill_buf()?) == ferret_policy::Content::Binary
-                    {
-                        return Ok(());
-                    }
-                    each(&mut buffered, size)
-                } else {
-                    each(input, size)
-                }
-            })
+            groups::read_file(path, recursive, each, &stopped)
         })
     }
 
     fn direct(&mut self, path: &Path, input: &mut dyn Read, size: u64) -> io::Result<()> {
-        let mut output = OutputBuffer::default();
-        let result = scan(
-            self.plan,
-            self.filename
-                .then_some(label(path, self.plan.paths.is_empty())),
-            input,
-            size,
-            &mut self.buffer,
-            &mut output,
-        );
-        match result {
-            Ok(result) => self.commit(path, result, output),
-            Err(ScanError::Input(error)) => {
-                self.error(path, &error);
-                Ok(())
-            }
-            Err(ScanError::Output(error)) => Err(error),
-        }
+        let flag = self.cancelled;
+        let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
+        self.transaction(path, &mut |each| {
+            groups::stream(input, size, each, &stopped)
+        })
     }
 
+    #[cfg(test)]
     fn checked(
         &mut self,
         path: &Path,
         name: NameId,
         reader: &mut CheckedReader<'_>,
     ) -> io::Result<()> {
+        let flag = self.cancelled;
+        let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
         self.transaction(path, &mut |each| {
-            reader(name, ReadRequest::Stream(each, &|| false))
+            reader(name, ReadRequest::Stream(each, &stopped))
         })
     }
 
@@ -362,57 +371,23 @@ impl<W: Write> Host<'_, W> {
         path: &Path,
         read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
     ) -> io::Result<()> {
-        let mut output = OutputBuffer::default();
-        let mut result = InputResult::default();
-        let mut output_failure = None;
-        let outcome = ferret_query::retry_read(
-            || {
-                output = OutputBuffer::default();
-                result = InputResult::default();
-                let mut each = |input: &mut dyn Read, size| {
-                    match scan(
-                        self.plan,
-                        self.filename
-                            .then_some(label(path, self.plan.paths.is_empty())),
-                        input,
-                        size,
-                        &mut self.buffer,
-                        &mut output,
-                    ) {
-                        Ok(scanned) => {
-                            result = scanned;
-                            Ok(())
-                        }
-                        Err(ScanError::Input(error)) => Err(error),
-                        Err(ScanError::Output(error)) => {
-                            // Consumer's I/O ABI cannot carry the distinction.
-                            // Retain the original fault outside that boundary.
-                            output_failure = Some(error);
-                            Err(io::Error::other("grep output failed"))
-                        }
-                    }
-                };
-                let outcome = read(&mut each);
-                if output_failure.is_some() {
-                    // Never retry an output fault, even if the reader reports
-                    // a changed version. The original error is returned below.
-                    ReadOutcome::Cancelled
-                } else {
-                    outcome
-                }
-            },
-            &|| false,
-        );
-        if let Some(error) = output_failure {
-            return Err(error);
+        let flag = self.cancelled;
+        let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
+        let render = groups::Render {
+            plan: self.plan,
+            prefix: self
+                .filename
+                .then_some(label(path, self.plan.paths.is_empty())),
+            stopped: &stopped,
+        };
+        match groups::observe(&render, &mut self.buffer, read, false)? {
+            groups::Observed::Ready(group) => self.commit(path, group.result, group.output),
+            groups::Observed::Failed(error) => {
+                self.error(path, &error);
+                Ok(())
+            }
+            groups::Observed::Skipped => Ok(()),
         }
-        match outcome {
-            ReadOutcome::Stable(_) => return self.commit(path, result, output),
-            ReadOutcome::Failed(error) => self.error(path, &error),
-            ReadOutcome::Vanished | ReadOutcome::Cancelled => {}
-            ReadOutcome::RetryChanged => self.error(path, &ReadFault::Unstable),
-        }
-        Ok(())
     }
 
     fn commit(
@@ -452,7 +427,10 @@ impl<W: Write> Host<'_, W> {
                 writeln!(self.writer, "{}", result.count)?;
             }
         } else {
-            output.write_to(&mut self.writer)?;
+            let flag = self.cancelled;
+            groups::emit(&mut output, &mut self.writer, &|| {
+                flag.is_some_and(|flag| flag.load(Ordering::Acquire))
+            })?;
         }
         Ok(())
     }
@@ -469,37 +447,6 @@ fn label(path: &Path, implicit: bool) -> &[u8] {
             bytes
         }
     }
-}
-
-fn scan(
-    plan: &Plan,
-    prefix: Option<&[u8]>,
-    input: &mut dyn Read,
-    size: u64,
-    buffer: &mut Vec<u8>,
-    output: &mut OutputBuffer,
-) -> Result<InputResult, ScanError> {
-    #[cfg(test)]
-    seam::BEFORE_SCAN.with_borrow_mut(|hook| {
-        if let Some(hook) = hook {
-            hook();
-        }
-    });
-    #[cfg(test)]
-    let mut observed = seam::Observed(input);
-    #[cfg(test)]
-    let input: &mut dyn Read = &mut observed;
-    line_grep::scan(plan, input, size, buffer, &|| false, |number, line| {
-        if let Some(prefix) = prefix {
-            output.write_all(prefix)?;
-            output.write_all(b":")?;
-        }
-        if plan.line_number {
-            write!(output, "{number}:")?;
-        }
-        output.write_all(line)?;
-        output.write_all(b"\n")
-    })
 }
 
 #[cfg(test)]
@@ -544,6 +491,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 errors: false,
+                cancelled: None,
             };
             host.file(&path, recursive).unwrap();
             seam::AFTER_READ.with_borrow_mut(|hook| *hook = None);
@@ -618,6 +566,7 @@ mod tests {
                     buffer: Vec::new(),
                     matched: false,
                     errors: false,
+                    cancelled: None,
                 };
                 host.file(&path, recursive).unwrap();
                 seam::BEFORE_SCAN.with_borrow_mut(|hook| *hook = None);
@@ -656,6 +605,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             errors: false,
+            cancelled: None,
         };
         let mut attempts = 0;
         let mut reader = |_, request: ReadRequest<'_>| {
@@ -695,6 +645,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 errors: false,
+                cancelled: None,
             };
             let mut attempts = 0;
             let mut reader = |_, request: ReadRequest<'_>| {
@@ -742,6 +693,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             errors: false,
+            cancelled: None,
         };
         assert_eq!(
             host.direct(Path::new("file"), &mut &b"red\n"[..], 4)

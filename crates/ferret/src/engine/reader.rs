@@ -48,8 +48,9 @@ pub(crate) fn direct(
     path: &std::path::Path,
     cap: Option<u64>,
     each: ferret_query::Consumer<'_>,
+    cancelled: &dyn Fn() -> bool,
 ) -> ReadOutcome {
-    match ferret_crawl::content::stream_file_until(path, cap, each, &|| false) {
+    match ferret_crawl::content::stream_file_until(path, cap, each, cancelled) {
         Ok(_) => ReadOutcome::Stable(ReadVersion::Current),
         Err(error) => fault(error, false),
     }

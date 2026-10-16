@@ -334,6 +334,14 @@ Colour mode/environment selection is matched; exact ANSI reset placement and
 hyperlinks are not promised. Files finish in any order; their groups do not
 interleave. Reuse find's bounded output/spill machinery where grouping needs it.
 
+**M2 output overrides (confirmed 2026-10-17):** the last `-l`/`-c` selects
+name or count output; `-q` independently overrides both, in either argv order.
+`-o` remains a count modifier under `-c`; under `-v` it emits whole selected
+nonmatching lines. `--no-fixed-strings` and `--no-invert-match` undo those
+switches. Do not invent negations rg does not accept (`--no-quiet`,
+`--no-only-matching`, `--no-count`, `--no-ignore-case`). Case-sensitive `-s`
+and line-number negation remain in their scheduled later slices.
+
 `--json` emits rg begin/match/context/end/summary JSON Lines: byte spans,
 absolute offsets, line numbers, text-or-base64 fields and semantic counts.
 Match schemas/values except key order, timings and physical work counters
@@ -404,10 +412,44 @@ adapts policy/read faults, and renders bounded per-file output using find’s
 spill buffer. The same typed host adapter supplies search’s legacy optional
 read result. There is no query-to-crawl/policy edge or new executor.
 
-M1 emits file groups sequentially. M2’s shared iteration and scan-planning work
-must extend the existing bounded worker scheduling to line groups, using D77’s
-thread setting; do not create a second pool. SCAN.md’s parallel search numbers
-are consequently not M1 grep timings. Resident names still build on open (D78 A).
+M1 emitted file groups sequentially. M2 extends the same verification scheduler
+to line groups, using D77's thread setting as described below. SCAN.md's parallel
+search numbers are consequently not M1 grep timings. Resident names still build
+on open (D78 A).
+
+### M2 seam as built (2026-10-17)
+
+The same query verifier Pool, ring, byte reservation, spawn path and stop guards
+carry either document rows or completed file groups. A worker claims from the
+host's streaming CatalogSource producer, selects candidates with grep policy,
+reads/validates, matches and renders one file. One-file batches bound queued
+groups; no array of every path or second concurrent pool is introduced. The
+calling thread publishes whole groups. Stdin is a direct operand barrier;
+workers never wait for its producer. Explicit operands resolve before searching,
+including failed-path diagnostics even when a quiet match is found elsewhere.
+
+D77's index setting and environment override select workers. Explicit-only
+commands keep the no-index rule and use the override/default count, limited to
+the number of file operands. Inversion declares Searchable as its name universe
+and does not load positive postings; ordinary positive output, names and nonzero
+counts declare Candidates. Positive posting absence never supplies a -v result.
+
+The host keeps bounded, prefix-free records only for duplicated catalogued
+content: at most 64 KiB of accounted records per entry and 16 MiB total before
+cache eviction, plus bounded container overhead. Every alias first passes its
+own full-key catalog-version stat. Current bytes remain path-local and never
+enter this DocId cache. Large groups skip caching and use the ordinary spill
+path; concurrent cache misses may independently read the same document. No
+cache lock is held during file I/O, matching or output.
+
+A shared cancellation flag reaches planning, typed reads, retry acceptance,
+line/span iteration and chunked spill rendering/replay. A worker's stable quiet
+hit stops work immediately, even while an earlier position is still reading;
+fatal output/spill faults also stop workers. Interrupted writes are not used as
+a cancellation signal because write_all retries them. Queued groups and spill
+handles are bounded by the ring/workers; spill bytes follow the required output,
+without silent truncation or an invented cap. The existing long-line input
+buffer exception still applies. No dependency or index-format change.
 
 ## Differential acceptance
 
