@@ -48,7 +48,12 @@ impl Tree {
             base,
             children: Mutex::new(Vec::new()),
         };
-        assert!(tree.local(&["index", "src"]).status.success());
+        let output = tree.local(&["index", "src"]);
+        assert!(
+            output.status.success(),
+            "initial index failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         tree
     }
     fn command(&self, args: &[&str]) -> Command {
