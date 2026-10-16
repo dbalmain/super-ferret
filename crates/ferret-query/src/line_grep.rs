@@ -2,11 +2,11 @@
 //! resolution, policy selection and output; matching and streaming are shared
 //! with content search through ferret-verify and `scan`.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::ops::ControlFlow;
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ferret_verify::{Grep, GrepFlags, LineFlags};
 
@@ -41,6 +41,7 @@ pub struct Plan {
     pub output: Output,
     pub only_matching: bool,
     pub invert: bool,
+    pub stdin_patterns: bool,
 }
 
 /// Name and count switches override one another in argv order; quiet is
@@ -79,6 +80,8 @@ pub enum ParseError {
     Utf8(&'static str),
     Unsupported(String),
     Pattern(ferret_verify::GrepError),
+    PatternFile(PathBuf, io::Error),
+    StdinConflict,
 }
 
 impl std::fmt::Display for ParseError {
@@ -91,6 +94,10 @@ impl std::fmt::Display for ParseError {
                 write!(f, "{flag} is not supported; use rg for this command")
             }
             Self::Pattern(error) => error.fmt(f),
+            Self::PatternFile(path, error) => write!(f, "{}: {error}", path.display()),
+            Self::StdinConflict => {
+                f.write_str("cannot read patterns and search input from stdin together")
+            }
         }
     }
 }
@@ -100,8 +107,26 @@ impl std::error::Error for ParseError {}
 /// Parse rg spellings, clusters, attached values and `--`. Glob validation
 /// follows in the policy adapter, still before input resolution.
 pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
+    parse_with(args, &mut |path| {
+        if path == Path::new("-") {
+            let mut bytes = Vec::new();
+            io::stdin().lock().read_to_end(&mut bytes)?;
+            Ok(bytes)
+        } else {
+            std::fs::read(path)
+        }
+    })
+}
+
+/// Parse using an input adapter for pattern files. Resolved names-only and
+/// information requests never invoke it. The production wrapper supplies
+/// filesystem/stdin reads; tests can observe this actual I/O boundary.
+pub fn parse_with(
+    args: &[OsString],
+    read: &mut dyn FnMut(&Path) -> io::Result<Vec<u8>>,
+) -> Result<Command, ParseError> {
     let mut positionals = Vec::new();
-    let mut patterns = Vec::new();
+    let mut sources = Vec::new();
     let mut globs = Vec::new();
     let (mut line_number, mut quiet, mut done) = (false, false, false);
     let (mut fold, mut fixed, mut invert, mut only_matching) = (false, false, false, false);
@@ -116,6 +141,16 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
         let bytes = arg.as_bytes();
         if !done && bytes == b"--" {
             done = true;
+            continue;
+        }
+        if !done && (bytes == b"--file" || bytes.starts_with(b"--file=")) {
+            let path = if bytes == b"--file" {
+                args.next().map(|arg| PathBuf::from(arg.as_os_str()))
+            } else {
+                Some(PathBuf::from(OsStr::from_bytes(&bytes[7..])))
+            }
+            .ok_or_else(|| ParseError::Value("--file".to_owned()))?;
+            sources.push(PatternSource::File(path));
             continue;
         }
         if !done && bytes.starts_with(b"--") {
@@ -172,7 +207,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                         .ok_or_else(|| ParseError::Value(flag.to_owned()))?;
                     match flag {
                         "--glob" => globs.push(value),
-                        "--regexp" => patterns.push(value),
+                        "--regexp" => sources.push(PatternSource::Argument(value)),
                         _ if value != "never" => return Err(unsupported(text)),
                         _ => {}
                     }
@@ -218,6 +253,16 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                     }
                     b'h' => help = true,
                     b'V' => version = true,
+                    b'f' => {
+                        let path = if at + 1 < bytes.len() {
+                            Some(PathBuf::from(OsStr::from_bytes(&bytes[at + 1..])))
+                        } else {
+                            args.next().map(|arg| PathBuf::from(arg.as_os_str()))
+                        }
+                        .ok_or_else(|| ParseError::Value("-f".to_owned()))?;
+                        sources.push(PatternSource::File(path));
+                        break;
+                    }
                     b'g' | b'e' => {
                         let value = if at + 1 < bytes.len() {
                             std::str::from_utf8(&bytes[at + 1..]).ok()
@@ -228,7 +273,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                         if flag == b'g' {
                             globs.push(value.to_owned());
                         } else {
-                            patterns.push(value.to_owned());
+                            sources.push(PatternSource::Argument(value.to_owned()));
                         }
                         break;
                     }
@@ -253,18 +298,43 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
             hidden,
         }));
     }
-    if patterns.is_empty() {
+    if sources.is_empty() {
         if positionals.is_empty() {
             return Err(ParseError::MissingPattern);
         }
-        patterns.push(
+        sources.push(PatternSource::Argument(
             positionals
                 .remove(0)
                 .into_string()
                 .map_err(|_| ParseError::Utf8("pattern"))?,
-        );
+        ));
     }
-    let paths = positionals.into_iter().map(PathBuf::from).collect();
+    let paths: Vec<PathBuf> = positionals.into_iter().map(PathBuf::from).collect();
+    let stdin_patterns = sources
+        .iter()
+        .any(|source| matches!(source, PatternSource::File(path) if path == Path::new("-")));
+    if stdin_patterns && paths.iter().any(|path| path == Path::new("-")) {
+        return Err(ParseError::StdinConflict);
+    }
+    let mut patterns = Vec::new();
+    for source in sources {
+        match source {
+            PatternSource::Argument(pattern) => patterns.push(pattern),
+            PatternSource::File(path) => {
+                let bytes =
+                    read(&path).map_err(|error| ParseError::PatternFile(path.clone(), error))?;
+                let text = std::str::from_utf8(&bytes).map_err(|error| {
+                    ParseError::PatternFile(path, io::Error::new(io::ErrorKind::InvalidData, error))
+                })?;
+                for line in text.split_inclusive('\n') {
+                    let line = line
+                        .strip_suffix('\n')
+                        .map_or(line, |line| line.strip_suffix('\r').unwrap_or(line));
+                    patterns.push(line.to_owned());
+                }
+            }
+        }
+    }
     let grep = GrepFlags {
         case_insensitive: fold,
     }
@@ -288,7 +358,13 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
         output,
         only_matching,
         invert,
+        stdin_patterns,
     }))
+}
+
+enum PatternSource {
+    Argument(String),
+    File(PathBuf),
 }
 
 fn unsupported(flag: &str) -> ParseError {
@@ -445,6 +521,18 @@ mod tests {
                 .any(|w| w.iter().map(u8::to_ascii_lowercase).eq(key.iter().copied())),
             Trigrams::And(parts) => parts.iter().all(|p| admits(p, original)),
             Trigrams::Or(parts) => parts.iter().any(|p| admits(p, original)),
+        }
+    }
+
+    #[test]
+    fn resolved_names_only_never_reads_pattern_files_or_stdin() {
+        for args in [
+            vec!["--files", "-f", "missing"],
+            vec!["--files", "-f", "-"],
+            vec!["--help", "-f", "missing"],
+        ] {
+            let args: Vec<_> = args.into_iter().map(OsString::from).collect();
+            parse_with(&args, &mut |_| panic!("names-only attempted pattern I/O")).unwrap();
         }
     }
 

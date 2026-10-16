@@ -71,7 +71,13 @@ Remaining ranked flags, in ranking order within each milestone:
 M1 adds `--color=never`, help/version and `--scan`/`--scan-uncovered`; M5 adds
 colour auto/always/ansi. Support rg aliases (`-.`, `-p`) and negating switches.
 Only `-f` contents split into newline-separated alternatives (`-f -` reads
-stdin); empty files match nothing, empty lines supply empty patterns. Positional
+stdin); empty files match nothing, empty lines supply empty patterns.
+**M4 probes (2026-10-17):** strip CR only as part of CRLF in pattern files;
+a lone final CR and a leading UTF-8 BOM are literal pattern bytes. Invalid
+UTF-8 is a pattern-file error. Resolved `--files` ignores `-f` without opening
+it, including missing files and stdin. When `-f -` supplies search patterns,
+no paths defaults to `.`; explicit search `-` is an error. Pattern-file paths
+are byte paths, including attached and long equals spellings. Positional
 and each `-e` argument remain intact, including actual LF bytes. Resolve line/
 multiline mode, newline validation, `-F` escaping and qualifiers **before**
 shared compilation/derivation. Without `-U`, literal LF patterns error; with

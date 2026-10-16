@@ -296,7 +296,6 @@ fn unsupported_tiers_refuse_before_output() {
         "--no-files",
         "-P",
         "-m1",
-        "-f",
         "-H",
         "-N",
         "--no-line-number",
@@ -1206,6 +1205,7 @@ fn files_never_waits_for_stdin_eof_even_when_implicitly_piped() {
     for args in [
         vec!["--files", "-"],
         vec!["--files", "-q", "-"],
+        vec!["--files", "-f", "-", "one.rs"],
         vec!["--files"],
     ] {
         let (reader, writer) = UnixStream::pair().unwrap();
@@ -1280,4 +1280,88 @@ profile_cases! {
     m4_fold_overrides_smart: 0 => ["-Si", "Blue", "one.rs"];
     m4_sensitive_long: 1 => ["-i", "--case-sensitive", "blue", "one.rs"];
     m4_profile_names_only_ignored: 0 => ["--files", "-Swx", "-e", "[", "."];
+}
+
+profile_cases! {
+    m4_pattern_empty: 1 => ["-f", "empty", "one.rs"];
+    m4_pattern_blank: 0 => ["-f", "blank", "one.rs"];
+    m4_pattern_missing: 2 => ["-f", "missing", "one.rs"];
+    m4_pattern_missing_quiet: 2 => ["-q", "-f", "missing", "one.rs"];
+    m4_pattern_empty_with_argument: 0 => ["-fempty", "-e", "red", "one.rs"];
+    m4_pattern_stdin_explicit: 0 => ["-f", "-", "one.rs"], stdin = b"red\n";
+    m4_pattern_stdin_default_directory: 0 => ["-f-"], stdin = b"red\n";
+    m4_pattern_stdin_conflict: 2 => ["-f", "-", "-"], stdin = b"red\n";
+    m4_pattern_stdin_empty: 1 => ["-f", "-", "one.rs"], stdin = b"";
+    m4_pattern_stdin_empty_line: 0 => ["-f", "-", "one.rs"], stdin = b"\n";
+    m4_pattern_names_missing_ignored: 0 => ["--files", "-f", "missing", "."];
+    m4_pattern_names_stdin_ignored: 0 => ["--files", "-f", "-", "."], stdin = b"[\n";
+    m4_pattern_missing_value: 2 => ["-f"];
+}
+
+#[test]
+fn m4_pattern_file_line_endings_modes_and_decoded_literals() {
+    let fixture = Fixture::new("m4-pattern-file");
+    for (bytes, args, status) in [
+        (
+            &b"red\r\nBLUE\r\n"[..],
+            vec!["-f", ".patterns", "one.rs"],
+            0,
+        ),
+        (b"red\r", vec!["-f", ".patterns", "crlf"], 0),
+        (b"red\r", vec!["-f", ".patterns", "one.rs"], 1),
+        (b"\r\n", vec!["-f", ".patterns", "two.txt"], 0),
+        (b"red\n\n", vec!["--file=.patterns", "two.txt"], 0),
+        (
+            b"\xef\xbb\xbfred\n",
+            vec!["--file", ".patterns", "one.rs"],
+            1,
+        ),
+        (b"\xff\n", vec!["-f", ".patterns", "one.rs"], 2),
+        (b"red.*\nBLUE\n", vec!["-F", "-f.patterns", "one.rs"], 0),
+        (b"red\nBLUE\n", vec!["-S", "-f", ".patterns", "one.rs"], 0),
+        (b"blue\n", vec!["-S", "-f", ".patterns", "one.rs"], 0),
+        (b"red\n", vec!["-x", "-f", ".patterns", "one.rs"], 1),
+        (b"BLUE\n", vec!["-x", "-f", ".patterns", "one.rs"], 0),
+        (b"red\n", vec!["-w", "-f", ".patterns", "one.rs"], 0),
+        (b"blue\n", vec!["-f", ".patterns", "-e", "red", "one.rs"], 0),
+        (b"red\n", vec!["-e", "BLUE", "-f", ".patterns", "one.rs"], 0),
+        (
+            b"red\n",
+            vec!["-f", ".patterns", "-f", ".patterns", "one.rs"],
+            0,
+        ),
+        (b"", vec!["-v", "-f", ".patterns", "one.rs"], 0),
+    ] {
+        fixture.write(".patterns", bytes);
+        let output = fixture.compare(&args, None);
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "{bytes:?}: {args:?}: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn m4_pattern_file_paths_are_bytes_in_long_and_attached_options() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let fixture = Fixture::new("m4-pattern-byte-path");
+    let name = OsString::from_vec(b".patterns-\xff".to_vec());
+    fs::write(fixture.tree().join(&name), b"red\n").unwrap();
+    let rg = std::env::var_os("FERRET_RG").unwrap();
+    for prefix in [b"-f".as_slice(), b"--file="] {
+        let mut option = prefix.to_vec();
+        option.extend_from_slice(name.as_bytes());
+        let option = OsString::from_vec(option);
+        let mut oracle = fixture.command(&rg);
+        oracle.arg(&option).arg("one.rs");
+        let oracle = run(oracle, None);
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command.args(["grep"]).arg(&option).arg("one.rs");
+        let actual = run(command, None);
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(actual.stdout, oracle.stdout);
+        assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+    }
 }

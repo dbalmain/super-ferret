@@ -36,6 +36,7 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -v, --invert-match  select nonmatching lines\n\
   -F, --fixed-strings treat patterns literally\n\
   -e, --regexp PATTERN add an alternative pattern\n\
+  -f, --file FILE     read patterns from FILE (- for stdin)\n\
   -c, --count         count selected lines (-co counts spans)\n\
   --files            list selected file names without reading contents\n\
   --hidden, -.       include held hidden files and directories\n\
@@ -86,7 +87,11 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     }
     let cancelled = AtomicBool::new(false);
     let stopped = || cancelled.load(Ordering::Acquire);
-    let inputs = resolve_inputs(&plan.paths, false);
+    let inputs = if plan.stdin_patterns && plan.paths.is_empty() {
+        resolve_inputs(&[PathBuf::from(".")], false)
+    } else {
+        resolve_inputs(&plan.paths, false)
+    };
     let recursive = inputs
         .iter()
         .any(|input| matches!(input, Input::Directory(_)));
