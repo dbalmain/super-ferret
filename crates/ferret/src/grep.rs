@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use ferret_catalog::NameId;
 use ferret_policy::GrepSelection;
 use ferret_query::find::{CatalogSource, EntrySource, FileKind, OutputBuffer};
-use ferret_query::line_grep::{self, InputResult, Plan};
+use ferret_query::line_grep::{self, InputResult, Plan, ScanError};
 use ferret_query::{CheckedReader, ReadFault, ReadOutcome, ReadRequest};
 
 use crate::cli::{self, Exit};
@@ -338,10 +338,11 @@ impl<W: Write> Host<'_, W> {
         );
         match result {
             Ok(result) => self.commit(path, result, output),
-            Err(error) => {
+            Err(ScanError::Input(error)) => {
                 self.error(path, &error);
                 Ok(())
             }
+            Err(ScanError::Output(error)) => Err(error),
         }
     }
 
@@ -363,12 +364,13 @@ impl<W: Write> Host<'_, W> {
     ) -> io::Result<()> {
         let mut output = OutputBuffer::default();
         let mut result = InputResult::default();
+        let mut output_failure = None;
         let outcome = ferret_query::retry_read(
             || {
                 output = OutputBuffer::default();
                 result = InputResult::default();
                 let mut each = |input: &mut dyn Read, size| {
-                    result = scan(
+                    match scan(
                         self.plan,
                         self.filename
                             .then_some(label(path, self.plan.paths.is_empty())),
@@ -376,13 +378,34 @@ impl<W: Write> Host<'_, W> {
                         size,
                         &mut self.buffer,
                         &mut output,
-                    )?;
-                    Ok(())
+                    ) {
+                        Ok(scanned) => {
+                            result = scanned;
+                            Ok(())
+                        }
+                        Err(ScanError::Input(error)) => Err(error),
+                        Err(ScanError::Output(error)) => {
+                            // Consumer's I/O ABI cannot carry the distinction.
+                            // Retain the original fault outside that boundary.
+                            output_failure = Some(error);
+                            Err(io::Error::other("grep output failed"))
+                        }
+                    }
                 };
-                read(&mut each)
+                let outcome = read(&mut each);
+                if output_failure.is_some() {
+                    // Never retry an output fault, even if the reader reports
+                    // a changed version. The original error is returned below.
+                    ReadOutcome::Cancelled
+                } else {
+                    outcome
+                }
             },
             &|| false,
         );
+        if let Some(error) = output_failure {
+            return Err(error);
+        }
         match outcome {
             ReadOutcome::Stable(_) => return self.commit(path, result, output),
             ReadOutcome::Failed(error) => self.error(path, &error),
@@ -438,7 +461,7 @@ fn scan(
     size: u64,
     buffer: &mut Vec<u8>,
     output: &mut OutputBuffer,
-) -> io::Result<InputResult> {
+) -> Result<InputResult, ScanError> {
     #[cfg(test)]
     let mut observed = seam::Observed(input);
     #[cfg(test)]

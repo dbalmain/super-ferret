@@ -576,3 +576,43 @@ fn nul_stops_stdin_while_its_producer_holds_the_stream_open() {
         assert!(output.stderr.is_empty());
     }
 }
+
+// R1/P3: creating the first group's spill fails. Explicit files, catalogued
+// files and stdin must stop before the subsequent small matching file.
+#[test]
+fn spill_failure_stops_before_the_next_matching_file() {
+    let fixture = Fixture::new("spill-failure");
+    fs::create_dir_all(fixture.tree().join("ordered")).unwrap();
+    fixture.write("ordered/big.txt", &b"red\n".repeat(20_000));
+    fixture.write("ordered/small.txt", b"red small\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let mut outcomes = Vec::new();
+    for args in [
+        vec!["grep", "red", "ordered/big.txt", "ordered/small.txt"],
+        vec!["grep", "red", "ordered"],
+        vec!["grep", "red", "-", "ordered/small.txt"],
+    ] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        if args.contains(&"-") {
+            command.stdin(Stdio::from(
+                fs::File::open(fixture.tree().join("ordered/big.txt")).unwrap(),
+            ));
+        }
+        command
+            .arg("--index")
+            .arg(fixture.base.join("index"))
+            .args(args)
+            .env("TMPDIR", fixture.base.join("unavailable-spill-directory"));
+        let output = run(command, None);
+        outcomes.push((
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).contains("output spill"),
+            output.stdout.is_empty(),
+        ));
+    }
+    assert_eq!(
+        outcomes,
+        [(Some(2), true, true); 3],
+        "a later file printed after output failed"
+    );
+}

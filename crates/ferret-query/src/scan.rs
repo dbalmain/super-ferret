@@ -1,4 +1,4 @@
-//! Shared bounded streaming for document search and grep line output. A run
+//! Shared streaming for document search and grep line output. A run
 //! ends just before its last LF; its trailing partial line stays in the buffer.
 
 use std::io::{self, Read};
@@ -13,14 +13,14 @@ pub(crate) const BUFFER: usize = 64 << 10;
 /// With no sentinel the document-search chunk boundaries stay unchanged.
 /// Allocation is fallible, cancellation is checked
 /// between reads, and a consumer can stop without reading the rest of a file.
-pub(crate) fn runs(
+pub(crate) fn runs<E: From<io::Error>>(
     source: &mut dyn Read,
     len: u64,
     buffer: &mut Vec<u8>,
     stopped: &dyn Fn() -> bool,
     sentinel: Option<u8>,
-    mut each: impl FnMut(&[u8], usize, bool) -> io::Result<ControlFlow<()>>,
-) -> io::Result<()> {
+    mut each: impl FnMut(&[u8], usize, bool) -> Result<ControlFlow<()>, E>,
+) -> Result<(), E> {
     if buffer.len() < BUFFER {
         buffer
             .try_reserve_exact(BUFFER - buffer.len())
@@ -30,7 +30,7 @@ pub(crate) fn runs(
     let (mut filled, mut base) = (0, 0);
     loop {
         if stopped() {
-            return Err(io::ErrorKind::Interrupted.into());
+            return Err(io::Error::from(io::ErrorKind::Interrupted).into());
         }
         let left = len.saturating_sub(base as u64 + filled as u64);
         let fresh = filled;
@@ -50,7 +50,7 @@ pub(crate) fn runs(
             match source.read(&mut buffer[filled..]) {
                 Ok(n) => n,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         };
         filled += n;

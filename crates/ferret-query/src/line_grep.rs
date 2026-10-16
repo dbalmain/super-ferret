@@ -178,6 +178,36 @@ pub struct InputResult {
     pub binary: bool,
 }
 
+/// Input faults may be recoverable per file; an output failure must stop the
+/// command, even when it occurs inside the checked-reader callback.
+#[derive(Debug)]
+pub enum ScanError {
+    Input(io::Error),
+    Output(io::Error),
+}
+
+impl From<io::Error> for ScanError {
+    fn from(error: io::Error) -> Self {
+        Self::Input(error)
+    }
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(error) | Self::Output(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Input(error) | Self::Output(error) => Some(error),
+        }
+    }
+}
+
 /// Searches LF-delimited lines without their terminators; one initial UTF-8
 /// BOM is stripped. Every selected line is passed once to `emit` with its
 /// 1-based number. The host buffers output until a checked read succeeds.
@@ -188,7 +218,7 @@ pub fn scan(
     buffer: &mut Vec<u8>,
     stopped: &dyn Fn() -> bool,
     mut emit: impl FnMut(u64, &[u8]) -> io::Result<()>,
-) -> io::Result<InputResult> {
+) -> Result<InputResult, ScanError> {
     let search = plan.grep.search();
     let mut result = InputResult::default();
     let mut number = 0;
@@ -215,14 +245,14 @@ pub fn scan(
                 }
                 number += 1;
                 if stopped() {
-                    return Err(io::ErrorKind::Interrupted.into());
+                    return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                 }
                 if search.find(line).is_some() {
                     result.matched = true;
                     if plan.quiet {
                         return Ok(ControlFlow::Break(()));
                     }
-                    emit(number, line)?;
+                    emit(number, line).map_err(ScanError::Output)?;
                 }
             }
             if binary.is_some() {

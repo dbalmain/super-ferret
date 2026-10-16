@@ -189,7 +189,8 @@ output universes, count/quiet interactions, duplicate/current-byte caching,
 shared scan planning and bounded parallel line-group execution. M3–M9 remain
 as the corrected GREP.md table; PCRE2 remains a refusal.
 
-No benchmark ran here. On the benchmark machine, build once:
+No benchmark ran during M1 implementation. Review round 1’s requested rough
+timing comparison is recorded below. On the benchmark machine, build once:
 
 ```sh
 nix develop --command cargo build --release -p ferret
@@ -219,7 +220,8 @@ and actual content/output work. Report paths/patterns/content only privately.
 
 2026-10-16: read Astra’s full note and reproduced all three findings. D73
 and GREP.md require checked reads for regular-file candidates. P1 is committed
-as `35bf01d`; P2 and P3 are in progress.
+as `35bf01d`, P2 as `16b0a5f`; P3 is the third R1 fix commit. All three
+fixes and their revert checks are complete.
 
 ### P1 — regular-file transactions
 
@@ -293,3 +295,36 @@ or gates ran during the recorded samples. Script:
 `/tmp/grep-review-search-compare.py`; raw samples:
 `/tmp/grep-review-search-data/timings.json`. Original benchmark commands above
 remain for the benchmark machine; this limited comparison was requested in R1.
+
+### P3 — fatal output and spill errors
+
+Reproduced with an unavailable TMPDIR, `big.txt` (20,000 matching lines) then
+`small.txt` (one matching line), through real CLI execution. Explicit files and
+stdin reported an error but still printed small.txt. Indexed input was worse:
+the spill create ENOENT became a vanished candidate and exit 0, also printing
+small.txt. The test covers all three routes; stdin receives big.txt through an
+open descriptor so no producer timing or broken-pipe helper obscures results.
+
+The line scanner now distinguishes input and output faults; the shared run
+reader preserves its consumer's error type. The host retains fatal output
+faults outside Consumer's I/O-only callback ABI and returns the original error
+before any input-fault handling; fatal errors cannot trigger a read retry.
+Stdin uses the same typed distinction. Existing stdout/commit failures already
+stop the command; spill create/write and rendering failures now do too.
+
+Revert check restored all three P3 production files to P2, leaving the new
+regression in place. It failed for explicit, indexed and stdin modes:
+`(exit, spill diagnostic, stdout empty)` was `(2, true, false)`,
+`(0, false, false)`, `(2, true, false)`. All must be `(2, true, true)`.
+Logs: `/tmp/grep-review-p3-repro.log`, `/tmp/grep-review-p3-revert.log`,
+`/tmp/grep-review-p3-fixed.log`. P3 gates: fmt and all-target clippy passed
+with zero compiler warnings; workspace tests **1129 passed / 13 ignored**
+(up four from the M1 baseline), no additional sandbox/TCP skips. Full log:
+`/tmp/grep-review-p3-gates.log`. The full run includes the final three-route
+spill regression and all owned differential cases.
+
+R1 changes no dependencies or manifests and needs no new D-brief. All three
+review findings reproduced. The only additional finding is the indexed spill
+ENOENT/vanished mapping noted above; fixed by retaining the output fault at its
+source. M2 scope above is unchanged. The worktree used for timing was deleted;
+no pushes and no other agent CLI launches.
