@@ -295,7 +295,6 @@ fn unsupported_tiers_refuse_before_output() {
     for flag in [
         "--no-files",
         "-P",
-        "-m1",
         "-H",
         "-N",
         "--no-line-number",
@@ -1363,5 +1362,190 @@ fn m4_pattern_file_paths_are_bytes_in_long_and_attached_options() {
         assert_eq!(actual.status.code(), Some(0));
         assert_eq!(actual.stdout, oracle.stdout);
         assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+    }
+}
+
+profile_cases! {
+    m4_count_matches: 0 => ["--count-matches", "red", "one.rs"];
+    m4_count_matches_absent: 1 => ["--count-matches", "violet", "one.rs"];
+    m4_count_zero_explicit: 1 => ["-c", "--include-zero", "violet", "one.rs"];
+    m4_count_zero_empty: 1 => ["-c", "--include-zero", "red", "empty"];
+    m4_count_zero_indexed: 1 => ["-c", "--include-zero", "violet", "."];
+    m4_count_positive_and_zero: 0 => ["-c", "--include-zero", "red", "."];
+    m4_count_matches_zero: 1 => ["--count-matches", "--include-zero", "violet", "."];
+    m4_count_zero_negation: 1 => ["-c", "--include-zero", "--no-include-zero", "violet", "."];
+    m4_count_lines_override: 0 => ["--count-matches", "-c", "red", "one.rs"];
+    m4_count_matches_override: 0 => ["-c", "--count-matches", "red", "one.rs"];
+    m4_count_only_modifier: 0 => ["--count-matches", "-oc", "red", "one.rs"];
+    m4_count_matches_inverted: 0 => ["-v", "--count-matches", "red", "one.rs"];
+    m4_count_inverted_zero: 1 => ["-v", "-c", "--include-zero", "red", "sub/three.rs"];
+    m4_count_smart_quiet_zero: 1 => ["-qSc", "--include-zero", "violet", "."];
+    m4_count_smart_quiet_hit: 0 => ["-qSc", "--include-zero", "blue", "."];
+    m4_count_empty_ascii_spans: 0 => ["--count-matches", "", "-"], stdin = b"abc\n";
+    m4_count_empty_unicode_spans: 0 => ["--count-matches", "", "-"], stdin = "éK\n".as_bytes();
+    m4_count_word_spans: 0 => ["-w", "--count-matches", "red", "one.rs"];
+    m4_count_line_spans: 0 => ["-x", "--count-matches", "BLUE", "one.rs"];
+    m4_without_match_explicit: 0 => ["--files-without-match", "violet", "one.rs"];
+    m4_without_match_rejected: 1 => ["--files-without-match", "red", "one.rs"];
+    m4_without_match_empty: 0 => ["--files-without-match", "red", "empty"];
+    m4_without_match_indexed: 0 => ["--files-without-match", "red", "."];
+    m4_without_match_inverted: 0 => ["-v", "--files-without-match", "red", "sub/three.rs"];
+    m4_without_match_quiet_hit: 0 => ["-q", "--files-without-match", "violet", "one.rs"];
+    m4_without_match_quiet_rejected: 1 => ["-q", "--files-without-match", "red", "one.rs"];
+    m4_without_match_stdin: 0 => ["--files-without-match", "red", "-"], stdin = b"blue\n";
+    m4_without_match_overrides_count: 1 => ["-c", "--files-without-match", "red", "one.rs"];
+    m4_count_overrides_without_match: 0 => ["--files-without-match", "-c", "red", "one.rs"];
+    m4_names_only_overrides_without_match: 0 => ["--files-without-match", "--files", "one.rs"];
+    m4_without_match_overrides_names_only: 0 => ["--files", "--files-without-match", "violet", "one.rs"];
+    m4_max_one_line: 0 => ["-nm1", "red", "one.rs"];
+    m4_max_two_lines: 0 => ["--max-count=2", "red", "one.rs"];
+    m4_max_spans_finish_line: 0 => ["-om1", "red", "-"], stdin = b"red red\nred\n";
+    m4_max_count_spans: 0 => ["--count-matches", "-m1", "red", "-"], stdin = b"red red\nred\n";
+    m4_max_inverted_lines: 0 => ["-vnm1", "red", "one.rs"];
+    m4_max_repeated_override: 0 => ["-m1", "-m2", "-c", "red", "one.rs"];
+    m4_max_zero: 1 => ["-m0", "red", "one.rs"];
+    m4_max_zero_skips_regex: 1 => ["-m0", "[", "one.rs"];
+    m4_max_zero_skips_inputs: 1 => ["-m0", "red", "missing"];
+    m4_max_zero_no_zero_record: 1 => ["-m0", "-c", "--include-zero", "red", "one.rs"];
+    m4_max_zero_no_without_record: 1 => ["-m0", "--files-without-match", "red", "one.rs"];
+    m4_max_zero_pattern_file_error: 2 => ["-m0", "-f", "missing", "one.rs"];
+    m4_max_zero_glob_error: 2 => ["-m0", "-g", "[", "red", "one.rs"];
+    m4_max_negative: 2 => ["-m-1", "red", "one.rs"];
+    m4_max_overflow: 2 => ["-m18446744073709551616", "red", "one.rs"];
+    m4_max_missing_value: 2 => ["-m"];
+    m4_max_zero_names_only_ignored: 0 => ["--files", "-m0", "one.rs"];
+    m4_count_negation_refused: 2 => ["--no-count-matches", "red", "one.rs"];
+    m4_without_negation_refused: 2 => ["--no-files-without-match", "red", "one.rs"];
+}
+
+#[test]
+fn m4_snapshot_zeros_and_no_match_names_do_not_use_current_negative_bytes() {
+    let fixture = Fixture::new("m4-snapshot-negatives");
+    fs::create_dir_all(fixture.tree().join("records")).unwrap();
+    fixture.write("records/positive", b"red\n");
+    fixture.write("records/negative", b"blue\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    fixture.write("records/positive", b"blue\n");
+    fixture.write("records/negative", b"red\n");
+    for (args, expected, status) in [
+        (
+            vec!["-c", "--include-zero", "red", "records"],
+            &b"records/negative:0\nrecords/positive:0\n"[..],
+            1,
+        ),
+        (
+            vec!["--files-without-match", "red", "records"],
+            b"records/negative\nrecords/positive\n",
+            0,
+        ),
+        (
+            vec!["-vc", "--include-zero", "red", "records"],
+            b"records/negative:0\nrecords/positive:1\n",
+            0,
+        ),
+        (
+            vec!["-c", "--include-zero", "red", "records/negative"],
+            b"1\n",
+            0,
+        ),
+        (
+            vec!["--files-without-match", "red", "records/negative"],
+            b"",
+            1,
+        ),
+    ] {
+        let mut argv = vec!["grep"];
+        argv.extend(args);
+        let actual = fixture.ferret(&argv, None);
+        assert_eq!(actual.status.code(), Some(status), "{argv:?}: {actual:?}");
+        assert_eq!(
+            groups(&actual.stdout, &fixture.tree()),
+            groups(expected, &fixture.tree()),
+            "{argv:?}: {actual:?}"
+        );
+        assert!(actual.stderr.is_empty());
+    }
+    // A posting-negative snapshot name can remain after deletion. Its absence
+    // proof is from the snapshot; an explicit vanished operand is an error.
+    fs::remove_file(fixture.tree().join("records/negative")).unwrap();
+    let output = fixture.ferret(&["grep", "-c", "--include-zero", "red", "records"], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output
+            .stdout
+            .windows(b"records/negative:0\n".len())
+            .any(|s| s == b"records/negative:0\n")
+    );
+    let output = fixture.ferret(
+        &["grep", "--files-without-match", "red", "records/negative"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+}
+
+#[test]
+fn m4_opaque_fallback_reads_current_bytes_for_zero_and_no_match_modes() {
+    let fixture = Fixture::new("m4-fallback-negatives");
+    fs::create_dir_all(fixture.tree().join("opaque")).unwrap();
+    fixture.write(".ferretignore", b"/opaque/\n");
+    fixture.write("opaque/leaf", b"blue\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    fixture.write("opaque/leaf", b"red red\n");
+    for (args, status) in [
+        (vec!["-c", "--include-zero", "red", "opaque"], 0),
+        (vec!["--count-matches", "red", "opaque"], 0),
+        (vec!["--files-without-match", "red", "opaque"], 1),
+        (vec!["-v", "--files-without-match", "red", "opaque"], 0),
+    ] {
+        let output = fixture.compare(&args, None);
+        assert_eq!(output.status.code(), Some(status));
+    }
+}
+
+#[test]
+fn m4_input_faults_never_supply_zero_or_no_match_records() {
+    let fixture = Fixture::new("m4-fault-not-negative");
+    fs::create_dir_all(fixture.tree().join("denied")).unwrap();
+    fixture.write("denied/leaf", b"red\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    let path = fixture.tree().join("denied/leaf");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut outcomes = Vec::new();
+    for output in ["--files-without-match", "-c", "--count-matches"] {
+        for operand in ["denied", "denied/leaf"] {
+            let actual = fixture.ferret(&["grep", output, "--include-zero", "red", operand], None);
+            outcomes.push((
+                actual.status.code(),
+                actual.stdout.is_empty(),
+                actual.stderr.is_empty(),
+            ));
+        }
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(outcomes, [(Some(2), true, false); 6]);
+}
+
+profile_cases! {
+    m4_without_quiet_hit_overrides_operand_error: 0 => ["-q", "--files-without-match", "violet", "one.rs", "missing"];
+    m4_without_quiet_failure_keeps_operand_error: 2 => ["-q", "--files-without-match", "red", "one.rs", "missing"];
+    m4_count_missing_is_not_zero: 2 => ["-c", "--include-zero", "red", "missing"];
+    m4_zero_flag_does_not_change_lines: 0 => ["--include-zero", "red", "one.rs"];
+    m4_matching_names_override_without_match: 0 => ["--files-without-match", "-l", "red", "one.rs"];
+    m4_without_match_ignores_only_matching: 0 => ["--files-without-match", "-o", "violet", "one.rs"];
+}
+
+#[test]
+fn m4_zero_limit_needs_no_index_even_for_directories_or_invalid_patterns() {
+    let fixture = Fixture::new("m4-zero-no-index");
+    fs::remove_dir_all(fixture.base.join("index")).unwrap();
+    for args in [
+        vec!["-m0", "red", "."],
+        vec!["-m0", "[", "."],
+        vec!["-m0", "red", "missing"],
+    ] {
+        let output = fixture.compare(&args, None);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
     }
 }

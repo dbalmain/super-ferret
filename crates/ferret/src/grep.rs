@@ -38,6 +38,10 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -e, --regexp PATTERN add an alternative pattern\n\
   -f, --file FILE     read patterns from FILE (- for stdin)\n\
   -c, --count         count selected lines (-co counts spans)\n\
+  --count-matches    count match spans, including empty spans\n\
+  --include-zero     print zero counts (exit 1 without matches)\n\
+  --files-without-match print paths with no selected line\n\
+  -m, --max-count N   stop after N selected lines per file\n\
   --files            list selected file names without reading contents\n\
   --hidden, -.       include held hidden files and directories\n\
   --color=never      plain output\n\
@@ -85,6 +89,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             return failure(&format!("glob {glob:?}: {error}"));
         }
     }
+    if plan.max_count == Some(0) {
+        return Exit::NoMatch;
+    }
     let cancelled = AtomicBool::new(false);
     let stopped = || cancelled.load(Ordering::Acquire);
     let inputs = if plan.stdin_patterns && plan.paths.is_empty() {
@@ -104,7 +111,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         None
     };
     let pin = engine.as_ref().map(Engine::pin);
-    let candidates = if plan.universe() == line_grep::Universe::Candidates {
+    let candidates = if !plan.invert {
         match pin
             .as_ref()
             .map(|pin| pin.grep_candidates(&plan.grep, &stopped))
@@ -216,7 +223,8 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 candidates.as_ref(),
                 &selection,
                 cwd.clone(),
-            );
+            )
+            .with_absence(plan.universe() == line_grep::Universe::Searchable);
             if let Err(error) = groups::run(
                 &mut host,
                 move |stopped| source.next(stopped),
@@ -432,7 +440,7 @@ impl<W: Write> Host<'_, W> {
         if self.plan.quiet {
             return Ok(());
         }
-        if self.plan.output == Output::Names {
+        if matches!(self.plan.output, Output::Names | Output::WithoutMatch) {
             if result.matched {
                 self.writer
                     .write_all(label(path, self.plan.paths.is_empty()))?;
@@ -440,17 +448,15 @@ impl<W: Write> Host<'_, W> {
             }
             return Ok(());
         }
-        if result.binary {
-            if result.matched {
-                self.writer.write_all(if path == Path::new("-") {
-                    b"(standard input)"
-                } else {
-                    label(path, self.plan.paths.is_empty())
-                })?;
-                self.writer.write_all(b": binary file matches\n")?;
-            }
-        } else if self.plan.output == Output::Count {
-            if result.matched {
+        if result.binary && result.matched {
+            self.writer.write_all(if path == Path::new("-") {
+                b"(standard input)"
+            } else {
+                label(path, self.plan.paths.is_empty())
+            })?;
+            self.writer.write_all(b": binary file matches\n")?;
+        } else if matches!(self.plan.output, Output::Count | Output::CountMatches) {
+            if result.matched || (self.plan.include_zero && result.searched) {
                 if self.filename {
                     self.writer
                         .write_all(label(path, self.plan.paths.is_empty()))?;

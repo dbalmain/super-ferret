@@ -250,11 +250,13 @@ pub(super) enum Job {
     Direct(PathBuf, bool),
     Checked(PathBuf, NameId, u32),
     Failed(PathBuf, String),
+    // Catalog posting absence only: explicit/live inputs always read bytes.
+    Absent(PathBuf),
 }
 impl Job {
     fn path(&self) -> &Path {
         match self {
-            Self::Direct(p, _) | Self::Checked(p, _, _) | Self::Failed(p, _) => p,
+            Self::Direct(p, _) | Self::Checked(p, _, _) | Self::Failed(p, _) | Self::Absent(p) => p,
         }
     }
 }
@@ -366,6 +368,12 @@ impl Worker<'_> {
                 &mut |each| read_file(path, *recursive, each, stopped),
                 false,
             )?,
+            Job::Absent(_) => Observed::Ready(Group {
+                result: InputResult::empty(&self.plan),
+                output: OutputBuffer::default(),
+                version: ReadVersion::Catalogued,
+                records: None,
+            }),
             Job::Failed(_, _) => Observed::Skipped,
         };
         Ok(observed)
@@ -472,6 +480,7 @@ pub(super) struct Source<'a> {
     descend: bool,
     catalog: Option<&'a ferret_catalog::Catalog>,
     candidates: Option<&'a ferret_index::DocSet>,
+    emit_absent: bool,
     selection: &'a GrepSelection,
     cwd: PathBuf,
     #[cfg(test)]
@@ -493,6 +502,7 @@ impl<'a> Source<'a> {
             descend: true,
             catalog,
             candidates,
+            emit_absent: false,
             selection,
             cwd,
             #[cfg(test)]
@@ -500,6 +510,11 @@ impl<'a> Source<'a> {
             #[cfg(test)]
             on_listing_poll: None,
         }
+    }
+
+    pub(super) fn with_absence(mut self, emit: bool) -> Self {
+        self.emit_absent = emit;
+        self
     }
 
     pub fn next(&mut self, stopped: &dyn Fn() -> bool) -> Option<(u64, Job)> {
@@ -570,6 +585,9 @@ impl<'a> Source<'a> {
                             .candidates
                             .is_some_and(|candidates| !candidates.contains(doc.0))
                         {
+                            if self.emit_absent {
+                                return Some((0, Job::Absent(entry.path().to_owned())));
+                            }
                             continue;
                         }
                         return Some((

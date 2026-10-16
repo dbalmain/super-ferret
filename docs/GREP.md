@@ -147,7 +147,13 @@ candidates and uncovered names still verify; faults never establish zero. Zero r
 `-v` selects nonmatching **lines**, never `NOT grep:` documents: even a positive
 document can contain nonmatches. Under inversion, zero-count shortcuts cannot
 use positive posting absence; read the selected lines. Quiet/name modes may
-stop early; counts/context finish required work. Keep reads/output cancellable
+stop early; counts/context finish required work. **M4 implementation
+(2026-10-17):** non-inverted zero/no-match modes enumerate all searchable names
+while retaining the candidate set. The shared producer turns snapshot posting
+absence into a no-lines job; explicit inputs and opaque fallback always read
+current bytes. Inversion does not prepare or consult positive postings. Quiet
+positive counts need no zero records and retain candidate enumeration.
+Keep reads/output cancellable
 and queues bounded.
 
 ## Freshness and operands
@@ -354,7 +360,18 @@ on `foo foo\nfoo\n`, `foo` counts 2 but `foo|\A\z\n` counts 3 although that
 alternative is impossible. `foo\nbar` over two lines counts 1. Under `-v`,
 count selected nonmatching lines (also for
 `--count-matches`); `-o -v` emits those lines. Suppress zero counts unless
-`--include-zero`. Separate `-m`'s search limit, line-boundary clipping after
+`--include-zero`. **M4 probes (2026-10-17):** `--count-matches`, `-c`,
+`-l`, `--files-without-match` and `--files` override output mode in argv order;
+`-o` still modifies `-c`. `--no-include-zero` reverses zero emission. There are
+no `--no-count-matches` or `--no-files-without-match` switches. A no-match name
+(including an empty input) makes exit 0; zero counts alone do not. Input faults
+and vanished candidates never yield a zero or no-match record. Snapshot
+posting absence may still emit a stale name, as D73 permits.
+
+In line mode `-m` limits selected lines, finishing every span on the last
+selected line. `-m0` loads pattern files and validates globs, but skips regex
+compilation and all search-input/index resolution; it prints nothing, including
+under zero/no-match modes. Names-only ignores the limit. Separate `-m`'s search limit, line-boundary clipping after
 that limit, and subsequent rendering/counting. Pin the clipping interaction:
 `foo foo\nbar\nfoo\n`, `-U -m1 'foo(?:\nbar)?'` gives count 2 and `-o`
 emits two three-byte `foo` records, not the later `bar` portion. `-m0` searches
@@ -399,7 +416,10 @@ recursive input retains its existing file size cap. Output spill bounds output
 memory, not this input-line buffer.
 If a selected line preceded it, print `PATH: binary file matches` on stdout
 instead (stdin label: `(standard input)`); count modes also use that message,
-`-l` prints the path, `-q` prints nothing. This counts as success. Otherwise
+`-l` prints the path, `-q` prints nothing. **M4 clarification (2026-10-17):**
+`--files-without-match` prints a name only when no selected line preceded the
+sentinel. Requested zero counts can print zero after a no-match binary stop;
+selected binary count inputs keep the existing message rule. This counts as success. Otherwise
 skip the file. `-a` disables detection. Early `-q`/`-l` may finish before a
 later NUL. Match rg's stdout channel, not its buffer-dependent warning/offset
 bytes. JSON keeps prior match events, sets `end.binary_offset`, and emits no

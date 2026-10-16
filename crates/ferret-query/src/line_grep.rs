@@ -42,6 +42,8 @@ pub struct Plan {
     pub only_matching: bool,
     pub invert: bool,
     pub stdin_patterns: bool,
+    pub include_zero: bool,
+    pub max_count: Option<u64>,
 }
 
 /// Name and count switches override one another in argv order; quiet is
@@ -51,6 +53,8 @@ pub enum Output {
     Lines,
     Names,
     Count,
+    CountMatches,
+    WithoutMatch,
 }
 
 /// Names required after resolving output and selection switches.
@@ -61,10 +65,16 @@ pub enum Universe {
 }
 
 impl Plan {
-    /// Inversion requires every selected searchable name, including documents
-    /// excluded by the positive postings. Absence never proves a selected line.
+    /// Inversion, zero counts and no-match names enumerate searchable names.
+    /// Only non-inverted snapshot output may use posting absence; it never
+    /// proves a selected inverted line. Quiet positive searches need no zeros.
     pub fn universe(&self) -> Universe {
-        if self.invert {
+        if self.invert
+            || self.output == Output::WithoutMatch
+            || (!self.quiet
+                && self.include_zero
+                && matches!(self.output, Output::Count | Output::CountMatches))
+        {
             Universe::Searchable
         } else {
             Universe::Candidates
@@ -77,6 +87,7 @@ impl Plan {
 pub enum ParseError {
     MissingPattern,
     Value(String),
+    Number(String),
     Utf8(&'static str),
     Unsupported(String),
     Pattern(ferret_verify::GrepError),
@@ -88,7 +99,11 @@ impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingPattern => f.write_str("a pattern is required"),
-            Self::Value(flag) => write!(f, "{flag} needs a UTF-8 value"),
+            Self::Value(flag) => write!(f, "{flag} needs a value"),
+            Self::Number(value) => write!(
+                f,
+                "invalid --max-count: {value:?}; expected a nonnegative integer"
+            ),
             Self::Utf8(argument) => write!(f, "{argument} must be UTF-8"),
             Self::Unsupported(flag) => {
                 write!(f, "{flag} is not supported; use rg for this command")
@@ -134,6 +149,8 @@ pub fn parse_with(
     let (mut word, mut line) = (false, false);
     let mut hidden = false;
     let mut files = false;
+    let mut include_zero = false;
+    let mut max_count = None;
     let mut output = Output::Lines;
     let (mut help, mut version) = (false, false);
     let mut args = args.iter();
@@ -191,6 +208,16 @@ pub fn parse_with(
                 "--no-invert-match" if value.is_none() => invert = false,
                 "--only-matching" if value.is_none() => only_matching = true,
                 "--files" if value.is_none() => files = true,
+                "--include-zero" if value.is_none() => include_zero = true,
+                "--no-include-zero" if value.is_none() => include_zero = false,
+                "--count-matches" if value.is_none() => {
+                    output = Output::CountMatches;
+                    files = false;
+                }
+                "--files-without-match" if value.is_none() => {
+                    output = Output::WithoutMatch;
+                    files = false;
+                }
                 "--files-with-matches" if value.is_none() => {
                     output = Output::Names;
                     files = false;
@@ -200,12 +227,15 @@ pub fn parse_with(
                     files = false;
                 }
                 "--scan" | "--scan-uncovered" if value.is_none() => {}
-                "--glob" | "--color" | "--regexp" => {
+                "--glob" | "--color" | "--regexp" | "--max-count" => {
                     let value = value
                         .map(str::to_owned)
                         .or_else(|| args.next().and_then(|s| s.to_str()).map(str::to_owned))
                         .ok_or_else(|| ParseError::Value(flag.to_owned()))?;
                     match flag {
+                        "--max-count" => {
+                            max_count = Some(value.parse().map_err(|_| ParseError::Number(value))?)
+                        }
                         "--glob" => globs.push(value),
                         "--regexp" => sources.push(PatternSource::Argument(value)),
                         _ if value != "never" => return Err(unsupported(text)),
@@ -263,14 +293,20 @@ pub fn parse_with(
                         sources.push(PatternSource::File(path));
                         break;
                     }
-                    b'g' | b'e' => {
+                    b'g' | b'e' | b'm' => {
                         let value = if at + 1 < bytes.len() {
                             std::str::from_utf8(&bytes[at + 1..]).ok()
                         } else {
                             args.next().and_then(|s| s.to_str())
                         }
                         .ok_or_else(|| ParseError::Value(format!("-{}", char::from(flag))))?;
-                        if flag == b'g' {
+                        if flag == b'm' {
+                            max_count = Some(
+                                value
+                                    .parse()
+                                    .map_err(|_| ParseError::Number(value.to_owned()))?,
+                            );
+                        } else if flag == b'g' {
                             globs.push(value.to_owned());
                         } else {
                             sources.push(PatternSource::Argument(value.to_owned()));
@@ -335,6 +371,9 @@ pub fn parse_with(
             }
         }
     }
+    if max_count == Some(0) {
+        patterns.clear();
+    }
     let grep = GrepFlags {
         case_insensitive: fold,
     }
@@ -359,6 +398,8 @@ pub fn parse_with(
         only_matching,
         invert,
         stdin_patterns,
+        include_zero,
+        max_count,
     }))
 }
 
@@ -403,6 +444,19 @@ pub struct InputResult {
     pub matched: bool,
     pub binary: bool,
     pub count: u64,
+    pub searched: bool,
+}
+
+impl InputResult {
+    /// Successful empty input or snapshot posting absence, never an I/O fault.
+    pub fn empty(plan: &Plan) -> Self {
+        let searched = plan.max_count != Some(0);
+        Self {
+            searched,
+            matched: searched && plan.output == Output::WithoutMatch,
+            ..Self::default()
+        }
+    }
 }
 
 /// Input faults may be recoverable per file; an output failure must stop the
@@ -447,7 +501,11 @@ pub fn scan(
     mut emit: impl FnMut(u64, &[u8]) -> io::Result<()>,
 ) -> Result<InputResult, ScanError> {
     let search = plan.grep.search();
-    let mut result = InputResult::default();
+    let mut result = InputResult::empty(plan);
+    if !result.searched {
+        return Ok(result);
+    }
+    let mut selected_lines = 0;
     let mut number = 0;
     crate::scan::runs(
         input,
@@ -475,11 +533,16 @@ pub fn scan(
                     return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                 }
                 if search.find(line).is_some() != plan.invert {
+                    if plan.output == Output::WithoutMatch {
+                        result.matched = false;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    selected_lines += 1;
                     result.matched = true;
                     if plan.quiet || plan.output == Output::Names {
                         return Ok(ControlFlow::Break(()));
                     }
-                    if plan.only_matching && !plan.invert {
+                    if (plan.only_matching || plan.output == Output::CountMatches) && !plan.invert {
                         for span in search.spans(line) {
                             if stopped() {
                                 return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
@@ -494,6 +557,9 @@ pub fn scan(
                         if plan.output == Output::Lines {
                             emit(number, line).map_err(ScanError::Output)?;
                         }
+                    }
+                    if plan.max_count.is_some_and(|limit| selected_lines >= limit) {
+                        return Ok(ControlFlow::Break(()));
                     }
                 }
             }
@@ -597,6 +663,26 @@ mod tests {
     fn output_universe_follows_resolved_inversion_and_count_overrides() {
         for (args, universe, output) in [
             (vec!["-c", "red"], Universe::Candidates, Output::Count),
+            (
+                vec!["-c", "--include-zero", "red"],
+                Universe::Searchable,
+                Output::Count,
+            ),
+            (
+                vec!["--files-without-match", "red"],
+                Universe::Searchable,
+                Output::WithoutMatch,
+            ),
+            (
+                vec!["-q", "--files-without-match", "red"],
+                Universe::Searchable,
+                Output::WithoutMatch,
+            ),
+            (
+                vec!["-qc", "--include-zero", "red"],
+                Universe::Candidates,
+                Output::Count,
+            ),
             (vec!["-vc", "red"], Universe::Searchable, Output::Count),
             (vec!["-cl", "red"], Universe::Candidates, Output::Names),
             (
