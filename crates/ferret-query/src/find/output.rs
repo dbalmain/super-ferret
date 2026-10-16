@@ -92,6 +92,11 @@ impl OutputBuffer {
         self.bytes.capacity()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_spilled(&self) -> bool {
+        self.file.is_some()
+    }
+
     /// Replay a bounded range without changing the append cursor. Context
     /// windows use this for rolling retention and replay; cancellation is
     /// polled between at most 64 KiB chunks. Faults remain output faults.

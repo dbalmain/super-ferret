@@ -114,6 +114,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spilled_window_repeatedly_evicts_compacts_and_replays_exact_bytes() {
+        use std::collections::VecDeque;
+
+        let mut window = Before::new(5, &|| false);
+        let mut reference = VecDeque::new();
+        let mut compactions = 0;
+        let mut spilled = false;
+        for number in 1_u64..=512 {
+            let mut bytes = format!("record {number}: ").into_bytes();
+            bytes.resize(
+                17_000 + (number as usize % 7) * 97,
+                b'a' + (number % 26) as u8,
+            );
+            let previous_head = window.head;
+            let was_spilled = window.store.is_spilled();
+            window.push(number, &bytes).unwrap();
+            spilled |= window.store.is_spilled();
+            if window.head < previous_head {
+                assert!(was_spilled && window.store.is_spilled());
+                compactions += 1;
+            }
+            reference.push_back((number, bytes));
+            if reference.len() > 5 {
+                reference.pop_front();
+            }
+        }
+        assert!(spilled);
+        assert!(compactions >= 50, "only {compactions} spilled compactions");
+        let mut actual = Vec::new();
+        window
+            .emit(&mut |line| {
+                assert_eq!(line.kind, LineKind::Context);
+                assert!(!line.fragment);
+                actual.extend_from_slice(&line.number.to_le_bytes());
+                actual.extend_from_slice(line.bytes);
+                actual.push(b'\n');
+                Ok(())
+            })
+            .unwrap();
+        let mut expected = Vec::new();
+        for (number, bytes) in reference {
+            expected.extend_from_slice(&number.to_le_bytes());
+            expected.extend_from_slice(&bytes);
+            expected.push(b'\n');
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(window.store.len(), 0);
+    }
+
+    #[test]
     fn large_context_counts_spill_headers_and_rolling_windows_compact() {
         for limit in [2, 20_000] {
             let mut window = Before::new(limit, &|| false);
