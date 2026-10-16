@@ -32,6 +32,7 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -F, --fixed-strings treat patterns literally\n\
   -e, --regexp PATTERN add an alternative pattern\n\
   -c, --count         count selected lines (-co counts spans)\n\
+  --hidden, -.       include held hidden files and directories\n\
   --color=never      plain output\n\
   --scan             accepted; broad patterns always scan\n\n\
 Directories use snapshot names/postings and current candidate bytes.\n\
@@ -70,7 +71,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     if std::env::var_os("RIPGREP_CONFIG_PATH").is_some_and(|s| !s.is_empty()) {
         return failure("RIPGREP_CONFIG_PATH is set; pass flags explicitly");
     }
-    let mut selection = GrepSelection::default();
+    let mut selection = GrepSelection::default().with_hidden(plan.hidden);
     for glob in &plan.globs {
         if let Err(error) = selection.push(glob) {
             return failure(&format!("glob {glob:?}: {error}"));

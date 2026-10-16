@@ -38,9 +38,16 @@ impl std::error::Error for GrepGlobError {}
 pub struct GrepSelection {
     rules: Vec<(bool, Vec<Pattern>)>,
     positive: bool,
+    hidden: bool,
 }
 
 impl GrepSelection {
+    /// Reveals held hidden names without overriding exclusions or globs.
+    pub fn with_hidden(mut self, hidden: bool) -> Self {
+        self.hidden = hidden;
+        self
+    }
+
     /// Adds one `-g` operand. Leading `!` excludes; the last matching rule
     /// wins. Invalid globs fail before any content is searched.
     pub fn push(&mut self, glob: &str) -> Result<(), GrepGlobError> {
@@ -83,13 +90,14 @@ impl GrepSelection {
         for end in components.len().saturating_sub(depth) + 1..components.len() {
             let matched = self.decision(&components[..end], true);
             if matched == Some(false)
-                || (components[end - 1].starts_with(b".") && matched != Some(true))
+                || (!self.hidden && components[end - 1].starts_with(b".") && matched != Some(true))
             {
                 return false;
             }
         }
         self.decision(&components, false).unwrap_or_else(|| {
-            !self.positive && !components.last().is_some_and(|p| p.starts_with(b"."))
+            !self.positive
+                && (self.hidden || !components.last().is_some_and(|p| p.starts_with(b".")))
         })
     }
 
@@ -105,7 +113,9 @@ impl GrepSelection {
             .collect();
         let matched = self.decision(&components, true);
         matched != Some(false)
-            && (matched == Some(true) || !components.last().is_some_and(|p| p.starts_with(b".")))
+            && (matched == Some(true)
+                || self.hidden
+                || !components.last().is_some_and(|p| p.starts_with(b".")))
     }
 
     fn decision(&self, components: &[&[u8]], directory: bool) -> Option<bool> {

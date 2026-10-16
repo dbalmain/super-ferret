@@ -27,6 +27,7 @@ pub struct Plan {
     pub globs: Vec<String>,
     pub line_number: bool,
     pub quiet: bool,
+    pub hidden: bool,
     pub output: Output,
     pub only_matching: bool,
     pub invert: bool,
@@ -94,6 +95,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
     let mut globs = Vec::new();
     let (mut line_number, mut quiet, mut done) = (false, false, false);
     let (mut fold, mut fixed, mut invert, mut only_matching) = (false, false, false, false);
+    let mut hidden = false;
     let mut output = Output::Lines;
     let (mut help, mut version) = (false, false);
     let mut args = args.iter();
@@ -113,6 +115,8 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                 "--version" if value.is_none() => version = true,
                 "--line-number" if value.is_none() => line_number = true,
                 "--quiet" if value.is_none() => quiet = true,
+                "--hidden" if value.is_none() => hidden = true,
+                "--no-hidden" if value.is_none() => hidden = false,
                 "--ignore-case" if value.is_none() => fold = true,
                 "--fixed-strings" if value.is_none() => fixed = true,
                 "--no-fixed-strings" if value.is_none() => fixed = false,
@@ -141,6 +145,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
                 match flag {
                     b'n' => line_number = true,
                     b'q' => quiet = true,
+                    b'.' => hidden = true,
                     b'i' => fold = true,
                     b'F' => fixed = true,
                     b'v' => invert = true,
@@ -199,6 +204,7 @@ pub fn parse(args: &[OsString]) -> Result<Command, ParseError> {
         globs,
         line_number,
         quiet,
+        hidden,
         output,
         only_matching,
         invert,

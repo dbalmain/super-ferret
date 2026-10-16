@@ -217,7 +217,10 @@ Cases where rg can search what indexed grep cannot: ferret-only global or
 rg reinclusion that ferret's traversal did not retain (including different
 negation precedence); new names; and content omitted by the size/binary
 policy. Explicit starts/live mode are the exceptions above. `--hidden` alone
-does not undo ferret ignore rules. `-g` last-match wins, supports slash, `**`,
+does not undo ferret ignore rules. **M3 clarification (2026-10-17):**
+`-.` aliases `--hidden`; `--no-hidden` reverses it in argv order. The hidden
+switch applies equally to content and name modes, without weakening negative
+globs or ferret's excluded universe. `-g` last-match wins, supports slash, `**`,
 classes and brace alternatives; positive globs can expose held hidden names,
 but cannot resurrect excluded names. D13 reinclusion can retain ancestor directories. The rg glob layer still
 prunes rejected ancestors: a file-only positive cannot revive a pruned or

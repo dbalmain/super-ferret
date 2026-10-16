@@ -294,7 +294,6 @@ fn unsupported_tiers_refuse_before_output() {
     let fixture = Fixture::new("refusals");
     for flag in [
         "--files",
-        "--hidden",
         "-P",
         "-m1",
         "-x",
@@ -949,4 +948,21 @@ profile_cases! {
 profile_cases! {
     repeated_global_fold_keeps_inline_override: 0 => ["-i", "-e", "(?-i)red", "-e", "blue", "-"], stdin = b"RED\nBLUE\nred\n";
     repeated_global_fold_does_not_refold: 1 => ["-i", "-e", "(?-i)red", "-e", "blue", "-"], stdin = b"RED\n";
+}
+
+// M3 hidden selection uses the same policy/glob layer in content and names
+// mode.
+profile_cases! {
+    hidden_lines: 0 => ["--hidden", "red", "."];
+    hidden_absent: 1 => ["--hidden", "aubergine", "."];
+    hidden_off: 0 => ["--hidden", "--no-hidden", "red", "."];
+    hidden_alias_cluster: 0 => ["-.n", "red", "."];
+    hidden_folded: 0 => ["--hidden", "-i", "blue", "."];
+    hidden_inverted: 0 => ["--hidden", "-v", "red", "."];
+    hidden_matching_names: 0 => ["--hidden", "-l", "red", "."];
+    hidden_counts: 0 => ["--hidden", "-c", "red", "."];
+    hidden_glob_composition: 0 => ["--hidden", "-g", "*.rs", "red", "."];
+    hidden_glob_excluded: 1 => ["--hidden", "-g", "!.hidden/**", "red", ".hidden"];
+    hidden_repeated_enable: 0 => ["--hidden", "--no-hidden", "--hidden", "red", "."];
+    hidden_value_refused: 2 => ["--hidden=yes", "red", "."];
 }
