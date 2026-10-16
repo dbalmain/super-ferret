@@ -1,0 +1,66 @@
+# fm-screen builds per segment (libsais 0.2, 16 OpenMP threads for SA; FM transform single-threaded from the SA)
+segment=0 docs=15507 text_bytes=1072238668 sa_bytes=4288954672 sais_threads=16 sais_wall_s=16.75 since_start_s=0.90
+build_sa segment=0 wall_s=30.44 cpu_s=229.74 peak_rss_kb=5260212
+segment=1 docs=21353 text_bytes=1073336712 sa_bytes=4293346848 sais_threads=16 sais_wall_s=16.63 since_start_s=1.00
+build_sa segment=1 wall_s=19.22 cpu_s=226.25 peak_rss_kb=5264948
+segment=2 docs=18366 text_bytes=1073136976 sa_bytes=4292547904 sais_threads=16 sais_wall_s=17.18 since_start_s=1.03
+build_sa segment=2 wall_s=19.82 cpu_s=230.77 peak_rss_kb=5264672
+segment=3 docs=57150 text_bytes=760100362 sa_bytes=3040401448 sais_threads=16 sais_wall_s=11.93 since_start_s=1.18
+build_sa segment=3 wall_s=14.18 cpu_s=160.33 peak_rss_kb=3732936
+segment=0 n=1072238668 symbols=230 nodes=229 tree_bits=5936800244 bits_per_symbol=5.537 wt_bytes=788496824 rate32_mark_bytes=142406764 rate32_sample_bytes=134029840 rate32_samples=33507460 rate64_mark_bytes=142406764 rate64_sample_bytes=67014924 rate64_samples=16753731 rate128_mark_bytes=142406764 rate128_sample_bytes=33507464 rate128_samples=8376866
+build_fm segment=0 wall_s=38.62 cpu_s=38.40 peak_rss_kb=6284352
+segment=1 n=1073336712 symbols=230 nodes=229 tree_bits=5684894739 bits_per_symbol=5.296 wt_bytes=755040688 rate32_mark_bytes=142552556 rate32_sample_bytes=134167096 rate32_samples=33541774 rate64_mark_bytes=142552556 rate64_sample_bytes=67083552 rate64_samples=16770888 rate128_mark_bytes=142552556 rate128_sample_bytes=33541780 rate128_samples=8385445
+build_fm segment=1 wall_s=55.90 cpu_s=38.13 peak_rss_kb=6290832
+segment=2 n=1073136976 symbols=230 nodes=229 tree_bits=5812127916 bits_per_symbol=5.416 wt_bytes=771938756 rate32_mark_bytes=142526036 rate32_sample_bytes=134142128 rate32_samples=33535532 rate64_mark_bytes=142526036 rate64_sample_bytes=67071068 rate64_samples=16767767 rate128_mark_bytes=142526036 rate128_sample_bytes=33535536 rate128_samples=8383884
+build_fm segment=2 wall_s=36.75 cpu_s=36.33 peak_rss_kb=6290480
+segment=3 n=760100362 symbols=230 nodes=229 tree_bits=4176609122 bits_per_symbol=5.495 wt_bytes=554721528 rate32_mark_bytes=100950904 rate32_sample_bytes=95012552 rate32_samples=23753138 rate64_mark_bytes=100950904 rate64_sample_bytes=47506280 rate64_samples=11876570 rate128_mark_bytes=100950904 rate128_sample_bytes=23753144 rate128_samples=5938286
+build_fm segment=3 wall_s=26.74 cpu_s=26.62 peak_rss_kb=4456672
+# resident sequential loads (FM index files, cold)
+resident_load arm=fm128 segment=0 bytes=964411052 cold_sequential_ms=795.2
+resident_load arm=fm32 segment=0 bytes=1064933428 cold_sequential_ms=6102.9
+resident_load arm=fm32 segment=0 bytes=1064933428 cold_sequential_ms=875.8
+resident_load arm=fm32 segment=1 bytes=1031760340 cold_sequential_ms=766.7
+resident_load arm=fm32 segment=2 bytes=1048606920 cold_sequential_ms=858.2
+resident_load arm=fm32 segment=3 bytes=750684984 cold_sequential_ms=612.9
+resident_load arm=fm64 segment=0 bytes=997918512 cold_sequential_ms=6090.7
+# driver timeline (cargo = running cargo processes at step start; df = GB free)
+21:53:00 count fm32 0 | cargo=0 df=   23G
+21:53:14 rare fm32 0 | cargo=0 df=   23G
+21:53:18 count fm64 0 | cargo=0 df=   23G
+21:53:31 rare fm64 0 | cargo=0 df=   23G
+21:53:37 count fm128 0 | cargo=0 df=   23G
+21:53:51 rare fm128 0 | cargo=0 df=   23G
+21:54:00 alt resident fm32 0 | cargo=0 df=   23G
+21:54:45 alt resident fm128 0 | cargo=0 df=   23G
+21:58:16 delete sa+text 0 | cargo=0 df=   23G
+21:58:16 build-sa 1 | cargo=0 df=   28G
+21:58:35 build-fm 1 | cargo=0 df=   23G
+21:59:31 lookup sa 1 | cargo=0 df=   22G
+21:59:59 count fm32 1 | cargo=0 df=   21G
+22:00:05 rare fm32 1 | cargo=0 df=   21G
+22:00:07 count fm64 1 | cargo=0 df=   21G
+22:00:14 rare fm64 1 | cargo=0 df=   21G
+22:00:16 count fm128 1 | cargo=0 df=   21G
+22:00:23 rare fm128 1 | cargo=0 df=   21G
+22:00:27 delete sa+text 1 | cargo=0 df=   21G
+22:00:28 build-sa 2 | cargo=0 df=   26G
+22:00:48 build-fm 2 | cargo=0 df=   21G
+22:01:24 lookup sa 2 | cargo=0 df=   20G
+22:01:48 count fm32 2 | cargo=0 df=   20G
+22:01:55 rare fm32 2 | cargo=0 df=   20G
+22:01:57 count fm64 2 | cargo=0 df=   20G
+22:02:03 rare fm64 2 | cargo=0 df=   20G
+22:02:07 count fm128 2 | cargo=0 df=   20G
+22:02:13 rare fm128 2 | cargo=0 df=   20G
+22:02:18 delete sa+text 2 | cargo=0 df=   20G
+22:02:18 build-sa 3 | cargo=0 df=   25G
+22:02:33 build-fm 3 | cargo=0 df=   21G
+22:03:00 lookup sa 3 | cargo=0 df=   20G
+22:04:16 count fm32 3 | cargo=0 df=   20G
+22:04:22 rare fm32 3 | cargo=0 df=   20G
+22:04:24 count fm64 3 | cargo=0 df=   20G
+22:04:31 rare fm64 3 | cargo=0 df=   20G
+22:04:34 count fm128 3 | cargo=0 df=   20G
+22:04:40 rare fm128 3 | cargo=0 df=   20G
+22:04:45 delete sa+text 3 | cargo=0 df=   20G
+22:04:45 done 0 1 2 3 | cargo=0 df=   23G

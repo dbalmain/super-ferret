@@ -4869,6 +4869,64 @@ run cold, for example as the first search after a boot or after memory
 pressure, then B, or A at its size, buys 12–90× cold that no amount of
 threading reaches.
 
+### D76 addendum — a suffix array or an FM-index
+
+**Status: open.** Measured in [FMINDEX.md](FMINDEX.md) on the same
+population. Verification ran on 16 threads, the count used for threaded
+trigrams from `wt/par-verify` (D76 C, cited, not re-run). Times are median
+ms, cold / warm. The SA is per 1 GB segment, ASCII-folded, with lines
+verified around each hit.
+
+**Question:** Does a suffix array or an FM-index beat word 4+5 and threaded
+trigrams by enough to justify its size and merge cost?
+
+| Class | Threaded trigrams | Word 4+5 | Suffix array | FM-index s=32 |
+| --- | ---: | ---: | ---: | ---: |
+| rare literal | 900–930 / 49.5 | 9.9 / 0.56 | 57.9 / 0.82 | 70.5 / 1.16 |
+| identifier | 1,738–1,845 / 92.8 | 4,544 / 402 | 1,447 / 114 | est. ≥ 620 warm |
+| alternation | 2,061–2,356 / 142.9 | 5,485 / 302 | 878 / 53.3 | est. 438 warm |
+| broad | 2,778–3,532 / 301.7 | 11,164 / 880 | 2,949 / 225 | est. 13,276 warm |
+| code | 1,690–2,195 / 359.2 | 5,638 / 2,552 | 568 / 92.4 | est. ≥ 185 warm |
+| bytes | 286 MB | +1,607 MB | +19,894 MB (5.0× corpus) | +3,896 MB (0.98×) |
+
+Threaded-trigram cold is a range because only 8- and 32-thread cold rows
+exist. Word 4+5's non-rare rows verify on one thread. The FM's non-rare rows
+are estimates built from a measured locate cost of 3.6 µs per occurrence.
+
+| Option | Costs | Buys |
+| --- | --- | --- |
+| A. Suffix array + folded text per segment | 5× corpus on disk: 20 GB here, about 50 GB at D40's 10 M entries. A merged segment is rebuilt: about 20 s and 230 CPU s per GB at 16 threads, writing 5 bytes per corpus byte. Updates go to a delta segment plus a tombstone bitmap. Each segment adds about 30 binary-search steps per literal. | Alternation 2.7× and code 3.9× faster than threaded trigrams warm (2.3–3× cold). Alternation candidates equal the oracle's documents. Rare literals 60× threaded trigrams warm, but 6× slower than word 4+5 cold. Identifier 1.2× slower warm; broad unchanged. |
+| B. FM-index, s=64 | 0.92× corpus: 3.6 GB, 2.3× word 4+5. The same rebuild as A plus 37 s per GB for the transform. Locate is 8.4 µs per occurrence. | Rare literals 0.95 ms warm and 90 ms cold (lookup only). Any literal's count in about 1 ms warm. Seconds per query on every other class: no help there. |
+| C. Neither: threaded trigrams, plus word 4+5 or the term screen for rare literals (D76 A/B) | Rare literals stay at 50 ms warm without a second screen. | No new index lifecycle. Word 4+5 already beats both arms on rare literals cold, at 8% of A's bytes. |
+
+Case, all options: the index is ASCII-folded.
+- Case-insensitive queries need nothing more, because `required_literals`
+  emits Unicode case variants as OR alternatives.
+- Case-sensitive queries use the folded screen, and verification filters.
+  The extra candidates were not measured.
+- An exact-case SA would double A.
+
+**Recommendation: C.** A's best wins are on alternation and code: 90 and
+267 ms saved warm, about 1.2 s cold. They cost 70× the trigram index and a
+rebuild at every merge. Its rare-literal win is matched cold by word 4+5 at
+a twelfth of the bytes. B pays nearly a corpus of bytes to answer only rare
+literals and counts. The hypothesis held for alternation and code, and
+failed on three points:
+- Cold rare literals: the SA is slower than word 4+5 (58 against 9.9 ms).
+- Identifiers: the literal is selective, but the regex is not. Candidates
+  are 55× the oracle's bytes, and combining 2 M positions costs 51 ms.
+- Literals of 1–2 bytes never reach a screen.
+
+Line-level verification is sound for all 250 queries and independent of the
+index. It needs positions, which trigrams do not keep.
+
+**Fact that would change it:**
+- Agent traces showing alternation or code-class regexes dominate grep time,
+  with 5× corpus on disk acceptable: then A.
+- Literal occurrence counts becoming a product feature (a frequency facet,
+  say; `grep -c` counts matching lines, which the FM cannot give without
+  locating): then B.
+
 ## D77 — Default verification threads: every core, or at most 16
 
 **Status: answered 2026-10-15, C, stored. Dave took the recommendation after
