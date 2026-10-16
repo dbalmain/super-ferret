@@ -414,14 +414,24 @@ query open. For non-binary input with no LF, line buffering grows with the line:
 explicit files and stdin have no invented cap and use fallible allocation;
 recursive input retains its existing file size cap. Output spill bounds output
 memory, not this input-line buffer.
-If a selected line preceded it, print `PATH: binary file matches` on stdout
-instead (stdin label: `(standard input)`); count modes also use that message,
-`-l` prints the path, `-q` prints nothing. **M4 clarification (2026-10-17):**
-`--files-without-match` prints a name only when no selected line preceded the
-sentinel. Requested zero counts can print zero after a no-match binary stop;
-selected binary count inputs keep the existing message rule. This counts as success. Otherwise
-skip the file. `-a` disables detection. Early `-q`/`-l` may finish before a
-later NUL. Match rg's stdout channel, not its buffer-dependent warning/offset
+If a selected line preceded it, plain line/span output prints
+`PATH: binary file matches` on stdout instead (stdin label: `(standard input)`).
+`-l` prints the path and `-q` prints nothing. **M4 review R1 correction
+(2026-10-17):** pinned rg keeps `-c`, `-co` and `--count-matches` output
+numeric, with or without `-m`; the earlier blanket binary-message rule for
+counts was wrong. Count the selected lines/spans before ferret's first-NUL
+stop, retaining the documented binary stopping policy. Requested zero counts
+can print zero after a no-match binary stop. `--files-without-match` prints a
+name only when no selected line preceded the sentinel. Only selected lines or
+names make exit 0; zero records alone do not.
+
+An already-detected NUL remains binary even when `-m` stops at a complete
+selected line before that byte in the received chunk. Pinned probes of
+`-m1 red -` on `red\0x` and `red\nred\0x` both report binary, whereas
+`-m1 -c` / `-m1 --count-matches` print `1` and unlimited counts print `1`
+and `2` respectively. Early limits, `-q` and `-l` need not read ahead to find
+an as-yet unread NUL. `-a` disables detection. Match rg's stdout channel, not
+its buffer-dependent warning/offset
 bytes. JSON keeps prior match events, sets `end.binary_offset`, and emits no
 plain warning. An I/O error never becomes a binary skip.
 

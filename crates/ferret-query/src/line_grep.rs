@@ -520,6 +520,9 @@ pub fn scan(
                 run
             };
             let binary = memchr::memchr(0, run);
+            // M4 R1: a selected-line limit cannot hide a sentinel already
+            // received, even when it follows a complete selected line.
+            result.binary = binary.is_some();
             let text = &run[..binary.unwrap_or(run.len())];
             let mut lines = text.split(|&b| b == b'\n').peekable();
             while let Some(line) = lines.next() {
@@ -564,7 +567,6 @@ pub fn scan(
                 }
             }
             if binary.is_some() {
-                result.binary = true;
                 return Ok(ControlFlow::Break(()));
             }
             Ok(ControlFlow::Continue(()))
@@ -802,39 +804,64 @@ mod tests {
         );
         assert!(result.is_err());
     }
-    // R1/P2: the scanner must stop within the chunk containing NUL, even
-    // when the source has no LF or EOF and refuses a second read.
+    // R1/P2 and M4 R1: an already-read NUL survives the selected-line limit,
+    // including a NUL after a complete line; no mode requests another read.
     #[test]
     fn binary_sentinel_stops_before_another_read_or_buffer_growth() {
-        struct Source {
+        struct Source<'a> {
+            bytes: &'a [u8],
             reads: usize,
         }
-        impl Read for Source {
+        impl Read for Source<'_> {
             fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
                 self.reads += 1;
                 if self.reads != 1 {
                     return Err(io::Error::other("read past NUL"));
                 }
-                bytes[..5].copy_from_slice(b"red\0x");
-                Ok(5)
+                bytes[..self.bytes.len()].copy_from_slice(self.bytes);
+                Ok(self.bytes.len())
             }
         }
-        let Command::Search(plan) = parse(&["red".into()]).unwrap() else {
-            panic!("search")
-        };
-        let mut source = Source { reads: 0 };
-        let mut buffer = Vec::new();
-        let result = scan(
-            &plan,
-            &mut source,
-            u64::MAX,
-            &mut buffer,
-            &|| false,
-            |_, _| Ok(()),
-        )
-        .unwrap();
-        assert!(result.matched && result.binary);
-        assert_eq!(source.reads, 1);
-        assert_eq!(buffer.len(), crate::scan::BUFFER);
+        for bytes in [b"red\0x".as_slice(), b"red\nred\0x"] {
+            for flags in [
+                vec![],
+                vec!["-m1"],
+                vec!["-c"],
+                vec!["-m1", "-c"],
+                vec!["--count-matches"],
+                vec!["-m1", "--count-matches"],
+                vec!["-co"],
+                vec!["-m1", "-co"],
+            ] {
+                let mut args: Vec<_> = flags.iter().map(OsString::from).collect();
+                args.push("red".into());
+                let Command::Search(plan) = parse(&args).unwrap() else {
+                    panic!("search")
+                };
+                let mut source = Source { bytes, reads: 0 };
+                let mut buffer = Vec::new();
+                let result = scan(
+                    &plan,
+                    &mut source,
+                    u64::MAX,
+                    &mut buffer,
+                    &|| false,
+                    |_, _| Ok(()),
+                )
+                .unwrap();
+                assert!(
+                    result.matched && result.binary,
+                    "{flags:?}: {bytes:?}: {result:?}"
+                );
+                let expected = if flags.contains(&"-m1") {
+                    1
+                } else {
+                    bytes.iter().filter(|&&b| b == b'\n').count() as u64 + 1
+                };
+                assert_eq!(result.count, expected, "{flags:?}: {bytes:?}");
+                assert_eq!(source.reads, 1);
+                assert_eq!(buffer.len(), crate::scan::BUFFER);
+            }
+        }
     }
 }

@@ -448,14 +448,8 @@ impl<W: Write> Host<'_, W> {
             }
             return Ok(());
         }
-        if result.binary && result.matched {
-            self.writer.write_all(if path == Path::new("-") {
-                b"(standard input)"
-            } else {
-                label(path, self.plan.paths.is_empty())
-            })?;
-            self.writer.write_all(b": binary file matches\n")?;
-        } else if matches!(self.plan.output, Output::Count | Output::CountMatches) {
+        // M4 R1: counts stay numeric after a binary sentinel, as in rg.
+        if matches!(self.plan.output, Output::Count | Output::CountMatches) {
             if result.matched || (self.plan.include_zero && result.searched) {
                 if self.filename {
                     self.writer
@@ -464,6 +458,13 @@ impl<W: Write> Host<'_, W> {
                 }
                 writeln!(self.writer, "{}", result.count)?;
             }
+        } else if result.binary && result.matched {
+            self.writer.write_all(if path == Path::new("-") {
+                b"(standard input)"
+            } else {
+                label(path, self.plan.paths.is_empty())
+            })?;
+            self.writer.write_all(b": binary file matches\n")?;
         } else {
             let flag = self.cancelled;
             groups::emit(&mut output, &mut self.writer, &|| {

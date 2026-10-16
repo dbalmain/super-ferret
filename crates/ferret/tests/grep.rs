@@ -522,18 +522,45 @@ fn nul_stops_stdin_while_its_producer_holds_the_stream_open() {
     use std::time::Duration;
 
     let fixture = Fixture::new("nul-open-producer");
-    for (bytes, status, expected) in [
-        (&b"\0"[..], 1, &b""[..]),
+    for (flags, bytes, status, expected) in [
+        (vec![], &b"\0"[..], 1, &b""[..]),
         (
+            vec![],
             &b"red\n\0"[..],
             0,
             &b"(standard input): binary file matches\n"[..],
         ),
         (
+            vec![],
             &b"red\0"[..],
             0,
             &b"(standard input): binary file matches\n"[..],
         ),
+        // M4 R1: the NUL is either in the fragment reaching the limit or
+        // beyond a complete selected line in the same received write.
+        (
+            vec!["-m1"],
+            b"red\0x",
+            0,
+            b"(standard input): binary file matches\n",
+        ),
+        (
+            vec!["-m1"],
+            b"red\nred\0x",
+            0,
+            b"(standard input): binary file matches\n",
+        ),
+        (vec!["-c"], b"red\0x", 0, b"1\n"),
+        (vec!["-c"], b"red\nred\0x", 0, b"2\n"),
+        (vec!["-m1", "-c"], b"red\0x", 0, b"1\n"),
+        (vec!["-m1", "-c"], b"red\nred\0x", 0, b"1\n"),
+        (vec!["--count-matches"], b"red\0x", 0, b"1\n"),
+        (vec!["--count-matches"], b"red\nred\0x", 0, b"2\n"),
+        (vec!["-m1", "--count-matches"], b"red\0x", 0, b"1\n"),
+        (vec!["-m1", "--count-matches"], b"red\nred\0x", 0, b"1\n"),
+        (vec!["-m1", "--count-matches"], b"red red\0x", 0, b"2\n"),
+        (vec!["-co"], b"red red\0x", 0, b"2\n"),
+        (vec!["-m1", "-co"], b"red red\0x", 0, b"2\n"),
     ] {
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let (release, held) = mpsc::channel();
@@ -544,7 +571,9 @@ fn nul_stops_stdin_while_its_producer_holds_the_stream_open() {
         let fd: OwnedFd = reader.into();
         let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
         let child = command
-            .args(["grep", "red", "-"])
+            .arg("grep")
+            .args(&flags)
+            .args(["red", "-"])
             .stdin(Stdio::from(fd))
             .spawn()
             .unwrap();
@@ -563,7 +592,7 @@ fn nul_stops_stdin_while_its_producer_holds_the_stream_open() {
         };
         waiter.join().unwrap();
         assert_eq!(output.status.code(), Some(status), "{output:?}");
-        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stdout, expected, "{flags:?}: {bytes:?}");
         assert!(output.stderr.is_empty());
     }
 }
@@ -1548,4 +1577,17 @@ fn m4_zero_limit_needs_no_index_even_for_directories_or_invalid_patterns() {
         assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
         assert!(output.stdout.is_empty() && output.stderr.is_empty());
     }
+}
+
+// M4 review R1: binary count output is numeric, independently of -m.
+profile_cases! {
+    m4_binary_count_limited_fragment: 0 => ["-m1", "-c", "red", "-"], stdin = b"red\0x";
+    m4_binary_count_limited_after_line: 0 => ["-m1", "-c", "red", "-"], stdin = b"red\nred\0x";
+    m4_binary_count_fragment: 0 => ["-c", "red", "-"], stdin = b"red\0x";
+    m4_binary_count_after_line: 0 => ["-c", "red", "-"], stdin = b"red\nred\0x";
+    m4_binary_match_count_fragment: 0 => ["--count-matches", "red", "-"], stdin = b"red\0x";
+    m4_binary_match_count_after_line: 0 => ["--count-matches", "red", "-"], stdin = b"red\nred\0x";
+    m4_binary_count_only_matching_spans: 0 => ["-co", "red", "-"], stdin = b"red red\0x";
+    m4_binary_count_only_matching_limited_spans: 0 => ["-m1", "-co", "red", "-"], stdin = b"red red\0x";
+    m4_binary_match_count_limited_spans: 0 => ["-m1", "--count-matches", "red", "-"], stdin = b"red red\0x";
 }
