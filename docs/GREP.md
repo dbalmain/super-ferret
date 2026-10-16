@@ -2,11 +2,11 @@
 
 Contract for `ferret grep [OPTIONS] PATTERN [PATH...]`, following ripgrep
 15.2.0, also the grep-compat oracle pin. Dave reproduced key cases on 15.1.0;
-that corroborates those cases, not a second oracle pin. **Design for review;
-no implementation starts until reviewed.** D62
+that corroborates those cases, not a second oracle pin. **Contract updated 2026-10-16 against answered D72–D75 and the merged scan
+work (2026-10-13–15).** D62
 requires this CLI; [FIND.md](FIND.md), D47 and [S3.md](S3.md) set its indexed
-model. Anything not promised here is not promised. D72–D75 below are provisional
-recommendations; their briefs are held outside the repository for Dave.
+model. Anything not promised here is not promised. D72–D75 are answered in
+[DECISIONS.md](DECISIONS.md).
 
 ## Modes and scope
 
@@ -15,7 +15,7 @@ recommendations; their briefs are held outside the repository for Dave.
 | Recursive directory, default `.` | Pinned catalog and S3 trigram postings; current bytes for candidates |
 | Explicit file, file symlink, or `-` | Direct current-byte search, without opening an index |
 | `--no-ignore`, `-u`/`-uu` | Unrestricted live walk, without opening an index |
-| `--live` (D73 provisional, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
+| `--live` (D73 A+D, M6) | Current tree with ferret policy; catalog supplies root anchors, not names/postings |
 
 Resolve indexes as find does: `ferret --index DIR`, `FERRET_INDEX`, then XDG
 data. Missing/incompatible indexes or unindexed directory starts exit 2 with
@@ -99,12 +99,25 @@ anchors/classes alone give no keys. Trimming only weakens filtering. Reuse
 `GrepAtom`, candidate `Source`/cursors, coverage and name narrowing; S2 terms
 cannot prove an arbitrary substring/regex match.
 
-**D72 provisional:** grep automatically permits scans. `--scan` and its alias
+**D72 A (confirmed 2026-10-16):** grep automatically permits scans. `--scan` and its alias
 are accepted but unnecessary; `search` retains M > live/4 and uncovered >
 10,000 refusal. Short/All/dense patterns and incomplete coverage scan the
 selected searchable files.
 Estimates choose postings or enumeration, not refusal. No new index structures
-or positions; density remains the priority.
+or positions; density remains the priority. Trigram indexes are optional.
+
+**Scan update (2026-10-16):** D76 C chose parallel verification before new
+screens; the shared scan now has worker-owned candidate work, bracketed
+streaming reads and required-run verification. SCAN.md reports roughly
+139–154 ms warm and 3.4–4.2 s cold against rg’s 154–178 ms and 5.1–6.1 s on
+its corpus after review fixes. These are search/name-output measurements, not
+a grep line-output benchmark or a general guarantee. The earlier warning that
+no-trigram grep should not be expected to beat rg is superseded by those
+measurements. Broad scans are a viable plan, not inherently a fallback failure.
+Reuse the D77 C index setting `search_threads`, capped by available parallelism,
+with `FERRET_SEARCH_THREADS` override and `min(16, available_parallelism)`
+fallback. D78 A keeps resident names built on open; do not add lazy residency
+as a grep prerequisite. Measure grep’s output and first-result costs separately.
 
 After output-mode overrides, the plan explicitly declares its **required
 output universe**, independently of candidate matches:
@@ -129,7 +142,7 @@ and queues bounded.
 
 ## Freshness and operands
 
-**D73 provisional: indexed mode is not exact over the current tree.** Names,
+**D73 A (confirmed 2026-10-16): indexed mode is not exact over the current tree.** Names,
 visibility and posting absence come from the pinned catalog/follow generations.
 New files and new matches in old posting-negative files can be missed. A daemon
 freshness target of about one second is not a deadline or a query barrier.
@@ -140,7 +153,7 @@ answers; unchanged copies share content facts after independent full-key stats.
 Drop vanished candidates even under inversion. Other read failures report an
 error, never a negative match. Retry instability once, then continue with exit 2.
 No atomic tree snapshot is promised; default `--files` keeps stale listings.
-**D73 provisional A+D:** `--live` (M6) enumerates current names and reads current
+**D73 A+D (confirmed 2026-10-16):** `--live` (M6) enumerates current names and reads current
 bytes with D13 policy now, independently of `--no-ignore`. Reconstruct
 `DirRules::root`, `enter` and `traverse` per D13 from covering catalog roots;
 outside-root directories still need indexing or unrestricted mode. Do not read
@@ -171,7 +184,7 @@ Oversize/allocation failures are errors, never truncation or a no-match answer.
 
 ## Ignore rules and visibility
 
-**D74 provisional:** indexed visibility is D47/D13, with rg hidden/glob filters
+**D74 A (confirmed 2026-10-16):** indexed visibility is D47/D13, with rg hidden/glob filters
 on top. It uses ferret global rules, `.gitignore`/`info/exclude` inside worktrees
 at/below indexed roots, and higher-priority `.ferretignore`. Ignore-file changes
 require refresh; a query does not read a second policy hierarchy.
@@ -205,14 +218,16 @@ term/trigram sections.
 
 ## Regex dialect
 
-Keep `regex::bytes` behind `ferret-verify` (D17 reopened; recommendation A).
+Keep `regex::bytes` behind `ferret-verify` (D17 A; D76 C retained the engine
+and parallelised verification before new screens, confirmed 2026-10-16).
 The locked regex 1.13.1 supports rg's regular syntax: quantifiers, alternation,
 groups, class set operations, Unicode properties, inline flags and assertions.
 Lookaround (106 rg repos) and backreferences (5) need PCRE2 in rg too.
 Refuse every `-P`, even regular patterns; no own engine, PCRE dependency or
 process fallback. Reconsider after screening/engine-share measurements.
 
-Grep's default is **case-sensitive**, unlike `search grep:`. `-i` uses Unicode
+Grep's default is **case-sensitive**, as is `search grep:` (D67 A2;
+corrected 2026-10-16). `-i` uses Unicode
 simple folding; `-S` folds only when there is a literal and no uppercase literal
 across patterns, not uppercase letters in escapes/property names. Last case
 switch wins; inline flags still scope normally. `-F` escapes literal patterns
@@ -227,10 +242,13 @@ search within lines. S3 keeps whole-document scope. `-U` allows cross-line spans
 dotall (the flag or inline `(?s)`) makes dot match LF. Empty matches
 advance as specified below. Compile/derive share flags.
 Differences retained: whole-document S3 anchors versus grep line mode; resource
-limits can reject patterns rg accepts. **D75 provisional A:** raw input retains
-UTF-8 BOMs and does not decode UTF-16; rg auto-detects BOMs. This can miss even
-explicit-file matches and requires Dave's approval, not a blanket waiver.
-Invalid UTF-8 alone is text; offsets refer to original bytes.
+limits can reject patterns rg accepts. **D75 D (corrected 2026-10-16):** strip one initial UTF-8 BOM consistently
+for indexed candidates, explicit files and stdin, before line matching and NUL
+detection. Keep original indexed bytes for trigram filtering: removing a prefix
+preserves every necessary substring key. UTF-16 decoding is deferred; its
+misses are an approved encoding difference, including explicit input. Invalid
+UTF-8 alone is text. M1 covers UTF-8 BOM positives and UTF-16 differences;
+later offset-bearing output must specify its BOM offset convention.
 
 ## Output and exit status
 
@@ -313,7 +331,7 @@ Error wording differs from rg; diagnostic presence and exit status are tested.
 capture spans; extend `GrepFlags`, do not add a CLI-only regex executor.
 `ferret-query` owns `grep` parsing, selection/planning and result records; reuse
 `GrepAtom`, P/M estimates, candidate cursors and S2 coverage/read/cache rules.
-`search grep:` keeps document truth, fold-by-default and D67 refusal. It shares
+`search grep:` keeps document truth, case-sensitive defaults and D67 refusal. It shares
 the matcher/derivation/reader, not grep's line-output grammar or `-v` semantics.
 D71 remains separate; grep arguments are patterns.
 
@@ -340,8 +358,9 @@ direct streams use an input adapter with the same matcher and typed I/O errors.
 ## Differential acceptance
 
 Oracle: grep-compat's pinned rg 15.2.0, empty rg config, controlled stdin/tty,
-locale and colour. Harness remains read-only in this slice. Later request its
-maintainer's ferret adapter; do not claim a run before that exists. Account for
+locale and colour. Harness remains read-only in this slice. Use a scratch adapter outside both repositories if the harness has no ferret
+target; never modify the harness or copy its mined rows into owned tests
+(updated 2026-10-16). Account for
 all **3,332** rendered commands every milestone: exact agreement, supported
 accepted difference, deferred refusal, or harness failure. Zero unexplained
 supported differences and zero failures is the gate; refused rows are not agrees.
@@ -375,7 +394,7 @@ make positive fixtures essential. Compare whole file/context groups, not sorted
 lines; JSON ignores only order/time/work. Check exit and diagnostic presence.
 
 Accepted differences are only those specified above: snapshot freshness,
-visibility/cap, binary messages/policy, raw encoding only if D75 A is approved,
+visibility/cap, binary messages/policy, deferred UTF-16 decoding under D75 D,
 order, colour escapes, resource limits and JSON physical work/times. Record each
 by command id, cause, channels and minimal reproducer; visibility takes precedence over accompanying
 binary messages (709/571 visibility versus 33/4 binary-only GNU/git rows).
@@ -383,9 +402,9 @@ No blanket waiver for missing matches on an unchanged visible text file.
 
 ## Build slices M1…Mn
 
-Each slice is one Sol-sized review, cumulative and green. Do not start M1 while
-D72–D75 are unsettled. All later implementation slices run CLAUDE's full gates;
-this document-only slice runs no cargo commands.
+Each slice is one Sol-sized review, cumulative and green. D72–D75 are settled
+(confirmed 2026-10-16); M1 includes D75 D UTF-8 BOM handling. All commits,
+including the contract correction, run CLAUDE’s full gates per the M1 brief.
 
 | Slice | Scope / crates touched | E / S | Acceptance gate |
 | --- | --- | ---: | --- |
@@ -420,19 +439,22 @@ M8 replacement; M9 JSON. Include positive/zero-result queries and synthetic
 10M-entry scaling, labelled separately. Fewer results are not a speed win.
 
 Change the plan if selective warm p90 is slower than rg or reads over half the
-selected bytes: measure stronger screening before engine work (S3 currently
-reads ~1.38 GB for ~8 MB of actual rare-literal matches; four-key trimming
-explains only 2.4%). If post-screening verification exceeds half of p90 and the
+selected bytes: measure stronger screening before engine work. The original
+S3 measurement read ~1.38 GB for ~8 MB of rare-literal matches; four-key trimming
+explained only 2.4%. D76 C and SCAN.md supersede that serial latency baseline
+(update 2026-10-16), not the candidate-volume concern. If post-screening verification exceeds half of p90 and the
 engine exceeds half of verification, revisit D17. If broad scans are over 2×
 rg's comparable p90, fix enumeration/streaming or reopen D72; if new-name misses
 harm agents, reopen D73. No global refresh, new positional index or PCRE engine
 is justified merely by a compatibility rank.
 
-## Provisional decisions
+## Answered decisions (checked 2026-10-16)
 
-D72: automatic grep scans; `search --scan` remains explicit. D73: snapshot
-membership/absence by default plus opt-in policy-preserving `--live` (A+D).
-D74: D47 visibility with explicit/unrestricted exceptions. D75: raw encoding
-(A), explicitly provisional because BOM/UTF-16 matches can be missed.
-Dave's questions/options/recommendations are in the external grep design briefs;
-review these defaults before assigning builders.
+D72 A: automatic grep scans; `search --scan` remains explicit. D73 A+D:
+snapshot membership/absence by default plus opt-in policy-preserving `--live`.
+D74 A: D47 visibility with explicit/unrestricted exceptions; `.ignore` and
+`.rgignore` support is a possible later feature, not scheduled. D74 A agrees
+with this document’s earlier D47 recommendation; its provisional status was
+stale, not its visibility choice. D75 D replaces the earlier raw-input A:
+strip initial UTF-8 BOMs everywhere; retain the approved UTF-16 difference.
+No new unresolved product decision was needed for these corrections.
