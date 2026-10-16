@@ -194,10 +194,14 @@ non-regular and missing-input rules, symlink handling and diagnostic events.
 Malformed patterns warn and are skipped; valid rules in the same file remain.
 The remaining host differences are deliberate: live probes the three policy
 names directly rather than selecting them from crawl's prior directory listing
-(so a newly created policy name can be seen); live rejects a scope on a policy
-I/O fault rather than continuing with that input absent and recording coverage;
-and live checks cancellation around each bounded load. It does not record
-crawl's watch dependencies or worktree identities. Global configuration remains
+(so a newly created policy name can be seen); live reports the first policy
+I/O fault with grep's diagnostic prefix and rejects the scope, rather than
+continuing with that input absent and recording all coverage faults; and live
+checks cancellation around each bounded load. Live opens canonical directory
+paths with a no-follow final component, independently of find's earlier walk
+observations; crawl follows the configured root operand and uses checked
+parent-relative handles below it. Live does not record crawl's watch
+dependencies or worktree identities. Global configuration remains
 a separate host input: no scoped size limit; missing configuration quietly uses
 defaults without index's setup warnings or file creation; dangling links and
 unreadable or non-regular files are errors. Its nonblocking open also rejects
@@ -209,6 +213,11 @@ mean those dependency bytes can be avoided with the current format. It does
 not enumerate the stored names. Live mode leaves `Links`, `Entries` and all
 content sections unloaded, proved through the production lazy section cells.
 It resolves the existing thread setting without opening Engine.
+
+**Review correction (2026-10-17):** a failed configured-root resolution is
+reported only for a requested scope containing that root or contained by it.
+An inaccessible unrelated root does not abort a healthy-root query. Relevant
+anchor failures still prevent both line and names output for that scope.
 
 Nested configured roots reset policy when reached or explicitly selected;
 they do not revive an ancestor already pruned by policy or grep filters. This

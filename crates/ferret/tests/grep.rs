@@ -2560,3 +2560,45 @@ fn m6_live_oversized_policy_is_a_fault() {
         );
     }
 }
+
+// Resolving an inaccessible root used to abort queries outside its scope.
+// An ancestor query includes that failed anchor and must still fail.
+#[test]
+fn m6_live_anchor_faults_are_scoped_to_requested_roots() {
+    let fixture = Fixture::new("live-root-faults");
+    fs::create_dir(fixture.tree().join("healthy")).unwrap();
+    fs::create_dir_all(fixture.tree().join("private/other")).unwrap();
+    fixture.write("healthy/hit", b"red\n");
+    fixture.write("private/other/hit", b"red\n");
+    let indexed = fixture.ferret(&["index", "healthy", "private/other"], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    let private = fixture.tree().join("private");
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+    // Restore permissions before assertions, including when a CLI regresses.
+    let results = [
+        vec!["grep", "--live", "red", "healthy"],
+        vec!["grep", "--live", "--files", "healthy"],
+        vec!["grep", "--live", "red", "private/other"],
+        vec!["grep", "--live", "--files", "private/other"],
+        vec!["grep", "--live", "red", "."],
+        vec!["grep", "--live", "--files", "."],
+    ]
+    .map(|args| fixture.ferret(&args, None));
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    for (result, expected) in results[..2]
+        .iter()
+        .zip([&b"healthy/hit:red\n"[..], &b"healthy/hit\n"[..]])
+    {
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        assert_eq!(result.stdout, expected, "{result:?}");
+        assert!(result.stderr.is_empty(), "{result:?}");
+    }
+    for result in &results[2..] {
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        assert!(result.stdout.is_empty(), "{result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("Permission denied"),
+            "{result:?}"
+        );
+    }
+}

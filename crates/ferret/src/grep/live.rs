@@ -17,6 +17,7 @@ const NONBLOCK: i32 = 0x800;
 #[derive(Clone)]
 pub(super) struct Anchors {
     roots: Arc<[PathBuf]>,
+    faults: Arc<[(PathBuf, io::Error)]>,
     global: Arc<str>,
     index: Arc<Path>,
 }
@@ -38,19 +39,21 @@ impl Anchors {
         #[cfg(test)]
         OPENED.with_borrow_mut(|opened| *opened = Some(catalog.clone()));
         let mut roots = Vec::new();
+        let mut faults = Vec::new();
         for (_, root) in catalog.roots() {
-            // Only existing anchors can cover a current directory. An unrelated
-            // vanished root does not prevent querying another configured root.
-            match fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(root))) {
+            let path = Path::new(std::ffi::OsStr::from_bytes(root));
+            match fs::canonicalize(path) {
                 Ok(root) => roots.push(root),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
+                // Defer anchor faults until the requested scope is known.
+                // Catalog roots are absolute canonical paths from indexing.
+                Err(error) => faults.push((path.to_owned(), error)),
             }
         }
         roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
         roots.dedup();
         Ok(Self {
             roots: roots.into(),
+            faults: faults.into(),
             global,
             index: index.to_owned().into(),
         })
@@ -60,6 +63,16 @@ impl Anchors {
     }
     pub fn validate(&self, path: &Path) -> io::Result<PathBuf> {
         let current = fs::canonicalize(path)?;
+        if let Some((root, error)) = self
+            .faults
+            .iter()
+            .find(|(root, _)| current.starts_with(root) || root.starts_with(&current))
+        {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("policy root {}: {error}", root.display()),
+            ));
+        }
         if !self.roots.iter().any(|root| current.starts_with(root)) {
             return Err(io::Error::other(
                 "directory is outside configured roots; index it or use --no-ignore",
