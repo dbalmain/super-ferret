@@ -5017,3 +5017,30 @@ the build is 9 ms of a query that already beats `rg`.
 catalogs near 10M rows make C worth its format change, since each query would
 pay 300 ms or more. So would a real 10M tree whose build exceeds about 1 s, with
 daemons or not, since the first query after each start pays it.
+
+## D79 — Empty absolute anchors in line grep output
+
+**Status: open, 2026-10-17; M2 uses A provisionally.**
+
+**Question:** should line-oriented `-o`/`-co` retain the per-line span rule in
+GREP.md, or reproduce rg 15.2.0’s cross-line empty-absolute-anchor artefacts?
+Owned binary probes (no oracle source): on `red\nred\nred\n`, `rg -o '\A'`
+prints one empty record and then two `red` records; `-o '\A|\z'` emits four
+empty records, while the contract’s per-line spans give six. On
+`ox\ncedar\nx\n`, `-no '\A'` emits `1:`, `2:`, `3:x`. Ordinary nonempty
+absolute-anchor matches and `^|$` do follow the expected per-line rule.
+
+| Option | Tradeoff |
+| --- | --- |
+| A. Retain per-line spans | Keeps one iterator and the written contract; documented rg differences for these empty-absolute-anchor outputs. |
+| B. Reproduce rg artefacts | Closer output on those probes; depends on cross-line state that is not described by the matcher’s spans, with unclear bounds and buffer sensitivity. |
+| C. Refuse affected profiles | Avoids output disagreement but rejects valid regular syntax that M2 promises, including patterns outside the observed cases if detection is conservative. |
+
+**Recommendation: A.** Keep anchors’ assertion context and byte-wise empty
+advancement consistent in the shared iterator; do not infer a new span rule
+from erroneous-looking cross-line output. M2 records this as provisional,
+not an approved blanket compatibility waiver.
+
+**Fact that would change it:** a documented, stable rg rule that cheaply
+explains these outputs, or significant affected commands in the 3,332 audit.
+Then B, with owned positive/negative cases for that rule.
