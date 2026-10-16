@@ -242,17 +242,14 @@ fn depth_limits_prune_and_quit_drive_the_real_walk() {
 fn live_walk_cancels_within_one_directory_check_interval() {
     // Pin the bug where cancellation could not be observed until readdir had
     // populated the entire directory's child stack.
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let tree = Tree::new("cancel-walk");
     for index in 0..(walk::CANCELLATION_INTERVAL * 8) {
         fs::write(tree.0.join(format!("entry-{index:04}")), []).unwrap();
     }
     let mut source = LiveWalk::new(vec![tree.0.clone()], Options::default());
-    assert_eq!(
-        source.next(true).unwrap().unwrap().path(),
-        tree.0.as_path()
-    );
+    assert_eq!(source.next(true).unwrap().unwrap().path(), tree.0.as_path());
 
     const CANCEL_AFTER: usize = 1_000;
     let cancel = AtomicBool::new(false);
@@ -267,9 +264,58 @@ fn live_walk_cancels_within_one_directory_check_interval() {
     let next = source.next_with_cancel(true, &mut || Ok(()), &mut cancelled);
 
     assert!(cancel.load(Ordering::Relaxed));
-    assert!(next.is_none(), "the walk yielded a child after cancellation");
+    assert!(
+        next.is_none(),
+        "the walk yielded a child after cancellation"
+    );
     assert!(checked_entries >= CANCEL_AFTER);
     assert!(checked_entries < CANCEL_AFTER + walk::CANCELLATION_INTERVAL);
+
+    struct CancelOutput {
+        output: Output,
+        checks: AtomicUsize,
+    }
+    impl Effects for CancelOutput {
+        fn cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::Relaxed) >= 2
+        }
+        fn print(&mut self, path: &Path, nul: bool) -> io::Result<()> {
+            self.output.print(path, nul)
+        }
+        fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.output.write(bytes)
+        }
+        fn error(&mut self, error: &WalkError) {
+            self.output.error(error);
+        }
+        fn command(&mut self, command: &mut Command) -> io::Result<bool> {
+            self.output.command(command)
+        }
+    }
+
+    let plan = Plan::parse(&[
+        "-I".into(),
+        tree.0.as_os_str().to_owned(),
+        "-print".into(),
+        "-exec".into(),
+        "true".into(),
+        "{}".into(),
+        ";".into(),
+    ])
+    .unwrap();
+    let mut output = CancelOutput {
+        output: Output::default(),
+        checks: AtomicUsize::new(0),
+    };
+    let outcome = plan.run(&mut plan.live_source(), &mut output).unwrap();
+
+    assert_eq!(outcome.errors, 0);
+    assert_eq!(output.checks.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        output.output.bytes,
+        [tree.0.as_os_str().as_bytes(), b"\n"].concat()
+    );
+    assert!(output.output.errors.is_empty());
 }
 
 #[test]
