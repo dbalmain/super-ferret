@@ -239,6 +239,40 @@ fn depth_limits_prune_and_quit_drive_the_real_walk() {
 }
 
 #[test]
+fn live_walk_cancels_within_one_directory_check_interval() {
+    // Pin the bug where cancellation could not be observed until readdir had
+    // populated the entire directory's child stack.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tree = Tree::new("cancel-walk");
+    for index in 0..(walk::CANCELLATION_INTERVAL * 8) {
+        fs::write(tree.0.join(format!("entry-{index:04}")), []).unwrap();
+    }
+    let mut source = LiveWalk::new(vec![tree.0.clone()], Options::default());
+    assert_eq!(
+        source.next(true).unwrap().unwrap().path(),
+        tree.0.as_path()
+    );
+
+    const CANCEL_AFTER: usize = 1_000;
+    let cancel = AtomicBool::new(false);
+    let mut checked_entries = 0;
+    let mut cancelled = || {
+        checked_entries += walk::CANCELLATION_INTERVAL;
+        if checked_entries >= CANCEL_AFTER {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        cancel.load(Ordering::Relaxed)
+    };
+    let next = source.next_with_cancel(true, &mut || Ok(()), &mut cancelled);
+
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(next.is_none(), "the walk yielded a child after cancellation");
+    assert!(checked_entries >= CANCEL_AFTER);
+    assert!(checked_entries < CANCEL_AFTER + walk::CANCELLATION_INTERVAL);
+}
+
+#[test]
 fn name_and_path_globs_use_find_semantics_including_c_classes() {
     let tree = Tree::new("glob");
     let cases: &[(&[&str], &[&str])] = &[

@@ -481,6 +481,17 @@ pub trait EntrySource {
     ) -> Option<Result<&Entry, WalkError>> {
         self.next(descend)
     }
+    /// Fetches the next entry while allowing long source operations to poll
+    /// for cancellation. Sources that cannot poll internally retain their
+    /// existing fetch behavior.
+    fn next_with_cancel(
+        &mut self,
+        descend: bool,
+        before_directory: &mut dyn FnMut() -> io::Result<()>,
+        _cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<&Entry, WalkError>> {
+        self.next_with(descend, before_directory)
+    }
 }
 
 impl<S: EntrySource + ?Sized> EntrySource for &mut S {
@@ -502,6 +513,7 @@ impl<S: EntrySource + ?Sized> EntrySource for &mut S {
 /// getdents64 buffer. One call reads a typical directory whole; 8 KiB took
 /// three calls per directory on the timing tree.
 const LISTING_BUFFER: usize = 64 * 1024;
+pub(super) const CANCELLATION_INTERVAL: usize = 256;
 
 /// A directory entry's own fields while its children use the lent entry.
 #[derive(Clone, Default)]
