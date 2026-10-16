@@ -309,7 +309,6 @@ fn unsupported_tiers_refuse_before_output() {
         "--no-files",
         "-P",
         "--heading-off",
-        "--live",
         "-U",
         "-r",
         "--json",
@@ -882,60 +881,73 @@ fn quiet_and_closed_stdout_stop_parallel_work_before_open_stdin() {
     for file in 0..8 {
         fixture.write(&format!("bulk-{file}"), &b"red payload\n".repeat(20_000));
     }
-    for quiet in [true, false] {
-        let (reader, writer) = UnixStream::pair().unwrap();
-        let (release, held) = mpsc::channel();
-        let producer = thread::spawn(move || {
-            held.recv().unwrap();
-            drop(writer);
-        });
-        let fd: OwnedFd = reader.into();
-        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
-        command.arg("grep");
-        if quiet {
-            command.arg("-q");
-        }
-        command
-            .arg("red")
-            .args((0..8).map(|file| format!("bulk-{file}")))
-            .arg("-")
-            .env("FERRET_SEARCH_THREADS", "4")
-            .stdin(Stdio::from(fd));
-        let mut child = command.spawn().unwrap();
-        let reader = if quiet {
-            None
-        } else {
-            let mut stdout = child.stdout.take().unwrap();
-            Some(thread::spawn(move || {
-                let mut byte = [0];
-                stdout.read_exact(&mut byte).unwrap();
-                drop(stdout);
-            }))
-        };
-        let (finished, completion) = mpsc::channel();
-        let waiter =
-            thread::spawn(move || finished.send(child.wait_with_output().unwrap()).unwrap());
-        let observed = completion.recv_timeout(Duration::from_secs(5));
-        release.send(()).unwrap();
-        producer.join().unwrap();
-        let output = match observed {
-            Ok(output) => output,
-            Err(error) => {
-                waiter.join().unwrap();
-                panic!("grep waited for stdin after cancellation: {error}");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for mode in [None, Some("--live"), Some("-u")] {
+        for quiet in [true, false] {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            let (release, held) = mpsc::channel();
+            let producer = thread::spawn(move || {
+                held.recv().unwrap();
+                drop(writer);
+            });
+            let fd: OwnedFd = reader.into();
+            let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+            command
+                .arg("--index")
+                .arg(fixture.base.join("index"))
+                .arg("grep");
+            if let Some(mode) = mode {
+                command.arg(mode);
             }
-        };
-        waiter.join().unwrap();
-        if let Some(reader) = reader {
-            reader.join().unwrap();
+            if quiet {
+                command.arg("-q");
+            }
+            command.arg("red");
+            if mode.is_some() {
+                command.arg(".");
+            } else {
+                command.args((0..8).map(|file| format!("bulk-{file}")));
+            }
+            command
+                .arg("-")
+                .env("FERRET_SEARCH_THREADS", "4")
+                .stdin(Stdio::from(fd));
+            let mut child = command.spawn().unwrap();
+            let reader = if quiet {
+                None
+            } else {
+                let mut stdout = child.stdout.take().unwrap();
+                Some(thread::spawn(move || {
+                    let mut byte = [0];
+                    stdout.read_exact(&mut byte).unwrap();
+                    drop(stdout);
+                }))
+            };
+            let (finished, completion) = mpsc::channel();
+            let waiter =
+                thread::spawn(move || finished.send(child.wait_with_output().unwrap()).unwrap());
+            let observed = completion.recv_timeout(Duration::from_secs(5));
+            release.send(()).unwrap();
+            producer.join().unwrap();
+            let output = match observed {
+                Ok(output) => output,
+                Err(error) => {
+                    waiter.join().unwrap();
+                    panic!("grep waited for stdin after cancellation: {error}");
+                }
+            };
+            waiter.join().unwrap();
+            if let Some(reader) = reader {
+                reader.join().unwrap();
+            }
+            assert_eq!(
+                output.status.code(),
+                Some(if quiet { 0 } else { 2 }),
+                "{output:?}"
+            );
+            assert_eq!(output.stderr.is_empty(), quiet);
+            assert!(output.stdout.is_empty());
         }
-        assert_eq!(
-            output.status.code(),
-            Some(if quiet { 0 } else { 2 }),
-            "{output:?}"
-        );
-        assert_eq!(output.stderr.is_empty(), quiet);
-        assert!(output.stdout.is_empty());
     }
 }
 
@@ -2023,4 +2035,430 @@ fn m6_third_unrestricted_step_refuses_until_binary_mode_exists() {
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty() && !output.stderr.is_empty());
     }
+}
+
+impl Fixture {
+    fn agree_live(&self, args: &[&str]) {
+        let mut indexed = vec!["grep"];
+        indexed.extend_from_slice(args);
+        let mut live = vec!["grep", "--live"];
+        live.extend_from_slice(args);
+        let context = args.iter().any(|arg| arg.starts_with("-C"));
+        if context {
+            indexed.extend(["--heading", "-Hn"]);
+            live.extend(["--heading", "-Hn"]);
+        }
+        let snapshot = self.ferret(&indexed, None);
+        let current = self.ferret(&live, None);
+        assert_eq!(
+            current.status.code(),
+            snapshot.status.code(),
+            "{args:?}: {current:?} vs {snapshot:?}"
+        );
+        assert_eq!(current.stderr, snapshot.stderr, "{args:?}");
+        if context {
+            let complete_groups = |bytes: &[u8]| {
+                let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+                let mut remaining = bytes;
+                let mut groups = Vec::new();
+                // Numbered content cannot contain an unprefixed blank;
+                // double LF separates complete heading file groups.
+                while let Some(at) = remaining.windows(2).position(|w| w == b"\n\n") {
+                    groups.push(remaining[..at].to_vec());
+                    remaining = &remaining[at + 2..];
+                }
+                groups.push(remaining.to_vec());
+                groups.sort();
+                groups
+            };
+            assert_eq!(
+                complete_groups(&current.stdout),
+                complete_groups(&snapshot.stdout),
+                "{args:?}"
+            );
+        } else {
+            assert_eq!(
+                groups(&current.stdout, &self.tree()),
+                groups(&snapshot.stdout, &self.tree()),
+                "{args:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn m6_live_and_snapshot_agree_without_policy_or_tree_changes() {
+    let fixture = Fixture::new("live-policy-agreement");
+    fs::write(
+        fixture.base.join("home/config/ferret/ignore"),
+        b"global-block\n.git/\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fixture.tree().join(".git/info")).unwrap();
+    fixture.write(".git/info/exclude", b"vcs-exclude\n");
+    fixture.write(".gitignore", b"*.vcs\n");
+    fixture.write(
+        ".ferretignore",
+        b"ferret-block\n/target/\n!/target/keep/**\n",
+    );
+    fs::create_dir_all(fixture.tree().join("target/keep")).unwrap();
+    // Both directories are Traverse, so neither input may be opened.
+    fixture.write("target/.ferretignore", b"!*\n");
+    fixture.write("target/.git", b"not a gitdir file\n");
+    fixture.write("target/keep/.ferretignore", b"*\n");
+    for (name, bytes) in [
+        ("global-block", b"red global\n".as_slice()),
+        ("vcs-exclude", b"red vcs exclude\n"),
+        ("lost.vcs", b"red vcs\n"),
+        ("ferret-block", b"red ferret\n"),
+        ("target/lost", b"red excluded\n"),
+        ("target/keep/found", b"red reinclude\n"),
+        ("binary-held", b"red\0text\n"),
+    ] {
+        fixture.write(name, bytes);
+    }
+    let large = fs::File::create(fixture.tree().join("large-held")).unwrap();
+    large.set_len(9 << 20).unwrap();
+    let indexed = fixture.ferret(&["index", "."], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    for args in [
+        vec!["red", "."],
+        vec!["--hidden", "red", "."],
+        vec!["-a", "red", "."],
+        vec!["-c", "--include-zero", "red", "."],
+        vec!["--files-without-match", "violet", "."],
+        vec!["-v", "red", "."],
+        vec!["-g", "*block", "red", "."],
+        vec!["--files", "."],
+        vec!["--files", "--hidden", "."],
+        vec!["--max-depth", "1", "red", "."],
+        vec!["-C1", "red", "."],
+        vec!["red", "target/keep"],
+    ] {
+        fixture.agree_live(&args);
+    }
+    let output = fixture.ferret(&["grep", "--live", "red", "."], None);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("target/keep/found:red reinclude"),
+        "{output:?}"
+    );
+    for absent in [
+        "global-block",
+        "vcs-exclude",
+        "lost.vcs",
+        "ferret-block",
+        "target/lost",
+        "binary-held",
+        "large-held",
+    ] {
+        assert!(!text.contains(absent), "{absent}: {output:?}");
+    }
+}
+
+#[test]
+fn m6_live_discovers_new_names_and_new_matches_without_widening_visibility() {
+    let fixture = Fixture::new("live-freshness");
+    fixture.write(".ferretignore", b"blocked\n");
+    fixture.write("old-negative", b"blue\n");
+    fixture.write("blocked", b"red excluded\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    fixture.write("old-negative", b"red new match\n");
+    fixture.write("new-file", b"red new name\n");
+    fs::create_dir(fixture.tree().join("new-dir")).unwrap();
+    fixture.write("new-dir/leaf", b"red new child\n");
+    let snapshot = fixture.ferret(&["grep", "red", "."], None);
+    assert!(!String::from_utf8_lossy(&snapshot.stdout).contains("old-negative"));
+    assert!(!String::from_utf8_lossy(&snapshot.stdout).contains("new-file"));
+    let live = fixture.ferret(&["grep", "--live", "red", "."], None);
+    assert!(live.status.success(), "{live:?}");
+    let text = String::from_utf8_lossy(&live.stdout);
+    for name in ["old-negative", "new-file", "new-dir/leaf"] {
+        assert!(text.contains(name), "{live:?}");
+    }
+    assert!(!text.contains("blocked"));
+    for args in [
+        vec!["--live", "red", "new-dir"],
+        vec!["--live", "--no-ignore", "red", "blocked"],
+    ] {
+        let mut oracle = args.clone();
+        oracle.retain(|arg| *arg != "--live");
+        let expected = fixture.oracle(&oracle, None);
+        let mut actual = vec!["grep"];
+        actual.extend(args);
+        let actual = fixture.ferret(&actual, None);
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(
+            groups(&actual.stdout, &fixture.tree()),
+            groups(&expected.stdout, &fixture.tree())
+        );
+    }
+    // A posting-negative snapshot can establish zero, but a live read cannot
+    // use that absence after the file acquired a match.
+    for flags in [vec!["-c", "--include-zero"], vec!["--files-without-match"]] {
+        let mut indexed = vec!["grep"];
+        indexed.extend(flags.clone());
+        indexed.extend(["red", "."]);
+        let mut current = vec!["grep", "--live"];
+        current.extend(flags);
+        current.extend(["red", "."]);
+        let old = fixture.ferret(&indexed, None);
+        let new = fixture.ferret(&current, None);
+        assert!(old.status.success() && new.status.success());
+        assert!(String::from_utf8_lossy(&old.stdout).contains("old-negative"));
+        assert!(!String::from_utf8_lossy(&new.stdout).contains("old-negative:0"));
+        if current.contains(&"--files-without-match") {
+            assert!(!String::from_utf8_lossy(&new.stdout).contains("old-negative"));
+        }
+    }
+}
+
+#[test]
+fn m6_live_nested_roots_and_ancestor_reconstruction_match_snapshot() {
+    let fixture = Fixture::new("live-nested-root");
+    for directory in ["deep/inner", "target/keep/deeper"] {
+        fs::create_dir_all(fixture.tree().join(directory)).unwrap();
+    }
+    fixture.write(".ferretignore", b"*.blocked\n/target/\n!/target/keep/**\n");
+    fixture.write("deep/inner/found.blocked", b"red nested root\n");
+    fixture.write("target/.ferretignore", b"!*\n");
+    fixture.write("target/keep/.ferretignore", b"*.blocked\n");
+    fixture.write("target/keep/deeper/found.blocked", b"red traversed\n");
+    assert!(
+        fixture
+            .ferret(&["index", ".", "deep/inner"], None)
+            .status
+            .success()
+    );
+    for args in [
+        vec!["red", "."],
+        vec!["red", "deep/inner"],
+        vec!["--files", "."],
+        vec!["red", "target/keep/deeper"],
+        vec!["--files", "target/keep/deeper"],
+    ] {
+        fixture.agree_live(&args);
+    }
+}
+
+#[test]
+fn m6_live_policy_changes_and_explicit_operand_exceptions() {
+    let fixture = Fixture::new("live-policy-changes");
+    fixture.write(".ferretignore", b"blocked\n");
+    fs::create_dir(fixture.tree().join("blocked")).unwrap();
+    fixture.write("blocked/.ferretignore", b"*\n");
+    fixture.write("blocked/leaf", b"red explicit ignored start\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for args in [
+        vec!["red", "blocked"],
+        vec!["--files", "blocked"],
+        vec!["red", "blocked/leaf"],
+    ] {
+        fixture.agree_live(&args);
+    }
+    fixture.write(".ferretignore", b"one.rs\n");
+    let current = fixture.ferret(&["grep", "--live", "red", "."], None);
+    let text = String::from_utf8_lossy(&current.stdout);
+    assert!(current.status.success(), "{current:?}");
+    assert!(!text.contains("one.rs"));
+    assert!(!text.contains("blocked/leaf")); // entered now, its current rule applies
+    let direct = fixture.ferret(&["grep", "--live", "red", "one.rs"], None);
+    assert!(direct.status.success());
+    let outside = fixture.base.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("leaf"), b"red outside\n").unwrap();
+    let outside = outside.to_str().unwrap();
+    let denied = fixture.ferret(&["grep", "--live", "red", outside], None);
+    assert_eq!(denied.status.code(), Some(2));
+    assert!(denied.stdout.is_empty());
+    let allowed = fixture.ferret(&["grep", "--live", "-u", "red", outside], None);
+    assert!(allowed.status.success(), "{allowed:?}");
+}
+
+#[test]
+fn m6_live_prunes_excluded_ancestors_of_nested_roots() {
+    let fixture = Fixture::new("live-excluded-parent");
+    fs::create_dir_all(fixture.tree().join("sealed/inner")).unwrap();
+    fixture.write(".ferretignore", b"/sealed/\n");
+    fixture.write("sealed/inner/leaf", b"red nested\n");
+    fixture.write("sealed/inner/.ferretignore", b"inner-blocked\n");
+    fixture.write("sealed/inner/inner-blocked", b"red nested exclusion\n");
+    fixture.write("sealed/lost", b"red ignored\n");
+    let indexed = fixture.ferret(&["index", ".", "sealed/inner"], None);
+    assert!(indexed.status.success(), "{indexed:?}");
+    for args in [
+        vec!["red", "."],
+        vec!["--files", "."],
+        vec!["red", "sealed/inner"],
+        vec!["red", "sealed"],
+    ] {
+        fixture.agree_live(&args);
+    }
+    let output = fixture.ferret(&["grep", "--live", "red", "."], None);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("sealed/inner/leaf"), "{output:?}");
+    let explicit = fixture.ferret(&["grep", "--live", "red", "sealed/inner"], None);
+    assert!(explicit.status.success());
+    assert!(String::from_utf8_lossy(&explicit.stdout).contains("leaf:red nested"));
+    assert!(!text.contains("sealed/lost"), "{output:?}");
+}
+
+#[test]
+fn m6_live_gitdir_commondir_and_symlinked_ignore_inputs_match_snapshot() {
+    for git_link in [false, true] {
+        let fixture = Fixture::new(if git_link {
+            "live-symlink-git"
+        } else {
+            "live-linked-git"
+        });
+        let common = fixture.base.join("git-area");
+        fs::create_dir_all(common.join("info")).unwrap();
+        fs::create_dir_all(common.join("worktrees/checkout")).unwrap();
+        fs::write(common.join("worktrees/checkout/commondir"), b"../..\n").unwrap();
+        fixture.write("exclude-rules", b"vcs-excluded\n");
+        symlink(
+            fixture.tree().join("exclude-rules"),
+            common.join("info/exclude"),
+        )
+        .unwrap();
+        if git_link {
+            symlink(&common, fixture.tree().join(".git")).unwrap();
+        } else {
+            fixture.write(".git", b"gitdir: ../git-area/worktrees/checkout\n");
+        }
+        fixture.write(".gitignore", b"*.hide\n");
+        fixture.write("ferret-rules", b"!kept.hide\n");
+        symlink("ferret-rules", fixture.tree().join(".ferretignore")).unwrap();
+        for name in ["vcs-excluded", "lost.hide", "kept.hide", "plain"] {
+            fixture.write(name, b"red\n");
+        }
+        assert!(fixture.ferret(&["index", "."], None).status.success());
+        for args in [
+            vec!["red", "."],
+            vec!["--files", "--hidden", "."],
+            vec!["red", "sub"],
+        ] {
+            fixture.agree_live(&args);
+        }
+        fs::remove_file(fixture.tree().join(".gitignore")).unwrap();
+        fixture.write("vcs-rules", b"plain\n");
+        symlink("vcs-rules", fixture.tree().join(".gitignore")).unwrap();
+        assert!(fixture.ferret(&["index", "."], None).status.success());
+        fixture.agree_live(&["red", "."]);
+    }
+}
+
+impl Fixture {
+    fn live_oracle(&self, args: &[&str], input: Option<&[u8]>) {
+        let mut oracle = args.to_vec();
+        oracle.retain(|arg| *arg != "--live");
+        let expected = self.oracle(&oracle, input);
+        let mut candidate = vec!["grep"];
+        candidate.extend_from_slice(args);
+        let actual = self.ferret(&candidate, input);
+        assert_eq!(
+            actual.status.code(),
+            expected.status.code(),
+            "{args:?}: {actual:?} vs {expected:?}"
+        );
+        assert_eq!(
+            actual.stderr.is_empty(),
+            expected.stderr.is_empty(),
+            "{args:?}"
+        );
+        assert_eq!(
+            groups(&actual.stdout, &self.tree()),
+            groups(&expected.stdout, &self.tree()),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn m6_live_binary_depth_and_operand_matrix() {
+    let fixture = Fixture::new("live-operands");
+    fs::create_dir(fixture.tree().join("nul")).unwrap();
+    fixture.write("nul/before", b"red\0x\nblue\n");
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for args in [
+        vec!["--live", "red", "one.rs"],
+        vec!["--live", "red", "link"],
+        vec!["--live", "red", "dirlink"],
+        vec!["--live", "red", "sub", "-"],
+        vec!["--live", "red", "-"],
+        vec!["--live", "--files", "sub"],
+        vec!["--live", "--max-depth=0", "red", "."],
+        vec!["--live", "--max-depth=1", "red", "sub"],
+        vec!["--live", "--hidden", "red", "."],
+        vec!["--live", "-g", "*.rs", "red", "."],
+        vec!["--live", "-a", "red", "nul"],
+        vec!["--live", "-av", "red", "nul"],
+        vec!["--live", "-ac", "red", "nul"],
+        vec!["--live", "-aq", "red", "nul"],
+        vec!["--live", "-al", "red", "nul"],
+        vec!["--live", "-ao", "red", "nul"],
+        vec!["--live", "-a", "--files-without-match", "red", "nul"],
+        vec!["--live", "-ac", "--include-zero", "violet", "nul"],
+    ] {
+        fixture.live_oracle(&args, Some(b"red stdin\n"));
+    }
+    fs::remove_dir_all(fixture.base.join("index")).unwrap();
+    for args in [
+        vec!["--live", "red", "one.rs"],
+        vec!["--live", "red", "-"],
+        vec!["--live", "-u", "red", "."],
+        vec!["--live", "--files", "-uu", "."],
+    ] {
+        fixture.live_oracle(&args, Some(b"red stdin\n"));
+    }
+}
+
+#[test]
+fn m6_recursive_cap_is_independent_of_text_and_freshness() {
+    let fixture = Fixture::new("live-cap");
+    fs::create_dir(fixture.tree().join("large")).unwrap();
+    fixture.write("large/big", b"red\n");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.tree().join("large/big"))
+        .unwrap();
+    file.set_len(9 << 20).unwrap();
+    assert!(fixture.ferret(&["index", "."], None).status.success());
+    for flags in [vec!["-a"], vec!["--live", "-a"]] {
+        let mut args = vec!["grep"];
+        args.extend(flags);
+        args.extend(["-q", "red", "large"]);
+        let result = fixture.ferret(&args, None);
+        assert_eq!(result.status.code(), Some(1), "{result:?}");
+    }
+    for args in [
+        vec!["--live", "-auq", "red", "large"],
+        vec!["-auq", "red", "large"],
+        vec!["--live", "-aq", "red", "large/big"],
+    ] {
+        fixture.live_oracle(&args, None);
+    }
+    fixture.agree_live(&["--files", "large"]);
+}
+
+#[test]
+fn m6_live_policy_faults_never_establish_zero_or_no_match() {
+    let fixture = Fixture::new("live-policy-faults");
+    symlink("absent-rules", fixture.tree().join(".ferretignore")).unwrap();
+    for flags in [
+        vec!["-c", "--include-zero"],
+        vec!["--files-without-match"],
+        vec!["--files"],
+    ] {
+        let mut args = vec!["grep", "--live"];
+        args.extend(flags);
+        if !args.contains(&"--files") {
+            args.push("violet");
+        }
+        args.push(".");
+        let output = fixture.ferret(&args, None);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+    }
+    fixture.live_oracle(&["--live", "-u", "red", "."], None);
 }

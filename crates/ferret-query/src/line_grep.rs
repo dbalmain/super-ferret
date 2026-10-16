@@ -36,6 +36,7 @@ pub struct Names {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Traversal {
     pub unrestricted: bool,
+    pub live: bool,
     pub max_depth: Option<usize>,
 }
 
@@ -261,6 +262,7 @@ pub fn parse_with(
                     line_number = true;
                 }
                 "--quiet" if value.is_none() => quiet = true,
+                "--live" if value.is_none() => traversal.live = true,
                 "--no-ignore" if value.is_none() => traversal.unrestricted = true,
                 "--ignore" if value.is_none() => traversal.unrestricted = false,
                 "--unrestricted" if value.is_none() => {

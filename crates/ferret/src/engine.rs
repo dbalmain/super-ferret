@@ -702,6 +702,11 @@ pub fn env_threads(value: Option<&str>) -> Option<usize> {
         .filter(|&threads| threads > 0)
 }
 
+/// Resolve index settings without opening the resident content engine.
+pub(crate) fn search_threads_for(index: &Path) -> usize {
+    Threads::new(index).get()
+}
+
 impl Threads {
     fn new(index: &Path) -> Arc<Self> {
         Arc::new(Self {

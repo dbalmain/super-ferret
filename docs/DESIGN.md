@@ -65,6 +65,13 @@ backlog; workers own checked reads and line rendering, while the host publishes
 whole groups and propagates cancellation. Bounded catalog-version line records
 are reused only after each alias's own stat; current-byte answers stay local.
 
+Grep M6 (2026-10-17) keeps the graph. Host namespace adapters choose find's
+catalog or physical live constructors; policy-preserving live search loads
+validated root anchors and reconstructs D13 with the existing pure DirRules.
+Ignore-file I/O lives in the CLI host, not in policy or the query walker.
+Unrestricted live search needs no catalog. All content reads still use the
+same bracket/retry and bounded worker/group engine.
+
 Two boundaries carry the design, and both are where D1 said the thought goes:
 
 - **`ferret-index` knows doc ids and byte strings, not files.** It is the part

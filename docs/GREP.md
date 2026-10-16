@@ -181,7 +181,27 @@ rule can reverse decisions in both directions, as the crawl test at
 or posting absence here. Host policy adapters prune the existing live walk;
 they retain ignore/size/binary selection and apply grep hidden/glob filters.
 Explicit starts keep their exceptions. `--live --no-ignore` chooses unrestricted
-walking.
+walking. **M6 implementation (2026-10-17):** both hosts use find's physical live
+source, with current D13 `root` / `enter` / `traverse` state in the host adapter.
+Only entered directories load ignore files or probe worktrees. Gitdir,
+commondir, info/exclude, symlinked ignore inputs and lossy rule text follow the
+crawl policy. Policy-input faults report an error; they do not establish zero
+or no match. No names or posting absence are consulted for live exclusion.
+
+The validated `Catalog::Roots` API also loads its format dependencies
+`DirNames`, `Names`, `NameHeap` and `Strings`; "root anchors only" does not
+mean those dependency bytes can be avoided with the current format. It does
+not enumerate the stored names. Live mode leaves `Links`, `Entries` and all
+content sections unloaded, proved through the production lazy section cells.
+It resolves the existing thread setting without opening Engine.
+
+Nested configured roots reset policy when reached or explicitly selected;
+they do not revive an ancestor already pruned by policy or grep filters. This
+matches the indexed source on an unchanged tree. Explicit ignored starts retain
+the unrestricted opaque-fallback exception without loading nested ignore files,
+even below a configured nested root. Select that root explicitly to apply its
+own policy. This is the existing indexed fallback behavior, rather than a
+freshness-dependent visibility change.
 
 **Read-transaction clarification (2026-10-16, review R1):** regular explicit
 files and opaque/ignored-directory fallback files use the same open-descriptor

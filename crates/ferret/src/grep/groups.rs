@@ -527,6 +527,8 @@ pub(super) struct Source<'a> {
     emit_absent: bool,
     traversal: line_grep::Traversal,
     text: bool,
+    live: Option<&'a live::Anchors>,
+    policy: Option<live::Policy>,
     selection: &'a GrepSelection,
     cwd: PathBuf,
     #[cfg(test)]
@@ -551,6 +553,8 @@ impl<'a> Source<'a> {
             emit_absent: false,
             traversal: Default::default(),
             text: false,
+            live: None,
+            policy: None,
             selection,
             cwd,
             #[cfg(test)]
@@ -558,6 +562,11 @@ impl<'a> Source<'a> {
             #[cfg(test)]
             on_listing_poll: None,
         }
+    }
+
+    pub(super) fn with_live(mut self, live: Option<&'a live::Anchors>) -> Self {
+        self.live = live;
+        self
     }
 
     pub(super) fn with_traversal(mut self, traversal: line_grep::Traversal, text: bool) -> Self {
@@ -633,6 +642,20 @@ impl<'a> Source<'a> {
                             && self
                                 .selection
                                 .descend(relative.as_os_str().as_bytes(), entry.depth());
+                        if self.descend
+                            && let Some(policy) = &mut self.policy
+                        {
+                            match policy.accepts(entry, true, stopped) {
+                                Ok(allowed) => self.descend = allowed,
+                                Err(error) => {
+                                    self.descend = false;
+                                    return Some((
+                                        0,
+                                        Job::Failed(entry.path().to_owned(), error.to_string()),
+                                    ));
+                                }
+                            }
+                        }
                         continue;
                     }
                     if kind != FileKind::File
@@ -641,6 +664,18 @@ impl<'a> Source<'a> {
                             .allows(relative.as_os_str().as_bytes(), entry.depth())
                     {
                         continue;
+                    }
+                    if let Some(policy) = &mut self.policy {
+                        match policy.accepts(entry, true, stopped) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => {
+                                return Some((
+                                    0,
+                                    Job::Failed(entry.path().to_owned(), error.to_string()),
+                                ));
+                            }
+                        }
                     }
                     if let (Some(catalog), Some(name)) = (self.catalog, entry.catalog_name()) {
                         let inode = catalog.name(name).child;
@@ -679,11 +714,19 @@ impl<'a> Source<'a> {
                     return Some((0, Job::Failed(path, error.to_string())));
                 }
                 Input::Directory(path) => {
+                    self.policy = match self
+                        .live
+                        .map(|anchors| anchors.start(&path, stopped))
+                        .transpose()
+                    {
+                        Ok(policy) => policy,
+                        Err(error) => return Some((0, Job::Failed(path, error.to_string()))),
+                    };
                     match sources::Directory::new(
                         &path,
                         self.catalog,
                         &self.cwd,
-                        self.traversal.unrestricted,
+                        self.traversal.unrestricted || self.live.is_some(),
                     ) {
                         Ok(source) => self.source = Some(source),
                         Err(error) => return Some((0, Job::Failed(path, error.to_string()))),

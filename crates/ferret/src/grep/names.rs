@@ -42,9 +42,32 @@ fn execute(
     let inputs = resolve_inputs(&plan.paths, true);
     let catalog = inputs
         .iter()
-        .any(|input| matches!(input, Input::Directory(_)) && !plan.traversal.unrestricted)
+        .any(|input| {
+            matches!(input, Input::Directory(_))
+                && !plan.traversal.unrestricted
+                && !plan.traversal.live
+        })
         .then(|| open_catalog(index))
         .transpose()?;
+    let live = if inputs
+        .iter()
+        .any(|input| matches!(input, Input::Directory(_)))
+        && plan.traversal.live
+        && !plan.traversal.unrestricted
+    {
+        Some(live::Anchors::open(index)?)
+    } else {
+        None
+    };
+    for input in &inputs {
+        if let Input::Directory(path) = input
+            && let Some(anchors) = &live
+        {
+            anchors
+                .validate(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+    }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     if let Some(catalog) = &catalog {
         for input in &inputs {
@@ -104,11 +127,17 @@ fn execute(
             }
             Input::Failed(_, _) => {}
             Input::Directory(path) => {
+                let stopped = || cancelled.load(Ordering::Acquire);
+                let mut policy = live
+                    .as_ref()
+                    .map(|anchors| anchors.start(&path, &stopped))
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
                 let mut source = sources::Directory::new(
                     &path,
                     catalog.as_ref(),
                     &cwd,
-                    plan.traversal.unrestricted,
+                    plan.traversal.unrestricted || live.is_some(),
                 )
                 .map_err(|e| e.to_string())?;
                 let mut descend = true;
@@ -145,9 +174,36 @@ fn execute(
                                 .traversal
                                 .max_depth
                                 .is_none_or(|limit| entry.depth() < limit)
-                                && selection.descend(relative, entry.depth())
+                                && selection.descend(relative, entry.depth());
+                            if descend && let Some(policy) = &mut policy {
+                                match policy.accepts(entry, false, &stopped) {
+                                    Ok(allowed) => descend = allowed,
+                                    Err(error) => {
+                                        errors = true;
+                                        descend = false;
+                                        cli::error(&format!(
+                                            "grep: {}: {error}",
+                                            entry.path().display()
+                                        ));
+                                    }
+                                }
+                            }
                         }
                         Ok(FileKind::File) if selection.allows(relative, entry.depth()) => {
+                            if let Some(policy) = &mut policy {
+                                match policy.accepts(entry, false, &stopped) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(error) => {
+                                        errors = true;
+                                        cli::error(&format!(
+                                            "grep: {}: {error}",
+                                            entry.path().display()
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
                             if emit(entry.path())? {
                                 return Ok(Exit::Ok);
                             }

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod groups;
+mod live;
 mod names;
 mod presentation;
 mod sources;
@@ -53,6 +54,7 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -0, --null         NUL-terminate filenames\n\
   -p, --pretty       colour, headings and line numbers\n\
   --color MODE       auto/always/ansi/never\n\
+  --live             current tree with ferret visibility policy\n\
   -u/--no-ignore     unrestricted current-tree walk\n\
   -uu                unrestricted including hidden paths\n\
   -a, --text         search binary bytes as text\n\
@@ -117,7 +119,15 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
     let recursive = inputs
         .iter()
         .any(|input| matches!(input, Input::Directory(_)));
-    let engine = if recursive && !plan.traversal.unrestricted {
+    let live = if recursive && plan.traversal.live && !plan.traversal.unrestricted {
+        match live::Anchors::open(index) {
+            Ok(anchors) => Some(anchors),
+            Err(error) => return failure(&error),
+        }
+    } else {
+        None
+    };
+    let engine = if recursive && !plan.traversal.unrestricted && !plan.traversal.live {
         match open_index(index) {
             Ok(engine) => Some(engine),
             Err(error) => return failure(&error),
@@ -158,14 +168,21 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         Ok(cwd) => cwd,
         Err(error) => return failure(&error.to_string()),
     };
-    if let Some(pin) = &pin {
-        for input in &inputs {
-            if let Input::Directory(path) = input {
+    for input in &inputs {
+        if let Input::Directory(path) = input {
+            if let Some(anchors) = &live {
+                if let Err(error) = anchors.validate(path) {
+                    return failure(&format!("{}: {error}", path.display()));
+                }
+            } else if let Some(pin) = &pin {
                 let mut source =
-                    CatalogSource::paths(pin.catalog().clone(), vec![path.clone()], cwd.clone());
+                    match sources::Directory::new(path, Some(pin.catalog()), &cwd, false) {
+                        Ok(source) => source,
+                        Err(error) => return failure(&error.to_string()),
+                    };
                 if let Some(Err(error)) = source.next(true) {
                     return failure(&format!(
-                        "{}: {}; index this directory; live modes arrive in M6",
+                        "{}: {}; index this directory or use --live / --no-ignore",
                         error.path.display(),
                         error.error
                     ));
@@ -201,6 +218,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         .collect();
     let threads = pin.as_ref().map_or_else(
         || {
+            if let Some(anchors) = &live {
+                return anchors.search_threads();
+            }
             let available = std::thread::available_parallelism().map_or(1, |n| n.get());
             engine::search_threads(
                 engine::env_threads(std::env::var("FERRET_SEARCH_THREADS").ok().as_deref()),
@@ -243,6 +263,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 cwd.clone(),
             )
             .with_traversal(plan.traversal, plan.text)
+            .with_live(live.as_ref())
             .with_absence(plan.universe() == line_grep::Universe::Searchable);
             if let Err(error) = groups::run(
                 &mut host,
