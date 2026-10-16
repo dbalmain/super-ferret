@@ -8,6 +8,8 @@ use std::ops::Range;
 use super::*;
 
 fn push<T>(items: &mut Vec<T>, item: T) -> io::Result<()> {
+    #[cfg(test)]
+    tests::metadata_reservation()?;
     items.try_reserve(1).map_err(io::Error::other)?;
     items.push(item);
     Ok(())
@@ -134,6 +136,7 @@ pub(super) fn scan(
         return Ok(result);
     }
 
+    let last_line_start = lines[lines.len() - 1].start;
     let whole = !plan.grep.excludes_lf();
     let regex = plan.grep.regex();
     let mut groups: Vec<Range<usize>> = Vec::new();
@@ -176,7 +179,9 @@ pub(super) fn scan(
                     terminal_context = true;
                     break;
                 }
-                if !whole {
+                // LF-excluding iteration is line based: a first EOF hit on
+                // this line is discovery, unlike advancing past an earlier hit.
+                if !whole && previous_line == Some(lines.len() - 1) {
                     break;
                 }
             }
@@ -226,13 +231,19 @@ pub(super) fn scan(
     let match_count =
         !plan.invert && (whole || plan.only_matching || plan.output == Output::CountMatches);
     if match_count {
+        let mut previous_start = None;
         for span in regex.spans(&bytes[..clip]) {
             cancelled(stopped)?;
-            if span.start >= clip
-                && !(whole && result.count == 0 && !bytes[..clip].ends_with(b"\n"))
-            {
+            let first_on_line = previous_start.is_none_or(|start| start < last_line_start);
+            let first_terminal = if whole {
+                previous_start.is_none()
+            } else {
+                first_on_line
+            };
+            if span.start >= clip && (bytes[..clip].ends_with(b"\n") || !first_terminal) {
                 break;
             }
+            previous_start = Some(span.start);
             result.count += 1;
         }
     } else {
@@ -262,12 +273,18 @@ pub(super) fn scan(
             lines.len().saturating_sub(before)..lines.len(),
         )?;
     }
-    let mut spans = Vec::new();
+    let mut spans: Vec<Range<usize>> = Vec::new();
     // Re-match the clipped prefix, then search the tail independently. A
     // cross-line match clipped by -m cannot colour or select its later suffix.
     for span in regex.spans(&bytes[..clip]) {
         cancelled(stopped)?;
-        if span.start >= clip && !(whole && spans.is_empty() && !bytes[..clip].ends_with(b"\n")) {
+        let first_on_line = spans.last().is_none_or(|span| span.start < last_line_start);
+        let first_terminal = if whole {
+            spans.is_empty()
+        } else {
+            first_on_line
+        };
+        if span.start >= clip && (bytes[..clip].ends_with(b"\n") || !first_terminal) {
             break;
         }
         push(&mut spans, span)?;
@@ -351,7 +368,7 @@ pub(super) fn scan(
                 }
                 for span in relevant {
                     cancelled(stopped)?;
-                    if whole && span.is_empty() {
+                    if span.is_empty() {
                         if span.start == bytes.len() && !bytes.ends_with(b"\n") {
                             emit(Line {
                                 number: index as u64 + 1,
@@ -361,8 +378,11 @@ pub(super) fn scan(
                                 highlights: Some(&[]),
                             })
                             .map_err(ScanError::Output)?;
+                            continue;
                         }
-                        continue;
+                        if whole {
+                            continue;
+                        }
                     }
                     let from = span.start.max(range.start).min(content_end);
                     let to = span.end.min(content_end);
@@ -425,6 +445,31 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    thread_local! {
+        static METADATA_FAILURE_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn metadata_reservation() -> io::Result<()> {
+        METADATA_FAILURE_AFTER.with(|remaining| match remaining.get() {
+            None => Ok(()),
+            Some(0) => {
+                remaining.set(None);
+                Err(io::ErrorKind::OutOfMemory.into())
+            }
+            Some(left) => {
+                remaining.set(Some(left - 1));
+                Ok(())
+            }
+        })
+    }
+
+    struct MetadataFailure;
+    impl Drop for MetadataFailure {
+        fn drop(&mut self) {
+            METADATA_FAILURE_AFTER.set(None);
+        }
+    }
+
     fn plan(args: &[&str]) -> Plan {
         let Command::Search(plan) =
             parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap()
@@ -465,6 +510,29 @@ mod tests {
         );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn metadata_allocation_faults_propagate_through_the_real_scanner() {
+        // The existing push/reservation seam serves both line offsets and
+        // spans. Fail each vector's first allocation, without a global
+        // allocator.
+        for successful_reservations in [0, 4] {
+            let plan = plan(&["-U", "red\\nblue"]);
+            METADATA_FAILURE_AFTER.set(Some(successful_reservations));
+            let _reset = MetadataFailure;
+            let result = scan(
+                &plan,
+                &mut &b"red\nblue\n"[..],
+                9,
+                &mut Vec::new(),
+                &|| false,
+                |_| panic!("failed metadata must not emit"),
+            );
+            assert!(matches!(result, Err(ScanError::Input(error))
+                if error.kind() == io::ErrorKind::OutOfMemory));
+            assert_eq!(METADATA_FAILURE_AFTER.get(), None);
+        }
     }
 
     #[test]

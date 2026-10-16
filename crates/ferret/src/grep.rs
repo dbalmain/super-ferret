@@ -202,6 +202,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         writer: stdout.lock(),
         buffer: Vec::new(),
         matched: false,
+        emitted_group: false,
         errors: false,
         cancelled: Some(&cancelled),
     };
@@ -407,6 +408,7 @@ struct Host<'a, W> {
     writer: W,
     buffer: Vec<u8>,
     matched: bool,
+    emitted_group: bool,
     errors: bool,
     cancelled: Option<&'a AtomicBool>,
 }
@@ -479,7 +481,6 @@ impl<W: Write> Host<'_, W> {
         result: InputResult,
         mut output: OutputBuffer,
     ) -> io::Result<()> {
-        let previous = self.matched;
         self.matched |= result.matched;
         if self.plan.quiet {
             return Ok(());
@@ -501,7 +502,7 @@ impl<W: Write> Host<'_, W> {
         }
         // M4 R1: counts stay numeric after a binary sentinel, as in rg.
         if matches!(self.plan.output, Output::Count | Output::CountMatches) {
-            if result.matched || (self.plan.include_zero && result.searched) {
+            if result.count > 0 || (self.plan.include_zero && result.searched) {
                 if self.filename {
                     presentation::path(
                         &self.plan.presentation,
@@ -523,14 +524,16 @@ impl<W: Write> Host<'_, W> {
                 label(path, self.plan.paths.is_empty())
             })?;
             self.writer.write_all(b": binary file matches\n")?;
+            self.emitted_group = true;
         } else {
-            if previous && result.matched && !output.is_empty() {
+            if self.emitted_group && !output.is_empty() {
                 if self.plan.presentation.heading == Some(true) {
                     self.writer.write_all(b"\n")?;
                 } else if self.plan.before > 0 || self.plan.after > 0 {
                     self.writer.write_all(b"--\n")?;
                 }
             }
+            self.emitted_group |= !output.is_empty();
             let flag = self.cancelled;
             groups::emit(&mut output, &mut self.writer, &|| {
                 flag.is_some_and(|flag| flag.load(Ordering::Acquire))
@@ -594,6 +597,7 @@ mod tests {
                 writer: Vec::new(),
                 buffer: Vec::new(),
                 matched: false,
+                emitted_group: false,
                 errors: false,
                 cancelled: None,
             };
@@ -647,6 +651,7 @@ mod tests {
                 writer: Vec::new(),
                 buffer: Vec::new(),
                 matched: false,
+                emitted_group: false,
                 errors: false,
                 cancelled: None,
             };
@@ -721,6 +726,7 @@ mod tests {
                     writer: Vec::new(),
                     buffer: Vec::new(),
                     matched: false,
+                    emitted_group: false,
                     errors: false,
                     cancelled: None,
                 };
@@ -760,6 +766,7 @@ mod tests {
             writer: Vec::new(),
             buffer: Vec::new(),
             matched: false,
+            emitted_group: false,
             errors: false,
             cancelled: None,
         };
@@ -800,6 +807,7 @@ mod tests {
                 writer: Vec::new(),
                 buffer: Vec::new(),
                 matched: false,
+                emitted_group: false,
                 errors: false,
                 cancelled: None,
             };
@@ -848,6 +856,7 @@ mod tests {
             writer: Broken,
             buffer: Vec::new(),
             matched: false,
+            emitted_group: false,
             errors: false,
             cancelled: None,
         };

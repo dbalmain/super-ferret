@@ -983,6 +983,7 @@ mod tests {
                 writer: Vec::new(),
                 buffer: Vec::new(),
                 matched: false,
+                emitted_group: false,
                 errors: false,
                 cancelled: Some(&flag),
             };
@@ -1158,6 +1159,7 @@ mod tests {
             writer: Vec::new(),
             buffer: Vec::new(),
             matched: false,
+            emitted_group: false,
             errors: false,
             cancelled: Some(&flag),
         };
@@ -1277,6 +1279,7 @@ mod tests {
             writer: Vec::new(),
             buffer: Vec::new(),
             matched: false,
+            emitted_group: false,
             errors: false,
             cancelled: Some(&flag),
         };

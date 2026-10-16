@@ -516,6 +516,22 @@ iteration poll cancellation. Input growth and variable-size line/span metadata
 use fallible allocation; an unrepresentable extent or allocation failure is an
 input error. All bytes and rendered groups remain inside the existing
 bracket/retry transaction; a failed attempt publishes no prefix or zero record.
+There is **no small peak-memory bound** for explicit files, stdin or unrestricted
+multiline input. The whole input buffer and line/span metadata grow with the
+input and match count; output spills and host-cache budgets do not cap them.
+Indexed and policy-preserving input retain their existing size cap. No extra
+cap is imposed on explicit, stdin or unrestricted input.
+
+**M7 fix round 1 (2026-10-17):** discovery of a first terminal word assertion
+on an unterminated line is retained in selection, counts and spans; advancing
+an iterator to EOF still supplies no extra match. Context-only file groups
+participate in inter-file separators even when search status is no-match;
+a successful search with empty span output supplies no separator. A zero count
+is published only with `--include-zero`, independently of search success.
+For `a\nb\n`, `-Ucm1 'a\n\b'` still discovers a hit and exits 0, but the
+bounded re-match count is 0: it prints nothing, or `0` with `--include-zero`.
+Pinned rg prints `1` in this case. The separate search/count bounds are retained
+as required; the zero-publication correction does not change those bounds.
 
 Pipe defaults: no colour, no heading, no line numbers, filename prefixes for
 recursive/multiple operands; one explicit file/stdin omits its filename. Tty
