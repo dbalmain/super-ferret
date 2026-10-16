@@ -749,7 +749,7 @@ fn idle_exit_waits_for_publication_and_restart_backstops_debounced_hints() {
         ("FERRET_WATCH_TEST_REFRESH_DELAY_MS", "300"),
     ]);
     // A missed idle deadline must not take down an in-flight publication.
-    assert!(tree.status().contains("\"writer_busy\":true"));
+    wait(|| tree.status().contains("\"writer_busy\":true"));
     assert!(
         tree.daemon
             .as_mut()
