@@ -259,3 +259,36 @@ rows in the full supported audit and is not counted as an approved exception.
 No other M2 implementation work remains; later flags remain the named slices
 in GREP.md. No manifest/dependency edits, pushes, other agent CLI launches or
 benchmarks. Work was confined to grep-m2; grep-m1 was left untouched.
+
+## Review round 1
+
+Started 2026-10-17. Read Astra’s complete note. Baseline: 1196 passed /
+13 ignored. Reproducing regex composition and producer cancellation before
+fixing them; the third commit will replace sidecar-based audit acceptance with
+classification from each row’s own difference records and repeat all 3332 rows.
+
+### Fix 1 — preserve pattern argument syntax
+
+Reproduced through the real CLI: `(?x)red # comment` exited 2 with an
+unclosed-group error, for a single pattern and repeated -e. The pinned
+rg 15.2.0 also rejects both; accepting them restores M1 syntax and is now an
+explicit GREP.md exception. Binary probes confirmed inline case flags remain
+local to each -e argument (`(?i)a` followed by `b` does not match `B`).
+Single patterns compile unchanged. Repeated patterns resolve each argument
+independently to HIR before composing alternatives; derivation uses that same
+compiled expression. No engine sources were read.
+
+Added two positive real CLI syntax regressions and four owned differential
+cases (two positive, two negative). Named differential total: 123 = 87 positive,
+26 no-hit, 10 error; with the two syntax exceptions: 125 owned profile cases.
+The additional scope guard reproduces global -i overriding an argument's
+(?-i) if folding is applied twice to lowered HIR. Compile the resolved union
+without folding again. Both additional cases failed before that correction
+(`/tmp/grep-m2-r1-pattern-global-reverted.log`).
+Reverting only trigram.rs makes BOTH syntax tests fail with exit 2, as expected
+(`/tmp/grep-m2-r1-pattern-reverted.log`); restored before gates.
+Fmt, all-target clippy and workspace tests green, zero compiler warnings:
+**1202 passed / 13 ignored**, up six. No flake rerun or extra skips.
+Final gate logs: `/tmp/grep-m2-r1-pattern-final-{fmt,clippy,gates}.log`.
+The first fix was amended before replaying fix 2, preserving one commit per
+review finding; this count is from the first fix alone.

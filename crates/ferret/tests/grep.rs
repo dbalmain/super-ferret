@@ -911,3 +911,42 @@ fn quiet_and_closed_stdout_stop_parallel_work_before_open_stdin() {
 profile_cases! {
     quiet_before_error: 0 => ["-q", "red", "one.rs", "absent"];
 }
+
+// Review R1: trailing extended-mode comments must survive composition. rg
+// 15.2 rejects these too, so assert the restored M1 syntax directly.
+fn check_extended_comment(args: &[&str], expected: &[u8]) {
+    let fixture = Fixture::new(if args.len() == 3 {
+        "extended-comment-single"
+    } else {
+        "extended-comment-multiple"
+    });
+    let output = fixture.ferret(args, Some(b"red\nblue\n"));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, expected);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn extended_comments_survive_single_patterns() {
+    check_extended_comment(&["grep", "(?x)red # comment", "-"], b"red\n");
+}
+
+#[test]
+fn extended_comments_survive_repeated_patterns() {
+    check_extended_comment(
+        &["grep", "-e", "(?x)red # comment", "-e", "blue", "-"],
+        b"red\nblue\n",
+    );
+}
+
+profile_cases! {
+    repeated_flags_are_local: 0 => ["-e", "(?i)a", "-e", "b", "-"], stdin = b"A\nB\nb\n";
+    repeated_flags_do_not_leak: 1 => ["-e", "(?i)a", "-e", "b", "-"], stdin = b"B\n";
+}
+
+// Review R1: lowering resolves folding once; global -i must not refold an
+// argument whose inline flags explicitly disable it.
+profile_cases! {
+    repeated_global_fold_keeps_inline_override: 0 => ["-i", "-e", "(?-i)red", "-e", "blue", "-"], stdin = b"RED\nBLUE\nred\n";
+    repeated_global_fold_does_not_refold: 1 => ["-i", "-e", "(?-i)red", "-e", "blue", "-"], stdin = b"RED\n";
+}

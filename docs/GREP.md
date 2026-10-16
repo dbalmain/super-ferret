@@ -256,7 +256,13 @@ corrected 2026-10-16). `-i` uses Unicode
 simple folding; `-S` folds only when there is a literal and no uppercase literal
 across patterns, not uppercase letters in escapes/property names. Last case
 switch wins; inline flags still scope normally. `-F` escapes literal patterns
-before shared compilation/derivation, retaining Unicode `-i`. `-w` uses half
+before shared compilation/derivation, retaining Unicode `-i`. **2026-10-17 correction:**
+compile a single argument unchanged; resolve each repeated `-e` argument's
+syntax/inline flags before composing its alternatives, without reapplying
+folding to that resolved syntax. Flags stay local (including `(?-i)` under
+`-i`), and extended-mode trailing comments cannot consume inserted delimiters. The pinned
+rg 15.2.0 rejects those trailing comments after wrapping them; ferret retains
+M1's accepted syntax as an explicit compatibility exception. `-w` uses half
 word boundaries, not ordinary `\b` on both ends; `-x` anchors whole lines.
 Last `-w`/`-x` wins. These features are supported by the locked
 [regex syntax](https://docs.rs/regex/1.13.1/regex/#syntax).

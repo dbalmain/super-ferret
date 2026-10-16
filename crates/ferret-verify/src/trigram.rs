@@ -189,15 +189,35 @@ impl GrepFlags {
         let patterns: Vec<String> = patterns
             .iter()
             .map(|pattern| {
-                let pattern = if fixed {
+                if fixed {
                     regex::escape(pattern)
                 } else {
                     pattern.clone()
-                };
-                format!("(?:{pattern})")
+                }
             })
             .collect();
-        self.compile_lines(&patterns.join("|"))
+        if let [pattern] = patterns.as_slice() {
+            return self.compile_lines(pattern);
+        }
+        let mut alternatives = Vec::with_capacity(patterns.len());
+        for pattern in &patterns {
+            // Parse each argument before adding delimiters: an extended-mode
+            // trailing comment would swallow a textual closing parenthesis.
+            // HIR resolves inline flags within that argument's scope.
+            self.compile_lines(pattern)?;
+            let hir = self
+                .parser()
+                .build()
+                .parse(pattern)
+                .map_err(|e| GrepError::Derivation(e.to_string()))?;
+            alternatives.push(format!("(?:{hir})"));
+        }
+        // HIR has already resolved folding, including inline (?-i). Applying
+        // the caller's default again would refold case-sensitive literals.
+        GrepFlags {
+            case_insensitive: false,
+        }
+        .compile_lines(&alternatives.join("|"))
     }
 
     /// Experimental required literals, using the same Cox fold and flags as
