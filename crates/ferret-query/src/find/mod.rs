@@ -82,6 +82,13 @@ pub(crate) struct Options {
 }
 
 impl Options {
+    fn at(cwd: std::path::PathBuf) -> Self {
+        Self {
+            cwd: Some(std::sync::Arc::new(cwd)),
+            ..Self::default()
+        }
+    }
+
     fn logical_path<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
         match &self.cwd {
             Some(cwd) => std::borrow::Cow::Owned(cwd.join(path)),

@@ -8,7 +8,7 @@ Updated GREP.md on 2026-10-16: D72 A and D73 A+D confirmed; D74 A is D47 visibil
 
 ## Implementation and commits
 
-Pending.
+Prerequisite commit: factored expression-free CatalogSource/LiveWalk constructors and exposed catalog identity on entries; introduced neutral checked-reader outcomes and crawl fault adaptation, retaining search's legacy Option view; factored the existing streamed scan loop for reuse by line output. Fault mapping/retry/failed-byte regressions run before CLI wiring. Existing cancellation-accounting tests caught extra stop checks in the refactor; preserved their original boundaries. Full gates: 1035 passed, 13 ignored. An initial run also hit an existing daemon idle-exit timing assertion; rerun passed without skips.
 
 ## Owned differential cases and observed differences
 

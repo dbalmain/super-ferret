@@ -17,6 +17,8 @@ use ferret_index::{Budget, CatalogView, DocSet, Fault, Followed, IndexWriter, Me
 use ferret_query::find::{Effects, Outcome, Plan, Unsupported};
 use ferret_query::{Content, DocNames, NameIndex, Query, Row, RunError, Stats, UNCOVERED_BOUND};
 
+mod reader;
+
 static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// A checked, fully loaded query engine. A query-only engine takes no writer
@@ -540,28 +542,10 @@ impl QuerySession {
         };
         let documents = ferret_crawl::Documents::by_name(catalog)?;
         let fork = || -> Box<ferret_query::Reader<'_>> {
-            // One reader per thread for this query: the directories it
-            // walks are held for the query's later paths.
-            let mut reader = documents.fork().holding_directories();
-            Box::new(move |name, request: ferret_query::ReadRequest<'_>| {
-                let observed = match request {
-                    ferret_query::ReadRequest::Stat => reader.stat_name(catalog, name),
-                    // `stop` is the query's cancellation, and on a
-                    // worker also the pool's stop at a limit.
-                    ferret_query::ReadRequest::Bytes(out, stop) => {
-                        reader.read_current_name_until(catalog, name, out, stop)
-                    }
-                    ferret_query::ReadRequest::Stream(each, stop) => {
-                        reader.stream_current_name_until(catalog, name, each, stop)
-                    }
-                }
-                .ok()?;
-                let recorded = catalog.inode(catalog.name(name).child).stat;
-                Some(if recorded.same_version(&observed) {
-                    ferret_query::ReadVersion::Catalogued
-                } else {
-                    ferret_query::ReadVersion::Current
-                })
+            let mut checked = reader::checked(catalog, &documents);
+            Box::new(move |name, request| match checked(name, request) {
+                ferret_query::ReadOutcome::Stable(version) => Some(version),
+                _ => None,
             })
         };
         query.run_content_parallel(

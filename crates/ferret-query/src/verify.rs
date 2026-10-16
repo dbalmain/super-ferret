@@ -1096,10 +1096,6 @@ fn unread(start: Instant, stopped: &dyn Fn() -> bool) -> Outcome {
     }
 }
 
-/// The read buffer for streamed documents: one per thread, reused, small
-/// enough to stay in cache while the regex runs over what was just read.
-const LINES: usize = 64 << 10;
-
 /// Whether every atom is a pattern [`stream`] can search a run of lines at
 /// a time: then documents are streamed, not read whole.
 fn streams(atoms: &[ContentAtom]) -> bool {
@@ -1114,7 +1110,7 @@ fn streams(atoms: &[ContentAtom]) -> bool {
 /// its last `\n`, not including it, with the partial line after it carried
 /// to the next. A line longer than the buffer grows it, by doubling, up to
 /// the rest of the document's declared length: a document's buffer is never
-/// larger than [`LINES`] or its length. The run stops early once every atom
+/// larger than 64 KiB or its length. The run stops early once every atom
 /// has matched.
 ///
 /// The answers are the whole-document search's. The first match of a
@@ -1139,9 +1135,6 @@ fn stream(
     if stopped() {
         return Outcome::Stopped(Matched::default());
     }
-    if buffer.len() < LINES {
-        buffer.resize(LINES, 0);
-    }
     // Sized before the read, in case the host never calls `each`.
     let mut answers = vec![None; regexes.len()];
     // Which atoms' answers are final: matched, or searched to the end.
@@ -1162,44 +1155,7 @@ fn stream(
             halted = true;
             Err(io::Error::other("stopped"))
         };
-        // `buffer[..filled]` is the document from offset `base`, starting
-        // at a line.
-        let (mut filled, mut base) = (0, 0);
-        loop {
-            if stopped() {
-                return halt();
-            }
-            // The source holds at most `len` bytes: once they are all in,
-            // that is the end, and the buffer never grows past them.
-            let left = len.saturating_sub(base as u64 + filled as u64);
-            let n = match left {
-                0 => 0,
-                _ => {
-                    if filled == buffer.len() {
-                        let grown = (buffer.len() * 2).min(filled + left as usize);
-                        buffer
-                            .try_reserve_exact(grown - buffer.len())
-                            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
-                        buffer.resize(grown, 0);
-                    }
-                    match source.read(&mut buffer[filled..]) {
-                        Ok(n) => n,
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e),
-                    }
-                }
-            };
-            // `buffer[..filled]` held no `\n` before this read.
-            let fresh = filled;
-            filled += n;
-            let end = match n {
-                0 => filled,
-                _ => match memchr::memrchr(b'\n', &buffer[fresh..filled]) {
-                    Some(end) => fresh + end,
-                    None => continue,
-                },
-            };
-            let run = &buffer[..end];
+        crate::scan::runs(source, len, buffer, stopped, |run, base, terminated| {
             let engine = Instant::now();
             for ((search, answer), done) in regexes.iter().zip(&mut answers).zip(&mut done) {
                 let (false, Some(search)) = (*done, search) else {
@@ -1213,20 +1169,18 @@ fn stream(
                     *answer = Some(base + found);
                     open -= 1;
                 }
-                // The last run settles a miss too.
-                *done = answer.is_some() || n == 0;
+                *done = answer.is_some() || !terminated;
             }
             regex += engine.elapsed();
-            if open == 0 || n == 0 {
-                if stopped() {
-                    return halt();
-                }
-                return Ok(());
+            if (open == 0 || !terminated) && stopped() {
+                return halt();
             }
-            buffer.copy_within(end + 1..filled, 0);
-            filled -= end + 1;
-            base += end + 1;
-        }
+            Ok(if open == 0 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            })
+        })
     };
     let version = read(name, ReadRequest::Stream(&mut each, stopped));
     // The atoms that finished, matched or not: every one after a full read.
@@ -2116,7 +2070,7 @@ mod streamed {
     /// and at 8 MiB, the size cap, and the answers stay the whole search's.
     #[test]
     fn a_long_line_grows_the_buffer_to_the_documents_length_at_most() {
-        use super::LINES;
+        use crate::scan::BUFFER as LINES;
         let query = Query::parse("grep:a$ grep:ab", UNIX_EPOCH + Duration::from_secs(1)).unwrap();
         let never = || false;
         let regexes = Hand::new(&mut |_, _| None, &query.atoms).regexes;

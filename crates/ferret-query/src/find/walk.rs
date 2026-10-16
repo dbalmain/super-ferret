@@ -135,6 +135,13 @@ impl Entry {
         Path::new(OsStr::from_bytes(&self.path[..self.root_len]))
     }
 
+    /// Catalog name identity when this entry came from stored children.
+    pub fn catalog_name(&self) -> Option<ferret_catalog::NameId> {
+        let catalog = self.state.catalog.as_ref()?;
+        let parent = self.state.parent?;
+        catalog.lookup(parent, self.name())
+    }
+
     /// Depth relative to the current start path, which has depth zero.
     pub fn depth(&self) -> usize {
         self.state.depth
@@ -600,6 +607,11 @@ pub struct LiveWalk {
 }
 
 impl LiveWalk {
+    /// An unrestricted physical walk, retaining each operand's spelling.
+    pub fn paths(paths: Vec<PathBuf>, cwd: PathBuf) -> Self {
+        Self::new(paths, Options::at(cwd))
+    }
+
     pub(super) fn new(paths: Vec<PathBuf>, options: Options) -> Self {
         Self {
             catalog: None,
@@ -1277,6 +1289,12 @@ pub struct CatalogSource {
 }
 
 impl CatalogSource {
+    /// Catalog visibility with find's ordinary physical traversal and live
+    /// fallback for explicit ignored/opaque starts. No expression is parsed.
+    pub fn paths(catalog: Catalog, paths: Vec<PathBuf>, cwd: PathBuf) -> Self {
+        Self::new(catalog, paths, Options::at(cwd))
+    }
+
     pub(super) fn new(catalog: Catalog, paths: Vec<PathBuf>, options: Options) -> Self {
         let mut walk = LiveWalk::new(paths, options);
         walk.removed_children = walk
