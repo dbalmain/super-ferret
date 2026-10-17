@@ -5214,7 +5214,7 @@ changed by this final coverage addition, and no private row is waived.
 
 ## D87 — Clipped multiline JSON submatches
 
-**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-A) uses B provisionally.**
+**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-A) uses B provisionally; tail rule amended by fix round 1, `a05e100`.**
 
 Question: should JSON re-match beyond a clipped selected region to reproduce
 rg 15.2.0, or retain M7/M8's bounded publication contract?
@@ -5224,9 +5224,12 @@ rg 15.2.0, or retain M7/M8's bounded publication contract?
   panics on ordinary optional-LF patterns after -m. This conflicts with the
   existing bounded capture/publication contract.
 - **B — bounded event submatches.** Retain the existing scanner's clipped
-  assertion/span bounds and clamp trailing spans to each event. This preserves
-  valid byte ranges and avoids publishing an unselected suffix. It can omit a
-  discovered boundary-sensitive submatch that rg reports after truncation.
+  assertion/span bounds. Recheck a split trailing occurrence within each
+  original source line, retaining its LF and only complete regex matches.
+  Lines with no local match become JSON context, even when plain discovery
+  keeps match formatting. Valid byte bounds alone cannot license a submatch.
+  This avoids publishing an unselected suffix, but can omit a discovered
+  boundary-sensitive submatch that rg reports after initial-region truncation.
 
 Recommendation: B, provisional, extending D82/M8-C. On red-red/LF/blue/LF with
 -U -m1 'red(?:\nblue)?', pinned rg --json panics at an out-of-range slice. On
@@ -5236,6 +5239,14 @@ zero submatches for the latter, consistently with the existing count bounds.
 A requirement for JSON-specific unbounded assertion truth, or a pinned oracle
 with safe clipping consistent with the existing contract, would change this
 recommendation. These owned conflicts are not private-audit waivers.
+
+Fix round 1 changes D87's tail rule explicitly: blanket span intersection was
+incorrect, not an intended compatibility choice. On a/LF/b/LF/a/LF/b/LF with
+--json -Um1 -A2 'a\nb', rechecking yields one a-LF-b-LF match event and two
+context events, matches 1 / matched_lines 2, agreeing with pinned rg 15.2.0.
+For 'a(?:\nb)?', the trailing a line retains only the complete local a match;
+b becomes context. That is matches 2 / matched_lines 3; rg panics after its
+initial event. Initial clipped-region assertion bounds are unchanged.
 
 ## D88 — rg 15.2 replacement metadata versus the written contract
 
