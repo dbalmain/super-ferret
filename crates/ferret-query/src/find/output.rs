@@ -73,17 +73,7 @@ impl Write for OutputBuffer {
     }
     fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
         if let Some(spill) = &mut self.file {
-            let written = spill
-                .file
-                .write_vectored(bytes)
-                .map_err(|error| spill_error("write", &spill.path, error))?;
-            if written == 0 && bytes.iter().any(|part| !part.is_empty()) {
-                return Err(spill_error(
-                    "write",
-                    &spill.path,
-                    io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer"),
-                ));
-            }
+            let written = spill_progress(spill.file.write_vectored(bytes), bytes, &spill.path)?;
             self.len += written as u64;
             Ok(written)
         } else {
@@ -228,6 +218,24 @@ impl OutputBuffer {
         self.file = None;
         self.len = 0;
     }
+}
+
+/// A vectored spill write's progress. No progress on nonempty input is the
+/// `WriteZero` that `write_all` would report, still naming the spill.
+fn spill_progress(
+    written: io::Result<usize>,
+    bytes: &[IoSlice<'_>],
+    path: &Path,
+) -> io::Result<usize> {
+    let written = written.map_err(|error| spill_error("write", path, error))?;
+    if written == 0 && bytes.iter().any(|part| !part.is_empty()) {
+        return Err(spill_error(
+            "write",
+            path,
+            io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer"),
+        ));
+    }
+    Ok(written)
 }
 
 fn spill_error(operation: &'static str, path: &Path, error: io::Error) -> io::Error {
@@ -461,4 +469,43 @@ pub(super) fn policy(expression: &super::Expression) -> Policy {
     });
     policy.checkpoint |= prints > 1;
     policy
+}
+
+#[cfg(test)]
+mod spill_tests {
+    use super::*;
+
+    #[test]
+    fn zero_progress_on_a_nonempty_vector_names_the_spill() {
+        let path = Path::new("/spill/ferret-output-1");
+        let error = spill_progress(Ok(0), &[IoSlice::new(b""), IoSlice::new(b"x")], path)
+            .expect_err("no progress on a nonempty vector");
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(error_path(&error), Some(path));
+        assert_eq!(
+            error.to_string(),
+            "write output spill /spill/ferret-output-1: failed to write whole buffer"
+        );
+    }
+
+    #[test]
+    fn progress_and_empty_vectors_pass_through() {
+        let path = Path::new("/spill/ferret-output-1");
+        assert_eq!(
+            spill_progress(Ok(3), &[IoSlice::new(b"xyz")], path).unwrap(),
+            3
+        );
+        assert_eq!(
+            spill_progress(Ok(0), &[IoSlice::new(b"")], path).unwrap(),
+            0
+        );
+        let error = spill_progress(
+            Err(io::ErrorKind::Interrupted.into()),
+            &[IoSlice::new(b"x")],
+            path,
+        )
+        .expect_err("errors keep their kind");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error_path(&error), Some(path));
+    }
 }
