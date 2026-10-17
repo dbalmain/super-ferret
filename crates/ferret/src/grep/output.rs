@@ -4,28 +4,27 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, IsTerminal, Stdout, StdoutLock, Write};
-use std::os::fd::AsFd;
+use std::mem::ManuallyDrop;
+use std::os::fd::{AsRawFd, FromRawFd};
 
 const BLOCK: usize = 64 << 10;
 
+/// Linux's `EBADF`, which std's stdout reports as a successful write.
+const EBADF: i32 = 9;
+
 pub(super) struct Writer<'a> {
     line: StdoutLock<'a>,
-    block: Option<BufWriter<File>>,
+    block: Option<BufWriter<Raw>>,
 }
 
 impl<'a> Writer<'a> {
     pub(super) fn new(stdout: &'a Stdout, block: bool) -> Self {
-        // Duplication preserves the shared file offset of `2>&1`. Reopening
-        // /dev/stdout would instead give regular files an independent offset.
-        // If no descriptor is available, retain std's existing destination.
-        let block = (block && !stdout.is_terminal())
-            .then(|| stdout.as_fd().try_clone_to_owned().ok())
-            .flatten()
-            .map(|fd| BufWriter::with_capacity(BLOCK, File::from(fd)));
-        Self {
-            line: stdout.lock(),
-            block,
-        }
+        let mut line = stdout.lock();
+        // Anything std still holds must go first. If it cannot, keep std's
+        // destination, which will report the fault on the next write.
+        let block = (block && !stdout.is_terminal() && line.flush().is_ok())
+            .then(|| BufWriter::with_capacity(BLOCK, Raw::stdout(&line)));
+        Self { line, block }
     }
 }
 
@@ -52,5 +51,38 @@ impl Drop for Writer<'_> {
         if let Some(writer) = self.block.take() {
             let _ = writer.into_parts();
         }
+    }
+}
+
+/// Descriptor 1 itself, written while the `Writer` holds stdout's lock, so
+/// nothing else can write around it. Unlike std's stdout it has no line
+/// buffer to search each block for its last LF, and unlike a duplicate it
+/// takes no descriptor an input may need.
+struct Raw(ManuallyDrop<File>);
+
+impl Raw {
+    fn stdout(lock: &StdoutLock<'_>) -> Self {
+        let fd = lock.as_raw_fd();
+        // D11: std offers no safe way to write to descriptor 1 without a
+        // second descriptor or its line writer, which cost 9% (0.961 s against
+        // 0.880 s) on indexed `grep -F -a the` at 32 threads.
+        // SAFETY: std never closes descriptor 1, and `ManuallyDrop` keeps
+        // this `File` from closing it either, so it is borrowed, not owned.
+        #[allow(unsafe_code)]
+        let file = unsafe { File::from_raw_fd(fd) };
+        Self(ManuallyDrop::new(file))
+    }
+}
+
+impl Write for Raw {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self.0.write(bytes) {
+            Err(error) if error.raw_os_error() == Some(EBADF) => Ok(bytes.len()),
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

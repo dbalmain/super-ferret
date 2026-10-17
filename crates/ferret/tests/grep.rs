@@ -1749,6 +1749,36 @@ fn buffered_stdout_precedes_the_next_read_diagnostic() {
     );
 }
 
+// Block-buffering redirected stdout must not cost a descriptor: at the
+// lowest limit that still lets an input open, the search behaves as it does
+// without the limit. A duplicated stdout once took that last descriptor.
+#[test]
+fn buffered_stdout_needs_no_extra_descriptor() {
+    let fixture = Fixture::new("buffered-stdout-descriptors");
+    let run = |limit: Option<u32>| {
+        let path = fixture.base.join("out");
+        let out = fs::File::create(&path).unwrap();
+        let script = match limit {
+            Some(limit) => format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
+            None => "exec \"$0\" \"$@\"".to_owned(),
+        };
+        let mut command = fixture.command(OsStr::new("sh"));
+        command
+            .arg("-c")
+            .arg(script)
+            .arg(env!("CARGO_BIN_EXE_ferret"))
+            .args(["grep", "red", "one.rs"])
+            .env("FERRET_SEARCH_THREADS", "1")
+            .stdout(out);
+        let output = command.output().unwrap();
+        (output.status.code(), fs::read(path).unwrap(), output.stderr)
+    };
+    let unlimited = run(None);
+    assert_eq!(unlimited.0, Some(0));
+    assert!(!unlimited.1.is_empty());
+    assert_eq!(run(Some(4)), unlimited);
+}
+
 // Exercise the CLI destination after the consumer has accepted some output,
 // rather than only an injected writer that fails on its first call.
 #[test]

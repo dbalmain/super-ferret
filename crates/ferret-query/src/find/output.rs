@@ -601,13 +601,16 @@ mod spill_tests {
     fn buffered_spill_partial_writes_and_ranges_keep_exact_bytes() {
         let mut output = OutputBuffer::default().with_buffered_spill();
         let mut expected = vec![b'x'; MEMORY_LIMIT];
-        expected.extend_from_slice(b"first tail");
         output.write_all(&expected).unwrap();
-        let mut calls = 0;
+        // A small write after the spill exists stays pending until flush.
+        output.write_all(b"first tail").unwrap();
+        expected.extend_from_slice(b"first tail");
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = calls.clone();
         WRITE.with_borrow_mut(|hook| {
             *hook = Some(Box::new(move |file, parts| {
-                calls += 1;
-                if calls == 2 {
+                counted.set(counted.get() + 1);
+                if counted.get() == 2 {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
                 file.write(&parts[0][..parts[0].len().min(3)])
@@ -615,6 +618,8 @@ mod spill_tests {
         });
         output.flush().unwrap();
         WRITE.with_borrow_mut(|hook| *hook = None);
+        // Ten pending bytes, three at a time, plus the interrupted call.
+        assert_eq!(calls.get(), 5);
         output.write_all(b"second tail").unwrap();
         expected.extend_from_slice(b"second tail");
         let mut range = Vec::new();
