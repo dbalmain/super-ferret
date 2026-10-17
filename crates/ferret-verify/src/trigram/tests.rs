@@ -786,7 +786,7 @@ fn join(rng: &mut Rng, docs: &[Vec<u8>]) -> Vec<u8> {
 
 /// [`super::Search::find`] against the pattern over the whole text: the
 /// same first match.
-fn check_search(grep: &super::Grep, search: &super::Search, text: &[u8], tally: &mut Tally) {
+fn check_search(grep: &super::Grep, search: &super::Search<'_>, text: &[u8], tally: &mut Tally) {
     let expected = grep.regex().find(text).map(|m| m.start);
     assert_eq!(
         search.find(text),
@@ -1098,6 +1098,24 @@ fn the_search_finds_the_patterns_first_match_in_random_text() {
         }
         for grep in &greps {
             same_first(grep, &text);
+        }
+    }
+}
+
+// Borrowed caches survive separate inputs without retaining their bytes or
+// changing assertion/span context, including invalid UTF-8 and terminal empties.
+#[test]
+fn borrowed_and_owned_searches_agree_across_reused_inputs() {
+    let flags = GrepFlags { case_insensitive: false };
+    for pattern in [r"\w+ing\b", r"[a-z]+ing", r"^red$", r"\A|\z", "", r"\s", r"(?-u:\xFF)"] {
+        let grep = flags.compile_lines(pattern).unwrap();
+        let owned = grep.search();
+        let borrowed = grep.borrowed_search();
+        for _ in 0..3 {
+            for bytes in [b"singing red\n".as_slice(), "é singing\n".as_bytes(), b"\xffred\n", b"red", b"\n", b""] {
+                assert_eq!(borrowed.find(bytes), owned.find(bytes), "{pattern}: {bytes:?}");
+                assert_eq!(borrowed.spans(bytes).collect::<Vec<_>>(), owned.spans(bytes).collect::<Vec<_>>());
+            }
         }
     }
 }

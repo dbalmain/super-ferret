@@ -16,6 +16,7 @@
 //! uses [`GrepFlags::required_literals`] to measure longer grams through
 //! the same fold, while shipped trigrams retain their original limits.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -288,10 +289,21 @@ impl Grep {
 
     /// A copy of what finds the first match, for one thread's own use
     /// (its engine caches are then its own).
-    pub fn search(&self) -> Search {
+    pub fn search(&self) -> Search<'static> {
         Search {
-            regex: self.regex.clone(),
-            filter: self.filter.clone(),
+            regex: Cow::Owned(self.regex.clone()),
+            filter: self.filter.clone().map(Cow::Owned),
+        }
+    }
+
+    /// Reuse this grep's cache pool across inputs instead of creating cold
+    /// caches for each file. The regex pool supplies independent concurrent
+    /// searches with their own caches; owned searches remain available for
+    /// long-lived worker-local use.
+    pub fn borrowed_search(&self) -> Search<'_> {
+        Search {
+            regex: Cow::Borrowed(&self.regex),
+            filter: self.filter.as_ref().map(Cow::Borrowed),
         }
     }
 
@@ -352,9 +364,9 @@ impl Grep {
 /// after case folding, so it accepts every case variant the pattern does
 /// (`k` and the Kelvin sign, `s` and the long s).
 #[derive(Clone, Debug)]
-pub struct Search {
-    regex: Regex,
-    filter: Option<Filter>,
+pub struct Search<'a> {
+    regex: Cow<'a, Regex>,
+    filter: Option<Cow<'a, Filter>>,
 }
 
 /// [`Search`]'s required run and window.
@@ -366,7 +378,7 @@ struct Filter {
     within: Option<Box<[bool; 256]>>,
 }
 
-impl Search {
+impl Search<'_> {
     /// Offset of the first match's start in `text`.
     pub fn find(&self, text: &[u8]) -> Option<usize> {
         let Some(filter) = &self.filter else {

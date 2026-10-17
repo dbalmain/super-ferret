@@ -60,7 +60,7 @@ pub(super) fn scan(
         }
         emit(line)
     };
-    let search = plan.grep.search();
+    let search = plan.grep.borrowed_search();
     let mut bytes = Vec::new();
     let mut spans = Vec::new();
     let mut result = scan_records(plan, input, size, buffer, stopped, |line| {

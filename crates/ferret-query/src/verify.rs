@@ -918,7 +918,7 @@ struct Hand<'r, 'a> {
     /// This thread's own copy of each grep atom's search, by atom: a regex
     /// shared between threads hands each a match cache from a pool, which
     /// many threads at once contend on.
-    regexes: Vec<Option<Search>>,
+    regexes: Vec<Option<Search<'static>>>,
 }
 
 impl<'r, 'a> Hand<'r, 'a> {
@@ -1057,7 +1057,7 @@ impl<'q, 'r, 'a> Verifier<'q, 'r, 'a> {
 /// unless `stopped` says to stop first; the reader is given `stopped` too.
 fn verify(
     atoms: &[ContentAtom],
-    regexes: &[Option<Search>],
+    regexes: &[Option<Search<'_>>],
     read: &mut Reader<'_>,
     matcher: &mut TextMatcher,
     bytes: &mut Vec<u8>,
@@ -1153,7 +1153,7 @@ fn streams(atoms: &[ContentAtom]) -> bool {
 /// returned, counts the atoms that had finished: those that matched, and
 /// those the last run was searched for without a match.
 fn stream(
-    regexes: &[Option<Search>],
+    regexes: &[Option<Search<'_>>],
     read: &mut Reader<'_>,
     buffer: &mut Vec<u8>,
     name: NameId,

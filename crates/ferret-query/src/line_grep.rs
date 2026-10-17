@@ -806,7 +806,7 @@ fn scan_records(
     if plan.multiline {
         return multiline::scan(plan, input, size, buffer, stopped, emit);
     }
-    let search = plan.grep.search();
+    let search = plan.grep.borrowed_search();
     // LF exclusion alone is insufficient: absolute and CRLF anchors see a
     // different boundary on a detached line (D79). The shared HIR proof also
     // rules those out. Context and inversion still need every intervening line.
