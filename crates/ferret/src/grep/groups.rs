@@ -22,6 +22,7 @@ pub(super) struct Render<'a> {
 
 #[derive(Clone)]
 struct Record {
+    offset: u64,
     source_lines: Option<(u64, u64)>,
     terminated: bool,
     number: u64,
@@ -57,6 +58,7 @@ impl Capture {
             self.records = None;
         } else if let Some(records) = &mut self.records {
             records.push(Record {
+                offset: line.offset,
                 source_lines: line.source_lines,
                 terminated: line.terminated,
                 number: line.number,
@@ -93,6 +95,12 @@ impl Render<'_> {
             inner: output,
             stopped: self.stopped,
         };
+        if self.plan.json {
+            if self.plan.quiet {
+                return Ok(());
+            }
+            return super::json::line(&mut output, self.prefix.unwrap_or(b"<stdin>"), self.plan.line_number, line);
+        }
         if previous.is_none()
             && self.plan.presentation.heading == Some(true)
             && let Some(prefix) = self.prefix
@@ -377,7 +385,7 @@ impl Worker<'_> {
     ) -> io::Result<Observed> {
         let render = Render {
             plan: &self.plan,
-            prefix: filename.then(|| label(job.path(), self.plan.paths.is_empty())),
+            prefix: (filename || self.plan.json).then(|| label(job.path(), self.plan.paths.is_empty())),
             stopped,
         };
         let observed = match job {
@@ -395,6 +403,7 @@ impl Worker<'_> {
                                 render.line(
                                     &mut output,
                                     line_grep::Line {
+                                        offset: record.offset,
                                         source_lines: record.source_lines,
                                         terminated: record.terminated,
                                         number: record.number,
@@ -471,6 +480,7 @@ pub(super) fn run<'a, W: Write>(
     let filename = host.filename;
     let cache = Mutex::new(Cache::default());
     let hit = AtomicBool::new(false);
+    let quiet_stats = Mutex::new(json::Stats::default());
     let fatal = Mutex::new(None);
     let result = ferret_query::file_groups(
         threads,
@@ -489,6 +499,9 @@ pub(super) fn run<'a, W: Write>(
             }
             match result {
                 Ok(observed) => {
+                    if plan.quiet && plan.json && let Observed::Ready(group) = &observed {
+                        lock(&quiet_stats).add(group.result, 0);
+                    }
                     if plan.quiet
                         && matches!(&observed, Observed::Ready(group) if group.result.matched)
                     {
@@ -515,6 +528,7 @@ pub(super) fn run<'a, W: Write>(
                 return ControlFlow::Continue(());
             }
             let result = match observed {
+                Observed::Ready(_) if plan.quiet && plan.json => Ok(()),
                 Observed::Ready(group) => host.commit(job.path(), group.result, group.output),
                 Observed::Skipped => Ok(()),
                 Observed::Failed(error) => {
@@ -535,6 +549,7 @@ pub(super) fn run<'a, W: Write>(
         },
     );
     host.matched |= hit.load(Ordering::Acquire);
+    host.json_stats.merge(std::mem::take(&mut *lock(&quiet_stats)));
     if let Some(error) = lock(&fatal).take() {
         Err(error)
     } else {
@@ -1035,6 +1050,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
+            json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: Some(&flag),
             };
@@ -1211,6 +1227,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+            json_stats: json::Stats::default(),
             errors: false,
             cancelled: Some(&flag),
         };
@@ -1331,6 +1348,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+            json_stats: json::Stats::default(),
             errors: false,
             cancelled: Some(&flag),
         };

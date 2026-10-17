@@ -34,23 +34,28 @@ impl<'a> Before<'a> {
         }
         Ok(())
     }
-    fn header(&self, offset: u64) -> io::Result<(u64, u64)> {
-        let mut bytes = [0; 16];
+    fn header(&self, offset: u64) -> io::Result<(u64, u64, u64)> {
+        let mut bytes = [0; 24];
         self.store
-            .read_range(offset, 16, &mut &mut bytes[..], self.stopped)?;
+            .read_range(offset, 24, &mut &mut bytes[..], self.stopped)?;
         Ok((
             u64::from_le_bytes(bytes[..8].try_into().map_err(io::Error::other)?),
-            u64::from_le_bytes(bytes[8..].try_into().map_err(io::Error::other)?),
+            u64::from_le_bytes(bytes[8..16].try_into().map_err(io::Error::other)?),
+            u64::from_le_bytes(bytes[16..].try_into().map_err(io::Error::other)?),
         ))
     }
+    #[cfg(test)]
     pub fn push(&mut self, number: u64, bytes: &[u8]) -> io::Result<()> {
+        self.push_at(number, 0, bytes)
+    }
+    pub fn push_at(&mut self, number: u64, offset: u64, bytes: &[u8]) -> io::Result<()> {
         if self.limit == 0 {
             return Ok(());
         }
         // Reclaim discarded in-memory records before they can force a spill.
         // Small -B windows must not create one temporary file per 64 KiB of
         // history that no longer belongs to the window.
-        let incoming = 16_u64.saturating_add(bytes.len() as u64);
+        let incoming = 24_u64.saturating_add(bytes.len() as u64);
         if self.head > 0
             && self.store.len().saturating_add(incoming) > 64 << 10
             && (self.store.len() - self.head).saturating_add(incoming) <= 64 << 10
@@ -59,11 +64,12 @@ impl<'a> Before<'a> {
         }
         self.append(&number.to_le_bytes())?;
         self.append(&(bytes.len() as u64).to_le_bytes())?;
+        self.append(&offset.to_le_bytes())?;
         self.append(bytes)?;
         self.count += 1;
         if self.count > self.limit {
-            let (_, len) = self.header(self.head)?;
-            self.head += 16 + len;
+            let (_, len, _) = self.header(self.head)?;
+            self.head += 24 + len;
             self.count -= 1;
         }
         if self.head > 64 << 10 && self.head > self.store.len() / 2 {
@@ -87,14 +93,15 @@ impl<'a> Before<'a> {
         let mut offset = self.head;
         let mut bytes = Vec::new();
         for _ in 0..self.count {
-            let (number, len) = self.header(offset)?;
+            let (number, len, source_offset) = self.header(offset)?;
             let len = usize::try_from(len).map_err(io::Error::other)?;
             bytes.clear();
             bytes.try_reserve(len).map_err(io::Error::other)?;
             bytes.resize(len, 0);
             self.store
-                .read_range(offset + 16, len as u64, &mut &mut bytes[..], self.stopped)?;
+                .read_range(offset + 24, len as u64, &mut &mut bytes[..], self.stopped)?;
             emit(Line {
+                offset: source_offset,
                 source_lines: None,
                 terminated: true,
                 number,
@@ -103,7 +110,7 @@ impl<'a> Before<'a> {
                 fragment: false,
                 highlights: None,
             })?;
-            offset += 16 + len as u64;
+            offset += 24 + len as u64;
         }
         self.store = OutputBuffer::default();
         self.head = 0;

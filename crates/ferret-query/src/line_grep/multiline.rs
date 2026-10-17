@@ -117,7 +117,11 @@ pub(super) fn scan(
         return Ok(result);
     }
     result.binary = read_all(source, size, buffer, plan.text, stopped)?;
+    if result.binary {
+        result.binary_offset = Some(buffer.len() as u64 - u64::from(buffer.starts_with(b"\xef\xbb\xbf")) * 3);
+    }
     let bytes = buffer.strip_prefix(b"\xef\xbb\xbf").unwrap_or(buffer);
+    result.bytes_searched = bytes.len() as u64;
     let mut lines = Vec::new();
     let mut start = 0;
     for (chunk_number, chunk) in bytes.chunks(crate::scan::BUFFER).enumerate() {
@@ -377,6 +381,50 @@ pub(super) fn scan(
             } else {
                 LineKind::Context
             };
+            if plan.json {
+                let last = if whole && selected && !plan.invert {
+                    groups[group_at].end.min(window.end)
+                } else {
+                    index + 1
+                };
+                let region = range.start..lines[last - 1].end;
+                highlights.clear();
+                if plan.invert {
+                    for span in regex.spans(&bytes[region.clone()]) {
+                        cancelled(stopped)?;
+                        if span.start < region.len() {
+                            push(&mut highlights, span)?;
+                        }
+                    }
+                } else {
+                    for span in &spans[span_at..] {
+                        cancelled(stopped)?;
+                        if span.start >= region.end {
+                            break;
+                        }
+                        // A tail's cross-line discovery cannot publish a
+                        // submatch outside this event's source bytes (M9-A).
+                        push(
+                            &mut highlights,
+                            span.start.max(region.start) - region.start
+                                ..span.end.min(region.end) - region.start,
+                        )?;
+                    }
+                }
+                emit(Line {
+                    offset: region.start as u64,
+                    source_lines: Some((index as u64 + 1, last as u64)),
+                    terminated: bytes[region.end - 1] == b'\n',
+                    number: index as u64 + 1,
+                    bytes: &bytes[region],
+                    kind,
+                    fragment: false,
+                    highlights: Some(&highlights),
+                })
+                .map_err(ScanError::Output)?;
+                index = last;
+                continue;
+            }
             // Suffix discovery can license an unchanged tail record even
             // when bounded span collection has no printable terminal span.
             if plan.only_matching
@@ -386,6 +434,7 @@ pub(super) fn scan(
                 && relevant.is_empty()
             {
                 emit(Line {
+                    offset: range.start as u64,
                     source_lines: None,
                     terminated: bytes[range.end - 1] == b'\n',
                     number: index as u64 + 1,
@@ -401,6 +450,7 @@ pub(super) fn scan(
             if plan.replacement.is_some() {
                 if plan.invert {
                     let line = Line {
+                        offset: range.start as u64,
                         number: index as u64 + 1,
                         source_lines: Some((index as u64 + 1, index as u64 + 1)),
                         terminated: bytes[range.end - 1] == b'\n',
@@ -443,6 +493,7 @@ pub(super) fn scan(
                         plan,
                         &bytes[range.clone()],
                         Line {
+                            offset: range.start as u64,
                             number: index as u64 + 1,
                             source_lines: Some((index as u64 + 1, index as u64 + 1)),
                             terminated: bytes[range.end - 1] == b'\n',
@@ -493,6 +544,7 @@ pub(super) fn scan(
                     },
                     replacement_spans.iter().cloned(),
                     Line {
+                        offset: range.start as u64,
                         number: index as u64 + 1,
                         source_lines: Some((index as u64 + 1, last as u64)),
                         terminated: bytes[end - 1] == b'\n',
@@ -514,6 +566,7 @@ pub(super) fn scan(
                     if span.is_empty() {
                         if span.start == bytes.len() && !bytes.ends_with(b"\n") {
                             emit(Line {
+                                offset: range.start as u64,
                                 source_lines: None,
                                 terminated: true,
                                 number: index as u64 + 1,
@@ -536,6 +589,7 @@ pub(super) fn scan(
                         continue;
                     }
                     emit(Line {
+                        offset: range.start as u64,
                         source_lines: None,
                         terminated: true,
                         number: index as u64 + 1,
@@ -574,6 +628,7 @@ pub(super) fn scan(
                     }
                 }
                 emit(Line {
+                    offset: range.start as u64,
                     source_lines: None,
                     terminated: true,
                     number: index as u64 + 1,

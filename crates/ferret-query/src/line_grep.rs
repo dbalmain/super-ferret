@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use ferret_verify::{Grep, GrepFlags, LineFlags};
 
 mod context;
+mod events;
 mod multiline;
 mod replacement;
 
@@ -98,6 +99,7 @@ pub struct Plan {
     pub traversal: Traversal,
     pub text: bool,
     pub multiline: bool,
+    pub json: bool,
     pub replacement: Option<Box<ferret_verify::Replacement>>,
 }
 
@@ -150,6 +152,7 @@ pub enum ParseError {
     Pattern(ferret_verify::GrepError),
     PatternFile(PathBuf, io::Error),
     StdinConflict,
+    JsonMode,
 }
 
 impl std::fmt::Display for ParseError {
@@ -178,6 +181,7 @@ impl std::fmt::Display for ParseError {
             Self::StdinConflict => {
                 f.write_str("cannot read patterns and search input from stdin together")
             }
+            Self::JsonMode => f.write_str("--json cannot be combined with names or count output"),
         }
     }
 }
@@ -212,6 +216,7 @@ pub fn parse_with(
     let (mut fold, mut fixed, mut invert, mut only_matching) = (false, false, false, false);
     let mut smart_case = false;
     let mut replacement = None;
+    let mut json = false;
     let (mut word, mut line) = (false, false);
     let mut hidden = false;
     let mut text_mode = false;
@@ -282,6 +287,8 @@ pub fn parse_with(
                     line_number = true;
                 }
                 "--quiet" if value.is_none() => quiet = true,
+                "--json" if value.is_none() => json = true,
+                "--no-json" if value.is_none() => json = false,
                 "--live" if value.is_none() => traversal.live = true,
                 "--no-ignore" if value.is_none() => traversal.unrestricted = true,
                 "--ignore" if value.is_none() => traversal.unrestricted = false,
@@ -500,6 +507,13 @@ pub fn parse_with(
     if version {
         return Ok(Command::Version);
     }
+    if json && (files || output != Output::Lines) {
+        return Err(ParseError::JsonMode);
+    }
+    if json {
+        only_matching = false;
+        replacement = None;
+    }
     if files {
         return Ok(Command::Files(Names {
             paths: positionals.into_iter().map(PathBuf::from).collect(),
@@ -594,6 +608,7 @@ pub fn parse_with(
         traversal,
         text: text_mode,
         multiline,
+        json,
     }))
 }
 
@@ -655,6 +670,19 @@ pub struct InputResult {
     pub binary: bool,
     pub count: u64,
     pub searched: bool,
+    /// First detected NUL, relative to bytes after initial BOM removal.
+    pub binary_offset: Option<u64>,
+    /// Semantic JSON counts describe published match records, including tails.
+    pub stats: EventStats,
+    pub bytes_searched: u64,
+    pub elapsed: std::time::Duration,
+}
+
+/// Publication counts, independent of selection limits and plain count output.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EventStats {
+    pub matched_lines: u64,
+    pub matches: u64,
 }
 
 impl InputResult {
@@ -725,6 +753,9 @@ pub enum LineKind {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Line<'a> {
+    /// Source byte offset after initial BOM removal. JSON records retain LF
+    /// in `bytes`; ordinary rendered records omit it.
+    pub offset: u64,
     /// Inclusive original source lines when replacement changes displayed
     /// line counts. Group separators use these boundaries, not display numbers.
     pub source_lines: Option<(u64, u64)>,
@@ -748,6 +779,24 @@ pub fn scan_lines(
     size: u64,
     buffer: &mut Vec<u8>,
     stopped: &dyn Fn() -> bool,
+    emit: impl FnMut(Line<'_>) -> io::Result<()>,
+) -> Result<InputResult, ScanError> {
+    let start = std::time::Instant::now();
+    let mut result = if plan.json {
+        events::scan(plan, input, size, buffer, stopped, emit)
+    } else {
+        scan_records(plan, input, size, buffer, stopped, emit)
+    }?;
+    result.elapsed = start.elapsed();
+    Ok(result)
+}
+
+fn scan_records(
+    plan: &Plan,
+    input: &mut dyn Read,
+    size: u64,
+    buffer: &mut Vec<u8>,
+    stopped: &dyn Fn() -> bool,
     mut emit: impl FnMut(Line<'_>) -> io::Result<()>,
 ) -> Result<InputResult, ScanError> {
     if plan.multiline {
@@ -759,6 +808,7 @@ pub fn scan_lines(
         return Ok(result);
     }
     let mut selected_lines = 0;
+    let mut bom = 0_u64;
     let mut number = 0;
     let rendering = plan.output == Output::Lines && !plan.quiet;
     let after = if rendering { plan.after } else { 0 };
@@ -793,7 +843,9 @@ pub fn scan_lines(
         (!plan.text).then_some(0),
         |run, base, terminated| {
             let run = if base == 0 {
-                run.strip_prefix(b"\xef\xbb\xbf").unwrap_or(run)
+                let stripped = run.strip_prefix(b"\xef\xbb\xbf").unwrap_or(run);
+                bom = (run.len() - stripped.len()) as u64;
+                stripped
             } else {
                 run
             };
@@ -801,6 +853,10 @@ pub fn scan_lines(
             // M4 R1: a selected-line limit cannot hide a sentinel already
             // received, even when it follows a complete selected line.
             result.binary = binary.is_some();
+            if let Some(at) = binary {
+                result.binary_offset = Some(base as u64 + at as u64 - if base == 0 { 0 } else { bom });
+            }
+            let mut offset = base as u64 - if base == 0 { 0 } else { bom };
             let text = &run[..binary.unwrap_or(run.len())];
             let mut lines = text.split(|&b| b == b'\n').peekable();
             while let Some(line) = lines.next() {
@@ -810,6 +866,9 @@ pub fn scan_lines(
                     break;
                 }
                 let line_terminated = lines.peek().is_some() || terminated;
+                let line_offset = offset;
+                offset += line.len() as u64 + u64::from(line_terminated);
+                result.bytes_searched = offset;
                 number += 1;
                 if stopped() {
                     return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
@@ -824,6 +883,7 @@ pub fn scan_lines(
                         {
                             for span in search.spans(line) {
                                 emit(Line {
+                                    offset: line_offset,
                                     source_lines: None,
                                     terminated: line_terminated,
                                     number,
@@ -836,6 +896,7 @@ pub fn scan_lines(
                             }
                         } else {
                             emit(Line {
+                                offset: line_offset,
                                 source_lines: None,
                                 terminated: line_terminated,
                                 number,
@@ -878,6 +939,7 @@ pub fn scan_lines(
                             result.count += 1;
                             if plan.output == Output::Lines && plan.replacement.is_none() {
                                 emit(Line {
+                                    offset: line_offset,
                                     source_lines: None,
                                     terminated: line_terminated,
                                     number,
@@ -891,6 +953,7 @@ pub fn scan_lines(
                         }
                         if plan.output == Output::Lines && plan.replacement.is_some() {
                             emit(Line {
+                                offset: line_offset,
                                 source_lines: None,
                                 terminated: line_terminated,
                                 number,
@@ -905,6 +968,7 @@ pub fn scan_lines(
                         result.count += 1;
                         if plan.output == Output::Lines {
                             emit(Line {
+                                offset: line_offset,
                                 source_lines: None,
                                 terminated: line_terminated,
                                 number,
@@ -924,6 +988,7 @@ pub fn scan_lines(
                     }
                 } else if rendering && number <= trailing {
                     emit(Line {
+                        offset: line_offset,
                         source_lines: None,
                         terminated: line_terminated,
                         number,
@@ -934,7 +999,7 @@ pub fn scan_lines(
                     })
                     .map_err(ScanError::Output)?;
                 } else if rendering {
-                    before.push(number, line).map_err(ScanError::Output)?;
+                    before.push_at(number, line_offset, line).map_err(ScanError::Output)?;
                 }
             }
             if binary.is_some() {

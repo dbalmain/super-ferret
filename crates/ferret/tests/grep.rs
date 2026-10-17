@@ -310,7 +310,7 @@ fn unsupported_tiers_refuse_before_output() {
         "-P",
         "--heading-off",
         "--no-replace",
-        "--json",
+        "--json=true",
         "-j2",
         "--no-quiet",
     ] {
@@ -3713,5 +3713,106 @@ fn m8_r1_inverted_assertions_keep_source_bounds_with_and_without_context() {
                 }
             }
         }
+    }
+}
+
+
+fn normalized_json(output: &[u8], quiet: bool) -> Vec<u8> {
+    let python = std::env::var_os("FERRET_PYTHON").expect("nix supplies Python");
+    let mut command = Command::new(python);
+    command.arg("-c").arg(include_str!("support/grep_json.py")).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if quiet { command.arg("--quiet"); }
+    let normalized = run(command, Some(output));
+    assert!(normalized.status.success(), "JSON validation failed: {normalized:?}");
+    normalized.stdout
+}
+
+impl Fixture {
+    fn compare_json(&self, args: &[&str], input: Option<&[u8]>) -> Output {
+        let mut options = vec!["--json"];
+        options.extend_from_slice(args);
+        let oracle = self.oracle(&options, input);
+        options.insert(0, "grep");
+        let actual = self.ferret(&options, input);
+        assert_eq!(actual.status.code(), oracle.status.code(), "{args:?}: {actual:?} vs {oracle:?}");
+        assert_eq!(actual.stderr.is_empty(), oracle.stderr.is_empty(), "{args:?}: {actual:?} vs {oracle:?}");
+        let quiet = args.contains(&"-q");
+        assert_eq!(normalized_json(&actual.stdout, quiet), normalized_json(&oracle.stdout, quiet),
+                   "{args:?}: {actual:?} vs {oracle:?}");
+        actual
+    }
+}
+
+macro_rules! json_cases {
+    ($($name:ident: $status:literal => [$($arg:expr),*];)*) => {$ (
+        #[test]
+        fn $name() {
+            let fixture = Fixture::new(stringify!($name));
+            let output = fixture.compare_json(&[$($arg),*], None);
+            assert_eq!(output.status.code(), Some($status));
+        }
+    )*};
+}
+
+json_cases! {
+    m9_json_lines: 0 => ["red", "one.rs"];
+    m9_json_no_match: 1 => ["absent", "one.rs"];
+    m9_json_empty_input: 1 => ["", "empty"];
+    m9_json_empty_line: 0 => ["", "blank"];
+    m9_json_unterminated: 0 => ["red", "last"];
+    m9_json_crlf: 0 => ["red", "crlf"];
+    m9_json_bom: 0 => ["red", "bom"];
+    m9_json_invalid_lines: 0 => ["red", "invalid"];
+    m9_json_invalid_match: 0 => [r"(?-u:\xFF)", "invalid"];
+    m9_json_unicode: 0 => ["-i", "kilo", "unicode"];
+    m9_json_empty_spans: 0 => ["", "one.rs"];
+    m9_json_adjacent_spans: 0 => ["r|e|d", "one.rs"];
+    m9_json_consuming_empty: 0 => ["a*", "one.rs"];
+    m9_json_terminal_unterminated: 0 => [r"\z", "last"];
+    m9_json_terminal_lf: 0 => [r"\z", "one.rs"];
+    m9_json_only_ignored: 0 => ["-o", "red", "one.rs"];
+    m9_json_decorations_ignored: 0 => ["--heading", "--color=always", "-0HI", "red", "one.rs"];
+    m9_json_no_numbers: 0 => ["-N", "red", "one.rs"];
+    m9_json_numbers_override: 0 => ["-Nn", "red", "one.rs"];
+    m9_json_context: 0 => ["-C1", "red", "one.rs"];
+    m9_json_limit_tail: 0 => ["-m1", "-A2", "red", "one.rs"];
+    m9_json_limit: 0 => ["-m1", "red", "one.rs"];
+    m9_json_zero_limit: 1 => ["-m0", "red", "one.rs"];
+    m9_json_invert: 0 => ["-v", "red", "one.rs"];
+    m9_json_invert_context: 0 => ["-voC1", "red", "one.rs"];
+    m9_json_quiet: 0 => ["-q", "red", "one.rs"];
+    m9_json_quiet_invert: 0 => ["-q", "-v", "red", "one.rs"];
+    m9_json_quiet_no_match: 1 => ["-q", "absent", "one.rs"];
+    m9_json_multiline: 0 => ["-U", r"red lantern\nBLUE", "one.rs"];
+    m9_json_multiline_context: 0 => ["-UC1", r"red lantern\nBLUE", "one.rs"];
+    m9_json_multiline_lf_excluded: 0 => ["-U", "red", "one.rs"];
+    m9_json_multiline_fixed: 0 => ["-UF", "red lantern\nBLUE", "one.rs"];
+    m9_json_multiline_empty: 0 => ["-U", "(?s:.*?)", "one.rs"];
+    m9_json_multiline_absolute: 0 => ["-U", r"\A", "one.rs"];
+    m9_json_multiline_terminal: 0 => ["-U", r"\z", "last"];
+    m9_json_multiline_context_only: 1 => ["-UB1", r"\z", "one.rs"];
+    m9_json_multiline_invert: 0 => ["-UvC1", r"red lantern\nBLUE", "one.rs"];
+    m9_json_multiline_invert_empty: 0 => ["-Uv", r"\z", "one.rs"];
+    m9_json_multiline_inverted_limit: 0 => ["-Uvm1", "red|\n", "one.rs"];
+    m9_json_indexed: 0 => ["red", "."];
+    m9_json_indexed_context: 0 => ["-C1", "lantern", "."];
+    m9_json_unrestricted: 0 => ["-uu", "red", "."];
+    m9_json_invalid_pattern: 2 => ["[", "one.rs"];
+}
+
+
+#[test]
+fn m9_json_replacement_is_ignored_as_specified_provisionally() {
+    let fixture = Fixture::new("m9-json-replacement-contract");
+    for flags in ["-or", "-Uor"] {
+        let args = ["--json", flags, "<$0>", "red", "one.rs"];
+        let oracle = fixture.oracle(&args, None);
+        let actual = fixture.ferret(&["grep", "--json", flags, "<$0>", "red", "one.rs"], None);
+        let plain = fixture.ferret(&["grep", "--json", "red", "one.rs"], None);
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(normalized_json(&actual.stdout, false), normalized_json(&plain.stdout, false));
+        // M9-B: rg 15.2 adds metadata despite GREP.md's explicit ignore rule.
+        assert!(oracle.stdout.windows(b"\"replacement\"".len()).any(|w| w == b"\"replacement\""));
+        assert_ne!(normalized_json(&actual.stdout, false), normalized_json(&oracle.stdout, false));
     }
 }

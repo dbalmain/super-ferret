@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod groups;
+mod json;
 mod live;
 mod names;
 mod presentation;
@@ -37,6 +38,7 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -U, --multiline     permit matches across LF boundaries\n\
   --multiline-dotall  let dot match LF with -U\n\
   -r, --replace TEXT replace matches in output; inputs stay unchanged\n\
+  --json             rg JSON Lines events and summary\n\
   -o, --only-matching print nonoverlapping match spans\n\
   -l, --files-with-matches print each matching path once\n\
   -v, --invert-match  select nonmatching lines\n\
@@ -80,6 +82,7 @@ enum Input {
 /// and index resolution; all search errors use grep's status 2, including
 /// output failures.
 pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
+    let start = std::time::Instant::now();
     let command = match line_grep::parse(args) {
         Ok(command) => command,
         Err(error) => return failure(&error.to_string()),
@@ -102,7 +105,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         return exit;
     }
     let tty = presentation::resolve(&mut plan.presentation);
-    plan.line_number = plan.presentation.numbers.unwrap_or(tty);
+    plan.line_number = plan.presentation.numbers.unwrap_or(tty || plan.json);
     let mut selection = GrepSelection::default().with_hidden(plan.hidden);
     for glob in &plan.globs {
         if let Err(error) = selection.push(glob) {
@@ -204,6 +207,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
         buffer: Vec::new(),
         matched: false,
         emitted_group: false,
+        json_stats: json::Stats::default(),
         errors: false,
         cancelled: Some(&cancelled),
     };
@@ -240,7 +244,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             .map(|(pin, documents)| engine::reader::checked(pin.catalog(), documents))
     };
     let mut inputs = inputs.into_iter().peekable();
-    while inputs.peek().is_some() {
+    'inputs: while inputs.peek().is_some() {
         let mut segment = Vec::new();
         while inputs
             .peek()
@@ -280,7 +284,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 return failure(&format!("writing stdout: {error}"));
             }
             if plan.quiet && host.matched {
-                return Exit::Ok;
+                break 'inputs;
             }
         }
         if matches!(inputs.peek(), Some(Input::Stdin)) {
@@ -289,14 +293,19 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 return failure(&format!("writing stdout: {error}"));
             }
             if plan.quiet && host.matched {
-                return Exit::Ok;
+                break 'inputs;
             }
         }
+    }
+    if plan.json && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start) {
+        return failure(&format!("writing stdout: {error}"));
     }
     if let Err(error) = host.writer.flush() {
         return failure(&format!("writing stdout: {error}"));
     }
-    if host.errors {
+    if plan.quiet && host.matched {
+        Exit::Ok
+    } else if host.errors {
         Exit::Usage
     } else if host.matched {
         Exit::Ok
@@ -308,7 +317,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
 fn context_error(global_json: bool) -> Option<Exit> {
     if global_json {
         return Some(failure(
-            "global --json framing is not supported for grep; grep --json is deferred to M9",
+            "global --json framing is not supported for grep; use ferret grep --json",
         ));
     }
     if std::env::var_os("RIPGREP_CONFIG_PATH").is_some_and(|s| !s.is_empty()) {
@@ -410,6 +419,7 @@ struct Host<'a, W> {
     buffer: Vec<u8>,
     matched: bool,
     emitted_group: bool,
+    json_stats: json::Stats,
     errors: bool,
     cancelled: Option<&'a AtomicBool>,
 }
@@ -461,8 +471,7 @@ impl<W: Write> Host<'_, W> {
         let stopped = || flag.is_some_and(|flag| flag.load(Ordering::Acquire));
         let render = groups::Render {
             plan: self.plan,
-            prefix: self
-                .filename
+            prefix: (self.filename || self.plan.json)
                 .then_some(label(path, self.plan.paths.is_empty())),
             stopped: &stopped,
         };
@@ -483,6 +492,23 @@ impl<W: Write> Host<'_, W> {
         mut output: OutputBuffer,
     ) -> io::Result<()> {
         self.matched |= result.matched;
+        if self.plan.json {
+            let mut printed = 0;
+            if !self.plan.quiet && !output.is_empty() {
+                let path = label(path, self.plan.paths.is_empty());
+                let mut begin = Vec::new();
+                json::begin(&mut begin, path)?;
+                printed = begin.len() as u64 + output.len();
+                self.writer.write_all(&begin)?;
+                let flag = self.cancelled;
+                groups::emit(&mut output, &mut self.writer, &|| {
+                    flag.is_some_and(|flag| flag.load(Ordering::Acquire))
+                })?;
+                json::end(&mut self.writer, path, result, printed)?;
+            }
+            self.json_stats.add(result, printed);
+            return Ok(());
+        }
         if self.plan.quiet {
             return Ok(());
         }
@@ -601,6 +627,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
+        json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
             };
@@ -655,6 +682,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
+        json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
             };
@@ -730,6 +758,7 @@ mod tests {
                     buffer: Vec::new(),
                     matched: false,
                     emitted_group: false,
+        json_stats: json::Stats::default(),
                     errors: false,
                     cancelled: None,
                 };
@@ -770,6 +799,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+        json_stats: json::Stats::default(),
             errors: false,
             cancelled: None,
         };
@@ -811,6 +841,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
+        json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
             };
@@ -860,6 +891,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
+        json_stats: json::Stats::default(),
             errors: false,
             cancelled: None,
         };
