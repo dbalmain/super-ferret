@@ -188,10 +188,14 @@ impl Render<'_> {
         #[cfg(test)]
         let input: &mut dyn Read = &mut observed;
         let mut previous = None;
-        line_grep::scan_lines(self.plan, input, size, buffer, self.stopped, |line| {
+        let result = line_grep::scan_lines(self.plan, input, size, buffer, self.stopped, |line| {
             capture.push(line);
             self.line(output, line, &mut previous)
-        })
+        });
+        // Complete staging inside the checked-read callback: a late spill
+        // fault must discard the capture, before any group can be published.
+        output.flush().map_err(ScanError::Output)?;
+        result
     }
 }
 
@@ -203,13 +207,13 @@ pub(super) fn observe(
     read: &mut dyn FnMut(ferret_query::Consumer<'_>) -> ReadOutcome,
     cache: bool,
 ) -> io::Result<Observed> {
-    let mut output = OutputBuffer::default();
+    let mut output = OutputBuffer::default().with_buffered_spill();
     let mut result = InputResult::default();
     let mut capture = Capture::new(cache);
     let mut output_failure = None;
     let outcome = ferret_query::retry_read(
         || {
-            output = OutputBuffer::default();
+            output = OutputBuffer::default().with_buffered_spill();
             result = InputResult::default();
             capture = Capture::new(cache);
             let mut each = |input: &mut dyn Read, size| match render.scan(
@@ -469,7 +473,7 @@ impl Worker<'_> {
                 if let Some(cached) = cached {
                     match read(*name, ReadRequest::Stat) {
                         ReadOutcome::Stable(ReadVersion::Catalogued) => {
-                            let mut output = OutputBuffer::default();
+                            let mut output = OutputBuffer::default().with_buffered_spill();
                             let mut previous = None;
                             for record in &cached.records {
                                 render.line(
@@ -524,7 +528,7 @@ impl Worker<'_> {
             )?,
             Job::Absent(_) => Observed::Ready(Group {
                 result: InputResult::empty(&self.plan),
-                output: OutputBuffer::default(),
+                output: OutputBuffer::default().with_buffered_spill(),
                 version: ReadVersion::Catalogued,
                 records: None,
             }),
@@ -869,7 +873,7 @@ mod tests {
     fn vectored_plain_records_replay_exactly_before_and_after_spilling() {
         for size in [0, 11, ENTRY_BYTES * 3 + 7] {
             let bytes = vec![b'x'; size];
-            let mut output = OutputBuffer::default();
+            let mut output = OutputBuffer::default().with_buffered_spill();
             for _ in 0..3 {
                 let mut writer = Cancellable {
                     inner: &mut output,
@@ -1288,7 +1292,7 @@ mod tests {
             }
         }
         let flag = AtomicBool::new(false);
-        let mut output = OutputBuffer::default();
+        let mut output = OutputBuffer::default().with_buffered_spill();
         output.write_all(&vec![b'x'; 3 * CHUNK]).unwrap();
         let mut sink = Sink {
             flag: &flag,

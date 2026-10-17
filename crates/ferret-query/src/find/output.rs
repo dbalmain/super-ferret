@@ -23,11 +23,24 @@ pub struct OutputBuffer {
     file: Option<Spill>,
     len: u64,
     checkpoint: u64,
+    buffered_spill: bool,
 }
 
 struct Spill {
     file: File,
     path: PathBuf,
+}
+
+impl Spill {
+    fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(result) = spill_tests::WRITE.with_borrow_mut(|hook| {
+            hook.as_mut().map(|hook| hook(&mut self.file, bytes))
+        }) {
+            return result;
+        }
+        self.file.write_vectored(bytes)
+    }
 }
 
 impl Write for OutputBuffer {
@@ -60,6 +73,18 @@ impl Write for OutputBuffer {
                 }
             }
         }
+        if self.file.is_some() {
+            if self.buffered_spill {
+                if bytes.len() > MEMORY_LIMIT - self.bytes.len() {
+                    self.flush()?;
+                }
+                if bytes.len() < MEMORY_LIMIT {
+                    self.bytes.extend_from_slice(bytes);
+                    self.len += bytes.len() as u64;
+                    return Ok(bytes.len());
+                }
+            }
+        }
         if let Some(spill) = &mut self.file {
             spill
                 .file
@@ -72,8 +97,8 @@ impl Write for OutputBuffer {
         Ok(bytes.len())
     }
     fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
-        if let Some(spill) = &mut self.file {
-            let written = spill_progress(spill.file.write_vectored(bytes), bytes, &spill.path)?;
+        if !self.buffered_spill && let Some(spill) = &mut self.file {
+            let written = spill_progress(spill.write_vectored(bytes), bytes, &spill.path)?;
             self.len += written as u64;
             Ok(written)
         } else {
@@ -86,11 +111,37 @@ impl Write for OutputBuffer {
         }
     }
     fn flush(&mut self) -> io::Result<()> {
+        if !self.buffered_spill {
+            return Ok(());
+        }
+        if let Some(spill) = &mut self.file {
+            let mut written = 0;
+            let result = (|| {
+                while written < self.bytes.len() {
+                    let parts = [IoSlice::new(&self.bytes[written..])];
+                    match spill_progress(spill.write_vectored(&parts), &parts, &spill.path) {
+                        Ok(count) => written += count,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(())
+            })();
+            self.bytes.drain(..written);
+            result?;
+        }
         Ok(())
     }
 }
 
 impl OutputBuffer {
+    /// Stage spill writes in the capture's existing 64 KiB allocation. Call
+    /// `flush` before completing a capture to surface deferred spill faults
+    /// before publication. Default captures retain immediate write faults.
+    pub fn with_buffered_spill(mut self) -> Self {
+        self.buffered_spill = true;
+        self
+    }
     /// Captured byte length, including spilled bytes.
     pub fn len(&self) -> u64 {
         self.len
@@ -135,10 +186,19 @@ impl OutputBuffer {
             }
             let count = (end - at).min(MEMORY_LIMIT as u64) as usize;
             if let Some(spill) = &self.file {
-                spill
-                    .file
-                    .read_exact_at(&mut buffer[..count], at)
-                    .map_err(|error| spill_error("read", &spill.path, error))?;
+                let disk_len = self.len - self.bytes.len() as u64;
+                let disk_count = disk_len.saturating_sub(at).min(count as u64) as usize;
+                if disk_count > 0 {
+                    spill
+                        .file
+                        .read_exact_at(&mut buffer[..disk_count], at)
+                        .map_err(|error| spill_error("read", &spill.path, error))?;
+                }
+                if disk_count < count {
+                    let tail = (at + disk_count as u64 - disk_len) as usize;
+                    buffer[disk_count..count]
+                        .copy_from_slice(&self.bytes[tail..tail + count - disk_count]);
+                }
                 writer.write_all(&buffer[..count])?;
             } else {
                 writer.write_all(&self.bytes[at as usize..at as usize + count])?;
@@ -176,6 +236,7 @@ impl OutputBuffer {
     }
 
     fn emit(&mut self, mut write: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+        self.flush()?;
         if let Some(spill) = &mut self.file {
             spill
                 .file
@@ -199,6 +260,13 @@ impl OutputBuffer {
     }
     fn truncate(&mut self, len: u64) -> io::Result<()> {
         if let Some(spill) = &mut self.file {
+            let disk_len = self.len - self.bytes.len() as u64;
+            if self.buffered_spill && len >= disk_len {
+                self.bytes.truncate((len - disk_len) as usize);
+                self.len = len;
+                return Ok(());
+            }
+            self.bytes.clear();
             spill
                 .file
                 .set_len(len)
@@ -474,6 +542,12 @@ pub(super) fn policy(expression: &super::Expression) -> Policy {
 #[cfg(test)]
 mod spill_tests {
     use super::*;
+    use std::cell::RefCell;
+
+    type SpillWrite = dyn FnMut(&mut File, &[IoSlice<'_>]) -> io::Result<usize>;
+    thread_local! {
+        pub(super) static WRITE: RefCell<Option<Box<SpillWrite>>> = RefCell::new(None);
+    }
 
     #[test]
     fn zero_progress_on_a_nonempty_vector_names_the_spill() {
