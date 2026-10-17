@@ -883,16 +883,19 @@ fn scan_records(
                     }
                     let Some(hit) = search.find(remaining) else {
                         // InputResult exposes bytes searched even without JSON.
-                        // A later run's callbacks also observe skipped line numbers.
+                        // A later run's callbacks also observe skipped line
+                        // numbers.
                         offset += remaining.len() as u64 + u64::from(terminated);
                         result.bytes_searched = offset;
                         number += memchr::memchr_iter(b'\n', remaining).count() as u64
-                            + u64::from(terminated || binary.is_some()
-                                || (!remaining.is_empty() && !remaining.ends_with(b"\n")));
+                            + u64::from(
+                                terminated
+                                    || binary.is_some()
+                                    || (!remaining.is_empty() && !remaining.ends_with(b"\n")),
+                            );
                         break;
                     };
-                    let first = memchr::memrchr(b'\n', &remaining[..hit])
-                        .map_or(0, |at| at + 1);
+                    let first = memchr::memrchr(b'\n', &remaining[..hit]).map_or(0, |at| at + 1);
                     let end = memchr::memchr(b'\n', &remaining[hit..])
                         .map_or(remaining.len(), |at| hit + at);
                     number += memchr::memchr_iter(b'\n', &remaining[..first]).count() as u64;
@@ -907,10 +910,19 @@ fn scan_records(
                 };
                 // No extra line after a terminal LF or at empty EOF. A partial
                 // line before NUL is searched: NUL is a binary sentinel.
-                if !fast && line.is_empty() && lines.peek().is_none() && !terminated && binary.is_none() {
+                if !fast
+                    && line.is_empty()
+                    && lines.peek().is_none()
+                    && !terminated
+                    && binary.is_none()
+                {
                     break;
                 }
-                let line_terminated = if fast { next.is_some() } else { lines.peek().is_some() } || terminated;
+                let line_terminated = if fast {
+                    next.is_some()
+                } else {
+                    lines.peek().is_some()
+                } || terminated;
                 let line_offset = offset;
                 offset += line.len() as u64 + u64::from(line_terminated);
                 result.bytes_searched = offset;
@@ -1096,52 +1108,131 @@ mod tests {
         let mut slow = plan.clone();
         slow.force_per_line = true;
         let expected = scan(&slow);
-        assert_eq!(actual, expected, "pattern {:?}, {} input bytes", plan.grep.pattern(), bytes.len());
+        assert_eq!(
+            actual,
+            expected,
+            "pattern {:?}, {} input bytes",
+            plan.grep.pattern(),
+            bytes.len()
+        );
     }
 
     #[test]
     fn run_search_and_per_line_search_emit_identical_records_and_results() {
         let documents: &[&[u8]] = &[
-            b"red\ngap\nred\n", b"red\ngap\nred", b"gap\nred\n",
-            b"gap\nred", b"red red\r\ngap\r\nred\r\n", b"\nred\n\n",
-            b"\xef\xbb\xbfred\ngap\nred\n", b"red\0red\n",
-            b"gap\0red\n", b"red\n\0red\n", b"\0red\n", b"\n\0",
-            b"gap\n", b"gap", b"", b"\n", b"\n\n", b"red\nred\nred\n",
-            b"\xffred\n\xff\nred\xff\n", "Kilo\nred\nſea\n".as_bytes(),
+            b"red\ngap\nred\n",
+            b"red\ngap\nred",
+            b"gap\nred\n",
+            b"gap\nred",
+            b"red red\r\ngap\r\nred\r\n",
+            b"\nred\n\n",
+            b"\xef\xbb\xbfred\ngap\nred\n",
+            b"red\0red\n",
+            b"gap\0red\n",
+            b"red\n\0red\n",
+            b"\0red\n",
+            b"\n\0",
+            b"sing\nwalking\nred\nsinging\n",
+            b"gap\n",
+            b"gap",
+            b"",
+            b"\n",
+            b"\n\n",
+            b"red\nred\nred\n",
+            b"\xffred\n\xff\nred\xff\n",
+            "Kilo\nred\nſea\n".as_bytes(),
         ];
         let patterns = [
-            "red", "absent", "", "^", "$", "^$", "^red$", r"\bred\b",
-            r"\b", r"\B", r"\b{start-half}", r"\b{end-half}", r"\w+ing\b",
-            "red|$", "red?", "red*", "(?i:red)", "[a-z]+red", "[a-z]*red",
+            "red",
+            "absent",
+            "",
+            "^",
+            "$",
+            "^$",
+            "^red$",
+            r"\bred\b",
+            r"\b",
+            r"\B",
+            r"\b{start-half}",
+            r"\b{end-half}",
+            r"\w+ing\b",
+            "red|$",
+            "red?",
+            "red*",
+            "(?i:red)",
+            "[a-z]+red",
+            "[a-z]*red",
             // These must retain per-line assertion/consumption bounds (D79).
-            r"\Ared", r"red\z", r"\A|\z", "(?-m:^red$)", "(?R:^red$)",
-            r"\s", r"[^x]", "(?s:.)", r"[\s\S]", r"(?-u:\xFF)",
+            r"\Ared",
+            r"red\z",
+            r"\A|\z",
+            "(?-m:^red$)",
+            "(?R:^red$)",
+            r"\s",
+            r"[^x]",
+            "(?s:.)",
+            r"[\s\S]",
+            r"(?-u:\xFF)",
         ];
         let profiles: &[&[&str]] = &[
-            &[], &["-n"], &["-m1"], &["-m2"], &["-m0"], &["-c"],
-            &["-co"], &["--count-matches"], &["-l"], &["-q"], &["-o"],
-            &["-om1"], &["-cm1"], &["--json"], &["--json", "-m1"],
-            &["--json", "-q"], &["--json", "-N"], &["-r", "<$0>"],
-            &["-or", "<$0>"], &["--files-without-match"],
+            &[],
+            &["-n"],
+            &["-m1"],
+            &["-m2"],
+            &["-m0"],
+            &["-c"],
+            &["-co"],
+            &["--count-matches"],
+            &["-l"],
+            &["-q"],
+            &["-o"],
+            &["-om1"],
+            &["-cm1"],
+            &["--json"],
+            &["--json", "-m1"],
+            &["--json", "-q"],
+            &["--json", "-N"],
+            &["-r", "<$0>"],
+            &["-or", "<$0>"],
+            &["--files-without-match"],
             // Unchanged fallbacks share the same switch and public entry point.
-            &["-v"], &["-C1"], &["--json", "-A1"], &["-U"],
+            &["-v"],
+            &["-C1"],
+            &["--json", "-A1"],
+            &["-U"],
         ];
         for pattern in patterns {
             for &profile in profiles {
                 for text in [false, true] {
                     let mut args: Vec<_> = profile.iter().map(OsString::from).collect();
-                    if text { args.push("-a".into()); }
+                    if text {
+                        args.push("-a".into());
+                    }
                     args.push(pattern.into());
-                    let Command::Search(plan) = parse(&args).unwrap() else { panic!("search") };
-                    for &bytes in documents { compare_scanners(&plan, bytes); }
+                    let Command::Search(plan) = parse(&args).unwrap() else {
+                        panic!("search")
+                    };
+                    for &bytes in documents {
+                        compare_scanners(&plan, bytes);
+                    }
                 }
             }
         }
-        for flags in [vec!["-F"], vec!["-Fi"], vec!["-w"], vec!["-x"], vec!["-e", "", "-e"]] {
+        for flags in [
+            vec!["-F"],
+            vec!["-Fi"],
+            vec!["-w"],
+            vec!["-x"],
+            vec!["-e", "", "-e"],
+        ] {
             let mut args: Vec<_> = flags.into_iter().map(OsString::from).collect();
             args.push("red".into());
-            let Command::Search(plan) = parse(&args).unwrap() else { panic!("search") };
-            for &bytes in documents { compare_scanners(&plan, bytes); }
+            let Command::Search(plan) = parse(&args).unwrap() else {
+                panic!("search")
+            };
+            for &bytes in documents {
+                compare_scanners(&plan, bytes);
+            }
         }
     }
 
@@ -1161,9 +1252,13 @@ mod tests {
                 for flags in ["-n", "-o", "-c", "-l", "-q", "-m1", "--json"] {
                     for text in [false, true] {
                         let mut args = vec![flags.into()];
-                        if text { args.push("-a".into()); }
+                        if text {
+                            args.push("-a".into());
+                        }
                         args.push("red".into());
-                        let Command::Search(plan) = parse(&args).unwrap() else { panic!("search") };
+                        let Command::Search(plan) = parse(&args).unwrap() else {
+                            panic!("search")
+                        };
                         compare_scanners(&plan, &input);
                     }
                 }

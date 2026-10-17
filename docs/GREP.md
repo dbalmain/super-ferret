@@ -156,6 +156,18 @@ positive counts need no zero records and retain candidate enumeration.
 Keep reads/output cancellable
 and queues bounded.
 
+**Line scan optimization (2026-10-18):** non-inverted line mode without
+context searches each remaining run before locating the selected line with
+vectorized LF searches. Selected-line limits, counts, names, quiet, `-o`,
+replacement and JSON retain their existing line-local processing. Eligibility
+uses the verifier's resolved HIR proof: no consuming node admits LF, and
+assertions must agree on a whole-line run and a detached line. Multi-line
+`^`/`$` and word boundaries qualify; absolute anchors, disabled multi-line
+anchors, CRLF assertions and LF-admitting classes/dotall retain per-line search.
+`line_terminator` alone does not establish LF exclusion. Original line numbers,
+source offsets, binary detection and searched-byte counts remain unchanged.
+Multiline, inversion and context keep their existing scanners.
+
 ## Freshness and operands
 
 **D73 A (confirmed 2026-10-16): indexed mode is not exact over the current tree.** Names,
