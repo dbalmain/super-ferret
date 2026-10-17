@@ -633,6 +633,16 @@ trailing context are rechecked within that source line: a mandatory LF match
 cannot publish its following context line twice. An optional LF branch can
 therefore differ from rg's cross-boundary capture there as well (M8-C).
 
+**M8 fix round 1 (2026-10-17):** selected multiline inverted lines have no
+replacement captures. Context capture searches retain their original LF rather
+than manufacturing EOF on a detached line. On `a\nb\nc\n`, `-Uv -r X '\z'`
+prints the three unchanged lines. Replacement shares the ordinary renderer's
+explicit terminal-tail fallback: on `a\nbc\n`, `-Uonm1 -A1 -r X 'a|\z'`
+prints `1:X` and `2:bc`. Tail discovery can license that unchanged existing
+line even when bounded span collection has no terminal span; it does not add
+a searchable line or increase the count. Both examples agree with pinned rg
+15.2.0; neither is a D85/D86 compatibility exception.
+
 `--json` emits rg begin/match/context/end/summary JSON Lines: byte spans,
 absolute offsets, line numbers, text-or-base64 fields and semantic counts.
 Match schemas/values except key order, timings and physical work counters

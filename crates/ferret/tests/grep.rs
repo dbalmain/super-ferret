@@ -3522,3 +3522,196 @@ fn m8_limited_trailing_context_never_repeats_a_cross_line_capture() {
         b"1:<red> x\n2-gap\n3:<red\n4:blue>\n5:end\n4-blue\n5-end\n"
     );
 }
+
+#[test]
+fn m8_r1_selected_inverted_lines_do_not_invent_terminal_captures() {
+    let fixture = Fixture::new("m8-r1-inverted-terminal");
+    let actual = fixture.compare_raw(&["-Uv", "-rX", r"\z", "-"], Some(b"a\nb\nc\n"));
+    assert_eq!(actual.status.code(), Some(0));
+    assert_eq!(actual.stdout, b"a\nb\nc\n");
+}
+
+#[test]
+fn m8_r1_terminal_tail_fallback_survives_replacement_without_spans() {
+    let fixture = Fixture::new("m8-r1-terminal-tail");
+    let actual = fixture.compare_raw(&["-Uonm1", "-A1", "-rX", r"a|\z", "-"], Some(b"a\nbc\n"));
+    assert_eq!(actual.status.code(), Some(0));
+    assert_eq!(actual.stdout, b"1:X\n2:bc\n");
+}
+
+#[test]
+fn m8_r1_replacement_crosses_m7_terminal_publication_matrix() {
+    let fixture = Fixture::new("m8-r1-terminal-matrix");
+    let mut cases: Vec<(Vec<&str>, &[u8])> = vec![
+        (vec!["-UnB1", r"\z"], b"abc\nabc\n"),
+        (vec!["-Uon", r"\z"], b"abc"),
+        (vec!["-Uc", r"\z"], b"abc"),
+        (vec!["-Uvn", r"\z"], b"abc"),
+    ];
+    // M7 R1: first terminal discovery, advancement and count profiles.
+    for flags in [
+        vec!["-Un"],
+        vec!["-Uon"],
+        vec!["-Uc"],
+        vec!["-Uco"],
+        vec!["-U", "--count-matches"],
+    ] {
+        let mut args = flags;
+        args.push(r"\b{end}");
+        cases.push((args, b"abc"));
+    }
+    for bytes in [b"a\nbc".as_slice(), b"abc def", "é".as_bytes()] {
+        cases.push((vec!["-Uon", r"\b{end}"], bytes));
+        cases.push((vec!["-Uco", r"\b{end}"], bytes));
+    }
+    for pattern in ["", r"\b", "a*"] {
+        cases.push((vec!["-Uco", pattern], b"abc"));
+    }
+    cases.push((vec!["-Uvn", r"\b{end}"], b"abc"));
+    // M7 R2: independent tail discovery, including final LF and earlier hits.
+    for (pattern, bytes, after) in [
+        (r"\b{end}", b"a\nbc".as_slice(), "-A1"),
+        (r"a|\z", b"a\nbc", "-A1"),
+        (r"\b", b"a\nbc", "-A1"),
+        (r"\b{end}", b"a\nbc def", "-A1"),
+        (r"\b{end}", b"a\nbc\n", "-A1"),
+        (r"\b{end}", b"a\nx\nbc", "-A1"),
+        (r"a|\z", b"a\na\nbc", "-A2"),
+        (r"\b{end}", b"a\nx\nbc", "-A2"),
+        (r"a|\z", b"a\nbc\n", "-A1"),
+        (r"a|\z", b"a\nbc\n", "-A2"),
+    ] {
+        for flags in [
+            vec!["-Uonm1"],
+            vec!["-Unm1"],
+            vec!["-Uonm1", "--color=always"],
+        ] {
+            let mut args = flags;
+            args.extend([after, pattern]);
+            cases.push((args, bytes));
+        }
+    }
+    // Binary detection discards context-only output even after replacement.
+    for flags in [
+        vec!["-UnB1"],
+        vec!["-UonB1"],
+        vec!["-UnB1", "--heading", "-H", "--color=always", "-0"],
+        vec!["-UonB1", "--heading", "-H", "--color=always", "-0"],
+    ] {
+        let mut args = flags;
+        args.push(r"\z");
+        cases.push((args, b"one\n\0"));
+    }
+    for (args, bytes) in cases {
+        for replacement in ["X", "<$0>", "", "X\nY"] {
+            let mut args = args.clone();
+            args.splice(0..0, ["-r", replacement]);
+            args.push("-");
+            fixture.compare_raw(&args, Some(bytes));
+        }
+    }
+    // M7 R1: counts retain bounded re-matching regardless of replacement.
+    for flags in [
+        vec!["-Ucm1"],
+        vec!["-Ucom1"],
+        vec!["-U", "--count-matches", "-m1"],
+    ] {
+        for include in [false, true] {
+            let mut args = flags.clone();
+            args.extend(["-rX"]);
+            if include {
+                args.push("--include-zero");
+            }
+            args.extend([r"a\n\b", "-"]);
+            let oracle = fixture.oracle(&args, Some(b"a\nb\n"));
+            assert_eq!(oracle.status.code(), Some(0));
+            assert_eq!(oracle.stdout, b"1\n");
+            args.insert(0, "grep");
+            let actual = fixture.ferret(&args, Some(b"a\nb\n"));
+            assert_eq!(actual.status.code(), Some(0));
+            assert_eq!(actual.stdout, if include { b"0\n".as_slice() } else { b"" });
+            assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+        }
+    }
+    // D82 A's independent tail count remains unchanged as well.
+    let args = ["-Ucom1", "-A1", "-rX", r"\b{end}", "-"];
+    let oracle = fixture.oracle(&args, Some(b"a\nbc"));
+    assert_eq!(oracle.stdout, b"2\n");
+    let actual = fixture.ferret(
+        &["grep", "-Ucom1", "-A1", "-rX", r"\b{end}", "-"],
+        Some(b"a\nbc"),
+    );
+    assert_eq!(actual.stdout, b"1\n");
+    assert_eq!(actual.status.code(), Some(0));
+    assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+    // Whole context-only and empty groups retain M7's inter-file separators.
+    fixture.write("terminal-a", b"one\n");
+    fixture.write("terminal-b", b"abc\n");
+    for extra in [vec![], vec!["--heading", "-I"]] {
+        for pattern in [r"\z", "abc|(?s:.*?)"] {
+            for replacement in ["X", ""] {
+                let mut args = vec!["-UHnoB1", "-r", replacement];
+                args.extend(&extra);
+                args.extend([pattern, "terminal-a", "terminal-b"]);
+                let oracle = fixture.oracle(&args, None);
+                let mut actual_args = vec!["grep"];
+                actual_args.extend(&args);
+                let actual = fixture.ferret(&actual_args, None);
+                let expected_exit = if pattern == r"\z" { 1 } else { 0 };
+                assert_eq!(actual.status.code(), Some(expected_exit));
+                assert_eq!(oracle.status.code(), Some(expected_exit));
+                assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+                assert_eq!(
+                    actual.stdout.ends_with(b"\n"),
+                    oracle.stdout.ends_with(b"\n")
+                );
+                // Compare complete groups while allowing either file order.
+                // Sorting individual records would hide missing separators.
+                let separator = if extra.is_empty() { "\n--\n" } else { "\n\n" };
+                let groups = |bytes: &[u8]| {
+                    let text = std::str::from_utf8(bytes).unwrap();
+                    let mut groups: Vec<_> = text
+                        .strip_suffix('\n')
+                        .unwrap_or(text)
+                        .split(separator)
+                        .map(str::to_owned)
+                        .collect();
+                    groups.sort();
+                    groups
+                };
+                assert_eq!(groups(&actual.stdout), groups(&oracle.stdout), "{args:?}");
+            }
+        }
+    }
+    fixture.write("terminal-binary", b"one\n\0");
+    fixture.compare_raw(
+        &["-UHnB1", "-rX", r"\z", "terminal-binary", "terminal-b"],
+        None,
+    );
+}
+
+#[test]
+fn m8_r1_inverted_assertions_keep_source_bounds_with_and_without_context() {
+    let fixture = Fixture::new("m8-r1-inverted-assertions");
+    for bytes in [b"a x\nb\nc\n".as_slice(), b"a x\nb\nc", b"a\n\nb\n"] {
+        for pattern in [
+            r"\z",
+            r"\A",
+            r"a|\z",
+            r"^a|\z",
+            r"(?P<end>\z)",
+            r"\b{end}",
+            r"\b",
+            r"\B",
+            r"^$",
+            r"a\nb",
+            r"a\n",
+        ] {
+            for flags in ["-Uvn", "-Uvon", "-UvnC1", "-UvonC1"] {
+                for replacement in ["X", "<$0:$1>", ""] {
+                    fixture.compare_raw(&[flags, "-r", replacement, pattern, "-"], Some(bytes));
+                }
+            }
+        }
+    }
+}

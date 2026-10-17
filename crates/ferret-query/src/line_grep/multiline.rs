@@ -377,23 +377,58 @@ pub(super) fn scan(
             } else {
                 LineKind::Context
             };
+            // Suffix discovery can license an unchanged tail record even
+            // when bounded span collection has no printable terminal span.
+            if plan.only_matching
+                && !plan.invert
+                && kind == LineKind::Match
+                && !selected
+                && relevant.is_empty()
+            {
+                emit(Line {
+                    source_lines: None,
+                    terminated: bytes[range.end - 1] == b'\n',
+                    number: index as u64 + 1,
+                    bytes: &bytes[range.start..content_end],
+                    kind,
+                    fragment: false,
+                    highlights: Some(&[]),
+                })
+                .map_err(ScanError::Output)?;
+                index += 1;
+                continue;
+            }
             if plan.replacement.is_some() {
                 if plan.invert {
-                    replacement::line(
-                        plan,
-                        Line {
-                            number: index as u64 + 1,
-                            source_lines: Some((index as u64 + 1, index as u64 + 1)),
-                            terminated: bytes[range.end - 1] == b'\n',
-                            bytes: &bytes[range.start..content_end],
-                            kind,
-                            fragment: false,
-                            highlights: None,
-                        },
-                        stopped,
-                        &mut emit,
-                    )
-                    .map_err(ScanError::Output)?;
+                    let line = Line {
+                        number: index as u64 + 1,
+                        source_lines: Some((index as u64 + 1, index as u64 + 1)),
+                        terminated: bytes[range.end - 1] == b'\n',
+                        bytes: &bytes[range.start..content_end],
+                        kind,
+                        fragment: false,
+                        highlights: Some(&[]),
+                    };
+                    if selected {
+                        // Inverted selection has no replacement captures. A
+                        // detached line would manufacture absolute assertions.
+                        emit(line).map_err(ScanError::Output)?;
+                    } else {
+                        let source = &bytes[range.clone()];
+                        replacement::region(
+                            plan,
+                            replacement::Region {
+                                source,
+                                clip: source.len(),
+                                range: 0..line.bytes.len(),
+                            },
+                            regex.spans(source),
+                            line,
+                            stopped,
+                            &mut emit,
+                        )
+                        .map_err(ScanError::Output)?;
+                    }
                     index += 1;
                     continue;
                 }
@@ -474,18 +509,6 @@ pub(super) fn scan(
                 continue;
             }
             if plan.only_matching && !plan.invert && kind == LineKind::Match {
-                if !selected && relevant.is_empty() {
-                    emit(Line {
-                        source_lines: None,
-                        terminated: true,
-                        number: index as u64 + 1,
-                        bytes: &bytes[range.start..content_end],
-                        kind,
-                        fragment: false,
-                        highlights: Some(&[]),
-                    })
-                    .map_err(ScanError::Output)?;
-                }
                 for span in relevant {
                     cancelled(stopped)?;
                     if span.is_empty() {

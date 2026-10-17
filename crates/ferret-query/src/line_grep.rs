@@ -993,6 +993,55 @@ mod tests {
     }
 
     #[test]
+    fn multiline_replacement_splitting_stops_after_the_first_emitted_line() {
+        use std::cell::Cell;
+        let Command::Search(plan) =
+            parse(&["-Ur".into(), "$2\n$1\nlast".into(), r"(red)\n(blue)".into()]).unwrap()
+        else {
+            panic!("search")
+        };
+        assert!(
+            !plan.grep.excludes_lf(),
+            "must exercise multiline splitting"
+        );
+        let bytes = b"red\nblue\nred\nblue\n";
+        let expected = vec![
+            (1, b"blue".to_vec()),
+            (2, b"red".to_vec()),
+            (3, b"last".to_vec()),
+            (4, b"blue".to_vec()),
+            (5, b"red".to_vec()),
+            (6, b"last".to_vec()),
+        ];
+        for cancel in [false, true] {
+            let stopped = Cell::new(false);
+            let mut records = Vec::new();
+            let result = scan_lines(
+                &plan,
+                &mut &bytes[..],
+                bytes.len() as u64,
+                &mut Vec::new(),
+                &|| stopped.get(),
+                |line| {
+                    records.push((line.number, line.bytes.to_vec()));
+                    if cancel {
+                        stopped.set(true);
+                    }
+                    Ok(())
+                },
+            );
+            if cancel {
+                assert!(matches!(result, Err(ScanError::Output(ref error))
+                    if error.kind() == io::ErrorKind::ConnectionAborted));
+                assert_eq!(records, expected[..1]);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(records, expected);
+            }
+        }
+    }
+
+    #[test]
     fn resolved_names_only_never_reads_pattern_files_or_stdin() {
         for args in [
             vec!["--files", "-f", "missing"],
