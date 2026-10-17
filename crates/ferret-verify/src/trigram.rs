@@ -380,7 +380,12 @@ struct Filter {
     /// Every byte a consuming node can admit. Full-span searches keep a
     /// whole line when assertions are present; line selection adds context
     /// around this narrower window instead.
-    within: Box<[bool; 256]>,
+    within: Box<Window>,
+}
+
+#[derive(Clone, Debug)]
+struct Window {
+    bytes: [bool; 256],
     assertions: bool,
 }
 
@@ -389,11 +394,11 @@ impl Filter {
         (
             text[at..hit.start]
                 .iter()
-                .rposition(|&b| !self.within[usize::from(b)])
+                .rposition(|&b| !self.within.bytes[usize::from(b)])
                 .map_or(at, |i| at + i + 1),
             text[hit.end..]
                 .iter()
-                .position(|&b| !self.within[usize::from(b)])
+                .position(|&b| !self.within.bytes[usize::from(b)])
                 .map_or(text.len(), |i| hit.end + i),
         )
     }
@@ -409,7 +414,7 @@ impl Search<'_> {
         while at <= text.len() {
             let hit = filter.run.find(&text[at..])?;
             let hit = at + hit.start..at + hit.end;
-            let (start, end) = if filter.assertions {
+            let (start, end) = if filter.within.assertions {
                 (
                     memchr::memrchr(b'\n', &text[at..hit.start]).map_or(at, |i| at + i + 1),
                     memchr::memchr(b'\n', &text[hit.end..]).map_or(text.len(), |i| hit.end + i),
@@ -492,14 +497,13 @@ fn filter(hir: &Hir) -> Option<Filter> {
     // Printing a HIR gives a pattern that parses back to it; it is already
     // case folded, so it compiles with the builder's defaults.
     let run = Regex::build(&regex::bytes::RegexBuilder::new(&run.to_string())).ok()?;
-    let mut within = Box::new([false; 256]);
-    let assertions = !match_bytes(hir, &mut within);
-    within[usize::from(b'\n')] = false;
-    Some(Filter {
-        run,
-        within,
-        assertions,
-    })
+    let mut within = Box::new(Window {
+        bytes: [false; 256],
+        assertions: false,
+    });
+    within.assertions = !match_bytes(hir, &mut within.bytes);
+    within.bytes[usize::from(b'\n')] = false;
+    Some(Filter { run, within })
 }
 
 /// Marks in `within` every byte a match of `hir` can contain; false when

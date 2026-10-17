@@ -77,6 +77,13 @@ impl Write for OutputBuffer {
                 .file
                 .write_vectored(bytes)
                 .map_err(|error| spill_error("write", &spill.path, error))?;
+            if written == 0 && bytes.iter().any(|part| !part.is_empty()) {
+                return Err(spill_error(
+                    "write",
+                    &spill.path,
+                    io::Error::new(io::ErrorKind::WriteZero, "failed to write whole buffer"),
+                ));
+            }
             self.len += written as u64;
             Ok(written)
         } else {

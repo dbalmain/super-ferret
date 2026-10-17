@@ -360,7 +360,12 @@ fn write_parts(mut output: impl Write, mut parts: &mut [IoSlice<'_>]) -> io::Res
     IoSlice::advance_slices(&mut parts, 0);
     while !parts.is_empty() {
         match output.write_vectored(parts) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
             Ok(written) => IoSlice::advance_slices(&mut parts, written),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
