@@ -5109,3 +5109,105 @@ M7's bounded re-match finds 0.
 
 **Fact that would change it:** a requirement to reproduce rg's count here.
 Then B.
+
+## D83 — Replacement presentation and terminal empty matches
+
+**Status: open, 2026-10-17; M8 (`wt/grep-m8`, M8-A) uses B provisionally.**
+
+Question: should replacement use every ordinary line span, or reproduce pinned
+rg 15.2.0's replacement-specific terminal bounds and whole-line fallback?
+
+- **A — reuse every ordinary span.** Smallest implementation and uniform
+  iteration, but adds a replacement at unterminated EOF that rg omits. It
+  also replaces the line selected solely by a first terminal assertion.
+- **B — retain discovery/counts, bound replacement presentation.** Keep the
+  shared iterator and original capture haystack, but omit terminal EOF
+  replacement on an unterminated line. A line selected solely by that terminal
+  assertion retains its unchanged whole-line fallback, including under -o.
+  Requires retaining source termination through line rendering, but agrees
+  with the oracle and preserves M7's search/publication distinction.
+
+Recommendation: B, provisional. On abc without LF, -or X '' emits three X
+records, whereas abc-LF emits four. On unterminated abc, -or X '\z' emits abc;
+with LF it emits X. Counts still describe original matches. Requiring uniform
+span and replacement presentation, or a new oracle removing this artifact,
+would change the recommendation to A.
+
+## D84 — Multiline replacement records
+
+**Status: open, 2026-10-17; M8 (`wt/grep-m8`, M8-B) uses B provisionally.**
+
+Question: should multiline replacement preserve one output record per source
+line, or reproduce rg's transformed match-group records?
+
+- **A — preserve source lines.** Smaller record model, but cannot remove an
+  LF captured across lines or add correctly prefixed replacement lines.
+- **B — expand bounded capture spans before projecting output lines.** Render
+  each selected source group, split the result for LF-including profiles and
+  retain original source end separately for context boundaries. LF-excluding
+  profiles retain line-mode replacement bytes (literal replacement LF does
+  not acquire another prefix). This agrees with pinned rg while adding source
+  boundary metadata to cached records.
+
+Recommendation: B, provisional. On a/b/c/d with -UnC1 -r X 'b\nc', rg emits
+1-a, 2:X, 4-d without a group separator. Replacing with X-LF-Y-LF-Z emits
+2:X, 3:Y, 4:Z and still 4-d. A requirement for stable source-line records, or
+an oracle changing this projection, would change the recommendation to A.
+
+## D85 — Replacement captures after multiline clipping
+
+**Status: open, 2026-10-17; M8 (`wt/grep-m8`, M8-C) uses A provisionally.**
+
+Question: should replacement preserve M7's bounded re-match contract, or adopt
+rg's replacement-specific unbounded re-match and suffix publication after -m?
+
+- **A — bounded replacement captures.** Use the same clipped match spans and
+  assertion bounds as existing output. This keeps GREP.md's explicit M7 limit
+  example and prevents a replacement from publishing an otherwise unselected
+  suffix, but differs from rg's replacement fast path for an optional LF branch.
+- **B — reproduce rg's replacement suffix.** Re-match the source beyond the
+  clipped group, potentially capture across its end, and in plain output copy
+  later unmatched lines into that positive group before emitting the requested
+  context again. This matches rg but weakens the existing clipping contract
+  and requires independently tracking replacement's expanded publication bounds.
+
+Recommendation: A, provisional. The owned input red-red/LF/blue/LF/gap/LF/red/
+LF/blue/LF with -Unm1 -A2 -r '<$0>' 'red(?:\nblue)?' makes rg capture the
+second red plus blue, then copy the entire remaining suffix into the match
+record, followed by blue/gap again as context. Ferret retains two bounded red
+expansions and the requested blue/gap context. Under -o rg still captures the
+cross-boundary blue, without the unmatched suffix. A requirement that replacement
+must override the accepted M7 clipping rule, or a pinned oracle whose bounded
+behavior no longer conflicts, would change the recommendation to B.
+
+This is an explicit owned spec/oracle conflict, not a D74 audit waiver. No
+private corpus row has been licensed by this decision.
+
+M8-C also applies to independently discovered trailing context: recheck a
+cross-line tail within each source line. Mandatory LF patterns retain whole
+context (matching rg); optional LF patterns retain a bounded local capture
+instead of expanding a cross-line capture and publishing the suffix again.
+The owned tail regression records both the agreement and the rg discrepancy.
+
+## D86 — Inherited absolute-anchor presentation
+
+**Status: open, 2026-10-17; M8 (`wt/grep-m8`, M8-D) uses A provisionally.**
+
+Question: should replacement inherit D79's per-line absolute-anchor spans or
+reproduce rg's cross-line empty-anchor presentation state?
+
+- **A — inherit per-line spans.** Preserves GREP.md's line-mode assertion
+  scope and the existing M2/D79 recommendation, with no alternate executor.
+  It differs from rg when an empty absolute-start capture is rendered across
+  several lines, including ordinary replacement output.
+- **B — reproduce cross-line presentation state.** Matches rg's first-only
+  replacement, with unchanged whole-line fallback on later selected lines,
+  but introduces a second assertion/presentation boundary in line mode.
+
+Recommendation: A, provisional, extending the already-open D79 choice to
+replacement. On three red-LF lines, -nr '<$0:$1>' '()\A' emits <:>red on every
+line in ferret, versus only the first in rg. Under -nor, ferret emits three
+<:> records; rg emits <:>, red, red. An answer to D79 choosing oracle artifacts
+or a requirement to give replacement different assertion truth would change
+the recommendation to B. Owned tests record both outputs; no output code was
+changed by this final coverage addition, and no private row is waived.
