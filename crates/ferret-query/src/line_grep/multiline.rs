@@ -290,19 +290,35 @@ pub(super) fn scan(
         push(&mut spans, span)?;
     }
     if clip < bytes.len() {
+        // Trailing spans have independent advancement state; their discovery
+        // cannot increase the clipped count computed above.
+        let mut previous_start = None;
         for span in regex.spans_at(bytes, clip) {
             cancelled(stopped)?;
-            if span.start >= bytes.len() {
+            let first_terminal =
+                previous_start.is_none_or(|start| !whole && start < last_line_start);
+            if span.start >= bytes.len() && (bytes.ends_with(b"\n") || !first_terminal) {
                 break;
             }
+            previous_start = Some(span.start);
             push(&mut spans, span)?;
         }
     }
     let mut tail_selection = Vec::new();
     if !plan.invert && clip < bytes.len() && plan.after > 0 {
+        let mut previous_start = None;
         for span in regex.rebased_spans(&bytes[clip..]) {
             cancelled(stopped)?;
-            push(&mut tail_selection, span.start + clip..span.end + clip)?;
+            let span = span.start + clip..span.end + clip;
+            if !whole
+                && span.start >= bytes.len()
+                && (bytes.ends_with(b"\n")
+                    || previous_start.is_some_and(|start| start >= last_line_start))
+            {
+                break;
+            }
+            previous_start = Some(span.start);
+            push(&mut tail_selection, span)?;
         }
     }
     let (mut group_at, mut span_at, mut tail_at) = (0, 0, 0);
@@ -346,7 +362,12 @@ pub(super) fn scan(
             }
             let tail_match = tail_selection[tail_at..]
                 .iter()
-                .take_while(|span| span.start < range.end)
+                .take_while(|span| {
+                    span.start < range.end
+                        || (range.end == bytes.len()
+                            && (whole || !bytes.ends_with(b"\n"))
+                            && span.start == range.end)
+                })
                 .any(|span| {
                     span.is_empty() || (span.start < content_end && span.end > range.start)
                 });

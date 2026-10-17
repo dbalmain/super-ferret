@@ -3069,3 +3069,90 @@ fn m7_r1_text_mode_requires_a_match_after_nul_through_the_multiline_reader() {
     assert_eq!(stopped_at_nul.status.code(), Some(1));
     assert!(stopped_at_nul.stdout.is_empty());
 }
+
+#[test]
+fn m7_r2_context_only_binary_results_discard_every_plain_decoration() {
+    let fixture = Fixture::new("m7-r2-binary-context");
+    for flags in [
+        vec!["-UnB1"],
+        vec!["-UonB1"],
+        vec!["-UnB1", "--heading", "-H", "--color=always", "-0"],
+        vec!["-UonB1", "--heading", "-H", "--color=always", "-0"],
+    ] {
+        let mut args = flags;
+        args.extend([r"\z", "-"]);
+        let oracle = fixture.oracle(&args, Some(b"one\n\0"));
+        assert_eq!(oracle.status.code(), Some(1));
+        assert!(oracle.stdout.is_empty() && oracle.stderr.is_empty());
+        let mut actual_args = vec!["grep"];
+        actual_args.extend(&args);
+        let actual = fixture.ferret(&actual_args, Some(b"one\n\0"));
+        assert_eq!(actual.status.code(), Some(1));
+        assert!(actual.stdout.is_empty(), "{args:?}: {actual:?}");
+        assert!(actual.stderr.is_empty());
+    }
+    // Suppression also leaves no file group to separate from later text output.
+    fixture.write("m7-binary", b"one\n\0");
+    fixture.write("m7-text", b"two\n");
+    fixture.compare_raw(&["-UHnB1", r"\z", "m7-binary", "m7-text"], None);
+}
+
+#[test]
+fn m7_r2_first_terminal_tail_hits_keep_match_formatting_after_the_limit() {
+    let fixture = Fixture::new("m7-r2-terminal-tail");
+    for (pattern, expected) in [
+        (r"\b{end}", b"1:\n2:bc\n".as_slice()),
+        (r"a|\z", b"1:a\n2:bc\n"),
+    ] {
+        let args = ["-Uonm1", "-A1", pattern, "-"];
+        let oracle = fixture.oracle(&args, Some(b"a\nbc"));
+        assert_eq!(oracle.status.code(), Some(0));
+        assert_eq!(oracle.stdout, expected);
+        assert!(oracle.stderr.is_empty());
+        let actual = fixture.ferret(&["grep", "-Uonm1", "-A1", pattern, "-"], Some(b"a\nbc"));
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(actual.stdout, expected, "{pattern}: {actual:?}");
+        assert!(actual.stderr.is_empty());
+        for extra in [vec!["-Unm1"], vec!["-Uonm1", "--color=always"]] {
+            let mut args = extra;
+            args.extend(["-A1", pattern, "-"]);
+            fixture.compare_raw(&args, Some(b"a\nbc"));
+        }
+    }
+    // Discovery on the last line is distinct from advancing to its terminal
+    // position after an earlier hit, or reaching a final LF. Context stays
+    // bounded.
+    for (pattern, bytes) in [
+        (r"\b", b"a\nbc".as_slice()),
+        (r"\b{end}", b"a\nbc def"),
+        (r"\b{end}", b"a\nbc\n"),
+        (r"\b{end}", b"a\nx\nbc"),
+    ] {
+        fixture.compare_raw(&["-Uonm1", "-A1", pattern, "-"], Some(bytes));
+    }
+    // Suffix discovery can find the final assertion after earlier tail hits.
+    // An LF-including EOF assertion can label the existing trailing line even
+    // after LF; it adds no selected line or count.
+    for (pattern, bytes, expected) in [
+        (
+            r"a|\z",
+            b"a\na\nbc".as_slice(),
+            b"1:a\n2:a\n3:bc\n".as_slice(),
+        ),
+        (r"\b{end}", b"a\nx\nbc", b"1:\n2:\n3:bc\n"),
+        (r"a|\z", b"a\nbc\n", b"1:a\n2:bc\n"),
+    ] {
+        let actual = fixture.compare_raw(&["-Uonm1", "-A2", pattern, "-"], Some(bytes));
+        assert_eq!(actual.stdout, expected);
+        fixture.compare_raw(&["-Unm1", "-A2", pattern, "-"], Some(bytes));
+    }
+    // D82 A: counts re-match the clipped prefix; a trailing match does not
+    // raise the limited count. rg's LF-excluding -co path instead prints 2.
+    let oracle = fixture.oracle(&["-Ucom1", "-A1", r"\b{end}", "-"], Some(b"a\nbc"));
+    assert_eq!(oracle.status.code(), Some(0));
+    assert_eq!(oracle.stdout, b"2\n");
+    let actual = fixture.ferret(&["grep", "-Ucom1", "-A1", r"\b{end}", "-"], Some(b"a\nbc"));
+    assert_eq!(actual.status.code(), Some(0));
+    assert_eq!(actual.stdout, b"1\n");
+    assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+}

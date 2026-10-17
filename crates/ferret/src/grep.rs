@@ -517,14 +517,16 @@ impl<W: Write> Host<'_, W> {
                 }
                 writeln!(self.writer, "{}", result.count)?;
             }
-        } else if result.binary && result.matched {
-            self.writer.write_all(if path == Path::new("-") {
-                b"(standard input)"
-            } else {
-                label(path, self.plan.paths.is_empty())
-            })?;
-            self.writer.write_all(b": binary file matches\n")?;
-            self.emitted_group = true;
+        } else if result.binary {
+            if result.matched {
+                self.writer.write_all(if path == Path::new("-") {
+                    b"(standard input)"
+                } else {
+                    label(path, self.plan.paths.is_empty())
+                })?;
+                self.writer.write_all(b": binary file matches\n")?;
+                self.emitted_group = true;
+            }
         } else {
             if self.emitted_group && !output.is_empty() {
                 if self.plan.presentation.heading == Some(true) {

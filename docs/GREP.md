@@ -533,6 +533,17 @@ bounded re-match count is 0: it prints nothing, or `0` with `--include-zero`.
 Pinned rg prints `1` in this case. The separate search/count bounds are retained
 as required; the zero-publication correction does not change those bounds.
 
+**M7 fix round 2 (2026-10-17):** after `-m`, a first terminal word assertion
+in the trailing window keeps match formatting: on unterminated `a\nbc`,
+`-Uonm1 -A1 '\b{end}'` prints `1:` and `2:bc`. Tail discovery and re-matched
+spans retain distinct assertion bounds. With the LF-including `a|\z`, even
+`a\nbc\n` formats the existing second line as a match; this adds no searchable
+line after LF. Neither case increases the limited count. Ferret's
+`-Ucom1 -A1 '\b{end}'` remains `1`, while pinned rg prints `2`; the accepted
+bounded-count contract above is retained. Binary results discard every
+buffered plain group, including context-only and decorated output; search
+success decides only whether a binary warning is printed.
+
 Pipe defaults: no colour, no heading, no line numbers, filename prefixes for
 recursive/multiple operands; one explicit file/stdin omits its filename. Tty
 defaults: colour, headings and line numbers. Overrides follow rg, including
