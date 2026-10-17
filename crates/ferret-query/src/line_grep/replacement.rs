@@ -1,19 +1,17 @@
 //! Capture expansion before byte records reach the host. Matching stays in
 //! ferret-verify; records retain replacement highlights for cache replay.
+//! Whole-input expansion retains one displayed line, not an expanded group.
 
 use std::ops::Range;
 
 use super::*;
 
-fn append(buffer: &mut Vec<u8>, bytes: &[u8], stopped: &dyn Fn() -> bool) -> io::Result<()> {
-    for chunk in bytes.chunks(crate::scan::BUFFER) {
-        if stopped() {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        buffer.try_reserve(chunk.len()).map_err(io::Error::other)?;
-        buffer.extend_from_slice(chunk);
+fn cancelled(stopped: &dyn Fn() -> bool) -> io::Result<()> {
+    if stopped() {
+        Err(io::ErrorKind::ConnectionAborted.into())
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 pub(super) fn line(
@@ -24,9 +22,49 @@ pub(super) fn line(
 ) -> io::Result<()> {
     region(
         plan,
-        Region { source: line.bytes, clip: line.bytes.len(), range: 0..line.bytes.len() },
+        Region {
+            source: line.bytes,
+            clip: line.bytes.len(),
+            range: 0..line.bytes.len(),
+        },
         plan.grep.regex().spans(line.bytes),
         line,
+        stopped,
+        emit,
+    )
+}
+
+/// A cross-line discovery in an -m tail cannot publish the following line
+/// twice. Classify and capture this context line within its own bounds (M8-C).
+pub(super) fn trailing(
+    plan: &Plan,
+    source: &[u8],
+    line: Line<'_>,
+    stopped: &dyn Fn() -> bool,
+    emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+) -> io::Result<()> {
+    let regex = plan.grep.regex();
+    let end = if plan.grep.excludes_lf() {
+        line.bytes.len()
+    } else {
+        source.len()
+    };
+    region(
+        plan,
+        Region {
+            source,
+            clip: source.len(),
+            range: 0..end,
+        },
+        regex.spans(source),
+        Line {
+            kind: if regex.find(source).is_some() {
+                LineKind::Match
+            } else {
+                LineKind::Context
+            },
+            ..line
+        },
         stopped,
         emit,
     )
@@ -52,24 +90,29 @@ pub(super) fn region(
         return emit(line);
     };
     let whole = plan.multiline && !plan.invert && !plan.grep.excludes_lf();
-    let only = plan.only_matching && if plan.invert {
-        line.kind == LineKind::Context
-    } else {
-        line.kind == LineKind::Match
-    };
-    let mut bytes = Vec::new();
-    let mut highlights = Vec::new();
+    let only = plan.only_matching
+        && if plan.invert {
+            line.kind == LineKind::Context
+        } else {
+            line.kind == LineKind::Match
+        };
+    let mut output = Records::new(
+        Line {
+            fragment: only,
+            ..line
+        },
+        whole,
+    );
     let mut at = region.range.start;
     let mut expanded = false;
-    let mut number = line.number;
     let mut had_spans = false;
     for span in spans {
         had_spans = true;
-        if stopped() {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        if span.start < region.range.start || span.start > region.range.end
-            || (span.start == region.range.end && !(span.is_empty() && line.terminated && !whole)) {
+        cancelled(stopped)?;
+        if span.start < region.range.start
+            || span.start > region.range.end
+            || (span.start == region.range.end && !(span.is_empty() && line.terminated && !whole))
+        {
             continue;
         }
         let haystack = if span.start < region.clip {
@@ -82,23 +125,14 @@ pub(super) fn region(
         };
         expanded = true;
         if !only {
-            append(&mut bytes, &region.source[at..span.start], stopped)?;
+            output.push(&region.source[at..span.start], false, stopped, emit)?;
+        } else if whole {
+            output.line.number += line_feeds(&region.source[at..span.start], stopped)?;
         }
-        let start = bytes.len();
-        replacement.expand(&captures, |piece| append(&mut bytes, piece, stopped))?;
+        output.merge = whole;
+        replacement.expand(&captures, |piece| output.push(piece, true, stopped, emit))?;
         if only {
-            if whole {
-                number += region.source[at..span.start]
-                    .iter().filter(|&&byte| byte == b'\n').count() as u64;
-            }
-            emit_bytes(&bytes, &[], Line { number, fragment: true, ..line }, whole, stopped, emit)?;
-            if whole {
-                number += bytes.iter().filter(|&&byte| byte == b'\n').count() as u64;
-            }
-            bytes.clear();
-        } else {
-            highlights.try_reserve(1).map_err(io::Error::other)?;
-            highlights.push(start..bytes.len());
+            output.flush(!whole, stopped, emit)?;
         }
         at = span.end.min(region.range.end);
     }
@@ -108,53 +142,101 @@ pub(super) fn region(
     if only {
         // A discovered terminal assertion can select a line without a
         // printable span. Keep the existing whole-line fallback.
-        return if had_spans || (plan.multiline && plan.invert) { emit(line) } else { Ok(()) };
+        return if had_spans || (plan.multiline && plan.invert) {
+            emit(line)
+        } else {
+            Ok(())
+        };
     }
-    append(&mut bytes, &region.source[at..region.range.end], stopped)?;
-    emit_bytes(&bytes, &highlights, line, whole, stopped, emit)
+    output.push(&region.source[at..region.range.end], false, stopped, emit)?;
+    output.flush(!whole, stopped, emit)
 }
 
-fn emit_bytes(
-    bytes: &[u8],
-    spans: &[Range<usize>],
-    line: Line<'_>,
-    whole: bool,
-    stopped: &dyn Fn() -> bool,
-    emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
-) -> io::Result<()> {
-    if !whole {
-        return emit(Line { bytes, highlights: (!line.fragment).then_some(spans), ..line });
-    }
-    let mut at = 0;
-    let mut number = line.number;
-    let mut highlights: Vec<Range<usize>> = Vec::new();
-    for chunk in bytes.split_inclusive(|&byte| byte == b'\n') {
-        if stopped() {
-            return Err(io::ErrorKind::ConnectionAborted.into());
+struct Records<'a> {
+    line: Line<'a>,
+    split: bool,
+    merge: bool,
+    bytes: Vec<u8>,
+    highlights: Vec<Range<usize>>,
+}
+
+impl<'a> Records<'a> {
+    fn new(line: Line<'a>, split: bool) -> Self {
+        Self {
+            line,
+            split,
+            merge: false,
+            bytes: Vec::new(),
+            highlights: Vec::new(),
         }
-        let content = chunk.strip_suffix(b"\n").unwrap_or(chunk);
-        highlights.clear();
-        for span in spans {
-            let start = span.start.max(at);
-            let end = span.end.min(at + content.len());
-            if start < end {
-                let range = start - at..end - at;
-                if let Some(last) = highlights.last_mut() && last.end == range.start {
-                    last.end = range.end;
+    }
+
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        highlighted: bool,
+        stopped: &dyn Fn() -> bool,
+        emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut at = 0;
+        while at < bytes.len() {
+            cancelled(stopped)?;
+            let chunk = &bytes[at..bytes.len().min(at.saturating_add(crate::scan::BUFFER))];
+            let newline = self.split.then(|| memchr::memchr(b'\n', chunk)).flatten();
+            let piece = &chunk[..newline.unwrap_or(chunk.len())];
+            let start = self.bytes.len();
+            self.bytes
+                .try_reserve(piece.len())
+                .map_err(io::Error::other)?;
+            self.bytes.extend_from_slice(piece);
+            if highlighted && !piece.is_empty() && !self.line.fragment {
+                let span = start..self.bytes.len();
+                if self.merge
+                    && let Some(last) = self.highlights.last_mut()
+                    && last.end == start
+                {
+                    last.end = span.end;
                 } else {
-                    highlights.try_reserve(1).map_err(io::Error::other)?;
-                    highlights.push(range);
+                    self.highlights.try_reserve(1).map_err(io::Error::other)?;
+                    self.highlights.push(span);
                 }
             }
+            self.merge = highlighted;
+            at += piece.len();
+            if newline.is_some() {
+                self.flush(true, stopped, emit)?;
+                self.line.number += 1;
+                at += 1;
+            }
         }
-        emit(Line {
-            number,
-            bytes: content,
-            highlights: (!line.fragment).then_some(&highlights),
-            ..line
-        })?;
-        at += chunk.len();
-        number += 1;
+        Ok(())
     }
-    Ok(())
+
+    fn flush(
+        &mut self,
+        force: bool,
+        stopped: &dyn Fn() -> bool,
+        emit: &mut impl FnMut(Line<'_>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if force || !self.bytes.is_empty() {
+            cancelled(stopped)?;
+            emit(Line {
+                bytes: &self.bytes,
+                highlights: (!self.line.fragment).then_some(&self.highlights),
+                ..self.line
+            })?;
+            self.bytes.clear();
+            self.highlights.clear();
+        }
+        Ok(())
+    }
+}
+
+fn line_feeds(bytes: &[u8], stopped: &dyn Fn() -> bool) -> io::Result<u64> {
+    let mut count = 0;
+    for chunk in bytes.chunks(crate::scan::BUFFER) {
+        cancelled(stopped)?;
+        count += memchr::memchr_iter(b'\n', chunk).count() as u64;
+    }
+    Ok(count)
 }

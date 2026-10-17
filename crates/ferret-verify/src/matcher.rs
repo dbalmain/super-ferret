@@ -81,7 +81,9 @@ impl Regex {
     /// Resolve replacement references against this compiled pattern.
     pub fn replacement(&self, template: &str) -> Replacement {
         Replacement::new(template, |name| {
-            self.0.capture_names().position(|candidate| candidate == Some(name))
+            self.0
+                .capture_names()
+                .position(|candidate| candidate == Some(name))
         })
     }
 
@@ -101,9 +103,14 @@ impl Matcher for Regex {
 }
 
 /// Captures from one match; engine types stay inside the verifier.
- pub struct Captures<'t>(regex::bytes::Captures<'t>);
+pub struct Captures<'t>(regex::bytes::Captures<'t>);
 
 impl Captures<'_> {
+    /// A participating group's byte offsets in the original supplied haystack.
+    pub fn span(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        self.0.get(index).map(|capture| capture.range())
+    }
+
     /// A participating group's bytes; group zero is the complete match.
     pub fn get(&self, index: usize) -> Option<&[u8]> {
         self.0.get(index).map(|capture| capture.as_bytes())
@@ -143,7 +150,10 @@ impl Replacement {
             let braced = bytes.get(at + 1) == Some(&b'{');
             let start = at + if braced { 2 } else { 1 };
             let mut end = start;
-            while bytes.get(end).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+            while bytes
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
                 end += 1;
             }
             if end == start || (braced && bytes.get(end) != Some(&b'}')) {
@@ -242,6 +252,30 @@ impl Iterator for Spans<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_spans_keep_original_offsets_empty_and_absent_groups() {
+        let regex = Regex::new(r"(?P<word>r(ed))()|(blue)", false).unwrap();
+        let captures = regex.captures_at(b"xx red blue", 1).unwrap();
+        assert_eq!(captures.span(0), Some(3..6));
+        assert_eq!(captures.span(1), Some(3..6));
+        assert_eq!(captures.span(2), Some(4..6));
+        assert_eq!(captures.span(3), Some(6..6));
+        assert_eq!(captures.span(4), None);
+        let replacement = regex.replacement("${word}X/$wordX/$2/$$/$4/${word!}");
+        let mut expanded = Vec::new();
+        replacement
+            .expand(&captures, |bytes| {
+                expanded.extend_from_slice(bytes);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(expanded, b"redX//ed/$//${word!}");
+        let regex = Regex::new(r"(?-u:(\xFF))", false).unwrap();
+        let captures = regex.captures_at(b"x\xff", 0).unwrap();
+        assert_eq!(captures.span(1), Some(1..2));
+        assert_eq!(captures.get(1), Some(b"\xff".as_slice()));
+    }
 
     // M2: scalar-consuming matches and byte-wise empty advancement coexist.
     #[test]

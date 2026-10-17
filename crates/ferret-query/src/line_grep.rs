@@ -98,7 +98,7 @@ pub struct Plan {
     pub traversal: Traversal,
     pub text: bool,
     pub multiline: bool,
-    pub replacement: Option<ferret_verify::Replacement>,
+    pub replacement: Option<Box<ferret_verify::Replacement>>,
 }
 
 /// Name and count switches override one another in argv order; quiet is
@@ -247,9 +247,13 @@ pub fn parse_with(
                 args.next().map(|arg| arg.as_bytes())
             } else {
                 Some(&bytes[10..])
-            }.ok_or_else(|| ParseError::Value("--replace".to_owned()))?;
-            replacement = Some(std::str::from_utf8(value)
-                .map_err(|_| ParseError::Utf8("replacement"))?.to_owned());
+            }
+            .ok_or_else(|| ParseError::Value("--replace".to_owned()))?;
+            replacement = Some(
+                std::str::from_utf8(value)
+                    .map_err(|_| ParseError::Utf8("replacement"))?
+                    .to_owned(),
+            );
             continue;
         }
         if !done && bytes.starts_with(b"--") {
@@ -435,9 +439,13 @@ pub fn parse_with(
                             Some(&bytes[at + 1..])
                         } else {
                             args.next().map(|arg| arg.as_bytes())
-                        }.ok_or_else(|| ParseError::Value("-r".to_owned()))?;
-                        replacement = Some(std::str::from_utf8(value)
-                            .map_err(|_| ParseError::Utf8("replacement"))?.to_owned());
+                        }
+                        .ok_or_else(|| ParseError::Value("-r".to_owned()))?;
+                        replacement = Some(
+                            std::str::from_utf8(value)
+                                .map_err(|_| ParseError::Utf8("replacement"))?
+                                .to_owned(),
+                        );
                         break;
                     }
                     b'f' => {
@@ -542,15 +550,29 @@ pub fn parse_with(
     if max_count == Some(0) {
         patterns.clear();
     }
-    let settings = GrepFlags { case_insensitive: fold };
-    let flags = LineFlags { fixed, smart_case, word, line, multiline, dotall };
+    let settings = GrepFlags {
+        case_insensitive: fold,
+    };
+    let flags = LineFlags {
+        fixed,
+        smart_case,
+        word,
+        line,
+        multiline,
+        dotall,
+    };
     let (grep, replacement) = if let Some(template) = replacement {
         let (grep, replacement) = settings
             .compile_line_replacement(&patterns, flags, &template)
             .map_err(ParseError::Pattern)?;
-        (grep, Some(replacement))
+        (grep, Some(Box::new(replacement)))
     } else {
-        (settings.compile_line_profile(&patterns, flags).map_err(ParseError::Pattern)?, None)
+        (
+            settings
+                .compile_line_profile(&patterns, flags)
+                .map_err(ParseError::Pattern)?,
+            None,
+        )
     };
     Ok(Command::Search(Plan {
         grep,
@@ -706,7 +728,8 @@ pub struct Line<'a> {
     /// Inclusive original source lines when replacement changes displayed
     /// line counts. Group separators use these boundaries, not display numbers.
     pub source_lines: Option<(u64, u64)>,
-    /// Whether the original line had LF; replacement omits advanced EOF empties.
+    /// Whether the original line had LF; replacement omits advanced EOF
+    /// empties.
     pub terminated: bool,
     pub number: u64,
     pub bytes: &'a [u8],
@@ -794,7 +817,11 @@ pub fn scan_lines(
                 let selected = search.find(line).is_some() != plan.invert;
                 if limited {
                     if rendering {
-                        if selected && plan.only_matching && !plan.invert && plan.replacement.is_none() {
+                        if selected
+                            && plan.only_matching
+                            && !plan.invert
+                            && plan.replacement.is_none()
+                        {
                             for span in search.spans(line) {
                                 emit(Line {
                                     source_lines: None,
@@ -871,7 +898,8 @@ pub fn scan_lines(
                                 kind: LineKind::Match,
                                 fragment: false,
                                 highlights: None,
-                            }).map_err(ScanError::Output)?;
+                            })
+                            .map_err(ScanError::Output)?;
                         }
                     } else {
                         result.count += 1;
@@ -936,6 +964,35 @@ mod tests {
     }
 
     #[test]
+    fn replacement_cancellation_after_one_record_stops_expansion() {
+        use std::cell::Cell;
+        for flags in ["-or", "-Uor"] {
+            let Command::Search(plan) =
+                parse(&[flags.into(), "<$0>".into(), "red".into()]).unwrap()
+            else {
+                panic!("search")
+            };
+            let stopped = Cell::new(false);
+            let mut emitted = 0;
+            let bytes = b"red red\n";
+            let result = scan_lines(
+                &plan,
+                &mut &bytes[..],
+                bytes.len() as u64,
+                &mut Vec::new(),
+                &|| stopped.get(),
+                |_| {
+                    emitted += 1;
+                    stopped.set(true);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{flags}: cancelled expansion succeeded");
+            assert_eq!(emitted, 1);
+        }
+    }
+
+    #[test]
     fn resolved_names_only_never_reads_pattern_files_or_stdin() {
         for args in [
             vec!["--files", "-f", "missing"],
@@ -951,6 +1008,12 @@ mod tests {
     #[test]
     fn fixed_folded_and_repeated_profiles_are_sound_over_original_bytes() {
         let profiles: &[(&[&str], &[u8])] = &[
+            (&["-r", "<$1>", "(red)"], b"red\nviolet\n"),
+            (
+                &["-Uor", "<$1>", "(?-u:(\\xFF))red\\nviolet"],
+                b"\xffred\nviolet\n",
+            ),
+            (&["-r", "<$name>", "(?P<name>red)"], b"red.*\n"),
             (&["-U", "red\\nviolet"], b"red\nviolet\n"),
             (&["-U", "(?s:red.*violet)"], b"red\nviolet\n"),
             (&["-UF", "red\nviolet"], b"red\nviolet\n"),

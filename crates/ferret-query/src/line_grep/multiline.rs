@@ -372,11 +372,6 @@ pub(super) fn scan(
                 .any(|span| {
                     span.is_empty() || (span.start < content_end && span.end > range.start)
                 });
-            let tail_match = tail_match && (plan.replacement.is_none()
-                || tail_selection[tail_at..].iter().any(|span| {
-                    span.start >= range.start && span.start < range.end
-                        && span.end <= lines[window.end - 1].end
-                }));
             let kind = if selected || (!plan.invert && tail_match) {
                 LineKind::Match
             } else {
@@ -384,46 +379,81 @@ pub(super) fn scan(
             };
             if plan.replacement.is_some() {
                 if plan.invert {
-                    replacement::line(plan, Line {
-                        number: index as u64 + 1,
-                        source_lines: Some((index as u64 + 1, index as u64 + 1)),
-                        terminated: bytes[range.end - 1] == b'\n',
-                        bytes: &bytes[range.start..content_end],
-                        kind,
-                        fragment: false,
-                        highlights: None,
-                    }, stopped, &mut emit).map_err(ScanError::Output)?;
+                    replacement::line(
+                        plan,
+                        Line {
+                            number: index as u64 + 1,
+                            source_lines: Some((index as u64 + 1, index as u64 + 1)),
+                            terminated: bytes[range.end - 1] == b'\n',
+                            bytes: &bytes[range.start..content_end],
+                            kind,
+                            fragment: false,
+                            highlights: None,
+                        },
+                        stopped,
+                        &mut emit,
+                    )
+                    .map_err(ScanError::Output)?;
                     index += 1;
                     continue;
                 }
-                let last = if whole && !plan.invert && selected {
+                if !selected
+                    && range.start >= clip
+                    && clip < bytes.len()
+                    && relevant
+                        .iter()
+                        .any(|span| span.start < range.start || span.end > range.end)
+                {
+                    replacement::trailing(
+                        plan,
+                        &bytes[range.clone()],
+                        Line {
+                            number: index as u64 + 1,
+                            source_lines: Some((index as u64 + 1, index as u64 + 1)),
+                            terminated: bytes[range.end - 1] == b'\n',
+                            bytes: &bytes[range.start..content_end],
+                            kind,
+                            fragment: false,
+                            highlights: None,
+                        },
+                        stopped,
+                        &mut emit,
+                    )
+                    .map_err(ScanError::Output)?;
+                    index += 1;
+                    continue;
+                }
+                let last = if whole && selected {
                     groups[group_at].end.min(window.end)
                 } else {
                     index + 1
                 };
                 let end = lines[last - 1].end;
-                let range_end = if !whole && bytes[end - 1] == b'\n' { end - 1 } else { end };
-                let mut local = Vec::new();
-                let replacement_spans = if plan.invert {
-                    for span in regex.spans(&bytes[range.clone()]) {
-                        cancelled(stopped)?;
-                        push(&mut local, span.start + range.start..span.end + range.start)?;
-                    }
-                    local.as_slice()
+                let range_end = if !whole && bytes[end - 1] == b'\n' {
+                    end - 1
                 } else {
-                    let mut end_at = span_at;
-                    while end_at < spans.len() && (spans[end_at].start < end
-                        || (end == bytes.len() && !bytes.ends_with(b"\n") && spans[end_at].start == end)) {
-                        cancelled(stopped)?;
-                        end_at += 1;
-                    }
-                    if kind == LineKind::Context { &[] } else { &spans[span_at..end_at] }
+                    end
+                };
+                let mut end_at = span_at;
+                while end_at < spans.len()
+                    && (spans[end_at].start < end
+                        || (end == bytes.len()
+                            && !bytes.ends_with(b"\n")
+                            && spans[end_at].start == end))
+                {
+                    cancelled(stopped)?;
+                    end_at += 1;
+                }
+                let replacement_spans = if kind == LineKind::Context {
+                    &[]
+                } else {
+                    &spans[span_at..end_at]
                 };
                 replacement::region(
                     plan,
                     replacement::Region {
                         source: bytes,
-                        clip: if plan.invert { bytes.len() } else { clip },
+                        clip,
                         range: range.start..range_end,
                     },
                     replacement_spans.iter().cloned(),
@@ -438,7 +468,8 @@ pub(super) fn scan(
                     },
                     stopped,
                     &mut emit,
-                ).map_err(ScanError::Output)?;
+                )
+                .map_err(ScanError::Output)?;
                 index = last;
                 continue;
             }

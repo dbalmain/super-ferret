@@ -105,7 +105,9 @@ impl Render<'_> {
             })?;
         }
         if (self.plan.before > 0 || self.plan.after > 0)
-            && previous.is_some_and(|number| line.source_lines.map_or(line.number, |(start, _)| start) > number.saturating_add(1))
+            && previous.is_some_and(|number| {
+                line.source_lines.map_or(line.number, |(start, _)| start) > number.saturating_add(1)
+            })
         {
             output.write_all(b"--\n")?;
         }
@@ -952,6 +954,49 @@ mod tests {
                 + 7
                 + 2 * std::mem::size_of::<std::ops::Range<usize>>()
         );
+    }
+
+    #[test]
+    fn replacement_cache_retains_source_boundaries_and_expanded_highlights() {
+        let streams = Cell::new(0);
+        let stats = Cell::new(0);
+        let read = |_: NameId, request: ReadRequest<'_>| {
+            match request {
+                ReadRequest::Stat => stats.set(stats.get() + 1),
+                ReadRequest::Stream(each, _) => {
+                    streams.set(streams.get() + 1);
+                    let bytes = b"a\nred\nblue\nz\n";
+                    each(&mut &bytes[..], bytes.len() as u64).unwrap();
+                }
+                ReadRequest::Bytes(_, _) => panic!("stream expected"),
+            }
+            ReadOutcome::Stable(ReadVersion::Catalogued)
+        };
+        let mut worker = Worker {
+            plan: plan(&["-UnC1", "--color=always", "-r", "<$2/$1>", "(red)\\n(blue)"]),
+            buffer: Vec::new(),
+            read: Some(Box::new(read)),
+        };
+        let cache = Mutex::new(Cache::default());
+        for name in [0, 1] {
+            let Observed::Ready(mut group) = worker
+                .prepare(
+                    &Job::Checked("copy".into(), NameId(name), 0),
+                    false,
+                    &cache,
+                    true,
+                    &|| false,
+                )
+                .unwrap()
+            else {
+                panic!("ready")
+            };
+            let mut actual = Vec::new();
+            group.output.write_to(&mut actual).unwrap();
+            assert_eq!(actual, b"\x1b[0m\x1b[32m1\x1b[0m-a\n\x1b[0m\x1b[32m2\x1b[0m:\x1b[0m\x1b[1m\x1b[31m<blue/red>\x1b[0m\n\x1b[0m\x1b[32m4\x1b[0m-z\n");
+        }
+        assert_eq!(streams.get(), 1);
+        assert_eq!(stats.get(), 1);
     }
 
     // M2: a later quiet hit must stop a read already in progress, before the

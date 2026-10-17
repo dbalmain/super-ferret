@@ -68,7 +68,6 @@ impl GrepFlags {
         Ok((grep, replacement))
     }
 
-
     /// Resolve fixed strings, smart case and half/whole-line boundaries before
     /// deriving necessary trigrams. Inline flags remain scoped to arguments.
     pub fn compile_line_profile(

@@ -3303,3 +3303,222 @@ fn m8_replacement_line_counts_preserve_original_context_boundaries() {
         }
     }
 }
+
+#[test]
+fn m8_clipped_replacement_captures_retain_m7_bounds_provisionally() {
+    let fixture = Fixture::new("m8-clipped-captures");
+    let input = b"red red\nblue\ngap\nred\nblue\n";
+    // M8-C: rg's replacement fast path widens capture bounds and can copy an
+    // unselected suffix. Retain the explicit M7 clipping contract
+    // provisionally.
+    for (only, expected, oracle_expected) in [
+        (
+            false,
+            b"1:<red> <red>\n2-blue\n3-gap\n".as_slice(),
+            b"1:<red> <red\n2:blue>\n3:gap\n4:red\n5:blue\n2-blue\n3-gap\n".as_slice(),
+        ),
+        (
+            true,
+            b"1:<red>\n1:<red>\n2-blue\n3-gap\n".as_slice(),
+            b"1:<red>\n1:<red\n2:blue>\n2-blue\n3-gap\n".as_slice(),
+        ),
+    ] {
+        let mut args = vec!["-Unm1", "-A2", "-r<$0>", "red(?:\nblue)?", "-"];
+        if only {
+            args.insert(0, "-o");
+        }
+        let oracle = fixture.oracle(&args, Some(input));
+        assert_eq!(oracle.status.code(), Some(0));
+        assert_eq!(oracle.stdout, oracle_expected);
+        args.insert(0, "grep");
+        let actual = fixture.ferret(&args, Some(input));
+        assert_eq!(actual.status.code(), Some(0));
+        assert!(actual.stderr.is_empty());
+        assert_eq!(actual.stdout, expected);
+    }
+    // D79's existing per-line absolute-anchor choice also applies to capture
+    // replacement. rg carries empty \A presentation state across lines.
+    for mode in ["-nr", "-nor"] {
+        let input = b"red\nred\nred\n";
+        let args = [mode, "<$0:$1>", "()\\A", "-"];
+        let oracle = fixture.oracle(&args, Some(input));
+        assert_eq!(oracle.status.code(), Some(0));
+        assert_eq!(
+            oracle.stdout,
+            if mode == "-nr" {
+                b"1:<:>red\n2:red\n3:red\n".as_slice()
+            } else {
+                b"1:<:>\n2:red\n3:red\n".as_slice()
+            }
+        );
+        let mut actual_args = vec!["grep"];
+        actual_args.extend(args);
+        let actual = fixture.ferret(&actual_args, Some(input));
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(
+            actual.stdout,
+            if mode == "-nr" {
+                b"1:<:>red\n2:<:>red\n3:<:>red\n".as_slice()
+            } else {
+                b"1:<:>\n2:<:>\n3:<:>\n".as_slice()
+            }
+        );
+    }
+}
+
+#[test]
+fn m8_embedded_lf_only_records_keep_line_mode_numbers() {
+    let fixture = Fixture::new("m8-literal-lf");
+    for mode in ["-noC1", "-UnoC1", "-nvoC1", "-UnvoC1"] {
+        fixture.compare_raw(&[mode, "-r", "X\nY", "red", "one.rs"], None);
+    }
+}
+
+#[test]
+fn m8_multiline_inverted_context_uses_line_local_captures() {
+    let fixture = Fixture::new("m8-invert-captures");
+    for mode in ["-UnvC1", "-UnvoC1"] {
+        fixture.compare_raw(&[mode, "-r<$0>", "red(?:\nBLUE)?", "one.rs"], None);
+    }
+}
+
+#[test]
+fn m8_spec_replacement_examples_are_discriminating() {
+    let fixture = Fixture::new("m8-spec-examples");
+    for (input, args, expected) in [
+        (
+            b"red\n".as_slice(),
+            vec!["-or", "$wordX", "(?P<word>red)", "-"],
+            b"\n".as_slice(),
+        ),
+        (
+            b"red\n".as_slice(),
+            vec!["-or", "${word}X", "(?P<word>red)", "-"],
+            b"redX\n".as_slice(),
+        ),
+        (
+            b"red\n".as_slice(),
+            vec!["-or", "$1X", "(red)", "-"],
+            b"\n".as_slice(),
+        ),
+        (
+            b"red\n".as_slice(),
+            vec!["-or", "${1}X", "(red)", "-"],
+            b"redX\n".as_slice(),
+        ),
+        (
+            b"red\n".as_slice(),
+            vec!["-or", "${word!}", "(?P<word>red)", "-"],
+            b"${word!}\n".as_slice(),
+        ),
+        (
+            b"red blue\n".as_slice(),
+            vec!["-r", "<$1:$2>", "(red)|(blue)", "-"],
+            b"<red:> <:blue>\n".as_slice(),
+        ),
+        (
+            b"abc".as_slice(),
+            vec!["-or", "X", "", "-"],
+            b"X\nX\nX\n".as_slice(),
+        ),
+        (
+            b"abc\n".as_slice(),
+            vec!["-or", "X", "", "-"],
+            b"X\nX\nX\nX\n".as_slice(),
+        ),
+        (
+            b"abc".as_slice(),
+            vec!["-or", "X", "\\z", "-"],
+            b"abc\n".as_slice(),
+        ),
+        (
+            b"a\nb\nc\nd\n".as_slice(),
+            vec!["-UnC1", "-rX", "b\nc", "-"],
+            b"1-a\n2:X\n4-d\n".as_slice(),
+        ),
+        (
+            b"a\nb\nc\nd\n".as_slice(),
+            vec!["-UnC1", "-r", "X\nY\nZ", "b\nc", "-"],
+            b"1-a\n2:X\n3:Y\n4:Z\n4-d\n".as_slice(),
+        ),
+    ] {
+        let output = fixture.compare_raw(&args, Some(input));
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, expected);
+    }
+}
+
+#[test]
+fn m8_empty_replacement_groups_never_supply_headings_or_separators() {
+    let fixture = Fixture::new("m8-empty-publication");
+    fixture.write("delete", b"red\nBLUE\n");
+    fixture.write("keep", b"pre red\nBLUE\n");
+    for flags in [
+        vec!["-UnoC1"],
+        vec!["-UnC1"],
+        vec!["-UnoC1", "--color=always"],
+    ] {
+        let mut args = flags;
+        args.extend([
+            "-r",
+            "$lead",
+            "(?P<lead>pre )?red\nBLUE\n",
+            "delete",
+            "keep",
+        ]);
+        fixture.compare_raw(&args, None);
+    }
+    // M7's existing empty-heading artifact remains explicit: publishing an
+    // empty successful file is not licensed by search success alone.
+    let args = [
+        "-UnoC1",
+        "-H",
+        "--heading",
+        "-r",
+        "$lead",
+        "(?P<lead>pre )?red\nBLUE\n",
+        "delete",
+        "keep",
+    ];
+    let oracle = fixture.oracle(&args, None);
+    assert!(
+        oracle.stdout.windows(7).any(|bytes| bytes == b"delete\n"),
+        "{oracle:?}"
+    );
+    let mut actual_args = vec!["grep"];
+    actual_args.extend(args);
+    let actual = fixture.ferret(&actual_args, None);
+    assert_eq!(actual.status.code(), Some(0));
+    assert_eq!(actual.stdout, b"keep\n1:pre \n");
+}
+
+#[test]
+fn m8_limited_trailing_context_never_repeats_a_cross_line_capture() {
+    let fixture = Fixture::new("m8-tail-captures");
+    let input = b"red\nblue\ngap\nred\nblue\nend\n";
+    for mode in ["-Unm1", "-Unom1"] {
+        let output = fixture.compare_raw(&[mode, "-A4", "-r<$0>", "red\nblue", "-"], Some(input));
+        assert_eq!(
+            output.stdout,
+            b"1:<red\n2:blue>\n3-gap\n4-red\n5-blue\n6-end\n"
+        );
+    }
+    let input = b"red x\ngap\nred\nblue\nend\n";
+    // M8-C also bounds captures on independently discovered trailing lines.
+    // rg can expand red-LF-blue then print blue again as context.
+    let actual = fixture.ferret(
+        &["grep", "-Unm1", "-A4", "-r<$0>", "red(?:\nblue)?", "-"],
+        Some(input),
+    );
+    assert_eq!(actual.status.code(), Some(0));
+    assert_eq!(actual.stdout, b"1:<red> x\n2-gap\n3:<red>\n4-blue\n5-end\n");
+    let oracle = fixture.oracle(
+        &["-Unm1", "-A4", "-r<$0>", "red(?:\nblue)?", "-"],
+        Some(input),
+    );
+    assert_eq!(oracle.status.code(), Some(0));
+    assert_eq!(
+        oracle.stdout,
+        b"1:<red> x\n2-gap\n3:<red\n4:blue>\n5:end\n4-blue\n5-end\n"
+    );
+}

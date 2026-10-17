@@ -583,6 +583,13 @@ are accepted; the last replacement wins. Replacement arguments must be UTF-8;
 captured bytes may contain invalid UTF-8 and are preserved unchanged. Counts,
 name modes, quiet and names-only retain original search semantics.
 
+The existing D79 per-line absolute-anchor choice also applies to replacement,
+provisionally (M8-D). On three `red` lines, `-nr '<$0:$1>' '()\A'` inserts
+`<:>` on every line; pinned rg inserts it only on the first and prints later
+lines unchanged.
+This preserves the written line-scope contract and is an explicit oracle
+artifact, rather than a new silent exception.
+
 `$0` is the complete match; `$1`, `${1}`, `$name` and `${name}` interpolate
 captures. Unbraced references consume the longest ASCII alphanumeric/underscore
 run: on `(?P<word>red)`, `$wordX` is empty while `${word}X` is `redX`;
@@ -595,17 +602,36 @@ On `red blue` with `(red)|(blue)`, `<$1:$2>` produces `<red:> <:blue>`.
 Replacement precedes colour and `-o` projection, retaining original capture
 bounds. `-o` emits each expansion, and colour highlights replacement bytes.
 Line-mode context is also replaced; inversion still selects original lines.
+With replacement, multiline inverted context also uses line-local captures;
+`-o` emits its expansions when present, otherwise keeps the whole context line.
 Multiline replacement expands selected source groups before projecting display
 lines; context separators retain original source boundaries even when expansion
 adds/removes LF. LF-excluding profiles retain line-oriented replacement output,
 so an embedded replacement LF gets no additional prefix. LF-including `-o`
 suppresses empty expansions; ordinary empty output records still print LF.
-These presentation choices are provisional (M8-A/B in `.ai/m8-decisions.md`).
+Expansion is cancellable and fallibly allocated. It keeps one displayed line
+and its highlights; rendered records still use the host's bounded cache/spill
+path. A source or expanded line can be arbitrarily long, under the existing
+line-sized memory exception. It does not accumulate an expanded multiline
+group. These presentation choices are provisional (M8-A/B in
+`.ai/m8-decisions.md`).
 On unterminated `abc`, `-or X ''` emits three X records; with final LF it emits
 four. `-or X '\z'` on unterminated `abc` emits the unchanged `abc` line.
 On `a\nb\nc\nd\n`, `-UnC1 -r X 'b\nc'` prints `1-a`, `2:X`, `4-d`,
 without an inserted group separator. Replacing with `X`-LF-`Y`-LF-`Z` prints
 `2:X`, `3:Y`, `4:Z`, followed by original context `4-d`.
+
+Replacement keeps M7's clipped capture/assertion bounds after `-m`,
+**provisionally (M8-C)**. Pinned rg can instead re-match past the clipped group
+and publish an unmatched suffix: on `red red\nblue\ngap\nred\nblue\n`,
+`-Unm1 -A2 -r '<$0>' 'red(?:\nblue)?'` captures cross-boundary `blue` and
+copies the remaining suffix into the positive group before repeating requested
+context. Ferret emits bounded `1:<red> <red>`, `2-blue`, `3-gap`.
+This is a documented spec/oracle conflict; replacement does not silently widen
+M7's established publication bounds. Cross-line discoveries in replacement's
+trailing context are rechecked within that source line: a mandatory LF match
+cannot publish its following context line twice. An optional LF branch can
+therefore differ from rg's cross-boundary capture there as well (M8-C).
 
 `--json` emits rg begin/match/context/end/summary JSON Lines: byte spans,
 absolute offsets, line numbers, text-or-base64 fields and semantic counts.
