@@ -5237,7 +5237,7 @@ A requirement for JSON-specific unbounded assertion truth, or a pinned oracle
 with safe clipping consistent with the existing contract, would change this
 recommendation. These owned conflicts are not private-audit waivers.
 
-## D88 — Rg 15.2 replacement metadata versus the written contract
+## D88 — rg 15.2 replacement metadata versus the written contract
 
 **Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-B) uses A provisionally.**
 
