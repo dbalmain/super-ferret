@@ -101,6 +101,8 @@ pub struct Plan {
     pub multiline: bool,
     pub json: bool,
     pub replacement: Option<Box<ferret_verify::Replacement>>,
+    #[cfg(test)]
+    force_per_line: bool,
 }
 
 /// Name and count switches override one another in argv order; quiet is
@@ -589,6 +591,8 @@ pub fn parse_with(
         )
     };
     Ok(Command::Search(Plan {
+        #[cfg(test)]
+        force_per_line: false,
         grep,
         replacement,
         paths,
@@ -664,7 +668,7 @@ pub fn candidates(
 
 /// Result of scanning one input. Binary detection discards the input's plain
 /// output; a quiet match may finish before a later NUL is read.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InputResult {
     pub matched: bool,
     pub binary: bool,
@@ -679,7 +683,7 @@ pub struct InputResult {
 }
 
 /// Publication counts, independent of selection limits and plain count output.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EventStats {
     pub matched_lines: u64,
     pub matches: u64,
@@ -803,6 +807,12 @@ fn scan_records(
         return multiline::scan(plan, input, size, buffer, stopped, emit);
     }
     let search = plan.grep.search();
+    // LF exclusion alone is insufficient: absolute and CRLF anchors see a
+    // different boundary on a detached line (D79). The shared HIR proof also
+    // rules those out. Context and inversion still need every intervening line.
+    let fast = !plan.invert && plan.before == 0 && plan.after == 0 && plan.grep.is_line_local();
+    #[cfg(test)]
+    let fast = fast && !plan.force_per_line;
     let mut result = InputResult::empty(plan);
     if !result.searched {
         return Ok(result);
@@ -860,13 +870,47 @@ fn scan_records(
             let mut offset = base as u64 - if base == 0 { 0 } else { bom };
             let text = &run[..binary.unwrap_or(run.len())];
             let mut lines = text.split(|&b| b == b'\n').peekable();
-            while let Some(line) = lines.next() {
+            let mut next = Some(0);
+            loop {
+                let line = if fast {
+                    let Some(start) = next.take() else { break };
+                    let remaining = &text[start..];
+                    if stopped() {
+                        return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
+                    }
+                    if remaining.is_empty() && !terminated && binary.is_none() {
+                        break;
+                    }
+                    let Some(hit) = search.find(remaining) else {
+                        // InputResult exposes bytes searched even without JSON.
+                        // A later run's callbacks also observe skipped line numbers.
+                        offset += remaining.len() as u64 + u64::from(terminated);
+                        result.bytes_searched = offset;
+                        number += memchr::memchr_iter(b'\n', remaining).count() as u64
+                            + u64::from(terminated || binary.is_some()
+                                || (!remaining.is_empty() && !remaining.ends_with(b"\n")));
+                        break;
+                    };
+                    let first = memchr::memrchr(b'\n', &remaining[..hit])
+                        .map_or(0, |at| at + 1);
+                    let end = memchr::memchr(b'\n', &remaining[hit..])
+                        .map_or(remaining.len(), |at| hit + at);
+                    number += memchr::memchr_iter(b'\n', &remaining[..first]).count() as u64;
+                    offset += first as u64;
+                    if end < remaining.len() {
+                        next = Some(start + end + 1);
+                    }
+                    &remaining[first..end]
+                } else {
+                    let Some(line) = lines.next() else { break };
+                    line
+                };
                 // No extra line after a terminal LF or at empty EOF. A partial
                 // line before NUL is searched: NUL is a binary sentinel.
-                if line.is_empty() && lines.peek().is_none() && !terminated && binary.is_none() {
+                if !fast && line.is_empty() && lines.peek().is_none() && !terminated && binary.is_none() {
                     break;
                 }
-                let line_terminated = lines.peek().is_some() || terminated;
+                let line_terminated = if fast { next.is_some() } else { lines.peek().is_some() } || terminated;
                 let line_offset = offset;
                 offset += line.len() as u64 + u64::from(line_terminated);
                 result.bytes_searched = offset;
@@ -874,7 +918,7 @@ fn scan_records(
                 if stopped() {
                     return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                 }
-                let selected = search.find(line).is_some() != plan.invert;
+                let selected = fast || (search.find(line).is_some() != plan.invert);
                 if limited {
                     if rendering {
                         if selected
@@ -1018,6 +1062,123 @@ fn scan_records(
 mod tests {
     use super::*;
     use ferret_verify::Trigrams;
+
+    // Compare the actual scanner with its old path, including the source
+    // metadata consumed by plain rendering, replacement and JSON encoding.
+    fn compare_scanners(plan: &Plan, bytes: &[u8]) {
+        let scan = |plan: &Plan| {
+            let mut output = Vec::new();
+            let mut result = scan_lines(
+                plan,
+                &mut &bytes[..],
+                bytes.len() as u64,
+                &mut Vec::new(),
+                &|| false,
+                |line| {
+                    output.push((
+                        line.offset,
+                        line.source_lines,
+                        line.terminated,
+                        line.number,
+                        line.bytes.to_vec(),
+                        line.kind,
+                        line.fragment,
+                        line.highlights.map(<[_]>::to_vec),
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            result.elapsed = std::time::Duration::ZERO;
+            (output, result)
+        };
+        let actual = scan(plan);
+        let mut slow = plan.clone();
+        slow.force_per_line = true;
+        let expected = scan(&slow);
+        assert_eq!(actual, expected, "pattern {:?}, {} input bytes", plan.grep.pattern(), bytes.len());
+    }
+
+    #[test]
+    fn run_search_and_per_line_search_emit_identical_records_and_results() {
+        let documents: &[&[u8]] = &[
+            b"red\ngap\nred\n", b"red\ngap\nred", b"gap\nred\n",
+            b"gap\nred", b"red red\r\ngap\r\nred\r\n", b"\nred\n\n",
+            b"\xef\xbb\xbfred\ngap\nred\n", b"red\0red\n",
+            b"gap\0red\n", b"red\n\0red\n", b"\0red\n", b"\n\0",
+            b"gap\n", b"gap", b"", b"\n", b"\n\n", b"red\nred\nred\n",
+            b"\xffred\n\xff\nred\xff\n", "Kilo\nred\nſea\n".as_bytes(),
+        ];
+        let patterns = [
+            "red", "absent", "", "^", "$", "^$", "^red$", r"\bred\b",
+            r"\b", r"\B", r"\b{start-half}", r"\b{end-half}", r"\w+ing\b",
+            "red|$", "red?", "red*", "(?i:red)", "[a-z]+red", "[a-z]*red",
+            // These must retain per-line assertion/consumption bounds (D79).
+            r"\Ared", r"red\z", r"\A|\z", "(?-m:^red$)", "(?R:^red$)",
+            r"\s", r"[^x]", "(?s:.)", r"[\s\S]", r"(?-u:\xFF)",
+        ];
+        let profiles: &[&[&str]] = &[
+            &[], &["-n"], &["-m1"], &["-m2"], &["-m0"], &["-c"],
+            &["-co"], &["--count-matches"], &["-l"], &["-q"], &["-o"],
+            &["-om1"], &["-cm1"], &["--json"], &["--json", "-m1"],
+            &["--json", "-q"], &["--json", "-N"], &["-r", "<$0>"],
+            &["-or", "<$0>"], &["--files-without-match"],
+            // Unchanged fallbacks share the same switch and public entry point.
+            &["-v"], &["-C1"], &["--json", "-A1"], &["-U"],
+        ];
+        for pattern in patterns {
+            for &profile in profiles {
+                for text in [false, true] {
+                    let mut args: Vec<_> = profile.iter().map(OsString::from).collect();
+                    if text { args.push("-a".into()); }
+                    args.push(pattern.into());
+                    let Command::Search(plan) = parse(&args).unwrap() else { panic!("search") };
+                    for &bytes in documents { compare_scanners(&plan, bytes); }
+                }
+            }
+        }
+        for flags in [vec!["-F"], vec!["-Fi"], vec!["-w"], vec!["-x"], vec!["-e", "", "-e"]] {
+            let mut args: Vec<_> = flags.into_iter().map(OsString::from).collect();
+            args.push("red".into());
+            let Command::Search(plan) = parse(&args).unwrap() else { panic!("search") };
+            for &bytes in documents { compare_scanners(&plan, bytes); }
+        }
+    }
+
+    #[test]
+    fn run_search_preserves_partial_lines_across_reads_and_run_offsets() {
+        let mut bytes = b"red\ngap\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', crate::scan::BUFFER * 2 + 17));
+        bytes.extend_from_slice(b"red\n\ngap\nred\n");
+        // The first read contains a complete run followed by a partial line;
+        // that line survives multiple reads before the next callback.
+        for prefix in [b"".as_slice(), b"\xef\xbb\xbf"] {
+            let mut input = prefix.to_vec();
+            input.extend_from_slice(&bytes);
+            for suffix in [b"".as_slice(), b"red", b"\0red\n"] {
+                let mut input = input.clone();
+                input.extend_from_slice(suffix);
+                for flags in ["-n", "-o", "-c", "-l", "-q", "-m1", "--json"] {
+                    for text in [false, true] {
+                        let mut args = vec![flags.into()];
+                        if text { args.push("-a".into()); }
+                        args.push("red".into());
+                        let Command::Search(plan) = parse(&args).unwrap() else { panic!("search") };
+                        compare_scanners(&plan, &input);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offset_presentation_flags_remain_refused() {
+        // These are outside the current grep contract, including this slice.
+        for flag in ["--column", "-b"] {
+            assert!(matches!(parse(&[flag.into(), "red".into()]),
+                Err(ParseError::Unsupported(value)) if value == flag));
+        }
+    }
 
     fn admits(query: &Trigrams, original: &[u8]) -> bool {
         match query {
