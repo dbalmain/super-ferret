@@ -45,14 +45,24 @@ impl Stats {
         write!(
             out,
             ",\"searches\":{},\"searches_with_match\":{},\"bytes_searched\":{},\"bytes_printed\":{},\"matched_lines\":{},\"matches\":{}}}",
-            self.searches, self.searches_with_match, self.bytes_searched,
-            self.bytes_printed, self.matched_lines, self.matches
+            self.searches,
+            self.searches_with_match,
+            self.bytes_searched,
+            self.bytes_printed,
+            self.matched_lines,
+            self.matches
         )
     }
 }
 
 fn duration(out: &mut dyn Write, elapsed: Duration) -> io::Result<()> {
-    write!(out, "{{\"secs\":{},\"nanos\":{},\"human\":\"{:.6}s\"}}", elapsed.as_secs(), elapsed.subsec_nanos(), elapsed.as_secs_f64())
+    write!(
+        out,
+        "{{\"secs\":{},\"nanos\":{},\"human\":\"{:.6}s\"}}",
+        elapsed.as_secs(),
+        elapsed.subsec_nanos(),
+        elapsed.as_secs_f64()
+    )
 }
 
 fn field(out: &mut dyn Write, bytes: &[u8]) -> io::Result<()> {
@@ -92,17 +102,32 @@ pub(super) fn begin(out: &mut dyn Write, path: &[u8]) -> io::Result<()> {
     out.write_all(b"}}\n")
 }
 
-pub(super) fn line(out: &mut dyn Write, path: &[u8], numbers: bool, line: Line<'_>) -> io::Result<()> {
-    let kind = if line.kind == LineKind::Match { "match" } else { "context" };
+pub(super) fn line(
+    out: &mut dyn Write,
+    path: &[u8],
+    numbers: bool,
+    line: Line<'_>,
+) -> io::Result<()> {
+    let kind = if line.kind == LineKind::Match {
+        "match"
+    } else {
+        "context"
+    };
     write!(out, "{{\"type\":\"{kind}\",\"data\":{{\"path\":")?;
     field(out, path)?;
     out.write_all(b",\"lines\":")?;
     field(out, line.bytes)?;
     out.write_all(b",\"line_number\":")?;
-    if numbers { write!(out, "{}", line.number)?; } else { out.write_all(b"null")?; }
+    if numbers {
+        write!(out, "{}", line.number)?;
+    } else {
+        out.write_all(b"null")?;
+    }
     write!(out, ",\"absolute_offset\":{},\"submatches\":[", line.offset)?;
     for (at, span) in line.highlights.unwrap_or_default().iter().enumerate() {
-        if at > 0 { out.write_all(b",")?; }
+        if at > 0 {
+            out.write_all(b",")?;
+        }
         out.write_all(b"{\"match\":")?;
         field(out, &line.bytes[span.clone()])?;
         write!(out, ",\"start\":{},\"end\":{}}}", span.start, span.end)?;
@@ -110,11 +135,20 @@ pub(super) fn line(out: &mut dyn Write, path: &[u8], numbers: bool, line: Line<'
     out.write_all(b"]}}\n")
 }
 
-pub(super) fn end(out: &mut dyn Write, path: &[u8], result: InputResult, printed: u64) -> io::Result<()> {
+pub(super) fn end(
+    out: &mut dyn Write,
+    path: &[u8],
+    result: InputResult,
+    printed: u64,
+) -> io::Result<()> {
     out.write_all(b"{\"type\":\"end\",\"data\":{\"path\":")?;
     field(out, path)?;
     out.write_all(b",\"binary_offset\":")?;
-    if let Some(offset) = result.binary_offset { write!(out, "{offset}")?; } else { out.write_all(b"null")?; }
+    if let Some(offset) = result.binary_offset {
+        write!(out, "{offset}")?;
+    } else {
+        out.write_all(b"null")?;
+    }
     out.write_all(b",\"stats\":")?;
     let mut stats = Stats::default();
     stats.add(result, printed);

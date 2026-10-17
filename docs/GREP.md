@@ -649,6 +649,70 @@ Match schemas/values except key order, timings and physical work counters
 (index skipping changes those). JSON ignores `-o`, heading and replacement;
 refuse it with names/count modes. Ferret envelopes are not rg JSON.
 
+**M9 probes (2026-10-17):** `--json` / `--no-json` resolve in argv order.
+JSON defaults line numbers on and respects explicit `-N`; paths are always
+present. Every byte field independently uses `{text:...}` for valid UTF-8 or
+`{bytes:...}` for standard padded base64. Source LF is retained, CR is literal,
+and an unterminated last line gains no LF. Absolute offsets and binary offsets
+are measured **after stripping the initial UTF-8 BOM**; submatch start/end are
+byte offsets relative to the event's source bytes, including empty spans.
+LF-including multiline matches publish a complete contiguous selected source
+group in one event, retaining separate, unmerged submatches.
+
+For `red red\nblue\nred`, JSON emits two match events at offsets 0 and 13;
+semantic stats are matched_lines 2 and matches 3. For `a\nb\nc\nd\n` with
+`-U 'b\nc'`, one match event contains `b\nc\n`, starts at line 2 / offset 2,
+and has submatch [0,3); stats are matched_lines 2 and matches 1.
+
+Begin/end are published for actual file records, including context-only files
+that exit 1. No-match files without context publish neither. An empty successful
+span presentation still publishes its selected source in JSON, independently
+of `-o`. All file events, binary state and stats belong to the successful checked
+read attempt; retry, disappearance and faults discard them together. Summary
+is emitted once even with no file events; `-m0` emits nothing. Quiet emits only
+summary and finishes the matching file's semantic stats before stopping work.
+
+`matched_lines` counts source lines in **match events**, including matching
+trailing context after `-m`; `matches` counts their submatches. Context events
+can carry submatches but contribute neither count. `searches_with_match` counts
+successful selected files independently of span count or context publication.
+Summary sums these semantic fields from successful files. Quiet has no event
+submatch printer: its separate counting iterator retains a first terminal
+assertion but omits advanced EOF empties, and LF-including inverted regions
+contribute at least one logical match per selected source line. Thus `-q '\z'` on unterminated `abc`
+reports matches 1, while ordinary JSON publishes that source with no submatches.
+These are separate from plain `-c` / `--count-matches` and D82's bounded count: on `a\nb\n` with
+`-Um1 'a\n\b'`, a selected a-LF event has no bounded submatches, matched_lines
+1, matches 0, searches_with_match 1. Pinned rg instead reports one truncated
+submatch. Timings and physical `searches`, `bytes_searched`, `bytes_printed`
+may differ; the JSON audit must retain the three semantic fields above.
+
+**Contract/oracle differences:** rg 15.2.0 lets names/count modes override JSON;
+ferret deliberately refuses their combination as required above. The earlier
+claim that rg JSON ignores replacement is wrong: rg retains source bytes but
+adds a `replacement` byte field to each submatch. Ferret provisionally retains
+the explicit ignore rule (M9-B); adopting that optional metadata is the proposed
+future shape. JSON also inherits the D79 per-line assertion choice (M9-C): on
+`abc\nabc\n` with `'\A'`, ferret reports an empty submatch on each line,
+where rg reports it only on the first. With `-m1 -A1 '\z'` on `a\nbc`,
+ferret labels the tail as a match without submatches; rg labels it context.
+
+M9-A provisionally preserves bounded multiline submatches: rg can panic on
+`red red\nblue\n` with `-Um1 'red(?:\nblue)?'`; ferret publishes the selected
+first line and two bounded red spans. M9-D preserves existing limit/window
+selection: on `x\na\ny\na\nz\n` with `-Uvm1 -A1 a`, ferret emits match x
+and context a, while rg emits matches x/a/y (the discrepancy also exists in
+plain line mode). With `-Um1 -A1 'a|\z'`, ferret emits match a and context y,
+while rg labels y as a match. These owned discrepancies are provisional choices,
+not accepted differences in private audit rows.
+
+JSON retains the first-NUL prefix policy below: prior events survive, and
+`end.binary_offset` identifies the sentinel. For `red\0red\n`, the selected
+prefix event contains exactly `red`, has one submatch, and binary_offset 3;
+rg substitutes LF for NUL and can search its received suffix. Ferret neither
+invents that LF nor searches beyond its first-NUL stop. `-a` disables detection
+and publishes original NUL bytes as escaped text.
+
 Binary policy differs: recursive binary-sniffed files are absent. On searched
 input, first NUL stops searching and discards buffered plain file output.
 Detect NUL in each read chunk, without waiting for LF or EOF (review R1,

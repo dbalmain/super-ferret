@@ -99,7 +99,12 @@ impl Render<'_> {
             if self.plan.quiet {
                 return Ok(());
             }
-            return super::json::line(&mut output, self.prefix.unwrap_or(b"<stdin>"), self.plan.line_number, line);
+            return super::json::line(
+                &mut output,
+                self.prefix.unwrap_or(b"<stdin>"),
+                self.plan.line_number,
+                line,
+            );
         }
         if previous.is_none()
             && self.plan.presentation.heading == Some(true)
@@ -385,7 +390,8 @@ impl Worker<'_> {
     ) -> io::Result<Observed> {
         let render = Render {
             plan: &self.plan,
-            prefix: (filename || self.plan.json).then(|| label(job.path(), self.plan.paths.is_empty())),
+            prefix: (filename || self.plan.json)
+                .then(|| label(job.path(), self.plan.paths.is_empty())),
             stopped,
         };
         let observed = match job {
@@ -499,7 +505,10 @@ pub(super) fn run<'a, W: Write>(
             }
             match result {
                 Ok(observed) => {
-                    if plan.quiet && plan.json && let Observed::Ready(group) = &observed {
+                    if plan.quiet
+                        && plan.json
+                        && let Observed::Ready(group) = &observed
+                    {
                         lock(&quiet_stats).add(group.result, 0);
                     }
                     if plan.quiet
@@ -549,7 +558,8 @@ pub(super) fn run<'a, W: Write>(
         },
     );
     host.matched |= hit.load(Ordering::Acquire);
-    host.json_stats.merge(std::mem::take(&mut *lock(&quiet_stats)));
+    host.json_stats
+        .merge(std::mem::take(&mut *lock(&quiet_stats)));
     if let Some(error) = lock(&fatal).take() {
         Err(error)
     } else {
@@ -1050,7 +1060,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
-            json_stats: json::Stats::default(),
+                json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: Some(&flag),
             };
@@ -1380,5 +1390,57 @@ mod tests {
     #[test]
     fn quiet_hit_cancels_opaque_listing() {
         check_quiet_listing(true);
+    }
+
+    #[test]
+    fn json_cached_aliases_retain_offsets_submatches_and_their_own_paths() {
+        let streams = Cell::new(0);
+        let stats = Cell::new(0);
+        let read = |_: NameId, request: ReadRequest<'_>| {
+            match request {
+                ReadRequest::Stat => stats.set(stats.get() + 1),
+                ReadRequest::Stream(each, _) => {
+                    streams.set(streams.get() + 1);
+                    let bytes = b"blue\nred red\n";
+                    each(&mut &bytes[..], bytes.len() as u64).unwrap();
+                }
+                ReadRequest::Bytes(_, _) => panic!("stream expected"),
+            }
+            ReadOutcome::Stable(ReadVersion::Catalogued)
+        };
+        let mut worker = Worker {
+            plan: plan(&["--json", "-B1", "red"]),
+            buffer: Vec::new(),
+            read: Some(Box::new(read)),
+        };
+        let cache = Mutex::new(Cache::default());
+        for (name, path) in [(0, "first"), (1, "second")] {
+            let Observed::Ready(mut group) = worker
+                .prepare(
+                    &Job::Checked(path.into(), NameId(name), 0),
+                    false,
+                    &cache,
+                    true,
+                    &|| false,
+                )
+                .unwrap()
+            else {
+                panic!("ready")
+            };
+            let mut actual = Vec::new();
+            group.output.write_to(&mut actual).unwrap();
+            let text = String::from_utf8(actual).unwrap();
+            assert_eq!(
+                text.matches(&format!(r#""path":{{"text":"{path}"}}"#))
+                    .count(),
+                2
+            );
+            assert!(text.contains(r#""absolute_offset":5"#));
+            assert!(text.contains(r#""start":4,"end":7"#));
+            assert_eq!(group.result.stats.matched_lines, 1);
+            assert_eq!(group.result.stats.matches, 2);
+        }
+        assert_eq!(streams.get(), 1);
+        assert_eq!(stats.get(), 1);
     }
 }

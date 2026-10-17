@@ -118,7 +118,8 @@ pub(super) fn scan(
     }
     result.binary = read_all(source, size, buffer, plan.text, stopped)?;
     if result.binary {
-        result.binary_offset = Some(buffer.len() as u64 - u64::from(buffer.starts_with(b"\xef\xbb\xbf")) * 3);
+        result.binary_offset =
+            Some(buffer.len() as u64 - u64::from(buffer.starts_with(b"\xef\xbb\xbf")) * 3);
     }
     let bytes = buffer.strip_prefix(b"\xef\xbb\xbf").unwrap_or(buffer);
     result.bytes_searched = bytes.len() as u64;
@@ -225,7 +226,7 @@ pub(super) fn scan(
         return Ok(result);
     }
     result.matched = selected;
-    if plan.quiet || plan.output == Output::Names {
+    if (plan.quiet && !plan.json) || plan.output == Output::Names {
         return Ok(result);
     }
     if !(selected || terminal_context && plan.before > 0 && plan.output == Output::Lines) {
@@ -382,17 +383,19 @@ pub(super) fn scan(
                 LineKind::Context
             };
             if plan.json {
-                let last = if whole && selected && !plan.invert {
+                let last = if whole && selected && (!plan.invert || plan.quiet) {
                     groups[group_at].end.min(window.end)
                 } else {
                     index + 1
                 };
                 let region = range.start..lines[last - 1].end;
                 highlights.clear();
-                if plan.invert {
-                    for span in regex.spans(&bytes[region.clone()]) {
+                if kind == LineKind::Context {
+                    for span in regex.spans(&bytes[range.clone()]) {
                         cancelled(stopped)?;
-                        if span.start < region.len() {
+                        if span.start < region.len()
+                            && (plan.invert || span.end <= content_end - range.start)
+                        {
                             push(&mut highlights, span)?;
                         }
                     }
@@ -401,6 +404,9 @@ pub(super) fn scan(
                         cancelled(stopped)?;
                         if span.start >= region.end {
                             break;
+                        }
+                        if plan.invert && (span.start < region.start || span.end > region.end) {
+                            continue;
                         }
                         // A tail's cross-line discovery cannot publish a
                         // submatch outside this event's source bytes (M9-A).

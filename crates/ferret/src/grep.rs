@@ -284,6 +284,9 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 return failure(&format!("writing stdout: {error}"));
             }
             if plan.quiet && host.matched {
+                if !plan.json {
+                    return Exit::Ok;
+                }
                 break 'inputs;
             }
         }
@@ -293,11 +296,16 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
                 return failure(&format!("writing stdout: {error}"));
             }
             if plan.quiet && host.matched {
+                if !plan.json {
+                    return Exit::Ok;
+                }
                 break 'inputs;
             }
         }
     }
-    if plan.json && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start) {
+    if plan.json
+        && let Err(error) = json::summary(&mut host.writer, &host.json_stats, start)
+    {
         return failure(&format!("writing stdout: {error}"));
     }
     if let Err(error) = host.writer.flush() {
@@ -627,7 +635,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
-        json_stats: json::Stats::default(),
+                json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
             };
@@ -682,7 +690,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
-        json_stats: json::Stats::default(),
+                json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
             };
@@ -758,7 +766,7 @@ mod tests {
                     buffer: Vec::new(),
                     matched: false,
                     emitted_group: false,
-        json_stats: json::Stats::default(),
+                    json_stats: json::Stats::default(),
                     errors: false,
                     cancelled: None,
                 };
@@ -799,7 +807,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
-        json_stats: json::Stats::default(),
+            json_stats: json::Stats::default(),
             errors: false,
             cancelled: None,
         };
@@ -841,7 +849,7 @@ mod tests {
                 buffer: Vec::new(),
                 matched: false,
                 emitted_group: false,
-        json_stats: json::Stats::default(),
+                json_stats: json::Stats::default(),
                 errors: false,
                 cancelled: None,
             };
@@ -891,7 +899,7 @@ mod tests {
             buffer: Vec::new(),
             matched: false,
             emitted_group: false,
-        json_stats: json::Stats::default(),
+            json_stats: json::Stats::default(),
             errors: false,
             cancelled: None,
         };
@@ -901,6 +909,79 @@ mod tests {
                 .kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    #[test]
+    fn json_retry_discards_events_offsets_binary_state_and_counts_together() {
+        for multiline in [false, true] {
+            let mut args = vec!["--json".into(), "-B1".into(), "red".into()];
+            if multiline {
+                args.insert(0, "-U".into());
+            }
+            let line_grep::Command::Search(mut plan) = line_grep::parse(&args).unwrap() else {
+                panic!("search")
+            };
+            plan.line_number = true;
+            for failure in [false, true] {
+                let mut host = Host {
+                    plan: &plan,
+                    filename: false,
+                    writer: Vec::new(),
+                    buffer: Vec::new(),
+                    matched: false,
+                    emitted_group: false,
+                    json_stats: json::Stats::default(),
+                    errors: false,
+                    cancelled: None,
+                };
+                let mut attempts = 0;
+                let mut reader = |_, request: ReadRequest<'_>| {
+                    attempts += 1;
+                    let ReadRequest::Stream(each, _) = request else {
+                        panic!("stream")
+                    };
+                    let bytes: &[u8] = if attempts == 1 {
+                        b"obsolete context\nred red\0"
+                    } else {
+                        b"blue\nred\n"
+                    };
+                    each(&mut &bytes[..], bytes.len() as u64).unwrap();
+                    if attempts == 1 {
+                        ReadOutcome::RetryChanged
+                    } else if failure {
+                        ReadOutcome::Failed(ReadFault::Unstable)
+                    } else {
+                        ReadOutcome::Stable(ReadVersion::Current)
+                    }
+                };
+                host.checked(Path::new("actual-path"), NameId(0), &mut reader)
+                    .unwrap();
+                assert_eq!(attempts, 2);
+                assert_eq!(host.matched, !failure);
+                assert_eq!(host.errors, failure);
+                if failure {
+                    assert!(host.writer.is_empty());
+                } else {
+                    let text = String::from_utf8(host.writer).unwrap();
+                    assert!(!text.contains("obsolete"));
+                    assert!(text.contains(r#""absolute_offset":5"#));
+                    assert!(text.contains(r#""binary_offset":null"#));
+                    assert!(text.contains(r#""matched_lines":1,"matches":1"#));
+                    assert_eq!(text.matches(r#""type":"begin""#).count(), 1);
+                    assert_eq!(text.matches(r#""type":"end""#).count(), 1);
+                    let mut summary = Vec::new();
+                    json::summary(&mut summary, &host.json_stats, std::time::Instant::now())
+                        .unwrap();
+                    let parsed = crate::protocol::parse_object(&summary).unwrap();
+                    let stats = parsed.field("data").unwrap().field("stats").unwrap();
+                    assert_eq!(stats.field("matches").unwrap().number(), Some(1));
+                    assert_eq!(
+                        stats.field("searches_with_match").unwrap().number(),
+                        Some(1)
+                    );
+                }
+            }
+        }
     }
 }
 

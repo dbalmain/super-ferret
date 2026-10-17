@@ -13,21 +13,49 @@ pub(super) fn scan(
 ) -> Result<InputResult, ScanError> {
     // JSON's quiet summary still needs the selected file's complete stats.
     // The host suppresses records and stops at its first stable matching file.
-    let mut profile = plan.clone();
-    profile.quiet = false;
     let mut stats = EventStats::default();
     let mut record = |line: Line<'_>| {
         if stopped() {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
         if line.kind == LineKind::Match {
-            let lines = memchr::memchr_iter(b'\n', line.bytes).count() as u64
-                + u64::from(!line.bytes.ends_with(b"\n"));
+            let mut lines = u64::from(!line.bytes.ends_with(b"\n"));
+            for chunk in line.bytes.chunks(crate::scan::BUFFER) {
+                if stopped() {
+                    return Err(io::ErrorKind::ConnectionAborted.into());
+                }
+                lines += memchr::memchr_iter(b'\n', chunk).count() as u64;
+            }
             stats.matched_lines += lines;
-            stats.matches += if plan.quiet && plan.invert {
+            stats.matches += if !plan.quiet {
+                line.highlights.map_or(0, |spans| spans.len() as u64)
+            } else if plan.invert && plan.grep.excludes_lf() {
                 lines
             } else {
-                line.highlights.map_or(0, |spans| spans.len() as u64)
+                // Quiet has no submatch presentation: its source-group
+                // counting iterator retains a first terminal assertion,
+                // while omitting EOF reached by advancing an earlier match.
+                let source = if !plan.multiline && line.terminated {
+                    line.bytes.strip_suffix(b"\n").unwrap_or(line.bytes)
+                } else {
+                    line.bytes
+                };
+                let mut count = 0;
+                for span in plan.grep.regex().spans(source) {
+                    if stopped() {
+                        return Err(io::ErrorKind::ConnectionAborted.into());
+                    }
+                    if span.start == source.len()
+                        && count > 0
+                        && (plan.multiline || !line.terminated)
+                    {
+                        break;
+                    }
+                    count += 1;
+                }
+                // Without a submatch printer, inverted stats retain at least
+                // one logical match per selected source line.
+                if plan.invert { count.max(lines) } else { count }
             };
         }
         emit(line)
@@ -35,12 +63,14 @@ pub(super) fn scan(
     let search = plan.grep.search();
     let mut bytes = Vec::new();
     let mut spans = Vec::new();
-    let mut result = scan_records(&profile, input, size, buffer, stopped, |line| {
+    let mut result = scan_records(plan, input, size, buffer, stopped, |line| {
         if plan.multiline {
             return record(line);
         }
         bytes.clear();
-        bytes.try_reserve(line.bytes.len().saturating_add(1)).map_err(io::Error::other)?;
+        bytes
+            .try_reserve(line.bytes.len().saturating_add(1))
+            .map_err(io::Error::other)?;
         bytes.extend_from_slice(line.bytes);
         if line.terminated {
             bytes.push(b'\n');
@@ -66,4 +96,38 @@ pub(super) fn scan(
     })?;
     result.stats = stats;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn json_cancellation_after_a_record_stops_before_the_next_source_record() {
+        for flags in ["--json", "-U"] {
+            let Command::Search(plan) =
+                parse(&["--json".into(), flags.into(), "red".into()]).unwrap()
+            else {
+                panic!("search")
+            };
+            let stopped = Cell::new(false);
+            let mut records = 0;
+            let bytes = b"red\nred\nred\n";
+            let result = scan_lines(
+                &plan,
+                &mut &bytes[..],
+                bytes.len() as u64,
+                &mut Vec::new(),
+                &|| stopped.get(),
+                |_| {
+                    records += 1;
+                    stopped.set(true);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(records, 1);
+        }
+    }
 }

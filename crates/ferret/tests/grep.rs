@@ -3716,14 +3716,22 @@ fn m8_r1_inverted_assertions_keep_source_bounds_with_and_without_context() {
     }
 }
 
-
 fn normalized_json(output: &[u8], quiet: bool) -> Vec<u8> {
-    let python = std::env::var_os("FERRET_PYTHON").expect("nix supplies Python");
+    let python = std::env::var_os("FERRET_PYTHON").unwrap_or_else(|| panic!("nix supplies Python"));
     let mut command = Command::new(python);
-    command.arg("-c").arg(include_str!("support/grep_json.py")).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if quiet { command.arg("--quiet"); }
+    command
+        .arg("-c")
+        .arg(include_str!("support/grep_json.py"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if quiet {
+        command.arg("--quiet");
+    }
     let normalized = run(command, Some(output));
-    assert!(normalized.status.success(), "JSON validation failed: {normalized:?}");
+    assert!(
+        normalized.status.success(),
+        "JSON validation failed: {normalized:?}"
+    );
     normalized.stdout
 }
 
@@ -3734,11 +3742,22 @@ impl Fixture {
         let oracle = self.oracle(&options, input);
         options.insert(0, "grep");
         let actual = self.ferret(&options, input);
-        assert_eq!(actual.status.code(), oracle.status.code(), "{args:?}: {actual:?} vs {oracle:?}");
-        assert_eq!(actual.stderr.is_empty(), oracle.stderr.is_empty(), "{args:?}: {actual:?} vs {oracle:?}");
+        assert_eq!(
+            actual.status.code(),
+            oracle.status.code(),
+            "{args:?}: {actual:?} vs {oracle:?}"
+        );
+        assert_eq!(
+            actual.stderr.is_empty(),
+            oracle.stderr.is_empty(),
+            "{args:?}: {actual:?} vs {oracle:?}"
+        );
         let quiet = args.contains(&"-q");
-        assert_eq!(normalized_json(&actual.stdout, quiet), normalized_json(&oracle.stdout, quiet),
-                   "{args:?}: {actual:?} vs {oracle:?}");
+        assert_eq!(
+            normalized_json(&actual.stdout, quiet),
+            normalized_json(&oracle.stdout, quiet),
+            "{args:?}: {actual:?} vs {oracle:?}"
+        );
         actual
     }
 }
@@ -3783,6 +3802,9 @@ json_cases! {
     m9_json_quiet: 0 => ["-q", "red", "one.rs"];
     m9_json_quiet_invert: 0 => ["-q", "-v", "red", "one.rs"];
     m9_json_quiet_no_match: 1 => ["-q", "absent", "one.rs"];
+    m9_json_quiet_before_error: 0 => ["-q", "red", "one.rs", "missing"];
+    m9_json_recoverable_error: 2 => ["red", "one.rs", "missing"];
+    m9_json_empty_unicode_byte_spans: 0 => ["", "unicode"];
     m9_json_multiline: 0 => ["-U", r"red lantern\nBLUE", "one.rs"];
     m9_json_multiline_context: 0 => ["-UC1", r"red lantern\nBLUE", "one.rs"];
     m9_json_multiline_lf_excluded: 0 => ["-U", "red", "one.rs"];
@@ -3800,7 +3822,6 @@ json_cases! {
     m9_json_invalid_pattern: 2 => ["[", "one.rs"];
 }
 
-
 #[test]
 fn m9_json_replacement_is_ignored_as_specified_provisionally() {
     let fixture = Fixture::new("m9-json-replacement-contract");
@@ -3810,9 +3831,312 @@ fn m9_json_replacement_is_ignored_as_specified_provisionally() {
         let actual = fixture.ferret(&["grep", "--json", flags, "<$0>", "red", "one.rs"], None);
         let plain = fixture.ferret(&["grep", "--json", "red", "one.rs"], None);
         assert_eq!(actual.status.code(), Some(0));
-        assert_eq!(normalized_json(&actual.stdout, false), normalized_json(&plain.stdout, false));
+        assert_eq!(
+            normalized_json(&actual.stdout, false),
+            normalized_json(&plain.stdout, false)
+        );
         // M9-B: rg 15.2 adds metadata despite GREP.md's explicit ignore rule.
-        assert!(oracle.stdout.windows(b"\"replacement\"".len()).any(|w| w == b"\"replacement\""));
-        assert_ne!(normalized_json(&actual.stdout, false), normalized_json(&oracle.stdout, false));
+        assert!(
+            oracle
+                .stdout
+                .windows(b"\"replacement\"".len())
+                .any(|w| w == b"\"replacement\"")
+        );
+        assert_ne!(
+            normalized_json(&actual.stdout, false),
+            normalized_json(&oracle.stdout, false)
+        );
+    }
+}
+
+#[test]
+fn m9_json_source_bytes_spans_offsets_and_semantic_stats() {
+    let fixture = Fixture::new("m9-json-source-stats");
+    let output = fixture.compare_json(&["red", "-"], Some(b"red red\nblue\nred"));
+    let normalized = String::from_utf8(normalized_json(&output.stdout, false)).unwrap();
+    assert!(normalized.contains(r#""absolute_offset":13"#));
+    assert_eq!(
+        normalized
+            .matches(r#""matched_lines":2,"matches":3,"searches_with_match":1"#)
+            .count(),
+        2
+    );
+    for flags in [vec!["-U", "-"], vec!["-U", "-C1", "-"]] {
+        let mut args = flags[..flags.len() - 1].to_vec();
+        args.extend([r"b\nc", "-"]);
+        let output = fixture.compare_json(&args, Some(b"a\nb\nc\nd\n"));
+        let normalized = String::from_utf8(normalized_json(&output.stdout, false)).unwrap();
+        assert!(normalized.contains(r#""lines":{"text":"b\nc\n"}"#));
+        assert_eq!(
+            normalized
+                .matches(r#""matched_lines":2,"matches":1,"searches_with_match":1"#)
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn m9_json_invalid_path_and_each_field_choose_their_own_encoding() {
+    let fixture = Fixture::new("m9-json-byte-fields");
+    let path = OsStr::from_bytes(b"name-\xff");
+    fs::write(fixture.tree().join(path), b"\xff red\n").unwrap();
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .args(["grep", "--json", r"(?-u:\xFF)|red"])
+        .arg(path);
+    let actual = run(command, None);
+    let mut command = fixture.command(&std::env::var_os("FERRET_RG").unwrap());
+    command.args(["--json", r"(?-u:\xFF)|red"]).arg(path);
+    let oracle = run(command, None);
+    assert_eq!(actual.status.code(), Some(0));
+    assert_eq!(
+        normalized_json(&actual.stdout, false),
+        normalized_json(&oracle.stdout, false)
+    );
+    let text = String::from_utf8(actual.stdout).unwrap();
+    assert!(text.contains(r#""path":{"bytes":"bmFtZS3/"}"#));
+    assert!(text.contains(r#""lines":{"bytes":"/yByZWQK"}"#));
+    assert!(text.contains(r#""match":{"bytes":"/w=="}"#));
+    assert!(text.contains(r#""match":{"text":"red"}"#));
+}
+
+#[test]
+fn m9_json_binary_keeps_events_and_reports_bom_relative_offset() {
+    let fixture = Fixture::new("m9-json-binary-offset");
+    // Cross a streaming chunk: neither offsets nor the BOM adjustment may
+    // restart when the scanner discards a completed run.
+    let mut bytes = b"\xef\xbb\xbf".to_vec();
+    bytes.extend_from_slice(&b"blue\n".repeat(17_000));
+    bytes.extend_from_slice(b"red\nnone\0tail");
+    for flags in [
+        vec![],
+        vec!["-U"],
+        vec!["-m1"],
+        vec!["-U", "-m1"],
+        vec!["-B1"],
+    ] {
+        let mut args = flags;
+        args.extend(["red", "-"]);
+        let output = fixture.compare_json(&args, Some(&bytes));
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains(r#""binary_offset":85008"#)
+        );
+    }
+    fixture.compare_json(&["-a", "red", "-"], Some(b"red\nnone\0red\n"));
+    fixture.compare_json(&["-Ua", "red", "-"], Some(b"red\nnone\0red\n"));
+    fixture.compare_json(&["absent", "-"], Some(b"none\0tail"));
+}
+
+#[test]
+fn m9_json_first_nul_prefix_is_the_existing_binary_policy() {
+    let fixture = Fixture::new("m9-json-first-nul");
+    for flags in [vec![], vec!["-U"]] {
+        let mut args = vec!["grep", "--json"];
+        args.extend(flags);
+        args.extend(["red", "-"]);
+        let output = fixture.ferret(&args, Some(b"red\0red\n"));
+        assert_eq!(output.status.code(), Some(0));
+        let normalized = String::from_utf8(normalized_json(&output.stdout, false)).unwrap();
+        assert!(normalized.contains(r#""lines":{"text":"red"}"#));
+        assert!(normalized.contains(r#""binary_offset":3"#));
+        assert_eq!(
+            normalized
+                .matches(r#""matched_lines":1,"matches":1,"searches_with_match":1"#)
+                .count(),
+            2
+        );
+        // rg substitutes LF for NUL and can search the remaining buffer.
+        // Ferret's first-NUL prefix retains its original bytes and stops.
+        let oracle = fixture.oracle(&args[1..], Some(b"red\0red\n"));
+        assert_ne!(
+            normalized_json(&output.stdout, false),
+            normalized_json(&oracle.stdout, false)
+        );
+    }
+}
+
+#[test]
+fn m9_json_context_only_and_empty_success_publish_independently() {
+    let fixture = Fixture::new("m9-json-publication");
+    fixture.write("context-a", b"a\nb\n");
+    fixture.write("context-b", b"c\nd\n");
+    let output = fixture.compare_json(&["-UB1", r"\z", "context-a", "context-b"], None);
+    assert_eq!(output.status.code(), Some(1));
+    let raw = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(raw.matches(r#""type":"begin""#).count(), 2);
+    assert_eq!(raw.matches(r#""type":"end""#).count(), 2);
+    assert!(!raw.contains(r#""type":"match""#));
+    // JSON ignores -o: a selected empty-span source still has a match event.
+    fixture.compare_json(&["-Uo", "(?s:.*?)", "context-a", "empty"], None);
+}
+
+#[test]
+fn m9_json_names_and_counts_refuse_before_any_input_or_pattern_io() {
+    let fixture = Fixture::new("m9-json-refusals");
+    for mode in [
+        "--files",
+        "-l",
+        "--files-without-match",
+        "-c",
+        "--count-matches",
+    ] {
+        for flags in [vec!["--json", mode], vec![mode, "--json", "-q"]] {
+            let mut args = vec!["grep"];
+            args.extend(flags);
+            args.extend(["-f", "missing-pattern-file", "missing-input"]);
+            let output = fixture.ferret(&args, None);
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--json cannot be combined"));
+        }
+    }
+    // This is an explicit spec restriction: rg lets the names/count mode win.
+    assert_eq!(
+        fixture
+            .oracle(&["--json", "-c", "red", "one.rs"], None)
+            .stdout,
+        b"2\n"
+    );
+    fixture.compare_raw(&["--json", "--no-json", "-c", "red", "one.rs"], None);
+    fixture.compare_raw(&["--no-json", "red", "one.rs"], None);
+    fixture.compare_json(&["--no-json", "--json", "red", "one.rs"], None);
+    let global = fixture.ferret(&["--json", "grep", "red", "one.rs"], None);
+    assert_eq!(global.status.code(), Some(2));
+    assert!(global.stdout.is_empty());
+}
+
+#[test]
+fn m9_json_spills_complete_groups_and_base64_quantum_boundaries() {
+    let fixture = Fixture::new("m9-json-spills");
+    fixture.write("large-invalid", &vec![0xff; 3 * 8192 + 2]);
+    fixture.compare_json(&[r"(?-u:.*)", "large-invalid"], None);
+    fixture.write("many", &b"red red\n".repeat(2500));
+    fixture.compare_json(&["red", "many", "one.rs", "many"], None);
+    fixture.compare_json(&["-U", r"red|\n", "many"], None);
+}
+
+#[test]
+fn m9_json_terminal_and_inverted_context_matrix() {
+    let fixture = Fixture::new("m9-json-terminal-matrix");
+    for bytes in [
+        &b"a\nbc"[..],
+        b"a\nbc\n",
+        b"a\na\nbc",
+        b"abc\nabc\n",
+        b"x\na\ny\na\nz\n",
+        b"\xffa\nbc\n",
+    ] {
+        for pattern in ["a", r"\b{end}", r"a|\n", "(?s:.*?)", ""] {
+            for flags in [
+                vec![],
+                vec!["-C1"],
+                vec!["-m1", "-A1"],
+                vec!["-U"],
+                vec!["-U", "-m1", "-A1"],
+                vec!["-Uv", "-C1"],
+                vec!["-v", "-C1"],
+            ] {
+                let mut args = flags;
+                args.extend([pattern, "-"]);
+                fixture.compare_json(&args, Some(bytes));
+            }
+        }
+    }
+}
+
+#[test]
+fn m9_json_clipped_submatches_remain_within_the_published_region() {
+    let fixture = Fixture::new("m9-json-clipping-contract");
+    let args = ["--json", "-Um1", r"red(?:\nblue)?", "-"];
+    let actual = fixture.ferret(
+        &["grep", args[0], args[1], args[2], args[3]],
+        Some(b"red red\nblue\n"),
+    );
+    assert_eq!(actual.status.code(), Some(0));
+    let normalized = String::from_utf8(normalized_json(&actual.stdout, false)).unwrap();
+    assert!(normalized.contains(r#""lines":{"text":"red red\n"}"#));
+    assert_eq!(
+        normalized
+            .matches(r#""matched_lines":1,"matches":2,"searches_with_match":1"#)
+            .count(),
+        2
+    );
+    // M9-A: pinned rg slices past the clipped event and panics. Ferret keeps
+    // both bounded red spans and publishes no blue suffix.
+    let oracle = fixture.oracle(&args, Some(b"red red\nblue\n"));
+    assert_eq!(oracle.status.code(), Some(101));
+    assert!(String::from_utf8_lossy(&oracle.stderr).contains("out of range"));
+
+    let args = ["--json", "-Um1", r"a\n\b", "-"];
+    let actual = fixture.ferret(
+        &["grep", args[0], args[1], args[2], args[3]],
+        Some(b"a\nb\n"),
+    );
+    assert_eq!(actual.status.code(), Some(0));
+    let normalized = String::from_utf8(normalized_json(&actual.stdout, false)).unwrap();
+    assert!(normalized.contains(r#""lines":{"text":"a\n"}"#));
+    assert!(normalized.contains(r#""submatches":[]"#));
+    assert_eq!(
+        normalized
+            .matches(r#""matched_lines":1,"matches":0,"searches_with_match":1"#)
+            .count(),
+        2
+    );
+    let oracle = fixture.oracle(&args, Some(b"a\nb\n"));
+    assert_eq!(oracle.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&oracle.stdout).contains(r#""match":{"text":"a\n"}"#));
+}
+
+#[test]
+fn m9_json_inherits_line_assertion_and_limit_windows_provisionally() {
+    let fixture = Fixture::new("m9-json-inherited-contracts");
+    for (args, bytes, expected_lines, expected_matches) in [
+        (vec![r"\A", "-"], &b"abc\nabc\n"[..], 2, 2),
+        (vec!["-m1", "-A1", r"\z", "-"], b"a\nbc", 2, 1),
+        (vec!["-Uvm1", "-A1", "a", "-"], b"x\na\ny\na\nz\n", 1, 0),
+        (vec!["-Um1", "-A1", r"a|\z", "-"], b"x\na\ny\na\nz\n", 1, 1),
+    ] {
+        let mut full = vec!["--json"];
+        full.extend(args);
+        let oracle = fixture.oracle(&full, Some(bytes));
+        full.insert(0, "grep");
+        let actual = fixture.ferret(&full, Some(bytes));
+        assert_eq!(actual.status.code(), Some(0));
+        assert_eq!(oracle.status.code(), Some(0));
+        let normalized = normalized_json(&actual.stdout, false);
+        let text = String::from_utf8(normalized.clone()).unwrap();
+        assert_eq!(text.matches(&format!(r#""matched_lines":{expected_lines},"matches":{expected_matches},"searches_with_match":1"#)).count(), 2);
+        assert_ne!(
+            normalized,
+            normalized_json(&oracle.stdout, false),
+            "{full:?}"
+        );
+    }
+}
+
+#[test]
+fn m9_json_quiet_stats_keep_counting_and_event_span_bounds_separate() {
+    let fixture = Fixture::new("m9-json-quiet-boundaries");
+    fixture.compare_json(
+        &["-q", "-Uv", "-m1", r"a\nb", "-"],
+        Some(b"x\na\nb\ny\na\nb\nz\n"),
+    );
+    for bytes in [&b"abc"[..], b"a\nbc", b"abc\n", b"x\na\ny\na\nz\n"] {
+        for pattern in [r"\z", "", r"\b{end}", r"a|\n"] {
+            for flags in [
+                vec!["-q"],
+                vec!["-q", "-U"],
+                vec!["-q", "-Uv"],
+                vec!["-q", "-Uv", "-m1"],
+                vec!["-q", "-U", "-m1", "-A1"],
+            ] {
+                let mut args = flags;
+                args.extend([pattern, "-"]);
+                fixture.compare_json(&args, Some(bytes));
+            }
+        }
     }
 }

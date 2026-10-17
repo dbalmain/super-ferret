@@ -753,8 +753,8 @@ pub enum LineKind {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Line<'a> {
-    /// Source byte offset after initial BOM removal. JSON records retain LF
-    /// in `bytes`; ordinary rendered records omit it.
+    /// Original source line/group start after initial BOM removal. JSON
+    /// records retain LF in `bytes`; ordinary rendered records omit it.
     pub offset: u64,
     /// Inclusive original source lines when replacement changes displayed
     /// line counts. Group separators use these boundaries, not display numbers.
@@ -810,7 +810,7 @@ fn scan_records(
     let mut selected_lines = 0;
     let mut bom = 0_u64;
     let mut number = 0;
-    let rendering = plan.output == Output::Lines && !plan.quiet;
+    let rendering = plan.output == Output::Lines && (!plan.quiet || plan.json);
     let after = if rendering { plan.after } else { 0 };
     let mut before = context::Before::new(if rendering { plan.before } else { 0 }, stopped);
     let mut trailing = 0;
@@ -854,7 +854,8 @@ fn scan_records(
             // received, even when it follows a complete selected line.
             result.binary = binary.is_some();
             if let Some(at) = binary {
-                result.binary_offset = Some(base as u64 + at as u64 - if base == 0 { 0 } else { bom });
+                result.binary_offset =
+                    Some(base as u64 + at as u64 - if base == 0 { 0 } else { bom });
             }
             let mut offset = base as u64 - if base == 0 { 0 } else { bom };
             let text = &run[..binary.unwrap_or(run.len())];
@@ -924,7 +925,7 @@ fn scan_records(
                     }
                     selected_lines += 1;
                     result.matched = true;
-                    if plan.quiet || plan.output == Output::Names {
+                    if (plan.quiet && !plan.json) || plan.output == Output::Names {
                         return Ok(ControlFlow::Break(()));
                     }
                     if rendering {
@@ -999,7 +1000,9 @@ fn scan_records(
                     })
                     .map_err(ScanError::Output)?;
                 } else if rendering {
-                    before.push_at(number, line_offset, line).map_err(ScanError::Output)?;
+                    before
+                        .push_at(number, line_offset, line)
+                        .map_err(ScanError::Output)?;
                 }
             }
             if binary.is_some() {
@@ -1122,6 +1125,8 @@ mod tests {
     #[test]
     fn fixed_folded_and_repeated_profiles_are_sound_over_original_bytes() {
         let profiles: &[(&[&str], &[u8])] = &[
+            (&["--json", "-i", "KILO"], "Kilo\n".as_bytes()),
+            (&["--json", "-U", "red\\nviolet"], b"red\nviolet\n"),
             (&["-r", "<$1>", "(red)"], b"red\nviolet\n"),
             (
                 &["-Uor", "<$1>", "(?-u:(\\xFF))red\\nviolet"],
