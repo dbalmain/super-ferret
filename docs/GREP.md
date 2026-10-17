@@ -175,8 +175,19 @@ preserving the original left haystack and four bytes of right context for
 LF/Unicode word assertions. An occurrence ending beyond the consuming window
 cannot select it. Actual spans, captures, replacement and JSON still use their
 original source-line bounds. Uncoloured, unnumbered plain records combine path,
-separator, data and LF with vectored spill writes; checked publication, the
-64 KiB cancellation bound and output-fault classification remain unchanged.
+separator, data and LF through the capture's vectored writer. Grep stages spill
+writes in the same bounded 64 KiB allocation, finishing them inside the
+checked-read callback before accepting a group. Find's default captures retain
+immediate spill-write faults. Redirected grep stdout uses a 64 KiB block buffer
+over a duplicated descriptor (preserving shared stdout/stderr offsets); terminal
+stdout retains line buffering. NUL-terminated name modes also retain the
+original line buffer and its diagnostic ordering. Each other published group
+and names-only record is flushed before the next operand or diagnostic, and
+help/version and the final JSON summary also flush explicitly. A publication
+fault also drains its previously accepted prefix before reporting the error.
+Failed destinations are discarded without an implicit drop retry. Checked
+publication, the 64 KiB cancellation bound and output-fault classification
+remain unchanged.
 
 ## Freshness and operands
 

@@ -491,6 +491,7 @@ impl Worker<'_> {
                                     &mut previous,
                                 )?;
                             }
+                            output.flush()?;
                             return Ok(Observed::Ready(Group {
                                 result: cached.result,
                                 output,
@@ -868,6 +869,66 @@ impl<'a> Source<'a> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    // Isolate RLIMIT_FSIZE in a child: the final four spill bytes must fail
+    // inside the checked-read callback, even if the reader then reports an
+    // input fault. Otherwise a deferred output failure becomes a read error.
+    #[test]
+    fn late_spill_failure_remains_a_capture_fault() {
+        const MARKER: &str = "FERRET_TEST_LATE_SPILL";
+        if std::env::var_os(MARKER).is_none() {
+            const LAUNCH: &str = concat!(
+                "import os, resource, signal, sys; ",
+                "resource.setrlimit(resource.RLIMIT_FSIZE, (65536, 65536)); ",
+                "signal.signal(signal.SIGXFSZ, signal.SIG_IGN); ",
+                "os.execv(sys.argv[1], [sys.argv[1], '--exact', ",
+                "'grep::groups::tests::late_spill_failure_remains_a_capture_fault', '--nocapture'])",
+            );
+            let output = std::process::Command::new(
+                std::env::var_os("FERRET_PYTHON").expect("dev shell supplies Python"),
+            )
+            .args(["-c", LAUNCH])
+            .arg(std::env::current_exe().unwrap())
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let line_grep::Command::Search(plan) = line_grep::parse(&["red".into()]).unwrap() else {
+            panic!("search")
+        };
+        let render = Render {
+            plan: &plan,
+            prefix: None,
+            stopped: &|| false,
+        };
+        let mut bytes = b"red ".to_vec();
+        bytes.resize(CHUNK - 1, b'x');
+        bytes.extend_from_slice(b"\nred\n");
+        let error = observe(
+            &render,
+            &mut Vec::new(),
+            &mut |each| {
+                let _ = each(&mut &bytes[..], bytes.len() as u64);
+                ReadOutcome::Failed(ReadFault::Io(
+                    ReadOperation::Read,
+                    io::ErrorKind::PermissionDenied.into(),
+                ))
+            },
+            false,
+        )
+        .err()
+        .expect("spill fault takes precedence over the reader's fault");
+        assert!(
+            error.to_string().starts_with("write output spill "),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("File too large (os error 27)"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn vectored_plain_records_replay_exactly_before_and_after_spilling() {

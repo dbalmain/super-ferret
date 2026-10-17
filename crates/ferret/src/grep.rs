@@ -13,6 +13,7 @@ mod groups;
 mod json;
 mod live;
 mod names;
+mod output;
 mod presentation;
 mod sources;
 
@@ -203,7 +204,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             .presentation
             .filename
             .unwrap_or(recursive || inputs.len() > 1),
-        writer: stdout.lock(),
+        writer: output::Writer::new(&stdout, !nul_names(&plan)),
         buffer: Vec::new(),
         matched: false,
         emitted_group: false,
@@ -335,7 +336,9 @@ fn context_error(global_json: bool) -> Option<Exit> {
 }
 
 fn print(bytes: &[u8]) -> Exit {
-    match io::stdout().lock().write_all(bytes) {
+    let stdout = io::stdout();
+    let mut writer = output::Writer::new(&stdout, true);
+    match writer.write_all(bytes).and_then(|()| writer.flush()) {
         Ok(()) => Exit::Ok,
         Err(error) => failure(&format!("writing stdout: {error}")),
     }
@@ -432,6 +435,12 @@ struct Host<'a, W> {
     cancelled: Option<&'a AtomicBool>,
 }
 
+fn nul_names(plan: &Plan) -> bool {
+    plan.presentation.null
+        && matches!(plan.output, Output::Names | Output::WithoutMatch)
+        && !plan.json
+}
+
 impl<W: Write> Host<'_, W> {
     fn error(&mut self, path: &Path, error: &dyn std::fmt::Display) {
         cli::error(&format!("grep: {}: {error}", path.display()));
@@ -493,7 +502,20 @@ impl<W: Write> Host<'_, W> {
         }
     }
 
-    fn commit(
+    fn commit(&mut self, path: &Path, result: InputResult, output: OutputBuffer) -> io::Result<()> {
+        let published = self.publish(path, result, output);
+        // NUL names retain std's existing line buffering and diagnostic
+        // ordering, including a pending name when the next operand fails.
+        if nul_names(self.plan) {
+            return published;
+        }
+        // Surface even a short final group's write error before another
+        // operand, diagnostic, quiet return or stdin barrier can run.
+        self.writer.flush()?;
+        published
+    }
+
+    fn publish(
         &mut self,
         path: &Path,
         result: InputResult,
@@ -909,6 +931,92 @@ mod tests {
                 .kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    // A short group can fit entirely in the destination buffer. Its late
+    // failure must stop publication before a later input or diagnostic runs.
+    #[test]
+    fn final_group_flush_errors_stop_publication() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let line_grep::Command::Search(plan) = line_grep::parse(&["red".into()]).unwrap() else {
+            panic!("search")
+        };
+        let mut host = Host {
+            plan: &plan,
+            filename: false,
+            writer: io::BufWriter::new(Broken),
+            buffer: Vec::new(),
+            matched: false,
+            emitted_group: false,
+            json_stats: json::Stats::default(),
+            errors: false,
+            cancelled: None,
+        };
+        assert_eq!(
+            host.direct(Path::new("file"), &mut &b"red\n"[..], 4)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    // A later publication fault (including a spill read fault) must not
+    // discard an already accepted JSON begin event before its diagnostic.
+    #[test]
+    fn publication_faults_flush_the_previously_accepted_prefix() {
+        #[derive(Default)]
+        struct FailSecond {
+            pending: Vec<u8>,
+            published: Vec<u8>,
+            calls: usize,
+        }
+        impl Write for FailSecond {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls > 1 {
+                    return Err(io::Error::other("late output fault"));
+                }
+                self.pending.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.published.append(&mut self.pending);
+                Ok(())
+            }
+        }
+        let line_grep::Command::Search(plan) =
+            line_grep::parse(&["--json".into(), "red".into()]).unwrap()
+        else {
+            panic!("search")
+        };
+        let mut host = Host {
+            plan: &plan,
+            filename: false,
+            writer: FailSecond::default(),
+            buffer: Vec::new(),
+            matched: false,
+            emitted_group: false,
+            json_stats: json::Stats::default(),
+            errors: false,
+            cancelled: None,
+        };
+        let error = host
+            .direct(Path::new("file"), &mut &b"red\n"[..], 4)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "late output fault");
+        assert_eq!(
+            host.writer.published,
+            b"{\"type\":\"begin\",\"data\":{\"path\":{\"text\":\"file\"}}}\n"
+        );
+        assert!(host.writer.pending.is_empty());
     }
 
     #[test]

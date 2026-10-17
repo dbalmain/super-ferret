@@ -8,7 +8,9 @@ use super::*;
 
 pub(super) fn run(plan: &Names, index: Option<&Path>) -> Exit {
     let cancelled = AtomicBool::new(false);
-    match execute(plan, index, &mut io::stdout().lock(), &cancelled) {
+    let stdout = io::stdout();
+    let mut writer = output::Writer::new(&stdout, !plan.presentation.null);
+    match execute(plan, index, &mut writer, &cancelled) {
         Ok(exit) => exit,
         Err(error) => failure(&error),
     }
@@ -104,6 +106,13 @@ fn execute(
             label(path, plan.paths.is_empty()),
         )
         .and_then(|()| writer.write_all(if plan.presentation.null { b"\0" } else { b"\n" }))
+        .and_then(|()| {
+            if plan.presentation.null {
+                Ok(())
+            } else {
+                writer.flush()
+            }
+        })
         .map_err(|error| {
             cancelled.store(true, Ordering::Release);
             format!("writing stdout: {error}")

@@ -34,9 +34,9 @@ struct Spill {
 impl Spill {
     fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
         #[cfg(test)]
-        if let Some(result) = spill_tests::WRITE.with_borrow_mut(|hook| {
-            hook.as_mut().map(|hook| hook(&mut self.file, bytes))
-        }) {
+        if let Some(result) = spill_tests::WRITE
+            .with_borrow_mut(|hook| hook.as_mut().map(|hook| hook(&mut self.file, bytes)))
+        {
             return result;
         }
         self.file.write_vectored(bytes)
@@ -73,16 +73,14 @@ impl Write for OutputBuffer {
                 }
             }
         }
-        if self.file.is_some() {
-            if self.buffered_spill {
-                if bytes.len() > MEMORY_LIMIT - self.bytes.len() {
-                    self.flush()?;
-                }
-                if bytes.len() < MEMORY_LIMIT {
-                    self.bytes.extend_from_slice(bytes);
-                    self.len += bytes.len() as u64;
-                    return Ok(bytes.len());
-                }
+        if self.file.is_some() && self.buffered_spill {
+            if bytes.len() > MEMORY_LIMIT - self.bytes.len() {
+                self.flush()?;
+            }
+            if bytes.len() < MEMORY_LIMIT {
+                self.bytes.extend_from_slice(bytes);
+                self.len += bytes.len() as u64;
+                return Ok(bytes.len());
             }
         }
         if let Some(spill) = &mut self.file {
@@ -97,7 +95,9 @@ impl Write for OutputBuffer {
         Ok(bytes.len())
     }
     fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
-        if !self.buffered_spill && let Some(spill) = &mut self.file {
+        if !self.buffered_spill
+            && let Some(spill) = &mut self.file
+        {
             let written = spill_progress(spill.write_vectored(bytes), bytes, &spill.path)?;
             self.len += written as u64;
             Ok(written)
@@ -547,6 +547,88 @@ mod spill_tests {
     type SpillWrite = dyn FnMut(&mut File, &[IoSlice<'_>]) -> io::Result<usize>;
     thread_local! {
         pub(super) static WRITE: RefCell<Option<Box<SpillWrite>>> = RefCell::new(None);
+    }
+
+    // Deferred faults must still name the spill, and must precede publication.
+    #[test]
+    fn buffered_spill_faults_never_publish_a_prefix() {
+        for zero in [false, true] {
+            let mut output = OutputBuffer::default().with_buffered_spill();
+            output.write_all(&vec![b'x'; MEMORY_LIMIT]).unwrap();
+            output.write_all(b"tail").unwrap();
+            let spill = output.file.as_mut().unwrap();
+            let path = spill.path.clone();
+            if zero {
+                let mut returned_zero = false;
+                WRITE.with_borrow_mut(|hook| {
+                    *hook = Some(Box::new(move |_, _| {
+                        if returned_zero {
+                            return Err(io::Error::other("retried zero progress"));
+                        }
+                        returned_zero = true;
+                        Ok(0)
+                    }))
+                });
+            } else {
+                spill.file = OpenOptions::new().write(true).open("/dev/full").unwrap();
+            }
+            let mut published = Vec::new();
+            let error = output.write_to(&mut published).unwrap_err();
+            WRITE.with_borrow_mut(|hook| *hook = None);
+            assert!(published.is_empty());
+            assert_eq!(error_path(&error), Some(path.as_path()));
+            if zero {
+                assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "write output spill {}: failed to write whole buffer",
+                        path.display()
+                    )
+                );
+            } else {
+                assert_eq!(error.raw_os_error(), None);
+                assert!(error.to_string().starts_with(&format!(
+                    "write output spill {}: No space left on device",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    // A short write followed by EINTR must neither repeat nor lose bytes.
+    #[test]
+    fn buffered_spill_partial_writes_and_ranges_keep_exact_bytes() {
+        let mut output = OutputBuffer::default().with_buffered_spill();
+        let mut expected = vec![b'x'; MEMORY_LIMIT];
+        expected.extend_from_slice(b"first tail");
+        output.write_all(&expected).unwrap();
+        let mut calls = 0;
+        WRITE.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move |file, parts| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                file.write(&parts[0][..parts[0].len().min(3)])
+            }))
+        });
+        output.flush().unwrap();
+        WRITE.with_borrow_mut(|hook| *hook = None);
+        output.write_all(b"second tail").unwrap();
+        expected.extend_from_slice(b"second tail");
+        let mut range = Vec::new();
+        output
+            .read_range((MEMORY_LIMIT - 2) as u64, 23, &mut range, &|| false)
+            .unwrap();
+        assert_eq!(range, expected[MEMORY_LIMIT - 2..]);
+        output.truncate((MEMORY_LIMIT + 2) as u64).unwrap();
+        expected.truncate(MEMORY_LIMIT + 2);
+        output.write_all(b"replacement").unwrap();
+        expected.extend_from_slice(b"replacement");
+        let mut actual = Vec::new();
+        output.write_to(&mut actual).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

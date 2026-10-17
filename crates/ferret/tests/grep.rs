@@ -1708,6 +1708,94 @@ fn m5_before_context_spill_failure_stops_the_command() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("output spill"));
 }
 
+// Buffering stdout must not move a completed group past the next operand's
+// diagnostic when both descriptors share one open file description.
+#[test]
+fn buffered_stdout_precedes_the_next_read_diagnostic() {
+    let fixture = Fixture::new("buffered-diagnostic-order");
+    fixture.write("denied", b"red denied\n");
+    fs::set_permissions(
+        fixture.tree().join("denied"),
+        fs::Permissions::from_mode(0o0),
+    )
+    .unwrap();
+    let path = fixture.base.join("combined");
+    let combined = fs::File::create(&path).unwrap();
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .args(["grep", "red", "one.rs", "denied"])
+        .env("FERRET_SEARCH_THREADS", "1")
+        .stdout(combined.try_clone().unwrap())
+        .stderr(combined);
+    let status = command.status().unwrap();
+    assert_eq!(status.code(), Some(2));
+    let combined = fs::read(path).unwrap();
+    assert_eq!(combined, b"one.rs:red lantern\none.rs:red red\nferret: grep: denied: Open: Permission denied (os error 13)\n");
+
+    // NUL names have no terminating LF. Preserve the baseline's pending
+    // line-buffer tail after the later diagnostic, rather than reordering it.
+    let path = fixture.base.join("combined-nul");
+    let combined = fs::File::create(&path).unwrap();
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .args(["grep", "-l0", "red", "one.rs", "denied"])
+        .env("FERRET_SEARCH_THREADS", "1")
+        .stdout(combined.try_clone().unwrap())
+        .stderr(combined);
+    assert_eq!(command.status().unwrap().code(), Some(2));
+    assert_eq!(
+        fs::read(path).unwrap(),
+        b"ferret: grep: denied: Open: Permission denied (os error 13)\none.rs\0"
+    );
+}
+
+// Exercise the CLI destination after the consumer has accepted some output,
+// rather than only an injected writer that fails on its first call.
+#[test]
+fn buffered_stdout_broken_pipe_mid_group_and_late_full_disk() {
+    use std::io::Read;
+
+    let fixture = Fixture::new("buffered-stdout-faults");
+    fixture.write("large", &b"red line\n".repeat(100_000));
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command.args(["grep", "red", "large"]);
+    let mut child = command.spawn().unwrap();
+    let mut pipe = child.stdout.take().unwrap();
+    let mut prefix = [0; 32 << 10];
+    pipe.read_exact(&mut prefix).unwrap();
+    assert!(prefix.starts_with(b"red line\n"));
+    drop(pipe);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        output.stderr,
+        b"ferret: grep: writing stdout: Broken pipe (os error 32)\n"
+    );
+
+    // This complete output fits in a block: the failure occurs on its final
+    // flush, including the help/names branches outside file publication.
+    for args in [
+        vec!["grep", "red", "one.rs"],
+        vec!["grep", "--files", "one.rs"],
+        vec!["grep", "--help"],
+        vec!["grep", "--version"],
+    ] {
+        let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+        command.args(args).stdout(
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        );
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            output.stderr,
+            b"ferret: grep: writing stdout: No space left on device (os error 28)\n"
+        );
+    }
+}
+
 // M5: these comparisons attach each child to a real pty. The helper captures
 // its terminal bytes (including the tty's LF-to-CRLF processing) unchanged.
 #[derive(Debug)]
