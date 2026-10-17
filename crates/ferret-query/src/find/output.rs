@@ -2,7 +2,7 @@
 //! to an unlinked file. Commit and quit share a lock across all worker tasks.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -70,6 +70,23 @@ impl Write for OutputBuffer {
         }
         self.len += bytes.len() as u64;
         Ok(bytes.len())
+    }
+    fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
+        if let Some(spill) = &mut self.file {
+            let written = spill
+                .file
+                .write_vectored(bytes)
+                .map_err(|error| spill_error("write", &spill.path, error))?;
+            self.len += written as u64;
+            Ok(written)
+        } else {
+            self.write(
+                bytes
+                    .iter()
+                    .find(|part| !part.is_empty())
+                    .map_or(&[], |part| &**part),
+            )
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())

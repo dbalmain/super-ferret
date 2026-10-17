@@ -5,7 +5,7 @@
 use super::*;
 use ferret_query::{ReadOperation, ReadVersion};
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, IoSlice};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -130,6 +130,27 @@ impl Render<'_> {
         } else {
             b":"
         };
+        if !self.plan.presentation.color.enabled() && !self.plan.line_number {
+            let prefix = self
+                .prefix
+                .filter(|_| self.plan.presentation.heading != Some(true));
+            let separator = prefix.map_or(b"".as_slice(), |_| {
+                if self.plan.presentation.null {
+                    b"\0"
+                } else {
+                    delimiter
+                }
+            });
+            return write_parts(
+                &mut output,
+                &mut [
+                    IoSlice::new(prefix.unwrap_or_default()),
+                    IoSlice::new(separator),
+                    IoSlice::new(line.bytes),
+                    IoSlice::new(b"\n"),
+                ],
+            );
+        }
         if self.plan.presentation.heading != Some(true)
             && let Some(prefix) = self.prefix
         {
@@ -303,9 +324,49 @@ impl<W: Write + ?Sized> Write for Cancellable<'_, W> {
         }
         self.inner.write(&bytes[..bytes.len().min(CHUNK)])
     }
+    fn write_vectored(&mut self, bytes: &[IoSlice<'_>]) -> io::Result<usize> {
+        if (self.stopped)() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "grep cancelled",
+            ));
+        }
+        // Cap both bytes and stack space. Partial vector writes preserve the
+        // same between-chunk cancellation bound as ordinary writes.
+        let mut parts = [IoSlice::new(&[]); 4];
+        let mut left = CHUNK;
+        let mut used = 0;
+        for part in bytes
+            .iter()
+            .filter(|part| !part.is_empty())
+            .take(parts.len())
+        {
+            let count = part.len().min(left);
+            parts[used] = IoSlice::new(&part[..count]);
+            used += 1;
+            left -= count;
+            if left == 0 {
+                break;
+            }
+        }
+        self.inner.write_vectored(&parts[..used])
+    }
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
+}
+
+fn write_parts(mut output: impl Write, mut parts: &mut [IoSlice<'_>]) -> io::Result<()> {
+    IoSlice::advance_slices(&mut parts, 0);
+    while !parts.is_empty() {
+        match output.write_vectored(parts) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => IoSlice::advance_slices(&mut parts, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn emit(
@@ -798,6 +859,85 @@ impl<'a> Source<'a> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn vectored_plain_records_replay_exactly_before_and_after_spilling() {
+        for size in [0, 11, ENTRY_BYTES * 3 + 7] {
+            let bytes = vec![b'x'; size];
+            let mut output = OutputBuffer::default();
+            for _ in 0..3 {
+                let mut writer = Cancellable {
+                    inner: &mut output,
+                    stopped: &|| false,
+                };
+                write_parts(
+                    &mut writer,
+                    &mut [
+                        IoSlice::new(b"path"),
+                        IoSlice::new(b":"),
+                        IoSlice::new(&bytes),
+                        IoSlice::new(b"\n"),
+                    ],
+                )
+                .unwrap();
+            }
+            let mut replay = Vec::new();
+            output.write_to(&mut replay).unwrap();
+            assert_eq!(
+                replay,
+                [b"path:".as_slice(), &bytes, b"\n"].concat().repeat(3)
+            );
+            assert_eq!(output.len(), replay.len() as u64);
+        }
+    }
+
+    #[test]
+    fn vectored_records_handle_partial_interrupted_zero_and_cancelled_writes() {
+        struct Short {
+            bytes: Vec<u8>,
+            interrupt: bool,
+            limit: usize,
+        }
+        impl Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let count = bytes.len().min(self.limit);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut short = Short {
+            bytes: Vec::new(),
+            interrupt: true,
+            limit: 2,
+        };
+        write_parts(
+            &mut short,
+            &mut [
+                IoSlice::new(b""),
+                IoSlice::new(b"abc"),
+                IoSlice::new(b"def"),
+                IoSlice::new(b"\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(short.bytes, b"abcdef\n");
+        short.limit = 0;
+        let error = write_parts(&mut short, &mut [IoSlice::new(b"x")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        let mut writer = Cancellable {
+            inner: &mut short,
+            stopped: &|| true,
+        };
+        let error = write_parts(&mut writer, &mut [IoSlice::new(b"x")]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(short.bytes, b"abcdef\n");
+    }
 
     fn plan(args: &[&str]) -> Plan {
         let line_grep::Command::Search(plan) =

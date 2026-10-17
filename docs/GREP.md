@@ -168,6 +168,16 @@ anchors, CRLF assertions and LF-admitting classes/dotall retain per-line search.
 source offsets, binary detection and searched-byte counts remain unchanged.
 Multiline, inversion and context keep their existing scanners.
 
+**Matcher/output update (2026-10-18):** grep borrows the compiled regex's cache
+pool across inputs; content-search workers retain their owned search copies.
+Line selection can narrow required-run searches to consuming-byte windows while
+preserving the original left haystack and four bytes of right context for
+LF/Unicode word assertions. An occurrence ending beyond the consuming window
+cannot select it. Actual spans, captures, replacement and JSON still use their
+original source-line bounds. Uncoloured, unnumbered plain records combine path,
+separator, data and LF with vectored spill writes; checked publication, the
+64 KiB cancellation bound and output-fault classification remain unchanged.
+
 ## Freshness and operands
 
 **D73 A (confirmed 2026-10-16): indexed mode is not exact over the current tree.** Names,

@@ -363,6 +363,10 @@ impl Grep {
 /// ([`Grep::is_line_local`]). The run is cut from the parsed pattern itself,
 /// after case folding, so it accepts every case variant the pattern does
 /// (`k` and the Kelvin sign, `s` and the long s).
+///
+/// Line selection additionally uses consuming-byte windows with original left
+/// context and four right-context bytes. Its end-position bound prevents added
+/// context, including an artificial EOF, from supplying a selected match.
 #[derive(Clone, Debug)]
 pub struct Search<'a> {
     regex: Cow<'a, Regex>,
@@ -373,9 +377,26 @@ pub struct Search<'a> {
 #[derive(Clone, Debug)]
 struct Filter {
     run: Regex,
-    /// The bytes a match can be made of, by byte value; `None` for a
-    /// pattern with assertions, whose window is the line.
-    within: Option<Box<[bool; 256]>>,
+    /// Every byte a consuming node can admit. Full-span searches keep a
+    /// whole line when assertions are present; line selection adds context
+    /// around this narrower window instead.
+    within: Box<[bool; 256]>,
+    assertions: bool,
+}
+
+impl Filter {
+    fn window(&self, text: &[u8], at: usize, hit: std::ops::Range<usize>) -> (usize, usize) {
+        (
+            text[at..hit.start]
+                .iter()
+                .rposition(|&b| !self.within[usize::from(b)])
+                .map_or(at, |i| at + i + 1),
+            text[hit.end..]
+                .iter()
+                .position(|&b| !self.within[usize::from(b)])
+                .map_or(text.len(), |i| hit.end + i),
+        )
+    }
 }
 
 impl Search<'_> {
@@ -387,27 +408,49 @@ impl Search<'_> {
         let mut at = 0;
         while at <= text.len() {
             let hit = filter.run.find(&text[at..])?;
-            let (hit, hit_end) = (at + hit.start, at + hit.end);
-            let (start, end) = match &filter.within {
-                None => (
-                    memchr::memrchr(b'\n', &text[at..hit]).map_or(at, |i| at + i + 1),
-                    memchr::memchr(b'\n', &text[hit_end..]).map_or(text.len(), |i| hit_end + i),
-                ),
-                Some(within) => (
-                    text[at..hit]
-                        .iter()
-                        .rposition(|&b| !within[usize::from(b)])
-                        .map_or(at, |i| at + i + 1),
-                    text[hit_end..]
-                        .iter()
-                        .position(|&b| !within[usize::from(b)])
-                        .map_or(text.len(), |i| hit_end + i),
-                ),
+            let hit = at + hit.start..at + hit.end;
+            let (start, end) = if filter.assertions {
+                (
+                    memchr::memrchr(b'\n', &text[at..hit.start]).map_or(at, |i| at + i + 1),
+                    memchr::memchr(b'\n', &text[hit.end..]).map_or(text.len(), |i| hit.end + i),
+                )
+            } else {
+                filter.window(text, at, hit)
             };
             if let Some(span) = self.regex.find(&text[start..end]) {
                 return Some(start + span.start);
             }
             // `text[end]` is outside every window.
+            at = end + 1;
+        }
+        None
+    }
+
+    /// A position on the first matching line, possibly at its LF or end.
+    /// Requires [`Grep::is_line_local`]. Consuming-byte windows keep original
+    /// left context and four right-context bytes for LF/Unicode word
+    /// assertions. An occurrence ending in that added context cannot select
+    /// the window. Rendering and counts still search the complete original
+    /// line.
+    pub fn matching_line(&self, text: &[u8]) -> Option<usize> {
+        let Some(filter) = &self.filter else {
+            return self.regex.shortest_match(text);
+        };
+        let mut at = 0;
+        while at <= text.len() {
+            let hit = filter.run.find(&text[at..])?;
+            let (start, end) = filter.window(text, at, at + hit.start..at + hit.end);
+            // The supported assertions inspect at most one UTF-8 scalar on
+            // either side. Keep the left haystack intact and include enough
+            // right context even when a scalar is invalid or four bytes wide.
+            let context = end.saturating_add(4).min(text.len());
+            if self
+                .regex
+                .shortest_match_at(&text[..context], start)
+                .is_some_and(|found| found <= end)
+            {
+                return Some(start);
+            }
             at = end + 1;
         }
         None
@@ -450,11 +493,13 @@ fn filter(hir: &Hir) -> Option<Filter> {
     // case folded, so it compiles with the builder's defaults.
     let run = Regex::build(&regex::bytes::RegexBuilder::new(&run.to_string())).ok()?;
     let mut within = Box::new([false; 256]);
-    let within = match_bytes(hir, &mut within).then(|| {
-        within[usize::from(b'\n')] = false;
-        within
-    });
-    Some(Filter { run, within })
+    let assertions = !match_bytes(hir, &mut within);
+    within[usize::from(b'\n')] = false;
+    Some(Filter {
+        run,
+        within,
+        assertions,
+    })
 }
 
 /// Marks in `within` every byte a match of `hir` can contain; false when
@@ -496,7 +541,15 @@ fn match_bytes(hir: &Hir, within: &mut [bool; 256]) -> bool {
         HirKind::Repetition(repetition) => match_bytes(&repetition.sub, within),
         HirKind::Capture(capture) => match_bytes(&capture.sub, within),
         HirKind::Concat(hirs) | HirKind::Alternation(hirs) => {
-            hirs.iter().all(|hir| match_bytes(hir, within))
+            // Assertions require context, but every consuming node still
+            // contributes to the selection window's byte set.
+            let mut plain = true;
+            for hir in hirs {
+                if !match_bytes(hir, within) {
+                    plain = false;
+                }
+            }
+            plain
         }
     }
 }

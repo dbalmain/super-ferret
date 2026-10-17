@@ -45,6 +45,17 @@ impl Regex {
         self.0.find(bytes).map(|m| m.range())
     }
 
+    /// An earliest match end, allowing the engine to stop without finding
+    /// the full leftmost span or running a reverse search for its start.
+    pub(crate) fn shortest_match(&self, bytes: &[u8]) -> Option<usize> {
+        self.shortest_match_at(bytes, 0)
+    }
+
+    /// Earliest end from `at`, retaining the original left assertion context.
+    pub(crate) fn shortest_match_at(&self, bytes: &[u8], at: usize) -> Option<usize> {
+        self.0.shortest_match_at(bytes, at)
+    }
+
     /// Nonoverlapping byte spans, retaining the complete haystack for
     /// assertions. Empty spans advance one byte, including inside UTF-8; an
     /// empty span at the previous consuming match's end is suppressed.

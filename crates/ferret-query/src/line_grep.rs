@@ -881,7 +881,7 @@ fn scan_records(
                     if remaining.is_empty() && !terminated && binary.is_none() {
                         break;
                     }
-                    let Some(hit) = search.find(remaining) else {
+                    let Some(hit) = search.matching_line(remaining) else {
                         // InputResult exposes bytes searched even without JSON.
                         // A later run's callbacks also observe skipped line
                         // numbers.
@@ -1133,6 +1133,9 @@ mod tests {
             b"\0red\n",
             b"\n\0",
             b"sing\nwalking\nred\nsinging\n",
+            b"a b z\nb\nred gap red\n",
+            b"\x90\x80\x81\xf0\x90\x80\x81X\n",
+            "singing界no\nwalking\nx singing𐀀 end\nsinging🙂\n".as_bytes(),
             b"gap\n",
             b"gap",
             b"",
@@ -1157,6 +1160,11 @@ mod tests {
             r"\b{end-half}",
             r"\w+ing\b",
             "red|$",
+            "red.*red|gap",
+            "a.*z|b",
+            r"a*(?-u:\x90\x80\x81)$",
+            r"(?-u:[\x00-\x09\x0B-\xEF]*\x90\x80\x81)$",
+            r"[a-z]+ing\b",
             "red?",
             "red*",
             "(?i:red)",

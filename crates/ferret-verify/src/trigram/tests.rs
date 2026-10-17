@@ -794,6 +794,15 @@ fn check_search(grep: &super::Grep, search: &super::Search<'_>, text: &[u8], tal
         "{:?} over {text:?}",
         grep.pattern()
     );
+    if grep.is_line_local() {
+        let line = |at: usize| memchr::memchr_iter(b'\n', &text[..at]).count();
+        assert_eq!(
+            search.matching_line(text).map(line),
+            expected.map(line),
+            "line selection {:?} over {text:?}",
+            grep.pattern()
+        );
+    }
     if search.filters() {
         tally.filtered_matched += u32::from(expected.is_some());
         tally.filtered_windowed += u32::from(expected.is_none() && search.run_occurs(text));
@@ -1103,19 +1112,91 @@ fn the_search_finds_the_patterns_first_match_in_random_text() {
 }
 
 // Borrowed caches survive separate inputs without retaining their bytes or
-// changing assertion/span context, including invalid UTF-8 and terminal empties.
+// changing assertion/span context, including invalid UTF-8 and terminal
+// empties.
 #[test]
 fn borrowed_and_owned_searches_agree_across_reused_inputs() {
-    let flags = GrepFlags { case_insensitive: false };
-    for pattern in [r"\w+ing\b", r"[a-z]+ing", r"^red$", r"\A|\z", "", r"\s", r"(?-u:\xFF)"] {
+    let flags = GrepFlags {
+        case_insensitive: false,
+    };
+    for pattern in [
+        r"\w+ing\b",
+        r"[a-z]+ing",
+        r"^red$",
+        r"\A|\z",
+        "",
+        r"\s",
+        r"(?-u:\xFF)",
+    ] {
         let grep = flags.compile_lines(pattern).unwrap();
         let owned = grep.search();
         let borrowed = grep.borrowed_search();
         for _ in 0..3 {
-            for bytes in [b"singing red\n".as_slice(), "é singing\n".as_bytes(), b"\xffred\n", b"red", b"\n", b""] {
-                assert_eq!(borrowed.find(bytes), owned.find(bytes), "{pattern}: {bytes:?}");
-                assert_eq!(borrowed.spans(bytes).collect::<Vec<_>>(), owned.spans(bytes).collect::<Vec<_>>());
+            for bytes in [
+                b"singing red\n".as_slice(),
+                "é singing\n".as_bytes(),
+                b"\xffred\n",
+                b"red",
+                b"\n",
+                b"",
+            ] {
+                assert_eq!(
+                    borrowed.find(bytes),
+                    owned.find(bytes),
+                    "{pattern}: {bytes:?}"
+                );
+                assert_eq!(
+                    borrowed.spans(bytes).collect::<Vec<_>>(),
+                    owned.spans(bytes).collect::<Vec<_>>()
+                );
             }
+        }
+    }
+}
+
+// Selection needs the first matching source line even when an earliest end
+// belongs to a different alternative than the full leftmost-first span.
+#[test]
+fn earliest_end_and_full_span_select_the_same_source_line() {
+    let flags = GrepFlags {
+        case_insensitive: false,
+    };
+    for pattern in [
+        r"a.*z|b",
+        r"red.*red|gap",
+        r"^|$",
+        r"\b",
+        r"\B",
+        r"\w+ing\b",
+        r"[a-z]+ing",
+        r"a*(?-u:\x90\x80\x81)$",
+        r"(?-u:[\x00-\x09\x0B-\xEF]*\x90\x80\x81)$",
+        r"[a-z]+ing\b",
+        "",
+        r"a*?",
+        r"(?-u:\xFF)",
+    ] {
+        let grep = flags.compile_lines(pattern).unwrap();
+        let search = grep.borrowed_search();
+        for text in [
+            b"a b z\nb\n".as_slice(),
+            b"gap\nred red\n",
+            "é walking\nmissing\n".as_bytes(),
+            b"\xff\nred\r\n\n",
+            b"",
+            b"\n",
+            b"red",
+            b"\x90\x80\x81\xf0\x90\x80\x81X",
+            "singing界no\nwalking\n".as_bytes(),
+            "x singing𐀀 end\n".as_bytes(),
+            "singing🙂\nred\n".as_bytes(),
+        ] {
+            let line = |at: usize| memchr::memchr_iter(b'\n', &text[..at]).count();
+            assert_eq!(
+                search.matching_line(text).map(line),
+                search.find(text).map(line),
+                "{pattern}: {text:?}"
+            );
         }
     }
 }

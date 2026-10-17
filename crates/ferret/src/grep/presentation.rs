@@ -71,7 +71,11 @@ pub(super) fn text(plan: &Plan, writer: &mut impl Write, line: Line<'_>) -> io::
     if let Some(spans) = line.highlights {
         highlighted(writer, line.bytes, spans.iter().cloned())
     } else {
-        highlighted(writer, line.bytes, plan.grep.borrowed_search().spans(line.bytes))
+        highlighted(
+            writer,
+            line.bytes,
+            plan.grep.borrowed_search().spans(line.bytes),
+        )
     }
 }
 
