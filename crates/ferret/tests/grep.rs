@@ -309,7 +309,7 @@ fn unsupported_tiers_refuse_before_output() {
         "--no-files",
         "-P",
         "--heading-off",
-        "-r",
+        "--no-replace",
         "--json",
         "-j2",
         "--no-quiet",
@@ -3155,4 +3155,151 @@ fn m7_r2_first_terminal_tail_hits_keep_match_formatting_after_the_limit() {
     assert_eq!(actual.status.code(), Some(0));
     assert_eq!(actual.stdout, b"1\n");
     assert!(actual.stderr.is_empty() && oracle.stderr.is_empty());
+}
+
+// M8: references are resolved from the original captures, before -o detaches
+// spans or colour sees the resulting bytes. These are owned binary probes.
+profile_cases! {
+    m8_numbered: 0 => ["-r", "$2/$1/$0", "(red) (lantern)", "one.rs"];
+    m8_named: 0 => ["--replace", "${lamp}:$tone", "(?P<tone>red) (?<lamp>lantern)", "one.rs"];
+    m8_name_boundary: 0 => ["-or", "$toneX/${tone}X", "(?P<tone>red)", "one.rs"];
+    m8_number_boundary: 0 => ["-or", "$1X/${1}X", "(red)", "one.rs"];
+    m8_dollar: 0 => ["-or", "$$:$0:$$$1:$", "(red)", "one.rs"];
+    m8_missing_capture: 0 => ["-or", "$99/${missing}", "(red)", "one.rs"];
+    m8_nonparticipating: 0 => ["-or", "<$1:$2>", "(red)|(BLUE)", "one.rs"];
+    m8_empty_group: 0 => ["-or", "<$1>", "()red", "one.rs"];
+    m8_empty_matches: 0 => ["-or", "<$0>", "", "last"];
+    m8_empty_replacement: 0 => ["-or", "", "red", "one.rs"];
+    m8_malformed_braces_literal: 0 => ["-or", "${}/${tone!}/${tone", "(?P<tone>red)", "one.rs"];
+    m8_leading_zero_reference: 0 => ["-or", "${01}:$00", "(red)", "one.rs"];
+    m8_unknown_overflow_reference: 0 => ["-or", "$999999999999999999999999", "red", "one.rs"];
+    m8_unicode_capture_reference_literal: 0 => ["-or", "$é:${é}:${1}", "(?P<é>red)", "one.rs"];
+    m8_backslash_literal: 0 => ["-r", "\\n", "red", "one.rs"];
+    m8_repeated_last_wins: 0 => ["-rOLD", "--replace=NEW", "red", "one.rs"];
+    m8_cluster_attached: 0 => ["-nor<$1>", "(red)", "one.rs"];
+    m8_fixed_capture_zero: 0 => ["-For", "<$0:$1>", "red", "one.rs"];
+    m8_fold_capture_original: 0 => ["-ior", "$1", "(blue)", "one.rs"];
+    m8_word_capture: 0 => ["-wor", "$1", "(red)", "one.rs"];
+    m8_repeated_patterns: 0 => ["-or", "$1:$2", "-e", "(red)", "-e", "(BLUE)", "one.rs"];
+    m8_no_match: 1 => ["-r", "X", "violet", "one.rs"];
+    m8_empty_input: 1 => ["-r", "X", "", "empty"];
+    m8_count: 0 => ["-cr", "X", "red", "one.rs"];
+    m8_span_count: 0 => ["-cor", "X", "red", "one.rs"];
+    m8_count_matches: 0 => ["--count-matches", "-rX", "red", "one.rs"];
+    m8_inverted_count: 0 => ["-vcr", "X", "red", "one.rs"];
+    m8_names: 0 => ["-lr", "X", "red", "one.rs"];
+    m8_without_match: 0 => ["--files-without-match", "-rX", "violet", "one.rs"];
+    m8_quiet: 0 => ["-qr", "X", "red", "one.rs"];
+    m8_files_ignores_replacement: 0 => ["--files", "-r$0", "one.rs"];
+    m8_missing_value: 2 => ["red", "one.rs", "-r"];
+    m8_missing_long_value: 2 => ["red", "one.rs", "--replace"];
+    m8_replacement_does_not_supply_pattern: 2 => ["-rX"];
+    m8_no_replace_negation: 2 => ["--no-replace", "red", "one.rs"];
+    m8_invalid_pattern: 2 => ["-rX", "[", "one.rs"];
+    m8_crlf: 0 => ["-nr", "<$1>", "(red)", "crlf"];
+    m8_bom: 0 => ["-r", "<$1>", "^(red)", "bom"];
+    m8_invalid_capture: 0 => ["-or", "<$1>", "(?-u:(\\xFF))", "invalid"];
+    m8_context_invert: 0 => ["-vnC1", "-r<$0>", "red", "one.rs"];
+    m8_context_invert_only: 0 => ["-vonC1", "-r<$0>", "red", "one.rs"];
+    m8_context_limit: 0 => ["-nm1", "-A2", "-r<$0>", "red", "one.rs"];
+    m8_colour: 0 => ["--color=always", "-r<$0>", "red", "one.rs"];
+    m8_colour_only: 0 => ["--color=always", "-or<$0>", "red", "one.rs"];
+    m8_colour_empty: 0 => ["--color=always", "-or<$0>", "", "last"];
+    m8_colour_delete: 0 => ["--color=always", "-r", "", "red", "one.rs"];
+}
+
+#[test]
+fn m8_invalid_utf8_replacement_arguments_are_errors() {
+    let fixture = Fixture::new("m8-invalid-replacement");
+    for args in [
+        vec![OsStr::new("-r"), OsStr::from_bytes(b"\xff$0")],
+        vec![OsStr::from_bytes(b"--replace=\xff$0")],
+        vec![OsStr::from_bytes(b"-or\xff$0")],
+    ] {
+        for mode in [None, Some("--files"), Some("-q")] {
+            let mut actual = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+            actual.arg("grep");
+            let mut oracle = fixture.command(&std::env::var_os("FERRET_RG").unwrap());
+            for command in [&mut actual, &mut oracle] {
+                command.args(&args).args(["red", "one.rs"]);
+                if let Some(mode) = mode {
+                    command.arg(mode);
+                }
+            }
+            for output in [actual.output().unwrap(), oracle.output().unwrap()] {
+                assert_eq!(output.status.code(), Some(2), "{output:?}");
+                assert!(output.stdout.is_empty() && !output.stderr.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn m8_every_input_file_keeps_its_content_hash() {
+    use std::hash::{DefaultHasher, Hasher};
+    fn hashes(root: &Path) -> Vec<(PathBuf, u64)> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() && !path.is_symlink() {
+                found.extend(hashes(&path));
+            } else if path.is_file() {
+                let mut hasher = DefaultHasher::new();
+                hasher.write(&fs::read(&path).unwrap());
+                found.push((path, hasher.finish()));
+            }
+        }
+        found.sort();
+        found
+    }
+    let fixture = Fixture::new("m8-unchanged-inputs");
+    let before = hashes(&fixture.tree());
+    for flags in [vec![], vec!["-o"], vec!["-U"], vec!["-UC2"], vec!["-vC2"]] {
+        let mut args = vec!["grep", "-r", "${1}NEW\n$$"];
+        args.extend(flags);
+        args.extend(["(red)", "."]);
+        let output = fixture.ferret(&args, None);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(hashes(&fixture.tree()), before);
+    }
+}
+
+profile_cases! {
+    m8_multiline_cross_capture: 0 => ["-Un", "-r<$2/$1>", "(red lantern)\n(BLUE)", "one.rs"];
+    m8_multiline_only_cross_capture: 0 => ["-Uno", "-r<$2/$1>", "(red lantern)\n(BLUE)", "one.rs"];
+    m8_multiline_capture_lf: 0 => ["-Un", "-r<$0>", "red lantern\nBLUE", "one.rs"];
+    m8_multiline_colour: 0 => ["-Un", "--color=always", "-r<$0>", "red lantern\nBLUE", "one.rs"];
+    m8_multiline_only_colour: 0 => ["-Uno", "--color=always", "-r<$0>", "red lantern\nBLUE", "one.rs"];
+    m8_multiline_delete: 0 => ["-Un", "-r", "", "red lantern\nBLUE", "one.rs"];
+    m8_multiline_only_delete: 0 => ["-Uno", "-r", "", "red lantern\nBLUE", "one.rs"];
+    m8_multiline_delete_terminator: 0 => ["-Un", "-r", "", "red lantern\nBLUE\n", "one.rs"];
+    m8_multiline_count: 0 => ["-UcrX", "red lantern\nBLUE", "one.rs"];
+    m8_multiline_lf_excluded: 0 => ["-UnrX", "red", "one.rs"];
+    m8_multiline_empty: 0 => ["-UnorX", "(?s:.*?)", "one.rs"];
+    m8_multiline_empty_delete: 0 => ["-Unor", "", "(?s:.*?)", "one.rs"];
+    m8_multiline_empty_lf_excluded: 0 => ["-UnorX", "", "one.rs"];
+    m8_multiline_absolute: 0 => ["-UnrX", "\\A", "one.rs"];
+    m8_multiline_absolute_only: 0 => ["-UnorX", "\\A", "one.rs"];
+    m8_multiline_terminal: 0 => ["-UnorX", "\\z", "last"];
+    m8_multiline_inverted_context: 0 => ["-UnvC1", "-rX", "red lantern\nBLUE", "one.rs"];
+    m8_multiline_inverted_only_context: 0 => ["-UnvoC1", "-rX", "red lantern\nBLUE", "one.rs"];
+    m8_multiline_limit: 0 => ["-Unm1", "-rX", "red(?:\nBLUE)?", "one.rs"];
+    m8_multiline_limit_tail: 0 => ["-Unm1", "-A2", "-rX", "red(?:\nBLUE)?", "one.rs"];
+}
+
+#[test]
+fn m8_replacement_line_counts_preserve_original_context_boundaries() {
+    let fixture = Fixture::new("m8-context-boundaries");
+    fixture.write("replacement", b"a\nb\nc\nd\ne\nf\ng\nh\ni\n");
+    for (pattern, replacement) in [
+        ("b\nc", "X"),
+        ("b\nc", "X\nY\nZ"),
+        ("b\nc|d\ne", "X"),
+        ("b\nc|g\nh", "X"),
+        ("b\nc|g\nh", "X\nY\nZ"),
+    ] {
+        for flags in ["-UnC1", "-UnoC1"] {
+            fixture.compare_raw(&[flags, "-r", replacement, pattern, "replacement"], None);
+        }
+    }
 }

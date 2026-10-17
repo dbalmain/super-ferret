@@ -22,6 +22,8 @@ pub(super) struct Render<'a> {
 
 #[derive(Clone)]
 struct Record {
+    source_lines: Option<(u64, u64)>,
+    terminated: bool,
     number: u64,
     bytes: Vec<u8>,
     kind: line_grep::LineKind,
@@ -55,6 +57,8 @@ impl Capture {
             self.records = None;
         } else if let Some(records) = &mut self.records {
             records.push(Record {
+                source_lines: line.source_lines,
+                terminated: line.terminated,
                 number: line.number,
                 bytes: line.bytes.to_vec(),
                 kind: line.kind,
@@ -101,11 +105,11 @@ impl Render<'_> {
             })?;
         }
         if (self.plan.before > 0 || self.plan.after > 0)
-            && previous.is_some_and(|number| line.number > number.saturating_add(1))
+            && previous.is_some_and(|number| line.source_lines.map_or(line.number, |(start, _)| start) > number.saturating_add(1))
         {
             output.write_all(b"--\n")?;
         }
-        *previous = Some(line.number);
+        *previous = Some(line.source_lines.map_or(line.number, |(_, end)| end));
         let delimiter: &[u8] = if line.kind == line_grep::LineKind::Context {
             b"-"
         } else {
@@ -389,6 +393,8 @@ impl Worker<'_> {
                                 render.line(
                                     &mut output,
                                     line_grep::Line {
+                                        source_lines: record.source_lines,
+                                        terminated: record.terminated,
                                         number: record.number,
                                         bytes: &record.bytes,
                                         kind: record.kind,

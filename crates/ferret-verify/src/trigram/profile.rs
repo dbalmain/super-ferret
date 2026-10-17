@@ -54,6 +54,21 @@ impl ast::Visitor for Literals {
 }
 
 impl GrepFlags {
+    /// Compile the shared execution profile and resolve replacement capture
+    /// references against that same regex. Replacement never affects the
+    /// necessary query or document truth.
+    pub fn compile_line_replacement(
+        &self,
+        patterns: &[String],
+        flags: LineFlags,
+        template: &str,
+    ) -> Result<(Grep, crate::Replacement), GrepError> {
+        let grep = self.compile_line_profile(patterns, flags)?;
+        let replacement = grep.regex().replacement(template);
+        Ok((grep, replacement))
+    }
+
+
     /// Resolve fixed strings, smart case and half/whole-line boundaries before
     /// deriving necessary trigrams. Inline flags remain scoped to arguments.
     pub fn compile_line_profile(

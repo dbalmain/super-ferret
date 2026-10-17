@@ -12,6 +12,7 @@ use ferret_verify::{Grep, GrepFlags, LineFlags};
 
 mod context;
 mod multiline;
+mod replacement;
 
 /// Information requests skip environment, index and input resolution.
 #[derive(Debug)]
@@ -97,6 +98,7 @@ pub struct Plan {
     pub traversal: Traversal,
     pub text: bool,
     pub multiline: bool,
+    pub replacement: Option<ferret_verify::Replacement>,
 }
 
 /// Name and count switches override one another in argv order; quiet is
@@ -209,6 +211,7 @@ pub fn parse_with(
     let (mut line_number, mut quiet, mut done) = (false, false, false);
     let (mut fold, mut fixed, mut invert, mut only_matching) = (false, false, false, false);
     let mut smart_case = false;
+    let mut replacement = None;
     let (mut word, mut line) = (false, false);
     let mut hidden = false;
     let mut text_mode = false;
@@ -237,6 +240,16 @@ pub fn parse_with(
             }
             .ok_or_else(|| ParseError::Value("--file".to_owned()))?;
             sources.push(PatternSource::File(path));
+            continue;
+        }
+        if !done && (bytes == b"--replace" || bytes.starts_with(b"--replace=")) {
+            let value = if bytes == b"--replace" {
+                args.next().map(|arg| arg.as_bytes())
+            } else {
+                Some(&bytes[10..])
+            }.ok_or_else(|| ParseError::Value("--replace".to_owned()))?;
+            replacement = Some(std::str::from_utf8(value)
+                .map_err(|_| ParseError::Utf8("replacement"))?.to_owned());
             continue;
         }
         if !done && bytes.starts_with(b"--") {
@@ -417,6 +430,16 @@ pub fn parse_with(
                     }
                     b'h' => help = true,
                     b'V' => version = true,
+                    b'r' => {
+                        let value = if at + 1 < bytes.len() {
+                            Some(&bytes[at + 1..])
+                        } else {
+                            args.next().map(|arg| arg.as_bytes())
+                        }.ok_or_else(|| ParseError::Value("-r".to_owned()))?;
+                        replacement = Some(std::str::from_utf8(value)
+                            .map_err(|_| ParseError::Utf8("replacement"))?.to_owned());
+                        break;
+                    }
                     b'f' => {
                         let path = if at + 1 < bytes.len() {
                             Some(PathBuf::from(OsStr::from_bytes(&bytes[at + 1..])))
@@ -519,23 +542,19 @@ pub fn parse_with(
     if max_count == Some(0) {
         patterns.clear();
     }
-    let grep = GrepFlags {
-        case_insensitive: fold,
-    }
-    .compile_line_profile(
-        &patterns,
-        LineFlags {
-            fixed,
-            smart_case,
-            word,
-            line,
-            multiline,
-            dotall,
-        },
-    )
-    .map_err(ParseError::Pattern)?;
+    let settings = GrepFlags { case_insensitive: fold };
+    let flags = LineFlags { fixed, smart_case, word, line, multiline, dotall };
+    let (grep, replacement) = if let Some(template) = replacement {
+        let (grep, replacement) = settings
+            .compile_line_replacement(&patterns, flags, &template)
+            .map_err(ParseError::Pattern)?;
+        (grep, Some(replacement))
+    } else {
+        (settings.compile_line_profile(&patterns, flags).map_err(ParseError::Pattern)?, None)
+    };
     Ok(Command::Search(Plan {
         grep,
+        replacement,
         paths,
         globs,
         line_number,
@@ -684,6 +703,11 @@ pub enum LineKind {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Line<'a> {
+    /// Inclusive original source lines when replacement changes displayed
+    /// line counts. Group separators use these boundaries, not display numbers.
+    pub source_lines: Option<(u64, u64)>,
+    /// Whether the original line had LF; replacement omits advanced EOF empties.
+    pub terminated: bool,
     pub number: u64,
     pub bytes: &'a [u8],
     pub kind: LineKind,
@@ -719,6 +743,9 @@ pub fn scan_lines(
     let mut trailing = 0;
     let mut limited = false;
     let mut emit = |line: Line<'_>| {
+        if plan.replacement.is_some() {
+            return replacement::line(plan, line, stopped, &mut emit);
+        }
         if line.kind == LineKind::Context && plan.only_matching && plan.invert {
             for span in search.spans(line.bytes) {
                 if stopped() {
@@ -759,6 +786,7 @@ pub fn scan_lines(
                 if line.is_empty() && lines.peek().is_none() && !terminated && binary.is_none() {
                     break;
                 }
+                let line_terminated = lines.peek().is_some() || terminated;
                 number += 1;
                 if stopped() {
                     return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
@@ -766,9 +794,11 @@ pub fn scan_lines(
                 let selected = search.find(line).is_some() != plan.invert;
                 if limited {
                     if rendering {
-                        if selected && plan.only_matching && !plan.invert {
+                        if selected && plan.only_matching && !plan.invert && plan.replacement.is_none() {
                             for span in search.spans(line) {
                                 emit(Line {
+                                    source_lines: None,
+                                    terminated: line_terminated,
                                     number,
                                     bytes: &line[span],
                                     kind: LineKind::Match,
@@ -779,6 +809,8 @@ pub fn scan_lines(
                             }
                         } else {
                             emit(Line {
+                                source_lines: None,
+                                terminated: line_terminated,
                                 number,
                                 bytes: line,
                                 kind: if selected {
@@ -817,8 +849,10 @@ pub fn scan_lines(
                                 return Err(ScanError::Input(io::ErrorKind::Interrupted.into()));
                             }
                             result.count += 1;
-                            if plan.output == Output::Lines {
+                            if plan.output == Output::Lines && plan.replacement.is_none() {
                                 emit(Line {
+                                    source_lines: None,
+                                    terminated: line_terminated,
                                     number,
                                     bytes: &line[span],
                                     kind: LineKind::Match,
@@ -828,10 +862,23 @@ pub fn scan_lines(
                                 .map_err(ScanError::Output)?;
                             }
                         }
+                        if plan.output == Output::Lines && plan.replacement.is_some() {
+                            emit(Line {
+                                source_lines: None,
+                                terminated: line_terminated,
+                                number,
+                                bytes: line,
+                                kind: LineKind::Match,
+                                fragment: false,
+                                highlights: None,
+                            }).map_err(ScanError::Output)?;
+                        }
                     } else {
                         result.count += 1;
                         if plan.output == Output::Lines {
                             emit(Line {
+                                source_lines: None,
+                                terminated: line_terminated,
                                 number,
                                 bytes: line,
                                 kind: LineKind::Match,
@@ -849,6 +896,8 @@ pub fn scan_lines(
                     }
                 } else if rendering && number <= trailing {
                     emit(Line {
+                        source_lines: None,
+                        terminated: line_terminated,
                         number,
                         bytes: line,
                         kind: LineKind::Context,

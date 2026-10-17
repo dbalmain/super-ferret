@@ -36,6 +36,7 @@ const HELP: &str = "ferret grep [OPTIONS] PATTERN [PATH...]\n\n\
   -x, --line-regexp   match whole lines\n\
   -U, --multiline     permit matches across LF boundaries\n\
   --multiline-dotall  let dot match LF with -U\n\
+  -r, --replace TEXT replace matches in output; inputs stay unchanged\n\
   -o, --only-matching print nonoverlapping match spans\n\
   -l, --files-with-matches print each matching path once\n\
   -v, --invert-match  select nonmatching lines\n\

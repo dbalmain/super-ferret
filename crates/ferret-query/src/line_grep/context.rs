@@ -95,6 +95,8 @@ impl<'a> Before<'a> {
             self.store
                 .read_range(offset + 16, len as u64, &mut &mut bytes[..], self.stopped)?;
             emit(Line {
+                source_lines: None,
+                terminated: true,
                 number,
                 bytes: &bytes,
                 kind: LineKind::Context,

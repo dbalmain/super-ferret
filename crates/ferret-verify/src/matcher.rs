@@ -73,6 +73,18 @@ impl Regex {
         }
     }
 
+    /// Capture spans retain the supplied haystack's assertion context.
+    pub fn captures_at<'t>(&self, bytes: &'t [u8], at: usize) -> Option<Captures<'t>> {
+        self.0.captures_at(bytes, at).map(Captures)
+    }
+
+    /// Resolve replacement references against this compiled pattern.
+    pub fn replacement(&self, template: &str) -> Replacement {
+        Replacement::new(template, |name| {
+            self.0.capture_names().position(|candidate| candidate == Some(name))
+        })
+    }
+
     /// Compiles with every setting already chosen (`GrepFlags`).
     pub(crate) fn build(builder: &regex::bytes::RegexBuilder) -> Result<Regex, RegexError> {
         builder
@@ -85,6 +97,99 @@ impl Regex {
 impl Matcher for Regex {
     fn is_match(&self, bytes: &[u8]) -> bool {
         self.0.is_match(bytes)
+    }
+}
+
+/// Captures from one match; engine types stay inside the verifier.
+ pub struct Captures<'t>(regex::bytes::Captures<'t>);
+
+impl Captures<'_> {
+    /// A participating group's bytes; group zero is the complete match.
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        self.0.get(index).map(|capture| capture.as_bytes())
+    }
+}
+
+/// Parsed rg replacement syntax. References are resolved once, while bytes
+/// are expanded from each match's original haystack, including invalid UTF-8.
+#[derive(Clone, Debug)]
+pub struct Replacement {
+    parts: Vec<ReplacementPart>,
+}
+
+#[derive(Clone, Debug)]
+enum ReplacementPart {
+    Literal(Vec<u8>),
+    Capture(usize),
+}
+
+impl Replacement {
+    fn new(template: &str, named: impl Fn(&str) -> Option<usize>) -> Self {
+        let bytes = template.as_bytes();
+        let mut parts = Vec::new();
+        let mut literal = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            if bytes[at] != b'$' {
+                literal.push(bytes[at]);
+                at += 1;
+                continue;
+            }
+            if bytes.get(at + 1) == Some(&b'$') {
+                literal.push(b'$');
+                at += 2;
+                continue;
+            }
+            let braced = bytes.get(at + 1) == Some(&b'{');
+            let start = at + if braced { 2 } else { 1 };
+            let mut end = start;
+            while bytes.get(end).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_') {
+                end += 1;
+            }
+            if end == start || (braced && bytes.get(end) != Some(&b'}')) {
+                literal.push(b'$');
+                at += 1;
+                continue;
+            }
+            if !literal.is_empty() {
+                parts.push(ReplacementPart::Literal(std::mem::take(&mut literal)));
+            }
+            // The reference consists entirely of ASCII bytes.
+            let name = &template[start..end];
+            let index = if name.bytes().all(|byte| byte.is_ascii_digit()) {
+                name.parse().ok()
+            } else {
+                named(name)
+            };
+            if let Some(index) = index {
+                parts.push(ReplacementPart::Capture(index));
+            }
+            at = end + usize::from(braced);
+        }
+        if !literal.is_empty() {
+            parts.push(ReplacementPart::Literal(literal));
+        }
+        Self { parts }
+    }
+
+    /// Emit literal/captured byte pieces without accumulating expanded output.
+    /// The caller controls allocation, cancellation and output-fault handling.
+    pub fn expand<E>(
+        &self,
+        captures: &Captures<'_>,
+        mut emit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for part in &self.parts {
+            match part {
+                ReplacementPart::Literal(bytes) => emit(bytes)?,
+                ReplacementPart::Capture(index) => {
+                    if let Some(bytes) = captures.get(*index) {
+                        emit(bytes)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
