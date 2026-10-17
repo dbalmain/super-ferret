@@ -5211,3 +5211,123 @@ line in ferret, versus only the first in rg. Under -nor, ferret emits three
 or a requirement to give replacement different assertion truth would change
 the recommendation to B. Owned tests record both outputs; no output code was
 changed by this final coverage addition, and no private row is waived.
+
+## D87 — Clipped multiline JSON submatches
+
+**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-A) uses B provisionally.**
+
+Question: should JSON re-match beyond a clipped selected region to reproduce
+rg 15.2.0, or retain M7/M8's bounded publication contract?
+
+- **A — unbounded oracle re-match.** Reproduces rg's cross-boundary captures
+  where it succeeds, but can attach spans beyond the event's source bytes and
+  panics on ordinary optional-LF patterns after -m. This conflicts with the
+  existing bounded capture/publication contract.
+- **B — bounded event submatches.** Retain the existing scanner's clipped
+  assertion/span bounds and clamp trailing spans to each event. This preserves
+  valid byte ranges and avoids publishing an unselected suffix. It can omit a
+  discovered boundary-sensitive submatch that rg reports after truncation.
+
+Recommendation: B, provisional, extending D82/M8-C. On red-red/LF/blue/LF with
+-U -m1 'red(?:\nblue)?', pinned rg --json panics at an out-of-range slice. On
+a/LF/b/LF with -Um1 'a\n\b', rg reports the truncated a-LF span while bounded
+re-matching has no span. Preserve the selected event and search status, with
+zero submatches for the latter, consistently with the existing count bounds.
+A requirement for JSON-specific unbounded assertion truth, or a pinned oracle
+with safe clipping consistent with the existing contract, would change this
+recommendation. These owned conflicts are not private-audit waivers.
+
+## D88 — Rg 15.2 replacement metadata versus the written contract
+
+**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-B) uses A provisionally.**
+
+Question: should JSON ignore replacement as GREP.md explicitly requires, or
+add rg 15.2.0's replacement metadata to each submatch?
+
+- **A — honor the explicit ignore rule.** Keep source lines and submatches
+  identical to JSON without -r. Small, independent publication surface, but
+  differs from rg 15.2.0's optional `replacement` field.
+- **B — add replacement metadata.** Matches the pinned schema extension and
+  helps consumers preview transformations, but changes the explicit contract
+  and requires original capture expansion at every JSON submatch boundary,
+  including provisional clipping/assertion bounds.
+
+Recommendation: A, provisional, because the current slice explicitly says to
+ignore replacement. On red-LF with --json -or X red, rg retains lines red-LF
+and match red but adds replacement {text:X}. Ferret emits the same event as
+without -r. An instruction to adopt replacement metadata, or an updated
+contract that distinguishes metadata from transformed source, would change
+this to B. The better future contract is original source plus optional
+replacement metadata, with capture bounds stated explicitly. No private
+corpus row is waived by this owned discrepancy.
+
+## D89 — Inherited line assertion presentation in JSON
+
+**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-C) uses A provisionally.**
+
+Question: should JSON use the specified per-line assertion scope, or reproduce
+rg's stateful absolute-assertion spans and trailing-context classification?
+
+- **A — retain line-scope selection and spans.** Extends D79's existing choice
+  to source submatches and keeps JSON on the existing selection scanner. It
+  differs from rg's later empty absolute-anchor submatches and limit tails.
+- **B — reproduce stateful presentation.** Matches rg's first-only absolute
+  start submatch and its context classification after -m, but requires another
+  assertion/publication state alongside the established per-line contract.
+
+Recommendation: A, provisional. On abc-LF/abc-LF with --json '\A', ferret
+reports one empty submatch on each selected source line; rg reports it only
+on the first. On a-LF/bc with --json -m1 -A1 '\z', ferret classifies bc as a
+match without printable submatches; rg classifies it as context. This extends
+the documented D79/line-scope choice rather than silently adopting a new scope.
+A decision that JSON must have its own stateful assertion contract, or a D79
+answer replacing per-line scope, would change the recommendation to B.
+
+## D90 — Inherited inverted limit/context windows
+
+**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-D) uses A provisionally.**
+
+Question: should JSON reuse the selected-line and clipped-window contract, or
+reproduce rg's additional inverted tail search and terminal suffix artifacts?
+
+- **A — retain established selection and windows.** Keeps the written -m and
+  -A rules and the existing scanner for all publication modes. It can differ
+  from rg's inverted after-context path and suffix rebasing at terminal LF.
+- **B — reproduce the extra tail search.** Matches rg's extra selected lines
+  and their shifted context boundary, but changes existing selection/window
+  behavior and adds separate JSON selection state or a broader plain fix.
+
+Recommendation: A, provisional. On x-LF/a-LF/y-LF/a-LF/z-LF with -Uvm1 -A1 a,
+ferret publishes match x and context a; rg publishes matches x, a and y. The
+same plain discrepancy exists without JSON and without -U. On the same bytes
+with -Um1 -A1 'a|\z', ferret publishes match a and context y; rg labels y as a
+match after suffix-based terminal discovery. This is separate from bounded
+submatch counting: all JSON counts still describe the emitted events. A
+requirement to prioritize these oracle tail artifacts over the explicit limit/
+window contract would change the recommendation to B and needs a focused
+selection fix plus regressions for the existing plain path.
+
+## D91 — Quiet JSON summary counting bounds
+
+**Status: open, 2026-10-17; M9 (`wt/grep-m9`, M9-E) uses B provisionally.**
+
+Question: should quiet summary reuse ordinary event submatch counts, or follow
+rg's separate counting iterator and inverted logical-line floor?
+
+- **A — reuse event counts.** Smallest and uniform across -q, but reports zero
+  matches for a first terminal assertion that rg's quiet summary counts, and
+  undercounts inverted source regions with no printed regex occurrences.
+- **B — retain separate quiet counting bounds.** Re-count each selected source
+  group with the shared byte matcher. Keep a first terminal assertion, omit
+  advanced EOF empties, and retain at least one logical match per inverted
+  selected source line. Adds quiet-only iteration, but matches pinned summaries
+  without changing selection, plain counts or ordinary JSON submatches.
+
+Recommendation: B, provisional. On unterminated abc, --json '\z' publishes a
+selected source with no submatches, while adding -q reports matches 1. On
+x/a/y/a/z with -Uqv -m1 'a|\n', quiet stats are matched_lines 4 / matches 6;
+with -Uqv '\z' over the same LF-terminated bytes they are 5 / 5. The owned
+quiet matrix and cross-line gap case pin the first-terminal, advanced-EOF and
+line-floor distinctions. A requirement that -q preserve event-span counts
+exactly, or a pinned oracle removing this separate counting path, would change
+the recommendation to A.
