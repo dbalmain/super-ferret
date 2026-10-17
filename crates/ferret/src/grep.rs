@@ -961,6 +961,25 @@ mod tests {
                 assert_eq!(host.errors, failure);
                 if failure {
                     assert!(host.writer.is_empty());
+                    let mut summary = Vec::new();
+                    json::summary(&mut summary, &host.json_stats, std::time::Instant::now())
+                        .unwrap();
+                    let parsed = crate::protocol::parse_object(&summary).unwrap();
+                    let stats = parsed.field("data").unwrap().field("stats").unwrap();
+                    for key in [
+                        "matches",
+                        "matched_lines",
+                        "searches_with_match",
+                        "searches",
+                        "bytes_searched",
+                        "bytes_printed",
+                    ] {
+                        assert_eq!(
+                            stats.field(key).unwrap().number(),
+                            Some(0),
+                            "{key}: failed attempts reached summary"
+                        );
+                    }
                 } else {
                     let text = String::from_utf8(host.writer).unwrap();
                     assert!(!text.contains("obsolete"));

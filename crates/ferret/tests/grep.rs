@@ -3826,25 +3826,31 @@ json_cases! {
 fn m9_json_replacement_is_ignored_as_specified_provisionally() {
     let fixture = Fixture::new("m9-json-replacement-contract");
     for flags in ["-or", "-Uor"] {
-        let args = ["--json", flags, "<$0>", "red", "one.rs"];
-        let oracle = fixture.oracle(&args, None);
-        let actual = fixture.ferret(&["grep", "--json", flags, "<$0>", "red", "one.rs"], None);
-        let plain = fixture.ferret(&["grep", "--json", "red", "one.rs"], None);
+        let args = ["--json", flags, "<$0>", "red", "-"];
+        let oracle = fixture.oracle(&args, Some(b"red\n"));
+        let actual = fixture.ferret(
+            &["grep", "--json", flags, "<$0>", "red", "-"],
+            Some(b"red\n"),
+        );
         assert_eq!(actual.status.code(), Some(0));
-        assert_eq!(
-            normalized_json(&actual.stdout, false),
-            normalized_json(&plain.stdout, false)
+        assert_eq!(oracle.status.code(), Some(0));
+        // D88: source bytes and spans remain literal; rg adds replacement
+        // metadata.
+        assert_json_stream(
+            &actual,
+            r#"[
+            ["begin","<stdin>"], ["match","red\n",1,0,[[0,3,"red"]]],
+            ["end",null,[1,1,1]], ["summary",[1,1,1]]
+        ]"#,
+            false,
         );
-        // M9-B: rg 15.2 adds metadata despite GREP.md's explicit ignore rule.
-        assert!(
-            oracle
-                .stdout
-                .windows(b"\"replacement\"".len())
-                .any(|w| w == b"\"replacement\"")
-        );
-        assert_ne!(
-            normalized_json(&actual.stdout, false),
-            normalized_json(&oracle.stdout, false)
+        assert_json_stream(
+            &oracle,
+            r#"[
+            ["begin","<stdin>"], ["match","red\n",1,0,[[0,3,"red","<red>"]]],
+            ["end",null,[1,1,1]], ["summary",[1,1,1]]
+        ]"#,
+            false,
         );
     }
 }
@@ -4056,19 +4062,19 @@ fn m9_json_clipped_submatches_remain_within_the_published_region() {
         Some(b"red red\nblue\n"),
     );
     assert_eq!(actual.status.code(), Some(0));
-    let normalized = String::from_utf8(normalized_json(&actual.stdout, false)).unwrap();
-    assert!(normalized.contains(r#""lines":{"text":"red red\n"}"#));
-    assert_eq!(
-        normalized
-            .matches(r#""matched_lines":1,"matches":2,"searches_with_match":1"#)
-            .count(),
-        2
+    assert_json_stream(
+        &actual,
+        r#"[
+        ["begin","<stdin>"], ["match","red red\n",1,0,[[0,3,"red"],[4,7,"red"]]],
+        ["end",null,[1,2,1]], ["summary",[1,2,1]]
+    ]"#,
+        false,
     );
-    // M9-A: pinned rg slices past the clipped event and panics. Ferret keeps
-    // both bounded red spans and publishes no blue suffix.
+    // D87: rg panics before publishing a match; no suffix is licensed here.
     let oracle = fixture.oracle(&args, Some(b"red red\nblue\n"));
     assert_eq!(oracle.status.code(), Some(101));
     assert!(String::from_utf8_lossy(&oracle.stderr).contains("out of range"));
+    assert_partial_json_stream(&oracle, r#"[["begin","<stdin>"]]"#);
 
     let args = ["--json", "-Um1", r"a\n\b", "-"];
     let actual = fixture.ferret(
@@ -4076,28 +4082,57 @@ fn m9_json_clipped_submatches_remain_within_the_published_region() {
         Some(b"a\nb\n"),
     );
     assert_eq!(actual.status.code(), Some(0));
-    let normalized = String::from_utf8(normalized_json(&actual.stdout, false)).unwrap();
-    assert!(normalized.contains(r#""lines":{"text":"a\n"}"#));
-    assert!(normalized.contains(r#""submatches":[]"#));
-    assert_eq!(
-        normalized
-            .matches(r#""matched_lines":1,"matches":0,"searches_with_match":1"#)
-            .count(),
-        2
+    assert_json_stream(
+        &actual,
+        r#"[
+        ["begin","<stdin>"], ["match","a\n",1,0,[]],
+        ["end",null,[1,0,1]], ["summary",[1,0,1]]
+    ]"#,
+        false,
     );
     let oracle = fixture.oracle(&args, Some(b"a\nb\n"));
     assert_eq!(oracle.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&oracle.stdout).contains(r#""match":{"text":"a\n"}"#));
+    assert_json_stream(
+        &oracle,
+        r#"[
+        ["begin","<stdin>"], ["match","a\n",1,0,[[0,2,"a\n"]]],
+        ["end",null,[1,1,1]], ["summary",[1,1,1]]
+    ]"#,
+        false,
+    );
 }
 
 #[test]
 fn m9_json_inherits_line_assertion_and_limit_windows_provisionally() {
     let fixture = Fixture::new("m9-json-inherited-contracts");
-    for (args, bytes, expected_lines, expected_matches) in [
-        (vec![r"\A", "-"], &b"abc\nabc\n"[..], 2, 2),
-        (vec!["-m1", "-A1", r"\z", "-"], b"a\nbc", 2, 1),
-        (vec!["-Uvm1", "-A1", "a", "-"], b"x\na\ny\na\nz\n", 1, 0),
-        (vec!["-Um1", "-A1", r"a|\z", "-"], b"x\na\ny\na\nz\n", 1, 1),
+    for (args, bytes, chosen, oracle_expected) in [
+        // D90: pin x and a specifically; counts cannot license publishing z.
+        (
+            vec!["-Uvm1", "-A1", "a", "-"],
+            &b"x\na\ny\na\nz\n"[..],
+            r#"[["begin","<stdin>"],["match","x\n",1,0,[]],["context","a\n",2,2,[[0,1,"a"]]],["end",null,[1,0,1]],["summary",[1,0,1]]]"#,
+            r#"[["begin","<stdin>"],["match","x\n",1,0,[]],["match","a\n",2,2,[[0,1,"a"]]],["match","y\n",3,4,[]],["end",null,[3,1,1]],["summary",[3,1,1]]]"#,
+        ),
+        // D89 inherits D79's per-line absolute assertions.
+        (
+            vec![r"\A", "-"],
+            b"abc\nabc\n",
+            r#"[["begin","<stdin>"],["match","abc\n",1,0,[[0,0,""]]],["match","abc\n",2,4,[[0,0,""]]],["end",null,[2,2,1]],["summary",[2,2,1]]]"#,
+            r#"[["begin","<stdin>"],["match","abc\n",1,0,[[0,0,""]]],["match","abc\n",2,4,[]],["end",null,[2,1,1]],["summary",[2,1,1]]]"#,
+        ),
+        (
+            vec!["-m1", "-A1", r"\z", "-"],
+            b"a\nbc",
+            r#"[["begin","<stdin>"],["match","a\n",1,0,[[1,1,""]]],["match","bc",2,2,[]],["end",null,[2,1,1]],["summary",[2,1,1]]]"#,
+            r#"[["begin","<stdin>"],["match","a\n",1,0,[[1,1,""]]],["context","bc",2,2,[]],["end",null,[1,1,1]],["summary",[1,1,1]]]"#,
+        ),
+        // D90: terminal suffix discovery differs without widening source bytes.
+        (
+            vec!["-Um1", "-A1", r"a|\z", "-"],
+            b"x\na\ny\na\nz\n",
+            r#"[["begin","<stdin>"],["match","a\n",2,2,[[0,1,"a"]]],["context","y\n",3,4,[]],["end",null,[1,1,1]],["summary",[1,1,1]]]"#,
+            r#"[["begin","<stdin>"],["match","a\n",2,2,[[0,1,"a"]]],["match","y\n",3,4,[]],["end",null,[2,1,1]],["summary",[2,1,1]]]"#,
+        ),
     ] {
         let mut full = vec!["--json"];
         full.extend(args);
@@ -4106,14 +4141,8 @@ fn m9_json_inherits_line_assertion_and_limit_windows_provisionally() {
         let actual = fixture.ferret(&full, Some(bytes));
         assert_eq!(actual.status.code(), Some(0));
         assert_eq!(oracle.status.code(), Some(0));
-        let normalized = normalized_json(&actual.stdout, false);
-        let text = String::from_utf8(normalized.clone()).unwrap();
-        assert_eq!(text.matches(&format!(r#""matched_lines":{expected_lines},"matches":{expected_matches},"searches_with_match":1"#)).count(), 2);
-        assert_ne!(
-            normalized,
-            normalized_json(&oracle.stdout, false),
-            "{full:?}"
-        );
+        assert_json_stream(&actual, chosen, false);
+        assert_json_stream(&oracle, oracle_expected, false);
     }
 }
 
@@ -4138,5 +4167,202 @@ fn m9_json_quiet_stats_keep_counting_and_event_span_bounds_separate() {
                 fixture.compare_json(&args, Some(bytes));
             }
         }
+    }
+}
+
+fn assert_json_stream(output: &Output, expected: &str, quiet: bool) {
+    assert_json_projection(output, expected, quiet, "--expect");
+}
+
+fn assert_partial_json_stream(output: &Output, expected: &str) {
+    assert_json_projection(output, expected, false, "--expect-partial");
+}
+
+fn assert_json_projection(output: &Output, expected: &str, quiet: bool, flag: &str) {
+    let python = std::env::var_os("FERRET_PYTHON").unwrap_or_else(|| panic!("nix supplies Python"));
+    let mut command = Command::new(python);
+    command
+        .args(["-c", include_str!("support/grep_json.py"), flag, expected])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if quiet {
+        command.arg("--quiet");
+    }
+    let checked = run(command, Some(&output.stdout));
+    assert!(
+        checked.status.success(),
+        "event stream mismatch: {checked:?}"
+    );
+}
+
+#[test]
+fn m9_r1_trailing_multiline_submatches_are_rechecked_within_source_lines() {
+    let fixture = Fixture::new("m9-r1-cross-line-tail");
+    let input = b"a\nb\na\nb\n";
+    let args = ["--json", "-Um1", "-A2", r"a\nb", "-"];
+    let expected = r#"[
+        ["begin","<stdin>"],
+        ["match","a\nb\n",1,0,[[0,3,"a\nb"]]],
+        ["context","a\n",3,4,[]],
+        ["context","b\n",4,6,[]],
+        ["end",null,[2,1,1]],
+        ["summary",[2,1,1]]
+    ]"#;
+    let oracle = fixture.oracle(&args, Some(input));
+    assert_eq!(oracle.status.code(), Some(0));
+    assert_json_stream(&oracle, expected, false);
+    let mut command = vec!["grep"];
+    command.extend(args);
+    let actual = fixture.ferret(&command, Some(input));
+    assert_eq!(actual.status.code(), Some(0));
+    assert_json_stream(&actual, expected, false);
+    let plain = fixture.ferret(&["grep", "-Unm1", "-A2", r"a\nb", "-"], Some(input));
+    assert_eq!(plain.stdout, b"1:a\n2:b\n3:a\n4:b\n");
+}
+
+#[test]
+fn m9_r1_optional_cross_line_tail_keeps_only_complete_local_matches() {
+    let fixture = Fixture::new("m9-r1-optional-tail");
+    let input = b"a\nb\na\nb\n";
+    let args = ["--json", "-Um1", "-A2", r"a(?:\nb)?", "-"];
+    let mut full = vec!["grep"];
+    full.extend(args);
+    let actual = fixture.ferret(&full, Some(input));
+    assert_eq!(actual.status.code(), Some(0));
+    assert_json_stream(
+        &actual,
+        r#"[
+        ["begin","<stdin>"],
+        ["match","a\nb\n",1,0,[[0,3,"a\nb"]]],
+        ["match","a\n",3,4,[[0,1,"a"]]],
+        ["context","b\n",4,6,[]],
+        ["end",null,[3,2,1]], ["summary",[3,2,1]]
+    ]"#,
+        false,
+    );
+    // D87 retains valid line-local matches instead of reproducing rg's panic.
+    let oracle = fixture.oracle(&args, Some(input));
+    assert_eq!(oracle.status.code(), Some(101));
+    assert!(String::from_utf8_lossy(&oracle.stderr).contains("out of range"));
+    assert_partial_json_stream(
+        &oracle,
+        r#"[
+        ["begin","<stdin>"], ["match","a\nb\n",1,0,[[0,3,"a\nb"]]]
+    ]"#,
+    );
+}
+
+#[test]
+fn m9_r1_nul_line_selection_and_raw_prefix_are_explicit_binary_policy() {
+    let fixture = Fixture::new("m9-r1-nul-boundaries");
+    let empty = fixture.compare_json(&["-v", "red", "empty"], None);
+    assert_eq!(empty.status.code(), Some(1));
+    assert_json_stream(&empty, r#"[["summary",[0,0,0]]]"#, false);
+    for (bytes, expected, oracle_lines, multiline_expected, multiline_status) in [
+        (
+            &b"\0"[..],
+            r#"[["begin","<stdin>"],["match","",1,0,[]],["end",0,[1,0,1]],["summary",[1,0,1]]]"#,
+            r#"[["begin","<stdin>"],["match","SENTINEL",1,0,[]],["end",0,[1,0,1]],["summary",[1,0,1]]]"#,
+            r#"[["summary",[0,0,0]]]"#,
+            1,
+        ),
+        (
+            b"\n\0",
+            r#"[["begin","<stdin>"],["match","\n",1,0,[]],["match","",2,1,[]],["end",1,[2,0,1]],["summary",[2,0,1]]]"#,
+            r#"[["begin","<stdin>"],["match","\n",1,0,[]],["match","SENTINEL",2,1,[]],["end",1,[2,0,1]],["summary",[2,0,1]]]"#,
+            r#"[["begin","<stdin>"],["match","\n",1,0,[]],["end",1,[1,0,1]],["summary",[1,0,1]]]"#,
+            0,
+        ),
+        (
+            b"red\n\0",
+            r#"[["begin","<stdin>"],["match","",2,4,[]],["end",4,[1,0,1]],["summary",[1,0,1]]]"#,
+            r#"[["begin","<stdin>"],["match","SENTINEL",2,4,[]],["end",4,[1,0,1]],["summary",[1,0,1]]]"#,
+            r#"[["summary",[0,0,0]]]"#,
+            1,
+        ),
+        (
+            b"blue\n\0",
+            r#"[["begin","<stdin>"],["match","blue\n",1,0,[]],["match","",2,5,[]],["end",5,[2,0,1]],["summary",[2,0,1]]]"#,
+            r#"[["begin","<stdin>"],["match","blue\n",1,0,[]],["match","SENTINEL",2,5,[]],["end",5,[2,0,1]],["summary",[2,0,1]]]"#,
+            r#"[["begin","<stdin>"],["match","blue\n",1,0,[]],["end",5,[1,0,1]],["summary",[1,0,1]]]"#,
+            0,
+        ),
+    ] {
+        fixture.write("binary", bytes);
+        for path in ["-", "binary"] {
+            let input = (path == "-").then_some(bytes);
+            let chosen = expected.replace("<stdin>", if path == "-" { "<stdin>" } else { path });
+            let oracle_expected = oracle_lines
+                .replace("SENTINEL", if path == "-" { r"\n" } else { r"\u0000" })
+                .replace("<stdin>", if path == "-" { "<stdin>" } else { path });
+            for flags in ["-v", "-Uv"] {
+                let actual = fixture.ferret(&["grep", "--json", flags, "red", path], input);
+                let is_multiline = flags == "-Uv";
+                assert_eq!(
+                    actual.status.code(),
+                    Some(if is_multiline { multiline_status } else { 0 })
+                );
+                let expected = if is_multiline {
+                    multiline_expected
+                        .replace("<stdin>", if path == "-" { "<stdin>" } else { path })
+                } else {
+                    chosen.clone()
+                };
+                assert_json_stream(&actual, &expected, false);
+                let oracle = fixture.oracle(&["--json", flags, "red", path], input);
+                assert_eq!(oracle.status.code(), Some(0));
+                assert_json_stream(&oracle, &oracle_expected, false);
+            }
+        }
+    }
+    for flags in ["-av", "-Uav"] {
+        fixture.compare_json(&[flags, "red", "-"], Some(b"\0"));
+        let actual = fixture.ferret(&["grep", "--json", flags, "red", "-"], Some(b"\0"));
+        assert_json_stream(
+            &actual,
+            r#"[["begin","<stdin>"],["match","\u0000",1,0,[]],["end",null,[1,0,1]],["summary",[1,0,1]]]"#,
+            false,
+        );
+    }
+}
+
+#[test]
+fn m9_r1_quiet_decision_has_independent_summary_expectations() {
+    let fixture = Fixture::new("m9-r1-quiet-decision");
+    for (args, input, expected) in [
+        (
+            vec!["--json", "-q", "-Um1", "-A2", r"a\nb", "-"],
+            &b"a\nb\na\nb\n"[..],
+            r#"[["summary",[2,1,1]]]"#,
+        ),
+        (
+            vec!["--json", "-q", "-Um1", "-A2", r"a(?:\nb)?", "-"],
+            b"a\nb\na\nb\n",
+            r#"[["summary",[3,2,1]]]"#,
+        ),
+        (
+            vec!["--json", "-q", r"\z", "-"],
+            &b"abc"[..],
+            r#"[["summary",[1,1,1]]]"#,
+        ),
+        (
+            vec!["--json", "-q", "-Uvm1", r"a|\n", "-"],
+            b"x\na\ny\na\nz\n",
+            r#"[["summary",[4,6,1]]]"#,
+        ),
+        (
+            vec!["--json", "-q", "-Uv", r"\z", "-"],
+            b"x\na\ny\na\nz\n",
+            r#"[["summary",[5,5,1]]]"#,
+        ),
+    ] {
+        let oracle = fixture.oracle(&args, Some(input));
+        assert_eq!(oracle.status.code(), Some(0));
+        assert_json_stream(&oracle, expected, true);
+        let mut full = vec!["grep"];
+        full.extend(args);
+        let actual = fixture.ferret(&full, Some(input));
+        assert_eq!(actual.status.code(), Some(0));
+        assert_json_stream(&actual, expected, true);
     }
 }

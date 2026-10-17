@@ -390,7 +390,30 @@ pub(super) fn scan(
                 };
                 let region = range.start..lines[last - 1].end;
                 highlights.clear();
-                if kind == LineKind::Context {
+                let recheck_tail = !selected
+                    && !plan.invert
+                    && range.start >= clip
+                    && relevant
+                        .iter()
+                        .any(|span| span.start < range.start || span.end > range.end);
+                let mut kind = kind;
+                if recheck_tail {
+                    // A split tail occurrence is not a submatch of either
+                    // source line. Recheck with its original LF, as replacement
+                    // does, instead of fabricating intersections (D87).
+                    let source = &bytes[range.clone()];
+                    kind = if regex.find(source).is_some() {
+                        LineKind::Match
+                    } else {
+                        LineKind::Context
+                    };
+                    for span in regex.spans(source) {
+                        cancelled(stopped)?;
+                        if span.start < source.len() {
+                            push(&mut highlights, span)?;
+                        }
+                    }
+                } else if kind == LineKind::Context {
                     for span in regex.spans(&bytes[range.clone()]) {
                         cancelled(stopped)?;
                         if span.start < region.len()
@@ -405,15 +428,12 @@ pub(super) fn scan(
                         if span.start >= region.end {
                             break;
                         }
-                        if plan.invert && (span.start < region.start || span.end > region.end) {
+                        if span.start < region.start || span.end > region.end {
                             continue;
                         }
-                        // A tail's cross-line discovery cannot publish a
-                        // submatch outside this event's source bytes (M9-A).
                         push(
                             &mut highlights,
-                            span.start.max(region.start) - region.start
-                                ..span.end.min(region.end) - region.start,
+                            span.start - region.start..span.end - region.start,
                         )?;
                     }
                 }

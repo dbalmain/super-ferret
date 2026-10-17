@@ -713,6 +713,33 @@ rg substitutes LF for NUL and can search its received suffix. Ferret neither
 invents that LF nor searches beyond its first-NUL stop. `-a` disables detection
 and publishes original NUL bytes as escaped text.
 
+**M9 fix round 1 (2026-10-18):** a cross-line occurrence split by trailing
+JSON event boundaries must be rechecked within each original source line,
+including its LF, as replacement already does. Only complete local regex
+matches become submatches; intersecting a global span with a line can fabricate
+bytes that do not match. A tail line with no local match becomes JSON context.
+Plain trailing discovery/formatting is unchanged. This corrects D87 / M9-A's
+former blanket tail clamping; initial clipped assertion bounds are unchanged.
+
+On `a\nb\na\nb\n` with `--json -Um1 -A2 'a\nb'`, JSON emits one match event
+containing `a\nb\n` at line 1 / offset 0, followed by context `a\n` at line 3 /
+offset 4 and context `b\n` at line 4 / offset 6. Stats are matches 1 and
+matched_lines 2, agreeing with pinned rg 15.2.0. With `'a(?:\nb)?'`, the tail
+has a complete local `a` submatch [0,1) and then context `b\n`: matches 2 and
+matched_lines 3. Pinned rg instead panics after the initial cross-line event.
+
+A NUL-only input under line-mode `--json -v red` still selects the pending
+sentinel line: an empty source-prefix event at line 1 / offset 0, no submatches,
+matched_lines 1, matches 0, binary_offset 0 and exit 0. An LF before NUL leaves
+the NUL on another real source line; its empty prefix is not a phantom EOF
+record. Pinned rg 15.2.0 selects the same lines, but emits literal NUL for regular
+files and a substituted LF for stdin. Ferret's empty text follows the existing
+first-NUL raw-prefix policy, without either sentinel representation; this is a
+binary-policy compatibility difference, not D74 visibility. Multiline buffers
+the first-NUL prefix: an empty prefix or a prefix ending at LF supplies no extra
+line there. These existing mode-specific outcomes are unchanged and explicitly
+tested. Text mode retains the NUL and agrees with rg.
+
 Binary policy differs: recursive binary-sniffed files are absent. On searched
 input, first NUL stops searching and discards buffered plain file output.
 Detect NUL in each read chunk, without waiting for LF or EOF (review R1,

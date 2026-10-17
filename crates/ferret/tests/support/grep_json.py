@@ -104,5 +104,39 @@ def normalize(raw, quiet=False):
                       sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode()
 
 
+def projection(raw):
+    """Readable event signatures for independent, literal stream expectations."""
+    result = []
+    for line in raw.splitlines():
+        event = json.loads(line)
+        kind, data = event['type'], event['data']
+        if kind == 'begin':
+            result.append([kind, byte_field(data['path']).decode('utf-8')])
+        elif kind in ('match', 'context'):
+            spans = []
+            for span in data['submatches']:
+                item = [span['start'], span['end'], byte_field(span['match']).decode('utf-8')]
+                if 'replacement' in span:
+                    item.append(byte_field(span['replacement']).decode('utf-8'))
+                spans.append(item)
+            result.append([kind, byte_field(data['lines']).decode('utf-8'),
+                           data['line_number'], data['absolute_offset'], spans])
+        elif kind in ('end', 'summary'):
+            counts = [data['stats'][key] for key in ('matched_lines', 'matches', 'searches_with_match')]
+            result.append([kind, data['binary_offset'], counts] if kind == 'end' else [kind, counts])
+        else:
+            raise AssertionError(kind)
+    return result
+
+
 if __name__ == '__main__':
-    sys.stdout.buffer.write(normalize(sys.stdin.buffer.read(), quiet='--quiet' in sys.argv))
+    raw = sys.stdin.buffer.read()
+    partial = '--expect-partial' in sys.argv
+    normalized = b'' if partial else normalize(raw, quiet='--quiet' in sys.argv)
+    flag = '--expect-partial' if partial else '--expect'
+    if flag in sys.argv:
+        expected = json.loads(sys.argv[sys.argv.index(flag) + 1])
+        actual = projection(raw)
+        assert actual == expected, (actual, expected)
+    else:
+        sys.stdout.buffer.write(normalized)
