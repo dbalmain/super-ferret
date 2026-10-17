@@ -77,11 +77,12 @@ impl Write for OutputBuffer {
             if bytes.len() > MEMORY_LIMIT - self.bytes.len() {
                 self.flush()?;
             }
-            if bytes.len() < MEMORY_LIMIT {
-                self.bytes.extend_from_slice(bytes);
-                self.len += bytes.len() as u64;
-                return Ok(bytes.len());
-            }
+            // Accept only what fits, so one call spills at most the pending
+            // block and the caller's cancellation check runs between blocks.
+            let accepted = bytes.len().min(MEMORY_LIMIT - self.bytes.len());
+            self.bytes.extend_from_slice(&bytes[..accepted]);
+            self.len += accepted as u64;
+            return Ok(accepted);
         }
         if let Some(spill) = &mut self.file {
             spill
@@ -633,6 +634,28 @@ mod spill_tests {
         expected.extend_from_slice(b"replacement");
         let mut actual = Vec::new();
         output.write_to(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn buffered_spill_writes_at_most_one_block_per_call() {
+        // The caller checks cancellation between write calls, so one call
+        // must not drain the pending block and then spill a large part too.
+        let mut output = OutputBuffer::default().with_buffered_spill();
+        output.write_all(&[b'x'; MEMORY_LIMIT]).unwrap();
+        output.write_all(&[b'y'; MEMORY_LIMIT - 1]).unwrap();
+        let spilled =
+            |output: &OutputBuffer| output.file.as_ref().unwrap().file.metadata().unwrap().len();
+        let before = spilled(&output);
+        let accepted = output.write(&[b'z'; MEMORY_LIMIT]).unwrap();
+        assert!(accepted > 0);
+        assert!(spilled(&output) - before <= MEMORY_LIMIT as u64);
+        output.write_all(&[b'z'; MEMORY_LIMIT][accepted..]).unwrap();
+        let mut actual = Vec::new();
+        output.write_to(&mut actual).unwrap();
+        let mut expected = vec![b'x'; MEMORY_LIMIT];
+        expected.extend_from_slice(&[b'y'; MEMORY_LIMIT - 1]);
+        expected.extend_from_slice(&[b'z'; MEMORY_LIMIT]);
         assert_eq!(actual, expected);
     }
 

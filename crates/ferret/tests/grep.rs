@@ -1779,6 +1779,28 @@ fn buffered_stdout_needs_no_extra_descriptor() {
     assert_eq!(run(Some(4)), unlimited);
 }
 
+// std's stdout reports EBADF as success, so a stdout opened read-only must
+// still exit 0 with nothing on stderr, as it did before block buffering.
+#[test]
+fn buffered_stdout_read_only_descriptor_is_silent() {
+    let fixture = Fixture::new("buffered-stdout-read-only");
+    fixture.write("large", &b"red line\n".repeat(20_000));
+    let path = fixture.base.join("out");
+    fs::File::create(&path).unwrap();
+    let mut command = fixture.command(OsStr::new(env!("CARGO_BIN_EXE_ferret")));
+    command
+        .args(["grep", "red", "large"])
+        .stdout(fs::File::open(&path).unwrap());
+    let output = command.output().unwrap();
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        (Some(0), "".into())
+    );
+}
+
 // Exercise the CLI destination after the consumer has accepted some output,
 // rather than only an injected writer that fails on its first call.
 #[test]

@@ -204,7 +204,7 @@ pub fn run(args: &[OsString], index: Option<&Path>, global_json: bool) -> Exit {
             .presentation
             .filename
             .unwrap_or(recursive || inputs.len() > 1),
-        writer: output::Writer::new(&stdout, !nul_names(&plan)),
+        writer: output::Writer::new(&stdout, block_stdout(&plan)),
         buffer: Vec::new(),
         matched: false,
         emitted_group: false,
@@ -433,6 +433,13 @@ struct Host<'a, W> {
     json_stats: json::Stats,
     errors: bool,
     cancelled: Option<&'a AtomicBool>,
+}
+
+/// Live policy loading warns on stderr from search workers, which no group
+/// flush orders against output, so live mode keeps std's line buffer, as
+/// do NUL name modes.
+fn block_stdout(plan: &Plan) -> bool {
+    !nul_names(plan) && !plan.traversal.live
 }
 
 fn nul_names(plan: &Plan) -> bool {

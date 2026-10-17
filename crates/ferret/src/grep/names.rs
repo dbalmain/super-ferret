@@ -9,7 +9,11 @@ use super::*;
 pub(super) fn run(plan: &Names, index: Option<&Path>) -> Exit {
     let cancelled = AtomicBool::new(false);
     let stdout = io::stdout();
-    let mut writer = output::Writer::new(&stdout, !plan.presentation.null);
+    let mut writer = output::Writer::new(
+        &stdout,
+        // As in `block_stdout`: live policy warnings bypass the writer.
+        !plan.presentation.null && !plan.traversal.live,
+    );
     match execute(plan, index, &mut writer, &cancelled) {
         Ok(exit) => exit,
         Err(error) => failure(&error),

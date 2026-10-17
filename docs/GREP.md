@@ -179,9 +179,10 @@ separator, data and LF through the capture's vectored writer. Grep stages spill
 writes in the same bounded 64 KiB allocation, finishing them inside the
 checked-read callback before accepting a group. Find's default captures retain
 immediate spill-write faults. Redirected grep stdout uses a 64 KiB block buffer
-over a duplicated descriptor (preserving shared stdout/stderr offsets); terminal
-stdout retains line buffering. NUL-terminated name modes also retain the
-original line buffer and its diagnostic ordering. Each other published group
+written to descriptor 1 itself, with no second descriptor (preserving shared
+stdout/stderr offsets); terminal stdout retains line buffering. NUL-terminated
+name modes and `--live`, whose policy warnings come from search workers, also
+retain the original line buffer and its diagnostic ordering. Each other published group
 and names-only record is flushed before the next operand or diagnostic, and
 help/version and the final JSON summary also flush explicitly. A publication
 fault also drains its previously accepted prefix before reporting the error.
