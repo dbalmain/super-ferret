@@ -1724,50 +1724,76 @@ impl Drop for StopOnPanic<'_> {
     }
 }
 
-/// Visits streaming file tasks on workers, publishing inside `work` in
-/// completion order. One thread keeps source order. The callback owns
-/// publication locking and returns `Break` to stop all workers; the producer
-/// must poll its stop predicate during traversal. Input reservations match
-/// [`file_groups`], but no finished groups wait in the ordered ring.
-pub fn visit_files<Task, State>(
+/// Prepares checked file groups on workers and emits them on the caller in
+/// completion order. One thread keeps source order. A bounded queue holds at
+/// most `threads` groups; workers own at most one each, and the caller one.
+/// Input reservations and producer cancellation match [`file_groups`].
+pub fn completion_groups<Task, State, Group: Send>(
     threads: usize,
     cancelled: &AtomicBool,
     next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Task)> + Send,
     make: impl Fn() -> State + Sync,
-    work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> ControlFlow<()> + Sync,
+    work: impl Fn(&mut State, Task, &dyn Fn() -> bool) -> Group + Sync,
+    mut emit: impl FnMut(Group) -> ControlFlow<()>,
 ) {
     if threads <= 1 {
-        groups_alone(next, cancelled, &make, &work, &mut |flow| flow);
+        groups_alone(next, cancelled, &make, &work, &mut emit);
         return;
     }
     let pool = Pool::<GroupItem<()>>::schedule(0, threads);
-    // Outside the scope: ordinary return joins workers before stopping them.
-    let _stop = StopOnDrop(&pool);
-    let source = Mutex::new(next);
-    let run = || {
-        let _panic = StopOnPanic(&pool);
-        let mut state = make();
-        let stopped = || pool.halted() || cancelled.load(Ordering::Acquire);
-        while !stopped() {
-            let Some((size, task)) = lock(&source)(&stopped) else {
-                break;
-            };
-            let Some(size) = pool.reserve(size.max(crate::scan::BUFFER as u64), &stopped) else {
-                break;
-            };
-            let flow = work(&mut state, task, &stopped);
-            pool.release(size);
-            if flow.is_break() {
-                pool.halt();
-            }
-        }
-    };
+    let source = Mutex::new((next, false));
+    let (sender, receiver) = std::sync::mpsc::sync_channel(threads);
     std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&pool);
+        let make = &make;
+        let work = &work;
         let started = (0..threads)
-            .take_while(|&i| spawn(scope, i, run).is_ok())
+            .take_while(|&i| {
+                let sender = sender.clone();
+                let source = &source;
+                let pool = &pool;
+                spawn(scope, i, move || {
+                    let _panic = StopOnPanic(pool);
+                    let mut state = make();
+                    let stopped = || pool.halted() || cancelled.load(Ordering::Acquire);
+                    while !stopped() {
+                        let task = {
+                            let mut source = lock(source);
+                            if source.1 || stopped() {
+                                None
+                            } else {
+                                let task = source.0(&stopped);
+                                source.1 = task.is_none();
+                                task
+                            }
+                        };
+                        let Some((size, task)) = task else { break };
+                        let Some(size) =
+                            pool.reserve(size.max(crate::scan::BUFFER as u64), &stopped)
+                        else {
+                            break;
+                        };
+                        let group = work(&mut state, task, &stopped);
+                        pool.release(size);
+                        if stopped() || sender.send(group).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .is_ok()
+            })
             .count();
+        drop(sender);
         if started == 0 {
-            run();
+            groups_alone(&mut lock(&source).0, cancelled, make, work, &mut emit);
+            return;
+        }
+        // The owning iterator drops the receiver on break, unblocking senders
+        // before scope join. The stop guard also wakes input-budget waiters.
+        for group in receiver {
+            if cancelled.load(Ordering::Acquire) || emit(group).is_break() {
+                break;
+            }
         }
     });
 }
@@ -2389,7 +2415,7 @@ mod group_tests {
         let reached = AtomicBool::new(false);
         let result = std::panic::catch_unwind(|| {
             let mut task = 0;
-            visit_files(
+            completion_groups(
                 2,
                 &AtomicBool::new(false),
                 |_| {
@@ -2410,6 +2436,7 @@ mod group_tests {
                     assert!(reached.load(Ordering::Acquire));
                     panic!("injected worker panic with a live reservation");
                 },
+                |_: ()| ControlFlow::Continue(()),
             );
         });
         assert!(result.is_err());

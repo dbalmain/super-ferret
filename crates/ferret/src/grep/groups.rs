@@ -1,6 +1,6 @@
 //! File transactions, bounded record caching and worker-owned line rendering.
 //! The parent host supplies operands/policy; query's existing scheduler owns
-//! parallelism. Workers publish completed transactions under the host mutex.
+//! parallelism. A bounded completion queue feeds the calling publisher.
 
 use super::*;
 use ferret_query::{ReadOperation, ReadVersion};
@@ -573,7 +573,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 type Fork<'a> = dyn Fn() -> Option<Box<CheckedReader<'a>>> + Sync + 'a;
 
-pub(super) fn run<'a, W: Write + Send>(
+pub(super) fn run<'a, W: Write>(
     host: &mut Host<'_, W>,
     mut next: impl FnMut(&dyn Fn() -> bool) -> Option<(u64, Job)> + Send,
     fork: &Fork<'a>,
@@ -587,14 +587,12 @@ pub(super) fn run<'a, W: Write + Send>(
     let hit = AtomicBool::new(false);
     let quiet_stats = Mutex::new(json::Stats::default());
     let fatal = Mutex::new(None);
-    let shared = Mutex::new(&mut *host);
-    ferret_query::visit_files(
+    let publication = Mutex::new(());
+    ferret_query::completion_groups(
         threads,
         cancelled,
         |stopped| {
-            // Live policy warnings are emitted while advancing the source.
-            // Hold the publication lock so none can split another file's group.
-            let _publication = plan.traversal.live.then(|| lock(&shared));
+            let _publication = plan.traversal.live.then(|| lock(&publication));
             next(stopped)
         },
         || Worker {
@@ -608,7 +606,7 @@ pub(super) fn run<'a, W: Write + Send>(
             if worker.buffer.capacity() > ferret_query::KEPT_BUFFER {
                 worker.buffer = Vec::new();
             }
-            let observed = match result {
+            match result {
                 Ok(observed) => {
                     if plan.quiet
                         && plan.json
@@ -622,7 +620,7 @@ pub(super) fn run<'a, W: Write + Send>(
                         hit.store(true, Ordering::Release);
                         cancelled.store(true, Ordering::Release);
                     }
-                    observed
+                    (job, observed)
                 }
                 Err(error) => {
                     if !stopped() {
@@ -632,15 +630,12 @@ pub(super) fn run<'a, W: Write + Send>(
                         }
                         cancelled.store(true, Ordering::Release);
                     }
-                    Observed::Skipped
+                    (job, Observed::Skipped)
                 }
-            };
-            let mut host = lock(&shared);
-            // Recheck under the same lock as failure and publication: a worker
-            // already waiting here must not publish after another group faults.
-            if stopped() {
-                return ControlFlow::Break(());
             }
+        },
+        |(job, observed)| {
+            let _publication = lock(&publication);
             if let Job::Failed(_, message) = &job {
                 host.error(job.path(), message);
                 return ControlFlow::Continue(());
